@@ -128,15 +128,16 @@ pub fn handle_sidewind_message(
             // Check if this PID already has a window; if so, reuse its surface slot
             // and update the existing window instead of creating a duplicate.
             let count = *window_count;
-            let existing_window_idx = if let Some(existing_s_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
+            let existing_s_idx = surfaces.iter().position(|s| s.active && s.pid == sender_pid);
+            let existing_window_idx = if let Some(es_idx) = existing_s_idx {
                 windows[..count].iter().position(|w| {
-                    matches!(w.content, WindowContent::External(idx) if idx == existing_s_idx as u32)
+                    matches!(w.content, WindowContent::External(idx) if idx == es_idx as u32)
                 })
             } else {
                 None
             };
 
-            let surface_idx = if let Some(existing_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
+            let surface_idx = if let Some(existing_idx) = existing_s_idx {
                 surfaces[existing_idx].unmap();
                 Some(existing_idx)
             } else {

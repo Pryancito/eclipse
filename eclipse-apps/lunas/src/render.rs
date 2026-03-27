@@ -465,9 +465,9 @@ fn draw_window(
             if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
                 // Derive the blit region from the window content area, but clamp it to the
                 // actually-mapped surface buffer so we never read past `vaddr`.
+                // Use max(0) to avoid wrapping negative i32 into a huge u32.
                 let src_w = window.w.max(0) as u32;
-                let intended_h = (window.h - ShellWindow::TITLE_H).max(0) as u32;
-                let intended_h = intended_h.min(content_h as u32);
+                let intended_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32).min(content_h as u32);
 
                 // Compute the maximum number of rows available in the buffer.
                 // Assume 4 bytes per pixel (ARGB8888) to ensure we do not
@@ -890,29 +890,28 @@ mod tests {
     fn test_format_metric() {
         let mut buf = [0u8; 16];
         let s = format_metric(&mut buf, "CPU:", 45.0);
-        assert!(s.contains("CPU:"));
-        assert!(s.contains("45%"));
+        assert_eq!(s, "CPU:45%");
     }
 
     #[test]
     fn test_format_metric_100() {
         let mut buf = [0u8; 16];
         let s = format_metric(&mut buf, "CPU:", 100.0);
-        assert!(s.contains("100%"), "expected '100%' in '{}'", s);
+        assert_eq!(s, "CPU:100%");
     }
 
     #[test]
     fn test_format_metric_zero() {
         let mut buf = [0u8; 16];
         let s = format_metric(&mut buf, "MEM:", 0.0);
-        assert!(s.contains("00%"), "expected '00%' in '{}'", s);
+        assert_eq!(s, "MEM:00%");
     }
 
     #[test]
     fn test_format_metric_single_digit() {
         let mut buf = [0u8; 16];
         let s = format_metric(&mut buf, "NET:", 5.0);
-        assert!(s.contains("05%"), "expected '05%' in '{}'", s);
+        assert_eq!(s, "NET:05%");
     }
 
     #[test]
