@@ -715,6 +715,14 @@ impl LunasState {
                     }
                     self.dirty = true;
                 }
+                ContextAction::BrightnessUp => {
+                    self.desktop.brightness_level = (self.desktop.brightness_level + 10).min(100);
+                    self.dirty = true;
+                }
+                ContextAction::BrightnessDown => {
+                    self.desktop.brightness_level = self.desktop.brightness_level.saturating_sub(10);
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }

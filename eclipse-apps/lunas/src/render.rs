@@ -286,14 +286,14 @@ pub fn draw_desktop_shell(
     fb.blit_background();
 
     // 2. Draw taskbar
-    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage);
+    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
     for i in 0..window_count {
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
-        draw_window(fb, w, surfaces, input.focused_window == Some(i));
+        draw_window(fb, w, surfaces, input.focused_window == Some(i), input.window_decoration_style);
     }
 
     // 4. Draw overlays
@@ -368,6 +368,50 @@ const TASK_TITLE_TRUNCATED_CHARS: usize = 14;
 /// Character width for the FONT_6X12 monospaced font.
 const FONT_CHAR_WIDTH: i32 = 6;
 
+// ── Running-dot indicator constants ──
+/// Width (px) of each running-instance dot.
+const RUN_DOT_W: i32 = 4;
+/// Gap (px) between adjacent running-instance dots.
+const RUN_DOT_GAP: i32 = 2;
+/// Stride between dot origins (dot width + gap).
+const RUN_DOT_STRIDE: i32 = RUN_DOT_W + RUN_DOT_GAP;
+
+// ── Mini-icon colour derivation constants ──
+/// Fallback seed byte when the window title is empty.
+const MINI_ICON_SEED_DEFAULT: u8 = 80;
+/// Multiplier for the red channel of the mini-icon colour.
+const MINI_ICON_R_MUL: u8 = 97;
+/// Multiplier for the green channel of the mini-icon colour.
+const MINI_ICON_G_MUL: u8 = 71;
+/// Multiplier for the blue channel of the mini-icon colour.
+const MINI_ICON_B_MUL: u8 = 53;
+/// Minimum additive offset for the red channel (keeps colours visible).
+const MINI_ICON_R_ADD: u8 = 20;
+/// Minimum additive offset for the green channel.
+const MINI_ICON_G_ADD: u8 = 60;
+/// Minimum additive offset for the blue channel.
+const MINI_ICON_B_ADD: u8 = 100;
+/// Cap for the red channel (prevents overly bright red-dominant icons).
+const MINI_ICON_R_MAX: u8 = 140;
+/// Cap for the green channel.
+const MINI_ICON_G_MAX: u8 = 160;
+/// Cap for the blue channel.
+const MINI_ICON_B_MAX: u8 = 210;
+
+// ── Window decoration style title-bar colours ──
+/// Default style: focused title bar colour.
+const TITLE_DEFAULT_FOCUSED: Rgb888 = Rgb888::new(25, 40, 80);
+/// Default style: unfocused title bar colour.
+const TITLE_DEFAULT_UNFOCUSED: Rgb888 = Rgb888::new(20, 25, 45);
+/// Minimal style: focused title bar colour.
+const TITLE_MINIMAL_FOCUSED: Rgb888 = Rgb888::new(40, 42, 54);
+/// Minimal style: unfocused title bar colour.
+const TITLE_MINIMAL_UNFOCUSED: Rgb888 = Rgb888::new(30, 32, 42);
+/// Neon style: focused title bar colour.
+const TITLE_NEON_FOCUSED: Rgb888 = Rgb888::new(0, 40, 60);
+/// Neon style: unfocused title bar colour.
+const TITLE_NEON_UNFOCUSED: Rgb888 = Rgb888::new(0, 25, 40);
+
 /// Draw the bottom taskbar.
 fn draw_taskbar(
     fb: &mut FramebufferState,
@@ -377,6 +421,7 @@ fn draw_taskbar(
     window_count: usize,
     cpu_usage: f32,
     mem_usage: f32,
+    net_usage: f32,
 ) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
@@ -400,6 +445,7 @@ fn draw_taskbar(
         .draw(fb);
 
     // ── Launcher button ──
+    let launcher_is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::Launcher;
     let launcher_bg = if input.launcher_active {
         Rgb888::new(0, 128, 255)
     } else {
@@ -409,6 +455,25 @@ fn draw_taskbar(
     let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
         .into_styled(launcher_style)
         .draw(fb);
+    // Hover border when not active
+    if launcher_is_hovered && !input.launcher_active {
+        let launcher_hover_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(0, 140, 255))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
+            .into_styled(launcher_hover_style)
+            .draw(fb);
+    }
+    // Active indicator dot at bottom of launcher button
+    if input.launcher_active {
+        let active_dot_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::WHITE)
+            .build();
+        let _ = Rectangle::new(Point::new(20, bar_y + 36), Size::new(4, 2))
+            .into_styled(active_dot_style)
+            .draw(fb);
+    }
 
     // Launcher icon (grid dots)
     let dot_color = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
@@ -438,6 +503,32 @@ fn draw_taskbar(
         let ws_char_buf = [b'0' + ws + 1];
         let ws_label = core::str::from_utf8(&ws_char_buf[..1]).unwrap_or("?");
         let _ = Text::new(ws_label, Point::new(ws_x + 7, bar_y + 26), ws_label_style).draw(fb);
+
+        // Presence dot(s) below the workspace indicator — shown when the workspace
+        // has open (non-minimized) windows. Active workspace gets a bright dot;
+        // inactive workspaces with windows get a dim dot.
+        if !active {
+            let ws_has_windows = (0..window_count).any(|wi| {
+                let w = &windows[wi];
+                w.content != WindowContent::None && !w.closing && w.workspace == ws
+            });
+            if ws_has_windows {
+                let presence_style = PrimitiveStyleBuilder::new()
+                    .fill_color(Rgb888::new(80, 100, 160))
+                    .build();
+                let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
+                    .into_styled(presence_style)
+                    .draw(fb);
+            }
+        } else {
+            // Active workspace: always show a bright dot at the bottom of the indicator
+            let presence_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 200, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
+                .into_styled(presence_style)
+                .draw(fb);
+        }
     }
 
     // ── Separator after workspaces ──
@@ -455,15 +546,16 @@ fn draw_taskbar(
         let app = &desktop.pinned_apps[i];
         let (r, g, b) = app.icon_color;
 
-        // Check if this pinned app has a running window matching its name
+        // Count running windows on this workspace whose title starts with the pinned app name
         let app_name = app.name_str();
-        let is_running = (0..window_count).any(|w_idx| {
+        let run_count = (0..window_count).filter(|&w_idx| {
             let w = &windows[w_idx];
             if w.content == WindowContent::None || w.closing { return false; }
             if w.workspace != input.current_workspace { return false; }
             let w_title = w.title_str();
             w_title.len() >= app_name.len() && w_title[..app_name.len()].eq_ignore_ascii_case(app_name)
-        });
+        }).count();
+        let is_running = run_count > 0;
 
         // Hover highlight
         let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::PinnedApp(i);
@@ -484,6 +576,20 @@ fn draw_taskbar(
         .into_styled(icon_style)
         .draw(fb);
 
+        // Hover outline border on the pinned app icon
+        if is_hovered {
+            let hover_border_style = PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb888::new(0, 180, 255))
+                .stroke_width(1)
+                .build();
+            let _ = Rectangle::new(
+                Point::new(app_x, bar_y + 6),
+                Size::new(TASKBAR_ICON_SIZE as u32, TASKBAR_ICON_SIZE as u32),
+            )
+            .into_styled(hover_border_style)
+            .draw(fb);
+        }
+
         // App first-letter icon
         let letter_color = if is_running {
             Rgb888::WHITE
@@ -496,17 +602,20 @@ fn draw_taskbar(
         let char_str = first_char.encode_utf8(&mut char_buf);
         let _ = Text::new(char_str, Point::new(app_x + 12, bar_y + 26), letter_style).draw(fb);
 
-        // Running indicator dot below the icon
-        if is_running {
+        // Running indicator: 1-3 dots below the icon depending on instance count
+        if run_count > 0 {
             let dot_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 200, 255))
                 .build();
-            let _ = Rectangle::new(
-                Point::new(app_x + TASKBAR_ICON_SIZE / 2 - 2, bar_y + 40),
-                Size::new(4, 2),
-            )
-            .into_styled(dot_style)
-            .draw(fb);
+            let (dot_start_x, n) = running_dot_layout(run_count, app_x, TASKBAR_ICON_SIZE);
+            for d in 0..n {
+                let _ = Rectangle::new(
+                    Point::new(dot_start_x + d * RUN_DOT_STRIDE, bar_y + 40),
+                    Size::new(RUN_DOT_W as u32, 2),
+                )
+                .into_styled(dot_style)
+                .draw(fb);
+            }
         }
 
         app_x += TASKBAR_ICON_SIZE + TASKBAR_ICON_SPACING;
@@ -585,22 +694,71 @@ fn draw_taskbar(
             .into_styled(task_style)
             .draw(fb);
 
-        // Window title (truncated with ellipsis)
+        // Left accent bar on focused window task (2px vertical stripe)
+        if focused {
+            let left_accent_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 150, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(win_x, bar_y + 8), Size::new(2, 28))
+                .into_styled(left_accent_style)
+                .draw(fb);
+        }
+
+        // Small coloured mini-icon (12×12) with the first letter of the window title.
+        // Colour is derived from the first byte of the title for a stable per-app hue.
+        let title_first_byte = w_title.as_bytes().first().copied().unwrap_or(MINI_ICON_SEED_DEFAULT);
+        let icon_r = title_first_byte.wrapping_mul(MINI_ICON_R_MUL).saturating_add(MINI_ICON_R_ADD).min(MINI_ICON_R_MAX);
+        let icon_g = title_first_byte.wrapping_mul(MINI_ICON_G_MUL).saturating_add(MINI_ICON_G_ADD).min(MINI_ICON_G_MAX);
+        let icon_b = title_first_byte.wrapping_mul(MINI_ICON_B_MUL).saturating_add(MINI_ICON_B_ADD).min(MINI_ICON_B_MAX);
+        let mini_icon_bg = if is_minimized {
+            Rgb888::new(icon_r / 2, icon_g / 2, icon_b / 2)
+        } else {
+            Rgb888::new(icon_r, icon_g, icon_b)
+        };
+        let mini_icon_style = PrimitiveStyleBuilder::new().fill_color(mini_icon_bg).build();
+        let _ = Rectangle::new(Point::new(win_x + 4, bar_y + 14), Size::new(12, 12))
+            .into_styled(mini_icon_style)
+            .draw(fb);
+        let first_char = w_title.chars().next().unwrap_or('?');
+        let mut icon_char_buf = [0u8; 4];
+        let icon_char_str = first_char.encode_utf8(&mut icon_char_buf);
+        let icon_letter_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+        let _ = Text::new(icon_char_str, Point::new(win_x + 5, bar_y + 24), icon_letter_style).draw(fb);
+
+        // Window title (truncated with ellipsis), offset right to make room for the mini-icon.
+        // On hover, reserve 14px on the right for the close button.
         let title_color = if is_minimized {
             Rgb888::new(100, 110, 130)
         } else {
             Rgb888::new(180, 190, 210)
         };
         let task_text_style = MonoTextStyle::new(&FONT_6X12, title_color);
-        if w_title.len() > TASK_TITLE_MAX_CHARS {
-            let truncated_title = &w_title[..TASK_TITLE_TRUNCATED_CHARS];
-            let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
-            let _ = Text::new("..", Point::new(win_x + 6 + TASK_TITLE_TRUNCATED_CHARS as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
+        let title_x = win_x + 20;
+        // When hovered, cap title 14px earlier to leave room for the "×" close button.
+        let title_max_chars = if is_hovered { TASK_TITLE_MAX_CHARS - 2 } else { TASK_TITLE_MAX_CHARS };
+        let title_truncated_chars = if is_hovered { TASK_TITLE_TRUNCATED_CHARS - 2 } else { TASK_TITLE_TRUNCATED_CHARS };
+        if w_title.len() > title_max_chars {
+            let truncated_title = &w_title[..title_truncated_chars];
+            let _ = Text::new(truncated_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(title_x + title_truncated_chars as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
         } else {
-            let _ = Text::new(w_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new(w_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
         }
 
-        // Focused indicator
+        // Inline close "×" button on the right edge — only on hover.
+        if is_hovered {
+            let close_x = win_x + win_item_w - 14;
+            let close_bg_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(180, 40, 40))
+                .build();
+            let _ = Rectangle::new(Point::new(close_x, bar_y + 12), Size::new(12, 12))
+                .into_styled(close_bg_style)
+                .draw(fb);
+            let close_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+            let _ = Text::new("x", Point::new(close_x + 3, bar_y + 22), close_text_style).draw(fb);
+        }
+
+        // Bottom focus indicator (full-width blue bar under the button)
         if focused {
             let focus_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 128, 255))
@@ -629,21 +787,57 @@ fn draw_taskbar(
     // ── System tray area (right side) ──
     let tray_x = tray_start;
 
+    // Subtle tray background tint — visually separates the tray from the window tasks area.
+    let tray_bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(12, 15, 30))
+        .build();
+    let _ = Rectangle::new(Point::new(tray_x + 1, bar_y + 1), Size::new((TASKBAR_TRAY_WIDTH - 1) as u32, (bar_h - 1) as u32))
+        .into_styled(tray_bg_style)
+        .draw(fb);
+
     // Tray separator
     let _ = Rectangle::new(Point::new(tray_x, bar_y + 8), Size::new(1, 28))
         .into_styled(sep_style)
         .draw(fb);
 
-    // CPU metric
+    // CPU metric text
     let metrics_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
     let mut cpu_buf = [0u8; 16];
     let cpu_str = format_metric(&mut cpu_buf, "CPU:", cpu_usage);
     let _ = Text::new(cpu_str, Point::new(tray_x + 10, bar_y + 18), metrics_style).draw(fb);
 
-    // Memory metric
+    // CPU mini progress bar below the text — turns red above 80 %
+    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * 46) / 100;
+    if cpu_bar_w > 0 {
+        let cpu_bar_color = if cpu_usage > 80.0 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(0, 130, 220)
+        };
+        let cpu_bar_style = PrimitiveStyleBuilder::new().fill_color(cpu_bar_color).build();
+        let _ = Rectangle::new(Point::new(tray_x + 10, bar_y + 33), Size::new(cpu_bar_w as u32, 2))
+            .into_styled(cpu_bar_style)
+            .draw(fb);
+    }
+
+    // MEM metric text
     let mut mem_buf = [0u8; 16];
     let mem_str = format_metric(&mut mem_buf, "MEM:", mem_usage);
-    let _ = Text::new(mem_str, Point::new(tray_x + 80, bar_y + 18), metrics_style).draw(fb);
+    let _ = Text::new(mem_str, Point::new(tray_x + 78, bar_y + 18), metrics_style).draw(fb);
+
+    // MEM mini progress bar below the text — turns red above 80 %
+    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * 46) / 100;
+    if mem_bar_w > 0 {
+        let mem_bar_color = if mem_usage > 80.0 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(80, 200, 120)
+        };
+        let mem_bar_style = PrimitiveStyleBuilder::new().fill_color(mem_bar_color).build();
+        let _ = Rectangle::new(Point::new(tray_x + 78, bar_y + 33), Size::new(mem_bar_w as u32, 2))
+            .into_styled(mem_bar_style)
+            .draw(fb);
+    }
 
     // Tiling mode indicator — small "T" badge between MEM and notifications
     if input.tiling_active {
@@ -655,6 +849,42 @@ fn draw_taskbar(
             .draw(fb);
         let tiling_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 120));
         let _ = Text::new("T", Point::new(tray_x + 140, bar_y + 19), tiling_text).draw(fb);
+    }
+
+    // Window decoration style badge — shown when not default (style > 0).
+    // Styles: 1 = "M" (minimal, grey), 2 = "N" (neon, cyan).
+    if input.window_decoration_style > 0 {
+        let (style_char, style_color) = match input.window_decoration_style {
+            1 => ("M", Rgb888::new(140, 150, 170)),
+            _ => ("N", Rgb888::new(0, 240, 220)),
+        };
+        let deco_text = MonoTextStyle::new(&FONT_6X12, style_color);
+        let _ = Text::new(style_char, Point::new(tray_x + 126, bar_y + 19), deco_text).draw(fb);
+    }
+
+    // Brightness mini-bar (24px wide) with a small "☀" glyph (represented as "*").
+    // Shown as a very thin 24×2px bar just above the tiling badge position.
+    {
+        let bri = desktop.brightness_level.min(100) as i32;
+        let bri_bar_x = tray_x + 10;
+        let bri_bar_w_full: i32 = 24;
+        let bri_bar_w = (bri * bri_bar_w_full) / 100;
+        // Background track
+        let bri_track_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(30, 38, 60))
+            .build();
+        let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w_full as u32, 2))
+            .into_styled(bri_track_style)
+            .draw(fb);
+        // Fill
+        if bri_bar_w > 0 {
+            let bri_fill_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(220, 200, 80))
+                .build();
+            let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w as u32, 2))
+                .into_styled(bri_fill_style)
+                .draw(fb);
+        }
     }
 
     // Notification bell indicator
@@ -676,8 +906,14 @@ fn draw_taskbar(
         let nstr = format_u32(&mut nbuf, notif_count as u32);
         let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
     } else {
-        let bell_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
-        let _ = Text::new(".", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
+        // Outline box as a quiet bell placeholder when there are no unread notifications.
+        let bell_outline = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(70, 85, 115))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(notif_x, bar_y + 11), Size::new(8, 8))
+            .into_styled(bell_outline)
+            .draw(fb);
     }
 
     // Volume indicator (mute-aware)
@@ -699,7 +935,7 @@ fn draw_taskbar(
     };
     let _ = Text::new(vol_icon, Point::new(vol_x, bar_y + 18), vol_style).draw(fb);
 
-    // Volume level bar (below icon)
+    // Volume level bar (below icon) — spans up to 20px (proportional)
     if !desktop.volume_muted && desktop.volume_level > 0 {
         let bar_w = (desktop.volume_level as i32 * 20) / 100;
         let vol_bar_style = PrimitiveStyleBuilder::new()
@@ -711,6 +947,49 @@ fn draw_taskbar(
         )
         .into_styled(vol_bar_style)
         .draw(fb);
+    }
+
+    // Volume percentage text below the bar (e.g. "75" or "M" when muted)
+    {
+        let vol_pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 85, 115));
+        if desktop.volume_muted {
+            let _ = Text::new("M", Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
+        } else {
+            let mut vpbuf = [0u8; 4];
+            let vp = desktop.volume_level.min(100) as u32;
+            let mut vpos = 0usize;
+            if vp >= 100 {
+                vpbuf[vpos] = b'1'; vpos += 1;
+                vpbuf[vpos] = b'0'; vpos += 1;
+                vpbuf[vpos] = b'0'; vpos += 1;
+            } else {
+                vpbuf[vpos] = b'0' + (vp / 10) as u8; vpos += 1;
+                vpbuf[vpos] = b'0' + (vp % 10) as u8; vpos += 1;
+            }
+            let vstr = core::str::from_utf8(&vpbuf[..vpos]).unwrap_or("?");
+            let _ = Text::new(vstr, Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
+        }
+    }
+
+    // Network activity indicator — small coloured dot at tray_x+205.
+    // Green when active (net_usage > 0.5%), dim grey when idle.
+    {
+        let net_x = tray_x + 205;
+        let net_connected = net_usage > 0.5;
+        let net_dot_color = if net_connected {
+            Rgb888::new(0, 210, 130)
+        } else {
+            Rgb888::new(50, 60, 85)
+        };
+        let net_dot_style = PrimitiveStyleBuilder::new().fill_color(net_dot_color).build();
+        // Outer dot (6×6)
+        let _ = Rectangle::new(Point::new(net_x, bar_y + 19), Size::new(6, 6))
+            .into_styled(net_dot_style)
+            .draw(fb);
+        // Label below
+        let net_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(60, 75, 110));
+        let net_label = if net_connected { "N" } else { "n" };
+        let _ = Text::new(net_label, Point::new(net_x, bar_y + 34), net_label_style).draw(fb);
     }
 
     // Battery indicator — shown when show_battery is enabled.
@@ -759,6 +1038,17 @@ fn draw_taskbar(
             let charge_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 240, 120));
             let _ = Text::new("+", Point::new(bat_x + 20, bar_y + 26), charge_style).draw(fb);
         }
+
+        // Battery percentage text below the battery icon
+        let bat_pct_color = if bat_level <= 20 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(90, 110, 150)
+        };
+        let bat_pct_style = MonoTextStyle::new(&FONT_6X12, bat_pct_color);
+        let mut bat_pct_buf = [0u8; 6];
+        let bat_pct_str = format_battery_pct(&mut bat_pct_buf, bat_level as u32);
+        let _ = Text::new(bat_pct_str, Point::new(bat_x, bar_y + 33), bat_pct_style).draw(fb);
     }
 
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
@@ -775,18 +1065,16 @@ fn draw_taskbar(
         let time_str = core::str::from_utf8(&time_buf[..5]).unwrap_or("00:00");
         let _ = Text::new(time_str, Point::new(fb_w - 56, bar_y + 14), clock_style).draw(fb);
 
-        // Date below time (DD/MM)
+        // Date below time (DD/MM with day-of-week prefix)
         let date_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 110, 140));
-        let mut date_buf = [0u8; 8];
         let d = desktop.clock_day;
         let mo = desktop.clock_month;
-        date_buf[0] = b'0' + d / 10;
-        date_buf[1] = b'0' + d % 10;
-        date_buf[2] = b'/';
-        date_buf[3] = b'0' + mo / 10;
-        date_buf[4] = b'0' + mo % 10;
-        let date_str = core::str::from_utf8(&date_buf[..5]).unwrap_or("01/01");
-        let _ = Text::new(date_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
+        let year = desktop.clock_year as u32;
+        // Three-letter day-of-week abbreviation (Sakamoto: 0=Sun, 1=Mon…5=Fri, 6=Sat)
+        const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let dow_idx = (day_of_week(year, mo as u32, d as u32) % 7) as usize;
+        let dow_str = DOW_ABBR.get(dow_idx).copied().unwrap_or("???");
+        let _ = Text::new(dow_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
     } else {
         let _ = Text::new("LUNAS", Point::new(fb_w - 56, bar_y + 18), clock_style).draw(fb);
     }
@@ -874,11 +1162,13 @@ fn draw_taskbar(
 }
 
 /// Draw a single window with decorations.
+/// `decoration_style`: 0 = default (dark blue), 1 = minimal (charcoal), 2 = neon (cyan accent).
 fn draw_window(
     fb: &mut FramebufferState,
     window: &ShellWindow,
     surfaces: &[ExternalSurface],
     focused: bool,
+    decoration_style: u8,
 ) {
     let cx = window.curr_x as i32;
     let cy = window.curr_y as i32;
@@ -895,37 +1185,47 @@ fn draw_window(
         .into_styled(shadow_style)
         .draw(fb);
 
-    // Title bar
-    let title_color = if focused {
-        Rgb888::new(25, 40, 80)
-    } else {
-        Rgb888::new(20, 25, 45)
+    // Title bar — colour varies with decoration style
+    let title_color = match decoration_style {
+        1 => if focused { TITLE_MINIMAL_FOCUSED } else { TITLE_MINIMAL_UNFOCUSED }, // minimal
+        2 => if focused { TITLE_NEON_FOCUSED } else { TITLE_NEON_UNFOCUSED },       // neon
+        _ => if focused { TITLE_DEFAULT_FOCUSED } else { TITLE_DEFAULT_UNFOCUSED }, // default
     };
     let title_style = PrimitiveStyleBuilder::new().fill_color(title_color).build();
     let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ShellWindow::TITLE_H as u32))
         .into_styled(title_style)
         .draw(fb);
 
+    // Neon style: a bright accent line at the top of the title bar
+    if decoration_style == 2 {
+        let neon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 240, 220)).build();
+        let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, 2))
+            .into_styled(neon_style)
+            .draw(fb);
+    }
+
     // Title text
     let title_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
     let title = window.title_str();
     let _ = Text::new(title, Point::new(cx + 8, cy + 18), title_text_style).draw(fb);
 
-    // Close button (red circle)
+    // Close button (red circle) — always present
     let close_x = cx + cw - 21;
     let close_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 50, 50)).build();
     let _ = Rectangle::new(Point::new(close_x, cy + 6), Size::new(16, 16))
         .into_styled(close_style)
         .draw(fb);
 
-    // Maximize button (cyan)
-    let max_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 180, 220)).build();
+    // Maximize button — cyan or neon
+    let max_color = if decoration_style == 2 { Rgb888::new(0, 240, 180) } else { Rgb888::new(0, 180, 220) };
+    let max_style = PrimitiveStyleBuilder::new().fill_color(max_color).build();
     let _ = Rectangle::new(Point::new(close_x - 21, cy + 6), Size::new(16, 16))
         .into_styled(max_style)
         .draw(fb);
 
-    // Minimize button (dim cyan)
-    let min_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 120, 160)).build();
+    // Minimize button
+    let min_color = if decoration_style == 1 { Rgb888::new(80, 90, 110) } else { Rgb888::new(0, 120, 160) };
+    let min_style = PrimitiveStyleBuilder::new().fill_color(min_color).build();
     let _ = Rectangle::new(Point::new(close_x - 42, cy + 6), Size::new(16, 16))
         .into_styled(min_style)
         .draw(fb);
@@ -984,10 +1284,15 @@ fn draw_window(
         WindowContent::None => {}
     }
 
-    // Focus highlight border
+    // Focus highlight border — colour varies with decoration style
     if focused {
+        let highlight_color = match decoration_style {
+            1 => Rgb888::new(100, 110, 140), // minimal: dim grey-blue
+            2 => Rgb888::new(0, 240, 220),   // neon: bright cyan
+            _ => Rgb888::new(0, 128, 255),   // default: blue
+        };
         let highlight_style = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(0, 128, 255))
+            .stroke_color(highlight_color)
             .stroke_width(2)
             .build();
         let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ch as u32))
@@ -1438,6 +1743,13 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
             let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new((menu_w - 2) as u32, item_h as u32))
                 .into_styled(hover_style)
                 .draw(fb);
+            // Left accent bar on hovered item
+            let accent_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 140, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new(2, item_h as u32))
+                .into_styled(accent_style)
+                .draw(fb);
         }
 
         let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
@@ -1635,6 +1947,36 @@ fn format_metric<'a>(buf: &'a mut [u8; 16], label: &str, value: f32) -> &'a str 
     core::str::from_utf8(&buf[..pos]).unwrap_or("??")
 }
 
+/// Format battery level as "XX%" or "100%" into a caller-provided buffer.
+/// Returns a `&str` slice into the buffer.
+fn format_battery_pct<'a>(buf: &'a mut [u8; 6], level: u32) -> &'a str {
+    let pct = level.min(100);
+    let mut pos = 0usize;
+    if pct >= 100 {
+        buf[pos] = b'1'; pos += 1;
+        buf[pos] = b'0'; pos += 1;
+        buf[pos] = b'0'; pos += 1;
+    } else {
+        buf[pos] = b'0' + (pct / 10) as u8; pos += 1;
+        buf[pos] = b'0' + (pct % 10) as u8; pos += 1;
+    }
+    buf[pos] = b'%'; pos += 1;
+    core::str::from_utf8(&buf[..pos]).unwrap_or("?%")
+}
+
+/// Compute the x offset of the first running-indicator dot for a pinned app icon.
+/// Returns `(dot_start_x, n_dots)` where `n_dots` is clamped to 3.
+/// `icon_left_x` is the left edge of the icon (e.g. `app_x`).
+/// `icon_size` is the icon width (e.g. `TASKBAR_ICON_SIZE`).
+fn running_dot_layout(run_count: usize, icon_left_x: i32, icon_size: i32) -> (i32, i32) {
+    let n = run_count.min(3) as i32;
+    if n == 0 { return (0, 0); }
+    // n dots of RUN_DOT_W each, with RUN_DOT_GAP between them (no trailing gap)
+    let total_w = n * RUN_DOT_STRIDE - RUN_DOT_GAP;
+    let dot_start_x = icon_left_x + icon_size / 2 - total_w / 2;
+    (dot_start_x, n)
+}
+
 fn format_u32<'a>(buf: &'a mut [u8; 8], val: u32) -> &'a str {
     if val == 0 {
         buf[0] = b'0';
@@ -1688,8 +2030,8 @@ fn format_ipv4(buf: &mut [u8; 20], ip: &[u8; 4]) -> usize {
     pos
 }
 
-/// Returns the day of week for a given date (0 = Monday … 6 = Sunday).
-/// Uses Tomohiko Sakamoto's algorithm.
+/// Returns the day of week for a given date using Tomohiko Sakamoto's algorithm.
+/// Returns 0 = Sunday, 1 = Monday, …, 5 = Friday, 6 = Saturday.
 fn day_of_week(mut y: u32, m: u32, d: u32) -> u32 {
     const T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     if m < 3 { y -= 1; }
@@ -1901,5 +2243,122 @@ mod tests {
         let len = format_ipv4(&mut buf, &[127, 0, 0, 1]);
         let ip = core::str::from_utf8(&buf[..len]).unwrap();
         assert_eq!(ip, "127.0.0.1");
+    }
+
+    // ── Tests for new visual-improvement helpers ──
+
+    #[test]
+    fn test_format_battery_pct_full() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 100), "100%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_zero() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 0), "00%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_single_digit() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 5), "05%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_two_digits() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 83), "83%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_clamps_over_100() {
+        let mut buf = [0u8; 6];
+        // Values > 100 should be clamped to 100.
+        assert_eq!(format_battery_pct(&mut buf, 120), "100%");
+    }
+
+    #[test]
+    fn test_running_dot_layout_zero() {
+        // No running instances → returns (0, 0).
+        let (_, n) = running_dot_layout(0, 160, 32);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_running_dot_layout_one() {
+        // 1 instance → 1 dot, centred under the icon.
+        let (start_x, n) = running_dot_layout(1, 160, 32);
+        assert_eq!(n, 1);
+        // icon centre = 160 + 16 = 176; total_w = 4; offset = 176 - 2 = 174
+        assert_eq!(start_x, 174);
+    }
+
+    #[test]
+    fn test_running_dot_layout_two() {
+        // 2 instances → 2 dots.
+        let (start_x, n) = running_dot_layout(2, 160, 32);
+        assert_eq!(n, 2);
+        // total_w = 2*RUN_DOT_STRIDE - RUN_DOT_GAP = 10; offset = 5; start = 176 - 5 = 171
+        assert_eq!(start_x, 171);
+    }
+
+    #[test]
+    fn test_running_dot_layout_three() {
+        // 3 instances → 3 dots.
+        let (start_x, n) = running_dot_layout(3, 160, 32);
+        assert_eq!(n, 3);
+        // total_w = 3*RUN_DOT_STRIDE - RUN_DOT_GAP = 16; offset = 8; start = 176 - 8 = 168
+        assert_eq!(start_x, 168);
+    }
+
+    #[test]
+    fn test_running_dot_layout_clamped_to_three() {
+        // Even with 5 running instances, only 3 dots are shown.
+        let (_, n) = running_dot_layout(5, 160, 32);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn test_running_dot_spacing_consistent() {
+        // Adjacent dots are RUN_DOT_STRIDE pixels apart.
+        let (start_x_3, n) = running_dot_layout(3, 0, 32);
+        assert_eq!(n, 3);
+        let dot0 = start_x_3;
+        let dot1 = start_x_3 + RUN_DOT_STRIDE;
+        let dot2 = start_x_3 + RUN_DOT_STRIDE * 2;
+        assert_eq!(dot1 - dot0, RUN_DOT_STRIDE);
+        assert_eq!(dot2 - dot1, RUN_DOT_STRIDE);
+    }
+
+    // ── Tests for day-of-week abbreviation ──
+
+    #[test]
+    fn test_day_of_week_known_dates() {
+        // 2026-03-27 is a Friday — Sakamoto returns 5 (0=Sun,1=Mon…5=Fri,6=Sat).
+        assert_eq!(day_of_week(2026, 3, 27), 5);
+    }
+
+    #[test]
+    fn test_day_of_week_monday() {
+        // 2026-03-23 is a Monday → Sakamoto returns 1.
+        assert_eq!(day_of_week(2026, 3, 23), 1);
+    }
+
+    #[test]
+    fn test_day_of_week_sunday() {
+        // 2026-03-29 is a Sunday → Sakamoto returns 0.
+        assert_eq!(day_of_week(2026, 3, 29), 0);
+    }
+
+    #[test]
+    fn test_day_of_week_abbr_array() {
+        const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        // 2026-03-27 is Friday → index 5 → "Fri"
+        let idx = day_of_week(2026, 3, 27) as usize;
+        assert_eq!(DOW_ABBR[idx], "Fri");
+        // 2026-03-23 is Monday → index 1 → "Mon"
+        let idx2 = day_of_week(2026, 3, 23) as usize;
+        assert_eq!(DOW_ABBR[idx2], "Mon");
     }
 }
