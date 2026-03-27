@@ -73,6 +73,7 @@ pub enum ContextAction {
     VolumeUp,
     VolumeDown,
     ToggleMute,
+    SetVolume(u8),
 }
 
 /// A single context menu item.
@@ -820,14 +821,10 @@ impl InputState {
                                 if self.cursor_x >= bar_x && self.cursor_x < bar_x + bar_w
                                     && self.cursor_y >= vp_y + 55 && self.cursor_y < vp_y + 71
                                 {
-                                    // Click on volume bar — adjust level
+                                    // Click on volume bar — set level directly
                                     let relative = self.cursor_x - bar_x;
-                                    let new_vol = ((relative * 100) / bar_w).clamp(0, 100);
-                                    self.pending_context_action = if new_vol > 50 {
-                                        ContextAction::VolumeUp
-                                    } else {
-                                        ContextAction::VolumeDown
-                                    };
+                                    let new_vol = ((relative * 100) / bar_w).clamp(0, 100) as u8;
+                                    self.pending_context_action = ContextAction::SetVolume(new_vol);
                                 } else {
                                     // Click on mute label area — toggle mute
                                     self.pending_context_action = ContextAction::ToggleMute;

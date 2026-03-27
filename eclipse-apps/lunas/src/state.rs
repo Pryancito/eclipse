@@ -443,6 +443,11 @@ impl LunasState {
                     self.desktop.volume_muted = !self.desktop.volume_muted;
                     self.dirty = true;
                 }
+                ContextAction::SetVolume(level) => {
+                    self.desktop.volume_level = level;
+                    self.desktop.volume_muted = false;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -613,15 +618,18 @@ fn unix_timestamp_to_date(timestamp: u64) -> (u8, u8) {
         31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
     ];
 
-    let mut month = 0u8;
+    let mut month = 1u8;
     for (i, &days) in month_days.iter().enumerate() {
         if remaining_days < days {
             month = (i + 1) as u8;
             break;
         }
         remaining_days -= days;
+        // If we consumed all months, remaining_days stays for the last month
+        if i == 11 {
+            month = 12;
+        }
     }
-    if month == 0 { month = 12; }
 
     let day = (remaining_days + 1) as u8;
     (month, day)
