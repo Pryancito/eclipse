@@ -286,7 +286,7 @@ pub fn draw_desktop_shell(
     fb.blit_background();
 
     // 2. Draw taskbar
-    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage);
+    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
     for i in 0..window_count {
@@ -407,6 +407,7 @@ fn draw_taskbar(
     window_count: usize,
     cpu_usage: f32,
     mem_usage: f32,
+    net_usage: f32,
 ) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
@@ -430,6 +431,7 @@ fn draw_taskbar(
         .draw(fb);
 
     // ── Launcher button ──
+    let launcher_is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::Launcher;
     let launcher_bg = if input.launcher_active {
         Rgb888::new(0, 128, 255)
     } else {
@@ -439,6 +441,25 @@ fn draw_taskbar(
     let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
         .into_styled(launcher_style)
         .draw(fb);
+    // Hover border when not active
+    if launcher_is_hovered && !input.launcher_active {
+        let launcher_hover_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(0, 140, 255))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
+            .into_styled(launcher_hover_style)
+            .draw(fb);
+    }
+    // Active indicator dot at bottom of launcher button
+    if input.launcher_active {
+        let active_dot_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::WHITE)
+            .build();
+        let _ = Rectangle::new(Point::new(20, bar_y + 36), Size::new(4, 2))
+            .into_styled(active_dot_style)
+            .draw(fb);
+    }
 
     // Launcher icon (grid dots)
     let dot_color = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
@@ -468,6 +489,32 @@ fn draw_taskbar(
         let ws_char_buf = [b'0' + ws + 1];
         let ws_label = core::str::from_utf8(&ws_char_buf[..1]).unwrap_or("?");
         let _ = Text::new(ws_label, Point::new(ws_x + 7, bar_y + 26), ws_label_style).draw(fb);
+
+        // Presence dot(s) below the workspace indicator — shown when the workspace
+        // has open (non-minimized) windows. Active workspace gets a bright dot;
+        // inactive workspaces with windows get a dim dot.
+        if !active {
+            let ws_has_windows = (0..window_count).any(|wi| {
+                let w = &windows[wi];
+                w.content != WindowContent::None && !w.closing && w.workspace == ws
+            });
+            if ws_has_windows {
+                let presence_style = PrimitiveStyleBuilder::new()
+                    .fill_color(Rgb888::new(80, 100, 160))
+                    .build();
+                let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
+                    .into_styled(presence_style)
+                    .draw(fb);
+            }
+        } else {
+            // Active workspace: always show a bright dot at the bottom of the indicator
+            let presence_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 200, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
+                .into_styled(presence_style)
+                .draw(fb);
+        }
     }
 
     // ── Separator after workspaces ──
@@ -514,6 +561,20 @@ fn draw_taskbar(
         )
         .into_styled(icon_style)
         .draw(fb);
+
+        // Hover outline border on the pinned app icon
+        if is_hovered {
+            let hover_border_style = PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb888::new(0, 180, 255))
+                .stroke_width(1)
+                .build();
+            let _ = Rectangle::new(
+                Point::new(app_x, bar_y + 6),
+                Size::new(TASKBAR_ICON_SIZE as u32, TASKBAR_ICON_SIZE as u32),
+            )
+            .into_styled(hover_border_style)
+            .draw(fb);
+        }
 
         // App first-letter icon
         let letter_color = if is_running {
@@ -651,6 +712,7 @@ fn draw_taskbar(
         let _ = Text::new(icon_char_str, Point::new(win_x + 5, bar_y + 24), icon_letter_style).draw(fb);
 
         // Window title (truncated with ellipsis), offset right to make room for the mini-icon.
+        // On hover, reserve 14px on the right for the close button.
         let title_color = if is_minimized {
             Rgb888::new(100, 110, 130)
         } else {
@@ -658,12 +720,28 @@ fn draw_taskbar(
         };
         let task_text_style = MonoTextStyle::new(&FONT_6X12, title_color);
         let title_x = win_x + 20;
-        if w_title.len() > TASK_TITLE_MAX_CHARS {
-            let truncated_title = &w_title[..TASK_TITLE_TRUNCATED_CHARS];
+        // When hovered, cap title 14px earlier to leave room for the "×" close button.
+        let title_max_chars = if is_hovered { TASK_TITLE_MAX_CHARS - 2 } else { TASK_TITLE_MAX_CHARS };
+        let title_truncated_chars = if is_hovered { TASK_TITLE_TRUNCATED_CHARS - 2 } else { TASK_TITLE_TRUNCATED_CHARS };
+        if w_title.len() > title_max_chars {
+            let truncated_title = &w_title[..title_truncated_chars];
             let _ = Text::new(truncated_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
-            let _ = Text::new("..", Point::new(title_x + TASK_TITLE_TRUNCATED_CHARS as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(title_x + title_truncated_chars as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
         } else {
             let _ = Text::new(w_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
+        }
+
+        // Inline close "×" button on the right edge — only on hover.
+        if is_hovered {
+            let close_x = win_x + win_item_w - 14;
+            let close_bg_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(180, 40, 40))
+                .build();
+            let _ = Rectangle::new(Point::new(close_x, bar_y + 12), Size::new(12, 12))
+                .into_styled(close_bg_style)
+                .draw(fb);
+            let close_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+            let _ = Text::new("x", Point::new(close_x + 3, bar_y + 22), close_text_style).draw(fb);
         }
 
         // Bottom focus indicator (full-width blue bar under the button)
@@ -807,7 +885,7 @@ fn draw_taskbar(
     };
     let _ = Text::new(vol_icon, Point::new(vol_x, bar_y + 18), vol_style).draw(fb);
 
-    // Volume level bar (below icon)
+    // Volume level bar (below icon) — spans up to 20px (proportional)
     if !desktop.volume_muted && desktop.volume_level > 0 {
         let bar_w = (desktop.volume_level as i32 * 20) / 100;
         let vol_bar_style = PrimitiveStyleBuilder::new()
@@ -819,6 +897,49 @@ fn draw_taskbar(
         )
         .into_styled(vol_bar_style)
         .draw(fb);
+    }
+
+    // Volume percentage text below the bar (e.g. "75" or "M" when muted)
+    {
+        let vol_pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 85, 115));
+        if desktop.volume_muted {
+            let _ = Text::new("M", Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
+        } else {
+            let mut vpbuf = [0u8; 4];
+            let vp = desktop.volume_level.min(100) as u32;
+            let mut vpos = 0usize;
+            if vp >= 100 {
+                vpbuf[vpos] = b'1'; vpos += 1;
+                vpbuf[vpos] = b'0'; vpos += 1;
+                vpbuf[vpos] = b'0'; vpos += 1;
+            } else {
+                vpbuf[vpos] = b'0' + (vp / 10) as u8; vpos += 1;
+                vpbuf[vpos] = b'0' + (vp % 10) as u8; vpos += 1;
+            }
+            let vstr = core::str::from_utf8(&vpbuf[..vpos]).unwrap_or("?");
+            let _ = Text::new(vstr, Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
+        }
+    }
+
+    // Network activity indicator — small coloured dot at tray_x+205.
+    // Green when active (net_usage > 0.5%), dim grey when idle.
+    {
+        let net_x = tray_x + 205;
+        let net_connected = net_usage > 0.5;
+        let net_dot_color = if net_connected {
+            Rgb888::new(0, 210, 130)
+        } else {
+            Rgb888::new(50, 60, 85)
+        };
+        let net_dot_style = PrimitiveStyleBuilder::new().fill_color(net_dot_color).build();
+        // Outer dot (6×6)
+        let _ = Rectangle::new(Point::new(net_x, bar_y + 19), Size::new(6, 6))
+            .into_styled(net_dot_style)
+            .draw(fb);
+        // Label below
+        let net_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(60, 75, 110));
+        let net_label = if net_connected { "N" } else { "n" };
+        let _ = Text::new(net_label, Point::new(net_x, bar_y + 34), net_label_style).draw(fb);
     }
 
     // Battery indicator — shown when show_battery is enabled.
@@ -894,18 +1015,16 @@ fn draw_taskbar(
         let time_str = core::str::from_utf8(&time_buf[..5]).unwrap_or("00:00");
         let _ = Text::new(time_str, Point::new(fb_w - 56, bar_y + 14), clock_style).draw(fb);
 
-        // Date below time (DD/MM)
+        // Date below time (DD/MM with day-of-week prefix)
         let date_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 110, 140));
-        let mut date_buf = [0u8; 8];
         let d = desktop.clock_day;
         let mo = desktop.clock_month;
-        date_buf[0] = b'0' + d / 10;
-        date_buf[1] = b'0' + d % 10;
-        date_buf[2] = b'/';
-        date_buf[3] = b'0' + mo / 10;
-        date_buf[4] = b'0' + mo % 10;
-        let date_str = core::str::from_utf8(&date_buf[..5]).unwrap_or("01/01");
-        let _ = Text::new(date_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
+        let year = desktop.clock_year as u32;
+        // Three-letter day-of-week abbreviation (Sakamoto: 0=Sun, 1=Mon…5=Fri, 6=Sat)
+        const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let dow_idx = day_of_week(year, mo as u32, d as u32) as usize;
+        let dow_str = DOW_ABBR.get(dow_idx).copied().unwrap_or("???");
+        let _ = Text::new(dow_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
     } else {
         let _ = Text::new("LUNAS", Point::new(fb_w - 56, bar_y + 18), clock_style).draw(fb);
     }
@@ -1844,8 +1963,8 @@ fn format_ipv4(buf: &mut [u8; 20], ip: &[u8; 4]) -> usize {
     pos
 }
 
-/// Returns the day of week for a given date (0 = Monday … 6 = Sunday).
-/// Uses Tomohiko Sakamoto's algorithm.
+/// Returns the day of week for a given date using Tomohiko Sakamoto's algorithm.
+/// Returns 0 = Sunday, 1 = Monday, …, 5 = Friday, 6 = Saturday.
 fn day_of_week(mut y: u32, m: u32, d: u32) -> u32 {
     const T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     if m < 3 { y -= 1; }
@@ -2143,5 +2262,36 @@ mod tests {
         let dot2 = start_x_3 + RUN_DOT_STRIDE * 2;
         assert_eq!(dot1 - dot0, RUN_DOT_STRIDE);
         assert_eq!(dot2 - dot1, RUN_DOT_STRIDE);
+    }
+
+    // ── Tests for day-of-week abbreviation ──
+
+    #[test]
+    fn test_day_of_week_known_dates() {
+        // 2026-03-27 is a Friday — Sakamoto returns 5 (0=Sun,1=Mon…5=Fri,6=Sat).
+        assert_eq!(day_of_week(2026, 3, 27), 5);
+    }
+
+    #[test]
+    fn test_day_of_week_monday() {
+        // 2026-03-23 is a Monday → Sakamoto returns 1.
+        assert_eq!(day_of_week(2026, 3, 23), 1);
+    }
+
+    #[test]
+    fn test_day_of_week_sunday() {
+        // 2026-03-29 is a Sunday → Sakamoto returns 0.
+        assert_eq!(day_of_week(2026, 3, 29), 0);
+    }
+
+    #[test]
+    fn test_day_of_week_abbr_array() {
+        const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        // 2026-03-27 is Friday → index 5 → "Fri"
+        let idx = day_of_week(2026, 3, 27) as usize;
+        assert_eq!(DOW_ABBR[idx], "Fri");
+        // 2026-03-23 is Monday → index 1 → "Mon"
+        let idx2 = day_of_week(2026, 3, 23) as usize;
+        assert_eq!(DOW_ABBR[idx2], "Mon");
     }
 }
