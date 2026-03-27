@@ -50,6 +50,10 @@ pub enum TaskbarHit {
     WindowTask(usize),
     /// The notification area was clicked.
     Notifications,
+    /// The volume indicator was clicked.
+    Volume,
+    /// The clock area was clicked.
+    Clock,
 }
 
 /// Determine what element is at position (px, py) on the taskbar.
@@ -118,6 +122,18 @@ pub fn taskbar_hit_test(
     let notif_x = tray_start + 155;
     if px >= notif_x - 5 && px < notif_x + 20 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Notifications;
+    }
+
+    // Volume indicator: around tray_x + 180
+    let vol_x = tray_start + 180;
+    if px >= vol_x - 5 && px < vol_x + 15 && py >= bar_y + 4 && py < bar_y + 36 {
+        return TaskbarHit::Volume;
+    }
+
+    // Clock area: far right
+    let clock_x = fb_width - 50;
+    if px >= clock_x && px < fb_width && py >= bar_y + 4 && py < bar_y + 36 {
+        return TaskbarHit::Clock;
     }
 
     TaskbarHit::None
@@ -232,6 +248,12 @@ pub struct InputState {
     pub pinned_app_count: usize,
     /// Index of the last pinned app that was clicked (for the caller to act on).
     pub last_pinned_app_click: Option<usize>,
+    /// Taskbar element currently under the cursor (for hover highlight).
+    pub hovered_taskbar_element: TaskbarHit,
+    /// Set when volume indicator is clicked (for the caller to act on).
+    pub volume_clicked: bool,
+    /// Set when clock area is clicked (for the caller to act on).
+    pub clock_clicked: bool,
 }
 
 impl InputState {
@@ -262,6 +284,9 @@ impl InputState {
             notifications_visible: false,
             pinned_app_count: 0,
             last_pinned_app_click: None,
+            hovered_taskbar_element: TaskbarHit::None,
+            volume_clicked: false,
+            clock_clicked: false,
         }
     }
 
@@ -548,6 +573,19 @@ impl InputState {
                     }
                 }
 
+                // Update taskbar hover state
+                let hover_hit = taskbar_hit_test(
+                    self.cursor_x, self.cursor_y,
+                    self.fb_width, self.fb_height,
+                    self.pinned_app_count,
+                    windows, *window_count,
+                    self.current_workspace,
+                );
+                if hover_hit != self.hovered_taskbar_element {
+                    self.hovered_taskbar_element = hover_hit;
+                    dirty = true;
+                }
+
                 dirty = true;
             }
             // Mouse button
@@ -593,6 +631,14 @@ impl InputState {
                                 }
                                 TaskbarHit::Notifications => {
                                     self.notifications_visible = !self.notifications_visible;
+                                    dirty = true;
+                                }
+                                TaskbarHit::Volume => {
+                                    self.volume_clicked = true;
+                                    dirty = true;
+                                }
+                                TaskbarHit::Clock => {
+                                    self.clock_clicked = true;
                                     dirty = true;
                                 }
                                 _ => {
@@ -862,5 +908,55 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.notifications_visible, "notifications should toggle on");
+    }
+
+    #[test]
+    fn test_taskbar_hit_volume() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Volume is at tray_start + 180 = (1920 - 250) + 180 = 1850
+        let hit = taskbar_hit_test(1850, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::Volume);
+    }
+
+    #[test]
+    fn test_taskbar_hit_clock() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Clock is at fb_w - 50 = 1870
+        let hit = taskbar_hit_test(1880, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::Clock);
+    }
+
+    #[test]
+    fn test_taskbar_click_volume() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Volume area at tray_start + 180 = 1850
+        state.cursor_x = 1850;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.volume_clicked, "volume_clicked should be set");
+    }
+
+    #[test]
+    fn test_taskbar_hover_tracking() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Move cursor to first pinned app
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
+        state.cursor_x = 170;
+        state.cursor_y = 1080 - 20;
+        let _ = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.hovered_taskbar_element, TaskbarHit::PinnedApp(0));
     }
 }

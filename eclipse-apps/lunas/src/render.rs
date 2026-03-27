@@ -441,8 +441,13 @@ fn draw_taskbar(
             w_title.len() >= app_name.len() && w_title[..app_name.len()].eq_ignore_ascii_case(app_name)
         });
 
+        // Hover highlight
+        let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::PinnedApp(i);
+
         // App icon background
-        let icon_bg = if is_running {
+        let icon_bg = if is_hovered {
+            Rgb888::new(r.saturating_add(40), g.saturating_add(40), b.saturating_add(40))
+        } else if is_running {
             Rgb888::new(r.saturating_add(20), g.saturating_add(20), b.saturating_add(20))
         } else {
             Rgb888::new(r / 3, g / 3, b / 3)
@@ -510,7 +515,10 @@ fn draw_taskbar(
 
         // Window task button
         let focused = input.focused_window == Some(w_idx);
-        let task_bg = if focused {
+        let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::WindowTask(w_idx);
+        let task_bg = if is_hovered {
+            Rgb888::new(45, 60, 95)
+        } else if focused {
             Rgb888::new(35, 50, 80)
         } else {
             Rgb888::new(25, 30, 50)
@@ -520,11 +528,15 @@ fn draw_taskbar(
             .into_styled(task_style)
             .draw(fb);
 
-        // Window title (truncated)
+        // Window title (truncated with ellipsis)
         let task_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
-        let truncated_len = w_title.len().min(16);
-        let truncated_title = &w_title[..truncated_len];
-        let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+        if w_title.len() > 16 {
+            let truncated_title = &w_title[..14];
+            let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(win_x + 6 + 14 * 6, bar_y + 26), task_text_style).draw(fb);
+        } else {
+            let _ = Text::new(w_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+        }
 
         // Focused indicator
         if focused {
@@ -581,15 +593,55 @@ fn draw_taskbar(
         let _ = Text::new(".", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
     }
 
-    // Volume indicator
+    // Volume indicator (mute-aware)
     let vol_x = tray_x + 180;
-    let vol_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(120, 140, 180));
-    let vol_icon = if desktop.volume_level > 50 { "+" } else if desktop.volume_level > 0 { "~" } else { "-" };
+    let vol_color = if desktop.volume_muted {
+        Rgb888::new(220, 50, 50)
+    } else {
+        Rgb888::new(120, 140, 180)
+    };
+    let vol_style = MonoTextStyle::new(&FONT_6X12, vol_color);
+    let vol_icon = if desktop.volume_muted {
+        "X"
+    } else if desktop.volume_level > 50 {
+        "+"
+    } else if desktop.volume_level > 0 {
+        "~"
+    } else {
+        "-"
+    };
     let _ = Text::new(vol_icon, Point::new(vol_x, bar_y + 18), vol_style).draw(fb);
 
-    // Clock / branding area (far right)
+    // Volume level bar (below icon)
+    if !desktop.volume_muted && desktop.volume_level > 0 {
+        let bar_w = (desktop.volume_level as i32 * 20) / 100;
+        let vol_bar_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 150, 255))
+            .build();
+        let _ = Rectangle::new(
+            Point::new(vol_x - 2, bar_y + 22),
+            Size::new(bar_w as u32, 2),
+        )
+        .into_styled(vol_bar_style)
+        .draw(fb);
+    }
+
+    // Clock display (far right) — shows HH:MM when clock is enabled, else branding
     let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
-    let _ = Text::new("LUNAS", Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+    if desktop.show_clock {
+        let mut time_buf = [0u8; 8];
+        let h = desktop.clock_hours;
+        let m = desktop.clock_minutes;
+        time_buf[0] = b'0' + h / 10;
+        time_buf[1] = b'0' + h % 10;
+        time_buf[2] = b':';
+        time_buf[3] = b'0' + m / 10;
+        time_buf[4] = b'0' + m % 10;
+        let time_str = core::str::from_utf8(&time_buf[..5]).unwrap_or("00:00");
+        let _ = Text::new(time_str, Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+    } else {
+        let _ = Text::new("LUNAS", Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+    }
 
     // Bottom accent for branding
     let accent_style = PrimitiveStyleBuilder::new()

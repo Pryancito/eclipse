@@ -247,12 +247,61 @@ impl LunasState {
             self.dirty = true;
         }
 
+        // Process taskbar actions from input
+        self.process_taskbar_actions();
+
         // Update system metrics periodically
         self.update_metrics_if_needed();
 
         let needs_render = self.dirty;
         self.dirty = false;
         needs_render
+    }
+
+    /// Process pending taskbar actions (pinned app launch, volume toggle, clock).
+    fn process_taskbar_actions(&mut self) {
+        // Handle pinned app click — launch the app
+        if let Some(app_idx) = self.input.last_pinned_app_click.take() {
+            if app_idx < self.desktop.pinned_count {
+                // Copy exec_path to a local buffer to avoid borrow conflict
+                let mut path_buf = [0u8; 64];
+                path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
+                let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
+                if len > 0 {
+                    if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
+                        self.launch_app(exec);
+                    }
+                }
+            }
+        }
+
+        // Handle volume click — toggle mute
+        if self.input.volume_clicked {
+            self.input.volume_clicked = false;
+            self.desktop.volume_muted = !self.desktop.volume_muted;
+            self.dirty = true;
+        }
+
+        // Handle clock click — toggle dashboard
+        if self.input.clock_clicked {
+            self.input.clock_clicked = false;
+            self.input.dashboard_active = !self.input.dashboard_active;
+            self.dirty = true;
+        }
+    }
+
+    /// Launch an application by its executable path.
+    fn launch_app(&mut self, _exec_path: &str) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            let _ = std::process::Command::new(_exec_path).spawn();
+        }
+        // On non-Eclipse targets (tests), we just record the intent
+        #[cfg(not(target_vendor = "eclipse"))]
+        {
+            // No-op: app launching is only available on Eclipse OS
+        }
+        self.dirty = true;
     }
 
     /// Update system metrics at a throttled rate.
@@ -294,6 +343,19 @@ impl LunasState {
         self.anomaly_count = stats.anomaly_count;
         self.heap_fragmentation = stats.heap_fragmentation;
         self.prev_stats = Some(stats);
+
+        // Update clock from wall time offset (Unix timestamp in seconds)
+        if stats.wall_time_offset > 0 {
+            let secs_today = (stats.wall_time_offset % 86400) as u32;
+            self.desktop.clock_hours = (secs_today / 3600) as u8;
+            self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
+        } else {
+            // Fallback: derive from uptime ticks (milliseconds) for basic progression
+            let secs = (stats.uptime_ticks / 1000) as u32;
+            let secs_today = secs % 86400;
+            self.desktop.clock_hours = (secs_today / 3600) as u8;
+            self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
+        }
 
         // Process list
         self.process_count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) } as usize;
@@ -449,5 +511,45 @@ mod tests {
         let _ = log.extend_from_slice(b"test log");
         state.handle_event(&CompositorEvent::KernelLog(log));
         assert!(state.log_len > 0);
+    }
+
+    #[test]
+    fn test_pinned_app_click_consumed() {
+        let mut state = LunasState::new().expect("init");
+        // Simulate a pinned app click
+        state.input.last_pinned_app_click = Some(0);
+        state.dirty = false;
+        let _ = state.update();
+        // The click should have been consumed
+        assert_eq!(state.input.last_pinned_app_click, None);
+    }
+
+    #[test]
+    fn test_volume_toggle_mute() {
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.desktop.volume_muted);
+        // Simulate volume click
+        state.input.volume_clicked = true;
+        let _ = state.update();
+        assert!(state.desktop.volume_muted);
+        assert!(!state.input.volume_clicked);
+        // Click again to unmute
+        state.input.volume_clicked = true;
+        let _ = state.update();
+        assert!(!state.desktop.volume_muted);
+    }
+
+    #[test]
+    fn test_clock_click_toggles_dashboard() {
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.input.dashboard_active);
+        state.input.clock_clicked = true;
+        let _ = state.update();
+        assert!(state.input.dashboard_active);
+        assert!(!state.input.clock_clicked);
+        // Click again to close
+        state.input.clock_clicked = true;
+        let _ = state.update();
+        assert!(!state.input.dashboard_active);
     }
 }
