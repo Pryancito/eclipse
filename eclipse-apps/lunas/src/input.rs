@@ -82,6 +82,8 @@ pub enum ContextAction {
     LaunchPinnedApp(usize),
     /// Remove a pinned app from the taskbar by index.
     UnpinApp(usize),
+    /// Pin a running window (by its window index) to the taskbar.
+    PinApp(usize),
 }
 
 /// A single context menu item.
@@ -154,6 +156,17 @@ impl ContextMenu {
         self.visible = false;
         self.item_count = 0;
         self.hovered_index = None;
+    }
+
+    /// Clamp menu position so it stays fully within the screen bounds.
+    /// Call this after all items have been added.
+    pub fn clamp_to_screen(&mut self, fb_w: i32, fb_h: i32) {
+        let menu_w = crate::render::CONTEXT_MENU_W;
+        let menu_h = (self.item_count as i32) * crate::render::CONTEXT_MENU_ITEM_H;
+        if self.x + menu_w > fb_w { self.x = fb_w - menu_w; }
+        if self.x < 0 { self.x = 0; }
+        if self.y + menu_h > fb_h { self.y = fb_h - menu_h; }
+        if self.y < 0 { self.y = 0; }
     }
 }
 
@@ -562,6 +575,62 @@ impl InputState {
                 }
 
                 if pressed {
+                    // ── Context menu keyboard navigation (highest priority) ──
+                    if self.context_menu.visible {
+                        let code = (scancode & 0x7FFF) as u8;
+                        match code {
+                            0x01 => {
+                                // Escape: close context menu
+                                self.context_menu.hide();
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x48 if (self.modifiers & 8) == 0 => {
+                                // Up arrow (without Super): move selection up.
+                                // The Super modifier guard is needed because scancode 0x48 with
+                                // Super maps to KeyAction::Maximize — Down arrow (0x50) has no
+                                // conflicting Super binding so no guard is required there.
+                                let count = self.context_menu.item_count;
+                                if count > 0 {
+                                    self.context_menu.hovered_index = Some(
+                                        match self.context_menu.hovered_index {
+                                            Some(h) if h > 0 => h - 1,
+                                            _ => 0,
+                                        }
+                                    );
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x50 => {
+                                // Down arrow: move selection down
+                                let count = self.context_menu.item_count;
+                                if count > 0 {
+                                    self.context_menu.hovered_index = Some(
+                                        match self.context_menu.hovered_index {
+                                            Some(h) => (h + 1).min(count - 1),
+                                            None => 0,
+                                        }
+                                    );
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x1C => {
+                                // Enter: activate hovered item
+                                if let Some(idx) = self.context_menu.hovered_index {
+                                    if idx < self.context_menu.item_count {
+                                        self.pending_context_action = self.context_menu.items[idx].action;
+                                    }
+                                }
+                                self.context_menu.hide();
+                                dirty = true;
+                                return dirty;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Handle search bar input
                     if self.search_active {
                         let action = scancode_to_action(scancode, self.modifiers);
@@ -1145,6 +1214,8 @@ impl InputState {
                                 }
                                 self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(w_idx));
                                 self.context_menu.add_item("Close", ContextAction::CloseWindow(w_idx));
+                                self.context_menu.add_item("Pin to Taskbar", ContextAction::PinApp(w_idx));
+                                self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                                 dirty = true;
                             }
                         } else if let TaskbarHit::PinnedApp(app_idx) = tb_hit {
@@ -1152,6 +1223,7 @@ impl InputState {
                             self.context_menu.show(self.cursor_x, self.cursor_y - 60);
                             self.context_menu.add_item("Open", ContextAction::LaunchPinnedApp(app_idx));
                             self.context_menu.add_item("Unpin", ContextAction::UnpinApp(app_idx));
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Volume = tb_hit {
                             // Right-click on volume → volume control context menu
@@ -1159,6 +1231,7 @@ impl InputState {
                             self.context_menu.add_item("Volume Up", ContextAction::VolumeUp);
                             self.context_menu.add_item("Volume Down", ContextAction::VolumeDown);
                             self.context_menu.add_item("Mute/Unmute", ContextAction::ToggleMute);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         }
                     } else {
@@ -1174,6 +1247,8 @@ impl InputState {
                             }
                             self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(idx));
                             self.context_menu.add_item("Close", ContextAction::CloseWindow(idx));
+                            self.context_menu.add_item("Pin to Taskbar", ContextAction::PinApp(idx));
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else {
                             // Right-click on desktop background → desktop context menu
@@ -1182,10 +1257,57 @@ impl InputState {
                             self.context_menu.add_item("Toggle Tiling", ContextAction::ToggleTiling);
                             self.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
                             self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         }
                     }
                 }
+                if button == 2 && pressed { // Middle click
+                    // Middle-click on a window task in the taskbar → close the window
+                    let tb_hit = taskbar_hit_test(
+                        self.cursor_x, self.cursor_y,
+                        self.fb_width, self.fb_height,
+                        self.pinned_app_count,
+                        &self.pinned_app_names,
+                        windows, *window_count,
+                        self.current_workspace,
+                        self.task_scroll_offset,
+                    );
+                    if let TaskbarHit::WindowTask(w_idx) = tb_hit {
+                        if w_idx < *window_count {
+                            windows[w_idx].closing = true;
+                            if self.focused_window == Some(w_idx) {
+                                self.focused_window = None;
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+            // Mouse scroll wheel
+            3 => {
+                // value > 0 = scroll down, value < 0 = scroll up
+                let scroll_down = event.value > 0;
+                let tray_start = self.fb_width - crate::render::TASKBAR_TRAY_WIDTH;
+                let vol_x = tray_start + 180;
+                let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
+
+                if on_taskbar && self.cursor_x >= vol_x - 5 && self.cursor_x < vol_x + 15 {
+                    // Scroll on volume area → adjust volume level
+                    self.pending_context_action = if scroll_down {
+                        ContextAction::VolumeDown
+                    } else {
+                        ContextAction::VolumeUp
+                    };
+                } else {
+                    // Scroll anywhere else → scroll the running-window task list
+                    if scroll_down {
+                        self.task_scroll_offset += 1;
+                    } else {
+                        self.task_scroll_offset = self.task_scroll_offset.saturating_sub(1);
+                    }
+                }
+                dirty = true;
             }
             _ => {}
         }
@@ -1661,7 +1783,7 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible for window");
-        assert_eq!(state.context_menu.item_count, 3); // Minimize, Maximize, Close
+        assert_eq!(state.context_menu.item_count, 4); // Minimize, Maximize, Close, Pin to Taskbar
     }
 
     #[test]
@@ -1914,5 +2036,174 @@ mod tests {
         assert_eq!(state.context_menu.items[0].action, ContextAction::VolumeUp);
         assert_eq!(state.context_menu.items[1].action, ContextAction::VolumeDown);
         assert_eq!(state.context_menu.items[2].action, ContextAction::ToggleMute);
+    }
+
+    #[test]
+    fn test_escape_key_closes_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Open a context menu
+        state.context_menu.show(100, 100);
+        state.context_menu.add_item("New Window", ContextAction::NewWindow);
+        assert!(state.context_menu.visible);
+
+        // Press Escape (scancode 0x01)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x01, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!state.context_menu.visible, "Escape should close context menu");
+        // focused_window should remain unchanged (not close a window)
+    }
+
+    #[test]
+    fn test_arrow_keys_navigate_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Open a context menu with 3 items
+        state.context_menu.show(100, 100);
+        state.context_menu.add_item("Item A", ContextAction::NewWindow);
+        state.context_menu.add_item("Item B", ContextAction::ToggleTiling);
+        state.context_menu.add_item("Item C", ContextAction::OpenDashboard);
+        assert_eq!(state.context_menu.hovered_index, None);
+
+        // Press Down arrow (scancode 0x50)
+        let ev_down = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        state.apply_event(&ev_down, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.context_menu.hovered_index, Some(0));
+
+        // Press Down again
+        state.apply_event(&ev_down, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.context_menu.hovered_index, Some(1));
+
+        // Press Up (scancode 0x48)
+        let ev_up = InputEvent { device_id: 0, event_type: 0, code: 0x48, value: 1, timestamp: 0 };
+        state.apply_event(&ev_up, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.context_menu.hovered_index, Some(0));
+    }
+
+    #[test]
+    fn test_enter_activates_context_menu_item() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        state.context_menu.show(100, 100);
+        state.context_menu.add_item("New Window", ContextAction::NewWindow);
+        state.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
+        state.context_menu.hovered_index = Some(1); // Dashboard selected
+
+        // Press Enter (scancode 0x1C)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!state.context_menu.visible, "Enter should close menu");
+        assert_eq!(state.pending_context_action, ContextAction::OpenDashboard);
+    }
+
+    #[test]
+    fn test_middle_click_window_task_closes_window() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+
+        // Middle-click on the window task button at x=180
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 2, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(windows[0].closing, "middle-click should close the window");
+    }
+
+    #[test]
+    fn test_scroll_wheel_scrolls_task_list() {
+        let mut state = InputState::new(1920, 1080);
+        assert_eq!(state.task_scroll_offset, 0);
+
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Scroll down (value > 0)
+        let ev_down = InputEvent { device_id: 0, event_type: 3, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev_down, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.task_scroll_offset, 1);
+
+        // Scroll up (value < 0)
+        let ev_up = InputEvent { device_id: 0, event_type: 3, code: 0, value: -1, timestamp: 0 };
+        state.apply_event(&ev_up, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.task_scroll_offset, 0);
+
+        // Scroll up at 0 should not underflow
+        state.apply_event(&ev_up, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.task_scroll_offset, 0, "scroll offset should not underflow");
+    }
+
+    #[test]
+    fn test_scroll_wheel_on_volume_adjusts_volume() {
+        let mut state = InputState::new(1920, 1080);
+        // Position cursor on volume area: tray_start = 1920 - 250 = 1670, vol_x = 1670 + 180 = 1850
+        state.cursor_x = 1850;
+        state.cursor_y = 1080 - 20; // on taskbar
+
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Scroll up on volume → VolumeUp
+        let ev_up = InputEvent { device_id: 0, event_type: 3, code: 0, value: -1, timestamp: 0 };
+        state.apply_event(&ev_up, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.pending_context_action, ContextAction::VolumeUp);
+
+        // Scroll down on volume → VolumeDown
+        let ev_down = InputEvent { device_id: 0, event_type: 3, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev_down, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.pending_context_action, ContextAction::VolumeDown);
+    }
+
+    #[test]
+    fn test_context_menu_clamp_to_screen() {
+        let mut menu = ContextMenu::new();
+        // Show near bottom-right corner
+        menu.show(1850, 1060);
+        menu.add_item("Item A", ContextAction::NewWindow);
+        menu.add_item("Item B", ContextAction::ToggleTiling);
+        // Height = 2 * 28 = 56; x + 180 = 2030 > 1920; y + 56 = 1116 > 1080
+        menu.clamp_to_screen(1920, 1080);
+        assert!(menu.x + crate::render::CONTEXT_MENU_W <= 1920, "menu x should be clamped");
+        assert!(menu.y + 2 * crate::render::CONTEXT_MENU_ITEM_H <= 1080, "menu y should be clamped");
+    }
+
+    #[test]
+    fn test_right_click_window_taskbar_shows_pin_option() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.context_menu.visible);
+        // Last item should be Pin to Taskbar
+        let last = state.context_menu.item_count - 1;
+        assert_eq!(state.context_menu.items[last].action, ContextAction::PinApp(0));
     }
 }

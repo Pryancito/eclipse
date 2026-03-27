@@ -645,19 +645,49 @@ impl LunasState {
                 }
                 ContextAction::UnpinApp(app_idx) => {
                     self.desktop.unpin_app(app_idx);
-                    // Re-sync pinned app names and count to input state
-                    self.input.pinned_app_count = self.desktop.pinned_count;
-                    for i in 0..self.desktop.pinned_count.min(16) {
-                        let name = self.desktop.pinned_apps[i].name_str();
-                        let name_bytes = name.as_bytes();
-                        let len = name_bytes.len().min(32);
-                        self.input.pinned_app_names[i] = [0u8; 32];
-                        self.input.pinned_app_names[i][..len].copy_from_slice(&name_bytes[..len]);
+                    self.sync_pinned_apps_to_input();
+                    self.dirty = true;
+                }
+                ContextAction::PinApp(w_idx) => {
+                    if w_idx < self.space.window_count
+                        && self.desktop.pinned_count < crate::desktop::MAX_PINNED_APPS
+                    {
+                        // Copy window title to avoid borrow conflict
+                        let mut title_buf = [0u8; 32];
+                        let title_str = self.space.windows[w_idx].title_str();
+                        let title_len = title_str.len().min(32);
+                        title_buf[..title_len].copy_from_slice(&title_str.as_bytes()[..title_len]);
+
+                        if let Ok(title) = core::str::from_utf8(&title_buf[..title_len]) {
+                            if !title.is_empty() {
+                                // Skip if already pinned
+                                let already = (0..self.desktop.pinned_count).any(|i| {
+                                    self.desktop.pinned_apps[i].name_str().eq_ignore_ascii_case(title)
+                                });
+                                if !already {
+                                    self.desktop.pin_app(title, 0, 180, 255);
+                                    self.sync_pinned_apps_to_input();
+                                }
+                            }
+                        }
                     }
                     self.dirty = true;
                 }
                 ContextAction::None => {}
             }
+        }
+    }
+
+    /// Synchronise pinned app count and names from DesktopShell into InputState
+    /// so that taskbar hit-testing stays in sync after any pin/unpin operation.
+    fn sync_pinned_apps_to_input(&mut self) {
+        self.input.pinned_app_count = self.desktop.pinned_count;
+        for i in 0..self.desktop.pinned_count.min(16) {
+            let name = self.desktop.pinned_apps[i].name_str();
+            let name_bytes = name.as_bytes();
+            let len = name_bytes.len().min(32);
+            self.input.pinned_app_names[i] = [0u8; 32];
+            self.input.pinned_app_names[i][..len].copy_from_slice(&name_bytes[..len]);
         }
     }
 
@@ -1398,5 +1428,62 @@ mod tests {
         assert_eq!(state.input.pinned_app_count, initial_count - 1, "input pinned count should be synced");
         // The first app should now be "Files" (was at index 1)
         assert_eq!(state.desktop.pinned_apps[0].name_str(), "Files");
+    }
+
+    #[test]
+    fn test_context_action_pin_app_adds_to_taskbar() {
+        use crate::input::ContextAction;
+        use crate::compositor::{ShellWindow, WindowContent};
+        let mut state = LunasState::new().expect("init");
+        let initial_count = state.desktop.pinned_count; // 5
+
+        // Add a window with a unique title not yet pinned
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            ..Default::default()
+        };
+        let idx = state.space.window_count;
+        state.space.map_window(win);
+        let title = b"MyUniqueApp";
+        state.space.windows[idx].title[..title.len()].copy_from_slice(title);
+
+        // Pin the window
+        state.input.pending_context_action = ContextAction::PinApp(idx);
+        let _ = state.update();
+
+        assert_eq!(state.desktop.pinned_count, initial_count + 1, "pinned count should increase");
+        assert_eq!(state.input.pinned_app_count, initial_count + 1, "input count should be synced");
+        // Last pinned app should be "MyUniqueApp"
+        assert_eq!(state.desktop.pinned_apps[initial_count].name_str(), "MyUniqueApp");
+    }
+
+    #[test]
+    fn test_context_action_pin_app_skips_duplicate() {
+        use crate::input::ContextAction;
+        use crate::compositor::{ShellWindow, WindowContent};
+        let mut state = LunasState::new().expect("init");
+        let initial_count = state.desktop.pinned_count; // 5
+
+        // Add a window titled "Terminal" (already pinned)
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            ..Default::default()
+        };
+        let idx = state.space.window_count;
+        state.space.map_window(win);
+        let title = b"Terminal";
+        state.space.windows[idx].title[..title.len()].copy_from_slice(title);
+
+        // Try to pin it — should be a no-op since "Terminal" is already pinned
+        state.input.pending_context_action = ContextAction::PinApp(idx);
+        let _ = state.update();
+
+        assert_eq!(state.desktop.pinned_count, initial_count, "duplicate pin should be skipped");
     }
 }

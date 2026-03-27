@@ -641,6 +641,18 @@ fn draw_taskbar(
     let mem_str = format_metric(&mut mem_buf, "MEM:", mem_usage);
     let _ = Text::new(mem_str, Point::new(tray_x + 80, bar_y + 18), metrics_style).draw(fb);
 
+    // Tiling mode indicator — small "T" badge between MEM and notifications
+    if input.tiling_active {
+        let tiling_bg_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 100, 50))
+            .build();
+        let _ = Rectangle::new(Point::new(tray_x + 138, bar_y + 8), Size::new(14, 14))
+            .into_styled(tiling_bg_style)
+            .draw(fb);
+        let tiling_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 120));
+        let _ = Text::new("T", Point::new(tray_x + 140, bar_y + 19), tiling_text).draw(fb);
+    }
+
     // Notification bell indicator
     let notif_count = desktop.unread_count();
     let notif_x = tray_x + 155;
