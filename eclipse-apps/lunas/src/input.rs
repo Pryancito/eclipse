@@ -865,10 +865,15 @@ impl InputState {
                                 }
                                 TaskbarHit::WindowTask(w_idx) => {
                                     if w_idx < *window_count {
-                                        if windows[w_idx].minimized {
+                                        if self.focused_window == Some(w_idx) && !windows[w_idx].minimized {
+                                            // Window is focused and visible: minimize it (toggle)
+                                            windows[w_idx].minimized = true;
+                                            self.focused_window = None;
+                                        } else {
+                                            // Window is not focused or is minimized: restore and focus
                                             windows[w_idx].minimized = false;
+                                            self.focused_window = Some(w_idx);
                                         }
-                                        self.focused_window = Some(w_idx);
                                         dirty = true;
                                     }
                                 }
@@ -1341,6 +1346,73 @@ mod tests {
         // With 0 pinned apps: sep2_x = TASKBAR_APPS_START_X + 2 = 162, win_x = 170
         let hit = taskbar_hit_test(180, 1080 - 20, 1920, 1080, 0, &windows, 1, 0);
         assert_eq!(hit, TaskbarHit::WindowTask(0));
+    }
+
+    #[test]
+    fn test_taskbar_click_window_task_focuses() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = false;
+
+        // Position on window task (win_x = 170 with 0 pinned apps)
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.focused_window, Some(0), "window task click should focus window");
+        assert!(!windows[0].minimized);
+    }
+
+    #[test]
+    fn test_taskbar_click_focused_window_minimizes() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = false;
+        state.focused_window = Some(0); // already focused
+
+        // Click on the focused window task
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(windows[0].minimized, "clicking focused window task should minimize it");
+        assert_eq!(state.focused_window, None, "focus should be cleared after minimize");
+    }
+
+    #[test]
+    fn test_taskbar_click_minimized_window_restores() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = true; // already minimized
+
+        // Click on the minimized window task
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!windows[0].minimized, "clicking minimized window task should restore it");
+        assert_eq!(state.focused_window, Some(0), "restored window should be focused");
     }
 
     #[test]

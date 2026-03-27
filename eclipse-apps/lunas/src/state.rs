@@ -280,9 +280,45 @@ impl LunasState {
 
     /// Process pending taskbar actions (pinned app launch, volume toggle, clock, launcher).
     fn process_taskbar_actions(&mut self) {
-        // Handle pinned app click — launch the app
+        // Handle pinned app click — focus running window or launch the app
         if let Some(app_idx) = self.input.last_pinned_app_click.take() {
-            self.launch_pinned_app(app_idx);
+            // Copy app name to a local buffer to avoid borrow conflicts
+            let mut name_buf = [0u8; 32];
+            let name_len = if app_idx < self.desktop.pinned_count {
+                let name = self.desktop.pinned_apps[app_idx].name_str();
+                let len = name.len().min(32);
+                name_buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+                len
+            } else {
+                0
+            };
+            let app_name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+
+            // Search for a running window on the current workspace matching this pinned app
+            let mut running_window: Option<usize> = None;
+            if !app_name.is_empty() {
+                for w_idx in 0..self.space.window_count {
+                    let w = &self.space.windows[w_idx];
+                    if w.content == crate::compositor::WindowContent::None || w.closing { continue; }
+                    if w.workspace != self.input.current_workspace { continue; }
+                    let w_title = w.title_str();
+                    if w_title.len() >= app_name.len()
+                        && w_title[..app_name.len()].eq_ignore_ascii_case(app_name)
+                    {
+                        running_window = Some(w_idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(w_idx) = running_window {
+                // Focus and restore the running window instead of launching again
+                self.space.windows[w_idx].minimized = false;
+                self.input.focused_window = Some(w_idx);
+                self.dirty = true;
+            } else {
+                self.launch_pinned_app(app_idx);
+            }
         }
 
         // Handle launcher click — do hit test with desktop.pinned_apps
@@ -751,6 +787,64 @@ mod tests {
         let _ = state.update();
         // The click should have been consumed
         assert_eq!(state.input.last_pinned_app_click, None);
+    }
+
+    #[test]
+    fn test_pinned_app_click_focuses_running_window() {
+        let mut state = LunasState::new().expect("init");
+        // Add a window whose title starts with the first pinned app's name
+        let app_name = state.desktop.pinned_apps[0].name_str().to_string();
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            ..Default::default()
+        };
+        state.space.map_window(win);
+        // Set window title to match the pinned app name
+        let title_bytes = app_name.as_bytes();
+        let len = title_bytes.len().min(32);
+        state.space.windows[0].title[..len].copy_from_slice(&title_bytes[..len]);
+
+        state.input.current_workspace = 0;
+
+        // Simulate clicking the first pinned app
+        state.input.last_pinned_app_click = Some(0);
+        let _ = state.update();
+
+        // Click should have been consumed
+        assert_eq!(state.input.last_pinned_app_click, None);
+        // The running window should be focused instead of launching a new app
+        assert_eq!(state.input.focused_window, Some(0));
+        assert!(!state.space.windows[0].minimized);
+    }
+
+    #[test]
+    fn test_pinned_app_click_restores_minimized_running_window() {
+        let mut state = LunasState::new().expect("init");
+        let app_name = state.desktop.pinned_apps[0].name_str().to_string();
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            minimized: true,
+            ..Default::default()
+        };
+        state.space.map_window(win);
+        let title_bytes = app_name.as_bytes();
+        let len = title_bytes.len().min(32);
+        state.space.windows[0].title[..len].copy_from_slice(&title_bytes[..len]);
+
+        state.input.current_workspace = 0;
+
+        // Clicking pinned app with minimized matching window should restore and focus it
+        state.input.last_pinned_app_click = Some(0);
+        let _ = state.update();
+
+        assert_eq!(state.input.focused_window, Some(0));
+        assert!(!state.space.windows[0].minimized, "window should be restored");
     }
 
     #[test]

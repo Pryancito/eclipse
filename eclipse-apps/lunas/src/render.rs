@@ -518,9 +518,9 @@ fn draw_taskbar(
     let mut win_x = sep2_x + 8;
     let win_item_w = 120i32;
     let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
+    let mut task_overflow = false;
 
     for w_idx in 0..window_count {
-        if win_x + win_item_w > tray_start - 10 { break; }
         let w = &windows[w_idx];
         if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
@@ -532,6 +532,11 @@ fn draw_taskbar(
             w_title.len() >= pname.len() && w_title[..pname.len()].eq_ignore_ascii_case(pname)
         });
         if already_pinned { continue; }
+
+        if win_x + win_item_w > tray_start - 10 {
+            task_overflow = true;
+            break;
+        }
 
         // Window task button
         let focused = input.focused_window == Some(w_idx);
@@ -577,6 +582,13 @@ fn draw_taskbar(
         }
 
         win_x += win_item_w + 4;
+    }
+
+    // Overflow indicator: show ">" when more windows exist than can fit in the taskbar
+    if task_overflow {
+        let overflow_x = tray_start - 18;
+        let overflow_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(120, 130, 160));
+        let _ = Text::new(">", Point::new(overflow_x, bar_y + 26), overflow_style).draw(fb);
     }
 
     // ── System tray area (right side) ──
