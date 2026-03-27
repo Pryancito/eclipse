@@ -344,6 +344,13 @@ pub const TASKBAR_APPS_START_X: i32 = 160;
 /// Width of the system tray area on the right side.
 pub const TASKBAR_TRAY_WIDTH: i32 = 250;
 
+/// Maximum characters for a window task title before truncation.
+const TASK_TITLE_MAX_CHARS: usize = 16;
+/// Characters shown before ellipsis in truncated window titles.
+const TASK_TITLE_TRUNCATED_CHARS: usize = 14;
+/// Character width for the FONT_6X12 monospaced font.
+const FONT_CHAR_WIDTH: i32 = 6;
+
 /// Draw the bottom taskbar.
 fn draw_taskbar(
     fb: &mut FramebufferState,
@@ -538,13 +545,10 @@ fn draw_taskbar(
             Rgb888::new(180, 190, 210)
         };
         let task_text_style = MonoTextStyle::new(&FONT_6X12, title_color);
-        const MAX_TITLE_CHARS: usize = 16;
-        const TRUNCATED_CHARS: usize = 14;
-        const CHAR_WIDTH: i32 = 6;
-        if w_title.len() > MAX_TITLE_CHARS {
-            let truncated_title = &w_title[..TRUNCATED_CHARS];
+        if w_title.len() > TASK_TITLE_MAX_CHARS {
+            let truncated_title = &w_title[..TASK_TITLE_TRUNCATED_CHARS];
             let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
-            let _ = Text::new("..", Point::new(win_x + 6 + TRUNCATED_CHARS as i32 * CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(win_x + 6 + TASK_TITLE_TRUNCATED_CHARS as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
         } else {
             let _ = Text::new(w_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
         }
@@ -950,6 +954,17 @@ pub const LAUNCHER_ITEMS_Y_OFFSET: i32 = 50;
 /// Maximum items visible in the launcher.
 pub const LAUNCHER_MAX_VISIBLE: usize = 9;
 
+/// Width of the notification panel.
+pub const NOTIF_PANEL_W: i32 = 300;
+/// Height of the notification panel.
+pub const NOTIF_PANEL_H: i32 = 250;
+
+/// Compute the launcher panel bounds (x, y, w, h) given the framebuffer height.
+pub fn launcher_panel_bounds(fb_height: i32) -> (i32, i32, i32, i32) {
+    let py = fb_height - TASKBAR_HEIGHT - LAUNCHER_PANEL_H - 10;
+    (LAUNCHER_PANEL_X, py, LAUNCHER_PANEL_W, LAUNCHER_PANEL_H)
+}
+
 /// Draw the app launcher panel.
 fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &InputState) {
     let fb_h = fb.info.height as i32;
@@ -1080,8 +1095,8 @@ fn draw_search_bar(fb: &mut FramebufferState, query: &str) {
 /// Draw the notifications panel.
 fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
     let fb_w = fb.info.width as i32;
-    let panel_w = 300;
-    let panel_h = 250;
+    let panel_w = NOTIF_PANEL_W;
+    let panel_h = NOTIF_PANEL_H;
     let px = fb_w - panel_w - 10;
     let py = 10;
 

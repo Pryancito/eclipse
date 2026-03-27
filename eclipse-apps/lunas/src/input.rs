@@ -152,17 +152,14 @@ pub fn launcher_hit_test(
     search_query: &str,
 ) -> Option<usize> {
     use crate::render::{
-        LAUNCHER_PANEL_W, LAUNCHER_PANEL_H, LAUNCHER_PANEL_X,
+        launcher_panel_bounds,
         LAUNCHER_ITEM_H, LAUNCHER_ITEMS_Y_OFFSET, LAUNCHER_MAX_VISIBLE,
-        TASKBAR_HEIGHT,
     };
 
-    let panel_x = LAUNCHER_PANEL_X;
-    let panel_y = fb_height - TASKBAR_HEIGHT - LAUNCHER_PANEL_H - 10;
-    let panel_w = LAUNCHER_PANEL_W;
+    let (panel_x, panel_y, panel_w, panel_h) = launcher_panel_bounds(fb_height);
 
     // Check if click is within the launcher panel
-    if px < panel_x || px >= panel_x + panel_w || py < panel_y || py >= panel_y + LAUNCHER_PANEL_H {
+    if px < panel_x || px >= panel_x + panel_w || py < panel_y || py >= panel_y + panel_h {
         return None;
     }
 
@@ -720,9 +717,8 @@ impl InputState {
                         // ── Notification panel click → mark all read ──
                         if self.notifications_visible {
                             // Click anywhere closes notifications and marks them as read
-                            use crate::render::{TASKBAR_HEIGHT};
-                            let panel_w = 300;
-                            let panel_h = 250;
+                            let panel_w = crate::render::NOTIF_PANEL_W;
+                            let panel_h = crate::render::NOTIF_PANEL_H;
                             let panel_x = self.fb_width - panel_w - 10;
                             let panel_y = 10;
                             if self.cursor_x >= panel_x && self.cursor_x < panel_x + panel_w

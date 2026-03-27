@@ -282,17 +282,7 @@ impl LunasState {
     fn process_taskbar_actions(&mut self) {
         // Handle pinned app click — launch the app
         if let Some(app_idx) = self.input.last_pinned_app_click.take() {
-            if app_idx < self.desktop.pinned_count {
-                // Copy exec_path to a local buffer to avoid borrow conflict
-                let mut path_buf = [0u8; 64];
-                path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
-                let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
-                if len > 0 {
-                    if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
-                        self.launch_app(exec);
-                    }
-                }
-            }
+            self.launch_pinned_app(app_idx);
         }
 
         // Handle launcher click — do hit test with desktop.pinned_apps
@@ -307,28 +297,16 @@ impl LunasState {
                 self.input.search_query.as_str(),
             );
             if let Some(app_idx) = hit {
-                if app_idx < self.desktop.pinned_count {
-                    let mut path_buf = [0u8; 64];
-                    path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
-                    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
-                    if len > 0 {
-                        if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
-                            self.launch_app(exec);
-                        }
-                    }
-                    self.input.launcher_active = false;
-                    self.input.search_active = false;
-                    self.input.search_query.clear();
-                    self.dirty = true;
-                }
+                self.launch_pinned_app(app_idx);
+                self.input.launcher_active = false;
+                self.input.search_active = false;
+                self.input.search_query.clear();
+                self.dirty = true;
             } else {
                 // Clicked outside launcher items — check if outside panel to close
-                let panel_y = self.input.fb_height
-                    - crate::render::TASKBAR_HEIGHT
-                    - crate::render::LAUNCHER_PANEL_H - 10;
-                let panel_x = crate::render::LAUNCHER_PANEL_X;
-                let panel_w = crate::render::LAUNCHER_PANEL_W;
-                let panel_h = crate::render::LAUNCHER_PANEL_H;
+                use crate::render::{launcher_panel_bounds, TASKBAR_HEIGHT};
+                let (panel_x, panel_y, panel_w, panel_h) =
+                    launcher_panel_bounds(self.input.fb_height);
                 if cx < panel_x || cx >= panel_x + panel_w
                     || cy < panel_y || cy >= panel_y + panel_h
                 {
@@ -343,18 +321,9 @@ impl LunasState {
 
         // Handle launcher app click from direct index (alternative path)
         if let Some(app_idx) = self.input.launcher_app_click.take() {
-            if app_idx < self.desktop.pinned_count {
-                let mut path_buf = [0u8; 64];
-                path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
-                let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
-                if len > 0 {
-                    if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
-                        self.launch_app(exec);
-                    }
-                }
-                self.input.launcher_active = false;
-                self.dirty = true;
-            }
+            self.launch_pinned_app(app_idx);
+            self.input.launcher_active = false;
+            self.dirty = true;
         }
 
         // Handle volume click — toggle mute
@@ -376,6 +345,21 @@ impl LunasState {
             self.input.notifications_mark_read = false;
             self.desktop.mark_all_read();
             self.dirty = true;
+        }
+    }
+
+    /// Launch a pinned app by its index, looking up its exec_path.
+    fn launch_pinned_app(&mut self, app_idx: usize) {
+        if app_idx < self.desktop.pinned_count {
+            // Copy exec_path to a local buffer to avoid borrow conflict
+            let mut path_buf = [0u8; 64];
+            path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
+            let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
+            if len > 0 {
+                if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
+                    self.launch_app(exec);
+                }
+            }
         }
     }
 
@@ -435,17 +419,15 @@ impl LunasState {
 
         // Update clock from wall time offset (Unix timestamp in seconds)
         const SECONDS_PER_DAY: u64 = 86400;
-        if stats.wall_time_offset > 0 {
-            let secs_today = (stats.wall_time_offset % SECONDS_PER_DAY) as u32;
-            self.desktop.clock_hours = (secs_today / 3600) as u8;
-            self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
+        let secs_today = if stats.wall_time_offset > 0 {
+            (stats.wall_time_offset % SECONDS_PER_DAY) as u32
         } else {
             // Fallback: derive from uptime ticks (milliseconds) for basic progression
             let secs = (stats.uptime_ticks / 1000) as u32;
-            let secs_today = secs % SECONDS_PER_DAY as u32;
-            self.desktop.clock_hours = (secs_today / 3600) as u8;
-            self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
-        }
+            secs % SECONDS_PER_DAY as u32
+        };
+        self.desktop.clock_hours = (secs_today / 3600) as u8;
+        self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
 
         // Process list
         self.process_count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) } as usize;
