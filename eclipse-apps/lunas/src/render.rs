@@ -329,6 +329,10 @@ pub fn draw_desktop_shell(
         draw_volume_popup(fb, desktop);
     }
 
+    if input.clock_panel_active {
+        draw_clock_panel(fb, desktop);
+    }
+
     if input.context_menu.visible {
         draw_context_menu(fb, &input.context_menu);
     }
@@ -355,7 +359,7 @@ pub const TASKBAR_ICON_SPACING: i32 = 6;
 pub const TASKBAR_APPS_START_X: i32 = 160;
 
 /// Width of the system tray area on the right side.
-pub const TASKBAR_TRAY_WIDTH: i32 = 250;
+pub const TASKBAR_TRAY_WIDTH: i32 = 300;
 
 /// Maximum characters for a window task title before truncation.
 const TASK_TITLE_MAX_CHARS: usize = 16;
@@ -709,6 +713,54 @@ fn draw_taskbar(
         .draw(fb);
     }
 
+    // Battery indicator — shown when show_battery is enabled.
+    // Position: tray_x + 212 (= fb_w - 88 with tray_width 300).
+    if desktop.show_battery {
+        let bat_x = tray_x + 212;
+        let bat_level = desktop.battery_level.min(100) as i32;
+        let bat_charging = desktop.battery_charging;
+
+        // Battery outline (16px × 10px rectangle + 2px bump on right)
+        let bat_outline_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(100, 120, 160))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(bat_x, bar_y + 17), Size::new(16, 10))
+            .into_styled(bat_outline_style)
+            .draw(fb);
+        // Battery terminal bump
+        let bump_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(100, 120, 160))
+            .build();
+        let _ = Rectangle::new(Point::new(bat_x + 16, bar_y + 19), Size::new(2, 6))
+            .into_styled(bump_style)
+            .draw(fb);
+
+        // Battery fill (green / yellow / red)
+        let fill_w = ((bat_level * 14) / 100).max(0) as u32;
+        let fill_color = if bat_charging {
+            Rgb888::new(0, 200, 100)
+        } else if bat_level > 50 {
+            Rgb888::new(80, 200, 80)
+        } else if bat_level > 20 {
+            Rgb888::new(220, 180, 0)
+        } else {
+            Rgb888::new(220, 50, 50)
+        };
+        if fill_w > 0 {
+            let fill_style = PrimitiveStyleBuilder::new().fill_color(fill_color).build();
+            let _ = Rectangle::new(Point::new(bat_x + 1, bar_y + 18), Size::new(fill_w, 8))
+                .into_styled(fill_style)
+                .draw(fb);
+        }
+
+        // Charging indicator: "+" icon
+        if bat_charging {
+            let charge_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 240, 120));
+            let _ = Text::new("+", Point::new(bat_x + 20, bar_y + 26), charge_style).draw(fb);
+        }
+    }
+
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
     let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
     if desktop.show_clock {
@@ -721,7 +773,7 @@ fn draw_taskbar(
         time_buf[3] = b'0' + m / 10;
         time_buf[4] = b'0' + m % 10;
         let time_str = core::str::from_utf8(&time_buf[..5]).unwrap_or("00:00");
-        let _ = Text::new(time_str, Point::new(fb_w - 50, bar_y + 14), clock_style).draw(fb);
+        let _ = Text::new(time_str, Point::new(fb_w - 56, bar_y + 14), clock_style).draw(fb);
 
         // Date below time (DD/MM)
         let date_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 110, 140));
@@ -734,16 +786,53 @@ fn draw_taskbar(
         date_buf[3] = b'0' + mo / 10;
         date_buf[4] = b'0' + mo % 10;
         let date_str = core::str::from_utf8(&date_buf[..5]).unwrap_or("01/01");
-        let _ = Text::new(date_str, Point::new(fb_w - 50, bar_y + 30), date_style).draw(fb);
+        let _ = Text::new(date_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
     } else {
-        let _ = Text::new("LUNAS", Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+        let _ = Text::new("LUNAS", Point::new(fb_w - 56, bar_y + 18), clock_style).draw(fb);
     }
 
-    // Bottom accent for branding
+    // "Show Desktop" button — thin strip at the very right edge
+    let show_desk_color = if input.show_desktop_active {
+        Rgb888::new(0, 128, 255)
+    } else if input.hovered_taskbar_element == crate::input::TaskbarHit::ShowDesktop {
+        Rgb888::new(60, 80, 130)
+    } else {
+        Rgb888::new(25, 30, 50)
+    };
+    let show_desk_style = PrimitiveStyleBuilder::new().fill_color(show_desk_color).build();
+    let _ = Rectangle::new(Point::new(fb_w - 6, bar_y), Size::new(6, bar_h as u32))
+        .into_styled(show_desk_style)
+        .draw(fb);
+    // Separator line to the left of the button
+    let _ = Rectangle::new(Point::new(fb_w - 7, bar_y + 8), Size::new(1, 28))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // Drag-and-drop indicator: ghost outline on target PinnedApp icon
+    if let Some(drag_src) = input.dragging_pinned_app {
+        let hover_hit = input.hovered_taskbar_element;
+        if let crate::input::TaskbarHit::PinnedApp(tgt) = hover_hit {
+            if tgt != drag_src {
+                let target_x = TASKBAR_APPS_START_X + tgt as i32 * (TASKBAR_ICON_SIZE + TASKBAR_ICON_SPACING);
+                let ghost_style = PrimitiveStyleBuilder::new()
+                    .stroke_color(Rgb888::new(0, 180, 255))
+                    .stroke_width(2)
+                    .build();
+                let _ = Rectangle::new(
+                    Point::new(target_x - 1, bar_y + 5),
+                    Size::new(TASKBAR_ICON_SIZE as u32 + 2, TASKBAR_ICON_SIZE as u32 + 2),
+                )
+                .into_styled(ghost_style)
+                .draw(fb);
+            }
+        }
+    }
+
+    // Bottom accent for branding (now aligned to clock position)
     let accent_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb888::new(0, 100, 200))
         .build();
-    let _ = Rectangle::new(Point::new(fb_w - 50, bar_y + bar_h - 2), Size::new(45, 2))
+    let _ = Rectangle::new(Point::new(fb_w - 56, bar_y + bar_h - 2), Size::new(50, 2))
         .into_styled(accent_style)
         .draw(fb);
 
@@ -1085,6 +1174,11 @@ pub const VOLUME_PANEL_H: i32 = 100;
 pub const CONTEXT_MENU_ITEM_H: i32 = 28;
 /// Context menu width.
 pub const CONTEXT_MENU_W: i32 = 180;
+
+/// Width of the clock/calendar panel.
+pub const CLOCK_PANEL_W: i32 = 168;
+/// Height of the clock/calendar panel.
+pub const CLOCK_PANEL_H: i32 = 128;
 
 /// Compute the launcher panel bounds (x, y, w, h) given the framebuffer height.
 pub fn launcher_panel_bounds(fb_height: i32) -> (i32, i32, i32, i32) {
@@ -1592,6 +1686,130 @@ fn format_ipv4(buf: &mut [u8; 20], ip: &[u8; 4]) -> usize {
         pos += 1;
     }
     pos
+}
+
+/// Returns the day of week for a given date (0 = Monday … 6 = Sunday).
+/// Uses Tomohiko Sakamoto's algorithm.
+fn day_of_week(mut y: u32, m: u32, d: u32) -> u32 {
+    const T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    if m < 3 { y -= 1; }
+    (y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d) % 7
+}
+
+/// Returns the number of days in a given month.
+fn days_in_month(m: u32, y: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if y % 400 == 0 => 29,
+        2 if y % 100 == 0 => 28,
+        2 if y % 4 == 0 => 29,
+        _ => 28,
+    }
+}
+
+/// Month name abbreviations (Jan=1 … Dec=12).
+fn month_name(m: u8) -> &'static str {
+    match m {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "???",
+    }
+}
+
+/// Draw the clock/calendar popup panel above the clock area.
+pub fn draw_clock_panel(
+    fb: &mut FramebufferState,
+    desktop: &crate::desktop::DesktopShell,
+) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+
+    let pw = CLOCK_PANEL_W;
+    let ph = CLOCK_PANEL_H;
+    // Align right edge with the right edge of the clock; sit just above the taskbar.
+    let px = (fb_w - 6 - pw).max(0);
+    let py = fb_h - TASKBAR_HEIGHT - ph - 5;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(18, 22, 40))
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 80, 180))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Header: "Mon Mar 2026"
+    let header_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let mon_name = month_name(desktop.clock_month);
+    // Build "MMM YYYY" header in a stack buffer
+    let mut hbuf = [0u8; 12];
+    let mname_bytes = mon_name.as_bytes();
+    hbuf[..3].copy_from_slice(&mname_bytes[..3]);
+    hbuf[3] = b' ';
+    let y = desktop.clock_year as u32;
+    hbuf[4] = b'0' + ((y / 1000) % 10) as u8;
+    hbuf[5] = b'0' + ((y / 100) % 10) as u8;
+    hbuf[6] = b'0' + ((y / 10) % 10) as u8;
+    hbuf[7] = b'0' + (y % 10) as u8;
+    let header_str = core::str::from_utf8(&hbuf[..8]).unwrap_or("??? 0000");
+    let _ = Text::new(header_str, Point::new(px + 34, py + 14), header_style).draw(fb);
+
+    // Day-of-week labels row: "Mo Tu We Th Fr Sa Su"
+    let dow_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
+    const DOW_LABELS: &[&str] = &["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+    for (i, label) in DOW_LABELS.iter().enumerate() {
+        let _ = Text::new(label, Point::new(px + 4 + i as i32 * 23, py + 28), dow_style).draw(fb);
+    }
+
+    // Calendar grid
+    let day_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
+    let today_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 255));
+    let today_bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(0, 60, 120))
+        .build();
+
+    let m = desktop.clock_month as u32;
+    let y = desktop.clock_year as u32;
+    let total_days = days_in_month(m, y);
+    // day_of_week returns 0=Sun,1=Mon…6=Sat; we want 0=Mon … 6=Sun
+    let first_dow_sun = day_of_week(y, m, 1); // 0=Sun
+    let col_start = if first_dow_sun == 0 { 6 } else { first_dow_sun - 1 }; // convert to Mon-first
+
+    let mut col = col_start;
+    let mut row = 0i32;
+    let mut dbuf = [0u8; 8];
+    for day in 1..=total_days {
+        let cell_x = px + 4 + col as i32 * 23;
+        let cell_y = py + 42 + row * 14;
+
+        if day == desktop.clock_day as u32 {
+            // Highlight today
+            let _ = Rectangle::new(Point::new(cell_x - 1, cell_y - 10), Size::new(18, 13))
+                .into_styled(today_bg_style)
+                .draw(fb);
+            let d_str = format_u32(&mut dbuf, day);
+            let _ = Text::new(d_str, Point::new(cell_x, cell_y), today_style).draw(fb);
+        } else {
+            let d_str = format_u32(&mut dbuf, day);
+            let _ = Text::new(d_str, Point::new(cell_x, cell_y), day_style).draw(fb);
+        }
+
+        col += 1;
+        if col >= 7 {
+            col = 0;
+            row += 1;
+        }
+    }
 }
 
 #[cfg(test)]

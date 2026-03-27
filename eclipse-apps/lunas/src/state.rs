@@ -401,6 +401,13 @@ impl LunasState {
 
     /// Process pending taskbar actions (pinned app launch, volume toggle, clock, launcher).
     fn process_taskbar_actions(&mut self) {
+        // Handle pinned-app drag reorder (higher priority than click)
+        if let Some((src, dst)) = self.input.pending_pinned_swap.take() {
+            self.desktop.swap_pinned_apps(src, dst);
+            self.sync_pinned_apps_to_input();
+            self.dirty = true;
+        }
+
         // Handle pinned app click — focus running window or launch the app
         if let Some(app_idx) = self.input.last_pinned_app_click.take() {
             // Copy app name to a local buffer to avoid borrow conflicts
@@ -490,12 +497,47 @@ impl LunasState {
             self.dirty = true;
         }
 
-        // Handle clock click — toggle dashboard
+        // Handle clock click — toggle calendar panel (not dashboard)
         if self.input.clock_clicked {
             self.input.clock_clicked = false;
-            self.input.dashboard_active = !self.input.dashboard_active;
+            self.input.clock_panel_active = !self.input.clock_panel_active;
             self.dirty = true;
         }
+
+        // Handle "Show Desktop" toggle — minimize or restore all workspace windows
+        let prev_show_desktop = self.input.show_desktop_active;
+        // (show_desktop_active was already toggled in apply_event on button press)
+        // We need to detect a change and act on it.
+        // Use a flag: if show_desktop_active just became true, minimize; if false, restore.
+        // We detect the transition by checking if the mask is zero (first time) vs non-zero.
+        if self.input.show_desktop_active && self.input.show_desktop_minimized_mask == 0 {
+            // Minimize all non-minimized windows on the current workspace
+            let ws = self.input.current_workspace;
+            let mut mask = 0u32;
+            for i in 0..self.space.window_count.min(32) {
+                let w = &mut self.space.windows[i];
+                if w.content == crate::compositor::WindowContent::None || w.closing { continue; }
+                if w.workspace != ws { continue; }
+                if !w.minimized {
+                    w.minimized = true;
+                    mask |= 1u32 << i;
+                }
+            }
+            self.input.show_desktop_minimized_mask = mask;
+            self.input.focused_window = None;
+            self.dirty = true;
+        } else if !self.input.show_desktop_active && self.input.show_desktop_minimized_mask != 0 {
+            // Restore windows that were minimized by Show Desktop
+            let mask = self.input.show_desktop_minimized_mask;
+            for i in 0..self.space.window_count.min(32) {
+                if (mask >> i) & 1 != 0 {
+                    self.space.windows[i].minimized = false;
+                }
+            }
+            self.input.show_desktop_minimized_mask = 0;
+            self.dirty = true;
+        }
+        let _ = prev_show_desktop;
 
         // Handle notification panel close → mark all read
         if self.input.notifications_mark_read {
@@ -1065,17 +1107,17 @@ mod tests {
     }
 
     #[test]
-    fn test_clock_click_toggles_dashboard() {
+    fn test_clock_click_toggles_calendar_panel() {
         let mut state = LunasState::new().expect("init");
-        assert!(!state.input.dashboard_active);
+        assert!(!state.input.clock_panel_active);
         state.input.clock_clicked = true;
         let _ = state.update();
-        assert!(state.input.dashboard_active);
-        assert!(!state.input.clock_clicked);
+        assert!(state.input.clock_panel_active, "clock click should open calendar panel");
+        assert!(!state.input.clock_clicked, "clock_clicked should be cleared");
         // Click again to close
         state.input.clock_clicked = true;
         let _ = state.update();
-        assert!(!state.input.dashboard_active);
+        assert!(!state.input.clock_panel_active, "second click should close calendar panel");
     }
 
     #[test]
@@ -1485,5 +1527,96 @@ mod tests {
         let _ = state.update();
 
         assert_eq!(state.desktop.pinned_count, initial_count, "duplicate pin should be skipped");
+    }
+
+    #[test]
+    fn test_show_desktop_minimizes_and_restores_windows() {
+        use crate::compositor::{ShellWindow, WindowContent};
+        let mut state = LunasState::new().expect("init");
+
+        // Add two visible windows on workspace 0
+        let win_a = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            ..Default::default()
+        };
+        let win_b = ShellWindow {
+            x: 400, y: 100, w: 200, h: 200,
+            curr_x: 400.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            ..Default::default()
+        };
+        let ia = state.space.window_count;
+        state.space.map_window(win_a);
+        let ib = state.space.window_count;
+        state.space.map_window(win_b);
+        assert!(!state.space.windows[ia].minimized);
+        assert!(!state.space.windows[ib].minimized);
+
+        // Activate show-desktop
+        state.input.show_desktop_active = true;
+        let _ = state.update();
+        assert!(state.space.windows[ia].minimized, "window A should be minimized");
+        assert!(state.space.windows[ib].minimized, "window B should be minimized");
+        assert_ne!(state.input.show_desktop_minimized_mask, 0, "mask should be non-zero");
+
+        // Deactivate show-desktop — windows should be restored
+        state.input.show_desktop_active = false;
+        let _ = state.update();
+        assert!(!state.space.windows[ia].minimized, "window A should be restored");
+        assert!(!state.space.windows[ib].minimized, "window B should be restored");
+        assert_eq!(state.input.show_desktop_minimized_mask, 0, "mask should be cleared");
+    }
+
+    #[test]
+    fn test_pinned_app_drag_swap() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        let initial_first = state.desktop.pinned_apps[0].name_str().to_string();
+        let initial_second = state.desktop.pinned_apps[1].name_str().to_string();
+
+        // Signal a drag swap: move app 0 to position 1
+        state.input.pending_pinned_swap = Some((0, 1));
+        let _ = state.update();
+
+        assert_eq!(state.desktop.pinned_apps[0].name_str(), initial_second, "apps should be swapped");
+        assert_eq!(state.desktop.pinned_apps[1].name_str(), initial_first, "apps should be swapped");
+        // Input state should be synced
+        let new_name = {
+            let b = &state.input.pinned_app_names[0];
+            let len = b.iter().position(|&x| x == 0).unwrap_or(32);
+            core::str::from_utf8(&b[..len]).unwrap_or("").to_string()
+        };
+        assert_eq!(new_name, initial_second, "input pinned names should be synced after swap");
+        // No pending action
+        assert_eq!(state.input.pending_context_action, ContextAction::None);
+    }
+
+    #[test]
+    fn test_desktop_battery_fields_default() {
+        let state = LunasState::new().expect("init");
+        // Battery fields should be initialized
+        assert_eq!(state.desktop.battery_level, 80, "default battery level should be 80");
+        assert!(!state.desktop.battery_charging, "default should not be charging");
+        assert!(state.desktop.show_battery, "show_battery should be true by default");
+    }
+
+    #[test]
+    fn test_desktop_swap_pinned_apps_noop_same_index() {
+        let mut state = LunasState::new().expect("init");
+        let name0_before = state.desktop.pinned_apps[0].name_str().to_string();
+        state.desktop.swap_pinned_apps(0, 0);
+        assert_eq!(state.desktop.pinned_apps[0].name_str(), name0_before.as_str(), "swap(0,0) should be no-op");
+    }
+
+    #[test]
+    fn test_calendar_fields_initialized() {
+        let state = LunasState::new().expect("init");
+        assert_eq!(state.desktop.clock_year, 2026, "clock_year should be initialized");
+        assert!(state.desktop.clock_day >= 1 && state.desktop.clock_day <= 31);
+        assert!(state.desktop.clock_month >= 1 && state.desktop.clock_month <= 12);
     }
 }

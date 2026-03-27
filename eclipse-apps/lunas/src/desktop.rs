@@ -118,6 +118,10 @@ pub struct DesktopShell {
     pub volume_level: u8,
     pub volume_muted: bool,
     pub brightness_level: u8,
+    /// Current battery level (0-100). 0 = empty, 100 = full.
+    pub battery_level: u8,
+    /// Whether the device is currently charging.
+    pub battery_charging: bool,
     /// Current clock hours (0-23), updated from system time.
     pub clock_hours: u8,
     /// Current clock minutes (0-59), updated from system time.
@@ -126,6 +130,8 @@ pub struct DesktopShell {
     pub clock_day: u8,
     /// Current month (1-12).
     pub clock_month: u8,
+    /// Current year (e.g. 2026).
+    pub clock_year: u16,
 }
 
 impl DesktopShell {
@@ -142,10 +148,13 @@ impl DesktopShell {
             volume_level: 75,
             volume_muted: false,
             brightness_level: 100,
+            battery_level: 80,
+            battery_charging: false,
             clock_hours: 0,
             clock_minutes: 0,
             clock_day: 1,
             clock_month: 1,
+            clock_year: 2026,
         };
 
         // Default pinned apps with executable paths
@@ -183,6 +192,14 @@ impl DesktopShell {
         }
         self.pinned_apps[self.pinned_count - 1] = PinnedApp::default();
         self.pinned_count -= 1;
+    }
+
+    /// Swap two pinned apps by index (drag-and-drop reorder).
+    /// Does nothing if either index is out of range or they are the same.
+    pub fn swap_pinned_apps(&mut self, a: usize, b: usize) {
+        if a != b && a < self.pinned_count && b < self.pinned_count {
+            self.pinned_apps.swap(a, b);
+        }
     }
 
     pub fn push_notification(&mut self, msg: &str, priority: u8) {
