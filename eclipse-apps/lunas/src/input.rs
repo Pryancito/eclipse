@@ -33,6 +33,7 @@ pub enum KeyAction {
     Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
     ToggleSystemCentral, ToggleTiling, ToggleSearch, ArrowUp, ArrowDown,
     Input(char), Enter, Backspace, ToggleNotifications, ToggleNetworkDetails,
+    BrightnessUp, BrightnessDown,
 }
 
 /// Represents what element was clicked on the taskbar.
@@ -67,6 +68,10 @@ pub enum TaskbarHit {
 /// Maximum number of items in a context menu.
 pub const CONTEXT_MENU_MAX_ITEMS: usize = 8;
 
+/// Number of distinct window decoration styles (0 = default, 1 = minimal, 2 = neon).
+/// Used by `CycleWindowVisual` action to wrap the style index.
+pub const DECORATION_STYLE_COUNT: u8 = 3;
+
 /// An action that a context menu item triggers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ContextAction {
@@ -88,6 +93,10 @@ pub enum ContextAction {
     UnpinApp(usize),
     /// Pin a running window (by its window index) to the taskbar.
     PinApp(usize),
+    /// Increase screen brightness by one step.
+    BrightnessUp,
+    /// Decrease screen brightness by one step.
+    BrightnessDown,
 }
 
 /// A single context menu item.
@@ -391,6 +400,8 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x0F => if (modifiers & 4) != 0 { KeyAction::CycleWindowVisual } else { KeyAction::CycleForward },
         0x29 => KeyAction::CycleBackward,
         0x32 => KeyAction::Minimize,
+        // Super+R = Restore focused window
+        0x13 => if (modifiers & 8) != 0 { KeyAction::Restore } else { KeyAction::None },
         0x5B => KeyAction::ToggleDashboard,
         0x26 => KeyAction::ToggleLock,
         0x1E => KeyAction::ToggleLauncher,
@@ -399,12 +410,19 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x4B => KeyAction::SnapLeft,
         0x4D => KeyAction::SnapRight,
         0x14 => if (modifiers & 8) != 0 { KeyAction::ToggleTiling } else { KeyAction::None },
+        // Super+Up = Maximize, plain Up = ArrowUp
         0x48 => if (modifiers & 8) != 0 { KeyAction::Maximize } else { KeyAction::ArrowUp },
-        0x50 => KeyAction::ArrowDown,
+        // Super+Down = Restore (un-maximize/un-minimize), plain Down = ArrowDown
+        0x50 => if (modifiers & 8) != 0 { KeyAction::Restore } else { KeyAction::ArrowDown },
         0x1C => KeyAction::Enter,
         0x0E => KeyAction::Backspace,
         0x36 => if (modifiers & 8) != 0 { KeyAction::ToggleNotifications } else { KeyAction::None },
         0x12 => if (modifiers & 8) != 0 { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
+        // Brightness keys (F5=0x3F = down, F6=0x40 = up) or Super+PgDown/PgUp (0x51/0x49)
+        0x3F => KeyAction::BrightnessDown,
+        0x40 => KeyAction::BrightnessUp,
+        0x49 => if (modifiers & 8) != 0 { KeyAction::BrightnessUp } else { KeyAction::None },
+        0x51 => if (modifiers & 8) != 0 { KeyAction::BrightnessDown } else { KeyAction::None },
         _ => KeyAction::None,
     }
 }
@@ -526,6 +544,8 @@ pub struct InputState {
     /// When a pinned-app drag ends over a different icon, this holds (src, dst) indices
     /// for state.rs to swap the apps. Cleared after processing.
     pub pending_pinned_swap: Option<(usize, usize)>,
+    /// Window decoration style index (0 = default, 1 = minimal, 2 = neon). Cycled by CycleWindowVisual.
+    pub window_decoration_style: u8,
 }
 
 impl InputState {
@@ -577,6 +597,7 @@ impl InputState {
             drag_press_x: 0,
             drag_press_y: 0,
             pending_pinned_swap: None,
+            window_decoration_style: 0,
         }
     }
 
@@ -769,6 +790,48 @@ impl InputState {
                                     dirty = true;
                                 }
                             }
+                        }
+                        KeyAction::Restore => {
+                            // Un-maximize if maximized; un-minimize if minimized.
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let w = &mut windows[idx];
+                                    if w.maximized {
+                                        let (sx, sy, sw, sh) = w.stored_rect;
+                                        w.x = sx; w.y = sy; w.w = sw; w.h = sh;
+                                        w.maximized = false;
+                                    } else if w.minimized {
+                                        w.minimized = false;
+                                    }
+                                    dirty = true;
+                                }
+                            } else {
+                                // No focused window: try to restore the most recently minimized window
+                                for i in (0..*window_count).rev() {
+                                    if windows[i].minimized && windows[i].content != WindowContent::None && !windows[i].closing {
+                                        windows[i].minimized = false;
+                                        self.focused_window = Some(i);
+                                        dirty = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        KeyAction::CycleWindowVisual => {
+                            // Cycle window decoration style (0 = default, 1 = minimal, 2 = neon).
+                            // Note: modifier 4 (Alt) + Tab (0x0F) triggers this action.
+                            // This differs from classic Alt+Tab application switching; in Lunas,
+                            // application cycling uses Tab alone (CycleForward / CycleBackward).
+                            self.window_decoration_style = (self.window_decoration_style + 1) % DECORATION_STYLE_COUNT;
+                            dirty = true;
+                        }
+                        KeyAction::BrightnessUp => {
+                            self.pending_context_action = ContextAction::BrightnessUp;
+                            dirty = true;
+                        }
+                        KeyAction::BrightnessDown => {
+                            self.pending_context_action = ContextAction::BrightnessDown;
+                            dirty = true;
                         }
                         KeyAction::CycleForward => {
                             if *window_count > 0 {
@@ -2463,5 +2526,144 @@ mod tests {
         let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(!state.clock_panel_active, "clicking outside should close calendar panel");
+    }
+
+    // ── Tests for new keyboard actions: Restore, CycleWindowVisual, Brightness ──
+
+    #[test]
+    fn test_scancode_restore_super_down() {
+        // Super+Down = Restore
+        assert_eq!(scancode_to_action(0x50, 8), KeyAction::Restore);
+    }
+
+    #[test]
+    fn test_scancode_restore_super_r() {
+        // Super+R = Restore
+        assert_eq!(scancode_to_action(0x13, 8), KeyAction::Restore);
+    }
+
+    #[test]
+    fn test_scancode_brightness_up() {
+        assert_eq!(scancode_to_action(0x40, 0), KeyAction::BrightnessUp);
+    }
+
+    #[test]
+    fn test_scancode_brightness_down() {
+        assert_eq!(scancode_to_action(0x3F, 0), KeyAction::BrightnessDown);
+    }
+
+    #[test]
+    fn test_restore_un_maximizes_window() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].maximized = true;
+        windows[0].stored_rect = (100, 100, 400, 300);
+        state.focused_window = Some(0);
+
+        // Super+Down (scancode 0x50, Super modifier=8)
+        state.modifiers = 8;
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!windows[0].maximized, "window should be un-maximized");
+        assert_eq!(windows[0].x, 100, "window x should be restored");
+    }
+
+    #[test]
+    fn test_restore_un_minimizes_window() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = true;
+        state.focused_window = Some(0);
+
+        state.modifiers = 8;
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!windows[0].minimized, "window should be un-minimized");
+    }
+
+    #[test]
+    fn test_restore_no_focused_restores_last_minimized() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 2;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = true;
+        windows[1].content = WindowContent::InternalDemo;
+        windows[1].workspace = 0;
+        windows[1].minimized = true;
+        state.focused_window = None;
+
+        state.modifiers = 8;
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        // Last (index 1) minimized window should be restored
+        assert!(!windows[1].minimized, "last minimized window should be restored");
+        assert_eq!(state.focused_window, Some(1));
+    }
+
+    #[test]
+    fn test_cycle_window_visual_increments() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        assert_eq!(state.window_decoration_style, 0);
+
+        // Ctrl+Tab (scancode 0x0F, Ctrl modifier=2)
+        state.modifiers = 4; // Alt modifier for CycleWindowVisual
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x0F, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.window_decoration_style, 1, "style should advance to 1");
+
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.window_decoration_style, 2, "style should advance to 2");
+
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.window_decoration_style, 0, "style should wrap back to 0");
+    }
+
+    #[test]
+    fn test_brightness_up_action() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x40, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.pending_context_action, ContextAction::BrightnessUp);
+    }
+
+    #[test]
+    fn test_brightness_down_action() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x3F, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.pending_context_action, ContextAction::BrightnessDown);
+    }
+
+    #[test]
+    fn test_super_down_without_super_is_arrow_down() {
+        // Without Super modifier, 0x50 = ArrowDown (not Restore)
+        assert_eq!(scancode_to_action(0x50, 0), KeyAction::ArrowDown);
     }
 }

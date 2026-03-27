@@ -293,7 +293,7 @@ pub fn draw_desktop_shell(
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
-        draw_window(fb, w, surfaces, input.focused_window == Some(i));
+        draw_window(fb, w, surfaces, input.focused_window == Some(i), input.window_decoration_style);
     }
 
     // 4. Draw overlays
@@ -397,6 +397,20 @@ const MINI_ICON_R_MAX: u8 = 140;
 const MINI_ICON_G_MAX: u8 = 160;
 /// Cap for the blue channel.
 const MINI_ICON_B_MAX: u8 = 210;
+
+// ── Window decoration style title-bar colours ──
+/// Default style: focused title bar colour.
+const TITLE_DEFAULT_FOCUSED: Rgb888 = Rgb888::new(25, 40, 80);
+/// Default style: unfocused title bar colour.
+const TITLE_DEFAULT_UNFOCUSED: Rgb888 = Rgb888::new(20, 25, 45);
+/// Minimal style: focused title bar colour.
+const TITLE_MINIMAL_FOCUSED: Rgb888 = Rgb888::new(40, 42, 54);
+/// Minimal style: unfocused title bar colour.
+const TITLE_MINIMAL_UNFOCUSED: Rgb888 = Rgb888::new(30, 32, 42);
+/// Neon style: focused title bar colour.
+const TITLE_NEON_FOCUSED: Rgb888 = Rgb888::new(0, 40, 60);
+/// Neon style: unfocused title bar colour.
+const TITLE_NEON_UNFOCUSED: Rgb888 = Rgb888::new(0, 25, 40);
 
 /// Draw the bottom taskbar.
 fn draw_taskbar(
@@ -837,6 +851,42 @@ fn draw_taskbar(
         let _ = Text::new("T", Point::new(tray_x + 140, bar_y + 19), tiling_text).draw(fb);
     }
 
+    // Window decoration style badge — shown when not default (style > 0).
+    // Styles: 1 = "M" (minimal, grey), 2 = "N" (neon, cyan).
+    if input.window_decoration_style > 0 {
+        let (style_char, style_color) = match input.window_decoration_style {
+            1 => ("M", Rgb888::new(140, 150, 170)),
+            _ => ("N", Rgb888::new(0, 240, 220)),
+        };
+        let deco_text = MonoTextStyle::new(&FONT_6X12, style_color);
+        let _ = Text::new(style_char, Point::new(tray_x + 126, bar_y + 19), deco_text).draw(fb);
+    }
+
+    // Brightness mini-bar (24px wide) with a small "☀" glyph (represented as "*").
+    // Shown as a very thin 24×2px bar just above the tiling badge position.
+    {
+        let bri = desktop.brightness_level.min(100) as i32;
+        let bri_bar_x = tray_x + 10;
+        let bri_bar_w_full: i32 = 24;
+        let bri_bar_w = (bri * bri_bar_w_full) / 100;
+        // Background track
+        let bri_track_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(30, 38, 60))
+            .build();
+        let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w_full as u32, 2))
+            .into_styled(bri_track_style)
+            .draw(fb);
+        // Fill
+        if bri_bar_w > 0 {
+            let bri_fill_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(220, 200, 80))
+                .build();
+            let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w as u32, 2))
+                .into_styled(bri_fill_style)
+                .draw(fb);
+        }
+    }
+
     // Notification bell indicator
     let notif_count = desktop.unread_count();
     let notif_x = tray_x + 155;
@@ -1022,7 +1072,7 @@ fn draw_taskbar(
         let year = desktop.clock_year as u32;
         // Three-letter day-of-week abbreviation (Sakamoto: 0=Sun, 1=Mon…5=Fri, 6=Sat)
         const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        let dow_idx = day_of_week(year, mo as u32, d as u32) as usize;
+        let dow_idx = (day_of_week(year, mo as u32, d as u32) % 7) as usize;
         let dow_str = DOW_ABBR.get(dow_idx).copied().unwrap_or("???");
         let _ = Text::new(dow_str, Point::new(fb_w - 56, bar_y + 30), date_style).draw(fb);
     } else {
@@ -1112,11 +1162,13 @@ fn draw_taskbar(
 }
 
 /// Draw a single window with decorations.
+/// `decoration_style`: 0 = default (dark blue), 1 = minimal (charcoal), 2 = neon (cyan accent).
 fn draw_window(
     fb: &mut FramebufferState,
     window: &ShellWindow,
     surfaces: &[ExternalSurface],
     focused: bool,
+    decoration_style: u8,
 ) {
     let cx = window.curr_x as i32;
     let cy = window.curr_y as i32;
@@ -1133,37 +1185,47 @@ fn draw_window(
         .into_styled(shadow_style)
         .draw(fb);
 
-    // Title bar
-    let title_color = if focused {
-        Rgb888::new(25, 40, 80)
-    } else {
-        Rgb888::new(20, 25, 45)
+    // Title bar — colour varies with decoration style
+    let title_color = match decoration_style {
+        1 => if focused { TITLE_MINIMAL_FOCUSED } else { TITLE_MINIMAL_UNFOCUSED }, // minimal
+        2 => if focused { TITLE_NEON_FOCUSED } else { TITLE_NEON_UNFOCUSED },       // neon
+        _ => if focused { TITLE_DEFAULT_FOCUSED } else { TITLE_DEFAULT_UNFOCUSED }, // default
     };
     let title_style = PrimitiveStyleBuilder::new().fill_color(title_color).build();
     let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ShellWindow::TITLE_H as u32))
         .into_styled(title_style)
         .draw(fb);
 
+    // Neon style: a bright accent line at the top of the title bar
+    if decoration_style == 2 {
+        let neon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 240, 220)).build();
+        let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, 2))
+            .into_styled(neon_style)
+            .draw(fb);
+    }
+
     // Title text
     let title_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
     let title = window.title_str();
     let _ = Text::new(title, Point::new(cx + 8, cy + 18), title_text_style).draw(fb);
 
-    // Close button (red circle)
+    // Close button (red circle) — always present
     let close_x = cx + cw - 21;
     let close_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 50, 50)).build();
     let _ = Rectangle::new(Point::new(close_x, cy + 6), Size::new(16, 16))
         .into_styled(close_style)
         .draw(fb);
 
-    // Maximize button (cyan)
-    let max_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 180, 220)).build();
+    // Maximize button — cyan or neon
+    let max_color = if decoration_style == 2 { Rgb888::new(0, 240, 180) } else { Rgb888::new(0, 180, 220) };
+    let max_style = PrimitiveStyleBuilder::new().fill_color(max_color).build();
     let _ = Rectangle::new(Point::new(close_x - 21, cy + 6), Size::new(16, 16))
         .into_styled(max_style)
         .draw(fb);
 
-    // Minimize button (dim cyan)
-    let min_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 120, 160)).build();
+    // Minimize button
+    let min_color = if decoration_style == 1 { Rgb888::new(80, 90, 110) } else { Rgb888::new(0, 120, 160) };
+    let min_style = PrimitiveStyleBuilder::new().fill_color(min_color).build();
     let _ = Rectangle::new(Point::new(close_x - 42, cy + 6), Size::new(16, 16))
         .into_styled(min_style)
         .draw(fb);
@@ -1222,10 +1284,15 @@ fn draw_window(
         WindowContent::None => {}
     }
 
-    // Focus highlight border
+    // Focus highlight border — colour varies with decoration style
     if focused {
+        let highlight_color = match decoration_style {
+            1 => Rgb888::new(100, 110, 140), // minimal: dim grey-blue
+            2 => Rgb888::new(0, 240, 220),   // neon: bright cyan
+            _ => Rgb888::new(0, 128, 255),   // default: blue
+        };
         let highlight_style = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(0, 128, 255))
+            .stroke_color(highlight_color)
             .stroke_width(2)
             .build();
         let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ch as u32))
