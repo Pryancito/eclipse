@@ -411,8 +411,8 @@ fn draw_taskbar(
             Rgb888::new(120, 130, 160)
         };
         let ws_label_style = MonoTextStyle::new(&FONT_6X12, ws_label_color);
-        let mut ws_digit = [b'0' + ws + 1];
-        let ws_label = core::str::from_utf8(&ws_digit[..1]).unwrap_or("?");
+        let ws_char_buf = [b'0' + ws + 1];
+        let ws_label = core::str::from_utf8(&ws_char_buf[..1]).unwrap_or("?");
         let _ = Text::new(ws_label, Point::new(ws_x + 7, bar_y + 26), ws_label_style).draw(fb);
     }
 

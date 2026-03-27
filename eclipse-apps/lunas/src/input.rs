@@ -84,9 +84,10 @@ pub fn taskbar_hit_test(
         }
     }
 
-    // Pinned apps: starting at TASKBAR_APPS_START_X, each icon 32px wide, spacing 6px
-    let icon_size: i32 = 32;
-    let icon_spacing: i32 = 6;
+    // Pinned apps: starting at TASKBAR_APPS_START_X, using shared layout constants
+    use crate::render::{TASKBAR_ICON_SIZE, TASKBAR_ICON_SPACING};
+    let icon_size: i32 = TASKBAR_ICON_SIZE;
+    let icon_spacing: i32 = TASKBAR_ICON_SPACING;
     let mut app_x = TASKBAR_APPS_START_X;
     for i in 0..pinned_count {
         if px >= app_x && px < app_x + icon_size && py >= bar_y + 6 && py < bar_y + 38 {
@@ -99,7 +100,7 @@ pub fn taskbar_hit_test(
     let sep2_x = app_x + 2;
     let mut win_x = sep2_x + 8;
     let win_item_w: i32 = 120;
-    let tray_start = fb_width - 250; // TASKBAR_TRAY_WIDTH
+    let tray_start = fb_width - crate::render::TASKBAR_TRAY_WIDTH;
 
     for w_idx in 0..window_count {
         if win_x + win_item_w > tray_start - 10 { break; }
