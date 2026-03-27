@@ -78,6 +78,10 @@ pub enum ContextAction {
     VolumeDown,
     ToggleMute,
     SetVolume(u8),
+    /// Launch (or focus) a pinned app by index.
+    LaunchPinnedApp(usize),
+    /// Remove a pinned app from the taskbar by index.
+    UnpinApp(usize),
 }
 
 /// A single context menu item.
@@ -1143,6 +1147,19 @@ impl InputState {
                                 self.context_menu.add_item("Close", ContextAction::CloseWindow(w_idx));
                                 dirty = true;
                             }
+                        } else if let TaskbarHit::PinnedApp(app_idx) = tb_hit {
+                            // Right-click on pinned app → open/focus and unpin options
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 60);
+                            self.context_menu.add_item("Open", ContextAction::LaunchPinnedApp(app_idx));
+                            self.context_menu.add_item("Unpin", ContextAction::UnpinApp(app_idx));
+                            dirty = true;
+                        } else if let TaskbarHit::Volume = tb_hit {
+                            // Right-click on volume → volume control context menu
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 90);
+                            self.context_menu.add_item("Volume Up", ContextAction::VolumeUp);
+                            self.context_menu.add_item("Volume Down", ContextAction::VolumeDown);
+                            self.context_menu.add_item("Mute/Unmute", ContextAction::ToggleMute);
+                            dirty = true;
                         }
                     } else {
                         // Right-click on desktop background or window
@@ -1848,5 +1865,54 @@ mod tests {
         // But the Terminal window is skipped, so there's nothing at x=210
         let hit = taskbar_hit_test(210, 1080 - 20, 1920, 1080, 1, &names, &windows, 1, 0, 0);
         assert_ne!(hit, TaskbarHit::WindowTask(0), "pinned-matched window should not hit as WindowTask");
+    }
+
+    #[test]
+    fn test_right_click_pinned_app_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        // Set up one pinned app
+        state.pinned_app_count = 1;
+        let name = b"Terminal";
+        state.pinned_app_names[0][..name.len()].copy_from_slice(name);
+
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Click on first pinned app icon: TASKBAR_APPS_START_X = 160, icon_size = 32
+        // Center of first icon = 160 + 16 = 176
+        state.cursor_x = 176;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.context_menu.visible, "context menu should be visible for pinned app");
+        assert_eq!(state.context_menu.item_count, 2); // Open, Unpin
+        assert_eq!(state.context_menu.items[0].action, ContextAction::LaunchPinnedApp(0));
+        assert_eq!(state.context_menu.items[1].action, ContextAction::UnpinApp(0));
+    }
+
+    #[test]
+    fn test_right_click_volume_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Volume area: tray_start = 1920 - 250 = 1670
+        // vol_x = tray_start + 180 = 1850; hit range [1845, 1865)
+        state.cursor_x = 1850;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.context_menu.visible, "context menu should be visible for volume");
+        assert_eq!(state.context_menu.item_count, 3); // Volume Up, Volume Down, Mute/Unmute
+        assert_eq!(state.context_menu.items[0].action, ContextAction::VolumeUp);
+        assert_eq!(state.context_menu.items[1].action, ContextAction::VolumeDown);
+        assert_eq!(state.context_menu.items[2].action, ContextAction::ToggleMute);
     }
 }

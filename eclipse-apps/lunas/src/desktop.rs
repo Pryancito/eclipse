@@ -172,6 +172,19 @@ impl DesktopShell {
         }
     }
 
+    /// Remove a pinned app by index, shifting remaining apps down.
+    /// Does nothing if the index is out of range.
+    pub fn unpin_app(&mut self, idx: usize) {
+        if idx >= self.pinned_count {
+            return;
+        }
+        for i in idx..(self.pinned_count - 1) {
+            self.pinned_apps[i] = self.pinned_apps[i + 1].clone();
+        }
+        self.pinned_apps[self.pinned_count - 1] = PinnedApp::default();
+        self.pinned_count -= 1;
+    }
+
     pub fn push_notification(&mut self, msg: &str, priority: u8) {
         if self.notification_count < MAX_NOTIFICATIONS {
             self.notifications[self.notification_count] = Notification::new(msg, priority);
@@ -282,5 +295,45 @@ mod tests {
             shell.pin_app("Extra", 0, 0, 0);
         }
         assert_eq!(shell.pinned_count, MAX_PINNED_APPS);
+    }
+
+    #[test]
+    fn test_unpin_app_removes_correctly() {
+        let mut shell = DesktopShell::new();
+        // Default has 5 apps: Terminal, Files, Editor, Browser, Settings
+        assert_eq!(shell.pinned_count, 5);
+
+        // Unpin the second app (Files at index 1)
+        shell.unpin_app(1);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[0].name_str(), "Terminal");
+        assert_eq!(shell.pinned_apps[1].name_str(), "Editor");
+        assert_eq!(shell.pinned_apps[2].name_str(), "Browser");
+        assert_eq!(shell.pinned_apps[3].name_str(), "Settings");
+    }
+
+    #[test]
+    fn test_unpin_app_first() {
+        let mut shell = DesktopShell::new();
+        shell.unpin_app(0);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[0].name_str(), "Files");
+    }
+
+    #[test]
+    fn test_unpin_app_last() {
+        let mut shell = DesktopShell::new();
+        let last_idx = shell.pinned_count - 1;
+        shell.unpin_app(last_idx);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[3].name_str(), "Browser");
+    }
+
+    #[test]
+    fn test_unpin_app_out_of_range() {
+        let mut shell = DesktopShell::new();
+        // Should do nothing for out-of-range index
+        shell.unpin_app(10);
+        assert_eq!(shell.pinned_count, 5);
     }
 }

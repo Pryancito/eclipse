@@ -605,6 +605,57 @@ impl LunasState {
                     self.desktop.volume_muted = false;
                     self.dirty = true;
                 }
+                ContextAction::LaunchPinnedApp(app_idx) => {
+                    // Focus running window matching this pinned app, or launch if none
+                    let mut name_buf = [0u8; 32];
+                    let name_len = if app_idx < self.desktop.pinned_count {
+                        let name = self.desktop.pinned_apps[app_idx].name_str();
+                        let len = name.len().min(32);
+                        name_buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+                        len
+                    } else {
+                        0
+                    };
+                    let app_name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+                    let mut running_window: Option<usize> = None;
+                    if !app_name.is_empty() {
+                        for w_idx in 0..self.space.window_count {
+                            let w = &self.space.windows[w_idx];
+                            if w.content == crate::compositor::WindowContent::None || w.closing { continue; }
+                            if w.workspace != self.input.current_workspace { continue; }
+                            let w_title = w.title_str();
+                            // Use byte comparison to avoid UTF-8 boundary issues
+                            let title_bytes = w_title.as_bytes();
+                            let name_bytes = app_name.as_bytes();
+                            if title_bytes.len() >= name_bytes.len()
+                                && title_bytes[..name_bytes.len()].eq_ignore_ascii_case(name_bytes)
+                            {
+                                running_window = Some(w_idx);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(w_idx) = running_window {
+                        self.space.windows[w_idx].minimized = false;
+                        self.input.focused_window = Some(w_idx);
+                    } else {
+                        self.launch_pinned_app(app_idx);
+                    }
+                    self.dirty = true;
+                }
+                ContextAction::UnpinApp(app_idx) => {
+                    self.desktop.unpin_app(app_idx);
+                    // Re-sync pinned app names and count to input state
+                    self.input.pinned_app_count = self.desktop.pinned_count;
+                    for i in 0..self.desktop.pinned_count.min(16) {
+                        let name = self.desktop.pinned_apps[i].name_str();
+                        let name_bytes = name.as_bytes();
+                        let len = name_bytes.len().min(32);
+                        self.input.pinned_app_names[i] = [0u8; 32];
+                        self.input.pinned_app_names[i][..len].copy_from_slice(&name_bytes[..len]);
+                    }
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -1303,5 +1354,49 @@ mod tests {
         }
         // The count should also be in sync
         assert_eq!(state.input.pinned_app_count, state.desktop.pinned_count);
+    }
+
+    #[test]
+    fn test_context_action_launch_pinned_app_focuses_running_window() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        // Add a window matching the first pinned app ("Terminal")
+        let app_name = state.desktop.pinned_apps[0].name_str().to_string();
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            workspace: 0,
+            minimized: true,
+            ..Default::default()
+        };
+        let idx = state.space.window_count;
+        state.space.map_window(win);
+        let title_bytes = app_name.as_bytes();
+        let title_len = title_bytes.len().min(32);
+        state.space.windows[idx].title[..title_len].copy_from_slice(&title_bytes[..title_len]);
+
+        // LaunchPinnedApp(0) should focus and restore the running window
+        state.input.pending_context_action = ContextAction::LaunchPinnedApp(0);
+        let _ = state.update();
+        assert!(!state.space.windows[idx].minimized, "window should be restored");
+        assert_eq!(state.input.focused_window, Some(idx), "window should be focused");
+    }
+
+    #[test]
+    fn test_context_action_unpin_app_syncs_input() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        let initial_count = state.desktop.pinned_count; // 5
+        assert_eq!(state.input.pinned_app_count, initial_count);
+
+        // Unpin the first app (Terminal)
+        state.input.pending_context_action = ContextAction::UnpinApp(0);
+        let _ = state.update();
+
+        assert_eq!(state.desktop.pinned_count, initial_count - 1, "desktop pinned count should decrease");
+        assert_eq!(state.input.pinned_app_count, initial_count - 1, "input pinned count should be synced");
+        // The first app should now be "Files" (was at index 1)
+        assert_eq!(state.desktop.pinned_apps[0].name_str(), "Files");
     }
 }
