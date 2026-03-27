@@ -8,6 +8,7 @@ use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
+use crate::wayland::{WaylandCompositor, XwaylandIntegration, WaylandAction, XwaylandAction, make_wayland_window};
 use std::prelude::v1::*;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
@@ -75,6 +76,10 @@ pub struct LunasState {
     pub log_buf: [u8; 512],
     pub log_len: usize,
     pub last_input_tick: u64,
+    /// Wayland compositor: manages protocol state for connected Wayland clients.
+    pub wayland: WaylandCompositor,
+    /// XWayland integration: manages XWayland process and X11 window state.
+    pub xwayland: XwaylandIntegration,
 }
 
 impl LunasState {
@@ -118,6 +123,8 @@ impl LunasState {
             log_buf: [0; 512],
             log_len: 0,
             last_input_tick: 0,
+            wayland: WaylandCompositor::new(),
+            xwayland: XwaylandIntegration::new(),
         };
 
         // Pre-render background
@@ -208,13 +215,120 @@ impl LunasState {
                 }
                 self.dirty = true;
             }
-            CompositorEvent::Wayland(_data, _pid) => {
-                // Wayland message processing (placeholder for protocol handling)
-                self.dirty = true;
+            CompositorEvent::Wayland(data, pid) => {
+                let pid = *pid;
+                let fb_w = self.backend.fb.info.width as i32;
+                let fb_h = self.backend.fb.info.height as i32;
+                let action = self.wayland.handle_message(data, pid);
+                match action {
+                    WaylandAction::CreateSurface { pid, surface_id, conn_idx } => {
+                        if self.space.window_count < self.space.windows.len() {
+                            let win = make_wayland_window(
+                                surface_id, conn_idx,
+                                fb_w, fb_h,
+                                self.input.current_workspace,
+                                b"Wayland",
+                            );
+                            let w_idx = self.space.window_count;
+                            self.space.map_window(win);
+                            self.wayland.register_surface_window(pid, surface_id, w_idx);
+                        }
+                        self.dirty = true;
+                    }
+                    WaylandAction::CommitSurface { pid, surface_id } => {
+                        // Mark the window as ready to show (no external buffer in Wayland
+                        // windows — they render themselves; just ensure it's not minimized).
+                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
+                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                if w_idx < self.space.window_count {
+                                    self.space.windows[w_idx].minimized = false;
+                                }
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                    WaylandAction::DestroySurface { pid, surface_id } => {
+                        let w_idx_opt = self.wayland.connections.iter()
+                            .find(|c| c.pid == pid)
+                            .and_then(|c| c.window_for_surface(surface_id));
+                        if let Some(w_idx) = w_idx_opt {
+                            if w_idx < self.space.window_count {
+                                self.space.windows[w_idx].closing = true;
+                                if self.input.focused_window == Some(w_idx) {
+                                    self.input.focused_window = None;
+                                }
+                            }
+                        }
+                        if let Some(c) = self.wayland.connections.iter_mut().find(|c| c.pid == pid) {
+                            c.remove_surface(surface_id);
+                        }
+                        self.dirty = true;
+                    }
+                    WaylandAction::None => {
+                        self.dirty = true;
+                    }
+                }
             }
-            CompositorEvent::X11(_data, _pid) => {
-                // X11 message processing (placeholder)
-                self.dirty = true;
+            CompositorEvent::X11(data, pid) => {
+                let pid = *pid;
+                let fb_w = self.backend.fb.info.width as i32;
+                let fb_h = self.backend.fb.info.height as i32;
+                let action = self.xwayland.handle_x11_event(data, pid);
+                match action {
+                    XwaylandAction::MapWindow { window_id } => {
+                        // Create a ShellWindow for this X11 window if there's room.
+                        if self.space.window_count < self.space.windows.len() {
+                            // Use window_id as a unique surface_id; conn_idx = 0 (XWayland slot)
+                            use crate::compositor::WindowContent;
+                            let mut title_buf = [0u8; 32];
+                            title_buf[..6].copy_from_slice(b"X11App");
+                            let win = ShellWindow {
+                                x: 80, y: ShellWindow::TITLE_H + 30,
+                                w: (fb_w / 2).max(320),
+                                h: (fb_h / 2).max(240),
+                                curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+                                content: WindowContent::Wayland {
+                                    surface_id: window_id,
+                                    conn_idx: 0,
+                                },
+                                workspace: self.input.current_workspace,
+                                title: title_buf,
+                                ..Default::default()
+                            };
+                            self.space.map_window(win);
+                        }
+                        self.dirty = true;
+                    }
+                    XwaylandAction::UnmapWindow { window_id } => {
+                        use crate::compositor::WindowContent;
+                        let count = self.space.window_count;
+                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
+                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
+                        }) {
+                            self.space.windows[w_idx].minimized = true;
+                            if self.input.focused_window == Some(w_idx) {
+                                self.input.focused_window = None;
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                    XwaylandAction::DestroyWindow { window_id } => {
+                        use crate::compositor::WindowContent;
+                        let count = self.space.window_count;
+                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
+                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
+                        }) {
+                            self.space.windows[w_idx].closing = true;
+                            if self.input.focused_window == Some(w_idx) {
+                                self.input.focused_window = None;
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                    XwaylandAction::None => {
+                        self.dirty = true;
+                    }
+                }
             }
         }
     }
@@ -1067,5 +1181,101 @@ mod tests {
         let state = LunasState::new().expect("init");
         assert_eq!(state.desktop.clock_day, 1);
         assert_eq!(state.desktop.clock_month, 1);
+    }
+
+    #[test]
+    fn test_wayland_compositor_initialized() {
+        let state = LunasState::new().expect("init");
+        assert!(state.wayland.connections.is_empty(), "no wayland connections at startup");
+        assert!(!state.xwayland.is_active(), "xwayland not active at startup");
+    }
+
+    #[test]
+    fn test_handle_event_wayland_create_surface() {
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.space.window_count, 0);
+
+        // Simulate wl_compositor.create_surface: obj=4, opcode=0, new_id=5
+        let mut msg = heapless::Vec::<u8, 512>::new();
+        let _ = msg.extend_from_slice(&4u32.to_le_bytes()); // obj_id (compositor)
+        let _ = msg.extend_from_slice(&((12u32 << 16) | 0u32).to_le_bytes()); // size=12, op=0
+        let _ = msg.extend_from_slice(&5u32.to_le_bytes()); // new surface id
+
+        state.handle_event(&CompositorEvent::Wayland(msg, 42));
+        // A new ShellWindow should have been created for the Wayland surface.
+        assert_eq!(state.space.window_count, 1);
+        assert!(matches!(
+            state.space.windows[0].content,
+            WindowContent::Wayland { surface_id: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn test_handle_event_wayland_commit_surface() {
+        let mut state = LunasState::new().expect("init");
+
+        // First create a surface
+        let mut msg = heapless::Vec::<u8, 512>::new();
+        let _ = msg.extend_from_slice(&4u32.to_le_bytes());
+        let _ = msg.extend_from_slice(&((12u32 << 16) | 0u32).to_le_bytes());
+        let _ = msg.extend_from_slice(&5u32.to_le_bytes());
+        state.handle_event(&CompositorEvent::Wayland(msg, 42));
+        assert_eq!(state.space.window_count, 1);
+
+        // Minimize the window manually
+        state.space.windows[0].minimized = true;
+
+        // Commit the surface — should restore it
+        let mut commit_msg = heapless::Vec::<u8, 512>::new();
+        let _ = commit_msg.extend_from_slice(&5u32.to_le_bytes()); // obj_id = surface
+        let _ = commit_msg.extend_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // op=6 commit
+        state.handle_event(&CompositorEvent::Wayland(commit_msg, 42));
+        assert!(!state.space.windows[0].minimized, "commit should restore window");
+    }
+
+    #[test]
+    fn test_handle_event_x11_map_window() {
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.space.window_count, 0);
+
+        // Simulate X11 MapNotify event (type=19, window_id=77)
+        let mut ev = heapless::Vec::<u8, 512>::new();
+        let mut buf = [0u8; 32];
+        buf[0] = 19; // MapNotify
+        buf[4..8].copy_from_slice(&77u32.to_le_bytes());
+        let _ = ev.extend_from_slice(&buf);
+        state.xwayland.set_pid(55);
+        state.handle_event(&CompositorEvent::X11(ev, 55));
+
+        assert_eq!(state.space.window_count, 1, "X11 MapNotify should create a window");
+        assert!(matches!(
+            state.space.windows[0].content,
+            WindowContent::Wayland { surface_id: 77, .. }
+        ));
+    }
+
+    #[test]
+    fn test_handle_event_x11_destroy_window() {
+        use crate::compositor::WindowContent;
+        let mut state = LunasState::new().expect("init");
+        state.xwayland.set_pid(55);
+
+        // Map a window first
+        let mut map_ev = heapless::Vec::<u8, 512>::new();
+        let mut map_buf = [0u8; 32];
+        map_buf[0] = 19;
+        map_buf[4..8].copy_from_slice(&10u32.to_le_bytes());
+        let _ = map_ev.extend_from_slice(&map_buf);
+        state.handle_event(&CompositorEvent::X11(map_ev, 55));
+        assert_eq!(state.space.window_count, 1);
+
+        // Now destroy it
+        let mut destroy_ev = heapless::Vec::<u8, 512>::new();
+        let mut destroy_buf = [0u8; 32];
+        destroy_buf[0] = 17; // DestroyNotify
+        destroy_buf[4..8].copy_from_slice(&10u32.to_le_bytes());
+        let _ = destroy_ev.extend_from_slice(&destroy_buf);
+        state.handle_event(&CompositorEvent::X11(destroy_ev, 55));
+        assert!(state.space.windows[0].closing, "DestroyNotify should mark window as closing");
     }
 }
