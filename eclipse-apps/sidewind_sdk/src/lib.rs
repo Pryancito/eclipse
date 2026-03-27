@@ -9,6 +9,10 @@
 //! El kernel de Eclipse OS usa **receive() no bloqueante**: si no hay mensajes retorna (0, 0)
 //! inmediatamente. No hay "Zombie Receive" que cause deadlock. Para evitar starvation al
 //! drenar muchos eventos, inserta `yield_cpu()` periódicamente en bucles de poll_event.
+//!
+
+extern crate alloc;
+extern crate libc;
 
 pub mod font_terminus_12;
 pub mod font_terminus_14;
@@ -21,7 +25,7 @@ pub mod gpu;
 
 pub use gpu::{GpuDevice, GpuBackend, GpuCommandEncoder, SurfaceGpuExt};
 
-use eclipse_libc::{eclipse_send as send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
+use libc::{eclipse_send as send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
 use eclipse_ipc::prelude::IpcChannel;
 use sidewind_core::{SideWindMessage, SWND_OP_DESTROY, SideWindEvent};
 
@@ -69,10 +73,6 @@ impl SideWindSurface {
         
         let path_str = unsafe { core::str::from_utf8_unchecked(&path[..5+name_len]) };
         
-        // In Eclipse OS, to create a virtual file in /tmp we just open it.
-        // We might need a flag to ensure it's created if not exists?
-        // Current kernel implementation of DevFS/EclipseFS might need O_CREAT if we had it.
-        // For now assume open creates or exists.
         let mut path_c = [0u8; 65];
         path_c[..path_str.len()].copy_from_slice(path_str.as_bytes());
         path_c[path_str.len()] = 0;

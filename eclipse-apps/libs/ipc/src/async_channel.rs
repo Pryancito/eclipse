@@ -74,7 +74,7 @@ where
     loop {
         match Pin::new(&mut *future).poll(&mut cx) {
             Poll::Ready(out) => return out,
-            Poll::Pending => unsafe { crate::eclipse_libc::yield_cpu() },
+            Poll::Pending => unsafe { crate::libc::yield_cpu() },
         }
     }
 }

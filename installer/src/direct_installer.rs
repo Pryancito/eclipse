@@ -547,6 +547,7 @@ impl DirectInstaller {
             ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "/usr/bin/demo_client"),
             ("eclipse-apps/target/x86_64-unknown-eclipse/release/wayland_handshake", "/usr/bin/wayland_handshake"),
             ("eclipse-apps/target/x86_64-unknown-eclipse/release/x11_bridge_test", "/usr/bin/x11_bridge_test"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar", "/usr/bin/rwaybar"),
             // Mantener rutas antiguas para compatibilidad
             ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
             ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
@@ -651,6 +652,7 @@ impl DirectInstaller {
             ("userland/target/release/eclipse_userland", "eclipse_userland"),
             ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "smithay_app"),
             ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar", "rwaybar"),
         ];
 
         for (source, name) in userland_modules {

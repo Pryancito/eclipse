@@ -4,16 +4,26 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false }
-eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
+# The original eclipse-libc dependency is now moved to a target-specific section
+# and renamed to libc.
+
+# The eclipse_ipc dependency is also moved to the target-specific section.
+# sidewind_core, embedded-graphics, heapless, micromath, sidewind-opengl remain here
 sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
 heapless = "0.8"
 micromath = "2.1.0"
 sidewind-opengl = { path = "../sidewind_opengl" }
 
-[features]
-host-testing = ["eclipse-libc/host-testing"]
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+libc = { path = "../../eclipse-relibc", default-features = false }
+std = { package = "eclipse_std", path = "../../eclipse_std" }
+eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 
+[features]
+host-testing = ["libc/host-testing"] # Changed from eclipse-libc/host-testing
+
+# Al ejecutar `cargo test`, Cargo une features: así eclipse-libc recibe host-testing,
+# no registra su global_allocator (mmap Eclipse) y se usa el allocator del sistema.
 [dev-dependencies]
-eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }
+libc = { path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }

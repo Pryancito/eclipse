@@ -1200,7 +1200,9 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
 
 pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
     // Damage tracking removed; draw decoration fully if visible.
-    draw_window_decoration_at(fb, w, is_focused, x, button_hover);
+    if !w.is_panel {
+        draw_window_decoration_at(fb, w, is_focused, x, button_hover);
+    }
 
     if w.curr_w > 100.0 {
         match w.content {
@@ -1298,6 +1300,7 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     let size = (fb.info.pitch as usize) * (fb.info.height as usize);
     let data = unsafe { core::slice::from_raw_parts_mut(fb.back_addr as *mut u8, size) };
     if let Some(mut painter) = SkiaPainter::new(data, fb.info.width, fb.info.height) {
+        if ww < 20 || wh < 20 { return; } // Avoid degenerate paths that cause tiny-skia panics
         let shadow_color = SkiaPainter::color(0, 0, 0, 120);
         painter.draw_shadow_advanced(wx as f32, wy as f32, ww as f32, wh as f32, 10.0, 8.0, shadow_color);
         

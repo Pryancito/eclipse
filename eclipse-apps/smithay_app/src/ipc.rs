@@ -187,24 +187,33 @@ pub fn handle_sidewind_message(
                         buffer_size, active: true, ready_to_flip: false,
                     };
                     
-                    // Clamp initial window position to screen bounds
+                    let is_panel = &msg.name[..7] == b"rwaybar";
+                    
+                    // Clamp initial window position to screen bounds (only for non-panels)
                     let margin = 50;
-                    let clamped_x = msg.x.clamp(margin, (fb_width - 100).max(margin));
-                    let clamped_y = msg.y.clamp(ShellWindow::TITLE_H, (fb_height - 100).max(ShellWindow::TITLE_H));
+                    let (clamped_x, clamped_y) = if is_panel {
+                        (msg.x, msg.y)
+                    } else {
+                        (msg.x.clamp(margin, (fb_width - 100).max(margin)),
+                         msg.y.clamp(ShellWindow::TITLE_H, (fb_height - 100).max(ShellWindow::TITLE_H)))
+                    };
+
+                    let win_h = if is_panel { msg.h as i32 } else { msg.h as i32 + 26 };
 
                     windows[*window_count] = ShellWindow {
                         x: clamped_x, y: clamped_y,
-                        w: msg.w as i32, h: msg.h as i32 + 26,
+                        w: msg.w as i32, h: win_h,
                         curr_x: (clamped_x + msg.w as i32 / 2) as f32,
-                        curr_y: (clamped_y + (msg.h as i32 + 26) / 2) as f32,
+                        curr_y: (clamped_y + win_h / 2) as f32,
                         curr_w: 0.0, curr_h: 0.0,
                         minimized: false, maximized: false, closing: false,
-                        stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + 26),
+                        stored_rect: (clamped_x, clamped_y, msg.w as i32, win_h),
                         workspace: input_state.current_workspace,
                         content: WindowContent::External(s_idx as u32),
                         damage: alloc::vec::Vec::new(),
                         buffer_handle: None,
                         is_dmabuf: false,
+                        is_panel,
                     };
                     let _new_idx = *window_count;
                     *window_count += 1;

@@ -2,7 +2,7 @@
 //! Gestiona automáticamente fast path (≤24 bytes, registros) y slow path (buffer).
 
 use core::cmp::Ord;
-use crate::eclipse_libc::{receive, receive_fast, eclipse_send as send, yield_cpu};
+use crate::libc::{receive, receive_fast, eclipse_send as send, yield_cpu};
 use sidewind_core::SideWindMessage;
 use crate::types::{EclipseMessage, MAX_MSG_LEN, parse_fast, parse_slow, build_subscribe_payload, build_input_pid_response_payload};
 

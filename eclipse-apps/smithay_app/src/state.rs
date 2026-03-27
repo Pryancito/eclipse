@@ -932,6 +932,7 @@ impl SmithayState {
                 damage: alloc::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
+                is_panel: false,
             };
             self.space.map_window(win);
             self.input.focused_window = Some(idx);
@@ -1275,6 +1276,7 @@ mod tests {
             damage: alloc::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            is_panel: false,
         });
         
         state.input.focused_window = Some(0);
@@ -1297,6 +1299,7 @@ mod tests {
             damage: alloc::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            is_panel: false,
         });
         state.input.focused_window = Some(0);
         state.input.request_close_window = true;

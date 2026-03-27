@@ -1,6 +1,6 @@
 //! Constantes y funciones de descubrimiento de servicios de Eclipse OS
 
-use crate::eclipse_libc::{receive, eclipse_send as send, yield_cpu};
+use crate::libc::{receive, eclipse_send as send, yield_cpu};
 use crate::types::{GET_INPUT_PID_MSG, TAG_INPT, GET_NETWORK_PID_MSG, TAG_NETW, build_subscribe_payload};
 
 // ============================================================================

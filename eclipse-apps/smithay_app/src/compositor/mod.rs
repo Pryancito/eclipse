@@ -50,6 +50,7 @@ pub struct ShellWindow {
     pub damage: alloc::vec::Vec<(i32, i32, i32, i32)>,
     pub buffer_handle: Option<u32>, // GEM handle for DMABUF
     pub is_dmabuf: bool,
+    pub is_panel: bool,
 }
 
 impl Default for ShellWindow {
@@ -64,6 +65,7 @@ impl Default for ShellWindow {
             damage: alloc::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            is_panel: false,
         }
     }
 }
@@ -80,6 +82,7 @@ impl ShellWindow {
             damage: alloc::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            is_panel: false,
         }
     }
 

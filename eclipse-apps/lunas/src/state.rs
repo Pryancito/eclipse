@@ -22,7 +22,7 @@ unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_voi
 #[cfg(not(target_vendor = "eclipse"))]
 fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
 #[cfg(not(target_vendor = "eclipse"))]
-fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> usize { 0 }
+fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> isize { 0 }
 
 /// Service information for the system central panel.
 #[derive(Clone, Copy, Default)]
@@ -219,11 +219,18 @@ impl LunasState {
     /// Drain IPC messages and process all pending events.
     pub fn handle_ipc(&mut self) {
         #[cfg(not(test))]
-        self.backend.drain_ipc_into_pending(64);
+        self.backend.drain_ipc_into_pending(128);
 
-        // Process all available events
-        while let Some(event) = self.backend.poll_event() {
-            self.handle_event(&event);
+        // Process a fixed amount of events per frame to maintain 60 FPS
+        let mut events_processed = 0usize;
+        const EVENTS_PER_FRAME: usize = 64;
+        while events_processed < EVENTS_PER_FRAME {
+            if let Some(event) = self.backend.poll_event() {
+                self.handle_event(&event);
+                events_processed += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -261,7 +268,7 @@ impl LunasState {
 
         // System stats
         let mut stats = SystemStats::default();
-        let _ = get_system_stats(&mut stats);
+        let _ = unsafe { get_system_stats(&mut stats) };
 
         if let Some(ref prev) = self.prev_stats {
             let total_delta = stats.uptime_ticks.saturating_sub(prev.uptime_ticks);
@@ -286,7 +293,7 @@ impl LunasState {
         self.prev_stats = Some(stats);
 
         // Process list
-        self.process_count = get_process_list(self.process_list.as_mut_ptr(), 32);
+        self.process_count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) } as usize;
 
         self.dirty = true;
     }

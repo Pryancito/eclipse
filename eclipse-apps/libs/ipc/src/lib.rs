@@ -26,10 +26,10 @@ pub mod services;
 pub mod types;
 
 #[cfg(not(target_os = "linux"))]
-extern crate eclipse_libc;
+extern crate libc;
 
 #[cfg(target_os = "linux")]
-pub mod eclipse_libc {
+pub mod libc {
     use eclipse_syscall::InputEvent;
 
     pub unsafe fn receive(_buf: *mut u8, _len: usize, _from: *mut u32) -> usize { 0 }

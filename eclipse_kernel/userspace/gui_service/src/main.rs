@@ -12,7 +12,7 @@ const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
 static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
-const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
+const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 
 // No longer needed: we use exec() in main directly
 

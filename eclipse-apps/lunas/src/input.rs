@@ -122,7 +122,7 @@ pub struct InputState {
     pub fb_width: i32,
     pub fb_height: i32,
     pub modifiers: u32,
-    pub sensitivity: f32,
+    pub mouse_sensitivity: i32,
     pub invert_y: bool,
     pub focused_window: Option<usize>,
     pub dragging_window: Option<usize>,
@@ -150,7 +150,7 @@ impl InputState {
             fb_width,
             fb_height,
             modifiers: 0,
-            sensitivity: 1.0,
+            mouse_sensitivity: 100,
             invert_y: false,
             focused_window: None,
             dragging_window: None,
@@ -348,10 +348,10 @@ impl InputState {
                             dirty = true;
                         }
                         KeyAction::SensitivityPlus => {
-                            self.sensitivity = (self.sensitivity + 0.1).min(5.0);
+                            self.mouse_sensitivity = (self.mouse_sensitivity + 25).min(200);
                         }
                         KeyAction::SensitivityMinus => {
-                            self.sensitivity = (self.sensitivity - 0.1).max(0.1);
+                            self.mouse_sensitivity = (self.mouse_sensitivity - 25).max(50);
                         }
                         KeyAction::InvertY => {
                             self.invert_y = !self.invert_y;
@@ -367,30 +367,62 @@ impl InputState {
             }
             // Mouse move
             1 => {
-                let dx = (event.code as i16) as i32;
-                let dy = event.value;
-                self.cursor_x = (self.cursor_x + (dx as f32 * self.sensitivity) as i32).clamp(0, self.fb_width - 1);
-                let y_delta = if self.invert_y { -dy } else { dy };
-                self.cursor_y = (self.cursor_y + (y_delta as f32 * self.sensitivity) as i32).clamp(0, self.fb_height - 1);
+                if event.code == 0xFFFF {
+                    // Coalesced dx+dy event: dx = lower i16, dy = upper i16.
+                    let dx = (event.value as i16) as i32;
+                    let dy = ((event.value >> 16) as i16) as i32;
+                    let dx = dx.clamp(i8::MIN as i32, i8::MAX as i32);
+                    let dy = dy.clamp(i8::MIN as i32, i8::MAX as i32);
+                    let ddx = (dx * self.mouse_sensitivity) / 100;
+                    let ddy = (dy * self.mouse_sensitivity) / 100;
 
-                // Window dragging
-                if let Some(drag_idx) = self.dragging_window {
-                    if drag_idx < *window_count {
-                        windows[drag_idx].x = self.cursor_x - self.drag_offset_x;
-                        windows[drag_idx].y = self.cursor_y - self.drag_offset_y;
-                        dirty = true;
+                    self.cursor_x = (self.cursor_x + ddx).clamp(0, self.fb_width - 1);
+                    let dy_effective = if self.invert_y { -ddy } else { ddy };
+                    self.cursor_y = (self.cursor_y + dy_effective).clamp(0, self.fb_height - 1);
+
+                    // Window dragging
+                    if let Some(drag_idx) = self.dragging_window {
+                        if drag_idx < *window_count {
+                            windows[drag_idx].x = (windows[drag_idx].x + ddx).clamp(0, self.fb_width - windows[drag_idx].w);
+                            windows[drag_idx].y = (windows[drag_idx].y + dy_effective).clamp(0, self.fb_height - windows[drag_idx].h);
+                            dirty = true;
+                        }
                     }
-                }
 
-                // Window resizing
-                if let Some(resize_idx) = self.resizing_window {
-                    if resize_idx < *window_count {
-                        let w = &mut windows[resize_idx];
-                        let new_w = (self.cursor_x - w.x).max(100);
-                        let new_h = (self.cursor_y - w.y).max(80);
-                        w.w = new_w;
-                        w.h = new_h;
-                        dirty = true;
+                    // Window resizing
+                    if let Some(resize_idx) = self.resizing_window {
+                        if resize_idx < *window_count {
+                            windows[resize_idx].w = (self.cursor_x - windows[resize_idx].x + 8).max(50);
+                            windows[resize_idx].h = (self.cursor_y - windows[resize_idx].y + 8).max(40);
+                            dirty = true;
+                        }
+                    }
+                } else if event.code == 0 {
+                    let d = (event.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
+                    self.cursor_x = (self.cursor_x + d).clamp(0, self.fb_width - 1);
+                    if let Some(drag_idx) = self.dragging_window {
+                        if drag_idx < *window_count {
+                            windows[drag_idx].x = (windows[drag_idx].x + d).clamp(0, self.fb_width - windows[drag_idx].w);
+                        }
+                    }
+                    if let Some(resize_idx) = self.resizing_window {
+                        if resize_idx < *window_count {
+                            windows[resize_idx].w = (self.cursor_x - windows[resize_idx].x + 8).max(50);
+                        }
+                    }
+                } else if event.code == 1 {
+                    let d = (event.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
+                    let dy = if self.invert_y { -d } else { d };
+                    self.cursor_y = (self.cursor_y + dy).clamp(0, self.fb_height - 1);
+                    if let Some(drag_idx) = self.dragging_window {
+                        if drag_idx < *window_count {
+                            windows[drag_idx].y = (windows[drag_idx].y + dy).clamp(0, self.fb_height - windows[drag_idx].h);
+                        }
+                    }
+                    if let Some(resize_idx) = self.resizing_window {
+                        if resize_idx < *window_count {
+                            windows[resize_idx].h = (self.cursor_y - windows[resize_idx].y + 8).max(40);
+                        }
                     }
                 }
 
@@ -554,7 +586,8 @@ mod tests {
         let mut surfaces = [ExternalSurface::default(); 16];
         let mut count = 0;
 
-        let ev = InputEvent { device_id: 0, event_type: 1, code: 10, value: 5, timestamp: 0 };
+        // Use core X-axis event
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0, value: 5, timestamp: 0 };
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.cursor_x > 960);
@@ -567,8 +600,8 @@ mod tests {
         let mut surfaces = [ExternalSurface::default(); 16];
         let mut count = 0;
 
-        // Move cursor far right
-        let ev = InputEvent { device_id: 0, event_type: 1, code: 500, value: 0, timestamp: 0 };
+        // Move cursor far right using X-axis event
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0, value: 500, timestamp: 0 };
         let _ = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(state.cursor_x <= 99);
     }

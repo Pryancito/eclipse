@@ -11,12 +11,11 @@ use embedded_graphics::text::Text;
 use embedded_graphics::geometry::{Point, Size};
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface};
 use crate::input::InputState;
-use crate::painter::SkiaPainter;
 use crate::style_engine::StyleEngine;
 use crate::desktop::DesktopShell;
 use crate::state::ServiceInfo;
-use eclipse_ipc::types::NetExtendedStats;
-use sidewind::font_terminus_14;
+
+use crate::display::{self, DisplayDevice, DisplayCaps, ControlDevice};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -24,91 +23,62 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 
 /// Framebuffer info from the kernel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FramebufferInfo {
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
-    pub bpp: u32,
+    pub bpp: u8,
     pub address: u64,
 }
 
 /// Central framebuffer state for rendering.
 pub struct FramebufferState {
     pub info: FramebufferInfo,
+    pub back_fb_id: display::control::framebuffer::Handle,
+    pub front_fb_id: display::control::framebuffer::Handle,
     pub back_addr: usize,
     pub front_addr: usize,
     pub background_addr: usize,
+    pub drm_fd: usize,
+    pub drm_crtc: display::control::CrtcHandle,
     pub gpu: Option<sidewind::gpu::GpuDevice>,
-    pub drm_fd: i32,
-    pub back_fb_id: u32,
-    pub front_fb_id: u32,
-    pub drm_crtc: u32,
 }
 
 impl FramebufferState {
-    /// Initialize framebuffer from DRM device (Eclipse OS target).
     #[cfg(not(test))]
     pub fn init() -> Option<Self> {
         #[cfg(target_vendor = "eclipse")]
         {
+            let dev = DisplayDevice::open().ok()?;
+            let fb_front = dev.create_framebuffer().ok()?;
+            let fb_back  = dev.create_framebuffer().ok()?;
+
+            let background_addr = if let Ok(db) = dev.create_dumb_buffer(dev.caps.width, dev.caps.height, 32) {
+                dev.map_buffer(db.handle, db.size).unwrap_or(core::ptr::null_mut()) as usize
+            } else {
+                0
+            };
+
             let info = FramebufferInfo {
-                width: DEFAULT_WIDTH,
-                height: DEFAULT_HEIGHT,
-                pitch: DEFAULT_WIDTH * 4,
+                address: fb_front.addr as u64,
+                width: dev.caps.width,
+                height: dev.caps.height,
+                pitch: dev.caps.pitch,
                 bpp: 32,
-                address: 0,
+                ..Default::default()
             };
-
-            let buffer_size = (info.pitch * info.height) as usize;
-            let back_addr = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    buffer_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                ) as usize
-            };
-            if back_addr == 0 || back_addr == usize::MAX { return None; }
-
-            let front_addr = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    buffer_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                ) as usize
-            };
-            if front_addr == 0 || front_addr == usize::MAX { return None; }
-
-            let background_addr = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    buffer_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                ) as usize
-            };
-            if background_addr == 0 || background_addr == usize::MAX { return None; }
-
-            let gpu = sidewind::gpu::GpuDevice::init();
 
             Some(Self {
                 info,
-                back_addr,
-                front_addr,
+                back_fb_id: fb_back.fb_id,
+                front_fb_id: fb_front.fb_id,
+                back_addr: fb_back.addr,
+                front_addr: fb_front.addr,
                 background_addr,
-                gpu,
-                drm_fd: -1,
-                back_fb_id: 0,
-                front_fb_id: 0,
-                drm_crtc: 0,
+                drm_fd: dev.fd as usize,
+                drm_crtc: dev.crtc,
+                gpu: Some(sidewind::gpu::GpuDevice::new()),
             })
         }
 
@@ -130,14 +100,14 @@ impl FramebufferState {
         };
         Self {
             info,
+            back_fb_id: display::control::framebuffer::Handle(0),
+            front_fb_id: display::control::framebuffer::Handle(0),
             back_addr: 0x1000,
             front_addr: 0x2000,
             background_addr: 0x3000,
+            drm_fd: 0,
+            drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
-            drm_fd: -1,
-            back_fb_id: 0,
-            front_fb_id: 0,
-            drm_crtc: 0,
         }
     }
 
@@ -145,7 +115,14 @@ impl FramebufferState {
     pub fn present(&mut self) -> bool {
         #[cfg(all(not(test), target_vendor = "eclipse"))]
         {
-            let _ = eclipse_syscall::call::drm_page_flip(self.drm_crtc, self.back_fb_id);
+            let dev = DisplayDevice {
+                fd: self.drm_fd,
+                caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                crtc: self.drm_crtc,
+                connector: display::control::ConnectorHandle(0),
+            };
+
+            let _ = dev.page_flip(self.back_fb_id);
             core::mem::swap(&mut self.back_addr, &mut self.front_addr);
             core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
             true

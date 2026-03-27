@@ -191,13 +191,13 @@ build_sidewind_project() {
     # Compilar todo el workspace usando el target personalizado de Eclipse
     # parse_stack_sizes es herramienta host (usa stack-sizes/anyhow/byteorder con std) - excluir del build Eclipse
     print_status "Compilando workspace Sidewind para target Eclipse..."
-    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes --exclude smithay
+    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes
     
     if [ $? -eq 0 ]; then
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test rwaybar lunas"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
@@ -1456,6 +1456,7 @@ show_build_summary() {
     echo "  Calculadora Wayland: wayland_apps/wayland_calculator/target/release/wayland_calculator"
     echo "  Terminal Wayland: wayland_apps/wayland_terminal/target/release/wayland_terminal"
     echo "  Editor de texto Wayland: wayland_apps/wayland_text_editor/target/release/wayland_text_editor"
+    echo "  Rwaybar: eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar"
     echo ""
     echo "Desktop Environment:"
     echo "  Nota: Desktop environment no implementado en esta versión"
