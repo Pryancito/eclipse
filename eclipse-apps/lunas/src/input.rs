@@ -54,6 +54,10 @@ pub enum TaskbarHit {
     Volume,
     /// The clock area was clicked.
     Clock,
+    /// The scroll-left (◀) button for window tasks was clicked.
+    TaskScrollLeft,
+    /// The scroll-right (▶) button for window tasks was clicked.
+    TaskScrollRight,
 }
 
 /// Maximum number of items in a context menu.
@@ -157,9 +161,11 @@ pub fn taskbar_hit_test(
     fb_width: i32,
     fb_height: i32,
     pinned_count: usize,
+    pinned_app_names: &[[u8; 32]],
     windows: &[ShellWindow],
     window_count: usize,
     current_workspace: u8,
+    task_scroll_offset: usize,
 ) -> TaskbarHit {
     use crate::render::{TASKBAR_HEIGHT, TASKBAR_APPS_START_X};
 
@@ -195,15 +201,69 @@ pub fn taskbar_hit_test(
 
     // Running windows area (after separator): start at sep2_x + 8
     let sep2_x = app_x + 2;
-    let mut win_x = sep2_x + 8;
-    let win_item_w: i32 = 120;
     let tray_start = fb_width - crate::render::TASKBAR_TRAY_WIDTH;
 
+    // Scroll buttons: drawn just before the tray separator when overflow is present.
+    // Left scroll button occupies 16px immediately after win_tasks_start.
+    let scroll_btn_w: i32 = 16;
+    let tasks_start_x = sep2_x + 8;
+
+    // Scroll-left button (always at tasks_start_x when scroll_offset > 0)
+    if task_scroll_offset > 0 {
+        if px >= tasks_start_x && px < tasks_start_x + scroll_btn_w
+            && py >= bar_y + 8 && py < bar_y + 36
+        {
+            return TaskbarHit::TaskScrollLeft;
+        }
+    }
+
+    // The window tasks start after the scroll-left button (if shown)
+    let task_origin_x = if task_scroll_offset > 0 {
+        tasks_start_x + scroll_btn_w + 2
+    } else {
+        tasks_start_x
+    };
+
+    let mut win_x = task_origin_x;
+    let win_item_w: i32 = 120;
+
+    // We need to know whether there is overflow to position the scroll-right button.
+    // Reserve space for scroll-right button (16px) before tray.
+    let scroll_right_area_w = scroll_btn_w + 4;
+    let task_area_end = tray_start - 10 - scroll_right_area_w;
+
+    let mut skipped = 0usize;
     for w_idx in 0..window_count {
-        if win_x + win_item_w > tray_start - 10 { break; }
         let w = &windows[w_idx];
         if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != current_workspace { continue; }
+
+        // Skip windows that are already represented by a pinned app icon
+        let w_title = w.title_str();
+        let already_pinned = (0..pinned_count.min(pinned_app_names.len())).any(|pi| {
+            let pname_bytes = &pinned_app_names[pi];
+            let pname_len = pname_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+            let pname = core::str::from_utf8(&pname_bytes[..pname_len]).unwrap_or("");
+            !pname.is_empty()
+                && w_title.len() >= pname.len()
+                && w_title[..pname.len()].eq_ignore_ascii_case(pname)
+        });
+        if already_pinned { continue; }
+
+        // Apply scroll offset
+        if skipped < task_scroll_offset {
+            skipped += 1;
+            continue;
+        }
+
+        if win_x + win_item_w > task_area_end {
+            // This window overflows — check scroll-right button area
+            let sr_x = tray_start - scroll_btn_w - 6;
+            if px >= sr_x && px < sr_x + scroll_btn_w && py >= bar_y + 8 && py < bar_y + 36 {
+                return TaskbarHit::TaskScrollRight;
+            }
+            break;
+        }
 
         if px >= win_x && px < win_x + win_item_w && py >= bar_y + 8 && py < bar_y + 36 {
             return TaskbarHit::WindowTask(w_idx);
@@ -412,6 +472,12 @@ pub struct InputState {
     pub volume_panel_active: bool,
     /// Whether the network details panel is visible.
     pub network_details_active: bool,
+    /// Names of pinned apps, mirrored from DesktopShell for hit-testing inside apply_event.
+    pub pinned_app_names: [[u8; 32]; 16],
+    /// Tooltip text shown above the currently-hovered taskbar element (empty = hidden).
+    pub tooltip: heapless::String<64>,
+    /// Scroll offset for the running-windows task list (in items, not pixels).
+    pub task_scroll_offset: usize,
 }
 
 impl InputState {
@@ -453,6 +519,9 @@ impl InputState {
             pending_context_action: ContextAction::None,
             volume_panel_active: false,
             network_details_active: false,
+            pinned_app_names: [[0u8; 32]; 16],
+            tooltip: heapless::String::new(),
+            task_scroll_offset: 0,
         }
     }
 
@@ -748,11 +817,50 @@ impl InputState {
                     self.cursor_x, self.cursor_y,
                     self.fb_width, self.fb_height,
                     self.pinned_app_count,
+                    &self.pinned_app_names,
                     windows, *window_count,
                     self.current_workspace,
+                    self.task_scroll_offset,
                 );
                 if hover_hit != self.hovered_taskbar_element {
                     self.hovered_taskbar_element = hover_hit;
+                    // Update tooltip text for the newly hovered element
+                    self.tooltip.clear();
+                    match hover_hit {
+                        TaskbarHit::Launcher => {
+                            let _ = self.tooltip.push_str("Launcher");
+                        }
+                        TaskbarHit::PinnedApp(i) => {
+                            if i < self.pinned_app_count && i < self.pinned_app_names.len() {
+                                let name_bytes = &self.pinned_app_names[i];
+                                let len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+                                if let Ok(s) = core::str::from_utf8(&name_bytes[..len]) {
+                                    let _ = self.tooltip.push_str(s);
+                                }
+                            }
+                        }
+                        TaskbarHit::WindowTask(w_idx) => {
+                            if w_idx < *window_count {
+                                let _ = self.tooltip.push_str(windows[w_idx].title_str());
+                            }
+                        }
+                        TaskbarHit::Notifications => {
+                            let _ = self.tooltip.push_str("Notifications");
+                        }
+                        TaskbarHit::Volume => {
+                            let _ = self.tooltip.push_str("Volume");
+                        }
+                        TaskbarHit::Clock => {
+                            let _ = self.tooltip.push_str("Clock");
+                        }
+                        TaskbarHit::TaskScrollLeft => {
+                            let _ = self.tooltip.push_str("Scroll left");
+                        }
+                        TaskbarHit::TaskScrollRight => {
+                            let _ = self.tooltip.push_str("Scroll right");
+                        }
+                        _ => {}
+                    }
                     dirty = true;
                 }
 
@@ -844,8 +952,10 @@ impl InputState {
                             self.cursor_x, self.cursor_y,
                             self.fb_width, self.fb_height,
                             self.pinned_app_count,
+                            &self.pinned_app_names,
                             windows, *window_count,
                             self.current_workspace,
+                            self.task_scroll_offset,
                         );
                         let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
                         if on_taskbar {
@@ -865,10 +975,15 @@ impl InputState {
                                 }
                                 TaskbarHit::WindowTask(w_idx) => {
                                     if w_idx < *window_count {
-                                        if windows[w_idx].minimized {
+                                        if self.focused_window == Some(w_idx) && !windows[w_idx].minimized {
+                                            // Window is focused and visible: minimize it (toggle)
+                                            windows[w_idx].minimized = true;
+                                            self.focused_window = None;
+                                        } else {
+                                            // Window is not focused or is minimized: restore and focus
                                             windows[w_idx].minimized = false;
+                                            self.focused_window = Some(w_idx);
                                         }
-                                        self.focused_window = Some(w_idx);
                                         dirty = true;
                                     }
                                 }
@@ -882,6 +997,14 @@ impl InputState {
                                 }
                                 TaskbarHit::Clock => {
                                     self.clock_clicked = true;
+                                    dirty = true;
+                                }
+                                TaskbarHit::TaskScrollLeft => {
+                                    self.task_scroll_offset = self.task_scroll_offset.saturating_sub(1);
+                                    dirty = true;
+                                }
+                                TaskbarHit::TaskScrollRight => {
+                                    self.task_scroll_offset += 1;
                                     dirty = true;
                                 }
                                 _ => {
@@ -1003,8 +1126,10 @@ impl InputState {
                             self.cursor_x, self.cursor_y,
                             self.fb_width, self.fb_height,
                             self.pinned_app_count,
+                            &self.pinned_app_names,
                             windows, *window_count,
                             self.current_workspace,
+                            self.task_scroll_offset,
                         );
                         if let TaskbarHit::WindowTask(w_idx) = tb_hit {
                             if w_idx < *window_count {
@@ -1112,37 +1237,41 @@ mod tests {
     #[test]
     fn test_taskbar_hit_launcher() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
-        let hit = taskbar_hit_test(20, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let names = [[0u8; 32]; 16];
+        let hit = taskbar_hit_test(20, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::Launcher);
     }
 
     #[test]
     fn test_taskbar_hit_workspace() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // Workspace 0 starts at x=48
-        let hit = taskbar_hit_test(55, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(55, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::Workspace(0));
         // Workspace 1 at x=74
-        let hit = taskbar_hit_test(80, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(80, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::Workspace(1));
     }
 
     #[test]
     fn test_taskbar_hit_pinned_app() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // First pinned app starts at TASKBAR_APPS_START_X = 160
-        let hit = taskbar_hit_test(170, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(170, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::PinnedApp(0));
         // Second pinned app at 160 + 32 + 6 = 198
-        let hit = taskbar_hit_test(205, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(205, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::PinnedApp(1));
     }
 
     #[test]
     fn test_taskbar_hit_none_above_bar() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // Click above the taskbar should return None
-        let hit = taskbar_hit_test(500, 500, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(500, 500, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::None);
     }
 
@@ -1231,16 +1360,18 @@ mod tests {
     #[test]
     fn test_taskbar_hit_volume() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // Volume is at tray_start + 180 = (1920 - 250) + 180 = 1850
-        let hit = taskbar_hit_test(1850, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(1850, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::Volume);
     }
 
     #[test]
     fn test_taskbar_hit_clock() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // Clock is at fb_w - 50 = 1870
-        let hit = taskbar_hit_test(1880, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        let hit = taskbar_hit_test(1880, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
         assert_eq!(hit, TaskbarHit::Clock);
     }
 
@@ -1331,6 +1462,7 @@ mod tests {
     #[test]
     fn test_taskbar_minimized_window_hit() {
         let mut windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
         // Create a minimized window
         windows[0].content = WindowContent::InternalDemo;
         windows[0].minimized = true;
@@ -1339,8 +1471,75 @@ mod tests {
         // Minimized windows should now appear in taskbar hit test
         // Running windows area starts after pinned apps separator
         // With 0 pinned apps: sep2_x = TASKBAR_APPS_START_X + 2 = 162, win_x = 170
-        let hit = taskbar_hit_test(180, 1080 - 20, 1920, 1080, 0, &windows, 1, 0);
+        let hit = taskbar_hit_test(180, 1080 - 20, 1920, 1080, 0, &names, &windows, 1, 0, 0);
         assert_eq!(hit, TaskbarHit::WindowTask(0));
+    }
+
+    #[test]
+    fn test_taskbar_click_window_task_focuses() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = false;
+
+        // Position on window task (win_x = 170 with 0 pinned apps)
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.focused_window, Some(0), "window task click should focus window");
+        assert!(!windows[0].minimized);
+    }
+
+    #[test]
+    fn test_taskbar_click_focused_window_minimizes() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = false;
+        state.focused_window = Some(0); // already focused
+
+        // Click on the focused window task
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(windows[0].minimized, "clicking focused window task should minimize it");
+        assert_eq!(state.focused_window, None, "focus should be cleared after minimize");
+    }
+
+    #[test]
+    fn test_taskbar_click_minimized_window_restores() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        windows[0].minimized = true; // already minimized
+
+        // Click on the minimized window task
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!windows[0].minimized, "clicking minimized window task should restore it");
+        assert_eq!(state.focused_window, Some(0), "restored window should be focused");
     }
 
     #[test]
@@ -1490,28 +1689,164 @@ mod tests {
     }
 
     #[test]
-    fn test_volume_panel_toggle() {
+    fn test_taskbar_scroll_left_hit() {
+        let names = [[0u8; 32]; 16];
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // scroll_offset=1 so the ◀ button is rendered at tasks_start_x (= sep2_x + 8 = 170)
+        // tasks_start_x with 0 pinned apps: sep2_x = 162, tasks_start_x = 170
+        let hit = taskbar_hit_test(172, 1080 - 20, 1920, 1080, 0, &names, &windows, 0, 0, 1);
+        assert_eq!(hit, TaskbarHit::TaskScrollLeft);
+    }
+
+    #[test]
+    fn test_taskbar_scroll_left_not_shown_at_offset_zero() {
+        let names = [[0u8; 32]; 16];
+        let mut windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // At offset=0 there is no scroll-left button; the same x hits the window task
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        let hit = taskbar_hit_test(172, 1080 - 20, 1920, 1080, 0, &names, &windows, 1, 0, 0);
+        assert_eq!(hit, TaskbarHit::WindowTask(0));
+    }
+
+    #[test]
+    fn test_taskbar_scroll_right_click_increments() {
         let mut state = InputState::new(1920, 1080);
-        state.pinned_app_count = 5;
+        state.pinned_app_count = 0;
+        // Fill up window slots so we have overflow
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 12;
+        for i in 0..12 {
+            windows[i].content = WindowContent::InternalDemo;
+            windows[i].workspace = 0;
+        }
+        assert_eq!(state.task_scroll_offset, 0);
+
+        // Click scroll-right button (sr_x = tray_start - scroll_btn_w - 6 = 1670 - 16 - 6 = 1648)
+        // tray_start = 1920 - 250 = 1670
+        state.cursor_x = 1650;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.task_scroll_offset, 1, "scroll offset should increment");
+    }
+
+    #[test]
+    fn test_taskbar_scroll_left_click_decrements() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        state.task_scroll_offset = 3;
         let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
         let mut surfaces = [ExternalSurface::default(); 16];
         let mut count = 0;
 
-        assert!(!state.volume_panel_active);
-
-        // Click volume area to open panel
-        state.cursor_x = 1850;
+        // Click the ◀ button (tasks_start_x with 0 pinned: 170)
+        state.cursor_x = 172;
         state.cursor_y = 1080 - 20;
-
         let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
-        assert!(state.volume_panel_active, "volume panel should be on");
+        assert_eq!(state.task_scroll_offset, 2, "scroll offset should decrement");
+    }
 
-        // Release and click again to toggle off
-        let ev_release = InputEvent { device_id: 0, event_type: 2, code: 0, value: 0, timestamp: 0 };
-        state.apply_event(&ev_release, &mut windows, &mut count, &mut surfaces);
-        let ev2 = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+    #[test]
+    fn test_taskbar_scroll_left_no_underflow() {
+        let mut state = InputState::new(1920, 1080);
+        state.task_scroll_offset = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // At offset=0 the ◀ button is not rendered, so clicking there is a no-op for scrolling
+        state.cursor_x = 172;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.task_scroll_offset, 0, "offset must not underflow");
+    }
+
+    #[test]
+    fn test_tooltip_set_on_hover_pinned_app() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 1;
+        let app_name = b"Terminal";
+        state.pinned_app_names[0][..app_name.len()].copy_from_slice(app_name);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Move cursor to first pinned app (x=170, taskbar y)
+        state.cursor_x = 170;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert_eq!(state.hovered_taskbar_element, TaskbarHit::PinnedApp(0));
+        assert_eq!(state.tooltip.as_str(), "Terminal");
+    }
+
+    #[test]
+    fn test_tooltip_set_on_hover_window_task() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        let title = b"MyWindow";
+        windows[0].title[..title.len()].copy_from_slice(title);
+
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert_eq!(state.hovered_taskbar_element, TaskbarHit::WindowTask(0));
+        assert_eq!(state.tooltip.as_str(), "MyWindow");
+    }
+
+    #[test]
+    fn test_tooltip_cleared_on_hover_off_taskbar() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Move onto taskbar
+        state.cursor_x = 20;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.tooltip.as_str(), "Launcher");
+
+        // Move off taskbar
+        state.cursor_x = 500;
+        state.cursor_y = 500;
+        let ev2 = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
         state.apply_event(&ev2, &mut windows, &mut count, &mut surfaces);
-        assert!(!state.volume_panel_active, "volume panel should be off");
+        assert_eq!(state.tooltip.as_str(), "", "tooltip should clear when off taskbar");
+    }
+
+    #[test]
+    fn test_already_pinned_windows_skipped_in_hit_test() {
+        let mut names = [[0u8; 32]; 16];
+        let name = b"Terminal";
+        names[0][..name.len()].copy_from_slice(name);
+
+        let mut windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Window with title matching pinned app "Terminal"
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+        let title = b"Terminal";
+        windows[0].title[..title.len()].copy_from_slice(title);
+
+        // With 1 pinned app and a matching window, the window should be skipped in hit test
+        // so clicking after sep2 should NOT return WindowTask(0)
+        // sep2_x with 1 pinned app: 160 + 32 + 6 + 2 = 200, win_x = 208
+        // But the Terminal window is skipped, so there's nothing at x=210
+        let hit = taskbar_hit_test(210, 1080 - 20, 1920, 1080, 1, &names, &windows, 1, 0, 0);
+        assert_ne!(hit, TaskbarHit::WindowTask(0), "pinned-matched window should not hit as WindowTask");
     }
 }

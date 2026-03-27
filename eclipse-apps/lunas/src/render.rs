@@ -518,9 +518,28 @@ fn draw_taskbar(
     let mut win_x = sep2_x + 8;
     let win_item_w = 120i32;
     let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
+    let scroll_btn_w: i32 = 16;
+
+    // ── Scroll-left button (◀) — only visible when scrolled past the beginning ──
+    let scroll_left_x = win_x;
+    if input.task_scroll_offset > 0 {
+        let sl_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::TaskScrollLeft;
+        let sl_bg = if sl_hovered { Rgb888::new(60, 80, 130) } else { Rgb888::new(30, 40, 70) };
+        let sl_style = PrimitiveStyleBuilder::new().fill_color(sl_bg).build();
+        let _ = Rectangle::new(Point::new(scroll_left_x, bar_y + 8), Size::new(scroll_btn_w as u32, 28))
+            .into_styled(sl_style)
+            .draw(fb);
+        let sl_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 200, 240));
+        let _ = Text::new("<", Point::new(scroll_left_x + 5, bar_y + 26), sl_text).draw(fb);
+        win_x += scroll_btn_w + 2;
+    }
+
+    // Reserve space for the scroll-right button area at the end
+    let task_area_end = tray_start - 10 - scroll_btn_w - 4;
+    let mut task_overflow = false;
+    let mut skipped = 0usize;
 
     for w_idx in 0..window_count {
-        if win_x + win_item_w > tray_start - 10 { break; }
         let w = &windows[w_idx];
         if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
@@ -532,6 +551,17 @@ fn draw_taskbar(
             w_title.len() >= pname.len() && w_title[..pname.len()].eq_ignore_ascii_case(pname)
         });
         if already_pinned { continue; }
+
+        // Apply scroll offset
+        if skipped < input.task_scroll_offset {
+            skipped += 1;
+            continue;
+        }
+
+        if win_x + win_item_w > task_area_end {
+            task_overflow = true;
+            break;
+        }
 
         // Window task button
         let focused = input.focused_window == Some(w_idx);
@@ -577,6 +607,19 @@ fn draw_taskbar(
         }
 
         win_x += win_item_w + 4;
+    }
+
+    // ── Scroll-right button (▶) — shown when there are more tasks than fit ──
+    if task_overflow {
+        let sr_x = tray_start - scroll_btn_w - 6;
+        let sr_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::TaskScrollRight;
+        let sr_bg = if sr_hovered { Rgb888::new(60, 80, 130) } else { Rgb888::new(30, 40, 70) };
+        let sr_style = PrimitiveStyleBuilder::new().fill_color(sr_bg).build();
+        let _ = Rectangle::new(Point::new(sr_x, bar_y + 8), Size::new(scroll_btn_w as u32, 28))
+            .into_styled(sr_style)
+            .draw(fb);
+        let sr_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 200, 240));
+        let _ = Text::new(">", Point::new(sr_x + 5, bar_y + 26), sr_text).draw(fb);
     }
 
     // ── System tray area (right side) ──
@@ -691,6 +734,42 @@ fn draw_taskbar(
     let _ = Rectangle::new(Point::new(fb_w - 50, bar_y + bar_h - 2), Size::new(45, 2))
         .into_styled(accent_style)
         .draw(fb);
+
+    // ── Tooltip: floating label above the hovered taskbar element ──
+    let tooltip = input.tooltip.as_str();
+    if !tooltip.is_empty() && input.hovered_taskbar_element != crate::input::TaskbarHit::None {
+        let char_w = FONT_CHAR_WIDTH;
+        let tip_len = tooltip.len().min(32) as i32;
+        let tip_w = tip_len * char_w + 10;
+        let tip_h = 16;
+        // Position the tooltip above the taskbar, horizontally centred on the cursor
+        let tip_x = (input.cursor_x - tip_w / 2).clamp(2, fb_w - tip_w - 2);
+        let tip_y = bar_y - tip_h - 4;
+
+        // Background pill
+        let tip_bg_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(30, 35, 60))
+            .build();
+        let _ = Rectangle::new(Point::new(tip_x, tip_y), Size::new(tip_w as u32, tip_h as u32))
+            .into_styled(tip_bg_style)
+            .draw(fb);
+        // Border
+        let tip_border_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(60, 80, 140))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(tip_x, tip_y), Size::new(tip_w as u32, tip_h as u32))
+            .into_styled(tip_border_style)
+            .draw(fb);
+        // Text
+        let tip_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 240));
+        let _ = Text::new(
+            &tooltip[..tooltip.len().min(32)],
+            Point::new(tip_x + 5, tip_y + tip_h - 3),
+            tip_text_style,
+        )
+        .draw(fb);
+    }
 }
 
 /// Draw a single window with decorations.
