@@ -125,6 +125,17 @@ pub fn handle_sidewind_message(
                 return;
             }
 
+            // Check if this PID already has a window; if so, reuse its surface slot
+            // and update the existing window instead of creating a duplicate.
+            let count = *window_count;
+            let existing_window_idx = if let Some(existing_s_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
+                windows[..count].iter().position(|w| {
+                    matches!(w.content, WindowContent::External(idx) if idx == existing_s_idx as u32)
+                })
+            } else {
+                None
+            };
+
             let surface_idx = if let Some(existing_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
                 surfaces[existing_idx].unmap();
                 Some(existing_idx)
@@ -133,58 +144,77 @@ pub fn handle_sidewind_message(
             };
 
             if let Some(s_idx) = surface_idx {
-                if *window_count < windows.len() {
-                    let mut path = [0u8; 64];
-                    path[0..5].copy_from_slice(b"/tmp/");
-                    let mut name_len = 0;
-                    for i in 0..32 {
-                        if msg.name[i] == 0 { break; }
-                        path[5 + i] = msg.name[i];
-                        name_len += 1;
-                    }
-                    path[5 + name_len] = 0;
+                // Only require a free window slot if we are NOT reusing an existing window.
+                if existing_window_idx.is_none() && *window_count >= windows.len() {
+                    return;
+                }
 
-                    #[cfg(target_vendor = "eclipse")]
-                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
-                    #[cfg(not(target_vendor = "eclipse"))]
-                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
-
-                    if fd < 0 { return; }
-
-                    let vaddr = unsafe { mmap(core::ptr::null_mut(), buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
-                    unsafe { close(fd) };
-
-                    if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
+                let mut path = [0u8; 64];
+                path[0..5].copy_from_slice(b"/tmp/");
+                let mut name_len = 0;
+                for i in 0..32 {
+                    let b = msg.name[i];
+                    if b == 0 { break; }
+                    // Allow only a conservative subset of ASCII characters to avoid
+                    // path traversal or injection (no '/', no '.', no control bytes).
+                    if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
                         return;
                     }
+                    path[5 + name_len] = b;
+                    name_len += 1;
+                }
+                if name_len == 0 {
+                    return;
+                }
+                path[5 + name_len] = 0;
 
-                    surfaces[s_idx] = ExternalSurface {
-                        id: sender_pid, pid: sender_pid, vaddr: vaddr as usize,
-                        buffer_size, active: true, ready_to_flip: false,
-                    };
+                #[cfg(target_vendor = "eclipse")]
+                let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
+                #[cfg(not(target_vendor = "eclipse"))]
+                let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
 
-                    let margin = 50;
-                    let clamped_x = msg.x.clamp(margin, (fb_width - 100).max(margin));
-                    let clamped_y = msg.y.clamp(ShellWindow::TITLE_H, (fb_height - 100).max(ShellWindow::TITLE_H));
+                if fd < 0 { return; }
 
-                    let mut title = [0u8; 32];
-                    title[..name_len.min(32)].copy_from_slice(&msg.name[..name_len.min(32)]);
+                let vaddr = unsafe { mmap(core::ptr::null_mut(), buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
+                unsafe { close(fd) };
 
-                    windows[*window_count] = ShellWindow {
-                        x: clamped_x, y: clamped_y,
-                        w: msg.w as i32, h: msg.h as i32 + ShellWindow::TITLE_H,
-                        curr_x: (clamped_x + msg.w as i32 / 2) as f32,
-                        curr_y: (clamped_y + (msg.h as i32 + ShellWindow::TITLE_H) / 2) as f32,
-                        curr_w: 0.0, curr_h: 0.0,
-                        minimized: false, maximized: false, closing: false,
-                        stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
-                        workspace: input_state.current_workspace,
-                        content: WindowContent::External(s_idx as u32),
-                        damage: alloc::vec::Vec::new(),
-                        buffer_handle: None,
-                        is_dmabuf: false,
-                        title,
-                    };
+                if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
+                    return;
+                }
+
+                surfaces[s_idx] = ExternalSurface {
+                    id: sender_pid, pid: sender_pid, vaddr: vaddr as usize,
+                    buffer_size, mapped_len: buffer_size, active: true, ready_to_flip: false,
+                };
+
+                let margin = 50;
+                let clamped_x = msg.x.clamp(margin, (fb_width - 100).max(margin));
+                let clamped_y = msg.y.clamp(ShellWindow::TITLE_H, (fb_height - 100).max(ShellWindow::TITLE_H));
+
+                let mut title = [0u8; 32];
+                title[..name_len.min(32)].copy_from_slice(&msg.name[..name_len.min(32)]);
+
+                let new_window = ShellWindow {
+                    x: clamped_x, y: clamped_y,
+                    w: msg.w as i32, h: msg.h as i32 + ShellWindow::TITLE_H,
+                    curr_x: (clamped_x + msg.w as i32 / 2) as f32,
+                    curr_y: (clamped_y + (msg.h as i32 + ShellWindow::TITLE_H) / 2) as f32,
+                    curr_w: 0.0, curr_h: 0.0,
+                    minimized: false, maximized: false, closing: false,
+                    stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
+                    workspace: input_state.current_workspace,
+                    content: WindowContent::External(s_idx as u32),
+                    damage: alloc::vec::Vec::new(),
+                    buffer_handle: None,
+                    is_dmabuf: false,
+                    title,
+                };
+
+                if let Some(w_idx) = existing_window_idx {
+                    // Reuse the existing window slot for this PID.
+                    windows[w_idx] = new_window;
+                } else {
+                    windows[*window_count] = new_window;
                     *window_count += 1;
                 }
             }
@@ -224,7 +254,9 @@ pub fn handle_sidewind_message(
                         windows[w_idx].w = msg.w as i32;
                         windows[w_idx].h = msg.h as i32 + ShellWindow::TITLE_H;
                         if let WindowContent::External(s_idx) = windows[w_idx].content {
-                            surfaces[s_idx as usize].buffer_size = (msg.w as usize).saturating_mul(msg.h as usize).saturating_mul(4);
+                            // Do not change buffer_size or mapped_len here; the mapping
+                            // length is determined at CREATE time.  The render blit is
+                            // clamped to the mapped extent so oversized windows are safe.
                             surfaces[s_idx as usize].ready_to_flip = false;
                         }
                     }
@@ -303,5 +335,65 @@ mod tests {
         };
         handle_sidewind_message(&msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
         assert_eq!(window_count, 0);
+    }
+
+    #[test]
+    fn test_create_rejects_empty_name() {
+        let mut surfaces = [ExternalSurface::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
+        let mut window_count = 0;
+        let mut input_state = InputState::new(1920, 1080);
+
+        // All-zero name should be rejected (empty name).
+        let msg = SideWindMessage {
+            tag: SIDEWIND_TAG, op: SWND_OP_CREATE,
+            x: 100, y: 100, w: 200, h: 200,
+            name: [0; 32],
+        };
+        handle_sidewind_message(&msg, 42, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        assert_eq!(window_count, 0, "empty name should be rejected");
+    }
+
+    #[test]
+    fn test_create_rejects_path_traversal() {
+        let mut surfaces = [ExternalSurface::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
+        let mut window_count = 0;
+        let mut input_state = InputState::new(1920, 1080);
+
+        // Name containing '/' should be rejected.
+        let mut bad_name = [0u8; 32];
+        bad_name[0] = b'.';
+        bad_name[1] = b'.';
+        bad_name[2] = b'/';
+        bad_name[3] = b'x';
+        let msg = SideWindMessage {
+            tag: SIDEWIND_TAG, op: SWND_OP_CREATE,
+            x: 100, y: 100, w: 200, h: 200,
+            name: bad_name,
+        };
+        handle_sidewind_message(&msg, 42, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        assert_eq!(window_count, 0, "path traversal name should be rejected");
+    }
+
+    #[test]
+    fn test_create_rejects_dot_in_name() {
+        let mut surfaces = [ExternalSurface::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
+        let mut window_count = 0;
+        let mut input_state = InputState::new(1920, 1080);
+
+        // Name containing '.' should be rejected (no dots allowed).
+        let mut bad_name = [0u8; 32];
+        bad_name[0] = b'.';
+        bad_name[1] = b'h';
+        bad_name[2] = b'i';
+        let msg = SideWindMessage {
+            tag: SIDEWIND_TAG, op: SWND_OP_CREATE,
+            x: 100, y: 100, w: 200, h: 200,
+            name: bad_name,
+        };
+        handle_sidewind_message(&msg, 42, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        assert_eq!(window_count, 0, "name with dots should be rejected");
     }
 }

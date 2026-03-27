@@ -463,9 +463,27 @@ fn draw_window(
         WindowContent::External(s_idx) => {
             let s = s_idx as usize;
             if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
-                let src_w = window.w as u32;
-                let src_h = (window.h - ShellWindow::TITLE_H) as u32;
-                fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, cx, content_y);
+                // Derive the blit region from the window content area, but clamp it to the
+                // actually-mapped surface buffer so we never read past `vaddr`.
+                let src_w = window.w.max(0) as u32;
+                let intended_h = (window.h - ShellWindow::TITLE_H).max(0) as u32;
+                let intended_h = intended_h.min(content_h as u32);
+
+                // Compute the maximum number of rows available in the buffer.
+                // Assume 4 bytes per pixel (ARGB8888) to ensure we do not
+                // overrun the mapped region even if the window is larger than the surface.
+                let max_pixels = (surfaces[s].mapped_len / 4) as u32;
+                let max_h_for_buffer = if src_w > 0 {
+                    max_pixels / src_w
+                } else {
+                    0
+                };
+
+                let src_h = intended_h.min(max_h_for_buffer);
+
+                if src_w > 0 && src_h > 0 {
+                    fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, cx, content_y);
+                }
             } else {
                 // Loading indicator
                 let loading_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 25, 40)).build();
@@ -825,15 +843,20 @@ fn format_metric<'a>(buf: &'a mut [u8; 16], label: &str, value: f32) -> &'a str 
     let label_len = label_bytes.len().min(6);
     buf[..label_len].copy_from_slice(&label_bytes[..label_len]);
 
-    let int_part = value as u32;
-    let d0 = (int_part / 10 % 10) as u8 + b'0';
-    let d1 = (int_part % 10) as u8 + b'0';
-    buf[label_len] = d0;
-    buf[label_len + 1] = d1;
-    buf[label_len + 2] = b'%';
+    let int_part = (value as u32).min(999);
+    let mut pos = label_len;
+    if int_part >= 100 {
+        buf[pos] = (int_part / 100 % 10) as u8 + b'0';
+        pos += 1;
+    }
+    buf[pos] = (int_part / 10 % 10) as u8 + b'0';
+    pos += 1;
+    buf[pos] = (int_part % 10) as u8 + b'0';
+    pos += 1;
+    buf[pos] = b'%';
+    pos += 1;
 
-    let total = label_len + 3;
-    core::str::from_utf8(&buf[..total]).unwrap_or("??")
+    core::str::from_utf8(&buf[..pos]).unwrap_or("??")
 }
 
 fn format_u32<'a>(buf: &'a mut [u8; 8], val: u32) -> &'a str {
@@ -868,6 +891,28 @@ mod tests {
         let mut buf = [0u8; 16];
         let s = format_metric(&mut buf, "CPU:", 45.0);
         assert!(s.contains("CPU:"));
+        assert!(s.contains("45%"));
+    }
+
+    #[test]
+    fn test_format_metric_100() {
+        let mut buf = [0u8; 16];
+        let s = format_metric(&mut buf, "CPU:", 100.0);
+        assert!(s.contains("100%"), "expected '100%' in '{}'", s);
+    }
+
+    #[test]
+    fn test_format_metric_zero() {
+        let mut buf = [0u8; 16];
+        let s = format_metric(&mut buf, "MEM:", 0.0);
+        assert!(s.contains("00%"), "expected '00%' in '{}'", s);
+    }
+
+    #[test]
+    fn test_format_metric_single_digit() {
+        let mut buf = [0u8; 16];
+        let s = format_metric(&mut buf, "NET:", 5.0);
+        assert!(s.contains("05%"), "expected '05%' in '{}'", s);
     }
 
     #[test]
