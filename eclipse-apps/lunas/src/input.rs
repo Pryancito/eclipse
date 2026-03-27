@@ -32,7 +32,7 @@ pub enum KeyAction {
     SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual,
     Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
     ToggleSystemCentral, ToggleTiling, ToggleSearch, ArrowUp, ArrowDown,
-    Input(char), Enter, Backspace, ToggleNotifications,
+    Input(char), Enter, Backspace, ToggleNotifications, ToggleNetworkDetails,
 }
 
 /// Represents what element was clicked on the taskbar.
@@ -54,6 +54,98 @@ pub enum TaskbarHit {
     Volume,
     /// The clock area was clicked.
     Clock,
+}
+
+/// Maximum number of items in a context menu.
+pub const CONTEXT_MENU_MAX_ITEMS: usize = 8;
+
+/// An action that a context menu item triggers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContextAction {
+    None,
+    NewWindow,
+    ToggleTiling,
+    OpenDashboard,
+    CycleWallpaper,
+    CloseWindow(usize),
+    MinimizeWindow(usize),
+    MaximizeWindow(usize),
+    VolumeUp,
+    VolumeDown,
+    ToggleMute,
+}
+
+/// A single context menu item.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenuItem {
+    pub label: [u8; 24],
+    pub action: ContextAction,
+}
+
+impl Default for ContextMenuItem {
+    fn default() -> Self {
+        Self { label: [0; 24], action: ContextAction::None }
+    }
+}
+
+impl ContextMenuItem {
+    pub fn new(label: &str, action: ContextAction) -> Self {
+        let mut item = Self::default();
+        let bytes = label.as_bytes();
+        let len = bytes.len().min(24);
+        item.label[..len].copy_from_slice(&bytes[..len]);
+        item.action = action;
+        item
+    }
+
+    pub fn label_str(&self) -> &str {
+        let len = self.label.iter().position(|&b| b == 0).unwrap_or(24);
+        core::str::from_utf8(&self.label[..len]).unwrap_or("")
+    }
+}
+
+/// Context menu state.
+pub struct ContextMenu {
+    pub visible: bool,
+    pub x: i32,
+    pub y: i32,
+    pub items: [ContextMenuItem; CONTEXT_MENU_MAX_ITEMS],
+    pub item_count: usize,
+    pub hovered_index: Option<usize>,
+}
+
+impl ContextMenu {
+    pub fn new() -> Self {
+        Self {
+            visible: false,
+            x: 0,
+            y: 0,
+            items: core::array::from_fn(|_| ContextMenuItem::default()),
+            item_count: 0,
+            hovered_index: None,
+        }
+    }
+
+    pub fn show(&mut self, x: i32, y: i32) {
+        self.visible = true;
+        self.x = x;
+        self.y = y;
+        self.item_count = 0;
+        self.hovered_index = None;
+    }
+
+    pub fn add_item(&mut self, label: &str, action: ContextAction) {
+        if self.item_count < CONTEXT_MENU_MAX_ITEMS {
+            self.items[self.item_count] = ContextMenuItem::new(label, action);
+            self.item_count += 1;
+        }
+    }
+
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.item_count = 0;
+        self.hovered_index = None;
+    }
 }
 
 /// Determine what element is at position (px, py) on the taskbar.
@@ -219,6 +311,7 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x1C => KeyAction::Enter,
         0x0E => KeyAction::Backspace,
         0x36 => if (modifiers & 8) != 0 { KeyAction::ToggleNotifications } else { KeyAction::None },
+        0x12 => if (modifiers & 8) != 0 { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
         _ => KeyAction::None,
     }
 }
@@ -310,6 +403,14 @@ pub struct InputState {
     pub launcher_click_pos: Option<(i32, i32)>,
     /// Set when notification panel is closed by clicking on it (for the caller to mark all read).
     pub notifications_mark_read: bool,
+    /// Context menu state (right-click menus).
+    pub context_menu: ContextMenu,
+    /// Pending context action from a menu click (for the caller to act on).
+    pub pending_context_action: ContextAction,
+    /// Whether the volume popup panel is visible.
+    pub volume_panel_active: bool,
+    /// Whether the network details panel is visible.
+    pub network_details_active: bool,
 }
 
 impl InputState {
@@ -347,6 +448,10 @@ impl InputState {
             launcher_app_click: None,
             launcher_click_pos: None,
             notifications_mark_read: false,
+            context_menu: ContextMenu::new(),
+            pending_context_action: ContextAction::None,
+            volume_panel_active: false,
+            network_details_active: false,
         }
     }
 
@@ -440,6 +545,10 @@ impl InputState {
                         }
                         KeyAction::ToggleNotifications => {
                             self.notifications_visible = !self.notifications_visible;
+                            dirty = true;
+                        }
+                        KeyAction::ToggleNetworkDetails => {
+                            self.network_details_active = !self.network_details_active;
                             dirty = true;
                         }
                         KeyAction::CloseWindow => {
@@ -646,6 +755,26 @@ impl InputState {
                     dirty = true;
                 }
 
+                // Update context menu hover
+                if self.context_menu.visible {
+                    let item_h: i32 = 28;
+                    let menu_w: i32 = 180;
+                    let mut new_hover = None;
+                    for i in 0..self.context_menu.item_count {
+                        let iy = self.context_menu.y + (i as i32) * item_h;
+                        if self.cursor_x >= self.context_menu.x && self.cursor_x < self.context_menu.x + menu_w
+                            && self.cursor_y >= iy && self.cursor_y < iy + item_h
+                        {
+                            new_hover = Some(i);
+                            break;
+                        }
+                    }
+                    if new_hover != self.context_menu.hovered_index {
+                        self.context_menu.hovered_index = new_hover;
+                        dirty = true;
+                    }
+                }
+
                 dirty = true;
             }
             // Mouse button
@@ -656,6 +785,63 @@ impl InputState {
                 if button == 0 { // Left click
                     self.left_button_down = pressed;
                     if pressed {
+                        // ── Context menu click detection (highest priority) ──
+                        if self.context_menu.visible {
+                            let menu = &self.context_menu;
+                            let item_h: i32 = 28;
+                            let menu_w: i32 = 180;
+                            let mut hit_item = false;
+                            for i in 0..menu.item_count {
+                                let iy = menu.y + (i as i32) * item_h;
+                                if self.cursor_x >= menu.x && self.cursor_x < menu.x + menu_w
+                                    && self.cursor_y >= iy && self.cursor_y < iy + item_h
+                                {
+                                    self.pending_context_action = menu.items[i].action;
+                                    hit_item = true;
+                                    break;
+                                }
+                            }
+                            self.context_menu.hide();
+                            dirty = true;
+                            if hit_item { return dirty; }
+                        }
+
+                        // ── Volume panel click detection ──
+                        if self.volume_panel_active {
+                            use crate::render::{VOLUME_PANEL_W, VOLUME_PANEL_H, TASKBAR_TRAY_WIDTH};
+                            let vp_x = self.fb_width - TASKBAR_TRAY_WIDTH + 160;
+                            let vp_y = self.fb_height - crate::render::TASKBAR_HEIGHT - VOLUME_PANEL_H - 5;
+                            if self.cursor_x >= vp_x && self.cursor_x < vp_x + VOLUME_PANEL_W
+                                && self.cursor_y >= vp_y && self.cursor_y < vp_y + VOLUME_PANEL_H
+                            {
+                                // Click inside volume panel
+                                let bar_x = vp_x + 15;
+                                let bar_w: i32 = VOLUME_PANEL_W - 30;
+                                if self.cursor_x >= bar_x && self.cursor_x < bar_x + bar_w
+                                    && self.cursor_y >= vp_y + 55 && self.cursor_y < vp_y + 71
+                                {
+                                    // Click on volume bar — adjust level
+                                    let relative = self.cursor_x - bar_x;
+                                    let new_vol = ((relative * 100) / bar_w).clamp(0, 100);
+                                    self.pending_context_action = if new_vol > 50 {
+                                        ContextAction::VolumeUp
+                                    } else {
+                                        ContextAction::VolumeDown
+                                    };
+                                } else {
+                                    // Click on mute label area — toggle mute
+                                    self.pending_context_action = ContextAction::ToggleMute;
+                                }
+                                dirty = true;
+                                return dirty;
+                            } else {
+                                // Clicked outside volume panel → close it
+                                self.volume_panel_active = false;
+                                dirty = true;
+                                return dirty;
+                            }
+                        }
+
                         // ── Taskbar click detection (highest priority) ──
                         let tb_hit = taskbar_hit_test(
                             self.cursor_x, self.cursor_y,
@@ -694,7 +880,7 @@ impl InputState {
                                     dirty = true;
                                 }
                                 TaskbarHit::Volume => {
-                                    self.volume_clicked = true;
+                                    self.volume_panel_active = !self.volume_panel_active;
                                     dirty = true;
                                 }
                                 TaskbarHit::Clock => {
@@ -807,6 +993,58 @@ impl InputState {
                         // Button released
                         self.dragging_window = None;
                         self.resizing_window = None;
+                    }
+                }
+                if button == 1 && pressed { // Right click
+                    // Close any existing context menu
+                    self.context_menu.hide();
+
+                    let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
+                    if on_taskbar {
+                        // Right-click on taskbar: check if on a window task item
+                        let tb_hit = taskbar_hit_test(
+                            self.cursor_x, self.cursor_y,
+                            self.fb_width, self.fb_height,
+                            self.pinned_app_count,
+                            windows, *window_count,
+                            self.current_workspace,
+                        );
+                        if let TaskbarHit::WindowTask(w_idx) = tb_hit {
+                            if w_idx < *window_count {
+                                self.context_menu.show(self.cursor_x, self.cursor_y - 90);
+                                if windows[w_idx].minimized {
+                                    self.context_menu.add_item("Restore", ContextAction::MinimizeWindow(w_idx));
+                                } else {
+                                    self.context_menu.add_item("Minimize", ContextAction::MinimizeWindow(w_idx));
+                                }
+                                self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(w_idx));
+                                self.context_menu.add_item("Close", ContextAction::CloseWindow(w_idx));
+                                dirty = true;
+                            }
+                        }
+                    } else {
+                        // Right-click on desktop background or window
+                        let focus = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count);
+                        if let Some(idx) = focus {
+                            // Right-click on a window → window context menu
+                            self.context_menu.show(self.cursor_x, self.cursor_y);
+                            if windows[idx].minimized {
+                                self.context_menu.add_item("Restore", ContextAction::MinimizeWindow(idx));
+                            } else {
+                                self.context_menu.add_item("Minimize", ContextAction::MinimizeWindow(idx));
+                            }
+                            self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(idx));
+                            self.context_menu.add_item("Close", ContextAction::CloseWindow(idx));
+                            dirty = true;
+                        } else {
+                            // Right-click on desktop background → desktop context menu
+                            self.context_menu.show(self.cursor_x, self.cursor_y);
+                            self.context_menu.add_item("New Window", ContextAction::NewWindow);
+                            self.context_menu.add_item("Toggle Tiling", ContextAction::ToggleTiling);
+                            self.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
+                            self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+                            dirty = true;
+                        }
                     }
                 }
             }
@@ -1024,7 +1262,7 @@ mod tests {
         let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
-        assert!(state.volume_clicked, "volume_clicked should be set");
+        assert!(state.volume_panel_active, "volume panel should be toggled on");
     }
 
     #[test]
@@ -1125,5 +1363,158 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert_eq!(state.launcher_click_pos, Some((100, 700)));
+    }
+
+    #[test]
+    fn test_context_menu_new() {
+        let menu = ContextMenu::new();
+        assert!(!menu.visible);
+        assert_eq!(menu.item_count, 0);
+        assert_eq!(menu.hovered_index, None);
+    }
+
+    #[test]
+    fn test_context_menu_show_and_add_items() {
+        let mut menu = ContextMenu::new();
+        menu.show(100, 200);
+        assert!(menu.visible);
+        assert_eq!(menu.x, 100);
+        assert_eq!(menu.y, 200);
+
+        menu.add_item("New Window", ContextAction::NewWindow);
+        menu.add_item("Close", ContextAction::CloseWindow(0));
+        assert_eq!(menu.item_count, 2);
+        assert_eq!(menu.items[0].label_str(), "New Window");
+        assert_eq!(menu.items[0].action, ContextAction::NewWindow);
+        assert_eq!(menu.items[1].label_str(), "Close");
+    }
+
+    #[test]
+    fn test_context_menu_hide() {
+        let mut menu = ContextMenu::new();
+        menu.show(50, 50);
+        menu.add_item("Test", ContextAction::None);
+        assert!(menu.visible);
+        menu.hide();
+        assert!(!menu.visible);
+        assert_eq!(menu.item_count, 0);
+    }
+
+    #[test]
+    fn test_context_menu_max_items() {
+        let mut menu = ContextMenu::new();
+        menu.show(0, 0);
+        for _ in 0..CONTEXT_MENU_MAX_ITEMS + 5 {
+            menu.add_item("Item", ContextAction::None);
+        }
+        assert_eq!(menu.item_count, CONTEXT_MENU_MAX_ITEMS);
+    }
+
+    #[test]
+    fn test_right_click_desktop_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click on empty desktop area
+        state.cursor_x = 500;
+        state.cursor_y = 500;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.context_menu.visible, "context menu should be visible");
+        assert_eq!(state.context_menu.item_count, 4); // New Window, Toggle Tiling, Dashboard, Change Wallpaper
+        assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
+    }
+
+    #[test]
+    fn test_right_click_taskbar_window_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 1;
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].workspace = 0;
+
+        // Position on window task item in taskbar: sep2_x = 162, win_x = 170
+        state.cursor_x = 180;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.context_menu.visible, "context menu should be visible for window");
+        assert_eq!(state.context_menu.item_count, 3); // Minimize, Maximize, Close
+    }
+
+    #[test]
+    fn test_left_click_closes_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Show a context menu
+        state.context_menu.show(100, 100);
+        state.context_menu.add_item("New Window", ContextAction::NewWindow);
+        assert!(state.context_menu.visible);
+
+        // Left-click on the menu item
+        state.cursor_x = 110;
+        state.cursor_y = 110;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!state.context_menu.visible, "context menu should be closed");
+        assert_eq!(state.pending_context_action, ContextAction::NewWindow);
+    }
+
+    #[test]
+    fn test_network_details_toggle() {
+        let mut state = InputState::new(1920, 1080);
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        assert!(!state.network_details_active);
+
+        // Simulate Super+E key press (scancode 0x12, Super modifier = 8)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x12, value: 1, timestamp: 0 };
+        state.modifiers = 8; // Super key
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.network_details_active, "network details should be active");
+    }
+
+    #[test]
+    fn test_volume_panel_toggle() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        assert!(!state.volume_panel_active);
+
+        // Click volume area to open panel
+        state.cursor_x = 1850;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.volume_panel_active, "volume panel should be on");
+
+        // Release and click again to toggle off
+        let ev_release = InputEvent { device_id: 0, event_type: 2, code: 0, value: 0, timestamp: 0 };
+        state.apply_event(&ev_release, &mut windows, &mut count, &mut surfaces);
+        let ev2 = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev2, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.volume_panel_active, "volume panel should be off");
     }
 }

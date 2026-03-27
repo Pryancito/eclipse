@@ -346,6 +346,106 @@ impl LunasState {
             self.desktop.mark_all_read();
             self.dirty = true;
         }
+
+        // Handle pending context menu action
+        use crate::input::ContextAction;
+        let action = self.input.pending_context_action;
+        if action != ContextAction::None {
+            self.input.pending_context_action = ContextAction::None;
+            match action {
+                ContextAction::NewWindow => {
+                    use crate::compositor::{ShellWindow, WindowContent};
+                    let fb_w = self.backend.fb.info.width as i32;
+                    let fb_h = self.backend.fb.info.height as i32;
+                    let win = ShellWindow {
+                        x: 100 + (self.space.window_count as i32 * 30) % (fb_w / 2),
+                        y: 100 + (self.space.window_count as i32 * 30) % (fb_h / 3),
+                        w: 400, h: 300,
+                        curr_x: 100.0, curr_y: 100.0, curr_w: 400.0, curr_h: 300.0,
+                        content: WindowContent::InternalDemo,
+                        workspace: self.input.current_workspace,
+                        ..Default::default()
+                    };
+                    let title = b"Lunas Terminal\0";
+                    let idx = self.space.window_count;
+                    self.space.map_window(win);
+                    if idx < self.space.window_count {
+                        let len = title.len().min(32);
+                        self.space.windows[idx].title[..len].copy_from_slice(&title[..len]);
+                    }
+                    self.input.focused_window = Some(idx);
+                    self.dirty = true;
+                }
+                ContextAction::ToggleTiling => {
+                    self.input.tiling_active = !self.input.tiling_active;
+                    self.dirty = true;
+                }
+                ContextAction::OpenDashboard => {
+                    self.input.dashboard_active = !self.input.dashboard_active;
+                    self.dirty = true;
+                }
+                ContextAction::CycleWallpaper => {
+                    self.desktop.wallpaper_mode = match self.desktop.wallpaper_mode {
+                        crate::desktop::WallpaperMode::SolidColor => crate::desktop::WallpaperMode::Gradient,
+                        crate::desktop::WallpaperMode::Gradient => crate::desktop::WallpaperMode::CosmicTheme,
+                        crate::desktop::WallpaperMode::CosmicTheme => crate::desktop::WallpaperMode::SolidColor,
+                    };
+                    self.dirty = true;
+                }
+                ContextAction::CloseWindow(idx) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].closing = true;
+                        if self.input.focused_window == Some(idx) {
+                            self.input.focused_window = None;
+                        }
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::MinimizeWindow(idx) => {
+                    if idx < self.space.window_count {
+                        let w = &mut self.space.windows[idx];
+                        w.minimized = !w.minimized;
+                        if w.minimized && self.input.focused_window == Some(idx) {
+                            self.input.focused_window = None;
+                        }
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::MaximizeWindow(idx) => {
+                    if idx < self.space.window_count {
+                        let fb_w = self.backend.fb.info.width as i32;
+                        let fb_h = self.backend.fb.info.height as i32;
+                        let w = &mut self.space.windows[idx];
+                        if w.maximized {
+                            let (sx, sy, sw, sh) = w.stored_rect;
+                            w.x = sx; w.y = sy; w.w = sw; w.h = sh;
+                            w.maximized = false;
+                        } else {
+                            w.stored_rect = (w.x, w.y, w.w, w.h);
+                            w.x = 0;
+                            w.y = ShellWindow::TITLE_H;
+                            w.w = fb_w;
+                            w.h = fb_h - ShellWindow::TITLE_H - 44;
+                            w.maximized = true;
+                        }
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::VolumeUp => {
+                    self.desktop.volume_level = (self.desktop.volume_level + 10).min(100);
+                    self.dirty = true;
+                }
+                ContextAction::VolumeDown => {
+                    self.desktop.volume_level = self.desktop.volume_level.saturating_sub(10);
+                    self.dirty = true;
+                }
+                ContextAction::ToggleMute => {
+                    self.desktop.volume_muted = !self.desktop.volume_muted;
+                    self.dirty = true;
+                }
+                ContextAction::None => {}
+            }
+        }
     }
 
     /// Launch a pinned app by its index, looking up its exec_path.
@@ -417,7 +517,7 @@ impl LunasState {
         self.heap_fragmentation = stats.heap_fragmentation;
         self.prev_stats = Some(stats);
 
-        // Update clock from wall time offset (Unix timestamp in seconds)
+        // Update clock and date from wall time offset (Unix timestamp in seconds)
         const SECONDS_PER_DAY: u64 = 86400;
         let secs_today = if stats.wall_time_offset > 0 {
             (stats.wall_time_offset % SECONDS_PER_DAY) as u32
@@ -428,6 +528,13 @@ impl LunasState {
         };
         self.desktop.clock_hours = (secs_today / 3600) as u8;
         self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
+
+        // Compute day/month from Unix timestamp
+        if stats.wall_time_offset > 0 {
+            let (month, day) = unix_timestamp_to_date(stats.wall_time_offset);
+            self.desktop.clock_month = month;
+            self.desktop.clock_day = day;
+        }
 
         // Process list
         self.process_count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) } as usize;
@@ -451,6 +558,7 @@ impl LunasState {
             self.net_usage,
             &self.log_buf,
             self.log_len,
+            self.net_extended_stats.as_ref(),
         );
         self.backend.swap_buffers();
     }
@@ -480,6 +588,47 @@ impl LunasState {
             }
         }
     }
+}
+
+/// Convert a Unix timestamp (seconds since epoch) to (month, day).
+fn unix_timestamp_to_date(timestamp: u64) -> (u8, u8) {
+    let days_since_epoch = (timestamp / 86400) as u32;
+    // Simple date calculation from days since 1970-01-01
+    let mut year = 1970u32;
+    let mut remaining_days = days_since_epoch;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = is_leap_year(year);
+    let month_days: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+
+    let mut month = 0u8;
+    for (i, &days) in month_days.iter().enumerate() {
+        if remaining_days < days {
+            month = (i + 1) as u8;
+            break;
+        }
+        remaining_days -= days;
+    }
+    if month == 0 { month = 12; }
+
+    let day = (remaining_days + 1) as u8;
+    (month, day)
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -598,15 +747,15 @@ mod tests {
 
     #[test]
     fn test_volume_toggle_mute() {
+        use crate::input::ContextAction;
         let mut state = LunasState::new().expect("init");
         assert!(!state.desktop.volume_muted);
-        // Simulate volume click
-        state.input.volume_clicked = true;
+        // Simulate mute toggle via context action
+        state.input.pending_context_action = ContextAction::ToggleMute;
         let _ = state.update();
         assert!(state.desktop.volume_muted);
-        assert!(!state.input.volume_clicked);
-        // Click again to unmute
-        state.input.volume_clicked = true;
+        // Toggle again to unmute
+        state.input.pending_context_action = ContextAction::ToggleMute;
         let _ = state.update();
         assert!(!state.desktop.volume_muted);
     }
@@ -687,5 +836,134 @@ mod tests {
         // All notifications should be marked as read
         assert_eq!(state.desktop.unread_count(), 0);
         assert!(!state.input.notifications_mark_read);
+    }
+
+    #[test]
+    fn test_context_action_new_window() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.space.window_count, 0);
+
+        state.input.pending_context_action = ContextAction::NewWindow;
+        let _ = state.update();
+
+        assert_eq!(state.space.window_count, 1);
+        assert_eq!(state.input.pending_context_action, ContextAction::None);
+    }
+
+    #[test]
+    fn test_context_action_toggle_tiling() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.input.tiling_active);
+
+        state.input.pending_context_action = ContextAction::ToggleTiling;
+        let _ = state.update();
+        assert!(state.input.tiling_active);
+    }
+
+    #[test]
+    fn test_context_action_cycle_wallpaper() {
+        use crate::input::ContextAction;
+        use crate::desktop::WallpaperMode;
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::CosmicTheme);
+
+        state.input.pending_context_action = ContextAction::CycleWallpaper;
+        let _ = state.update();
+        assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::SolidColor);
+
+        state.input.pending_context_action = ContextAction::CycleWallpaper;
+        let _ = state.update();
+        assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::Gradient);
+    }
+
+    #[test]
+    fn test_context_action_close_window() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            ..Default::default()
+        };
+        state.space.map_window(win);
+        state.input.focused_window = Some(0);
+
+        state.input.pending_context_action = ContextAction::CloseWindow(0);
+        let _ = state.update();
+        assert!(state.space.windows[0].closing);
+        assert_eq!(state.input.focused_window, None);
+    }
+
+    #[test]
+    fn test_context_action_minimize_window() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 200,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            ..Default::default()
+        };
+        state.space.map_window(win);
+        state.input.focused_window = Some(0);
+
+        state.input.pending_context_action = ContextAction::MinimizeWindow(0);
+        let _ = state.update();
+        assert!(state.space.windows[0].minimized);
+        assert_eq!(state.input.focused_window, None);
+
+        // Toggle back to restore
+        state.input.pending_context_action = ContextAction::MinimizeWindow(0);
+        let _ = state.update();
+        assert!(!state.space.windows[0].minimized);
+    }
+
+    #[test]
+    fn test_context_action_volume_up_down() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        let initial_vol = state.desktop.volume_level;
+
+        state.input.pending_context_action = ContextAction::VolumeUp;
+        let _ = state.update();
+        assert_eq!(state.desktop.volume_level, initial_vol + 10);
+
+        state.input.pending_context_action = ContextAction::VolumeDown;
+        let _ = state.update();
+        assert_eq!(state.desktop.volume_level, initial_vol);
+    }
+
+    #[test]
+    fn test_unix_timestamp_to_date() {
+        // 2024-01-01 00:00:00 UTC = 1704067200
+        let (month, day) = unix_timestamp_to_date(1704067200);
+        assert_eq!(month, 1);
+        assert_eq!(day, 1);
+    }
+
+    #[test]
+    fn test_unix_timestamp_to_date_leap_year() {
+        // 2024-02-29 00:00:00 UTC = 1709164800
+        let (month, day) = unix_timestamp_to_date(1709164800);
+        assert_eq!(month, 2);
+        assert_eq!(day, 29);
+    }
+
+    #[test]
+    fn test_unix_timestamp_to_date_epoch() {
+        // 1970-01-01 = 0
+        let (month, day) = unix_timestamp_to_date(0);
+        assert_eq!(month, 1);
+        assert_eq!(day, 1);
+    }
+
+    #[test]
+    fn test_date_fields_initialized() {
+        let state = LunasState::new().expect("init");
+        assert_eq!(state.desktop.clock_day, 1);
+        assert_eq!(state.desktop.clock_month, 1);
     }
 }
