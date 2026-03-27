@@ -89,7 +89,7 @@ impl WaylandCompositor {
             if self.connections.len() < MAX_WAYLAND_CONNECTIONS {
                 self.connections.push(ClientConnection::new(pid));
             } else {
-                // Drop the oldest connection to make room (LRU approximation).
+                // Drop the oldest connection (FIFO eviction by insertion order).
                 self.connections.remove(0);
                 self.connections.push(ClientConnection::new(pid));
             }

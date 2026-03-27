@@ -130,8 +130,15 @@ impl LunasState {
         // Pre-render background
         state.backend.fb.pre_render_background();
 
-        // Sync pinned app count to input state for taskbar click detection
+        // Sync pinned app count and names to input state for taskbar hit detection
         state.input.pinned_app_count = state.desktop.pinned_count;
+        for i in 0..state.desktop.pinned_count.min(16) {
+            let name = state.desktop.pinned_apps[i].name_str();
+            let name_bytes = name.as_bytes();
+            let len = name_bytes.len().min(32);
+            state.input.pinned_app_names[i] = [0u8; 32];
+            state.input.pinned_app_names[i][..len].copy_from_slice(&name_bytes[..len]);
+        }
 
         // Welcome notification
         state.desktop.push_notification("Lunas Desktop initialized", 1);
@@ -1277,5 +1284,24 @@ mod tests {
         let _ = destroy_ev.extend_from_slice(&destroy_buf);
         state.handle_event(&CompositorEvent::X11(destroy_ev, 55));
         assert!(state.space.windows[0].closing, "DestroyNotify should mark window as closing");
+    }
+
+    #[test]
+    fn test_pinned_app_names_synced_at_init() {
+        use crate::desktop::DesktopShell;
+        let state = LunasState::new().expect("init");
+        // Verify that input.pinned_app_names mirrors the desktop's pinned apps
+        for i in 0..state.desktop.pinned_count.min(16) {
+            let desktop_name = state.desktop.pinned_apps[i].name_str();
+            let input_name_bytes = &state.input.pinned_app_names[i];
+            let input_name_len = input_name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+            let input_name = core::str::from_utf8(&input_name_bytes[..input_name_len]).unwrap_or("");
+            assert_eq!(
+                desktop_name, input_name,
+                "pinned_app_names[{i}] should match desktop pinned app name"
+            );
+        }
+        // The count should also be in sync
+        assert_eq!(state.input.pinned_app_count, state.desktop.pinned_count);
     }
 }
