@@ -1112,22 +1112,9 @@ impl InputState {
                                     self.current_workspace = ws;
                                     dirty = true;
                                 }
-                                TaskbarHit::PinnedApp(idx) => {
-                                    // If we were dragging a pinned app and released over a
-                                    // different one, signal a reorder swap; otherwise treat as click.
-                                    if let Some(src) = self.dragging_pinned_app.take() {
-                                        let dx = (self.cursor_x - self.drag_press_x).abs();
-                                        let dy = (self.cursor_y - self.drag_press_y).abs();
-                                        if (dx > 4 || dy > 4) && src != idx {
-                                            // Drag threshold crossed → reorder
-                                            self.pending_pinned_swap = Some((src, idx));
-                                        } else {
-                                            // No significant move → regular click
-                                            self.last_pinned_app_click = Some(idx);
-                                        }
-                                    } else {
-                                        self.last_pinned_app_click = Some(idx);
-                                    }
+                                TaskbarHit::PinnedApp(_idx) => {
+                                    // Drag already initiated above (dragging_pinned_app = Some(idx)).
+                                    // The click/swap is finalised on button release, not press.
                                     dirty = true;
                                 }
                                 TaskbarHit::WindowTask(w_idx) => {
@@ -1283,8 +1270,35 @@ impl InputState {
                         // Button released
                         self.dragging_window = None;
                         self.resizing_window = None;
-                        // Cancel any pinned-app drag that didn't end on a PinnedApp
-                        self.dragging_pinned_app = None;
+                        // Finalise any pinned-app drag.
+                        if let Some(src) = self.dragging_pinned_app.take() {
+                            let dx = (self.cursor_x - self.drag_press_x).abs();
+                            let dy = (self.cursor_y - self.drag_press_y).abs();
+                            let drag_moved = dx > 4 || dy > 4;
+                            let tb_hit = taskbar_hit_test(
+                                self.cursor_x, self.cursor_y,
+                                self.fb_width, self.fb_height,
+                                self.pinned_app_count,
+                                &self.pinned_app_names,
+                                windows, *window_count,
+                                self.current_workspace,
+                                self.task_scroll_offset,
+                            );
+                            if let TaskbarHit::PinnedApp(dst) = tb_hit {
+                                if drag_moved && src != dst {
+                                    // Drag threshold crossed → reorder
+                                    self.pending_pinned_swap = Some((src, dst));
+                                } else {
+                                    // No significant move → regular click
+                                    self.last_pinned_app_click = Some(src);
+                                }
+                            } else if !drag_moved {
+                                // Released outside any pinned app without significant movement
+                                // → treat as a click on the original icon.
+                                self.last_pinned_app_click = Some(src);
+                                // Otherwise the drag was cancelled — do nothing.
+                            }
+                        }
                     }
                 }
                 if button == 1 && pressed { // Right click
@@ -1567,13 +1581,19 @@ mod tests {
         let mut surfaces = [ExternalSurface::default(); 16];
         let mut count = 0;
 
-        // Click on first pinned app at x=170
+        // Click on first pinned app at x=170: press then release at the same position.
         state.cursor_x = 170;
         state.cursor_y = 1080 - 20;
 
-        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
-        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        let press = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&press, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
+        // Drag has started but click is not yet finalised on press.
+        assert_eq!(state.dragging_pinned_app, Some(0), "drag should be initiated on press");
+
+        // Release at the same position → no drag threshold crossed → click registered.
+        let release = InputEvent { device_id: 0, event_type: 2, code: 0, value: 0, timestamp: 0 };
+        state.apply_event(&release, &mut windows, &mut count, &mut surfaces);
         assert_eq!(state.last_pinned_app_click, Some(0));
     }
 
