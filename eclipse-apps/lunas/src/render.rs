@@ -280,6 +280,7 @@ pub fn draw_desktop_shell(
     net_usage: f32,
     log_buf: &[u8],
     log_len: usize,
+    net_extended_stats: Option<&eclipse_ipc::types::NetExtendedStats>,
 ) {
     // 1. Blit background
     fb.blit_background();
@@ -304,6 +305,10 @@ pub fn draw_desktop_shell(
         draw_system_central(fb, services, service_count);
     }
 
+    if input.network_details_active {
+        draw_network_panel(fb, net_usage, net_extended_stats);
+    }
+
     if input.lock_screen_active {
         draw_lock_screen(fb);
     }
@@ -318,6 +323,14 @@ pub fn draw_desktop_shell(
 
     if input.notifications_visible {
         draw_notifications(fb, desktop);
+    }
+
+    if input.volume_panel_active {
+        draw_volume_popup(fb, desktop);
+    }
+
+    if input.context_menu.visible {
+        draw_context_menu(fb, &input.context_menu);
     }
 
     // 5. Draw cursor
@@ -641,7 +654,7 @@ fn draw_taskbar(
         .draw(fb);
     }
 
-    // Clock display (far right) — shows HH:MM when clock is enabled, else branding
+    // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
     let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
     if desktop.show_clock {
         let mut time_buf = [0u8; 8];
@@ -653,7 +666,20 @@ fn draw_taskbar(
         time_buf[3] = b'0' + m / 10;
         time_buf[4] = b'0' + m % 10;
         let time_str = core::str::from_utf8(&time_buf[..5]).unwrap_or("00:00");
-        let _ = Text::new(time_str, Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+        let _ = Text::new(time_str, Point::new(fb_w - 50, bar_y + 14), clock_style).draw(fb);
+
+        // Date below time (DD/MM)
+        let date_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 110, 140));
+        let mut date_buf = [0u8; 8];
+        let d = desktop.clock_day;
+        let mo = desktop.clock_month;
+        date_buf[0] = b'0' + d / 10;
+        date_buf[1] = b'0' + d % 10;
+        date_buf[2] = b'/';
+        date_buf[3] = b'0' + mo / 10;
+        date_buf[4] = b'0' + mo % 10;
+        let date_str = core::str::from_utf8(&date_buf[..5]).unwrap_or("01/01");
+        let _ = Text::new(date_str, Point::new(fb_w - 50, bar_y + 30), date_style).draw(fb);
     } else {
         let _ = Text::new("LUNAS", Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
     }
@@ -959,6 +985,16 @@ pub const NOTIF_PANEL_W: i32 = 300;
 /// Height of the notification panel.
 pub const NOTIF_PANEL_H: i32 = 250;
 
+/// Width of the volume popup panel.
+pub const VOLUME_PANEL_W: i32 = 180;
+/// Height of the volume popup panel.
+pub const VOLUME_PANEL_H: i32 = 100;
+
+/// Context menu item height.
+pub const CONTEXT_MENU_ITEM_H: i32 = 28;
+/// Context menu width.
+pub const CONTEXT_MENU_W: i32 = 180;
+
 /// Compute the launcher panel bounds (x, y, w, h) given the framebuffer height.
 pub fn launcher_panel_bounds(fb_height: i32) -> (i32, i32, i32, i32) {
     let py = fb_height - TASKBAR_HEIGHT - LAUNCHER_PANEL_H - 10;
@@ -1182,6 +1218,215 @@ fn draw_hud_overlay(fb: &mut FramebufferState, log_buf: &[u8], log_len: usize) {
     }
 }
 
+/// Draw the context menu overlay.
+fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu) {
+    let menu_w = CONTEXT_MENU_W;
+    let item_h = CONTEXT_MENU_ITEM_H;
+    let menu_h = (menu.item_count as i32) * item_h;
+    let mx = menu.x;
+    let my = menu.y;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(22, 26, 48)).build();
+    let _ = Rectangle::new(Point::new(mx, my), Size::new(menu_w as u32, menu_h as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 90, 200))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(mx, my), Size::new(menu_w as u32, menu_h as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Items
+    for i in 0..menu.item_count {
+        let iy = my + (i as i32) * item_h;
+
+        // Hover highlight
+        if menu.hovered_index == Some(i) {
+            let hover_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(35, 50, 80))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new((menu_w - 2) as u32, item_h as u32))
+                .into_styled(hover_style)
+                .draw(fb);
+        }
+
+        let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
+        let label = menu.items[i].label_str();
+        let _ = Text::new(label, Point::new(mx + 12, iy + 19), text_style).draw(fb);
+    }
+}
+
+/// Draw the volume popup panel.
+fn draw_volume_popup(fb: &mut FramebufferState, desktop: &DesktopShell) {
+    let panel_w = VOLUME_PANEL_W;
+    let panel_h = VOLUME_PANEL_H;
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
+    let px = tray_start + 160;
+    let py = fb_h - TASKBAR_HEIGHT - panel_h - 5;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(18, 22, 40)).build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 80, 180))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Title
+    let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let _ = Text::new("VOLUME", Point::new(px + 60, py + 20), title_style).draw(fb);
+
+    // Mute indicator
+    let mute_text = if desktop.volume_muted { "MUTED" } else { "ACTIVE" };
+    let mute_color = if desktop.volume_muted {
+        Rgb888::new(220, 50, 50)
+    } else {
+        Rgb888::new(0, 200, 100)
+    };
+    let mute_style = MonoTextStyle::new(&FONT_6X12, mute_color);
+    let _ = Text::new(mute_text, Point::new(px + 60, py + 40), mute_style).draw(fb);
+
+    // Volume bar background
+    let bar_x = px + 15;
+    let bar_y = py + 55;
+    let bar_w = panel_w - 30;
+    let bar_h: i32 = 16;
+    let bar_bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 35, 55)).build();
+    let _ = Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w as u32, bar_h as u32))
+        .into_styled(bar_bg_style)
+        .draw(fb);
+
+    // Volume bar fill
+    if !desktop.volume_muted {
+        let fill_w = ((bar_w as u32) * (desktop.volume_level as u32)) / 100;
+        if fill_w > 0 {
+            let fill_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 150, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(bar_x, bar_y), Size::new(fill_w, bar_h as u32))
+                .into_styled(fill_style)
+                .draw(fb);
+        }
+    }
+
+    // Volume level text
+    let level_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
+    let mut vol_buf = [0u8; 8];
+    let vol_str = format_u32(&mut vol_buf, desktop.volume_level as u32);
+    let _ = Text::new(vol_str, Point::new(px + 70, py + 88), level_style).draw(fb);
+    let _ = Text::new("%", Point::new(px + 70 + (vol_str.len() as i32) * 6, py + 88), level_style).draw(fb);
+}
+
+/// Draw the network details panel.
+fn draw_network_panel(
+    fb: &mut FramebufferState,
+    net_usage: f32,
+    net_extended_stats: Option<&eclipse_ipc::types::NetExtendedStats>,
+) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let panel_w: i32 = 420;
+    let panel_h: i32 = 280;
+    let px = (fb_w - panel_w) / 2;
+    let py = (fb_h - panel_h) / 2;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(12, 15, 28)).build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 80, 180))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Title
+    let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let _ = Text::new("NETWORK DETAILS", Point::new(px + 140, py + 24), title_style).draw(fb);
+
+    // Network gauge
+    draw_gauge(fb, px + 20, py + 45, 380, 24, net_usage, "NET", Rgb888::new(200, 100, 255));
+
+    let info_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
+    let label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 130, 180));
+
+    if let Some(stats) = net_extended_stats {
+        // Loopback interface status
+        let lo_status = if stats.lo_up != 0 { "UP" } else { "DOWN" };
+        let lo_color = if stats.lo_up != 0 { Rgb888::new(0, 200, 100) } else { Rgb888::new(220, 50, 50) };
+        let lo_style = MonoTextStyle::new(&FONT_6X12, lo_color);
+        let _ = Text::new("lo:", Point::new(px + 20, py + 90), label_style).draw(fb);
+        let _ = Text::new(lo_status, Point::new(px + 60, py + 90), lo_style).draw(fb);
+
+        // lo IPv4
+        let mut ip_buf = [0u8; 20];
+        let ip_len = format_ipv4(&mut ip_buf, &stats.lo_ipv4);
+        let _ = Text::new(core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("?"), Point::new(px + 100, py + 90), info_style).draw(fb);
+
+        // eth0 interface status
+        let eth_status = if stats.eth0_up != 0 { "UP" } else { "DOWN" };
+        let eth_color = if stats.eth0_up != 0 { Rgb888::new(0, 200, 100) } else { Rgb888::new(220, 50, 50) };
+        let eth_style = MonoTextStyle::new(&FONT_6X12, eth_color);
+        let _ = Text::new("eth0:", Point::new(px + 20, py + 115), label_style).draw(fb);
+        let _ = Text::new(eth_status, Point::new(px + 80, py + 115), eth_style).draw(fb);
+
+        // eth0 IPv4
+        let mut ip_buf2 = [0u8; 20];
+        let ip_len2 = format_ipv4(&mut ip_buf2, &stats.eth0_ipv4);
+        let _ = Text::new(core::str::from_utf8(&ip_buf2[..ip_len2]).unwrap_or("?"), Point::new(px + 120, py + 115), info_style).draw(fb);
+
+        // Gateway
+        let _ = Text::new("Gateway:", Point::new(px + 20, py + 140), label_style).draw(fb);
+        let mut gw_buf = [0u8; 20];
+        let gw_len = format_ipv4(&mut gw_buf, &stats.eth0_gateway);
+        let _ = Text::new(core::str::from_utf8(&gw_buf[..gw_len]).unwrap_or("?"), Point::new(px + 120, py + 140), info_style).draw(fb);
+
+        // DNS
+        let _ = Text::new("DNS:", Point::new(px + 20, py + 160), label_style).draw(fb);
+        let mut dns_buf = [0u8; 20];
+        let dns_len = format_ipv4(&mut dns_buf, &stats.eth0_dns);
+        let _ = Text::new(core::str::from_utf8(&dns_buf[..dns_len]).unwrap_or("?"), Point::new(px + 120, py + 160), info_style).draw(fb);
+
+        // RX bytes
+        let _ = Text::new("RX bytes:", Point::new(px + 20, py + 190), label_style).draw(fb);
+        let mut buf3 = [0u8; 16];
+        let rx_bytes_str = format_u64(&mut buf3, stats.rx_bytes);
+        let _ = Text::new(rx_bytes_str, Point::new(px + 160, py + 190), info_style).draw(fb);
+
+        // TX bytes
+        let _ = Text::new("TX bytes:", Point::new(px + 20, py + 210), label_style).draw(fb);
+        let mut buf4 = [0u8; 16];
+        let tx_bytes_str = format_u64(&mut buf4, stats.tx_bytes);
+        let _ = Text::new(tx_bytes_str, Point::new(px + 160, py + 210), info_style).draw(fb);
+    } else {
+        let _ = Text::new("No extended stats", Point::new(px + 120, py + 130), label_style).draw(fb);
+        let _ = Text::new("available", Point::new(px + 150, py + 150), label_style).draw(fb);
+    }
+
+    // Close hint
+    let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
+    let _ = Text::new("Super+E to close", Point::new(px + 140, py + 260), hint_style).draw(fb);
+}
+
 // ── Helper functions ──
 
 fn format_metric<'a>(buf: &'a mut [u8; 16], label: &str, value: f32) -> &'a str {
@@ -1219,6 +1464,43 @@ fn format_u32<'a>(buf: &'a mut [u8; 8], val: u32) -> &'a str {
     }
     pos += 1;
     core::str::from_utf8(&buf[pos..8]).unwrap_or("?")
+}
+
+fn format_u64<'a>(buf: &'a mut [u8; 16], val: u64) -> &'a str {
+    if val == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut n = val;
+    let mut pos: usize = 15;
+    while n > 0 && pos > 0 {
+        buf[pos] = (n % 10) as u8 + b'0';
+        n /= 10;
+        pos -= 1;
+    }
+    pos += 1;
+    core::str::from_utf8(&buf[pos..16]).unwrap_or("?")
+}
+
+fn format_ipv4(buf: &mut [u8; 20], ip: &[u8; 4]) -> usize {
+    let mut pos = 0;
+    for (i, &octet) in ip.iter().enumerate() {
+        if i > 0 {
+            buf[pos] = b'.';
+            pos += 1;
+        }
+        if octet >= 100 {
+            buf[pos] = b'0' + octet / 100;
+            pos += 1;
+        }
+        if octet >= 10 {
+            buf[pos] = b'0' + (octet / 10) % 10;
+            pos += 1;
+        }
+        buf[pos] = b'0' + octet % 10;
+        pos += 1;
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -1272,5 +1554,43 @@ mod tests {
         let mut buf = [0u8; 8];
         let s = format_u32(&mut buf, 0);
         assert_eq!(s, "0");
+    }
+
+    #[test]
+    fn test_format_u64_basic() {
+        let mut buf = [0u8; 16];
+        let s = format_u64(&mut buf, 123456789);
+        assert_eq!(s, "123456789");
+    }
+
+    #[test]
+    fn test_format_u64_zero() {
+        let mut buf = [0u8; 16];
+        let s = format_u64(&mut buf, 0);
+        assert_eq!(s, "0");
+    }
+
+    #[test]
+    fn test_format_ipv4() {
+        let mut buf = [0u8; 20];
+        let len = format_ipv4(&mut buf, &[192, 168, 1, 100]);
+        let ip = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(ip, "192.168.1.100");
+    }
+
+    #[test]
+    fn test_format_ipv4_zeros() {
+        let mut buf = [0u8; 20];
+        let len = format_ipv4(&mut buf, &[0, 0, 0, 0]);
+        let ip = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(ip, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_format_ipv4_loopback() {
+        let mut buf = [0u8; 20];
+        let len = format_ipv4(&mut buf, &[127, 0, 0, 1]);
+        let ip = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(ip, "127.0.0.1");
     }
 }

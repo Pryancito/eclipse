@@ -122,6 +122,10 @@ pub struct DesktopShell {
     pub clock_hours: u8,
     /// Current clock minutes (0-59), updated from system time.
     pub clock_minutes: u8,
+    /// Current day of month (1-31).
+    pub clock_day: u8,
+    /// Current month (1-12).
+    pub clock_month: u8,
 }
 
 impl DesktopShell {
@@ -140,6 +144,8 @@ impl DesktopShell {
             brightness_level: 100,
             clock_hours: 0,
             clock_minutes: 0,
+            clock_day: 1,
+            clock_month: 1,
         };
 
         // Default pinned apps with executable paths
