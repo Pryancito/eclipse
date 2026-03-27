@@ -368,6 +368,36 @@ const TASK_TITLE_TRUNCATED_CHARS: usize = 14;
 /// Character width for the FONT_6X12 monospaced font.
 const FONT_CHAR_WIDTH: i32 = 6;
 
+// ── Running-dot indicator constants ──
+/// Width (px) of each running-instance dot.
+const RUN_DOT_W: i32 = 4;
+/// Gap (px) between adjacent running-instance dots.
+const RUN_DOT_GAP: i32 = 2;
+/// Stride between dot origins (dot width + gap).
+const RUN_DOT_STRIDE: i32 = RUN_DOT_W + RUN_DOT_GAP;
+
+// ── Mini-icon colour derivation constants ──
+/// Fallback seed byte when the window title is empty.
+const MINI_ICON_SEED_DEFAULT: u8 = 80;
+/// Multiplier for the red channel of the mini-icon colour.
+const MINI_ICON_R_MUL: u8 = 97;
+/// Multiplier for the green channel of the mini-icon colour.
+const MINI_ICON_G_MUL: u8 = 71;
+/// Multiplier for the blue channel of the mini-icon colour.
+const MINI_ICON_B_MUL: u8 = 53;
+/// Minimum additive offset for the red channel (keeps colours visible).
+const MINI_ICON_R_ADD: u8 = 20;
+/// Minimum additive offset for the green channel.
+const MINI_ICON_G_ADD: u8 = 60;
+/// Minimum additive offset for the blue channel.
+const MINI_ICON_B_ADD: u8 = 100;
+/// Cap for the red channel (prevents overly bright red-dominant icons).
+const MINI_ICON_R_MAX: u8 = 140;
+/// Cap for the green channel.
+const MINI_ICON_G_MAX: u8 = 160;
+/// Cap for the blue channel.
+const MINI_ICON_B_MAX: u8 = 210;
+
 /// Draw the bottom taskbar.
 fn draw_taskbar(
     fb: &mut FramebufferState,
@@ -455,15 +485,16 @@ fn draw_taskbar(
         let app = &desktop.pinned_apps[i];
         let (r, g, b) = app.icon_color;
 
-        // Check if this pinned app has a running window matching its name
+        // Count running windows on this workspace whose title starts with the pinned app name
         let app_name = app.name_str();
-        let is_running = (0..window_count).any(|w_idx| {
+        let run_count = (0..window_count).filter(|&w_idx| {
             let w = &windows[w_idx];
             if w.content == WindowContent::None || w.closing { return false; }
             if w.workspace != input.current_workspace { return false; }
             let w_title = w.title_str();
             w_title.len() >= app_name.len() && w_title[..app_name.len()].eq_ignore_ascii_case(app_name)
-        });
+        }).count();
+        let is_running = run_count > 0;
 
         // Hover highlight
         let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::PinnedApp(i);
@@ -496,17 +527,20 @@ fn draw_taskbar(
         let char_str = first_char.encode_utf8(&mut char_buf);
         let _ = Text::new(char_str, Point::new(app_x + 12, bar_y + 26), letter_style).draw(fb);
 
-        // Running indicator dot below the icon
-        if is_running {
+        // Running indicator: 1-3 dots below the icon depending on instance count
+        if run_count > 0 {
             let dot_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 200, 255))
                 .build();
-            let _ = Rectangle::new(
-                Point::new(app_x + TASKBAR_ICON_SIZE / 2 - 2, bar_y + 40),
-                Size::new(4, 2),
-            )
-            .into_styled(dot_style)
-            .draw(fb);
+            let (dot_start_x, n) = running_dot_layout(run_count, app_x, TASKBAR_ICON_SIZE);
+            for d in 0..n {
+                let _ = Rectangle::new(
+                    Point::new(dot_start_x + d * RUN_DOT_STRIDE, bar_y + 40),
+                    Size::new(RUN_DOT_W as u32, 2),
+                )
+                .into_styled(dot_style)
+                .draw(fb);
+            }
         }
 
         app_x += TASKBAR_ICON_SIZE + TASKBAR_ICON_SPACING;
@@ -585,22 +619,54 @@ fn draw_taskbar(
             .into_styled(task_style)
             .draw(fb);
 
-        // Window title (truncated with ellipsis)
+        // Left accent bar on focused window task (2px vertical stripe)
+        if focused {
+            let left_accent_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 150, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(win_x, bar_y + 8), Size::new(2, 28))
+                .into_styled(left_accent_style)
+                .draw(fb);
+        }
+
+        // Small coloured mini-icon (12×12) with the first letter of the window title.
+        // Colour is derived from the first byte of the title for a stable per-app hue.
+        let title_first_byte = w_title.as_bytes().first().copied().unwrap_or(MINI_ICON_SEED_DEFAULT);
+        let icon_r = title_first_byte.wrapping_mul(MINI_ICON_R_MUL).saturating_add(MINI_ICON_R_ADD).min(MINI_ICON_R_MAX);
+        let icon_g = title_first_byte.wrapping_mul(MINI_ICON_G_MUL).saturating_add(MINI_ICON_G_ADD).min(MINI_ICON_G_MAX);
+        let icon_b = title_first_byte.wrapping_mul(MINI_ICON_B_MUL).saturating_add(MINI_ICON_B_ADD).min(MINI_ICON_B_MAX);
+        let mini_icon_bg = if is_minimized {
+            Rgb888::new(icon_r / 2, icon_g / 2, icon_b / 2)
+        } else {
+            Rgb888::new(icon_r, icon_g, icon_b)
+        };
+        let mini_icon_style = PrimitiveStyleBuilder::new().fill_color(mini_icon_bg).build();
+        let _ = Rectangle::new(Point::new(win_x + 4, bar_y + 14), Size::new(12, 12))
+            .into_styled(mini_icon_style)
+            .draw(fb);
+        let first_char = w_title.chars().next().unwrap_or('?');
+        let mut icon_char_buf = [0u8; 4];
+        let icon_char_str = first_char.encode_utf8(&mut icon_char_buf);
+        let icon_letter_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+        let _ = Text::new(icon_char_str, Point::new(win_x + 5, bar_y + 24), icon_letter_style).draw(fb);
+
+        // Window title (truncated with ellipsis), offset right to make room for the mini-icon.
         let title_color = if is_minimized {
             Rgb888::new(100, 110, 130)
         } else {
             Rgb888::new(180, 190, 210)
         };
         let task_text_style = MonoTextStyle::new(&FONT_6X12, title_color);
+        let title_x = win_x + 20;
         if w_title.len() > TASK_TITLE_MAX_CHARS {
             let truncated_title = &w_title[..TASK_TITLE_TRUNCATED_CHARS];
-            let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
-            let _ = Text::new("..", Point::new(win_x + 6 + TASK_TITLE_TRUNCATED_CHARS as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new(truncated_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(title_x + TASK_TITLE_TRUNCATED_CHARS as i32 * FONT_CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
         } else {
-            let _ = Text::new(w_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new(w_title, Point::new(title_x, bar_y + 26), task_text_style).draw(fb);
         }
 
-        // Focused indicator
+        // Bottom focus indicator (full-width blue bar under the button)
         if focused {
             let focus_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 128, 255))
@@ -629,21 +695,57 @@ fn draw_taskbar(
     // ── System tray area (right side) ──
     let tray_x = tray_start;
 
+    // Subtle tray background tint — visually separates the tray from the window tasks area.
+    let tray_bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(12, 15, 30))
+        .build();
+    let _ = Rectangle::new(Point::new(tray_x + 1, bar_y + 1), Size::new((TASKBAR_TRAY_WIDTH - 1) as u32, (bar_h - 1) as u32))
+        .into_styled(tray_bg_style)
+        .draw(fb);
+
     // Tray separator
     let _ = Rectangle::new(Point::new(tray_x, bar_y + 8), Size::new(1, 28))
         .into_styled(sep_style)
         .draw(fb);
 
-    // CPU metric
+    // CPU metric text
     let metrics_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
     let mut cpu_buf = [0u8; 16];
     let cpu_str = format_metric(&mut cpu_buf, "CPU:", cpu_usage);
     let _ = Text::new(cpu_str, Point::new(tray_x + 10, bar_y + 18), metrics_style).draw(fb);
 
-    // Memory metric
+    // CPU mini progress bar below the text — turns red above 80 %
+    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * 46) / 100;
+    if cpu_bar_w > 0 {
+        let cpu_bar_color = if cpu_usage > 80.0 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(0, 130, 220)
+        };
+        let cpu_bar_style = PrimitiveStyleBuilder::new().fill_color(cpu_bar_color).build();
+        let _ = Rectangle::new(Point::new(tray_x + 10, bar_y + 33), Size::new(cpu_bar_w as u32, 2))
+            .into_styled(cpu_bar_style)
+            .draw(fb);
+    }
+
+    // MEM metric text
     let mut mem_buf = [0u8; 16];
     let mem_str = format_metric(&mut mem_buf, "MEM:", mem_usage);
-    let _ = Text::new(mem_str, Point::new(tray_x + 80, bar_y + 18), metrics_style).draw(fb);
+    let _ = Text::new(mem_str, Point::new(tray_x + 78, bar_y + 18), metrics_style).draw(fb);
+
+    // MEM mini progress bar below the text — turns red above 80 %
+    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * 46) / 100;
+    if mem_bar_w > 0 {
+        let mem_bar_color = if mem_usage > 80.0 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(80, 200, 120)
+        };
+        let mem_bar_style = PrimitiveStyleBuilder::new().fill_color(mem_bar_color).build();
+        let _ = Rectangle::new(Point::new(tray_x + 78, bar_y + 33), Size::new(mem_bar_w as u32, 2))
+            .into_styled(mem_bar_style)
+            .draw(fb);
+    }
 
     // Tiling mode indicator — small "T" badge between MEM and notifications
     if input.tiling_active {
@@ -676,8 +778,14 @@ fn draw_taskbar(
         let nstr = format_u32(&mut nbuf, notif_count as u32);
         let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
     } else {
-        let bell_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
-        let _ = Text::new(".", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
+        // Outline box as a quiet bell placeholder when there are no unread notifications.
+        let bell_outline = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(70, 85, 115))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(notif_x, bar_y + 11), Size::new(8, 8))
+            .into_styled(bell_outline)
+            .draw(fb);
     }
 
     // Volume indicator (mute-aware)
@@ -759,6 +867,17 @@ fn draw_taskbar(
             let charge_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 240, 120));
             let _ = Text::new("+", Point::new(bat_x + 20, bar_y + 26), charge_style).draw(fb);
         }
+
+        // Battery percentage text below the battery icon
+        let bat_pct_color = if bat_level <= 20 {
+            Rgb888::new(220, 80, 50)
+        } else {
+            Rgb888::new(90, 110, 150)
+        };
+        let bat_pct_style = MonoTextStyle::new(&FONT_6X12, bat_pct_color);
+        let mut bat_pct_buf = [0u8; 6];
+        let bat_pct_str = format_battery_pct(&mut bat_pct_buf, bat_level as u32);
+        let _ = Text::new(bat_pct_str, Point::new(bat_x, bar_y + 33), bat_pct_style).draw(fb);
     }
 
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
@@ -1438,6 +1557,13 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
             let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new((menu_w - 2) as u32, item_h as u32))
                 .into_styled(hover_style)
                 .draw(fb);
+            // Left accent bar on hovered item
+            let accent_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 140, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new(2, item_h as u32))
+                .into_styled(accent_style)
+                .draw(fb);
         }
 
         let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
@@ -1633,6 +1759,36 @@ fn format_metric<'a>(buf: &'a mut [u8; 16], label: &str, value: f32) -> &'a str 
     pos += 1;
 
     core::str::from_utf8(&buf[..pos]).unwrap_or("??")
+}
+
+/// Format battery level as "XX%" or "100%" into a caller-provided buffer.
+/// Returns a `&str` slice into the buffer.
+fn format_battery_pct<'a>(buf: &'a mut [u8; 6], level: u32) -> &'a str {
+    let pct = level.min(100);
+    let mut pos = 0usize;
+    if pct >= 100 {
+        buf[pos] = b'1'; pos += 1;
+        buf[pos] = b'0'; pos += 1;
+        buf[pos] = b'0'; pos += 1;
+    } else {
+        buf[pos] = b'0' + (pct / 10) as u8; pos += 1;
+        buf[pos] = b'0' + (pct % 10) as u8; pos += 1;
+    }
+    buf[pos] = b'%'; pos += 1;
+    core::str::from_utf8(&buf[..pos]).unwrap_or("?%")
+}
+
+/// Compute the x offset of the first running-indicator dot for a pinned app icon.
+/// Returns `(dot_start_x, n_dots)` where `n_dots` is clamped to 3.
+/// `icon_left_x` is the left edge of the icon (e.g. `app_x`).
+/// `icon_size` is the icon width (e.g. `TASKBAR_ICON_SIZE`).
+fn running_dot_layout(run_count: usize, icon_left_x: i32, icon_size: i32) -> (i32, i32) {
+    let n = run_count.min(3) as i32;
+    if n == 0 { return (0, 0); }
+    // n dots of RUN_DOT_W each, with RUN_DOT_GAP between them (no trailing gap)
+    let total_w = n * RUN_DOT_STRIDE - RUN_DOT_GAP;
+    let dot_start_x = icon_left_x + icon_size / 2 - total_w / 2;
+    (dot_start_x, n)
 }
 
 fn format_u32<'a>(buf: &'a mut [u8; 8], val: u32) -> &'a str {
@@ -1901,5 +2057,91 @@ mod tests {
         let len = format_ipv4(&mut buf, &[127, 0, 0, 1]);
         let ip = core::str::from_utf8(&buf[..len]).unwrap();
         assert_eq!(ip, "127.0.0.1");
+    }
+
+    // ── Tests for new visual-improvement helpers ──
+
+    #[test]
+    fn test_format_battery_pct_full() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 100), "100%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_zero() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 0), "00%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_single_digit() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 5), "05%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_two_digits() {
+        let mut buf = [0u8; 6];
+        assert_eq!(format_battery_pct(&mut buf, 83), "83%");
+    }
+
+    #[test]
+    fn test_format_battery_pct_clamps_over_100() {
+        let mut buf = [0u8; 6];
+        // Values > 100 should be clamped to 100.
+        assert_eq!(format_battery_pct(&mut buf, 120), "100%");
+    }
+
+    #[test]
+    fn test_running_dot_layout_zero() {
+        // No running instances → returns (0, 0).
+        let (_, n) = running_dot_layout(0, 160, 32);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_running_dot_layout_one() {
+        // 1 instance → 1 dot, centred under the icon.
+        let (start_x, n) = running_dot_layout(1, 160, 32);
+        assert_eq!(n, 1);
+        // icon centre = 160 + 16 = 176; total_w = 4; offset = 176 - 2 = 174
+        assert_eq!(start_x, 174);
+    }
+
+    #[test]
+    fn test_running_dot_layout_two() {
+        // 2 instances → 2 dots.
+        let (start_x, n) = running_dot_layout(2, 160, 32);
+        assert_eq!(n, 2);
+        // total_w = 2*RUN_DOT_STRIDE - RUN_DOT_GAP = 10; offset = 5; start = 176 - 5 = 171
+        assert_eq!(start_x, 171);
+    }
+
+    #[test]
+    fn test_running_dot_layout_three() {
+        // 3 instances → 3 dots.
+        let (start_x, n) = running_dot_layout(3, 160, 32);
+        assert_eq!(n, 3);
+        // total_w = 3*RUN_DOT_STRIDE - RUN_DOT_GAP = 16; offset = 8; start = 176 - 8 = 168
+        assert_eq!(start_x, 168);
+    }
+
+    #[test]
+    fn test_running_dot_layout_clamped_to_three() {
+        // Even with 5 running instances, only 3 dots are shown.
+        let (_, n) = running_dot_layout(5, 160, 32);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn test_running_dot_spacing_consistent() {
+        // Adjacent dots are RUN_DOT_STRIDE pixels apart.
+        let (start_x_3, n) = running_dot_layout(3, 0, 32);
+        assert_eq!(n, 3);
+        let dot0 = start_x_3;
+        let dot1 = start_x_3 + RUN_DOT_STRIDE;
+        let dot2 = start_x_3 + RUN_DOT_STRIDE * 2;
+        assert_eq!(dot1 - dot0, RUN_DOT_STRIDE);
+        assert_eq!(dot2 - dot1, RUN_DOT_STRIDE);
     }
 }
