@@ -8,6 +8,7 @@ members = [
     "x11_bridge_test",
     "eclipse_std",
     "libs/ipc",
+    "lunas",
 ]
 exclude = ["libs/ipc_tests", "std_test"]
 

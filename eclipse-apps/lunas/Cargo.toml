@@ -1,0 +1,44 @@
+# Lunas Desktop Environment for Eclipse OS
+# Un solo binario: backend según target.
+# - target linux (host): modo prueba sin framebuffer real.
+# - target no-linux (eclipse): compositor nativo (DRM, SideWind, IPC).
+
+[package]
+name = "lunas"
+version = "0.2.0"
+edition = "2021"
+autobins = false
+
+[lib]
+name = "lunas"
+path = "src/lib.rs"
+
+[dependencies]
+heapless = "0.8"
+embedded-graphics = "0.8.1"
+micromath = "2.1.0"
+bitflags = "2.4"
+tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
+eclipse-syscall = { path = "../../eclipse-syscall" }
+
+# Dependencias solo para target Eclipse (vendor eclipse).
+[target.'cfg(target_vendor = "eclipse")'.dependencies]
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+sidewind = { path = "../sidewind" }
+eclipse-syscall = { path = "../../eclipse-syscall" }
+eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+libc = { version = "0.2", default-features = false }
+
+# Dependencias para target Linux (host) — tests y desarrollo
+[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
+sidewind = { path = "../sidewind" }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+libc = "0.2"
+
+[features]
+default = []
+trace-frames = []
+
+[[bin]]
+name = "lunas"
+path = "src/main.rs"
