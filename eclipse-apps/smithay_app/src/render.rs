@@ -40,7 +40,6 @@ use crate::style_engine::StyleEngine;
 use eclipse_ipc::types::NetExtendedStats;
 use crate::display::{self, DisplayDevice, DisplayCaps, ControlDevice};
 use crate::painter::SkiaPainter;
-use tiny_skia::Color;
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
