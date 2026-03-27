@@ -247,12 +247,134 @@ impl LunasState {
             self.dirty = true;
         }
 
+        // Update launcher hover (needs access to desktop.pinned_apps)
+        if self.input.launcher_active {
+            use crate::input::launcher_hit_test;
+            let new_hover = launcher_hit_test(
+                self.input.cursor_x,
+                self.input.cursor_y,
+                self.input.fb_height,
+                self.desktop.pinned_count,
+                &self.desktop.pinned_apps,
+                self.input.search_active,
+                self.input.search_query.as_str(),
+            );
+            if new_hover != self.input.launcher_hovered_index {
+                self.input.launcher_hovered_index = new_hover;
+                self.dirty = true;
+            }
+        } else if self.input.launcher_hovered_index.is_some() {
+            self.input.launcher_hovered_index = None;
+        }
+
+        // Process taskbar actions from input
+        self.process_taskbar_actions();
+
         // Update system metrics periodically
         self.update_metrics_if_needed();
 
         let needs_render = self.dirty;
         self.dirty = false;
         needs_render
+    }
+
+    /// Process pending taskbar actions (pinned app launch, volume toggle, clock, launcher).
+    fn process_taskbar_actions(&mut self) {
+        // Handle pinned app click — launch the app
+        if let Some(app_idx) = self.input.last_pinned_app_click.take() {
+            self.launch_pinned_app(app_idx);
+        }
+
+        // Handle launcher click — do hit test with desktop.pinned_apps
+        if let Some((cx, cy)) = self.input.launcher_click_pos.take() {
+            use crate::input::launcher_hit_test;
+            let hit = launcher_hit_test(
+                cx, cy,
+                self.input.fb_height,
+                self.desktop.pinned_count,
+                &self.desktop.pinned_apps,
+                self.input.search_active,
+                self.input.search_query.as_str(),
+            );
+            if let Some(app_idx) = hit {
+                self.launch_pinned_app(app_idx);
+                self.input.launcher_active = false;
+                self.input.search_active = false;
+                self.input.search_query.clear();
+                self.dirty = true;
+            } else {
+                // Clicked outside launcher items — check if outside panel to close
+                use crate::render::{launcher_panel_bounds, TASKBAR_HEIGHT};
+                let (panel_x, panel_y, panel_w, panel_h) =
+                    launcher_panel_bounds(self.input.fb_height);
+                if cx < panel_x || cx >= panel_x + panel_w
+                    || cy < panel_y || cy >= panel_y + panel_h
+                {
+                    // Clicked outside launcher → close it
+                    self.input.launcher_active = false;
+                    self.input.search_active = false;
+                    self.input.search_query.clear();
+                    self.dirty = true;
+                }
+            }
+        }
+
+        // Handle launcher app click from direct index (alternative path)
+        if let Some(app_idx) = self.input.launcher_app_click.take() {
+            self.launch_pinned_app(app_idx);
+            self.input.launcher_active = false;
+            self.dirty = true;
+        }
+
+        // Handle volume click — toggle mute
+        if self.input.volume_clicked {
+            self.input.volume_clicked = false;
+            self.desktop.volume_muted = !self.desktop.volume_muted;
+            self.dirty = true;
+        }
+
+        // Handle clock click — toggle dashboard
+        if self.input.clock_clicked {
+            self.input.clock_clicked = false;
+            self.input.dashboard_active = !self.input.dashboard_active;
+            self.dirty = true;
+        }
+
+        // Handle notification panel close → mark all read
+        if self.input.notifications_mark_read {
+            self.input.notifications_mark_read = false;
+            self.desktop.mark_all_read();
+            self.dirty = true;
+        }
+    }
+
+    /// Launch a pinned app by its index, looking up its exec_path.
+    fn launch_pinned_app(&mut self, app_idx: usize) {
+        if app_idx < self.desktop.pinned_count {
+            // Copy exec_path to a local buffer to avoid borrow conflict
+            let mut path_buf = [0u8; 64];
+            path_buf.copy_from_slice(&self.desktop.pinned_apps[app_idx].exec_path);
+            let len = path_buf.iter().position(|&b| b == 0).unwrap_or(64);
+            if len > 0 {
+                if let Ok(exec) = core::str::from_utf8(&path_buf[..len]) {
+                    self.launch_app(exec);
+                }
+            }
+        }
+    }
+
+    /// Launch an application by its executable path.
+    fn launch_app(&mut self, _exec_path: &str) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            let _ = std::process::Command::new(_exec_path).spawn();
+        }
+        // On non-Eclipse targets (tests), we just record the intent
+        #[cfg(not(target_vendor = "eclipse"))]
+        {
+            // No-op: app launching is only available on Eclipse OS
+        }
+        self.dirty = true;
     }
 
     /// Update system metrics at a throttled rate.
@@ -294,6 +416,18 @@ impl LunasState {
         self.anomaly_count = stats.anomaly_count;
         self.heap_fragmentation = stats.heap_fragmentation;
         self.prev_stats = Some(stats);
+
+        // Update clock from wall time offset (Unix timestamp in seconds)
+        const SECONDS_PER_DAY: u64 = 86400;
+        let secs_today = if stats.wall_time_offset > 0 {
+            (stats.wall_time_offset % SECONDS_PER_DAY) as u32
+        } else {
+            // Fallback: derive from uptime ticks (milliseconds) for basic progression
+            let secs = (stats.uptime_ticks / 1000) as u32;
+            secs % SECONDS_PER_DAY as u32
+        };
+        self.desktop.clock_hours = (secs_today / 3600) as u8;
+        self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
 
         // Process list
         self.process_count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) } as usize;
@@ -449,5 +583,109 @@ mod tests {
         let _ = log.extend_from_slice(b"test log");
         state.handle_event(&CompositorEvent::KernelLog(log));
         assert!(state.log_len > 0);
+    }
+
+    #[test]
+    fn test_pinned_app_click_consumed() {
+        let mut state = LunasState::new().expect("init");
+        // Simulate a pinned app click
+        state.input.last_pinned_app_click = Some(0);
+        state.dirty = false;
+        let _ = state.update();
+        // The click should have been consumed
+        assert_eq!(state.input.last_pinned_app_click, None);
+    }
+
+    #[test]
+    fn test_volume_toggle_mute() {
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.desktop.volume_muted);
+        // Simulate volume click
+        state.input.volume_clicked = true;
+        let _ = state.update();
+        assert!(state.desktop.volume_muted);
+        assert!(!state.input.volume_clicked);
+        // Click again to unmute
+        state.input.volume_clicked = true;
+        let _ = state.update();
+        assert!(!state.desktop.volume_muted);
+    }
+
+    #[test]
+    fn test_clock_click_toggles_dashboard() {
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.input.dashboard_active);
+        state.input.clock_clicked = true;
+        let _ = state.update();
+        assert!(state.input.dashboard_active);
+        assert!(!state.input.clock_clicked);
+        // Click again to close
+        state.input.clock_clicked = true;
+        let _ = state.update();
+        assert!(!state.input.dashboard_active);
+    }
+
+    #[test]
+    fn test_launcher_click_launches_app() {
+        let mut state = LunasState::new().expect("init");
+        state.input.launcher_active = true;
+
+        // Click position of first launcher item
+        // Panel at y = fb_h - 44 - 400 - 10
+        let fb_h = state.backend.fb.info.height as i32;
+        let panel_y = fb_h - 44 - 400 - 10;
+        let item_y = panel_y + 50; // first item
+
+        state.input.launcher_click_pos = Some((100, item_y + 5));
+        let _ = state.update();
+
+        // Launcher should close after clicking an item
+        assert!(!state.input.launcher_active);
+        assert_eq!(state.input.launcher_click_pos, None);
+    }
+
+    #[test]
+    fn test_launcher_click_outside_closes() {
+        let mut state = LunasState::new().expect("init");
+        state.input.launcher_active = true;
+
+        // Click far outside the launcher panel
+        state.input.launcher_click_pos = Some((800, 400));
+        let _ = state.update();
+
+        // Launcher should close when clicking outside
+        assert!(!state.input.launcher_active);
+    }
+
+    #[test]
+    fn test_launcher_hover_updates() {
+        let mut state = LunasState::new().expect("init");
+        state.input.launcher_active = true;
+
+        // Position cursor over first launcher item
+        let fb_h = state.backend.fb.info.height as i32;
+        let panel_y = fb_h - 44 - 400 - 10;
+        state.input.cursor_x = 100;
+        state.input.cursor_y = panel_y + 50 + 5;
+
+        let _ = state.update();
+        assert!(state.input.launcher_hovered_index.is_some());
+    }
+
+    #[test]
+    fn test_notification_mark_read_on_close() {
+        let mut state = LunasState::new().expect("init");
+        // Add notifications
+        state.desktop.push_notification("Alert 1", 1);
+        state.desktop.push_notification("Alert 2", 1);
+        assert!(state.desktop.unread_count() > 0);
+
+        // Simulate notification panel being closed by clicking on it
+        state.input.notifications_mark_read = true;
+        let _ = state.update();
+
+        // All notifications should be marked as read
+        assert_eq!(state.desktop.unread_count(), 0);
+        assert!(!state.input.notifications_mark_read);
     }
 }

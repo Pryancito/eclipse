@@ -51,6 +51,8 @@ pub struct PinnedApp {
     pub name: [u8; 32],
     pub icon_color: (u8, u8, u8),
     pub running: bool,
+    /// Executable path for launching this app (e.g. "/bin/terminal").
+    pub exec_path: [u8; 64],
 }
 
 impl Default for PinnedApp {
@@ -59,6 +61,7 @@ impl Default for PinnedApp {
             name: [0; 32],
             icon_color: (100, 100, 100),
             running: false,
+            exec_path: [0; 64],
         }
     }
 }
@@ -73,9 +76,24 @@ impl PinnedApp {
         app
     }
 
+    /// Create a pinned app with name, color, and executable path.
+    pub fn with_exec(name: &str, r: u8, g: u8, b: u8, exec: &str) -> Self {
+        let mut app = Self::new(name, r, g, b);
+        let bytes = exec.as_bytes();
+        let len = bytes.len().min(64);
+        app.exec_path[..len].copy_from_slice(&bytes[..len]);
+        app
+    }
+
     pub fn name_str(&self) -> &str {
         let len = self.name.iter().position(|&b| b == 0).unwrap_or(32);
         core::str::from_utf8(&self.name[..len]).unwrap_or("")
+    }
+
+    /// Return the executable path as a string slice.
+    pub fn exec_path_str(&self) -> &str {
+        let len = self.exec_path.iter().position(|&b| b == 0).unwrap_or(64);
+        core::str::from_utf8(&self.exec_path[..len]).unwrap_or("")
     }
 }
 
@@ -98,7 +116,12 @@ pub struct DesktopShell {
     pub show_clock: bool,
     pub show_battery: bool,
     pub volume_level: u8,
+    pub volume_muted: bool,
     pub brightness_level: u8,
+    /// Current clock hours (0-23), updated from system time.
+    pub clock_hours: u8,
+    /// Current clock minutes (0-59), updated from system time.
+    pub clock_minutes: u8,
 }
 
 impl DesktopShell {
@@ -113,15 +136,18 @@ impl DesktopShell {
             show_clock: true,
             show_battery: true,
             volume_level: 75,
+            volume_muted: false,
             brightness_level: 100,
+            clock_hours: 0,
+            clock_minutes: 0,
         };
 
-        // Default pinned apps
-        shell.pin_app("Terminal", 0, 200, 100);
-        shell.pin_app("Files", 100, 150, 255);
-        shell.pin_app("Editor", 200, 160, 50);
-        shell.pin_app("Browser", 255, 100, 50);
-        shell.pin_app("Settings", 150, 150, 150);
+        // Default pinned apps with executable paths
+        shell.pin_app_with_exec("Terminal", 0, 200, 100, "/bin/terminal");
+        shell.pin_app_with_exec("Files", 100, 150, 255, "/bin/files");
+        shell.pin_app_with_exec("Editor", 200, 160, 50, "/bin/editor");
+        shell.pin_app_with_exec("Browser", 255, 100, 50, "/bin/browser");
+        shell.pin_app_with_exec("Settings", 150, 150, 150, "/bin/settings");
 
         shell
     }
@@ -129,6 +155,13 @@ impl DesktopShell {
     pub fn pin_app(&mut self, name: &str, r: u8, g: u8, b: u8) {
         if self.pinned_count < MAX_PINNED_APPS {
             self.pinned_apps[self.pinned_count] = PinnedApp::new(name, r, g, b);
+            self.pinned_count += 1;
+        }
+    }
+
+    pub fn pin_app_with_exec(&mut self, name: &str, r: u8, g: u8, b: u8, exec: &str) {
+        if self.pinned_count < MAX_PINNED_APPS {
+            self.pinned_apps[self.pinned_count] = PinnedApp::with_exec(name, r, g, b, exec);
             self.pinned_count += 1;
         }
     }
@@ -208,6 +241,31 @@ mod tests {
         let app = PinnedApp::new("Terminal", 0, 200, 100);
         assert_eq!(app.name_str(), "Terminal");
         assert_eq!(app.icon_color, (0, 200, 100));
+        assert_eq!(app.exec_path_str(), "");
+    }
+
+    #[test]
+    fn test_pinned_app_with_exec() {
+        let app = PinnedApp::with_exec("Terminal", 0, 200, 100, "/bin/terminal");
+        assert_eq!(app.name_str(), "Terminal");
+        assert_eq!(app.exec_path_str(), "/bin/terminal");
+    }
+
+    #[test]
+    fn test_desktop_shell_pinned_exec_paths() {
+        let shell = DesktopShell::new();
+        assert_eq!(shell.pinned_apps[0].exec_path_str(), "/bin/terminal");
+        assert_eq!(shell.pinned_apps[1].exec_path_str(), "/bin/files");
+        assert_eq!(shell.pinned_apps[4].exec_path_str(), "/bin/settings");
+    }
+
+    #[test]
+    fn test_desktop_shell_clock_defaults() {
+        let shell = DesktopShell::new();
+        assert_eq!(shell.clock_hours, 0);
+        assert_eq!(shell.clock_minutes, 0);
+        assert!(!shell.volume_muted);
+        assert!(shell.show_clock);
     }
 
     #[test]
