@@ -118,6 +118,10 @@ pub struct DesktopShell {
     pub volume_level: u8,
     pub volume_muted: bool,
     pub brightness_level: u8,
+    /// Current battery level (0-100). 0 = empty, 100 = full.
+    pub battery_level: u8,
+    /// Whether the device is currently charging.
+    pub battery_charging: bool,
     /// Current clock hours (0-23), updated from system time.
     pub clock_hours: u8,
     /// Current clock minutes (0-59), updated from system time.
@@ -126,6 +130,8 @@ pub struct DesktopShell {
     pub clock_day: u8,
     /// Current month (1-12).
     pub clock_month: u8,
+    /// Current year (e.g. 2026).
+    pub clock_year: u16,
 }
 
 impl DesktopShell {
@@ -142,10 +148,13 @@ impl DesktopShell {
             volume_level: 75,
             volume_muted: false,
             brightness_level: 100,
+            battery_level: 80,
+            battery_charging: false,
             clock_hours: 0,
             clock_minutes: 0,
             clock_day: 1,
             clock_month: 1,
+            clock_year: 2026,
         };
 
         // Default pinned apps with executable paths
@@ -169,6 +178,27 @@ impl DesktopShell {
         if self.pinned_count < MAX_PINNED_APPS {
             self.pinned_apps[self.pinned_count] = PinnedApp::with_exec(name, r, g, b, exec);
             self.pinned_count += 1;
+        }
+    }
+
+    /// Remove a pinned app by index, shifting remaining apps down.
+    /// Does nothing if the index is out of range.
+    pub fn unpin_app(&mut self, idx: usize) {
+        if idx >= self.pinned_count {
+            return;
+        }
+        for i in idx..(self.pinned_count - 1) {
+            self.pinned_apps[i] = self.pinned_apps[i + 1].clone();
+        }
+        self.pinned_apps[self.pinned_count - 1] = PinnedApp::default();
+        self.pinned_count -= 1;
+    }
+
+    /// Swap two pinned apps by index (drag-and-drop reorder).
+    /// Does nothing if either index is out of range or they are the same.
+    pub fn swap_pinned_apps(&mut self, a: usize, b: usize) {
+        if a != b && a < self.pinned_count && b < self.pinned_count {
+            self.pinned_apps.swap(a, b);
         }
     }
 
@@ -282,5 +312,45 @@ mod tests {
             shell.pin_app("Extra", 0, 0, 0);
         }
         assert_eq!(shell.pinned_count, MAX_PINNED_APPS);
+    }
+
+    #[test]
+    fn test_unpin_app_removes_correctly() {
+        let mut shell = DesktopShell::new();
+        // Default has 5 apps: Terminal, Files, Editor, Browser, Settings
+        assert_eq!(shell.pinned_count, 5);
+
+        // Unpin the second app (Files at index 1)
+        shell.unpin_app(1);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[0].name_str(), "Terminal");
+        assert_eq!(shell.pinned_apps[1].name_str(), "Editor");
+        assert_eq!(shell.pinned_apps[2].name_str(), "Browser");
+        assert_eq!(shell.pinned_apps[3].name_str(), "Settings");
+    }
+
+    #[test]
+    fn test_unpin_app_first() {
+        let mut shell = DesktopShell::new();
+        shell.unpin_app(0);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[0].name_str(), "Files");
+    }
+
+    #[test]
+    fn test_unpin_app_last() {
+        let mut shell = DesktopShell::new();
+        let last_idx = shell.pinned_count - 1;
+        shell.unpin_app(last_idx);
+        assert_eq!(shell.pinned_count, 4);
+        assert_eq!(shell.pinned_apps[3].name_str(), "Browser");
+    }
+
+    #[test]
+    fn test_unpin_app_out_of_range() {
+        let mut shell = DesktopShell::new();
+        // Should do nothing for out-of-range index
+        shell.unpin_app(10);
+        assert_eq!(shell.pinned_count, 5);
     }
 }
