@@ -530,10 +530,13 @@ fn draw_taskbar(
 
         // Window title (truncated with ellipsis)
         let task_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
-        if w_title.len() > 16 {
-            let truncated_title = &w_title[..14];
+        const MAX_TITLE_CHARS: usize = 16;
+        const TRUNCATED_CHARS: usize = 14;
+        const CHAR_WIDTH: i32 = 6;
+        if w_title.len() > MAX_TITLE_CHARS {
+            let truncated_title = &w_title[..TRUNCATED_CHARS];
             let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
-            let _ = Text::new("..", Point::new(win_x + 6 + 14 * 6, bar_y + 26), task_text_style).draw(fb);
+            let _ = Text::new("..", Point::new(win_x + 6 + TRUNCATED_CHARS as i32 * CHAR_WIDTH, bar_y + 26), task_text_style).draw(fb);
         } else {
             let _ = Text::new(w_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
         }

@@ -345,14 +345,15 @@ impl LunasState {
         self.prev_stats = Some(stats);
 
         // Update clock from wall time offset (Unix timestamp in seconds)
+        const SECONDS_PER_DAY: u64 = 86400;
         if stats.wall_time_offset > 0 {
-            let secs_today = (stats.wall_time_offset % 86400) as u32;
+            let secs_today = (stats.wall_time_offset % SECONDS_PER_DAY) as u32;
             self.desktop.clock_hours = (secs_today / 3600) as u8;
             self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
         } else {
             // Fallback: derive from uptime ticks (milliseconds) for basic progression
             let secs = (stats.uptime_ticks / 1000) as u32;
-            let secs_today = secs % 86400;
+            let secs_today = secs % SECONDS_PER_DAY as u32;
             self.desktop.clock_hours = (secs_today / 3600) as u8;
             self.desktop.clock_minutes = ((secs_today % 3600) / 60) as u8;
         }
