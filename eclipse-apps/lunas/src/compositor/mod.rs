@@ -148,24 +148,29 @@ pub struct ExternalSurface {
     pub pid: u32,
     pub vaddr: usize,
     pub buffer_size: usize,
+    /// The actual length of the mmap'd region. Stays constant after CREATE;
+    /// `buffer_size` may diverge on UPDATE but the blit is clamped to this.
+    pub mapped_len: usize,
     pub active: bool,
     pub ready_to_flip: bool,
 }
 
 impl Default for ExternalSurface {
     fn default() -> Self {
-        Self { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false, ready_to_flip: false }
+        Self { id: 0, pid: 0, vaddr: 0, buffer_size: 0, mapped_len: 0, active: false, ready_to_flip: false }
     }
 }
 
 impl ExternalSurface {
     pub fn unmap(&mut self) {
-        if self.vaddr != 0 && self.vaddr != 0x1000 {
+        if self.vaddr != 0 && self.mapped_len > 0 {
             unsafe {
-                libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
+                libc::munmap(self.vaddr as *mut core::ffi::c_void, self.mapped_len);
             }
         }
         self.vaddr = 0;
+        self.buffer_size = 0;
+        self.mapped_len = 0;
         self.active = false;
     }
 
@@ -317,5 +322,26 @@ mod tests {
             assert_eq!(focus_under_cursor(50, 50, &windows, 2), Some(0));
             assert_eq!(next_visible(0, true, &windows, 2), Some(1));
         }
+    }
+
+    #[test]
+    fn test_unmap_clears_mapped_len() {
+        let mut surface = ExternalSurface {
+            id: 1, pid: 100, vaddr: 0, buffer_size: 4096, mapped_len: 4096,
+            active: true, ready_to_flip: true,
+        };
+        surface.unmap();
+        assert_eq!(surface.vaddr, 0);
+        assert_eq!(surface.buffer_size, 0);
+        assert_eq!(surface.mapped_len, 0);
+        assert!(!surface.active);
+    }
+
+    #[test]
+    fn test_unmap_zero_vaddr_no_panic() {
+        let mut surface = ExternalSurface::default();
+        surface.unmap();
+        assert_eq!(surface.vaddr, 0);
+        assert_eq!(surface.mapped_len, 0);
     }
 }

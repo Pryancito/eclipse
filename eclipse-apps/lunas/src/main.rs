@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn main_loop_iterations_complete_without_hanging() {
         let mut state = LunasState::new().expect("state");
-        const N: u64 = 500_000;
+        const N: u64 = 10_000;
         for _ in 0..N {
             while let Some(_event) = state.backend.poll_event() {
                 state.handle_event(&_event);

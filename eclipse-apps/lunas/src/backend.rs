@@ -42,7 +42,7 @@ impl Backend {
             #[cfg(target_vendor = "eclipse")]
             let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY | O_NONBLOCK, 0) };
             #[cfg(not(target_vendor = "eclipse"))]
-            let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY | O_NONBLOCK, 0) };
+            let fd = unsafe { open(b"input:\0".as_ptr() as *const i8, O_RDONLY | O_NONBLOCK, 0) };
             if fd >= 0 { Some(fd) } else { None }
         };
         #[cfg(test)]
