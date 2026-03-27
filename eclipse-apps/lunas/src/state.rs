@@ -127,8 +127,11 @@ impl LunasState {
             xwayland: XwaylandIntegration::new(),
         };
 
-        // Pre-render background
-        state.backend.fb.pre_render_background();
+        // Pre-render background using the current wallpaper mode and colour.
+        state.backend.fb.pre_render_background(
+            state.desktop.wallpaper_mode,
+            state.desktop.wallpaper_color,
+        );
 
         // Sync pinned app count and names to input state for taskbar hit detection
         state.input.pinned_app_count = state.desktop.pinned_count;
@@ -589,6 +592,11 @@ impl LunasState {
                         crate::desktop::WallpaperMode::Gradient => crate::desktop::WallpaperMode::CosmicTheme,
                         crate::desktop::WallpaperMode::CosmicTheme => crate::desktop::WallpaperMode::SolidColor,
                     };
+                    // Re-render the background buffer for the new wallpaper mode.
+                    self.backend.fb.pre_render_background(
+                        self.desktop.wallpaper_mode,
+                        self.desktop.wallpaper_color,
+                    );
                     self.dirty = true;
                 }
                 ContextAction::CloseWindow(idx) => {

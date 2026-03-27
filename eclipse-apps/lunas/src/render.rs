@@ -12,7 +12,7 @@ use embedded_graphics::geometry::{Point, Size};
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface};
 use crate::input::InputState;
 use crate::style_engine::StyleEngine;
-use crate::desktop::DesktopShell;
+use crate::desktop::{DesktopShell, WallpaperMode};
 use crate::state::ServiceInfo;
 
 use crate::display::{self, DisplayDevice, DisplayCaps, ControlDevice};
@@ -151,35 +151,82 @@ impl FramebufferState {
     }
 
     /// Pre-render the desktop background (cosmic theme).
-    pub fn pre_render_background(&mut self) {
+    /// Pre-render the desktop background into the background buffer.
+    ///
+    /// - `WallpaperMode::SolidColor`: fills the buffer with a single colour.
+    /// - `WallpaperMode::Gradient`:   top-to-bottom gradient from the base colour
+    ///   to a darker complementary tone.
+    /// - `WallpaperMode::CosmicTheme`: the classic dark-blue/purple cosmic
+    ///   gradient with a 200-star starfield (previous default behaviour).
+    pub fn pre_render_background(&mut self, mode: WallpaperMode, color: (u8, u8, u8)) {
         #[cfg(not(test))]
         {
             let pitch_px = self.info.pitch as usize / 4;
             let ptr = self.background_addr as *mut u32;
-            for y in 0..self.info.height as usize {
-                for x in 0..self.info.width as usize {
-                    // Cosmic gradient: dark blue to deep purple
-                    let r = (10 + (y * 15 / self.info.height as usize)) as u8;
-                    let g = (12 + (x * 8 / self.info.width as usize)) as u8;
-                    let b = (30 + (y * 25 / self.info.height as usize)) as u8;
-                    let pixel = 0xFF00_0000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-                    unsafe {
-                        core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel);
+            let h = self.info.height as usize;
+            let w = self.info.width as usize;
+
+            match mode {
+                WallpaperMode::SolidColor => {
+                    let pixel = 0xFF00_0000u32
+                        | ((color.0 as u32) << 16)
+                        | ((color.1 as u32) << 8)
+                        | (color.2 as u32);
+                    for y in 0..h {
+                        for x in 0..w {
+                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
+                        }
                     }
                 }
-            }
-
-            // Draw starfield
-            let mut seed = 42u64;
-            for _ in 0..200 {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let sx = ((seed >> 16) as usize) % self.info.width as usize;
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let sy = ((seed >> 16) as usize) % self.info.height as usize;
-                let brightness = 150 + ((seed >> 32) as u8 % 105);
-                let star_pixel = 0xFF00_0000u32 | ((brightness as u32) << 16) | ((brightness as u32) << 8) | (brightness as u32);
-                unsafe {
-                    core::ptr::write_volatile(ptr.add(sy * pitch_px + sx), star_pixel);
+                WallpaperMode::Gradient => {
+                    // Top: base colour; bottom: darkened by ~50 %.
+                    let (r0, g0, b0) = color;
+                    let r1 = (r0 as u32).saturating_sub(r0 as u32 / 2) as u8;
+                    let g1 = (g0 as u32).saturating_sub(g0 as u32 / 2) as u8;
+                    let b1 = (b0 as u32).saturating_sub(b0 as u32 / 2) as u8;
+                    let h_norm = h.max(1) as u32; // denominator, pre-computed once
+                    let lerp = |a: u8, b: u8, t: u32| -> u8 {
+                        (a as u32 + (b as u32).wrapping_sub(a as u32).wrapping_mul(t) / 255) as u8
+                    };
+                    for y in 0..h {
+                        let t = (y as u32 * 255) / h_norm; // 0 (top) → 255 (bottom)
+                        let r = lerp(r0, r1, t);
+                        let g = lerp(g0, g1, t);
+                        let b = lerp(b0, b1, t);
+                        let pixel = 0xFF00_0000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                        for x in 0..w {
+                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
+                        }
+                    }
+                }
+                WallpaperMode::CosmicTheme => {
+                    // Cosmic gradient: dark blue to deep purple.
+                    for y in 0..h {
+                        for x in 0..w {
+                            let r = (10 + (y * 15 / h)) as u8;
+                            let g = (12 + (x * 8  / w)) as u8;
+                            let b = (30 + (y * 25 / h)) as u8;
+                            let pixel = 0xFF00_0000u32
+                                | ((r as u32) << 16)
+                                | ((g as u32) << 8)
+                                | (b as u32);
+                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
+                        }
+                    }
+                    // Deterministic starfield.
+                    let mut seed = 42u64;
+                    for _ in 0..200 {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let sx = ((seed >> 16) as usize) % w;
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let sy = ((seed >> 16) as usize) % h;
+                        let brightness = 150 + ((seed >> 32) as u8 % 105);
+                        let star_pixel = 0xFF00_0000u32
+                            | ((brightness as u32) << 16)
+                            | ((brightness as u32) << 8)
+                            | (brightness as u32);
+                        unsafe { core::ptr::write_volatile(ptr.add(sy * pitch_px + sx), star_pixel); }
+                    }
                 }
             }
         }
@@ -2360,5 +2407,65 @@ mod tests {
         // 2026-03-23 is Monday → index 1 → "Mon"
         let idx2 = day_of_week(2026, 3, 23) as usize;
         assert_eq!(DOW_ABBR[idx2], "Mon");
+    }
+
+    // ── Tests for wallpaper mode pre-rendering ──
+
+    #[test]
+    fn test_pre_render_background_solid_color_no_panic() {
+        // In test mode the function body is skipped, so this just verifies
+        // the signature accepts all three WallpaperMode variants.
+        let mut fb = FramebufferState::mock();
+        fb.pre_render_background(WallpaperMode::SolidColor, (40, 80, 120));
+        // No assertion needed — the call must not panic.
+    }
+
+    #[test]
+    fn test_pre_render_background_gradient_no_panic() {
+        let mut fb = FramebufferState::mock();
+        fb.pre_render_background(WallpaperMode::Gradient, (100, 50, 200));
+    }
+
+    #[test]
+    fn test_pre_render_background_cosmic_no_panic() {
+        let mut fb = FramebufferState::mock();
+        fb.pre_render_background(WallpaperMode::CosmicTheme, (10, 15, 30));
+    }
+
+    #[test]
+    fn test_gradient_lerp_at_zero() {
+        // At t=0 (top of screen) the output colour equals the base colour.
+        let (r0, g0, b0): (u8, u8, u8) = (100, 80, 200);
+        let lerp = |a: u8, b: u8, t: u32| -> u8 {
+            (a as u32 + (b as u32).wrapping_sub(a as u32).wrapping_mul(t) / 255) as u8
+        };
+        let r1 = (r0 as u32).saturating_sub(r0 as u32 / 2) as u8;
+        let g1 = (g0 as u32).saturating_sub(g0 as u32 / 2) as u8;
+        let b1 = (b0 as u32).saturating_sub(b0 as u32 / 2) as u8;
+        assert_eq!(lerp(r0, r1, 0), r0);
+        assert_eq!(lerp(g0, g1, 0), g0);
+        assert_eq!(lerp(b0, b1, 0), b0);
+    }
+
+    #[test]
+    fn test_gradient_lerp_darkens_toward_bottom() {
+        // The bottom colour should be no brighter than the top colour.
+        let (r0, g0, b0): (u8, u8, u8) = (200, 180, 160);
+        let r1 = (r0 as u32).saturating_sub(r0 as u32 / 2) as u8;
+        let g1 = (g0 as u32).saturating_sub(g0 as u32 / 2) as u8;
+        let b1 = (b0 as u32).saturating_sub(b0 as u32 / 2) as u8;
+        assert!(r1 <= r0, "bottom red should be <= top red");
+        assert!(g1 <= g0, "bottom green should be <= top green");
+        assert!(b1 <= b0, "bottom blue should be <= top blue");
+    }
+
+    #[test]
+    fn test_solid_color_pixel_value() {
+        // Verify the pixel encoding formula for a known colour.
+        let (r, g, b): (u8, u8, u8) = (255, 128, 0);
+        let pixel = 0xFF00_0000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        assert_eq!((pixel >> 16) & 0xFF, 255);
+        assert_eq!((pixel >> 8) & 0xFF, 128);
+        assert_eq!(pixel & 0xFF, 0);
     }
 }
