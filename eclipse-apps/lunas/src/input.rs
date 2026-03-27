@@ -35,6 +35,93 @@ pub enum KeyAction {
     Input(char), Enter, Backspace, ToggleNotifications,
 }
 
+/// Represents what element was clicked on the taskbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TaskbarHit {
+    /// No taskbar element was hit.
+    None,
+    /// The launcher button (grid icon) was clicked.
+    Launcher,
+    /// A workspace indicator was clicked (workspace index 0-3).
+    Workspace(u8),
+    /// A pinned app was clicked (index into desktop.pinned_apps).
+    PinnedApp(usize),
+    /// A running window task item was clicked (window index).
+    WindowTask(usize),
+    /// The notification area was clicked.
+    Notifications,
+}
+
+/// Determine what element is at position (px, py) on the taskbar.
+/// Returns `TaskbarHit::None` if the position is not on the taskbar.
+pub fn taskbar_hit_test(
+    px: i32,
+    py: i32,
+    fb_width: i32,
+    fb_height: i32,
+    pinned_count: usize,
+    windows: &[ShellWindow],
+    window_count: usize,
+    current_workspace: u8,
+) -> TaskbarHit {
+    use crate::render::{TASKBAR_HEIGHT, TASKBAR_APPS_START_X};
+
+    let bar_y = fb_height - TASKBAR_HEIGHT;
+    if py < bar_y || py >= fb_height {
+        return TaskbarHit::None;
+    }
+
+    // Launcher button: (4, bar_y+6) to (40, bar_y+38)
+    if px >= 4 && px < 40 && py >= bar_y + 6 && py < bar_y + 38 {
+        return TaskbarHit::Launcher;
+    }
+
+    // Workspace indicators: 4 workspaces starting at x=48, each 20px wide, spacing 26px
+    for ws in 0..4u8 {
+        let ws_x = 48 + (ws as i32) * 26;
+        if px >= ws_x && px < ws_x + 20 && py >= bar_y + 12 && py < bar_y + 32 {
+            return TaskbarHit::Workspace(ws);
+        }
+    }
+
+    // Pinned apps: starting at TASKBAR_APPS_START_X, each icon 32px wide, spacing 6px
+    let icon_size: i32 = 32;
+    let icon_spacing: i32 = 6;
+    let mut app_x = TASKBAR_APPS_START_X;
+    for i in 0..pinned_count {
+        if px >= app_x && px < app_x + icon_size && py >= bar_y + 6 && py < bar_y + 38 {
+            return TaskbarHit::PinnedApp(i);
+        }
+        app_x += icon_size + icon_spacing;
+    }
+
+    // Running windows area (after separator): start at sep2_x + 8
+    let sep2_x = app_x + 2;
+    let mut win_x = sep2_x + 8;
+    let win_item_w: i32 = 120;
+    let tray_start = fb_width - 250; // TASKBAR_TRAY_WIDTH
+
+    for w_idx in 0..window_count {
+        if win_x + win_item_w > tray_start - 10 { break; }
+        let w = &windows[w_idx];
+        if w.content == WindowContent::None || w.minimized || w.closing { continue; }
+        if w.workspace != current_workspace { continue; }
+
+        if px >= win_x && px < win_x + win_item_w && py >= bar_y + 8 && py < bar_y + 36 {
+            return TaskbarHit::WindowTask(w_idx);
+        }
+        win_x += win_item_w + 4;
+    }
+
+    // Notification area: around tray_x + 155
+    let notif_x = tray_start + 155;
+    if px >= notif_x - 5 && px < notif_x + 20 && py >= bar_y + 4 && py < bar_y + 36 {
+        return TaskbarHit::Notifications;
+    }
+
+    TaskbarHit::None
+}
+
 pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
     let code = (scancode & 0x7FFF) as u8;
     match code {
@@ -140,6 +227,10 @@ pub struct InputState {
     pub search_query: heapless::String<64>,
     pub tiling_active: bool,
     pub notifications_visible: bool,
+    /// Number of pinned apps (synced from DesktopShell for taskbar hit detection).
+    pub pinned_app_count: usize,
+    /// Index of the last pinned app that was clicked (for the caller to act on).
+    pub last_pinned_app_click: Option<usize>,
 }
 
 impl InputState {
@@ -168,6 +259,8 @@ impl InputState {
             search_query: heapless::String::new(),
             tiling_active: false,
             notifications_visible: false,
+            pinned_app_count: 0,
+            last_pinned_app_click: None,
         }
     }
 
@@ -464,6 +557,50 @@ impl InputState {
                 if button == 0 { // Left click
                     self.left_button_down = pressed;
                     if pressed {
+                        // ── Taskbar click detection (highest priority) ──
+                        let tb_hit = taskbar_hit_test(
+                            self.cursor_x, self.cursor_y,
+                            self.fb_width, self.fb_height,
+                            self.pinned_app_count,
+                            windows, *window_count,
+                            self.current_workspace,
+                        );
+                        let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
+                        if on_taskbar {
+                            self.last_pinned_app_click = None;
+                            match tb_hit {
+                                TaskbarHit::Launcher => {
+                                    self.launcher_active = !self.launcher_active;
+                                    dirty = true;
+                                }
+                                TaskbarHit::Workspace(ws) => {
+                                    self.current_workspace = ws;
+                                    dirty = true;
+                                }
+                                TaskbarHit::PinnedApp(idx) => {
+                                    self.last_pinned_app_click = Some(idx);
+                                    dirty = true;
+                                }
+                                TaskbarHit::WindowTask(w_idx) => {
+                                    if w_idx < *window_count {
+                                        if windows[w_idx].minimized {
+                                            windows[w_idx].minimized = false;
+                                        }
+                                        self.focused_window = Some(w_idx);
+                                        dirty = true;
+                                    }
+                                }
+                                TaskbarHit::Notifications => {
+                                    self.notifications_visible = !self.notifications_visible;
+                                    dirty = true;
+                                }
+                                _ => {
+                                    // Clicked on taskbar but not a specific element
+                                    dirty = true;
+                                }
+                            }
+                        } else {
+                        // ── Window focus / interaction ──
                         let focus = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count);
                         if let Some(idx) = focus {
                             self.focused_window = Some(idx);
@@ -534,6 +671,7 @@ impl InputState {
                         } else {
                             self.focused_window = None;
                         }
+                        } // end else (not on taskbar)
                         dirty = true;
                     } else {
                         // Button released
@@ -604,5 +742,124 @@ mod tests {
         let ev = InputEvent { device_id: 0, event_type: 1, code: 0, value: 500, timestamp: 0 };
         let _ = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(state.cursor_x <= 99);
+    }
+
+    #[test]
+    fn test_taskbar_hit_launcher() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let hit = taskbar_hit_test(20, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::Launcher);
+    }
+
+    #[test]
+    fn test_taskbar_hit_workspace() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Workspace 0 starts at x=48
+        let hit = taskbar_hit_test(55, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::Workspace(0));
+        // Workspace 1 at x=74
+        let hit = taskbar_hit_test(80, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::Workspace(1));
+    }
+
+    #[test]
+    fn test_taskbar_hit_pinned_app() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // First pinned app starts at TASKBAR_APPS_START_X = 160
+        let hit = taskbar_hit_test(170, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::PinnedApp(0));
+        // Second pinned app at 160 + 32 + 6 = 198
+        let hit = taskbar_hit_test(205, 1080 - 20, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::PinnedApp(1));
+    }
+
+    #[test]
+    fn test_taskbar_hit_none_above_bar() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Click above the taskbar should return None
+        let hit = taskbar_hit_test(500, 500, 1920, 1080, 5, &windows, 0, 0);
+        assert_eq!(hit, TaskbarHit::None);
+    }
+
+    #[test]
+    fn test_taskbar_click_launcher_toggles() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Move cursor to taskbar launcher area
+        state.cursor_x = 20;
+        state.cursor_y = 1080 - 20;
+
+        // Left mouse button press
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.launcher_active, "launcher should toggle on");
+
+        // Click again to toggle off
+        let ev2 = InputEvent { device_id: 0, event_type: 2, code: 0, value: 0, timestamp: 0 };
+        state.apply_event(&ev2, &mut windows, &mut count, &mut surfaces);
+        let ev3 = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev3, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.launcher_active, "launcher should toggle off");
+    }
+
+    #[test]
+    fn test_taskbar_click_workspace_switch() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        assert_eq!(state.current_workspace, 0);
+
+        // Move cursor to workspace indicator 1 (at x=74, y=bar_y+20)
+        state.cursor_x = 80;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.current_workspace, 1);
+    }
+
+    #[test]
+    fn test_taskbar_click_pinned_app() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Click on first pinned app at x=170
+        state.cursor_x = 170;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.last_pinned_app_click, Some(0));
+    }
+
+    #[test]
+    fn test_taskbar_click_notifications() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Notification area is at tray_start + 155 = (1920 - 250) + 155 = 1825
+        state.cursor_x = 1825;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(state.notifications_visible, "notifications should toggle on");
     }
 }

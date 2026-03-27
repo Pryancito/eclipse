@@ -123,6 +123,9 @@ impl LunasState {
         // Pre-render background
         state.backend.fb.pre_render_background();
 
+        // Sync pinned app count to input state for taskbar click detection
+        state.input.pinned_app_count = state.desktop.pinned_count;
+
         // Welcome notification
         state.desktop.push_notification("Lunas Desktop initialized", 1);
 
@@ -358,6 +361,7 @@ mod tests {
         assert!(state.dirty);
         assert_eq!(state.desktop.pinned_count, 5);
         assert_eq!(state.desktop.notification_count, 1); // Welcome notification
+        assert_eq!(state.input.pinned_app_count, 5); // Synced from desktop
     }
 
     #[test]

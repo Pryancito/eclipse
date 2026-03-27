@@ -285,7 +285,7 @@ pub fn draw_desktop_shell(
     fb.blit_background();
 
     // 2. Draw taskbar
-    draw_taskbar(fb, input, desktop, cpu_usage, mem_usage);
+    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
     for i in 0..window_count {
@@ -329,17 +329,34 @@ pub fn draw_desktop_shell(
     }
 }
 
+/// Taskbar height in pixels.
+pub const TASKBAR_HEIGHT: i32 = 44;
+
+/// Pinned app icon size in the taskbar.
+pub const TASKBAR_ICON_SIZE: i32 = 32;
+
+/// Spacing between taskbar pinned app icons.
+pub const TASKBAR_ICON_SPACING: i32 = 6;
+
+/// Left margin where pinned apps start (after launcher + workspace indicators).
+pub const TASKBAR_APPS_START_X: i32 = 160;
+
+/// Width of the system tray area on the right side.
+pub const TASKBAR_TRAY_WIDTH: i32 = 250;
+
 /// Draw the bottom taskbar.
 fn draw_taskbar(
     fb: &mut FramebufferState,
     input: &InputState,
-    _desktop: &DesktopShell,
+    desktop: &DesktopShell,
+    windows: &[ShellWindow],
+    window_count: usize,
     cpu_usage: f32,
     mem_usage: f32,
 ) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
-    let bar_h = 44;
+    let bar_h = TASKBAR_HEIGHT;
     let bar_y = fb_h - bar_h;
 
     // Taskbar background
@@ -350,7 +367,7 @@ fn draw_taskbar(
         .into_styled(taskbar_style)
         .draw(fb);
 
-    // Top border
+    // Top border accent line
     let border_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb888::new(0, 100, 200))
         .build();
@@ -358,43 +375,229 @@ fn draw_taskbar(
         .into_styled(border_style)
         .draw(fb);
 
-    // App launcher button
-    let launcher_style = PrimitiveStyleBuilder::new()
-        .fill_color(if input.launcher_active { Rgb888::new(0, 128, 255) } else { Rgb888::new(30, 40, 60) })
-        .build();
-    let _ = Rectangle::new(Point::new(4, bar_y + 4), Size::new(36, 36))
+    // ── Launcher button ──
+    let launcher_bg = if input.launcher_active {
+        Rgb888::new(0, 128, 255)
+    } else {
+        Rgb888::new(30, 40, 60)
+    };
+    let launcher_style = PrimitiveStyleBuilder::new().fill_color(launcher_bg).build();
+    let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
         .into_styled(launcher_style)
         .draw(fb);
 
-    // Launcher icon (grid of dots)
+    // Launcher icon (grid dots)
     let dot_color = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
     let _ = Text::new(":::", Point::new(10, bar_y + 26), dot_color).draw(fb);
 
-    // Clock / system tray area
-    let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
-    let _ = Text::new("LUNAS", Point::new(fb_w - 60, bar_y + 18), clock_style).draw(fb);
+    // ── Workspace indicators ──
+    for ws in 0..4u8 {
+        let ws_x = 48 + (ws as i32) * 26;
+        let active = ws == input.current_workspace;
+        let ws_color = if active {
+            Rgb888::new(0, 128, 255)
+        } else {
+            Rgb888::new(40, 50, 70)
+        };
+        let ws_style = PrimitiveStyleBuilder::new().fill_color(ws_color).build();
+        let _ = Rectangle::new(Point::new(ws_x, bar_y + 12), Size::new(20, 20))
+            .into_styled(ws_style)
+            .draw(fb);
 
-    // System metrics in taskbar
+        // Workspace number label
+        let ws_label_color = if active {
+            Rgb888::WHITE
+        } else {
+            Rgb888::new(120, 130, 160)
+        };
+        let ws_label_style = MonoTextStyle::new(&FONT_6X12, ws_label_color);
+        let mut ws_digit = [b'0' + ws + 1];
+        let ws_label = core::str::from_utf8(&ws_digit[..1]).unwrap_or("?");
+        let _ = Text::new(ws_label, Point::new(ws_x + 7, bar_y + 26), ws_label_style).draw(fb);
+    }
+
+    // ── Separator after workspaces ──
+    let sep_x = TASKBAR_APPS_START_X - 6;
+    let sep_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(50, 60, 90))
+        .build();
+    let _ = Rectangle::new(Point::new(sep_x, bar_y + 8), Size::new(1, 28))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // ── Pinned apps ──
+    let mut app_x = TASKBAR_APPS_START_X;
+    for i in 0..desktop.pinned_count {
+        let app = &desktop.pinned_apps[i];
+        let (r, g, b) = app.icon_color;
+
+        // Check if this pinned app has a running window matching its name
+        let app_name = app.name_str();
+        let is_running = (0..window_count).any(|w_idx| {
+            let w = &windows[w_idx];
+            if w.content == WindowContent::None || w.closing { return false; }
+            if w.workspace != input.current_workspace { return false; }
+            let w_title = w.title_str();
+            w_title.len() >= app_name.len() && w_title[..app_name.len()].eq_ignore_ascii_case(app_name)
+        });
+
+        // App icon background
+        let icon_bg = if is_running {
+            Rgb888::new(r.saturating_add(20), g.saturating_add(20), b.saturating_add(20))
+        } else {
+            Rgb888::new(r / 3, g / 3, b / 3)
+        };
+        let icon_style = PrimitiveStyleBuilder::new().fill_color(icon_bg).build();
+        let _ = Rectangle::new(
+            Point::new(app_x, bar_y + 6),
+            Size::new(TASKBAR_ICON_SIZE as u32, TASKBAR_ICON_SIZE as u32),
+        )
+        .into_styled(icon_style)
+        .draw(fb);
+
+        // App first-letter icon
+        let letter_color = if is_running {
+            Rgb888::WHITE
+        } else {
+            Rgb888::new(180, 190, 210)
+        };
+        let letter_style = MonoTextStyle::new(&FONT_6X12, letter_color);
+        let first_char = app_name.chars().next().unwrap_or('?');
+        let mut char_buf = [0u8; 4];
+        let char_str = first_char.encode_utf8(&mut char_buf);
+        let _ = Text::new(char_str, Point::new(app_x + 12, bar_y + 26), letter_style).draw(fb);
+
+        // Running indicator dot below the icon
+        if is_running {
+            let dot_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 200, 255))
+                .build();
+            let _ = Rectangle::new(
+                Point::new(app_x + TASKBAR_ICON_SIZE / 2 - 2, bar_y + 40),
+                Size::new(4, 2),
+            )
+            .into_styled(dot_style)
+            .draw(fb);
+        }
+
+        app_x += TASKBAR_ICON_SIZE + TASKBAR_ICON_SPACING;
+    }
+
+    // ── Separator after pinned apps ──
+    let sep2_x = app_x + 2;
+    let _ = Rectangle::new(Point::new(sep2_x, bar_y + 8), Size::new(1, 28))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // ── Running windows (not matching pinned apps) ──
+    let mut win_x = sep2_x + 8;
+    let win_item_w = 120i32;
+    let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
+
+    for w_idx in 0..window_count {
+        if win_x + win_item_w > tray_start - 10 { break; }
+        let w = &windows[w_idx];
+        if w.content == WindowContent::None || w.minimized || w.closing { continue; }
+        if w.workspace != input.current_workspace { continue; }
+
+        // Skip windows whose titles match a pinned app (already shown above)
+        let w_title = w.title_str();
+        let already_pinned = (0..desktop.pinned_count).any(|pi| {
+            let pname = desktop.pinned_apps[pi].name_str();
+            w_title.len() >= pname.len() && w_title[..pname.len()].eq_ignore_ascii_case(pname)
+        });
+        if already_pinned { continue; }
+
+        // Window task button
+        let focused = input.focused_window == Some(w_idx);
+        let task_bg = if focused {
+            Rgb888::new(35, 50, 80)
+        } else {
+            Rgb888::new(25, 30, 50)
+        };
+        let task_style = PrimitiveStyleBuilder::new().fill_color(task_bg).build();
+        let _ = Rectangle::new(Point::new(win_x, bar_y + 8), Size::new(win_item_w as u32, 28))
+            .into_styled(task_style)
+            .draw(fb);
+
+        // Window title (truncated)
+        let task_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
+        let truncated_len = w_title.len().min(16);
+        let truncated_title = &w_title[..truncated_len];
+        let _ = Text::new(truncated_title, Point::new(win_x + 6, bar_y + 26), task_text_style).draw(fb);
+
+        // Focused indicator
+        if focused {
+            let focus_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 128, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(win_x, bar_y + 38), Size::new(win_item_w as u32, 2))
+                .into_styled(focus_style)
+                .draw(fb);
+        }
+
+        win_x += win_item_w + 4;
+    }
+
+    // ── System tray area (right side) ──
+    let tray_x = tray_start;
+
+    // Tray separator
+    let _ = Rectangle::new(Point::new(tray_x, bar_y + 8), Size::new(1, 28))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // CPU metric
     let metrics_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
     let mut cpu_buf = [0u8; 16];
     let cpu_str = format_metric(&mut cpu_buf, "CPU:", cpu_usage);
-    let _ = Text::new(cpu_str, Point::new(fb_w - 200, bar_y + 18), metrics_style).draw(fb);
+    let _ = Text::new(cpu_str, Point::new(tray_x + 10, bar_y + 18), metrics_style).draw(fb);
 
+    // Memory metric
     let mut mem_buf = [0u8; 16];
     let mem_str = format_metric(&mut mem_buf, "MEM:", mem_usage);
-    let _ = Text::new(mem_str, Point::new(fb_w - 130, bar_y + 18), metrics_style).draw(fb);
+    let _ = Text::new(mem_str, Point::new(tray_x + 80, bar_y + 18), metrics_style).draw(fb);
 
-    // Workspace indicators
-    for ws in 0..4u8 {
-        let ws_x = 48 + (ws as i32) * 24;
-        let active = ws == input.current_workspace;
-        let ws_style = PrimitiveStyleBuilder::new()
-            .fill_color(if active { Rgb888::new(0, 128, 255) } else { Rgb888::new(40, 50, 70) })
+    // Notification bell indicator
+    let notif_count = desktop.unread_count();
+    let notif_x = tray_x + 155;
+    if notif_count > 0 {
+        let bell_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 200, 50));
+        let _ = Text::new("!", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
+
+        // Badge with count
+        let badge_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(220, 50, 50))
             .build();
-        let _ = Rectangle::new(Point::new(ws_x, bar_y + 12), Size::new(18, 18))
-            .into_styled(ws_style)
+        let _ = Rectangle::new(Point::new(notif_x + 6, bar_y + 6), Size::new(12, 12))
+            .into_styled(badge_style)
             .draw(fb);
+        let badge_text = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+        let mut nbuf = [0u8; 8];
+        let nstr = format_u32(&mut nbuf, notif_count as u32);
+        let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
+    } else {
+        let bell_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
+        let _ = Text::new(".", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
     }
+
+    // Volume indicator
+    let vol_x = tray_x + 180;
+    let vol_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(120, 140, 180));
+    let vol_icon = if desktop.volume_level > 50 { "+" } else if desktop.volume_level > 0 { "~" } else { "-" };
+    let _ = Text::new(vol_icon, Point::new(vol_x, bar_y + 18), vol_style).draw(fb);
+
+    // Clock / branding area (far right)
+    let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
+    let _ = Text::new("LUNAS", Point::new(fb_w - 50, bar_y + 18), clock_style).draw(fb);
+
+    // Bottom accent for branding
+    let accent_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(0, 100, 200))
+        .build();
+    let _ = Rectangle::new(Point::new(fb_w - 50, bar_y + bar_h - 2), Size::new(45, 2))
+        .into_styled(accent_style)
+        .draw(fb);
 }
 
 /// Draw a single window with decorations.
