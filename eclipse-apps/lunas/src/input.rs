@@ -402,22 +402,16 @@ pub fn taskbar_hit_test(
         win_x += win_item_w + 4;
     }
 
-    // Notification area: around tray_x + 155
-    let notif_x = tray_start + 155;
+    // Notification area: around tray_x + 70
+    let notif_x = tray_start + 70;
     if px >= notif_x - 5 && px < notif_x + 20 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Notifications;
     }
 
-    // Volume indicator: around tray_x + 180
-    let vol_x = tray_start + 180;
+    // Volume indicator: around tray_x + 100
+    let vol_x = tray_start + 100;
     if px >= vol_x - 5 && px < vol_x + 15 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Volume;
-    }
-
-    // Battery indicator: around tray_x + 212 (tray_width now 300, so fb_w - 88)
-    let bat_x = tray_start + 212;
-    if px >= bat_x - 2 && px < bat_x + 36 && py >= bar_y + 4 && py < bar_y + 36 {
-        return TaskbarHit::Battery;
     }
 
     // Clock area: fb_width - 56 to fb_width - 6
@@ -1862,7 +1856,7 @@ impl InputState {
                 // value > 0 = scroll down, value < 0 = scroll up
                 let scroll_down = event.value > 0;
                 let tray_start = self.fb_width - crate::render::TASKBAR_TRAY_WIDTH;
-                let vol_x = tray_start + 180;
+                let vol_x = tray_start + 100;
                 let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
 
                 if on_taskbar && self.cursor_x >= vol_x - 5 && self.cursor_x < vol_x + 15 {
@@ -2441,16 +2435,16 @@ mod tests {
         // Fill up window slots so we have overflow
         let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
         let mut surfaces = [ExternalSurface::default(); 16];
-        let mut count = 12;
-        for i in 0..12 {
+        let mut count = 15;
+        for i in 0..15 {
             windows[i].content = WindowContent::InternalDemo;
             windows[i].workspace = 0;
         }
         assert_eq!(state.task_scroll_offset, 0);
 
-        // Click scroll-right button (sr_x = tray_start - scroll_btn_w - 6 = 1620 - 16 - 6 = 1598)
-        // tray_start = 1920 - 300 = 1620
-        state.cursor_x = 1600;
+        // Click scroll-right button (sr_x = tray_start - scroll_btn_w - 6 = 1700 - 16 - 6 = 1678)
+        // tray_start = 1920 - 220 = 1700
+        state.cursor_x = 1680;
         state.cursor_y = 1080 - 20;
         let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
@@ -2800,12 +2794,15 @@ mod tests {
     // ── Next-phase feature tests ──
 
     #[test]
-    fn test_taskbar_hit_battery() {
+    fn test_taskbar_hit_battery_removed() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
         let names = [[0u8; 32]; 16];
-        // Battery: tray_start + 212 = (1920 - 300) + 212 = 1832
+        // Old battery position (tray_start+212 with tray_width=300) should no longer be a hit
+        // With new TASKBAR_TRAY_WIDTH=220, tray_start = 1920-220 = 1700; old bat_x = 1700+212=1912
+        // That's actually in the Clock area now. Test that the old wide tray x is now Clock/None.
+        // Simpler: just test that TaskbarHit::Battery is never returned.
         let hit = taskbar_hit_test(1832, 1080 - 20, 1920, 1080, 0, &names, &windows, 0, 0, 0);
-        assert_eq!(hit, TaskbarHit::Battery, "battery area should be hit");
+        assert_ne!(hit, TaskbarHit::Battery, "battery hit zone should be removed");
     }
 
     #[test]

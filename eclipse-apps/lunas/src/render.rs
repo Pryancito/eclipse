@@ -479,7 +479,7 @@ pub fn draw_desktop_shell(
     }
 
     // 2. Draw taskbar
-    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage, net_usage);
+    draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
     for i in 0..window_count {
@@ -561,7 +561,7 @@ pub const TASKBAR_ICON_SPACING: i32 = 6;
 pub const TASKBAR_APPS_START_X: i32 = 160;
 
 /// Width of the system tray area on the right side.
-pub const TASKBAR_TRAY_WIDTH: i32 = 300;
+pub const TASKBAR_TRAY_WIDTH: i32 = 220;
 
 /// Maximum characters for a window task title before truncation.
 const TASK_TITLE_MAX_CHARS: usize = 16;
@@ -621,8 +621,6 @@ fn draw_taskbar(
     desktop: &DesktopShell,
     windows: &[ShellWindow],
     window_count: usize,
-    cpu_usage: f32,
-    mem_usage: f32,
     net_usage: f32,
 ) {
     let fb_w = fb.info.width as i32;
@@ -1015,70 +1013,37 @@ fn draw_taskbar(
         .into_styled(sep_style)
         .draw(fb);
 
-    // CPU metric icon
-    draw_raw_icon(fb, assets::CPU_ICON, tray_x + 10, bar_y + 8, 24, 24);
-
-    // CPU & MEM mini progress bars stacked under CPU icon (46px wide)
-    let bar_x = tray_x + 10;
-    let bar_w_full = 46;
-    let track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(25, 30, 50)).build();
-
-    // CPU bar with background track
-    let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(bar_w_full as u32, 2))
-        .into_styled(track_style)
-        .draw(fb);
-    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * bar_w_full) / 100;
-    if cpu_bar_w > 0 {
-        let cpu_bar_color = if cpu_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(0, 140, 255) };
-        let cpu_bar_style = PrimitiveStyleBuilder::new().fill_color(cpu_bar_color).build();
-        let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(cpu_bar_w as u32, 2))
-            .into_styled(cpu_bar_style)
-            .draw(fb);
-    }
-
-    // MEM bar with background track
-    let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(bar_w_full as u32, 2))
-        .into_styled(track_style)
-        .draw(fb);
-    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * bar_w_full) / 100;
-    if mem_bar_w > 0 {
-        let mem_bar_color = if mem_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(50, 210, 120) };
-        let mem_bar_style = PrimitiveStyleBuilder::new().fill_color(mem_bar_color).build();
-        let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(mem_bar_w as u32, 2))
-            .into_styled(mem_bar_style)
-            .draw(fb);
-    }
-
-    // Tiling mode indicator — small "T" badge between MEM and notifications
+    // ── Tiling mode indicator "T" badge ──
     if input.tiling_active {
         let tiling_bg_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(0, 100, 50))
             .build();
-        let _ = Rectangle::new(Point::new(tray_x + 138, bar_y + 8), Size::new(14, 14))
+        let _ = Rectangle::new(Point::new(tray_x + 8, bar_y + 11), Size::new(14, 14))
             .into_styled(tiling_bg_style)
             .draw(fb);
         let tiling_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 120));
-        let _ = Text::new("T", Point::new(tray_x + 140, bar_y + 19), tiling_text).draw(fb);
+        let _ = Text::new("T", Point::new(tray_x + 10, bar_y + 22), tiling_text).draw(fb);
     }
 
-    // Window decoration style badge — shown when not default (style > 0).
-    // Styles: 1 = "M" (minimal, grey), 2 = "N" (neon, cyan).
+    // ── Window decoration style badge "M"/"N" ──
     if input.window_decoration_style > 0 {
         let (style_char, style_color) = match input.window_decoration_style {
             1 => ("M", Rgb888::new(140, 150, 170)),
             _ => ("N", Rgb888::new(0, 240, 220)),
         };
         let deco_text = MonoTextStyle::new(&FONT_6X12, style_color);
-        let _ = Text::new(style_char, Point::new(tray_x + 126, bar_y + 19), deco_text).draw(fb);
+        let _ = Text::new(style_char, Point::new(tray_x + 26, bar_y + 22), deco_text).draw(fb);
     }
 
-    // Brightness mini-bar (24px wide) with a small "☀" glyph (represented as "*").
-    // Shown as a very thin 24×2px bar just above the tiling badge position.
+    // ── Brightness mini-bar (24px wide) with sun glyph ──
     {
         let bri = desktop.brightness_level.min(100) as i32;
-        let bri_bar_x = tray_x + 65; // Moved to where RAM icon was
+        let bri_bar_x = tray_x + 38;
         let bri_bar_w_full: i32 = 24;
         let bri_bar_w = (bri * bri_bar_w_full) / 100;
+        // Sun glyph above the bar
+        let sun_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(220, 200, 80));
+        let _ = Text::new("*", Point::new(bri_bar_x, bar_y + 20), sun_style).draw(fb);
         // Background track
         let bri_track_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(30, 38, 60))
@@ -1097,12 +1062,12 @@ fn draw_taskbar(
         }
     }
 
-    // Notification bell indicator
+    // ── Notification bell indicator ──
     let notif_count = desktop.unread_count();
-    let notif_x = tray_x + 155;
+    let notif_x = tray_x + 70;
     draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
     if desktop.do_not_disturb {
-        // DND active: draw a red diagonal line over the bell to indicate suppression
+        // DND active: red bars + "Z" label
         let dnd_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(220, 60, 60))
             .build();
@@ -1112,11 +1077,9 @@ fn draw_taskbar(
         let _ = Rectangle::new(Point::new(notif_x + 2, bar_y + 15), Size::new(18, 2))
             .into_styled(dnd_style)
             .draw(fb);
-        // Small "Z" label to indicate quiet/sleep
         let dnd_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(220, 60, 60));
         let _ = Text::new("Z", Point::new(notif_x + 16, bar_y + 10), dnd_text).draw(fb);
     } else if notif_count > 0 {
-        // Badge with count
         let badge_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(220, 50, 50))
             .build();
@@ -1129,25 +1092,24 @@ fn draw_taskbar(
         let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
     }
 
-    // Volume indicator (mute-aware)
-    let vol_x = tray_x + 180;
-    // Volume icon
+    // ── Volume indicator ──
+    let vol_x = tray_x + 100;
     draw_raw_icon(fb, assets::VOLUME_ICON, vol_x - 4, bar_y + 8, 24, 24);
 
-    // Network icon
-    let net_x = tray_x + 205;
+    // ── Network icon ──
+    let net_x = tray_x + 126;
     draw_raw_icon(fb, assets::NETWORK_ICON, net_x, bar_y + 8, 24, 24);
 
-    // Night Light indicator: warm amber dot when active
+    // ── Night Light indicator: warm amber dot when active ──
     if desktop.night_light_active {
         let nl_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(255, 160, 40))
             .build();
-        let _ = Circle::new(Point::new(tray_x + 228, bar_y + 10), 8)
+        let _ = Circle::new(Point::new(tray_x + 150, bar_y + 14), 8)
             .into_styled(nl_style)
             .draw(fb);
         let nl_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(15, 10, 0));
-        let _ = Text::new("N", Point::new(tray_x + 230, bar_y + 20), nl_text).draw(fb);
+        let _ = Text::new("N", Point::new(tray_x + 152, bar_y + 22), nl_text).draw(fb);
     }
 
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
@@ -2048,7 +2010,8 @@ fn draw_volume_popup(fb: &mut FramebufferState, desktop: &DesktopShell) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
     let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
-    let px = tray_start + 160;
+    // Centre the panel above the volume icon (now at tray_start + 96..120)
+    let px = (tray_start + 18).min(fb_w - panel_w - 4);
     let py = fb_h - TASKBAR_HEIGHT - panel_h - 5;
 
     // Background
