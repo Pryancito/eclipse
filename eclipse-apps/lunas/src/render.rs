@@ -1554,10 +1554,8 @@ fn format_temp<'a>(buf: &'a mut [u8; 16], temp: u32) -> &'a str {
     }
     buf[pos] = b'0' + (temp % 10) as u8; pos += 1;
     // Suffix "degC" (ASCII workaround; font lacks U+00B0 degree symbol)
-    buf[pos] = b'd'; pos += 1;
-    buf[pos] = b'e'; pos += 1;
-    buf[pos] = b'g'; pos += 1;
-    buf[pos] = b'C'; pos += 1;
+    buf[pos..pos + 4].copy_from_slice(b"degC");
+    pos += 4;
     core::str::from_utf8(&buf[..pos]).unwrap_or("CPU: ?")
 }
 fn draw_system_central(fb: &mut FramebufferState, services: &[ServiceInfo], service_count: usize) {
@@ -2205,25 +2203,13 @@ pub fn draw_battery_panel(fb: &mut FramebufferState, desktop: &DesktopShell) {
 
     // Battery level percentage text
     let mut pct_buf = [0u8; 8];
-    let pct_str = {
-        let digits = level;
-        let s = if digits == 100 {
-            "100%"
-        } else if digits >= 10 {
-            let hi = (digits / 10) as u8 + b'0';
-            let lo = (digits % 10) as u8 + b'0';
-            pct_buf[0] = hi;
-            pct_buf[1] = lo;
-            pct_buf[2] = b'%';
-            core::str::from_utf8(&pct_buf[..3]).unwrap_or("?%")
-        } else {
-            let lo = digits as u8 + b'0';
-            pct_buf[0] = lo;
-            pct_buf[1] = b'%';
-            core::str::from_utf8(&pct_buf[..2]).unwrap_or("?%")
-        };
-        s
-    };
+    let pct_val = format_u32(&mut pct_buf, level as u32);
+    // Append "%" to the number string in a small stack buffer
+    let mut pct_full_buf = [0u8; 8];
+    let pct_len = pct_val.len();
+    pct_full_buf[..pct_len].copy_from_slice(pct_val.as_bytes());
+    pct_full_buf[pct_len] = b'%';
+    let pct_str = core::str::from_utf8(&pct_full_buf[..pct_len + 1]).unwrap_or("?%");
     let pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
     let _ = Text::new(pct_str, Point::new(px + pw / 2 - 10, py + 54), pct_style).draw(fb);
 

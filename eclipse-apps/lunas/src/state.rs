@@ -1788,4 +1788,53 @@ mod tests {
         assert_eq!(state.history_pos, 1);
         assert_eq!(state.cpu_history[0], 99.0, "oldest entry should be overwritten");
     }
+
+    // ── Calendar navigation tests ──
+
+    #[test]
+    fn test_calendar_nav_prev() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.input.calendar_month_offset, 0);
+        state.input.pending_context_action = ContextAction::CalendarPrev;
+        let _ = state.update();
+        assert_eq!(state.input.calendar_month_offset, -1, "CalendarPrev should decrement offset");
+    }
+
+    #[test]
+    fn test_calendar_nav_next() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        state.input.pending_context_action = ContextAction::CalendarNext;
+        let _ = state.update();
+        assert_eq!(state.input.calendar_month_offset, 1, "CalendarNext should increment offset");
+    }
+
+    #[test]
+    fn test_calendar_nav_clamped() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        // Navigate 30 months back — should clamp at -24
+        for _ in 0..30 {
+            state.input.pending_context_action = ContextAction::CalendarPrev;
+            let _ = state.update();
+        }
+        assert_eq!(state.input.calendar_month_offset, -24, "Calendar offset should clamp at -24");
+    }
+
+    // ── DismissNotification action tests ──
+
+    #[test]
+    fn test_dismiss_notification_via_action() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        // LunasState::new() adds a welcome notification, so start from that known state
+        let initial_count = state.desktop.notification_count;
+        state.desktop.push_notification("test-msg", 1);
+        assert_eq!(state.desktop.notification_count, initial_count + 1);
+        // Dismiss index 0 (the oldest / welcome notification)
+        state.input.pending_context_action = ContextAction::DismissNotification(0);
+        let _ = state.update();
+        assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
+    }
 }

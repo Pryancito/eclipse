@@ -368,4 +368,47 @@ mod tests {
         shell.unpin_app(10);
         assert_eq!(shell.pinned_count, 5);
     }
+
+    // ── Notification dismiss tests ──
+
+    #[test]
+    fn test_dismiss_notification_first() {
+        let mut shell = DesktopShell::new();
+        shell.push_notification("first", 1);
+        shell.push_notification("second", 1);
+        shell.push_notification("third", 1);
+        assert_eq!(shell.notification_count, 3);
+        shell.dismiss_notification(0);
+        assert_eq!(shell.notification_count, 2);
+        assert_eq!(shell.notifications[0].message_str(), "second");
+        assert_eq!(shell.notifications[1].message_str(), "third");
+    }
+
+    #[test]
+    fn test_dismiss_notification_last() {
+        let mut shell = DesktopShell::new();
+        shell.push_notification("alpha", 1);
+        shell.push_notification("beta", 1);
+        shell.dismiss_notification(1);
+        assert_eq!(shell.notification_count, 1);
+        assert_eq!(shell.notifications[0].message_str(), "alpha");
+    }
+
+    #[test]
+    fn test_dismiss_notification_out_of_range() {
+        let mut shell = DesktopShell::new();
+        shell.push_notification("only", 1);
+        shell.dismiss_notification(5); // out-of-range — should do nothing
+        assert_eq!(shell.notification_count, 1);
+    }
+
+    #[test]
+    fn test_dismiss_all_notifications() {
+        let mut shell = DesktopShell::new();
+        shell.push_notification("a", 1);
+        shell.push_notification("b", 1);
+        shell.dismiss_notification(0);
+        shell.dismiss_notification(0);
+        assert_eq!(shell.notification_count, 0);
+    }
 }
