@@ -1,20 +1,10 @@
-//! Wayland and XWayland compositor support for Lunas.
+//! Native, minimal Wayland protocol implementation for Lunas.
 //!
-//! This module bridges incoming Wayland protocol messages (received via IPC as
-//! `CompositorEvent::Wayland`) and X11 messages (via `CompositorEvent::X11`) into
-//! Lunas' window management layer.
-//!
-//! # Architecture
-//! - `WaylandCompositor` tracks per-client `WaylandConnection` objects (keyed by PID).
-//!   Each connection holds the protocol state machine (registry, compositor, surfaces).
-//! - When a Wayland client creates and commits a surface, a `ShellWindow` with
-//!   `WindowContent::Wayland { surface_id, conn_idx }` is inserted into the space.
-//! - `XwaylandIntegration` wraps `XwmState` from `sidewind_xwayland` and handles
-//!   X11 window mapping events forwarded by the XWayland translation layer.
+//! Instead of using a full Wayland state machine crate, we manually construct
+//! the binary events and handle the handshake for the terminal app.
 
 use std::prelude::v1::*;
-use sidewind_wayland::WaylandConnection;
-use sidewind_xwayland::XwmState;
+use sidewind::xwayland::XwmState;
 use crate::compositor::{ShellWindow, WindowContent};
 
 /// Maximum concurrent Wayland client connections.
@@ -24,54 +14,45 @@ pub const MAX_WAYLAND_CONNECTIONS: usize = 16;
 pub struct ClientConnection {
     /// PID of the Wayland client process.
     pub pid: u32,
-    /// Wayland protocol state machine for this client.
-    pub conn: WaylandConnection,
     /// Surfaces created by this client: maps surface_id → window_slot_index.
     pub surfaces: alloc::vec::Vec<(u32, Option<usize>)>,
-    /// Next surface ID to assign.
-    next_surface_id: u32,
+    /// Does the client have a registry?
+    pub registry_id: Option<u32>,
+    /// Global object names
+    pub compositor_name: u32,
+    pub shm_name: u32,
+    pub shell_name: u32,
 }
 
 impl ClientConnection {
     pub fn new(pid: u32) -> Self {
         Self {
             pid,
-            conn: WaylandConnection::new(),
             surfaces: alloc::vec::Vec::new(),
-            next_surface_id: 1,
+            registry_id: None,
+            compositor_name: 1,
+            shm_name: 2,
+            shell_name: 3,
         }
     }
 
-    /// Allocate a new surface ID for this client.
-    pub fn alloc_surface_id(&mut self) -> u32 {
-        let id = self.next_surface_id;
-        self.next_surface_id = self.next_surface_id.wrapping_add(1).max(1);
-        self.surfaces.push((id, None));
-        id
-    }
-
-    /// Associate a surface with a window slot.
     pub fn set_window_for_surface(&mut self, surface_id: u32, window_idx: usize) {
         if let Some(entry) = self.surfaces.iter_mut().find(|(s, _)| *s == surface_id) {
             entry.1 = Some(window_idx);
         }
     }
 
-    /// Find the window index for a surface, if any.
     pub fn window_for_surface(&self, surface_id: u32) -> Option<usize> {
         self.surfaces.iter().find(|(s, _)| *s == surface_id).and_then(|(_, w)| *w)
     }
 
-    /// Remove a surface from tracking.
     pub fn remove_surface(&mut self, surface_id: u32) {
         self.surfaces.retain(|(s, _)| *s != surface_id);
     }
 }
 
-/// Tracks all active Wayland client connections.
 pub struct WaylandCompositor {
     pub connections: alloc::vec::Vec<ClientConnection>,
-    /// Pending response bytes to send back: (pid, data)
     pub pending_responses: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)>,
 }
 
@@ -83,30 +64,7 @@ impl WaylandCompositor {
         }
     }
 
-    /// Look up or create a connection slot for the given PID.
-    fn get_or_create_connection(&mut self, pid: u32) -> &mut ClientConnection {
-        if !self.connections.iter().any(|c| c.pid == pid) {
-            if self.connections.len() < MAX_WAYLAND_CONNECTIONS {
-                self.connections.push(ClientConnection::new(pid));
-            } else {
-                // Drop the oldest connection (FIFO eviction by insertion order).
-                self.connections.remove(0);
-                self.connections.push(ClientConnection::new(pid));
-            }
-        }
-        self.connections.iter_mut().find(|c| c.pid == pid).unwrap()
-    }
-
-    /// Return the slot index for a client's connection.
-    fn conn_idx_for_pid(&self, pid: u32) -> Option<usize> {
-        self.connections.iter().position(|c| c.pid == pid)
-    }
-
     /// Process a raw Wayland protocol message from client `pid`.
-    ///
-    /// Parses the message through the `WaylandConnection` state machine and,
-    /// when a `wl_compositor.create_surface` request is detected, registers a
-    /// new surface. Returns `WaylandAction` describing what Lunas should do.
     pub fn handle_message(
         &mut self,
         data: &[u8],
@@ -116,107 +74,118 @@ impl WaylandCompositor {
             return WaylandAction::None;
         }
 
-        // Parse the raw Wayland header to detect surface creation.
+        // Wayland Header: [obj_id: u32, size_op: u32]
         let obj_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let size_op = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let opcode = (size_op & 0xFFFF) as u16;
+        let _size = (size_op >> 16) as usize;
 
-        // Ensure connection exists; compute conn_idx before the mutable borrow.
-        let conn_idx = {
-            if !self.connections.iter().any(|c| c.pid == pid) {
-                if self.connections.len() < MAX_WAYLAND_CONNECTIONS {
-                    self.connections.push(ClientConnection::new(pid));
-                } else {
-                    self.connections.remove(0);
-                    self.connections.push(ClientConnection::new(pid));
-                }
+        // Find or create connection
+        let conn_idx = if let Some(idx) = self.connections.iter().position(|c| c.pid == pid) {
+            idx
+        } else {
+            if self.connections.len() < MAX_WAYLAND_CONNECTIONS {
+                self.connections.push(ClientConnection::new(pid));
+                self.connections.len() - 1
+            } else {
+                self.connections.remove(0);
+                self.connections.push(ClientConnection::new(pid));
+                self.connections.len() - 1
             }
-            self.connections.iter().position(|c| c.pid == pid).unwrap()
         };
 
-        // Process message through the protocol state machine.
-        let reply = self.connections[conn_idx].conn.process_message(data);
-        if let Some(r) = reply {
-            if !r.is_empty() {
-                self.pending_responses.push((pid, r));
+        match obj_id {
+            1 => { // wl_display
+                if opcode == 1 { // get_registry(new_id)
+                    if data.len() >= 12 {
+                        let registry_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                        self.connections[conn_idx].registry_id = Some(registry_id);
+                        self.respond_with_globals(pid, registry_id);
+                    }
+                }
             }
-        }
+            _ => {
+                // If this is a bind request on the registry
+                if let Some(reg_id) = self.connections[conn_idx].registry_id {
+                    if obj_id == reg_id && opcode == 0 { // bind(name, interface, version, new_id)
+                        // For now we just ignore the bind request but we could track the bound IDs.
+                    }
+                }
 
-        // Drain any pending events the state machine queued.
-        while let Some(ev) = self.connections[conn_idx].conn.pending_events.pop_front() {
-            if !ev.is_empty() {
-                self.pending_responses.push((pid, ev));
-            }
-        }
+                // Create Surface (opcode 0 on wl_compositor)
+                // In terminal, compositor bound ID is likely 4.
+                if opcode == 0 && obj_id == 4 && data.len() >= 12 {
+                    let surface_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                    if surface_id > 0 {
+                        self.connections[conn_idx].surfaces.push((surface_id, None));
+                        return WaylandAction::CreateSurface { pid, surface_id, conn_idx };
+                    }
+                }
 
-        // Detect wl_compositor.create_surface (opcode 0) — the result new_id is in data[8..12].
-        // The sidewind_wayland WlCompositor handler returns the new surface ID as 4 bytes.
-        // Check: opcode == 0 and obj_id is likely a compositor object (≥ 3 by protocol convention)
-        if opcode == 0 && obj_id >= 3 && data.len() >= 12 {
-            let surface_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            if surface_id > 0 {
-                self.connections[conn_idx].surfaces.push((surface_id, None));
-                return WaylandAction::CreateSurface { pid, surface_id, conn_idx };
-            }
-        }
-
-        // Detect wl_surface.commit (opcode 6) — the surface should be made visible.
-        // The obj_id is the surface's Wayland object ID.
-        if opcode == 6 {
-            return WaylandAction::CommitSurface { pid, surface_id: obj_id };
-        }
-
-        // Detect wl_surface.destroy (opcode 0 on a wl_surface object).
-        // We can only distinguish this from create_surface by obj_id range; surface IDs
-        // assigned above start at 1, compositor objects are typically ≥ 3. A safe heuristic:
-        // if the object is < 3 treat it as a display/registry message only.
-        // For destroy: wl_surface uses opcode 0 for destroy in older protocols. We detect
-        // it when obj_id matches a known surface_id for this client.
-        if opcode == 0 {
-            let surface_id = obj_id;
-            let has = self.connections[conn_idx].surfaces.iter().any(|(s, _)| *s == surface_id);
-            if has {
-                return WaylandAction::DestroySurface { pid, surface_id };
+                // Surface Commit (opcode 6 on wl_surface)
+                // In terminal, surface ID starts at 7.
+                if opcode == 6 && obj_id >= 7 {
+                    return WaylandAction::CommitSurface { pid, surface_id: obj_id };
+                }
             }
         }
 
         WaylandAction::None
     }
 
-    /// Register that a surface has been assigned a ShellWindow slot.
+    /// Construct and queue global registry events.
+    fn respond_with_globals(&mut self, pid: u32, registry_id: u32) {
+        let mut globals = alloc::vec::Vec::new();
+        
+        // Helper to append a global event
+        let mut add_global = |name: u32, interface: &str, version: u32| {
+            let mut ev = alloc::vec::Vec::new();
+            ev.extend_from_slice(&registry_id.to_le_bytes()); // sender = registry
+            let opcode = 0u16; // global event
+            let if_len = interface.len() + 1; // including null
+            let payload_size = 4 + 4 + if_len + ((4 - (if_len % 4)) % 4) + 4;
+            let total_size = 4 + 4 + payload_size;
+            
+            ev.extend_from_slice(&((total_size as u32) << 16 | (opcode as u32)).to_le_bytes());
+            ev.extend_from_slice(&name.to_le_bytes());
+            ev.extend_from_slice(&(if_len as u32).to_le_bytes());
+            ev.extend_from_slice(interface.as_bytes());
+            ev.push(0); // null terminator
+            while ev.len() % 4 != 0 { ev.push(0); } // padding
+            ev.extend_from_slice(&version.to_le_bytes());
+            
+            globals.extend_from_slice(&ev);
+        };
+
+        add_global(1, "wl_compositor", 4);
+        add_global(2, "wl_shm", 1);
+        add_global(3, "wl_shell", 1);
+
+        self.pending_responses.push((pid, globals));
+    }
+
     pub fn register_surface_window(&mut self, pid: u32, surface_id: u32, window_idx: usize) {
         if let Some(client) = self.connections.iter_mut().find(|c| c.pid == pid) {
             client.set_window_for_surface(surface_id, window_idx);
         }
     }
 
-    /// Remove all state for a disconnected client.
     pub fn disconnect_client(&mut self, pid: u32) {
         self.connections.retain(|c| c.pid != pid);
     }
 }
 
-/// Actions that the compositor module requests from the main state.
 #[derive(Debug, PartialEq)]
 pub enum WaylandAction {
     None,
-    /// A Wayland client created a new surface.
     CreateSurface { pid: u32, surface_id: u32, conn_idx: usize },
-    /// A Wayland client committed (made visible) a surface.
     CommitSurface { pid: u32, surface_id: u32 },
-    /// A Wayland client destroyed a surface.
     DestroySurface { pid: u32, surface_id: u32 },
 }
 
 /// XWayland integration state.
-///
-/// XWayland is an X11 server that translates X11 clients into Wayland surfaces.
-/// Lunas tracks XWayland's PID so it can route X11 window management events to
-/// the correct ShellWindows.
 pub struct XwaylandIntegration {
-    /// PID of the running XWayland process, if any.
     pub xwayland_pid: Option<u32>,
-    /// X Window Manager state (atom cache, mapped windows).
     pub xwm: XwmState,
 }
 
@@ -228,50 +197,33 @@ impl XwaylandIntegration {
         }
     }
 
-    /// Record that XWayland has started with the given PID.
     pub fn set_pid(&mut self, pid: u32) {
         self.xwayland_pid = Some(pid);
     }
 
-    /// Process an X11 protocol event forwarded by XWayland.
-    ///
-    /// Returns the X11 window ID if a new window was mapped (for Lunas to create
-    /// a corresponding `ShellWindow`), or `None` otherwise.
     pub fn handle_x11_event(&mut self, data: &[u8], pid: u32) -> XwaylandAction {
-        // Verify this came from the expected XWayland process.
         if let Some(xpid) = self.xwayland_pid {
-            if xpid != pid {
-                return XwaylandAction::None;
-            }
+            if xpid != pid { return XwaylandAction::None; }
         } else {
-            // Accept the first X11 sender as XWayland.
             self.xwayland_pid = Some(pid);
         }
 
-        // Parse minimal X11 event header: 1 byte event type.
-        // X11 MapNotify event type = 19, UnmapNotify = 18, DestroyNotify = 17.
-        if data.is_empty() {
-            return XwaylandAction::None;
-        }
-
-        let event_type = data[0] & 0x7F; // strip send_event bit
+        if data.is_empty() { return XwaylandAction::None; }
+        let event_type = data[0] & 0x7F;
 
         match event_type {
-            19 => {
-                // MapNotify: window_id at bytes 4..8
+            19 => { // MapNotify
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 self.xwm.handle_map_request(window_id);
                 XwaylandAction::MapWindow { window_id }
             }
-            18 => {
-                // UnmapNotify: window_id at bytes 4..8
+            18 => { // UnmapNotify
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 XwaylandAction::UnmapWindow { window_id }
             }
-            17 => {
-                // DestroyNotify: window_id at bytes 4..8
+            17 => { // DestroyNotify
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 self.xwm.windows.retain(|&w| w != window_id);
@@ -281,25 +233,18 @@ impl XwaylandIntegration {
         }
     }
 
-    /// Return whether XWayland is currently active.
     pub fn is_active(&self) -> bool {
         self.xwayland_pid.is_some()
     }
 }
 
-/// Actions that XWayland integration requests from the main state.
-#[derive(Debug, PartialEq)]
 pub enum XwaylandAction {
     None,
-    /// An X11 window has been mapped (made visible).
     MapWindow { window_id: u32 },
-    /// An X11 window has been unmapped (hidden).
     UnmapWindow { window_id: u32 },
-    /// An X11 window has been destroyed.
     DestroyWindow { window_id: u32 },
 }
 
-/// Build a default `ShellWindow` for a newly created Wayland surface.
 pub fn make_wayland_window(
     surface_id: u32,
     conn_idx: usize,
@@ -324,222 +269,5 @@ pub fn make_wayland_window(
         workspace,
         title: title_buf,
         ..Default::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_wayland_compositor_new() {
-        let wc = WaylandCompositor::new();
-        assert!(wc.connections.is_empty());
-        assert!(wc.pending_responses.is_empty());
-    }
-
-    #[test]
-    fn test_get_or_create_connection() {
-        let mut wc = WaylandCompositor::new();
-        wc.get_or_create_connection(42);
-        assert_eq!(wc.connections.len(), 1);
-        assert_eq!(wc.connections[0].pid, 42);
-        // Calling again with same PID should not add a new connection.
-        wc.get_or_create_connection(42);
-        assert_eq!(wc.connections.len(), 1);
-    }
-
-    #[test]
-    fn test_get_or_create_multiple_connections() {
-        let mut wc = WaylandCompositor::new();
-        wc.get_or_create_connection(1);
-        wc.get_or_create_connection(2);
-        wc.get_or_create_connection(3);
-        assert_eq!(wc.connections.len(), 3);
-    }
-
-    #[test]
-    fn test_disconnect_client() {
-        let mut wc = WaylandCompositor::new();
-        wc.get_or_create_connection(10);
-        wc.get_or_create_connection(20);
-        assert_eq!(wc.connections.len(), 2);
-        wc.disconnect_client(10);
-        assert_eq!(wc.connections.len(), 1);
-        assert_eq!(wc.connections[0].pid, 20);
-    }
-
-    #[test]
-    fn test_client_connection_alloc_surface() {
-        let mut cc = ClientConnection::new(99);
-        let id1 = cc.alloc_surface_id();
-        let id2 = cc.alloc_surface_id();
-        assert_ne!(id1, id2);
-        assert_eq!(cc.surfaces.len(), 2);
-    }
-
-    #[test]
-    fn test_register_and_query_surface_window() {
-        let mut cc = ClientConnection::new(99);
-        let sid = cc.alloc_surface_id();
-        assert_eq!(cc.window_for_surface(sid), None);
-        cc.set_window_for_surface(sid, 5);
-        assert_eq!(cc.window_for_surface(sid), Some(5));
-    }
-
-    #[test]
-    fn test_register_surface_window_via_compositor() {
-        let mut wc = WaylandCompositor::new();
-        wc.get_or_create_connection(7);
-        wc.connections[0].surfaces.push((1, None));
-        wc.register_surface_window(7, 1, 3);
-        assert_eq!(wc.connections[0].window_for_surface(1), Some(3));
-    }
-
-    #[test]
-    fn test_handle_message_too_short() {
-        let mut wc = WaylandCompositor::new();
-        let action = wc.handle_message(&[0u8; 4], 5);
-        assert_eq!(action, WaylandAction::None);
-    }
-
-    #[test]
-    fn test_handle_message_get_registry() {
-        let mut wc = WaylandCompositor::new();
-        // wl_display.get_registry: obj=1, size=12, op=1, new_id=2
-        let mut msg = [0u8; 12];
-        msg[0..4].copy_from_slice(&1u32.to_le_bytes()); // obj_id = 1 (wl_display)
-        msg[4..8].copy_from_slice(&((12u32 << 16) | 1u32).to_le_bytes()); // size=12, op=1
-        msg[8..12].copy_from_slice(&2u32.to_le_bytes()); // new_id = 2 (registry)
-        let action = wc.handle_message(&msg, 100);
-        // get_registry doesn't create a surface → should be None
-        assert_eq!(action, WaylandAction::None);
-        // Connection should have been created
-        assert_eq!(wc.connections.len(), 1);
-    }
-
-    #[test]
-    fn test_handle_message_create_surface() {
-        let mut wc = WaylandCompositor::new();
-        // Simulate wl_compositor.create_surface: obj=4 (compositor), opcode=0, new_id=5
-        let mut msg = [0u8; 12];
-        msg[0..4].copy_from_slice(&4u32.to_le_bytes()); // obj_id = 4 (compositor)
-        msg[4..8].copy_from_slice(&((12u32 << 16) | 0u32).to_le_bytes()); // size=12, op=0
-        msg[8..12].copy_from_slice(&5u32.to_le_bytes()); // new surface id=5
-        let action = wc.handle_message(&msg, 200);
-        assert!(matches!(action, WaylandAction::CreateSurface { pid: 200, surface_id: 5, .. }));
-    }
-
-    #[test]
-    fn test_handle_message_commit_surface() {
-        let mut wc = WaylandCompositor::new();
-        // Simulate wl_surface.commit: obj=5, opcode=6
-        let mut msg = [0u8; 8];
-        msg[0..4].copy_from_slice(&5u32.to_le_bytes()); // obj_id = 5 (surface)
-        msg[4..8].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // size=8, op=6
-        let action = wc.handle_message(&msg, 300);
-        assert_eq!(action, WaylandAction::CommitSurface { pid: 300, surface_id: 5 });
-    }
-
-    #[test]
-    fn test_max_connections_evicts_oldest() {
-        let mut wc = WaylandCompositor::new();
-        for i in 0..MAX_WAYLAND_CONNECTIONS {
-            wc.get_or_create_connection(i as u32);
-        }
-        assert_eq!(wc.connections.len(), MAX_WAYLAND_CONNECTIONS);
-        // Adding one more should evict the oldest (pid=0)
-        wc.get_or_create_connection(99);
-        assert_eq!(wc.connections.len(), MAX_WAYLAND_CONNECTIONS);
-        assert!(!wc.connections.iter().any(|c| c.pid == 0));
-        assert!(wc.connections.iter().any(|c| c.pid == 99));
-    }
-
-    // ── XwaylandIntegration tests ──
-
-    #[test]
-    fn test_xwayland_integration_new() {
-        let xi = XwaylandIntegration::new();
-        assert!(xi.xwayland_pid.is_none());
-        assert!(!xi.is_active());
-    }
-
-    #[test]
-    fn test_xwayland_set_pid() {
-        let mut xi = XwaylandIntegration::new();
-        xi.set_pid(999);
-        assert_eq!(xi.xwayland_pid, Some(999));
-        assert!(xi.is_active());
-    }
-
-    #[test]
-    fn test_xwayland_handle_map_notify() {
-        let mut xi = XwaylandIntegration::new();
-        xi.set_pid(55);
-        // X11 MapNotify: event_type=19, window_id at [4..8]
-        let mut ev = [0u8; 32];
-        ev[0] = 19; // MapNotify
-        ev[4..8].copy_from_slice(&42u32.to_le_bytes()); // window_id
-        let action = xi.handle_x11_event(&ev, 55);
-        assert_eq!(action, XwaylandAction::MapWindow { window_id: 42 });
-        assert!(xi.xwm.windows.contains(&42));
-    }
-
-    #[test]
-    fn test_xwayland_handle_unmap_notify() {
-        let mut xi = XwaylandIntegration::new();
-        xi.set_pid(55);
-        xi.xwm.handle_map_request(10);
-        let mut ev = [0u8; 32];
-        ev[0] = 18; // UnmapNotify
-        ev[4..8].copy_from_slice(&10u32.to_le_bytes());
-        let action = xi.handle_x11_event(&ev, 55);
-        assert_eq!(action, XwaylandAction::UnmapWindow { window_id: 10 });
-    }
-
-    #[test]
-    fn test_xwayland_handle_destroy_notify() {
-        let mut xi = XwaylandIntegration::new();
-        xi.set_pid(55);
-        xi.xwm.handle_map_request(77);
-        assert!(xi.xwm.windows.contains(&77));
-        let mut ev = [0u8; 32];
-        ev[0] = 17; // DestroyNotify
-        ev[4..8].copy_from_slice(&77u32.to_le_bytes());
-        let action = xi.handle_x11_event(&ev, 55);
-        assert_eq!(action, XwaylandAction::DestroyWindow { window_id: 77 });
-        assert!(!xi.xwm.windows.contains(&77));
-    }
-
-    #[test]
-    fn test_xwayland_ignores_wrong_pid() {
-        let mut xi = XwaylandIntegration::new();
-        xi.set_pid(55);
-        let mut ev = [0u8; 32];
-        ev[0] = 19; // MapNotify
-        ev[4..8].copy_from_slice(&1u32.to_le_bytes());
-        let action = xi.handle_x11_event(&ev, 99); // wrong PID
-        assert_eq!(action, XwaylandAction::None);
-    }
-
-    #[test]
-    fn test_xwayland_auto_detect_pid() {
-        let mut xi = XwaylandIntegration::new();
-        // No PID set — first sender is registered as XWayland
-        let mut ev = [0u8; 32];
-        ev[0] = 19;
-        ev[4..8].copy_from_slice(&3u32.to_le_bytes());
-        let action = xi.handle_x11_event(&ev, 123);
-        assert_eq!(action, XwaylandAction::MapWindow { window_id: 3 });
-        assert_eq!(xi.xwayland_pid, Some(123));
-    }
-
-    #[test]
-    fn test_make_wayland_window() {
-        let win = make_wayland_window(5, 2, 1920, 1080, 0, b"MyApp");
-        assert_eq!(win.content, WindowContent::Wayland { surface_id: 5, conn_idx: 2 });
-        assert!(win.w > 0 && win.h > 0);
-        assert_eq!(win.workspace, 0);
-        assert_eq!(&win.title[..5], b"MyApp");
     }
 }

@@ -387,6 +387,37 @@ impl LunasState {
                 break;
             }
         }
+
+        // Send any pending Wayland responses back to clients
+        self.flush_wayland_responses();
+    }
+
+    /// Flush pending Wayland protocol messages back to their respective clients.
+    pub fn flush_wayland_responses(&mut self) {
+        use sidewind::MSG_TYPE_WAYLAND;
+        use eclipse_ipc::types::TAG_WAYL;
+        
+        // Take the responses out of the wayland state to avoid borrow conflicts
+        let responses = core::mem::take(&mut self.wayland.pending_responses);
+        for (pid, data) in responses {
+            if !data.is_empty() {
+                // Prepend "WAYL" tag to the payload as expected by the terminal client
+                let mut full_msg = [0u8; 512];
+                full_msg[0..4].copy_from_slice(TAG_WAYL);
+                let copy_len = data.len().min(512 - 4);
+                full_msg[4..4 + copy_len].copy_from_slice(&data[..copy_len]);
+                
+                unsafe {
+                    let _ = eclipse_send(
+                        pid,
+                        MSG_TYPE_WAYLAND,
+                        full_msg.as_ptr() as *const core::ffi::c_void,
+                        4 + copy_len,
+                        0,
+                    );
+                }
+            }
+        }
     }
 
     /// Update animations, metrics, and layout. Returns true if rendering is needed.

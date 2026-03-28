@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "smithay_app",
     "sidewind",
     "sidewind_core",
     "wayland_handshake",
@@ -11,7 +10,7 @@ members = [
     "lunas",
     "terminal",
 ]
-exclude = ["libs/ipc_tests", "std_test"]
+exclude = ["libs/ipc_tests", "std_test", "smithay_app"]
 
 [workspace.package]
 version = "0.2.0"

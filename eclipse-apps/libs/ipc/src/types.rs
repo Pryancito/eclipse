@@ -151,7 +151,7 @@ pub enum EclipseMessage {
 
     /// Mensaje del protocolo Wayland (id: u32, size+op: u32, args...).
     /// Llega con prefijo "WAYL".
-    Wayland { data: [u8; MAX_MSG_LEN - 4], len: usize },
+    Wayland { data: [u8; MAX_MSG_LEN - 4], len: usize, from: u32 },
 
     /// Mensaje desconocido/raw (fallback para extensibilidad futura).
     Raw { data: [u8; MAX_MSG_LEN], len: usize, from: u32 },
@@ -267,7 +267,7 @@ mod impl_parse {
             let mut data = [0u8; MAX_MSG_LEN - 4];
             let payload_len = len.saturating_sub(4).min(MAX_MSG_LEN - 4);
             data[..payload_len].copy_from_slice(&buf[4..4 + payload_len]);
-            return Some(EclipseMessage::Wayland { data, len: payload_len });
+            return Some(EclipseMessage::Wayland { data, len: payload_len, from });
         }
         if from == 0 && len >= 4 && buf[0..4] == *TAG_KLOG {
             let mut line = [0u8; 252];

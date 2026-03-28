@@ -88,11 +88,11 @@ impl IpcHandler {
                     let _ = v.extend_from_slice(&line[..len.min(252)]);
                     return Some(CompositorEvent::KernelLog(v));
                 }
-                Some(EclipseMessage::Wayland { data, len }) => {
+                Some(EclipseMessage::Wayland { data, len, from }) => {
                     self.message_count += 1;
                     let mut vec = heapless::Vec::new();
                     let _ = vec.extend_from_slice(&data[..len]);
-                    return Some(CompositorEvent::Wayland(vec, 0));
+                    return Some(CompositorEvent::Wayland(vec, from));
                 }
                 Some(_) => {
                     continue;
