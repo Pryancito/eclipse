@@ -138,6 +138,12 @@ pub enum ContextAction {
     TakeScreenshot,
     /// Mark all desktop notifications as read.
     MarkNotificationsRead,
+    /// Dismiss a single notification by index.
+    DismissNotification(usize),
+    /// Navigate the calendar to the previous month.
+    CalendarPrev,
+    /// Navigate the calendar to the next month.
+    CalendarNext,
     /// Toggle the launcher/app-drawer panel.
     ToggleLauncher,
     /// Lock the screen (activate lock screen overlay).
@@ -675,6 +681,8 @@ pub struct InputState {
     pub launcher_keyboard_index: Option<usize>,
     /// Whether the battery/power info panel is visible (toggled by clicking the battery icon).
     pub battery_panel_active: bool,
+    /// Offset from current month for calendar display (-1 = prev, 0 = this, +1 = next, etc).
+    pub calendar_month_offset: i8,
 }
 
 impl InputState {
@@ -739,6 +747,7 @@ impl InputState {
             notification_count: 0,
             launcher_keyboard_index: None,
             battery_panel_active: false,
+            calendar_month_offset: 0,
         }
     }
 
@@ -1531,12 +1540,30 @@ impl InputState {
                             if self.cursor_x >= cp_x && self.cursor_x < cp_x + CLOCK_PANEL_W
                                 && self.cursor_y >= cp_y && self.cursor_y < cp_y + CLOCK_PANEL_H
                             {
+                                // Calendar navigation arrows
+                                // Left arrow: px+4 to px+14, py+4 to py+18
+                                if self.cursor_x >= cp_x + 4 && self.cursor_x < cp_x + 14
+                                    && self.cursor_y >= cp_y + 4 && self.cursor_y < cp_y + 18
+                                {
+                                    self.pending_context_action = ContextAction::CalendarPrev;
+                                    dirty = true;
+                                    return dirty;
+                                }
+                                // Right arrow: px+pw-14 to px+pw-4, py+4 to py+18
+                                if self.cursor_x >= cp_x + CLOCK_PANEL_W - 14 && self.cursor_x < cp_x + CLOCK_PANEL_W - 4
+                                    && self.cursor_y >= cp_y + 4 && self.cursor_y < cp_y + 18
+                                {
+                                    self.pending_context_action = ContextAction::CalendarNext;
+                                    dirty = true;
+                                    return dirty;
+                                }
                                 // Clicked inside the calendar panel — do nothing (panel stays open)
                                 dirty = true;
                                 return dirty;
                             } else {
                                 // Clicked outside → close the calendar
                                 self.clock_panel_active = false;
+                                self.calendar_month_offset = 0;
                                 dirty = true;
                                 return dirty;
                             }
@@ -1705,6 +1732,21 @@ impl InputState {
                             if self.cursor_x >= panel_x && self.cursor_x < panel_x + panel_w
                                 && self.cursor_y >= panel_y && self.cursor_y < panel_y + panel_h
                             {
+                                // Check if user clicked a dismiss [×] button on a notification row
+                                let dnd_offset = if self.do_not_disturb { 54 } else { 50 };
+                                let items_start = panel_y + dnd_offset;
+                                for i in 0..8usize {
+                                    let row_y = items_start + i as i32 * 25;
+                                    let dismiss_x = panel_x + panel_w - 18;
+                                    let dismiss_y = row_y - 10;
+                                    if self.cursor_x >= dismiss_x && self.cursor_x < dismiss_x + 12
+                                        && self.cursor_y >= dismiss_y && self.cursor_y < dismiss_y + 12
+                                    {
+                                        self.pending_context_action = ContextAction::DismissNotification(i);
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                }
                                 // Clicked inside notification panel — mark read
                                 self.notifications_visible = false;
                                 self.notifications_mark_read = true;

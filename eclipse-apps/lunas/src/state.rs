@@ -790,6 +790,18 @@ impl LunasState {
                     self.desktop.mark_all_read();
                     self.dirty = true;
                 }
+                ContextAction::DismissNotification(idx) => {
+                    self.desktop.dismiss_notification(idx);
+                    self.dirty = true;
+                }
+                ContextAction::CalendarPrev => {
+                    self.input.calendar_month_offset = (self.input.calendar_month_offset - 1).max(-24);
+                    self.dirty = true;
+                }
+                ContextAction::CalendarNext => {
+                    self.input.calendar_month_offset = (self.input.calendar_month_offset + 1).min(24);
+                    self.dirty = true;
+                }
                 ContextAction::ToggleLauncher => {
                     self.input.launcher_active = !self.input.launcher_active;
                     self.dirty = true;

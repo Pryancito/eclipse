@@ -534,7 +534,7 @@ pub fn draw_desktop_shell(
     }
 
     if input.clock_panel_active {
-        draw_clock_panel(fb, desktop);
+        draw_clock_panel(fb, desktop, input.calendar_month_offset);
     }
 
     if input.context_menu.visible {
@@ -1990,6 +1990,18 @@ fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
         // Notification Icon (Bell)
         draw_raw_icon(fb, assets::NOTIFICATION_ICON, px + 8, notif_y - 12, 20, 20);
         let _ = Text::new(msg, Point::new(px + 32, notif_y), notif_style).draw(fb);
+
+        // Dismiss [×] button
+        let dismiss_x = px + panel_w - 18;
+        let dismiss_y = notif_y - 10;
+        let dismiss_bg = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(180, 40, 40))
+            .build();
+        let _ = Rectangle::new(Point::new(dismiss_x, dismiss_y), Size::new(12, 12))
+            .into_styled(dismiss_bg)
+            .draw(fb);
+        let dismiss_text = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+        let _ = Text::new("x", Point::new(dismiss_x + 3, dismiss_y + 10), dismiss_text).draw(fb);
     }
 
     if desktop.notification_count == 0 {
@@ -2063,6 +2075,15 @@ fn draw_quick_settings_panel(fb: &mut FramebufferState, desktop: &DesktopShell) 
     // Brightness row
     let br_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(130, 140, 170));
     let _ = Text::new("Brightness", Point::new(px + 10, py + 130), br_label_style).draw(fb);
+
+    // Brightness percentage label (right-aligned)
+    let mut bri_pct_buf = [0u8; 8];
+    let bri_pct_str = format_u32(&mut bri_pct_buf, desktop.brightness_level as u32);
+    let bri_pct_x = px + pw - 4 - (bri_pct_str.len() as i32 + 1) * 6;
+    let pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 200, 200));
+    let _ = Text::new(bri_pct_str, Point::new(bri_pct_x, py + 130), pct_style).draw(fb);
+    let _ = Text::new("%", Point::new(bri_pct_x + bri_pct_str.len() as i32 * 6, py + 130), pct_style).draw(fb);
+
     let bri_track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 38, 60)).build();
     let _ = Rectangle::new(Point::new(px + 10, py + 134), Size::new((pw - 20) as u32, 6))
         .into_styled(bri_track_style)
@@ -2074,10 +2095,24 @@ fn draw_quick_settings_panel(fb: &mut FramebufferState, desktop: &DesktopShell) 
             .into_styled(bri_fill_style)
             .draw(fb);
     }
+    // Brightness thumb knob
+    let bri_thumb_x = px + 10 + (bri_fill_w as i32) - 2;
+    let thumb_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
+    let _ = Rectangle::new(Point::new(bri_thumb_x.max(px + 10), py + 131), Size::new(4, 10))
+        .into_styled(thumb_style)
+        .draw(fb);
 
     // Volume row
     let vol_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(130, 140, 170));
     let _ = Text::new("Volume", Point::new(px + 10, py + 160), vol_label_style).draw(fb);
+
+    // Volume percentage label (right-aligned)
+    let mut vol_pct_buf = [0u8; 8];
+    let vol_pct_str = format_u32(&mut vol_pct_buf, desktop.volume_level as u32);
+    let vol_pct_x = px + pw - 4 - (vol_pct_str.len() as i32 + 1) * 6;
+    let _ = Text::new(vol_pct_str, Point::new(vol_pct_x, py + 160), pct_style).draw(fb);
+    let _ = Text::new("%", Point::new(vol_pct_x + vol_pct_str.len() as i32 * 6, py + 160), pct_style).draw(fb);
+
     let vol_track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 38, 60)).build();
     let _ = Rectangle::new(Point::new(px + 10, py + 164), Size::new((pw - 20) as u32, 6))
         .into_styled(vol_track_style)
@@ -2089,6 +2124,11 @@ fn draw_quick_settings_panel(fb: &mut FramebufferState, desktop: &DesktopShell) 
             .into_styled(vol_fill_style)
             .draw(fb);
     }
+    // Volume thumb knob
+    let vol_thumb_x = px + 10 + (vol_fill_w as i32) - 2;
+    let _ = Rectangle::new(Point::new(vol_thumb_x.max(px + 10), py + 161), Size::new(4, 10))
+        .into_styled(thumb_style)
+        .draw(fb);
 
     // Close hint
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
@@ -2643,6 +2683,7 @@ fn month_name(m: u8) -> &'static str {
 pub fn draw_clock_panel(
     fb: &mut FramebufferState,
     desktop: &crate::desktop::DesktopShell,
+    calendar_offset: i8,
 ) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
@@ -2669,15 +2710,30 @@ pub fn draw_clock_panel(
         .into_styled(border_style)
         .draw(fb);
 
-    // Header: "Mon Mar 2026"
+    // Apply month offset to get display month/year
+    let (disp_month, disp_year) = {
+        let mut m = desktop.clock_month as i32;
+        let mut y = desktop.clock_year as i32;
+        m += calendar_offset as i32;
+        while m < 1 { m += 12; y -= 1; }
+        while m > 12 { m -= 12; y += 1; }
+        (m as u32, y as u32)
+    };
+
+    // Navigation arrows
+    let arrow_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 140, 200));
+    let _ = Text::new("<", Point::new(px + 4, py + 14), arrow_style).draw(fb);
+    let _ = Text::new(">", Point::new(px + pw - 14, py + 14), arrow_style).draw(fb);
+
+    // Header: "MMM YYYY"
     let header_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
-    let mon_name = month_name(desktop.clock_month);
+    let mon_name = month_name(disp_month as u8);
     // Build "MMM YYYY" header in a stack buffer
     let mut hbuf = [0u8; 12];
     let mname_bytes = mon_name.as_bytes();
     hbuf[..3].copy_from_slice(&mname_bytes[..3]);
     hbuf[3] = b' ';
-    let y = desktop.clock_year as u32;
+    let y = disp_year;
     hbuf[4] = b'0' + ((y / 1000) % 10) as u8;
     hbuf[5] = b'0' + ((y / 100) % 10) as u8;
     hbuf[6] = b'0' + ((y / 10) % 10) as u8;
@@ -2699,8 +2755,8 @@ pub fn draw_clock_panel(
         .fill_color(Rgb888::new(0, 60, 120))
         .build();
 
-    let m = desktop.clock_month as u32;
-    let y = desktop.clock_year as u32;
+    let m = disp_month;
+    let y = disp_year;
     let total_days = days_in_month(m, y);
     // day_of_week returns 0=Sun,1=Mon…6=Sat; we want 0=Mon … 6=Sun
     let first_dow_sun = day_of_week(y, m, 1); // 0=Sun
@@ -2713,7 +2769,8 @@ pub fn draw_clock_panel(
         let cell_x = px + 4 + col as i32 * 23;
         let cell_y = py + 42 + row * 14;
 
-        if day == desktop.clock_day as u32 {
+        // Only highlight today if viewing the current month
+        if calendar_offset == 0 && day == desktop.clock_day as u32 {
             // Highlight today
             let _ = Rectangle::new(Point::new(cell_x - 1, cell_y - 10), Size::new(18, 13))
                 .into_styled(today_bg_style)

@@ -10,7 +10,7 @@ pub const MAX_NOTIFICATIONS: usize = 16;
 pub const MAX_PINNED_APPS: usize = 8;
 
 /// A desktop notification.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Notification {
     pub message: [u8; 64],
     pub priority: u8,
@@ -236,6 +236,15 @@ impl DesktopShell {
         for n in &mut self.notifications[..self.notification_count] {
             n.read = true;
         }
+    }
+
+    /// Remove a single notification by index, shifting the rest down.
+    pub fn dismiss_notification(&mut self, idx: usize) {
+        if idx >= self.notification_count { return; }
+        for i in idx..self.notification_count - 1 {
+            self.notifications[i] = self.notifications[i + 1];
+        }
+        self.notification_count -= 1;
     }
 }
 
