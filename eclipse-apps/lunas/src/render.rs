@@ -539,6 +539,10 @@ pub fn draw_desktop_shell(
         draw_quick_settings_panel(fb, desktop);
     }
 
+    if input.battery_panel_active {
+        draw_battery_panel(fb, desktop);
+    }
+
     // 5. Draw cursor
     draw_cursor(fb, input.cursor_x, input.cursor_y);
 
@@ -1600,8 +1604,8 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
     }
 
     // Render pinned apps from desktop (filtered by search query if active)
-    let app_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
     let hovered_launcher = input.launcher_hovered_index;
+    let keyboard_launcher = input.launcher_keyboard_index;
 
     let mut visible_idx: i32 = 0;
     for i in 0..desktop.pinned_count {
@@ -1620,9 +1624,22 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
         let app_y = py + LAUNCHER_ITEMS_Y_OFFSET + visible_idx * LAUNCHER_ITEM_H;
         let (r, g, b) = app.icon_color;
 
-        // Hover highlight
+        // Keyboard selection highlight (brighter accent border) or mouse hover highlight
+        let is_keyboard_selected = keyboard_launcher == Some(i);
         let is_hovered = hovered_launcher == Some(i);
-        if is_hovered {
+        if is_keyboard_selected {
+            let sel_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(20, 50, 100))
+                .stroke_color(Rgb888::new(0, 140, 255))
+                .stroke_width(1)
+                .build();
+            let _ = Rectangle::new(
+                Point::new(px + 4, app_y - 10),
+                Size::new((panel_w - 8) as u32, LAUNCHER_ITEM_H as u32),
+            )
+            .into_styled(sel_style)
+            .draw(fb);
+        } else if is_hovered {
             let hover_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(30, 40, 70))
                 .build();
@@ -1659,8 +1676,14 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
             let _ = Text::new(char_str, Point::new(px + 18, app_y + 4), icon_letter_style).draw(fb);
         }
 
-        // App name
-        let _ = Text::new(app_name, Point::new(px + 44, app_y + 4), app_style).draw(fb);
+        // App name (bright when keyboard-selected)
+        let name_color = if is_keyboard_selected {
+            Rgb888::new(255, 255, 255)
+        } else {
+            Rgb888::new(200, 210, 230)
+        };
+        let name_style = MonoTextStyle::new(&FONT_6X12, name_color);
+        let _ = Text::new(app_name, Point::new(px + 44, app_y + 4), name_style).draw(fb);
 
         // Exec path hint (dim)
         let exec_str = app.exec_path_str();
@@ -1676,6 +1699,15 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
         let empty_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
         let _ = Text::new("No matching apps", Point::new(px + 80, py + 200), empty_style).draw(fb);
     }
+
+    // Keyboard navigation hint at the bottom of the launcher panel
+    let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(60, 70, 100));
+    let _ = Text::new(
+        "\x18\x19 sel  Enter launch  Esc close",
+        Point::new(px + 8, py + panel_h - 10),
+        hint_style,
+    )
+    .draw(fb);
 }
 
 /// Draw the search bar overlay.
@@ -1872,6 +1904,133 @@ fn draw_quick_settings_panel(fb: &mut FramebufferState, desktop: &DesktopShell) 
     // Close hint
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
     let _ = Text::new("Super+Q to close", Point::new(px + 30, py + ph - 10), hint_style).draw(fb);
+}
+
+/// Draw the battery/power info panel (toggled by clicking the battery tray icon).
+pub fn draw_battery_panel(fb: &mut FramebufferState, desktop: &DesktopShell) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let pw = 200i32;
+    let ph = 160i32;
+    // Positioned above the battery indicator in the tray (right side, above taskbar)
+    let px = fb_w - pw - 10;
+    let py = fb_h - TASKBAR_HEIGHT - ph - 5;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(18, 22, 40))
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 80, 180))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Title
+    let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let _ = Text::new("BATTERY", Point::new(px + 68, py + 16), title_style).draw(fb);
+
+    // Separator
+    let sep_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(40, 50, 80))
+        .build();
+    let _ = Rectangle::new(Point::new(px + 4, py + 22), Size::new((pw - 8) as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // Battery level bar
+    let level = desktop.battery_level.min(100) as u32;
+    let bar_w = (pw - 40) as u32;
+    let filled_w = bar_w * level / 100;
+
+    // Track
+    let track_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(30, 38, 60))
+        .stroke_color(Rgb888::new(60, 70, 110))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px + 20, py + 38), Size::new(bar_w, 22))
+        .into_styled(track_style)
+        .draw(fb);
+
+    // Fill colour: red < 20%, yellow < 50%, green otherwise
+    let fill_color = if level < 20 {
+        Rgb888::new(220, 40, 40)
+    } else if level < 50 {
+        Rgb888::new(220, 180, 40)
+    } else {
+        Rgb888::new(40, 200, 80)
+    };
+    if filled_w > 0 {
+        let fill_style = PrimitiveStyleBuilder::new().fill_color(fill_color).build();
+        let _ = Rectangle::new(Point::new(px + 20, py + 38), Size::new(filled_w, 22))
+            .into_styled(fill_style)
+            .draw(fb);
+    }
+
+    // Battery level percentage text
+    let mut pct_buf = [0u8; 8];
+    let pct_str = {
+        let digits = level;
+        let s = if digits == 100 {
+            "100%"
+        } else if digits >= 10 {
+            let hi = (digits / 10) as u8 + b'0';
+            let lo = (digits % 10) as u8 + b'0';
+            pct_buf[0] = hi;
+            pct_buf[1] = lo;
+            pct_buf[2] = b'%';
+            core::str::from_utf8(&pct_buf[..3]).unwrap_or("?%")
+        } else {
+            let lo = digits as u8 + b'0';
+            pct_buf[0] = lo;
+            pct_buf[1] = b'%';
+            core::str::from_utf8(&pct_buf[..2]).unwrap_or("?%")
+        };
+        s
+    };
+    let pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+    let _ = Text::new(pct_str, Point::new(px + pw / 2 - 10, py + 54), pct_style).draw(fb);
+
+    // Charging status
+    let charge_label = if desktop.battery_charging { "Charging" } else { "On Battery" };
+    let charge_color = if desktop.battery_charging {
+        Rgb888::new(80, 220, 120)
+    } else {
+        Rgb888::new(180, 180, 200)
+    };
+    let charge_style = MonoTextStyle::new(&FONT_6X12, charge_color);
+    let _ = Text::new(charge_label, Point::new(px + 10, py + 82), charge_style).draw(fb);
+
+    // Separator
+    let _ = Rectangle::new(Point::new(px + 4, py + 92), Size::new((pw - 8) as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // Brightness row (re-uses brightness from desktop)
+    let br_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(130, 140, 170));
+    let _ = Text::new("Brightness", Point::new(px + 10, py + 108), br_label_style).draw(fb);
+    let bri_track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 38, 60)).build();
+    let _ = Rectangle::new(Point::new(px + 10, py + 112), Size::new((pw - 20) as u32, 6))
+        .into_styled(bri_track_style)
+        .draw(fb);
+    let bri_fill_w = ((pw - 20) as u32 * desktop.brightness_level as u32) / 100;
+    if bri_fill_w > 0 {
+        let bri_fill_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 200, 80)).build();
+        let _ = Rectangle::new(Point::new(px + 10, py + 112), Size::new(bri_fill_w, 6))
+            .into_styled(bri_fill_style)
+            .draw(fb);
+    }
+
+    // Close hint
+    let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
+    let _ = Text::new("Click battery to close", Point::new(px + 12, py + ph - 10), hint_style).draw(fb);
 }
 
 /// Draw the mouse cursor.

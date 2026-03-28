@@ -794,6 +794,10 @@ impl LunasState {
                     self.input.current_workspace = ws;
                     self.dirty = true;
                 }
+                ContextAction::ToggleBatteryPanel => {
+                    self.input.battery_panel_active = !self.input.battery_panel_active;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -1705,5 +1709,22 @@ mod tests {
         assert_eq!(state.desktop.clock_year, 2026, "clock_year should be initialized");
         assert!(state.desktop.clock_day >= 1 && state.desktop.clock_day <= 31);
         assert!(state.desktop.clock_month >= 1 && state.desktop.clock_month <= 12);
+    }
+
+    #[test]
+    fn test_toggle_battery_panel_context_action() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.input.battery_panel_active, "battery panel should start closed");
+
+        // Dispatch ToggleBatteryPanel action
+        state.input.pending_context_action = ContextAction::ToggleBatteryPanel;
+        let _ = state.update();
+        assert!(state.input.battery_panel_active, "ToggleBatteryPanel should open the battery panel");
+
+        // Dispatch again to close
+        state.input.pending_context_action = ContextAction::ToggleBatteryPanel;
+        let _ = state.update();
+        assert!(!state.input.battery_panel_active, "second ToggleBatteryPanel should close the battery panel");
     }
 }
