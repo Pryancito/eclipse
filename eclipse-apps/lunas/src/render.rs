@@ -549,6 +549,10 @@ pub fn draw_desktop_shell(
         draw_battery_panel(fb, desktop);
     }
 
+    if input.net_config_active {
+        draw_network_config_panel(fb, input);
+    }
+
     // 5. Draw cursor
     draw_cursor(fb, input.cursor_x, input.cursor_y);
 
@@ -1803,6 +1807,11 @@ pub const CLOCK_PANEL_W: i32 = 168;
 /// Height of the clock/calendar panel.
 pub const CLOCK_PANEL_H: i32 = 128;
 
+/// Width of the network configuration panel.
+pub const NET_CONFIG_PANEL_W: i32 = 480;
+/// Height of the network configuration panel.
+pub const NET_CONFIG_PANEL_H: i32 = 290;
+
 /// Compute the launcher panel bounds (x, y, w, h) given the framebuffer height.
 pub fn launcher_panel_bounds(fb_height: i32) -> (i32, i32, i32, i32) {
     let py = fb_height - TASKBAR_HEIGHT - LAUNCHER_PANEL_H - 10;
@@ -2602,6 +2611,207 @@ fn draw_network_panel(
     // Close hint
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
     let _ = Text::new("Super+E to close", Point::new(px + 60, py + 246), hint_style).draw(fb);
+}
+
+/// Draw the network configuration panel (DHCP / Static IP settings).
+fn draw_network_config_panel(fb: &mut FramebufferState, input: &InputState) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let pw = NET_CONFIG_PANEL_W;
+    let ph = NET_CONFIG_PANEL_H;
+    // Centre the panel vertically above the taskbar
+    let px = (fb_w - pw) / 2;
+    let py = (fb_h - TASKBAR_HEIGHT - ph) / 2;
+
+    // Semi-transparent dark backdrop
+    let backdrop_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(5, 8, 20))
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(backdrop_style)
+        .draw(fb);
+
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 100, 220))
+        .stroke_width(2)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Title bar
+    let title_bar_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(10, 20, 50))
+        .build();
+    let _ = Rectangle::new(Point::new(px + 2, py + 2), Size::new((pw - 4) as u32, 22))
+        .into_styled(title_bar_style)
+        .draw(fb);
+    let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let _ = Text::new("CONFIGURACION DE RED", Point::new(px + 130, py + 16), title_style).draw(fb);
+
+    // Close [×] button at top-right
+    let close_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 80, 80));
+    let _ = Text::new("[x]", Point::new(px + pw - 24, py + 16), close_style).draw(fb);
+
+    // Separator below title
+    let sep_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(30, 45, 80))
+        .build();
+    let _ = Rectangle::new(Point::new(px + 4, py + 26), Size::new((pw - 8) as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // ── DHCP / Static toggle buttons ──
+    let btn_y = py + 34;
+    let btn_h: u32 = 22;
+
+    // DHCP button
+    let dhcp_active = !input.net_manual_mode;
+    let dhcp_fill = if dhcp_active { Rgb888::new(0, 90, 200) } else { Rgb888::new(20, 25, 50) };
+    let dhcp_stroke = if dhcp_active { Rgb888::new(0, 180, 255) } else { Rgb888::new(60, 70, 110) };
+    let dhcp_btn_style = PrimitiveStyleBuilder::new()
+        .fill_color(dhcp_fill)
+        .stroke_color(dhcp_stroke)
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px + 20, btn_y), Size::new(110, btn_h))
+        .into_styled(dhcp_btn_style)
+        .draw(fb);
+    let dhcp_text_color = if dhcp_active { Rgb888::new(0, 220, 255) } else { Rgb888::new(140, 150, 180) };
+    let dhcp_text_style = MonoTextStyle::new(&FONT_6X12, dhcp_text_color);
+    let _ = Text::new("DHCP (Auto)", Point::new(px + 30, btn_y + 15), dhcp_text_style).draw(fb);
+
+    // Static/Manual button
+    let static_active = input.net_manual_mode;
+    let static_fill = if static_active { Rgb888::new(0, 90, 200) } else { Rgb888::new(20, 25, 50) };
+    let static_stroke = if static_active { Rgb888::new(0, 180, 255) } else { Rgb888::new(60, 70, 110) };
+    let static_btn_style = PrimitiveStyleBuilder::new()
+        .fill_color(static_fill)
+        .stroke_color(static_stroke)
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px + 140, btn_y), Size::new(130, btn_h))
+        .into_styled(static_btn_style)
+        .draw(fb);
+    let static_text_color = if static_active { Rgb888::new(0, 220, 255) } else { Rgb888::new(140, 150, 180) };
+    let static_text_style = MonoTextStyle::new(&FONT_6X12, static_text_color);
+    let _ = Text::new("IP Estatica", Point::new(px + 155, btn_y + 15), static_text_style).draw(fb);
+
+    let label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 130, 180));
+    let value_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 200, 230));
+    let edit_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+
+    if !input.net_manual_mode {
+        // ── DHCP mode: show current config read-only ──
+        let info_y = py + 80;
+        let _ = Text::new("Modo:", Point::new(px + 16, info_y), label_style).draw(fb);
+        let _ = Text::new("DHCP — Direccion asignada automaticamente", Point::new(px + 80, info_y), value_style).draw(fb);
+
+        let cfg = &input.net_static_config;
+        let mut ip_buf = [0u8; 20];
+        let ip_len = format_ipv4(&mut ip_buf, &cfg.ipv4);
+        let _ = Text::new("IP actual:", Point::new(px + 16, info_y + 24), label_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("—"), Point::new(px + 110, info_y + 24), value_style).draw(fb);
+
+        let mut gw_buf = [0u8; 20];
+        let gw_len = format_ipv4(&mut gw_buf, &cfg.gateway_v4);
+        let _ = Text::new("Gateway:", Point::new(px + 16, info_y + 48), label_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&gw_buf[..gw_len]).unwrap_or("—"), Point::new(px + 110, info_y + 48), value_style).draw(fb);
+
+        let mut dns_buf = [0u8; 20];
+        let dns_len = format_ipv4(&mut dns_buf, &cfg.dns_v4);
+        let _ = Text::new("DNS:", Point::new(px + 16, info_y + 72), label_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&dns_buf[..dns_len]).unwrap_or("—"), Point::new(px + 110, info_y + 72), value_style).draw(fb);
+
+        // Renew IP button
+        let btn_x = px + pw / 2 - 80;
+        let btn_y2 = py + 200;
+        let renew_btn_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 80, 180))
+            .stroke_color(Rgb888::new(0, 160, 255))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(btn_x, btn_y2), Size::new(160, 28))
+            .into_styled(renew_btn_style)
+            .draw(fb);
+        let btn_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 255));
+        let _ = Text::new("Renovar IP (DHCP)", Point::new(btn_x + 14, btn_y2 + 18), btn_text_style).draw(fb);
+    } else {
+        // ── Static IP mode: editable form ──
+        let cfg = &input.net_static_config;
+
+        // Field labels and current values
+        let fields: [(&str, [u8; 4], bool); 4] = [
+            ("Direccion IP:", cfg.ipv4, true),
+            ("Mascara (/prefix):", [0, 0, 0, cfg.ipv4_prefix], false), // prefix special-cased below
+            ("Puerta de enlace:", cfg.gateway_v4, true),
+            ("DNS primario:", cfg.dns_v4, true),
+        ];
+
+        for (i, (label, raw_val, is_ipv4)) in fields.iter().enumerate() {
+            let fy = py + 80 + (i as i32 * 38);
+            let fid = (i as u8) + 1;
+            let is_editing = input.net_edit_field == fid;
+
+            let _ = Text::new(label, Point::new(px + 16, fy), label_style).draw(fb);
+
+            // Value box
+            let box_x = px + pw / 2 - 20;
+            let box_w: u32 = (pw / 2 + 10) as u32;
+            let box_style = PrimitiveStyleBuilder::new()
+                .stroke_color(if is_editing { Rgb888::new(0, 180, 255) } else { Rgb888::new(40, 55, 85) })
+                .stroke_width(if is_editing { 2 } else { 1 })
+                .build();
+            let _ = Rectangle::new(Point::new(box_x, fy - 14), Size::new(box_w, 20))
+                .into_styled(box_style)
+                .draw(fb);
+
+            // Value text (editing buffer or formatted value)
+            let style = if is_editing { edit_style } else { value_style };
+            if is_editing {
+                let buf_str = input.net_edit_buffer.as_str();
+                let _ = Text::new(buf_str, Point::new(box_x + 4, fy), style).draw(fb);
+                // Blinking cursor placeholder
+                let cursor_x = box_x + 4 + (buf_str.len() as i32) * 6;
+                let cursor_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 255));
+                let _ = Text::new("|", Point::new(cursor_x, fy), cursor_style).draw(fb);
+            } else if *is_ipv4 {
+                let mut vbuf = [0u8; 20];
+                let vlen = format_ipv4(&mut vbuf, raw_val);
+                let _ = Text::new(core::str::from_utf8(&vbuf[..vlen]).unwrap_or("?"), Point::new(box_x + 4, fy), style).draw(fb);
+            } else {
+                // Prefix field (stored in raw_val[3])
+                let mut pbuf = [0u8; 8];
+                let pstr = format_u32(&mut pbuf, raw_val[3] as u32);
+                let _ = Text::new(pstr, Point::new(box_x + 4, fy), style).draw(fb);
+            }
+
+            // Click hint
+            if !is_editing {
+                let hint = MonoTextStyle::new(&FONT_6X12, Rgb888::new(50, 65, 95));
+                let _ = Text::new("[click]", Point::new(box_x + box_w as i32 - 48, fy), hint).draw(fb);
+            }
+        }
+
+        // Apply button
+        let apply_x = px + pw / 2 - 80;
+        let apply_y = py + 242;
+        let apply_btn_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 120, 60))
+            .stroke_color(Rgb888::new(0, 220, 100))
+            .stroke_width(1)
+            .build();
+        let _ = Rectangle::new(Point::new(apply_x, apply_y), Size::new(160, 26))
+            .into_styled(apply_btn_style)
+            .draw(fb);
+        let apply_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 230, 110));
+        let _ = Text::new("Aplicar Cambios", Point::new(apply_x + 18, apply_y + 17), apply_text_style).draw(fb);
+    }
+
+    // Close hint at bottom
+    let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
+    let _ = Text::new("Esc para cerrar", Point::new(px + pw - 110, py + ph - 10), hint_style).draw(fb);
 }
 
 // ── Helper functions ──
