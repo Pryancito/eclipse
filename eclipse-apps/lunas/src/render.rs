@@ -248,6 +248,51 @@ impl FramebufferState {
         }
     }
 
+    /// Apply a warm tint (night light / blue-light filter) over the entire back buffer.
+    /// `strength` is 0-100, where 100 is the maximum blue reduction.
+    pub fn apply_night_light(&mut self, strength: u8) {
+        #[cfg(not(test))]
+        {
+            let pitch_px = self.info.pitch as usize / 4;
+            let ptr = self.back_addr as *mut u32;
+            let reduction = (strength as u32 * NIGHT_LIGHT_MAX_BLUE_REDUCTION) / 100;
+            let red_boost = (strength as u32 * NIGHT_LIGHT_RED_WARMTH) / 100;
+            for y in 0..self.info.height as usize {
+                for x in 0..self.info.width as usize {
+                    unsafe {
+                        let pixel = core::ptr::read_volatile(ptr.add(y * pitch_px + x));
+                        let r = (pixel >> 16) & 0xFF;
+                        let g = (pixel >> 8) & 0xFF;
+                        let b = pixel & 0xFF;
+                        let new_r = (r + red_boost).min(255);
+                        let new_b = b.saturating_sub(reduction);
+                        let new_pixel = (pixel & 0xFF000000) | (new_r << 16) | (g << 8) | new_b;
+                        core::ptr::write_volatile(ptr.add(y * pitch_px + x), new_pixel);
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        { let _ = strength; }
+    }
+
+    /// Save the current back buffer to /tmp/screenshot.raw on Eclipse targets.
+    #[cfg(target_vendor = "eclipse")]
+    pub fn save_screenshot(&self) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create("/tmp/screenshot.raw") {
+            let pitch = self.info.pitch as usize;
+            let h = self.info.height as usize;
+            let ptr = self.back_addr as *const u8;
+            for row in 0..h {
+                let row_slice = unsafe {
+                    core::slice::from_raw_parts(ptr.add(row * pitch), pitch)
+                };
+                let _ = f.write_all(row_slice);
+            }
+        }
+    }
+
     /// Blit an external surface buffer onto the back buffer.
     pub fn blit_buffer(&mut self, vaddr: usize, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32) {
         #[cfg(not(test))]
@@ -343,6 +388,71 @@ fn draw_raw_icon(fb: &mut FramebufferState, data: &[u8], x: i32, y: i32, w: u32,
 
 // ── Desktop Shell Rendering ──
 
+/// Pixels from screen edge at which a window drag activates a snap zone guide.
+const SNAP_EDGE_THRESHOLD: i32 = 20;
+
+/// Default night light filter strength (0-100). Applied when night light mode is active.
+const DEFAULT_NIGHT_LIGHT_STRENGTH: u8 = 60;
+
+/// Maximum reduction of the blue channel in the night light filter (0-255).
+const NIGHT_LIGHT_MAX_BLUE_REDUCTION: u32 = 160;
+
+/// Red warmth boost in the night light filter (0-255).
+const NIGHT_LIGHT_RED_WARMTH: u32 = 30;
+
+/// Draw semi-transparent snap zone guide rectangles when a window is being dragged.
+/// Shows visual guides for half-screen (left/right) and quarter-screen (corners) zones.
+fn draw_snap_guides(fb: &mut FramebufferState, input: &InputState) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let cx = input.cursor_x;
+    let cy = input.cursor_y;
+    let usable_h = fb_h - TASKBAR_HEIGHT;
+    let usable_half_h = usable_h / 2;
+
+    // Define snap zones with their trigger region and highlight rect.
+    // Each entry: (trigger condition, highlight x, y, w, h)
+    struct SnapZone { x: i32, y: i32, w: i32, h: i32 }
+
+    let edge_threshold = SNAP_EDGE_THRESHOLD;
+    let center_y = crate::compositor::ShellWindow::TITLE_H;
+
+    let zone: Option<SnapZone> = if cx < edge_threshold && cy < usable_half_h {
+        Some(SnapZone { x: 0, y: center_y, w: fb_w / 2, h: usable_half_h - center_y })
+    } else if cx >= fb_w - edge_threshold && cy < usable_half_h {
+        Some(SnapZone { x: fb_w / 2, y: center_y, w: fb_w / 2, h: usable_half_h - center_y })
+    } else if cx < edge_threshold && cy >= usable_half_h {
+        Some(SnapZone { x: 0, y: usable_half_h, w: fb_w / 2, h: usable_h - usable_half_h })
+    } else if cx >= fb_w - edge_threshold && cy >= usable_half_h {
+        Some(SnapZone { x: fb_w / 2, y: usable_half_h, w: fb_w / 2, h: usable_h - usable_half_h })
+    } else if cx < edge_threshold {
+        Some(SnapZone { x: 0, y: center_y, w: fb_w / 2, h: usable_h - center_y })
+    } else if cx >= fb_w - edge_threshold {
+        Some(SnapZone { x: fb_w / 2, y: center_y, w: fb_w / 2, h: usable_h - center_y })
+    } else if cy < edge_threshold {
+        Some(SnapZone { x: 0, y: center_y, w: fb_w, h: usable_h - center_y })
+    } else {
+        None
+    };
+
+    if let Some(z) = zone {
+        // Semi-transparent highlight (simulated with a dim filled rect + border)
+        let fill_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 60, 140))
+            .build();
+        let _ = Rectangle::new(Point::new(z.x, z.y), Size::new(z.w as u32, z.h as u32))
+            .into_styled(fill_style)
+            .draw(fb);
+        let border_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(0, 160, 255))
+            .stroke_width(2)
+            .build();
+        let _ = Rectangle::new(Point::new(z.x, z.y), Size::new(z.w as u32, z.h as u32))
+            .into_styled(border_style)
+            .draw(fb);
+    }
+}
+
 /// Draw the complete desktop shell (background, taskbar, windows, overlays).
 pub fn draw_desktop_shell(
     fb: &mut FramebufferState,
@@ -369,7 +479,7 @@ pub fn draw_desktop_shell(
     }
 
     // 2. Draw taskbar
-    draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage, net_usage);
+    draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
     for i in 0..window_count {
@@ -377,6 +487,11 @@ pub fn draw_desktop_shell(
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
         draw_window(fb, w, surfaces, input.focused_window == Some(i), input.window_decoration_style);
+    }
+
+    // 3.5. Draw snap zone guides when dragging a window near screen edges/corners
+    if input.dragging_window.is_some() {
+        draw_snap_guides(fb, input);
     }
 
     // 4. Draw overlays
@@ -420,8 +535,17 @@ pub fn draw_desktop_shell(
         draw_context_menu(fb, &input.context_menu);
     }
 
+    if input.quick_settings_active {
+        draw_quick_settings_panel(fb, desktop);
+    }
+
     // 5. Draw cursor
     draw_cursor(fb, input.cursor_x, input.cursor_y);
+
+    // 6. Apply night light filter last so it tints everything on screen.
+    if desktop.night_light_active {
+        fb.apply_night_light(DEFAULT_NIGHT_LIGHT_STRENGTH);
+    }
 }
 
 /// Taskbar height in pixels.
@@ -437,7 +561,7 @@ pub const TASKBAR_ICON_SPACING: i32 = 6;
 pub const TASKBAR_APPS_START_X: i32 = 160;
 
 /// Width of the system tray area on the right side.
-pub const TASKBAR_TRAY_WIDTH: i32 = 300;
+pub const TASKBAR_TRAY_WIDTH: i32 = 220;
 
 /// Maximum characters for a window task title before truncation.
 const TASK_TITLE_MAX_CHARS: usize = 16;
@@ -497,8 +621,6 @@ fn draw_taskbar(
     desktop: &DesktopShell,
     windows: &[ShellWindow],
     window_count: usize,
-    cpu_usage: f32,
-    mem_usage: f32,
     net_usage: f32,
 ) {
     let fb_w = fb.info.width as i32;
@@ -891,70 +1013,37 @@ fn draw_taskbar(
         .into_styled(sep_style)
         .draw(fb);
 
-    // CPU metric icon
-    draw_raw_icon(fb, assets::CPU_ICON, tray_x + 10, bar_y + 8, 24, 24);
-
-    // CPU & MEM mini progress bars stacked under CPU icon (46px wide)
-    let bar_x = tray_x + 10;
-    let bar_w_full = 46;
-    let track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(25, 30, 50)).build();
-
-    // CPU bar with background track
-    let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(bar_w_full as u32, 2))
-        .into_styled(track_style)
-        .draw(fb);
-    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * bar_w_full) / 100;
-    if cpu_bar_w > 0 {
-        let cpu_bar_color = if cpu_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(0, 140, 255) };
-        let cpu_bar_style = PrimitiveStyleBuilder::new().fill_color(cpu_bar_color).build();
-        let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(cpu_bar_w as u32, 2))
-            .into_styled(cpu_bar_style)
-            .draw(fb);
-    }
-
-    // MEM bar with background track
-    let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(bar_w_full as u32, 2))
-        .into_styled(track_style)
-        .draw(fb);
-    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * bar_w_full) / 100;
-    if mem_bar_w > 0 {
-        let mem_bar_color = if mem_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(50, 210, 120) };
-        let mem_bar_style = PrimitiveStyleBuilder::new().fill_color(mem_bar_color).build();
-        let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(mem_bar_w as u32, 2))
-            .into_styled(mem_bar_style)
-            .draw(fb);
-    }
-
-    // Tiling mode indicator — small "T" badge between MEM and notifications
+    // ── Tiling mode indicator "T" badge ──
     if input.tiling_active {
         let tiling_bg_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(0, 100, 50))
             .build();
-        let _ = Rectangle::new(Point::new(tray_x + 138, bar_y + 8), Size::new(14, 14))
+        let _ = Rectangle::new(Point::new(tray_x + 8, bar_y + 11), Size::new(14, 14))
             .into_styled(tiling_bg_style)
             .draw(fb);
         let tiling_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 220, 120));
-        let _ = Text::new("T", Point::new(tray_x + 140, bar_y + 19), tiling_text).draw(fb);
+        let _ = Text::new("T", Point::new(tray_x + 10, bar_y + 22), tiling_text).draw(fb);
     }
 
-    // Window decoration style badge — shown when not default (style > 0).
-    // Styles: 1 = "M" (minimal, grey), 2 = "N" (neon, cyan).
+    // ── Window decoration style badge "M"/"N" ──
     if input.window_decoration_style > 0 {
         let (style_char, style_color) = match input.window_decoration_style {
             1 => ("M", Rgb888::new(140, 150, 170)),
             _ => ("N", Rgb888::new(0, 240, 220)),
         };
         let deco_text = MonoTextStyle::new(&FONT_6X12, style_color);
-        let _ = Text::new(style_char, Point::new(tray_x + 126, bar_y + 19), deco_text).draw(fb);
+        let _ = Text::new(style_char, Point::new(tray_x + 26, bar_y + 22), deco_text).draw(fb);
     }
 
-    // Brightness mini-bar (24px wide) with a small "☀" glyph (represented as "*").
-    // Shown as a very thin 24×2px bar just above the tiling badge position.
+    // ── Brightness mini-bar (24px wide) with sun glyph ──
     {
         let bri = desktop.brightness_level.min(100) as i32;
-        let bri_bar_x = tray_x + 65; // Moved to where RAM icon was
+        let bri_bar_x = tray_x + 38;
         let bri_bar_w_full: i32 = 24;
         let bri_bar_w = (bri * bri_bar_w_full) / 100;
+        // Sun glyph above the bar
+        let sun_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(220, 200, 80));
+        let _ = Text::new("*", Point::new(bri_bar_x, bar_y + 20), sun_style).draw(fb);
         // Background track
         let bri_track_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(30, 38, 60))
@@ -973,14 +1062,24 @@ fn draw_taskbar(
         }
     }
 
-    // Notification bell indicator
+    // ── Notification bell indicator ──
     let notif_count = desktop.unread_count();
-    let notif_x = tray_x + 155;
-    if notif_count > 0 {
-        // Notification icon (Bell)
-        draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
-
-        // Badge with count
+    let notif_x = tray_x + 70;
+    draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
+    if desktop.do_not_disturb {
+        // DND active: red bars + "Z" label
+        let dnd_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(220, 60, 60))
+            .build();
+        let _ = Rectangle::new(Point::new(notif_x + 2, bar_y + 10), Size::new(18, 2))
+            .into_styled(dnd_style)
+            .draw(fb);
+        let _ = Rectangle::new(Point::new(notif_x + 2, bar_y + 15), Size::new(18, 2))
+            .into_styled(dnd_style)
+            .draw(fb);
+        let dnd_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(220, 60, 60));
+        let _ = Text::new("Z", Point::new(notif_x + 16, bar_y + 10), dnd_text).draw(fb);
+    } else if notif_count > 0 {
         let badge_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(220, 50, 50))
             .build();
@@ -991,19 +1090,27 @@ fn draw_taskbar(
         let mut nbuf = [0u8; 8];
         let nstr = format_u32(&mut nbuf, notif_count as u32);
         let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
-    } else {
-        // Quiet notification icon
-        draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
     }
 
-    // Volume indicator (mute-aware)
-    let vol_x = tray_x + 180;
-    // Volume icon
+    // ── Volume indicator ──
+    let vol_x = tray_x + 100;
     draw_raw_icon(fb, assets::VOLUME_ICON, vol_x - 4, bar_y + 8, 24, 24);
 
-    // Network icon
-    let net_x = tray_x + 205;
+    // ── Network icon ──
+    let net_x = tray_x + 126;
     draw_raw_icon(fb, assets::NETWORK_ICON, net_x, bar_y + 8, 24, 24);
+
+    // ── Night Light indicator: warm amber dot when active ──
+    if desktop.night_light_active {
+        let nl_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(255, 160, 40))
+            .build();
+        let _ = Circle::new(Point::new(tray_x + 150, bar_y + 14), 8)
+            .into_styled(nl_style)
+            .draw(fb);
+        let nl_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(15, 10, 0));
+        let _ = Text::new("N", Point::new(tray_x + 152, bar_y + 22), nl_text).draw(fb);
+    }
 
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
     let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
@@ -1443,10 +1550,12 @@ pub const VOLUME_PANEL_W: i32 = 180;
 /// Height of the volume popup panel.
 pub const VOLUME_PANEL_H: i32 = 100;
 
-/// Context menu item height.
+/// Context menu regular item height.
 pub const CONTEXT_MENU_ITEM_H: i32 = 28;
+/// Context menu separator height (thin visual divider).
+pub const CONTEXT_MENU_SEP_H: i32 = 8;
 /// Context menu width.
-pub const CONTEXT_MENU_W: i32 = 180;
+pub const CONTEXT_MENU_W: i32 = 200;
 
 /// Width of the clock/calendar panel.
 pub const CLOCK_PANEL_W: i32 = 168;
@@ -1626,16 +1735,39 @@ fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
     let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
     let _ = Text::new("NOTIFICATIONS", Point::new(px + 90, py + 24), title_style).draw(fb);
 
+    // DND status banner
+    if desktop.do_not_disturb {
+        let dnd_bg_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(60, 20, 20))
+            .build();
+        let _ = Rectangle::new(Point::new(px + 4, py + 30), Size::new((panel_w - 8) as u32, 14))
+            .into_styled(dnd_bg_style)
+            .draw(fb);
+        let dnd_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(220, 100, 100));
+        let _ = Text::new("Do Not Disturb is ON", Point::new(px + 42, py + 40), dnd_text).draw(fb);
+    }
+
     // Display notifications
     let notif_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
+    let items_start_y = if desktop.do_not_disturb { py + 54 } else { py + 50 };
     for i in 0..desktop.notification_count.min(8) {
         let notif = &desktop.notifications[i];
-        let notif_y = py + 50 + (i as i32) * 28;
+        let notif_y = items_start_y + (i as i32) * 25;
+        if notif_y + 12 > py + panel_h { break; }
         let msg_len = notif.message.iter().position(|&b| b == 0).unwrap_or(64);
         let msg = core::str::from_utf8(&notif.message[..msg_len]).unwrap_or("");
-        
+
+        // Unread indicator dot
+        if !notif.read {
+            let dot_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 140, 255))
+                .build();
+            let _ = Rectangle::new(Point::new(px + 6, notif_y - 8), Size::new(4, 4))
+                .into_styled(dot_style)
+                .draw(fb);
+        }
         // Notification Icon (Bell)
-        draw_raw_icon(fb, assets::NOTIFICATION_ICON, px + 8, notif_y - 14, 20, 20);
+        draw_raw_icon(fb, assets::NOTIFICATION_ICON, px + 8, notif_y - 12, 20, 20);
         let _ = Text::new(msg, Point::new(px + 32, notif_y), notif_style).draw(fb);
     }
 
@@ -1643,6 +1775,103 @@ fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
         let empty_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
         let _ = Text::new("No notifications", Point::new(px + 80, py + 130), empty_style).draw(fb);
     }
+}
+
+/// Draw the Quick Settings panel — a compact panel with common toggles.
+/// Accessible via Super+Q; positioned in the top-right above the tray.
+fn draw_quick_settings_panel(fb: &mut FramebufferState, desktop: &DesktopShell) {
+    let fb_w = fb.info.width as i32;
+    let fb_h = fb.info.height as i32;
+    let pw = 220i32;
+    let ph = 220i32;
+    let px = fb_w - pw - 10;
+    let py = fb_h - TASKBAR_HEIGHT - ph - 5;
+
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(18, 22, 40))
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+    // Border
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(Rgb888::new(0, 80, 180))
+        .stroke_width(1)
+        .build();
+    let _ = Rectangle::new(Point::new(px, py), Size::new(pw as u32, ph as u32))
+        .into_styled(border_style)
+        .draw(fb);
+
+    // Title
+    let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
+    let _ = Text::new("QUICK SETTINGS", Point::new(px + 42, py + 16), title_style).draw(fb);
+
+    // Separator
+    let sep_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(40, 50, 80))
+        .build();
+    let _ = Rectangle::new(Point::new(px + 4, py + 22), Size::new((pw - 8) as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // Helper closure to draw a toggle row
+    let draw_toggle = |fb: &mut FramebufferState, row_y: i32, label: &str, active: bool| {
+        // Toggle background pill
+        let pill_color = if active { Rgb888::new(0, 100, 200) } else { Rgb888::new(30, 36, 60) };
+        let pill_style = PrimitiveStyleBuilder::new().fill_color(pill_color).build();
+        let _ = Rectangle::new(Point::new(px + pw - 46, row_y), Size::new(36, 16))
+            .into_styled(pill_style)
+            .draw(fb);
+        // Toggle knob
+        let knob_x = if active { px + pw - 46 + 20 } else { px + pw - 46 + 2 };
+        let knob_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
+        let _ = Rectangle::new(Point::new(knob_x, row_y + 2), Size::new(14, 12))
+            .into_styled(knob_style)
+            .draw(fb);
+        // Label
+        let label_color = if active { Rgb888::new(200, 210, 255) } else { Rgb888::new(130, 140, 170) };
+        let label_style = MonoTextStyle::new(&FONT_6X12, label_color);
+        let _ = Text::new(label, Point::new(px + 10, row_y + 12), label_style).draw(fb);
+    };
+
+    draw_toggle(fb, py + 34, "Do Not Disturb", desktop.do_not_disturb);
+    draw_toggle(fb, py + 62, "Night Light", desktop.night_light_active);
+    draw_toggle(fb, py + 90, "Volume Mute", desktop.volume_muted);
+
+    // Brightness row
+    let br_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(130, 140, 170));
+    let _ = Text::new("Brightness", Point::new(px + 10, py + 130), br_label_style).draw(fb);
+    let bri_track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 38, 60)).build();
+    let _ = Rectangle::new(Point::new(px + 10, py + 134), Size::new((pw - 20) as u32, 6))
+        .into_styled(bri_track_style)
+        .draw(fb);
+    let bri_fill_w = ((pw - 20) as u32 * desktop.brightness_level as u32) / 100;
+    if bri_fill_w > 0 {
+        let bri_fill_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 200, 80)).build();
+        let _ = Rectangle::new(Point::new(px + 10, py + 134), Size::new(bri_fill_w, 6))
+            .into_styled(bri_fill_style)
+            .draw(fb);
+    }
+
+    // Volume row
+    let vol_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(130, 140, 170));
+    let _ = Text::new("Volume", Point::new(px + 10, py + 160), vol_label_style).draw(fb);
+    let vol_track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 38, 60)).build();
+    let _ = Rectangle::new(Point::new(px + 10, py + 164), Size::new((pw - 20) as u32, 6))
+        .into_styled(vol_track_style)
+        .draw(fb);
+    let vol_fill_w = ((pw - 20) as u32 * desktop.volume_level as u32) / 100;
+    if vol_fill_w > 0 {
+        let vol_fill_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 150, 255)).build();
+        let _ = Rectangle::new(Point::new(px + 10, py + 164), Size::new(vol_fill_w, 6))
+            .into_styled(vol_fill_style)
+            .draw(fb);
+    }
+
+    // Close hint
+    let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
+    let _ = Text::new("Super+Q to close", Point::new(px + 30, py + ph - 10), hint_style).draw(fb);
 }
 
 /// Draw the mouse cursor.
@@ -1695,13 +1924,12 @@ fn draw_hud_overlay(fb: &mut FramebufferState, log_buf: &[u8], log_len: usize) {
 /// Draw the context menu overlay.
 fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu) {
     let menu_w = CONTEXT_MENU_W;
-    let item_h = CONTEXT_MENU_ITEM_H;
-    let menu_h = (menu.item_count as i32) * item_h;
     let mx = menu.x;
     let my = menu.y;
+    let menu_h = menu.total_height();
 
     // Background
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(22, 26, 48)).build();
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 24, 45)).build();
     let _ = Rectangle::new(Point::new(mx, my), Size::new(menu_w as u32, menu_h as u32))
         .into_styled(bg_style)
         .draw(fb);
@@ -1715,9 +1943,24 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
         .into_styled(border_style)
         .draw(fb);
 
-    // Items
+    // Items — rendered with variable heights
+    let mut iy = my;
     for i in 0..menu.item_count {
-        let iy = my + (i as i32) * item_h;
+        let item = &menu.items[i];
+        if item.separator {
+            // Separator: thin horizontal line centered in the SEP_H slot
+            let line_y = iy + CONTEXT_MENU_SEP_H / 2;
+            let sep_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(45, 55, 85))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 6, line_y), Size::new((menu_w - 12) as u32, 1))
+                .into_styled(sep_style)
+                .draw(fb);
+            iy += CONTEXT_MENU_SEP_H;
+            continue;
+        }
+
+        let item_h = CONTEXT_MENU_ITEM_H;
 
         // Hover highlight
         if menu.hovered_index == Some(i) {
@@ -1727,7 +1970,7 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
             let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new((menu_w - 2) as u32, item_h as u32))
                 .into_styled(hover_style)
                 .draw(fb);
-            // Left accent bar on hovered item
+            // Left accent bar
             let accent_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 140, 255))
                 .build();
@@ -1736,9 +1979,27 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
                 .draw(fb);
         }
 
-        let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
-        let label = menu.items[i].label_str();
-        let _ = Text::new(label, Point::new(mx + 12, iy + 19), text_style).draw(fb);
+        // Checkmark indicator (filled square dot) before the label
+        if item.checked {
+            let dot_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 180, 100))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 7, iy + item_h / 2 - 3), Size::new(6, 6))
+                .into_styled(dot_style)
+                .draw(fb);
+        }
+
+        // Label — offset right to make room for checkmark area
+        let text_color = if menu.hovered_index == Some(i) {
+            Rgb888::new(220, 230, 255)
+        } else {
+            Rgb888::new(190, 200, 220)
+        };
+        let text_style = MonoTextStyle::new(&FONT_6X12, text_color);
+        let label = item.label_str();
+        let _ = Text::new(label, Point::new(mx + 18, iy + item_h / 2 + 5), text_style).draw(fb);
+
+        iy += item_h;
     }
 }
 
@@ -1749,7 +2010,8 @@ fn draw_volume_popup(fb: &mut FramebufferState, desktop: &DesktopShell) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
     let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
-    let px = tray_start + 160;
+    // Centre the panel above the volume icon (now at tray_start + 96..120)
+    let px = (tray_start + 18).min(fb_w - panel_w - 4);
     let py = fb_h - TASKBAR_HEIGHT - panel_h - 5;
 
     // Background

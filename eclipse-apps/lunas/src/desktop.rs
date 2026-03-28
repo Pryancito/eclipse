@@ -132,6 +132,10 @@ pub struct DesktopShell {
     pub clock_month: u8,
     /// Current year (e.g. 2026).
     pub clock_year: u16,
+    /// Do Not Disturb mode — when active, incoming notifications are suppressed visually.
+    pub do_not_disturb: bool,
+    /// Night Light mode — when active, a warm tint is applied to reduce blue light.
+    pub night_light_active: bool,
 }
 
 impl DesktopShell {
@@ -144,7 +148,7 @@ impl DesktopShell {
             wallpaper_mode: WallpaperMode::CosmicTheme,
             wallpaper_color: (10, 15, 30),
             show_clock: true,
-            show_battery: false,
+            show_battery: true,
             volume_level: 75,
             volume_muted: false,
             brightness_level: 100,
@@ -155,6 +159,8 @@ impl DesktopShell {
             clock_day: 1,
             clock_month: 1,
             clock_year: 2026,
+            do_not_disturb: false,
+            night_light_active: false,
         };
 
         // Default pinned apps with executable paths

@@ -13,6 +13,28 @@ use crate::compositor::{
 };
 use eclipse_ipc::types::{NetExtendedStats, NetStaticConfig};
 
+/// Append the decimal representation of a `u8` value to a heapless String.
+/// Uses only the digits 0-9 with no allocation.
+fn push_u8_decimal(s: &mut heapless::String<64>, v: u8) {
+    let mut buf = [0u8; 3];
+    let mut n = v as u16;
+    let mut len = 0;
+    if n == 0 {
+        buf[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 {
+            buf[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        buf[..len].reverse();
+    }
+    for &b in &buf[..len] {
+        let _ = s.push(b as char);
+    }
+}
+
 #[derive(Clone)]
 pub enum CompositorEvent {
     Input(InputEvent),
@@ -29,11 +51,20 @@ pub enum CompositorEvent {
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
-    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual,
+    SnapLeft, SnapRight, SnapTopLeft, SnapTopRight, SnapBottomLeft, SnapBottomRight,
+    SwitchWorkspace(u8), CycleWindowVisual,
     Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
     ToggleSystemCentral, ToggleTiling, ToggleSearch, ArrowUp, ArrowDown,
     Input(char), Enter, Backspace, ToggleNotifications, ToggleNetworkDetails,
     BrightnessUp, BrightnessDown,
+    /// Toggle Do Not Disturb mode (Super+D).
+    ToggleDoNotDisturb,
+    /// Toggle Night Light mode — warm tint to reduce blue light (Super+N).
+    ToggleNightLight,
+    /// Take a screenshot of the current screen (PrintScreen).
+    Screenshot,
+    /// Toggle Quick Settings panel (Super+Q).
+    ToggleQuickSettings,
 }
 
 /// Represents what element was clicked on the taskbar.
@@ -65,8 +96,8 @@ pub enum TaskbarHit {
     TaskScrollRight,
 }
 
-/// Maximum number of items in a context menu.
-pub const CONTEXT_MENU_MAX_ITEMS: usize = 8;
+/// Maximum number of items in a context menu (includes separators).
+pub const CONTEXT_MENU_MAX_ITEMS: usize = 12;
 
 /// Number of distinct window decoration styles (0 = default, 1 = minimal, 2 = neon).
 /// Used by `CycleWindowVisual` action to wrap the style index.
@@ -97,6 +128,24 @@ pub enum ContextAction {
     BrightnessUp,
     /// Decrease screen brightness by one step.
     BrightnessDown,
+    /// Set brightness to a specific level (0-100). Used by QS panel slider.
+    SetBrightness(u8),
+    /// Toggle Do Not Disturb mode.
+    ToggleDoNotDisturb,
+    /// Toggle Night Light mode (warm colour tint).
+    ToggleNightLight,
+    /// Capture the current framebuffer to disk.
+    TakeScreenshot,
+    /// Mark all desktop notifications as read.
+    MarkNotificationsRead,
+    /// Toggle the launcher/app-drawer panel.
+    ToggleLauncher,
+    /// Lock the screen (activate lock screen overlay).
+    ToggleLock,
+    /// Toggle show-desktop mode (minimize/restore all windows).
+    ShowDesktop,
+    /// Switch to a specific workspace by index (0-3).
+    SwitchWorkspace(u8),
 }
 
 /// A single context menu item.
@@ -104,11 +153,15 @@ pub enum ContextAction {
 pub struct ContextMenuItem {
     pub label: [u8; 24],
     pub action: ContextAction,
+    /// When `true`, this slot renders as a visual separator line rather than a clickable item.
+    pub separator: bool,
+    /// When `true`, a checkmark indicator is drawn before the label (for toggle states).
+    pub checked: bool,
 }
 
 impl Default for ContextMenuItem {
     fn default() -> Self {
-        Self { label: [0; 24], action: ContextAction::None }
+        Self { label: [0; 24], action: ContextAction::None, separator: false, checked: false }
     }
 }
 
@@ -158,9 +211,30 @@ impl ContextMenu {
         self.hovered_index = None;
     }
 
+    /// Add a regular clickable item.
     pub fn add_item(&mut self, label: &str, action: ContextAction) {
         if self.item_count < CONTEXT_MENU_MAX_ITEMS {
             self.items[self.item_count] = ContextMenuItem::new(label, action);
+            self.item_count += 1;
+        }
+    }
+
+    /// Add an item that shows a checkmark indicator when `checked` is true (for toggle states).
+    pub fn add_checked_item(&mut self, label: &str, action: ContextAction, checked: bool) {
+        if self.item_count < CONTEXT_MENU_MAX_ITEMS {
+            let mut item = ContextMenuItem::new(label, action);
+            item.checked = checked;
+            self.items[self.item_count] = item;
+            self.item_count += 1;
+        }
+    }
+
+    /// Add a visual separator line between groups of items.
+    pub fn add_separator(&mut self) {
+        if self.item_count < CONTEXT_MENU_MAX_ITEMS {
+            let mut item = ContextMenuItem::default();
+            item.separator = true;
+            self.items[self.item_count] = item;
             self.item_count += 1;
         }
     }
@@ -171,11 +245,38 @@ impl ContextMenu {
         self.hovered_index = None;
     }
 
+    /// Return the pixel height of item at `idx`.
+    pub fn item_height(items: &[ContextMenuItem], idx: usize) -> i32 {
+        if items[idx].separator {
+            crate::render::CONTEXT_MENU_SEP_H
+        } else {
+            crate::render::CONTEXT_MENU_ITEM_H
+        }
+    }
+
+    /// Return the Y pixel offset of item `idx` relative to the top of the menu.
+    pub fn item_y_offset(items: &[ContextMenuItem], idx: usize) -> i32 {
+        let mut y = 0;
+        for i in 0..idx {
+            y += Self::item_height(items, i);
+        }
+        y
+    }
+
+    /// Compute the total pixel height of the menu.
+    pub fn total_height(&self) -> i32 {
+        let mut h = 0;
+        for i in 0..self.item_count {
+            h += Self::item_height(&self.items, i);
+        }
+        h
+    }
+
     /// Clamp menu position so it stays fully within the screen bounds.
     /// Call this after all items have been added.
     pub fn clamp_to_screen(&mut self, fb_w: i32, fb_h: i32) {
         let menu_w = crate::render::CONTEXT_MENU_W;
-        let menu_h = (self.item_count as i32) * crate::render::CONTEXT_MENU_ITEM_H;
+        let menu_h = self.total_height();
         if self.x + menu_w > fb_w { self.x = fb_w - menu_w; }
         if self.x < 0 { self.x = 0; }
         if self.y + menu_h > fb_h { self.y = fb_h - menu_h; }
@@ -301,22 +402,16 @@ pub fn taskbar_hit_test(
         win_x += win_item_w + 4;
     }
 
-    // Notification area: around tray_x + 155
-    let notif_x = tray_start + 155;
+    // Notification area: around tray_x + 70
+    let notif_x = tray_start + 70;
     if px >= notif_x - 5 && px < notif_x + 20 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Notifications;
     }
 
-    // Volume indicator: around tray_x + 180
-    let vol_x = tray_start + 180;
+    // Volume indicator: around tray_x + 100
+    let vol_x = tray_start + 100;
     if px >= vol_x - 5 && px < vol_x + 15 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Volume;
-    }
-
-    // Battery indicator: around tray_x + 212 (tray_width now 300, so fb_w - 88)
-    let bat_x = tray_start + 212;
-    if px >= bat_x - 2 && px < bat_x + 36 && py >= bar_y + 4 && py < bar_y + 36 {
-        return TaskbarHit::Battery;
     }
 
     // Clock area: fb_width - 56 to fb_width - 6
@@ -394,8 +489,8 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x0D => KeyAction::SensitivityPlus,
         0x0C => KeyAction::SensitivityMinus,
         0x17 => KeyAction::InvertY,
-        0x47 => KeyAction::CenterCursor,
-        0x31 => KeyAction::NewWindow,
+        0x47 => if (modifiers & 8) != 0 { KeyAction::SnapTopLeft } else { KeyAction::CenterCursor },
+        0x31 => if (modifiers & 8) != 0 { KeyAction::ToggleNightLight } else { KeyAction::NewWindow },
         0x01 => KeyAction::CloseWindow,
         0x0F => if (modifiers & 4) != 0 { KeyAction::CycleWindowVisual } else { KeyAction::CycleForward },
         0x29 => KeyAction::CycleBackward,
@@ -418,11 +513,19 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x0E => KeyAction::Backspace,
         0x36 => if (modifiers & 8) != 0 { KeyAction::ToggleNotifications } else { KeyAction::None },
         0x12 => if (modifiers & 8) != 0 { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
-        // Brightness keys (F5=0x3F = down, F6=0x40 = up) or Super+PgDown/PgUp (0x51/0x49)
+        // Brightness keys (F5=0x3F = down, F6=0x40 = up)
         0x3F => KeyAction::BrightnessDown,
         0x40 => KeyAction::BrightnessUp,
-        0x49 => if (modifiers & 8) != 0 { KeyAction::BrightnessUp } else { KeyAction::None },
-        0x51 => if (modifiers & 8) != 0 { KeyAction::BrightnessDown } else { KeyAction::None },
+        // Super+Home/PgUp/End/PgDn = snap to screen quarters
+        0x49 => if (modifiers & 8) != 0 { KeyAction::SnapTopRight } else { KeyAction::None },
+        0x4F => if (modifiers & 8) != 0 { KeyAction::SnapBottomLeft } else { KeyAction::None },
+        0x51 => if (modifiers & 8) != 0 { KeyAction::SnapBottomRight } else { KeyAction::None },
+        // Super+D = Do Not Disturb toggle
+        0x20 => if (modifiers & 8) != 0 { KeyAction::ToggleDoNotDisturb } else { KeyAction::None },
+        // Super+Q = Quick Settings panel
+        0x10 => if (modifiers & 8) != 0 { KeyAction::ToggleQuickSettings } else { KeyAction::None },
+        // PrintScreen = Screenshot
+        0x37 => KeyAction::Screenshot,
         _ => KeyAction::None,
     }
 }
@@ -546,6 +649,20 @@ pub struct InputState {
     pub pending_pinned_swap: Option<(usize, usize)>,
     /// Window decoration style index (0 = default, 1 = minimal, 2 = neon). Cycled by CycleWindowVisual.
     pub window_decoration_style: u8,
+    /// Whether the Quick Settings panel is visible (Super+Q toggle).
+    pub quick_settings_active: bool,
+    /// Mirrored from `DesktopShell::do_not_disturb`; used when building context menu checkmarks.
+    pub do_not_disturb: bool,
+    /// Mirrored from `DesktopShell::night_light_active`; used when building context menu checkmarks.
+    pub night_light_active: bool,
+    /// Mirrored from `DesktopShell::volume_muted`; used when building context menu checkmarks.
+    pub volume_muted: bool,
+    /// Mirrored from `DesktopShell::volume_level`; used when building state-aware tooltips.
+    pub volume_level: u8,
+    /// Mirrored from `DesktopShell::battery_level`; used when building state-aware tooltips.
+    pub battery_level: u8,
+    /// Mirrored from `DesktopShell::notification_count`; used when building tooltips.
+    pub notification_count: usize,
 }
 
 impl InputState {
@@ -598,6 +715,13 @@ impl InputState {
             drag_press_y: 0,
             pending_pinned_swap: None,
             window_decoration_style: 0,
+            quick_settings_active: false,
+            do_not_disturb: false,
+            night_light_active: false,
+            volume_muted: false,
+            volume_level: 75,
+            battery_level: 80,
+            notification_count: 0,
         }
     }
 
@@ -645,40 +769,50 @@ impl InputState {
                                 return dirty;
                             }
                             0x48 if (self.modifiers & 8) == 0 => {
-                                // Up arrow (without Super): move selection up.
-                                // The Super modifier guard is needed because scancode 0x48 with
-                                // Super maps to KeyAction::Maximize — Down arrow (0x50) has no
-                                // conflicting Super binding so no guard is required there.
+                                // Up arrow (without Super): move selection up, skipping separators.
                                 let count = self.context_menu.item_count;
                                 if count > 0 {
-                                    self.context_menu.hovered_index = Some(
-                                        match self.context_menu.hovered_index {
-                                            Some(h) if h > 0 => h - 1,
-                                            _ => 0,
-                                        }
-                                    );
+                                    let start = match self.context_menu.hovered_index {
+                                        Some(h) if h > 0 => h - 1,
+                                        _ => 0,
+                                    };
+                                    // Find the first non-separator at or above `start`
+                                    let mut sel = start;
+                                    loop {
+                                        if !self.context_menu.items[sel].separator { break; }
+                                        if sel == 0 { break; }
+                                        sel -= 1;
+                                    }
+                                    self.context_menu.hovered_index = Some(sel);
                                 }
                                 dirty = true;
                                 return dirty;
                             }
                             0x50 => {
-                                // Down arrow: move selection down
+                                // Down arrow: move selection down, skipping separators.
                                 let count = self.context_menu.item_count;
                                 if count > 0 {
-                                    self.context_menu.hovered_index = Some(
-                                        match self.context_menu.hovered_index {
-                                            Some(h) => (h + 1).min(count - 1),
-                                            None => 0,
-                                        }
-                                    );
+                                    let start = match self.context_menu.hovered_index {
+                                        Some(h) => (h + 1).min(count - 1),
+                                        None => 0,
+                                    };
+                                    let mut sel = start;
+                                    loop {
+                                        if !self.context_menu.items[sel].separator { break; }
+                                        if sel + 1 >= count { break; }
+                                        sel += 1;
+                                    }
+                                    self.context_menu.hovered_index = Some(sel);
                                 }
                                 dirty = true;
                                 return dirty;
                             }
                             0x1C => {
-                                // Enter: activate hovered item
+                                // Enter: activate hovered item (skip separators)
                                 if let Some(idx) = self.context_menu.hovered_index {
-                                    if idx < self.context_menu.item_count {
+                                    if idx < self.context_menu.item_count
+                                        && !self.context_menu.items[idx].separator
+                                    {
                                         self.pending_context_action = self.context_menu.items[idx].action;
                                     }
                                 }
@@ -832,6 +966,76 @@ impl InputState {
                         KeyAction::BrightnessDown => {
                             self.pending_context_action = ContextAction::BrightnessDown;
                             dirty = true;
+                        }
+                        KeyAction::ToggleDoNotDisturb => {
+                            self.pending_context_action = ContextAction::ToggleDoNotDisturb;
+                            dirty = true;
+                        }
+                        KeyAction::ToggleNightLight => {
+                            self.pending_context_action = ContextAction::ToggleNightLight;
+                            dirty = true;
+                        }
+                        KeyAction::Screenshot => {
+                            self.pending_context_action = ContextAction::TakeScreenshot;
+                            dirty = true;
+                        }
+                        KeyAction::ToggleQuickSettings => {
+                            self.quick_settings_active = !self.quick_settings_active;
+                            dirty = true;
+                        }
+                        KeyAction::SnapTopLeft => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let w = &mut windows[idx];
+                                    w.x = 0;
+                                    w.y = ShellWindow::TITLE_H;
+                                    w.w = self.fb_width / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapTopRight => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let w = &mut windows[idx];
+                                    w.x = self.fb_width / 2;
+                                    w.y = ShellWindow::TITLE_H;
+                                    w.w = self.fb_width / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapBottomLeft => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
+                                    let w = &mut windows[idx];
+                                    w.x = 0;
+                                    w.y = ShellWindow::TITLE_H + h;
+                                    w.w = self.fb_width / 2;
+                                    w.h = h;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapBottomRight => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
+                                    let w = &mut windows[idx];
+                                    w.x = self.fb_width / 2;
+                                    w.y = ShellWindow::TITLE_H + h;
+                                    w.w = self.fb_width / 2;
+                                    w.h = h;
+                                    dirty = true;
+                                }
+                            }
                         }
                         KeyAction::CycleForward => {
                             if *window_count > 0 {
@@ -1002,7 +1206,15 @@ impl InputState {
                     self.tooltip.clear();
                     match hover_hit {
                         TaskbarHit::Launcher => {
-                            let _ = self.tooltip.push_str("Launcher");
+                            let _ = self.tooltip.push_str("Launcher (Super+A)");
+                        }
+                        TaskbarHit::Workspace(ws) => {
+                            let _ = self.tooltip.push_str("Workspace ");
+                            let ws_char = (b'1' + ws) as char;
+                            let _ = self.tooltip.push(ws_char);
+                            let _ = self.tooltip.push_str(" (Super+");
+                            let _ = self.tooltip.push(ws_char);
+                            let _ = self.tooltip.push(')');
                         }
                         TaskbarHit::PinnedApp(i) => {
                             if i < self.pinned_app_count && i < self.pinned_app_names.len() {
@@ -1020,12 +1232,34 @@ impl InputState {
                         }
                         TaskbarHit::Notifications => {
                             let _ = self.tooltip.push_str("Notifications");
+                            if self.notification_count > 0 {
+                                let _ = self.tooltip.push_str(" (");
+                                push_u8_decimal(&mut self.tooltip, self.notification_count.min(99) as u8);
+                                let _ = self.tooltip.push(')');
+                            }
+                            if self.do_not_disturb {
+                                let _ = self.tooltip.push_str(" — DND");
+                            }
                         }
                         TaskbarHit::Volume => {
-                            let _ = self.tooltip.push_str("Volume");
+                            if self.volume_muted {
+                                let _ = self.tooltip.push_str("Volume: Muted");
+                            } else {
+                                let _ = self.tooltip.push_str("Volume: ");
+                                push_u8_decimal(&mut self.tooltip, self.volume_level);
+                                let _ = self.tooltip.push('%');
+                            }
+                        }
+                        TaskbarHit::Battery => {
+                            let _ = self.tooltip.push_str("Battery: ");
+                            push_u8_decimal(&mut self.tooltip, self.battery_level);
+                            let _ = self.tooltip.push('%');
                         }
                         TaskbarHit::Clock => {
                             let _ = self.tooltip.push_str("Calendar");
+                            if self.night_light_active {
+                                let _ = self.tooltip.push_str(" — Night Light ON");
+                            }
                         }
                         TaskbarHit::ShowDesktop => {
                             let _ = self.tooltip.push_str("Show Desktop");
@@ -1036,24 +1270,28 @@ impl InputState {
                         TaskbarHit::TaskScrollRight => {
                             let _ = self.tooltip.push_str("Scroll right");
                         }
-                        _ => {}
+                        TaskbarHit::None => {}
                     }
                     dirty = true;
                 }
 
                 // Update context menu hover
                 if self.context_menu.visible {
-                    let item_h: i32 = 28;
-                    let menu_w: i32 = 180;
+                    let menu_w: i32 = crate::render::CONTEXT_MENU_W;
                     let mut new_hover = None;
+                    let mut y = self.context_menu.y;
                     for i in 0..self.context_menu.item_count {
-                        let iy = self.context_menu.y + (i as i32) * item_h;
-                        if self.cursor_x >= self.context_menu.x && self.cursor_x < self.context_menu.x + menu_w
-                            && self.cursor_y >= iy && self.cursor_y < iy + item_h
+                        let h = ContextMenu::item_height(&self.context_menu.items, i);
+                        if !self.context_menu.items[i].separator
+                            && self.cursor_x >= self.context_menu.x
+                            && self.cursor_x < self.context_menu.x + menu_w
+                            && self.cursor_y >= y
+                            && self.cursor_y < y + h
                         {
                             new_hover = Some(i);
                             break;
                         }
+                        y += h;
                     }
                     if new_hover != self.context_menu.hovered_index {
                         self.context_menu.hovered_index = new_hover;
@@ -1074,18 +1312,22 @@ impl InputState {
                         // ── Context menu click detection (highest priority) ──
                         if self.context_menu.visible {
                             let menu = &self.context_menu;
-                            let item_h: i32 = 28;
-                            let menu_w: i32 = 180;
+                            let menu_w: i32 = crate::render::CONTEXT_MENU_W;
                             let mut hit_item = false;
+                            let mut y = menu.y;
                             for i in 0..menu.item_count {
-                                let iy = menu.y + (i as i32) * item_h;
-                                if self.cursor_x >= menu.x && self.cursor_x < menu.x + menu_w
-                                    && self.cursor_y >= iy && self.cursor_y < iy + item_h
+                                let h = ContextMenu::item_height(&menu.items, i);
+                                if !menu.items[i].separator
+                                    && self.cursor_x >= menu.x
+                                    && self.cursor_x < menu.x + menu_w
+                                    && self.cursor_y >= y
+                                    && self.cursor_y < y + h
                                 {
                                     self.pending_context_action = menu.items[i].action;
                                     hit_item = true;
                                     break;
                                 }
+                                y += h;
                             }
                             self.context_menu.hide();
                             dirty = true;
@@ -1138,6 +1380,64 @@ impl InputState {
                             } else {
                                 // Clicked outside → close the calendar
                                 self.clock_panel_active = false;
+                                dirty = true;
+                                return dirty;
+                            }
+                        }
+
+                        // ── Quick Settings panel click detection ──
+                        if self.quick_settings_active {
+                            use crate::render::TASKBAR_HEIGHT;
+                            let qs_w: i32 = 220;
+                            let qs_h: i32 = 220;
+                            let qs_x = self.fb_width - qs_w - 10;
+                            let qs_y = self.fb_height - TASKBAR_HEIGHT - qs_h - 5;
+                            if self.cursor_x >= qs_x && self.cursor_x < qs_x + qs_w
+                                && self.cursor_y >= qs_y && self.cursor_y < qs_y + qs_h
+                            {
+                                let row_x_toggle = qs_x + qs_w - 46;
+                                let row_w_toggle = 36;
+                                let slider_x = qs_x + 10;
+                                let slider_w = qs_w - 20;
+                                // Row 0: DND toggle pill (y = qs_y+34, h=16)
+                                if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
+                                    && self.cursor_y >= qs_y + 34 && self.cursor_y < qs_y + 50
+                                {
+                                    self.pending_context_action = ContextAction::ToggleDoNotDisturb;
+                                }
+                                // Row 1: Night Light toggle pill (y = qs_y+62, h=16)
+                                else if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
+                                    && self.cursor_y >= qs_y + 62 && self.cursor_y < qs_y + 78
+                                {
+                                    self.pending_context_action = ContextAction::ToggleNightLight;
+                                }
+                                // Row 2: Volume Mute toggle pill (y = qs_y+90, h=16)
+                                else if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
+                                    && self.cursor_y >= qs_y + 90 && self.cursor_y < qs_y + 106
+                                {
+                                    self.pending_context_action = ContextAction::ToggleMute;
+                                }
+                                // Brightness slider bar (y = qs_y+134, h=6) — set brightness level
+                                else if self.cursor_x >= slider_x && self.cursor_x < slider_x + slider_w
+                                    && self.cursor_y >= qs_y + 134 && self.cursor_y < qs_y + 142
+                                {
+                                    let rel = self.cursor_x - slider_x;
+                                    let level = ((rel * 100) / slider_w).clamp(0, 100) as u8;
+                                    self.pending_context_action = ContextAction::SetBrightness(level);
+                                }
+                                // Volume slider bar (y = qs_y+164, h=6) — set volume level
+                                else if self.cursor_x >= slider_x && self.cursor_x < slider_x + slider_w
+                                    && self.cursor_y >= qs_y + 164 && self.cursor_y < qs_y + 172
+                                {
+                                    let rel = self.cursor_x - slider_x;
+                                    let level = ((rel * 100) / slider_w).clamp(0, 100) as u8;
+                                    self.pending_context_action = ContextAction::SetVolume(level);
+                                }
+                                dirty = true;
+                                return dirty;
+                            } else {
+                                // Clicked outside → close Quick Settings
+                                self.quick_settings_active = false;
                                 dirty = true;
                                 return dirty;
                             }
@@ -1367,7 +1667,7 @@ impl InputState {
 
                     let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
                     if on_taskbar {
-                        // Right-click on taskbar: check if on a window task item
+                        // Right-click on taskbar: check what element was hit
                         let tb_hit = taskbar_hit_test(
                             self.cursor_x, self.cursor_y,
                             self.fb_width, self.fb_height,
@@ -1379,31 +1679,112 @@ impl InputState {
                         );
                         if let TaskbarHit::WindowTask(w_idx) = tb_hit {
                             if w_idx < *window_count {
-                                self.context_menu.show(self.cursor_x, self.cursor_y - 90);
+                                // ── Window task context menu ──
+                                // Height: 5 regular + 1 separator = 5*28 + 8 = 148px
+                                self.context_menu.show(self.cursor_x, self.cursor_y - 148);
                                 if windows[w_idx].minimized {
                                     self.context_menu.add_item("Restore", ContextAction::MinimizeWindow(w_idx));
                                 } else {
                                     self.context_menu.add_item("Minimize", ContextAction::MinimizeWindow(w_idx));
                                 }
-                                self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(w_idx));
+                                let is_max = windows[w_idx].maximized;
+                                self.context_menu.add_checked_item(
+                                    "Maximize",
+                                    ContextAction::MaximizeWindow(w_idx),
+                                    is_max,
+                                );
+                                self.context_menu.add_separator();
                                 self.context_menu.add_item("Close", ContextAction::CloseWindow(w_idx));
                                 self.context_menu.add_item("Pin to Taskbar", ContextAction::PinApp(w_idx));
                                 self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                                 dirty = true;
                             }
                         } else if let TaskbarHit::PinnedApp(app_idx) = tb_hit {
-                            // Right-click on pinned app → open/focus and unpin options
-                            self.context_menu.show(self.cursor_x, self.cursor_y - 60);
+                            // ── Pinned app context menu ──
+                            // Height: 3 regular + 1 separator = 3*28 + 8 = 92px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 92);
                             self.context_menu.add_item("Open", ContextAction::LaunchPinnedApp(app_idx));
-                            self.context_menu.add_item("Unpin", ContextAction::UnpinApp(app_idx));
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Unpin from Taskbar", ContextAction::UnpinApp(app_idx));
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Volume = tb_hit {
-                            // Right-click on volume → volume control context menu
-                            self.context_menu.show(self.cursor_x, self.cursor_y - 90);
+                            // ── Volume context menu (with mute checkmark) ──
+                            // Height: 3 regular + 1 separator = 3*28 + 8 = 92px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 92);
                             self.context_menu.add_item("Volume Up", ContextAction::VolumeUp);
                             self.context_menu.add_item("Volume Down", ContextAction::VolumeDown);
-                            self.context_menu.add_item("Mute/Unmute", ContextAction::ToggleMute);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_checked_item("Mute", ContextAction::ToggleMute, self.volume_muted);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Notifications = tb_hit {
+                            // ── Notifications context menu ──
+                            // Height: 2 regular + 1 separator = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_item("Mark All Read", ContextAction::MarkNotificationsRead);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_checked_item("Do Not Disturb", ContextAction::ToggleDoNotDisturb, self.do_not_disturb);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Clock = tb_hit {
+                            // ── Clock context menu ──
+                            // Height: 1 regular + 1 separator + 1 regular = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_item("Show Calendar", ContextAction::OpenDashboard);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_checked_item("Night Light", ContextAction::ToggleNightLight, self.night_light_active);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Battery = tb_hit {
+                            // ── Battery context menu ──
+                            // Height: 2 regular = 2*28 = 56px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 56);
+                            self.context_menu.add_item("Brightness Up", ContextAction::BrightnessUp);
+                            self.context_menu.add_item("Brightness Down", ContextAction::BrightnessDown);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Launcher = tb_hit {
+                            // ── Launcher context menu ──
+                            // Height: 1 regular + 1 sep + 1 regular = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_item("Open Launcher", ContextAction::ToggleLauncher);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Lock Screen", ContextAction::ToggleLock);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Workspace(ws) = tb_hit {
+                            // ── Workspace context menu ──
+                            // Height: 1 regular + 1 sep + 4 regular = 5*28 + 8 = 148px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 148);
+                            self.context_menu.add_item("New Window Here", ContextAction::NewWindow);
+                            self.context_menu.add_separator();
+                            for i in 0..4u8 {
+                                let label = match i {
+                                    0 => "Workspace 1",
+                                    1 => "Workspace 2",
+                                    2 => "Workspace 3",
+                                    _ => "Workspace 4",
+                                };
+                                self.context_menu.add_checked_item(
+                                    label,
+                                    ContextAction::SwitchWorkspace(i),
+                                    i == ws,
+                                );
+                            }
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::ShowDesktop = tb_hit {
+                            // ── Show Desktop context menu ──
+                            // Height: 2 regular + 1 sep = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_checked_item(
+                                "Show Desktop",
+                                ContextAction::ShowDesktop,
+                                self.show_desktop_active,
+                            );
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         }
@@ -1411,25 +1792,38 @@ impl InputState {
                         // Right-click on desktop background or window
                         let focus = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count);
                         if let Some(idx) = focus {
-                            // Right-click on a window → window context menu
+                            // ── Window context menu ──
+                            // Height: 5 regular + 1 separator = 5*28 + 8 = 148px
                             self.context_menu.show(self.cursor_x, self.cursor_y);
                             if windows[idx].minimized {
                                 self.context_menu.add_item("Restore", ContextAction::MinimizeWindow(idx));
                             } else {
                                 self.context_menu.add_item("Minimize", ContextAction::MinimizeWindow(idx));
                             }
-                            self.context_menu.add_item("Maximize", ContextAction::MaximizeWindow(idx));
+                            let is_max = windows[idx].maximized;
+                            self.context_menu.add_checked_item(
+                                "Maximize",
+                                ContextAction::MaximizeWindow(idx),
+                                is_max,
+                            );
+                            self.context_menu.add_separator();
                             self.context_menu.add_item("Close", ContextAction::CloseWindow(idx));
                             self.context_menu.add_item("Pin to Taskbar", ContextAction::PinApp(idx));
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else {
-                            // Right-click on desktop background → desktop context menu
+                            // ── Desktop context menu ──
+                            // Height: 5 regular + 2 separators + 2 checked = 7*28 + 2*8 = 212px
                             self.context_menu.show(self.cursor_x, self.cursor_y);
                             self.context_menu.add_item("New Window", ContextAction::NewWindow);
-                            self.context_menu.add_item("Toggle Tiling", ContextAction::ToggleTiling);
-                            self.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
                             self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_checked_item("Toggle Tiling", ContextAction::ToggleTiling, self.tiling_active);
+                            self.context_menu.add_checked_item("Do Not Disturb", ContextAction::ToggleDoNotDisturb, self.do_not_disturb);
+                            self.context_menu.add_checked_item("Night Light", ContextAction::ToggleNightLight, self.night_light_active);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
+                            self.context_menu.add_item("Screenshot", ContextAction::TakeScreenshot);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         }
@@ -1462,7 +1856,7 @@ impl InputState {
                 // value > 0 = scroll down, value < 0 = scroll up
                 let scroll_down = event.value > 0;
                 let tray_start = self.fb_width - crate::render::TASKBAR_TRAY_WIDTH;
-                let vol_x = tray_start + 180;
+                let vol_x = tray_start + 100;
                 let on_taskbar = self.cursor_y >= self.fb_height - crate::render::TASKBAR_HEIGHT;
 
                 if on_taskbar && self.cursor_x >= vol_x - 5 && self.cursor_x < vol_x + 15 {
@@ -1940,8 +2334,12 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible");
-        assert_eq!(state.context_menu.item_count, 4); // New Window, Toggle Tiling, Dashboard, Change Wallpaper
+        // 9 items: NewWindow, ChangeWallpaper, separator, ToggleTiling(checked), DND(checked),
+        //          NightLight(checked), separator, Dashboard, Screenshot
+        assert_eq!(state.context_menu.item_count, 9);
         assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
+        assert_eq!(state.context_menu.items[1].action, ContextAction::CycleWallpaper);
+        assert!(state.context_menu.items[2].separator, "third item should be separator");
     }
 
     #[test]
@@ -1962,7 +2360,10 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible for window");
-        assert_eq!(state.context_menu.item_count, 4); // Minimize, Maximize, Close, Pin to Taskbar
+        // 5 items: Minimize, Maximize(checked), separator, Close, Pin to Taskbar
+        assert_eq!(state.context_menu.item_count, 5);
+        assert!(state.context_menu.items[2].separator, "third item should be separator");
+        assert_eq!(state.context_menu.items[3].action, ContextAction::CloseWindow(0));
     }
 
     #[test]
@@ -2034,16 +2435,16 @@ mod tests {
         // Fill up window slots so we have overflow
         let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
         let mut surfaces = [ExternalSurface::default(); 16];
-        let mut count = 12;
-        for i in 0..12 {
+        let mut count = 15;
+        for i in 0..15 {
             windows[i].content = WindowContent::InternalDemo;
             windows[i].workspace = 0;
         }
         assert_eq!(state.task_scroll_offset, 0);
 
-        // Click scroll-right button (sr_x = tray_start - scroll_btn_w - 6 = 1620 - 16 - 6 = 1598)
-        // tray_start = 1920 - 300 = 1620
-        state.cursor_x = 1600;
+        // Click scroll-right button (sr_x = tray_start - scroll_btn_w - 6 = 1700 - 16 - 6 = 1678)
+        // tray_start = 1920 - 220 = 1700
+        state.cursor_x = 1680;
         state.cursor_y = 1080 - 20;
         let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
@@ -2137,7 +2538,7 @@ mod tests {
         state.cursor_y = 1080 - 20;
         let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
-        assert_eq!(state.tooltip.as_str(), "Launcher");
+        assert_eq!(state.tooltip.as_str(), "Launcher (Super+A)");
 
         // Move off taskbar
         state.cursor_x = 500;
@@ -2189,9 +2590,11 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible for pinned app");
-        assert_eq!(state.context_menu.item_count, 2); // Open, Unpin
+        // 3 items: Open, separator, Unpin from Taskbar
+        assert_eq!(state.context_menu.item_count, 3);
         assert_eq!(state.context_menu.items[0].action, ContextAction::LaunchPinnedApp(0));
-        assert_eq!(state.context_menu.items[1].action, ContextAction::UnpinApp(0));
+        assert!(state.context_menu.items[1].separator, "second item should be separator");
+        assert_eq!(state.context_menu.items[2].action, ContextAction::UnpinApp(0));
     }
 
     #[test]
@@ -2211,10 +2614,12 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible for volume");
-        assert_eq!(state.context_menu.item_count, 3); // Volume Up, Volume Down, Mute/Unmute
+        // 4 items: Volume Up, Volume Down, separator, Mute(checked)
+        assert_eq!(state.context_menu.item_count, 4);
         assert_eq!(state.context_menu.items[0].action, ContextAction::VolumeUp);
         assert_eq!(state.context_menu.items[1].action, ContextAction::VolumeDown);
-        assert_eq!(state.context_menu.items[2].action, ContextAction::ToggleMute);
+        assert!(state.context_menu.items[2].separator, "third item should be separator");
+        assert_eq!(state.context_menu.items[3].action, ContextAction::ToggleMute);
     }
 
     #[test]
@@ -2389,12 +2794,15 @@ mod tests {
     // ── Next-phase feature tests ──
 
     #[test]
-    fn test_taskbar_hit_battery() {
+    fn test_taskbar_hit_battery_removed() {
         let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
         let names = [[0u8; 32]; 16];
-        // Battery: tray_start + 212 = (1920 - 300) + 212 = 1832
+        // Old battery position (tray_start+212 with tray_width=300) should no longer be a hit
+        // With new TASKBAR_TRAY_WIDTH=220, tray_start = 1920-220 = 1700; old bat_x = 1700+212=1912
+        // That's actually in the Clock area now. Test that the old wide tray x is now Clock/None.
+        // Simpler: just test that TaskbarHit::Battery is never returned.
         let hit = taskbar_hit_test(1832, 1080 - 20, 1920, 1080, 0, &names, &windows, 0, 0, 0);
-        assert_eq!(hit, TaskbarHit::Battery, "battery area should be hit");
+        assert_ne!(hit, TaskbarHit::Battery, "battery hit zone should be removed");
     }
 
     #[test]
@@ -2646,5 +3054,74 @@ mod tests {
     fn test_super_down_without_super_is_arrow_down() {
         // Without Super modifier, 0x50 = ArrowDown (not Restore)
         assert_eq!(scancode_to_action(0x50, 0), KeyAction::ArrowDown);
+    }
+
+    #[test]
+    fn test_right_click_launcher_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click the launcher button (x≈20, y near bottom)
+        state.cursor_x = 20;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "Launcher right-click should show context menu");
+        assert_eq!(state.context_menu.item_count, 3); // Open Launcher, sep, Lock Screen
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ToggleLauncher);
+        assert!(state.context_menu.items[1].separator);
+        assert_eq!(state.context_menu.items[2].action, ContextAction::ToggleLock);
+    }
+
+    #[test]
+    fn test_right_click_workspace_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        state.current_workspace = 1;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click workspace 1 indicator (ws=0 at x=48, ws=1 at x=74)
+        state.cursor_x = 74;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "Workspace right-click should show context menu");
+        // 1 NewWindow + 1 sep + 4 workspace items = 6 items
+        assert_eq!(state.context_menu.item_count, 6);
+        assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
+        assert!(state.context_menu.items[1].separator);
+        // Workspace 2 (index 1) should be checked since current_workspace = 1
+        assert_eq!(state.context_menu.items[3].action, ContextAction::SwitchWorkspace(1));
+        assert!(state.context_menu.items[3].checked, "current workspace item should be checked");
+    }
+
+    #[test]
+    fn test_right_click_show_desktop_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        state.show_desktop_active = false;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click show-desktop strip (rightmost 6px: x = fb_w - 3 = 1917)
+        state.cursor_x = 1917;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "ShowDesktop right-click should show context menu");
+        assert_eq!(state.context_menu.item_count, 3); // ShowDesktop(checked), sep, Change Wallpaper
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ShowDesktop);
+        assert!(!state.context_menu.items[0].checked, "show_desktop unchecked when inactive");
+        assert!(state.context_menu.items[1].separator);
+        assert_eq!(state.context_menu.items[2].action, ContextAction::CycleWallpaper);
     }
 }

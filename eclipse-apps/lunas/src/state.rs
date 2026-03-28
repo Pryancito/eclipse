@@ -656,19 +656,24 @@ impl LunasState {
                 }
                 ContextAction::VolumeUp => {
                     self.desktop.volume_level = (self.desktop.volume_level + 10).min(100);
+                    self.input.volume_level = self.desktop.volume_level;
                     self.dirty = true;
                 }
                 ContextAction::VolumeDown => {
                     self.desktop.volume_level = self.desktop.volume_level.saturating_sub(10);
+                    self.input.volume_level = self.desktop.volume_level;
                     self.dirty = true;
                 }
                 ContextAction::ToggleMute => {
                     self.desktop.volume_muted = !self.desktop.volume_muted;
+                    self.input.volume_muted = self.desktop.volume_muted;
                     self.dirty = true;
                 }
                 ContextAction::SetVolume(level) => {
                     self.desktop.volume_level = level;
                     self.desktop.volume_muted = false;
+                    self.input.volume_level = level;
+                    self.input.volume_muted = false;
                     self.dirty = true;
                 }
                 ContextAction::LaunchPinnedApp(app_idx) => {
@@ -747,6 +752,48 @@ impl LunasState {
                     self.desktop.brightness_level = self.desktop.brightness_level.saturating_sub(10);
                     self.dirty = true;
                 }
+                ContextAction::SetBrightness(level) => {
+                    self.desktop.brightness_level = level;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleDoNotDisturb => {
+                    self.desktop.do_not_disturb = !self.desktop.do_not_disturb;
+                    self.input.do_not_disturb = self.desktop.do_not_disturb;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleNightLight => {
+                    self.desktop.night_light_active = !self.desktop.night_light_active;
+                    self.input.night_light_active = self.desktop.night_light_active;
+                    self.dirty = true;
+                }
+                ContextAction::TakeScreenshot => {
+                    // Capture back buffer to disk on Eclipse targets.
+                    #[cfg(target_vendor = "eclipse")]
+                    {
+                        self.backend.fb.save_screenshot();
+                    }
+                    self.dirty = true;
+                }
+                ContextAction::MarkNotificationsRead => {
+                    self.desktop.mark_all_read();
+                    self.dirty = true;
+                }
+                ContextAction::ToggleLauncher => {
+                    self.input.launcher_active = !self.input.launcher_active;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleLock => {
+                    self.input.lock_screen_active = !self.input.lock_screen_active;
+                    self.dirty = true;
+                }
+                ContextAction::ShowDesktop => {
+                    self.input.show_desktop_active = !self.input.show_desktop_active;
+                    self.dirty = true;
+                }
+                ContextAction::SwitchWorkspace(ws) => {
+                    self.input.current_workspace = ws;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -754,6 +801,7 @@ impl LunasState {
 
     /// Synchronise pinned app count and names from DesktopShell into InputState
     /// so that taskbar hit-testing stays in sync after any pin/unpin operation.
+    /// Also syncs other mirrored fields (volume, battery, notification count).
     fn sync_pinned_apps_to_input(&mut self) {
         self.input.pinned_app_count = self.desktop.pinned_count;
         for i in 0..self.desktop.pinned_count.min(16) {
@@ -763,6 +811,13 @@ impl LunasState {
             self.input.pinned_app_names[i] = [0u8; 32];
             self.input.pinned_app_names[i][..len].copy_from_slice(&name_bytes[..len]);
         }
+        // Sync state-aware tooltip fields
+        self.input.volume_level = self.desktop.volume_level;
+        self.input.battery_level = self.desktop.battery_level;
+        self.input.notification_count = self.desktop.notification_count;
+        self.input.do_not_disturb = self.desktop.do_not_disturb;
+        self.input.night_light_active = self.desktop.night_light_active;
+        self.input.volume_muted = self.desktop.volume_muted;
     }
 
     /// Launch a pinned app by its index, looking up its exec_path.
