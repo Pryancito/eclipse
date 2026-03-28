@@ -878,11 +878,12 @@ impl InputState {
                         KeyAction::SnapTopLeft => {
                             if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
                                     let w = &mut windows[idx];
                                     w.x = 0;
                                     w.y = ShellWindow::TITLE_H;
                                     w.w = self.fb_width / 2;
-                                    w.h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
                                     dirty = true;
                                 }
                             }
@@ -890,11 +891,12 @@ impl InputState {
                         KeyAction::SnapTopRight => {
                             if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
                                     let w = &mut windows[idx];
                                     w.x = self.fb_width / 2;
                                     w.y = ShellWindow::TITLE_H;
                                     w.w = self.fb_width / 2;
-                                    w.h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
                                     dirty = true;
                                 }
                             }
@@ -902,7 +904,8 @@ impl InputState {
                         KeyAction::SnapBottomLeft => {
                             if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
-                                    let h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
                                     let w = &mut windows[idx];
                                     w.x = 0;
                                     w.y = ShellWindow::TITLE_H + h;
@@ -915,7 +918,8 @@ impl InputState {
                         KeyAction::SnapBottomRight => {
                             if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
-                                    let h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    let tb_h = crate::render::TASKBAR_HEIGHT;
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - tb_h) / 2;
                                     let w = &mut windows[idx];
                                     w.x = self.fb_width / 2;
                                     w.y = ShellWindow::TITLE_H + h;

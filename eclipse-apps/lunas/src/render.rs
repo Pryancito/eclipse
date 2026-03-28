@@ -255,9 +255,8 @@ impl FramebufferState {
         {
             let pitch_px = self.info.pitch as usize / 4;
             let ptr = self.back_addr as *mut u32;
-            // Reduce blue channel by up to 160/255 and add slight red warmth
-            let reduction = (strength as u32 * 160) / 100;
-            let red_boost = (strength as u32 * 30) / 100;
+            let reduction = (strength as u32 * NIGHT_LIGHT_MAX_BLUE_REDUCTION) / 100;
+            let red_boost = (strength as u32 * NIGHT_LIGHT_RED_WARMTH) / 100;
             for y in 0..self.info.height as usize {
                 for x in 0..self.info.width as usize {
                     unsafe {
@@ -389,6 +388,18 @@ fn draw_raw_icon(fb: &mut FramebufferState, data: &[u8], x: i32, y: i32, w: u32,
 
 // ── Desktop Shell Rendering ──
 
+/// Pixels from screen edge at which a window drag activates a snap zone guide.
+const SNAP_EDGE_THRESHOLD: i32 = 20;
+
+/// Default night light filter strength (0-100). Applied when night light mode is active.
+const DEFAULT_NIGHT_LIGHT_STRENGTH: u8 = 60;
+
+/// Maximum reduction of the blue channel in the night light filter (0-255).
+const NIGHT_LIGHT_MAX_BLUE_REDUCTION: u32 = 160;
+
+/// Red warmth boost in the night light filter (0-255).
+const NIGHT_LIGHT_RED_WARMTH: u32 = 30;
+
 /// Draw semi-transparent snap zone guide rectangles when a window is being dragged.
 /// Shows visual guides for half-screen (left/right) and quarter-screen (corners) zones.
 fn draw_snap_guides(fb: &mut FramebufferState, input: &InputState) {
@@ -403,7 +414,7 @@ fn draw_snap_guides(fb: &mut FramebufferState, input: &InputState) {
     // Each entry: (trigger condition, highlight x, y, w, h)
     struct SnapZone { x: i32, y: i32, w: i32, h: i32 }
 
-    let edge_threshold = 20i32;
+    let edge_threshold = SNAP_EDGE_THRESHOLD;
     let center_y = crate::compositor::ShellWindow::TITLE_H;
 
     let zone: Option<SnapZone> = if cx < edge_threshold && cy < usable_half_h {
@@ -533,7 +544,7 @@ pub fn draw_desktop_shell(
 
     // 6. Apply night light filter last so it tints everything on screen.
     if desktop.night_light_active {
-        fb.apply_night_light(60);
+        fb.apply_night_light(DEFAULT_NIGHT_LIGHT_STRENGTH);
     }
 }
 
