@@ -1,0 +1,25 @@
+[package]
+name = "terminal"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+os-terminal = "0.7.3"
+tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
+heapless = "0.8"
+bitflags = "2.4"
+log = "0.4"
+
+# Dependencias solo para target Eclipse (vendor eclipse).
+[target.'cfg(target_vendor = "eclipse")'.dependencies]
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+sidewind = { path = "../sidewind" }
+eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+libc = { version = "0.2", default-features = false }
+eclipse-syscall = { path = "../../eclipse-syscall" }
+
+# Dependencias para target Linux (host) — tests y desarrollo
+[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
+sidewind = { path = "../sidewind" }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+libc = "0.2"

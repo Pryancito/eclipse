@@ -60,7 +60,7 @@ pub use opengl::{GlContext, Texture2D};
 /// Descubre el PID del compositor preguntando a init (PID 1).
 pub fn discover_composer() -> Option<u32> {
     const INIT_PID: u32 = 1;
-    const MAX_RETRIES: u32 = 500;
+    const MAX_RETRIES: u32 = 100_000;
 
     let _ = unsafe {
         send(
@@ -105,11 +105,13 @@ impl SideWindSurface {
         let mut path_c = [0u8; 65];
         path_c[..path_str.len()].copy_from_slice(path_str.as_bytes());
         path_c[path_str.len()] = 0;
-        let fd = unsafe { open(path_c.as_ptr() as *const ::core::ffi::c_char, O_RDWR, 0) };
+        // NOTA: Usamos copia en lugar de ln -s porque el cargador kernel no soporta symlinks todavía.
+        let fd = unsafe { open(path_c.as_ptr() as *const ::core::ffi::c_char, O_RDWR | 0x0040, 0) }; // 0x0040 es O_CREAT
         if fd < 0 {
             return None;
         }
         let size_bytes = (w * h * 4) as usize;
+        let _ = eclipse_syscall::ftruncate(fd as usize, size_bytes);
         let vaddr = unsafe {
             mmap(
                 ::core::ptr::null_mut(),

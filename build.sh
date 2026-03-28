@@ -197,7 +197,7 @@ build_sidewind_project() {
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test rwaybar lunas"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test lunas terminal"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
@@ -213,6 +213,21 @@ build_sidewind_project() {
                 fi
             fi
         done
+
+        # Enlazar /usr/bin/terminal a /bin/terminal para conveniencia del usuario (Solaris/Unix style)
+        # NOTA: Usamos copia en lugar de ln -s porque el cargador kernel no soporta symlinks todavía.
+        if [ -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" ]; then
+            mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/bin"
+            rm -f "$BASE_DIR/$BUILD_DIR/sysroot/bin/terminal"
+            cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/bin/terminal"
+            print_status "Copiado: /bin/terminal -> /usr/bin/terminal (sysroot)"
+            
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                mkdir -p "$BASE_DIR/$BUILD_DIR/bin"
+                rm -f "$BASE_DIR/$BUILD_DIR/bin/terminal"
+                cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" "$BASE_DIR/$BUILD_DIR/bin/terminal"
+            fi
+        fi
     else
         print_error "Error al compilar el proyecto Sidewind"
         cd "$BASE_DIR"
