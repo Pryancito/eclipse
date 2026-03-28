@@ -13,6 +13,28 @@ use crate::compositor::{
 };
 use eclipse_ipc::types::{NetExtendedStats, NetStaticConfig};
 
+/// Append the decimal representation of a `u8` value to a heapless String.
+/// Uses only the digits 0-9 with no allocation.
+fn push_u8_decimal(s: &mut heapless::String<64>, v: u8) {
+    let mut buf = [0u8; 3];
+    let mut n = v as u16;
+    let mut len = 0;
+    if n == 0 {
+        buf[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 {
+            buf[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        buf[..len].reverse();
+    }
+    for &b in &buf[..len] {
+        let _ = s.push(b as char);
+    }
+}
+
 #[derive(Clone)]
 pub enum CompositorEvent {
     Input(InputEvent),
@@ -106,6 +128,8 @@ pub enum ContextAction {
     BrightnessUp,
     /// Decrease screen brightness by one step.
     BrightnessDown,
+    /// Set brightness to a specific level (0-100). Used by QS panel slider.
+    SetBrightness(u8),
     /// Toggle Do Not Disturb mode.
     ToggleDoNotDisturb,
     /// Toggle Night Light mode (warm colour tint).
@@ -631,6 +655,12 @@ pub struct InputState {
     pub night_light_active: bool,
     /// Mirrored from `DesktopShell::volume_muted`; used when building context menu checkmarks.
     pub volume_muted: bool,
+    /// Mirrored from `DesktopShell::volume_level`; used when building state-aware tooltips.
+    pub volume_level: u8,
+    /// Mirrored from `DesktopShell::battery_level`; used when building state-aware tooltips.
+    pub battery_level: u8,
+    /// Mirrored from `DesktopShell::notification_count`; used when building tooltips.
+    pub notification_count: usize,
 }
 
 impl InputState {
@@ -687,6 +717,9 @@ impl InputState {
             do_not_disturb: false,
             night_light_active: false,
             volume_muted: false,
+            volume_level: 75,
+            battery_level: 80,
+            notification_count: 0,
         }
     }
 
@@ -1171,7 +1204,15 @@ impl InputState {
                     self.tooltip.clear();
                     match hover_hit {
                         TaskbarHit::Launcher => {
-                            let _ = self.tooltip.push_str("Launcher");
+                            let _ = self.tooltip.push_str("Launcher (Super+A)");
+                        }
+                        TaskbarHit::Workspace(ws) => {
+                            let _ = self.tooltip.push_str("Workspace ");
+                            let ws_char = (b'1' + ws) as char;
+                            let _ = self.tooltip.push(ws_char);
+                            let _ = self.tooltip.push_str(" (Super+");
+                            let _ = self.tooltip.push(ws_char);
+                            let _ = self.tooltip.push(')');
                         }
                         TaskbarHit::PinnedApp(i) => {
                             if i < self.pinned_app_count && i < self.pinned_app_names.len() {
@@ -1189,12 +1230,34 @@ impl InputState {
                         }
                         TaskbarHit::Notifications => {
                             let _ = self.tooltip.push_str("Notifications");
+                            if self.notification_count > 0 {
+                                let _ = self.tooltip.push_str(" (");
+                                push_u8_decimal(&mut self.tooltip, self.notification_count.min(99) as u8);
+                                let _ = self.tooltip.push(')');
+                            }
+                            if self.do_not_disturb {
+                                let _ = self.tooltip.push_str(" — DND");
+                            }
                         }
                         TaskbarHit::Volume => {
-                            let _ = self.tooltip.push_str("Volume");
+                            if self.volume_muted {
+                                let _ = self.tooltip.push_str("Volume: Muted");
+                            } else {
+                                let _ = self.tooltip.push_str("Volume: ");
+                                push_u8_decimal(&mut self.tooltip, self.volume_level);
+                                let _ = self.tooltip.push('%');
+                            }
+                        }
+                        TaskbarHit::Battery => {
+                            let _ = self.tooltip.push_str("Battery: ");
+                            push_u8_decimal(&mut self.tooltip, self.battery_level);
+                            let _ = self.tooltip.push('%');
                         }
                         TaskbarHit::Clock => {
                             let _ = self.tooltip.push_str("Calendar");
+                            if self.night_light_active {
+                                let _ = self.tooltip.push_str(" — Night Light ON");
+                            }
                         }
                         TaskbarHit::ShowDesktop => {
                             let _ = self.tooltip.push_str("Show Desktop");
@@ -1205,7 +1268,7 @@ impl InputState {
                         TaskbarHit::TaskScrollRight => {
                             let _ = self.tooltip.push_str("Scroll right");
                         }
-                        _ => {}
+                        TaskbarHit::None => {}
                     }
                     dirty = true;
                 }
@@ -1330,26 +1393,43 @@ impl InputState {
                             if self.cursor_x >= qs_x && self.cursor_x < qs_x + qs_w
                                 && self.cursor_y >= qs_y && self.cursor_y < qs_y + qs_h
                             {
-                                // Clicks on toggle rows dispatch context actions
                                 let row_x_toggle = qs_x + qs_w - 46;
                                 let row_w_toggle = 36;
-                                // Row 0: DND (y = qs_y+34, h=16)
+                                let slider_x = qs_x + 10;
+                                let slider_w = qs_w - 20;
+                                // Row 0: DND toggle pill (y = qs_y+34, h=16)
                                 if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
                                     && self.cursor_y >= qs_y + 34 && self.cursor_y < qs_y + 50
                                 {
                                     self.pending_context_action = ContextAction::ToggleDoNotDisturb;
                                 }
-                                // Row 1: Night Light (y = qs_y+62, h=16)
+                                // Row 1: Night Light toggle pill (y = qs_y+62, h=16)
                                 else if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
                                     && self.cursor_y >= qs_y + 62 && self.cursor_y < qs_y + 78
                                 {
                                     self.pending_context_action = ContextAction::ToggleNightLight;
                                 }
-                                // Row 2: Volume Mute (y = qs_y+90, h=16)
+                                // Row 2: Volume Mute toggle pill (y = qs_y+90, h=16)
                                 else if self.cursor_x >= row_x_toggle && self.cursor_x < row_x_toggle + row_w_toggle
                                     && self.cursor_y >= qs_y + 90 && self.cursor_y < qs_y + 106
                                 {
                                     self.pending_context_action = ContextAction::ToggleMute;
+                                }
+                                // Brightness slider bar (y = qs_y+134, h=6) — set brightness level
+                                else if self.cursor_x >= slider_x && self.cursor_x < slider_x + slider_w
+                                    && self.cursor_y >= qs_y + 134 && self.cursor_y < qs_y + 142
+                                {
+                                    let rel = self.cursor_x - slider_x;
+                                    let level = ((rel * 100) / slider_w).clamp(0, 100) as u8;
+                                    self.pending_context_action = ContextAction::SetBrightness(level);
+                                }
+                                // Volume slider bar (y = qs_y+164, h=6) — set volume level
+                                else if self.cursor_x >= slider_x && self.cursor_x < slider_x + slider_w
+                                    && self.cursor_y >= qs_y + 164 && self.cursor_y < qs_y + 172
+                                {
+                                    let rel = self.cursor_x - slider_x;
+                                    let level = ((rel * 100) / slider_w).clamp(0, 100) as u8;
+                                    self.pending_context_action = ContextAction::SetVolume(level);
                                 }
                                 dirty = true;
                                 return dirty;
@@ -2413,7 +2493,7 @@ mod tests {
         state.cursor_y = 1080 - 20;
         let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
-        assert_eq!(state.tooltip.as_str(), "Launcher");
+        assert_eq!(state.tooltip.as_str(), "Launcher (Super+A)");
 
         // Move off taskbar
         state.cursor_x = 500;
