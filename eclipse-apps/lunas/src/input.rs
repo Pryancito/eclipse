@@ -84,6 +84,8 @@ pub enum TaskbarHit {
     Notifications,
     /// The volume indicator was clicked.
     Volume,
+    /// The network icon was clicked.
+    Network,
     /// The battery indicator was clicked.
     Battery,
     /// The clock area was clicked.
@@ -154,6 +156,10 @@ pub enum ContextAction {
     SwitchWorkspace(u8),
     /// Toggle the battery/power info panel.
     ToggleBatteryPanel,
+    /// Toggle the network details panel.
+    ToggleNetworkDetails,
+    /// Open the network configuration panel.
+    OpenNetworkConfig,
 }
 
 /// A single context menu item.
@@ -422,6 +428,12 @@ pub fn taskbar_hit_test(
         return TaskbarHit::Volume;
     }
 
+    // Network icon: around tray_x + 126
+    let net_x = tray_start + 126;
+    if px >= net_x - 4 && px < net_x + 24 && py >= bar_y + 4 && py < bar_y + 36 {
+        return TaskbarHit::Network;
+    }
+
     // Clock area: fb_width - 56 to fb_width - 6
     let clock_x = fb_width - 56;
     if px >= clock_x && px < fb_width - 6 && py >= bar_y + 4 && py < bar_y + 36 {
@@ -683,6 +695,20 @@ pub struct InputState {
     pub battery_panel_active: bool,
     /// Offset from current month for calendar display (-1 = prev, 0 = this, +1 = next, etc).
     pub calendar_month_offset: i8,
+    /// Whether the network configuration panel is visible.
+    pub net_config_active: bool,
+    /// When true, the network config panel shows static IP form; when false it shows DHCP view.
+    pub net_manual_mode: bool,
+    /// Static network configuration being edited.
+    pub net_static_config: NetStaticConfig,
+    /// Which field is being edited in the static config form (0 = none, 1-4 = IP/prefix/GW/DNS).
+    pub net_edit_field: u8,
+    /// Buffer for the value currently being typed into a static config field.
+    pub net_edit_buffer: heapless::String<16>,
+    /// Signal to state.rs to apply the static network configuration via IPC.
+    pub apply_net_static: bool,
+    /// Signal to state.rs to request a DHCP IP renewal via IPC.
+    pub renew_dhcp: bool,
 }
 
 impl InputState {
@@ -748,7 +774,48 @@ impl InputState {
             launcher_keyboard_index: None,
             battery_panel_active: false,
             calendar_month_offset: 0,
+            net_config_active: false,
+            net_manual_mode: false,
+            net_static_config: NetStaticConfig {
+                ipv4: [192, 168, 1, 100],
+                ipv4_prefix: 24,
+                ipv6: [0u8; 16],
+                ipv6_prefix: 64,
+                gateway_v4: [192, 168, 1, 1],
+                gateway_v6: [0u8; 16],
+                dns_v4: [8, 8, 8, 8],
+                dns_v6: [0u8; 16],
+            },
+            net_edit_field: 0,
+            net_edit_buffer: heapless::String::new(),
+            apply_net_static: false,
+            renew_dhcp: false,
         }
+    }
+
+    /// Commit the value in `net_edit_buffer` to the corresponding field in `net_static_config`.
+    fn commit_net_edit_field(&mut self) {
+        let buf = self.net_edit_buffer.as_str();
+        match self.net_edit_field {
+            1 => { if let Some(ip) = Self::parse_ipv4(buf) { self.net_static_config.ipv4 = ip; } }
+            2 => { if let Ok(prefix) = buf.parse::<u8>() { self.net_static_config.ipv4_prefix = prefix.min(32); } }
+            3 => { if let Some(gw) = Self::parse_ipv4(buf) { self.net_static_config.gateway_v4 = gw; } }
+            4 => { if let Some(dns) = Self::parse_ipv4(buf) { self.net_static_config.dns_v4 = dns; } }
+            _ => {}
+        }
+        self.net_edit_field = 0;
+        self.net_edit_buffer.clear();
+    }
+
+    /// Parse a dotted-decimal IPv4 string (e.g. "192.168.1.1") into a [u8; 4].
+    fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+        let mut parts = s.split('.');
+        let a = parts.next()?.parse::<u8>().ok()?;
+        let b = parts.next()?.parse::<u8>().ok()?;
+        let c = parts.next()?.parse::<u8>().ok()?;
+        let d = parts.next()?.parse::<u8>().ok()?;
+        if parts.next().is_some() { return None; }
+        Some([a, b, c, d])
     }
 
     /// Apply an input event to the desktop state (keyboard + mouse handling).
@@ -926,6 +993,43 @@ impl InputState {
                         return dirty;
                     }
 
+                    // ── Network config panel keyboard input ──
+                    if self.net_config_active && self.net_edit_field > 0 {
+                        let code = (scancode & 0x7FFF) as u8;
+                        match code {
+                            0x01 => {
+                                // Escape: cancel editing current field
+                                self.net_edit_field = 0;
+                                self.net_edit_buffer.clear();
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x1C => {
+                                // Enter: commit the edited field value
+                                self.commit_net_edit_field();
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x0E => {
+                                // Backspace: delete last character
+                                self.net_edit_buffer.pop();
+                                dirty = true;
+                                return dirty;
+                            }
+                            _ => {
+                                // Accept digits and dots for IP address entry
+                                let shift = (self.modifiers & 1) != 0;
+                                if let Some(ch) = scancode_to_char(code as u16, shift) {
+                                    if (ch.is_ascii_digit() || ch == '.') && self.net_edit_buffer.len() < 15 {
+                                        let _ = self.net_edit_buffer.push(ch);
+                                        dirty = true;
+                                    }
+                                }
+                                return dirty;
+                            }
+                        }
+                    }
+
                     // ── Launcher keyboard navigation (when launcher overlay is open) ──
                     if self.launcher_active {
                         let code = (scancode & 0x7FFF) as u8;
@@ -1013,7 +1117,13 @@ impl InputState {
                             dirty = true;
                         }
                         KeyAction::CloseWindow => {
-                            if let Some(idx) = self.focused_window {
+                            // Escape first closes the network config panel if open
+                            if self.net_config_active {
+                                self.net_config_active = false;
+                                self.net_edit_field = 0;
+                                self.net_edit_buffer.clear();
+                                dirty = true;
+                            } else if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
                                     windows[idx].closing = true;
                                     self.focused_window = None;
@@ -1375,6 +1485,9 @@ impl InputState {
                                 let _ = self.tooltip.push('%');
                             }
                         }
+                        TaskbarHit::Network => {
+                            let _ = self.tooltip.push_str("Network — click for details");
+                        }
                         TaskbarHit::Battery => {
                             let _ = self.tooltip.push_str("Battery: ");
                             push_u8_decimal(&mut self.tooltip, self.battery_level);
@@ -1627,6 +1740,115 @@ impl InputState {
                             }
                         }
 
+                        // ── Network configuration panel click detection ──
+                        if self.net_config_active {
+                            use crate::render::{TASKBAR_HEIGHT, NET_CONFIG_PANEL_W, NET_CONFIG_PANEL_H};
+                            let pw = NET_CONFIG_PANEL_W;
+                            let ph = NET_CONFIG_PANEL_H;
+                            let pp_x = (self.fb_width - pw) / 2;
+                            let pp_y = (self.fb_height - TASKBAR_HEIGHT - ph) / 2;
+                            if self.cursor_x >= pp_x && self.cursor_x < pp_x + pw
+                                && self.cursor_y >= pp_y && self.cursor_y < pp_y + ph
+                            {
+                                // DHCP button: pp_x+20 to pp_x+110, pp_y+38 to pp_y+62
+                                if self.cursor_x >= pp_x + 20 && self.cursor_x < pp_x + 130
+                                    && self.cursor_y >= pp_y + 38 && self.cursor_y < pp_y + 62
+                                {
+                                    // Switch to DHCP mode
+                                    self.net_manual_mode = false;
+                                    self.net_edit_field = 0;
+                                    self.net_edit_buffer.clear();
+                                    dirty = true;
+                                    return dirty;
+                                }
+                                // Static/Manual button: pp_x+140 to pp_x+260, pp_y+38 to pp_y+62
+                                if self.cursor_x >= pp_x + 140 && self.cursor_x < pp_x + 270
+                                    && self.cursor_y >= pp_y + 38 && self.cursor_y < pp_y + 62
+                                {
+                                    // Switch to static/manual mode
+                                    self.net_manual_mode = true;
+                                    self.net_edit_field = 0;
+                                    self.net_edit_buffer.clear();
+                                    dirty = true;
+                                    return dirty;
+                                }
+                                if !self.net_manual_mode {
+                                    // DHCP mode: "Renew IP" button at pp_y+200..pp_y+230, centred
+                                    let btn_x = pp_x + pw / 2 - 80;
+                                    if self.cursor_x >= btn_x && self.cursor_x < btn_x + 160
+                                        && self.cursor_y >= pp_y + 200 && self.cursor_y < pp_y + 228
+                                    {
+                                        self.renew_dhcp = true;
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                } else {
+                                    // Static mode: field rows at pp_y+80, +118, +156, +194 (h=30 each)
+                                    for f in 0..4usize {
+                                        let fy = pp_y + 80 + (f as i32 * 38);
+                                        // Click on the value area (right half of row)
+                                        if self.cursor_x >= pp_x + pw / 2 - 20 && self.cursor_x < pp_x + pw - 10
+                                            && self.cursor_y >= fy - 14 && self.cursor_y < fy + 14
+                                        {
+                                            // Toggle editing this field (click again to deselect)
+                                            let fid = (f as u8) + 1;
+                                            if self.net_edit_field == fid {
+                                                // Already editing: commit and deselect
+                                                self.commit_net_edit_field();
+                                            } else {
+                                                // Start editing this field
+                                                if self.net_edit_field != 0 {
+                                                    self.commit_net_edit_field();
+                                                }
+                                                self.net_edit_field = fid;
+                                                self.net_edit_buffer.clear();
+                                                // Pre-fill with current value
+                                                use core::fmt::Write;
+                                                match fid {
+                                                    1 => { let ip = self.net_static_config.ipv4; let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]); }
+                                                    2 => { let _ = write!(&mut self.net_edit_buffer, "{}", self.net_static_config.ipv4_prefix); }
+                                                    3 => { let gw = self.net_static_config.gateway_v4; let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]); }
+                                                    4 => { let dns = self.net_static_config.dns_v4; let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", dns[0], dns[1], dns[2], dns[3]); }
+                                                    _ => {}
+                                                }
+                                            }
+                                            dirty = true;
+                                            return dirty;
+                                        }
+                                    }
+                                    // Apply button at pp_y+240..pp_y+270, centred
+                                    let btn_x = pp_x + pw / 2 - 80;
+                                    if self.cursor_x >= btn_x && self.cursor_x < btn_x + 160
+                                        && self.cursor_y >= pp_y + 240 && self.cursor_y < pp_y + 268
+                                    {
+                                        if self.net_edit_field != 0 {
+                                            self.commit_net_edit_field();
+                                        }
+                                        self.apply_net_static = true;
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                }
+                                // Close button: top-right corner pp_x+pw-24..pp_x+pw, pp_y..pp_y+24
+                                if self.cursor_x >= pp_x + pw - 24 && self.cursor_y < pp_y + 24 {
+                                    self.net_config_active = false;
+                                    self.net_edit_field = 0;
+                                    self.net_edit_buffer.clear();
+                                    dirty = true;
+                                    return dirty;
+                                }
+                                dirty = true;
+                                return dirty;
+                            } else {
+                                // Clicked outside → close the panel
+                                self.net_config_active = false;
+                                self.net_edit_field = 0;
+                                self.net_edit_buffer.clear();
+                                dirty = true;
+                                return dirty;
+                            }
+                        }
+
                         // ── Taskbar click detection (highest priority) ──
                         let tb_hit = taskbar_hit_test(
                             self.cursor_x, self.cursor_y,
@@ -1681,6 +1903,11 @@ impl InputState {
                                 }
                                 TaskbarHit::Volume => {
                                     self.volume_panel_active = !self.volume_panel_active;
+                                    dirty = true;
+                                }
+                                TaskbarHit::Network => {
+                                    // Left-click network: toggle network details panel
+                                    self.network_details_active = !self.network_details_active;
                                     dirty = true;
                                 }
                                 TaskbarHit::Battery => {
@@ -1916,6 +2143,17 @@ impl InputState {
                             self.context_menu.add_item("Volume Down", ContextAction::VolumeDown);
                             self.context_menu.add_separator();
                             self.context_menu.add_checked_item("Mute", ContextAction::ToggleMute, self.volume_muted);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Network = tb_hit {
+                            // ── Network context menu ──
+                            // Height: 4 regular + 1 separator = 4*28 + 8 = 120px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 120);
+                            self.context_menu.add_item("Network Details", ContextAction::ToggleNetworkDetails);
+                            self.context_menu.add_item("Configure Network", ContextAction::OpenNetworkConfig);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Night Light", ContextAction::ToggleNightLight);
+                            self.context_menu.add_item("Quick Settings", ContextAction::None);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Notifications = tb_hit {
@@ -3599,5 +3837,154 @@ mod tests {
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         // dashboard_active should NOT change because lock screen intercepts key events
         assert!(!state.dashboard_active, "Lock screen should block Super+D shortcut");
+    }
+
+    #[test]
+    fn test_taskbar_hit_network() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
+        // Network icon is at tray_start + 126, tray_start = 1920 - 220 = 1700; net_x = 1826
+        // Hit range: [1822, 1850)
+        let hit = taskbar_hit_test(1826, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
+        assert_eq!(hit, TaskbarHit::Network);
+    }
+
+    #[test]
+    fn test_left_click_network_toggles_network_panel() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Network icon at tray_start + 126 = 1700 + 126 = 1826
+        state.cursor_x = 1826;
+        state.cursor_y = 1080 - 20;
+
+        assert!(!state.network_details_active);
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.network_details_active, "left-click on network icon should open network details");
+
+        // Click again to close
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.network_details_active, "second click should close network details");
+    }
+
+    #[test]
+    fn test_right_click_network_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Network icon at tray_start + 126 = 1826; hit range [1822, 1850)
+        state.cursor_x = 1826;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.context_menu.visible, "right-click on network icon should show context menu");
+        // First item should be Network Details
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ToggleNetworkDetails);
+    }
+
+    #[test]
+    fn test_right_click_network_has_configure_item() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        state.cursor_x = 1826;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.context_menu.visible);
+        // Second item should be Configure Network
+        assert_eq!(state.context_menu.items[1].action, ContextAction::OpenNetworkConfig,
+            "second item should be OpenNetworkConfig");
+    }
+
+    #[test]
+    fn test_net_config_state_defaults() {
+        let state = InputState::new(1920, 1080);
+        assert!(!state.net_config_active, "net_config_active should start false");
+        assert!(!state.net_manual_mode, "net_manual_mode should default to false (DHCP)");
+        assert_eq!(state.net_edit_field, 0);
+        assert!(state.net_edit_buffer.is_empty());
+        assert!(!state.apply_net_static);
+        assert!(!state.renew_dhcp);
+    }
+
+    #[test]
+    fn test_parse_ipv4_valid() {
+        let ip = InputState::parse_ipv4("192.168.1.100");
+        assert_eq!(ip, Some([192, 168, 1, 100]));
+    }
+
+    #[test]
+    fn test_parse_ipv4_invalid() {
+        assert_eq!(InputState::parse_ipv4("not.an.ip"), None);
+        assert_eq!(InputState::parse_ipv4("256.0.0.1"), None);
+        assert_eq!(InputState::parse_ipv4("1.2.3"), None);
+    }
+
+    #[test]
+    fn test_escape_closes_net_config_panel() {
+        let mut state = InputState::new(1920, 1080);
+        state.net_config_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press Escape (scancode 0x01)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x01, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.net_config_active, "Escape should close the net config panel");
+    }
+
+    #[test]
+    fn test_net_config_keyboard_typing() {
+        let mut state = InputState::new(1920, 1080);
+        state.net_config_active = true;
+        state.net_manual_mode = true;
+        state.net_edit_field = 1; // editing IP field
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Type '1' (scancode 0x02)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x02, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.net_edit_buffer.as_str(), "1", "typing '1' should append to edit buffer");
+
+        // Backspace (scancode 0x0E)
+        let ev2 = InputEvent { device_id: 0, event_type: 0, code: 0x0E, value: 1, timestamp: 0 };
+        state.apply_event(&ev2, &mut windows, &mut count, &mut surfaces);
+        assert!(state.net_edit_buffer.is_empty(), "backspace should clear the char");
+    }
+
+    #[test]
+    fn test_commit_net_edit_field_ip() {
+        let mut state = InputState::new(1920, 1080);
+        state.net_edit_field = 1;
+        let _ = state.net_edit_buffer.push_str("10.0.0.1");
+        state.commit_net_edit_field();
+        assert_eq!(state.net_static_config.ipv4, [10, 0, 0, 1]);
+        assert_eq!(state.net_edit_field, 0);
+        assert!(state.net_edit_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_commit_net_edit_field_prefix() {
+        let mut state = InputState::new(1920, 1080);
+        state.net_edit_field = 2;
+        let _ = state.net_edit_buffer.push_str("16");
+        state.commit_net_edit_field();
+        assert_eq!(state.net_static_config.ipv4_prefix, 16);
     }
 }

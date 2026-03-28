@@ -577,6 +577,66 @@ impl LunasState {
             self.dirty = true;
         }
 
+        // ── Network configuration IPC actions ──
+        if self.input.apply_net_static {
+            self.input.apply_net_static = false;
+            if let Some(pid) = self.network_pid {
+                let header = eclipse_ipc::types::NetRequestHeader {
+                    magic: *eclipse_ipc::types::TAG_NETW,
+                    op: eclipse_ipc::types::NetOp::SetStaticConfig,
+                    request_id: 0,
+                    client_pid: pid,
+                    resource_id: 0,
+                };
+                let mut msg = [0u8; 256];
+                let hdr_size = core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>();
+                let cfg_size = core::mem::size_of::<eclipse_ipc::types::NetStaticConfig>();
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &header as *const _ as *const u8,
+                        msg.as_mut_ptr(),
+                        hdr_size,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        &self.input.net_static_config as *const _ as *const u8,
+                        msg.as_mut_ptr().add(hdr_size),
+                        cfg_size,
+                    );
+                    let _ = eclipse_send(
+                        pid,
+                        0x08,
+                        msg.as_ptr() as *const core::ffi::c_void,
+                        hdr_size + cfg_size,
+                        0,
+                    );
+                }
+            }
+            self.dirty = true;
+        }
+
+        if self.input.renew_dhcp {
+            self.input.renew_dhcp = false;
+            if let Some(pid) = self.network_pid {
+                let header = eclipse_ipc::types::NetRequestHeader {
+                    magic: *eclipse_ipc::types::TAG_NETW,
+                    op: eclipse_ipc::types::NetOp::SetDhcpConfig,
+                    request_id: 0,
+                    client_pid: pid,
+                    resource_id: 0,
+                };
+                unsafe {
+                    let _ = eclipse_send(
+                        pid,
+                        0x08,
+                        &header as *const _ as *const core::ffi::c_void,
+                        core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>(),
+                        0,
+                    );
+                }
+            }
+            self.dirty = true;
+        }
+
         // Handle pending context menu action
         use crate::input::ContextAction;
         let action = self.input.pending_context_action;
@@ -820,6 +880,14 @@ impl LunasState {
                 }
                 ContextAction::ToggleBatteryPanel => {
                     self.input.battery_panel_active = !self.input.battery_panel_active;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleNetworkDetails => {
+                    self.input.network_details_active = !self.input.network_details_active;
+                    self.dirty = true;
+                }
+                ContextAction::OpenNetworkConfig => {
+                    self.input.net_config_active = true;
                     self.dirty = true;
                 }
                 ContextAction::None => {}
