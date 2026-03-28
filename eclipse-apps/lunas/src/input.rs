@@ -29,11 +29,20 @@ pub enum CompositorEvent {
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
-    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual,
+    SnapLeft, SnapRight, SnapTopLeft, SnapTopRight, SnapBottomLeft, SnapBottomRight,
+    SwitchWorkspace(u8), CycleWindowVisual,
     Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
     ToggleSystemCentral, ToggleTiling, ToggleSearch, ArrowUp, ArrowDown,
     Input(char), Enter, Backspace, ToggleNotifications, ToggleNetworkDetails,
     BrightnessUp, BrightnessDown,
+    /// Toggle Do Not Disturb mode (Super+D).
+    ToggleDoNotDisturb,
+    /// Toggle Night Light mode — warm tint to reduce blue light (Super+N).
+    ToggleNightLight,
+    /// Take a screenshot of the current screen (PrintScreen).
+    Screenshot,
+    /// Toggle Quick Settings panel (Super+Q).
+    ToggleQuickSettings,
 }
 
 /// Represents what element was clicked on the taskbar.
@@ -97,6 +106,12 @@ pub enum ContextAction {
     BrightnessUp,
     /// Decrease screen brightness by one step.
     BrightnessDown,
+    /// Toggle Do Not Disturb mode.
+    ToggleDoNotDisturb,
+    /// Toggle Night Light mode (warm colour tint).
+    ToggleNightLight,
+    /// Capture the current framebuffer to disk.
+    TakeScreenshot,
 }
 
 /// A single context menu item.
@@ -394,8 +409,8 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x0D => KeyAction::SensitivityPlus,
         0x0C => KeyAction::SensitivityMinus,
         0x17 => KeyAction::InvertY,
-        0x47 => KeyAction::CenterCursor,
-        0x31 => KeyAction::NewWindow,
+        0x47 => if (modifiers & 8) != 0 { KeyAction::SnapTopLeft } else { KeyAction::CenterCursor },
+        0x31 => if (modifiers & 8) != 0 { KeyAction::ToggleNightLight } else { KeyAction::NewWindow },
         0x01 => KeyAction::CloseWindow,
         0x0F => if (modifiers & 4) != 0 { KeyAction::CycleWindowVisual } else { KeyAction::CycleForward },
         0x29 => KeyAction::CycleBackward,
@@ -418,11 +433,19 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x0E => KeyAction::Backspace,
         0x36 => if (modifiers & 8) != 0 { KeyAction::ToggleNotifications } else { KeyAction::None },
         0x12 => if (modifiers & 8) != 0 { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
-        // Brightness keys (F5=0x3F = down, F6=0x40 = up) or Super+PgDown/PgUp (0x51/0x49)
+        // Brightness keys (F5=0x3F = down, F6=0x40 = up)
         0x3F => KeyAction::BrightnessDown,
         0x40 => KeyAction::BrightnessUp,
-        0x49 => if (modifiers & 8) != 0 { KeyAction::BrightnessUp } else { KeyAction::None },
-        0x51 => if (modifiers & 8) != 0 { KeyAction::BrightnessDown } else { KeyAction::None },
+        // Super+Home/PgUp/End/PgDn = snap to screen quarters
+        0x49 => if (modifiers & 8) != 0 { KeyAction::SnapTopRight } else { KeyAction::None },
+        0x4F => if (modifiers & 8) != 0 { KeyAction::SnapBottomLeft } else { KeyAction::None },
+        0x51 => if (modifiers & 8) != 0 { KeyAction::SnapBottomRight } else { KeyAction::None },
+        // Super+D = Do Not Disturb toggle
+        0x20 => if (modifiers & 8) != 0 { KeyAction::ToggleDoNotDisturb } else { KeyAction::None },
+        // Super+Q = Quick Settings panel
+        0x10 => if (modifiers & 8) != 0 { KeyAction::ToggleQuickSettings } else { KeyAction::None },
+        // PrintScreen = Screenshot
+        0x37 => KeyAction::Screenshot,
         _ => KeyAction::None,
     }
 }
@@ -546,6 +569,8 @@ pub struct InputState {
     pub pending_pinned_swap: Option<(usize, usize)>,
     /// Window decoration style index (0 = default, 1 = minimal, 2 = neon). Cycled by CycleWindowVisual.
     pub window_decoration_style: u8,
+    /// Whether the Quick Settings panel is visible (Super+Q toggle).
+    pub quick_settings_active: bool,
 }
 
 impl InputState {
@@ -598,6 +623,7 @@ impl InputState {
             drag_press_y: 0,
             pending_pinned_swap: None,
             window_decoration_style: 0,
+            quick_settings_active: false,
         }
     }
 
@@ -832,6 +858,72 @@ impl InputState {
                         KeyAction::BrightnessDown => {
                             self.pending_context_action = ContextAction::BrightnessDown;
                             dirty = true;
+                        }
+                        KeyAction::ToggleDoNotDisturb => {
+                            self.pending_context_action = ContextAction::ToggleDoNotDisturb;
+                            dirty = true;
+                        }
+                        KeyAction::ToggleNightLight => {
+                            self.pending_context_action = ContextAction::ToggleNightLight;
+                            dirty = true;
+                        }
+                        KeyAction::Screenshot => {
+                            self.pending_context_action = ContextAction::TakeScreenshot;
+                            dirty = true;
+                        }
+                        KeyAction::ToggleQuickSettings => {
+                            self.quick_settings_active = !self.quick_settings_active;
+                            dirty = true;
+                        }
+                        KeyAction::SnapTopLeft => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let w = &mut windows[idx];
+                                    w.x = 0;
+                                    w.y = ShellWindow::TITLE_H;
+                                    w.w = self.fb_width / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapTopRight => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let w = &mut windows[idx];
+                                    w.x = self.fb_width / 2;
+                                    w.y = ShellWindow::TITLE_H;
+                                    w.w = self.fb_width / 2;
+                                    w.h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapBottomLeft => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    let w = &mut windows[idx];
+                                    w.x = 0;
+                                    w.y = ShellWindow::TITLE_H + h;
+                                    w.w = self.fb_width / 2;
+                                    w.h = h;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        KeyAction::SnapBottomRight => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    let h = (self.fb_height - ShellWindow::TITLE_H - 44) / 2;
+                                    let w = &mut windows[idx];
+                                    w.x = self.fb_width / 2;
+                                    w.y = ShellWindow::TITLE_H + h;
+                                    w.w = self.fb_width / 2;
+                                    w.h = h;
+                                    dirty = true;
+                                }
+                            }
                         }
                         KeyAction::CycleForward => {
                             if *window_count > 0 {
@@ -1430,6 +1522,8 @@ impl InputState {
                             self.context_menu.add_item("Toggle Tiling", ContextAction::ToggleTiling);
                             self.context_menu.add_item("Dashboard", ContextAction::OpenDashboard);
                             self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+                            self.context_menu.add_item("Do Not Disturb", ContextAction::ToggleDoNotDisturb);
+                            self.context_menu.add_item("Night Light", ContextAction::ToggleNightLight);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         }
@@ -1940,7 +2034,7 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible");
-        assert_eq!(state.context_menu.item_count, 4); // New Window, Toggle Tiling, Dashboard, Change Wallpaper
+        assert_eq!(state.context_menu.item_count, 6); // New Window, Toggle Tiling, Dashboard, Change Wallpaper, Do Not Disturb, Night Light
         assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
     }
 

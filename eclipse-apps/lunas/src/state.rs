@@ -747,6 +747,22 @@ impl LunasState {
                     self.desktop.brightness_level = self.desktop.brightness_level.saturating_sub(10);
                     self.dirty = true;
                 }
+                ContextAction::ToggleDoNotDisturb => {
+                    self.desktop.do_not_disturb = !self.desktop.do_not_disturb;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleNightLight => {
+                    self.desktop.night_light_active = !self.desktop.night_light_active;
+                    self.dirty = true;
+                }
+                ContextAction::TakeScreenshot => {
+                    // Capture back buffer to disk on Eclipse targets.
+                    #[cfg(target_vendor = "eclipse")]
+                    {
+                        self.backend.fb.save_screenshot();
+                    }
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
