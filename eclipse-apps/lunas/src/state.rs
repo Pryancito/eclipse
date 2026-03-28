@@ -822,6 +822,10 @@ impl LunasState {
                     self.input.battery_panel_active = !self.input.battery_panel_active;
                     self.dirty = true;
                 }
+                ContextAction::ToggleNetworkDetails => {
+                    self.input.network_details_active = !self.input.network_details_active;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }

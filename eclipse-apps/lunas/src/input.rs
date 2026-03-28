@@ -84,6 +84,8 @@ pub enum TaskbarHit {
     Notifications,
     /// The volume indicator was clicked.
     Volume,
+    /// The network icon was clicked.
+    Network,
     /// The battery indicator was clicked.
     Battery,
     /// The clock area was clicked.
@@ -154,6 +156,8 @@ pub enum ContextAction {
     SwitchWorkspace(u8),
     /// Toggle the battery/power info panel.
     ToggleBatteryPanel,
+    /// Toggle the network details panel.
+    ToggleNetworkDetails,
 }
 
 /// A single context menu item.
@@ -420,6 +424,12 @@ pub fn taskbar_hit_test(
     let vol_x = tray_start + 100;
     if px >= vol_x - 5 && px < vol_x + 15 && py >= bar_y + 4 && py < bar_y + 36 {
         return TaskbarHit::Volume;
+    }
+
+    // Network icon: around tray_x + 126
+    let net_x = tray_start + 126;
+    if px >= net_x - 4 && px < net_x + 24 && py >= bar_y + 4 && py < bar_y + 36 {
+        return TaskbarHit::Network;
     }
 
     // Clock area: fb_width - 56 to fb_width - 6
@@ -1375,6 +1385,9 @@ impl InputState {
                                 let _ = self.tooltip.push('%');
                             }
                         }
+                        TaskbarHit::Network => {
+                            let _ = self.tooltip.push_str("Network — click for details");
+                        }
                         TaskbarHit::Battery => {
                             let _ = self.tooltip.push_str("Battery: ");
                             push_u8_decimal(&mut self.tooltip, self.battery_level);
@@ -1683,6 +1696,11 @@ impl InputState {
                                     self.volume_panel_active = !self.volume_panel_active;
                                     dirty = true;
                                 }
+                                TaskbarHit::Network => {
+                                    // Left-click network: toggle network details panel
+                                    self.network_details_active = !self.network_details_active;
+                                    dirty = true;
+                                }
                                 TaskbarHit::Battery => {
                                     // Left-click battery: toggle power/battery info panel
                                     self.battery_panel_active = !self.battery_panel_active;
@@ -1916,6 +1934,16 @@ impl InputState {
                             self.context_menu.add_item("Volume Down", ContextAction::VolumeDown);
                             self.context_menu.add_separator();
                             self.context_menu.add_checked_item("Mute", ContextAction::ToggleMute, self.volume_muted);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Network = tb_hit {
+                            // ── Network context menu ──
+                            // Height: 3 regular + 1 separator = 3*28 + 8 = 92px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 92);
+                            self.context_menu.add_item("Network Details", ContextAction::ToggleNetworkDetails);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Night Light", ContextAction::ToggleNightLight);
+                            self.context_menu.add_item("Quick Settings", ContextAction::None);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Notifications = tb_hit {
@@ -3599,5 +3627,56 @@ mod tests {
         state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         // dashboard_active should NOT change because lock screen intercepts key events
         assert!(!state.dashboard_active, "Lock screen should block Super+D shortcut");
+    }
+
+    #[test]
+    fn test_taskbar_hit_network() {
+        let windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        let names = [[0u8; 32]; 16];
+        // Network icon is at tray_start + 126, tray_start = 1920 - 220 = 1700; net_x = 1826
+        // Hit range: [1822, 1850)
+        let hit = taskbar_hit_test(1826, 1080 - 20, 1920, 1080, 5, &names, &windows, 0, 0, 0);
+        assert_eq!(hit, TaskbarHit::Network);
+    }
+
+    #[test]
+    fn test_left_click_network_toggles_network_panel() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Network icon at tray_start + 126 = 1700 + 126 = 1826
+        state.cursor_x = 1826;
+        state.cursor_y = 1080 - 20;
+
+        assert!(!state.network_details_active);
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.network_details_active, "left-click on network icon should open network details");
+
+        // Click again to close
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.network_details_active, "second click should close network details");
+    }
+
+    #[test]
+    fn test_right_click_network_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Network icon at tray_start + 126 = 1826; hit range [1822, 1850)
+        state.cursor_x = 1826;
+        state.cursor_y = 1080 - 20;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(state.context_menu.visible, "right-click on network icon should show context menu");
+        // First item should be Network Details
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ToggleNetworkDetails);
     }
 }

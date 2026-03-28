@@ -1104,11 +1104,62 @@ fn draw_taskbar(
 
     // ── Volume indicator ──
     let vol_x = tray_x + 100;
+    // Hover highlight
+    if input.hovered_taskbar_element == crate::input::TaskbarHit::Volume {
+        let vol_hover_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(35, 45, 75))
+            .build();
+        let _ = Rectangle::new(Point::new(vol_x - 6, bar_y + 2), Size::new(28, 40))
+            .into_styled(vol_hover_style)
+            .draw(fb);
+    }
+    // Muted: draw icon with red tint via overlay bar; else draw normal icon
     draw_raw_icon(fb, assets::VOLUME_ICON, vol_x - 4, bar_y + 8, 24, 24);
+    if desktop.volume_muted {
+        // Red X mark over the icon when muted
+        let mute_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(220, 50, 50))
+            .build();
+        let _ = Rectangle::new(Point::new(vol_x + 10, bar_y + 8), Size::new(10, 2))
+            .into_styled(mute_style)
+            .draw(fb);
+        let _ = Rectangle::new(Point::new(vol_x + 10, bar_y + 28), Size::new(10, 2))
+            .into_styled(mute_style)
+            .draw(fb);
+    } else {
+        // Volume % text below icon
+        let vol_pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(120, 140, 200));
+        let mut vpct_buf = [0u8; 8];
+        let vpct = desktop.volume_level.min(100) as u32;
+        let vpct_str = format_u32(&mut vpct_buf, vpct);
+        let vol_text_x = vol_x - 4 + (24i32 - vpct_str.len() as i32 * 6) / 2;
+        let _ = Text::new(vpct_str, Point::new(vol_text_x, bar_y + 36), vol_pct_style).draw(fb);
+    }
 
     // ── Network icon ──
     let net_x = tray_x + 126;
+    // Hover highlight
+    if input.hovered_taskbar_element == crate::input::TaskbarHit::Network {
+        let net_hover_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(35, 45, 75))
+            .build();
+        let _ = Rectangle::new(Point::new(net_x - 2, bar_y + 2), Size::new(28, 40))
+            .into_styled(net_hover_style)
+            .draw(fb);
+    }
     draw_raw_icon(fb, assets::NETWORK_ICON, net_x, bar_y + 8, 24, 24);
+    // Connectivity status dot: green when actively transferring data, lighter green when idle/connected
+    {
+        let dot_color = if net_usage > 0.05 { // >5% usage = active transfer
+            Rgb888::new(0, 220, 80)   // active data flow
+        } else {
+            Rgb888::new(60, 180, 60)  // connected but idle
+        };
+        let dot_style = PrimitiveStyleBuilder::new().fill_color(dot_color).build();
+        let _ = Circle::new(Point::new(net_x + 16, bar_y + 6), 6)
+            .into_styled(dot_style)
+            .draw(fb);
+    }
 
     // ── Night Light indicator: warm amber dot when active ──
     if desktop.night_light_active {
@@ -2456,10 +2507,13 @@ fn draw_network_panel(
 ) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
-    let panel_w: i32 = 420;
-    let panel_h: i32 = 280;
-    let px = (fb_w - panel_w) / 2;
-    let py = (fb_h - panel_h) / 2;
+    let panel_w: i32 = 300;
+    let panel_h: i32 = 260;
+    // Position above the network icon in the tray (right side, above taskbar)
+    let tray_start = fb_w - TASKBAR_TRAY_WIDTH;
+    let net_icon_x = tray_start + 126;
+    let px = (net_icon_x - panel_w / 2).clamp(4, fb_w - panel_w - 4);
+    let py = fb_h - TASKBAR_HEIGHT - panel_h - 5;
 
     // Background
     let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(12, 15, 28)).build();
@@ -2478,10 +2532,16 @@ fn draw_network_panel(
 
     // Title
     let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
-    let _ = Text::new("NETWORK DETAILS", Point::new(px + 140, py + 24), title_style).draw(fb);
+    let _ = Text::new("NETWORK DETAILS", Point::new(px + 60, py + 20), title_style).draw(fb);
 
-    // Network gauge
-    draw_gauge(fb, px + 20, py + 45, 380, 24, net_usage, "NET", Rgb888::new(200, 100, 255));
+    // Separator
+    let sep_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(40, 50, 80)).build();
+    let _ = Rectangle::new(Point::new(px + 4, py + 26), Size::new((panel_w - 8) as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    // Network usage gauge
+    draw_gauge(fb, px + 12, py + 34, panel_w - 24, 20, net_usage, "NET", Rgb888::new(200, 100, 255));
 
     let info_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
     let label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 130, 180));
@@ -2491,57 +2551,57 @@ fn draw_network_panel(
         let lo_status = if stats.lo_up != 0 { "UP" } else { "DOWN" };
         let lo_color = if stats.lo_up != 0 { Rgb888::new(0, 200, 100) } else { Rgb888::new(220, 50, 50) };
         let lo_style = MonoTextStyle::new(&FONT_6X12, lo_color);
-        let _ = Text::new("lo:", Point::new(px + 20, py + 90), label_style).draw(fb);
-        let _ = Text::new(lo_status, Point::new(px + 60, py + 90), lo_style).draw(fb);
+        let _ = Text::new("lo:", Point::new(px + 12, py + 74), label_style).draw(fb);
+        let _ = Text::new(lo_status, Point::new(px + 50, py + 74), lo_style).draw(fb);
 
         // lo IPv4
         let mut ip_buf = [0u8; 20];
         let ip_len = format_ipv4(&mut ip_buf, &stats.lo_ipv4);
-        let _ = Text::new(core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("?"), Point::new(px + 100, py + 90), info_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("?"), Point::new(px + 90, py + 74), info_style).draw(fb);
 
         // eth0 interface status
         let eth_status = if stats.eth0_up != 0 { "UP" } else { "DOWN" };
         let eth_color = if stats.eth0_up != 0 { Rgb888::new(0, 200, 100) } else { Rgb888::new(220, 50, 50) };
         let eth_style = MonoTextStyle::new(&FONT_6X12, eth_color);
-        let _ = Text::new("eth0:", Point::new(px + 20, py + 115), label_style).draw(fb);
-        let _ = Text::new(eth_status, Point::new(px + 80, py + 115), eth_style).draw(fb);
+        let _ = Text::new("eth0:", Point::new(px + 12, py + 96), label_style).draw(fb);
+        let _ = Text::new(eth_status, Point::new(px + 60, py + 96), eth_style).draw(fb);
 
         // eth0 IPv4
         let mut ip_buf2 = [0u8; 20];
         let ip_len2 = format_ipv4(&mut ip_buf2, &stats.eth0_ipv4);
-        let _ = Text::new(core::str::from_utf8(&ip_buf2[..ip_len2]).unwrap_or("?"), Point::new(px + 120, py + 115), info_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&ip_buf2[..ip_len2]).unwrap_or("?"), Point::new(px + 100, py + 96), info_style).draw(fb);
 
         // Gateway
-        let _ = Text::new("Gateway:", Point::new(px + 20, py + 140), label_style).draw(fb);
+        let _ = Text::new("Gateway:", Point::new(px + 12, py + 118), label_style).draw(fb);
         let mut gw_buf = [0u8; 20];
         let gw_len = format_ipv4(&mut gw_buf, &stats.eth0_gateway);
-        let _ = Text::new(core::str::from_utf8(&gw_buf[..gw_len]).unwrap_or("?"), Point::new(px + 120, py + 140), info_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&gw_buf[..gw_len]).unwrap_or("?"), Point::new(px + 100, py + 118), info_style).draw(fb);
 
         // DNS
-        let _ = Text::new("DNS:", Point::new(px + 20, py + 160), label_style).draw(fb);
+        let _ = Text::new("DNS:", Point::new(px + 12, py + 140), label_style).draw(fb);
         let mut dns_buf = [0u8; 20];
         let dns_len = format_ipv4(&mut dns_buf, &stats.eth0_dns);
-        let _ = Text::new(core::str::from_utf8(&dns_buf[..dns_len]).unwrap_or("?"), Point::new(px + 120, py + 160), info_style).draw(fb);
+        let _ = Text::new(core::str::from_utf8(&dns_buf[..dns_len]).unwrap_or("?"), Point::new(px + 100, py + 140), info_style).draw(fb);
 
         // RX bytes
-        let _ = Text::new("RX bytes:", Point::new(px + 20, py + 190), label_style).draw(fb);
+        let _ = Text::new("RX:", Point::new(px + 12, py + 168), label_style).draw(fb);
         let mut buf3 = [0u8; 16];
         let rx_bytes_str = format_u64(&mut buf3, stats.rx_bytes);
-        let _ = Text::new(rx_bytes_str, Point::new(px + 160, py + 190), info_style).draw(fb);
+        let _ = Text::new(rx_bytes_str, Point::new(px + 50, py + 168), info_style).draw(fb);
 
         // TX bytes
-        let _ = Text::new("TX bytes:", Point::new(px + 20, py + 210), label_style).draw(fb);
+        let _ = Text::new("TX:", Point::new(px + 12, py + 188), label_style).draw(fb);
         let mut buf4 = [0u8; 16];
         let tx_bytes_str = format_u64(&mut buf4, stats.tx_bytes);
-        let _ = Text::new(tx_bytes_str, Point::new(px + 160, py + 210), info_style).draw(fb);
+        let _ = Text::new(tx_bytes_str, Point::new(px + 50, py + 188), info_style).draw(fb);
     } else {
-        let _ = Text::new("No extended stats", Point::new(px + 120, py + 130), label_style).draw(fb);
-        let _ = Text::new("available", Point::new(px + 150, py + 150), label_style).draw(fb);
+        let _ = Text::new("No extended stats", Point::new(px + 60, py + 120), label_style).draw(fb);
+        let _ = Text::new("available", Point::new(px + 90, py + 140), label_style).draw(fb);
     }
 
     // Close hint
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
-    let _ = Text::new("Super+E to close", Point::new(px + 140, py + 260), hint_style).draw(fb);
+    let _ = Text::new("Super+E to close", Point::new(px + 60, py + 246), hint_style).draw(fb);
 }
 
 // ── Helper functions ──
