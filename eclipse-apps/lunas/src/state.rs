@@ -80,6 +80,14 @@ pub struct LunasState {
     pub wayland: WaylandCompositor,
     /// XWayland integration: manages XWayland process and X11 window state.
     pub xwayland: XwaylandIntegration,
+    /// Ring buffer of the last 60 CPU usage samples (0-100).
+    pub cpu_history: [f32; 60],
+    /// Ring buffer of the last 60 memory usage samples (0-100).
+    pub mem_history: [f32; 60],
+    /// Ring buffer of the last 60 network usage samples (0-100).
+    pub net_history: [f32; 60],
+    /// Index for the next write position in history buffers.
+    pub history_pos: usize,
 }
 
 impl LunasState {
@@ -125,6 +133,10 @@ impl LunasState {
             last_input_tick: 0,
             wayland: WaylandCompositor::new(),
             xwayland: XwaylandIntegration::new(),
+            cpu_history: [0.0f32; 60],
+            mem_history: [0.0f32; 60],
+            net_history: [0.0f32; 60],
+            history_pos: 0,
         };
 
         // Pre-render background using the current wallpaper mode and colour.
@@ -893,6 +905,12 @@ impl LunasState {
         self.heap_fragmentation = stats.heap_fragmentation;
         self.prev_stats = Some(stats);
 
+        // Record history for sparklines
+        self.cpu_history[self.history_pos] = self.cpu_usage;
+        self.mem_history[self.history_pos] = self.mem_usage;
+        self.net_history[self.history_pos] = self.net_usage;
+        self.history_pos = (self.history_pos + 1) % 60;
+
         // Update clock and date from wall time offset (Unix timestamp in seconds)
         const SECONDS_PER_DAY: u64 = 86400;
         let secs_today = if stats.wall_time_offset > 0 {
@@ -935,6 +953,11 @@ impl LunasState {
             &self.log_buf,
             self.log_len,
             self.net_extended_stats.as_ref(),
+            &self.cpu_history,
+            &self.mem_history,
+            &self.net_history,
+            self.history_pos,
+            self.cpu_temp,
         );
         self.backend.swap_buffers();
     }

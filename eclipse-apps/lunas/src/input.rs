@@ -596,6 +596,12 @@ pub struct InputState {
     pub system_central_active: bool,
     pub network_panel_active: bool,
     pub lock_screen_active: bool,
+    /// Buffer holding digits entered on the lock screen (up to 4 digits).
+    pub lock_pin_buffer: [u8; 4],
+    /// Number of digits currently entered in the lock screen PIN.
+    pub lock_pin_len: usize,
+    /// Number of failed PIN attempts (resets on success).
+    pub lock_pin_attempts: u8,
     pub launcher_active: bool,
     pub search_active: bool,
     pub search_query: heapless::String<64>,
@@ -692,6 +698,9 @@ impl InputState {
             system_central_active: false,
             network_panel_active: false,
             lock_screen_active: false,
+            lock_pin_buffer: [0u8; 4],
+            lock_pin_len: 0,
+            lock_pin_attempts: 0,
             launcher_active: false,
             search_active: false,
             search_query: heapless::String::new(),
@@ -766,6 +775,54 @@ impl InputState {
                 }
 
                 if pressed {
+                    // ── Lock screen PIN input (highest priority when lock screen active) ──
+                    if self.lock_screen_active {
+                        let code = (scancode & 0x7FFF) as u16;
+                        match code {
+                            0x02..=0x0B => {
+                                // Digit keys: 0x02='1' .. 0x0A='9', 0x0B='0'
+                                let digit = if code == 0x0B { 0u8 } else { (code - 0x01) as u8 };
+                                if self.lock_pin_len < 4 {
+                                    self.lock_pin_buffer[self.lock_pin_len] = digit;
+                                    self.lock_pin_len += 1;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x1C => {
+                                // Enter: check PIN (demo PIN is "1234")
+                                if self.lock_pin_len == 4
+                                    && self.lock_pin_buffer[0] == 1
+                                    && self.lock_pin_buffer[1] == 2
+                                    && self.lock_pin_buffer[2] == 3
+                                    && self.lock_pin_buffer[3] == 4
+                                {
+                                    self.lock_screen_active = false;
+                                    self.lock_pin_len = 0;
+                                    self.lock_pin_attempts = 0;
+                                } else {
+                                    self.lock_pin_attempts = self.lock_pin_attempts.saturating_add(1);
+                                    self.lock_pin_len = 0;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x0E => {
+                                // Backspace: delete last digit
+                                if self.lock_pin_len > 0 {
+                                    self.lock_pin_len -= 1;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            _ => {
+                                // Consume all other keys while lock screen is active
+                                dirty = true;
+                                return dirty;
+                            }
+                        }
+                    }
+
                     // ── Context menu keyboard navigation (highest priority) ──
                     if self.context_menu.visible {
                         let code = (scancode & 0x7FFF) as u8;
@@ -1368,6 +1425,40 @@ impl InputState {
                 if button == 0 { // Left click
                     self.left_button_down = pressed;
                     if pressed {
+                        // ── Lock screen PIN pad click detection ──
+                        if self.lock_screen_active {
+                            let fb_cx = self.fb_width / 2;
+                            let fb_cy = self.fb_height / 2 - 80;
+                            let btn_w: i32 = 50;
+                            let btn_h: i32 = 40;
+                            let gap: i32 = 5;
+                            let grid_w = btn_w * 3 + gap * 2;
+                            let grid_x = fb_cx - grid_w / 2;
+                            let grid_y = fb_cy + 60;
+                            let digit_map: [u8; 12] = [1,2,3,4,5,6,7,8,9,10,0,11];
+                            for row in 0..4i32 {
+                                for col in 0..3i32 {
+                                    let idx = (row * 3 + col) as usize;
+                                    let bx = grid_x + col * (btn_w + gap);
+                                    let by = grid_y + row * (btn_h + gap);
+                                    if self.cursor_x >= bx && self.cursor_x < bx + btn_w
+                                        && self.cursor_y >= by && self.cursor_y < by + btn_h
+                                    {
+                                        let d = digit_map[idx];
+                                        // Only handle digit buttons 0-9 (skip * = 10, # = 11)
+                                        if d <= 9 && self.lock_pin_len < 4 {
+                                            self.lock_pin_buffer[self.lock_pin_len] = d;
+                                            self.lock_pin_len += 1;
+                                        }
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                }
+                            }
+                            dirty = true;
+                            return dirty;
+                        }
+
                         // ── Context menu click detection (highest priority) ──
                         if self.context_menu.visible {
                             let menu = &self.context_menu;

@@ -469,6 +469,11 @@ pub fn draw_desktop_shell(
     log_buf: &[u8],
     log_len: usize,
     net_extended_stats: Option<&eclipse_ipc::types::NetExtendedStats>,
+    cpu_history: &[f32; 60],
+    mem_history: &[f32; 60],
+    net_history: &[f32; 60],
+    history_pos: usize,
+    cpu_temp: u32,
 ) {
     // 1. Blit background
     fb.blit_background();
@@ -496,7 +501,8 @@ pub fn draw_desktop_shell(
 
     // 4. Draw overlays
     if input.dashboard_active {
-        draw_dashboard(fb, cpu_usage, mem_usage, net_usage);
+        draw_dashboard(fb, cpu_usage, mem_usage, net_usage,
+            cpu_history, mem_history, net_history, history_pos, cpu_temp);
     }
 
     if input.system_central_active {
@@ -508,7 +514,7 @@ pub fn draw_desktop_shell(
     }
 
     if input.lock_screen_active {
-        draw_lock_screen(fb);
+        draw_lock_screen(fb, input);
     }
 
     if input.launcher_active {
@@ -1339,12 +1345,64 @@ fn draw_window(
             }
         }
         WindowContent::InternalDemo => {
+            // Dark navy terminal background
             let demo_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(15, 20, 35)).build();
             let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
                 .into_styled(demo_style)
                 .draw(fb);
-            let demo_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 100));
-            let _ = Text::new("Lunas Terminal", Point::new(cx + 8, content_y + 20), demo_text).draw(fb);
+
+            // Header separator line
+            let sep_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(40, 50, 80)).build();
+            let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, 1))
+                .into_styled(sep_style)
+                .draw(fb);
+
+            let green = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 100));
+            let white = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+            let cyan = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 220));
+            let dim = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
+
+            let line_h = 14;
+            let x0 = cx + 8;
+            let max_y = content_y + content_h;
+            let mut ly = content_y + 4 + 12; // first baseline
+
+            // Simulated terminal output lines
+            let lines: &[(&str, &MonoTextStyle<Rgb888>)] = &[
+                ("lunas@eclipse:~$ ls /usr/share/lunas", &white),
+                ("bin/  config/  fonts/  icons/  themes/", &cyan),
+                ("lunas@eclipse:~$ uname -a", &white),
+                ("Eclipse OS 1.0 lunas-compositor x86_64", &cyan),
+                ("lunas@eclipse:~$ cat /etc/motd", &white),
+                ("Welcome to Eclipse OS - Lunas Desktop", &green),
+                ("lunas@eclipse:~$ uptime", &white),
+                ("up 0 days, 00:42, load: 0.12 0.08 0.05", &cyan),
+                ("lunas@eclipse:~$ free -h", &white),
+                ("Mem:  512M total, 387M used, 125M free", &cyan),
+                ("lunas@eclipse:~$ ps aux | head -3", &white),
+                ("PID  USER   CMD", &dim),
+                ("  1  root   /sbin/init", &cyan),
+                ("  2  lunas  compositor", &cyan),
+                ("lunas@eclipse:~$ ", &green),
+            ];
+
+            for &(text, style) in lines {
+                if ly > max_y - 4 { break; }
+                let _ = Text::new(text, Point::new(x0, ly), *style).draw(fb);
+                ly += line_h;
+            }
+
+            // Draw cursor block at end of last prompt line
+            // Subtract line_h to go back to the prompt line baseline, then offset 2px for alignment
+            let prompt_text = "lunas@eclipse:~$ ";
+            let cursor_x = x0 + (prompt_text.len() as i32) * 6;
+            let cursor_y_top = ly - line_h - 2;
+            if cursor_y_top < max_y - 4 {
+                let cursor_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
+                let _ = Rectangle::new(Point::new(cursor_x, cursor_y_top), Size::new(6, 12))
+                    .into_styled(cursor_style)
+                    .draw(fb);
+            }
         }
         WindowContent::Wayland { .. } => {
             // Wayland content already composited
@@ -1370,11 +1428,13 @@ fn draw_window(
 }
 
 /// Draw the system dashboard overlay.
-fn draw_dashboard(fb: &mut FramebufferState, cpu_usage: f32, mem_usage: f32, net_usage: f32) {
+fn draw_dashboard(fb: &mut FramebufferState, cpu_usage: f32, mem_usage: f32, net_usage: f32,
+    cpu_history: &[f32; 60], mem_history: &[f32; 60], net_history: &[f32; 60], history_pos: usize,
+    cpu_temp: u32) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
     let panel_w = 400;
-    let panel_h = 300;
+    let panel_h = 360;
     let px = (fb_w - panel_w) / 2;
     let py = (fb_h - panel_h) / 2;
 
@@ -1397,18 +1457,29 @@ fn draw_dashboard(fb: &mut FramebufferState, cpu_usage: f32, mem_usage: f32, net
     let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
     let _ = Text::new("SYSTEM DASHBOARD", Point::new(px + 120, py + 24), title_style).draw(fb);
 
-    // CPU gauge
+    // CPU gauge + sparkline
     draw_gauge(fb, px + 50, py + 50, 330, 30, cpu_usage, "CPU", Rgb888::new(0, 200, 100));
+    draw_sparkline(fb, px + 50, py + 80, 330, 18, cpu_history, history_pos, Rgb888::new(0, 200, 100));
 
-    // Memory gauge
-    draw_gauge(fb, px + 50, py + 100, 330, 30, mem_usage, "MEM", Rgb888::new(0, 150, 255));
+    // Memory gauge + sparkline
+    draw_gauge(fb, px + 50, py + 110, 330, 30, mem_usage, "MEM", Rgb888::new(0, 150, 255));
+    draw_sparkline(fb, px + 50, py + 140, 330, 18, mem_history, history_pos, Rgb888::new(0, 150, 255));
 
-    // Network gauge
-    draw_gauge(fb, px + 50, py + 150, 330, 30, net_usage, "NET", Rgb888::new(200, 100, 255));
+    // Network gauge + sparkline
+    draw_gauge(fb, px + 50, py + 170, 330, 30, net_usage, "NET", Rgb888::new(200, 100, 255));
+    draw_sparkline(fb, px + 50, py + 200, 330, 18, net_history, history_pos, Rgb888::new(200, 100, 255));
+
+    // CPU temperature display
+    if cpu_temp > 0 {
+        let temp_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 180, 100));
+        let mut buf = [0u8; 16];
+        let s = format_temp(&mut buf, cpu_temp);
+        let _ = Text::new(s, Point::new(px + 50, py + 240), temp_style).draw(fb);
+    }
 
     // Status text
     let status_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-    let _ = Text::new("Press Super to close", Point::new(px + 110, py + 280), status_style).draw(fb);
+    let _ = Text::new("Press Super to close", Point::new(px + 110, py + 340), status_style).draw(fb);
 }
 
 /// Draw a progress gauge.
@@ -1444,7 +1515,46 @@ fn draw_gauge(fb: &mut FramebufferState, x: i32, y: i32, w: i32, h: i32, value: 
     let _ = Text::new(label, Point::new(x + 4, y + h - 8), label_style).draw(fb);
 }
 
-/// Draw the system central panel (services monitor).
+/// Draw a mini sparkline (line graph) from a ring buffer of values.
+fn draw_sparkline(fb: &mut FramebufferState, x: i32, y: i32, w: i32, h: i32,
+    history: &[f32; 60], history_pos: usize, color: Rgb888) {
+    // Background
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 24, 40)).build();
+    let _ = Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(bg_style)
+        .draw(fb);
+
+    let n = 60usize;
+    let n_i32 = n as i32;
+    let dot_style = PrimitiveStyleBuilder::new().fill_color(color).build();
+    for i in 0..n {
+        let data_idx = (history_pos + i) % n;
+        let val = history[data_idx].clamp(0.0, 100.0);
+        let px = x + (i as i32 * w) / n_i32;
+        let py = y + h - 1 - ((val / 100.0) * (h - 1) as f32) as i32;
+        let _ = Rectangle::new(Point::new(px, py.max(y)), Size::new(2, 2))
+            .into_styled(dot_style)
+            .draw(fb);
+    }
+}
+
+/// Format a CPU temperature value as "CPU: XX°C" into a provided buffer.
+fn format_temp<'a>(buf: &'a mut [u8; 16], temp: u32) -> &'a str {
+    // "CPU: " prefix
+    buf[0] = b'C'; buf[1] = b'P'; buf[2] = b'U'; buf[3] = b':'; buf[4] = b' ';
+    let mut pos = 5;
+    // Write temperature digits
+    if temp >= 100 {
+        buf[pos] = b'0' + ((temp / 100) % 10) as u8; pos += 1;
+    }
+    if temp >= 10 {
+        buf[pos] = b'0' + ((temp / 10) % 10) as u8; pos += 1;
+    }
+    buf[pos] = b'0' + (temp % 10) as u8; pos += 1;
+    // degree symbol rendered as "C" (monospace bitmap font lacks degree glyph)
+    buf[pos] = b'C'; pos += 1;
+    core::str::from_utf8(&buf[..pos]).unwrap_or("CPU: ?")
+}
 fn draw_system_central(fb: &mut FramebufferState, services: &[ServiceInfo], service_count: usize) {
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
@@ -1509,8 +1619,8 @@ fn draw_system_central(fb: &mut FramebufferState, services: &[ServiceInfo], serv
     }
 }
 
-/// Draw the lock screen overlay.
-fn draw_lock_screen(fb: &mut FramebufferState) {
+/// Draw the lock screen overlay with PIN entry pad.
+fn draw_lock_screen(fb: &mut FramebufferState, input: &InputState) {
     let fb_w = fb.info.width;
     let fb_h = fb.info.height;
 
@@ -1520,19 +1630,92 @@ fn draw_lock_screen(fb: &mut FramebufferState) {
         .into_styled(bg_style)
         .draw(fb);
 
-    // Lock icon area
     let cx = (fb_w as i32) / 2;
-    let cy = (fb_h as i32) / 2 - 40;
-    let lock_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 100, 200)).build();
-    let _ = Rectangle::new(Point::new(cx - 30, cy), Size::new(60, 50))
-        .into_styled(lock_style)
-        .draw(fb);
+    let cy = (fb_h as i32) / 2 - 80;
 
+    // "LOCKED" label at top
+    let locked_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
+    let _ = Text::new("LOCKED", Point::new(cx - 18, cy - 30), locked_style).draw(fb);
+
+    // Title
     let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
-    let _ = Text::new("SISTEMA BLOQUEADO", Point::new(cx - 54, cy + 80), text_style).draw(fb);
+    let _ = Text::new("SISTEMA BLOQUEADO", Point::new(cx - 54, cy), text_style).draw(fb);
 
+    // PIN dots (4 circles)
+    let dot_y = cy + 25;
+    let dot_spacing = 30;
+    let dot_start_x = cx - (dot_spacing * 2) + dot_spacing / 2;
+    for i in 0..4 {
+        let dx = dot_start_x + i * dot_spacing;
+        if (i as usize) < input.lock_pin_len {
+            // Filled dot
+            let filled = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
+            let _ = Rectangle::new(Point::new(dx - 5, dot_y - 5), Size::new(10, 10))
+                .into_styled(filled)
+                .draw(fb);
+        } else {
+            // Empty outline
+            let outline = PrimitiveStyleBuilder::new()
+                .stroke_color(Rgb888::new(100, 120, 160))
+                .stroke_width(1)
+                .build();
+            let _ = Rectangle::new(Point::new(dx - 5, dot_y - 5), Size::new(10, 10))
+                .into_styled(outline)
+                .draw(fb);
+        }
+    }
+
+    // PIN pad grid: 3 columns x 4 rows
+    let btn_w: i32 = 50;
+    let btn_h: i32 = 40;
+    let gap: i32 = 5;
+    let grid_w = btn_w * 3 + gap * 2;
+    let grid_x = cx - grid_w / 2;
+    let grid_y = cy + 60;
+
+    let digits: &[&str; 12] = &["1","2","3","4","5","6","7","8","9","*","0","#"];
+    let btn_bg = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(30, 40, 70)).build();
+    let btn_text = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+
+    for row in 0..4 {
+        for col in 0..3 {
+            let idx = row * 3 + col;
+            let bx = grid_x + col as i32 * (btn_w + gap);
+            let by = grid_y + row as i32 * (btn_h + gap);
+            let _ = Rectangle::new(Point::new(bx, by), Size::new(btn_w as u32, btn_h as u32))
+                .into_styled(btn_bg)
+                .draw(fb);
+            let _ = Text::new(digits[idx], Point::new(bx + btn_w / 2 - 3, by + btn_h / 2 + 4), btn_text).draw(fb);
+        }
+    }
+
+    // Hint text
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-    let _ = Text::new("Press L to unlock", Point::new(cx - 48, cy + 100), hint_style).draw(fb);
+    let hint_y = grid_y + 4 * (btn_h + gap) + 10;
+    let _ = Text::new("Enter to confirm", Point::new(cx - 48, hint_y), hint_style).draw(fb);
+    let _ = Text::new("Backspace to delete", Point::new(cx - 57, hint_y + 16), hint_style).draw(fb);
+
+    // Failed attempts warning
+    if input.lock_pin_attempts > 0 {
+        let red_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 60, 60));
+        let mut msg_buf = [0u8; 32];
+        let msg = format_pin_fail(&mut msg_buf, input.lock_pin_attempts);
+        let _ = Text::new(msg, Point::new(cx - 72, hint_y + 36), red_style).draw(fb);
+    }
+}
+
+/// Format "Incorrect PIN (N attempts)" into a provided buffer.
+fn format_pin_fail<'a>(buf: &'a mut [u8; 32], attempts: u8) -> &'a str {
+    let prefix = b"Incorrect PIN (";
+    let suffix = b" attempts)";
+    let mut pos = 0;
+    for &b in prefix { buf[pos] = b; pos += 1; }
+    if attempts >= 10 {
+        buf[pos] = b'0' + (attempts / 10); pos += 1;
+    }
+    buf[pos] = b'0' + (attempts % 10); pos += 1;
+    for &b in suffix { if pos < 32 { buf[pos] = b; pos += 1; } }
+    core::str::from_utf8(&buf[..pos]).unwrap_or("Incorrect PIN")
 }
 
 /// Launcher panel constants.
