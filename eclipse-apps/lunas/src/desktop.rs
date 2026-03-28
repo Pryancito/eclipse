@@ -144,7 +144,7 @@ impl DesktopShell {
             wallpaper_mode: WallpaperMode::CosmicTheme,
             wallpaper_color: (10, 15, 30),
             show_clock: true,
-            show_battery: true,
+            show_battery: false,
             volume_level: 75,
             volume_muted: false,
             brightness_level: 100,

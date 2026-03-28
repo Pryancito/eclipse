@@ -27,6 +27,7 @@ pub mod ipc;
 pub mod painter;
 pub mod render;
 pub mod state;
+pub mod assets;
 pub mod style_engine;
 pub mod wayland;
 pub mod widgets;

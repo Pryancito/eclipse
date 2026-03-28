@@ -1024,9 +1024,6 @@ impl InputState {
                         TaskbarHit::Volume => {
                             let _ = self.tooltip.push_str("Volume");
                         }
-                        TaskbarHit::Battery => {
-                            let _ = self.tooltip.push_str("Battery");
-                        }
                         TaskbarHit::Clock => {
                             let _ = self.tooltip.push_str("Calendar");
                         }
@@ -2477,22 +2474,6 @@ mod tests {
         // Drag should be cancelled on button-release (swap is pending if over another PinnedApp)
         // In this test the cursor is not on-taskbar during release (no second press), so drag is cleared.
         assert!(state.dragging_pinned_app.is_none(), "drag should be cleared after button release");
-    }
-
-    #[test]
-    fn test_tooltip_battery_text() {
-        let mut state = InputState::new(1920, 1080);
-        state.pinned_app_count = 0;
-        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
-        let mut surfaces = [ExternalSurface::default(); 16];
-        let mut count = 0;
-
-        // Move cursor over battery area (tray_start + 212 = 1832)
-        state.cursor_x = 1832;
-        state.cursor_y = 1080 - 20;
-        let ev = InputEvent { device_id: 0, event_type: 1, code: 0xFFFF, value: 0, timestamp: 0 };
-        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
-        assert_eq!(state.tooltip.as_str(), "Battery", "tooltip should say Battery");
     }
 
     #[test]

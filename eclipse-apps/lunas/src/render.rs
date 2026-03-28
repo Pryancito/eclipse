@@ -5,13 +5,14 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder};
+use embedded_graphics::primitives::{Rectangle, Circle, PrimitiveStyleBuilder};
 use embedded_graphics::mono_font::{ascii::FONT_6X12, MonoTextStyle};
 use embedded_graphics::text::Text;
 use embedded_graphics::geometry::{Point, Size};
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface};
 use crate::input::InputState;
 use crate::style_engine::StyleEngine;
+use crate::assets;
 use crate::desktop::{DesktopShell, WallpaperMode};
 use crate::state::ServiceInfo;
 
@@ -310,6 +311,36 @@ impl OriginDimensions for FramebufferState {
     }
 }
 
+/// Helper to draw a raw RGB888 icon with transparency key (black).
+fn draw_raw_icon(fb: &mut FramebufferState, data: &[u8], x: i32, y: i32, w: u32, h: u32) {
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let offset = (row * w as i32 + col) as usize * 3;
+            if offset + 2 >= data.len() { break; }
+            let r = data[offset];
+            let g = data[offset + 1];
+            let b = data[offset + 2];
+            
+            // Adaptive transparency: Use brightness as alpha.
+            let alpha = r.max(g).max(b) as u16;
+            if alpha < 10 { continue; }
+            
+            if alpha < 255 {
+                // Blend with taskbar background Rgb(15, 18, 35) to smooth edges
+                let br = 15u16; let bg = 18u16; let bb = 35u16;
+                let r = ((r as u16 * alpha + br * (255 - alpha)) / 255) as u8;
+                let g = ((g as u16 * alpha + bg * (255 - alpha)) / 255) as u8;
+                let b = ((b as u16 * alpha + bb * (255 - alpha)) / 255) as u8;
+                let color = Rgb888::new(r, g, b);
+                let _ = fb.draw_iter(core::iter::once(embedded_graphics::Pixel(Point::new(x + col, y + row), color)));
+            } else {
+                let color = Rgb888::new(r, g, b);
+                let _ = fb.draw_iter(core::iter::once(embedded_graphics::Pixel(Point::new(x + col, y + row), color)));
+            }
+        }
+    }
+}
+
 // ── Desktop Shell Rendering ──
 
 /// Draw the complete desktop shell (background, taskbar, windows, overlays).
@@ -331,6 +362,11 @@ pub fn draw_desktop_shell(
 ) {
     // 1. Blit background
     fb.blit_background();
+
+    // 1.5. Draw HUD overlay (kernel log) — placed in background so it doesn't block windows
+    if log_len > 0 {
+        draw_hud_overlay(fb, log_buf, log_len);
+    }
 
     // 2. Draw taskbar
     draw_taskbar(fb, input, desktop, windows, window_count, cpu_usage, mem_usage, net_usage);
@@ -386,11 +422,6 @@ pub fn draw_desktop_shell(
 
     // 5. Draw cursor
     draw_cursor(fb, input.cursor_x, input.cursor_y);
-
-    // 6. Draw HUD overlay (kernel log)
-    if log_len > 0 {
-        draw_hud_overlay(fb, log_buf, log_len);
-    }
 }
 
 /// Taskbar height in pixels.
@@ -522,9 +553,8 @@ fn draw_taskbar(
             .draw(fb);
     }
 
-    // Launcher icon (grid dots)
-    let dot_color = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
-    let _ = Text::new(":::", Point::new(10, bar_y + 26), dot_color).draw(fb);
+    // Launcher icon (Lunas Logo)
+    draw_raw_icon(fb, assets::LUNAS_LOGO, 6, bar_y + 6, 32, 32);
 
     // ── Workspace indicators ──
     for ws in 0..4u8 {
@@ -637,17 +667,31 @@ fn draw_taskbar(
             .draw(fb);
         }
 
-        // App first-letter icon
-        let letter_color = if is_running {
-            Rgb888::WHITE
-        } else {
-            Rgb888::new(180, 190, 210)
+        // App icon (minimalist)
+        let icon_data = match app_name {
+            n if n.eq_ignore_ascii_case("Terminal") => Some(assets::TERMINAL_ICON),
+            n if n.eq_ignore_ascii_case("Files") => Some(assets::FILES_ICON),
+            n if n.eq_ignore_ascii_case("Editor") => Some(assets::EDITOR_ICON),
+            n if n.eq_ignore_ascii_case("Browser") => Some(assets::BROWSER_ICON),
+            n if n.eq_ignore_ascii_case("Settings") => Some(assets::SETTINGS_ICON),
+            _ => None,
         };
-        let letter_style = MonoTextStyle::new(&FONT_6X12, letter_color);
-        let first_char = app_name.chars().next().unwrap_or('?');
-        let mut char_buf = [0u8; 4];
-        let char_str = first_char.encode_utf8(&mut char_buf);
-        let _ = Text::new(char_str, Point::new(app_x + 12, bar_y + 26), letter_style).draw(fb);
+
+        if let Some(data) = icon_data {
+            draw_raw_icon(fb, data, app_x, bar_y + 6, 32, 32);
+        } else {
+            // Fallback to first-letter icon if no specific icon asset exists
+            let letter_color = if is_running {
+                Rgb888::WHITE
+            } else {
+                Rgb888::new(180, 190, 210)
+            };
+            let letter_style = MonoTextStyle::new(&FONT_6X12, letter_color);
+            let first_char = app_name.chars().next().unwrap_or('?');
+            let mut char_buf = [0u8; 4];
+            let char_str = first_char.encode_utf8(&mut char_buf);
+            let _ = Text::new(char_str, Point::new(app_x + 12, bar_y + 26), letter_style).draw(fb);
+        }
 
         // Running indicator: 1-3 dots below the icon depending on instance count
         if run_count > 0 {
@@ -847,41 +891,36 @@ fn draw_taskbar(
         .into_styled(sep_style)
         .draw(fb);
 
-    // CPU metric text
-    let metrics_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-    let mut cpu_buf = [0u8; 16];
-    let cpu_str = format_metric(&mut cpu_buf, "CPU:", cpu_usage);
-    let _ = Text::new(cpu_str, Point::new(tray_x + 10, bar_y + 18), metrics_style).draw(fb);
+    // CPU metric icon
+    draw_raw_icon(fb, assets::CPU_ICON, tray_x + 10, bar_y + 8, 24, 24);
 
-    // CPU mini progress bar below the text — turns red above 80 %
-    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * 46) / 100;
+    // CPU & MEM mini progress bars stacked under CPU icon (46px wide)
+    let bar_x = tray_x + 10;
+    let bar_w_full = 46;
+    let track_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(25, 30, 50)).build();
+
+    // CPU bar with background track
+    let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(bar_w_full as u32, 2))
+        .into_styled(track_style)
+        .draw(fb);
+    let cpu_bar_w = ((cpu_usage as i32).clamp(0, 100) * bar_w_full) / 100;
     if cpu_bar_w > 0 {
-        let cpu_bar_color = if cpu_usage > 80.0 {
-            Rgb888::new(220, 80, 50)
-        } else {
-            Rgb888::new(0, 130, 220)
-        };
+        let cpu_bar_color = if cpu_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(0, 140, 255) };
         let cpu_bar_style = PrimitiveStyleBuilder::new().fill_color(cpu_bar_color).build();
-        let _ = Rectangle::new(Point::new(tray_x + 10, bar_y + 33), Size::new(cpu_bar_w as u32, 2))
+        let _ = Rectangle::new(Point::new(bar_x, bar_y + 32), Size::new(cpu_bar_w as u32, 2))
             .into_styled(cpu_bar_style)
             .draw(fb);
     }
 
-    // MEM metric text
-    let mut mem_buf = [0u8; 16];
-    let mem_str = format_metric(&mut mem_buf, "MEM:", mem_usage);
-    let _ = Text::new(mem_str, Point::new(tray_x + 78, bar_y + 18), metrics_style).draw(fb);
-
-    // MEM mini progress bar below the text — turns red above 80 %
-    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * 46) / 100;
+    // MEM bar with background track
+    let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(bar_w_full as u32, 2))
+        .into_styled(track_style)
+        .draw(fb);
+    let mem_bar_w = ((mem_usage as i32).clamp(0, 100) * bar_w_full) / 100;
     if mem_bar_w > 0 {
-        let mem_bar_color = if mem_usage > 80.0 {
-            Rgb888::new(220, 80, 50)
-        } else {
-            Rgb888::new(80, 200, 120)
-        };
+        let mem_bar_color = if mem_usage > 80.0 { Rgb888::new(220, 80, 50) } else { Rgb888::new(50, 210, 120) };
         let mem_bar_style = PrimitiveStyleBuilder::new().fill_color(mem_bar_color).build();
-        let _ = Rectangle::new(Point::new(tray_x + 78, bar_y + 33), Size::new(mem_bar_w as u32, 2))
+        let _ = Rectangle::new(Point::new(bar_x, bar_y + 36), Size::new(mem_bar_w as u32, 2))
             .into_styled(mem_bar_style)
             .draw(fb);
     }
@@ -913,14 +952,14 @@ fn draw_taskbar(
     // Shown as a very thin 24×2px bar just above the tiling badge position.
     {
         let bri = desktop.brightness_level.min(100) as i32;
-        let bri_bar_x = tray_x + 10;
+        let bri_bar_x = tray_x + 65; // Moved to where RAM icon was
         let bri_bar_w_full: i32 = 24;
         let bri_bar_w = (bri * bri_bar_w_full) / 100;
         // Background track
         let bri_track_style = PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::new(30, 38, 60))
             .build();
-        let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w_full as u32, 2))
+        let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 33), Size::new(bri_bar_w_full as u32, 2))
             .into_styled(bri_track_style)
             .draw(fb);
         // Fill
@@ -928,7 +967,7 @@ fn draw_taskbar(
             let bri_fill_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(220, 200, 80))
                 .build();
-            let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 37), Size::new(bri_bar_w as u32, 2))
+            let _ = Rectangle::new(Point::new(bri_bar_x, bar_y + 33), Size::new(bri_bar_w as u32, 2))
                 .into_styled(bri_fill_style)
                 .draw(fb);
         }
@@ -938,8 +977,8 @@ fn draw_taskbar(
     let notif_count = desktop.unread_count();
     let notif_x = tray_x + 155;
     if notif_count > 0 {
-        let bell_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 200, 50));
-        let _ = Text::new("!", Point::new(notif_x, bar_y + 18), bell_style).draw(fb);
+        // Notification icon (Bell)
+        draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
 
         // Badge with count
         let badge_style = PrimitiveStyleBuilder::new()
@@ -953,150 +992,18 @@ fn draw_taskbar(
         let nstr = format_u32(&mut nbuf, notif_count as u32);
         let _ = Text::new(nstr, Point::new(notif_x + 8, bar_y + 16), badge_text).draw(fb);
     } else {
-        // Outline box as a quiet bell placeholder when there are no unread notifications.
-        let bell_outline = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(70, 85, 115))
-            .stroke_width(1)
-            .build();
-        let _ = Rectangle::new(Point::new(notif_x, bar_y + 11), Size::new(8, 8))
-            .into_styled(bell_outline)
-            .draw(fb);
+        // Quiet notification icon
+        draw_raw_icon(fb, assets::NOTIFICATION_ICON, notif_x, bar_y + 8, 24, 24);
     }
 
     // Volume indicator (mute-aware)
     let vol_x = tray_x + 180;
-    let vol_color = if desktop.volume_muted {
-        Rgb888::new(220, 50, 50)
-    } else {
-        Rgb888::new(120, 140, 180)
-    };
-    let vol_style = MonoTextStyle::new(&FONT_6X12, vol_color);
-    let vol_icon = if desktop.volume_muted {
-        "X"
-    } else if desktop.volume_level > 50 {
-        "+"
-    } else if desktop.volume_level > 0 {
-        "~"
-    } else {
-        "-"
-    };
-    let _ = Text::new(vol_icon, Point::new(vol_x, bar_y + 18), vol_style).draw(fb);
+    // Volume icon
+    draw_raw_icon(fb, assets::VOLUME_ICON, vol_x - 4, bar_y + 8, 24, 24);
 
-    // Volume level bar (below icon) — spans up to 20px (proportional)
-    if !desktop.volume_muted && desktop.volume_level > 0 {
-        let bar_w = (desktop.volume_level as i32 * 20) / 100;
-        let vol_bar_style = PrimitiveStyleBuilder::new()
-            .fill_color(Rgb888::new(0, 150, 255))
-            .build();
-        let _ = Rectangle::new(
-            Point::new(vol_x - 2, bar_y + 22),
-            Size::new(bar_w as u32, 2),
-        )
-        .into_styled(vol_bar_style)
-        .draw(fb);
-    }
-
-    // Volume percentage text below the bar (e.g. "75" or "M" when muted)
-    {
-        let vol_pct_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 85, 115));
-        if desktop.volume_muted {
-            let _ = Text::new("M", Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
-        } else {
-            let mut vpbuf = [0u8; 4];
-            let vp = desktop.volume_level.min(100) as u32;
-            let mut vpos = 0usize;
-            if vp >= 100 {
-                vpbuf[vpos] = b'1'; vpos += 1;
-                vpbuf[vpos] = b'0'; vpos += 1;
-                vpbuf[vpos] = b'0'; vpos += 1;
-            } else {
-                vpbuf[vpos] = b'0' + (vp / 10) as u8; vpos += 1;
-                vpbuf[vpos] = b'0' + (vp % 10) as u8; vpos += 1;
-            }
-            let vstr = core::str::from_utf8(&vpbuf[..vpos]).unwrap_or("?");
-            let _ = Text::new(vstr, Point::new(vol_x - 2, bar_y + 34), vol_pct_style).draw(fb);
-        }
-    }
-
-    // Network activity indicator — small coloured dot at tray_x+205.
-    // Green when active (net_usage > 0.5%), dim grey when idle.
-    {
-        let net_x = tray_x + 205;
-        let net_connected = net_usage > 0.5;
-        let net_dot_color = if net_connected {
-            Rgb888::new(0, 210, 130)
-        } else {
-            Rgb888::new(50, 60, 85)
-        };
-        let net_dot_style = PrimitiveStyleBuilder::new().fill_color(net_dot_color).build();
-        // Outer dot (6×6)
-        let _ = Rectangle::new(Point::new(net_x, bar_y + 19), Size::new(6, 6))
-            .into_styled(net_dot_style)
-            .draw(fb);
-        // Label below
-        let net_label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(60, 75, 110));
-        let net_label = if net_connected { "N" } else { "n" };
-        let _ = Text::new(net_label, Point::new(net_x, bar_y + 34), net_label_style).draw(fb);
-    }
-
-    // Battery indicator — shown when show_battery is enabled.
-    // Position: tray_x + 212 (= fb_w - 88 with tray_width 300).
-    if desktop.show_battery {
-        let bat_x = tray_x + 212;
-        let bat_level = desktop.battery_level.min(100) as i32;
-        let bat_charging = desktop.battery_charging;
-
-        // Battery outline (16px × 10px rectangle + 2px bump on right)
-        let bat_outline_style = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(100, 120, 160))
-            .stroke_width(1)
-            .build();
-        let _ = Rectangle::new(Point::new(bat_x, bar_y + 17), Size::new(16, 10))
-            .into_styled(bat_outline_style)
-            .draw(fb);
-        // Battery terminal bump
-        let bump_style = PrimitiveStyleBuilder::new()
-            .fill_color(Rgb888::new(100, 120, 160))
-            .build();
-        let _ = Rectangle::new(Point::new(bat_x + 16, bar_y + 19), Size::new(2, 6))
-            .into_styled(bump_style)
-            .draw(fb);
-
-        // Battery fill (green / yellow / red)
-        let fill_w = ((bat_level * 14) / 100).max(0) as u32;
-        let fill_color = if bat_charging {
-            Rgb888::new(0, 200, 100)
-        } else if bat_level > 50 {
-            Rgb888::new(80, 200, 80)
-        } else if bat_level > 20 {
-            Rgb888::new(220, 180, 0)
-        } else {
-            Rgb888::new(220, 50, 50)
-        };
-        if fill_w > 0 {
-            let fill_style = PrimitiveStyleBuilder::new().fill_color(fill_color).build();
-            let _ = Rectangle::new(Point::new(bat_x + 1, bar_y + 18), Size::new(fill_w, 8))
-                .into_styled(fill_style)
-                .draw(fb);
-        }
-
-        // Charging indicator: "+" icon
-        if bat_charging {
-            let charge_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 240, 120));
-            let _ = Text::new("+", Point::new(bat_x + 20, bar_y + 26), charge_style).draw(fb);
-        }
-
-        // Battery percentage text below the battery icon
-        let bat_pct_color = if bat_level <= 20 {
-            Rgb888::new(220, 80, 50)
-        } else {
-            Rgb888::new(90, 110, 150)
-        };
-        let bat_pct_style = MonoTextStyle::new(&FONT_6X12, bat_pct_color);
-        let mut bat_pct_buf = [0u8; 6];
-        let bat_pct_str = format_battery_pct(&mut bat_pct_buf, bat_level as u32);
-        let _ = Text::new(bat_pct_str, Point::new(bat_x, bar_y + 33), bat_pct_style).draw(fb);
-    }
+    // Network icon
+    let net_x = tray_x + 205;
+    draw_raw_icon(fb, assets::NETWORK_ICON, net_x, bar_y + 8, 24, 24);
 
     // Clock display (far right) — shows HH:MM and DD/MM when clock is enabled, else branding
     let clock_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 220));
@@ -1256,24 +1163,27 @@ fn draw_window(
     let title = window.title_str();
     let _ = Text::new(title, Point::new(cx + 8, cy + 18), title_text_style).draw(fb);
 
-    // Close button (red circle) — always present
+    // Window control buttons — Mac style (colored circles)
+    // Rojo: Cerrar, Amarillo: Maximizar, Verde: Minimizar
     let close_x = cx + cw - 21;
+    let btn_y = cy + 6;
+    let btn_size = 12; // Slightly smaller circles for a cleaner look
+    
+    // Close (Red)
     let close_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 50, 50)).build();
-    let _ = Rectangle::new(Point::new(close_x, cy + 6), Size::new(16, 16))
+    let _ = Circle::new(Point::new(close_x + 2, btn_y + 2), btn_size)
         .into_styled(close_style)
         .draw(fb);
 
-    // Maximize button — cyan or neon
-    let max_color = if decoration_style == 2 { Rgb888::new(0, 240, 180) } else { Rgb888::new(0, 180, 220) };
-    let max_style = PrimitiveStyleBuilder::new().fill_color(max_color).build();
-    let _ = Rectangle::new(Point::new(close_x - 21, cy + 6), Size::new(16, 16))
+    // Maximize (Yellow)
+    let max_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(230, 180, 50)).build();
+    let _ = Circle::new(Point::new(close_x - 19, btn_y + 2), btn_size)
         .into_styled(max_style)
         .draw(fb);
 
-    // Minimize button
-    let min_color = if decoration_style == 1 { Rgb888::new(80, 90, 110) } else { Rgb888::new(0, 120, 160) };
-    let min_style = PrimitiveStyleBuilder::new().fill_color(min_color).build();
-    let _ = Rectangle::new(Point::new(close_x - 42, cy + 6), Size::new(16, 16))
+    // Minimize (Green)
+    let min_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(50, 200, 80)).build();
+    let _ = Circle::new(Point::new(close_x - 40, btn_y + 2), btn_size)
         .into_styled(min_style)
         .draw(fb);
 
@@ -1377,13 +1287,13 @@ fn draw_dashboard(fb: &mut FramebufferState, cpu_usage: f32, mem_usage: f32, net
     let _ = Text::new("SYSTEM DASHBOARD", Point::new(px + 120, py + 24), title_style).draw(fb);
 
     // CPU gauge
-    draw_gauge(fb, px + 20, py + 50, 360, 30, cpu_usage, "CPU", Rgb888::new(0, 200, 100));
+    draw_gauge(fb, px + 50, py + 50, 330, 30, cpu_usage, "CPU", Rgb888::new(0, 200, 100));
 
     // Memory gauge
-    draw_gauge(fb, px + 20, py + 100, 360, 30, mem_usage, "MEM", Rgb888::new(0, 150, 255));
+    draw_gauge(fb, px + 50, py + 100, 330, 30, mem_usage, "MEM", Rgb888::new(0, 150, 255));
 
     // Network gauge
-    draw_gauge(fb, px + 20, py + 150, 360, 30, net_usage, "NET", Rgb888::new(200, 100, 255));
+    draw_gauge(fb, px + 50, py + 150, 330, 30, net_usage, "NET", Rgb888::new(200, 100, 255));
 
     // Status text
     let status_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
@@ -1405,6 +1315,17 @@ fn draw_gauge(fb: &mut FramebufferState, x: i32, y: i32, w: i32, h: i32, value: 
         let _ = Rectangle::new(Point::new(x, y), Size::new(fill_w, h as u32))
             .into_styled(fill_style)
             .draw(fb);
+    }
+
+    // Icon next to gauge
+    let icon_data = match label {
+        "CPU" => Some(assets::CPU_ICON),
+        "MEM" => Some(assets::RAM_ICON),
+        "NET" => Some(assets::NETWORK_ICON),
+        _ => None,
+    };
+    if let Some(data) = icon_data {
+        draw_raw_icon(fb, data, x - 35, y + 3, 24, 24);
     }
 
     // Label
@@ -1564,10 +1485,9 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
 
     // Search hint if search is active
     if input.search_active && !input.search_query.is_empty() {
-        let search_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 130, 180));
-        let _ = Text::new("Filter: ", Point::new(px + 10, py + 42), search_style).draw(fb);
+        draw_raw_icon(fb, assets::SEARCH_ICON, px + 10, py + 32, 24, 24);
         let query_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 220, 255));
-        let _ = Text::new(input.search_query.as_str(), Point::new(px + 58, py + 42), query_style).draw(fb);
+        let _ = Text::new(input.search_query.as_str(), Point::new(px + 40, py + 48), query_style).draw(fb);
     }
 
     // Render pinned apps from desktop (filtered by search query if active)
@@ -1605,16 +1525,30 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
             .draw(fb);
         }
 
-        // App icon (colored square with first letter)
-        let icon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(r, g, b)).build();
-        let _ = Rectangle::new(Point::new(px + 12, app_y - 8), Size::new(24, 24))
-            .into_styled(icon_style)
-            .draw(fb);
-        let first_char = app_name.chars().next().unwrap_or('?');
-        let mut char_buf = [0u8; 4];
-        let char_str = first_char.encode_utf8(&mut char_buf);
-        let icon_letter_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
-        let _ = Text::new(char_str, Point::new(px + 18, app_y + 4), icon_letter_style).draw(fb);
+        // App icon (minimalist)
+        let icon_data = match app_name {
+            n if n.eq_ignore_ascii_case("Terminal") => Some(assets::TERMINAL_ICON),
+            n if n.eq_ignore_ascii_case("Files") => Some(assets::FILES_ICON),
+            n if n.eq_ignore_ascii_case("Editor") => Some(assets::EDITOR_ICON),
+            n if n.eq_ignore_ascii_case("Browser") => Some(assets::BROWSER_ICON),
+            n if n.eq_ignore_ascii_case("Settings") => Some(assets::SETTINGS_ICON),
+            _ => None,
+        };
+
+        if let Some(data) = icon_data {
+            draw_raw_icon(fb, data, px + 12, app_y - 8, 32, 32);
+        } else {
+            // Fallback: App icon (colored square with first letter)
+            let icon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(r, g, b)).build();
+            let _ = Rectangle::new(Point::new(px + 12, app_y - 8), Size::new(24, 24))
+                .into_styled(icon_style)
+                .draw(fb);
+            let first_char = app_name.chars().next().unwrap_or('?');
+            let mut char_buf = [0u8; 4];
+            let char_str = first_char.encode_utf8(&mut char_buf);
+            let icon_letter_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+            let _ = Text::new(char_str, Point::new(px + 18, app_y + 4), icon_letter_style).draw(fb);
+        }
 
         // App name
         let _ = Text::new(app_name, Point::new(px + 44, app_y + 4), app_style).draw(fb);
@@ -1656,12 +1590,15 @@ fn draw_search_bar(fb: &mut FramebufferState, query: &str) {
         .into_styled(border_style)
         .draw(fb);
 
+    // Icon
+    draw_raw_icon(fb, assets::SEARCH_ICON, px + 12, py + 8, 24, 24);
+
     let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
     if query.is_empty() {
         let placeholder_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 110, 130));
-        let _ = Text::new("Search...", Point::new(px + 12, py + 26), placeholder_style).draw(fb);
+        let _ = Text::new("Search apps...", Point::new(px + 44, py + 26), placeholder_style).draw(fb);
     } else {
-        let _ = Text::new(query, Point::new(px + 12, py + 26), text_style).draw(fb);
+        let _ = Text::new(query, Point::new(px + 44, py + 26), text_style).draw(fb);
     }
 }
 
@@ -1693,10 +1630,13 @@ fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
     let notif_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
     for i in 0..desktop.notification_count.min(8) {
         let notif = &desktop.notifications[i];
-        let notif_y = py + 50 + (i as i32) * 24;
+        let notif_y = py + 50 + (i as i32) * 28;
         let msg_len = notif.message.iter().position(|&b| b == 0).unwrap_or(64);
         let msg = core::str::from_utf8(&notif.message[..msg_len]).unwrap_or("");
-        let _ = Text::new(msg, Point::new(px + 10, notif_y), notif_style).draw(fb);
+        
+        // Notification Icon (Bell)
+        draw_raw_icon(fb, assets::NOTIFICATION_ICON, px + 8, notif_y - 14, 20, 20);
+        let _ = Text::new(msg, Point::new(px + 32, notif_y), notif_style).draw(fb);
     }
 
     if desktop.notification_count == 0 {
@@ -1707,50 +1647,47 @@ fn draw_notifications(fb: &mut FramebufferState, desktop: &DesktopShell) {
 
 /// Draw the mouse cursor.
 fn draw_cursor(fb: &mut FramebufferState, cx: i32, cy: i32) {
-    let cursor_color = Rgb888::WHITE;
-    let cursor_style = PrimitiveStyleBuilder::new().fill_color(cursor_color).build();
-
-    // Simple arrow cursor (8x12)
-    for dy in 0..12 {
-        let width = (dy + 1).min(8);
-        let _ = Rectangle::new(Point::new(cx, cy + dy), Size::new(width as u32, 1))
-            .into_styled(cursor_style)
-            .draw(fb);
-    }
+    // Premium minimalist cursor icon
+    draw_raw_icon(fb, assets::CURSOR_ICON, cx, cy, 16, 16);
 }
 
 /// Draw the HUD overlay with kernel log messages.
 fn draw_hud_overlay(fb: &mut FramebufferState, log_buf: &[u8], log_len: usize) {
-    let hud_w = 350;
-    let hud_h = 100;
-    let hud_x = fb.info.width as i32 - hud_w - 10;
-    let hud_y = fb.info.height as i32 - 44 - hud_h - 10;
+    let hud_w = 400;
+    let hud_h = 180; // Taller for more lines
+    let hud_x = fb.info.width as i32 - hud_w - 20;
+    // Positioned slightly above the taskbar
+    let hud_y = fb.info.height as i32 - 44 - hud_h - 20;
 
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(10, 12, 25)).build();
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(5, 7, 15)).build();
     let _ = Rectangle::new(Point::new(hud_x, hud_y), Size::new(hud_w as u32, hud_h as u32))
         .into_styled(bg_style)
         .draw(fb);
 
     let border_style = PrimitiveStyleBuilder::new()
-        .stroke_color(Rgb888::new(0, 60, 140))
+        .stroke_color(Rgb888::new(0, 100, 180))
         .stroke_width(1)
         .build();
     let _ = Rectangle::new(Point::new(hud_x, hud_y), Size::new(hud_w as u32, hud_h as u32))
         .into_styled(border_style)
         .draw(fb);
 
-    let status_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 100));
-    let _ = Text::new("SISTEMA ONLINE", Point::new(hud_x + 8, hud_y + 16), status_style).draw(fb);
+    let status_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 255, 120));
+    let _ = Text::new("SISTEMA ONLINE", Point::new(hud_x + 10, hud_y + 18), status_style).draw(fb);
 
-    // Log text
-    let log_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(120, 140, 180));
+    // Log text — show the LATEST messages (scrolling logic)
+    let log_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(140, 160, 200));
     let safe_len = log_len.min(log_buf.len());
     if let Ok(text) = core::str::from_utf8(&log_buf[..safe_len]) {
-        let mut line_y = hud_y + 32;
-        for line in text.split('\n').take(5) {
-            let truncated = if line.len() > 50 { &line[..50] } else { line };
-            let _ = Text::new(truncated, Point::new(hud_x + 8, line_y), log_style).draw(fb);
-            line_y += 14;
+        let lines: alloc::vec::Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        let max_lines = 11;
+        let start_idx = if lines.len() > max_lines { lines.len() - max_lines } else { 0 };
+        
+        let mut line_y = hud_y + 36;
+        for &line in &lines[start_idx..] {
+            let truncated = if line.len() > 60 { &line[..60] } else { line };
+            let _ = Text::new(truncated, Point::new(hud_x + 10, line_y), log_style).draw(fb);
+            line_y += 12;
         }
     }
 }
@@ -1994,22 +1931,7 @@ fn format_metric<'a>(buf: &'a mut [u8; 16], label: &str, value: f32) -> &'a str 
     core::str::from_utf8(&buf[..pos]).unwrap_or("??")
 }
 
-/// Format battery level as "XX%" or "100%" into a caller-provided buffer.
-/// Returns a `&str` slice into the buffer.
-fn format_battery_pct<'a>(buf: &'a mut [u8; 6], level: u32) -> &'a str {
-    let pct = level.min(100);
-    let mut pos = 0usize;
-    if pct >= 100 {
-        buf[pos] = b'1'; pos += 1;
-        buf[pos] = b'0'; pos += 1;
-        buf[pos] = b'0'; pos += 1;
-    } else {
-        buf[pos] = b'0' + (pct / 10) as u8; pos += 1;
-        buf[pos] = b'0' + (pct % 10) as u8; pos += 1;
-    }
-    buf[pos] = b'%'; pos += 1;
-    core::str::from_utf8(&buf[..pos]).unwrap_or("?%")
-}
+
 
 /// Compute the x offset of the first running-indicator dot for a pinned app icon.
 /// Returns `(dot_start_x, n_dots)` where `n_dots` is clamped to 3.
@@ -2293,37 +2215,6 @@ mod tests {
     }
 
     // ── Tests for new visual-improvement helpers ──
-
-    #[test]
-    fn test_format_battery_pct_full() {
-        let mut buf = [0u8; 6];
-        assert_eq!(format_battery_pct(&mut buf, 100), "100%");
-    }
-
-    #[test]
-    fn test_format_battery_pct_zero() {
-        let mut buf = [0u8; 6];
-        assert_eq!(format_battery_pct(&mut buf, 0), "00%");
-    }
-
-    #[test]
-    fn test_format_battery_pct_single_digit() {
-        let mut buf = [0u8; 6];
-        assert_eq!(format_battery_pct(&mut buf, 5), "05%");
-    }
-
-    #[test]
-    fn test_format_battery_pct_two_digits() {
-        let mut buf = [0u8; 6];
-        assert_eq!(format_battery_pct(&mut buf, 83), "83%");
-    }
-
-    #[test]
-    fn test_format_battery_pct_clamps_over_100() {
-        let mut buf = [0u8; 6];
-        // Values > 100 should be clamped to 100.
-        assert_eq!(format_battery_pct(&mut buf, 120), "100%");
-    }
 
     #[test]
     fn test_running_dot_layout_zero() {

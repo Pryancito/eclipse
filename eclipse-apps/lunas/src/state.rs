@@ -73,7 +73,7 @@ pub struct LunasState {
     pub service_list: [ServiceInfo; 32],
     pub service_count: usize,
     pub dirty: bool,
-    pub log_buf: [u8; 512],
+    pub log_buf: [u8; 4096],
     pub log_len: usize,
     pub last_input_tick: u64,
     /// Wayland compositor: manages protocol state for connected Wayland clients.
@@ -120,7 +120,7 @@ impl LunasState {
             service_list: [ServiceInfo::new(); 32],
             service_count: 0,
             dirty: true,
-            log_buf: [0; 512],
+            log_buf: [0; 4096],
             log_len: 0,
             last_input_tick: 0,
             wayland: WaylandCompositor::new(),
@@ -211,18 +211,34 @@ impl LunasState {
                 }
             }
             CompositorEvent::KernelLog(line) => {
-                let available = self.log_buf.len() - self.log_len;
-                let copy_len = line.len().min(available);
-                if copy_len > 0 {
-                    self.log_buf[self.log_len..self.log_len + copy_len]
-                        .copy_from_slice(&line[..copy_len]);
-                    self.log_len += copy_len;
+                let total_needed = line.len() + 1; // line + newline
+                if total_needed > self.log_buf.len() {
+                    // Single line is larger than entire buffer (unlikely)
+                    return;
                 }
-                // Add newline if space
-                if self.log_len < self.log_buf.len() {
-                    self.log_buf[self.log_len] = b'\n';
-                    self.log_len += 1;
+
+                while self.log_len + total_needed > self.log_buf.len() {
+                    // Shift buffer left by removing the oldest message (up to the first newline)
+                    if let Some(first_nl) = self.log_buf[..self.log_len].iter().position(|&b| b == b'\n') {
+                        let shift = first_nl + 1;
+                        self.log_buf.copy_within(shift..self.log_len, 0);
+                        self.log_len -= shift;
+                    } else {
+                        // Current buffer has no newline? Just clear it to make room
+                        self.log_len = 0;
+                        break;
+                    }
                 }
+
+                // Append newest log line
+                let start = self.log_len;
+                self.log_buf[start..start + line.len()].copy_from_slice(line);
+                self.log_len += line.len();
+                
+                // Add the newline
+                self.log_buf[self.log_len] = b'\n';
+                self.log_len += 1;
+                
                 self.dirty = true;
             }
             CompositorEvent::Wayland(data, pid) => {
