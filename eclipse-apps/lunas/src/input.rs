@@ -1703,7 +1703,7 @@ impl InputState {
                             self.context_menu.show(self.cursor_x, self.cursor_y - 92);
                             self.context_menu.add_item("Open", ContextAction::LaunchPinnedApp(app_idx));
                             self.context_menu.add_separator();
-                            self.context_menu.add_item("Unpin from Bar", ContextAction::UnpinApp(app_idx));
+                            self.context_menu.add_item("Unpin from Taskbar", ContextAction::UnpinApp(app_idx));
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Volume = tb_hit {
@@ -2289,7 +2289,7 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible");
-        // 8 items: NewWindow, ChangeWallpaper, separator, ToggleTiling(checked), DND(checked),
+        // 9 items: NewWindow, ChangeWallpaper, separator, ToggleTiling(checked), DND(checked),
         //          NightLight(checked), separator, Dashboard, Screenshot
         assert_eq!(state.context_menu.item_count, 9);
         assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
@@ -2545,7 +2545,7 @@ mod tests {
         let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert!(dirty);
         assert!(state.context_menu.visible, "context menu should be visible for pinned app");
-        // 3 items: Open, separator, Unpin from Bar
+        // 3 items: Open, separator, Unpin from Taskbar
         assert_eq!(state.context_menu.item_count, 3);
         assert_eq!(state.context_menu.items[0].action, ContextAction::LaunchPinnedApp(0));
         assert!(state.context_menu.items[1].separator, "second item should be separator");
