@@ -664,11 +664,13 @@ impl LunasState {
                 }
                 ContextAction::ToggleMute => {
                     self.desktop.volume_muted = !self.desktop.volume_muted;
+                    self.input.volume_muted = self.desktop.volume_muted;
                     self.dirty = true;
                 }
                 ContextAction::SetVolume(level) => {
                     self.desktop.volume_level = level;
                     self.desktop.volume_muted = false;
+                    self.input.volume_muted = false;
                     self.dirty = true;
                 }
                 ContextAction::LaunchPinnedApp(app_idx) => {
@@ -749,10 +751,12 @@ impl LunasState {
                 }
                 ContextAction::ToggleDoNotDisturb => {
                     self.desktop.do_not_disturb = !self.desktop.do_not_disturb;
+                    self.input.do_not_disturb = self.desktop.do_not_disturb;
                     self.dirty = true;
                 }
                 ContextAction::ToggleNightLight => {
                     self.desktop.night_light_active = !self.desktop.night_light_active;
+                    self.input.night_light_active = self.desktop.night_light_active;
                     self.dirty = true;
                 }
                 ContextAction::TakeScreenshot => {
@@ -761,6 +765,10 @@ impl LunasState {
                     {
                         self.backend.fb.save_screenshot();
                     }
+                    self.dirty = true;
+                }
+                ContextAction::MarkNotificationsRead => {
+                    self.desktop.mark_all_read();
                     self.dirty = true;
                 }
                 ContextAction::None => {}

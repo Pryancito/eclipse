@@ -1588,10 +1588,12 @@ pub const VOLUME_PANEL_W: i32 = 180;
 /// Height of the volume popup panel.
 pub const VOLUME_PANEL_H: i32 = 100;
 
-/// Context menu item height.
+/// Context menu regular item height.
 pub const CONTEXT_MENU_ITEM_H: i32 = 28;
+/// Context menu separator height (thin visual divider).
+pub const CONTEXT_MENU_SEP_H: i32 = 8;
 /// Context menu width.
-pub const CONTEXT_MENU_W: i32 = 180;
+pub const CONTEXT_MENU_W: i32 = 200;
 
 /// Width of the clock/calendar panel.
 pub const CLOCK_PANEL_W: i32 = 168;
@@ -1960,13 +1962,12 @@ fn draw_hud_overlay(fb: &mut FramebufferState, log_buf: &[u8], log_len: usize) {
 /// Draw the context menu overlay.
 fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu) {
     let menu_w = CONTEXT_MENU_W;
-    let item_h = CONTEXT_MENU_ITEM_H;
-    let menu_h = (menu.item_count as i32) * item_h;
     let mx = menu.x;
     let my = menu.y;
+    let menu_h = menu.total_height();
 
     // Background
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(22, 26, 48)).build();
+    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 24, 45)).build();
     let _ = Rectangle::new(Point::new(mx, my), Size::new(menu_w as u32, menu_h as u32))
         .into_styled(bg_style)
         .draw(fb);
@@ -1980,9 +1981,24 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
         .into_styled(border_style)
         .draw(fb);
 
-    // Items
+    // Items — rendered with variable heights
+    let mut iy = my;
     for i in 0..menu.item_count {
-        let iy = my + (i as i32) * item_h;
+        let item = &menu.items[i];
+        if item.separator {
+            // Separator: thin horizontal line centered in the SEP_H slot
+            let line_y = iy + CONTEXT_MENU_SEP_H / 2;
+            let sep_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(45, 55, 85))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 6, line_y), Size::new((menu_w - 12) as u32, 1))
+                .into_styled(sep_style)
+                .draw(fb);
+            iy += CONTEXT_MENU_SEP_H;
+            continue;
+        }
+
+        let item_h = CONTEXT_MENU_ITEM_H;
 
         // Hover highlight
         if menu.hovered_index == Some(i) {
@@ -1992,7 +2008,7 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
             let _ = Rectangle::new(Point::new(mx + 1, iy), Size::new((menu_w - 2) as u32, item_h as u32))
                 .into_styled(hover_style)
                 .draw(fb);
-            // Left accent bar on hovered item
+            // Left accent bar
             let accent_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(0, 140, 255))
                 .build();
@@ -2001,9 +2017,27 @@ fn draw_context_menu(fb: &mut FramebufferState, menu: &crate::input::ContextMenu
                 .draw(fb);
         }
 
-        let text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
-        let label = menu.items[i].label_str();
-        let _ = Text::new(label, Point::new(mx + 12, iy + 19), text_style).draw(fb);
+        // Checkmark indicator (filled square dot) before the label
+        if item.checked {
+            let dot_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(0, 180, 100))
+                .build();
+            let _ = Rectangle::new(Point::new(mx + 7, iy + item_h / 2 - 3), Size::new(6, 6))
+                .into_styled(dot_style)
+                .draw(fb);
+        }
+
+        // Label — offset right to make room for checkmark area
+        let text_color = if menu.hovered_index == Some(i) {
+            Rgb888::new(220, 230, 255)
+        } else {
+            Rgb888::new(190, 200, 220)
+        };
+        let text_style = MonoTextStyle::new(&FONT_6X12, text_color);
+        let label = item.label_str();
+        let _ = Text::new(label, Point::new(mx + 18, iy + item_h / 2 + 5), text_style).draw(fb);
+
+        iy += item_h;
     }
 }
 
