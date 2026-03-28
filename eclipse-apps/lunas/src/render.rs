@@ -1538,7 +1538,9 @@ fn draw_sparkline(fb: &mut FramebufferState, x: i32, y: i32, w: i32, h: i32,
     }
 }
 
-/// Format a CPU temperature value as "CPU: XX°C" into a provided buffer.
+/// Format a CPU temperature value as "CPU: XXdegC" into a provided buffer.
+/// The monospace bitmap font used by lunas does not include the Unicode degree
+/// glyph (U+00B0), so we write the ASCII suffix "degC" instead.
 fn format_temp<'a>(buf: &'a mut [u8; 16], temp: u32) -> &'a str {
     // "CPU: " prefix
     buf[0] = b'C'; buf[1] = b'P'; buf[2] = b'U'; buf[3] = b':'; buf[4] = b' ';
@@ -1551,7 +1553,10 @@ fn format_temp<'a>(buf: &'a mut [u8; 16], temp: u32) -> &'a str {
         buf[pos] = b'0' + ((temp / 10) % 10) as u8; pos += 1;
     }
     buf[pos] = b'0' + (temp % 10) as u8; pos += 1;
-    // degree symbol rendered as "C" (monospace bitmap font lacks degree glyph)
+    // Suffix "degC" (ASCII workaround; font lacks U+00B0 degree symbol)
+    buf[pos] = b'd'; pos += 1;
+    buf[pos] = b'e'; pos += 1;
+    buf[pos] = b'g'; pos += 1;
     buf[pos] = b'C'; pos += 1;
     core::str::from_utf8(&buf[..pos]).unwrap_or("CPU: ?")
 }
@@ -1883,10 +1888,11 @@ fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &Inpu
         let _ = Text::new("No matching apps", Point::new(px + 80, py + 200), empty_style).draw(fb);
     }
 
-    // Keyboard navigation hint at the bottom of the launcher panel
+    // Keyboard navigation hint at the bottom of the launcher panel.
+    // \x18 = ASCII CAN (↑ arrow glyph in CP437/bitmap fonts), \x19 = EM (↓ arrow glyph).
     let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(60, 70, 100));
     let _ = Text::new(
-        "\x18\x19 sel  Enter launch  Esc close",
+        "^v sel  Enter launch  Esc close",
         Point::new(px + 8, py + panel_h - 10),
         hint_style,
     )

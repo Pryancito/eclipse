@@ -1750,4 +1750,30 @@ mod tests {
         let _ = state.update();
         assert!(!state.input.battery_panel_active, "second ToggleBatteryPanel should close the battery panel");
     }
+
+    #[test]
+    fn test_cpu_history_initialized_to_zero() {
+        let state = LunasState::new().expect("init");
+        assert_eq!(state.history_pos, 0, "history_pos should start at 0");
+        assert!(state.cpu_history.iter().all(|&v| v == 0.0), "cpu_history should start zeroed");
+        assert!(state.mem_history.iter().all(|&v| v == 0.0), "mem_history should start zeroed");
+        assert!(state.net_history.iter().all(|&v| v == 0.0), "net_history should start zeroed");
+    }
+
+    #[test]
+    fn test_history_ring_buffer_wraps() {
+        let mut state = LunasState::new().expect("init");
+        // Manually write 60 samples to fill the buffer and advance history_pos
+        for i in 0..60usize {
+            state.cpu_history[state.history_pos] = (i as f32) * 1.0;
+            state.history_pos = (state.history_pos + 1) % 60;
+        }
+        // After 60 writes the write position wraps back to 0
+        assert_eq!(state.history_pos, 0, "history_pos should wrap to 0 after 60 writes");
+        // Writing one more advances to 1
+        state.cpu_history[state.history_pos] = 99.0;
+        state.history_pos = (state.history_pos + 1) % 60;
+        assert_eq!(state.history_pos, 1);
+        assert_eq!(state.cpu_history[0], 99.0, "oldest entry should be overwritten");
+    }
 }

@@ -1435,7 +1435,14 @@ impl InputState {
                             let grid_w = btn_w * 3 + gap * 2;
                             let grid_x = fb_cx - grid_w / 2;
                             let grid_y = fb_cy + 60;
-                            let digit_map: [u8; 12] = [1,2,3,4,5,6,7,8,9,10,0,11];
+                            // PIN pad layout: 1-9 in a 3×3 grid, then *, 0, # in the last row.
+                            // None entries represent non-digit buttons (* and #) that are ignored.
+                            let digit_map: [Option<u8>; 12] = [
+                                Some(1), Some(2), Some(3),
+                                Some(4), Some(5), Some(6),
+                                Some(7), Some(8), Some(9),
+                                None,    Some(0), None,
+                            ];
                             for row in 0..4i32 {
                                 for col in 0..3i32 {
                                     let idx = (row * 3 + col) as usize;
@@ -1444,11 +1451,11 @@ impl InputState {
                                     if self.cursor_x >= bx && self.cursor_x < bx + btn_w
                                         && self.cursor_y >= by && self.cursor_y < by + btn_h
                                     {
-                                        let d = digit_map[idx];
-                                        // Only handle digit buttons 0-9 (skip * = 10, # = 11)
-                                        if d <= 9 && self.lock_pin_len < 4 {
-                                            self.lock_pin_buffer[self.lock_pin_len] = d;
-                                            self.lock_pin_len += 1;
+                                        if let Some(d) = digit_map[idx] {
+                                            if self.lock_pin_len < 4 {
+                                                self.lock_pin_buffer[self.lock_pin_len] = d;
+                                                self.lock_pin_len += 1;
+                                            }
                                         }
                                         dirty = true;
                                         return dirty;
@@ -3442,5 +3449,113 @@ mod tests {
             state.context_menu.items[i].action == ContextAction::ToggleBatteryPanel
         });
         assert!(has_power_info, "Clock context menu should include Power Info item");
+    }
+
+    // ── Lock screen PIN entry tests ──
+
+    #[test]
+    fn test_lock_screen_digit_entry() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press '1' (scancode 0x02)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x02, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 1);
+        assert_eq!(state.lock_pin_buffer[0], 1);
+    }
+
+    #[test]
+    fn test_lock_screen_pin_max_four_digits() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter 5 digits — only first 4 should be stored
+        for code in [0x02u16, 0x03, 0x04, 0x05, 0x06] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        assert_eq!(state.lock_pin_len, 4, "PIN should cap at 4 digits");
+    }
+
+    #[test]
+    fn test_lock_screen_backspace_removes_digit() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press '1' then backspace
+        let ev_digit = InputEvent { device_id: 0, event_type: 0, code: 0x02, value: 1, timestamp: 0 };
+        state.apply_event(&ev_digit, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 1);
+
+        let ev_bs = InputEvent { device_id: 0, event_type: 0, code: 0x0E, value: 1, timestamp: 0 };
+        state.apply_event(&ev_bs, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 0, "Backspace should remove last digit");
+    }
+
+    #[test]
+    fn test_lock_screen_correct_pin_unlocks() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter PIN 1-2-3-4 then Enter
+        for code in [0x02u16, 0x03, 0x04, 0x05] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        let ev_enter = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        state.apply_event(&ev_enter, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.lock_screen_active, "Correct PIN should unlock");
+        assert_eq!(state.lock_pin_len, 0, "PIN buffer should be cleared after unlock");
+        assert_eq!(state.lock_pin_attempts, 0, "Attempt counter should reset on success");
+    }
+
+    #[test]
+    fn test_lock_screen_wrong_pin_increments_attempts() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter wrong PIN 1-1-1-1 then Enter
+        for code in [0x02u16, 0x02, 0x02, 0x02] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        let ev_enter = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        state.apply_event(&ev_enter, &mut windows, &mut count, &mut surfaces);
+        assert!(state.lock_screen_active, "Wrong PIN should keep screen locked");
+        assert_eq!(state.lock_pin_attempts, 1, "Attempt counter should increment on failure");
+        assert_eq!(state.lock_pin_len, 0, "PIN buffer should be cleared after failed attempt");
+    }
+
+    #[test]
+    fn test_lock_screen_keys_not_forwarded_when_locked() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        state.dashboard_active = false;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press Super+D (toggle dashboard) — should be blocked by lock screen handler
+        state.modifiers = 8; // Super modifier
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x20, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        // dashboard_active should NOT change because lock screen intercepts key events
+        assert!(!state.dashboard_active, "Lock screen should block Super+D shortcut");
     }
 }
