@@ -138,6 +138,14 @@ pub enum ContextAction {
     TakeScreenshot,
     /// Mark all desktop notifications as read.
     MarkNotificationsRead,
+    /// Toggle the launcher/app-drawer panel.
+    ToggleLauncher,
+    /// Lock the screen (activate lock screen overlay).
+    ToggleLock,
+    /// Toggle show-desktop mode (minimize/restore all windows).
+    ShowDesktop,
+    /// Switch to a specific workspace by index (0-3).
+    SwitchWorkspace(u8),
 }
 
 /// A single context menu item.
@@ -1742,6 +1750,49 @@ impl InputState {
                             self.context_menu.add_item("Brightness Down", ContextAction::BrightnessDown);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
+                        } else if let TaskbarHit::Launcher = tb_hit {
+                            // ── Launcher context menu ──
+                            // Height: 1 regular + 1 sep + 1 regular = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_item("Open Launcher", ContextAction::ToggleLauncher);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Lock Screen", ContextAction::ToggleLock);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::Workspace(ws) = tb_hit {
+                            // ── Workspace context menu ──
+                            // Height: 1 regular + 1 sep + 4 regular = 5*28 + 8 = 148px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 148);
+                            self.context_menu.add_item("New Window Here", ContextAction::NewWindow);
+                            self.context_menu.add_separator();
+                            for i in 0..4u8 {
+                                let label = match i {
+                                    0 => "Workspace 1",
+                                    1 => "Workspace 2",
+                                    2 => "Workspace 3",
+                                    _ => "Workspace 4",
+                                };
+                                self.context_menu.add_checked_item(
+                                    label,
+                                    ContextAction::SwitchWorkspace(i),
+                                    i == ws,
+                                );
+                            }
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
+                        } else if let TaskbarHit::ShowDesktop = tb_hit {
+                            // ── Show Desktop context menu ──
+                            // Height: 2 regular + 1 sep = 2*28 + 8 = 64px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            self.context_menu.add_checked_item(
+                                "Show Desktop",
+                                ContextAction::ShowDesktop,
+                                self.show_desktop_active,
+                            );
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+                            self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
+                            dirty = true;
                         }
                     } else {
                         // Right-click on desktop background or window
@@ -3006,5 +3057,74 @@ mod tests {
     fn test_super_down_without_super_is_arrow_down() {
         // Without Super modifier, 0x50 = ArrowDown (not Restore)
         assert_eq!(scancode_to_action(0x50, 0), KeyAction::ArrowDown);
+    }
+
+    #[test]
+    fn test_right_click_launcher_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click the launcher button (x≈20, y near bottom)
+        state.cursor_x = 20;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "Launcher right-click should show context menu");
+        assert_eq!(state.context_menu.item_count, 3); // Open Launcher, sep, Lock Screen
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ToggleLauncher);
+        assert!(state.context_menu.items[1].separator);
+        assert_eq!(state.context_menu.items[2].action, ContextAction::ToggleLock);
+    }
+
+    #[test]
+    fn test_right_click_workspace_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        state.current_workspace = 1;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click workspace 1 indicator (ws=0 at x=48, ws=1 at x=74)
+        state.cursor_x = 74;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "Workspace right-click should show context menu");
+        // 1 NewWindow + 1 sep + 4 workspace items = 6 items
+        assert_eq!(state.context_menu.item_count, 6);
+        assert_eq!(state.context_menu.items[0].action, ContextAction::NewWindow);
+        assert!(state.context_menu.items[1].separator);
+        // Workspace 2 (index 1) should be checked since current_workspace = 1
+        assert_eq!(state.context_menu.items[3].action, ContextAction::SwitchWorkspace(1));
+        assert!(state.context_menu.items[3].checked, "current workspace item should be checked");
+    }
+
+    #[test]
+    fn test_right_click_show_desktop_shows_context_menu() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        state.show_desktop_active = false;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click show-desktop strip (rightmost 6px: x = fb_w - 3 = 1917)
+        state.cursor_x = 1917;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "ShowDesktop right-click should show context menu");
+        assert_eq!(state.context_menu.item_count, 3); // ShowDesktop(checked), sep, Change Wallpaper
+        assert_eq!(state.context_menu.items[0].action, ContextAction::ShowDesktop);
+        assert!(!state.context_menu.items[0].checked, "show_desktop unchecked when inactive");
+        assert!(state.context_menu.items[1].separator);
+        assert_eq!(state.context_menu.items[2].action, ContextAction::CycleWallpaper);
     }
 }

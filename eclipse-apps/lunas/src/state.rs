@@ -778,6 +778,22 @@ impl LunasState {
                     self.desktop.mark_all_read();
                     self.dirty = true;
                 }
+                ContextAction::ToggleLauncher => {
+                    self.input.launcher_active = !self.input.launcher_active;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleLock => {
+                    self.input.lock_screen_active = !self.input.lock_screen_active;
+                    self.dirty = true;
+                }
+                ContextAction::ShowDesktop => {
+                    self.input.show_desktop_active = !self.input.show_desktop_active;
+                    self.dirty = true;
+                }
+                ContextAction::SwitchWorkspace(ws) => {
+                    self.input.current_workspace = ws;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
