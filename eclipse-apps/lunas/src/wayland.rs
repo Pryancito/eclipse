@@ -10,6 +10,17 @@ use crate::compositor::{ShellWindow, WindowContent};
 /// Maximum concurrent Wayland client connections.
 pub const MAX_WAYLAND_CONNECTIONS: usize = 16;
 
+/// SHM buffer metadata recorded after wl_shm_pool.create_buffer.
+#[derive(Clone, Copy, Default)]
+pub struct ShmBufferDesc {
+    pub pool_fd: i32,
+    pub offset: i32,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub format: u32,
+}
+
 /// Per-client Wayland connection state.
 pub struct ClientConnection {
     /// PID of the Wayland client process.
@@ -18,10 +29,18 @@ pub struct ClientConnection {
     pub surfaces: alloc::vec::Vec<(u32, Option<usize>)>,
     /// Does the client have a registry?
     pub registry_id: Option<u32>,
-    /// Global object names
-    pub compositor_name: u32,
-    pub shm_name: u32,
-    pub shell_name: u32,
+    /// Bound object IDs for the compositor interfaces (assigned during bind).
+    pub bound_compositor_id: Option<u32>,
+    pub bound_shm_id: Option<u32>,
+    pub bound_shell_id: Option<u32>,
+    /// SHM pool state: pool_object_id, fd, and total size in bytes.
+    pub shm_pool_obj_id: Option<u32>,
+    pub shm_pool_fd: Option<i32>,
+    pub shm_pool_size: i32,
+    /// Buffer objects: maps buffer_object_id → ShmBufferDesc.
+    pub shm_buffers: alloc::vec::Vec<(u32, ShmBufferDesc)>,
+    /// Per-surface pending buffer (surface_id → buffer_object_id).
+    pub surface_pending_buffer: alloc::vec::Vec<(u32, u32)>,
 }
 
 impl ClientConnection {
@@ -30,9 +49,14 @@ impl ClientConnection {
             pid,
             surfaces: alloc::vec::Vec::new(),
             registry_id: None,
-            compositor_name: 1,
-            shm_name: 2,
-            shell_name: 3,
+            bound_compositor_id: None,
+            bound_shm_id: None,
+            bound_shell_id: None,
+            shm_pool_obj_id: None,
+            shm_pool_fd: None,
+            shm_pool_size: 0,
+            shm_buffers: alloc::vec::Vec::new(),
+            surface_pending_buffer: alloc::vec::Vec::new(),
         }
     }
 
@@ -48,6 +72,22 @@ impl ClientConnection {
 
     pub fn remove_surface(&mut self, surface_id: u32) {
         self.surfaces.retain(|(s, _)| *s != surface_id);
+        self.surface_pending_buffer.retain(|(s, _)| *s != surface_id);
+    }
+
+    /// Returns true if `obj_id` is a known surface for this client.
+    pub fn is_surface(&self, obj_id: u32) -> bool {
+        self.surfaces.iter().any(|(s, _)| *s == obj_id)
+    }
+
+    /// Look up the SHM buffer descriptor attached to a surface.
+    pub fn attached_buffer_for_surface(&self, surface_id: u32) -> Option<ShmBufferDesc> {
+        let buf_id = self.surface_pending_buffer.iter()
+            .find(|(s, _)| *s == surface_id)
+            .map(|(_, b)| *b)?;
+        self.shm_buffers.iter()
+            .find(|(id, _)| *id == buf_id)
+            .map(|(_, desc)| *desc)
     }
 }
 
@@ -78,7 +118,6 @@ impl WaylandCompositor {
         let obj_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let size_op = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let opcode = (size_op & 0xFFFF) as u16;
-        let _size = (size_op >> 16) as usize;
 
         // Find or create connection
         let conn_idx = if let Some(idx) = self.connections.iter().position(|c| c.pid == pid) {
@@ -105,16 +144,51 @@ impl WaylandCompositor {
                 }
             }
             _ => {
-                // If this is a bind request on the registry
+                // ── Registry bind ──────────────────────────────────────────────────────
+                // bind(name:u, interface:s, version:u, new_id:n)
+                // data[8..] = args (after 8-byte header)
                 if let Some(reg_id) = self.connections[conn_idx].registry_id {
-                    if obj_id == reg_id && opcode == 0 { // bind(name, interface, version, new_id)
-                        // For now we just ignore the bind request but we could track the bound IDs.
+                    if obj_id == reg_id && opcode == 0 && data.len() >= 16 {
+                        // Read: name (u32), string length (u32), interface bytes
+                        let name = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                        let str_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+                        if str_len > 0 && data.len() >= 16 + str_len {
+                            let iface_bytes = &data[16..16 + str_len.saturating_sub(1)]; // strip null
+                            // Padded string length (round up to 4)
+                            let padded = (str_len + 3) & !3;
+                            // new_id is after: 8 header + 4 name + 4 str_len + padded_str + 4 version
+                            let new_id_offset = 8 + 4 + 4 + padded + 4;
+                            if data.len() >= new_id_offset + 4 {
+                                let new_id = u32::from_le_bytes([
+                                    data[new_id_offset], data[new_id_offset+1],
+                                    data[new_id_offset+2], data[new_id_offset+3],
+                                ]);
+                                match iface_bytes {
+                                    b"wl_compositor" => {
+                                        self.connections[conn_idx].bound_compositor_id = Some(new_id);
+                                    }
+                                    b"wl_shm" => {
+                                        self.connections[conn_idx].bound_shm_id = Some(new_id);
+                                    }
+                                    b"wl_shell" => {
+                                        self.connections[conn_idx].bound_shell_id = Some(new_id);
+                                    }
+                                    _ => {}
+                                }
+                                let _ = name; // name is the global sequence number, not needed further
+                            }
+                        }
+                        return WaylandAction::None;
                     }
                 }
 
-                // Create Surface (opcode 0 on wl_compositor)
-                // In terminal, compositor bound ID is likely 4.
-                if opcode == 0 && obj_id == 4 && data.len() >= 12 {
+                let conn = &self.connections[conn_idx];
+
+                // ── wl_compositor.create_surface ───────────────────────────────────────
+                // Opcode 0; arg: new_id (u32)
+                let is_compositor = conn.bound_compositor_id == Some(obj_id)
+                    || (conn.bound_compositor_id.is_none() && obj_id == 4);
+                if opcode == 0 && is_compositor && data.len() >= 12 {
                     let surface_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
                     if surface_id > 0 {
                         self.connections[conn_idx].surfaces.push((surface_id, None));
@@ -122,10 +196,62 @@ impl WaylandCompositor {
                     }
                 }
 
-                // Surface Commit (opcode 6 on wl_surface)
-                // In terminal, surface ID starts at 7.
-                if opcode == 6 && obj_id >= 7 {
-                    return WaylandAction::CommitSurface { pid, surface_id: obj_id };
+                // ── wl_shm.create_pool ────────────────────────────────────────────────
+                // Opcode 0; args: new_id (u32), fd (u32/i32), size (i32)
+                let is_shm = conn.bound_shm_id == Some(obj_id)
+                    || (conn.bound_shm_id.is_none() && obj_id == 5);
+                if opcode == 0 && is_shm && data.len() >= 20 {
+                    let pool_id  = u32::from_le_bytes([data[8],  data[9],  data[10], data[11]]);
+                    let pool_fd  = i32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+                    let pool_sz  = i32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                    self.connections[conn_idx].shm_pool_obj_id = Some(pool_id);
+                    self.connections[conn_idx].shm_pool_fd     = Some(pool_fd);
+                    self.connections[conn_idx].shm_pool_size   = pool_sz;
+                    return WaylandAction::None;
+                }
+
+                // ── wl_shm_pool.create_buffer ─────────────────────────────────────────
+                // Opcode 0; args: new_id, offset, width, height, stride, format
+                let is_pool = conn.shm_pool_obj_id == Some(obj_id);
+                if opcode == 0 && is_pool && data.len() >= 32 {
+                    let buf_id  = u32::from_le_bytes([data[8],  data[9],  data[10], data[11]]);
+                    let offset  = i32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+                    let width   = i32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                    let height  = i32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+                    let stride  = i32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+                    let format  = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+                    let pool_fd = conn.shm_pool_fd.unwrap_or(-1);
+                    let desc = ShmBufferDesc { pool_fd, offset, width, height, stride, format };
+                    self.connections[conn_idx].shm_buffers.push((buf_id, desc));
+                    return WaylandAction::None;
+                }
+
+                // ── wl_surface.attach ─────────────────────────────────────────────────
+                // Opcode 1; args: buffer (object), x (i32), y (i32)
+                let conn = &self.connections[conn_idx];
+                if opcode == 1 && conn.is_surface(obj_id) && data.len() >= 12 {
+                    let buf_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                    // Record or update the pending buffer for this surface
+                    if let Some(entry) = self.connections[conn_idx].surface_pending_buffer
+                        .iter_mut().find(|(s, _)| *s == obj_id)
+                    {
+                        entry.1 = buf_id;
+                    } else {
+                        self.connections[conn_idx].surface_pending_buffer.push((obj_id, buf_id));
+                    }
+                    return WaylandAction::None;
+                }
+
+                // ── wl_surface.commit ─────────────────────────────────────────────────
+                // Opcode 6; no args
+                let conn = &self.connections[conn_idx];
+                if opcode == 6 && conn.is_surface(obj_id) {
+                    let shm_info = conn.attached_buffer_for_surface(obj_id);
+                    return WaylandAction::CommitSurface {
+                        pid,
+                        surface_id: obj_id,
+                        shm_buffer: shm_info,
+                    };
                 }
             }
         }
@@ -136,24 +262,25 @@ impl WaylandCompositor {
     /// Construct and queue global registry events.
     fn respond_with_globals(&mut self, pid: u32, registry_id: u32) {
         let mut globals = alloc::vec::Vec::new();
-        
-        // Helper to append a global event
+
         let mut add_global = |name: u32, interface: &str, version: u32| {
             let mut ev = alloc::vec::Vec::new();
             ev.extend_from_slice(&registry_id.to_le_bytes()); // sender = registry
             let opcode = 0u16; // global event
-            let if_len = interface.len() + 1; // including null
-            let payload_size = 4 + 4 + if_len + ((4 - (if_len % 4)) % 4) + 4;
-            let total_size = 4 + 4 + payload_size;
-            
-            ev.extend_from_slice(&((total_size as u32) << 16 | (opcode as u32)).to_le_bytes());
+            let if_len = interface.len() + 1; // including null terminator
+            let padded_str = (if_len + 3) & !3;
+            // payload = name:4 + if_len:4 + padded_string + version:4
+            let payload_size = 4 + 4 + padded_str + 4;
+            let total_size = 8 + payload_size; // 8-byte header + payload
+
+            ev.extend_from_slice(&(((total_size as u32) << 16) | (opcode as u32)).to_le_bytes());
             ev.extend_from_slice(&name.to_le_bytes());
             ev.extend_from_slice(&(if_len as u32).to_le_bytes());
             ev.extend_from_slice(interface.as_bytes());
-            ev.push(0); // null terminator
-            while ev.len() % 4 != 0 { ev.push(0); } // padding
+            ev.push(0u8); // null terminator
+            while ev.len() % 4 != 0 { ev.push(0u8); } // padding
             ev.extend_from_slice(&version.to_le_bytes());
-            
+
             globals.extend_from_slice(&ev);
         };
 
@@ -179,8 +306,25 @@ impl WaylandCompositor {
 pub enum WaylandAction {
     None,
     CreateSurface { pid: u32, surface_id: u32, conn_idx: usize },
-    CommitSurface { pid: u32, surface_id: u32 },
+    CommitSurface { pid: u32, surface_id: u32, shm_buffer: Option<ShmBufferDesc> },
     DestroySurface { pid: u32, surface_id: u32 },
+}
+
+impl core::fmt::Debug for ShmBufferDesc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ShmBufferDesc {{ fd: {}, {}x{} }}", self.pool_fd, self.width, self.height)
+    }
+}
+
+impl PartialEq for ShmBufferDesc {
+    fn eq(&self, other: &Self) -> bool {
+        self.pool_fd == other.pool_fd
+            && self.offset == other.offset
+            && self.width == other.width
+            && self.height == other.height
+            && self.stride == other.stride
+            && self.format == other.format
+    }
 }
 
 /// XWayland integration state.
@@ -271,3 +415,4 @@ pub fn make_wayland_window(
         ..Default::default()
     }
 }
+

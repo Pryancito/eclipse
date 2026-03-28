@@ -15,7 +15,7 @@ use core::matches;
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
 #[cfg(not(target_vendor = "eclipse"))]
 use eclipse_syscall::{ProcessInfo, SystemStats};
-use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
+use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE, SWND_EVENT_TYPE_KEY};
 use eclipse_ipc::types::NetExtendedStats;
 
 #[cfg(not(target_vendor = "eclipse"))]

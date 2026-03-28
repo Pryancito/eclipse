@@ -165,10 +165,11 @@ fn main() {
     let bound_shell_id = 6u32;
 
     // Bind Compositor
+    // Wayland wire size = 8 header + 32 args (name:4 + len:4 + "wl_compositor\0"+pad:16 + version:4 + new_id:4)
     let mut msg = [0u8; 44];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((44u32 << 16) | 0u32).to_le_bytes()); // bind
+    msg[8..12].copy_from_slice(&((40u32 << 16) | 0u32).to_le_bytes()); // bind, wire size=40
     msg[12..16].copy_from_slice(&compositor_id.to_le_bytes());
     let ifname = b"wl_compositor\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
@@ -178,10 +179,11 @@ fn main() {
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 44, 0); }
 
     // Bind SHM
+    // Wayland wire size = 8 header + 24 args (name:4 + len:4 + "wl_shm\0"+pad:8 + version:4 + new_id:4)
     let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((36u32 << 16) | 0u32).to_le_bytes()); 
+    msg[8..12].copy_from_slice(&((32u32 << 16) | 0u32).to_le_bytes()); // wire size=32
     msg[12..16].copy_from_slice(&shm_id.to_le_bytes());
     let ifname = b"wl_shm\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
@@ -191,10 +193,11 @@ fn main() {
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 36, 0); }
 
     // Bind Shell
+    // Wayland wire size = 8 header + 28 args (name:4 + len:4 + "wl_shell\0"+pad:12 + version:4 + new_id:4)
     let mut msg = [0u8; 40];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((40u32 << 16) | 0u32).to_le_bytes());
+    msg[8..12].copy_from_slice(&((36u32 << 16) | 0u32).to_le_bytes()); // wire size=36
     msg[12..16].copy_from_slice(&shell_id.to_le_bytes());
     let ifname = b"wl_shell\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
@@ -230,28 +233,30 @@ fn main() {
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 12, 0); }
 
     // Create SHM Pool (ID 9)
+    // Wayland wire size = 8 header + 12 args (new_id:4 + fd:4 + size:4) = 20; total with WAYL = 24
     let pool_id = 9u32;
-    let mut msg = [0u8; 20];
+    let mut msg = [0u8; 24];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&bound_shm_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((16u32 << 16) | 0u32).to_le_bytes()); // create_pool
+    msg[8..12].copy_from_slice(&((20u32 << 16) | 0u32).to_le_bytes()); // create_pool, wire size=20
     msg[12..16].copy_from_slice(&pool_id.to_le_bytes());
     msg[16..20].copy_from_slice(&(fd as u32).to_le_bytes()); // Pass target_fd (handle)
     msg[20..24].copy_from_slice(&(size_bytes as i32).to_le_bytes());
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0); }
 
     // Create Buffer (ID 10)
+    // Wayland wire size = 8 header + 24 args (new_id:4 + offset:4 + w:4 + h:4 + stride:4 + format:4) = 32; total with WAYL = 36
     let buffer_id = 10u32;
-    let mut msg = [0u8; 32];
+    let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&pool_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((28u32 << 16) | 0u32).to_le_bytes()); // create_buffer
+    msg[8..12].copy_from_slice(&((32u32 << 16) | 0u32).to_le_bytes()); // create_buffer, wire size=32
     msg[12..16].copy_from_slice(&buffer_id.to_le_bytes());
     msg[16..20].copy_from_slice(&0u32.to_le_bytes()); // offset
     msg[20..24].copy_from_slice(&(width as i32).to_le_bytes());
     msg[24..28].copy_from_slice(&(height as i32).to_le_bytes());
     msg[28..32].copy_from_slice(&(width as i32 * 4).to_le_bytes()); // stride
-    msg[32..36].copy_from_slice(&0u32.to_le_bytes()); // format (0=ARGB)
+    msg[32..36].copy_from_slice(&0u32.to_le_bytes()); // format (0=ARGB8888)
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 36, 0); }
 
     // 4. Initialization
@@ -260,19 +265,21 @@ fn main() {
     terminal.process(b"\x1b[1;32mEclipse OS Terminal (Wayland Enhanced)\x1b[0m\r\n\n$ ");
 
     // Initial attach & commit
-    let mut msg = [0u8; 20];
+    // attach(buffer, x, y): wire size = 8 header + 12 args (buffer_id:4 + x:4 + y:4) = 20; total with WAYL = 24
+    let mut msg = [0u8; 24];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((16u32 << 16) | 1u32).to_le_bytes()); // attach
+    msg[8..12].copy_from_slice(&((20u32 << 16) | 1u32).to_le_bytes()); // attach, wire size=20
     msg[12..16].copy_from_slice(&buffer_id.to_le_bytes());
     msg[16..20].copy_from_slice(&0u32.to_le_bytes()); // x
     msg[20..24].copy_from_slice(&0u32.to_le_bytes()); // y
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0); }
 
-    let mut msg = [0u8; 8];
+    // commit: wire size = 8 header + 0 args = 8; total with WAYL = 12
+    let mut msg = [0u8; 12];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit
+    msg[8..12].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit, wire size=8
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 12, 0); }
 
     loop {
@@ -286,8 +293,8 @@ fn main() {
                 if event.event_type == sidewind::SWND_EVENT_TYPE_KEY {
                     if let Some(c) = scancode_to_char(event.data1 as u16) {
                         terminal.process(&[c as u8]);
-                        // Signal change (commit)
-                        let mut msg = [0u8; 8];
+                        // Signal change via commit (wire size=8; total with WAYL=12)
+                        let mut msg = [0u8; 12];
                         msg[0..4].copy_from_slice(b"WAYL");
                         msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
                         msg[8..12].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit
