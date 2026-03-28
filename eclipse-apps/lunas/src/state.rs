@@ -80,6 +80,14 @@ pub struct LunasState {
     pub wayland: WaylandCompositor,
     /// XWayland integration: manages XWayland process and X11 window state.
     pub xwayland: XwaylandIntegration,
+    /// Ring buffer of the last 60 CPU usage samples (0-100).
+    pub cpu_history: [f32; 60],
+    /// Ring buffer of the last 60 memory usage samples (0-100).
+    pub mem_history: [f32; 60],
+    /// Ring buffer of the last 60 network usage samples (0-100).
+    pub net_history: [f32; 60],
+    /// Index for the next write position in history buffers.
+    pub history_pos: usize,
 }
 
 impl LunasState {
@@ -125,6 +133,10 @@ impl LunasState {
             last_input_tick: 0,
             wayland: WaylandCompositor::new(),
             xwayland: XwaylandIntegration::new(),
+            cpu_history: [0.0f32; 60],
+            mem_history: [0.0f32; 60],
+            net_history: [0.0f32; 60],
+            history_pos: 0,
         };
 
         // Pre-render background using the current wallpaper mode and colour.
@@ -778,6 +790,18 @@ impl LunasState {
                     self.desktop.mark_all_read();
                     self.dirty = true;
                 }
+                ContextAction::DismissNotification(idx) => {
+                    self.desktop.dismiss_notification(idx);
+                    self.dirty = true;
+                }
+                ContextAction::CalendarPrev => {
+                    self.input.calendar_month_offset = (self.input.calendar_month_offset - 1).max(-24);
+                    self.dirty = true;
+                }
+                ContextAction::CalendarNext => {
+                    self.input.calendar_month_offset = (self.input.calendar_month_offset + 1).min(24);
+                    self.dirty = true;
+                }
                 ContextAction::ToggleLauncher => {
                     self.input.launcher_active = !self.input.launcher_active;
                     self.dirty = true;
@@ -792,6 +816,10 @@ impl LunasState {
                 }
                 ContextAction::SwitchWorkspace(ws) => {
                     self.input.current_workspace = ws;
+                    self.dirty = true;
+                }
+                ContextAction::ToggleBatteryPanel => {
+                    self.input.battery_panel_active = !self.input.battery_panel_active;
                     self.dirty = true;
                 }
                 ContextAction::None => {}
@@ -889,6 +917,12 @@ impl LunasState {
         self.heap_fragmentation = stats.heap_fragmentation;
         self.prev_stats = Some(stats);
 
+        // Record history for sparklines
+        self.cpu_history[self.history_pos] = self.cpu_usage;
+        self.mem_history[self.history_pos] = self.mem_usage;
+        self.net_history[self.history_pos] = self.net_usage;
+        self.history_pos = (self.history_pos + 1) % 60;
+
         // Update clock and date from wall time offset (Unix timestamp in seconds)
         const SECONDS_PER_DAY: u64 = 86400;
         let secs_today = if stats.wall_time_offset > 0 {
@@ -931,6 +965,11 @@ impl LunasState {
             &self.log_buf,
             self.log_len,
             self.net_extended_stats.as_ref(),
+            &self.cpu_history,
+            &self.mem_history,
+            &self.net_history,
+            self.history_pos,
+            self.cpu_temp,
         );
         self.backend.swap_buffers();
     }
@@ -1705,5 +1744,97 @@ mod tests {
         assert_eq!(state.desktop.clock_year, 2026, "clock_year should be initialized");
         assert!(state.desktop.clock_day >= 1 && state.desktop.clock_day <= 31);
         assert!(state.desktop.clock_month >= 1 && state.desktop.clock_month <= 12);
+    }
+
+    #[test]
+    fn test_toggle_battery_panel_context_action() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert!(!state.input.battery_panel_active, "battery panel should start closed");
+
+        // Dispatch ToggleBatteryPanel action
+        state.input.pending_context_action = ContextAction::ToggleBatteryPanel;
+        let _ = state.update();
+        assert!(state.input.battery_panel_active, "ToggleBatteryPanel should open the battery panel");
+
+        // Dispatch again to close
+        state.input.pending_context_action = ContextAction::ToggleBatteryPanel;
+        let _ = state.update();
+        assert!(!state.input.battery_panel_active, "second ToggleBatteryPanel should close the battery panel");
+    }
+
+    #[test]
+    fn test_cpu_history_initialized_to_zero() {
+        let state = LunasState::new().expect("init");
+        assert_eq!(state.history_pos, 0, "history_pos should start at 0");
+        assert!(state.cpu_history.iter().all(|&v| v == 0.0), "cpu_history should start zeroed");
+        assert!(state.mem_history.iter().all(|&v| v == 0.0), "mem_history should start zeroed");
+        assert!(state.net_history.iter().all(|&v| v == 0.0), "net_history should start zeroed");
+    }
+
+    #[test]
+    fn test_history_ring_buffer_wraps() {
+        let mut state = LunasState::new().expect("init");
+        // Manually write 60 samples to fill the buffer and advance history_pos
+        for i in 0..60usize {
+            state.cpu_history[state.history_pos] = (i as f32) * 1.0;
+            state.history_pos = (state.history_pos + 1) % 60;
+        }
+        // After 60 writes the write position wraps back to 0
+        assert_eq!(state.history_pos, 0, "history_pos should wrap to 0 after 60 writes");
+        // Writing one more advances to 1
+        state.cpu_history[state.history_pos] = 99.0;
+        state.history_pos = (state.history_pos + 1) % 60;
+        assert_eq!(state.history_pos, 1);
+        assert_eq!(state.cpu_history[0], 99.0, "oldest entry should be overwritten");
+    }
+
+    // ── Calendar navigation tests ──
+
+    #[test]
+    fn test_calendar_nav_prev() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        assert_eq!(state.input.calendar_month_offset, 0);
+        state.input.pending_context_action = ContextAction::CalendarPrev;
+        let _ = state.update();
+        assert_eq!(state.input.calendar_month_offset, -1, "CalendarPrev should decrement offset");
+    }
+
+    #[test]
+    fn test_calendar_nav_next() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        state.input.pending_context_action = ContextAction::CalendarNext;
+        let _ = state.update();
+        assert_eq!(state.input.calendar_month_offset, 1, "CalendarNext should increment offset");
+    }
+
+    #[test]
+    fn test_calendar_nav_clamped() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        // Navigate 30 months back — should clamp at -24
+        for _ in 0..30 {
+            state.input.pending_context_action = ContextAction::CalendarPrev;
+            let _ = state.update();
+        }
+        assert_eq!(state.input.calendar_month_offset, -24, "Calendar offset should clamp at -24");
+    }
+
+    // ── DismissNotification action tests ──
+
+    #[test]
+    fn test_dismiss_notification_via_action() {
+        use crate::input::ContextAction;
+        let mut state = LunasState::new().expect("init");
+        // LunasState::new() adds a welcome notification, so start from that known state
+        let initial_count = state.desktop.notification_count;
+        state.desktop.push_notification("test-msg", 1);
+        assert_eq!(state.desktop.notification_count, initial_count + 1);
+        // Dismiss index 0 (the oldest / welcome notification)
+        state.input.pending_context_action = ContextAction::DismissNotification(0);
+        let _ = state.update();
+        assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
     }
 }

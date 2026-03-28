@@ -138,6 +138,12 @@ pub enum ContextAction {
     TakeScreenshot,
     /// Mark all desktop notifications as read.
     MarkNotificationsRead,
+    /// Dismiss a single notification by index.
+    DismissNotification(usize),
+    /// Navigate the calendar to the previous month.
+    CalendarPrev,
+    /// Navigate the calendar to the next month.
+    CalendarNext,
     /// Toggle the launcher/app-drawer panel.
     ToggleLauncher,
     /// Lock the screen (activate lock screen overlay).
@@ -146,6 +152,8 @@ pub enum ContextAction {
     ShowDesktop,
     /// Switch to a specific workspace by index (0-3).
     SwitchWorkspace(u8),
+    /// Toggle the battery/power info panel.
+    ToggleBatteryPanel,
 }
 
 /// A single context menu item.
@@ -594,6 +602,12 @@ pub struct InputState {
     pub system_central_active: bool,
     pub network_panel_active: bool,
     pub lock_screen_active: bool,
+    /// Buffer holding digits entered on the lock screen (up to 4 digits).
+    pub lock_pin_buffer: [u8; 4],
+    /// Number of digits currently entered in the lock screen PIN.
+    pub lock_pin_len: usize,
+    /// Number of failed PIN attempts (resets on success).
+    pub lock_pin_attempts: u8,
     pub launcher_active: bool,
     pub search_active: bool,
     pub search_query: heapless::String<64>,
@@ -663,6 +677,12 @@ pub struct InputState {
     pub battery_level: u8,
     /// Mirrored from `DesktopShell::notification_count`; used when building tooltips.
     pub notification_count: usize,
+    /// Keyboard-selected item in the launcher (used for ArrowUp/Down + Enter navigation).
+    pub launcher_keyboard_index: Option<usize>,
+    /// Whether the battery/power info panel is visible (toggled by clicking the battery icon).
+    pub battery_panel_active: bool,
+    /// Offset from current month for calendar display (-1 = prev, 0 = this, +1 = next, etc).
+    pub calendar_month_offset: i8,
 }
 
 impl InputState {
@@ -686,6 +706,9 @@ impl InputState {
             system_central_active: false,
             network_panel_active: false,
             lock_screen_active: false,
+            lock_pin_buffer: [0u8; 4],
+            lock_pin_len: 0,
+            lock_pin_attempts: 0,
             launcher_active: false,
             search_active: false,
             search_query: heapless::String::new(),
@@ -722,6 +745,9 @@ impl InputState {
             volume_level: 75,
             battery_level: 80,
             notification_count: 0,
+            launcher_keyboard_index: None,
+            battery_panel_active: false,
+            calendar_month_offset: 0,
         }
     }
 
@@ -758,6 +784,54 @@ impl InputState {
                 }
 
                 if pressed {
+                    // ── Lock screen PIN input (highest priority when lock screen active) ──
+                    if self.lock_screen_active {
+                        let code = (scancode & 0x7FFF) as u16;
+                        match code {
+                            0x02..=0x0B => {
+                                // Digit keys: 0x02='1' .. 0x0A='9', 0x0B='0'
+                                let digit = if code == 0x0B { 0u8 } else { (code - 0x01) as u8 };
+                                if self.lock_pin_len < 4 {
+                                    self.lock_pin_buffer[self.lock_pin_len] = digit;
+                                    self.lock_pin_len += 1;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x1C => {
+                                // Enter: check PIN (demo PIN is "1234")
+                                if self.lock_pin_len == 4
+                                    && self.lock_pin_buffer[0] == 1
+                                    && self.lock_pin_buffer[1] == 2
+                                    && self.lock_pin_buffer[2] == 3
+                                    && self.lock_pin_buffer[3] == 4
+                                {
+                                    self.lock_screen_active = false;
+                                    self.lock_pin_len = 0;
+                                    self.lock_pin_attempts = 0;
+                                } else {
+                                    self.lock_pin_attempts = self.lock_pin_attempts.saturating_add(1);
+                                    self.lock_pin_len = 0;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x0E => {
+                                // Backspace: delete last digit
+                                if self.lock_pin_len > 0 {
+                                    self.lock_pin_len -= 1;
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            _ => {
+                                // Consume all other keys while lock screen is active
+                                dirty = true;
+                                return dirty;
+                            }
+                        }
+                    }
+
                     // ── Context menu keyboard navigation (highest priority) ──
                     if self.context_menu.visible {
                         let code = (scancode & 0x7FFF) as u8;
@@ -852,6 +926,54 @@ impl InputState {
                         return dirty;
                     }
 
+                    // ── Launcher keyboard navigation (when launcher overlay is open) ──
+                    if self.launcher_active {
+                        let code = (scancode & 0x7FFF) as u8;
+                        match code {
+                            0x01 => {
+                                // Escape: close launcher
+                                self.launcher_active = false;
+                                self.launcher_keyboard_index = None;
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x48 if (self.modifiers & 8) == 0 => {
+                                // Up arrow: move keyboard selection up
+                                let max = self.pinned_app_count.saturating_sub(1);
+                                self.launcher_keyboard_index = Some(match self.launcher_keyboard_index {
+                                    Some(i) if i > 0 => i - 1,
+                                    _ => 0,
+                                }.min(max));
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x50 if (self.modifiers & 8) == 0 => {
+                                // Down arrow: move keyboard selection down
+                                let count = self.pinned_app_count;
+                                if count > 0 {
+                                    self.launcher_keyboard_index = Some(match self.launcher_keyboard_index {
+                                        Some(i) => (i + 1).min(count - 1),
+                                        None => 0,
+                                    });
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            0x1C => {
+                                // Enter: launch keyboard-selected app
+                                if let Some(idx) = self.launcher_keyboard_index {
+                                    if idx < self.pinned_app_count {
+                                        self.launcher_app_click = Some(idx);
+                                        self.launcher_keyboard_index = None;
+                                    }
+                                }
+                                dirty = true;
+                                return dirty;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     let action = scancode_to_action(scancode, self.modifiers);
                     match action {
                         KeyAction::ToggleDashboard => {
@@ -868,6 +990,9 @@ impl InputState {
                         }
                         KeyAction::ToggleLauncher => {
                             self.launcher_active = !self.launcher_active;
+                            if !self.launcher_active {
+                                self.launcher_keyboard_index = None;
+                            }
                             dirty = true;
                         }
                         KeyAction::ToggleSearch => {
@@ -1309,6 +1434,47 @@ impl InputState {
                 if button == 0 { // Left click
                     self.left_button_down = pressed;
                     if pressed {
+                        // ── Lock screen PIN pad click detection ──
+                        if self.lock_screen_active {
+                            let fb_cx = self.fb_width / 2;
+                            let fb_cy = self.fb_height / 2 - 80;
+                            let btn_w: i32 = 50;
+                            let btn_h: i32 = 40;
+                            let gap: i32 = 5;
+                            let grid_w = btn_w * 3 + gap * 2;
+                            let grid_x = fb_cx - grid_w / 2;
+                            let grid_y = fb_cy + 60;
+                            // PIN pad layout: 1-9 in a 3×3 grid, then *, 0, # in the last row.
+                            // None entries represent non-digit buttons (* and #) that are ignored.
+                            let digit_map: [Option<u8>; 12] = [
+                                Some(1), Some(2), Some(3),
+                                Some(4), Some(5), Some(6),
+                                Some(7), Some(8), Some(9),
+                                None,    Some(0), None,
+                            ];
+                            for row in 0..4i32 {
+                                for col in 0..3i32 {
+                                    let idx = (row * 3 + col) as usize;
+                                    let bx = grid_x + col * (btn_w + gap);
+                                    let by = grid_y + row * (btn_h + gap);
+                                    if self.cursor_x >= bx && self.cursor_x < bx + btn_w
+                                        && self.cursor_y >= by && self.cursor_y < by + btn_h
+                                    {
+                                        if let Some(d) = digit_map[idx] {
+                                            if self.lock_pin_len < 4 {
+                                                self.lock_pin_buffer[self.lock_pin_len] = d;
+                                                self.lock_pin_len += 1;
+                                            }
+                                        }
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                }
+                            }
+                            dirty = true;
+                            return dirty;
+                        }
+
                         // ── Context menu click detection (highest priority) ──
                         if self.context_menu.visible {
                             let menu = &self.context_menu;
@@ -1374,12 +1540,30 @@ impl InputState {
                             if self.cursor_x >= cp_x && self.cursor_x < cp_x + CLOCK_PANEL_W
                                 && self.cursor_y >= cp_y && self.cursor_y < cp_y + CLOCK_PANEL_H
                             {
+                                // Calendar navigation arrows
+                                // Left arrow: px+4 to px+14, py+4 to py+18
+                                if self.cursor_x >= cp_x + 4 && self.cursor_x < cp_x + 14
+                                    && self.cursor_y >= cp_y + 4 && self.cursor_y < cp_y + 18
+                                {
+                                    self.pending_context_action = ContextAction::CalendarPrev;
+                                    dirty = true;
+                                    return dirty;
+                                }
+                                // Right arrow: px+pw-14 to px+pw-4, py+4 to py+18
+                                if self.cursor_x >= cp_x + CLOCK_PANEL_W - 14 && self.cursor_x < cp_x + CLOCK_PANEL_W - 4
+                                    && self.cursor_y >= cp_y + 4 && self.cursor_y < cp_y + 18
+                                {
+                                    self.pending_context_action = ContextAction::CalendarNext;
+                                    dirty = true;
+                                    return dirty;
+                                }
                                 // Clicked inside the calendar panel — do nothing (panel stays open)
                                 dirty = true;
                                 return dirty;
                             } else {
                                 // Clicked outside → close the calendar
                                 self.clock_panel_active = false;
+                                self.calendar_month_offset = 0;
                                 dirty = true;
                                 return dirty;
                             }
@@ -1500,7 +1684,8 @@ impl InputState {
                                     dirty = true;
                                 }
                                 TaskbarHit::Battery => {
-                                    // Left-click battery: no panel for now, tooltip suffices
+                                    // Left-click battery: toggle power/battery info panel
+                                    self.battery_panel_active = !self.battery_panel_active;
                                     dirty = true;
                                 }
                                 TaskbarHit::Clock => {
@@ -1547,6 +1732,21 @@ impl InputState {
                             if self.cursor_x >= panel_x && self.cursor_x < panel_x + panel_w
                                 && self.cursor_y >= panel_y && self.cursor_y < panel_y + panel_h
                             {
+                                // Check if user clicked a dismiss [×] button on a notification row
+                                let dnd_offset = if self.do_not_disturb { 54 } else { 50 };
+                                let items_start = panel_y + dnd_offset;
+                                for i in 0..8usize {
+                                    let row_y = items_start + i as i32 * 25;
+                                    let dismiss_x = panel_x + panel_w - 18;
+                                    let dismiss_y = row_y - 10;
+                                    if self.cursor_x >= dismiss_x && self.cursor_x < dismiss_x + 12
+                                        && self.cursor_y >= dismiss_y && self.cursor_y < dismiss_y + 12
+                                    {
+                                        self.pending_context_action = ContextAction::DismissNotification(i);
+                                        dirty = true;
+                                        return dirty;
+                                    }
+                                }
                                 // Clicked inside notification panel — mark read
                                 self.notifications_visible = false;
                                 self.notifications_mark_read = true;
@@ -1729,17 +1929,21 @@ impl InputState {
                             dirty = true;
                         } else if let TaskbarHit::Clock = tb_hit {
                             // ── Clock context menu ──
-                            // Height: 1 regular + 1 separator + 1 regular = 2*28 + 8 = 64px
-                            self.context_menu.show(self.cursor_x, self.cursor_y - 64);
+                            // Height: 1 regular + 1 separator + 1 regular + 1 separator + 1 regular = 3*28 + 2*8 = 100px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 100);
                             self.context_menu.add_item("Show Calendar", ContextAction::OpenDashboard);
+                            self.context_menu.add_separator();
+                            self.context_menu.add_item("Power Info", ContextAction::ToggleBatteryPanel);
                             self.context_menu.add_separator();
                             self.context_menu.add_checked_item("Night Light", ContextAction::ToggleNightLight, self.night_light_active);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
                             dirty = true;
                         } else if let TaskbarHit::Battery = tb_hit {
                             // ── Battery context menu ──
-                            // Height: 2 regular = 2*28 = 56px
-                            self.context_menu.show(self.cursor_x, self.cursor_y - 56);
+                            // Height: 1 regular + 1 sep + 2 regular = 3*28 + 8 = 92px
+                            self.context_menu.show(self.cursor_x, self.cursor_y - 92);
+                            self.context_menu.add_item("Power Info", ContextAction::ToggleBatteryPanel);
+                            self.context_menu.add_separator();
                             self.context_menu.add_item("Brightness Up", ContextAction::BrightnessUp);
                             self.context_menu.add_item("Brightness Down", ContextAction::BrightnessDown);
                             self.context_menu.clamp_to_screen(self.fb_width, self.fb_height);
@@ -3123,5 +3327,277 @@ mod tests {
         assert!(!state.context_menu.items[0].checked, "show_desktop unchecked when inactive");
         assert!(state.context_menu.items[1].separator);
         assert_eq!(state.context_menu.items[2].action, ContextAction::CycleWallpaper);
+    }
+
+    // ── Launcher keyboard navigation tests ──
+
+    #[test]
+    fn test_launcher_escape_closes_launcher() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(0);
+        state.pinned_app_count = 2;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Escape scancode = 0x01
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x01, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert!(!state.launcher_active, "Escape should close the launcher");
+        assert_eq!(state.launcher_keyboard_index, None, "Escape should clear keyboard selection");
+    }
+
+    #[test]
+    fn test_launcher_arrow_down_selects_next() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = None;
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Down arrow = 0x50 (no Super modifier)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_keyboard_index, Some(0), "first Down should select index 0");
+
+        let ev2 = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        state.apply_event(&ev2, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_keyboard_index, Some(1), "second Down should advance to index 1");
+    }
+
+    #[test]
+    fn test_launcher_arrow_down_clamps_at_last() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(2);
+        state.pinned_app_count = 3; // indices 0, 1, 2
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Down arrow when already at last
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x50, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_keyboard_index, Some(2), "Down at last should stay at last");
+    }
+
+    #[test]
+    fn test_launcher_arrow_up_selects_prev() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(2);
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Up arrow = 0x48 (no Super modifier)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x48, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_keyboard_index, Some(1), "Up should go to previous index");
+    }
+
+    #[test]
+    fn test_launcher_arrow_up_clamps_at_zero() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(0);
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x48, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_keyboard_index, Some(0), "Up at index 0 should stay at 0");
+    }
+
+    #[test]
+    fn test_launcher_enter_triggers_launch() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(1);
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter = scancode 0x1C
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.launcher_app_click, Some(1), "Enter should set launcher_app_click to selected index");
+        assert_eq!(state.launcher_keyboard_index, None, "Enter should clear keyboard selection");
+    }
+
+    #[test]
+    fn test_launcher_enter_no_op_when_no_selection() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = None;
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.launcher_app_click, None, "Enter with no selection should not trigger launch");
+    }
+
+    #[test]
+    fn test_launcher_keyboard_index_reset_on_close() {
+        let mut state = InputState::new(1920, 1080);
+        state.launcher_active = true;
+        state.launcher_keyboard_index = Some(2);
+        state.pinned_app_count = 3;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Super+L (launcher toggle) = scancode 0x26 with modifier 8
+        state.modifiers = 8;
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x26, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        // launcher_active toggles off, keyboard index should be cleared
+        if !state.launcher_active {
+            assert_eq!(state.launcher_keyboard_index, None, "Closing launcher should reset keyboard index");
+        }
+    }
+
+    // ── Battery panel tests ──
+
+    #[test]
+    fn test_clock_right_click_includes_power_info() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 0;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Right-click on the clock area (fb_w - 56 to fb_w - 6; centre ≈ fb_w - 31 = 1889)
+        state.cursor_x = 1889;
+        state.cursor_y = 1080 - 20;
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 1, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+
+        assert!(state.context_menu.visible, "Clock right-click should show context menu");
+        // Menu should contain "Power Info" item (ToggleBatteryPanel action)
+        let has_power_info = (0..state.context_menu.item_count).any(|i| {
+            state.context_menu.items[i].action == ContextAction::ToggleBatteryPanel
+        });
+        assert!(has_power_info, "Clock context menu should include Power Info item");
+    }
+
+    // ── Lock screen PIN entry tests ──
+
+    #[test]
+    fn test_lock_screen_digit_entry() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press '1' (scancode 0x02)
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x02, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 1);
+        assert_eq!(state.lock_pin_buffer[0], 1);
+    }
+
+    #[test]
+    fn test_lock_screen_pin_max_four_digits() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter 5 digits — only first 4 should be stored
+        for code in [0x02u16, 0x03, 0x04, 0x05, 0x06] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        assert_eq!(state.lock_pin_len, 4, "PIN should cap at 4 digits");
+    }
+
+    #[test]
+    fn test_lock_screen_backspace_removes_digit() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press '1' then backspace
+        let ev_digit = InputEvent { device_id: 0, event_type: 0, code: 0x02, value: 1, timestamp: 0 };
+        state.apply_event(&ev_digit, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 1);
+
+        let ev_bs = InputEvent { device_id: 0, event_type: 0, code: 0x0E, value: 1, timestamp: 0 };
+        state.apply_event(&ev_bs, &mut windows, &mut count, &mut surfaces);
+        assert_eq!(state.lock_pin_len, 0, "Backspace should remove last digit");
+    }
+
+    #[test]
+    fn test_lock_screen_correct_pin_unlocks() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter PIN 1-2-3-4 then Enter
+        for code in [0x02u16, 0x03, 0x04, 0x05] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        let ev_enter = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        state.apply_event(&ev_enter, &mut windows, &mut count, &mut surfaces);
+        assert!(!state.lock_screen_active, "Correct PIN should unlock");
+        assert_eq!(state.lock_pin_len, 0, "PIN buffer should be cleared after unlock");
+        assert_eq!(state.lock_pin_attempts, 0, "Attempt counter should reset on success");
+    }
+
+    #[test]
+    fn test_lock_screen_wrong_pin_increments_attempts() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Enter wrong PIN 1-1-1-1 then Enter
+        for code in [0x02u16, 0x02, 0x02, 0x02] {
+            let ev = InputEvent { device_id: 0, event_type: 0, code, value: 1, timestamp: 0 };
+            state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        }
+        let ev_enter = InputEvent { device_id: 0, event_type: 0, code: 0x1C, value: 1, timestamp: 0 };
+        state.apply_event(&ev_enter, &mut windows, &mut count, &mut surfaces);
+        assert!(state.lock_screen_active, "Wrong PIN should keep screen locked");
+        assert_eq!(state.lock_pin_attempts, 1, "Attempt counter should increment on failure");
+        assert_eq!(state.lock_pin_len, 0, "PIN buffer should be cleared after failed attempt");
+    }
+
+    #[test]
+    fn test_lock_screen_keys_not_forwarded_when_locked() {
+        let mut state = InputState::new(1920, 1080);
+        state.lock_screen_active = true;
+        state.dashboard_active = false;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Press Super+D (toggle dashboard) — should be blocked by lock screen handler
+        state.modifiers = 8; // Super modifier
+        let ev = InputEvent { device_id: 0, event_type: 0, code: 0x20, value: 1, timestamp: 0 };
+        state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        // dashboard_active should NOT change because lock screen intercepts key events
+        assert!(!state.dashboard_active, "Lock screen should block Super+D shortcut");
     }
 }
