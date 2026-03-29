@@ -1487,21 +1487,46 @@ fn draw_window(
             draw_terminal_demo(fb, cx, content_y, cw, content_h);
         }
         WindowContent::Wayland { .. } => {
+            // Always fill the content area with a solid background first so that no
+            // desktop background bleeds through during the window open animation (while
+            // the blit dimensions are still smaller than the full content area).
+            let bg_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(15, 20, 35))
+                .build();
+            let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
+                .into_styled(bg_style)
+                .draw(fb);
+
             if let Some(vaddr) = window.buffer_handle {
-                // `window.w` and `window.h` are the committed buffer dimensions; they may
-                // temporarily exceed the animated `cw`/`ch` while the window grows into its
-                // target size.  We clip the copy area to the visible content region so that
-                // pixels are never written outside the window's current animated bounds.
-                let client_w = window.w;
-                let client_h = window.h - ShellWindow::TITLE_H;
-                // Number of pixels to copy: at most the content area that is currently visible.
-                // The `> 0` guards below safely handle any negative intermediate value.
-                let blit_w = client_w.min(cw);
-                let blit_h = client_h.min(content_h);
-                if blit_w > 0 && blit_h > 0 {
-                    // Use client_w as the source stride so row indexing matches the stride
-                    // the terminal used when writing (y * client_w + x).
-                    fb.blit_buffer(vaddr as usize, blit_w as u32, blit_h as u32, client_w as u32, cx, cy + ShellWindow::TITLE_H);
+                let raw_vaddr = vaddr as usize;
+                // Guard against self-referential blits: if the client's reported buffer
+                // address equals the compositor's own back or front framebuffer address,
+                // the blit would copy the desktop/framebuffer content into the window
+                // instead of the terminal's pixel data.  Fall back to the simulated
+                // terminal in that case so the window looks reasonable.
+                let is_own_fb = raw_vaddr == 0
+                    || raw_vaddr == fb.back_addr
+                    || raw_vaddr == fb.front_addr;
+                if is_own_fb {
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                } else {
+                    // `window.w` and `window.h` are the committed buffer dimensions; they may
+                    // temporarily exceed the animated `cw`/`ch` while the window grows into its
+                    // target size.  We clip the copy area to the visible content region so that
+                    // pixels are never written outside the window's current animated bounds.
+                    let client_w = window.w;
+                    let client_h = window.h - ShellWindow::TITLE_H;
+                    // Number of pixels to copy: at most the content area that is currently visible.
+                    // The `> 0` guards below safely handle any negative intermediate value.
+                    let blit_w = client_w.min(cw);
+                    let blit_h = client_h.min(content_h);
+                    if blit_w > 0 && blit_h > 0 {
+                        // Use client_w as the source stride so row indexing matches the stride
+                        // the terminal used when writing (y * client_w + x).
+                        fb.blit_buffer(raw_vaddr, blit_w as u32, blit_h as u32, client_w as u32, cx, cy + ShellWindow::TITLE_H);
+                    } else {
+                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    }
                 }
             } else {
                 // No buffer committed yet — show simulated terminal content as a placeholder
