@@ -130,6 +130,16 @@ pub enum WaylandInternalEvent {
         toplevel_id: u32,
         surface_id: u32,
     },
+    /// Emitted when xdg_toplevel.set_title is called by the client.
+    ToplevelTitleChanged {
+        toplevel_id: u32,
+        title: Vec<u8>,
+    },
+    /// Emitted when xdg_toplevel.set_app_id is called by the client.
+    ToplevelAppIdChanged {
+        toplevel_id: u32,
+        app_id: Vec<u8>,
+    },
 }
 
 impl WaylandConnection {
@@ -401,6 +411,26 @@ pub mod objects {
                         while ev.len() % 4 != 0 { ev.push(0); }
                         ev.extend_from_slice(&1u32.to_le_bytes()); // version
                         conn.send_event(id, 0, &ev);
+
+                        // 5. wl_seat (keyboard + pointer capabilities)
+                        let mut ev = Vec::new();
+                        ev.extend_from_slice(&5u32.to_le_bytes()); // name
+                        let ifname = b"wl_seat\0";
+                        ev.extend_from_slice(&(ifname.len() as u32).to_le_bytes());
+                        ev.extend_from_slice(ifname);
+                        while ev.len() % 4 != 0 { ev.push(0); }
+                        ev.extend_from_slice(&7u32.to_le_bytes()); // version
+                        conn.send_event(id, 0, &ev);
+
+                        // 6. wl_output (screen geometry)
+                        let mut ev = Vec::new();
+                        ev.extend_from_slice(&6u32.to_le_bytes()); // name
+                        let ifname = b"wl_output\0";
+                        ev.extend_from_slice(&(ifname.len() as u32).to_le_bytes());
+                        ev.extend_from_slice(ifname);
+                        while ev.len() % 4 != 0 { ev.push(0); }
+                        ev.extend_from_slice(&4u32.to_le_bytes()); // version
+                        conn.send_event(id, 0, &ev);
                     }
                 }
                 _ => return Err(WaylandError::UnknownOpcode(opcode)),
@@ -446,6 +476,43 @@ pub mod objects {
                             }
                             b"xdg_wm_base" => {
                                 conn.registry.set(*new_id, Box::new(XdgWmBase));
+                            }
+                            b"wl_seat" => {
+                                conn.registry.set(*new_id, Box::new(WlSeat));
+                                // Advertise capabilities: pointer (1) | keyboard (2)
+                                let mut caps = Vec::new();
+                                caps.extend_from_slice(&3u32.to_le_bytes());
+                                conn.send_event(*new_id, 0, &caps); // wl_seat.capabilities
+                            }
+                            b"wl_output" => {
+                                conn.registry.set(*new_id, Box::new(WlOutput));
+                                // Send geometry event: x=0, y=0, physical_w=0, physical_h=0,
+                                // subpixel=0, make="Eclipse", model="Virtual", transform=0
+                                let mut geom = Vec::new();
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // x
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // y
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // physical_width
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // physical_height
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // subpixel
+                                let make = b"Eclipse\0";
+                                geom.extend_from_slice(&(make.len() as u32).to_le_bytes());
+                                geom.extend_from_slice(make);
+                                while geom.len() % 4 != 0 { geom.push(0); }
+                                let model = b"Virtual\0";
+                                geom.extend_from_slice(&(model.len() as u32).to_le_bytes());
+                                geom.extend_from_slice(model);
+                                while geom.len() % 4 != 0 { geom.push(0); }
+                                geom.extend_from_slice(&0i32.to_le_bytes()); // transform
+                                conn.send_event(*new_id, 0, &geom); // wl_output.geometry
+                                // Send mode event: flags=1 (current), width=1920, height=1080, refresh=60000
+                                let mut mode = Vec::new();
+                                mode.extend_from_slice(&1u32.to_le_bytes()); // flags (current)
+                                mode.extend_from_slice(&1920i32.to_le_bytes()); // width
+                                mode.extend_from_slice(&1080i32.to_le_bytes()); // height
+                                mode.extend_from_slice(&60_000i32.to_le_bytes()); // refresh (mHz)
+                                conn.send_event(*new_id, 1, &mode); // wl_output.mode
+                                // Send done event (wl_output v2+)
+                                conn.send_event(*new_id, 2, &[]); // wl_output.done
                             }
                             b"zwp_linux_dmabuf_v1" => {
                                 conn.registry.set(*new_id, Box::new(ZwpLinuxDmabufV1));
@@ -722,15 +789,29 @@ pub mod objects {
     impl WaylandObject for XdgToplevel {
         fn interface_name(&self) -> &'static str { "xdg_toplevel" }
         fn version(&self) -> u32 { 1 }
-        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+        fn handle_request(&mut self, conn: &mut WaylandConnection, id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
             match opcode {
                 0 => { // destroy
                 }
                 1 => { // set_parent
                 }
-                2 => { // set_title
+                2 => { // set_title(title: string)
+                    let (decoded, _) = decode_args("s", args);
+                    if let Some(WaylandArg::String(title)) = decoded.into_iter().next() {
+                        conn.internal_events.push_back(WaylandInternalEvent::ToplevelTitleChanged {
+                            toplevel_id: id,
+                            title,
+                        });
+                    }
                 }
-                3 => { // set_app_id
+                3 => { // set_app_id(app_id: string)
+                    let (decoded, _) = decode_args("s", args);
+                    if let Some(WaylandArg::String(app_id)) = decoded.into_iter().next() {
+                        conn.internal_events.push_back(WaylandInternalEvent::ToplevelAppIdChanged {
+                            toplevel_id: id,
+                            app_id,
+                        });
+                    }
                 }
                 4 => { // show_window_menu
                 }
@@ -754,6 +835,73 @@ pub mod objects {
                 }
                 _ => {} // Ignore others for now
             }
+            Ok(())
+        }
+    }
+
+    /// wl_seat: provides input capabilities (keyboard, pointer, touch).
+    pub struct WlSeat;
+    impl WaylandObject for WlSeat {
+        fn interface_name(&self) -> &'static str { "wl_seat" }
+        fn version(&self) -> u32 { 7 }
+        fn handle_request(&mut self, conn: &mut WaylandConnection, _id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => { // get_pointer(id = new_id)
+                    let (decoded, _) = decode_args("n", args);
+                    if let Some(WaylandArg::NewId(new_id)) = decoded.into_iter().next() {
+                        conn.registry.set(new_id, Box::new(WlPointer));
+                    }
+                }
+                1 => { // get_keyboard(id = new_id)
+                    let (decoded, _) = decode_args("n", args);
+                    if let Some(WaylandArg::NewId(new_id)) = decoded.into_iter().next() {
+                        conn.registry.set(new_id, Box::new(WlKeyboard));
+                    }
+                }
+                2 => { // get_touch(id = new_id)
+                    let (decoded, _) = decode_args("n", args);
+                    if let Some(WaylandArg::NewId(new_id)) = decoded.into_iter().next() {
+                        // Touch not implemented; create a stub object
+                        conn.registry.set(new_id, Box::new(WlPointer));
+                    }
+                }
+                3 => { // release (wl_seat v5+)
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    /// wl_pointer: receives pointer (mouse) events from the compositor.
+    pub struct WlPointer;
+    impl WaylandObject for WlPointer {
+        fn interface_name(&self) -> &'static str { "wl_pointer" }
+        fn version(&self) -> u32 { 7 }
+        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, _opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+            // set_cursor (0), release (1) — no state to track yet
+            Ok(())
+        }
+    }
+
+    /// wl_keyboard: receives keyboard events from the compositor.
+    pub struct WlKeyboard;
+    impl WaylandObject for WlKeyboard {
+        fn interface_name(&self) -> &'static str { "wl_keyboard" }
+        fn version(&self) -> u32 { 7 }
+        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, _opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+            // release (0) — no state to track yet
+            Ok(())
+        }
+    }
+
+    /// wl_output: describes a physical or virtual display output.
+    pub struct WlOutput;
+    impl WaylandObject for WlOutput {
+        fn interface_name(&self) -> &'static str { "wl_output" }
+        fn version(&self) -> u32 { 4 }
+        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, _opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+            // release (0, wl_output v3+) — nothing to clean up
             Ok(())
         }
     }
