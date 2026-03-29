@@ -146,25 +146,26 @@ fn main() {
     let mut terminal = Terminal::new(display, Box::new(BitmapFont));
     terminal.process(b"\x1b[1;32mEclipse OS Terminal (Wayland EDP Optimized)\x1b[0m\r\n\n$ ");
 
-    // Helper to send frame commit
-    let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32| {
+    // Helper to send frame commit (includes direct vaddr for flat-memory compositing)
+    let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32, buf_vaddr: u64| {
         let mut commit = WaylandMsgCommitFrame::default();
-        commit.header = WaylandHeader::new(surface_id, 1, 24); // Opcode 1 for Surface: CommitFrame
+        commit.header = WaylandHeader::new(surface_id, 1, 32); // Opcode 1 for Surface: CommitFrame (32-byte)
         commit.pool_id = pool_id;
         commit.offset = 0;
         commit.width = width as u16;
         commit.height = height as u16;
         commit.stride = (width * 4) as u16;
         commit.format = 0; // ARGB8888
+        commit.vaddr = buf_vaddr; // direct buffer address for compositor
 
-        let mut buf = [0u8; 28];
+        let mut buf = [0u8; 36];
         buf[0..4].copy_from_slice(b"WAYL");
-        unsafe { core::ptr::write_unaligned(buf[4..28].as_mut_ptr() as *mut WaylandMsgCommitFrame, commit); }
-        unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, buf.as_ptr() as *const core::ffi::c_void, 28, 0); }
+        unsafe { core::ptr::write_unaligned(buf[4..36].as_mut_ptr() as *mut WaylandMsgCommitFrame, commit); }
+        unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, buf.as_ptr() as *const core::ffi::c_void, 36, 0); }
     };
 
     // Initial commit
-    send_commit(composer_pid, surface_id, pool_id);
+    send_commit(composer_pid, surface_id, pool_id, buffer_ptr as u64);
 
     loop {
         let mut buffer = [0u8; 128];
@@ -176,7 +177,7 @@ fn main() {
                 if event.event_type == sidewind::SWND_EVENT_TYPE_KEY {
                     if let Some(c) = scancode_to_char(event.data1 as u16) {
                         terminal.process(&[c as u8]);
-                        send_commit(composer_pid, surface_id, pool_id);
+                        send_commit(composer_pid, surface_id, pool_id, buffer_ptr as u64);
                     }
                 }
             }
