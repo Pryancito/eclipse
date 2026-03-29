@@ -292,6 +292,29 @@ impl LunasState {
                         }
                         self.dirty = true;
                     }
+                    WaylandAction::AttachBuffer { pid, surface_id, vaddr, width, height, .. } => {
+                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
+                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                if w_idx < self.space.window_count && vaddr != 0 {
+                                    let win = &mut self.space.windows[w_idx];
+                                    win.buffer_handle = Some(vaddr as u64);
+                                    win.w = width;
+                                    win.h = height + ShellWindow::TITLE_H;
+                                }
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                    WaylandAction::CommitSurface { pid, surface_id } => {
+                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
+                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                if w_idx < self.space.window_count {
+                                    self.space.windows[w_idx].minimized = false;
+                                }
+                            }
+                        }
+                        self.dirty = true;
+                    }
                     WaylandAction::DestroySurface { pid, surface_id } => {
                         let w_idx_opt = self.wayland.connections.iter()
                             .find(|c| c.pid == pid)

@@ -1287,6 +1287,74 @@ fn draw_taskbar(
     }
 }
 
+/// Render simulated terminal content into the window content area.
+/// Used by `WindowContent::InternalDemo` and as fallback for `WindowContent::Wayland`
+/// when the client has not yet committed a pixel buffer.
+fn draw_terminal_demo(
+    fb: &mut FramebufferState,
+    cx: i32,
+    content_y: i32,
+    cw: i32,
+    content_h: i32,
+) {
+    // Dark navy terminal background
+    let demo_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(15, 20, 35)).build();
+    let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
+        .into_styled(demo_style)
+        .draw(fb);
+
+    // Header separator line
+    let sep_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(40, 50, 80)).build();
+    let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, 1))
+        .into_styled(sep_style)
+        .draw(fb);
+
+    let green = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 100));
+    let white = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+    let cyan  = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 220));
+    let dim   = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
+
+    let line_h = 14;
+    let x0 = cx + 8;
+    let max_y = content_y + content_h;
+    let mut ly = content_y + 4 + 12;
+
+    let lines: &[(&str, &MonoTextStyle<Rgb888>)] = &[
+        ("lunas@eclipse:~$ ls /usr/share/lunas", &white),
+        ("bin/  config/  fonts/  icons/  themes/", &cyan),
+        ("lunas@eclipse:~$ uname -a", &white),
+        ("Eclipse OS 1.0 lunas-compositor x86_64", &cyan),
+        ("lunas@eclipse:~$ cat /etc/motd", &white),
+        ("Welcome to Eclipse OS - Lunas Desktop", &green),
+        ("lunas@eclipse:~$ uptime", &white),
+        ("up 0 days, 00:42, load: 0.12 0.08 0.05", &cyan),
+        ("lunas@eclipse:~$ free -h", &white),
+        ("Mem:  512M total, 387M used, 125M free", &cyan),
+        ("lunas@eclipse:~$ ps aux | head -3", &white),
+        ("PID  USER   CMD", &dim),
+        ("  1  root   /sbin/init", &cyan),
+        ("  2  lunas  compositor", &cyan),
+        ("lunas@eclipse:~$ ", &green),
+    ];
+
+    for &(text, style) in lines {
+        if ly > max_y - 4 { break; }
+        let _ = Text::new(text, Point::new(x0, ly), *style).draw(fb);
+        ly += line_h;
+    }
+
+    // Cursor block at end of last prompt line
+    let prompt_text = "lunas@eclipse:~$ ";
+    let cursor_x = x0 + (prompt_text.len() as i32) * 6;
+    let cursor_y_top = ly - line_h - 2;
+    if cursor_y_top < max_y - 4 {
+        let cursor_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
+        let _ = Rectangle::new(Point::new(cursor_x, cursor_y_top), Size::new(6, 12))
+            .into_styled(cursor_style)
+            .draw(fb);
+    }
+}
+
 /// Draw a single window with decorations.
 /// `decoration_style`: 0 = default (dark blue), 1 = minimal (charcoal), 2 = neon (cyan accent).
 fn draw_window(
@@ -1400,64 +1468,7 @@ fn draw_window(
             }
         }
         WindowContent::InternalDemo => {
-            // Dark navy terminal background
-            let demo_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(15, 20, 35)).build();
-            let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
-                .into_styled(demo_style)
-                .draw(fb);
-
-            // Header separator line
-            let sep_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(40, 50, 80)).build();
-            let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, 1))
-                .into_styled(sep_style)
-                .draw(fb);
-
-            let green = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 100));
-            let white = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
-            let cyan = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 200, 220));
-            let dim = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-
-            let line_h = 14;
-            let x0 = cx + 8;
-            let max_y = content_y + content_h;
-            let mut ly = content_y + 4 + 12; // first baseline
-
-            // Simulated terminal output lines
-            let lines: &[(&str, &MonoTextStyle<Rgb888>)] = &[
-                ("lunas@eclipse:~$ ls /usr/share/lunas", &white),
-                ("bin/  config/  fonts/  icons/  themes/", &cyan),
-                ("lunas@eclipse:~$ uname -a", &white),
-                ("Eclipse OS 1.0 lunas-compositor x86_64", &cyan),
-                ("lunas@eclipse:~$ cat /etc/motd", &white),
-                ("Welcome to Eclipse OS - Lunas Desktop", &green),
-                ("lunas@eclipse:~$ uptime", &white),
-                ("up 0 days, 00:42, load: 0.12 0.08 0.05", &cyan),
-                ("lunas@eclipse:~$ free -h", &white),
-                ("Mem:  512M total, 387M used, 125M free", &cyan),
-                ("lunas@eclipse:~$ ps aux | head -3", &white),
-                ("PID  USER   CMD", &dim),
-                ("  1  root   /sbin/init", &cyan),
-                ("  2  lunas  compositor", &cyan),
-                ("lunas@eclipse:~$ ", &green),
-            ];
-
-            for &(text, style) in lines {
-                if ly > max_y - 4 { break; }
-                let _ = Text::new(text, Point::new(x0, ly), *style).draw(fb);
-                ly += line_h;
-            }
-
-            // Draw cursor block at end of last prompt line
-            // Subtract line_h to go back to the prompt line baseline, then offset 2px for alignment
-            let prompt_text = "lunas@eclipse:~$ ";
-            let cursor_x = x0 + (prompt_text.len() as i32) * 6;
-            let cursor_y_top = ly - line_h - 2;
-            if cursor_y_top < max_y - 4 {
-                let cursor_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::WHITE).build();
-                let _ = Rectangle::new(Point::new(cursor_x, cursor_y_top), Size::new(6, 12))
-                    .into_styled(cursor_style)
-                    .draw(fb);
-            }
+            draw_terminal_demo(fb, cx, content_y, cw, content_h);
         }
         WindowContent::Wayland { .. } => {
             if let Some(vaddr) = window.buffer_handle {
@@ -1467,14 +1478,8 @@ fn draw_window(
                     fb.blit_buffer(vaddr as usize, client_w as u32, client_h as u32, cx, cy + ShellWindow::TITLE_H);
                 }
             } else {
-                // No buffer committed yet — show a dark placeholder instead of leaving the area black
-                let loading_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 25, 40)).build();
-                let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
-                    .into_styled(loading_style)
-                    .draw(fb);
-                let loading_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-                // -30 ≈ half the pixel width of "Loading..." at 6px/char to roughly centre it
-                let _ = Text::new("Loading...", Point::new(cx + cw / 2 - 30, content_y + content_h / 2), loading_text).draw(fb);
+                // No buffer committed yet — show simulated terminal content as a placeholder
+                draw_terminal_demo(fb, cx, content_y, cw, content_h);
             }
         }
         WindowContent::None => {}

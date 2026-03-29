@@ -66,7 +66,7 @@ pub struct WaylandMsgCreatePool {
 
 /// Mensaje atómico para atachar un buffer y hacer commit.
 /// Opcode: 1 (Target: surface_id)
-/// Total: 24 bytes. (Encaja en receive_fast del kernel)
+/// Total: 32 bytes. Includes direct vaddr for flat-memory compositing.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WaylandMsgCommitFrame {
@@ -77,6 +77,9 @@ pub struct WaylandMsgCommitFrame {
     pub height: u16,
     pub stride: u16,
     pub format: u16,
+    /// Direct virtual address of the pixel buffer in the sender's address space.
+    /// Non-zero value allows the compositor to blit without a shared-file pool.
+    pub vaddr: u64,
 }
 
 /// Evento de teclado enviado al cliente.
