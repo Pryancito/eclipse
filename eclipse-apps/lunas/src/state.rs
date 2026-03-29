@@ -298,8 +298,8 @@ impl LunasState {
                                 if w_idx < self.space.window_count && vaddr != 0 {
                                     let win = &mut self.space.windows[w_idx];
                                     win.buffer_handle = Some(vaddr as u64);
-                                    win.w = width;
-                                    win.h = height + ShellWindow::TITLE_H;
+                                    win.w = width as i32;
+                                    win.h = height as i32 + ShellWindow::TITLE_H;
                                 }
                             }
                         }

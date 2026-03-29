@@ -89,6 +89,9 @@ impl ClientConnection {
     }
 }
 
+/// Default SHM pool size when no explicit size is provided (640×480 ARGB).
+const DEFAULT_POOL_SIZE: usize = 640 * 480 * 4;
+
 pub struct WaylandCompositor {
     pub connections: alloc::vec::Vec<ClientConnection>,
     pub pending_responses: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)>,
@@ -250,33 +253,12 @@ impl WaylandCompositor {
                         }
                     }
                     Some(WaylandObjectType::Surface { id: surface_id }) => {
-                        if header.opcode == 1 && data.len() >= 32 {
-                            // EDP CommitFrame with direct vaddr (32-byte message)
+                        if header.opcode == 1 && data.len() >= 24 {
+                            // EDP CommitFrame: 32-byte message includes direct vaddr;
+                            // 24-byte legacy message falls back to pool lookup only.
                             let msg_ptr = data.as_ptr() as *const sidewind::wayland::WaylandMsgCommitFrame;
                             let msg = unsafe { core::ptr::read_unaligned(msg_ptr) };
-                            let vaddr = if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == msg.pool_id) {
-                                pool.vaddr + msg.offset as usize
-                            } else if msg.vaddr != 0 {
-                                msg.vaddr as usize
-                            } else {
-                                return WaylandAction::None;
-                            };
-                            return WaylandAction::CommitFrame {
-                                pid, surface_id,
-                                pool_id: msg.pool_id,
-                                offset: msg.offset,
-                                width: msg.width,
-                                height: msg.height,
-                                stride: msg.stride,
-                                format: msg.format,
-                                vaddr,
-                            };
-                        } else if header.opcode == 1 && data.len() >= 24 {
-                            // EDP CommitFrame without direct vaddr (legacy 24-byte message)
-                            let msg_ptr = data.as_ptr() as *const sidewind::wayland::WaylandMsgCommitFrame;
-                            let msg = unsafe { core::ptr::read_unaligned(msg_ptr) };
-                            if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == msg.pool_id) {
-                                let vaddr = pool.vaddr + msg.offset as usize;
+                            if let Some(vaddr) = self.resolve_commit_vaddr(conn_idx, &msg) {
                                 return WaylandAction::CommitFrame {
                                     pid, surface_id,
                                     pool_id: msg.pool_id,
@@ -304,9 +286,11 @@ impl WaylandCompositor {
                         }
                     }
                     _ => {
-                        // Unknown object type: opcode 0 with at least a new_id payload is
-                        // treated as wl_compositor.create_surface (clients may bind compositor
-                        // to any object ID without a prior registry exchange).
+                        // Fallback for unknown object types: if a client sends opcode 0 with
+                        // a payload large enough to hold a new_id (≥12 bytes), treat the
+                        // request as wl_compositor.create_surface.  This accommodates clients
+                        // that bind wl_compositor to an arbitrary object ID without going
+                        // through a full registry handshake (e.g. tests, simplified EDP clients).
                         if header.opcode == 0 && data.len() >= 12 {
                             let new_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
                             let width  = if data.len() >= 14 { u16::from_le_bytes([data[12], data[13]]) } else { 0 };
@@ -336,7 +320,7 @@ impl WaylandCompositor {
         let path = b"/tmp/Terminal\0";
         let fd = unsafe { libc::open(path.as_ptr() as *const core::ffi::c_char, libc::O_RDONLY, 0) };
         let vaddr = if fd >= 0 {
-            let sz = if pool_size > 0 { pool_size } else { 640 * 480 * 4 };
+            let sz = if pool_size > 0 { pool_size } else { DEFAULT_POOL_SIZE };
             let v = unsafe { libc::mmap(core::ptr::null_mut(), sz, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
             unsafe { libc::close(fd); }
             if !v.is_null() && v != (-1isize as *mut core::ffi::c_void) {
@@ -348,6 +332,24 @@ impl WaylandCompositor {
         self.connections[conn_idx].pools.push(ShmPool { id: new_id, vaddr, size: pool_size });
         self.connections[conn_idx].objects.push((new_id, WaylandObjectType::ShmPool { id: new_id }));
         WaylandAction::None
+    }
+
+    /// Resolve the pixel-buffer vaddr for a CommitFrame message.
+    ///
+    /// Priority: pool-based address (pool.vaddr + offset), then direct vaddr from message.
+    /// Returns `None` if neither source provides a valid address.
+    fn resolve_commit_vaddr(
+        &self,
+        conn_idx: usize,
+        msg: &sidewind::wayland::WaylandMsgCommitFrame,
+    ) -> Option<usize> {
+        if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == msg.pool_id) {
+            Some(pool.vaddr + msg.offset as usize)
+        } else if msg.vaddr != 0 {
+            Some(msg.vaddr as usize)
+        } else {
+            None
+        }
     }
 
     /// Construct and queue global registry events. (No longer used in EDP)
