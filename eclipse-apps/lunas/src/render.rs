@@ -1460,7 +1460,13 @@ fn draw_window(
             }
         }
         WindowContent::Wayland { .. } => {
-            // Wayland content already composited
+            if let Some(vaddr) = window.buffer_handle {
+                let client_w = window.w;
+                let client_h = window.h - ShellWindow::TITLE_H;
+                if client_w > 0 && client_h > 0 {
+                    fb.blit_buffer(vaddr as usize, client_w as u32, client_h as u32, cx, cy + ShellWindow::TITLE_H);
+                }
+            }
         }
         WindowContent::None => {}
     }

@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 use os_terminal::{DrawTarget, Terminal, Rgb};
 use os_terminal::font::BitmapFont;
 use sidewind::{discover_composer, MSG_TYPE_WAYLAND};
-use libc::{eclipse_send as send, receive, sleep_ms, open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_CREAT};
+use libc::{eclipse_send as send, receive, receive_fast, sleep_ms, open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_CREAT};
 
 // Custom DrawTarget that draws directly into our SHM region
 struct SidewindDrawTarget {
@@ -129,7 +129,21 @@ fn main() {
     for _ in 0..100 {
         let mut buffer = [0u8; 256];
         let mut sender: u32 = 0;
-        let len = unsafe { receive(buffer.as_mut_ptr(), buffer.len(), &mut sender) };
+        let mut len = 0;
+
+        // Try fast path first (messages <= 24 bytes)
+        if let Some((data, from, f_len)) = receive_fast() {
+            buffer[..24].copy_from_slice(&data);
+            sender = from;
+            len = f_len;
+        } else {
+            // Try slow path
+            len = unsafe { receive(buffer.as_mut_ptr(), buffer.len(), &mut sender) };
+        }
+
+        if len > 0 {
+            println!("[TERM-WAYL] Recv {} bytes from PID {}", len, sender);
+        }
         if len > 8 && sender == composer_pid && &buffer[0..4] == b"WAYL" {
             let mut offset = 4;
             while offset + 8 <= len {
@@ -138,12 +152,15 @@ fn main() {
                 let size_op = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
                 let size = (size_op >> 16) as usize;
                 let opcode = (size_op & 0xFFFF) as u16;
+                
+                println!("[TERM-WAYL]   Global/Event: obj={} op={} size={}", obj_id, opcode, size);
 
                 if obj_id == registry_id && opcode == 0 && offset + 16 <= len {
                     let name = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
                     let if_len = u32::from_le_bytes([p[12], p[13], p[14], p[15]]) as usize;
                     if offset + 16 + if_len <= len {
                         let interface = unsafe { core::str::from_utf8_unchecked(&p[16..16+if_len-1]) };
+                        println!("[TERM-WAYL]     Announce: name={} interface='{}'", name, interface);
                         if interface == "wl_compositor" { compositor_id = name; }
                         if interface == "wl_shm" { shm_id = name; }
                         if interface == "wl_shell" { shell_id = name; }
@@ -168,11 +185,11 @@ fn main() {
     let mut msg = [0u8; 44];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((44u32 << 16) | 0u32).to_le_bytes()); // bind
+    msg[8..12].copy_from_slice(&((40u32 << 16) | 0u32).to_le_bytes()); // bind
     msg[12..16].copy_from_slice(&compositor_id.to_le_bytes());
     let ifname = b"wl_compositor\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
-    msg[20..34].copy_from_slice(b"wl_compositor\0\0\0");
+    msg[20..36].copy_from_slice(b"wl_compositor\0\0\0");
     msg[36..40].copy_from_slice(&4u32.to_le_bytes()); // version
     msg[40..44].copy_from_slice(&bound_compositor_id.to_le_bytes());
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 44, 0); }
@@ -181,11 +198,11 @@ fn main() {
     let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((36u32 << 16) | 0u32).to_le_bytes()); 
+    msg[8..12].copy_from_slice(&((32u32 << 16) | 0u32).to_le_bytes()); 
     msg[12..16].copy_from_slice(&shm_id.to_le_bytes());
     let ifname = b"wl_shm\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
-    msg[20..27].copy_from_slice(b"wl_shm\0");
+    msg[20..28].copy_from_slice(b"wl_shm\0\0");
     msg[28..32].copy_from_slice(&1u32.to_le_bytes());
     msg[32..36].copy_from_slice(&bound_shm_id.to_le_bytes());
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 36, 0); }
@@ -194,11 +211,11 @@ fn main() {
     let mut msg = [0u8; 40];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&registry_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((40u32 << 16) | 0u32).to_le_bytes());
+    msg[8..12].copy_from_slice(&((36u32 << 16) | 0u32).to_le_bytes());
     msg[12..16].copy_from_slice(&shell_id.to_le_bytes());
     let ifname = b"wl_shell\0";
     msg[16..20].copy_from_slice(&(ifname.len() as u32).to_le_bytes());
-    msg[20..30].copy_from_slice(b"wl_shell\0\0");
+    msg[20..32].copy_from_slice(b"wl_shell\0\0\0\0");
     msg[32..36].copy_from_slice(&1u32.to_le_bytes());
     msg[36..40].copy_from_slice(&bound_shell_id.to_le_bytes());
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 40, 0); }
@@ -210,7 +227,9 @@ fn main() {
     msg[4..8].copy_from_slice(&bound_compositor_id.to_le_bytes());
     msg[8..12].copy_from_slice(&((12u32 << 16) | 0u32).to_le_bytes()); // create_surface
     msg[12..16].copy_from_slice(&surface_id.to_le_bytes());
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 16, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 16, 0) };
+    if rc < 0 { println!("[TERM] Error: create_surface failed (rc={})", rc); }
+    else { println!("[TERM] Create Surface sent: id={}", surface_id); }
 
     // Create Shell Surface (ID 8)
     let shell_surface_id = 8u32;
@@ -220,7 +239,9 @@ fn main() {
     msg[8..12].copy_from_slice(&((16u32 << 16) | 0u32).to_le_bytes()); // get_shell_surface
     msg[12..16].copy_from_slice(&shell_surface_id.to_le_bytes());
     msg[16..20].copy_from_slice(&surface_id.to_le_bytes());
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 20, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 20, 0) };
+    if rc < 0 { println!("[TERM] Error: get_shell_surface failed (rc={})", rc); }
+    else { println!("[TERM] Get Shell Surface sent: id={} surface={}", shell_surface_id, surface_id); }
 
     // Set Toplevel
     let mut msg = [0u8; 12];
@@ -231,28 +252,32 @@ fn main() {
 
     // Create SHM Pool (ID 9)
     let pool_id = 9u32;
-    let mut msg = [0u8; 20];
+    let mut msg = [0u8; 24];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&bound_shm_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((16u32 << 16) | 0u32).to_le_bytes()); // create_pool
+    msg[8..12].copy_from_slice(&((20u32 << 16) | 0u32).to_le_bytes()); // create_pool
     msg[12..16].copy_from_slice(&pool_id.to_le_bytes());
     msg[16..20].copy_from_slice(&(fd as u32).to_le_bytes()); // Pass target_fd (handle)
     msg[20..24].copy_from_slice(&(size_bytes as i32).to_le_bytes());
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0) };
+    if rc < 0 { println!("[TERM] Error: create_pool failed (rc={})", rc); }
+    else { println!("[TERM] Create SHM Pool sent: id={} size={}", pool_id, size_bytes); }
 
     // Create Buffer (ID 10)
     let buffer_id = 10u32;
-    let mut msg = [0u8; 32];
+    let mut msg = [0u8; 36];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&pool_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((28u32 << 16) | 0u32).to_le_bytes()); // create_buffer
+    msg[8..12].copy_from_slice(&((32u32 << 16) | 0u32).to_le_bytes()); // create_buffer
     msg[12..16].copy_from_slice(&buffer_id.to_le_bytes());
     msg[16..20].copy_from_slice(&0u32.to_le_bytes()); // offset
     msg[20..24].copy_from_slice(&(width as i32).to_le_bytes());
     msg[24..28].copy_from_slice(&(height as i32).to_le_bytes());
     msg[28..32].copy_from_slice(&(width as i32 * 4).to_le_bytes()); // stride
     msg[32..36].copy_from_slice(&0u32.to_le_bytes()); // format (0=ARGB)
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 36, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 36, 0) };
+    if rc < 0 { println!("[TERM] Error: create_buffer failed (rc={})", rc); }
+    else { println!("[TERM] Create Buffer sent: id={}", buffer_id); }
 
     // 4. Initialization
     let display = SidewindDrawTarget { vaddr: buffer_ptr, width: width as usize, height: height as usize };
@@ -260,20 +285,24 @@ fn main() {
     terminal.process(b"\x1b[1;32mEclipse OS Terminal (Wayland Enhanced)\x1b[0m\r\n\n$ ");
 
     // Initial attach & commit
-    let mut msg = [0u8; 20];
+    let mut msg = [0u8; 24];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
-    msg[8..12].copy_from_slice(&((16u32 << 16) | 1u32).to_le_bytes()); // attach
+    msg[8..12].copy_from_slice(&((20u32 << 16) | 1u32).to_le_bytes()); // attach (20 bytes: 8 header + 12 payload)
     msg[12..16].copy_from_slice(&buffer_id.to_le_bytes());
     msg[16..20].copy_from_slice(&0u32.to_le_bytes()); // x
     msg[20..24].copy_from_slice(&0u32.to_le_bytes()); // y
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 24, 0) };
+    if rc < 0 { println!("[TERM] Error: initial attach failed (rc={})", rc); }
+    else { println!("[TERM] Initial Attach sent: buffer={}", buffer_id); }
 
-    let mut msg = [0u8; 8];
+    let mut msg = [0u8; 12];
     msg[0..4].copy_from_slice(b"WAYL");
     msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
     msg[8..12].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit
-    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 12, 0); }
+    let rc = unsafe { send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 12, 0) };
+    if rc < 0 { println!("[TERM] Error: initial commit failed (rc={})", rc); }
+    else { println!("[TERM] Initial Commit sent: surface={}", surface_id); }
 
     loop {
         let mut buffer = [0u8; 128];
@@ -288,10 +317,9 @@ fn main() {
                         terminal.process(&[c as u8]);
                         // Signal change (commit)
                         let mut msg = [0u8; 8];
-                        msg[0..4].copy_from_slice(b"WAYL");
-                        msg[4..8].copy_from_slice(&surface_id.to_le_bytes());
-                        msg[8..12].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit
-                        unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 12, 0); }
+                        msg[0..4].copy_from_slice(&surface_id.to_le_bytes());
+                        msg[4..8].copy_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // commit
+                        unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, 8, 0); }
                     }
                 }
             }

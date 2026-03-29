@@ -198,6 +198,13 @@ mod impl_parse {
                 tx: u64::from_le_bytes(tx_bytes),
             });
         }
+        
+        if len >= 4 && data[0..4] == *TAG_WAYL {
+            let mut wayl_data = [0u8; MAX_MSG_LEN - 4];
+            let payload_len = len.saturating_sub(4).min(20); // max 20 bytes payload in fast path
+            wayl_data[..payload_len].copy_from_slice(&data[4..4 + payload_len]);
+            return Some(EclipseMessage::Wayland { data: wayl_data, len: payload_len, from: _from });
+        }
 
         None
     }

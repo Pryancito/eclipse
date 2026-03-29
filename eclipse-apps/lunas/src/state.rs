@@ -257,9 +257,11 @@ impl LunasState {
                 let pid = *pid;
                 let fb_w = self.backend.fb.info.width as i32;
                 let fb_h = self.backend.fb.info.height as i32;
-                let action = self.wayland.handle_message(data, pid);
-                match action {
+                let actions = self.wayland.handle_message(data, pid);
+                for action in actions {
+                    match action {
                     WaylandAction::CreateSurface { pid, surface_id, conn_idx } => {
+                        println!("[LUNAS-STATE] Wayland CreateSurface: id={} conn={} from={}", surface_id, conn_idx, pid);
                         if self.space.window_count < self.space.windows.len() {
                             let win = make_wayland_window(
                                 surface_id, conn_idx,
@@ -268,8 +270,24 @@ impl LunasState {
                                 b"Wayland",
                             );
                             let w_idx = self.space.window_count;
+                            println!("[LUNAS-STATE] Mapping Wayland window to index={}", w_idx);
                             self.space.map_window(win);
                             self.wayland.register_surface_window(pid, surface_id, w_idx);
+                        }
+                        self.dirty = true;
+                    }
+                    WaylandAction::AttachBuffer { pid, surface_id, vaddr, width, height } => {
+                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
+                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                println!("[LUNAS-STATE] Wayland AttachBuffer: surface={} window={} vaddr={:x} {}x{}", surface_id, w_idx, vaddr, width, height);
+                                if w_idx < self.space.window_count {
+                                    let win = &mut self.space.windows[w_idx];
+                                    win.buffer_handle = Some(vaddr as u64);
+                                    win.w = width;
+                                    win.h = height + ShellWindow::TITLE_H;
+                                    win.is_dmabuf = false;
+                                }
+                            }
                         }
                         self.dirty = true;
                     }
@@ -278,6 +296,7 @@ impl LunasState {
                         // windows — they render themselves; just ensure it's not minimized).
                         if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
                             if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                println!("[LUNAS-STATE] Wayland Commit: surface={} window={}", surface_id, w_idx);
                                 if w_idx < self.space.window_count {
                                     self.space.windows[w_idx].minimized = false;
                                 }
@@ -307,13 +326,15 @@ impl LunasState {
                     }
                 }
             }
-            CompositorEvent::X11(data, pid) => {
+        }
+        CompositorEvent::X11(data, pid) => {
                 let pid = *pid;
                 let fb_w = self.backend.fb.info.width as i32;
                 let fb_h = self.backend.fb.info.height as i32;
                 let action = self.xwayland.handle_x11_event(data, pid);
                 match action {
                     XwaylandAction::MapWindow { window_id } => {
+                        println!("[LUNAS-STATE] XWayland MapWindow: id={:#x} from={}", window_id, pid);
                         // Create a ShellWindow for this X11 window if there's room.
                         if self.space.window_count < self.space.windows.len() {
                             // Use window_id as a unique surface_id; conn_idx = 0 (XWayland slot)
@@ -333,6 +354,8 @@ impl LunasState {
                                 title: title_buf,
                                 ..Default::default()
                             };
+                            let w_idx = self.space.window_count;
+                            println!("[LUNAS-STATE] Mapping X11 window to index={}", w_idx);
                             self.space.map_window(win);
                         }
                         self.dirty = true;
@@ -408,6 +431,7 @@ impl LunasState {
                 full_msg[4..4 + copy_len].copy_from_slice(&data[..copy_len]);
                 
                 unsafe {
+                    println!("[LUNAS-WAYL] Flushing {} bytes to PID {}", 4 + copy_len, pid);
                     let _ = eclipse_send(
                         pid,
                         MSG_TYPE_WAYLAND,
@@ -1573,7 +1597,7 @@ mod tests {
         let mut msg = heapless::Vec::<u8, 512>::new();
         let _ = msg.extend_from_slice(&4u32.to_le_bytes());
         let _ = msg.extend_from_slice(&((12u32 << 16) | 0u32).to_le_bytes());
-        let _ = msg.extend_from_slice(&5u32.to_le_bytes());
+        let _ = msg.extend_from_slice(&7u32.to_le_bytes());
         state.handle_event(&CompositorEvent::Wayland(msg, 42));
         assert_eq!(state.space.window_count, 1);
 
@@ -1582,7 +1606,7 @@ mod tests {
 
         // Commit the surface — should restore it
         let mut commit_msg = heapless::Vec::<u8, 512>::new();
-        let _ = commit_msg.extend_from_slice(&5u32.to_le_bytes()); // obj_id = surface
+        let _ = commit_msg.extend_from_slice(&7u32.to_le_bytes()); // obj_id = surface
         let _ = commit_msg.extend_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // op=6 commit
         state.handle_event(&CompositorEvent::Wayland(commit_msg, 42));
         assert!(!state.space.windows[0].minimized, "commit should restore window");
@@ -1932,8 +1956,29 @@ mod tests {
         state.desktop.push_notification("test-msg", 1);
         assert_eq!(state.desktop.notification_count, initial_count + 1);
         // Dismiss index 0 (the oldest / welcome notification)
-        state.input.pending_context_action = ContextAction::DismissNotification(0);
+        state.input.pending_context_action = crate::input::ContextAction::DismissNotification(0);
         let _ = state.update();
         assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
+    }
+
+    #[test]
+    fn test_wayland_handshake_integration() {
+        let mut state = LunasState::new().expect("state");
+        let pid = 200u32;
+        let registry_id = 123u32;
+        
+        let mut msg_data = [0u8; 12];
+        msg_data[0..4].copy_from_slice(&1u32.to_le_bytes()); // display
+        msg_data[4..8].copy_from_slice(&((12u32 << 16) | 1u32).to_le_bytes()); // get_registry
+        msg_data[8..12].copy_from_slice(&registry_id.to_le_bytes()); 
+        
+        let mut wayl_vec = heapless::Vec::new();
+        let _ = wayl_vec.extend_from_slice(&msg_data);
+        let event = crate::input::CompositorEvent::Wayland(wayl_vec, pid);
+        
+        state.handle_event(&event);
+        
+        let conn = state.wayland.connections.iter().find(|c| c.pid == pid).expect("connection");
+        assert_eq!(conn.registry_id, Some(registry_id));
     }
 }

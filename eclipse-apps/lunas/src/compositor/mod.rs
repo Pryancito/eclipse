@@ -46,7 +46,7 @@ pub struct ShellWindow {
     pub workspace: u8,
     pub content: WindowContent,
     pub damage: alloc::vec::Vec<(i32, i32, i32, i32)>,
-    pub buffer_handle: Option<u32>,
+    pub buffer_handle: Option<u64>,
     pub is_dmabuf: bool,
     pub title: [u8; 32],
 }

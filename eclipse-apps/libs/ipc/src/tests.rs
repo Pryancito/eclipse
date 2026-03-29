@@ -3,7 +3,7 @@ pub mod tests {
     use crate::types::{
         EclipseMessage, parse_fast, parse_slow, build_subscribe_payload,
         build_input_pid_response_payload, MAX_MSG_LEN, TAG_INPT, TAG_NETW, TAG_NSTA, TAG_SUBS,
-        TAG_SVCS, GET_INPUT_PID_MSG, GET_NETWORK_PID_MSG, GET_NET_STATS_MSG, TAG_SWND,
+        TAG_SVCS, GET_INPUT_PID_MSG, GET_NETWORK_PID_MSG, GET_NET_STATS_MSG, TAG_SWND, TAG_WAYL,
     };
     use crate::protocol::EclipseEncode;
     use crate::channel::IpcChannel;
@@ -130,6 +130,24 @@ pub mod tests {
         assert!(parsed.is_none());
     }
 
+    #[test]
+    pub fn test_parse_fast_wayland() {
+        let mut data = [0u8; 24];
+        data[0..4].copy_from_slice(TAG_WAYL);
+        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // obj_id
+        data[8..12].copy_from_slice(&((12u32 << 16) | 1u32).to_le_bytes()); // size_op
+        data[12..16].copy_from_slice(&2u32.to_le_bytes()); // registry_id arg
+        
+        let parsed = parse_fast(&data, 42, 16);
+        match parsed {
+            Some(EclipseMessage::Wayland { data: _, len, from }) => {
+                assert_eq!(len, 12);
+                assert_eq!(from, 42);
+            }
+            _ => panic!("Failed to parse fast Wayland message"),
+        }
+    }
+
     // =========================================================================
     // Slow Path Parser Tests
     // =========================================================================
@@ -204,15 +222,33 @@ pub mod tests {
     }
 
     #[test]
+    pub fn test_parse_slow_wayland() {
+        let mut buf = [0u8; 256];
+        buf[0..4].copy_from_slice(TAG_WAYL);
+        // 100 bytes of mock data
+        buf[4..104].copy_from_slice(&[0xAA; 100]);
+        
+        let parsed = parse_slow(&buf, 104, 123);
+        match parsed {
+            Some(EclipseMessage::Wayland { data, len, from }) => {
+                assert_eq!(len, 100);
+                assert_eq!(from, 123);
+                assert_eq!(data[0], 0xAA);
+            }
+            _ => panic!("Failed to parse slow Wayland message"),
+        }
+    }
+
+    #[test]
     pub fn test_parse_slow_raw_fallback() {
-        let mut buf = [0u8; 260]; // Slightly larger than MAX_MSG_LEN (256)
+        let mut buf = [0u8; 520]; // Slightly larger than MAX_MSG_LEN (512)
         buf[0..4].copy_from_slice(b"WXYZ"); // Unknown tag
         
         // len is clamped to MAX_MSG_LEN returning length
-        let parsed = parse_slow(&buf, 260, 777);
+        let parsed = parse_slow(&buf, 520, 777);
         match parsed {
             Some(EclipseMessage::Raw { data, len, from }) => {
-                assert_eq!(len, 256); // it clamps to MAX_MSG_LEN internally
+                assert_eq!(len, 512); // it clamps to MAX_MSG_LEN internally
                 assert_eq!(from, 777);
                 assert_eq!(&data[0..4], b"WXYZ");
             }
@@ -361,7 +397,7 @@ pub mod tests {
 
     #[test]
     pub fn test_constants_max_msg_len_and_tags() {
-        assert_eq!(MAX_MSG_LEN, 256);
+        assert_eq!(MAX_MSG_LEN, 512);
         assert_eq!(TAG_SUBS, b"SUBS");
         assert_eq!(TAG_INPT, b"INPT");
         assert_eq!(TAG_NETW, b"NETW");
@@ -396,7 +432,6 @@ pub mod tests {
             timestamp: 0,
         };
         let msg = EclipseMessage::Input(ev);
-        let _ = format!("{:?}", msg);
         let cloned = msg.clone();
         match (&msg, &cloned) {
             (EclipseMessage::Input(a), EclipseMessage::Input(b)) => {
