@@ -135,23 +135,27 @@ impl WaylandCompositor {
 
         let conn_idx = self.get_or_create_connection(pid);
 
-        // Native Wayland messages: [obj_id: u32, size_op: u32, ...]
-        while offset + 8 <= data.len() {
-            let obj_id = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-            let size_op = u32::from_le_bytes([data[offset+4], data[offset+5], data[offset+6], data[offset+7]]);
-            let opcode = (size_op & 0xFFFF) as u16;
-            let size = (size_op >> 16) as usize;
+        // Check for "WAYL" tag (4 bytes) if present, common in early implementations
+        if data.len() >= 4 && &data[0..4] == b"WAYL" {
+            offset = 4;
+        }
 
+        // New Wayland messages: [header: 8 bytes, payload...]
+        while offset + 8 <= data.len() {
+            let header_ptr = data[offset..offset+8].as_ptr() as *const sidewind::wayland::WaylandHeader;
+            let header = unsafe { core::ptr::read_unaligned(header_ptr) };
+            
+            let size = header.length as usize;
             if size < 8 || offset + size > data.len() {
-                if offset + 8 == data.len() && size == 0 { break; }
-                println!("[LUNAS-WAYL] Error: Invalid message size {} at offset {} (total={}) from PID {}", size, offset, data.len(), pid);
                 break;
             }
 
             let msg_data = &data[offset..offset+size];
+            let obj_id = header.object_id;
+            let opcode = header.opcode;
             println!("[LUNAS-WAYL] Recv: obj={} op={} len={} from={}", obj_id, opcode, size, pid);
 
-            let action = self.process_single_message(conn_idx, obj_id, opcode, msg_data, pid);
+            let action = self.process_single_message(conn_idx, &header, msg_data, pid);
             if action != WaylandAction::None {
                 let _ = actions.push(action);
             }
@@ -168,176 +172,83 @@ impl WaylandCompositor {
     fn process_single_message(
         &mut self,
         conn_idx: usize,
-        obj_id: u32,
-        opcode: u16,
+        header: &sidewind::wayland::WaylandHeader,
         data: &[u8],
         pid: u32,
     ) -> WaylandAction {
-        // Find object type
-        let obj_type = self.connections[conn_idx].objects.iter()
-            .find(|(id, _)| *id == obj_id)
-            .map(|(_, t)| *t);
-
-        match obj_type {
-            Some(WaylandObjectType::Display) => {
-                if opcode == 1 { // get_registry(new_id)
-                    if data.len() >= 12 {
-                        let registry_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                        self.connections[conn_idx].registry_id = Some(registry_id);
-                        self.connections[conn_idx].objects.push((registry_id, WaylandObjectType::Registry));
-                        self.respond_with_globals(pid, registry_id);
-                    }
+        use sidewind::wayland::{ID_COMPOSITOR, ID_SHM};
+        
+        match header.object_id {
+            ID_COMPOSITOR => {
+                if header.opcode == 1 && data.len() >= 16 { // CreateSurface
+                    let msg_ptr = data.as_ptr() as *const sidewind::wayland::WaylandMsgCreateSurface;
+                    let msg = unsafe { core::ptr::read_unaligned(msg_ptr) };
+                    let new_id = msg.new_id;
+                    println!("[LUNAS-WAYL] Create Surface: id={} from={}", new_id, pid);
+                    self.connections[conn_idx].objects.push((new_id, WaylandObjectType::Surface { id: new_id }));
+                    self.connections[conn_idx].surfaces.push((new_id, None));
+                    return WaylandAction::CreateSurface { 
+                        pid, 
+                        surface_id: msg.new_id, 
+                        conn_idx,
+                        width: msg.width,
+                        height: msg.height,
+                    };
                 }
             }
-            Some(WaylandObjectType::Registry) => {
-                if opcode == 0 && data.len() >= 16 { // bind(name, interface, version, new_id)
-                    let name = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    let if_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-                    let padded_len = (if_len + 3) & !3;
-                    let version_idx = 16 + padded_len;
-                    let new_id_idx = 20 + padded_len;
-                    
-                    if data.len() >= new_id_idx + 4 {
-                        let new_id = u32::from_le_bytes([data[new_id_idx], data[new_id_idx+1], data[new_id_idx+2], data[new_id_idx+3]]);
-                        
-                        let interface_name = if if_len >= 13 && &data[16..16+13] == b"wl_compositor" {
-                            Some(WaylandObjectType::Compositor)
-                        } else if if_len >= 6 && &data[16..16+6] == b"wl_shm" {
-                            Some(WaylandObjectType::Shm)
-                        } else if if_len >= 8 && &data[16..16+8] == b"wl_shell" {
-                            Some(WaylandObjectType::Shell)
-                        } else {
-                            None
-                        };
-
-                        if let Some(t) = interface_name {
-                            println!("[LUNAS-WAYL] Bind: name={} new_id={} (type={:?}) from={}", name, new_id, t, pid);
-                            self.connections[conn_idx].objects.push((new_id, t));
-                        }
-                    }
-                }
-            }
-            Some(WaylandObjectType::Compositor) => {
-                if opcode == 0 && data.len() >= 12 { // create_surface(new_id)
-                    let surface_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    println!("[LUNAS-WAYL] Create Surface: id={} from={}", surface_id, pid);
-                    self.connections[conn_idx].objects.push((surface_id, WaylandObjectType::Surface { id: surface_id }));
-                    self.connections[conn_idx].surfaces.push((surface_id, None));
-                    return WaylandAction::CreateSurface { pid, surface_id, conn_idx };
-                }
-            }
-            Some(WaylandObjectType::Shm) => {
-                if opcode == 0 && data.len() >= 20 { // create_pool(new_id, fd, size)
-                    let pool_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    let size = i32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+            ID_SHM => {
+                if header.opcode == 1 && data.len() >= 20 { // CreatePool
+                    let msg_ptr = data.as_ptr() as *const sidewind::wayland::WaylandMsgCreatePool;
+                    let msg = unsafe { core::ptr::read_unaligned(msg_ptr) };
                     
                     let path = b"/tmp/Terminal\0";
                     let fd = unsafe { libc::open(path.as_ptr() as *const core::ffi::c_char, libc::O_RDONLY, 0) };
                     if fd >= 0 {
-                        let vaddr = unsafe { libc::mmap(core::ptr::null_mut(), size as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+                        let vaddr = unsafe { libc::mmap(core::ptr::null_mut(), msg.size as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
                         unsafe { libc::close(fd); }
                         if !vaddr.is_null() && vaddr != (-1isize as *mut core::ffi::c_void) {
-                            println!("[LUNAS-WAYL] Created SHM pool {} size={} vaddr={:p} from={}", pool_id, size, vaddr, pid);
-                            self.connections[conn_idx].pools.push(ShmPool { id: pool_id, vaddr: vaddr as usize, size });
-                            self.connections[conn_idx].objects.push((pool_id, WaylandObjectType::ShmPool { id: pool_id }));
-                        } else {
-                            println!("[LUNAS-WAYL] Error: mmap failed for pool {} size={} from={}", pool_id, size, pid);
-                        }
-                    } else {
-                        println!("[LUNAS-WAYL] Error: open /tmp/Terminal failed for pool {} from={}", pool_id, pid);
-                    }
-                }
-            }
-            Some(WaylandObjectType::Shell) => {
-                if opcode == 0 && data.len() >= 16 { // get_shell_surface(new_id, surface)
-                    let new_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    let surface_id = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-                    println!("[LUNAS-WAYL] Shell: get_shell_surface new_id={} surface={} from={}", new_id, surface_id, pid);
-                    self.connections[conn_idx].objects.push((new_id, WaylandObjectType::ShellSurface { surface_id }));
-                }
-            }
-            Some(WaylandObjectType::Surface { id: surface_id }) => {
-                if opcode == 1 { // attach(buffer, x, y)
-                    if data.len() >= 20 {
-                        let buffer_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                        println!("[LUNAS-WAYL] Surface {}: attach buffer {} from={}", surface_id, buffer_id, pid);
-                        self.connections[conn_idx].attached_buffers.retain(|(s, _)| *s != surface_id);
-                        self.connections[conn_idx].attached_buffers.push((surface_id, buffer_id));
-                        
-                        if let Some(buffer) = self.connections[conn_idx].buffers.iter().find(|b| b.id == buffer_id) {
-                            if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == buffer.pool_id) {
-                                let vaddr = pool.vaddr + buffer.offset as usize;
-                                return WaylandAction::AttachBuffer { 
-                                    pid, surface_id, vaddr,
-                                    width: buffer.width, height: buffer.height,
-                                };
-                            }
+                            let new_id = msg.new_id;
+                            let msg_size = msg.size;
+                            println!("[LUNAS-WAYL] Created SHM pool {} size={} vaddr={:p} from={}", new_id, msg_size, vaddr, pid);
+                            self.connections[conn_idx].pools.push(ShmPool { id: new_id, vaddr: vaddr as usize, size: msg_size as usize });
+                            self.connections[conn_idx].objects.push((new_id, WaylandObjectType::ShmPool { id: new_id }));
                         }
                     }
-                } else if opcode == 6 { // commit
-                    println!("[LUNAS-WAYL] Surface {}: commit from={}", surface_id, pid);
-                    return WaylandAction::CommitSurface { pid, surface_id };
-                }
-            }
-            Some(WaylandObjectType::ShellSurface { surface_id }) => {
-                if opcode == 1 { // set_toplevel
-                    println!("[LUNAS-WAYL] ShellSurface for surface {}: set_toplevel from={}", surface_id, pid);
-                }
-            }
-            Some(WaylandObjectType::ShmPool { id: pool_id }) => {
-                if opcode == 0 && data.len() >= 32 { // create_buffer(new_id, offset, width, height, stride, format)
-                    let buffer_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    let offset = i32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-                    let width = i32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-                    let height = i32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-                    let stride = i32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-                    let format = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
-                    println!("[LUNAS-WAYL] Created Buffer {} from pool {} ({}x{}, offset={})", buffer_id, pool_id, width, height, offset);
-                    self.connections[conn_idx].buffers.push(ShmBuffer {
-                        id: buffer_id, pool_id, offset, width, height, stride, format
-                    });
-                    self.connections[conn_idx].objects.push((buffer_id, WaylandObjectType::ShmBuffer { id: buffer_id }));
                 }
             }
             _ => {
-                println!("[LUNAS-WAYL] Warn: Unknown object {} or opcode {} from={}. Hex: {:?}", obj_id, opcode, pid, &data[..core::cmp::min(data.len(), 16)]);
+                let obj_type = self.connections[conn_idx].objects.iter()
+                    .find(|(id, _)| *id == header.object_id)
+                    .map(|(_, t)| *t);
+
+                if let Some(WaylandObjectType::Surface { id: surface_id }) = obj_type {
+                    if header.opcode == 1 && data.len() >= 24 { // CommitFrame
+                        let msg_ptr = data.as_ptr() as *const sidewind::wayland::WaylandMsgCommitFrame;
+                        let msg = unsafe { core::ptr::read_unaligned(msg_ptr) };
+                        
+                        if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == msg.pool_id) {
+                            let vaddr = pool.vaddr + msg.offset as usize;
+                            return WaylandAction::CommitFrame {
+                                pid, surface_id,
+                                pool_id: msg.pool_id,
+                                offset: msg.offset,
+                                width: msg.width,
+                                height: msg.height,
+                                stride: msg.stride,
+                                format: msg.format,
+                                vaddr,
+                            };
+                        }
+                    }
+                }
             }
         }
 
         WaylandAction::None
     }
 
-    /// Construct and queue global registry events.
-    fn respond_with_globals(&mut self, pid: u32, registry_id: u32) {
-        println!("[LUNAS-WAYL] Sending globals to PID {} (reg_id={})", pid, registry_id);
-        let mut globals = alloc::vec::Vec::new();
-        
-        // Helper to append a global event
-        let mut add_global = |name: u32, interface: &str, version: u32| {
-            let mut ev = alloc::vec::Vec::new();
-            ev.extend_from_slice(&registry_id.to_le_bytes()); // sender = registry
-            let opcode = 0u16; // global event
-            let if_len = interface.len() + 1; // including null
-            let payload_size = 4 + 4 + if_len + ((4 - (if_len % 4)) % 4) + 4;
-            let total_size = 4 + 4 + payload_size;
-            
-            ev.extend_from_slice(&((total_size as u32) << 16 | (opcode as u32)).to_le_bytes());
-            ev.extend_from_slice(&name.to_le_bytes());
-            ev.extend_from_slice(&(if_len as u32).to_le_bytes());
-            ev.extend_from_slice(interface.as_bytes());
-            ev.push(0); // null terminator
-            while ev.len() % 4 != 0 { ev.push(0); } // padding
-            ev.extend_from_slice(&version.to_le_bytes());
-            
-            globals.extend_from_slice(&ev);
-        };
-
-        add_global(1, "wl_compositor", 4);
-        add_global(2, "wl_shm", 1);
-        add_global(3, "wl_shell", 1);
-
-        println!("[LUNAS-WAYL] Queued glob message size: {}", globals.len());
-        self.pending_responses.push((pid, globals));
+    /// Construct and queue global registry events. (No longer used in EDP)
+    fn respond_with_globals(&mut self, _pid: u32, _registry_id: u32) {
     }
 
     pub fn disconnect_client(&mut self, pid: u32) {
@@ -348,9 +259,18 @@ impl WaylandCompositor {
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum WaylandAction {
     None,
-    CreateSurface { pid: u32, surface_id: u32, conn_idx: usize },
-    AttachBuffer { pid: u32, surface_id: u32, vaddr: usize, width: i32, height: i32 },
-    CommitSurface { pid: u32, surface_id: u32 },
+    CreateSurface { pid: u32, surface_id: u32, conn_idx: usize, width: u16, height: u16 },
+    CommitFrame { 
+        pid: u32, 
+        surface_id: u32, 
+        pool_id: u32, 
+        offset: u32,
+        width: u16,
+        height: u16,
+        stride: u16,
+        format: u16,
+        vaddr: usize,
+    },
     DestroySurface { pid: u32, surface_id: u32 },
 }
 

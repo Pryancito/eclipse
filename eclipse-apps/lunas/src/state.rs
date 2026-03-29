@@ -260,12 +260,12 @@ impl LunasState {
                 let actions = self.wayland.handle_message(data, pid);
                 for action in actions {
                     match action {
-                    WaylandAction::CreateSurface { pid, surface_id, conn_idx } => {
-                        println!("[LUNAS-STATE] Wayland CreateSurface: id={} conn={} from={}", surface_id, conn_idx, pid);
+                    WaylandAction::CreateSurface { pid, surface_id, conn_idx, width, height } => {
+                        println!("[LUNAS-STATE] Wayland CreateSurface: id={} conn={} size={}x{} from={}", surface_id, conn_idx, width, height, pid);
                         if self.space.window_count < self.space.windows.len() {
                             let win = make_wayland_window(
                                 surface_id, conn_idx,
-                                fb_w, fb_h,
+                                width as i32, height as i32,
                                 self.input.current_workspace,
                                 b"Wayland",
                             );
@@ -276,29 +276,17 @@ impl LunasState {
                         }
                         self.dirty = true;
                     }
-                    WaylandAction::AttachBuffer { pid, surface_id, vaddr, width, height } => {
+                    WaylandAction::CommitFrame { pid, surface_id, vaddr, width, height, .. } => {
                         if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
                             if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                println!("[LUNAS-STATE] Wayland AttachBuffer: surface={} window={} vaddr={:x} {}x{}", surface_id, w_idx, vaddr, width, height);
+                                println!("[LUNAS-STATE] Wayland CommitFrame: surface={} window={} vaddr={:x} {}x{}", surface_id, w_idx, vaddr, width, height);
                                 if w_idx < self.space.window_count {
                                     let win = &mut self.space.windows[w_idx];
                                     win.buffer_handle = Some(vaddr as u64);
-                                    win.w = width;
-                                    win.h = height + ShellWindow::TITLE_H;
+                                    win.w = width as i32;
+                                    win.h = height as i32 + ShellWindow::TITLE_H;
                                     win.is_dmabuf = false;
-                                }
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::CommitSurface { pid, surface_id } => {
-                        // Mark the window as ready to show (no external buffer in Wayland
-                        // windows — they render themselves; just ensure it's not minimized).
-                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
-                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                println!("[LUNAS-STATE] Wayland Commit: surface={} window={}", surface_id, w_idx);
-                                if w_idx < self.space.window_count {
-                                    self.space.windows[w_idx].minimized = false;
+                                    win.minimized = false;
                                 }
                             }
                         }

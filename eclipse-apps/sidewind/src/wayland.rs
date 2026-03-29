@@ -13,27 +13,81 @@ pub enum WaylandError {
     DecodeError,
 }
 
-/// Wayland wire protocol message header
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+/// Identificadores globales para servicios base de Wayland.
+pub const ID_COMPOSITOR: u32 = 1;
+pub const ID_SHM: u32 = 2;
+pub const ID_SEAT: u32 = 3;
+
+/// Cabecera binaria del protocolo Wayland optimizado.
+/// Total: 8 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct WaylandHeader {
     pub object_id: u32,
-    pub size_and_opcode: u32,
+    pub opcode: u8,
+    pub flags: u8,
+    pub length: u16,
 }
 
 impl WaylandHeader {
-    pub fn size(&self) -> u16 {
-        (self.size_and_opcode >> 16) as u16
-    }
-    pub fn opcode(&self) -> u16 {
-        (self.size_and_opcode & 0xFFFF) as u16
-    }
-    pub fn new(object_id: u32, opcode: u16, size: u16) -> Self {
+    pub fn new(object_id: u32, opcode: u8, length: u16) -> Self {
         Self {
             object_id,
-            size_and_opcode: ((size as u32) << 16) | (opcode as u32),
+            opcode,
+            flags: 0,
+            length,
         }
     }
+}
+
+/// Mensaje para crear una superficie.
+/// Opcode: 1 (Target: ID_COMPOSITOR)
+/// Total: 16 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaylandMsgCreateSurface {
+    pub header: WaylandHeader,
+    pub new_id: u32,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Mensaje para crear un pool de memoria compartida.
+/// Opcode: 1 (Target: ID_SHM)
+/// Total: 20 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaylandMsgCreatePool {
+    pub header: WaylandHeader,
+    pub new_id: u32,
+    pub size: u32,
+    pub _reserved: u32,
+}
+
+/// Mensaje atómico para atachar un buffer y hacer commit.
+/// Opcode: 1 (Target: surface_id)
+/// Total: 24 bytes. (Encaja en receive_fast del kernel)
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaylandMsgCommitFrame {
+    pub header: WaylandHeader,
+    pub pool_id: u32,
+    pub offset: u32,
+    pub width: u16,
+    pub height: u16,
+    pub stride: u16,
+    pub format: u16,
+}
+
+/// Evento de teclado enviado al cliente.
+/// Opcode: 10 (Target: ID_SEAT)
+/// Total: 12 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaylandEvtKeyboard {
+    pub header: WaylandHeader,
+    pub key: u16,
+    pub state: u16,
 }
 
 pub struct WaylandConnection {
