@@ -1,12 +1,15 @@
 [package]
 name = "sh"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-heapless = "0.8"
 
 [target.'cfg(target_vendor = "eclipse")'.dependencies]
 eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { version = "0.2", default-features = false }
+
+[lints]
+workspace = true

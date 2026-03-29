@@ -191,19 +191,8 @@ fn main() {
         let _ = eclipse_syscall::call::write(master_fd, s.as_bytes());
     }));
 
-    // Force a full render into the shared-memory buffer before the first commit.
-    //
-    // `flush()` alone is a no-op on a freshly created Terminal because there
-    // are no pending changes — the buffer stays solid black.  Sending an ANSI
-    // "erase display" sequence causes the terminal library to call `draw_pixel`
-    // for every cell (filling the buffer with the terminal's background colour)
-    // and to position the cursor at the home position.  A short banner line is
-    // added so the window shows visible content before the shell prompt arrives.
-    terminal.process(b"\x1b[H\x1b[2J");                        // cursor home, erase screen
-    terminal.process(b"\x1b[1;32mEclipse OS Terminal\x1b[0m\r\n"); // bold-green title
-    terminal.process(b"\x1b[32m$ \x1b[0m");                    // green shell prompt
-    terminal.flush();                                            // render cursor block
-
+    terminal.flush();
+    
     // Helper to send frame commit
     let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32, buf_vaddr: u64| {
         let mut commit = WaylandMsgCommitFrame::default();
