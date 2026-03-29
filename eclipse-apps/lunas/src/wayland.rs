@@ -434,21 +434,51 @@ impl XwaylandIntegration {
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 println!("[LUNAS-XWAYL] MapNotify window={:#x} from={}", window_id, pid);
-                (&mut self.xwm).handle_map_request(window_id);
+                self.xwm.handle_map_request(window_id);
                 XwaylandAction::MapWindow { window_id }
             }
             18 => { // UnmapNotify
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 println!("[LUNAS-XWAYL] UnmapNotify window={:#x} from={}", window_id, pid);
+                self.xwm.handle_unmap_request(window_id);
                 XwaylandAction::UnmapWindow { window_id }
             }
             17 => { // DestroyNotify
                 if data.len() < 8 { return XwaylandAction::None; }
                 let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 println!("[LUNAS-XWAYL] DestroyNotify window={:#x} from={}", window_id, pid);
-                self.xwm.windows.retain(|&w| w != window_id);
+                self.xwm.handle_destroy(window_id);
                 XwaylandAction::DestroyWindow { window_id }
+            }
+            22 => { // ConfigureNotify: window geometry changed
+                // Layout: [0]=event_type, [4..8]=window_id, [8..10]=x, [10..12]=y,
+                //         [12..14]=width, [14..16]=height
+                if data.len() < 16 { return XwaylandAction::None; }
+                let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let x      = i16::from_le_bytes([data[8],  data[9]]);
+                let y      = i16::from_le_bytes([data[10], data[11]]);
+                let width  = u16::from_le_bytes([data[12], data[13]]);
+                let height = u16::from_le_bytes([data[14], data[15]]);
+                println!("[LUNAS-XWAYL] ConfigureNotify window={:#x} x={} y={} w={} h={} from={}", window_id, x, y, width, height, pid);
+                self.xwm.set_window_geometry(window_id, x, y, width, height);
+                XwaylandAction::ConfigureWindow { window_id, x, y, width, height }
+            }
+            28 => { // PropertyNotify: window property changed (e.g. WM_NAME title)
+                // Layout: [0]=event_type, [4..8]=window_id, [8..12]=atom,
+                //         [12..]=property value bytes (simplified: raw title)
+                if data.len() < 12 { return XwaylandAction::None; }
+                let window_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let _atom     = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                // Title bytes follow the 12-byte header; strip trailing NUL bytes.
+                let raw = if data.len() > 12 { &data[12..] } else { &[] };
+                let title_end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let title_bytes = &raw[..title_end.min(31)];
+                println!("[LUNAS-XWAYL] PropertyNotify window={:#x} atom={} title_len={} from={}", window_id, _atom, title_bytes.len(), pid);
+                self.xwm.set_window_title(window_id, title_bytes);
+                let mut title = [0u8; 32];
+                title[..title_bytes.len()].copy_from_slice(title_bytes);
+                XwaylandAction::TitleChanged { window_id, title }
             }
             _ => {
                 println!("[LUNAS-XWAYL] Unknown X11 event type={} len={} from={}", event_type, data.len(), pid);
@@ -467,6 +497,10 @@ pub enum XwaylandAction {
     MapWindow { window_id: u32 },
     UnmapWindow { window_id: u32 },
     DestroyWindow { window_id: u32 },
+    /// X11 window geometry changed (ConfigureNotify).
+    ConfigureWindow { window_id: u32, x: i16, y: i16, width: u16, height: u16 },
+    /// X11 window title changed (PropertyNotify on WM_NAME or _NET_WM_NAME).
+    TitleChanged { window_id: u32, title: [u8; 32] },
 }
 
 pub fn make_wayland_window(
@@ -769,5 +803,118 @@ mod tests {
             }
             _ => panic!("expected SetTitle action, got {:?}", actions[0]),
         }
+    }
+
+    // ─── XWayland integration tests ───────────────────────────────────────────
+
+    fn build_x11_event(event_type: u8, window_id: u32, extra: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec![0u8; 4 + 4 + extra.len()];
+        buf[0] = event_type;
+        buf[4..8].copy_from_slice(&window_id.to_le_bytes());
+        buf[8..8 + extra.len()].copy_from_slice(extra);
+        buf
+    }
+
+    #[test]
+    fn test_xwayland_map_window() {
+        let mut xwl = XwaylandIntegration::new();
+        let pid = 55u32;
+        let window_id = 0x1234u32;
+        let data = build_x11_event(19, window_id, &[]);
+        let action = xwl.handle_x11_event(&data, pid);
+        assert!(matches!(action, XwaylandAction::MapWindow { window_id: w } if w == window_id));
+        assert!(xwl.xwm.windows.contains(&window_id));
+    }
+
+    #[test]
+    fn test_xwayland_unmap_window() {
+        let mut xwl = XwaylandIntegration::new();
+        let pid = 55u32;
+        let window_id = 0xABCDu32;
+        // Map first
+        let map = build_x11_event(19, window_id, &[]);
+        let _ = xwl.handle_x11_event(&map, pid);
+        assert!(xwl.xwm.windows.contains(&window_id));
+        // Now unmap
+        let unmap = build_x11_event(18, window_id, &[]);
+        let action = xwl.handle_x11_event(&unmap, pid);
+        assert!(matches!(action, XwaylandAction::UnmapWindow { window_id: w } if w == window_id));
+        assert!(!xwl.xwm.windows.contains(&window_id));
+    }
+
+    #[test]
+    fn test_xwayland_destroy_window() {
+        let mut xwl = XwaylandIntegration::new();
+        let pid = 55u32;
+        let window_id = 0xDEADu32;
+        let map = build_x11_event(19, window_id, &[]);
+        let _ = xwl.handle_x11_event(&map, pid);
+        let destroy = build_x11_event(17, window_id, &[]);
+        let action = xwl.handle_x11_event(&destroy, pid);
+        assert!(matches!(action, XwaylandAction::DestroyWindow { window_id: w } if w == window_id));
+        assert!(!xwl.xwm.windows.contains(&window_id));
+        assert!(xwl.xwm.window_props.get(&window_id).is_none());
+    }
+
+    #[test]
+    fn test_xwayland_configure_window() {
+        let mut xwl = XwaylandIntegration::new();
+        let pid = 55u32;
+        let window_id = 0x4242u32;
+        // ConfigureNotify: event[8..10]=x, [10..12]=y, [12..14]=w, [14..16]=h
+        let mut extra = [0u8; 8];
+        extra[0..2].copy_from_slice(&100i16.to_le_bytes()); // x
+        extra[2..4].copy_from_slice(&200i16.to_le_bytes()); // y
+        extra[4..6].copy_from_slice(&800u16.to_le_bytes()); // width
+        extra[6..8].copy_from_slice(&600u16.to_le_bytes()); // height
+        let data = build_x11_event(22, window_id, &extra);
+        let action = xwl.handle_x11_event(&data, pid);
+        match action {
+            XwaylandAction::ConfigureWindow { window_id: w, x, y, width, height } => {
+                assert_eq!(w, window_id);
+                assert_eq!(x, 100);
+                assert_eq!(y, 200);
+                assert_eq!(width, 800);
+                assert_eq!(height, 600);
+            }
+            _ => panic!("expected ConfigureWindow action"),
+        }
+        let geom = xwl.xwm.get_window_geometry(window_id).expect("geometry stored");
+        assert_eq!(geom, (100, 200, 800, 600));
+    }
+
+    #[test]
+    fn test_xwayland_property_notify_title() {
+        let mut xwl = XwaylandIntegration::new();
+        let pid = 55u32;
+        let window_id = 0x5555u32;
+        // PropertyNotify: event[8..12]=atom, [12..]=title bytes
+        let atom_bytes = 1u32.to_le_bytes(); // WM_NAME atom = 1
+        let title = b"My Window\0";
+        let mut extra = alloc::vec![0u8; 4 + title.len()];
+        extra[0..4].copy_from_slice(&atom_bytes);
+        extra[4..4 + title.len()].copy_from_slice(title);
+        let data = build_x11_event(28, window_id, &extra);
+        let action = xwl.handle_x11_event(&data, pid);
+        match action {
+            XwaylandAction::TitleChanged { window_id: w, title: t } => {
+                assert_eq!(w, window_id);
+                // Title should be "My Window" (without the trailing NUL, up to 31 chars)
+                let end = t.iter().position(|&b| b == 0).unwrap_or(32);
+                assert_eq!(&t[..end], b"My Window");
+            }
+            _ => panic!("expected TitleChanged action"),
+        }
+        assert_eq!(xwl.xwm.get_window_title(window_id), b"My Window");
+    }
+
+    #[test]
+    fn test_xwayland_ignores_foreign_pid() {
+        let mut xwl = XwaylandIntegration::new();
+        xwl.set_pid(10);
+        let data = build_x11_event(19, 42, &[]);
+        let action = xwl.handle_x11_event(&data, 99 /* different PID */);
+        assert!(matches!(action, XwaylandAction::None));
+        assert!(xwl.xwm.windows.is_empty());
     }
 }

@@ -407,6 +407,36 @@ impl LunasState {
                         }
                         self.dirty = true;
                     }
+                    XwaylandAction::ConfigureWindow { window_id, x, y, width, height } => {
+                        use crate::compositor::WindowContent;
+                        let count = self.space.window_count;
+                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
+                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
+                        }) {
+                            let win = &mut self.space.windows[w_idx];
+                            if x != 0 || y != 0 {
+                                win.x = x as i32;
+                                win.y = y as i32;
+                            }
+                            if width > 0 && height > 0 {
+                                win.w = width as i32;
+                                win.h = height as i32 + crate::compositor::ShellWindow::TITLE_H;
+                            }
+                            println!("[LUNAS-STATE] XWayland ConfigureWindow: id={:#x} x={} y={} {}x{}", window_id, x, y, width, height);
+                        }
+                        self.dirty = true;
+                    }
+                    XwaylandAction::TitleChanged { window_id, title } => {
+                        use crate::compositor::WindowContent;
+                        let count = self.space.window_count;
+                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
+                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
+                        }) {
+                            self.space.windows[w_idx].title = title;
+                            println!("[LUNAS-STATE] XWayland TitleChanged: id={:#x}", window_id);
+                        }
+                        self.dirty = true;
+                    }
                     XwaylandAction::None => {
                         self.dirty = true;
                     }
@@ -2001,5 +2031,71 @@ mod tests {
         
         let conn = state.wayland.connections.iter().find(|c| c.pid == pid).expect("connection");
         assert_eq!(conn.registry_id, Some(registry_id));
+    }
+
+    /// X11 ConfigureNotify should move/resize the corresponding compositor window.
+    #[test]
+    fn test_handle_event_x11_configure_window() {
+        use crate::compositor::WindowContent;
+        let mut state = LunasState::new().expect("init");
+        state.xwayland.set_pid(55);
+
+        // Map a window first
+        let mut map_ev = heapless::Vec::<u8, 512>::new();
+        let mut map_buf = [0u8; 32];
+        map_buf[0] = 19;
+        map_buf[4..8].copy_from_slice(&0xBBu32.to_le_bytes());
+        let _ = map_ev.extend_from_slice(&map_buf);
+        state.handle_event(&CompositorEvent::X11(map_ev, 55));
+        assert_eq!(state.space.window_count, 1);
+
+        // Send ConfigureNotify: x=50, y=60, w=640, h=480
+        let mut cfg_ev = heapless::Vec::<u8, 512>::new();
+        let mut cfg_buf = [0u8; 16];
+        cfg_buf[0] = 22; // ConfigureNotify
+        cfg_buf[4..8].copy_from_slice(&0xBBu32.to_le_bytes()); // window_id
+        cfg_buf[8..10].copy_from_slice(&50i16.to_le_bytes());   // x
+        cfg_buf[10..12].copy_from_slice(&60i16.to_le_bytes());  // y
+        cfg_buf[12..14].copy_from_slice(&640u16.to_le_bytes()); // width
+        cfg_buf[14..16].copy_from_slice(&480u16.to_le_bytes()); // height
+        let _ = cfg_ev.extend_from_slice(&cfg_buf);
+        state.handle_event(&CompositorEvent::X11(cfg_ev, 55));
+
+        let win = &state.space.windows[0];
+        assert_eq!(win.x, 50, "window x updated by ConfigureNotify");
+        assert_eq!(win.y, 60, "window y updated by ConfigureNotify");
+        assert_eq!(win.w, 640, "window width updated by ConfigureNotify");
+    }
+
+    /// X11 PropertyNotify should update the title of the corresponding compositor window.
+    #[test]
+    fn test_handle_event_x11_title_changed() {
+        let mut state = LunasState::new().expect("init");
+        state.xwayland.set_pid(55);
+
+        // Map a window
+        let mut map_ev = heapless::Vec::<u8, 512>::new();
+        let mut map_buf = [0u8; 32];
+        map_buf[0] = 19;
+        map_buf[4..8].copy_from_slice(&0xCCu32.to_le_bytes());
+        let _ = map_ev.extend_from_slice(&map_buf);
+        state.handle_event(&CompositorEvent::X11(map_ev, 55));
+        assert_eq!(state.space.window_count, 1);
+
+        // Send PropertyNotify with title "Hello"
+        let atom = 1u32.to_le_bytes();
+        let title_bytes = b"Hello\0";
+        let mut prop_buf = alloc::vec![0u8; 12 + 4 + title_bytes.len()];
+        prop_buf[0] = 28; // PropertyNotify
+        prop_buf[4..8].copy_from_slice(&0xCCu32.to_le_bytes()); // window_id
+        prop_buf[8..12].copy_from_slice(&atom);                  // atom
+        prop_buf[12..12 + title_bytes.len()].copy_from_slice(title_bytes);
+        let mut prop_ev = heapless::Vec::<u8, 512>::new();
+        let _ = prop_ev.extend_from_slice(&prop_buf);
+        state.handle_event(&CompositorEvent::X11(prop_ev, 55));
+
+        let title = &state.space.windows[0].title;
+        let end = title.iter().position(|&b| b == 0).unwrap_or(32);
+        assert_eq!(&title[..end], b"Hello", "window title updated by PropertyNotify");
     }
 }
