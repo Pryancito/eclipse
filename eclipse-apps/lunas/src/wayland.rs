@@ -283,6 +283,11 @@ impl WaylandCompositor {
                         } else if header.opcode == 6 {
                             // Standard wl_surface.commit
                             return WaylandAction::CommitSurface { pid, surface_id };
+                        } else if header.opcode == 2 && data.len() >= 40 {
+                            // SetTitle: 32-byte null-terminated title after the 8-byte header
+                            let mut title = [0u8; 32];
+                            title.copy_from_slice(&data[8..40]);
+                            return WaylandAction::SetTitle { pid, surface_id, title };
                         }
                     }
                     _ => {
@@ -392,6 +397,8 @@ pub enum WaylandAction {
     AttachBuffer { pid: u32, surface_id: u32, buffer_id: u32, width: i32, height: i32, vaddr: usize },
     /// Surface committed (standard Wayland wl_surface.commit, opcode 6).
     CommitSurface { pid: u32, surface_id: u32 },
+    /// Client requested a window-title change.
+    SetTitle { pid: u32, surface_id: u32, title: [u8; 32] },
 }
 
 /// XWayland integration state.
@@ -723,6 +730,44 @@ mod tests {
                 assert_eq!(vaddr, pool_vaddr, "pool vaddr must be preferred over msg.vaddr when pool mmap succeeded");
             }
             _ => panic!("expected CommitFrame action, got {:?}", actions[0]),
+        }
+    }
+
+    /// A SetTitle message (opcode 2 on a surface object) must decode to a SetTitle action
+    /// containing the null-terminated window title sent by the client.
+    #[test]
+    fn test_wayland_set_title_decoded() {
+        use sidewind::wayland::{WaylandHeader, WaylandMsgSetTitle};
+
+        let mut compositor = WaylandCompositor::new();
+        let pid = 300u32;
+        let surface_id = 0x2001u32;
+
+        let idx = compositor.get_or_create_connection(pid);
+        compositor.connections[idx].objects.push((surface_id, WaylandObjectType::Surface { id: surface_id }));
+        compositor.connections[idx].surfaces.push((surface_id, None));
+
+        let mut title_msg = WaylandMsgSetTitle::default();
+        let title_msg_size = core::mem::size_of::<WaylandMsgSetTitle>(); // 40 bytes
+        title_msg.header = WaylandHeader::new(surface_id, 2, title_msg_size as u16);
+        let title_bytes = b"Terminal\0";
+        title_msg.title[..title_bytes.len()].copy_from_slice(title_bytes);
+
+        // Prepend WAYL tag (4 bytes) + struct (40 bytes) = 44 bytes total
+        let mut buf = [0u8; 44];
+        buf[0..4].copy_from_slice(b"WAYL");
+        unsafe { core::ptr::write_unaligned(buf[4..44].as_mut_ptr() as *mut WaylandMsgSetTitle, title_msg); }
+
+        let actions = compositor.handle_message(&buf, pid);
+        assert_eq!(actions.len(), 1, "expected one SetTitle action");
+        match actions[0] {
+            WaylandAction::SetTitle { pid: p, surface_id: s, title } => {
+                assert_eq!(p, pid, "pid matches");
+                assert_eq!(s, surface_id, "surface_id matches");
+                // First 8 bytes of title should be "Terminal\0"
+                assert_eq!(&title[..9], b"Terminal\0", "title decoded correctly");
+            }
+            _ => panic!("expected SetTitle action, got {:?}", actions[0]),
         }
     }
 }

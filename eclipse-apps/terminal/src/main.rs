@@ -105,7 +105,7 @@ fn main() {
     // 3. Wayland Handshake (EDP Style - Simplified)
     println!("[TERM] Initializing Wayland session with PID {}...", composer_pid);
     
-    use sidewind::wayland::{ID_COMPOSITOR, ID_SHM, WaylandHeader, WaylandMsgCreatePool, WaylandMsgCreateSurface, WaylandMsgCommitFrame};
+    use sidewind::wayland::{ID_COMPOSITOR, ID_SHM, WaylandHeader, WaylandMsgCreatePool, WaylandMsgCreateSurface, WaylandMsgCommitFrame, WaylandMsgSetTitle};
 
     // 3.1 Create SHM Pool
     let pool_id = 0x1001u32;
@@ -132,6 +132,22 @@ fn main() {
         let _ = send(composer_pid, MSG_TYPE_WAYLAND, buf.as_ptr() as *const core::ffi::c_void, 40, 0);
     }
     println!("[TERM] Sent CreatePool id={} and CreateSurface id={}", pool_id, surface_id);
+
+    // 3.3 Set Window Title — sent as a separate message after CreateSurface so
+    //     the compositor knows the surface object already exists.
+    let mut title_msg = WaylandMsgSetTitle::default();
+    let title_msg_size = core::mem::size_of::<WaylandMsgSetTitle>(); // = 40 bytes
+    title_msg.header = WaylandHeader::new(surface_id, 2, title_msg_size as u16); // Opcode 2: SetTitle
+    let title_bytes = b"Terminal\0";
+    title_msg.title[..title_bytes.len()].copy_from_slice(title_bytes);
+    let title_buf_size = 4 + title_msg_size; // 4 (WAYL) + 40 (SetTitle) = 44
+    let mut title_buf = [0u8; 44];
+    title_buf[0..4].copy_from_slice(b"WAYL");
+    unsafe {
+        core::ptr::write_unaligned(title_buf[4..title_buf_size].as_mut_ptr() as *mut WaylandMsgSetTitle, title_msg);
+        let _ = send(composer_pid, MSG_TYPE_WAYLAND, title_buf.as_ptr() as *const core::ffi::c_void, title_buf_size, 0);
+    }
+    println!("[TERM] Sent SetTitle");
 
     // 4. Initialization — build the terminal and configure it for bare-metal use.
     //
@@ -216,8 +232,11 @@ fn main() {
                         terminal.set_font_manager(Box::new(TrueTypeFont::new(font_size, FONT_DATA)));
                         unsafe { core::ptr::write_bytes(buffer_ptr, 0, size_bytes); }
                         terminal.flush();
-                        dirty = true;
                     }
+                    // Any keypress may have caused the terminal library to redraw
+                    // cells (local echo, cursor movement, etc.), so always mark the
+                    // frame dirty so the updated pixels are committed to the compositor.
+                    dirty = true;
                 }
             }
         }

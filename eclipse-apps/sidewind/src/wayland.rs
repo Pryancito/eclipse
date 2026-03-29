@@ -82,6 +82,17 @@ pub struct WaylandMsgCommitFrame {
     pub vaddr: u64,
 }
 
+/// Message to set the window title shown in the compositor's decoration bar.
+/// Opcode: 2 (Target: surface_id)
+/// Total: 40 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaylandMsgSetTitle {
+    pub header: WaylandHeader,
+    /// Null-terminated UTF-8 window title.  Remaining bytes are zero-padded.
+    pub title: [u8; 32],
+}
+
 /// Evento de teclado enviado al cliente.
 /// Opcode: 10 (Target: ID_SEAT)
 /// Total: 12 bytes.

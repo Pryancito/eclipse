@@ -1505,15 +1505,20 @@ fn draw_window(
                     || raw_vaddr == fb.front_addr;
                 
                 if is_own_fb {
-                    // This means the client passed a bogus address. 
-                    // Draw a clear error indicator instead of a fake demo.
-                    let error_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 50, 50));
-                    let _ = Text::new("ERR: INVALID SHM ADDR", Point::new(cx + 10, content_y + 20), error_text).draw(fb);
+                    // The client passed a bogus address (zero or own framebuffer).
+                    // This can happen during startup before the first valid commit.
+                    // Show the simulated terminal demo so the window is still useful.
+                    println!("[LUNAS-RENDER] WARNING: window {} has bogus vaddr={:#x}; falling back to demo", window.title_str(), raw_vaddr);
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
                 } else {
                     // 4. Calculate the source dimensions based on the client's committed buffer.
-                    // The client draws into a buffer of size window.w x window.h
+                    // client_w = window.w (pixel buffer width = buffer stride)
+                    // client_h = window.h (outer window height including title bar; used as upper
+                    //   bound — actual buffer rows = window.h - TITLE_H, but blit_h is clamped
+                    //   to content_h which is always ≤ window.h - TITLE_H, so we never read past
+                    //   the end of the buffer).
                     let client_w = window.w;
-                    let client_h = window.h; 
+                    let client_h = window.h;
 
                     // 5. Calculate how much of that buffer we can actually show right now.
                     // This handles window resize animations where the current visible width (cw)
@@ -1536,9 +1541,9 @@ fn draw_window(
                     }
                 }
             } else {
-                // No buffer committed yet. Show a "Waiting for client" state.
-                let wait_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 100, 100));
-                let _ = Text::new("Waiting for buffer...", Point::new(cx + 10, content_y + 20), wait_text).draw(fb);
+                // No buffer committed yet — show the simulated terminal demo
+                // as a placeholder so the window is not just a blank rectangle.
+                draw_terminal_demo(fb, cx, content_y, cw, content_h);
             }
         }
         WindowContent::None => {}
