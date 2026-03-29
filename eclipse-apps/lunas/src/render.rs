@@ -1505,10 +1505,9 @@ fn draw_window(
                     || raw_vaddr == fb.front_addr;
                 
                 if is_own_fb {
-                    // This means the client passed a bogus address. 
-                    // Draw a clear error indicator instead of a fake demo.
-                    let error_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 50, 50));
-                    let _ = Text::new("ERR: INVALID SHM ADDR", Point::new(cx + 10, content_y + 20), error_text).draw(fb);
+                    // The client passed a bogus address (zero or own framebuffer).
+                    // Show the simulated terminal demo so the window is still useful.
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
                 } else {
                     // 4. Calculate the source dimensions based on the client's committed buffer.
                     // The client draws into a buffer of size window.w x window.h
@@ -1536,9 +1535,9 @@ fn draw_window(
                     }
                 }
             } else {
-                // No buffer committed yet. Show a "Waiting for client" state.
-                let wait_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 100, 100));
-                let _ = Text::new("Waiting for buffer...", Point::new(cx + 10, content_y + 20), wait_text).draw(fb);
+                // No buffer committed yet — show the simulated terminal demo
+                // as a placeholder so the window is not just a blank rectangle.
+                draw_terminal_demo(fb, cx, content_y, cw, content_h);
             }
         }
         WindowContent::None => {}

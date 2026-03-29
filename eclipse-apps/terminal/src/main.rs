@@ -175,6 +175,12 @@ fn main() {
         let _ = eclipse_syscall::call::write(master_fd, s.as_bytes());
     }));
 
+    // Render the initial terminal state (background colour + cursor) into the
+    // shared-memory buffer before committing the first frame.  Without this
+    // call the buffer stays solid black (the colour used to clear it above)
+    // and the compositor window appears blank until the first shell output.
+    terminal.flush();
+
     // Helper to send frame commit
     let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32, buf_vaddr: u64| {
         let mut commit = WaylandMsgCommitFrame::default();
