@@ -1466,6 +1466,15 @@ fn draw_window(
                 if client_w > 0 && client_h > 0 {
                     fb.blit_buffer(vaddr as usize, client_w as u32, client_h as u32, cx, cy + ShellWindow::TITLE_H);
                 }
+            } else {
+                // No buffer committed yet — show a dark placeholder instead of leaving the area black
+                let loading_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 25, 40)).build();
+                let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
+                    .into_styled(loading_style)
+                    .draw(fb);
+                let loading_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
+                // -30 ≈ half the pixel width of "Loading..." at 6px/char to roughly centre it
+                let _ = Text::new("Loading...", Point::new(cx + cw / 2 - 30, content_y + content_h / 2), loading_text).draw(fb);
             }
         }
         WindowContent::None => {}
