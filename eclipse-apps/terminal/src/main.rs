@@ -14,7 +14,11 @@ use os_terminal::font::BitmapFont;
 use sidewind::{discover_composer, MSG_TYPE_WAYLAND};
 use libc::{eclipse_send as send, receive, receive_fast, sleep_ms, open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_CREAT};
 
-// Custom DrawTarget that draws directly into our SHM region
+/// DrawTarget implementation for an ARGB8888 shared-memory pixel buffer.
+///
+/// Each pixel is written as `0x00_RR_GG_BB` (no forced alpha byte) using
+/// volatile stores so the compositor can observe every frame update via the
+/// shared mapping without the compiler eliding the writes.
 struct SidewindDrawTarget {
     vaddr: *mut u32,
     width: usize,
@@ -26,29 +30,14 @@ impl DrawTarget for SidewindDrawTarget {
         (self.width, self.height)
     }
 
+    #[inline(always)]
     fn draw_pixel(&mut self, x: usize, y: usize, color: Rgb) {
         if x < self.width && y < self.height {
-            let pixel = 0xFF00_0000u32 | ((color.0 as u32) << 16) | ((color.1 as u32) << 8) | (color.2 as u32);
+            let value = (color.0 as u32) << 16 | (color.1 as u32) << 8 | color.2 as u32;
             unsafe {
-                core::ptr::write_volatile(self.vaddr.add(y * self.width + x), pixel);
+                core::ptr::write_volatile(self.vaddr.add(y * self.width + x), value);
             }
         }
-    }
-}
-
-// Scancode mapping (same as before)
-#[cfg(target_vendor = "eclipse")]
-fn scancode_to_char(code: u16) -> Option<char> {
-    match code {
-        0x1E => Some('a'), 0x30 => Some('b'), 0x2E => Some('c'), 0x20 => Some('d'),
-        0x12 => Some('e'), 0x21 => Some('f'), 0x22 => Some('g'), 0x23 => Some('h'),
-        0x17 => Some('i'), 0x24 => Some('j'), 0x25 => Some('k'), 0x26 => Some('l'),
-        0x32 => Some('m'), 0x31 => Some('n'), 0x18 => Some('o'), 0x19 => Some('p'),
-        0x10 => Some('q'), 0x13 => Some('r'), 0x1F => Some('s'), 0x14 => Some('t'),
-        0x16 => Some('u'), 0x2F => Some('v'), 0x11 => Some('w'), 0x2D => Some('x'),
-        0x15 => Some('y'), 0x2C => Some('z'), 0x1C => Some('\r'), 0x39 => Some(' '),
-        0x0E => Some('\x08'), // Backspace
-        _ => None,
     }
 }
 
@@ -141,9 +130,37 @@ fn main() {
     unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, buf.as_ptr() as *const core::ffi::c_void, 20, 0); }
     println!("[TERM] Sent CreateSurface id={} ({}x{})", surface_id, width, height);
 
-    // 4. Initialization
+    // 4. Initialization — build the terminal and configure it for bare-metal use.
+    //
+    // `set_crnl_mapping(true)` makes the terminal convert incoming \r (Enter key)
+    // to \n and outgoing \n to \r\n, just like a real TTY line discipline would.
+    // This is necessary because Eclipse OS has no kernel TTY layer.
+    //
+    // A PTY loopback writer is registered so that keys processed by
+    // `handle_keyboard` (which generates ANSI escape sequences) are immediately
+    // fed back into `terminal.process()`.  This produces the expected echo
+    // behaviour without requiring a real shell back-end.
     let display = SidewindDrawTarget { vaddr: buffer_ptr, width: width as usize, height: height as usize };
     let mut terminal = Terminal::new(display, Box::new(BitmapFont));
+    terminal.set_crnl_mapping(true);
+
+    // Static ring-buffer that collects ANSI bytes emitted by handle_keyboard so
+    // they can be fed back to the terminal after each event.
+    //
+    // SAFETY: Eclipse OS runs this terminal as a single-threaded process with no
+    // signal handlers or interrupt-driven code that could race on PTY_OUTPUT.
+    // Every access is sequenced: the PTY writer closure fills the buffer, and the
+    // event loop drains it immediately after handle_keyboard returns.
+    static mut PTY_OUTPUT: heapless::Vec<u8, 512> = heapless::Vec::new();
+    terminal.set_pty_writer(Box::new(|s: &str| {
+        // SAFETY: single-threaded; no concurrent access possible.
+        unsafe {
+            for b in s.bytes() {
+                let _ = PTY_OUTPUT.push(b);
+            }
+        }
+    }));
+
     terminal.process(b"\x1b[1;32mEclipse OS Terminal (Wayland EDP Optimized)\x1b[0m\r\n\n$ ");
 
     // Helper to send frame commit (includes direct vaddr for flat-memory compositing)
@@ -175,8 +192,28 @@ fn main() {
             if &buffer[0..4] == b"SWND" {
                 let event = unsafe { core::ptr::read_unaligned(buffer[4..].as_ptr() as *const sidewind::SideWindEvent) };
                 if event.event_type == sidewind::SWND_EVENT_TYPE_KEY {
-                    if let Some(c) = scancode_to_char(event.data1 as u16) {
-                        terminal.process(&[c as u8]);
+                    // Pass the raw scancode (Scan Code Set 1) to the terminal's
+                    // keyboard handler.  It recognises make and break codes,
+                    // modifier keys, and generates the correct ANSI sequences
+                    // via the PTY writer registered above.
+                    let scancode = event.data1 as u8;
+                    let kb_event = terminal.handle_keyboard(scancode);
+
+                    // FontSize events need application-level handling; ignore
+                    // others since they are processed internally by the terminal.
+                    let _ = kb_event;
+
+                    // Drain the PTY loopback buffer and feed it back into the
+                    // terminal so keyboard output (echoed characters, ANSI
+                    // cursor moves, etc.) becomes visible immediately.
+                    // SAFETY: single-threaded; no concurrent access possible.
+                    let pending = unsafe {
+                        let copy = PTY_OUTPUT.clone();
+                        PTY_OUTPUT.clear();
+                        copy
+                    };
+                    if !pending.is_empty() {
+                        terminal.process(&pending);
                         send_commit(composer_pid, surface_id, pool_id, buffer_ptr as u64);
                     }
                 }
