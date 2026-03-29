@@ -336,16 +336,27 @@ impl WaylandCompositor {
 
     /// Resolve the pixel-buffer vaddr for a CommitFrame message.
     ///
-    /// Priority: pool-based address (pool.vaddr + offset), then direct vaddr from message.
-    /// Returns `None` if neither source provides a valid address.
+    /// Priority:
+    ///   1. pool-based address (pool.vaddr + offset) when the pool mmap succeeded (vaddr != 0)
+    ///   2. direct vaddr from the message (client's virtual address, valid when the OS uses a
+    ///      shared address space or the client passes a kernel-visible address)
+    ///
+    /// Returns `None` if neither source provides a valid (non-zero) address.
     fn resolve_commit_vaddr(
         &self,
         conn_idx: usize,
         msg: &sidewind::wayland::WaylandMsgCommitFrame,
     ) -> Option<usize> {
+        // Try pool-based address first, but only when the pool mmap succeeded.
+        // If pool.vaddr is 0 (mmap failed or returned a null mapping), fall through so
+        // we do not blit from address 0 and corrupt the framebuffer with stale data.
         if let Some(pool) = self.connections[conn_idx].pools.iter().find(|p| p.id == msg.pool_id) {
-            Some(pool.vaddr + msg.offset as usize)
-        } else if msg.vaddr != 0 {
+            if pool.vaddr != 0 {
+                return Some(pool.vaddr + msg.offset as usize);
+            }
+        }
+        // Fall back to the direct virtual address embedded in the commit message.
+        if msg.vaddr != 0 {
             Some(msg.vaddr as usize)
         } else {
             None
@@ -626,5 +637,92 @@ mod tests {
         compositor.handle_message(&surf_msg, pid2);
 
         assert_eq!(compositor.connections.len(), 2);
+    }
+
+    /// When the pool mmap fails (pool.vaddr == 0), resolve_commit_vaddr must fall back to the
+    /// direct vaddr embedded in the CommitFrame message instead of returning Some(0).
+    /// Returning Some(0) would cause the compositor to blit from address 0, reading the physical
+    /// framebuffer and rendering stale compositor output inside the client window's content area.
+    #[test]
+    fn test_resolve_commit_vaddr_falls_back_to_msg_vaddr_when_pool_vaddr_zero() {
+        use sidewind::wayland::{WaylandHeader, WaylandMsgCommitFrame};
+
+        let mut compositor = WaylandCompositor::new();
+        let pid = 200u32;
+        let pool_id = 0x1001u32;
+        let surface_id = 0x2001u32;
+        let direct_vaddr: u64 = 0x5000_0000;
+
+        let idx = compositor.get_or_create_connection(pid);
+        // Add the pool with vaddr=0 (simulates a failed mmap).
+        compositor.connections[idx].pools.push(ShmPool { id: pool_id, vaddr: 0, size: 4096 });
+        compositor.connections[idx].objects.push((surface_id, WaylandObjectType::Surface { id: surface_id }));
+        compositor.connections[idx].surfaces.push((surface_id, None));
+
+        // Build an EDP CommitFrame message with direct vaddr set.
+        let mut commit = WaylandMsgCommitFrame::default();
+        commit.header = WaylandHeader::new(surface_id, 1, 32);
+        commit.pool_id = pool_id;
+        commit.offset = 0;
+        commit.width = 640;
+        commit.height = 480;
+        commit.stride = 2560;
+        commit.format = 0;
+        commit.vaddr = direct_vaddr;
+
+        let mut buf = [0u8; 32];
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut WaylandMsgCommitFrame, commit); }
+
+        let actions = compositor.handle_message(&buf, pid);
+
+        // The CommitFrame action must carry the direct_vaddr, NOT 0.
+        assert_eq!(actions.len(), 1, "expected one CommitFrame action");
+        match actions[0] {
+            WaylandAction::CommitFrame { vaddr, .. } => {
+                assert_ne!(vaddr, 0, "vaddr must not be 0 (pool mmap failed; must fall back to msg.vaddr)");
+                assert_eq!(vaddr, direct_vaddr as usize, "vaddr must equal the direct address from the message");
+            }
+            _ => panic!("expected CommitFrame action, got {:?}", actions[0]),
+        }
+    }
+
+    /// When pool.vaddr is valid (non-zero), resolve_commit_vaddr must prefer it over msg.vaddr.
+    #[test]
+    fn test_resolve_commit_vaddr_prefers_pool_vaddr_when_valid() {
+        use sidewind::wayland::{WaylandHeader, WaylandMsgCommitFrame};
+
+        let mut compositor = WaylandCompositor::new();
+        let pid = 201u32;
+        let pool_id = 0x1002u32;
+        let surface_id = 0x2002u32;
+        let pool_vaddr: usize = 0x4000_0000;
+        let msg_vaddr: u64 = 0x5000_0000;
+
+        let idx = compositor.get_or_create_connection(pid);
+        compositor.connections[idx].pools.push(ShmPool { id: pool_id, vaddr: pool_vaddr, size: 4096 });
+        compositor.connections[idx].objects.push((surface_id, WaylandObjectType::Surface { id: surface_id }));
+        compositor.connections[idx].surfaces.push((surface_id, None));
+
+        let mut commit = WaylandMsgCommitFrame::default();
+        commit.header = WaylandHeader::new(surface_id, 1, 32);
+        commit.pool_id = pool_id;
+        commit.offset = 0;
+        commit.width = 64;
+        commit.height = 64;
+        commit.stride = 256;
+        commit.format = 0;
+        commit.vaddr = msg_vaddr;
+
+        let mut buf = [0u8; 32];
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut WaylandMsgCommitFrame, commit); }
+
+        let actions = compositor.handle_message(&buf, pid);
+        assert_eq!(actions.len(), 1, "expected one CommitFrame action");
+        match actions[0] {
+            WaylandAction::CommitFrame { vaddr, .. } => {
+                assert_eq!(vaddr, pool_vaddr, "pool vaddr must be preferred over msg.vaddr when pool mmap succeeded");
+            }
+            _ => panic!("expected CommitFrame action, got {:?}", actions[0]),
+        }
     }
 }
