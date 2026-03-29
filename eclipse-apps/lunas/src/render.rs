@@ -294,12 +294,28 @@ impl FramebufferState {
     }
 
     /// Blit an external surface buffer onto the back buffer.
-    pub fn blit_buffer(&mut self, vaddr: usize, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32) {
+    /// Blit a pixel buffer onto the back framebuffer.
+    ///
+    /// - `vaddr`      — virtual address of the source pixel buffer (ARGB8888).
+    /// - `src_w`      — number of pixels to copy per row (blit width).
+    /// - `src_h`      — number of rows to copy (blit height).
+    /// - `src_stride` — actual row width of the source buffer in pixels (≥ src_w).
+    ///                  Must equal the stride the client used when writing the buffer so
+    ///                  that `row * src_stride + col` gives the correct pixel offset.
+    ///                  Pass the same value as `src_w` when the buffer is tightly packed.
+    /// - `dst_x/y`    — destination top-left corner in the framebuffer.
+    pub fn blit_buffer(&mut self, vaddr: usize, src_w: u32, src_h: u32, src_stride: u32, dst_x: i32, dst_y: i32) {
+        // src_stride must be at least as wide as the copy region; a smaller stride would mean
+        // reading wrong pixels from adjacent rows.
+        debug_assert!(src_stride >= src_w, "blit_buffer: src_stride ({}) must be >= src_w ({})", src_stride, src_w);
         #[cfg(not(test))]
         {
             let fb_w = self.info.width as i32;
             let fb_h = self.info.height as i32;
             let pitch_px = self.info.pitch as usize / 4;
+            // Guard against a mis-specified stride at runtime by clamping, so we at worst
+            // read fewer pixels than expected rather than overrunning into the wrong row.
+            let stride = src_stride.max(src_w) as usize;
 
             for row in 0..src_h as i32 {
                 let dy = dst_y + row;
@@ -307,7 +323,7 @@ impl FramebufferState {
                 for col in 0..src_w as i32 {
                     let dx = dst_x + col;
                     if dx < 0 || dx >= fb_w { continue; }
-                    let src_offset = (row as usize) * (src_w as usize) + (col as usize);
+                    let src_offset = (row as usize) * stride + (col as usize);
                     let dst_offset = (dy as usize) * pitch_px + (dx as usize);
                     unsafe {
                         let pixel = core::ptr::read_volatile((vaddr as *const u32).add(src_offset));
@@ -1455,7 +1471,7 @@ fn draw_window(
                 let src_h = intended_h.min(max_h_for_buffer);
 
                 if src_w > 0 && src_h > 0 {
-                    fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, cx, content_y);
+                    fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, src_w, cx, content_y);
                 }
             } else {
                 // Loading indicator
@@ -1472,10 +1488,20 @@ fn draw_window(
         }
         WindowContent::Wayland { .. } => {
             if let Some(vaddr) = window.buffer_handle {
+                // `window.w` and `window.h` are the committed buffer dimensions; they may
+                // temporarily exceed the animated `cw`/`ch` while the window grows into its
+                // target size.  We clip the copy area to the visible content region so that
+                // pixels are never written outside the window's current animated bounds.
                 let client_w = window.w;
                 let client_h = window.h - ShellWindow::TITLE_H;
-                if client_w > 0 && client_h > 0 {
-                    fb.blit_buffer(vaddr as usize, client_w as u32, client_h as u32, cx, cy + ShellWindow::TITLE_H);
+                // Number of pixels to copy: at most the content area that is currently visible.
+                // The `> 0` guards below safely handle any negative intermediate value.
+                let blit_w = client_w.min(cw);
+                let blit_h = client_h.min(content_h);
+                if blit_w > 0 && blit_h > 0 {
+                    // Use client_w as the source stride so row indexing matches the stride
+                    // the terminal used when writing (y * client_w + x).
+                    fb.blit_buffer(vaddr as usize, blit_w as u32, blit_h as u32, client_w as u32, cx, cy + ShellWindow::TITLE_H);
                 }
             } else {
                 // No buffer committed yet — show simulated terminal content as a placeholder
