@@ -72,3 +72,4 @@ pub const SYS_SCHED_SETAFFINITY: usize = 66;
 pub const SYS_REGISTER_LOG_HUD: usize = 67;
 pub const SYS_FTRUNCATE: usize = 68;
 pub const SYS_SET_TIME: usize = 69;
+pub const SYS_SPAWN_WITH_STDIO: usize = 70;

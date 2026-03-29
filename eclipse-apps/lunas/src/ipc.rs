@@ -95,8 +95,6 @@ impl IpcHandler {
                     return Some(CompositorEvent::Wayland(vec, from));
                 }
                 Some(EclipseMessage::Raw { data, len, from }) => {
-                    println!("[LUNAS-IPC] Unknown Raw message from PID {}: [{}, {}, {}, {}...] len={}", 
-                        from, data[0], data[1], data[2], data[3], len);
                     continue;
                 }
                 Some(_) => {

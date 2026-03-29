@@ -197,7 +197,7 @@ build_sidewind_project() {
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test lunas terminal"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test lunas terminal sh"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
@@ -226,6 +226,18 @@ build_sidewind_project() {
                 mkdir -p "$BASE_DIR/$BUILD_DIR/bin"
                 rm -f "$BASE_DIR/$BUILD_DIR/bin/terminal"
                 cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" "$BASE_DIR/$BUILD_DIR/bin/terminal"
+            fi
+        fi
+	if [ -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/sh" ]; then
+            mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/bin"
+            rm -f "$BASE_DIR/$BUILD_DIR/sysroot/bin/sh"
+            cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/sh" "$BASE_DIR/$BUILD_DIR/sysroot/bin/sh"
+            print_status "Copiado: /bin/sh -> /usr/bin/sh (sysroot)"
+
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                mkdir -p "$BASE_DIR/$BUILD_DIR/bin"
+                rm -f "$BASE_DIR/$BUILD_DIR/bin/sh"
+                cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/sh" "$BASE_DIR/$BUILD_DIR/bin/sh"
             fi
         fi
     else

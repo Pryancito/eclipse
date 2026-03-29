@@ -1487,9 +1487,7 @@ fn draw_window(
             draw_terminal_demo(fb, cx, content_y, cw, content_h);
         }
         WindowContent::Wayland { .. } => {
-            // Always fill the content area with a solid background first so that no
-            // desktop background bleeds through during the window open animation (while
-            // the blit dimensions are still smaller than the full content area).
+            // 1. Draw a background to prevent visual artifacts during resize animations
             let bg_style = PrimitiveStyleBuilder::new()
                 .fill_color(Rgb888::new(15, 20, 35))
                 .build();
@@ -1497,40 +1495,50 @@ fn draw_window(
                 .into_styled(bg_style)
                 .draw(fb);
 
+            // 2. Check if the client has committed a valid buffer
             if let Some(vaddr) = window.buffer_handle {
                 let raw_vaddr = vaddr as usize;
-                // Guard against self-referential blits: if the client's reported buffer
-                // address equals the compositor's own back or front framebuffer address,
-                // the blit would copy the desktop/framebuffer content into the window
-                // instead of the terminal's pixel data.  Fall back to the simulated
-                // terminal in that case so the window looks reasonable.
+                
+                // 3. Safety Check: Prevent the compositor from reading its own video memory
                 let is_own_fb = raw_vaddr == 0
                     || raw_vaddr == fb.back_addr
                     || raw_vaddr == fb.front_addr;
+                
                 if is_own_fb {
-                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    // This means the client passed a bogus address. 
+                    // Draw a clear error indicator instead of a fake demo.
+                    let error_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(255, 50, 50));
+                    let _ = Text::new("ERR: INVALID SHM ADDR", Point::new(cx + 10, content_y + 20), error_text).draw(fb);
                 } else {
-                    // `window.w` and `window.h` are the committed buffer dimensions; they may
-                    // temporarily exceed the animated `cw`/`ch` while the window grows into its
-                    // target size.  We clip the copy area to the visible content region so that
-                    // pixels are never written outside the window's current animated bounds.
+                    // 4. Calculate the source dimensions based on the client's committed buffer.
+                    // The client draws into a buffer of size window.w x window.h
                     let client_w = window.w;
-                    let client_h = window.h - ShellWindow::TITLE_H;
-                    // Number of pixels to copy: at most the content area that is currently visible.
-                    // The `> 0` guards below safely handle any negative intermediate value.
+                    let client_h = window.h; 
+
+                    // 5. Calculate how much of that buffer we can actually show right now.
+                    // This handles window resize animations where the current visible width (cw)
+                    // might be smaller than the actual buffer the client rendered (client_w).
                     let blit_w = client_w.min(cw);
                     let blit_h = client_h.min(content_h);
+
                     if blit_w > 0 && blit_h > 0 {
-                        // Use client_w as the source stride so row indexing matches the stride
-                        // the terminal used when writing (y * client_w + x).
-                        fb.blit_buffer(raw_vaddr, blit_w as u32, blit_h as u32, client_w as u32, cx, cy + ShellWindow::TITLE_H);
-                    } else {
-                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                        // 6. The Blit Operation
+                        // Parameters (assumed based on standard blit signatures):
+                        // fb.blit_buffer(source_address, width_to_copy, height_to_copy, source_stride, dest_x, dest_y)
+                        fb.blit_buffer(
+                            raw_vaddr, 
+                            blit_w as u32, 
+                            blit_h as u32, 
+                            client_w as u32, // Stride: the total width of the client's buffer
+                            cx, 
+                            content_y        // Dest Y: Must be below the title bar
+                        );
                     }
                 }
             } else {
-                // No buffer committed yet — show simulated terminal content as a placeholder
-                draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                // No buffer committed yet. Show a "Waiting for client" state.
+                let wait_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 100, 100));
+                let _ = Text::new("Waiting for buffer...", Point::new(cx + 10, content_y + 20), wait_text).draw(fb);
             }
         }
         WindowContent::None => {}

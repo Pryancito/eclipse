@@ -67,6 +67,7 @@ fn ntp_task(
     dns_handle: smoltcp::iface::SocketHandle,
     now_ms: u64,
     device: &mut RawEthernetDevice,
+    dhcp_info: Option<DhcpInfo>,
 ) {
     if !device.get_link_status() {
          return;
@@ -130,7 +131,20 @@ fn ntp_task(
                             ntp.state = NtpState::WaitingResponse;
                         }
                         Err(e) => {
-                            println!("[NETWORK-SERVICE] NTP: Send failed: {:?}", e);
+                            println!("[NETWORK-SERVICE] NTP: Send failed to {}: {:?}", addr, e);
+                            // Diagnóstico de red
+                            for addr in iface.ip_addrs() {
+                                println!("  [DIAG] Interface IP: {}", addr);
+                            }
+                            if let Some(info) = dhcp_info {
+                                if let Some(gw) = info.router {
+                                    println!("  [DIAG] DHCP Gateway provided: {}", gw);
+                                } else {
+                                    println!("  [DIAG] DHCP provided IP but NO gateway!");
+                                }
+                            } else {
+                                println!("  [DIAG] No DHCP configuration active!");
+                            }
                             ntp.state = NtpState::Idle;
                             ntp.last_sync = now_ms;
                         }
@@ -651,6 +665,7 @@ fn main() {
             dns_handle,
             get_now_ms(),
             &mut device,
+            current_dhcp_config,
         );
 
         let rx_total = device.rx_bytes.load(Ordering::Relaxed);

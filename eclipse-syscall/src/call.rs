@@ -90,6 +90,22 @@ pub fn spawn(buf: &[u8], name: Option<&str>) -> Result<usize> {
     unsafe { cvt(syscall3(SYS_SPAWN, buf.as_ptr() as usize, buf.len(), name_ptr)) }
 }
 
+/// Spawn a new process from an ELF buffer, replacing stdin/stdout/stderr
+pub fn spawn_with_stdio(buf: &[u8], name: Option<&str>, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<usize> {
+    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    unsafe {
+        cvt(syscall6(
+            SYS_SPAWN_WITH_STDIO,
+            buf.as_ptr() as usize,
+            buf.len(),
+            name_ptr,
+            fd_in,
+            fd_out,
+            fd_err,
+        ))
+    }
+}
+
 /// List processes and their state
 pub fn get_process_list(buf: &mut [crate::ProcessInfo]) -> Result<usize> {
     unsafe { cvt(syscall2(SYS_GET_PROCESS_LIST, buf.as_mut_ptr() as usize, buf.len())) }
@@ -98,6 +114,11 @@ pub fn get_process_list(buf: &mut [crate::ProcessInfo]) -> Result<usize> {
 /// Kill a process by PID
 pub fn kill(pid: usize) -> Result<()> {
     unsafe { cvt_unit(syscall1(SYS_KILL, pid)) }
+}
+
+/// Wait for a child process to exit
+pub fn waitpid(status: *mut u32) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_WAIT, status as usize)) }
 }
 
 

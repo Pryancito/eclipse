@@ -98,6 +98,7 @@ pub enum SyscallNumber {
     RegisterLogHud = 67,
     Ftruncate = 68,
     SetTime = 69,
+    SpawnWithStdio = 70,
 }
 
 
@@ -323,6 +324,7 @@ pub extern "C" fn syscall_handler(
         67 => sys_register_log_hud(arg1),
         68 => sys_ftruncate(arg1, arg2),
         69 => sys_set_time(arg1),
+        70 => sys_spawn_with_stdio(arg1, arg2, arg3, arg4, arg5, arg6),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -1500,6 +1502,60 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
             serial::serial_print("\n");
             u64::MAX
         }
+    }
+}
+
+/// sys_spawn_with_stdio - Create a new process and replace its stdin/stdout/stderr
+/// arg1: pointer to ELF buffer
+/// arg2: size of ELF buffer
+/// arg3: pointer to process name string
+/// arg4: fd to map to stdin (0)
+/// arg5: fd to map to stdout (1)
+/// arg6: fd to map to stderr (2)
+fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, fd_out: u64, fd_err: u64) -> u64 {
+    // Re-implement the base logic to avoid the race condition!
+    // We cannot call sys_spawn directly because it enqueues the process, 
+    // making it runnable before we replace its FDs.
+    
+    use alloc::vec::Vec;
+    let elf_slice = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
+    let mut elf_data = Vec::with_capacity(elf_size as usize);
+    elf_data.extend_from_slice(elf_slice);
+    
+    let name_trimmed = if name_ptr != 0 {
+        let name_slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, 16) };
+        let len = name_slice.iter().position(|&b| b == 0).unwrap_or(16);
+        core::str::from_utf8(&name_slice[..len]).unwrap_or("unknown")
+    } else {
+        "unknown"
+    };
+
+    match crate::process::spawn_process(&elf_data, name_trimmed) {
+        Ok(pid) => {
+            crate::process::modify_process(pid, |p| {
+                p.parent_pid = crate::process::current_process_id();
+            }).unwrap();
+
+            // Override file descriptors BEFORE enqueuing
+            if let Some(parent_pid) = crate::process::current_process_id() {
+                let p_fd_in = crate::fd::fd_get(parent_pid, fd_in as usize);
+                let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
+                let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
+
+                if let Some(mut tables) = crate::fd::get_fd_table(pid as u32) {
+                    if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
+                        if let Some(fd) = p_fd_in { tables[child_fd_idx].fds[0] = fd; }
+                        if let Some(fd) = p_fd_out { tables[child_fd_idx].fds[1] = fd; }
+                        if let Some(fd) = p_fd_err { tables[child_fd_idx].fds[2] = fd; }
+                    }
+                }
+            }
+
+            // Now it's safely configured, we can let the scheduler run it
+            crate::scheduler::enqueue_process(pid);
+            pid as u64
+        }
+        Err(_) => u64::MAX,
     }
 }
 

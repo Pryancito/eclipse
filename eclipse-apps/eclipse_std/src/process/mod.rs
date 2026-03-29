@@ -47,7 +47,6 @@ impl Command {
         let _buf = fs::read(&self.program)?;
         
         unsafe {
-            // TODO: Construct proper argv/envp
             let pid = crate::libc::spawn(
                 self.program.as_ptr() as *const c_char,
                 core::ptr::null(),
@@ -58,6 +57,16 @@ impl Command {
             }
             
             Ok(Child { pid })
+        }
+    }
+
+    /// Executes the command replacing stdin, stdout, stderr with specific file descriptors
+    pub fn spawn_with_stdio(&mut self, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<Child> {
+        let buf = fs::read(&self.program)?;
+        
+        match eclipse_syscall::call::spawn_with_stdio(&buf, Some(&self.program), fd_in, fd_out, fd_err) {
+            Ok(pid) => Ok(Child { pid: pid as pid_t }),
+            Err(_) => Err(Error::new(ErrorKind::Other, "spawn_with_stdio syscall failed")),
         }
     }
 
@@ -81,14 +90,20 @@ impl Child {
     
     /// Forces the child process to exit.
     pub fn kill(&mut self) -> Result<()> {
-        // TODO: Implement SYS_KILL
-        Ok(())
+        match eclipse_syscall::call::kill(self.pid as usize) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Error::new(ErrorKind::Other, "kill failed")),
+        }
     }
     
     /// Waits for the child to exit completely, returning the status that it exited with.
     pub fn wait(&mut self) -> Result<ExitStatus> {
-        // TODO: Implement SYS_WAITPID
-        Ok(ExitStatus { code: 0 })
+        let mut status = 0u32;
+        // La syscall devuleve PID cuando retorna
+        match eclipse_syscall::call::waitpid(&mut status as *mut u32) {
+            Ok(_ret_pid) => Ok(ExitStatus { code: (status >> 8) as i32 }),
+            Err(_) => Err(Error::new(ErrorKind::Other, "waitpid failed")),
+        }
     }
 }
 

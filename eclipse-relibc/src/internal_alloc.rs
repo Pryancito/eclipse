@@ -12,8 +12,8 @@ use crate::types::*;
 
 // --- Constantes de Configuración ---
 const ALIGNMENT: usize = 16;
-const CHUNK_SIZE: usize = 64 * 1024; // 64KB
-const LARGE_THRESHOLD: usize = 32 * 1024; // 32KB
+const CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB
+const LARGE_THRESHOLD: usize = 1024 * 1024; // 1MB
 const PAGE_SIZE: usize = 4096;
 
 // --- Utilidades de Alineación ---
@@ -184,7 +184,9 @@ mod imp {
 
         let new_ptr = malloc(new_size);
         if !new_ptr.is_null() {
-            ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, old_user_size);
+            // Safely copy only the bounds of the old data to avoid Page Faults on resize.
+            let copy_len = if (new_size as usize) < old_user_size { new_size as usize } else { old_user_size };
+            ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, copy_len);
             free(ptr);
         }
         new_ptr

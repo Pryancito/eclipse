@@ -161,6 +161,7 @@ pub fn init() {
     register_scheme("shm", Arc::new(ShmScheme::new()));
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     register_scheme("eth", Arc::new(crate::eth::EthScheme));
+    register_scheme("pty", Arc::new(crate::pty::PtyScheme::new()));
 }
 
 /// Register a new scheme

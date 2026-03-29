@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-os-terminal = "0.7.3"
+os-terminal = { version = "0.7.3", features = ["truetype", "bitmap"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
 heapless = "0.8"
 bitflags = "2.4"
