@@ -175,6 +175,8 @@ fn main() {
         let _ = eclipse_syscall::call::write(master_fd, s.as_bytes());
     }));
 
+    terminal.flush();
+    
     // Helper to send frame commit
     let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32, buf_vaddr: u64| {
         let mut commit = WaylandMsgCommitFrame::default();
