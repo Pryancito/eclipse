@@ -332,6 +332,16 @@ impl LunasState {
                         }
                         self.dirty = true;
                     }
+                    WaylandAction::SetTitle { pid, surface_id, title } => {
+                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
+                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
+                                if w_idx < self.space.window_count {
+                                    self.space.windows[w_idx].title = title;
+                                }
+                            }
+                        }
+                        self.dirty = true;
+                    }
                     WaylandAction::None => {
                         self.dirty = true;
                     }

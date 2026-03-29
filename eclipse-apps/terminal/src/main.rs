@@ -105,7 +105,7 @@ fn main() {
     // 3. Wayland Handshake (EDP Style - Simplified)
     println!("[TERM] Initializing Wayland session with PID {}...", composer_pid);
     
-    use sidewind::wayland::{ID_COMPOSITOR, ID_SHM, WaylandHeader, WaylandMsgCreatePool, WaylandMsgCreateSurface, WaylandMsgCommitFrame};
+    use sidewind::wayland::{ID_COMPOSITOR, ID_SHM, WaylandHeader, WaylandMsgCreatePool, WaylandMsgCreateSurface, WaylandMsgCommitFrame, WaylandMsgSetTitle};
 
     // 3.1 Create SHM Pool
     let pool_id = 0x1001u32;
@@ -132,6 +132,22 @@ fn main() {
         let _ = send(composer_pid, MSG_TYPE_WAYLAND, buf.as_ptr() as *const core::ffi::c_void, 40, 0);
     }
     println!("[TERM] Sent CreatePool id={} and CreateSurface id={}", pool_id, surface_id);
+
+    // 3.3 Set Window Title — sent as a separate message after CreateSurface so
+    //     the compositor knows the surface object already exists.
+    let mut title_msg = WaylandMsgSetTitle::default();
+    let title_msg_size = core::mem::size_of::<WaylandMsgSetTitle>(); // = 40 bytes
+    title_msg.header = WaylandHeader::new(surface_id, 2, title_msg_size as u16); // Opcode 2: SetTitle
+    let title_bytes = b"Terminal\0";
+    title_msg.title[..title_bytes.len()].copy_from_slice(title_bytes);
+    let title_buf_size = 4 + title_msg_size; // 4 (WAYL) + 40 (SetTitle) = 44
+    let mut title_buf = [0u8; 44];
+    title_buf[0..4].copy_from_slice(b"WAYL");
+    unsafe {
+        core::ptr::write_unaligned(title_buf[4..title_buf_size].as_mut_ptr() as *mut WaylandMsgSetTitle, title_msg);
+        let _ = send(composer_pid, MSG_TYPE_WAYLAND, title_buf.as_ptr() as *const core::ffi::c_void, title_buf_size, 0);
+    }
+    println!("[TERM] Sent SetTitle");
 
     // 4. Initialization — build the terminal and configure it for bare-metal use.
     //
@@ -175,11 +191,18 @@ fn main() {
         let _ = eclipse_syscall::call::write(master_fd, s.as_bytes());
     }));
 
-    // Render the initial terminal state (background colour + cursor) into the
-    // shared-memory buffer before committing the first frame.  Without this
-    // call the buffer stays solid black (the colour used to clear it above)
-    // and the compositor window appears blank until the first shell output.
-    terminal.flush();
+    // Force a full render into the shared-memory buffer before the first commit.
+    //
+    // `flush()` alone is a no-op on a freshly created Terminal because there
+    // are no pending changes — the buffer stays solid black.  Sending an ANSI
+    // "erase display" sequence causes the terminal library to call `draw_pixel`
+    // for every cell (filling the buffer with the terminal's background colour)
+    // and to position the cursor at the home position.  A short banner line is
+    // added so the window shows visible content before the shell prompt arrives.
+    terminal.process(b"\x1b[H\x1b[2J");                        // cursor home, erase screen
+    terminal.process(b"\x1b[1;32mEclipse OS Terminal\x1b[0m\r\n"); // bold-green title
+    terminal.process(b"\x1b[32m$ \x1b[0m");                    // green shell prompt
+    terminal.flush();                                            // render cursor block
 
     // Helper to send frame commit
     let send_commit = |composer_pid: u32, surface_id: u32, pool_id: u32, buf_vaddr: u64| {

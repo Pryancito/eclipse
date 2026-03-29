@@ -283,6 +283,11 @@ impl WaylandCompositor {
                         } else if header.opcode == 6 {
                             // Standard wl_surface.commit
                             return WaylandAction::CommitSurface { pid, surface_id };
+                        } else if header.opcode == 2 && data.len() >= 40 {
+                            // SetTitle: 32-byte null-terminated title after the 8-byte header
+                            let mut title = [0u8; 32];
+                            title.copy_from_slice(&data[8..40]);
+                            return WaylandAction::SetTitle { pid, surface_id, title };
                         }
                     }
                     _ => {
@@ -392,6 +397,8 @@ pub enum WaylandAction {
     AttachBuffer { pid: u32, surface_id: u32, buffer_id: u32, width: i32, height: i32, vaddr: usize },
     /// Surface committed (standard Wayland wl_surface.commit, opcode 6).
     CommitSurface { pid: u32, surface_id: u32 },
+    /// Client requested a window-title change.
+    SetTitle { pid: u32, surface_id: u32, title: [u8; 32] },
 }
 
 /// XWayland integration state.
