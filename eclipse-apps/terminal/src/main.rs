@@ -243,8 +243,11 @@ fn main() {
                         terminal.set_font_manager(Box::new(TrueTypeFont::new(font_size, FONT_DATA)));
                         unsafe { core::ptr::write_bytes(buffer_ptr, 0, size_bytes); }
                         terminal.flush();
-                        dirty = true;
                     }
+                    // Any keypress may have caused the terminal library to redraw
+                    // cells (local echo, cursor movement, etc.), so always mark the
+                    // frame dirty so the updated pixels are committed to the compositor.
+                    dirty = true;
                 }
             }
         }
