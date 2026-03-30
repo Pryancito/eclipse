@@ -1,7 +1,7 @@
 //! unistd.h - POSIX OS API
 use crate::types::*;
 use crate::internal_alloc::{malloc, free};
-use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, mkdir as sys_mkdir, fstat as sys_fstat, Stat as sys_Stat};
+use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, mkdir as sys_mkdir, fstat as sys_fstat, ftruncate as sys_ftruncate, Stat as sys_Stat};
 use crate::header::time::nanosleep;
 
 #[no_mangle]
@@ -278,6 +278,14 @@ pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char,
              sys_close(fd).ok();
              -1
         },
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ftruncate(fd: c_int, length: off_t) -> c_int {
+    match sys_ftruncate(fd as usize, length as usize) {
+        Ok(_) => 0,
         Err(_) => -1,
     }
 }

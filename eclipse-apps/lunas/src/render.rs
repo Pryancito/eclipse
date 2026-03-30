@@ -469,7 +469,6 @@ fn draw_snap_guides(fb: &mut FramebufferState, input: &InputState) {
     }
 }
 
-/// Draw the complete desktop shell (background, taskbar, windows, overlays).
 pub fn draw_desktop_shell(
     fb: &mut FramebufferState,
     input: &InputState,
@@ -490,6 +489,7 @@ pub fn draw_desktop_shell(
     net_history: &[f32; 60],
     history_pos: usize,
     cpu_temp: u32,
+    snp_surfaces: &alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
 ) {
     // 1. Blit background
     fb.blit_background();
@@ -507,7 +507,7 @@ pub fn draw_desktop_shell(
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
-        draw_window(fb, w, surfaces, input.focused_window == Some(i), input.window_decoration_style);
+        draw_window(fb, w, surfaces, snp_surfaces, input.focused_window == Some(i), input.window_decoration_style);
     }
 
     // 3.5. Draw snap zone guides when dragging a window near screen edges/corners
@@ -1304,7 +1304,7 @@ fn draw_taskbar(
 }
 
 /// Render simulated terminal content into the window content area.
-/// Used by `WindowContent::InternalDemo` and as fallback for `WindowContent::Wayland`
+/// Used by `WindowContent::InternalDemo` and as fallback for `WindowContent::Snp`
 /// when the client has not yet committed a pixel buffer.
 fn draw_terminal_demo(
     fb: &mut FramebufferState,
@@ -1377,6 +1377,7 @@ fn draw_window(
     fb: &mut FramebufferState,
     window: &ShellWindow,
     surfaces: &[ExternalSurface],
+    snp_surfaces: &alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
     focused: bool,
     decoration_style: u8,
 ) {
@@ -1419,11 +1420,10 @@ fn draw_window(
     let title = window.title_str();
     let _ = Text::new(title, Point::new(cx + 8, cy + 18), title_text_style).draw(fb);
 
-    // Window control buttons — Mac style (colored circles)
-    // Rojo: Cerrar, Amarillo: Maximizar, Verde: Minimizar
+    // Window control buttons
     let close_x = cx + cw - 21;
     let btn_y = cy + 6;
-    let btn_size = 12; // Slightly smaller circles for a cleaner look
+    let btn_size = 12;
     
     // Close (Red)
     let close_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 50, 50)).build();
@@ -1443,118 +1443,71 @@ fn draw_window(
         .into_styled(min_style)
         .draw(fb);
 
-    // Window content area
     let content_y = cy + ShellWindow::TITLE_H;
     let content_h = ch - ShellWindow::TITLE_H;
-    if content_h <= 0 { return; }
-
-    match window.content {
-        WindowContent::External(s_idx) => {
-            let s = s_idx as usize;
-            if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
-                // Derive the blit region from the window content area, but clamp it to the
-                // actually-mapped surface buffer so we never read past `vaddr`.
-                // Use max(0) to avoid wrapping negative i32 into a huge u32.
-                let src_w = window.w.max(0) as u32;
-                let intended_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32).min(content_h as u32);
-
-                // Compute the maximum number of rows available in the buffer.
-                // Assume 4 bytes per pixel (ARGB8888) to ensure we do not
-                // overrun the mapped region even if the window is larger than the surface.
-                let max_pixels = (surfaces[s].mapped_len / 4) as u32;
-                let max_h_for_buffer = if src_w > 0 {
-                    max_pixels / src_w
-                } else {
-                    0
-                };
-
-                let src_h = intended_h.min(max_h_for_buffer);
-
-                if src_w > 0 && src_h > 0 {
-                    fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, src_w, cx, content_y);
-                }
-            } else {
-                // Loading indicator
-                let loading_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(20, 25, 40)).build();
-                let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
-                    .into_styled(loading_style)
-                    .draw(fb);
-                let loading_text = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 120, 160));
-                let _ = Text::new("Loading...", Point::new(cx + cw / 2 - 30, content_y + content_h / 2), loading_text).draw(fb);
-            }
-        }
-        WindowContent::InternalDemo => {
-            draw_terminal_demo(fb, cx, content_y, cw, content_h);
-        }
-        WindowContent::Wayland { .. } => {
-            // 1. Draw a background to prevent visual artifacts during resize animations
-            let bg_style = PrimitiveStyleBuilder::new()
-                .fill_color(Rgb888::new(15, 20, 35))
-                .build();
-            let _ = Rectangle::new(Point::new(cx, content_y), Size::new(cw as u32, content_h as u32))
-                .into_styled(bg_style)
-                .draw(fb);
-
-            // 2. Check if the client has committed a valid buffer
-            if let Some(vaddr) = window.buffer_handle {
-                let raw_vaddr = vaddr as usize;
-                
-                // 3. Safety Check: Prevent the compositor from reading its own video memory
-                let is_own_fb = raw_vaddr == 0
-                    || raw_vaddr == fb.back_addr
-                    || raw_vaddr == fb.front_addr;
-                
-                if is_own_fb {
-                    // The client passed a bogus address (zero or own framebuffer).
-                    // This can happen during startup before the first valid commit.
-                    // Show the simulated terminal demo so the window is still useful.
-                    println!("[LUNAS-RENDER] WARNING: window {} has bogus vaddr={:#x}; falling back to demo", window.title_str(), raw_vaddr);
-                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
-                } else {
-                    // 4. Calculate the source dimensions based on the client's committed buffer.
-                    // client_w = window.w (pixel buffer width = buffer stride)
-                    // client_h = window.h (outer window height including title bar; used as upper
-                    //   bound — actual buffer rows = window.h - TITLE_H, but blit_h is clamped
-                    //   to content_h which is always ≤ window.h - TITLE_H, so we never read past
-                    //   the end of the buffer).
-                    let client_w = window.w;
-                    let client_h = window.h;
-
-                    // 5. Calculate how much of that buffer we can actually show right now.
-                    // This handles window resize animations where the current visible width (cw)
-                    // might be smaller than the actual buffer the client rendered (client_w).
-                    let blit_w = client_w.min(cw);
-                    let blit_h = client_h.min(content_h);
-
-                    if blit_w > 0 && blit_h > 0 {
-                        // 6. The Blit Operation
-                        // Parameters (assumed based on standard blit signatures):
-                        // fb.blit_buffer(source_address, width_to_copy, height_to_copy, source_stride, dest_x, dest_y)
-                        fb.blit_buffer(
-                            raw_vaddr, 
-                            blit_w as u32, 
-                            blit_h as u32, 
-                            client_w as u32, // Stride: the total width of the client's buffer
-                            cx, 
-                            content_y        // Dest Y: Must be below the title bar
-                        );
+    
+    if content_h > 0 {
+        match window.content {
+            WindowContent::Snp { surface_id, pid } => {
+                if let Some(surface) = snp_surfaces.get(&(pid, surface_id)) {
+                    if surface.active && surface.vaddr != 0 {
+                        let mut src_ptr = surface.vaddr as *const u32;
+                        let fb_ptr = fb.back_addr as *mut u32;
+                        let fb_stride = fb.info.width as usize;
+                        
+                        for row in 0..content_h {
+                            let dy = content_y + row;
+                            if dy < 0 || dy >= fb.info.height as i32 { continue; }
+                            
+                            let dest_idx = (dy as usize) * fb_stride + (cx as usize);
+                            let _ = unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    src_ptr,
+                                    fb_ptr.add(dest_idx),
+                                    cw as usize
+                                )
+                            };
+                            src_ptr = unsafe { src_ptr.add(cw as usize) };
+                        }
+                    } else {
+                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
                     }
+                } else {
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
                 }
-            } else {
-                // No buffer committed yet — show the simulated terminal demo
-                // as a placeholder so the window is not just a blank rectangle.
+            }
+            WindowContent::External(s_idx) => {
+                let s = s_idx as usize;
+                if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
+                    let src_w = window.w.max(0) as u32;
+                    let intended_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32).min(content_h as u32);
+                    let max_pixels = (surfaces[s].mapped_len / 4) as u32;
+                    let max_h_for_buffer = if src_w > 0 { max_pixels / src_w } else { 0 };
+                    let src_h = intended_h.min(max_h_for_buffer);
+
+                    if src_w > 0 && src_h > 0 {
+                        fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, src_w, cx, content_y);
+                    }
+                } else {
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                }
+            }
+            WindowContent::InternalDemo => {
                 draw_terminal_demo(fb, cx, content_y, cw, content_h);
             }
+            WindowContent::X11 { .. } => {
+                draw_terminal_demo(fb, cx, content_y, cw, content_h);
+            }
+            WindowContent::None => {}
         }
-        WindowContent::None => {}
     }
 
-    // Focus highlight border — colour varies with decoration style
+    // Focus highlight border
     if focused {
         let highlight_color = match decoration_style {
-            1 => Rgb888::new(100, 110, 140), // minimal: dim grey-blue
-            2 => Rgb888::new(0, 240, 220),   // neon: bright cyan
-            _ => Rgb888::new(0, 128, 255),   // default: blue
+            1 => Rgb888::new(100, 110, 140),
+            2 => Rgb888::new(0, 240, 220),
+            _ => Rgb888::new(0, 128, 255),
         };
         let highlight_style = PrimitiveStyleBuilder::new()
             .stroke_color(highlight_color)

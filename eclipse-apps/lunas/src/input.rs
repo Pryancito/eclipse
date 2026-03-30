@@ -39,8 +39,7 @@ fn push_u8_decimal(s: &mut heapless::String<64>, v: u8) {
 pub enum CompositorEvent {
     Input(InputEvent),
     SideWind(SideWindMessage, u32),
-    Wayland(heapless::Vec<u8, 512>, u32),
-    X11(heapless::Vec<u8, 512>, u32),
+    Snp(heapless::Vec<u8, 512>, u32), // SNP protocol message
     NetStats(u64, u64),
     NetExtendedStats(NetExtendedStats),
     ServiceInfo(heapless::Vec<u8, 512>),
@@ -709,7 +708,7 @@ pub struct InputState {
     pub apply_net_static: bool,
     /// Signal to state.rs to request a DHCP IP renewal via IPC.
     pub renew_dhcp: bool,
-    pub pending_wayland_key: Option<(usize, u16, u16)>,
+    pub pending_snp_key: Option<(usize, u16, u16)>,
 }
 
 impl InputState {
@@ -791,7 +790,7 @@ impl InputState {
             net_edit_buffer: heapless::String::new(),
             apply_net_static: false,
             renew_dhcp: false,
-            pending_wayland_key: None,
+            pending_snp_key: None,
         }
     }
 
@@ -1344,9 +1343,10 @@ impl InputState {
                     if let Some(focused) = self.focused_window {
                         if focused < *window_count {
                             use crate::compositor::WindowContent;
-                            if let WindowContent::Wayland { conn_idx, .. } = windows[focused].content {
+                            if let WindowContent::Snp { .. } = windows[focused].content {
                                 let state_flag = if pressed { 1 } else { 0 };
-                                self.pending_wayland_key = Some((conn_idx, scancode, state_flag));
+                                // For SNP we use the focused index as conn_idx for simplicity in state.rs search
+                                self.pending_snp_key = Some((focused, scancode, state_flag));
                             }
                         }
                     }

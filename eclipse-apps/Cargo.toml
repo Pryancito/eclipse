@@ -3,8 +3,6 @@ resolver = "2"
 members = [
     "sidewind",
     "sidewind_core",
-    "wayland_handshake",
-    "x11_bridge_test",
     "eclipse_std",
     "libs/ipc",
     "lunas",

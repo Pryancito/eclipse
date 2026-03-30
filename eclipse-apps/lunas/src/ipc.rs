@@ -92,7 +92,7 @@ impl IpcHandler {
                     self.message_count += 1;
                     let mut vec = heapless::Vec::new();
                     let _ = vec.extend_from_slice(&data[..len]);
-                    return Some(CompositorEvent::Wayland(vec, from));
+                    return Some(CompositorEvent::Snp(vec, from));
                 }
                 Some(EclipseMessage::Raw { data, len, from }) => {
                     continue;
@@ -105,10 +105,10 @@ impl IpcHandler {
         None
     }
 
-    /// Send a Wayland protocol message to a client PID.
-    pub fn send_wayland(&mut self, target_pid: u32, data: &[u8]) {
+    /// Send an SNP protocol message to a client PID.
+    pub fn send_snp(&mut self, target_pid: u32, data: &[u8]) {
         #[cfg(not(test))]
-        let _ = self.channel.send_wayland(target_pid, data);
+        let _ = self.channel.send_wayland(target_pid, data); // We still use send_wayland in libs/ipc for now as it just adds "WAYL" tag
         #[cfg(test)]
         let _ = (target_pid, data);
     }

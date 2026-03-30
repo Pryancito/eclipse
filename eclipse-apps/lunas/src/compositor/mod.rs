@@ -18,7 +18,8 @@ pub enum WindowContent {
     None,
     InternalDemo,
     External(u32),
-    Wayland { surface_id: u32, conn_idx: usize },
+    Snp { surface_id: u32, pid: u32 },
+    X11 { window_id: u32, pid: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -131,7 +132,8 @@ impl ShellWindow {
                     false
                 }
             }
-            WindowContent::Wayland { .. } => true,
+            WindowContent::Snp { .. } => true,
+            WindowContent::X11 { .. } => true,
             WindowContent::None => false,
         }
     }

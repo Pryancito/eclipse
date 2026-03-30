@@ -4,18 +4,19 @@
 use crate::backend::Backend;
 use crate::compositor::Space;
 use crate::input::{InputState, CompositorEvent};
-use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
+use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::wayland::{WaylandCompositor, XwaylandIntegration, XwaylandAction};
+use crate::protocol::{SnpCompositor, SnpAction, make_snp_window};
+use sidewind::protocol::{SnpOpcode, SnpCommand, SnpRingControl, SnpPayloadLayerCreate};
+use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE, MSG_TYPE_WAYLAND};
 use std::prelude::v1::*;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
 #[cfg(not(target_vendor = "eclipse"))]
 use eclipse_syscall::{ProcessInfo, SystemStats};
-use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use eclipse_ipc::types::NetExtendedStats;
 
 #[cfg(not(target_vendor = "eclipse"))]
@@ -76,12 +77,10 @@ pub struct LunasState {
     pub log_buf: [u8; 4096],
     pub log_len: usize,
     pub last_input_tick: u64,
-    /// Wayland compositor: manages protocol state for connected Wayland clients.
-    pub wayland: WaylandCompositor,
-    /// Native Wayland display (Mocked for Dispatch pattern)
-    pub display: sidewind::wayland_server::Display<LunasState>,
-    /// XWayland integration: manages XWayland process and X11 window state.
-    pub xwayland: XwaylandIntegration,
+    /// SNP protocol handler: manages protocol state for connected client objects.
+    pub protocol: crate::protocol::SnpCompositor,
+    /// Mapped pixel buffers for SNP surfaces, indexed by (pid, surface_id).
+    pub snp_surfaces: alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -133,9 +132,8 @@ impl LunasState {
             log_buf: [0; 4096],
             log_len: 0,
             last_input_tick: 0,
-            wayland: WaylandCompositor::new(),
-            display: sidewind::wayland_server::Display::new().expect("Failed to create Wayland display"),
-            xwayland: XwaylandIntegration::new(),
+            protocol: crate::protocol::SnpCompositor::new(),
+            snp_surfaces: alloc::collections::BTreeMap::new(),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -161,10 +159,7 @@ impl LunasState {
         // Welcome notification
         state.desktop.push_notification("Lunas Desktop initialized", 1);
 
-        // Register Wayland Globals
-        use sidewind::wayland_server::protocol::{wl_compositor, wl_shm};
-        state.display.handle().create_global::<LunasState, wl_compositor::WlCompositor, _>(1, ());
-        state.display.handle().create_global::<LunasState, wl_shm::WlShm, _>(1, ());
+        // SNP protocol is registry-less for now or handled internally
 
         Some(state)
     }
@@ -183,26 +178,15 @@ impl LunasState {
                 );
                 if dirty { self.dirty = true; }
 
-                // Dispatch pending Wayland keyboard events
-                if let Some((conn_idx, scancode, state_val)) = self.input.pending_wayland_key.take() {
-                    if conn_idx < self.wayland.connections.len() {
-                        let pid = self.wayland.connections[conn_idx].pid;
-                        let mut msg = [0u8; 16];
-                        msg[0..4].copy_from_slice(b"WAYL");
-                        unsafe {
-                            let evt = msg.as_mut_ptr().add(4) as *mut sidewind::wayland::WaylandEvtKeyboard;
-                            (*evt).header.object_id = 3;       // ID_SEAT
-                            (*evt).header.opcode = 10;  // KEYBOARD OPCODE
-                            (*evt).header.length = 12;
-                            (*evt).key = scancode;
-                            (*evt).state = state_val;
-                            let _ = eclipse_send(
-                                pid,
-                                sidewind::MSG_TYPE_WAYLAND,
-                                msg.as_ptr() as *const core::ffi::c_void,
-                                16,
-                                0,
-                            );
+                // Dispatch pending SNP keyboard events
+                if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
+                    if let Some(w_idx) = self.input.focused_window {
+                        if let WindowContent::Snp { surface_id, pid } = self.space.windows[w_idx].content {
+                             let evt = sidewind::protocol::SnpPayloadEventKey { key: scancode as u32, state: state_val as u32 };
+                             let mut cmd = SnpCommand::new(SnpOpcode::EventKey, surface_id);
+                             unsafe { cmd.set_payload(&evt); }
+                             let payload_data = cmd.payload;
+                             self.protocol.send_event(pid, surface_id, SnpOpcode::EventKey, &payload_data);
                         }
                     }
                 }
@@ -214,11 +198,12 @@ impl LunasState {
                     self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
                 }
             }
-            CompositorEvent::SideWind(msg, pid) => {
+            CompositorEvent::SideWind(msg_ref, pid_ref) => {
+                let pid_val = *pid_ref;
                 let fb_w = self.backend.fb.info.width as i32;
                 let fb_h = self.backend.fb.info.height as i32;
                 handle_sidewind_message(
-                    msg, *pid,
+                    msg_ref, pid_val,
                     &mut self.surfaces,
                     &mut self.space.windows,
                     &mut self.space.window_count,
@@ -285,186 +270,140 @@ impl LunasState {
                 
                 self.dirty = true;
             }
-            CompositorEvent::Wayland(data, pid) => {
-                let pid = *pid;
-                // NEW: Use the native protocol handler which returns high-level actions.
-                let actions = self.wayland.handle_message(data, pid);
+            CompositorEvent::Snp(ref data_vec, pid_ref) => {
+                let pid = *pid_ref;
+                let data: &[u8] = &**data_vec;
+                
+                // Check for URB bootstrap message: "URB\0<ring_name>"
+                if data.len() >= 4 && &data[0..4] == b"URB\0" {
+                    let ring_name = core::str::from_utf8(&data[4..]).unwrap_or("").trim_matches('\0');
+                    println!("[LUNAS-STATE] Bootstrap URB for pid={}: {}", pid, ring_name);
+                    
+                    let mut path = [0u8; 64];
+                    path[0..5].copy_from_slice(b"/tmp/");
+                    let name_bytes = ring_name.as_bytes();
+                    let name_len = name_bytes.len().min(32);
+                    path[5..5+name_len].copy_from_slice(&name_bytes[..name_len]);
+                    
+                    let path_str = unsafe { core::str::from_utf8_unchecked(&path[..5+name_len]) };
+                    let mut path_c = [0u8; 65];
+                    path_c[..path_str.len()].copy_from_slice(path_str.as_bytes());
+                    path_c[path_str.len()] = 0;
+
+                    let ring_fd = unsafe { eclipse_syscall::call::open(path_str, eclipse_syscall::flag::O_RDWR) };
+                    if let Ok(fd) = ring_fd {
+                        let ring_size = (core::mem::size_of::<SnpRingControl>() + 1024 * 64) as usize;
+                        let ring_vaddr = unsafe {
+                            libc::mmap(core::ptr::null_mut(), ring_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd as i32, 0)
+                        };
+                        let _ = eclipse_syscall::call::close(fd);
+                        
+                        let conn = self.protocol.get_or_create_connection(pid);
+                        conn.ring_ptr = ring_vaddr as *mut SnpRingControl;
+                        conn.commands_ptr = unsafe { ring_vaddr.add(core::mem::size_of::<SnpRingControl>()) } as *mut SnpCommand;
+                    }
+                    return;
+                }
+
+                let actions = self.protocol.handle_message(data, pid);
                 for action in actions {
-                    self.process_wayland_action(action);
+                    self.process_snp_action(action);
                 }
                 
                 // Flush pending events for the client
-                if let Some(conn) = self.wayland.connections.iter_mut().find(|c| c.pid == pid) {
+                if let Some(conn) = self.protocol.connections.iter_mut().find(|c| c.pid == pid) {
                     for event in conn.pending_events.drain(..) {
-                        self.backend.ipc.send_wayland(pid, &event);
+                        self.backend.ipc.send_snp(pid, unsafe { core::slice::from_raw_parts(&event as *const _ as *const u8, 64) });
                     }
                 }
                 
                 self.dirty = true;
             }
-        CompositorEvent::X11(data, pid) => {
-                let pid = *pid;
-                let fb_w = self.backend.fb.info.width as i32;
-                let fb_h = self.backend.fb.info.height as i32;
-                let action = self.xwayland.handle_x11_event(data, pid);
-                match action {
-                    XwaylandAction::MapWindow { window_id } => {
-                        println!("[LUNAS-STATE] XWayland MapWindow: id={:#x} from={}", window_id, pid);
-                        // Create a ShellWindow for this X11 window if there's room.
-                        if self.space.window_count < self.space.windows.len() {
-                            // Use window_id as a unique surface_id; conn_idx = 0 (XWayland slot)
-                            use crate::compositor::WindowContent;
-                            let mut title_buf = [0u8; 32];
-                            title_buf[..6].copy_from_slice(b"X11App");
-                            let win = ShellWindow {
-                                x: 80, y: ShellWindow::TITLE_H + 30,
-                                w: (fb_w / 2).max(320),
-                                h: (fb_h / 2).max(240),
-                                curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
-                                content: WindowContent::Wayland {
-                                    surface_id: window_id,
-                                    conn_idx: 0,
-                                },
-                                workspace: self.input.current_workspace,
-                                title: title_buf,
-                                ..Default::default()
-                            };
-                            let w_idx = self.space.window_count;
-                            println!("[LUNAS-STATE] Mapping X11 window to index={}", w_idx);
-                            self.space.map_window(win);
-                        }
-                        self.dirty = true;
-                    }
-                    XwaylandAction::UnmapWindow { window_id } => {
-                        use crate::compositor::WindowContent;
-                        let count = self.space.window_count;
-                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
-                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
-                        }) {
-                            self.space.windows[w_idx].minimized = true;
-                            if self.input.focused_window == Some(w_idx) {
-                                self.input.focused_window = None;
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    XwaylandAction::DestroyWindow { window_id } => {
-                        use crate::compositor::WindowContent;
-                        let count = self.space.window_count;
-                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
-                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
-                        }) {
-                            self.space.windows[w_idx].closing = true;
-                            if self.input.focused_window == Some(w_idx) {
-                                self.input.focused_window = None;
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    XwaylandAction::ConfigureWindow { window_id, x, y, width, height } => {
-                        use crate::compositor::WindowContent;
-                        let count = self.space.window_count;
-                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
-                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
-                        }) {
-                            let win = &mut self.space.windows[w_idx];
-                            if x != 0 || y != 0 {
-                                win.x = x as i32;
-                                win.y = y as i32;
-                            }
-                            if width > 0 && height > 0 {
-                                win.w = width as i32;
-                                win.h = height as i32 + crate::compositor::ShellWindow::TITLE_H;
-                            }
-                            println!("[LUNAS-STATE] XWayland ConfigureWindow: id={:#x} x={} y={} {}x{}", window_id, x, y, width, height);
-                        }
-                        self.dirty = true;
-                    }
-                    XwaylandAction::TitleChanged { window_id, title } => {
-                        use crate::compositor::WindowContent;
-                        let count = self.space.window_count;
-                        if let Some(w_idx) = self.space.windows[..count].iter().position(|w| {
-                            matches!(w.content, WindowContent::Wayland { surface_id, .. } if surface_id == window_id)
-                        }) {
-                            self.space.windows[w_idx].title = title;
-                            println!("[LUNAS-STATE] XWayland TitleChanged: id={:#x}", window_id);
-                        }
-                        self.dirty = true;
-                    }
-                    XwaylandAction::None => {
-                        self.dirty = true;
-                    }
-                }
-            }
         }
     }
 
-    /// Process a high-level action from the Wayland protocol handler.
-    pub fn process_wayland_action(&mut self, action: crate::wayland::WaylandAction) {
-        use crate::wayland::{WaylandAction, make_wayland_window};
+    /// Process a high-level action from the SNP protocol handler.
+    pub fn process_snp_action(&mut self, action: SnpAction) {
+        use crate::protocol::make_snp_window;
 
         match action {
-            WaylandAction::CreateSurface { pid, surface_id, conn_idx, width, height } => {
-                println!("[LUNAS-STATE] Wayland CreateSurface: id={} from={}", surface_id, pid);
+            SnpAction::CreateSurface { pid, surface_id, width, height, name } => {
+                println!("[LUNAS-STATE] SNP CreateSurface: id={} from={} (name: {:?})", surface_id, pid, name);
+                
+                // 1. Map the pixel buffer
+                let mut path = [0u8; 64];
+                path[0..5].copy_from_slice(b"/tmp/");
+                let n_len = name.iter().position(|&b| b == 0).unwrap_or(24);
+                path[5..5+n_len].copy_from_slice(&name[..n_len]);
+                let path_str = unsafe { core::str::from_utf8_unchecked(&path[..5+n_len]) };
+                
+                let fb_size = (width as u32 * height as u32 * 4) as usize;
+                let mut surface = ExternalSurface {
+                    id: surface_id,
+                    pid,
+                    vaddr: 0,
+                    buffer_size: fb_size,
+                    mapped_len: fb_size,
+                    active: false,
+                    ready_to_flip: false,
+                };
+                
+                if let Ok(fd) = unsafe { eclipse_syscall::call::open(path_str, eclipse_syscall::flag::O_RDWR) } {
+                    let vaddr = unsafe {
+                        libc::mmap(core::ptr::null_mut(), fb_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd as i32, 0)
+                    };
+                    let _ = eclipse_syscall::call::close(fd);
+                    
+                    if !vaddr.is_null() && vaddr != (-1isize as *mut ::core::ffi::c_void) {
+                        surface.vaddr = vaddr as usize;
+                        surface.active = true;
+                        surface.ready_to_flip = true;
+                        self.snp_surfaces.insert((pid, surface_id), surface);
+                    }
+                }
+
+                // 2. Create the window
                 if self.space.window_count < self.space.windows.len() {
-                    let win = make_wayland_window(
+                    let mut win = make_snp_window(
                         surface_id,
-                        conn_idx,
-                        width as i32,
-                        height as i32,
+                        self.backend.fb.info.width as i32,
+                        self.backend.fb.info.height as i32,
                         self.input.current_workspace,
-                        b"WaylandApp"
+                        b"Terminal"
                     );
-                    let w_idx = self.space.window_count;
+                    win.content = WindowContent::Snp { surface_id, pid };
                     self.space.map_window(win);
-                    self.wayland.register_surface_window(pid, surface_id, w_idx);
+                    self.dirty = true;
                 }
             }
-            WaylandAction::CommitFrame { pid, surface_id, vaddr, .. } => {
-                // Legacy EDP commit: if we have a window for this surface, mark it for repaint.
-                if let Some(w_idx) = self.wayland.connections.iter()
-                    .find(|c| c.pid == pid)
-                    .and_then(|c| c.window_for_surface(surface_id))
-                {
-                    if w_idx < self.space.window_count {
-                        self.space.windows[w_idx].buffer_handle = Some(vaddr as u64);
-                        self.dirty = true;
-                    }
+            SnpAction::CommitSurface { pid, surface_id, fence } => {
+                if let Some(w_idx) = self.space.windows[..self.space.window_count].iter().position(|w| {
+                    matches!(w.content, WindowContent::Snp { surface_id: id, pid: p } if id == surface_id && p == pid)
+                }) {
+                    // In a real system, we'd check the fence value here for synchronization
+                    let _ = fence;
+                    self.dirty = true;
                 }
             }
-            WaylandAction::AttachBuffer { pid, surface_id, vaddr, .. } => {
-                println!("[LUNAS-STATE] Wayland Attach: surface={} vaddr={:#x} from={}", surface_id, vaddr, pid);
-                if let Some(w_idx) = self.wayland.connections.iter()
-                    .find(|c| c.pid == pid)
-                    .and_then(|c| c.window_for_surface(surface_id))
-                {
-                    if w_idx < self.space.window_count {
-                        self.space.windows[w_idx].buffer_handle = Some(vaddr as u64);
-                    }
+            SnpAction::SetTitle { pid, surface_id, title } => {
+                if let Some(w_idx) = self.space.windows[..self.space.window_count].iter().position(|w| {
+                    matches!(w.content, WindowContent::Snp { surface_id: id, pid: p } if id == surface_id && p == pid)
+                }) {
+                    self.space.windows[w_idx].title = title;
                 }
             }
-            WaylandAction::CommitSurface { pid, surface_id } => {
-                // Standard wl_surface.commit: trigger redraw of correctly mapped windows.
-                if let Some(w_idx) = self.wayland.connections.iter()
-                    .find(|c| c.pid == pid)
-                    .and_then(|c| c.window_for_surface(surface_id))
-                {
-                    if w_idx < self.space.window_count {
-                        self.dirty = true;
-                    }
+            SnpAction::SurfaceDestroy { pid, surface_id } => {
+                if let Some(w_idx) = self.space.windows[..self.space.window_count].iter().position(|w| {
+                    matches!(w.content, WindowContent::Snp { surface_id: id, pid: p } if id == surface_id && p == pid)
+                }) {
+                    self.space.windows[w_idx].closing = true;
                 }
             }
-            WaylandAction::SetTitle { pid, surface_id, title } => {
-                if let Some(w_idx) = self.wayland.connections.iter()
-                    .find(|c| c.pid == pid)
-                    .and_then(|c| c.window_for_surface(surface_id))
-                {
-                    if w_idx < self.space.window_count {
-                        self.space.windows[w_idx].title = title;
-                    }
-                }
+            SnpAction::AttachBuffer { .. } => {
+                // Buffer attaches are handled implicitly by the shared memory ring
+                // for now, but we could track them here for resource accounting.
             }
-            _ => {}
+            SnpAction::None => {}
         }
     }
 
@@ -485,35 +424,17 @@ impl LunasState {
             }
         }
 
-        // Send any pending Wayland responses back to clients
-        self.flush_wayland_responses();
+        // Flush any pending SNP responses back to clients
+        self.flush_snp_responses();
     }
 
-    /// Flush pending Wayland protocol messages back to their respective clients.
-    pub fn flush_wayland_responses(&mut self) {
-        use sidewind::MSG_TYPE_WAYLAND;
-        use eclipse_ipc::types::TAG_WAYL;
-        
-        // Take the responses out of the wayland state to avoid borrow conflicts
-        let responses = core::mem::take(&mut self.wayland.pending_responses);
-        for (pid, data) in responses {
-            if !data.is_empty() {
-                // Prepend "WAYL" tag to the payload as expected by the terminal client
-                let mut full_msg = [0u8; 512];
-                full_msg[0..4].copy_from_slice(TAG_WAYL);
-                let copy_len = data.len().min(512 - 4);
-                full_msg[4..4 + copy_len].copy_from_slice(&data[..copy_len]);
-                
-                unsafe {
-                    println!("[LUNAS-WAYL] Flushing {} bytes to PID {}", 4 + copy_len, pid);
-                    let _ = eclipse_send(
-                        pid,
-                        MSG_TYPE_WAYLAND,
-                        full_msg.as_ptr() as *const core::ffi::c_void,
-                        4 + copy_len,
-                        0,
-                    );
-                }
+    /// Flush pending SNP protocol messages back to their respective clients.
+    pub fn flush_snp_responses(&mut self) {
+        // Responses are already queued in connections by send_event
+        for conn in self.protocol.connections.iter_mut() {
+            let pid = conn.pid;
+            for event in conn.pending_events.drain(..) {
+                self.backend.ipc.send_snp(pid, unsafe { core::slice::from_raw_parts(&event as *const _ as *const u8, 64) });
             }
         }
     }
@@ -521,6 +442,12 @@ impl LunasState {
     /// Update animations, metrics, and layout. Returns true if rendering is needed.
     pub fn update(&mut self) -> bool {
         self.counter += 1;
+
+        // Poll all active SNP rings (URB)
+        let ring_actions = self.protocol.poll_active_rings();
+        for action in ring_actions {
+            self.process_snp_action(action);
+        }
 
         // Update window animations
         let animating = self.space.update_animations(&mut self.surfaces);
@@ -1167,6 +1094,7 @@ impl LunasState {
             &self.net_history,
             self.history_pos,
             self.cpu_temp,
+            &self.snp_surfaces,
         );
         self.backend.swap_buffers();
     }
@@ -1532,6 +1460,42 @@ mod tests {
     }
 
     #[test]
+    fn test_snp_v2_urb_polling() {
+        use sidewind::protocol::{SnpCommand, SnpOpcode, SnpRingControl, SnpPayloadLayerCreate};
+        let mut state = LunasState::new().expect("init");
+        let pid = 1234;
+        let conn = state.protocol.get_or_create_connection(pid);
+        
+        let mut ring_control = SnpRingControl { head: 0, tail: 0, size: 8, padding: 0 };
+        let mut commands = [SnpCommand::default(); 8];
+        
+        // Prepare a LayerCreate command
+        let mut cmd = SnpCommand::new(SnpOpcode::LayerCreate, 101);
+        let payload = SnpPayloadLayerCreate {
+            width: 800, height: 600, format: 0,
+            name: [0; 24],
+        };
+        unsafe { cmd.set_payload(&payload); }
+        
+        commands[0] = cmd;
+        ring_control.tail = 1;
+        
+        conn.ring_ptr = &mut ring_control;
+        conn.commands_ptr = commands.as_mut_ptr();
+        
+        // This should trigger the creation of a window
+        state.update();
+        
+        assert_eq!(state.space.window_count, 1);
+        if let WindowContent::Snp { surface_id, pid: p } = state.space.windows[0].content {
+            assert_eq!(surface_id, 101);
+            assert_eq!(p, pid);
+        } else {
+            panic!("Expected SNP window content");
+        }
+    }
+    
+    #[test]
     fn test_context_action_cycle_wallpaper() {
         use crate::input::ContextAction;
         use crate::desktop::WallpaperMode;
@@ -1637,100 +1601,16 @@ mod tests {
     }
 
     #[test]
-    fn test_wayland_compositor_initialized() {
+    fn test_snp_protocol_initialized() {
         let state = LunasState::new().expect("init");
-        assert!(state.wayland.connections.is_empty(), "no wayland connections at startup");
-        assert!(!state.xwayland.is_active(), "xwayland not active at startup");
+        assert!(state.protocol.connections.is_empty(), "no SNP connections at startup");
     }
 
-    #[test]
-    fn test_handle_event_wayland_create_surface() {
-        let mut state = LunasState::new().expect("init");
-        assert_eq!(state.space.window_count, 0);
 
-        // Simulate wl_compositor.create_surface: obj=4, opcode=0, new_id=5
-        let mut msg = heapless::Vec::<u8, 512>::new();
-        let _ = msg.extend_from_slice(&4u32.to_le_bytes()); // obj_id (compositor)
-        let _ = msg.extend_from_slice(&((12u32 << 16) | 0u32).to_le_bytes()); // size=12, op=0
-        let _ = msg.extend_from_slice(&5u32.to_le_bytes()); // new surface id
 
-        state.handle_event(&CompositorEvent::Wayland(msg, 42));
-        // A new ShellWindow should have been created for the Wayland surface.
-        assert_eq!(state.space.window_count, 1);
-        assert!(matches!(
-            state.space.windows[0].content,
-            WindowContent::Wayland { surface_id: 5, .. }
-        ));
-    }
 
-    #[test]
-    fn test_handle_event_wayland_commit_surface() {
-        let mut state = LunasState::new().expect("init");
 
-        // First create a surface
-        let mut msg = heapless::Vec::<u8, 512>::new();
-        let _ = msg.extend_from_slice(&4u32.to_le_bytes());
-        let _ = msg.extend_from_slice(&((12u32 << 16) | 0u32).to_le_bytes());
-        let _ = msg.extend_from_slice(&7u32.to_le_bytes());
-        state.handle_event(&CompositorEvent::Wayland(msg, 42));
-        assert_eq!(state.space.window_count, 1);
 
-        // Minimize the window manually
-        state.space.windows[0].minimized = true;
-
-        // Commit the surface — should restore it
-        let mut commit_msg = heapless::Vec::<u8, 512>::new();
-        let _ = commit_msg.extend_from_slice(&7u32.to_le_bytes()); // obj_id = surface
-        let _ = commit_msg.extend_from_slice(&((8u32 << 16) | 6u32).to_le_bytes()); // op=6 commit
-        state.handle_event(&CompositorEvent::Wayland(commit_msg, 42));
-        assert!(!state.space.windows[0].minimized, "commit should restore window");
-    }
-
-    #[test]
-    fn test_handle_event_x11_map_window() {
-        let mut state = LunasState::new().expect("init");
-        assert_eq!(state.space.window_count, 0);
-
-        // Simulate X11 MapNotify event (type=19, window_id=77)
-        let mut ev = heapless::Vec::<u8, 512>::new();
-        let mut buf = [0u8; 32];
-        buf[0] = 19; // MapNotify
-        buf[4..8].copy_from_slice(&77u32.to_le_bytes());
-        let _ = ev.extend_from_slice(&buf);
-        state.xwayland.set_pid(55);
-        state.handle_event(&CompositorEvent::X11(ev, 55));
-
-        assert_eq!(state.space.window_count, 1, "X11 MapNotify should create a window");
-        assert!(matches!(
-            state.space.windows[0].content,
-            WindowContent::Wayland { surface_id: 77, .. }
-        ));
-    }
-
-    #[test]
-    fn test_handle_event_x11_destroy_window() {
-        use crate::compositor::WindowContent;
-        let mut state = LunasState::new().expect("init");
-        state.xwayland.set_pid(55);
-
-        // Map a window first
-        let mut map_ev = heapless::Vec::<u8, 512>::new();
-        let mut map_buf = [0u8; 32];
-        map_buf[0] = 19;
-        map_buf[4..8].copy_from_slice(&10u32.to_le_bytes());
-        let _ = map_ev.extend_from_slice(&map_buf);
-        state.handle_event(&CompositorEvent::X11(map_ev, 55));
-        assert_eq!(state.space.window_count, 1);
-
-        // Now destroy it
-        let mut destroy_ev = heapless::Vec::<u8, 512>::new();
-        let mut destroy_buf = [0u8; 32];
-        destroy_buf[0] = 17; // DestroyNotify
-        destroy_buf[4..8].copy_from_slice(&10u32.to_le_bytes());
-        let _ = destroy_ev.extend_from_slice(&destroy_buf);
-        state.handle_event(&CompositorEvent::X11(destroy_ev, 55));
-        assert!(state.space.windows[0].closing, "DestroyNotify should mark window as closing");
-    }
 
     #[test]
     fn test_pinned_app_names_synced_at_init() {
@@ -2035,90 +1915,4 @@ mod tests {
         assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
     }
 
-    #[test]
-    fn test_wayland_handshake_integration() {
-        let mut state = LunasState::new().expect("state");
-        let pid = 200u32;
-        let registry_id = 123u32;
-        
-        let mut msg_data = [0u8; 12];
-        msg_data[0..4].copy_from_slice(&1u32.to_le_bytes()); // display
-        msg_data[4..8].copy_from_slice(&((12u32 << 16) | 1u32).to_le_bytes()); // get_registry
-        msg_data[8..12].copy_from_slice(&registry_id.to_le_bytes()); 
-        
-        let mut wayl_vec = heapless::Vec::new();
-        let _ = wayl_vec.extend_from_slice(&msg_data);
-        let event = crate::input::CompositorEvent::Wayland(wayl_vec, pid);
-        
-        state.handle_event(&event);
-        
-        let conn = state.wayland.connections.iter().find(|c| c.pid == pid).expect("connection");
-        assert_eq!(conn.registry_id, Some(registry_id));
-    }
-
-    /// X11 ConfigureNotify should move/resize the corresponding compositor window.
-    #[test]
-    fn test_handle_event_x11_configure_window() {
-        use crate::compositor::WindowContent;
-        let mut state = LunasState::new().expect("init");
-        state.xwayland.set_pid(55);
-
-        // Map a window first
-        let mut map_ev = heapless::Vec::<u8, 512>::new();
-        let mut map_buf = [0u8; 32];
-        map_buf[0] = 19;
-        map_buf[4..8].copy_from_slice(&0xBBu32.to_le_bytes());
-        let _ = map_ev.extend_from_slice(&map_buf);
-        state.handle_event(&CompositorEvent::X11(map_ev, 55));
-        assert_eq!(state.space.window_count, 1);
-
-        // Send ConfigureNotify: x=50, y=60, w=640, h=480
-        let mut cfg_ev = heapless::Vec::<u8, 512>::new();
-        let mut cfg_buf = [0u8; 16];
-        cfg_buf[0] = 22; // ConfigureNotify
-        cfg_buf[4..8].copy_from_slice(&0xBBu32.to_le_bytes()); // window_id
-        cfg_buf[8..10].copy_from_slice(&50i16.to_le_bytes());   // x
-        cfg_buf[10..12].copy_from_slice(&60i16.to_le_bytes());  // y
-        cfg_buf[12..14].copy_from_slice(&640u16.to_le_bytes()); // width
-        cfg_buf[14..16].copy_from_slice(&480u16.to_le_bytes()); // height
-        let _ = cfg_ev.extend_from_slice(&cfg_buf);
-        state.handle_event(&CompositorEvent::X11(cfg_ev, 55));
-
-        let win = &state.space.windows[0];
-        assert_eq!(win.x, 50, "window x updated by ConfigureNotify");
-        assert_eq!(win.y, 60, "window y updated by ConfigureNotify");
-        assert_eq!(win.w, 640, "window width updated by ConfigureNotify");
-    }
-
-    /// X11 PropertyNotify should update the title of the corresponding compositor window.
-    #[test]
-    fn test_handle_event_x11_title_changed() {
-        let mut state = LunasState::new().expect("init");
-        state.xwayland.set_pid(55);
-
-        // Map a window
-        let mut map_ev = heapless::Vec::<u8, 512>::new();
-        let mut map_buf = [0u8; 32];
-        map_buf[0] = 19;
-        map_buf[4..8].copy_from_slice(&0xCCu32.to_le_bytes());
-        let _ = map_ev.extend_from_slice(&map_buf);
-        state.handle_event(&CompositorEvent::X11(map_ev, 55));
-        assert_eq!(state.space.window_count, 1);
-
-        // Send PropertyNotify with title "Hello"
-        let atom = 1u32.to_le_bytes();
-        let title_bytes = b"Hello\0";
-        let mut prop_buf = alloc::vec![0u8; 12 + 4 + title_bytes.len()];
-        prop_buf[0] = 28; // PropertyNotify
-        prop_buf[4..8].copy_from_slice(&0xCCu32.to_le_bytes()); // window_id
-        prop_buf[8..12].copy_from_slice(&atom);                  // atom
-        prop_buf[12..12 + title_bytes.len()].copy_from_slice(title_bytes);
-        let mut prop_ev = heapless::Vec::<u8, 512>::new();
-        let _ = prop_ev.extend_from_slice(&prop_buf);
-        state.handle_event(&CompositorEvent::X11(prop_ev, 55));
-
-        let title = &state.space.windows[0].title;
-        let end = title.iter().position(|&b| b == 0).unwrap_or(32);
-        assert_eq!(&title[..end], b"Hello", "window title updated by PropertyNotify");
-    }
 }

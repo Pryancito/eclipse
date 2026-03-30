@@ -1270,6 +1270,31 @@ impl Scheme for FileSystemScheme {
         Ok(new_offset as usize)
     }
 
+    fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
+        // Resize the in-memory content vector for virtual /tmp files so that
+        // subsequent fmap() calls return a non-empty physical address, enabling
+        // true MAP_SHARED cross-process shared memory for the SideWind compositor
+        // protocol. Without this, the terminal's framebuffer remains 0 bytes
+        // and fmap() returns EINVAL, causing every mmap(MAP_SHARED) to fall back
+        // to private anonymous frames that are invisible to other processes.
+        let open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        match open_file {
+            OpenFile::Virtual { path, .. } => {
+                let path_clone = path.clone();
+                drop(open_files);
+                let mut vtmp = VIRTUAL_TMP.lock();
+                if let Some(content) = vtmp.get_mut(&path_clone) {
+                    content.resize(len, 0);
+                    Ok(0)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            }
+            _ => Err(scheme_error::ENOSYS),
+        }
+    }
+
     fn close(&self, id: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         if let Some(slot) = open_files.get_mut(id) {

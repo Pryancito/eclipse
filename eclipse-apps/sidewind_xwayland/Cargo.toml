@@ -1,8 +1,0 @@
-[package]
-name = "sidewind-xwayland"
-version = "0.2.0"
-edition = "2021"
-
-[dependencies]
-eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false }
-# We'll use core/alloc as usual

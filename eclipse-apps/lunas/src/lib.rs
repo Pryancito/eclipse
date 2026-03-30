@@ -29,7 +29,7 @@ pub mod render;
 pub mod state;
 pub mod assets;
 pub mod style_engine;
-pub mod wayland;
+pub mod protocol;
 pub mod widgets;
 
 #[cfg(target_vendor = "eclipse")]
