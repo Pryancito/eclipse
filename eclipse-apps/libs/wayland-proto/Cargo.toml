@@ -1,0 +1,18 @@
+[package]
+name = "wayland-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# SmallVec is used for small numbers of arguments in messages
+smallvec = { version = "1.11", default-features = false, features = ["union"] }
+# Heapless can be useful for fixed-size buffers, but kazari uses alloc
+# We'll use alloc# No-std heapless structures for event handling
+heapless = "0.8"
+
+# Eclipse OS internal libraries (no `eclipse_std` aquí: evita dos `std` al usar este crate desde Lunas en Linux).
+eclipse_ipc = { path = "../../libs/ipc" }
+eclipse-syscall = { path = "../../../eclipse-syscall" }
+
+[features]
+default = []

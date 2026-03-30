@@ -218,7 +218,7 @@ build_sidewind_project() {
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
-        local BINS="smithay_app demo_client lunas sh xfwl4"
+        local BINS="smithay_app demo_client lunas sh terminal glxgears"
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
@@ -230,12 +230,12 @@ build_sidewind_project() {
             fi
         done
 
-        # terminal: el crate se llama terminal-wb; en sysroot debe existir como 'terminal'
-        if [ -f "$_sw_rel/terminal-wb" ]; then
-            cp "$_sw_rel/terminal-wb" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
-            print_status "Instalado en sysroot: /usr/bin/terminal (desde terminal-wb)"
+        # terminal: el crate se llama terminal; en sysroot debe existir como 'terminal'
+        if [ -f "$_sw_rel/terminal" ]; then
+            cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
+            print_status "Instalado en sysroot: /usr/bin/terminal (desde terminal)"
             if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                cp "$_sw_rel/terminal-wb" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
+                cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
             fi
         elif [ -f "$_sw_rel/terminal" ]; then
             cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"

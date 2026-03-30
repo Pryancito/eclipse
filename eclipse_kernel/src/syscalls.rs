@@ -57,6 +57,7 @@ pub enum SyscallNumber {
     Wait = 61,
     Kill = 62,
     Ftruncate = 77,
+    Rename = 82,
     Mkdir = 83,
     Unlink = 87,
     Getppid = 110,
@@ -104,6 +105,8 @@ pub enum SyscallNumber {
     RegisterLogHud = 534,
     SetTime = 535,
     SpawnWithStdio = 536,
+    ThreadCreate = 537,
+    WaitPid = 538,
     ReceiveFast = 600,
 }
 
@@ -280,6 +283,7 @@ pub extern "C" fn syscall_handler(
         61 => sys_wait(arg1),
         62 => sys_kill(arg1),
         77 => sys_ftruncate(arg1, arg2),
+        82 => sys_rename(arg1, arg2),
         83 => sys_mkdir(arg1, arg2),
         87 => sys_unlink(arg1),
         110 => sys_getppid(),
@@ -328,6 +332,8 @@ pub extern "C" fn syscall_handler(
         534 => sys_register_log_hud(arg1),
         535 => sys_set_time(arg1),
         536 => sys_spawn_with_stdio(arg1, arg2, arg3, arg4, arg5, arg6),
+        537 => sys_thread_create(arg1, arg2, arg3),
+        538 => sys_wait_pid(arg1, arg2),
         600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
@@ -825,6 +831,17 @@ fn strlen_user_unique(path_ptr: u64, max_len: usize) -> u64 {
         }
     }
     max_len as u64
+}
+
+/// Rutas absolutas de usuario (`/…`) → `file:…`; `/dev/…` → `dev:…`.
+fn user_path_to_scheme_path(path_str: &str) -> String {
+    if path_str.starts_with("/dev/") {
+        format!("dev:{}", path_str.trim_start_matches("/dev/"))
+    } else if path_str.starts_with('/') {
+        format!("file:{}", path_str)
+    } else {
+        String::from(path_str)
+    }
 }
 
 /// Translate Linux x86_64 syscall ABI to Eclipse numbers (for static glibc binaries like Xfbdev).
@@ -1502,13 +1519,21 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
 /// arg1: pointer to status variable (or 0 for non-blocking poll / WNOHANG semantics)
 /// Returns: PID of terminated child, or -1 on error
 fn sys_wait(status_ptr: u64) -> u64 {
+    sys_wait_impl(status_ptr, 0)
+}
+
+/// Esperar hijo concreto (`wait_pid == 0` → cualquier hijo).
+fn sys_wait_pid(status_ptr: u64, wait_pid: u64) -> u64 {
+    sys_wait_impl(status_ptr, wait_pid)
+}
+
+fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
     use crate::process;
-    
+
     let mut stats = SYSCALL_STATS.lock();
     stats.wait_calls += 1;
     drop(stats);
-    
-    // Get current process ID
+
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
         None => {
@@ -1516,69 +1541,71 @@ fn sys_wait(status_ptr: u64) -> u64 {
             return u64::MAX;
         }
     };
-    
-    // Look for terminated child processes
-    loop {
-        let mut has_children = false;
-        let processes = process::list_processes();
-        
-        for (pid, state) in processes.iter() {
-            if *pid == 0 {
-                continue;
-            }
-            
-            if let Some(mut proc) = process::get_process(*pid) {
-                if proc.parent_pid == Some(current_pid) {
-                    has_children = true;
-                    if state == &process::ProcessState::Terminated {
-                        // Reap the child: clear parent_pid so wait() does not return
-                        // the same terminated child on subsequent calls.  Without this,
-                        // the caller (e.g. init's reap_zombies) would busy-loop forever
-                        // re-receiving the same PID.
-                        // Note: full resource cleanup (kernel stack, page tables, FDs)
-                        // is deferred; the process entry stays as Terminated in the table.
 
-                        // Write the child's exit status to *status_ptr using the standard
-                        // WEXITSTATUS encoding expected by POSIX wait(): the exit code
-                        // occupies bits [15:8] (i.e. exit_code << 8); bits [7:0] are 0
-                        // to indicate normal termination (not a signal).
-                        // Use write_unaligned to tolerate potentially unaligned status_ptr.
+    loop {
+        if wait_pid != 0 {
+            let wp = wait_pid as process::ProcessId;
+            match process::get_process(wp) {
+                Some(mut proc) if proc.parent_pid == Some(current_pid) => {
+                    if proc.state == process::ProcessState::Terminated {
                         if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                             let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
-                            unsafe { core::ptr::write_unaligned(status_ptr as *mut u32, wait_status); }
+                            unsafe {
+                                core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                            }
                         }
-
-                        // Ensure we are removed from the wait-waiter table before returning.
                         process::unregister_child_waiter(current_pid);
                         proc.parent_pid = None;
-                        process::update_process(*pid, proc);
-                        return *pid as u64;
+                        process::update_process(wp, proc);
+                        return wp as u64;
+                    }
+                }
+                _ => {
+                    process::unregister_child_waiter(current_pid);
+                    return u64::MAX;
+                }
+            }
+        } else {
+            let mut has_children = false;
+            let processes = process::list_processes();
+
+            for (pid, state) in processes.iter() {
+                if *pid == 0 {
+                    continue;
+                }
+
+                if let Some(mut proc) = process::get_process(*pid) {
+                    if proc.parent_pid == Some(current_pid) {
+                        has_children = true;
+                        if state == &process::ProcessState::Terminated {
+                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
+                                unsafe {
+                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                }
+                            }
+
+                            process::unregister_child_waiter(current_pid);
+                            proc.parent_pid = None;
+                            process::update_process(*pid, proc);
+                            return *pid as u64;
+                        }
                     }
                 }
             }
-        }
-        
-        if !has_children {
-            process::unregister_child_waiter(current_pid);
-            return u64::MAX; // -1 indicates no children (ECHILD)
+
+            if !has_children {
+                process::unregister_child_waiter(current_pid);
+                return u64::MAX;
+            }
         }
 
-        // When status_ptr == 0 the caller wants a non-blocking poll (WNOHANG semantics).
-        // Return immediately so init's main loop can keep servicing IPC requests.
         if status_ptr == 0 {
             return u64::MAX;
         }
 
-        // Block the parent process properly instead of spinning.
-        // register_child_waiter() must be called before marking as Blocked to avoid a race
-        // where the child exits between the list_processes() scan and the block.  Since
-        // exit_process() uses wake_parent_from_wait() which checks the waiter table, if the
-        // child exits just after we register but before we block, wake_parent_from_wait()
-        // will still set the state back to Ready before we enter Blocked state.
         process::register_child_waiter(current_pid);
 
-        // Mark the parent as Blocked so the scheduler will not re-schedule it
-        // until a child exits and calls wake_parent_from_wait().
         x86_64::instructions::interrupts::without_interrupts(|| {
             let slot = crate::ipc::pid_to_slot_fast(current_pid);
             let mut table = process::PROCESS_TABLE.lock();
@@ -1591,11 +1618,7 @@ fn sys_wait(status_ptr: u64) -> u64 {
             }
         });
 
-        // Yield: since state is Blocked, the scheduler will switch away and
-        // not re-schedule this process until exit_process() wakes us.
         crate::scheduler::yield_cpu();
-        // When we resume here, a child has exited (or a spurious wake occurred).
-        // Loop back to re-scan the process table.
     }
 }
 
@@ -2679,8 +2702,77 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
                 crate::scheduler::enqueue_process(tid);
                 return tid as u64;
             }
-            
-            return tid as u64;
+        }
+    }
+
+    u64::MAX
+}
+
+/// sys_thread_create — nuevo hilo (comparte VM del padre), primera ejecución en `entry` con **rdi** = `arg`.
+fn sys_thread_create(stack_top: u64, entry: u64, arg: u64) -> u64 {
+    use crate::process;
+
+    if stack_top < 0x1000 || entry < 0x1000 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(stack_top.saturating_sub(8), 8) {
+        return u64::MAX;
+    }
+    if !is_user_pointer(entry, 1) {
+        return u64::MAX;
+    }
+    if arg != 0 && !is_user_pointer(arg, 8) {
+        return u64::MAX;
+    }
+
+    if let Some(parent_pid) = process::current_process_id() {
+        if let Some(parent) = process::get_process(parent_pid) {
+            let resources = Arc::clone(&parent.resources);
+            let mut thread = process::Process::new(resources);
+            let tid = process::next_pid();
+            thread.id = tid;
+            thread.state = process::ProcessState::Ready;
+            thread.priority = parent.priority;
+            thread.time_slice = parent.time_slice;
+            thread.parent_pid = Some(parent_pid);
+            thread.fs_base = parent.fs_base;
+            thread.is_linux = parent.is_linux;
+
+            thread.context = parent.context;
+            thread.context.rip = entry;
+            thread.context.rdi = arg;
+            thread.context.rsp = stack_top;
+            thread.context.rax = 0;
+
+            let kstack_size = 32768u32;
+            let kstack = alloc::vec![0u8; kstack_size as usize];
+            let kstack_top = kstack.as_ptr() as u64 + u64::from(kstack_size);
+            core::mem::forget(kstack);
+            thread.kernel_stack_top = kstack_top & !0xF;
+
+            let mut success = false;
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut table = process::PROCESS_TABLE.lock();
+                for (slot_idx, slot) in table.iter_mut().enumerate() {
+                    if slot.is_none()
+                        || matches!(
+                            slot,
+                            Some(ref p) if p.state == process::ProcessState::Terminated
+                                && p.current_cpu == process::NO_CPU
+                        )
+                    {
+                        *slot = Some(thread);
+                        crate::ipc::register_pid_slot(tid, slot_idx);
+                        success = true;
+                        break;
+                    }
+                }
+            });
+
+            if success {
+                crate::scheduler::enqueue_process(tid);
+                return tid as u64;
+            }
         }
     }
 
@@ -3287,12 +3379,8 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
         Err(_) => return u64::MAX,
     };
 
-    // For now, we only support simple path lookup (ignoring dirfd if relative)
-    // In our RAM FS, everything is relative to root anyway if it starts with /
-    // Or relative to current dir? 
-    // We'll just use scheme::open but with O_STAT or similar if we had it.
-    // Instead, let's just use scheme::fstat on the path.
-    if let Ok((scheme_id, resource_id)) = crate::scheme::open(path_str, 0, 0) {
+    let scheme_path = user_path_to_scheme_path(path_str);
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
         let mut stat = crate::scheme::Stat::default();
         let res = if crate::scheme::fstat(scheme_id, resource_id, &mut stat).is_ok() {
             unsafe {
@@ -3326,8 +3414,9 @@ fn sys_mkdir(path_ptr: u64, mode: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    
-    match crate::scheme::mkdir(path_str, mode as u32) {
+
+    let scheme_path = user_path_to_scheme_path(path_str);
+    match crate::scheme::mkdir(&scheme_path, mode as u32) {
         Ok(_) => 0,
         Err(_) => u64::MAX,
     }
@@ -3349,8 +3438,43 @@ fn sys_unlink(path_ptr: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    
-    match crate::scheme::unlink(path_str) {
+
+    let scheme_path = user_path_to_scheme_path(path_str);
+    match crate::scheme::unlink(&scheme_path) {
+        Ok(_) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// sys_rename - Renombra ruta (solo soportado en esquemas que implementen `rename`, p.ej. tmp en file:).
+fn sys_rename(old_ptr: u64, new_ptr: u64) -> u64 {
+    let old_len = strlen_user_unique(old_ptr, MAX_PATH_LENGTH);
+    let new_len = strlen_user_unique(new_ptr, MAX_PATH_LENGTH);
+    if old_len == 0 || new_len == 0 {
+        return u64::MAX;
+    }
+    if old_len >= MAX_PATH_LENGTH as u64 || new_len >= MAX_PATH_LENGTH as u64 {
+        return u64::MAX;
+    }
+
+    let mut old_buf = [0u8; MAX_PATH_LENGTH];
+    let mut new_buf = [0u8; MAX_PATH_LENGTH];
+    unsafe {
+        core::ptr::copy_nonoverlapping(old_ptr as *const u8, old_buf.as_mut_ptr(), old_len as usize);
+        core::ptr::copy_nonoverlapping(new_ptr as *const u8, new_buf.as_mut_ptr(), new_len as usize);
+    }
+    let old_str = match core::str::from_utf8(&old_buf[0..old_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let new_str = match core::str::from_utf8(&new_buf[0..new_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    let old_scheme = user_path_to_scheme_path(old_str);
+    let new_scheme = user_path_to_scheme_path(new_str);
+    match crate::scheme::rename(&old_scheme, &new_scheme) {
         Ok(_) => 0,
         Err(_) => u64::MAX,
     }

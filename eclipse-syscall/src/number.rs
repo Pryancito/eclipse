@@ -36,6 +36,8 @@ pub const SYS_EXIT: usize = 60;
 pub const SYS_WAIT: usize = 61;
 pub const SYS_KILL: usize = 62;
 pub const SYS_FTRUNCATE: usize = 77;
+/// rename(oldpath, newpath) — mismos argumentos que Linux x86-64 (punteros a C-strings).
+pub const SYS_RENAME: usize = 82;
 pub const SYS_MKDIR: usize = 83;
 pub const SYS_UNLINK: usize = 87;
 pub const SYS_GETPPID: usize = 110;
@@ -83,5 +85,9 @@ pub const SYS_SCHED_SETAFFINITY: usize = 533;
 pub const SYS_REGISTER_LOG_HUD: usize = 534;
 pub const SYS_SET_TIME: usize = 535;
 pub const SYS_SPAWN_WITH_STDIO: usize = 536;
+/// Crear hilo de usuario: (stack_top alineado, entry rip, arg en rdi). Eclipse específico.
+pub const SYS_THREAD_CREATE: usize = 537;
+/// Esperar hijo: (status_ptr, wait_pid) — wait_pid == 0 equivale a cualquier hijo.
+pub const SYS_WAIT_PID: usize = 538;
 
 pub const SYS_RECEIVE_FAST: usize = 600;

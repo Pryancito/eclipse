@@ -1,7 +1,20 @@
 //! High-level, type-safe syscall wrappers
-use crate::error::{cvt, cvt_unit, Result};
+use crate::error::{cvt, cvt_unit, Error, Result};
 use crate::number::*;
 use crate::arch::*;
+
+/// Longitud máxima de ruta en userspace (el kernel usa `MAX_PATH_LENGTH` 1024 y lee hasta NUL).
+const MAX_USER_PATH: usize = 1023;
+
+#[inline]
+fn path_to_nul_stack(path: &str, buf: &mut [u8; 1024]) -> Result<*const u8> {
+    if path.len() > MAX_USER_PATH {
+        return Err(Error::new(crate::error::EINVAL));
+    }
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    buf[path.len()] = 0;
+    Ok(buf.as_ptr())
+}
 
 /// Write to a file descriptor
 pub fn write(fd: usize, buf: &[u8]) -> Result<usize> {
@@ -20,14 +33,9 @@ pub fn close(fd: usize) -> Result<()> {
 
 /// Open a path with raw string and flags
 pub fn open(path: &str, flags: usize) -> Result<usize> {
-    unsafe {
-        cvt(syscall3(
-            SYS_OPEN,
-            path.as_ptr() as usize,
-            flags,
-            0, // mode (optional in Linux/Eclipse for non-O_CREAT)
-        ))
-    }
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt(syscall3(SYS_OPEN, ptr as usize, flags, 0)) }
 }
 
 /// lseek wrapper
@@ -143,14 +151,24 @@ pub fn getppid() -> usize {
 
 /// Remove a file or directory
 pub fn unlink(path: &str) -> Result<()> {
-    unsafe {
-        cvt_unit(syscall3(
-            SYS_UNLINK,
-            path.as_ptr() as usize,
-            path.len(),
-            0,
-        ))
-    }
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall1(SYS_UNLINK, ptr as usize)) }
+}
+
+/// rename(2): rutas terminadas en NUL (copiadas a buffer interno).
+pub fn rename(old_path: &str, new_path: &str) -> Result<()> {
+    let mut old_buf = [0u8; 1024];
+    let mut new_buf = [0u8; 1024];
+    let old_ptr = path_to_nul_stack(old_path, &mut old_buf)?;
+    let new_ptr = path_to_nul_stack(new_path, &mut new_buf)?;
+    unsafe { cvt_unit(syscall2(SYS_RENAME, old_ptr as usize, new_ptr as usize)) }
+}
+
+/// Crear hilo: `stack_top` es el tope del stack (alineado, crece hacia abajo), `entry` función
+/// user con convención C, `arg` se pasa en **rdi**.
+pub fn thread_create(stack_top: usize, entry: usize, arg: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_THREAD_CREATE, stack_top, entry, arg)) }
 }
 
 /// Change signal action
@@ -158,22 +176,22 @@ pub fn sigaction(signum: usize, act: usize, oldact: usize) -> Result<()> {
     unsafe { cvt_unit(syscall3(SYS_SIGACTION, signum, act, oldact)) }
 }
 
-/// Wait for a child process to exit
+/// Wait for a child process to exit (cualquier hijo).
 pub fn waitpid(status: *mut u32) -> Result<usize> {
     unsafe { cvt(syscall1(SYS_WAIT, status as usize)) }
+}
+
+/// Esperar a que termine el hijo `pid` (0 = cualquier hijo, igual que [`waitpid`]).
+pub fn wait_pid(status: *mut u32, pid: usize) -> Result<usize> {
+    unsafe { cvt(syscall2(SYS_WAIT_PID, status as usize, pid)) }
 }
 
 
 /// mkdir(path, mode)
 pub fn mkdir(path: &str, mode: usize) -> Result<()> {
-    unsafe {
-        cvt_unit(syscall3(
-            SYS_MKDIR,
-            path.as_ptr() as usize,
-            path.len(),
-            mode,
-        ))
-    }
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall2(SYS_MKDIR, ptr as usize, mode)) }
 }
 
 /// Stat structure used by fstat/fstat_at
@@ -207,11 +225,13 @@ pub fn fstat(fd: usize, stat: &mut Stat) -> Result<()> {
 
 /// fstatat(dirfd, path, stat, flags)
 pub fn fstat_at(dirfd: usize, path: &str, stat: &mut Stat, flags: usize) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
     unsafe {
         cvt_unit(syscall4(
             SYS_FSTATAT,
             dirfd,
-            path.as_ptr() as usize,
+            ptr as usize,
             stat as *mut Stat as usize,
             flags,
         ))

@@ -482,13 +482,36 @@ mod target {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn remove(_pathname: *const c_char) -> c_int {
-        -1  // TODO: Implement SYS_UNLINK
+    pub unsafe extern "C" fn remove(pathname: *const c_char) -> c_int {
+        if pathname.is_null() {
+            *crate::header::errno::__errno_location() = crate::header::errno::EINVAL;
+            return -1;
+        }
+        let path_str = core::ffi::CStr::from_ptr(pathname).to_str().unwrap_or("");
+        match eclipse_syscall::call::unlink(path_str) {
+            Ok(()) => 0,
+            Err(e) => {
+                *crate::header::errno::__errno_location() = e.errno as c_int;
+                -1
+            }
+        }
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn rename(_oldpath: *const c_char, _newpath: *const c_char) -> c_int {
-        -1  // TODO: Implement SYS_RENAME
+    pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
+        if oldpath.is_null() || newpath.is_null() {
+            *crate::header::errno::__errno_location() = crate::header::errno::EINVAL;
+            return -1;
+        }
+        let old_str = core::ffi::CStr::from_ptr(oldpath).to_str().unwrap_or("");
+        let new_str = core::ffi::CStr::from_ptr(newpath).to_str().unwrap_or("");
+        match eclipse_syscall::call::rename(old_str, new_str) {
+            Ok(()) => 0,
+            Err(e) => {
+                *crate::header::errno::__errno_location() = e.errno as c_int;
+                -1
+            }
+        }
     }
 
     #[no_mangle]

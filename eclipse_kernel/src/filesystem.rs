@@ -1349,6 +1349,55 @@ impl Scheme for FileSystemScheme {
         Err(scheme_error::EINVAL)
     }
 
+    fn unlink(&self, path: &str) -> Result<usize, usize> {
+        let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+        if clean_path.starts_with("tmp/") || clean_path == "tmp" {
+            let mut vtmp = VIRTUAL_TMP.lock();
+            if vtmp.remove(&String::from(clean_path)).is_some() {
+                return Ok(0);
+            }
+            return Err(scheme_error::ENOENT);
+        }
+        Err(scheme_error::ENOSYS)
+    }
+
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<usize, usize> {
+        let old_key = if old_path.starts_with('/') {
+            &old_path[1..]
+        } else {
+            old_path
+        };
+        let new_key = if new_path.starts_with('/') {
+            &new_path[1..]
+        } else {
+            new_path
+        };
+        if !(old_key.starts_with("tmp/") || old_key == "tmp") {
+            return Err(scheme_error::ENOSYS);
+        }
+        if !(new_key.starts_with("tmp/") || new_key == "tmp") {
+            return Err(scheme_error::ENOSYS);
+        }
+        let old_s = String::from(old_key);
+        let new_s = String::from(new_key);
+        let mut vtmp = VIRTUAL_TMP.lock();
+        let data = match vtmp.remove(&old_s) {
+            Some(d) => d,
+            None => return Err(scheme_error::ENOENT),
+        };
+        vtmp.insert(new_s.clone(), data);
+        drop(vtmp);
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        for slot in open_files.iter_mut() {
+            if let Some(OpenFile::Virtual { path, .. }) = slot {
+                if *path == old_s {
+                    *path = new_s.clone();
+                }
+            }
+        }
+        Ok(0)
+    }
+
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;

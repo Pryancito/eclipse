@@ -79,10 +79,10 @@ pub mod fs;
 pub mod path;
 pub mod process;
 pub mod net;
+pub mod sync;
 pub mod env;
 pub mod time;
 pub mod thread;
-pub mod sync;
 pub mod error;
 pub mod os;
 

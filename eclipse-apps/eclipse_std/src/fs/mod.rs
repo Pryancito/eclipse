@@ -116,14 +116,37 @@ impl Drop for File {
     }
 }
 
-/// Metadata about a file (Stub)
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+
+/// Metadata from `stat(2)` vía eclipse-relibc.
 pub struct Metadata {
-    // TODO: Implement
+    mode: u32,
+    len: u64,
 }
 
 impl Metadata {
-    pub fn is_file(&self) -> bool { true }
-    pub fn is_dir(&self) -> bool { false }
+    pub fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// `stat` para una ruta.
+pub fn metadata(path: &str) -> Result<Metadata> {
+    let mut st = eclipse_syscall::call::Stat::default();
+    eclipse_syscall::call::fstat_at(0, path, &mut st, 0)
+        .map_err(|_| Error::new(ErrorKind::Other, "stat failed"))?;
+    Ok(Metadata {
+        mode: st.mode,
+        len: st.size,
+    })
 }
 
 /// Read the entire contents of a file into a bytes vector

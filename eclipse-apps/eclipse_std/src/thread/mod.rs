@@ -13,19 +13,21 @@ pub struct Thread {
 /// Join handle for a spawned thread
 pub struct JoinHandle<T> {
     thread: Thread,
-    _phantom: core::marker::PhantomData<T>,
+    result: *mut Option<T>,
 }
 
 impl Thread {
-    /// Get the current thread
+    /// Get the current thread (TID del scheduler).
     pub fn current() -> Thread {
-        unsafe {
-            Thread {
-                handle: core::mem::zeroed(), // TODO: proper implementation
-            }
+        let tid = eclipse_syscall::call::gettid() as u64;
+        Thread {
+            handle: crate::libc::pthread_t {
+                thread_id: tid,
+                join_cell: ptr::null_mut(),
+            },
         }
     }
-    
+
     /// Get thread ID
     pub fn id(&self) -> ThreadId {
         ThreadId(self.handle.thread_id)
@@ -43,39 +45,39 @@ where
     T: Send + 'static,
 {
     unsafe {
-        // Box the closure
-        let boxed = Box::new(f);
-        let raw = Box::into_raw(boxed);
-        
-        // Thread wrapper function
+        let result = Box::into_raw(Box::new(None::<T>));
+        let pair = Box::into_raw(Box::new((f, result)));
+
         extern "C" fn thread_wrapper<F, T>(arg: *mut c_void) -> *mut c_void
         where
             F: FnOnce() -> T + Send + 'static,
         {
             unsafe {
-                let boxed = Box::from_raw(arg as *mut F);
-                let _ = boxed();
+                let pair = *Box::from_raw(arg as *mut (F, *mut Option<T>));
+                let (f, out) = pair;
+                *out = Some(f());
                 ptr::null_mut()
             }
         }
-        
-        // Create pthread
+
         let mut handle: crate::libc::pthread_t = core::mem::zeroed();
-        let result = crate::libc::pthread_create(
+        let r = crate::libc::pthread_create(
             &mut handle as *mut crate::libc::pthread_t,
             ptr::null(),
             thread_wrapper::<F, T>,
-            raw as *mut c_void
+            pair as *mut c_void,
         );
-        
-        if result != 0 {
+
+        if r != 0 {
+            let _ = Box::from_raw(pair);
+            let _ = Box::from_raw(result);
             crate::eprintln!("Failed to create thread");
             crate::libc::exit(1);
         }
-        
+
         JoinHandle {
             thread: Thread { handle },
-            _phantom: core::marker::PhantomData,
+            result,
         }
     }
 }
@@ -84,13 +86,12 @@ impl<T> JoinHandle<T> {
     /// Wait for the thread to finish
     pub fn join(self) -> Result<T, ()> {
         unsafe {
-            let result = crate::libc::pthread_join(self.thread.handle, ptr::null_mut());
-            if result == 0 {
-                // TODO: return actual value
-                Err(())
-            } else {
-                Err(())
+            if crate::libc::pthread_join(self.thread.handle, ptr::null_mut()) != 0 {
+                let _ = Box::from_raw(self.result);
+                return Err(());
             }
+            let out = Box::from_raw(self.result);
+            out.ok_or(())
         }
     }
 }

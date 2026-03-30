@@ -101,6 +101,11 @@ pub trait Scheme: Send + Sync {
         Err(error::ENOSYS)
     }
 
+    /// Rename within the same scheme (`old_rel` / `new_rel` como en `open`).
+    fn rename(&self, _old_rel: &str, _new_rel: &str) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
+
     /// Change the size of a resource
     fn ftruncate(&self, _id: usize, _len: usize) -> Result<usize, usize> {
         Err(error::ENOSYS)
@@ -285,6 +290,33 @@ pub fn unlink(path: &str) -> Result<usize, usize> {
     };
 
     scheme.unlink(relative_path)
+}
+
+/// Renombra dentro del mismo esquema (`file:/a` → `file:` + `/a`).
+pub fn rename(old_path: &str, new_path: &str) -> Result<usize, usize> {
+    let mut old_parts = old_path.splitn(2, ':');
+    let old_scheme = old_parts.next().ok_or(error::EINVAL)?;
+    let old_rel = old_parts.next().unwrap_or("");
+
+    let mut new_parts = new_path.splitn(2, ':');
+    let new_scheme = new_parts.next().ok_or(error::EINVAL)?;
+    let new_rel = new_parts.next().unwrap_or("");
+
+    if old_scheme != new_scheme {
+        return Err(error::EINVAL);
+    }
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg
+            .schemes
+            .iter()
+            .find(|(name, _)| name == old_scheme)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.rename(old_rel, new_rel)
 }
 
 // --- SHM Scheme ---

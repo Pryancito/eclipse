@@ -2,6 +2,10 @@
 eclipse-os-complete/
 eclipse-os-build/
 eclipse-os.img
+# Sysroot precompilado local (scripts/build_eclipse_prebuilt_rustlib.sh)
+eclipse-prebuilt-rustlib/
+eclipse-rustlib-staging/
+eclipse-sysroot-merged/
 test_disk.img
 test_eclipsefs.img
 eclipse_ovmf_vars.fd

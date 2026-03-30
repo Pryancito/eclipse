@@ -8,9 +8,9 @@ members = [
     "lunas",
     "terminal",
     "sh",
-    "glium",
     "glxgears",
 ]
+# glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.
 exclude = ["libs/ipc_tests", "std_test", "smithay_app", "xfwl4"]
 
 [workspace.package]
@@ -33,6 +33,9 @@ broken_intra_doc_links = "forbid"
 eclipse_ipc = { path = "libs/ipc" }
 sidewind = { path = "sidewind" }
 sidewind_core = { path = "sidewind_core" }
+# Sin `std` por defecto: el target Eclipse usa build-std=core,alloc y eclipse_std como `std`
+# solo para binarios que la enlazan; las libs no_std no deben forzar `bitflags/std`.
+bitflags = { version = "2.4", default-features = false }
 
 [profile.release]
 # IMPORTANTE: Este es el lugar correcto para configurar perfiles en un workspace.
@@ -52,12 +55,6 @@ codegen-units = 1
 debug = false
 strip = "symbols"
 
-# Para debuggear smithay_app en Eclipse OS sin afectar al resto de binarios:
-# desactivamos el strip y activamos símbolos solo para ese paquete.
-[profile.release.package.smithay_app]
-strip = "none"
-debug = true
-
 [profile.dev]
 opt-level = "s"
 panic = "abort"
@@ -65,4 +62,3 @@ panic = "abort"
 [patch.crates-io]
 libc = { path = "../eclipse-relibc" }
 std = { package = "eclipse_std", path = "eclipse_std" }
-#num-traits = { path = "libs/num-traits" }
