@@ -43,12 +43,14 @@ impl Command {
     
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
-        // Eclipse OS currently spawns from an ELF buffer
-        let _buf = fs::read(&self.program)?;
-        
+        // Build a null-terminated path for the C API (String::as_ptr is NOT null-terminated)
+        let mut path_nt: Vec<u8> = Vec::with_capacity(self.program.len() + 1);
+        path_nt.extend_from_slice(self.program.as_bytes());
+        path_nt.push(0u8);
+
         unsafe {
             let pid = crate::libc::spawn(
-                self.program.as_ptr() as *const c_char,
+                path_nt.as_ptr() as *const c_char,
                 core::ptr::null(),
                 core::ptr::null()
             );
