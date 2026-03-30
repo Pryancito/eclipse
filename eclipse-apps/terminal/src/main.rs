@@ -5,98 +5,46 @@ extern crate alloc;
 #[cfg(target_vendor = "eclipse")]
 extern crate eclipse_std as std;
 
-use os_terminal::{DrawTarget, Terminal, Rgb};
-use os_terminal::font::{TrueTypeFont};
-use alloc::boxed::Box;
+use os_terminal::{DrawTarget, Rgb, Terminal};
+use os_terminal::font::BitmapFont;
 
-// Usamos únicamente la librería base mocked en Sidewind
-use sidewind::wayland_client::{
-    protocol::{
-        wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
-    },
-    Connection, Dispatch, QueueHandle,
+#[cfg(target_vendor = "eclipse")]
+use alloc::{boxed::Box, vec::Vec};
+
+#[cfg(target_vendor = "eclipse")]
+use sidewind::{
+    discover_composer, SideWindSurface, SWND_EVENT_TYPE_KEY,
 };
 
-const WIDTH: usize = 640;
-const HEIGHT: usize = 480;
-const FONT_DATA: &[u8] = include_bytes!("../../../libcosmic/res/noto/NotoSansMono-Regular.ttf");
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 500;
 
-// --- 1. NUESTRO ESTADO GLOBAL ---
-struct AppState {
-    compositor: Option<wl_compositor::WlCompositor>,
-    shm: Option<wl_shm::WlShm>,
-    surface: Option<wl_surface::WlSurface>,
-    buffer: Option<wl_buffer::WlBuffer>,
-    
-    // Terminal logic
-    terminal: Option<Terminal<WaylandDrawTarget<'static>>>,
-    font_size: f32,
-    master_fd: usize,
-    vaddr: *mut u32,
-}
-
-// --- 2. LA MÁQUINA DE ESTADOS (DISPATCHERS) ---
-
-impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<AppState>,
-    ) {
-        let wl_registry::Event::Global { name, interface, .. } = event;
-        match &interface[..] {
-            "wl_compositor" => {
-                state.compositor = Some(registry.bind::<wl_compositor::WlCompositor, _, _>(
-                    name, 1, qh, ()
-                ));
-            }
-            "wl_shm" => {
-                state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(
-                    name, 1, qh, ()
-                ));
-            }
-            _ => {}
-        }
-    }
-}
-
-// Implementaciones vacías para cumplir con el trait (como en la referencia)
-impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: (), _: &(), _: &Connection, _: &QueueHandle<AppState>) {}
-}
-impl Dispatch<wl_shm::WlShm, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm::WlShm, _: (), _: &(), _: &Connection, _: &QueueHandle<AppState>) {}
-}
-impl Dispatch<wl_surface::WlSurface, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_surface::WlSurface, _: (), _: &(), _: &Connection, _: &QueueHandle<AppState>) {}
-}
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: (), _: &(), _: &Connection, _: &QueueHandle<AppState>) {}
-}
-impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: (), _: &(), _: &Connection, _: &QueueHandle<AppState>) {}
-}
-
-// Target de renderizado manual para os-terminal
-struct WaylandDrawTarget<'a> {
-    buffer: &'a mut [u8],
+/// Draw target that writes ARGB pixels directly into the SideWind surface buffer.
+struct SurfaceDrawTarget {
+    ptr: *mut u32,
     width: usize,
     height: usize,
 }
 
-impl<'a> DrawTarget for WaylandDrawTarget<'a> {
-    fn size(&self) -> (usize, usize) { (self.width, self.height) }
+// Safety: the pointer is valid for the lifetime of the surface, which outlives the terminal.
+unsafe impl Send for SurfaceDrawTarget {}
+
+impl DrawTarget for SurfaceDrawTarget {
+    fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     #[inline(always)]
     fn draw_pixel(&mut self, x: usize, y: usize, color: Rgb) {
         if x < self.width && y < self.height {
-            let offset = (y * self.width + x) * 4;
-            self.buffer[offset] = color.2;     // B
-            self.buffer[offset + 1] = color.1; // G
-            self.buffer[offset + 2] = color.0; // R
-            self.buffer[offset + 3] = 0xFF;    // A
+            let idx = y * self.width + x;
+            // ARGB8888: alpha=0xFF, R, G, B
+            let pixel = 0xFF00_0000u32
+                | ((color.0 as u32) << 16)
+                | ((color.1 as u32) << 8)
+                | (color.2 as u32);
+            // Safety: idx is bounds-checked above; ptr is valid and aligned.
+            unsafe { *self.ptr.add(idx) = pixel };
         }
     }
 }
@@ -104,102 +52,114 @@ impl<'a> DrawTarget for WaylandDrawTarget<'a> {
 #[cfg(target_vendor = "eclipse")]
 fn main() {
     use std::prelude::v1::*;
-    use eclipse_syscall::call::{open, mmap, write, read, ioctl, sched_yield};
-    use eclipse_syscall::flag::{O_RDWR, O_CREAT, PROT_READ, PROT_WRITE, MAP_SHARED};
+    use eclipse_syscall::call::{close, ioctl, open, read, sched_yield, write};
+    use eclipse_syscall::flag::{O_CREAT, O_RDWR};
 
-    let stride = WIDTH * 4;
-    let size_bytes = stride * HEIGHT;
-
-    // 1. Conectar al compositor
-    let conn = Connection::connect_to_env().expect("Sidewind no responde");
-    let display = conn.display();
-    let mut event_queue = conn.new_event_queue();
-    let qh: QueueHandle<AppState> = event_queue.handle();
-
-    let mut state = AppState {
-        compositor: None,
-        shm: None,
-        surface: None,
-        buffer: None,
-        terminal: None,
-        font_size: 14.0,
-        master_fd: 0,
-        vaddr: core::ptr::null_mut(),
+    // 1. Locate the compositor; retry until it is ready.
+    let composer_pid = loop {
+        if let Some(pid) = discover_composer() {
+            break pid;
+        }
+        let _ = sched_yield();
     };
 
-    // 2. Obtener el Registry y sincronizar
-    let registry = display.get_registry(&qh, ());
-    event_queue.roundtrip(&mut state).expect("Registry sync failed");
+    // 2. Create the window surface.
+    let mut surface =
+        match SideWindSurface::new(composer_pid, 100, 100, WIDTH, HEIGHT, "terminal") {
+            Some(s) => s,
+            None => return,
+        };
 
-    let compositor = state.compositor.as_ref().expect("No compositor");
-    let shm = state.shm.as_ref().expect("No shm");
+    // 3. Build the draw target using the surface's shared-memory buffer.
+    let buf_ptr: *mut u32 = surface.buffer().as_mut_ptr();
+    let draw_target = SurfaceDrawTarget {
+        ptr: buf_ptr,
+        width: WIDTH as usize,
+        height: HEIGHT as usize,
+    };
 
-    // 3. Crear Superficie
-    let surface = compositor.create_surface(&qh, ());
-    state.surface = Some(surface.clone());
-
-    // 4. Preparar memoria compartida (SHM) - Estilo Eclipse
-    let fd = open("shm:Terminal", O_RDWR | O_CREAT).expect("Failed to open SHM");
-    let vaddr = mmap(0, size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd as isize, 0).expect("Failed to mmap");
-    state.vaddr = vaddr as *mut u32;
-
-    // 5. Crear Pool y Buffer
-    let pool = shm.create_pool(fd as i32, size_bytes as i32, &qh, ());
-    let buffer = pool.create_buffer(0, WIDTH as i32, HEIGHT as i32, stride as i32, wl_shm::Format::Argb8888, &qh, ());
-    state.buffer = Some(buffer);
-
-    // 6. Inicializar PTY y Terminal Logic
-    let master_fd = open("pty:master", O_RDWR).expect("Failed to open pty master");
-    state.master_fd = master_fd;
-    
-    // Launch shell (Simulado o real si existe spawn)
-    // let _ = spawn(b"/bin/sh", None);
-
-    let bytes = unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, size_bytes) };
-    let display_target = WaylandDrawTarget { buffer: bytes, width: WIDTH, height: HEIGHT };
-    let mut terminal = Terminal::new(display_target, Box::new(TrueTypeFont::new(state.font_size, FONT_DATA)));
+    // 4. Create the terminal emulator.
+    let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
     terminal.set_crnl_mapping(true);
-    
-    let mfd = master_fd;
-    terminal.set_pty_writer(Box::new(move |s: &str| {
-        let _ = write(mfd, s.as_bytes());
-    }));
-    
-    terminal.process(b"=== Raw Wayland Terminal ===\r\n");
-    terminal.flush();
-    state.terminal = Some(terminal);
 
-    // 7. Attach and Commit
-    surface.attach(state.buffer.as_ref(), 0, 0);
-    surface.damage_buffer(0, 0, WIDTH as i32, HEIGHT as i32);
+    // 5. Open the PTY master for bidirectional communication with the shell.
+    let pty_fd = open("pty:master", O_RDWR | O_CREAT).unwrap_or(usize::MAX);
+
+    // 6. Wire PTY writes: keyboard input flows from the terminal to the shell.
+    let pfd = pty_fd;
+    terminal.set_pty_writer(Box::new(move |s: &str| {
+        if pfd != usize::MAX {
+            let _ = write(pfd, s.as_bytes());
+        }
+    }));
+
+    // 7. Spawn the shell connected to the PTY.
+    if pty_fd != usize::MAX {
+        if let Ok(sh_fd) = open("/bin/sh", O_RDWR) {
+            let mut sh_data: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match read(sh_fd, &mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sh_data.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let _ = close(sh_fd);
+            if !sh_data.is_empty() {
+                let _ = eclipse_syscall::call::spawn_with_stdio(
+                    &sh_data,
+                    Some("sh"),
+                    pty_fd,
+                    pty_fd,
+                    pty_fd,
+                );
+            }
+        }
+    }
+
+    // 8. Show a welcome banner.
+    terminal.process(b"\x1b[1;32mEclipse OS Terminal\x1b[0m\r\n");
+    terminal.flush();
     surface.commit();
 
-    // 8. Bucle infinito (Dispatch)
+    // 9. Main event loop.
     loop {
-        // A) Procesar eventos Wayland (Teclado, etc.)
-        let _ = event_queue.blocking_dispatch(&mut state);
+        // Process compositor events (keyboard, resize, …).
+        while let Some(event) = surface.poll_event() {
+            if event.event_type == SWND_EVENT_TYPE_KEY {
+                let scancode = event.data1 as u8;
+                let pressed = event.data2 != 0;
+                // PS/2 Scancode Set 1: release events have bit 7 set.
+                let ps2 = if pressed { scancode } else { scancode | 0x80 };
+                let _ = terminal.handle_keyboard(ps2);
+                terminal.flush();
+                surface.commit();
+            }
+        }
 
-        // B) Lógica PTY (Manual)
-        if let Some(term) = &mut state.terminal {
+        // Drain any output produced by the shell via the PTY.
+        if pty_fd != usize::MAX {
             let mut available: usize = 0;
-            let res = ioctl(master_fd, 2, &mut available as *mut usize as usize);
-            if res.is_ok() && available > 0 {
-                let mut pty_buf = [0u8; 512];
-                if let Ok(n) = read(master_fd, &mut pty_buf) {
+            if ioctl(pty_fd, 2, &mut available as *mut usize as usize).is_ok()
+                && available > 0
+            {
+                let n = available.min(512);
+                let mut buf = [0u8; 512];
+                if let Ok(n) = read(pty_fd, &mut buf[..n]) {
                     if n > 0 {
-                        term.process(&pty_buf[..n]);
-                        term.flush();
-                        
-                        // Re-commit
+                        terminal.process(&buf[..n]);
+                        terminal.flush();
                         surface.commit();
                     }
                 }
             }
         }
-        
+
         let _ = sched_yield();
     }
 }
 
 #[cfg(not(target_vendor = "eclipse"))]
-fn main() { println!("Eclipse OS only."); }
+fn main() {
+    println!("Eclipse OS only.");
+}
