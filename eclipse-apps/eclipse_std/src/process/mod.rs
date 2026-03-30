@@ -45,10 +45,19 @@ impl Command {
     pub fn spawn(&mut self) -> Result<Child> {
         // Eclipse OS currently spawns from an ELF buffer
         let _buf = fs::read(&self.program)?;
-        
+
+        // Build a null-terminated copy of the path for the C FFI call.
+        // A Rust String's raw pointer is not null-terminated, so passing it
+        // directly to libc::spawn (which uses CStr::from_ptr) is undefined
+        // behaviour and causes sys_open to receive a corrupted path, making
+        // the spawned process never start.
+        let mut path_c: Vec<u8> = Vec::with_capacity(self.program.len() + 1);
+        path_c.extend_from_slice(self.program.as_bytes());
+        path_c.push(0u8);
+
         unsafe {
             let pid = crate::libc::spawn(
-                self.program.as_ptr() as *const c_char,
+                path_c.as_ptr() as *const c_char,
                 core::ptr::null(),
                 core::ptr::null()
             );
