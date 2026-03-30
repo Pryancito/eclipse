@@ -7,7 +7,7 @@ use libc::{InputEvent, eclipse_send};
 use eclipse_syscall::InputEvent;
 #[cfg(not(target_vendor = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
+use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
@@ -549,6 +549,38 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
     }
 }
 
+/// Ventana con foco que recibe teclas reenviadas por SideWind.
+///
+/// Para `Terminal` usamos `WindowContent::External(...)`, que corresponde a superficies SideWind reales.
+/// (SNP tiene comportamiento distinto: se maneja con `pending_snp_key`.)
+fn sidewind_keyboard_client_focused(
+    focused: Option<usize>,
+    window_count: usize,
+    windows: &[ShellWindow],
+) -> bool {
+    let Some(f) = focused else {
+        return false;
+    };
+    if f >= window_count {
+        return false;
+    }
+    matches!(windows[f].content, WindowContent::External(_))
+}
+
+/// Teclas que en Lunas tienen `KeyAction != None` pero el **keydown** debe llegar igual al cliente
+/// (p. ej. Enter = `KeyAction::Enter`; si solo reenviamos en release, el shell nunca ve `\r`/`\n`).
+fn forward_key_press_for_sidewind_client(
+    action: KeyAction,
+    scancode: u16,
+    modifiers: u32,
+) -> bool {
+    match action {
+        KeyAction::Enter | KeyAction::Backspace | KeyAction::ArrowUp | KeyAction::ArrowDown => true,
+        KeyAction::CycleForward => (scancode & 0x7FFF) as u8 == 0x0F && (modifiers & 4) == 0,
+        _ => false,
+    }
+}
+
 pub fn scancode_to_char(code: u16, shift: bool) -> Option<char> {
     match (code, shift) {
         (0x1E, false) => Some('a'), (0x1E, true) => Some('A'),
@@ -1079,6 +1111,38 @@ impl InputState {
                         }
                     }
 
+                    // Si el foco está en una ventana `External` (p.ej. el terminal-wb),
+                    // reenvía la tecla al cliente y evita que Lunas ejecute atajos globales
+                    // (por ejemplo, `L` puede togglear el lock-screen).
+                    if sidewind_keyboard_client_focused(self.focused_window, *window_count, windows) {
+                        if let Some(focused) = self.focused_window {
+                            if focused < *window_count {
+                                use crate::compositor::WindowContent;
+                                if let WindowContent::External(s_idx) = windows[focused].content {
+                                    let s_idx = s_idx as usize;
+                                    if s_idx < surfaces.len() && surfaces[s_idx].active {
+                                        let ev = SideWindEvent {
+                                            event_type: SWND_EVENT_TYPE_KEY,
+                                            data1: scancode as i32,
+                                            data2: if pressed { 1 } else { 0 },
+                                            data3: self.modifiers as i32,
+                                        };
+                                        let _ = unsafe {
+                                            eclipse_send(
+                                                surfaces[s_idx].pid,
+                                                sidewind::MSG_TYPE_INPUT,
+                                                &ev as *const _ as *const core::ffi::c_void,
+                                                core::mem::size_of::<SideWindEvent>(),
+                                                0,
+                                            )
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        return dirty;
+                    }
+
                     let action = scancode_to_action(scancode, self.modifiers);
                     match action {
                         KeyAction::ToggleDashboard => {
@@ -1274,7 +1338,17 @@ impl InputState {
                             }
                         }
                         KeyAction::CycleForward => {
-                            if *window_count > 0 {
+                            // Tab en terminal/SNP debe ir al cliente, no rotar ventanas del shell.
+                            let tab_to_client = sidewind_keyboard_client_focused(
+                                self.focused_window,
+                                *window_count,
+                                windows,
+                            ) && forward_key_press_for_sidewind_client(
+                                action,
+                                scancode,
+                                self.modifiers,
+                            );
+                            if !tab_to_client && *window_count > 0 {
                                 let from = self.focused_window.unwrap_or(0);
                                 if let Some(next) = crate::compositor::next_visible(from, true, windows, *window_count) {
                                     self.focused_window = Some(next);
@@ -1337,16 +1411,42 @@ impl InputState {
                     }
                 }
 
-                // ── Forward Wayland keyboard events ──
+                // ── Forward Wayland keyboard events + SideWind external key events ──
                 let action = scancode_to_action(scancode, self.modifiers);
-                if !pressed || action == KeyAction::None {
+                let forward_press_extra = pressed
+                    && sidewind_keyboard_client_focused(self.focused_window, *window_count, windows)
+                    && forward_key_press_for_sidewind_client(action, scancode, self.modifiers);
+                if !pressed || action == KeyAction::None || forward_press_extra {
                     if let Some(focused) = self.focused_window {
                         if focused < *window_count {
                             use crate::compositor::WindowContent;
-                            if let WindowContent::Snp { .. } = windows[focused].content {
-                                let state_flag = if pressed { 1 } else { 0 };
-                                // For SNP we use the focused index as conn_idx for simplicity in state.rs search
-                                self.pending_snp_key = Some((focused, scancode, state_flag));
+                            match &windows[focused].content {
+                                WindowContent::Snp { .. } => {
+                                    let state_flag = if pressed { 1 } else { 0 };
+                                    // For SNP we use the focused index as conn_idx for simplicity in state.rs search
+                                    self.pending_snp_key = Some((focused, scancode, state_flag));
+                                }
+                                WindowContent::External(s_idx) => {
+                                    let s_idx = *s_idx as usize;
+                                    if s_idx < surfaces.len() && surfaces[s_idx].active {
+                                        let ev = SideWindEvent {
+                                            event_type: SWND_EVENT_TYPE_KEY,
+                                            data1: scancode as i32,
+                                            data2: if pressed { 1 } else { 0 },
+                                            data3: self.modifiers as i32,
+                                        };
+                                        let _ = unsafe {
+                                            eclipse_send(
+                                                surfaces[s_idx].pid,
+                                                sidewind::MSG_TYPE_INPUT,
+                                                &ev as *const _ as *const core::ffi::c_void,
+                                                core::mem::size_of::<SideWindEvent>(),
+                                                0,
+                                            )
+                                        };
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

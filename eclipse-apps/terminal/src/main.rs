@@ -6,6 +6,10 @@ extern crate eclipse_std as std;
 
 use std::prelude::v1::*;
 use alloc::rc::Rc;
+#[cfg(target_vendor = "eclipse")]
+use alloc::vec::Vec;
+#[cfg(target_vendor = "eclipse")]
+use alloc::boxed::Box;
 use core::cell::RefCell;
 use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
 use wayland_proto::EclipseWaylandConnection;
@@ -14,10 +18,24 @@ use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
 use eclipse_syscall::{self, flag, ProcessInfo};
 use heapless::String as HString;
 
+use os_terminal::{DrawTarget, Rgb, Terminal};
+use os_terminal::font::BitmapFont;
+
 #[cfg(target_vendor = "eclipse")]
 use libc::{c_int, close, mmap, munmap, open};
 #[cfg(target_vendor = "eclipse")]
-use sidewind::{IpcChannel, SideWindMessage};
+use eclipse_ipc::prelude::EclipseMessage;
+#[cfg(target_vendor = "eclipse")]
+use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY};
+
+#[cfg(target_vendor = "eclipse")]
+use eclipse_syscall::call::{
+    close as sys_close,
+    ioctl as sys_ioctl,
+    read as sys_read,
+    spawn_with_stdio as sys_spawn_with_stdio,
+    write as sys_write,
+};
 
 /// Nombre único de SHM en /tmp/ para SideWind (evita colisión entre procesos).
 fn sidewind_shm_name(pid: u32) -> HString<24> {
@@ -119,6 +137,40 @@ fn find_pid_by_name(want: &[u8]) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(target_vendor = "eclipse")]
+struct SurfaceDrawTarget {
+    ptr: *mut u32,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(target_vendor = "eclipse")]
+unsafe impl Send for SurfaceDrawTarget {}
+
+#[cfg(target_vendor = "eclipse")]
+impl DrawTarget for SurfaceDrawTarget {
+    fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn draw_pixel(&mut self, x: usize, y: usize, rgb: Rgb) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = y * self.width + x;
+        // Lunas lee ARGB8888 como 0xAARRGGBB (ver FramebufferState::draw_iter/blits).
+        let pixel = 0xFF00_0000u32
+            | ((rgb.0 as u32) << 16)
+            | ((rgb.1 as u32) << 8)
+            | (rgb.2 as u32);
+        unsafe {
+            if !self.ptr.is_null() {
+                *self.ptr.add(idx) = pixel;
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -244,24 +296,205 @@ pub fn main() {
                 std::thread::yield_now();
             }
         };
-        let px = unsafe { core::slice::from_raw_parts_mut(ptr, (w as usize) * (h as usize)) };
-        for (i, p) in px.iter_mut().enumerate() {
-            let ww = w as usize;
-            let row = i / ww;
-            let content_top = 4usize;
-            let content_bottom = (h as usize).saturating_sub(8);
-            *p = if row >= content_top && row <= content_bottom && i % ww > 3 && i % ww + 3 < ww {
-                0xFF_12_12_18
+
+        // Render real del contenido del terminal con `os-terminal`.
+        // Esto escribe en el buffer ARGB8888 mmap del shm.
+        let draw_target = SurfaceDrawTarget {
+            ptr,
+            width: w as usize,
+            height: h as usize,
+        };
+        let font = Box::new(BitmapFont);
+        let mut terminal = Terminal::new(draw_target, font);
+        terminal.set_crnl_mapping(true);
+
+        // Mensaje inicial (visible antes de que `/bin/sh` emita su prompt).
+        terminal.process(b"\x1b[1;36mEclipse OS terminal-wb\x1b[0m\r\n");
+        terminal.flush();
+        let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_commit());
+
+        // --- PTY + /bin/sh ---
+        // - Nosotros escribimos al `pty:master`
+        // - El shell lee del `pty:slave/<n>`
+        // - Nosotros leemos la salida desde `pty:master`
+        //
+        // Importante: el syscall kernel asume que la ruta es C-string (terminada en NUL).
+        // Por eso usamos `libc::open` con buffers NUL.
+        let pty_master_fd = unsafe {
+            let path = b"pty:master\0";
+            let fd = open(
+                path.as_ptr() as *const core::ffi::c_char,
+                (flag::O_RDWR | flag::O_CREAT) as c_int,
+                0,
+            );
+            if fd < 0 {
+                -1isize as usize
             } else {
-                0xFF_0D_0D_12
-            };
+                fd as usize
+            }
+        };
+        if pty_master_fd == (-1isize as usize) {
+            std::println!("Failed to open pty:master");
+            loop {
+                std::thread::yield_now();
+            }
         }
-        let commit = SideWindMessage::new_commit();
-        let _ = IpcChannel::send_sidewind(lunas_pid, &commit);
-        std::println!("SideWind window committed; idle loop.");
+
+        // Obtener el índice del PTY para abrir el slave correspondiente.
+        let mut pair_id: usize = 0;
+        let _ = sys_ioctl(
+            pty_master_fd,
+            1, // request 1: TIOCGPTN in this pty implementation
+            &mut pair_id as *mut usize as usize,
+        );
+
+        let slave_path = alloc::format!("pty:slave/{}", pair_id);
+        let pty_slave_fd = unsafe {
+            let mut path_buf = [0u8; 64];
+            let bytes = slave_path.as_bytes();
+            let n = bytes.len().min(path_buf.len() - 1);
+            path_buf[..n].copy_from_slice(&bytes[..n]);
+            path_buf[n] = 0;
+            let fd = open(
+                path_buf.as_ptr() as *const core::ffi::c_char,
+                flag::O_RDWR as c_int,
+                0,
+            );
+            if fd < 0 {
+                -1isize as usize
+            } else {
+                fd as usize
+            }
+        };
+        if pty_slave_fd == (-1isize as usize) {
+            std::println!("Failed to open {}", slave_path);
+            let _ = sys_close(pty_master_fd).ok();
+            loop {
+                std::thread::yield_now();
+            }
+        }
+
+        // Cargar /bin/sh como ELF y spawnear con stdio conectado al PTY slave.
+        let sh_fd = unsafe {
+            let path = b"/bin/sh\0";
+            let fd = open(
+                path.as_ptr() as *const core::ffi::c_char,
+                flag::O_RDONLY as c_int,
+                0,
+            );
+            if fd < 0 {
+                -1isize as usize
+            } else {
+                fd as usize
+            }
+        };
+        if sh_fd == (-1isize as usize) {
+            std::println!("Failed to open /bin/sh");
+            let _ = sys_close(pty_slave_fd).ok();
+            let _ = sys_close(pty_master_fd).ok();
+            loop {
+                std::thread::yield_now();
+            }
+        }
+
+        let mut sh_bytes: Vec<u8> = Vec::with_capacity(128 * 1024);
+        let mut read_buf = [0u8; 4096];
+        loop {
+            let n = sys_read(sh_fd, &mut read_buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            sh_bytes.extend_from_slice(&read_buf[..n]);
+        }
+        let _ = sys_close(sh_fd);
+
+        let _sh_pid = match sys_spawn_with_stdio(
+            &sh_bytes,
+            Some("sh"),
+            pty_slave_fd,
+            pty_slave_fd,
+            pty_slave_fd,
+        ) {
+            Ok(pid) => pid,
+            Err(_) => {
+                std::println!("Failed to spawn sh (PTY)");
+                loop {
+                    std::thread::yield_now();
+                }
+            }
+        };
+
+        // Conectar escritor de PTY para `os-terminal` (bytes del teclado -> PTY master).
+        terminal.set_auto_flush(false);
+        let pfd_for_writer = pty_master_fd;
+        terminal.set_pty_writer(Box::new(move |s: &str| {
+            let _ = sys_write(pfd_for_writer, s.as_bytes());
+        }));
+
+        // --- Loop interactivo ---
+        // Teclado: Lunas reenvía `SideWindEvent` KEY al PID del cliente (no abrir `input:`: compite con el compositor).
+        let mut ipc_ch = IpcChannel::new();
+        let mut pty_buf = [0u8; 1024];
+        let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
+
+        std::println!("Terminal interactive: teclado (IPC desde Lunas) + shell (PTY).");
         let _ = size_bytes;
         loop {
-            std::thread::yield_now();
+            let mut dirty = false;
+
+            // 1) Teclado: drenar mensajes IPC (eventos KEY del compositor).
+            while let Some(msg) = ipc_ch.recv() {
+                if let EclipseMessage::Raw { data, len, .. } = msg {
+                    if len == sw_ev_sz {
+                        let ev = unsafe {
+                            core::ptr::read_unaligned(data.as_ptr() as *const SideWindEvent)
+                        };
+                        if ev.event_type == SWND_EVENT_TYPE_KEY {
+                            let sc = (ev.data1 as u16 & 0xFF) as u8;
+                            let pressed = ev.data2 != 0;
+                            let ps2 = if pressed { sc } else { sc | 0x80 };
+                            let _ = terminal.handle_keyboard(ps2);
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+
+            // 2) Salida del PTY: drenar bytes disponibles
+            let mut available: usize = 0;
+            let _ = sys_ioctl(
+                pty_master_fd,
+                2, // request 2: FIONREAD (bytes disponibles)
+                &mut available as *mut usize as usize,
+            );
+
+            while available > 0 {
+                let to_read = available.min(pty_buf.len());
+                let n = sys_read(pty_master_fd, &mut pty_buf[..to_read]).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                terminal.process(&pty_buf[..n]);
+                dirty = true;
+
+                // Re-leer available para drenar en lotes.
+                available = 0;
+                let _ = sys_ioctl(
+                    pty_master_fd,
+                    2,
+                    &mut available as *mut usize as usize,
+                );
+            }
+
+            // 3) Solo flushear + commit si hubo cambios reales.
+            if dirty {
+                terminal.flush();
+                let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_commit());
+            } else {
+                // Evitar 100% CPU: ceder al scheduler cuando estamos idle.
+                let _ = eclipse_syscall::call::sched_yield();
+                std::thread::yield_now();
+            }
         }
     }
 

@@ -54,9 +54,6 @@ fn main() {
         if cmd == "exit" {
             break;
         }
-
-        println!("Executing: {}", cmd);
-
         
         // Split args (very basic)
         let parts: Vec<&str> = cmd.split_whitespace().collect();

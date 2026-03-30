@@ -19,6 +19,7 @@ heapless = "0.8"
 wayland-proto = { path = "../libs/wayland-proto" }
 # SideWind: crate `eclipse-apps/sidewind` (reexporta tipos IPC y `sidewind_core` internamente).
 sidewind = { path = "../sidewind" }
+eclipse_ipc = { path = "../libs/ipc" }
 # Standard library bridge for Eclipse
 eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
