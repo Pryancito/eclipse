@@ -139,11 +139,11 @@ fn handle_filesystem_message(msg: &crate::ipc::Message) {
 extern "C" fn graphics_server() -> ! {
     serial::serial_print("Graphics server started\n");
     
-    // Get framebuffer info from kernel (syscall 15)
+    // Get framebuffer info from kernel (syscall 503)
     let fb_info_ptr = unsafe {
         let result: u64;
         core::arch::asm!(
-            "mov rax, 15",  // SYS_GET_FRAMEBUFFER_INFO
+            "mov rax, 503",  // SYS_GET_FRAMEBUFFER_INFO
             "syscall",
             out("rax") result,
             out("rcx") _,

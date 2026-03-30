@@ -5,14 +5,14 @@ use crate::types::*;
 #[thread_local]
 static mut ERRNO: c_int = 0;
 
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(any(target_os = "eclipse", not(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix)), eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe fn __errno_location() -> *mut c_int {
     &raw mut ERRNO as *mut c_int
 }
 
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+#[cfg(all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(target_os = "eclipse"), not(any(target_os = "eclipse", eclipse_target))))]
 extern "C" {
     pub fn __errno_location() -> *mut c_int;
 }
@@ -55,8 +55,8 @@ pub const ENOSYS: c_int = 35;
 
 pub const EWOULDBLOCK: c_int = EAGAIN;
 
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(any(target_os = "eclipse", not(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix)), eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int {
     let msg = strerror(errnum);
@@ -68,13 +68,13 @@ pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: siz
     0
 }
 
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+#[cfg(all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(target_os = "eclipse"), not(any(target_os = "eclipse", eclipse_target))))]
 extern "C" {
     pub fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int;
 }
 
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(any(target_os = "eclipse", not(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix)), eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn perror(s: *const c_char) {
     use crate::header::stdio::stderr;
@@ -101,13 +101,13 @@ pub unsafe extern "C" fn perror(s: *const c_char) {
     fputs(b"\n\0".as_ptr() as *const c_char, stderr);
 }
 
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+#[cfg(all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(target_os = "eclipse"), not(any(target_os = "eclipse", eclipse_target))))]
 extern "C" {
     pub fn perror(s: *const c_char);
 }
 
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(any(target_os = "eclipse", not(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix)), eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror(errnum: c_int) -> *const c_char {
     let msg: &[u8] = match errnum {
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn strerror(errnum: c_int) -> *const c_char {
     msg.as_ptr() as *const c_char
 }
 
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+#[cfg(all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(target_os = "eclipse"), not(any(target_os = "eclipse", eclipse_target))))]
 extern "C" {
     pub fn strerror(errnum: c_int) -> *const c_char;
 }

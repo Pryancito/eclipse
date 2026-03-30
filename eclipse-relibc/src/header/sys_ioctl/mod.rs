@@ -1,7 +1,7 @@
 //! sys/ioctl.h - I/O Control
 use crate::types::*;
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int {
     let ret = crate::eclipse_syscall::syscall3(

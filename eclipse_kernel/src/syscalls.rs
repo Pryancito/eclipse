@@ -28,77 +28,83 @@ pub(crate) static WALL_TIME_OFFSET: AtomicU64 = AtomicU64::new(0);
 #[repr(u64)]
 #[derive(Debug, Clone, Copy)]
 pub enum SyscallNumber {
-    Exit = 0,
+    Read = 0,
     Write = 1,
-    Read = 2,
-    Send = 3,
-    Receive = 4,
-    Yield = 5,
-    GetPid = 6,
-    Fork = 7,
-    Exec = 8,
-    Wait = 9,
-    GetServiceBinary = 10,
-    Open = 11,
-    Close = 12,
-    Lseek = 14,
-    GetFramebufferInfo = 15,
-    MapFramebuffer = 16,
-    PciEnumDevices = 17,
-    PciReadConfig = 18,
-    PciWriteConfig = 19,
-    Mmap = 20,
-    Munmap = 21,
-    Clone = 22,
-    GetTid = 23,
-    Futex = 24,
-    Nanosleep = 25,
-    Brk = 26,
-    RegisterDevice = 27,
-    Fmap = 28,
-    Mount = 29,
-    Fstat = 30,
-    Spawn = 31,
-    ArchPrctl = 32,
-    GetRandom = 33,
-    Ioctl = 34,
-    GetLastExecError = 35,
-    GetGpuDisplayInfo = 38,
-    SetCursorPosition = 39,
-    GpuAllocDisplayBuffer = 40,
-    GpuPresent = 41,
-    VirglCtxCreate = 42,
-    VirglCtxDestroy = 43,
-    VirglSubmit3d = 44,
-    VirglCtxAttachResource = 45,
-    VirglCtxDetachResource = 46,
-    GpuCommand = 56,
-    GetLogs = 49,
-    Socket = 100,
-    Bind = 101,
-    Listen = 102,
-    Accept = 103,
-    Connect = 104,
-    Mkdir = 105,
-    GetStorageDeviceCount = 50,
-    GetSystemStats = 51,
-    GetProcessList = 52,
-    Kill = 53,
-    SetProcessName = 54,
-    SpawnService = 55,
-    StopProgress = 57,
-    GetGpuBackend = 58,
-    SigAction = 60,
-    DrmPageFlip = 61,
-    DrmGetCaps = 62,
-    DrmAllocBuffer = 63,
-    DrmCreateFb = 64,
-    DrmMapHandle = 65,
-    SchedSetAffinity = 66,
-    RegisterLogHud = 67,
-    Ftruncate = 68,
-    SetTime = 69,
-    SpawnWithStdio = 70,
+    Open = 2,
+    Close = 3,
+    Stat = 4,
+    Fstat = 5,
+    Lseek = 8,
+    Mmap = 9,
+    Munmap = 11,
+    Brk = 12,
+    SigAction = 13,
+    Ioctl = 16,
+    Yield = 24,
+    Nanosleep = 35,
+    GetPid = 39,
+    Socket = 41,
+    Connect = 42,
+    Accept = 43,
+    Bind = 49,
+    Listen = 50,
+    Setsockopt = 54,
+    Getsockopt = 55,
+    Clone = 56,
+    Fork = 57,
+    Exec = 59,
+    Exit = 60,
+    Wait = 61,
+    Kill = 62,
+    Ftruncate = 77,
+    Mkdir = 83,
+    Unlink = 87,
+    Getppid = 110,
+    ArchPrctl = 158,
+    Gettid = 186,
+    Futex = 202,
+    Fstatat = 262,
+    GetRandom = 318,
+
+    // Eclipse-specific (500+)
+    Send = 500,
+    Receive = 501,
+    GetServiceBinary = 502,
+    GetFramebufferInfo = 503,
+    MapFramebuffer = 504,
+    PciEnumDevices = 505,
+    PciReadConfig = 506,
+    PciWriteConfig = 507,
+    RegisterDevice = 508,
+    Fmap = 509,
+    Mount = 510,
+    Spawn = 511,
+    GetLastExecError = 512,
+    ReadKey = 513,
+    ReadMousePacket = 514,
+    GetGpuDisplayInfo = 515,
+    SetCursorPosition = 516,
+    GpuAllocDisplayBuffer = 517,
+    GpuPresent = 518,
+    GetLogs = 519,
+    GetStorageDeviceCount = 520,
+    GetSystemStats = 521,
+    GetProcessList = 522,
+    SetProcessName = 523,
+    SpawnService = 524,
+    GpuCommand = 525,
+    StopProgress = 526,
+    GetGpuBackend = 527,
+    DrmPageFlip = 528,
+    DrmGetCaps = 529,
+    DrmAllocBuffer = 530,
+    DrmCreateFb = 531,
+    DrmMapHandle = 532,
+    SchedSetAffinity = 533,
+    RegisterLogHud = 534,
+    SetTime = 535,
+    SpawnWithStdio = 536,
+    ReceiveFast = 600,
 }
 
 
@@ -242,102 +248,87 @@ pub extern "C" fn syscall_handler(
          }
     }
 
-    let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = if is_linux {
-        match translate_linux_abi_unique(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) {
-            Some(t) => t,
-            None => (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6),
-        }
-    } else {
-        (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6)
-    };
+    let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     let ret = match syscall_num {
-        0 => sys_exit(arg1),
-        231 => sys_exit(arg1),  // Linux exit_group; Eclipse libc may use this number too
-        158 => sys_arch_prctl(arg1, arg2),  // Linux arch_prctl (TLS); exec'd glibc binaries use this
+        0 => sys_read(arg1, arg2, arg3),
         1 => sys_write(arg1, arg2, arg3),
-        2 => sys_read(arg1, arg2, arg3),
-        3 => sys_send(arg1, arg2, arg3, arg4),
-        4 => sys_receive(arg1, arg2, arg3),
-        5 => sys_yield(),
-        6 => sys_getpid(),
-        7 => sys_fork(&process_context),
-        8 => sys_exec(arg1, arg2),
-        9 => sys_wait(arg1),
-        10 => sys_get_service_binary(arg1, arg2, arg3),
-        11 => sys_open(arg1, arg2, arg3),
-        12 => sys_close(arg1),
-        13 => sys_getppid(),
-        14 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
-        15 => sys_get_framebuffer_info(arg1),
-        16 => sys_map_framebuffer(),
-        17 => sys_pci_enum_devices(arg1, arg2, arg3),
-        18 => sys_pci_read_config(arg1, arg2, arg3),
-        19 => sys_pci_write_config(arg1, arg2, arg3),
-        20 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
-        21 => sys_munmap(arg1, arg2),
-        22 => sys_clone(arg1, arg2, arg3),
-        23 => sys_gettid(),
-        24 => sys_futex(arg1, arg2, arg3, arg4),
-        25 => sys_nanosleep(arg1),
-        26 => sys_brk(arg1),
-        27 => sys_register_device(arg1, arg2, arg3),
-        28 => sys_fmap(arg1, arg2, arg3),
-        29 => sys_mount(arg1, arg2),
-        30 => sys_fstat(arg1, arg2),
-        31 => sys_spawn(arg1, arg2, arg3),
-        32 => sys_arch_prctl(arg1, arg2),
+        2 => sys_open(arg1, arg2, arg3),
+        3 => sys_close(arg1),
+        5 => sys_fstat(arg1, arg2),
+        8 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
+        9 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
+        11 => sys_munmap(arg1, arg2),
+        12 => sys_brk(arg1),
+        13 => u64::MAX, // sys_sigaction not yet implemented
+        16 => sys_ioctl(arg1, arg2, arg3),
+        24 => sys_yield(),
+        35 => sys_nanosleep(arg1),
+        39 => sys_getpid(),
+        41 => sys_socket(arg1, arg2, arg3),
+        42 => sys_connect(arg1, arg2, arg3),
+        43 => sys_accept(arg1, arg2, arg3),
+        49 => sys_bind(arg1, arg2, arg3),
+        50 => sys_listen(arg1, arg2),
+        54 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
+        55 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
+        56 => sys_clone(arg1, arg2, arg3),
+        57 => sys_fork(&process_context),
+        59 => sys_exec(arg1, arg2),
+        60 => sys_exit(arg1),
+        231 => sys_exit(arg1),  // Linux exit_group
+        61 => sys_wait(arg1),
+        62 => sys_kill(arg1),
+        77 => sys_ftruncate(arg1, arg2),
+        83 => sys_mkdir(arg1, arg2),
+        87 => sys_unlink(arg1),
+        110 => sys_getppid(),
+        158 => sys_arch_prctl(arg1, arg2),
+        186 => sys_gettid(),
+        202 => sys_futex(arg1, arg2, arg3, arg4),
+        262 => sys_fstatat(arg1, arg2, arg3, arg4),
+        318 => sys_getrandom(arg1, arg2, arg3),
 
-        33 => sys_getrandom(arg1, arg2, arg3),
-        34 => sys_ioctl(arg1, arg2, arg3),
-        35 => sys_get_last_exec_error(arg1, arg2),
-        36 => sys_read_key(),
-        37 => sys_read_mouse_packet(),
-        38 => sys_get_gpu_display_info(arg1),
-        39 => sys_set_cursor_position(arg1, arg2),
-        40 => sys_gpu_alloc_display_buffer(arg1, arg2, arg3),
-        41 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),   // Eclipse native
-        250 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),  // alias (avoids Linux socket=41 conflict)
-        42 => sys_virgl_ctx_create(arg1, arg2),
-        43 => sys_virgl_ctx_destroy(arg1),
-        44 => sys_virgl_submit_3d(arg1, arg2, arg3),
-        45 => sys_virgl_ctx_attach_resource(arg1, arg2),
-        46 => sys_virgl_ctx_detach_resource(arg1, arg2),
-        47 => sys_virgl_alloc_backing(arg1),
-        48 => sys_virgl_resource_attach_backing(arg1, arg2, arg3),
-        49 => sys_get_logs(arg1, arg2),
-        50 => sys_get_storage_device_count(),
-        51 => sys_get_system_stats(arg1),
-        52 => sys_get_process_list(arg1, arg2),
-        53 => sys_kill(arg1),
-        54 => sys_set_process_name(arg1, arg2),
-        55 => sys_spawn_service(arg1, arg2, arg3),
-        56 => sys_gpu_command(arg1, arg2, arg3, arg4),
-        57 => sys_stop_progress(),
-        58 => sys_gpu_get_backend(),
-        61 => sys_drm_page_flip(arg1),
-        62 => sys_drm_get_caps(arg1),
-        63 => sys_drm_alloc_buffer(arg1),
-        64 => sys_drm_create_fb(arg1, arg2, arg3, arg4),
-        65 => sys_drm_map_handle(arg1),
-        66 => sys_sched_setaffinity(arg1, arg2),
-        67 => sys_register_log_hud(arg1),
-        68 => sys_ftruncate(arg1, arg2),
-        69 => sys_set_time(arg1),
-        70 => sys_spawn_with_stdio(arg1, arg2, arg3, arg4, arg5, arg6),
-        100 => sys_socket(arg1, arg2, arg3),
-
-
-        101 => sys_bind(arg1, arg2, arg3),
-        102 => sys_listen(arg1, arg2),
-        103 => sys_accept(arg1, arg2, arg3),
-        104 => sys_connect(arg1, arg2, arg3),
-        105 => sys_mkdir(arg1, arg2),
-        106 => sys_fstatat(arg1, arg2, arg3, arg4),
-        107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
-        108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
-        109 => sys_unlink(arg1),
-        200 => sys_receive_fast(context), // Fast path: datos en registros, sin buffer
+        // Eclipse-specific (500+)
+        500 => sys_send(arg1, arg2, arg3, arg4),
+        501 => sys_receive(arg1, arg2, arg3),
+        502 => sys_get_service_binary(arg1, arg2, arg3),
+        503 => sys_get_framebuffer_info(arg1),
+        504 => sys_map_framebuffer(),
+        505 => sys_pci_enum_devices(arg1, arg2, arg3),
+        506 => sys_pci_read_config(arg1, arg2, arg3),
+        507 => sys_pci_write_config(arg1, arg2, arg3),
+        508 => sys_register_device(arg1, arg2, arg3),
+        509 => sys_fmap(arg1, arg2, arg3),
+        510 => sys_mount(arg1, arg2),
+        511 => sys_spawn(arg1, arg2, arg3),
+        512 => sys_get_last_exec_error(arg1, arg2),
+        513 => sys_read_key(),
+        514 => sys_read_mouse_packet(),
+        515 => sys_get_gpu_display_info(arg1),
+        516 => sys_set_cursor_position(arg1, arg2),
+        517 => sys_gpu_alloc_display_buffer(arg1, arg2, arg3),
+        518 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),
+        250 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5), // Legacy alias
+        519 => sys_get_logs(arg1, arg2),
+        520 => sys_get_storage_device_count(),
+        521 => sys_get_system_stats(arg1),
+        522 => sys_get_process_list(arg1, arg2),
+        523 => sys_set_process_name(arg1, arg2),
+        524 => sys_spawn_service(arg1, arg2, arg3),
+        525 => sys_gpu_command(arg1, arg2, arg3, arg4),
+        526 => sys_stop_progress(),
+        527 => sys_gpu_get_backend(),
+        528 => sys_drm_page_flip(arg1),
+        529 => sys_drm_get_caps(arg1),
+        530 => sys_drm_alloc_buffer(arg1),
+        531 => sys_drm_create_fb(arg1, arg2, arg3, arg4),
+        532 => sys_drm_map_handle(arg1),
+        533 => sys_sched_setaffinity(arg1, arg2),
+        534 => sys_register_log_hud(arg1),
+        535 => sys_set_time(arg1),
+        536 => sys_spawn_with_stdio(arg1, arg2, arg3, arg4, arg5, arg6),
+        600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
                 "[SYSCALL] Unknown syscall: {}{}{} from process {} on CPU {}\n",
@@ -838,53 +829,7 @@ fn strlen_user_unique(path_ptr: u64, max_len: usize) -> u64 {
 
 /// Translate Linux x86_64 syscall ABI to Eclipse numbers (for static glibc binaries like Xfbdev).
 /// Returns (eclipse_syscall_num, arg1, arg2, arg3, arg4, arg5) or None if not a known Linux syscall.
-fn translate_linux_abi_unique(
-    num: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-    arg5: u64,
-    arg6: u64,
-) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
-    let (eclipse_num, a1, a2, a3, a4, a5, a6) = match num {
-        0 => (2, arg1, arg2, arg3, arg4, arg5, arg6),           // read -> 2
-        1 => (1, arg1, arg2, arg3, arg4, arg5, arg6),           // write -> 1
-        2 => {
-            let path_len = strlen_user_unique(arg1, 4096);
-            (11, arg1, path_len, arg2, arg4, arg5, arg6)        // open(path, flags, mode) -> 11(path, len, flags)
-        }
-        3 => (12, arg1, arg2, arg3, arg4, arg5, arg6),          // close -> 12
-        5 => (30, arg1, arg2, arg3, arg4, arg5, arg6),          // fstat -> 30
-        8 => (14, arg1, arg2, arg3, arg4, arg5, arg6),          // lseek -> 14
-        9 => (20, arg1, arg2, arg3, arg4, arg5, arg6),          // mmap -> 20
-        11 => (21, arg1, arg2, arg3, arg4, arg5, arg6),         // munmap -> 21
-        12 => (26, arg1, arg2, arg3, arg4, arg5, arg6),         // brk -> 26
-        16 => (34, arg1, arg2, arg3, arg4, arg5, arg6),        // ioctl -> 34
-        39 => (6, arg1, arg2, arg3, arg4, arg5, arg6),          // getpid -> 6
-        60 => (0, arg1, arg2, arg3, arg4, arg5, arg6),         // exit -> 0
-        41 => (100, arg1, arg2, arg3, arg4, arg5, arg6),        // socket -> 100
-        42 => (104, arg1, arg2, arg3, arg4, arg5, arg6),        // connect -> 104
-        43 => (103, arg1, arg2, arg3, arg4, arg5, arg6),        // accept -> 103
-        49 => (101, arg1, arg2, arg3, arg4, arg5, arg6),        // bind -> 101
-        50 => (102, arg1, arg2, arg3, arg4, arg5, arg6),        // listen -> 102
-        83 => (105, arg1, arg2, arg3, arg4, arg5, arg6),        // mkdir -> 105
-        87 => (109, arg1, arg2, arg3, arg4, arg5, arg6),        // unlink -> 109
-        54 => (107, arg1, arg2, arg3, arg4, arg5, arg6),        // setsockopt -> 107
-        55 => (108, arg1, arg2, arg3, arg4, arg5, arg6),        // getsockopt -> 108
-        158 => (32, arg1, arg2, arg3, arg4, arg5, arg6),       // arch_prctl (TLS: ARCH_SET_FS etc.) -> 32
-        186 => (23, arg1, arg2, arg3, arg4, arg5, arg6),       // gettid -> 23
-        231 => (0, arg1, arg2, arg3, arg4, arg5, arg6),        // exit_group -> 0 (exit)
-        262 => (106, arg1, arg2, arg3, arg4, arg5, arg6),       // fstatat -> 106
-        35 => (25, arg1, arg2, arg3, arg4, arg5, arg6),          // nanosleep -> 25
-        318 => (33, arg1, arg2, arg3, arg4, arg5, arg6),         // getrandom -> sys_getrandom (33)
-        56 => (22, arg1, arg2, arg3, arg4, arg5, arg6),          // clone  -> sys_clone (22)
-        57 => (7,  arg1, arg2, arg3, arg4, arg5, arg6),          // fork   -> sys_fork  (7)
-        61 => (9,  arg1, arg2, arg3, arg4, arg5, arg6),          // wait4  -> sys_wait  (9)
-        _ => return None,
-    };
-    Some((eclipse_num, a1, a2, a3, a4, a5, a6))
-}
+// translate_linux_abi_unique removed as it is no longer necessary after syscall alignment.
 
 /// Verify if a pointer range points to valid user memory
 /// User memory range: 0x0000_0000_0000_0000 to 0x0000_7FFF_FFFF_FFFF
@@ -1740,7 +1685,8 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
 }
 
 /// sys_open - Open a file or scheme resource
-fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
+fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
+    let path_len = strlen_user_unique(path_ptr, 4096);
     let mut stats = SYSCALL_STATS.lock();
     stats.open_calls += 1;
     drop(stats);

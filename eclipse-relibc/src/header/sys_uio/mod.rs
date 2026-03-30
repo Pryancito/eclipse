@@ -8,13 +8,13 @@ pub struct iovec {
     pub iov_len: size_t,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn readv(_fd: c_int, _iov: *const iovec, _iovcnt: c_int) -> ssize_t {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn writev(_fd: c_int, _iov: *const iovec, _iovcnt: c_int) -> ssize_t {
     -1

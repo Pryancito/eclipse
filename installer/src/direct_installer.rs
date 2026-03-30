@@ -543,11 +543,11 @@ impl DirectInstaller {
 
         // Instalar aplicaciones de eclipse-apps
         let apps_to_install = vec![
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/smithay_app"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "/usr/bin/demo_client"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/wayland_handshake", "/usr/bin/wayland_handshake"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/x11_bridge_test", "/usr/bin/x11_bridge_test"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar", "/usr/bin/rwaybar"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "/usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/demo_client", "/usr/bin/demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/wayland_handshake", "/usr/bin/wayland_handshake"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/x11_bridge_test", "/usr/bin/x11_bridge_test"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/rwaybar", "/usr/bin/rwaybar"),
             // Mantener rutas antiguas para compatibilidad
             ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
             ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
@@ -650,9 +650,9 @@ impl DirectInstaller {
             ("userland/graphics_module/target/release/graphics_module", "graphics_module"),
             ("userland/app_framework/target/release/app_framework", "app_framework"),
             ("userland/target/release/eclipse_userland", "eclipse_userland"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "smithay_app"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "demo_client"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar", "rwaybar"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/demo_client", "demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/rwaybar", "rwaybar"),
         ];
 
         for (source, name) in userland_modules {
@@ -1068,7 +1068,7 @@ Desarrollado con amor en Rust
         // Copiar eclipse-systemd
         let systemd_paths = vec![
             "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd",
-            "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse-systemd",
+            "eclipse-apps/target/x86_64-unknown-linux-musl/release/eclipse-systemd",
         ];
         
         let mut systemd_copied = false;
@@ -1115,10 +1115,10 @@ Desarrollado con amor en Rust
             ("userland/module_loader/target/release/module_loader", "userland/bin/module_loader"),
             ("userland/graphics_module/target/release/graphics_module", "userland/bin/graphics_module"),
             ("userland/app_framework/target/release/app_framework", "userland/bin/app_framework"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "usr/bin/smithay_app"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "usr/bin/demo_client"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/wayland_handshake", "usr/bin/wayland_handshake"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/x11_bridge_test", "usr/bin/x11_bridge_test"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/demo_client", "usr/bin/demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/wayland_handshake", "usr/bin/wayland_handshake"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/x11_bridge_test", "usr/bin/x11_bridge_test"),
             ("eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel", "boot/eclipse_kernel"),
         ];
         
@@ -1303,8 +1303,8 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Copiar otros binarios del sistema
         let binaries = vec![
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/bash"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/sh"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "/usr/bin/bash"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "/usr/bin/sh"),
             ("userland/target/release/eclipse_userland", "/usr/bin/userland"),
         ];
         
@@ -1418,7 +1418,7 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         }
         
         // Instalar xfwl4
-        let smithay_path = "eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app";
+        let smithay_path = "eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app";
         if Path::new(smithay_path).exists() {
             eclipsefs.install_binary("/usr/bin/xfwl4", smithay_path)?;
             println!("         ✓ xfwl4 instalado en /usr/bin/");
@@ -1428,12 +1428,12 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Instalar otros binarios del sistema
         let binaries = vec![
-            ("/usr/bin/smithay_app", "eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app"),
-            ("/usr/bin/demo_client", "eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client"),
-            ("/usr/bin/rwaybar", "eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar"),
-            ("/usr/bin/eclipse_taskbar", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_taskbar"),
-            ("/usr/bin/eclipse_notifications", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_notifications"),
-            ("/usr/bin/eclipse_window_manager", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_window_manager"),
+            ("/usr/bin/smithay_app", "eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app"),
+            ("/usr/bin/demo_client", "eclipse-apps/target/x86_64-unknown-linux-musl/release/demo_client"),
+            ("/usr/bin/rwaybar", "eclipse-apps/target/x86_64-unknown-linux-musl/release/rwaybar"),
+            ("/usr/bin/eclipse_taskbar", "eclipse-apps/target/x86_64-unknown-linux-musl/release/eclipse_taskbar"),
+            ("/usr/bin/eclipse_notifications", "eclipse-apps/target/x86_64-unknown-linux-musl/release/eclipse_notifications"),
+            ("/usr/bin/eclipse_window_manager", "eclipse-apps/target/x86_64-unknown-linux-musl/release/eclipse_window_manager"),
         ];
         
         for (install_path, source_path) in binaries {
@@ -1518,8 +1518,8 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Copiar aplicaciones desde eclipse-apps
         let apps = vec![
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/smithay_app"),
-            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "/usr/bin/demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/smithay_app", "/usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-linux-musl/release/demo_client", "/usr/bin/demo_client"),
             ("eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "/usr/sbin/eclipse-systemd"),
             ("eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "/sbin/eclipse-systemd"),
         ];

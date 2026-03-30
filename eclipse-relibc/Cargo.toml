@@ -14,7 +14,7 @@ license = "MIT"
 eclipse-syscall = { path = "../eclipse-syscall" }
 
 [features]
-default = ["std", "allocator", "panic-handler"]
+default = ["std", "allocator"]
 allocator = []
 no-allocator = []
 panic-handler = []

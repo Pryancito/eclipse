@@ -1,11 +1,11 @@
 {
-    "llvm-target": "x86_64-unknown-none",
+    "llvm-target": "x86_64-unknown-linux-musl",
     "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
     "arch": "x86_64",
     "target-endian": "little",
     "target-pointer-width": 64,
     "target-c-int-width": 32,
-    "os": "none",
+    "os": "eclipse",
     "env": "",
     "vendor": "eclipse",
     "linker-flavor": "ld.lld",
@@ -14,10 +14,13 @@
     "panic-strategy": "abort",
     "relocation-model": "static",
     "code-model": "small",
-    "features": "+sse,+sse2",
+    "features": "+sse,+sse2,+avx,+avx2,+fma,+bmi1,+bmi2",
     "disable-redzone": true,
     "max-atomic-width": 64,
     "stack-probes": {
         "kind": "none"
-    }
+    },
+    "target-family": [
+        "unix"
+    ]
 }

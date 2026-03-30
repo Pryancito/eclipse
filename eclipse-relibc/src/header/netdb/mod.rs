@@ -32,25 +32,25 @@ pub struct addrinfo {
     pub ai_next: *mut addrinfo,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn gethostbyname(_name: *const c_char) -> *mut hostent {
     core::ptr::null_mut()
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn gethostbyaddr(_addr: *const c_void, _len: socklen_t, _type: c_int) -> *mut hostent {
     core::ptr::null_mut()
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn getservbyname(_name: *const c_char, _proto: *const c_char) -> *mut servent {
     core::ptr::null_mut()
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn getaddrinfo(
     _node: *const c_char,
@@ -61,13 +61,13 @@ pub unsafe extern "C" fn getaddrinfo(
     -1 // Failure for stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn freeaddrinfo(_res: *mut addrinfo) {
     // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn gai_strerror(_errcode: c_int) -> *const c_char {
     b"Unknown error\0".as_ptr() as *const c_char

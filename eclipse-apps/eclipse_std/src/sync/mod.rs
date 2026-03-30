@@ -1,6 +1,8 @@
 //! Synchronization Module - Mutex and Condvar using eclipse-libc pthread
 
 use core::cell::UnsafeCell;
+pub use core::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
 
 /// Mutual exclusion primitive
 pub struct Mutex<T: ?Sized> {

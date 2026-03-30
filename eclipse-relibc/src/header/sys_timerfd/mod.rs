@@ -1,34 +1,23 @@
-//! dirent.h - Directory operations
+//! sys/timerfd.h - Timer file descriptors
 use crate::types::*;
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct dirent {
-    pub d_ino: ino_t,
-    pub d_off: off_t,
-    pub d_reclen: c_ushort,
-    pub d_type: c_uchar,
-    pub d_name: [c_char; 256],
-}
-
-pub struct DIR {
-    pub fd: c_int,
-}
+pub const TFD_TIMER_ABSTIME: c_int = 1;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn opendir(_name: *const c_char) -> *mut DIR {
-    core::ptr::null_mut()
-}
-
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
-#[no_mangle]
-pub unsafe extern "C" fn readdir(_dirp: *mut DIR) -> *mut dirent {
-    core::ptr::null_mut()
-}
-
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
-#[no_mangle]
-pub unsafe extern "C" fn closedir(_dirp: *mut DIR) -> c_int {
+pub unsafe extern "C" fn timerfd_create(_clockid: clockid_t, _flags: c_int) -> c_int {
+    // Return a dummy FD that will be handled by our poll/read shims
     -1
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn timerfd_settime(_fd: c_int, _flags: c_int, _new_value: *const itimerspec, _old_value: *mut itimerspec) -> c_int {
+    0
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn timerfd_gettime(_fd: c_int, _curr_value: *mut itimerspec) -> c_int {
+    0
 }

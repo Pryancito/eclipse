@@ -11,7 +11,7 @@ pub struct utsname {
     pub machine: [c_char; 65],
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn uname(buf: *mut utsname) -> c_int {
     if buf.is_null() {

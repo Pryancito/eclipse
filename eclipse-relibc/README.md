@@ -63,10 +63,10 @@ Desde la raíz del repositorio Eclipse:
 cargo +nightly build -p eclipse-libc --release
 ```
 
-Para un target custom (p. ej. `x86_64-unknown-eclipse`):
+Para un target custom (p. ej. `x86_64-unknown-linux-musl`):
 
 ```bash
-cargo +nightly build -p eclipse-libc --target x86_64-unknown-eclipse.json -Z build-std=core,alloc --release
+cargo +nightly build -p eclipse-libc --target x86_64-unknown-linux-musl.json -Z build-std=core,alloc --release
 ```
 
 ## Relación con el resto de Eclipse OS

@@ -16,7 +16,7 @@ macro_rules! println {
     ($fmt:expr, $($arg:tt)*) => ($crate::print!(core::concat!($fmt, "\n"), $($arg)*));
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 core::arch::global_asm!(include_str!("posix_stubs.s"));
 
 extern crate alloc;
@@ -60,6 +60,8 @@ pub mod header {
     pub mod grp;
     pub mod ifaddrs;
     pub mod sys_eclipse;
+    pub mod sys_timerfd;
+    pub mod sys_eventfd;
 }
 
 pub use types::*;
@@ -95,6 +97,8 @@ pub use header::dirent::*;
 pub use header::pwd::*;
 pub use header::grp::*;
 pub use header::ifaddrs::*;
+pub use header::sys_timerfd::*;
+pub use header::sys_eventfd::*;
 pub use header::sys_eclipse::*;
 pub const O_RDONLY: c_int = eclipse_syscall::flag::O_RDONLY as c_int;
 pub const O_WRONLY: c_int = eclipse_syscall::flag::O_WRONLY as c_int;
@@ -109,9 +113,9 @@ pub const O_CLOEXEC: c_int = eclipse_syscall::flag::O_CLOEXEC as c_int;
 pub const O_NOFOLLOW: c_int = eclipse_syscall::flag::O_NOFOLLOW as c_int;
 pub const O_DIRECTORY: c_int = eclipse_syscall::flag::O_DIRECTORY as c_int;
 
-#[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(any(target_os = "eclipse", eclipse_target, target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
 pub const SYS_getrandom: c_int = eclipse_syscall::number::SYS_GETRANDOM as c_int;
-#[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(not(any(target_os = "eclipse", eclipse_target, target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))))))]
 pub const SYS_getrandom: c_int = 318;
 
 /// Linux x86-64 syscall number for futex(2).
@@ -129,7 +133,7 @@ pub const FUTEX_PRIVATE_FLAG: c_int = 128;
 /// Maximum value of a signed 32-bit integer.
 pub const INT_MAX: c_int = i32::MAX;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(eclipse_target)), eclipse_target)))]
 #[no_mangle]
 pub unsafe extern "C" fn syscall(_num: c_long, ...) -> c_long {
     // Accept any number/type of arguments after `_num` to remain ABI-compatible
@@ -140,37 +144,37 @@ pub unsafe extern "C" fn syscall(_num: c_long, ...) -> c_long {
     0
 }
 
-#[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(not(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(eclipse_target)), eclipse_target)))]
 extern "C" {
     pub fn syscall(num: c_long, ...) -> c_long;
 }
 
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetRegionStart() -> usize { 0 }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetGR() { }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetIP() { }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetTextRelBase() -> usize { 0 }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetDataRelBase() -> usize { 0 }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetLanguageSpecificData() -> *const u8 { core::ptr::null() }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetIPInfo() -> usize { 0 }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn __gcc_personality_v0() { }
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(eclipse_target))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_Resume() { }
 
@@ -181,7 +185,7 @@ pub unsafe extern "C" fn _Unwind_Resume() { }
 #[cfg(all(
     not(any(test, feature = "host-testing")),
     feature = "panic-handler",
-    eclipse_target,
+    any(target_os = "eclipse", eclipse_target),
 ))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

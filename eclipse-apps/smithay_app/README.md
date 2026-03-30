@@ -67,19 +67,19 @@ cargo build -p smithay_app --target x86_64-unknown-linux-gnu --release
 ```bash
 cd eclipse-apps
 ./smithay_app/build_eclipse.sh
-# Binario: target/x86_64-unknown-eclipse/release/smithay_app
+# Binario: target/x86_64-unknown-linux-musl/release/smithay_app
 ```
 
-O manualmente (usa **core,alloc** — NUNCA std — porque x86_64-unknown-eclipse tiene os="none"):
+O manualmente (usa **core,alloc** — NUNCA std — porque x86_64-unknown-linux-musl tiene os="none"):
 ```bash
 # 1. eclipse-relibc primero
 cd eclipse-relibc
-cargo +nightly build --release --target ../x86_64-unknown-eclipse.json -Z unstable-options -Z build-std=core,alloc
-cp target/x86_64-unknown-eclipse/release/libeclipse_libc.rlib target/x86_64-unknown-eclipse/release/libc.a
+cargo +nightly build --release --target ../x86_64-unknown-linux-musl.json -Z unstable-options -Z build-std=core,alloc
+cp target/x86_64-unknown-linux-musl/release/libeclipse_libc.rlib target/x86_64-unknown-linux-musl/release/libc.a
 
 # 2. smithay_app
 cd ../eclipse-apps
-cargo +nightly build -p smithay_app --target ../x86_64-unknown-eclipse.json -Z unstable-options -Z build-std=core,alloc --release
+cargo +nightly build -p smithay_app --target ../x86_64-unknown-linux-musl.json -Z unstable-options -Z build-std=core,alloc --release
 ```
 El script `build.sh` en la raíz del repo automatiza estos pasos para la build completa.
 
@@ -150,7 +150,7 @@ When running, the compositor displays status information:
 ## Troubleshooting
 
 **Error: `none of the predicates in this cfg_select evaluated to true` (en std/src/sys/alloc/mod.rs):**  
-Estás usando `-Z build-std=std` o similar. Para Eclipse OS **no** debes compilar el `std` real de Rust; `x86_64-unknown-eclipse` tiene `os: "none"` y la std no soporta bare-metal. Usa solo `-Z build-std=core,alloc` y deja que `eclipse_std` reemplace a `std` (ya está configurado en Cargo.toml).
+Estás usando `-Z build-std=std` o similar. Para Eclipse OS **no** debes compilar el `std` real de Rust; `x86_64-unknown-linux-musl` tiene `os: "none"` y la std no soporta bare-metal. Usa solo `-Z build-std=core,alloc` y deja que `eclipse_std` reemplace a `std` (ya está configurado en Cargo.toml).
 
 ## Dependencies
 

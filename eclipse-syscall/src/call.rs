@@ -24,8 +24,8 @@ pub fn open(path: &str, flags: usize) -> Result<usize> {
         cvt(syscall3(
             SYS_OPEN,
             path.as_ptr() as usize,
-            path.len(),
             flags,
+            0, // mode (optional in Linux/Eclipse for non-O_CREAT)
         ))
     }
 }
@@ -114,6 +114,33 @@ pub fn get_process_list(buf: &mut [crate::ProcessInfo]) -> Result<usize> {
 /// Kill a process by PID
 pub fn kill(pid: usize) -> Result<()> {
     unsafe { cvt_unit(syscall1(SYS_KILL, pid)) }
+}
+
+/// Fork the current process
+pub fn fork() -> Result<usize> {
+    unsafe { cvt(syscall0(SYS_FORK)) }
+}
+
+/// Get the parent PID
+pub fn getppid() -> usize {
+    unsafe { syscall0(SYS_GETPPID) }
+}
+
+/// Remove a file or directory
+pub fn unlink(path: &str) -> Result<()> {
+    unsafe {
+        cvt_unit(syscall3(
+            SYS_UNLINK,
+            path.as_ptr() as usize,
+            path.len(),
+            0,
+        ))
+    }
+}
+
+/// Change signal action
+pub fn sigaction(signum: usize, act: usize, oldact: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall3(SYS_SIGACTION, signum, act, oldact)) }
 }
 
 /// Wait for a child process to exit

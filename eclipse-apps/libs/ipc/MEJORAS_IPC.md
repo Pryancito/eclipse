@@ -84,7 +84,7 @@ let mut buf = [0u8; SLOW_BUF];
 - `parse_slow`: "SWND"+SideWindMessage válido, "SUBS"+pid, "INPT"+pid, "GET_INPUT_PID", mensaje desconocido → `Raw`.
 
 Así los cambios en tags o tamaños no rompen el parser sin que se note.
-**Nota:** El crate es `no_std` y el target es `x86_64-unknown-eclipse`, por lo que el test runner estándar no está disponible. Los tests se pueden añadir cuando exista un build para host o un test runner no_std.
+**Nota:** El crate es `no_std` y el target es `x86_64-unknown-linux-musl`, por lo que el test runner estándar no está disponible. Los tests se pueden añadir cuando exista un build para host o un test runner no_std.
 
 ### 6.2 Validación y seguridad
 **Mejora:** Antes de cada `read_unaligned` o `copy_from_slice` en `parse_slow`, comprobar explícitamente `len >= size_of::<T>()` (y que el tag coincide cuando aplique). Ya se hace en parte; documentar que el buffer de `receive()` puede no estar alineado y que por eso se usa `read_unaligned`.

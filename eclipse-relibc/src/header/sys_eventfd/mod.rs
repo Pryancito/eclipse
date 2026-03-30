@@ -1,34 +1,26 @@
-//! dirent.h - Directory operations
+//! sys/eventfd.h - Event file descriptors
 use crate::types::*;
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct dirent {
-    pub d_ino: ino_t,
-    pub d_off: off_t,
-    pub d_reclen: c_ushort,
-    pub d_type: c_uchar,
-    pub d_name: [c_char; 256],
-}
+pub const EFD_SEMAPHORE: c_int = 0o0000001;
+pub const EFD_CLOEXEC: c_int = 0o2000000;
+pub const EFD_NONBLOCK: c_int = 0o0004000;
 
-pub struct DIR {
-    pub fd: c_int,
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn eventfd(_initval: c_uint, _flags: c_int) -> c_int {
+    // For now, return -1 as it's not yet implemented in kernel
+    // but the symbol must exist to link.
+    -1
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn opendir(_name: *const c_char) -> *mut DIR {
-    core::ptr::null_mut()
+pub unsafe extern "C" fn eventfd_read(_fd: c_int, _value: *mut u64) -> c_int {
+    -1
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn readdir(_dirp: *mut DIR) -> *mut dirent {
-    core::ptr::null_mut()
-}
-
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
-#[no_mangle]
-pub unsafe extern "C" fn closedir(_dirp: *mut DIR) -> c_int {
+pub unsafe extern "C" fn eventfd_write(_fd: c_int, _value: u64) -> c_int {
     -1
 }

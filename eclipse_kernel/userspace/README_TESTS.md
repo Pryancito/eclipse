@@ -25,7 +25,7 @@ Los servicios usan `eclipse_std` en lugar de la std de Rust. Por eso:
 Para ejecutar tests en host de forma fiable, opciones posibles:
 
 1. Añadir un workspace o crate de tests que use la std del host y dependa de las libs de los servicios (donde se haya extraído lógica a lib).
-2. Ejecutar los tests en el target **x86_64-unknown-eclipse** con un test runner propio que no dependa del crate `test`.
+2. Ejecutar los tests en el target **x86_64-unknown-linux-musl** con un test runner propio que no dependa del crate `test`.
 3. Usar los runners manuales (como `input_service_tests`) compilando con el target host y las flags necesarias.
 
 ## Estructura de input_service

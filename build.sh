@@ -149,7 +149,7 @@ build_eclipse_libc() {
         # Instalar en sysroot como libc.a
         local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
         mkdir -p "$SYSROOT_LIB"
-        cp "target/$ECLIPSE_TARGET_NAME/release/liblibc.rlib" "$SYSROOT_LIB/libc.a"
+        cp "target/x86_64-unknown-eclipse/release/liblibc.rlib" "$SYSROOT_LIB/libc.a"
         print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a"
 
         # Debilitar todos los símbolos globales en libc.a para evitar
@@ -190,26 +190,42 @@ build_sidewind_project() {
     
     # Compilar todo el workspace usando el target personalizado de Eclipse
     # parse_stack_sizes es herramienta host (usa stack-sizes/anyhow/byteorder con std) - excluir del build Eclipse
-    print_status "Compilando workspace Sidewind para target Eclipse..."
-    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes
+    # WAYLAND_CLIENT_NO_PKG_CONFIG=1 y LIBUDEV_NO_PKG_CONFIG=1 evitan que pkg-config falle al no encontrar
+    # las librerías nativas de linux durante el build para el target Eclipse.
+    print_status "Compilando workspace Sidewind para target Eclipse (bypassing pkg-config)..."
+    
+    # Construir eclipse_std primero para tener el bridge de la librería estándar
+    print_status "Construyendo eclipse_std (std bridge)..."
+    cargo +nightly build -p eclipse_std --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
+    
+    # Mapear globalmente eclipse_std como 'std' para satisfacer dependencias crates.io (log, once_cell, etc.)
+    # Esto evita el error E0463: can't find crate for `std` en todas las subdependencias.
+    STD_RLIB=$(ls target/x86_64-unknown-eclipse/release/deps/libstd-*.rlib | head -n 1)
+    if [ -f "$STD_RLIB" ]; then
+        print_status "Mapeando std bridge desde: $STD_RLIB"
+        export RUSTFLAGS="--extern std=$BASE_DIR/eclipse-apps/$STD_RLIB $RUSTFLAGS"
+    fi
+
+    WAYLAND_CLIENT_NO_PKG_CONFIG=1 LIBUDEV_NO_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1 \
+    cargo +nightly build --workspace --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release --exclude parse_stack_sizes
     
     if [ $? -eq 0 ]; then
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test lunas terminal sh"
+        local BINS="smithay_app demo_client lunas terminal sh xfwl4"
         
         for bin in $BINS; do
-            if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
+            if [ -f "target/x86_64-unknown-linux-musl/release/$bin" ]; then
                 # Instalar en sysroot
                 mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
-                cp "target/x86_64-unknown-eclipse/release/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
+                cp "target/x86_64-unknown-linux-musl/release/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
                 print_status "Instalado en sysroot: /usr/bin/$bin"
                 
                 # Instalar en distribución
                 if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
                     mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
-                    cp "target/x86_64-unknown-eclipse/release/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
+                    cp "target/x86_64-unknown-linux-musl/release/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
                 fi
             fi
         done
@@ -511,7 +527,7 @@ build_installer() {
     
     cd installer
     
-    # Instalador es herramienta host (Linux), usa std. NO usar x86_64-unknown-eclipse.
+    # Instalador es herramienta host (Linux), usa std. NO usar x86_64-unknown-linux-musl.
     print_status "Compilando instalador..."
     cargo build --release
     
@@ -1469,7 +1485,7 @@ show_build_summary() {
     echo "Binarios compilados:"
     echo "Componentes compilados:"
     echo "  Librería EclipseFS: eclipsefs-lib/target/debug/libeclipsefs_lib.rlib"
-    echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init"
+    echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-linux-musl/release/eclipse-init"
     echo "  Kernel Eclipse OS: target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
     echo "  Instalador: installer/target/x86_64-unknown-linux-musl/release/eclipse-installer"
@@ -1483,7 +1499,7 @@ show_build_summary() {
     echo "  Calculadora Wayland: wayland_apps/wayland_calculator/target/release/wayland_calculator"
     echo "  Terminal Wayland: wayland_apps/wayland_terminal/target/release/wayland_terminal"
     echo "  Editor de texto Wayland: wayland_apps/wayland_text_editor/target/release/wayland_text_editor"
-    echo "  Rwaybar: eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar"
+    echo "  Rwaybar: eclipse-apps/target/x86_64-unknown-linux-musl/release/rwaybar"
     echo ""
     echo "Desktop Environment:"
     echo "  Nota: Desktop environment no implementado en esta versión"
@@ -1593,7 +1609,7 @@ build_eclipsefs_cli() {
     
     cd eclipsefs-cli
     
-    # eclipsefs-cli es herramienta host (Linux), usa std. NO usar x86_64-unknown-eclipse.
+    # eclipsefs-cli es herramienta host (Linux), usa std. NO usar x86_64-unknown-linux-musl.
     print_status "Compilando eclipsefs CLI tool..."
     cargo build --release
     

@@ -62,6 +62,13 @@ pub struct itimerval {
     pub it_value: timeval,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct itimerspec {
+    pub it_interval: timespec,
+    pub it_value: timespec,
+}
+
 pub const ITIMER_REAL: c_int = 0;
 pub const ITIMER_VIRTUAL: c_int = 1;
 pub const ITIMER_PROF: c_int = 2;

@@ -12,26 +12,40 @@ pub struct sigaction {
     pub sa_restorer: Option<unsafe extern "C" fn()>,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn signal(_signum: c_int, _handler: Option<OsSigHandlerPtr>) -> Option<OsSigHandlerPtr> {
     // Stub: return SIG_DFL (0)
     None
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn kill(_pid: pid_t, _sig: c_int) -> c_int {
-    0
+pub unsafe extern "C" fn kill(pid: pid_t, _sig: c_int) -> c_int {
+    use eclipse_syscall::call::kill;
+    match kill(pid as usize) {
+        Ok(_) => 0,
+        Err(e) => {
+            *crate::header::errno::__errno_location() = e.errno as c_int;
+            -1
+        }
+    }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn sigaction(_signum: c_int, _act: *const sigaction, _oldact: *mut sigaction) -> c_int {
-    0
+pub unsafe extern "C" fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int {
+    use eclipse_syscall::call::sigaction;
+    match sigaction(signum as usize, act as usize, oldact as usize) {
+        Ok(_) => 0,
+        Err(e) => {
+            *crate::header::errno::__errno_location() = e.errno as c_int;
+            -1
+        }
+    }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
     if !set.is_null() {
@@ -40,7 +54,7 @@ pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int {
     if !set.is_null() && signum > 0 && signum <= 64 {
@@ -49,7 +63,7 @@ pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn sigprocmask(_how: c_int, _set: *const sigset_t, _oldset: *mut sigset_t) -> c_int {
     0 // Stub

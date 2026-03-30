@@ -13,48 +13,61 @@
 #![cfg_attr(not(feature = "std_compat"), feature(alloc_error_handler))]
 #![feature(prelude_import)]
 #![feature(lang_items)]
+#![feature(core_intrinsics)]
 
+pub extern crate core;
 pub extern crate alloc;
+
+// Core functionality re-exports
+pub use core::option::Option::{self, Some, None};
+pub use core::result::Result::{self, Ok, Err};
+pub use core::marker::{Send, Sync, Sized, Unpin};
+pub use core::ops::{Fn, FnMut, FnOnce, Drop};
+pub use core::clone::Clone;
+pub use core::default::Default;
+pub use core::convert::{From, Into, AsRef, AsMut, TryFrom, TryInto};
+pub use core::iter::{Iterator, IntoIterator, Extend};
+pub use core::fmt::{self, Debug, Display};
+pub use core::u16;
+pub use core::u32;
+pub use core::u64;
+pub use core::i32;
+pub use core::f32;
+pub use core::f64;
+
 pub extern crate libc; // This is eclipse-libc-posix from Cargo.toml
 pub use alloc::vec as vec;
 
 use core::panic::PanicInfo;
 
-pub use core::fmt;
 pub mod ffi {
     pub use core::ffi::*;
     pub use crate::libc::{c_char, c_int, c_long, c_void, size_t, pid_t, FILE};
     pub use crate::env::{OsStr, OsString};
 }
 
-pub use core::ptr;
-
-// Re-exportar módulos de core para compatibilidad con crates que usan std::result, std::iter, etc.
-pub mod result {
-    pub use core::result::*;
-}
-pub mod option {
-    pub use core::option::*;
-}
-pub mod iter {
-    pub use core::iter::*;
-}
-pub mod marker {
-    pub use core::marker::*;
-}
-pub mod ops {
-    pub use core::ops::*;
-}
-pub mod mem {
-    pub use core::mem::*;
-}
-pub mod convert {
-    pub use core::convert::*;
-}
-
-pub mod any {
-    pub use core::any::*;
-}
+// Standard module re-exports (bridge to core)
+pub mod result { pub use core::result::*; }
+pub mod option { pub use core::option::*; }
+pub mod iter { pub use core::iter::*; }
+pub mod marker { pub use core::marker::*; }
+pub mod ops { pub use core::ops::*; }
+pub mod mem { pub use core::mem::*; }
+pub mod convert { pub use core::convert::*; }
+pub mod any { pub use core::any::*; }
+pub mod cell { pub use core::cell::*; }
+pub mod ptr { pub use core::ptr::*; }
+pub mod slice { pub use core::slice::*; }
+pub mod str { pub use core::str::*; }
+pub mod char { pub use core::char::*; }
+pub mod hash { pub use core::hash::*; }
+pub mod hint { pub use core::hint::*; }
+pub mod task { pub use core::task::*; }
+pub mod future { pub use core::future::*; }
+pub mod pin { pub use core::pin::*; }
+pub mod cmp { pub use core::cmp::*; }
+pub mod ascii { pub use core::ascii::*; }
+pub mod intrinsics { pub use core::intrinsics::*; }
 
 pub mod heap;
 #[macro_use]
@@ -91,7 +104,6 @@ pub mod prelude {
     pub mod v1 {
         pub use core::prelude::v1::*;
         pub use core::cmp::{PartialEq, PartialOrd, Eq, Ord};
-        pub use core::convert::{TryInto, TryFrom};
         pub use core::option::Option::{self, Some, None};
         pub use core::result::Result::{self, Ok, Err};
         pub use core::matches;
@@ -99,12 +111,14 @@ pub mod prelude {
         // Mismos re-exports que std::prelude::v1 (marker, ops, iter, mem, convert)
         pub use crate::marker::{Send, Sized, Sync, Unpin};
         pub use crate::ops::{Drop, Fn, FnMut, FnOnce};
-        pub use crate::mem::drop;
-        pub use crate::mem::{align_of, align_of_val, size_of, size_of_val};
-        pub use crate::convert::{AsMut, AsRef, From, Into};
+        pub use crate::mem::{drop, align_of, align_of_val, size_of, size_of_val};
+        pub use crate::convert::{AsMut, AsRef, From, Into, TryInto, TryFrom};
         pub use crate::iter::{
             DoubleEndedIterator, ExactSizeIterator, Extend, IntoIterator, Iterator,
         };
+        pub use core::clone::Clone;
+        pub use core::default::Default;
+        pub use core::borrow::{Borrow, BorrowMut};
 
         pub use crate::heap::init_heap;
         pub use crate::{print, println, eprint, eprintln};
@@ -122,7 +136,7 @@ pub mod prelude {
         pub use crate::time;
         pub use crate::thread;
         pub use crate::sync::{Mutex, Condvar};
-        pub use alloc::borrow::{ToOwned, Borrow};
+        pub use alloc::borrow::ToOwned;
     }
     #[prelude_import]
     pub use self::v1::*;
@@ -160,12 +174,9 @@ where
     let res = user_main();
     let exit_code = res.report();
     
-    // Exit the application
     unsafe {
         crate::libc::exit(exit_code as i32);
     }
-    
-    loop {}
 }
 
 pub trait Termination {
@@ -237,7 +248,6 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         crate::libc::exit(1);
     }
-    loop {}
 }
 
 /// Alloc error handler.
@@ -257,6 +267,5 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     unsafe {
         crate::libc::exit(2);
     }
-    loop {}
 }
 
