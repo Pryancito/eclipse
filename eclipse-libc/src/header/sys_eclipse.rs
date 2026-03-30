@@ -81,17 +81,23 @@ pub unsafe extern "C" fn set_process_name(name: *const c_char) -> c_int {
     if name.is_null() {
         return -1;
     }
-    
-    let res = eclipse_syscall::syscall1(
-        eclipse_syscall::number::SYS_SET_PROCESS_NAME,
-        name as usize
-    );
-    
-    if res == 0 {
-        0
-    } else {
-        -1
+    let mut len = 0usize;
+    while len < 15 {
+        let b = *name.add(len) as u8;
+        if b == 0 {
+            break;
+        }
+        len += 1;
     }
+    if len == 0 {
+        return -1;
+    }
+    let res = eclipse_syscall::syscall2(
+        eclipse_syscall::number::SYS_SET_PROCESS_NAME,
+        name as usize,
+        len,
+    );
+    if res == 0 { 0 } else { -1 }
 }
 
 #[repr(C, align(16))]

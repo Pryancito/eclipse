@@ -14,7 +14,7 @@
     "panic-strategy": "abort",
     "relocation-model": "static",
     "code-model": "small",
-    "features": "+sse,+sse2,+avx,+avx2,+fma,+bmi1,+bmi2",
+    "features": "+sse,+sse2",
     "disable-redzone": true,
     "max-atomic-width": 64,
     "stack-probes": {

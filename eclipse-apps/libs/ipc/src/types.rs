@@ -164,12 +164,24 @@ mod impl_parse {
     use core::cmp::Ord;
 
     #[cfg_attr(not(feature = "testable"), allow(dead_code))]
-    pub fn parse_fast(data: &[u8; 24], _from: u32, len: usize) -> Option<EclipseMessage> {
+    pub fn parse_fast(data: &[u8; 24], from: u32, len: usize) -> Option<EclipseMessage> {
+        // Tagged payloads before InputEvent: WAYL+payload can total 24 bytes (same as InputEvent size).
+        if len >= 4 && data[0..4] == *TAG_WAYL {
+            let mut wayl_data = [0u8; MAX_MSG_LEN - 4];
+            let payload_len = len.saturating_sub(4).min(20);
+            wayl_data[..payload_len].copy_from_slice(&data[4..4 + payload_len]);
+            return Some(EclipseMessage::Wayland {
+                data: wayl_data,
+                len: payload_len,
+                from,
+            });
+        }
+
         if len == core::mem::size_of::<InputEvent>() {
             let ev = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const InputEvent) };
             return Some(EclipseMessage::Input(ev));
         }
-        
+
         // Handle small control/response messages that arrive via fast path (<= 24 bytes)
         if len >= 8 {
             if data[0..4] == *TAG_INPT {
@@ -199,13 +211,6 @@ mod impl_parse {
             });
         }
         
-        if len >= 4 && data[0..4] == *TAG_WAYL {
-            let mut wayl_data = [0u8; MAX_MSG_LEN - 4];
-            let payload_len = len.saturating_sub(4).min(20); // max 20 bytes payload in fast path
-            wayl_data[..payload_len].copy_from_slice(&data[4..4 + payload_len]);
-            return Some(EclipseMessage::Wayland { data: wayl_data, len: payload_len, from: _from });
-        }
-
         None
     }
 

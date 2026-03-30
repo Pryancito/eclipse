@@ -65,20 +65,31 @@ pub unsafe extern "C" fn get_process_list(_buf: *mut ProcessInfo, _max_count: us
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn eclipse_kill(pid: u32) -> c_int {
-    let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_KILL, pid as usize);
+pub unsafe extern "C" fn eclipse_kill(pid: u32, sig: u32) -> c_int {
+    let res = eclipse_syscall::syscall2(eclipse_syscall::number::SYS_KILL, pid as usize, sig as usize);
     if res == 0 { 0 } else { -1 }
 }
 
 #[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
 #[no_mangle]
-pub unsafe extern "C" fn eclipse_kill(_pid: u32) -> c_int { -1 }
+pub unsafe extern "C" fn eclipse_kill(_pid: u32, _sig: u32) -> c_int { -1 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn set_process_name(name: *const c_char) -> c_int {
     if name.is_null() { return -1; }
-    let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_SET_PROCESS_NAME, name as usize);
+    let mut len = 0usize;
+    while len < 15 {
+        let b = *name.add(len) as u8;
+        if b == 0 { break; }
+        len += 1;
+    }
+    if len == 0 { return -1; }
+    let res = eclipse_syscall::syscall2(
+        eclipse_syscall::number::SYS_SET_PROCESS_NAME,
+        name as usize,
+        len,
+    );
     if res == 0 { 0 } else { -1 }
 }
 
@@ -273,11 +284,10 @@ pub fn eclipse_spawn(buf: &[u8], name: Option<&str>) -> i32 {
     res as i32
 }
 
-#[inline]
 pub fn spawn_service(service_id: u32, name_ptr: *const u8, name_len: usize) -> u64 {
     let res = unsafe {
         eclipse_syscall::syscall3(
-            55, // SYS_SPAWN_SERVICE
+            eclipse_syscall::number::SYS_SPAWN_SERVICE,
             service_id as usize,
             name_ptr as usize,
             name_len
@@ -338,16 +348,26 @@ impl<T> Drop for SpinlockGuard<'_, T> {
 }
 
 #[inline]
-pub fn eclipse_open(path: &str, flags: i32, _mode: i32) -> i32 {
+pub fn eclipse_open(path: &str, flags: i32, mode: i32) -> i32 {
+    let mut buf = [0u8; 512];
+    let b = path.as_bytes();
+    if b.is_empty() || b.len() >= buf.len() {
+        return -1;
+    }
+    buf[..b.len()].copy_from_slice(b);
     let res = unsafe {
         eclipse_syscall::syscall3(
             eclipse_syscall::number::SYS_OPEN,
-            path.as_ptr() as usize,
-            path.len(),
-            flags as usize
+            buf.as_ptr() as usize,
+            flags as usize,
+            mode as usize,
         )
     };
-    if res == core::usize::MAX { -1 } else { res as i32 }
+    if res == core::usize::MAX {
+        -1
+    } else {
+        res as i32
+    }
 }
 
 #[inline]
@@ -365,7 +385,7 @@ pub fn eclipse_close(fd: i32) -> i32 {
     unsafe { eclipse_syscall::syscall1(eclipse_syscall::number::SYS_CLOSE, fd as usize) as i32 }
 }
 
-/// Map a file-descriptor resource into process address space via SYS_FMAP (28).
+/// Map a file-descriptor resource into process address space via `SYS_FMAP` (509).
 /// Returns `Some(virtual_address)` on success or `None` on failure.
 #[inline]
 pub fn eclipse_fmap(fd: i32, offset: usize, len: usize) -> core::option::Option<usize> {

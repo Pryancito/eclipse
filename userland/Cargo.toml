@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
+eclipse-syscall = { path = "../eclipse-syscall" }
 libm = "0.2.2"
 heapless = "0.8"
 anyhow = "1.0"

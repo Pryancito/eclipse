@@ -1,177 +1,196 @@
-//! Sidewind Native Protocol (SNP) Compositor implementation for Lunas.
-//!
-//! Handles surface life-cycle, buffer management and event dispatching
-//! for SNP clients (e.g. Terminal) via Unified Ring Buffer (URB).
-
 use std::prelude::v1::*;
-use sidewind::protocol::*;
+use alloc::rc::Rc;
+use core::cell::RefCell;
+use wayland_proto::wl::{ObjectId, NewId, Payload, Message};
+use wayland_proto::wl::server::client::{Client, ClientId};
+use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
+use wayland_proto::wl::protocols::common::{wl_compositor, wl_surface, wl_shm, wl_display, wl_registry};
 use crate::compositor::{ShellWindow, WindowContent};
 
-/// Maximum concurrent SNP client connections.
-pub const MAX_SNP_CONNECTIONS: usize = 32;
+/// Lunas implementation of wl_compositor.
+pub struct LunasCompositor;
 
-pub struct ClientConnection {
-    pub pid: u32,
-    pub surfaces: Vec<u32>, // IDs of surfaces owned by this client
-    pub pending_events: Vec<SnpCommand>,
-    pub ring_ptr: *mut SnpRingControl,
-    pub commands_ptr: *mut SnpCommand,
-}
-
-impl ClientConnection {
-    pub fn new(pid: u32) -> Self {
-        Self {
-            pid,
-            surfaces: Vec::new(),
-            pending_events: Vec::new(),
-            ring_ptr: core::ptr::null_mut(),
-            commands_ptr: core::ptr::null_mut(),
-        }
-    }
-}
-
-pub struct SnpCompositor {
-    pub connections: Vec<ClientConnection>,
-}
-
-impl SnpCompositor {
-    pub fn new() -> Self {
-        Self {
-            connections: Vec::with_capacity(MAX_SNP_CONNECTIONS),
-        }
-    }
-
-    pub fn get_or_create_connection(&mut self, pid: u32) -> &mut ClientConnection {
-        if let Some(idx) = self.connections.iter().position(|c| c.pid == pid) {
-            &mut self.connections[idx]
-        } else {
-            if self.connections.len() >= MAX_SNP_CONNECTIONS {
-                self.connections.remove(0);
-            }
-            self.connections.push(ClientConnection::new(pid));
-            self.connections.last_mut().unwrap()
-        }
-    }
-
-    /// Process all active rings and return high-level actions.
-    pub fn poll_active_rings(&mut self) -> Vec<SnpAction> {
-        let mut actions = Vec::new();
-        // Use a loop with indexing to avoid long-lived mutable borrow of self.connections
-        for i in 0..self.connections.len() {
-            let conn = &mut self.connections[i];
-            if conn.ring_ptr.is_null() { continue; }
-            
-            unsafe {
-                let ring = &mut *conn.ring_ptr;
-                while ring.head != ring.tail {
-                    let cmd_idx = ring.head % ring.size;
-                    let cmd = &*conn.commands_ptr.add(cmd_idx as usize);
-                    
-                    let action = Self::process_command_static(cmd, conn.pid);
-                    if action != SnpAction::None {
-                        if let SnpAction::CreateSurface { surface_id, .. } = action {
-                            conn.surfaces.push(surface_id);
-                        }
-                        actions.push(action);
-                    }
-                    
-                    ring.head = ring.head.wrapping_add(1);
-                }
-            }
-        }
-        actions
-    }
-
-    fn process_command_static(cmd: &SnpCommand, pid: u32) -> SnpAction {
-        let opcode = unsafe { core::mem::transmute::<u32, SnpOpcode>(cmd.opcode) };
-        
+impl ObjectLogic for LunasCompositor {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
         match opcode {
-            SnpOpcode::LayerCreate => {
-                let msg = unsafe { cmd.get_payload::<SnpPayloadLayerCreate>() };
-                return SnpAction::CreateSurface { 
-                    pid, 
-                    surface_id: cmd.layer_id, 
-                    width: msg.width, 
-                    height: msg.height,
-                    name: msg.name,
+            0 => { // create_surface
+                let id = match args[0] {
+                    Payload::NewId(id) => id,
+                    _ => return Err(ServerError::MessageDeserializeError),
                 };
+                println!("[LUNAS] wl_compositor::create_surface id={:?}", id);
+                let surface = ObjectInner::Rc(Rc::new(RefCell::new(LunasSurface::new(id.as_id()))));
+                client.add_object(id, Object::new::<wl_surface::WlSurface>(id, surface));
+                Ok(())
             }
-            SnpOpcode::Commit => {
-                return SnpAction::CommitSurface { 
-                    pid, 
-                    surface_id: cmd.layer_id,
-                    fence: cmd.fence,
-                };
-            }
-            SnpOpcode::Destroy => {
-                return SnpAction::SurfaceDestroy { pid, surface_id: cmd.layer_id };
-            }
-            _ => SnpAction::None,
-        }
-    }
-
-    /// Process an SNP message from client (Fallback/Bootstrap).
-    pub fn handle_message(&mut self, data: &[u8], pid: u32) -> Vec<SnpAction> {
-        let mut actions = Vec::new();
-        if data.len() >= 64 {
-            let cmd_ptr = data.as_ptr() as *const SnpCommand;
-            let cmd = unsafe { core::ptr::read_unaligned(cmd_ptr) };
-            let action = Self::process_command_static(&cmd, pid);
-            if action != SnpAction::None {
-                actions.push(action);
-                
-                // Track surface
-                if let SnpAction::CreateSurface { surface_id, .. } = action {
-                    let conn = self.get_or_create_connection(pid);
-                    conn.surfaces.push(surface_id);
-                }
-            }
-        }
-        actions
-    }
-
-    pub fn send_event(&mut self, pid: u32, obj_id: u32, opcode: SnpOpcode, payload: &[u8]) {
-        if let Some(conn) = self.connections.iter_mut().find(|c| c.pid == pid) {
-            let mut cmd = SnpCommand::new(opcode, obj_id);
-            let len = payload.len().min(32);
-            cmd.payload[..len].copy_from_slice(&payload[..len]);
-            conn.pending_events.push(cmd);
+            _ => Err(ServerError::ObjectMismatch),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum SnpAction {
-    None,
-    CreateSurface { pid: u32, surface_id: u32, width: u16, height: u16, name: [u8; 24] },
-    AttachBuffer { pid: u32, surface_id: u32, buffer_id: u32 },
-    CommitSurface { pid: u32, surface_id: u32, fence: u64 },
-    SetTitle { pid: u32, surface_id: u32, title: [u8; 32] },
-    SurfaceDestroy { pid: u32, surface_id: u32 },
+/// Lunas implementation of wl_surface.
+pub struct LunasSurface {
+    id: ObjectId,
+    pub title: String,
 }
 
-pub fn make_snp_window(
-    surface_id: u32,
-    _fb_width: i32,
-    _fb_height: i32,
+impl LunasSurface {
+    pub fn new(id: ObjectId) -> Self {
+        Self { id, title: String::from("Wayland Window") }
+    }
+}
+
+impl ObjectLogic for LunasSurface {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            6 => { // commit
+                println!("[LUNAS] wl_surface::commit id={:?}", self.id);
+                Ok(())
+            }
+            _ => {
+                // Handle attach, damage, etc.
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Lunas implementation of wl_shm.
+pub struct LunasShm;
+
+impl ObjectLogic for LunasShm {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => { // create_pool
+                let id = match args[0] {
+                    Payload::NewId(id) => id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let fd = match args[1] {
+                     Payload::Int(fd) => fd,
+                     _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let size = match args[2] {
+                     Payload::Int(size) => size,
+                     _ => return Err(ServerError::MessageDeserializeError),
+                };
+                println!("[LUNAS] wl_shm::create_pool id={:?} fd={} size={}", id, fd, size);
+                // Implementation for shm pool would go here
+                Ok(())
+            }
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+pub fn make_wayland_window(
+    surface_id: ObjectId,
     workspace: u8,
-    title: &[u8],
+    title: &str,
 ) -> ShellWindow {
-    let x = 100;
-    let y = 100;
+    let x = 120;
+    let y = 120;
     let w = 640;
     let h = 480;
     let mut title_buf = [0u8; 32];
     let copy = title.len().min(31);
-    title_buf[..copy].copy_from_slice(&title[..copy]);
+    title_buf[..copy].copy_from_slice(&title.as_bytes()[..copy]);
     ShellWindow {
         x, y, w, h: h + ShellWindow::TITLE_H,
         curr_x: (x + w / 2) as f32,
         curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
         curr_w: 0.0, curr_h: 0.0,
-        content: WindowContent::Snp { surface_id, pid: 0 }, 
+        content: WindowContent::Snp { surface_id: surface_id.0, pid: 0 }, // Reusing Snp content for simplicity for now
         workspace,
         title: title_buf,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod wayland_server_tests {
+    use super::{LunasCompositor, LunasShm};
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use wayland_proto::eclipse_transport::EclipseWaylandConnection;
+    use wayland_proto::wl::protocols::common::wl_compositor::WlCompositor;
+    use wayland_proto::wl::protocols::common::wl_display::Request;
+    use wayland_proto::wl::protocols::common::wl_shm::WlShm;
+    use wayland_proto::wl::server::client::ClientId;
+    use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic};
+    use wayland_proto::wl::server::server::WaylandServer;
+    use wayland_proto::wl::{Message, NewId, ObjectId};
+
+    fn sample_server() -> WaylandServer {
+        let mut server = WaylandServer::new();
+        server.register_global(
+            "wl_compositor",
+            4,
+            || ObjectInner::Rc(Rc::new(RefCell::new(LunasCompositor))),
+            |id, inner| Object::new::<WlCompositor>(id, inner),
+        );
+        server.register_global(
+            "wl_shm",
+            1,
+            || ObjectInner::Rc(Rc::new(RefCell::new(LunasShm))),
+            |id, inner| Object::new::<WlShm>(id, inner),
+        );
+        server
+    }
+
+    /// Regresión: `wl_display::PAYLOAD_TYPES[2]` debe ser un solo `NewId` (get_registry), no el layout del evento error.
+    #[test]
+    fn get_registry_deserializes_and_creates_registry_object() {
+        let mut server = sample_server();
+        let con = Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2)));
+        server.add_client(ClientId(42), con);
+        let msg = Request::GetRegistry {
+            registry: NewId(2),
+        }
+        .into_raw(ObjectId(1));
+        let mut buf = [0u8; 256];
+        let mut handles = Vec::new();
+        let len = msg.serialize(&mut buf, &mut handles).expect("serialize get_registry");
+        let r = server.process_message(ClientId(42), &buf[..len]);
+        assert!(r.is_ok(), "process_message: {:?}", r);
+        let client = server
+            .clients
+            .get_mut(&ClientId(42))
+            .expect("client");
+        assert!(
+            client.object_mut(ObjectId(2)).is_ok(),
+            "wl_registry object id 2 should exist after get_registry"
+        );
+    }
+
+    #[test]
+    fn compositor_create_surface_adds_wl_surface_object() {
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(1),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut comp = LunasCompositor;
+        let args = alloc::vec![
+            wayland_proto::wl::Payload::NewId(NewId(5)),
+        ];
+        let r = ObjectLogic::handle_request(&mut comp, &mut client, 0, &args);
+        assert!(r.is_ok(), "create_surface: {:?}", r);
+        assert!(client.object_mut(ObjectId(5)).is_ok());
     }
 }

@@ -164,8 +164,10 @@ fn ntp_task(
                                 let unix_time = seconds as u64 - 2_208_988_800;
                                 println!("[NETWORK-SERVICE] NTP: Synchronized! Real Time: {} (Unix Epoch)", unix_time);
                                 unsafe {
-                                    // SYS_SET_TIME = 69
-                                    eclipse_syscall::syscall1(69, unix_time as usize);
+                                    eclipse_syscall::syscall1(
+                                        eclipse_syscall::number::SYS_SET_TIME,
+                                        unix_time as usize,
+                                    );
                                 }
                                 ntp.last_sync = now_ms;
                                 ntp.state = NtpState::Idle;

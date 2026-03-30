@@ -16,17 +16,13 @@
 
 use std::prelude::v1::*;
 
-mod logo;
+use eclipse_syscall::flag::O_RDWR;
+use eclipse_syscall::number::{
+    SYS_CLOSE, SYS_FMAP, SYS_GET_FRAMEBUFFER_INFO, SYS_GET_GPU_DISPLAY_INFO, SYS_OPEN,
+    SYS_PCI_ENUM_DEVICES, SYS_READ, SYS_REGISTER_DEVICE, SYS_STOP_PROGRESS,
+};
 
-/// Syscall numbers
-const SYS_OPEN: u64 = 11;
-const SYS_CLOSE: u64 = 12;
-const SYS_READ: u64 = 2;
-const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
-const SYS_FMAP: u64 = 28;
-const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
-const SYS_PCI_ENUM_DEVICES: u64 = 17;
-const SYS_STOP_PROGRESS: u64 = 57;
+mod logo;
 
 /// Framebuffer constants
 const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
@@ -50,16 +46,17 @@ struct FramebufferInfoFromKernel {
 
 /// Get framebuffer info from kernel using the display: scheme
 fn get_display_handle() -> Option<usize> {
-    let path = "display:";
+    // kernel sys_open usa strlen sobre puntero NUL-terminated
+    const PATH: &[u8; 9] = b"display:\0";
     let mut fd: usize;
-    
+
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr() as u64,
-            in("rsi") path.len() as u64,
-            in("rdx") 0u64, // flags
+            in("rax") SYS_OPEN as u64,
+            in("rdi") PATH.as_ptr() as u64,
+            in("rsi") O_RDWR as u64,
+            in("rdx") 0u64,
             lateout("rax") fd,
             options(nostack)
         );
@@ -92,7 +89,7 @@ fn get_kernel_framebuffer_info() -> Option<FramebufferInfoFromKernel> {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_GET_FRAMEBUFFER_INFO,
+            in("rax") SYS_GET_FRAMEBUFFER_INFO as u64,
             in("rdi") &mut info as *mut _ as u64,
             lateout("rax") result,
             options(nostack)
@@ -113,7 +110,7 @@ fn log_virtio_gpu_display_info() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_GET_GPU_DISPLAY_INFO,
+            in("rax") SYS_GET_GPU_DISPLAY_INFO as u64,
             in("rdi") dims.as_mut_ptr() as u64,
             lateout("rax") result,
             options(nostack)
@@ -130,7 +127,7 @@ fn map_framebuffer_via_scheme(fd: usize, size: usize) -> Option<usize> {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_FMAP,
+            in("rax") SYS_FMAP as u64,
             in("rdi") fd as u64,
             in("rsi") 0u64, // offset
             in("rdx") size as u64,
@@ -148,13 +145,20 @@ fn map_framebuffer_via_scheme(fd: usize, size: usize) -> Option<usize> {
 
 /// Open a path (e.g. "/dev/fb0") via syscall; returns fd or None
 fn open_path(path: &str) -> Option<usize> {
+    let mut buf = [0u8; 512];
+    let b = path.as_bytes();
+    if b.is_empty() || b.len() >= buf.len() {
+        return None;
+    }
+    buf[..b.len()].copy_from_slice(b);
+
     let fd: u64;
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr() as u64,
-            in("rsi") path.len() as u64,
+            in("rax") SYS_OPEN as u64,
+            in("rdi") buf.as_ptr() as u64,
+            in("rsi") O_RDWR as u64,
             in("rdx") 0u64,
             lateout("rax") fd,
             options(nostack)
@@ -172,7 +176,7 @@ fn close_fd(fd: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_CLOSE,
+            in("rax") SYS_CLOSE as u64,
             in("rdi") fd as u64,
             options(nostack)
         );
@@ -202,8 +206,6 @@ fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to white");
 }
 
-const SYS_REGISTER_DEVICE: u64 = 27;
-
 #[repr(u64)]
 enum DeviceType {
     Display = 5,
@@ -214,7 +216,7 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
         let mut result: u64;
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_REGISTER_DEVICE,
+            in("rax") SYS_REGISTER_DEVICE as u64,
             in("rdi") name.as_ptr() as u64,
             in("rsi") name.len() as u64,
             in("rdx") type_id as u64,
@@ -269,14 +271,14 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
     }
 
     // List /dev/ via scheme "dev:" (kernel returns registered device names)
-    const DEV_PATH: &[u8] = b"dev:";
+    const DEV_PATH: &[u8; 5] = b"dev:\0";
     let dev_fd = unsafe {
         let mut result: u64;
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_OPEN,
+            in("rax") SYS_OPEN as u64,
             in("rdi") DEV_PATH.as_ptr() as u64,
-            in("rsi") DEV_PATH.len() as u64,
+            in("rsi") O_RDWR as u64,
             in("rdx") 0u64,
             lateout("rax") result,
             options(nostack)
@@ -291,7 +293,7 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
                 let mut result: u64;
                 core::arch::asm!(
                     "int 0x80",
-                    in("rax") SYS_READ,
+                    in("rax") SYS_READ as u64,
                     in("rdi") dev_fd,
                     in("rsi") buf.as_mut_ptr() as u64,
                     in("rdx") buf.len() as u64,
@@ -323,7 +325,7 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
         unsafe {
             core::arch::asm!(
                 "int 0x80",
-                in("rax") SYS_CLOSE,
+                in("rax") SYS_CLOSE as u64,
                 in("rdi") dev_fd,
                 options(nostack)
             );
@@ -412,7 +414,7 @@ fn detect_nvidia_gpu() -> bool {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_PCI_ENUM_DEVICES,
+            in("rax") SYS_PCI_ENUM_DEVICES as u64,
             in("rdi") 0x03u64, // Display Controller class
             in("rsi") buffer.as_mut_ptr() as u64,
             in("rdx") 16u64, // max_devices
@@ -935,7 +937,7 @@ fn main() {
         unsafe {
             core::arch::asm!(
                 "int 0x80",
-                in("rax") SYS_GET_GPU_DISPLAY_INFO,
+                in("rax") SYS_GET_GPU_DISPLAY_INFO as u64,
                 in("rdi") dims.as_mut_ptr() as u64,
                 lateout("rax") result,
                 options(nostack)
@@ -1020,7 +1022,7 @@ fn main() {
         unsafe {
             core::arch::asm!(
                 "int 0x80",
-                in("rax") SYS_STOP_PROGRESS,
+                in("rax") SYS_STOP_PROGRESS as u64,
                 options(nostack)
             );
         }

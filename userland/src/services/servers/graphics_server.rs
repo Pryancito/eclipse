@@ -14,14 +14,9 @@
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
 
-/// Syscall number for getting framebuffer info
-const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
-/// Syscall number for mapping framebuffer into virtual memory
-const SYS_MAP_FRAMEBUFFER: u64 = 16;
-
 /// Framebuffer information from kernel/bootloader
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FramebufferInfo {
     pub address: u64,      // Physical address of framebuffer
     pub width: u32,        // Width in pixels
@@ -36,38 +31,39 @@ pub struct FramebufferInfo {
     pub blue_mask_shift: u8,
 }
 
-/// Get framebuffer info from kernel via syscall
+/// Get framebuffer info from kernel via syscall (Linux-style `SYS_GET_FRAMEBUFFER_INFO` = 503).
 fn get_framebuffer_info() -> Option<FramebufferInfo> {
-    let ptr: u64;
+    let mut info = FramebufferInfo::default();
+    let status: u64;
     unsafe {
         core::arch::asm!(
             "syscall",
-            inlateout("rax") SYS_GET_FRAMEBUFFER_INFO => ptr,
+            inlateout("rax") eclipse_syscall::number::SYS_GET_FRAMEBUFFER_INFO as u64 => status,
+            in("rdi") &mut info as *mut _ as u64,
             lateout("rcx") _,
             lateout("r11") _,
         );
     }
-    
-    if ptr == 0 {
-        None
+    if status == 0 {
+        Some(info)
     } else {
-        unsafe { Some(*(ptr as *const FramebufferInfo)) }
+        None
     }
 }
 
-/// Map framebuffer into process virtual memory
+/// Map framebuffer into process virtual memory (`SYS_MAP_FRAMEBUFFER` = 504).
 /// Returns virtual address where framebuffer is mapped, or None on failure
 fn map_framebuffer() -> Option<*mut u8> {
     let addr: u64;
     unsafe {
         core::arch::asm!(
             "syscall",
-            inlateout("rax") SYS_MAP_FRAMEBUFFER => addr,
+            inlateout("rax") eclipse_syscall::number::SYS_MAP_FRAMEBUFFER as u64 => addr,
             lateout("rcx") _,
             lateout("r11") _,
         );
     }
-    
+
     if addr == 0 {
         None
     } else {

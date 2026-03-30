@@ -198,37 +198,52 @@ build_sidewind_project() {
     print_status "Construyendo eclipse_std (std bridge)..."
     cargo +nightly build -p eclipse_std --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
     
-    # Mapear globalmente eclipse_std como 'std' para satisfacer dependencias crates.io (log, once_cell, etc.)
-    # Esto evita el error E0463: can't find crate for `std` en todas las subdependencias.
-    STD_RLIB=$(ls target/x86_64-unknown-eclipse/release/deps/libstd-*.rlib | head -n 1)
-    if [ -f "$STD_RLIB" ]; then
-        print_status "Mapeando std bridge desde: $STD_RLIB"
-        export RUSTFLAGS="--extern std=$BASE_DIR/eclipse-apps/$STD_RLIB $RUSTFLAGS"
-    fi
+    # La std sustituta es eclipse_std vía [patch.crates-io] en eclipse-apps/Cargo.toml.
+    # NO usar RUSTFLAGS='--extern std=...libstd-....rlib': en nightly reciente provoca ICE en
+    # build-std (alloc) y/o fallos al resolver dependencias (p. ej. smallvec en wayland-proto).
 
+    set +e
     WAYLAND_CLIENT_NO_PKG_CONFIG=1 LIBUDEV_NO_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1 \
-    cargo +nightly build --workspace --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release --exclude parse_stack_sizes
-    
-    if [ $? -eq 0 ]; then
+    cargo +nightly build --workspace --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
+    _sidewind_build_status=$?
+    set -e
+
+    if [ $_sidewind_build_status -eq 0 ]; then
         print_success "Proyecto Sidewind compilado exitosamente"
-        
-        # Lista de binarios a instalar
-        local BINS="smithay_app demo_client lunas terminal sh xfwl4"
-        
+
+        local _sw_rel="target/${ECLIPSE_TARGET_NAME}/release"
+        mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
+        if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+            mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
+        fi
+
+        # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
+        local BINS="smithay_app demo_client lunas sh xfwl4"
+
         for bin in $BINS; do
-            if [ -f "target/x86_64-unknown-linux-musl/release/$bin" ]; then
-                # Instalar en sysroot
-                mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
-                cp "target/x86_64-unknown-linux-musl/release/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
+            if [ -f "$_sw_rel/$bin" ]; then
+                cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
                 print_status "Instalado en sysroot: /usr/bin/$bin"
-                
-                # Instalar en distribución
                 if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                    mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
-                    cp "target/x86_64-unknown-linux-musl/release/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
+                    cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
                 fi
             fi
         done
+
+        # terminal: el crate se llama terminal-wb; en sysroot debe existir como 'terminal'
+        if [ -f "$_sw_rel/terminal-wb" ]; then
+            cp "$_sw_rel/terminal-wb" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
+            print_status "Instalado en sysroot: /usr/bin/terminal (desde terminal-wb)"
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                cp "$_sw_rel/terminal-wb" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
+            fi
+        elif [ -f "$_sw_rel/terminal" ]; then
+            cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
+            print_status "Instalado en sysroot: /usr/bin/terminal"
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
+            fi
+        fi
 
         # Enlazar /usr/bin/terminal a /bin/terminal para conveniencia del usuario (Solaris/Unix style)
         # NOTA: Usamos copia en lugar de ln -s porque el cargador kernel no soporta symlinks todavía.
@@ -1645,7 +1660,7 @@ main() {
     build_bootloader
     build_installer
     build_systemd
-    build_sidewind_project
+    # Sidewind/workspace Eclipse: build_userland → build_sidewind_project
     build_userland
     
     # build_userland builds: wayland_server, cosmic_client, module_loader etc.

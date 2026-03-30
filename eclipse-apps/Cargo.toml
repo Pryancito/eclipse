@@ -8,9 +8,8 @@ members = [
     "lunas",
     "terminal",
     "sh",
-    "xfwl4",
 ]
-exclude = ["libs/ipc_tests", "std_test", "smithay_app"]
+exclude = ["libs/ipc_tests", "std_test", "smithay_app", "xfwl4"]
 
 [workspace.package]
 version = "0.2.0"

@@ -33,6 +33,20 @@ fn main() {
 
     let mut state = LunasState::new().expect("Failed to initialize Lunas Desktop");
 
+    let _ = eclipse_syscall::call::set_process_name("lunas");
+
+    // Register Wayland globals
+    state.protocol.register_global(
+        "wl_compositor", 4,
+        || wayland_proto::wl::server::objects::ObjectInner::Rc(alloc::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasCompositor))),
+        |id, inner| wayland_proto::wl::server::objects::Object::new::<wayland_proto::wl::protocols::common::wl_compositor::WlCompositor>(id, inner)
+    );
+    state.protocol.register_global(
+        "wl_shm", 1,
+        || wayland_proto::wl::server::objects::ObjectInner::Rc(alloc::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasShm))),
+        |id, inner| wayland_proto::wl::server::objects::Object::new::<wayland_proto::wl::protocols::common::wl_shm::WlShm>(id, inner)
+    );
+
     let self_pid = unsafe { libc::getpid() as u32 };
     let _ = eclipse_syscall::call::register_log_hud(self_pid);
 

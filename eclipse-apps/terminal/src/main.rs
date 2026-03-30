@@ -1,268 +1,272 @@
-#![cfg_attr(target_vendor = "eclipse", no_std)]
+#![no_std]
+#![no_main]
 
-#[cfg(target_vendor = "eclipse")]
 extern crate alloc;
-#[cfg(target_vendor = "eclipse")]
 extern crate eclipse_std as std;
 
-use os_terminal::{DrawTarget, Rgb, Terminal};
-use os_terminal::font::BitmapFont;
+use std::prelude::v1::*;
+use alloc::rc::Rc;
+use core::cell::RefCell;
+use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
+use wayland_proto::EclipseWaylandConnection;
+use wayland_proto::wl::protocols::common::wl_registry;
+use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
+use eclipse_syscall::{self, flag, ProcessInfo};
+use heapless::String as HString;
 
 #[cfg(target_vendor = "eclipse")]
-use alloc::{boxed::Box, vec::Vec};
+use libc::{c_int, close, mmap, munmap, open};
+#[cfg(target_vendor = "eclipse")]
+use sidewind::{IpcChannel, SideWindMessage};
 
-#[cfg(not(target_vendor = "eclipse"))]
-use std::{boxed::Box, vec::Vec};
-
-// --- Universal Yield ---
-pub fn platform_yield() {
-    #[cfg(target_vendor = "eclipse")]
-    eclipse_syscall::call::sched_yield();
+/// Nombre único de SHM en /tmp/ para SideWind (evita colisión entre procesos).
+fn sidewind_shm_name(pid: u32) -> HString<24> {
+    let mut s = HString::new();
+    let _ = s.push_str("twb_");
+    let mut n = pid;
+    let mut tmp = [0u8; 10];
+    let mut i = 0usize;
+    if n == 0 {
+        tmp[0] = b'0';
+        i = 1;
+    } else {
+        while n > 0 && i < tmp.len() {
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+    }
+    for j in 0..i / 2 {
+        tmp.swap(j, i - 1 - j);
+    }
+    let _ = s.push_str(unsafe { core::str::from_utf8_unchecked(&tmp[..i]) });
+    s
 }
 
-// --- Host Mocks ---
-#[cfg(not(target_vendor = "eclipse"))]
-pub enum SideWindEvent { }
-#[cfg(not(target_vendor = "eclipse"))]
-pub const SWND_EVENT_TYPE_KEY: u32 = 1;
-#[cfg(not(target_vendor = "eclipse"))]
-pub fn discover_composer() -> Option<u32> { None }
-#[cfg(not(target_vendor = "eclipse"))]
-pub struct SideWindSurface { }
-#[cfg(not(target_vendor = "eclipse"))]
-impl SideWindSurface {
-    pub fn new(_: u32, _: i32, _: i32, _: u32, _: u32, _: &str) -> Option<Self> { None }
-    pub fn buffer(&mut self) -> &mut [u32] { &mut [] }
-    pub fn commit(&mut self) { }
-    pub fn poll_event(&self) -> Option<SideWindEvent> { None }
+/// Abre `/tmp/<name>`, mapea el framebuffer y envía `SWND_OP_CREATE` / `COMMIT` al compositor.
+#[cfg(target_vendor = "eclipse")]
+fn open_sidewind_window(
+    composer_pid: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    name: &str,
+) -> Option<(*mut u32, usize, u32, u32)> {
+    let mut path = [0u8; 64];
+    path[0..5].copy_from_slice(b"/tmp/");
+    let nb = name.as_bytes();
+    let nlen = nb.len().min(32).min(path.len() - 5 - 1);
+    path[5..5 + nlen].copy_from_slice(&nb[..nlen]);
+    path[5 + nlen] = 0;
+
+    let size_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    // Igual que `sidewind::SideWindSurface`: crear el nodo en /tmp y fijar tamaño antes de mmap.
+    let fd = unsafe {
+        open(
+            path.as_ptr() as *const core::ffi::c_char,
+            (flag::O_RDWR | flag::O_CREAT) as core::ffi::c_int,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    if eclipse_syscall::ftruncate(fd as usize, size_bytes).is_err() {
+        unsafe {
+            close(fd);
+        }
+        return None;
+    }
+    let vaddr = unsafe {
+        mmap(
+            core::ptr::null_mut(),
+            size_bytes,
+            (flag::PROT_READ | flag::PROT_WRITE) as c_int,
+            flag::MAP_SHARED as c_int,
+            fd,
+            0,
+        )
+    };
+    unsafe { close(fd) };
+    if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
+        return None;
+    }
+    let msg = SideWindMessage::new_create(x, y, w, h, name);
+    if !IpcChannel::send_sidewind(composer_pid, &msg) {
+        unsafe {
+            munmap(vaddr, size_bytes);
+        }
+        return None;
+    }
+    Some((vaddr as *mut u32, size_bytes, w, h))
 }
-#[cfg(not(target_vendor = "eclipse"))]
-pub fn open(_: &str, _: usize) -> Result<usize, ()> { Err(()) }
-#[cfg(not(target_vendor = "eclipse"))]
-pub fn read(_: usize, _: &mut [u8]) -> Result<usize, ()> { Err(()) }
-#[cfg(not(target_vendor = "eclipse"))]
-pub fn write(_: usize, _: &[u8]) -> Result<usize, ()> { Err(()) }
-#[cfg(not(target_vendor = "eclipse"))]
-pub fn ioctl(_: usize, _: usize, _: *mut usize) -> Result<(), ()> { Err(()) }
-#[cfg(not(target_vendor = "eclipse"))]
-pub const O_RDWR: usize = 0;
-#[cfg(not(target_vendor = "eclipse"))]
-pub const O_CREAT: usize = 0;
 
-// --- Eclipse Native ---
-#[cfg(target_vendor = "eclipse")]
-use sidewind::{
-    discover_composer, SideWindSurface, SWND_EVENT_TYPE_KEY,
-};
-#[cfg(target_vendor = "eclipse")]
-use eclipse_syscall::call::{close, ioctl, open, read, write, spawn_with_stdio};
-#[cfg(target_vendor = "eclipse")]
-use eclipse_syscall::flag::{O_CREAT, O_RDWR};
-
-const WIDTH: u32 = 800;
-const HEIGHT: u32 = 500;
-
-/// Draw target that writes pixels directly into the SNP shared memory buffer.
-struct SurfaceDrawTarget {
-    ptr: *mut u32,
-    width: usize,
-    height: usize,
+fn process_name_bytes(name: &[u8; 16]) -> &[u8] {
+    let end = name.iter().position(|&b| b == 0).unwrap_or(16);
+    &name[..end]
 }
 
-unsafe impl Send for SurfaceDrawTarget {}
+fn find_pid_by_name(want: &[u8]) -> Option<u32> {
+    let mut list = [ProcessInfo::default(); 48];
+    let count = eclipse_syscall::get_process_list(&mut list).ok()?;
+    for info in list.iter().take(count) {
+        if info.pid == 0 {
+            continue;
+        }
+        if process_name_bytes(&info.name) == want {
+            return Some(info.pid);
+        }
+    }
+    None
+}
 
-impl DrawTarget for SurfaceDrawTarget {
-    fn size(&self) -> (usize, usize) {
-        (self.width, self.height)
+#[no_mangle]
+pub fn main() {
+    std::init_runtime();
+
+    std::println!("--- Terminal-WB (Kazari-based Wayland) ---");
+
+    let self_pid = eclipse_syscall::getpid() as u32;
+    let lunas_pid = find_pid_by_name(b"lunas").or_else(|| find_pid_by_name(b"gui"));
+    let Some(lunas_pid) = lunas_pid else {
+        std::println!("Compositor not found (no process named 'lunas' or 'gui').");
+        return;
+    };
+
+    std::println!("Connecting to Lunas (PID {})...", lunas_pid);
+
+    let connection = Rc::new(RefCell::new(EclipseWaylandConnection::new(lunas_pid, self_pid)));
+    
+    // Object 1 is always the wl_display
+    let mut display = WlDisplay::new(connection.clone(), ObjectId(1));
+
+    // Request the registry (new object ID 2)
+    let registry_id = NewId(2);
+    std::println!("Requesting wl_registry (ID 2)...");
+    if let Err(e) = display.get_registry(registry_id) {
+        std::println!("Failed to send get_registry: {:?}", e);
+        return;
     }
 
-    #[inline(always)]
-    fn draw_pixel(&mut self, x: usize, y: usize, color: Rgb) {
-        if x < self.width && y < self.height {
-            let idx = y * self.width + x;
-            let pixel = 0xFF00_0000u32
-                | ((color.0 as u32) << 16)
-                | ((color.1 as u32) << 8)
-                | (color.2 as u32);
-            unsafe { 
-                if !self.ptr.is_null() {
-                    *self.ptr.add(idx) = pixel;
+    std::println!("Handshake sent. Waiting for events...");
+
+    // Main loop to receive events
+    let mut registry = wl_registry::WlRegistry::new(connection.clone(), ObjectId(2));
+    let mut compositor_id = None;
+    let mut shm_id = None;
+
+    loop {
+        let recv_res = (*connection).borrow().recv();
+        match recv_res {
+            Ok((data_vec, _handles)) => {
+                let mut rest: &[u8] = &data_vec[..];
+                while rest.len() >= 8 {
+                    let (id, op, msg_len) = match RawMessage::deserialize_header(rest) {
+                        Ok(h) => h,
+                        Err(_) => break,
+                    };
+                    if msg_len > rest.len() {
+                        std::println!("wl_registry: truncated frame (need {} have {})", msg_len, rest.len());
+                        break;
+                    }
+                    let chunk = &rest[..msg_len];
+                    rest = &rest[msg_len..];
+
+                    if id == ObjectId(2) {
+                        let Some(types) = wl_registry::WlRegistry::PAYLOAD_TYPES.get(op.0 as usize)
+                        else {
+                            std::println!("wl_registry: unknown opcode {}", op.0);
+                            continue;
+                        };
+                        let raw = match RawMessage::deserialize(chunk, types, &[]) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                std::println!("wl_registry: decode error: {:?}", e);
+                                continue;
+                            }
+                        };
+                        if let Ok(event) = wl_registry::Event::from_raw(connection.clone(), &raw) {
+                            match event {
+                                wl_registry::Event::Global { name, interface, version } => {
+                                    std::println!("Registry: Global {} {} v{}", name, interface, version);
+                                    if interface == "wl_compositor" {
+                                        let id = NewId(3);
+                                        std::println!("Binding to wl_compositor (ID 3)...");
+                                        if registry.bind(name, id).is_err() {
+                                            std::println!("bind wl_compositor failed");
+                                        }
+                                        compositor_id = Some(id.as_id());
+                                    } else if interface == "wl_shm" {
+                                        let id = NewId(4);
+                                        std::println!("Binding to wl_shm (ID 4)...");
+                                        if registry.bind(name, id).is_err() {
+                                            std::println!("bind wl_shm failed");
+                                        }
+                                        shm_id = Some(id.as_id());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        std::println!("Received message for object {:?}: Opcode={:?}", id, op);
+                    }
                 }
-            };
-        }
-    }
-}
-
-pub struct PtyManager {
-    fd: usize,
-}
-
-impl PtyManager {
-    pub fn new() -> Self {
-        #[cfg(target_vendor = "eclipse")]
-        {
-            let fd = open("pty:master", O_RDWR | O_CREAT).unwrap_or(usize::MAX);
-            Self { fd }
-        }
-        #[cfg(not(target_vendor = "eclipse"))]
-        Self { fd: usize::MAX }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.fd != usize::MAX
-    }
-
-    pub fn write(&self, data: &[u8]) {
-        #[cfg(target_vendor = "eclipse")]
-        if self.is_valid() {
-            let _ = write(self.fd, data);
-        }
-        let _ = data;
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> Option<usize> {
-        if !self.is_valid() { return None; }
-        
-        #[cfg(target_vendor = "eclipse")]
-        {
-            let mut available: usize = 0;
-            if ioctl(self.fd, 2, &mut available as *mut usize as usize).is_ok() && available > 0 {
-                let n = available.min(buf.len());
-                read(self.fd, &mut buf[..n]).ok()
-            } else {
-                None
+            }
+            Err(e) => {
+                std::println!("Recv error or timeout: {:?}", e);
             }
         }
-        #[cfg(not(target_vendor = "eclipse"))]
-        {
-            let _ = buf;
-            None
+
+        if compositor_id.is_some() && shm_id.is_some() {
+            std::println!("Handshake complete! Both compositor and shm bound.");
+            break;
         }
     }
 
-    pub fn spawn_shell(&self) {
-        if !self.is_valid() { return; }
-        
-        #[cfg(target_vendor = "eclipse")]
-        if let Ok(sh_fd) = open("/bin/sh", O_RDWR) {
-            let mut sh_data = Vec::new();
-            let mut tmp = [0u8; 4096];
+    std::println!("Terminal initialized successfully.");
+
+    // Wayland en Lunas aún no crea ventanas de shell por sí solo; SideWind es la ruta que el
+    // compositor usa para mapear /tmp/* y mostrar un marco en el escritorio.
+    #[cfg(target_vendor = "eclipse")]
+    {
+        let name = sidewind_shm_name(self_pid);
+        let name_str = name.as_str();
+        let win_w = 520u32;
+        let win_h = 340u32;
+        std::println!("Opening SideWind window (shm {})...", name_str);
+        let Some((ptr, size_bytes, w, h)) =
+            open_sidewind_window(lunas_pid, 120, 140, win_w, win_h, name_str)
+        else {
+            std::println!("SideWind window failed (open /tmp, mmap, or compositor IPC).");
             loop {
-                match read(sh_fd, &mut tmp) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => sh_data.extend_from_slice(&tmp[..n]),
-                }
+                std::thread::yield_now();
             }
-            let _ = close(sh_fd);
-            
-            if !sh_data.is_empty() {
-                let _ = spawn_with_stdio(
-                    &sh_data,
-                    Some("sh"),
-                    self.fd,
-                    self.fd,
-                    self.fd,
-                );
-            }
-        }
-    }
-}
-
-pub struct TerminalApp {
-    surface: SideWindSurface,
-    terminal: Terminal<SurfaceDrawTarget>,
-    pty: PtyManager,
-}
-impl TerminalApp {
-    pub fn new(composer_pid: u32) -> Option<Self> {
-        #[cfg(target_vendor = "eclipse")]
-        {
-            let mut surface = SideWindSurface::new(composer_pid, 100, 100, WIDTH, HEIGHT, "terminal")?;
-            
-            let draw_target = SurfaceDrawTarget {
-                ptr: surface.buffer().as_mut_ptr(),
-                width: WIDTH as usize,
-                height: HEIGHT as usize,
-            };
-
-            let font = Box::new(BitmapFont);
-            let mut terminal = Terminal::new(draw_target, font);
-            terminal.set_crnl_mapping(true);
-            
-            let pty = PtyManager::new();
-            
-            Some(Self {
-                surface,
-                terminal,
-                pty,
-            })
-        }
-        #[cfg(not(target_vendor = "eclipse"))]
-        {
-            let _ = composer_pid;
-            None
-        }
-    }
-
-    pub fn run(mut self) {
-        self.pty.spawn_shell();
-        
-        let pfd = self.pty.fd;
-        self.terminal.set_pty_writer(Box::new(move |s: &str| {
-            #[cfg(target_vendor = "eclipse")]
-            if pfd != usize::MAX {
-                let _ = write(pfd, s.as_bytes());
-            }
-            let _ = s;
-        }));
-
-        self.terminal.process(b"\x1b[1;36mEclipse OS SNP v2 Terminal\x1b[0m\r\n");
-        self.terminal.flush();
-        self.surface.commit();
-
-        #[cfg(target_vendor = "eclipse")]
-        loop {
-            while let Some(event) = self.surface.poll_event() {
-                if event.event_type == SWND_EVENT_TYPE_KEY {
-                    let scancode = event.data1 as u8;
-                    let pressed = event.data2 != 0;
-                    let ps2 = if pressed { scancode } else { scancode | 0x80 };
-                    let _ = self.terminal.handle_keyboard(ps2);
-                    self.terminal.flush();
-                    self.surface.commit();
-                }
-            }
-
-            let mut buf = [0u8; 1024];
-            if let Some(n) = self.pty.read(&mut buf) {
-                if n > 0 {
-                    self.terminal.process(&buf[..n]);
-                    self.terminal.flush();
-                    self.surface.commit();
-                }
-            }
-
-            platform_yield();
-        }
-    }
-}
-
-fn main() {
-    #[cfg(target_vendor = "eclipse")]
-    {
-        let composer_pid = loop {
-            if let Some(pid) = discover_composer() {
-                break pid;
-            }
-            platform_yield();
         };
-
-        if let Some(app) = TerminalApp::new(composer_pid) {
-            app.run();
+        let px = unsafe { core::slice::from_raw_parts_mut(ptr, (w as usize) * (h as usize)) };
+        for (i, p) in px.iter_mut().enumerate() {
+            let ww = w as usize;
+            let row = i / ww;
+            let content_top = 4usize;
+            let content_bottom = (h as usize).saturating_sub(8);
+            *p = if row >= content_top && row <= content_bottom && i % ww > 3 && i % ww + 3 < ww {
+                0xFF_12_12_18
+            } else {
+                0xFF_0D_0D_12
+            };
+        }
+        let commit = SideWindMessage::new_commit();
+        let _ = IpcChannel::send_sidewind(lunas_pid, &commit);
+        std::println!("SideWind window committed; idle loop.");
+        let _ = size_bytes;
+        loop {
+            std::thread::yield_now();
         }
     }
+
     #[cfg(not(target_vendor = "eclipse"))]
-    {
-        println!("Not running on Eclipse OS");
+    loop {
+        std::thread::yield_now();
     }
 }

@@ -1,4 +1,12 @@
-//! Syscall numbers
+//! Números de syscall para Eclipse OS (ABI **x86-64**).
+//!
+//! - **Compatibilidad Linux**: los syscalls “POSIX”/comunes usan los mismos números que
+//!   **Linux x86-64** (`read`=0, `write`=1, `open`=2, …, `getrandom`=318). El kernel
+//!   los despacha en `eclipse_kernel::syscalls::syscall_handler`.
+//! - **Extensiones Eclipse**: reservado el rango **≥ 500** (IPC, framebuffer, spawn de
+//!   servicios, DRM, etc.). No coinciden con Linux: ahí siempre usar estas constantes.
+//!
+//! Única fuente de verdad: este módulo + tabla `match` en `eclipse_kernel/src/syscalls.rs`.
 pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
 pub const SYS_OPEN: usize = 2;

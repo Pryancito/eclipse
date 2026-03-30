@@ -21,9 +21,9 @@ pub unsafe extern "C" fn signal(_signum: c_int, _handler: Option<OsSigHandlerPtr
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn kill(pid: pid_t, _sig: c_int) -> c_int {
+pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
     use eclipse_syscall::call::kill;
-    match kill(pid as usize) {
+    match kill(pid as usize, sig as usize) {
         Ok(_) => 0,
         Err(e) => {
             *crate::header::errno::__errno_location() = e.errno as c_int;

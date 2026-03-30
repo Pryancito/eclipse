@@ -2,7 +2,7 @@
 
 use std::prelude::v1::*;
 
-const SYS_REGISTER_DEVICE: usize = 27;
+use eclipse_syscall::number::SYS_REGISTER_DEVICE;
 
 #[allow(dead_code)]
 #[repr(u64)]

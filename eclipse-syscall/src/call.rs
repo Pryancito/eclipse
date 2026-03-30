@@ -51,6 +51,21 @@ pub fn getpid() -> usize {
     unsafe { syscall0(SYS_GETPID) }
 }
 
+/// Set the current process name (kernel stores up to 15 bytes; NUL not required).
+pub fn set_process_name(name: &str) -> Result<()> {
+    let len = name.len().min(15);
+    if len == 0 {
+        return Err(crate::error::Error::new(crate::error::EINVAL));
+    }
+    unsafe {
+        cvt_unit(syscall2(
+            SYS_SET_PROCESS_NAME,
+            name.as_ptr() as usize,
+            len,
+        ))
+    }
+}
+
 pub fn stop_progress() -> Result<usize> {
     unsafe { cvt(syscall0(SYS_STOP_PROGRESS)) }
 }
@@ -111,9 +126,9 @@ pub fn get_process_list(buf: &mut [crate::ProcessInfo]) -> Result<usize> {
     unsafe { cvt(syscall2(SYS_GET_PROCESS_LIST, buf.as_mut_ptr() as usize, buf.len())) }
 }
 
-/// Kill a process by PID
-pub fn kill(pid: usize) -> Result<()> {
-    unsafe { cvt_unit(syscall1(SYS_KILL, pid)) }
+/// Kill a process by PID with a signal
+pub fn kill(pid: usize, sig: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_KILL, pid, sig)) }
 }
 
 /// Fork the current process
@@ -197,7 +212,7 @@ pub fn fstat_at(dirfd: usize, path: &str, stat: &mut Stat, flags: usize) -> Resu
             SYS_FSTATAT,
             dirfd,
             path.as_ptr() as usize,
-            path.len(),
+            stat as *mut Stat as usize,
             flags,
         ))
     }

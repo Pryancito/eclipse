@@ -90,7 +90,7 @@ impl Child {
     
     /// Forces the child process to exit.
     pub fn kill(&mut self) -> Result<()> {
-        match eclipse_syscall::call::kill(self.pid as usize) {
+        match eclipse_syscall::call::kill(self.pid as usize, 9) {
             Ok(_) => Ok(()),
             Err(_) => Err(Error::new(ErrorKind::Other, "kill failed")),
         }

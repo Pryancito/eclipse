@@ -1,17 +1,28 @@
 [package]
-name = "terminal"
-version = "0.2.0"
+name = "terminal-wb"
+version = "0.1.0"
 edition = "2021"
+
+# Use waybackend only on host (Linux) for now
+[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
+waybackend = { version = "0.10", default-features = false }
+libc = "0.2"
 
 [dependencies]
 os-terminal = { version = "0.7.3", features = ["bitmap"] }
+bitflags = "2.4"
+# No-std heapless structures for event handling
+heapless = "0.8"
 
-# Dependencias solo para target Eclipse (vendor eclipse).
 [target.'cfg(target_vendor = "eclipse")'.dependencies]
+# Use wayland-proto from the local workspace
+wayland-proto = { path = "../libs/wayland-proto" }
+# SideWind: crate `eclipse-apps/sidewind` (reexporta tipos IPC y `sidewind_core` internamente).
 sidewind = { path = "../sidewind" }
+# Standard library bridge for Eclipse
 eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
+libc = { version = "0.2", default-features = false }
 
-# Dependencias para target Linux (host) — tests y desarrollo
-[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
-sidewind = { path = "../sidewind" }
+[features]
+default = []

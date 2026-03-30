@@ -25,6 +25,7 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 [target.'cfg(target_vendor = "eclipse")'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
+wayland-proto = { path = "../libs/wayland-proto" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
 libc = { version = "0.2", default-features = false }
@@ -33,6 +34,7 @@ libc = { version = "0.2", default-features = false }
 [target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+wayland-proto = { path = "../libs/wayland-proto" }
 libc = "0.2"
 
 [features]

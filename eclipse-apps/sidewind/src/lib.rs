@@ -18,8 +18,9 @@ pub mod ui;
 pub mod gpu;
 
 pub use gpu::{GpuBackend, GpuCommandEncoder, GpuDevice, SurfaceGpuExt};
+/// Canal IPC compartido con el compositor (`send_sidewind`, `send_raw`, etc.).
+pub use eclipse_ipc::prelude::IpcChannel;
 
-use eclipse_ipc::prelude::IpcChannel;
 #[cfg(not(target_os = "linux"))]
 use libc::{
     close, eclipse_send as send, mmap, munmap, open, receive, yield_cpu, MAP_SHARED, O_RDWR,
