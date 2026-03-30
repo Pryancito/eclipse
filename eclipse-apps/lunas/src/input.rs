@@ -709,6 +709,7 @@ pub struct InputState {
     pub apply_net_static: bool,
     /// Signal to state.rs to request a DHCP IP renewal via IPC.
     pub renew_dhcp: bool,
+    pub pending_wayland_key: Option<(usize, u16, u16)>,
 }
 
 impl InputState {
@@ -790,6 +791,7 @@ impl InputState {
             net_edit_buffer: heapless::String::new(),
             apply_net_static: false,
             renew_dhcp: false,
+            pending_wayland_key: None,
         }
     }
 
@@ -1333,6 +1335,20 @@ impl InputState {
                             dirty = true;
                         }
                         _ => {}
+                    }
+                }
+
+                // ── Forward Wayland keyboard events ──
+                let action = scancode_to_action(scancode, self.modifiers);
+                if !pressed || action == KeyAction::None {
+                    if let Some(focused) = self.focused_window {
+                        if focused < *window_count {
+                            use crate::compositor::WindowContent;
+                            if let WindowContent::Wayland { conn_idx, .. } = windows[focused].content {
+                                let state_flag = if pressed { 1 } else { 0 };
+                                self.pending_wayland_key = Some((conn_idx, scancode, state_flag));
+                            }
+                        }
                     }
                 }
             }

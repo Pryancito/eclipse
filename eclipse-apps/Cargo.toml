@@ -8,7 +8,8 @@ members = [
     "eclipse_std",
     "libs/ipc",
     "lunas",
-    "terminal", "sh",
+    "terminal",
+    "sh",
 ]
 exclude = ["libs/ipc_tests", "std_test", "smithay_app"]
 

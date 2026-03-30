@@ -973,16 +973,9 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         return u64::MAX;
     }
     
-    // Handle stdout (1) and stderr (2) by writing to serial
-    if fd == 1 || fd == 2 {
-        unsafe {
-            let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-            if let Ok(s) = core::str::from_utf8(slice) {
-                serial::serial_print(s);
-            }
-        }
-        return len;
-    }
+    // File descriptor routing
+    // La salida estándar (fd 1 y 2) ya está inicializada hacia "log:" vía fd_init_stdio,
+    // así que no necesitamos hardcodear llamadas serial_print que romperían los pipes/pty.
 
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
@@ -1786,7 +1779,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
             Ok(res) => res,
             Err(e) => {
                 if e != crate::scheme::error::EAGAIN {
-                    serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                    serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
                 }
                 return u64::MAX;
             }
@@ -1796,7 +1789,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
             Ok(res) => res,
             Err(e) => {
                 if e != crate::scheme::error::EAGAIN {
-                    serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                    serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
                 }
                 return u64::MAX;
             }

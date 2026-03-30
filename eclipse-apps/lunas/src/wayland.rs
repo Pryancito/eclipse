@@ -26,6 +26,8 @@ pub struct ClientConnection {
     pub surfaces: alloc::vec::Vec<(u32, Option<usize>)>,
     /// Does the client have a registry?
     pub registry_id: Option<u32>,
+    /// Pending events to be sent to this client.
+    pub pending_events: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +73,7 @@ impl ClientConnection {
             attached_buffers: alloc::vec::Vec::new(),
             surfaces: alloc::vec::Vec::new(),
             registry_id: None,
+            pending_events: alloc::vec::Vec::new(),
         }
     }
 
@@ -198,10 +201,13 @@ impl WaylandCompositor {
                         height: msg.height,
                     };
                 } else if header.opcode == 1 && data.len() >= 12 {
-                    // wl_display.get_registry: store the registry object ID
+                    // wl_display.get_registry(callback_id = new_id)
                     let registry_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                    println!("[LUNAS-WAYL] Get Registry: id={} from={}", registry_id, pid);
                     self.connections[conn_idx].registry_id = Some(registry_id);
                     self.connections[conn_idx].objects.push((registry_id, WaylandObjectType::Registry));
+                    
+                    self.respond_with_globals(conn_idx, registry_id);
                 }
             }
             ID_SHM => {
@@ -215,6 +221,33 @@ impl WaylandCompositor {
                     .map(|(_, t)| *t);
 
                 match obj_type {
+                    Some(WaylandObjectType::Registry) => {
+                        if header.opcode == 0 && data.len() >= 12 { // wl_registry.bind(name, iface, version, id)
+                            let name = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                            // For simplicity, we assume the client knows the signature and we just
+                            // look at the last 4 bytes of the message for the new_id.
+                            // The actual layout depends on the length of the interface string.
+                            let new_id = u32::from_le_bytes([data[data.len()-4], data[data.len()-3], data[data.len()-2], data[data.len()-1]]);
+                            
+                            println!("[LUNAS-WAYL] Registry Bind: name={} id={} from={}", name, new_id, pid);
+                            
+                            match name {
+                                1 => { // wl_compositor
+                                    self.connections[conn_idx].objects.push((new_id, WaylandObjectType::Compositor));
+                                }
+                                2 => { // wl_shm
+                                    self.connections[conn_idx].objects.push((new_id, WaylandObjectType::Shm));
+                                    // Advertise formats: ARGB8888 (0), XRGB8888 (1)
+                                    self.send_event(conn_idx, new_id, 0, &0u32.to_le_bytes());
+                                    self.send_event(conn_idx, new_id, 0, &1u32.to_le_bytes());
+                                }
+                                3 => { // wl_shell
+                                    self.connections[conn_idx].objects.push((new_id, WaylandObjectType::Shell));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     Some(WaylandObjectType::Compositor) => {
                         // Standard wl_compositor.create_surface (opcode 0)
                         if header.opcode == 0 && data.len() >= 12 {
@@ -368,8 +401,49 @@ impl WaylandCompositor {
         }
     }
 
-    /// Construct and queue global registry events. (No longer used in EDP)
-    fn respond_with_globals(&mut self, _pid: u32, _registry_id: u32) {
+    /// Construct and queue global registry events.
+    fn respond_with_globals(&mut self, conn_idx: usize, registry_id: u32) {
+        // 1. wl_compositor (ID 1, Version 4)
+        self.send_global(conn_idx, registry_id, 1, "wl_compositor", 4);
+        // 2. wl_shm (ID 2, Version 1)
+        self.send_global(conn_idx, registry_id, 2, "wl_shm", 1);
+        // 3. wl_shell (ID 3, Version 1)
+        self.send_global(conn_idx, registry_id, 3, "wl_shell", 1);
+        // 4. xdg_wm_base (ID 4, Version 1)
+        self.send_global(conn_idx, registry_id, 4, "xdg_wm_base", 1);
+        // 5. wl_seat (ID 5, Version 7)
+        self.send_global(conn_idx, registry_id, 5, "wl_seat", 7);
+        // 6. wl_output (ID 6, Version 4)
+        self.send_global(conn_idx, registry_id, 6, "wl_output", 4);
+    }
+
+    fn send_global(&mut self, conn_idx: usize, registry_id: u32, name: u32, interface: &str, version: u32) {
+        let mut args = alloc::vec::Vec::new();
+        args.extend_from_slice(&name.to_le_bytes());
+        
+        // String: length (including null) + bytes + padding
+        let iface_bytes = interface.as_bytes();
+        let len = iface_bytes.len() + 1;
+        args.extend_from_slice(&(len as u32).to_le_bytes());
+        args.extend_from_slice(iface_bytes);
+        args.push(0); // null terminator
+        while args.len() % 4 != 0 { args.push(0); }
+        
+        args.extend_from_slice(&version.to_le_bytes());
+        
+        self.send_event(conn_idx, registry_id, 0, &args); // wl_registry.global
+    }
+
+    fn send_event(&mut self, conn_idx: usize, obj_id: u32, opcode: u16, args: &[u8]) {
+        let size = 8 + args.len();
+        let mut data = alloc::vec::Vec::with_capacity(size);
+        data.extend_from_slice(&obj_id.to_le_bytes());
+        let size_op = ((size as u32) << 16) | (opcode as u32);
+        data.extend_from_slice(&size_op.to_le_bytes());
+        data.extend_from_slice(args);
+        while data.len() % 4 != 0 { data.push(0); }
+        
+        self.connections[conn_idx].pending_events.push(data);
     }
 
     pub fn disconnect_client(&mut self, pid: u32) {
@@ -917,4 +991,150 @@ mod tests {
         assert!(matches!(action, XwaylandAction::None));
         assert!(xwl.xwm.windows.is_empty());
     }
+}
+
+// --- Native Wayland Dispatch Implementation (Server Side) ---
+
+pub struct SurfaceData;
+pub struct PoolData { 
+    pub fd: i32, 
+    pub size: usize, 
+    pub ptr: *mut u8 
+}
+
+use sidewind::wayland_server::{
+    protocol::{wl_buffer, wl_compositor, wl_shm, wl_shm_pool, wl_surface},
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
+};
+use crate::state::LunasState;
+
+impl GlobalDispatch<wl_compositor::WlCompositor, ()> for LunasState {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<wl_compositor::WlCompositor>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+        println!("[SIDEWIND] Cliente conectado al Compositor");
+    }
+}
+
+impl GlobalDispatch<wl_shm::WlShm, ()> for LunasState {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<wl_shm::WlShm>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let shm = data_init.init(resource, ());
+        shm.format(wl_shm::Format::Argb8888);
+        shm.format(wl_shm::Format::Xrgb8888);
+        println!("[SIDEWIND] Cliente conectado a SHM");
+    }
+}
+
+impl Dispatch<wl_compositor::WlCompositor, ()> for LunasState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _compositor: &wl_compositor::WlCompositor,
+        request: wl_compositor::Request,
+        _: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wl_compositor::Request::CreateSurface { id } = request {
+            println!("[SIDEWIND] Petición: Crear Superficie");
+            data_init.init(id, SurfaceData);
+        }
+    }
+}
+
+impl Dispatch<wl_shm::WlShm, ()> for LunasState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _shm: &wl_shm::WlShm,
+        request: wl_shm::Request,
+        _: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wl_shm::Request::CreatePool { id, fd, size } = request {
+            println!("[SIDEWIND] Petición: Crear Pool SHM (FD: {}, Size: {})", fd, size);
+            
+            #[cfg(target_vendor = "eclipse")]
+            let ptr = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    size as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            #[cfg(not(target_vendor = "eclipse"))]
+            let ptr = core::ptr::null_mut();
+
+            if ptr == (-1isize as *mut core::ffi::c_void) || ptr.is_null() {
+                println!("[SIDEWIND] ERROR: mmap falló");
+            } else {
+                data_init.init(id, PoolData { fd, size: size as usize, ptr: ptr as *mut u8 });
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, PoolData> for LunasState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _pool: &wl_shm_pool::WlShmPool,
+        request: wl_shm_pool::Request,
+        _pool_data: &PoolData,
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wl_shm_pool::Request::CreateBuffer { id, .. } = request {
+            // En un sistema real guardaríamos el puntero exacto con offset
+            data_init.init(id, ());
+        }
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, SurfaceData> for LunasState {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        surface: &wl_surface::WlSurface,
+        request: wl_surface::Request,
+        _: &SurfaceData,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wl_surface::Request::Attach { .. } => {
+                println!("[SIDEWIND] Cliente {} anexó un buffer a la superficie {}", client.pid, surface.id);
+            }
+            wl_surface::Request::Damage { .. } => {
+                state.dirty = true;
+            }
+            wl_surface::Request::Commit => {
+                println!("[SIDEWIND] COMMIT recibido para superficie {}", surface.id);
+                // Aquí se activaría el renderizado de la ventana asociada
+                state.wayland.register_surface_window(client.pid, surface.id, 0); // Mock association
+                state.dirty = true;
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for LunasState {
+    fn request(_: &mut Self, _: &Client, _: &wl_buffer::WlBuffer, _: (), _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {}
 }

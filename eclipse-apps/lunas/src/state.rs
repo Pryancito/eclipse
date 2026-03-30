@@ -8,7 +8,7 @@ use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::wayland::{WaylandCompositor, XwaylandIntegration, WaylandAction, XwaylandAction, make_wayland_window};
+use crate::wayland::{WaylandCompositor, XwaylandIntegration, XwaylandAction};
 use std::prelude::v1::*;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
@@ -78,6 +78,8 @@ pub struct LunasState {
     pub last_input_tick: u64,
     /// Wayland compositor: manages protocol state for connected Wayland clients.
     pub wayland: WaylandCompositor,
+    /// Native Wayland display (Mocked for Dispatch pattern)
+    pub display: sidewind::wayland_server::Display<LunasState>,
     /// XWayland integration: manages XWayland process and X11 window state.
     pub xwayland: XwaylandIntegration,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
@@ -132,6 +134,7 @@ impl LunasState {
             log_len: 0,
             last_input_tick: 0,
             wayland: WaylandCompositor::new(),
+            display: sidewind::wayland_server::Display::new().expect("Failed to create Wayland display"),
             xwayland: XwaylandIntegration::new(),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
@@ -158,6 +161,11 @@ impl LunasState {
         // Welcome notification
         state.desktop.push_notification("Lunas Desktop initialized", 1);
 
+        // Register Wayland Globals
+        use sidewind::wayland_server::protocol::{wl_compositor, wl_shm};
+        state.display.handle().create_global::<LunasState, wl_compositor::WlCompositor, _>(1, ());
+        state.display.handle().create_global::<LunasState, wl_shm::WlShm, _>(1, ());
+
         Some(state)
     }
 
@@ -174,6 +182,30 @@ impl LunasState {
                     &mut self.surfaces,
                 );
                 if dirty { self.dirty = true; }
+
+                // Dispatch pending Wayland keyboard events
+                if let Some((conn_idx, scancode, state_val)) = self.input.pending_wayland_key.take() {
+                    if conn_idx < self.wayland.connections.len() {
+                        let pid = self.wayland.connections[conn_idx].pid;
+                        let mut msg = [0u8; 16];
+                        msg[0..4].copy_from_slice(b"WAYL");
+                        unsafe {
+                            let evt = msg.as_mut_ptr().add(4) as *mut sidewind::wayland::WaylandEvtKeyboard;
+                            (*evt).header.object_id = 3;       // ID_SEAT
+                            (*evt).header.opcode = 10;  // KEYBOARD OPCODE
+                            (*evt).header.length = 12;
+                            (*evt).key = scancode;
+                            (*evt).state = state_val;
+                            let _ = eclipse_send(
+                                pid,
+                                sidewind::MSG_TYPE_WAYLAND,
+                                msg.as_ptr() as *const core::ffi::c_void,
+                                16,
+                                0,
+                            );
+                        }
+                    }
+                }
 
                 // Apply tiling layout if active
                 if self.input.tiling_active {
@@ -255,99 +287,21 @@ impl LunasState {
             }
             CompositorEvent::Wayland(data, pid) => {
                 let pid = *pid;
-                let fb_w = self.backend.fb.info.width as i32;
-                let fb_h = self.backend.fb.info.height as i32;
+                // NEW: Use the native protocol handler which returns high-level actions.
                 let actions = self.wayland.handle_message(data, pid);
                 for action in actions {
-                    match action {
-                    WaylandAction::CreateSurface { pid, surface_id, conn_idx, width, height } => {
-                        println!("[LUNAS-STATE] Wayland CreateSurface: id={} conn={} size={}x{} from={}", surface_id, conn_idx, width, height, pid);
-                        if self.space.window_count < self.space.windows.len() {
-                            let win = make_wayland_window(
-                                surface_id, conn_idx,
-                                width as i32, height as i32,
-                                self.input.current_workspace,
-                                b"Wayland",
-                            );
-                            let w_idx = self.space.window_count;
-                            println!("[LUNAS-STATE] Mapping Wayland window to index={}", w_idx);
-                            self.space.map_window(win);
-                            self.wayland.register_surface_window(pid, surface_id, w_idx);
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::CommitFrame { pid, surface_id, vaddr, width, height, .. } => {
-                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
-                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                println!("[LUNAS-STATE] Wayland CommitFrame: surface={} window={} vaddr={:x} {}x{}", surface_id, w_idx, vaddr, width, height);
-                                if w_idx < self.space.window_count {
-                                    let win = &mut self.space.windows[w_idx];
-                                    win.buffer_handle = Some(vaddr as u64);
-                                    win.w = width as i32;
-                                    win.h = height as i32 + ShellWindow::TITLE_H;
-                                    win.is_dmabuf = false;
-                                    win.minimized = false;
-                                }
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::AttachBuffer { pid, surface_id, vaddr, width, height, .. } => {
-                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
-                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                if w_idx < self.space.window_count && vaddr != 0 {
-                                    let win = &mut self.space.windows[w_idx];
-                                    win.buffer_handle = Some(vaddr as u64);
-                                    win.w = width as i32;
-                                    win.h = height as i32 + ShellWindow::TITLE_H;
-                                }
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::CommitSurface { pid, surface_id } => {
-                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
-                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                if w_idx < self.space.window_count {
-                                    self.space.windows[w_idx].minimized = false;
-                                }
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::DestroySurface { pid, surface_id } => {
-                        let w_idx_opt = self.wayland.connections.iter()
-                            .find(|c| c.pid == pid)
-                            .and_then(|c| c.window_for_surface(surface_id));
-                        if let Some(w_idx) = w_idx_opt {
-                            if w_idx < self.space.window_count {
-                                self.space.windows[w_idx].closing = true;
-                                if self.input.focused_window == Some(w_idx) {
-                                    self.input.focused_window = None;
-                                }
-                            }
-                        }
-                        if let Some(c) = self.wayland.connections.iter_mut().find(|c| c.pid == pid) {
-                            c.remove_surface(surface_id);
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::SetTitle { pid, surface_id, title } => {
-                        if let Some(conn) = self.wayland.connections.iter().find(|c| c.pid == pid) {
-                            if let Some(w_idx) = conn.window_for_surface(surface_id) {
-                                if w_idx < self.space.window_count {
-                                    self.space.windows[w_idx].title = title;
-                                }
-                            }
-                        }
-                        self.dirty = true;
-                    }
-                    WaylandAction::None => {
-                        self.dirty = true;
+                    self.process_wayland_action(action);
+                }
+                
+                // Flush pending events for the client
+                if let Some(conn) = self.wayland.connections.iter_mut().find(|c| c.pid == pid) {
+                    for event in conn.pending_events.drain(..) {
+                        self.backend.ipc.send_wayland(pid, &event);
                     }
                 }
+                
+                self.dirty = true;
             }
-        }
         CompositorEvent::X11(data, pid) => {
                 let pid = *pid;
                 let fb_w = self.backend.fb.info.width as i32;
@@ -442,6 +396,75 @@ impl LunasState {
                     }
                 }
             }
+        }
+    }
+
+    /// Process a high-level action from the Wayland protocol handler.
+    pub fn process_wayland_action(&mut self, action: crate::wayland::WaylandAction) {
+        use crate::wayland::{WaylandAction, make_wayland_window};
+
+        match action {
+            WaylandAction::CreateSurface { pid, surface_id, conn_idx, width, height } => {
+                println!("[LUNAS-STATE] Wayland CreateSurface: id={} from={}", surface_id, pid);
+                if self.space.window_count < self.space.windows.len() {
+                    let win = make_wayland_window(
+                        surface_id,
+                        conn_idx,
+                        width as i32,
+                        height as i32,
+                        self.input.current_workspace,
+                        b"WaylandApp"
+                    );
+                    let w_idx = self.space.window_count;
+                    self.space.map_window(win);
+                    self.wayland.register_surface_window(pid, surface_id, w_idx);
+                }
+            }
+            WaylandAction::CommitFrame { pid, surface_id, vaddr, .. } => {
+                // Legacy EDP commit: if we have a window for this surface, mark it for repaint.
+                if let Some(w_idx) = self.wayland.connections.iter()
+                    .find(|c| c.pid == pid)
+                    .and_then(|c| c.window_for_surface(surface_id))
+                {
+                    if w_idx < self.space.window_count {
+                        self.space.windows[w_idx].buffer_handle = Some(vaddr as u64);
+                        self.dirty = true;
+                    }
+                }
+            }
+            WaylandAction::AttachBuffer { pid, surface_id, vaddr, .. } => {
+                println!("[LUNAS-STATE] Wayland Attach: surface={} vaddr={:#x} from={}", surface_id, vaddr, pid);
+                if let Some(w_idx) = self.wayland.connections.iter()
+                    .find(|c| c.pid == pid)
+                    .and_then(|c| c.window_for_surface(surface_id))
+                {
+                    if w_idx < self.space.window_count {
+                        self.space.windows[w_idx].buffer_handle = Some(vaddr as u64);
+                    }
+                }
+            }
+            WaylandAction::CommitSurface { pid, surface_id } => {
+                // Standard wl_surface.commit: trigger redraw of correctly mapped windows.
+                if let Some(w_idx) = self.wayland.connections.iter()
+                    .find(|c| c.pid == pid)
+                    .and_then(|c| c.window_for_surface(surface_id))
+                {
+                    if w_idx < self.space.window_count {
+                        self.dirty = true;
+                    }
+                }
+            }
+            WaylandAction::SetTitle { pid, surface_id, title } => {
+                if let Some(w_idx) = self.wayland.connections.iter()
+                    .find(|c| c.pid == pid)
+                    .and_then(|c| c.window_for_surface(surface_id))
+                {
+                    if w_idx < self.space.window_count {
+                        self.space.windows[w_idx].title = title;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

@@ -104,6 +104,14 @@ impl IpcHandler {
         }
         None
     }
+
+    /// Send a Wayland protocol message to a client PID.
+    pub fn send_wayland(&mut self, target_pid: u32, data: &[u8]) {
+        #[cfg(not(test))]
+        let _ = self.channel.send_wayland(target_pid, data);
+        #[cfg(test)]
+        let _ = (target_pid, data);
+    }
 }
 
 /// Handle a SideWind protocol message (window create/destroy/update/commit).

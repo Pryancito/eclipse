@@ -11,6 +11,8 @@ pub mod opengl;
 // Se exporta en todas las plataformas para que los tests de crates dependientes
 // (p. ej. smithay_app) puedan usarlo sin necesitar el flag `test` en sidewind.
 pub mod wayland;
+pub mod wayland_client;
+pub mod wayland_server;
 pub mod xwayland;
 #[cfg(not(target_os = "linux"))]
 pub mod nvidia;

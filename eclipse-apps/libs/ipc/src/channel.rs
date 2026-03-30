@@ -123,4 +123,15 @@ impl IpcChannel {
         };
         Self::send_raw(dest_pid, crate::services::MSG_TYPE_GRAPHICS, bytes)
     }
+
+    /// Enviar un mensaje del protocolo Wayland.
+    /// Prepend b"WAYL" al payload y usa MSG_TYPE_WAYLAND (0x80).
+    pub fn send_wayland(&mut self, dest_pid: u32, data: &[u8]) -> bool {
+        use sidewind_core::MSG_TYPE_WAYLAND;
+        let mut buf = [0u8; MAX_MSG_LEN];
+        if data.len() + 4 > MAX_MSG_LEN { return false; }
+        buf[0..4].copy_from_slice(b"WAYL");
+        buf[4..4+data.len()].copy_from_slice(data);
+        Self::send_raw(dest_pid, MSG_TYPE_WAYLAND, &buf[..4+data.len()])
+    }
 }

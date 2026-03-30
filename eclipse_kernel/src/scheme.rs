@@ -312,10 +312,10 @@ impl ShmScheme {
 
 impl Scheme for ShmScheme {
     fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
-        // Flags from POSIX (subset used here)
-        const O_CREAT: usize = 0x200;
-        const O_EXCL: usize = 0x800;
-        const O_TRUNC: usize = 0x400;
+        // Flags from POSIX / eclipse-syscall (O_RDWR is 0x02, etc.)
+        const O_CREAT: usize = 0x0040;
+        const O_EXCL: usize = 0x0080;
+        const O_TRUNC: usize = 0x0200;
 
         let mut regions = self.regions.lock();
         let mut handles = self.handles.lock();
@@ -504,7 +504,7 @@ mod tests {
     fn test_shm_refcount_unlink() {
         let shm = ShmScheme::new();
         // 1. Open region "test"
-        let fd1 = shm.open("test", 0x200, 0).expect("failed to open shm"); // O_CREAT
+        let fd1 = shm.open("test", 0x40, 0).expect("failed to open shm"); // O_CREAT
         {
             let regions = shm.regions.lock();
             let reg = regions.get("test").expect("region not found");
