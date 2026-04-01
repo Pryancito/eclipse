@@ -19,6 +19,7 @@ pub const SYS_MUNMAP: usize = 11;
 pub const SYS_BRK: usize = 12;
 pub const SYS_SIGACTION: usize = 13;
 pub const SYS_IOCTL: usize = 16;
+pub const SYS_PIPE: usize = 22;
 pub const SYS_YIELD: usize = 24;
 pub const SYS_NANOSLEEP: usize = 35;
 pub const SYS_GETPID: usize = 39;
@@ -38,8 +39,8 @@ pub const SYS_KILL: usize = 62;
 pub const SYS_FTRUNCATE: usize = 77;
 /// rename(oldpath, newpath) — mismos argumentos que Linux x86-64 (punteros a C-strings).
 pub const SYS_RENAME: usize = 82;
-pub const SYS_MKDIR: usize = 83;
-pub const SYS_UNLINK: usize = 87;
+pub const SYS_MKDIR: usize = 541;
+pub const SYS_UNLINK: usize = 540;
 pub const SYS_GETPPID: usize = 110;
 pub const SYS_ARCH_PRCTL: usize = 158;
 pub const SYS_GETTID: usize = 186;
@@ -89,5 +90,14 @@ pub const SYS_SPAWN_WITH_STDIO: usize = 536;
 pub const SYS_THREAD_CREATE: usize = 537;
 /// Esperar hijo: (status_ptr, wait_pid) — wait_pid == 0 equivale a cualquier hijo.
 pub const SYS_WAIT_PID: usize = 538;
+/// Listar hijos de un directorio: (path_ptr, buf_ptr, buf_size) → bytes escritos.
+/// Los nombres están separados por '\n' en el buffer de salida.
+pub const SYS_READDIR: usize = 539;
+// SYS_UNLINK = 540 y SYS_MKDIR = 541 ya definidos arriba (reaprovechando las constantes POSIX)
+/// Registrar argv para un proceso hijo recién spawnado: (child_pid, args_ptr, args_len).
+pub const SYS_SET_CHILD_ARGS: usize = 542;
+/// Obtener los argumentos del proceso actual (escritos por el padre al spawnear).
+/// (buf_ptr, buf_size) → bytes escritos. Formato: NUL-separated argv[0]\0argv[1]\0...
+pub const SYS_GET_PROCESS_ARGS: usize = 543;
 
 pub const SYS_RECEIVE_FAST: usize = 600;

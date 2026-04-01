@@ -167,6 +167,40 @@ pub fn init() {
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     register_scheme("eth", Arc::new(crate::eth::EthScheme));
     register_scheme("pty", Arc::new(crate::pty::PtyScheme::new()));
+    // El PipeScheme usa el singleton global PIPE_SCHEME; el proxy delega en él.
+    register_scheme("pipe", Arc::new(PipeSchemeProxy));
+}
+
+/// Proxy sin estado que delega todas las operaciones en el singleton PIPE_SCHEME.
+struct PipeSchemeProxy;
+
+impl Scheme for PipeSchemeProxy {
+    fn open(&self, path: &str, flags: usize, mode: u32) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.open(path, flags, mode)
+    }
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.read(id, buffer)
+    }
+    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.write(id, buffer)
+    }
+    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.lseek(id, offset, whence)
+    }
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.close(id)
+    }
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.fstat(id, stat)
+    }
+}
+
+/// Devuelve el scheme_id (índice en el REGISTRY) para un scheme dado por nombre.
+pub fn get_scheme_id(name: &str) -> Option<usize> {
+    let reg = REGISTRY.lock();
+    reg.schemes.iter().enumerate()
+        .find(|(_, (n, _))| n.as_str() == name)
+        .map(|(i, _)| i)
 }
 
 /// Register a new scheme

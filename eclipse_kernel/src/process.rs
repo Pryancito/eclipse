@@ -110,6 +110,11 @@ pub struct Process {
     pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
     pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
     pub ai_profile: crate::ai_core::ProcessProfile, // AI Behavior statistics
+    /// Máscara de señales pendientes (bit N = señal N pendiente).
+    pub pending_signals: u64,
+    /// Manejadores de señal registrados por el proceso vía sys_sigaction.
+    /// 0 = SIG_DFL (acción por defecto), 1 = SIG_IGN, otro = puntero a función.
+    pub signal_handlers: [u64; 64],
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -141,6 +146,8 @@ impl Process {
             exit_code: 0,
             cpu_affinity: None,
             ai_profile: crate::ai_core::ProcessProfile::new(),
+            pending_signals: 0,
+            signal_handlers: [0u64; 64],
         }
     }
 }
@@ -893,4 +900,51 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     crate::fd::fd_clone_for_fork(current_pid, child_pid);
 
     Some(child_pid)
+}
+
+// ---------------------------------------------------------------------------
+// Señales — helpers
+// ---------------------------------------------------------------------------
+
+/// Devuelve la máscara de señales pendientes de un proceso.
+pub fn get_pending_signals(pid: ProcessId) -> u64 {
+    PROCESS_TABLE.lock().iter()
+        .find_map(|slot| slot.as_ref().filter(|p| p.id == pid).map(|p| p.pending_signals))
+        .unwrap_or(0)
+}
+
+/// Establece un bit de señal como pendiente en el proceso destino y lo desbloquea
+/// si está en espera (para que la señal sea entregada en la próxima iteración).
+pub fn set_pending_signal(pid: ProcessId, signum: u8) {
+    if signum >= 64 { return; }
+    let mut table = PROCESS_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(p) = slot {
+            if p.id == pid {
+                p.pending_signals |= 1u64 << signum;
+                // Despertar al proceso si está bloqueado
+                if p.state == ProcessState::Blocked {
+                    p.state = ProcessState::Ready;
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Consume (limpia) un bit de señal del proceso actual y devuelve el handler registrado.
+/// Devuelve None si no hay señal pendiente o no hay proceso actual.
+pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<u64> {
+    if signum >= 64 { return None; }
+    let mask = 1u64 << signum;
+    let mut table = PROCESS_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(p) = slot {
+            if p.id == pid && (p.pending_signals & mask) != 0 {
+                p.pending_signals &= !mask;
+                return Some(p.signal_handlers[signum as usize]);
+            }
+        }
+    }
+    None
 }

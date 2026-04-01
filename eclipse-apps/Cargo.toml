@@ -8,6 +8,7 @@ members = [
     "lunas",
     "terminal",
     "sh",
+    "nano",
     "glxgears",
 ]
 # glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.

@@ -42,7 +42,8 @@ mod storage;
 mod progress;
 mod fd;  // File descriptor management
 mod scheme; // Redox-style scheme system
-mod pty; // PTY Scheme
+mod pty;    // PTY Scheme
+mod pipe;   // Pipe anónimas (sys_pipe / POSIX pipe)
 mod bcache; // Buffer Cache
 mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery

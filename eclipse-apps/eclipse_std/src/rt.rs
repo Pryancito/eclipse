@@ -27,6 +27,12 @@ unsafe fn read_argc_from_stack(rsp: *const u64) -> u64 {
 /// TLS no inicializado por ahora.
 pub fn init_runtime() {
     crate::heap::init_heap();
+    // Variables de entorno por defecto para todos los procesos de Eclipse OS
+    crate::env::set_var("TERM", "xterm-256color");
+    crate::env::set_var("HOME", "/");
+    crate::env::set_var("PATH", "/bin");
+    // Leer argv del kernel (registrado por el padre al hacer spawn)
+    crate::env::init_args();
     unsafe {
         // En Eclipse OS, SYS_SEND (3) requiere un msg_type. Usamos 0 para READY/HEART.
         let _ = crate::libc::eclipse_send(1, 0, b"READY\0".as_ptr() as *const crate::ffi::c_void, 6, 0);

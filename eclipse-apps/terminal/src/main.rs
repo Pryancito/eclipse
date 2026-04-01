@@ -18,24 +18,117 @@ use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
 use eclipse_syscall::{self, flag, ProcessInfo};
 use heapless::String as HString;
 
-use os_terminal::{DrawTarget, Rgb, Terminal};
+use os_terminal::{ClipboardHandler, DrawTarget, MouseInput, Rgb, Terminal};
 use os_terminal::font::BitmapFont;
 
+/// Portapapeles en memoria para el terminal de Eclipse OS.
+/// No hay portapapeles del sistema, pero Ctrl+Shift+C / Ctrl+Shift+V
+/// funcionan dentro de la misma sesión del terminal.
 #[cfg(target_vendor = "eclipse")]
-use libc::{c_int, close, mmap, munmap, open};
+struct EclipseClipboard {
+    text: alloc::string::String,
+}
+
+#[cfg(target_vendor = "eclipse")]
+impl EclipseClipboard {
+    fn new() -> Self {
+        Self { text: alloc::string::String::new() }
+    }
+}
+
+#[cfg(target_vendor = "eclipse")]
+impl ClipboardHandler for EclipseClipboard {
+    fn get_text(&mut self) -> Option<alloc::string::String> {
+        if self.text.is_empty() { None } else { Some(self.text.clone()) }
+    }
+    fn set_text(&mut self, text: alloc::string::String) {
+        self.text = text;
+    }
+}
+
+#[cfg(target_vendor = "eclipse")]
+use libc::{c_int, close, kill, mmap, munmap, open};
 #[cfg(target_vendor = "eclipse")]
 use eclipse_ipc::prelude::EclipseMessage;
 #[cfg(target_vendor = "eclipse")]
-use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY};
+use sidewind::{
+    IpcChannel, SideWindEvent, SideWindMessage,
+    SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE, SWND_EVENT_TYPE_RESIZE,
+    SWND_EVENT_TYPE_MOUSE_BUTTON,
+};
 
 #[cfg(target_vendor = "eclipse")]
 use eclipse_syscall::call::{
     close as sys_close,
+    exit as sys_exit,
     ioctl as sys_ioctl,
     read as sys_read,
     spawn_with_stdio as sys_spawn_with_stdio,
     write as sys_write,
 };
+
+/// Escanea un buffer de bytes del PTY buscando la última secuencia OSC de título.
+/// Formato: ESC ] {0|1|2} ; <título> { BEL(\x07) | ST(\x1b\\) }
+/// Devuelve el título en un array de 32 bytes (con NUL al final) o None.
+#[cfg(target_vendor = "eclipse")]
+fn extract_osc_title(buf: &[u8]) -> Option<[u8; 32]> {
+    let mut last: Option<[u8; 32]> = None;
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == b'\x1b' && buf[i + 1] == b']' {
+            // Aceptamos parámetros 0 (icon+title), 1 (icon) y 2 (title)
+            if matches!(buf[i + 2], b'0' | b'1' | b'2') && buf.get(i + 3) == Some(&b';') {
+                let ts = i + 4; // primer byte del texto
+                let mut j = ts;
+                while j < buf.len() {
+                    let term_bel = buf[j] == b'\x07';
+                    let term_st  = buf[j] == b'\x1b' && buf.get(j + 1) == Some(&b'\\');
+                    if term_bel || term_st {
+                        let len = (j - ts).min(31);
+                        let mut t = [0u8; 32];
+                        t[..len].copy_from_slice(&buf[ts..ts + len]);
+                        last = Some(t);
+                        i = j + if term_bel { 1 } else { 2 };
+                        break;
+                    }
+                    j += 1;
+                }
+                if j == buf.len() {
+                    break; // secuencia incompleta, esperar al próximo chunk
+                }
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    last
+}
+
+/// Tamaño de celda del BitmapFont (noto-sans-mono-bitmap, talla por defecto).
+/// Se usa para calcular cols/rows a partir de las dimensiones en píxeles.
+#[cfg(target_vendor = "eclipse")]
+const FONT_CHAR_W: u16 = 8;
+#[cfg(target_vendor = "eclipse")]
+const FONT_CHAR_H: u16 = 16;
+
+/// Layout de `struct winsize` (POSIX):
+///   [ws_rows, ws_cols, ws_xpixel, ws_ypixel]  —  4 × u16 = 8 bytes
+#[cfg(target_vendor = "eclipse")]
+#[repr(C)]
+struct WinSize {
+    ws_rows:   u16,
+    ws_cols:   u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[cfg(target_vendor = "eclipse")]
+fn set_pty_winsize(pty_master_fd: usize, rows: u16, cols: u16, xpix: u16, ypix: u16) {
+    let ws = WinSize { ws_rows: rows, ws_cols: cols, ws_xpixel: xpix, ws_ypixel: ypix };
+    let _ = sys_ioctl(pty_master_fd, 3, &ws as *const WinSize as usize);
+}
 
 /// Nombre único de SHM en /tmp/ para SideWind (evita colisión entre procesos).
 fn sidewind_shm_name(pid: u32) -> HString<24> {
@@ -307,6 +400,7 @@ pub fn main() {
         let font = Box::new(BitmapFont);
         let mut terminal = Terminal::new(draw_target, font);
         terminal.set_crnl_mapping(true);
+        terminal.set_clipboard(Box::new(EclipseClipboard::new()));
 
         // Mensaje inicial (visible antes de que `/bin/sh` emita su prompt).
         terminal.process(b"\x1b[1;36mEclipse OS terminal-wb\x1b[0m\r\n");
@@ -408,7 +502,7 @@ pub fn main() {
         }
         let _ = sys_close(sh_fd);
 
-        let _sh_pid = match sys_spawn_with_stdio(
+        let sh_pid = match sys_spawn_with_stdio(
             &sh_bytes,
             Some("sh"),
             pty_slave_fd,
@@ -424,6 +518,13 @@ pub fn main() {
             }
         };
 
+        // Informar al PTY del tamaño inicial de la ventana para que programas
+        // como vim/htop/nano sepan cuántas columnas y filas tienen disponibles.
+        let init_cols = win_w as u16 / FONT_CHAR_W;
+        let init_rows = win_h as u16 / FONT_CHAR_H;
+        set_pty_winsize(pty_master_fd, init_rows, init_cols, win_w as u16, win_h as u16);
+        std::println!("PTY window size: {}x{} chars ({}x{} px)", init_cols, init_rows, win_w, win_h);
+
         // Conectar escritor de PTY para `os-terminal` (bytes del teclado -> PTY master).
         terminal.set_auto_flush(false);
         let pfd_for_writer = pty_master_fd;
@@ -436,6 +537,8 @@ pub fn main() {
         let mut ipc_ch = IpcChannel::new();
         let mut pty_buf = [0u8; 1024];
         let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
+        // Último título enviado a Lunas; evita mensajes redundantes.
+        let mut last_title: [u8; 32] = [0; 32];
 
         std::println!("Terminal interactive: teclado (IPC desde Lunas) + shell (PTY).");
         let _ = size_bytes;
@@ -455,6 +558,38 @@ pub fn main() {
                             let ps2 = if pressed { sc } else { sc | 0x80 };
                             let _ = terminal.handle_keyboard(ps2);
                             dirty = true;
+                        } else if ev.event_type == SWND_EVENT_TYPE_MOUSE_BUTTON {
+                            // Botones de rueda del ratón: 4 = scroll up, 5 = scroll down.
+                            // (Convenio X11; los botones 1/2/3 se ignoran por ahora.)
+                            match ev.data1 {
+                                4 => {
+                                    // Rueda hacia el usuario → mostrar historial (scroll up).
+                                    terminal.handle_mouse(MouseInput::Scroll(3));
+                                    dirty = true;
+                                }
+                                5 => {
+                                    // Rueda alejándose → avanzar al final (scroll down).
+                                    terminal.handle_mouse(MouseInput::Scroll(-3));
+                                    dirty = true;
+                                }
+                                _ => {}
+                            }
+                        } else if ev.event_type == SWND_EVENT_TYPE_RESIZE {
+                            // El compositor redimensionó la ventana.
+                            // data1 = nuevo ancho en px, data2 = nuevo alto en px.
+                            let new_w = ev.data1.max(1) as u16;
+                            let new_h = ev.data2.max(1) as u16;
+                            let new_cols = new_w / FONT_CHAR_W;
+                            let new_rows = new_h / FONT_CHAR_H;
+                            set_pty_winsize(pty_master_fd, new_rows, new_cols, new_w, new_h);
+                            std::println!("[TERM] resize → {}x{} chars", new_cols, new_rows);
+                            dirty = true;
+                        } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
+                            // El usuario cerró la ventana: matar al shell y salir.
+                            unsafe { kill(sh_pid as c_int, 9) };
+                            let _ = sys_close(pty_slave_fd);
+                            let _ = sys_close(pty_master_fd);
+                            sys_exit(0);
                         }
                     }
                 }
@@ -476,6 +611,17 @@ pub fn main() {
                 }
                 terminal.process(&pty_buf[..n]);
                 dirty = true;
+
+                // Detectar cambios de título de ventana (secuencias OSC).
+                if let Some(title) = extract_osc_title(&pty_buf[..n]) {
+                    if title != last_title {
+                        let _ = IpcChannel::send_sidewind(
+                            lunas_pid,
+                            &SideWindMessage::new_set_title(&title),
+                        );
+                        last_title = title;
+                    }
+                }
 
                 // Re-leer available para drenar en lotes.
                 available = 0;

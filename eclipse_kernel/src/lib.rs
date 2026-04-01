@@ -38,6 +38,7 @@ pub mod fd;
 pub mod progress;
 pub mod scheme;
 pub mod pty;
+pub mod pipe;
 pub mod bcache;
 pub mod usb_hid;
 mod elf_loader;

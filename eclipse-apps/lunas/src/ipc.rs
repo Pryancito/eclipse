@@ -3,7 +3,7 @@
 
 use std::prelude::v1::*;
 pub use eclipse_ipc::prelude::*;
-use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
+use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT, SWND_OP_SET_TITLE};
 use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES, find_next_focusable};
 use core::matches;
@@ -281,6 +281,17 @@ pub fn handle_sidewind_message(
                         surfaces[s_idx as usize].ready_to_flip = true;
                     }
                 }
+            }
+        }
+        SWND_OP_SET_TITLE => {
+            // El cliente (terminal) actualiza el título de su ventana.
+            // msg.name contiene el título como bytes UTF-8 (hasta 31 + NUL).
+            let count = *window_count;
+            if let Some(w_idx) = windows[..count].iter().position(|w| {
+                matches!(w.content, WindowContent::External(idx)
+                    if (idx as usize) < surfaces.len() && surfaces[idx as usize].pid == sender_pid)
+            }) {
+                windows[w_idx].title = msg.name;
             }
         }
         _ => {}

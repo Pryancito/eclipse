@@ -14,7 +14,10 @@ pub const MSG_TYPE_X11: u32 = 0x00000100;
 pub const SWND_OP_CREATE: u32 = 1;
 pub const SWND_OP_DESTROY: u32 = 2;
 pub const SWND_OP_UPDATE: u32 = 3;
-pub const SWND_OP_COMMIT: u32 = 4; // New for Phase 4: explicitly signal buffer swap/update
+pub const SWND_OP_COMMIT: u32 = 4;
+/// Cliente notifica al compositor el nuevo título de su ventana.
+/// El título va en el campo `name` (hasta 31 bytes + NUL).
+pub const SWND_OP_SET_TITLE: u32 = 5;
 
 /// SideWind Event Types (Compositor -> Client)
 pub const SWND_EVENT_TYPE_KEY: u32 = 1;
@@ -74,6 +77,20 @@ impl SideWindMessage {
             x: 0, y: 0, w: 0, h: 0,
             name: [0; 32],
         }
+    }
+
+    /// Notificar al compositor el nuevo título de la ventana.
+    /// `title` debe ser UTF-8; se trunca a 31 bytes.
+    pub fn new_set_title(title: &[u8]) -> Self {
+        let mut msg = Self {
+            tag: SIDEWIND_TAG,
+            op: SWND_OP_SET_TITLE,
+            x: 0, y: 0, w: 0, h: 0,
+            name: [0; 32],
+        };
+        let len = title.len().min(31);
+        msg.name[..len].copy_from_slice(&title[..len]);
+        msg
     }
 }
 

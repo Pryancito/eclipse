@@ -263,8 +263,9 @@ pub extern "C" fn syscall_handler(
         9 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         11 => sys_munmap(arg1, arg2),
         12 => sys_brk(arg1),
-        13 => u64::MAX, // sys_sigaction not yet implemented
+        13 => sys_sigaction(arg1, arg2, arg3),
         16 => sys_ioctl(arg1, arg2, arg3),
+        22 => sys_pipe(arg1),
         24 => sys_yield(),
         35 => sys_nanosleep(arg1),
         39 => sys_getpid(),
@@ -333,7 +334,12 @@ pub extern "C" fn syscall_handler(
         535 => sys_set_time(arg1),
         536 => sys_spawn_with_stdio(arg1, arg2, arg3, arg4, arg5, arg6),
         537 => sys_thread_create(arg1, arg2, arg3),
-        538 => sys_wait_pid(arg1, arg2),
+        538 => sys_wait_pid(arg1, arg2, arg3),
+        539 => sys_readdir(arg1, arg2, arg3),
+        540 => sys_unlink(arg1),
+        541 => sys_mkdir(arg1, arg2),
+        542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context), // set_child_args(pid, ptr, len)
+        543 => sys_get_process_args(arg1, arg2),
         600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
@@ -460,12 +466,13 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
         return u64::MAX; // No se puede matar al kernel ni al init
     }
 
-    // Señales que no matan: ignorarlas.
+    let target_pid = pid as crate::process::ProcessId;
+
+    // Señales no fatales: entregarlas como pendientes (EINTR en próximo blocking syscall).
     if sig != 0 && sig != 9 && sig != 15 {
+        crate::process::set_pending_signal(target_pid, sig as u8);
         return 0;
     }
-
-    let target_pid = pid as crate::process::ProcessId;
 
     serial::serial_printf(format_args!("[KILL] pid={} sig={}\n", target_pid, sig));
 
@@ -1007,10 +1014,12 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                         return bytes_read as u64
                     },
                     Err(e) => {
+                        // Propagar el errno real (EINTR=4, EAGAIN=11, etc.) como valor negativo,
+                        // igual que Linux: -(errno) en complemento a dos (u64).
                         if e != crate::scheme::error::EAGAIN {
                             serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
                         }
-                        return u64::MAX;
+                        return (-(e as isize)) as u64;
                     }
                 }
             }
@@ -1521,6 +1530,48 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
 /// arg4: fd to map to stdin (0)
 /// arg5: fd to map to stdout (1)
 /// arg6: fd to map to stderr (2)
+// ---------------------------------------------------------------------------
+// Mapa de argumentos pendientes por proceso (syscalls 542/543)
+// Clave: PID hijo, valor: bytes NUL-separados con argv[0] argv[1] ...
+// ---------------------------------------------------------------------------
+static PROCESS_ARGS: spin::Mutex<alloc::collections::BTreeMap<crate::process::ProcessId, alloc::vec::Vec<u8>>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// sys_set_child_args (542): el padre llama esto justo después de spawn_with_stdio
+/// para registrar el argv del hijo antes de que el scheduler lo ejecute.
+fn sys_spawn_with_stdio_args(
+    child_pid_arg: u64, args_ptr: u64, args_len: u64,
+    _a4: u64, _a5: u64, _a6: u64,
+    _ctx: &mut crate::interrupts::SyscallContext,
+) -> u64 {
+    if args_ptr == 0 || args_len == 0 || args_len > 4096 { return u64::MAX; }
+    if !is_user_pointer(args_ptr, args_len) { return u64::MAX; }
+    let args_data = unsafe {
+        core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize)
+    }.to_vec();
+    PROCESS_ARGS.lock().insert(child_pid_arg as crate::process::ProcessId, args_data);
+    0
+}
+
+/// sys_get_process_args (543): el proceso llama esto al inicio para leer su argv.
+/// Devuelve el número de bytes escritos en buf (formato: NUL-separados).
+fn sys_get_process_args(buf_ptr: u64, buf_size: u64) -> u64 {
+    if buf_ptr == 0 || buf_size == 0 { return 0; }
+    if !is_user_pointer(buf_ptr, buf_size) { return 0; }
+    let pid = match crate::process::current_process_id() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut map = PROCESS_ARGS.lock();
+    if let Some(args) = map.remove(&pid) {
+        let n = args.len().min(buf_size as usize);
+        unsafe { core::ptr::copy_nonoverlapping(args.as_ptr(), buf_ptr as *mut u8, n); }
+        n as u64
+    } else {
+        0
+    }
+}
+
 fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, fd_out: u64, fd_err: u64) -> u64 {
     // Re-implement the base logic to avoid the race condition!
     // We cannot call sys_spawn directly because it enqueues the process, 
@@ -1573,15 +1624,17 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
 /// arg1: pointer to status variable (or 0 for non-blocking poll / WNOHANG semantics)
 /// Returns: PID of terminated child, or -1 on error
 fn sys_wait(status_ptr: u64) -> u64 {
-    sys_wait_impl(status_ptr, 0)
+    sys_wait_impl(status_ptr, 0, false)
 }
 
 /// Esperar hijo concreto (`wait_pid == 0` → cualquier hijo).
-fn sys_wait_pid(status_ptr: u64, wait_pid: u64) -> u64 {
-    sys_wait_impl(status_ptr, wait_pid)
+/// flags: bit 0 = WNOHANG (retornar 0 inmediatamente si ningún hijo ha terminado).
+fn sys_wait_pid(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
+    let wnohang = (flags & 1) != 0;
+    sys_wait_impl(status_ptr, wait_pid, wnohang)
 }
 
-fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
+fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
     use crate::process;
 
     let mut stats = SYSCALL_STATS.lock();
@@ -1660,6 +1713,12 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
             }
         }
 
+        // WNOHANG: si ningún hijo ha terminado aún, devolver 0 sin bloquear.
+        if wnohang {
+            return 0;
+        }
+
+        // Sin status_ptr no hay a dónde escribir el estado → salir.
         if status_ptr == 0 {
             return u64::MAX;
         }
@@ -3573,4 +3632,150 @@ fn sys_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 /// sys_get_storage_device_count - Get the number of registered block devices
 fn sys_get_storage_device_count() -> u64 {
     crate::storage::device_count() as u64
+}
+
+// ---------------------------------------------------------------------------
+// sys_readdir - Listar entradas de un directorio
+// ---------------------------------------------------------------------------
+/// sys_readdir(path_ptr, buf_ptr, buf_size) — Eclipse syscall 539.
+///
+/// Lee los nombres de los hijos del directorio en `path` y los escribe en `buf`
+/// separados por '\n'.  Devuelve el número de bytes escritos, o u64::MAX si el
+/// directorio no existe o no se puede leer.
+fn sys_readdir(path_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
+    if path_ptr == 0 || buf_ptr == 0 || buf_size == 0 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(path_ptr, 1) || !is_user_pointer(buf_ptr, buf_size) {
+        return u64::MAX;
+    }
+
+    // Leer la ruta
+    let mut path_buf = [0u8; 1024];
+    let path_len = unsafe {
+        let mut l = 0usize;
+        while l < 1023 {
+            let b = *((path_ptr + l as u64) as *const u8);
+            if b == 0 { break; }
+            path_buf[l] = b;
+            l += 1;
+        }
+        l
+    };
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // Convertir /bin → bin (quitar la barra inicial)
+    let clean = if path.starts_with('/') { &path[1..] } else { path };
+    let fs_path = if clean.is_empty() { "" } else { clean };
+
+    match crate::filesystem::list_dir_children(fs_path) {
+        Ok(names) => {
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_size as usize) };
+            let mut written = 0usize;
+            for name in &names {
+                let bytes = name.as_bytes();
+                if written + bytes.len() + 1 >= buf.len() { break; }
+                buf[written..written + bytes.len()].copy_from_slice(bytes);
+                written += bytes.len();
+                buf[written] = b'\n';
+                written += 1;
+            }
+            written as u64
+        }
+        Err(_) => u64::MAX,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sys_pipe - Crear un par de descriptores de fichero anónimos (POSIX pipe)
+// ---------------------------------------------------------------------------
+/// sys_pipe(pipefd_ptr) — Linux syscall 22.
+/// Crea una pipe anónima y escribe los dos FDs en [pipefd[0], pipefd[1]]:
+///   pipefd[0] → extremo de lectura
+///   pipefd[1] → extremo de escritura
+/// Devuelve 0 en éxito, u64::MAX en error.
+fn sys_pipe(pipefd_ptr: u64) -> u64 {
+    if pipefd_ptr == 0 || !is_user_pointer(pipefd_ptr, 8) {
+        return u64::MAX;
+    }
+
+    let pid = match current_process_id() {
+        Some(p) => p,
+        None    => return u64::MAX,
+    };
+
+    // Crear el canal en el singleton global y obtener los resource_ids
+    let (read_handle, write_handle) = crate::pipe::PIPE_SCHEME.new_pipe();
+
+    // Averiguar el scheme_id del scheme "pipe" en el registro
+    let scheme_id = match crate::scheme::get_scheme_id("pipe") {
+        Some(id) => id,
+        None     => return u64::MAX,
+    };
+
+    // Asignar FDs en la tabla del proceso actual
+    let read_fd = match crate::fd::fd_open(pid, scheme_id, read_handle, 0) {
+        Some(fd) => fd,
+        None     => return u64::MAX,
+    };
+    let write_fd = match crate::fd::fd_open(pid, scheme_id, write_handle, 0) {
+        Some(fd) => fd,
+        None => {
+            crate::fd::fd_close(pid, read_fd);
+            return u64::MAX;
+        }
+    };
+
+    // Escribir los FDs en el espacio de usuario
+    unsafe {
+        let ptr = pipefd_ptr as *mut u32;
+        *ptr           = read_fd  as u32;
+        *ptr.add(1)    = write_fd as u32;
+    }
+
+    serial::serial_printf(format_args!(
+        "[PIPE] new pipe: read_fd={} write_fd={}\n", read_fd, write_fd
+    ));
+    0
+}
+
+// ---------------------------------------------------------------------------
+// sys_sigaction - Registrar / consultar un manejador de señal
+// ---------------------------------------------------------------------------
+/// sys_sigaction(signum, new_action_ptr, old_action_ptr) — Linux syscall 13.
+///
+/// Estructura simplificada sigaction (solo handler, sin sa_mask/sa_flags):
+///   [0..8]  → handler (usize): 0 = SIG_DFL, 1 = SIG_IGN, else = fn ptr
+///
+/// Devuelve 0 en éxito, u64::MAX en error.
+fn sys_sigaction(signum: u64, new_action_ptr: u64, old_action_ptr: u64) -> u64 {
+    if signum >= 64 {
+        return u64::MAX;
+    }
+
+    let pid = match current_process_id() {
+        Some(p) => p,
+        None    => return u64::MAX,
+    };
+
+    if let Some(mut proc) = crate::process::get_process(pid) {
+        // Devolver el manejador anterior si se pidió
+        if old_action_ptr != 0 && is_user_pointer(old_action_ptr, 8) {
+            unsafe {
+                *(old_action_ptr as *mut u64) = proc.signal_handlers[signum as usize];
+            }
+        }
+        // Instalar el nuevo manejador
+        if new_action_ptr != 0 && is_user_pointer(new_action_ptr, 8) {
+            let new_handler = unsafe { *(new_action_ptr as *const u64) };
+            proc.signal_handlers[signum as usize] = new_handler;
+        }
+        crate::process::update_process(pid, proc);
+        0
+    } else {
+        u64::MAX
+    }
 }

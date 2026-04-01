@@ -12,6 +12,14 @@ pub struct PtyChannel {
     pub master_in: VecDeque<u8>, // Master reads from here, Slave writes to here
     pub slave_in: VecDeque<u8>,  // Slave reads from here, Master writes to here
     pub closed: bool,
+    /// Dimensiones de la ventana (TIOCSWINSZ / TIOCGWINSZ)
+    pub ws_rows: u16,
+    pub ws_cols: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+    /// PID del proceso que tiene abierto el extremo esclavo (0 = no registrado).
+    /// Se establece automáticamente en la primera apertura de "pty:slave/N".
+    pub slave_pid: crate::process::ProcessId,
 }
 
 impl PtyChannel {
@@ -20,6 +28,11 @@ impl PtyChannel {
             master_in: VecDeque::with_capacity(4096),
             slave_in: VecDeque::with_capacity(4096),
             closed: false,
+            ws_rows: 24,
+            ws_cols: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+            slave_pid: 0,
         }
     }
 }
@@ -79,11 +92,15 @@ impl Scheme for PtyScheme {
             let id_str = &path[6..];
             let pair_id = id_str.parse::<usize>().map_err(|_| error::ENOENT)?;
             let channels = self.channels.lock();
-            if pair_id < channels.len() && channels[pair_id].is_some() {
-                return Ok(self.new_handle(pair_id, false));
-            } else {
-                return Err(error::ENOENT);
+            if pair_id < channels.len() {
+                if let Some(arc) = channels[pair_id].as_ref() {
+                    // Registrar el PID del proceso que abre el esclavo
+                    let caller_pid = crate::process::current_process_id().unwrap_or(0);
+                    arc.lock().slave_pid = caller_pid;
+                    return Ok(self.new_handle(pair_id, false));
+                }
             }
+            return Err(error::ENOENT);
         }
         Err(error::ENOENT)
     }
@@ -118,6 +135,14 @@ impl Scheme for PtyScheme {
                 return Ok(0); // EOF
             }
             drop(channel);
+
+            // Comprobar señales pendientes antes de bloquearse: devolver EINTR
+            if let Some(pid) = crate::process::current_process_id() {
+                if crate::process::get_pending_signals(pid) != 0 {
+                    return Err(4); // EINTR = 4
+                }
+            }
+
             crate::scheduler::yield_cpu(); // Blocking read
         }
     }
@@ -200,6 +225,51 @@ impl Scheme for PtyScheme {
                 }
             }
             Ok(queue.len())
+        } else if request == 3 {
+            // TIOCSWINSZ: establecer tamaño de ventana del terminal.
+            // arg = puntero a [u16; 4] = [ws_rows, ws_cols, ws_xpixel, ws_ypixel]
+            if arg == 0 {
+                return Err(error::EINVAL);
+            }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let mut channel = channel_arc.lock();
+            let ptr = arg as *const u16;
+            // SAFETY: el puntero viene de userspace; en un kernel real usaríamos
+            // copy_from_user. Por ahora asumimos que el caller lo mapea correctamente.
+            let slave_pid = unsafe {
+                channel.ws_rows   = *ptr;
+                channel.ws_cols   = *ptr.add(1);
+                channel.ws_xpixel = *ptr.add(2);
+                channel.ws_ypixel = *ptr.add(3);
+                channel.slave_pid
+            };
+            // Enviar SIGWINCH (28) al proceso esclavo para que sepa que cambió el tamaño
+            if slave_pid != 0 {
+                crate::process::set_pending_signal(slave_pid, 28);
+            }
+            Ok(0)
+        } else if request == 4 {
+            // TIOCGWINSZ: leer tamaño de ventana del terminal.
+            // arg = puntero a [u16; 4] = [ws_rows, ws_cols, ws_xpixel, ws_ypixel]
+            if arg == 0 {
+                return Err(error::EINVAL);
+            }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let channel = channel_arc.lock();
+            let ptr = arg as *mut u16;
+            unsafe {
+                *ptr          = channel.ws_rows;
+                *ptr.add(1)   = channel.ws_cols;
+                *ptr.add(2)   = channel.ws_xpixel;
+                *ptr.add(3)   = channel.ws_ypixel;
+            }
+            Ok(0)
         } else {
             Err(error::ENOSYS)
         }

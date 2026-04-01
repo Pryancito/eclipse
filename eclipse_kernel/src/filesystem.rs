@@ -880,6 +880,90 @@ pub fn read_file(path: &str, buffer: &mut [u8]) -> Result<usize, &'static str> {
     Filesystem::read_file_by_inode(inode, buffer)
 }
 
+/// Lista los nombres de los hijos de un directorio dado por inode.
+/// Devuelve un Vec<String> con los nombres (sin ruta), o error si el inode no es directorio.
+pub fn list_dir_children_by_inode(inode: u32) -> Result<Vec<String>, &'static str> {
+    let _lock = FILESYSTEM_LOCK.lock();
+    let entry = Filesystem::read_inode_entry(inode)?;
+    let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+
+    let mut header_buf = [0u8; 8];
+    read_bytes_at(abs_disk_offset, &mut header_buf)?;
+    let record_size = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]) as usize;
+    if record_size < 8 || record_size > MAX_RECORD_SIZE {
+        return Err("Invalid directory record size");
+    }
+
+    let mut record_data = vec![0u8; record_size];
+    read_bytes_at(abs_disk_offset, &mut record_data)?;
+
+    // Recorrer TLVs buscando DIRECTORY_ENTRIES
+    let mut names = Vec::new();
+    let data = &record_data[8..]; // saltar cabecera de 8 bytes del record
+    let mut tlv_pos = 0usize;
+    while tlv_pos + 6 <= data.len() {
+        let tag = u16::from_le_bytes([data[tlv_pos], data[tlv_pos + 1]]);
+        let length = u32::from_le_bytes([data[tlv_pos+2], data[tlv_pos+3], data[tlv_pos+4], data[tlv_pos+5]]) as usize;
+        if tag == tlv_tags::DIRECTORY_ENTRIES && tlv_pos + 6 + length <= data.len() {
+            let dir_data = &data[tlv_pos + 6..tlv_pos + 6 + length];
+            let mut dir_off = 0usize;
+            while dir_off + 8 <= dir_data.len() {
+                let name_len = u32::from_le_bytes([
+                    dir_data[dir_off], dir_data[dir_off+1],
+                    dir_data[dir_off+2], dir_data[dir_off+3]
+                ]) as usize;
+                // Saltar inode (4 bytes en dir_off+4)
+                if name_len == 0 || dir_off + 8 + name_len > dir_data.len() { break; }
+                let name_bytes = &dir_data[dir_off + 8..dir_off + 8 + name_len];
+                if let Ok(name) = core::str::from_utf8(name_bytes) {
+                    names.push(String::from(name));
+                }
+                dir_off += 8 + name_len;
+            }
+            return Ok(names);
+        }
+        if length == 0 { break; }
+        tlv_pos += 6 + length;
+    }
+    Err("Not a directory (no DIRECTORY_ENTRIES TLV found)")
+}
+
+/// Lista los hijos de un directorio dado por ruta.
+pub fn list_dir_children(path: &str) -> Result<Vec<String>, &'static str> {
+    let inode = Filesystem::lookup_path(path)?;
+    list_dir_children_by_inode(inode)
+}
+
+/// Elimina un archivo.  Actualmente soportado solo para rutas /tmp/*.
+pub fn unlink_path(path: &str) -> Result<(), usize> {
+    use crate::scheme::error;
+    let clean = if path.starts_with('/') { &path[1..] } else { path };
+    if clean.starts_with("tmp/") || clean == "tmp" {
+        let mut vtmp = VIRTUAL_TMP.lock();
+        if vtmp.remove(&String::from(clean)).is_some() {
+            Ok(())
+        } else {
+            Err(error::ENOENT)
+        }
+    } else {
+        Err(error::ENOSYS)
+    }
+}
+
+/// Crea un directorio.  Actualmente soportado solo bajo /tmp/.
+pub fn mkdir_path(path: &str, _mode: u32) -> Result<(), usize> {
+    use crate::scheme::error;
+    let clean = if path.starts_with('/') { &path[1..] } else { path };
+    if clean.starts_with("tmp/") || clean == "tmp" {
+        // Guardamos el directorio como entrada vacía en VIRTUAL_TMP.
+        let mut vtmp = VIRTUAL_TMP.lock();
+        vtmp.entry(String::from(clean)).or_insert_with(alloc::vec::Vec::new);
+        Ok(())
+    } else {
+        Err(error::ENOSYS)
+    }
+}
+
 /// Leer un fichero completo asignando un buffer del tamaño exacto del TLV `CONTENT`.
 pub fn read_file_alloc(path: &str) -> Result<Vec<u8>, &'static str> {
     let inode = Filesystem::lookup_path(path)?;

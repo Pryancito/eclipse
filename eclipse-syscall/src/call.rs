@@ -149,12 +149,7 @@ pub fn getppid() -> usize {
     unsafe { syscall0(SYS_GETPPID) }
 }
 
-/// Remove a file or directory
-pub fn unlink(path: &str) -> Result<()> {
-    let mut buf = [0u8; 1024];
-    let ptr = path_to_nul_stack(path, &mut buf)?;
-    unsafe { cvt_unit(syscall1(SYS_UNLINK, ptr as usize)) }
-}
+// unlink definido más abajo junto con mkdir (versión con path+len)
 
 /// rename(2): rutas terminadas en NUL (copiadas a buffer interno).
 pub fn rename(old_path: &str, new_path: &str) -> Result<()> {
@@ -176,23 +171,70 @@ pub fn sigaction(signum: usize, act: usize, oldact: usize) -> Result<()> {
     unsafe { cvt_unit(syscall3(SYS_SIGACTION, signum, act, oldact)) }
 }
 
+/// Create an anonymous pipe.
+/// On return, fds[0] is the read end and fds[1] is the write end.
+pub fn pipe(fds: &mut [u32; 2]) -> Result<()> {
+    unsafe { cvt_unit(syscall1(SYS_PIPE, fds.as_mut_ptr() as usize)) }
+}
+
+/// List directory children.
+/// Writes newline-separated filenames into `buf` and returns the number of bytes written.
+pub fn readdir(path: &str, buf: &mut [u8]) -> Result<usize> {
+    let mut path_buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut path_buf)?;
+    unsafe {
+        cvt(syscall3(SYS_READDIR, ptr as usize, buf.as_mut_ptr() as usize, buf.len()))
+    }
+}
+
+/// Registrar argv para un proceso hijo justo después de spawn.
+/// Debe llamarse inmediatamente después de spawn_with_stdio, antes de yield.
+pub fn set_child_args(child_pid: usize, args: &[u8]) -> Result<()> {
+    unsafe {
+        cvt_unit(syscall3(SYS_SET_CHILD_ARGS, child_pid, args.as_ptr() as usize, args.len()))
+    }
+}
+
+/// Obtener los argumentos del proceso actual. Devuelve los bytes escritos.
+/// Formato: argv[0]\0argv[1]\0... (NUL-separados).
+pub fn get_process_args(buf: &mut [u8]) -> usize {
+    unsafe { syscall2(SYS_GET_PROCESS_ARGS, buf.as_mut_ptr() as usize, buf.len()) }
+}
+
+/// Remove a file. Only /tmp/* paths supported currently.
+pub fn unlink(path: &str) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall1(SYS_UNLINK, ptr as usize)) }
+}
+
+/// Create a directory. Only /tmp/* paths supported currently.
+pub fn mkdir(path: &str, mode: usize) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall2(SYS_MKDIR, ptr as usize, mode)) }
+}
+
 /// Wait for a child process to exit (cualquier hijo).
 pub fn waitpid(status: *mut u32) -> Result<usize> {
     unsafe { cvt(syscall1(SYS_WAIT, status as usize)) }
 }
 
 /// Esperar a que termine el hijo `pid` (0 = cualquier hijo, igual que [`waitpid`]).
+/// Espera bloqueante al hijo con PID dado.
 pub fn wait_pid(status: *mut u32, pid: usize) -> Result<usize> {
-    unsafe { cvt(syscall2(SYS_WAIT_PID, status as usize, pid)) }
+    unsafe { cvt(syscall3(SYS_WAIT_PID, status as usize, pid, 0)) }
+}
+
+/// Espera no-bloqueante (WNOHANG=1).
+/// Devuelve Ok(0) si ningún hijo ha terminado todavía,
+/// Ok(pid) si uno ha terminado, Err si no hay hijos.
+pub fn wait_pid_nohang(status: *mut u32, pid: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_WAIT_PID, status as usize, pid, 1)) }
 }
 
 
-/// mkdir(path, mode)
-pub fn mkdir(path: &str, mode: usize) -> Result<()> {
-    let mut buf = [0u8; 1024];
-    let ptr = path_to_nul_stack(path, &mut buf)?;
-    unsafe { cvt_unit(syscall2(SYS_MKDIR, ptr as usize, mode)) }
-}
+// mkdir definido más arriba junto con unlink
 
 /// Stat structure used by fstat/fstat_at
 #[repr(C)]

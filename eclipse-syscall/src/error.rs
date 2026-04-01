@@ -1,7 +1,9 @@
 //! Error handling
-pub const EINVAL: i32 = 22;
+pub const EINTR:  i32 = 4;
+pub const EBADF:  i32 = 9;
 pub const ENOMEM: i32 = 12;
-pub const EBADF: i32 = 9;
+pub const EPIPE:  i32 = 32;
+pub const EINVAL: i32 = 22;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Error {

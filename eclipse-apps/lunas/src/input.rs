@@ -9,7 +9,7 @@ use eclipse_syscall::InputEvent;
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 use sidewind::{
     SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON,
-    SWND_EVENT_TYPE_CLOSE,
+    SWND_EVENT_TYPE_CLOSE, SWND_EVENT_TYPE_RESIZE,
 };
 
 /// Envía SWND_EVENT_TYPE_CLOSE al proceso cliente y luego lo mata con SIGKILL.
@@ -58,6 +58,45 @@ fn notify_window_close(
     }
     println!("[LUNAS] SIGKILL sent to PID {}", target_pid);
 }
+/// Envía SWND_EVENT_TYPE_RESIZE al cliente externo de la ventana `idx`.
+/// Se llama al terminar un resize (botón liberado) con las dimensiones finales.
+fn notify_window_resize(
+    windows: &[ShellWindow],
+    idx: usize,
+    surfaces: &[ExternalSurface],
+) {
+    if idx >= windows.len() { return; }
+    let w = &windows[idx];
+    let pid = match w.content {
+        WindowContent::External(s_idx) => {
+            let s_idx = s_idx as usize;
+            if s_idx < surfaces.len() && surfaces[s_idx].active {
+                surfaces[s_idx].pid
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+    // El cliente recibe el área de contenido (sin barra de título).
+    let content_h = (w.h - ShellWindow::TITLE_H).max(1);
+    let ev = SideWindEvent {
+        event_type: SWND_EVENT_TYPE_RESIZE,
+        data1: w.w,
+        data2: content_h,
+        data3: 0,
+    };
+    let _ = unsafe {
+        eclipse_send(
+            pid,
+            sidewind::MSG_TYPE_INPUT,
+            &ev as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<SideWindEvent>(),
+            0,
+        )
+    };
+}
+
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor,
     find_next_focusable, MAX_SURFACE_DIM,
@@ -1563,6 +1602,37 @@ impl InputState {
                             windows[resize_idx].h = (self.cursor_y - windows[resize_idx].y + 8).max(40);
                         }
                     }
+                } else if event.code == 8 {
+                    // REL_WHEEL: rueda del ratón.
+                    // Convenio evdev: value > 0 = hacia el usuario (scroll up),
+                    //                 value < 0 = alejándose (scroll down).
+                    // Convenio X11 / terminal: botón 4 = scroll up, botón 5 = scroll down.
+                    if let Some(focused) = self.focused_window {
+                        if focused < *window_count {
+                            if let WindowContent::External(s_idx) = windows[focused].content {
+                                let s_idx = s_idx as usize;
+                                if s_idx < surfaces.len() && surfaces[s_idx].active {
+                                    let button = if event.value > 0 { 4i32 } else { 5i32 };
+                                    let ev = SideWindEvent {
+                                        event_type: SWND_EVENT_TYPE_MOUSE_BUTTON,
+                                        data1: button,
+                                        data2: event.value.abs(),
+                                        data3: 0,
+                                    };
+                                    let _ = unsafe {
+                                        eclipse_send(
+                                            surfaces[s_idx].pid,
+                                            sidewind::MSG_TYPE_INPUT,
+                                            &ev as *const _ as *const core::ffi::c_void,
+                                            core::mem::size_of::<SideWindEvent>(),
+                                            0,
+                                        )
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
                 }
 
                 // Forward mouse events to SideWind external surfaces
@@ -2226,8 +2296,14 @@ impl InputState {
                         dirty = true;
                     } else {
                         // Button released
+                        let was_resizing = self.resizing_window;
                         self.dragging_window = None;
                         self.resizing_window = None;
+                        // Notificar al cliente externo el nuevo tamaño al terminar el resize.
+                        if let Some(resize_idx) = was_resizing {
+                            notify_window_resize(windows, resize_idx, surfaces);
+                            dirty = true;
+                        }
                         // Finalise any pinned-app drag.
                         if let Some(src) = self.dragging_pinned_app.take() {
                             let dx = (self.cursor_x - self.drag_press_x).abs();

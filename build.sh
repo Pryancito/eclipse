@@ -218,7 +218,7 @@ build_sidewind_project() {
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
-        local BINS="smithay_app demo_client lunas sh terminal glxgears"
+        local BINS="smithay_app demo_client lunas sh nano terminal glxgears"
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
