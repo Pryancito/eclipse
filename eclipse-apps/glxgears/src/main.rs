@@ -14,7 +14,7 @@ use std::prelude::v1::*;
 use heapless::String as HString;
 
 #[cfg(target_vendor = "eclipse")]
-use libc::{c_int, close, mmap, munmap, open};
+use libc::{c_int, close, mmap, munmap, open, exit};
 #[cfg(target_vendor = "eclipse")]
 use eclipse_ipc::prelude::EclipseMessage;
 #[cfg(target_vendor = "eclipse")]
@@ -472,12 +472,12 @@ pub fn main() {
                             if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
                                 let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
                                 unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
-                                syscall_exit(0);
+                                unsafe { exit(0); }
                             }
                         } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
                             let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
                             unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
-                            syscall_exit(0);
+                            unsafe { exit(0); }
                         }
                     }
                 }
@@ -503,6 +503,6 @@ pub fn main() {
     #[cfg(not(target_vendor = "eclipse"))]
     {
         std::println!("glxgears: host-testing stub — no rendering outside Eclipse OS.");
-        syscall_exit(0);
+        unsafe { exit(0); }
     }
 }
