@@ -1,11 +1,7 @@
-use std::rc::Rc;
 use std::vec::Vec;
 use std::boxed::Box;
-use core::cell::{Ref, RefCell};
-use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
-use wayland_proto::EclipseWaylandConnection;
-use wayland_proto::wl::protocols::common::wl_registry;
-use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
+use std::rc::Rc;
+use core::cell::RefCell;
 use eclipse_syscall::{self, flag, ProcessInfo};
 use heapless::String as HString;
 
@@ -14,15 +10,6 @@ use os_terminal::font::BitmapFont;
 
 #[cfg(target_vendor = "eclipse")]
 use libc::{c_int, close, kill, mmap, munmap, open};
-#[cfg(target_vendor = "eclipse")]
-use eclipse_ipc::prelude::EclipseMessage;
-#[cfg(target_vendor = "eclipse")]
-use sidewind::{
-    IpcChannel, SideWindEvent, SideWindMessage,
-    SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE, SWND_EVENT_TYPE_RESIZE,
-    SWND_EVENT_TYPE_MOUSE_BUTTON,
-};
-
 #[cfg(target_vendor = "eclipse")]
 use eclipse_syscall::call::{
     close as sys_close,
@@ -33,6 +20,14 @@ use eclipse_syscall::call::{
     wait_pid_nohang as sys_wait_pid_nohang,
     write as sys_write,
 };
+
+// Wayland Unix socket client
+#[cfg(target_vendor = "eclipse")]
+use wayland_proto::unix_transport::UnixSocketConnection;
+#[cfg(target_vendor = "eclipse")]
+use wayland_proto::wl::wire::{RawMessage, ObjectId, NewId, Opcode, Payload, PayloadType};
+#[cfg(target_vendor = "eclipse")]
+use wayland_proto::wl::connection::Connection;
 
 // ============================================================================
 // Tipos y Estructuras
@@ -182,107 +177,167 @@ fn find_pid_by_name(want: &[u8]) -> Option<u32> {
 // ============================================================================
 
 struct TerminalApp {
-    lunas_pid: u32,
-    connection: Rc<RefCell<EclipseWaylandConnection>>,
-    surface_state: Rc<RefCell<SurfaceBacking>>,
+    /// Wayland Unix socket connection to Lunas.
+    wayland: UnixSocketConnection,
+    /// Assigned object IDs from the Wayland handshake.
+    surface_id: u32,
+    buffer_id: u32,
+    toplevel_id: u32,
+    keyboard_id: u32,
+    surface_state: core::cell::RefCell<SurfaceBacking>,
     terminal: Terminal<SharedSurfaceDrawTarget>,
     pty_master_fd: usize,
     pty_pair_id: usize,
     sh_pid: usize,
     sh_bytes: Vec<u8>,
-    name_str: String,
     last_title: [u8; 32],
+    /// Serial counter for protocol events.
+    serial: u32,
 }
 
 impl TerminalApp {
     fn new() -> Option<Self> {
         let self_pid = eclipse_syscall::getpid() as u32;
-        let lunas_pid = find_pid_by_name(b"lunas").or_else(|| find_pid_by_name(b"gui"));
-        if lunas_pid.is_none() {
-            std::println!("Terminal Error: Lunas/GUI not found");
-            return None;
-        }
-        let lunas_pid = lunas_pid.unwrap();
-
-        // 1. Wayland Handshake
-        let connection = Rc::new(RefCell::new(EclipseWaylandConnection::new(lunas_pid, self_pid)));
-        let mut display = WlDisplay::new(connection.clone(), ObjectId(1));
-        if display.get_registry(NewId(2)).is_err() {
-            std::println!("Terminal Error: Failed to get registry");
-            return None;
-        }
-
-        let mut registry = wl_registry::WlRegistry::new(connection.clone(), ObjectId(2));
-        let mut compositor_id = None;
-        let mut shm_id = None;
-
-        std::println!("Terminal: Starting Wayland handshake...");
-        'handshake: loop {
-            let res = (*connection).borrow_mut().recv();
-            if let Err(e) = res {
-                if e == wayland_proto::wl::connection::RecvError::InvalidMessage {
-                    continue;
-                }
-                std::println!("Terminal Error: Wayland recv failed: {:?}", e);
-                return None;
-            }
-            let (data_vec, _) = res.unwrap();
-            let mut rest: &[u8] = &data_vec[..];
-            while rest.len() >= 8 {
-                let header = RawMessage::deserialize_header(rest);
-                if header.is_err() { break; }
-                let (id, op, msg_len) = header.unwrap();
-                if msg_len > rest.len() { break; }
-                let chunk = &rest[..msg_len];
-                rest = &rest[msg_len..];
-
-                if id == ObjectId(2) {
-                    let types = wl_registry::WlRegistry::PAYLOAD_TYPES.get(op.0 as usize);
-                    if types.is_none() { continue; }
-                    let raw = RawMessage::deserialize(chunk, types.unwrap(), &[]);
-                    if raw.is_err() { continue; }
-                    if let Ok(wl_registry::Event::Global { name, interface, version: _ }) = wl_registry::Event::from_raw(connection.clone(), &raw.unwrap()) {
-                        if interface == "wl_compositor" {
-                            let id = NewId(3);
-                            let _ = registry.bind(name, id);
-                            compositor_id = Some(id.as_id());
-                        } else if interface == "wl_shm" {
-                            let id = NewId(4);
-                            let _ = registry.bind(name, id);
-                            shm_id = Some(id.as_id());
-                        }
-                    }
-                }
-            }
-            if compositor_id.is_some() && shm_id.is_some() { break 'handshake; }
-        }
-        std::println!("Terminal: Handshake OK");
-
-        // 2. SideWind Window
-        let name = sidewind_shm_name(self_pid);
-        let name_str = String::from(name.as_str());
         let win_w = 640u32;
         let win_h = 400u32;
+        let size_bytes = (win_w as usize) * (win_h as usize) * 4;
 
-        let res = Self::open_window(lunas_pid, 100, 100, win_w, win_h, &name_str);
-        if res.is_none() {
-            std::println!("Terminal Error: Failed to open window");
+        // ── 1. Allocate shared-memory framebuffer ─────────────────────────
+        let shm_name = sidewind_shm_name(self_pid);
+        let shm_path = format!("/tmp/{}\0", shm_name.as_str());
+        let shm_fd = unsafe {
+            open(shm_path.as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644)
+        };
+        if shm_fd < 0 { return None; }
+        let _ = eclipse_syscall::ftruncate(shm_fd as usize, size_bytes);
+        let vaddr = unsafe {
+            mmap(core::ptr::null_mut(), size_bytes,
+                 (flag::PROT_READ | flag::PROT_WRITE) as c_int,
+                 flag::MAP_SHARED as c_int, shm_fd, 0)
+        };
+        if vaddr.is_null() || vaddr == libc::MAP_FAILED {
+            unsafe { close(shm_fd) };
             return None;
         }
-        let (ptr, size_bytes, w, h) = res.unwrap();
-        std::println!("Terminal: Window opened at {:?}", ptr);
-        let surface_state = Rc::new(RefCell::new(SurfaceBacking {
-            ptr, width: w as usize, height: h as usize, size_bytes
-        }));
 
-        // 3. os-terminal setup
-        let draw_target = SharedSurfaceDrawTarget { state: surface_state.clone() };
+        // ── 2. Connect to Wayland compositor (/tmp/wayland-0) ────────────
+        let wayland = UnixSocketConnection::connect("/tmp/wayland-0")?;
+        wayland.set_nonblocking();
+
+        // ── 3. Wayland handshake ──────────────────────────────────────────
+        // Object ID allocation (client-side, starting at 2):
+        //  1 = wl_display (built-in)
+        //  2 = wl_registry
+        //  3 = wl_compositor
+        //  4 = wl_shm
+        //  5 = xdg_wm_base
+        //  6 = wl_seat
+        //  7 = wl_surface
+        //  8 = wl_shm_pool
+        //  9 = wl_buffer
+        // 10 = xdg_surface
+        // 11 = xdg_toplevel
+        // 12 = wl_keyboard
+
+        // wl_display.get_registry(id=2)
+        send_wayland(&wayland, 1, 1, &[Payload::NewId(NewId(2))]);
+
+        // Wait for wl_registry.global events and bind the globals we need.
+        let mut compositor_name = 0u32;
+        let mut shm_name_id = 0u32;
+        let mut xdg_name = 0u32;
+        let mut seat_name = 0u32;
+
+        // Blocking read with timeout: up to 5000 iterations
+        for _ in 0..5000 {
+            if let Ok((data, _)) = wayland.recv() {
+                let mut pos = 0usize;
+                while pos + 8 <= data.len() {
+                    if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                        let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                        // wl_registry.global: sender=2, opcode=0 → (name:uint, interface:string, version:uint)
+                        if sender == ObjectId(2) && opcode == Opcode(0) {
+                            let pts: &[PayloadType] = &[PayloadType::UInt, PayloadType::String, PayloadType::UInt];
+                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                let name = match raw.args.get(0) { Some(Payload::UInt(n)) => *n, _ => 0 };
+                                let iface = match raw.args.get(1) { Some(Payload::String(s)) => s.as_str(), _ => "" };
+                                if iface == "wl_compositor" { compositor_name = name; }
+                                else if iface == "wl_shm"   { shm_name_id = name; }
+                                else if iface == "xdg_wm_base" { xdg_name = name; }
+                                else if iface == "wl_seat"  { seat_name = name; }
+                            }
+                        }
+                        pos += msg_len.min(data.len() - pos);
+                    } else { break; }
+                }
+            }
+            if compositor_name != 0 && shm_name_id != 0 && xdg_name != 0 { break; }
+            let _ = eclipse_syscall::call::sched_yield();
+        }
+
+        if compositor_name == 0 { return None; }
+
+        // wl_registry.bind(compositor → id=3)
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(compositor_name), Payload::String(alloc::string::String::from("wl_compositor")), Payload::UInt(4), Payload::NewId(NewId(3))]);
+        // wl_registry.bind(shm → id=4)
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(shm_name_id), Payload::String(alloc::string::String::from("wl_shm")), Payload::UInt(1), Payload::NewId(NewId(4))]);
+        // wl_registry.bind(xdg_wm_base → id=5)
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(xdg_name), Payload::String(alloc::string::String::from("xdg_wm_base")), Payload::UInt(2), Payload::NewId(NewId(5))]);
+        // wl_registry.bind(wl_seat → id=6)
+        if seat_name != 0 {
+            send_wayland(&wayland, 2, 0, &[Payload::UInt(seat_name), Payload::String(alloc::string::String::from("wl_seat")), Payload::UInt(7), Payload::NewId(NewId(6))]);
+        }
+
+        // wl_compositor.create_surface(id=7)
+        send_wayland(&wayland, 3, 0, &[Payload::NewId(NewId(7))]);
+
+        // wl_shm.create_pool(id=8, fd=shm_fd, size=size_bytes)
+        // The fd is passed as ancillary SCM_RIGHTS data via the Handle mechanism.
+        send_wayland_with_fd(&wayland, 4, 0, &[Payload::NewId(NewId(8)), Payload::Int(size_bytes as i32)], shm_fd);
+        unsafe { close(shm_fd) };
+
+        // wl_shm_pool.create_buffer(id=9, offset=0, width, height, stride, format=1=XRGB8888)
+        let stride = (win_w * 4) as i32;
+        send_wayland(&wayland, 8, 0, &[
+            Payload::NewId(NewId(9)),
+            Payload::Int(0),
+            Payload::Int(win_w as i32), Payload::Int(win_h as i32),
+            Payload::Int(stride),
+            Payload::UInt(1), // WL_SHM_FORMAT_XRGB8888
+        ]);
+
+        // xdg_wm_base.get_xdg_surface(id=10, surface=7)
+        send_wayland(&wayland, 5, 1, &[Payload::NewId(NewId(10)), Payload::ObjectId(ObjectId(7))]);
+
+        // xdg_surface.get_toplevel(id=11)
+        send_wayland(&wayland, 10, 1, &[Payload::NewId(NewId(11))]);
+
+        // xdg_toplevel.set_title("Terminal")
+        send_wayland(&wayland, 11, 2, &[Payload::String(alloc::string::String::from("Terminal"))]);
+
+        // wl_seat.get_keyboard(id=12)
+        if seat_name != 0 {
+            send_wayland(&wayland, 6, 1, &[Payload::NewId(NewId(12))]);
+        }
+
+        // wl_surface.attach(buffer=9, x=0, y=0) + commit → triggers initial configure
+        send_wayland(&wayland, 7, 1, &[Payload::ObjectId(ObjectId(9)), Payload::Int(0), Payload::Int(0)]);
+        send_wayland(&wayland, 7, 6, &[]); // wl_surface.commit
+
+        // ── 4. Surface state + os-terminal setup ──────────────────────────
+        let shared_state = alloc::rc::Rc::new(core::cell::RefCell::new(SurfaceBacking {
+            ptr: vaddr as *mut u32,
+            width: win_w as usize,
+            height: win_h as usize,
+            size_bytes,
+        }));
+        let draw_target = SharedSurfaceDrawTarget { state: shared_state.clone() };
         let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
         terminal.set_crnl_mapping(true);
         terminal.set_clipboard(Box::new(EclipseClipboard::new()));
         terminal.set_auto_flush(false);
 
-        // 4. PTY & Shell
+        // ── 6. PTY & Shell ────────────────────────────────────────────────
         let pty_master_fd = unsafe {
             open(b"pty:master\0".as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0)
         } as usize;
@@ -295,15 +350,11 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
 
         let sh_res = std::fs::read("/bin/sh");
-        if sh_res.is_err() {
-            std::println!("Terminal Error: Failed to read /bin/sh");
-            return None;
-        }
+        if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
         let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
-            std::println!("Terminal Error: Failed to spawn /bin/sh");
             let _ = sys_close(pty_slave_fd);
             return None;
         }
@@ -318,24 +369,25 @@ impl TerminalApp {
         terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
 
         Some(Self {
-            lunas_pid, connection, surface_state, terminal, pty_master_fd, pty_pair_id,
-            sh_pid, sh_bytes, name_str, last_title: [0; 32],
+            wayland,
+            surface_id: 7,
+            buffer_id: 9,
+            toplevel_id: 11,
+            keyboard_id: 12,
+            surface_state: core::cell::RefCell::new(SurfaceBacking {
+                ptr: vaddr as *mut u32,
+                width: win_w as usize,
+                height: win_h as usize,
+                size_bytes,
+            }),
+            terminal,
+            pty_master_fd,
+            pty_pair_id,
+            sh_pid,
+            sh_bytes,
+            last_title: [0; 32],
+            serial: 1,
         })
-    }
-
-    fn open_window(composer_pid: u32, x: i32, y: i32, w: u32, h: u32, name: &str) -> Option<(*mut u32, usize, u32, u32)> {
-        let path = format!("/tmp/{}\0", name);
-        let size_bytes = (w as usize) * (h as usize) * 4;
-        let fd = unsafe { open(path.as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644) };
-        if fd < 0 { return None; }
-        let _ = eclipse_syscall::ftruncate(fd as usize, size_bytes);
-        let vaddr = unsafe { mmap(core::ptr::null_mut(), size_bytes, (flag::PROT_READ|flag::PROT_WRITE) as c_int, flag::MAP_SHARED as c_int, fd, 0) };
-        unsafe { close(fd) };
-        if vaddr.is_null() || vaddr == (!0isize as *mut _) { return None; }
-
-        let msg = SideWindMessage::new_create(x, y, w, h, name);
-        if !IpcChannel::send_sidewind(composer_pid, &msg) { return None; }
-        Some((vaddr as *mut u32, size_bytes, w, h))
     }
 
     fn run(&mut self) {
@@ -345,47 +397,81 @@ impl TerminalApp {
         loop {
             let mut dirty = false;
 
-            // 1. Teclado e IPC (Lunas -> Apps)
-            while let Some(msg) = (*self.connection).borrow().channel.borrow_mut().recv() {
-                if let EclipseMessage::Raw { data, len, .. } = msg {
-                    if len == core::mem::size_of::<SideWindEvent>() {
-                        let ev = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const SideWindEvent) };
-                        match ev.event_type {
-                            SWND_EVENT_TYPE_KEY => {
-                                let sc = (ev.data1 as u16 & 0xFF) as u8;
-                                let ps2 = if ev.data2 != 0 { sc } else { sc | 0x80 };
-                                let _ = self.terminal.handle_keyboard(ps2);
-                                dirty = true;
-                            }
-                            SWND_EVENT_TYPE_MOUSE_BUTTON => {
-                                if ev.data1 == 4 { self.terminal.handle_mouse(MouseInput::Scroll(3)); dirty = true; }
-                                else if ev.data1 == 5 { self.terminal.handle_mouse(MouseInput::Scroll(-3)); dirty = true; }
-                            }
-                            SWND_EVENT_TYPE_RESIZE => {
-                                let (nw, nh) = (ev.data1.max(1) as u32, ev.data2.max(1) as u32);
-                                if let Some((ptr, sz, w, h)) = Self::open_window(self.lunas_pid, 0, 0, nw, nh, &self.name_str) {
-                                    {
-                                        let mut sb = (*self.surface_state).borrow_mut();
-                                        unsafe { munmap(sb.ptr as *mut _, sb.size_bytes); }
-                                        *sb = SurfaceBacking { ptr, width: w as usize, height: h as usize, size_bytes: sz };
+            // ── 1. Receive Wayland events ──────────────────────────────────
+            if let Ok((data, _handles)) = self.wayland.recv() {
+                let mut pos = 0usize;
+                while pos + 8 <= data.len() {
+                    match RawMessage::deserialize_header(&data[pos..]) {
+                        Ok((sender, opcode, msg_len)) if pos + msg_len <= data.len() => {
+                            let chunk = &data[pos..pos + msg_len];
+
+                            // xdg_wm_base.ping(serial) → pong
+                            if sender == ObjectId(5) && opcode == Opcode(0) {
+                                let pts = &[PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    if let Some(Payload::UInt(s)) = raw.args.get(0) {
+                                        send_wayland(&self.wayland, 5, 2, &[Payload::UInt(*s)]);
                                     }
-                                    set_pty_winsize(self.pty_master_fd, nh as u16 / FONT_CHAR_H, nw as u16 / FONT_CHAR_W, nw as u16, nh as u16);
-                                    self.terminal.set_font_manager(Box::new(BitmapFont));
-                                    dirty = true;
                                 }
                             }
-                            SWND_EVENT_TYPE_CLOSE => {
+
+                            // xdg_surface.configure(serial) → ack_configure + commit
+                            if sender == ObjectId(10) && opcode == Opcode(0) {
+                                let pts = &[PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    if let Some(Payload::UInt(s)) = raw.args.get(0) {
+                                        self.serial = *s;
+                                        // xdg_surface.ack_configure(serial)
+                                        send_wayland(&self.wayland, 10, 4, &[Payload::UInt(self.serial)]);
+                                        // wl_surface.attach + commit to show content
+                                        send_wayland(&self.wayland, self.surface_id, 1,
+                                            &[Payload::ObjectId(ObjectId(self.buffer_id)), Payload::Int(0), Payload::Int(0)]);
+                                        send_wayland(&self.wayland, self.surface_id, 6, &[]);
+                                        dirty = true;
+                                    }
+                                }
+                            }
+
+                            // xdg_toplevel.configure(w, h, states) → resize if needed
+                            if sender == ObjectId(self.toplevel_id) && opcode == Opcode(0) {
+                                // new size from compositor — for now ignore (use our preferred size)
+                            }
+
+                            // xdg_toplevel.close → exit
+                            if sender == ObjectId(self.toplevel_id) && opcode == Opcode(1) {
                                 unsafe { kill(self.sh_pid as c_int, 9) };
                                 let _ = sys_close(self.pty_master_fd);
                                 sys_exit(0);
                             }
-                            _ => {}
+
+                            // wl_keyboard.key (opcode=3): serial, time, key, state
+                            if sender == ObjectId(self.keyboard_id) && opcode == Opcode(3) {
+                                let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    let state = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    // Convert Linux keycode to PS/2 scancode (simple mapping)
+                                    // Linux keycode = PS/2 scancode + 8 (for set-1 subset)
+                                    let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
+                                    let ps2 = if state != 0 { sc } else { sc | 0x80 };
+                                    let _ = self.terminal.handle_keyboard(ps2);
+                                    dirty = true;
+                                }
+                            }
+
+                            // wl_keyboard.keymap (opcode=0): format, fd, size — just close the fd
+                            if sender == ObjectId(self.keyboard_id) && opcode == Opcode(0) {
+                                // handles contains the fd if format != 0; we don't need it
+                            }
+
+                            pos += msg_len;
                         }
+                        _ => break,
                     }
                 }
             }
 
-            // 2. PTY Output -> Terminal
+            // ── 2. PTY Output -> Terminal ──────────────────────────────────
             let mut available: usize = 0;
             let _ = sys_ioctl(self.pty_master_fd, 2, &mut available as *mut _ as usize);
             while available > 0 {
@@ -395,7 +481,11 @@ impl TerminalApp {
                 self.terminal.process(&pty_buf[..n]);
                 if let Some(title) = extract_osc_title(&pty_buf[..n]) {
                     if title != self.last_title {
-                        let _ = IpcChannel::send_sidewind(self.lunas_pid, &SideWindMessage::new_set_title(&title));
+                        // xdg_toplevel.set_title
+                        let title_str = alloc::string::String::from(
+                            core::str::from_utf8(&title).unwrap_or("Terminal")
+                        );
+                        send_wayland(&self.wayland, self.toplevel_id, 2, &[Payload::String(title_str)]);
                         self.last_title = title;
                     }
                 }
@@ -404,7 +494,7 @@ impl TerminalApp {
                 let _ = sys_ioctl(self.pty_master_fd, 2, &mut available as *mut _ as usize);
             }
 
-            // 3. Shell Restart
+            // ── 3. Shell Restart ───────────────────────────────────────────
             let mut status = 0u32;
             if sys_wait_pid_nohang(&mut status, self.sh_pid as usize).map_or(false, |p| p != 0) {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
@@ -421,13 +511,30 @@ impl TerminalApp {
 
             if dirty {
                 self.terminal.flush();
-                let _ = IpcChannel::send_sidewind(self.lunas_pid, &SideWindMessage::new_commit());
+                // wl_surface.damage(0,0, max,max) + commit
+                send_wayland(&self.wayland, self.surface_id, 2,
+                    &[Payload::Int(0), Payload::Int(0), Payload::Int(i32::MAX), Payload::Int(i32::MAX)]);
+                send_wayland(&self.wayland, self.surface_id, 6, &[]); // commit
             } else {
                 let _ = eclipse_syscall::call::sched_yield();
                 std::thread::yield_now();
             }
         }
     }
+}
+
+/// Send a Wayland message on the Unix socket connection.
+#[cfg(target_vendor = "eclipse")]
+fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
+    use smallvec::SmallVec;
+    let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
+}
+
+/// Send a Wayland message with an ancillary file descriptor (SCM_RIGHTS).
+#[cfg(target_vendor = "eclipse")]
+fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
+    use wayland_proto::wl::wire::Handle;
+    let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
 }
 
 fn main() {

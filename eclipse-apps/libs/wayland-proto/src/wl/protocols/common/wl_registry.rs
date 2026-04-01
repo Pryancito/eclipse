@@ -119,8 +119,9 @@ impl Interface for WlRegistry {
             PayloadType::UInt,
             PayloadType::String,
             PayloadType::UInt,
-        ],
-        &[PayloadType::UInt],
+            PayloadType::NewId,
+        ], // bind: name, interface, version, id
+        &[PayloadType::UInt], // (placeholder for global_remove event opcode)
     ];
 
     fn new(con: Rc<RefCell<dyn Connection>>, object_id: ObjectId) -> WlRegistry {
@@ -141,11 +142,16 @@ impl Interface for WlRegistry {
 }
 
 impl WlRegistry {
-    pub fn bind(&mut self, name: u32, id: NewId) -> Result<(), SendError> {
+    pub fn bind(&mut self, name: u32, interface: &str, version: u32, id: NewId) -> Result<(), SendError> {
         self.con.borrow_mut().send(
             self.object_id,
             Opcode(0),
-            &[name.into(), id.into()],
+            &[
+                name.into(),
+                Payload::String(alloc::string::String::from(interface)),
+                version.into(),
+                id.into(),
+            ],
             &[],
         )
     }

@@ -12,8 +12,12 @@ pub struct Global {
     pub name: u32,
     pub interface: &'static str,
     pub version: u32,
-    pub logic_factory: fn() -> ObjectInner,
+    pub logic_factory: alloc::boxed::Box<dyn Fn() -> ObjectInner>,
     pub interface_type: fn(NewId, ObjectInner) -> Object,
+    /// Optional callback invoked immediately after a client binds this global.
+    /// Use it to send initial events (e.g. `wl_seat.capabilities`,
+    /// `wl_output.geometry/mode/done`).
+    pub post_bind: Option<alloc::boxed::Box<dyn Fn(ObjectId, &mut Client) -> Result<(), ServerError>>>,
 }
 
 pub struct WaylandServer {
@@ -35,8 +39,21 @@ impl WaylandServer {
         &mut self,
         interface: &'static str,
         version: u32,
-        logic_factory: fn() -> ObjectInner,
+        logic_factory: impl Fn() -> ObjectInner + 'static,
         interface_type: fn(NewId, ObjectInner) -> Object,
+    ) {
+        self.register_global_with_post_bind(interface, version, logic_factory, interface_type, None);
+    }
+
+    /// Like [`register_global`] but also calls `post_bind` right after a
+    /// client successfully binds the global, allowing initial events to be sent.
+    pub fn register_global_with_post_bind(
+        &mut self,
+        interface: &'static str,
+        version: u32,
+        logic_factory: impl Fn() -> ObjectInner + 'static,
+        interface_type: fn(NewId, ObjectInner) -> Object,
+        post_bind: Option<alloc::boxed::Box<dyn Fn(ObjectId, &mut Client) -> Result<(), ServerError>>>,
     ) {
         let name = self.next_global_id;
         self.next_global_id += 1;
@@ -44,8 +61,9 @@ impl WaylandServer {
             name,
             interface,
             version,
-            logic_factory,
+            logic_factory: alloc::boxed::Box::new(logic_factory),
             interface_type,
+            post_bind,
         });
     }
 
@@ -104,14 +122,22 @@ impl WaylandServer {
         if interface_name == "wl_registry" && opcode.0 == 0 {
              let name = match raw.args[0] { crate::wl::Payload::UInt(n) => n, _ => return Err(ServerError::MessageDeserializeError) };
              let id = match raw.args[3] { crate::wl::Payload::NewId(id) => id, _ => return Err(ServerError::MessageDeserializeError) };
-             
-             if let Some(global) = self.globals.iter().find(|g| g.name == name) {
-                  let logic = (global.logic_factory)();
-                  let new_obj = (global.interface_type)(id, logic);
-                  let client = self.clients.get_mut(&client_id).ok_or(ServerError::ClientNotFound)?;
-                  client.add_object(id, new_obj);
-             } else {
-                  return Err(ServerError::UnknownGlobal);
+
+             let global_idx = self.globals.iter().position(|g| g.name == name)
+                  .ok_or(ServerError::UnknownGlobal)?;
+
+             // Call logic_factory and interface_type using index (temporary borrows).
+             let logic = (self.globals[global_idx].logic_factory)();
+             let new_obj = (self.globals[global_idx].interface_type)(id, logic);
+
+             // Add the new object to the client.
+             let client = self.clients.get_mut(&client_id).ok_or(ServerError::ClientNotFound)?;
+             client.add_object(id, new_obj);
+
+             // Invoke post_bind callback if present.
+             // Borrow self.globals immutably (different field from self.clients).
+             if let Some(ref cb) = self.globals[global_idx].post_bind {
+                  let _ = cb(id.as_id(), client);
              }
         }
 
