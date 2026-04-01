@@ -660,6 +660,10 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
                       argv[3].parse().unwrap_or(1)),
                 _ => { sh_eprintln("Uso: seq [inicio] fin [paso]"); return Some(1); }
             };
+            if step == 0 {
+                sh_eprintln("seq: el paso no puede ser cero");
+                return Some(1);
+            }
             let mut i = start;
             while if step > 0 { i <= end } else { i >= end } {
                 sh_println(&format!("{}", i));
@@ -854,6 +858,7 @@ fn run_pipeline(pipeline: &Pipeline) -> i32 {
             let mut pipe_fds = [0u32; 2];
             if eclipse_syscall::call::pipe(&mut pipe_fds).is_err() {
                 sh_eprintln("sh: error creando pipe");
+                if prev_read_fd != 0 { let _ = eclipse_syscall::call::close(prev_read_fd); }
                 break;
             }
             let read_fd  = pipe_fds[0] as usize;

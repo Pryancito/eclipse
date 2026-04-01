@@ -109,13 +109,39 @@ pub fn sched_yield() -> Result<()> {
 
 /// Spawn a new process from an ELF buffer with an optional name
 pub fn spawn(buf: &[u8], name: Option<&str>) -> Result<usize> {
-    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    // The kernel reads the name byte-by-byte up to a NUL terminator.
+    // Rust &str is not NUL-terminated, so we copy into a stack buffer first.
+    // We slice s.as_bytes() (a &[u8]), not the &str itself, so there is no
+    // risk of splitting a multi-byte character — byte-index slicing of [u8] is
+    // always valid.  Process names on this platform are expected to be ASCII.
+    let mut name_buf = [0u8; 16];
+    let name_ptr = if let Some(s) = name {
+        let len = s.len().min(15);
+        name_buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+        // name_buf[len] is already 0 (NUL terminator)
+        name_buf.as_ptr() as usize
+    } else {
+        0
+    };
     unsafe { cvt(syscall3(SYS_SPAWN, buf.as_ptr() as usize, buf.len(), name_ptr)) }
 }
 
 /// Spawn a new process from an ELF buffer, replacing stdin/stdout/stderr
 pub fn spawn_with_stdio(buf: &[u8], name: Option<&str>, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<usize> {
-    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    // The kernel reads the name byte-by-byte up to a NUL terminator.
+    // Rust &str is not NUL-terminated, so we copy into a stack buffer first.
+    // We slice s.as_bytes() (a &[u8]), not the &str itself, so there is no
+    // risk of splitting a multi-byte character — byte-index slicing of [u8] is
+    // always valid.  Process names on this platform are expected to be ASCII.
+    let mut name_buf = [0u8; 16];
+    let name_ptr = if let Some(s) = name {
+        let len = s.len().min(15);
+        name_buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+        // name_buf[len] is already 0 (NUL terminator)
+        name_buf.as_ptr() as usize
+    } else {
+        0
+    };
     unsafe {
         cvt(syscall6(
             SYS_SPAWN_WITH_STDIO,
