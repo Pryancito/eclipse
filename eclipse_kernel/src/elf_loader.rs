@@ -570,12 +570,18 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     // Always reload CR3 to flush the TLB. exec remaps code pages via
     // map_user_page_4kb but the TLB may still cache the old fork'd PTEs.
     // A CR3 write flushes all non-global TLB entries.
-    if let Some(pid) = current_process_id() {
+    //
+    // Also read proc.fs_base now, before entering the noreturn asm block.
+    // "mov fs, ax" (ax=0) below zeroes the hidden FS base register (same as
+    // FS_BASE MSR), overwriting the wrmsr done by sys_exec / the scheduler.
+    // We must re-apply it inside the asm after the segment reload.
+    let tls_base: u64 = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
-            let want_cr3 = proc.resources.lock().page_table_phys;
-            unsafe { memory::set_cr3(want_cr3); }
-        }
-    }
+            let cr3 = proc.resources.lock().page_table_phys;
+            unsafe { memory::set_cr3(cr3); }
+            proc.fs_base
+        } else { 0 }
+    } else { 0 };
 
     // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHENT/AT_PHNUM first (some glibc inits use them early).
     unsafe {
@@ -634,6 +640,21 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             "xor ax, ax",
             "mov fs, ax",
             "mov gs, ax",
+            // "mov fs, ax" zeroed the hidden FS base register (FS_BASE MSR).
+            // Re-apply the TLS base so that FS-relative accesses (e.g. relibc
+            // errno at fs:-4) work correctly in user mode.
+            // r11 holds tls_base (loaded via the explicit-register input below).
+            // Guard: skip the wrmsr when tls_base is 0 (no TLS segment — rare
+            // but valid for stripped-down binaries), since writing 0 would be a
+            // no-op while unnecessarily serialising the pipeline.
+            "test r11, r11",
+            "jz 1f",
+            "mov ecx, 0xC0000100",  // IA32_FS_BASE MSR
+            "mov rax, r11",
+            "mov rdx, r11",
+            "shr rdx, 32",
+            "wrmsr",
+            "1:",
             // Limpiar todos los registros GP antes de entrar a userspace
             "xor rax, rax",
             "xor rbx, rbx",
@@ -656,6 +677,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             rfl = in(reg) 0x202u64,
             usp = in(reg) adjusted_stack,
             ss  = in(reg) 0x23u64,
+            in("r11") tls_base,
             options(noreturn)
         );
     }
