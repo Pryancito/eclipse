@@ -59,7 +59,8 @@ fn notify_window_close(
     println!("[LUNAS] SIGKILL sent to PID {}", target_pid);
 }
 use crate::compositor::{
-    ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
+    ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor,
+    find_next_focusable, MAX_SURFACE_DIM,
 };
 use eclipse_ipc::types::{NetExtendedStats, NetStaticConfig};
 
@@ -614,7 +615,7 @@ fn sidewind_keyboard_client_focused(
     if f >= window_count {
         return false;
     }
-    matches!(windows[f].content, WindowContent::External(_))
+    !windows[f].closing && matches!(windows[f].content, WindowContent::External(_))
 }
 
 /// Teclas que en Lunas tienen `KeyAction != None` pero el **keydown** debe llegar igual al cliente
@@ -1242,7 +1243,7 @@ impl InputState {
                                 if idx < *window_count {
                                     windows[idx].closing = true;
                                     notify_window_close(windows, idx, surfaces);
-                                    self.focused_window = None;
+                                    self.focused_window = find_next_focusable(windows, *window_count, Some(idx));
                                     dirty = true;
                                 }
                             }
@@ -2158,7 +2159,9 @@ impl InputState {
                                 WindowButton::Close => {
                                     windows[idx].closing = true;
                                     notify_window_close(windows, idx, surfaces);
-                                    self.focused_window = None;
+                                    // Transfer focus to the topmost remaining non-closing window
+                                    // so the user can immediately interact without needing to click.
+                                    self.focused_window = find_next_focusable(windows, *window_count, Some(idx));
                                 }
                                 WindowButton::Maximize => {
                                     let w = &mut windows[idx];
@@ -2455,7 +2458,7 @@ impl InputState {
                             windows[w_idx].closing = true;
                             notify_window_close(windows, w_idx, surfaces);
                             if self.focused_window == Some(w_idx) {
-                                self.focused_window = None;
+                                self.focused_window = find_next_focusable(windows, *window_count, Some(w_idx));
                             }
                             dirty = true;
                         }

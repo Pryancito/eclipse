@@ -619,7 +619,10 @@ impl LunasState {
                     if idx < self.space.window_count {
                         self.space.windows[idx].closing = true;
                         if self.input.focused_window == Some(idx) {
-                            self.input.focused_window = None;
+                            let wc = self.space.window_count;
+                            self.input.focused_window = crate::compositor::find_next_focusable(
+                                &self.space.windows, wc, Some(idx),
+                            );
                         }
                         self.dirty = true;
                     }

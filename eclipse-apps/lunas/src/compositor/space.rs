@@ -49,7 +49,7 @@ impl Space {
     pub fn window_under_cursor(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.window_count).rev() {
             let w = &self.windows[i];
-            if !matches!(w.content, WindowContent::None) && !w.minimized && w.contains(px, py) {
+            if !matches!(w.content, WindowContent::None) && !w.minimized && !w.closing && w.contains(px, py) {
                 return Some(i);
             }
         }
@@ -184,6 +184,28 @@ mod tests {
         space.map_window(win);
         assert_eq!(space.window_under_cursor(50, 50), Some(0));
         assert_eq!(space.window_under_cursor(5, 5), None);
+    }
+
+    #[test]
+    fn test_window_under_cursor_skips_closing() {
+        let mut space = Space::new();
+        // Window below (will be at index 0)
+        space.map_window(ShellWindow {
+            x: 0, y: 0, w: 200, h: 200,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 200.0, curr_h: 200.0,
+            content: WindowContent::InternalDemo,
+            ..Default::default()
+        });
+        // Closing window on top (will be at index 1)
+        space.map_window(ShellWindow {
+            x: 50, y: 50, w: 100, h: 100,
+            curr_x: 50.0, curr_y: 50.0, curr_w: 100.0, curr_h: 100.0,
+            content: WindowContent::InternalDemo,
+            closing: true,
+            ..Default::default()
+        });
+        // The closing window overlaps at (75, 75) but must be skipped; index 0 is returned.
+        assert_eq!(space.window_under_cursor(75, 75), Some(0));
     }
 
     #[test]

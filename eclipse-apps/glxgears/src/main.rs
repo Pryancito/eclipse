@@ -424,20 +424,15 @@ fn open_sidewind_window(
 pub fn main() {
     std::init_runtime();
 
-    std::println!("glxgears — Eclipse OS");
-
     #[cfg(target_vendor = "eclipse")]
     {
         let self_pid = eclipse_syscall::getpid() as u32;
         let lunas_pid = find_pid_by_name(b"lunas").or_else(|| find_pid_by_name(b"gui"));
         let Some(lunas_pid) = lunas_pid else {
-            std::println!("glxgears: compositor not found.");
             loop {
                 let _ = sched_yield();
             }
         };
-
-        std::println!("glxgears: compositor PID {}", lunas_pid);
 
         let win_w = 520u32;
         let win_h = 380u32;
@@ -447,13 +442,10 @@ pub fn main() {
         let Some((fb_ptr, fb_size)) =
             open_sidewind_window(lunas_pid, 160, 120, win_w, win_h, name_str)
         else {
-            std::println!("glxgears: failed to open SideWind window.");
             loop {
                 let _ = sched_yield();
             }
         };
-
-        std::println!("glxgears: window ready ({}×{}), entering render loop.", win_w, win_h);
 
         let buf_len = (win_w as usize).saturating_mul(win_h as usize);
         let buf: &mut [u32] =
@@ -465,40 +457,25 @@ pub fn main() {
 
         let mut ipc_ch = IpcChannel::new();
         let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
-        let mut frame: u64 = 0;
 
         loop {
-            frame += 1;
-            // Diagnóstico: confirmar que el render loop sigue vivo cada 300 frames.
-            if frame % 300 == 0 {
-                std::println!("glxgears: alive frame={}", frame);
-            }
-
             // Handle incoming IPC events (key press, resize, close).
             while let Some(msg) = ipc_ch.recv() {
-                match &msg {
-                    EclipseMessage::Raw { len, .. } => {
-                        std::println!("glxgears: recv Raw len={}", len);
-                    }
-                    _ => {
-                        std::println!("glxgears: recv non-Raw");
-                    }
-                }
                 if let EclipseMessage::Raw { data, len, .. } = msg {
                     if len == sw_ev_sz {
                         let ev = unsafe {
                             core::ptr::read_unaligned(data.as_ptr() as *const SideWindEvent)
                         };
-                        std::println!("glxgears: SideWindEvent type={} d1={} d2={} d3={}", ev.event_type, ev.data1, ev.data2, ev.data3);
                         if ev.event_type == SWND_EVENT_TYPE_KEY {
                             // Q or Escape → exit.
                             let sc = ev.data1 as u8;
                             if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
+                                let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
                                 unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
                                 syscall_exit(0);
                             }
                         } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
-                            std::println!("glxgears: received CLOSE, exiting.");
+                            let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
                             unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
                             syscall_exit(0);
                         }
