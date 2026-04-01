@@ -181,8 +181,28 @@ pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
         Some(i) => i,
         None => return,
     };
-    let mut tables = FD_TABLES.lock();
-    tables[child_idx] = tables[parent_idx];
+
+    // Collect FDs to dup before releasing the lock.
+    let mut to_dup: [(usize, usize); MAX_FDS_PER_PROCESS] = [(0, 0); MAX_FDS_PER_PROCESS];
+    let mut dup_count = 0;
+    {
+        let mut tables = FD_TABLES.lock();
+        tables[child_idx] = tables[parent_idx];
+        for fd in 0..MAX_FDS_PER_PROCESS {
+            if tables[child_idx].fds[fd].in_use {
+                to_dup[dup_count] = (
+                    tables[child_idx].fds[fd].scheme_id,
+                    tables[child_idx].fds[fd].resource_id,
+                );
+                dup_count += 1;
+            }
+        }
+    } // FD_TABLES lock released here
+
+    // Notify each scheme that a handle has been inherited by the child (ref counting).
+    for i in 0..dup_count {
+        let _ = crate::scheme::dup(to_dup[i].0, to_dup[i].1);
+    }
 }
 
 /// Initialize standard I/O for a process

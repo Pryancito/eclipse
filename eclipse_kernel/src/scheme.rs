@@ -110,6 +110,15 @@ pub trait Scheme: Send + Sync {
     fn ftruncate(&self, _id: usize, _len: usize) -> Result<usize, usize> {
         Err(error::ENOSYS)
     }
+
+    /// Notify the scheme that an existing handle has been inherited by a new process.
+    /// Called when a file descriptor is duplicated via spawn_with_stdio or fork.
+    /// Schemes that use reference counting (e.g. PtyScheme) override this to increment
+    /// their internal ref count so that close() only tears down the resource when the
+    /// last reference is gone.
+    fn dup(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0) // default: no-op for schemes without ref counting
+    }
 }
 
 /// Registry for all system schemes
@@ -290,6 +299,17 @@ pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result
         Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
     };
     scheme.ioctl(id, request, arg)
+}
+
+/// Notify the scheme that a handle has been inherited by a new process (fd dup/fork).
+/// Schemes with reference counting (e.g. PtyScheme) use this to track open references
+/// so that close() only destroys the resource when the last holder releases it.
+pub fn dup(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+    };
+    scheme.dup(id)
 }
 
 /// Create a directory by routing to the appropriate scheme

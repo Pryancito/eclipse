@@ -55,6 +55,7 @@ use eclipse_syscall::call::{
     ioctl as sys_ioctl,
     read as sys_read,
     spawn_with_stdio as sys_spawn_with_stdio,
+    wait_pid_nohang as sys_wait_pid_nohang,
     write as sys_write,
 };
 
@@ -502,7 +503,7 @@ fn main() {
         }
         let _ = sys_close(sh_fd);
 
-        let sh_pid = match sys_spawn_with_stdio(
+        let mut sh_pid = match sys_spawn_with_stdio(
             &sh_bytes,
             Some("sh"),
             pty_slave_fd,
@@ -517,6 +518,12 @@ fn main() {
                 }
             }
         };
+
+        // Cerrar la copia del slave en el proceso terminal: el shell (y sus hijos) son los
+        // únicos propietarios del extremo esclavo del PTY. Así, cuando el shell salga y cierre
+        // sus descriptores, el extremo maestro recibe EOF de forma limpia, permitiendo detectar
+        // que el shell ha terminado y relanzarlo.
+        let _ = sys_close(pty_slave_fd);
 
         // Informar al PTY del tamaño inicial de la ventana para que programas
         // como vim/htop/nano sepan cuántas columnas y filas tienen disponibles.
@@ -614,7 +621,6 @@ fn main() {
                         } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
                             // El usuario cerró la ventana: matar al shell y salir.
                             unsafe { kill(sh_pid as c_int, 9) };
-                            let _ = sys_close(pty_slave_fd);
                             let _ = sys_close(pty_master_fd);
                             sys_exit(0);
                         }
@@ -659,7 +665,41 @@ fn main() {
                 );
             }
 
-            // 3) Solo flushear + commit si hubo cambios reales.
+            // 3) Detectar si el shell ha salido y relanzarlo.
+            // Usamos WNOHANG para no bloquear el loop de eventos.
+            let mut sh_status = 0u32;
+            if sys_wait_pid_nohang(&mut sh_status, sh_pid as usize).map_or(false, |p| p != 0) {
+                // El shell terminó: reabrir el extremo esclavo del PTY y relanzar /bin/sh.
+                let new_slave_fd = unsafe {
+                    let mut path_buf = [0u8; 64];
+                    let slave_path = std::format!("pty:slave/{}", pair_id);
+                    let bytes = slave_path.as_bytes();
+                    let n = bytes.len().min(path_buf.len() - 1);
+                    path_buf[..n].copy_from_slice(&bytes[..n]);
+                    path_buf[n] = 0;
+                    let fd = open(
+                        path_buf.as_ptr() as *const core::ffi::c_char,
+                        flag::O_RDWR as c_int,
+                        0,
+                    );
+                    if fd < 0 { -1isize as usize } else { fd as usize }
+                };
+                if new_slave_fd != (-1isize as usize) {
+                    match sys_spawn_with_stdio(&sh_bytes, Some("sh"), new_slave_fd, new_slave_fd, new_slave_fd) {
+                        Ok(new_pid) => {
+                            let _ = sys_close(new_slave_fd);
+                            sh_pid = new_pid;
+                            terminal.process(b"\r\n\x1b[1;33m[nueva sesion de shell]\x1b[0m\r\n");
+                            dirty = true;
+                        }
+                        Err(_) => {
+                            let _ = sys_close(new_slave_fd);
+                        }
+                    }
+                }
+            }
+
+            // 4) Solo flushear + commit si hubo cambios reales.
             if dirty {
                 terminal.flush();
                 let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_commit());

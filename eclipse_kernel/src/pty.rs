@@ -11,7 +11,10 @@ use alloc::sync::Arc;
 pub struct PtyChannel {
     pub master_in: VecDeque<u8>, // Master reads from here, Slave writes to here
     pub slave_in: VecDeque<u8>,  // Slave reads from here, Master writes to here
-    pub closed: bool,
+    /// True when all master-side handles have been closed (slave reads get EOF).
+    pub master_closed: bool,
+    /// True when all slave-side handles have been closed (master reads get EOF).
+    pub slave_closed: bool,
     /// Dimensiones de la ventana (TIOCSWINSZ / TIOCGWINSZ)
     pub ws_rows: u16,
     pub ws_cols: u16,
@@ -27,7 +30,8 @@ impl PtyChannel {
         Self {
             master_in: VecDeque::with_capacity(4096),
             slave_in: VecDeque::with_capacity(4096),
-            closed: false,
+            master_closed: false,
+            slave_closed: false,
             ws_rows: 24,
             ws_cols: 80,
             ws_xpixel: 0,
@@ -40,6 +44,9 @@ impl PtyChannel {
 pub struct PtyHandle {
     pub pair_id: usize,
     pub is_master: bool,
+    /// Reference count: starts at 1, incremented on dup(), decremented on close().
+    /// The channel side is only marked closed when ref_count reaches 0.
+    pub ref_count: usize,
 }
 
 pub struct PtyScheme {
@@ -59,12 +66,12 @@ impl PtyScheme {
         let mut handles = self.handles.lock();
         for (i, slot) in handles.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(PtyHandle { pair_id, is_master });
+                *slot = Some(PtyHandle { pair_id, is_master, ref_count: 1 });
                 return i;
             }
         }
         let id = handles.len();
-        handles.push(Some(PtyHandle { pair_id, is_master }));
+        handles.push(Some(PtyHandle { pair_id, is_master, ref_count: 1 }));
         id
     }
 }
@@ -94,9 +101,12 @@ impl Scheme for PtyScheme {
             let channels = self.channels.lock();
             if pair_id < channels.len() {
                 if let Some(arc) = channels[pair_id].as_ref() {
-                    // Registrar el PID del proceso que abre el esclavo
                     let caller_pid = crate::process::current_process_id().unwrap_or(0);
-                    arc.lock().slave_pid = caller_pid;
+                    let mut ch = arc.lock();
+                    ch.slave_pid = caller_pid;
+                    // Reset slave_closed when a new slave handle is opened (e.g. shell respawn).
+                    ch.slave_closed = false;
+                    drop(ch);
                     return Ok(self.new_handle(pair_id, false));
                 }
             }
@@ -110,7 +120,7 @@ impl Scheme for PtyScheme {
         let handle = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
-            PtyHandle { pair_id: h.pair_id, is_master: h.is_master }
+            PtyHandle { pair_id: h.pair_id, is_master: h.is_master, ref_count: h.ref_count }
         };
 
         let channel_arc = {
@@ -131,8 +141,10 @@ impl Scheme for PtyScheme {
                     }
                 }
                 return Ok(read);
-            } else if channel.closed {
-                return Ok(0); // EOF
+            } else {
+                // EOF when the other side has fully closed
+                let eof = if handle.is_master { channel.slave_closed } else { channel.master_closed };
+                if eof { return Ok(0); }
             }
             drop(channel);
 
@@ -151,7 +163,7 @@ impl Scheme for PtyScheme {
         let handle = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
-            PtyHandle { pair_id: h.pair_id, is_master: h.is_master }
+            PtyHandle { pair_id: h.pair_id, is_master: h.is_master, ref_count: h.ref_count }
         };
 
         let channel_arc = {
@@ -160,7 +172,9 @@ impl Scheme for PtyScheme {
         };
 
         let mut channel = channel_arc.lock();
-        if channel.closed {
+        // EPIPE when the other side has fully closed
+        let closed = if handle.is_master { channel.slave_closed } else { channel.master_closed };
+        if closed {
             return Err(error::EPIPE);
         }
 
@@ -173,23 +187,33 @@ impl Scheme for PtyScheme {
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
-        let handle = {
+        // Decrement ref_count; only remove the handle and mark channel when it reaches 0.
+        let (pair_id, is_master, last_ref) = {
             let mut handles = self.handles.lock();
-            if let Some(h) = handles.get_mut(id) {
-                h.take().ok_or(error::EBADF)?
-            } else {
-                return Err(error::EBADF);
+            let h = handles.get_mut(id).and_then(|x| x.as_mut()).ok_or(error::EBADF)?;
+            h.ref_count = h.ref_count.saturating_sub(1);
+            let last = h.ref_count == 0;
+            let pair_id = h.pair_id;
+            let is_master = h.is_master;
+            if last {
+                handles[id] = None;
             }
+            (pair_id, is_master, last)
         };
 
-        let channel_arc = {
-            let channels = self.channels.lock();
-            channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned()
-        };
-
-        if let Some(arc) = channel_arc {
-            // Signal EOF via closed flag
-            arc.lock().closed = true;
+        if last_ref {
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(pair_id).and_then(|c| c.as_ref()).cloned()
+            };
+            if let Some(arc) = channel_arc {
+                let mut channel = arc.lock();
+                if is_master {
+                    channel.master_closed = true;
+                } else {
+                    channel.slave_closed = true;
+                }
+            }
         }
 
         Ok(0)
@@ -199,7 +223,7 @@ impl Scheme for PtyScheme {
         let handle = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
-            PtyHandle { pair_id: h.pair_id, is_master: h.is_master }
+            PtyHandle { pair_id: h.pair_id, is_master: h.is_master, ref_count: h.ref_count }
         };
         // Request 1: TIOCGPTN (Get PTY Number)
         if request == 1 {
@@ -283,5 +307,15 @@ impl Scheme for PtyScheme {
 
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
         Err(error::ESPIPE)
+    }
+
+    fn dup(&self, id: usize) -> Result<usize, usize> {
+        let mut handles = self.handles.lock();
+        if let Some(Some(h)) = handles.get_mut(id) {
+            h.ref_count += 1;
+            Ok(0)
+        } else {
+            Err(error::EBADF)
+        }
     }
 }
