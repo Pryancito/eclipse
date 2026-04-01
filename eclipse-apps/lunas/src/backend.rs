@@ -104,7 +104,7 @@ impl Backend {
             if n as usize != buf.len() {
                 return None;
             }
-            let ev = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) };
+            let ev = unsafe { core::ptr::read_unaligned::<InputEvent>(buf.as_ptr() as *const InputEvent) };
             Some(CompositorEvent::Input(ev))
         }
     }

@@ -51,15 +51,47 @@ impl FramebufferState {
     pub fn init() -> Option<Self> {
         #[cfg(target_vendor = "eclipse")]
         {
-            let dev = DisplayDevice::open().ok()?;
-            let fb_front = dev.create_framebuffer().ok()?;
-            let fb_back  = dev.create_framebuffer().ok()?;
+            let dev = match DisplayDevice::open() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[LUNAS] Failed to open display device: {:?}", e);
+                    return None;
+                }
+            };
+            eprintln!("[LUNAS] Display device opened: {:?}x{:?}", dev.caps.width, dev.caps.height);
+
+            let fb_front = match dev.create_framebuffer() {
+                Ok(fb) => fb,
+                Err(e) => {
+                    eprintln!("[LUNAS] Failed to create front framebuffer: {:?}", e);
+                    return None;
+                }
+            };
+            let fb_back = match dev.create_framebuffer() {
+                Ok(fb) => fb,
+                Err(e) => {
+                    eprintln!("[LUNAS] Failed to create back framebuffer: {:?}", e);
+                    return None;
+                }
+            };
 
             let background_addr = if let Ok(db) = dev.create_dumb_buffer(dev.caps.width, dev.caps.height, 32) {
-                dev.map_buffer(db.handle, db.size).unwrap_or(core::ptr::null_mut()) as usize
+                match dev.map_buffer(db.handle, db.size) {
+                    Ok(ptr) => ptr as usize,
+                    Err(e) => {
+                        eprintln!("[LUNAS] Failed to map background buffer: {:?}", e);
+                        0
+                    }
+                }
             } else {
+                eprintln!("[LUNAS] Failed to create background dumb buffer");
                 0
             };
+            
+            if background_addr == 0 {
+                return None;
+            }
+            eprintln!("[LUNAS] Framebuffers and background buffer initialized.");
 
             let info = FramebufferInfo {
                 address: fb_front.addr as u64,
@@ -492,17 +524,21 @@ pub fn draw_desktop_shell(
     snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
 ) {
     // 1. Blit background
+    unsafe { libc::write(2, "[LUNAS-R] Blit BG\n".as_ptr() as *const _, 18); }
     fb.blit_background();
 
     // 1.5. Draw HUD overlay (kernel log) — placed in background so it doesn't block windows
     if log_len > 0 {
+        unsafe { libc::write(2, "[LUNAS-R] HUD\n".as_ptr() as *const _, 14); }
         draw_hud_overlay(fb, log_buf, log_len);
     }
 
     // 2. Draw taskbar
+    unsafe { libc::write(2, "[LUNAS-R] Taskbar\n".as_ptr() as *const _, 18); }
     draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
+    unsafe { libc::write(2, "[LUNAS-R] Windows\n".as_ptr() as *const _, 18); }
     for i in 0..window_count {
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }

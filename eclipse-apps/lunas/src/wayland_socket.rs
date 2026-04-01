@@ -6,6 +6,7 @@
 //!
 //! This module is polled every frame from the Lunas main loop.
 
+use std::prelude::v1::*;
 use std::rc::Rc;
 use core::cell::RefCell;
 use wayland_proto::UnixSocketServer;
@@ -59,14 +60,14 @@ impl WaylandSocketServer {
         // ── Receive from existing Unix socket clients ───────────────────────
         // Collect Unix-socket client IDs first to avoid holding an active
         // borrow while we call process_message (which needs &mut protocol).
-        let ids: alloc::vec::Vec<ClientId> = protocol
+        let ids: Vec<ClientId> = protocol
             .clients
             .keys()
             .copied()
             .filter(|id| id.0 >= UNIX_CLIENT_ID_BASE)
             .collect();
 
-        let mut disconnected: alloc::vec::Vec<ClientId> = alloc::vec::Vec::new();
+        let mut disconnected: Vec<ClientId> = Vec::new();
 
         for id in ids {
             // Clone the connection Rc so we can release the immutable borrow
@@ -77,7 +78,8 @@ impl WaylandSocketServer {
             };
 
             // Try to receive data from this client's socket.
-            match conn_rc.borrow().recv() {
+            let recv_res = (*conn_rc).borrow().recv();
+            match recv_res {
                 Ok((data, _handles)) => {
                     // There may be multiple Wayland messages concatenated.
                     let mut pos = 0usize;

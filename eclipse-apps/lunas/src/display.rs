@@ -397,39 +397,59 @@ impl ControlDevice for DisplayDevice {
         #[cfg(target_vendor = "eclipse")]
         {
             #[repr(C)]
+            #[derive(Default)]
             struct DrmModeCardRes {
-                fb_id_ptr: u64, crtc_id_ptr: u64, connector_id_ptr: u64, encoder_id_ptr: u64,
-                count_fbs: u32, count_crtcs: u32, count_connectors: u32, count_encoders: u32,
-                min_width: u32, max_width: u32, min_height: u32, max_height: u32,
+                fb_id_ptr: u64,
+                crtc_id_ptr: u64,
+                connector_id_ptr: u64,
+                encoder_id_ptr: u64,
+                count_fbs: u32,
+                count_crtcs: u32,
+                count_connectors: u32,
+                count_encoders: u32,
+                min_width: u32,
+                max_width: u32,
+                min_height: u32,
+                max_height: u32,
             }
-            let mut args = DrmModeCardRes {
-                fb_id_ptr: 0, crtc_id_ptr: 0, connector_id_ptr: 0, encoder_id_ptr: 0,
-                count_fbs: 0, count_crtcs: 0, count_connectors: 0, count_encoders: 0,
-                min_width: 0, max_width: 0, min_height: 0, max_height: 0,
-            };
+            let mut args = DrmModeCardRes::default();
+            
+            // First call to get counts
             syscall::ioctl(self.fd, DRM_IOCTL_MODE_GETRESOURCES as usize, &mut args as *mut _ as usize)?;
             
-            let mut fbs = Vec::with_capacity(args.count_fbs as usize);
-            let mut crtcs = Vec::with_capacity(args.count_crtcs as usize);
-            let mut conns = Vec::with_capacity(args.count_connectors as usize);
+            let mut fbs_raw = std::vec![0u32; args.count_fbs as usize];
+            let mut crtcs_raw = std::vec![0u32; args.count_crtcs as usize];
+            let mut conns_raw = std::vec![0u32; args.count_connectors as usize];
+            let mut encoders_raw = std::vec![0u32; args.count_encoders as usize];
             
             unsafe {
-                fbs.set_len(args.count_fbs as usize);
-                crtcs.set_len(args.count_crtcs as usize);
-                conns.set_len(args.count_connectors as usize);
+                if args.count_fbs > 0 {
+                    args.fb_id_ptr = fbs_raw.as_mut_ptr() as u64;
+                }
+                if args.count_crtcs > 0 {
+                    args.crtc_id_ptr = crtcs_raw.as_mut_ptr() as u64;
+                }
+                if args.count_connectors > 0 {
+                    args.connector_id_ptr = conns_raw.as_mut_ptr() as u64;
+                }
+                if args.count_encoders > 0 {
+                    args.encoder_id_ptr = encoders_raw.as_mut_ptr() as u64;
+                }
 
-                args.fb_id_ptr = fbs.as_ptr() as u64;
-                args.crtc_id_ptr = crtcs.as_ptr() as u64;
-                args.connector_id_ptr = conns.as_ptr() as u64;
-
+                // Second call to fill buffers
                 syscall::ioctl(self.fd, DRM_IOCTL_MODE_GETRESOURCES as usize, &mut args as *mut _ as usize)?;
             }
 
-            Ok((
-                fbs.into_iter().map(control::framebuffer::Handle).collect(),
-                crtcs.into_iter().map(control::CrtcHandle).collect(),
-                conns.into_iter().map(control::ConnectorHandle).collect(),
-            ))
+            let mut fbs = Vec::with_capacity(fbs_raw.len());
+            for id in fbs_raw { fbs.push(control::framebuffer::Handle(id)); }
+            
+            let mut crtcs = Vec::with_capacity(crtcs_raw.len());
+            for id in crtcs_raw { crtcs.push(control::CrtcHandle(id)); }
+            
+            let mut conns = Vec::with_capacity(conns_raw.len());
+            for id in conns_raw { conns.push(control::ConnectorHandle(id)); }
+
+            Ok((fbs, crtcs, conns))
         }
         #[cfg(not(target_vendor = "eclipse"))]
         {

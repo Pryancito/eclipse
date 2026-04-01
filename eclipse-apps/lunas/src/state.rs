@@ -16,8 +16,8 @@ use wayland_proto::wl::protocols::common::wl_keyboard;
 use wayland_proto::wl::protocols::common::wl_pointer;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
-use alloc::collections::BTreeMap;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
@@ -108,12 +108,13 @@ pub struct LunasState {
 }
 
 impl LunasState {
-    pub fn new() -> Option<Self> {
+    pub fn new() -> Option<Box<Self>> {
+        eprintln!("[LUNAS] Initializing LunasState...");
         let backend = Backend::new()?;
         let fb_w = backend.fb.info.width as i32;
         let fb_h = backend.fb.info.height as i32;
 
-        let mut state = Self {
+        let mut state = Box::new(Self {
             backend,
             space: Space::new(),
             input: InputState::new(fb_w, fb_h),
@@ -150,7 +151,7 @@ impl LunasState {
             last_input_tick: 0,
             protocol: WaylandServer::new(),
             snp_surfaces: std::collections::BTreeMap::new(),
-            pending_surface_commits: Rc::new(RefCell::new(alloc::vec::Vec::new())),
+            pending_surface_commits: Rc::new(RefCell::new(Vec::new())),
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
@@ -159,7 +160,7 @@ impl LunasState {
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
             history_pos: 0,
-        };
+        });
 
         // Pre-render background using the current wallpaper mode and colour.
         state.backend.fb.pre_render_background(
@@ -182,6 +183,7 @@ impl LunasState {
 
         // SNP protocol is registry-less for now or handled internally
 
+        eprintln!("[LUNAS] LunasState successfully initialized.");
         Some(state)
     }
 
@@ -206,7 +208,7 @@ impl LunasState {
                             let focused_client = ClientId(pid);
 
                             // If client has a wl_keyboard object, dispatch via Wayland protocol
-                            let keyboard_id = self.keyboard_registry.borrow().get(&focused_client).copied();
+                            let keyboard_id = (*self.keyboard_registry).borrow().get(&focused_client).copied();
                             if let Some(kb_id) = keyboard_id {
                                 if let Some(client) = self.protocol.clients.get(&focused_client) {
                                     self.wayland_serial = self.wayland_serial.wrapping_add(1);
@@ -248,7 +250,7 @@ impl LunasState {
                 if let Some(w_idx) = self.input.focused_window {
                     if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
                         let focused_client = ClientId(pid);
-                        let pointer_id = self.pointer_registry.borrow().get(&focused_client).copied();
+                        let pointer_id = (*self.pointer_registry).borrow().get(&focused_client).copied();
 
                         if let Some(ptr_id) = pointer_id {
                             if let Some((sx, sy)) = self.input.pending_snp_mouse_move.take() {
@@ -377,8 +379,8 @@ impl LunasState {
                 let _ = self.protocol.process_message(ClientId(pid), data);
 
                 // Drain pending wl_surface commits and materialise ShellWindows
-                let commits: alloc::vec::Vec<SurfaceCommit> =
-                    self.pending_surface_commits.borrow_mut().drain(..).collect();
+                let commits: Vec<SurfaceCommit> =
+                    (*self.pending_surface_commits).borrow_mut().drain(..).collect();
 
                 let fb_w = self.backend.fb.info.width as i32;
                 let fb_h = self.backend.fb.info.height as i32;

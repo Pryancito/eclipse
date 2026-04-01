@@ -13,11 +13,14 @@ fn main() {
 
 
 fn main() {
+    eprintln!("[LUNAS] Starting Lunas Desktop Environment...");
     use lunas::state::LunasState;
 
     let mut state = LunasState::new().expect("Failed to initialize Lunas Desktop");
+    eprintln!("[LUNAS] State initialized, setting process name...");
 
     let _ = eclipse_syscall::call::set_process_name("lunas");
+    eprintln!("[LUNAS] Process name set, registering globals...");
 
     // Register Wayland globals — closures capture the shared protocol channels
     // so that all protocol objects (LunasSurface, LunasShmPool, LunasBuffer)
@@ -44,6 +47,7 @@ fn main() {
                 wayland_proto::wl::protocols::common::wl_compositor::WlCompositor
             >(id, inner),
         );
+        eprintln!("[LUNAS] Registered wl_compositor");
     }
 
     {
@@ -60,6 +64,7 @@ fn main() {
                 wayland_proto::wl::protocols::common::wl_shm::WlShm
             >(id, inner),
         );
+        eprintln!("[LUNAS] Registered wl_shm");
     }
 
     // ── Register new standard Wayland globals ────────────────────────────────
@@ -83,6 +88,7 @@ fn main() {
                 wayland_proto::wl::protocols::common::xdg_wm_base::XdgWmBase
             >(id, inner),
         );
+        eprintln!("[LUNAS] Registered xdg_wm_base");
     }
 
     // wl_seat — keyboard + pointer seat
@@ -107,13 +113,14 @@ fn main() {
             |id, inner| wayland_proto::wl::server::objects::Object::new::<
                 wayland_proto::wl::protocols::common::wl_seat::WlSeat
             >(id, inner),
-            Some(alloc::boxed::Box::new(|obj_id, client| {
+            Some(Box::new(|obj_id, client: &mut wayland_proto::wl::server::client::Client| {
                 // Send capabilities: keyboard + pointer
                 use wayland_proto::wl::protocols::common::wl_seat::{Event, CAP_KEYBOARD, CAP_POINTER};
                 client.send_event(obj_id, Event::Capabilities { capabilities: CAP_KEYBOARD | CAP_POINTER })
                     .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
             })),
         );
+        eprintln!("[LUNAS] Registered wl_seat");
     }
 
     // wl_output — display info
@@ -135,7 +142,7 @@ fn main() {
             |id, inner| wayland_proto::wl::server::objects::Object::new::<
                 wayland_proto::wl::protocols::common::wl_output::WlOutput
             >(id, inner),
-            Some(alloc::boxed::Box::new(move |obj_id, client| {
+            Some(Box::new(move |obj_id, client: &mut wayland_proto::wl::server::client::Client| {
                 use wayland_proto::wl::protocols::common::wl_output::{
                     Event, SUBPIXEL_UNKNOWN, TRANSFORM_NORMAL, MODE_CURRENT,
                 };
@@ -143,8 +150,8 @@ fn main() {
                     x: 0, y: 0,
                     physical_width: 527, physical_height: 296,
                     subpixel: SUBPIXEL_UNKNOWN,
-                    make: alloc::string::String::from("Eclipse OS"),
-                    model: alloc::string::String::from("Virtual Display"),
+                    make: String::from("Eclipse OS"),
+                    model: String::from("Virtual Display"),
                     transform: TRANSFORM_NORMAL,
                 }).map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)?;
                 client.send_event(obj_id, Event::Mode {
@@ -159,27 +166,42 @@ fn main() {
                     .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
             })),
         );
+        eprintln!("[LUNAS] Registered wl_output");
     }
 
+    eprintln!("[LUNAS] All globals registered, entering main loop...");
+
     // ── Start Wayland Unix socket server ─────────────────────────────────────
+    eprintln!("[LUNAS] Binding Wayland socket...");
     let mut wayland_socket = lunas::wayland_socket::WaylandSocketServer::new("/tmp/wayland-0");
     if wayland_socket.is_none() {
         eprintln!("[LUNAS] Warning: could not bind /tmp/wayland-0 — standard Wayland clients won't connect");
     }
 
+    eprintln!("[LUNAS] Getting self PID...");
     let self_pid = unsafe { libc::getpid() as u32 };
+    eprintln!("[LUNAS] Self PID: {}", self_pid);
+
+    eprintln!("[LUNAS] Registering HUD...");
     let _ = eclipse_syscall::call::register_log_hud(self_pid);
+    eprintln!("[LUNAS] HUD registered.");
 
     loop {
+        unsafe { libc::write(2, "[LUNAS-LOOP] Start\n".as_ptr() as *const _, 19); }
         // Accept and process standard Wayland socket clients
         if let Some(ref mut sock) = wayland_socket {
+            unsafe { libc::write(2, "[LUNAS-LOOP] Poll Wayland\n".as_ptr() as *const _, 26); }
             if sock.poll(&mut state.protocol) {
                 state.dirty = true;
             }
         }
+        unsafe { libc::write(2, "[LUNAS-LOOP] Handle IPC\n".as_ptr() as *const _, 24); }
         state.handle_ipc();
+        unsafe { libc::write(2, "[LUNAS-LOOP] Update\n".as_ptr() as *const _, 20); }
         state.update();
+        unsafe { libc::write(2, "[LUNAS-LOOP] Render\n".as_ptr() as *const _, 20); }
         state.render();
+        unsafe { libc::write(2, "[LUNAS-LOOP] Sleep\n".as_ptr() as *const _, 19); }
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }

@@ -1,7 +1,7 @@
 use std::prelude::v1::*;
 use std::rc::Rc;
 use core::cell::RefCell;
-use alloc::collections::BTreeMap;
+use std::collections::BTreeMap;
 use wayland_proto::wl::{ObjectId, NewId, Payload};
 use wayland_proto::wl::server::client::{Client, ClientId};
 use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
@@ -42,7 +42,7 @@ pub struct SurfaceCommit {
 pub type SharedBuffers = Rc<RefCell<BTreeMap<ObjectId, BufferInfo>>>;
 
 /// Shared list of pending surface commits.
-pub type SharedCommits = Rc<RefCell<alloc::vec::Vec<SurfaceCommit>>>;
+pub type SharedCommits = Rc<RefCell<std::vec::Vec<SurfaceCommit>>>;
 
 // ────────────────────────────────────────────────────────────────────────────
 // LunasCompositor  (wl_compositor)
@@ -110,7 +110,7 @@ impl ObjectLogic for LunasSurface {
                     Some(Payload::ObjectId(id)) => *id,
                     _ => return Ok(()), // null buffer is valid (detach)
                 };
-                self.attached_buffer = self.buffer_registry.borrow().get(&buffer_id).copied();
+                self.attached_buffer = (*self.buffer_registry).borrow().get(&buffer_id).copied();
                 Ok(())
             }
             2 | 9 => Ok(()), // damage / damage_buffer — ignore for now
@@ -119,7 +119,7 @@ impl ObjectLogic for LunasSurface {
             6 => {
                 // commit — publish a new frame
                 if let Some(info) = self.attached_buffer {
-                    self.pending_commits.borrow_mut().push(SurfaceCommit {
+                    (*self.pending_commits).borrow_mut().push(SurfaceCommit {
                         pid: self.pid,
                         surface_id: self.id.0,
                         vaddr: info.vaddr,
@@ -293,7 +293,7 @@ impl ObjectLogic for LunasShmPool {
 
                 let buf_vaddr = if self.vaddr != 0 { self.vaddr + offset } else { 0 };
                 let info = BufferInfo { vaddr: buf_vaddr, width, height, stride, format };
-                self.buffer_registry.borrow_mut().insert(id.as_id(), info);
+                (*self.buffer_registry).borrow_mut().insert(id.as_id(), info);
 
                 let buf_obj = ObjectInner::Rc(Rc::new(RefCell::new(LunasBuffer { info })));
                 client.add_object(id, Object::new::<wl_buffer::WlBuffer>(id, buf_obj));
@@ -440,7 +440,7 @@ impl ObjectLogic for LunasXdgSurface {
                     id: id.as_id(),
                     xdg_surface_id: self.id,
                     surface_id: self.surface_id,
-                    title: alloc::string::String::from("Wayland Window"),
+                    title: std::string::String::from("Wayland Window"),
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
                 })));
@@ -450,9 +450,9 @@ impl ObjectLogic for LunasXdgSurface {
                 // 1. xdg_toplevel.configure(0, 0, []) — client picks its own size
                 let tl_cfg = xdg_toplevel::Event::Configure {
                     width: 0, height: 0,
-                    states: wayland_proto::wl::wire::Array(alloc::vec::Vec::new()),
+                    states: wayland_proto::wl::wire::Array(std::vec::Vec::new()),
                 };
-                client.send_event(id, tl_cfg)?;
+                client.send_event(id.as_id(), tl_cfg)?;
 
                 // 2. xdg_surface.configure(serial=1)
                 let surf_cfg = xdg_surface::Event::Configure { serial: 1 };
@@ -476,7 +476,7 @@ pub struct LunasXdgToplevel {
     pub id: ObjectId,
     pub xdg_surface_id: ObjectId,
     pub surface_id: ObjectId,
-    pub title: alloc::string::String,
+    pub title: std::string::String,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
 }
@@ -529,7 +529,7 @@ impl ObjectLogic for LunasSeat {
                     Some(Payload::NewId(id)) => *id,
                     _ => return Err(ServerError::MessageDeserializeError),
                 };
-                self.pointer_registry.borrow_mut().insert(client.client_id(), id.as_id());
+                (*self.pointer_registry).borrow_mut().insert(client.client_id(), id.as_id());
                 let ptr_obj = ObjectInner::Rc(Rc::new(RefCell::new(LunasPointer {
                     id: id.as_id(),
                     client_id: client.client_id(),
@@ -543,7 +543,7 @@ impl ObjectLogic for LunasSeat {
                     Some(Payload::NewId(id)) => *id,
                     _ => return Err(ServerError::MessageDeserializeError),
                 };
-                self.keyboard_registry.borrow_mut().insert(client.client_id(), id.as_id());
+                (*self.keyboard_registry).borrow_mut().insert(client.client_id(), id.as_id());
                 let kb = ObjectInner::Rc(Rc::new(RefCell::new(LunasKeyboard {
                     id: id.as_id(),
                     client_id: client.client_id(),
@@ -558,11 +558,11 @@ impl ObjectLogic for LunasSeat {
                     fd: wayland_proto::wl::wire::Handle(-1),
                     size: 0,
                 };
-                client.send_event(id, keymap)?;
+                client.send_event(id.as_id(), keymap)?;
 
                 // Send repeat info: disabled (rate=0)
                 let repeat = wl_keyboard::Event::RepeatInfo { rate: 0, delay: 0 };
-                client.send_event(id, repeat)?;
+                client.send_event(id.as_id(), repeat)?;
 
                 Ok(())
             }
@@ -652,7 +652,7 @@ mod wayland_server_tests {
     use std::rc::Rc;
     use std::vec::Vec;
     use core::cell::RefCell;
-    use alloc::collections::BTreeMap;
+    use std::collections::BTreeMap;
     use wayland_proto::eclipse_transport::EclipseWaylandConnection;
     use wayland_proto::wl::protocols::common::wl_compositor::WlCompositor;
     use wayland_proto::wl::protocols::common::wl_display::Request;

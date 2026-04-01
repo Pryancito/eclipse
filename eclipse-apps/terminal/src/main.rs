@@ -278,14 +278,14 @@ impl TerminalApp {
         if compositor_name == 0 { return None; }
 
         // wl_registry.bind(compositor → id=3)
-        send_wayland(&wayland, 2, 0, &[Payload::UInt(compositor_name), Payload::String(alloc::string::String::from("wl_compositor")), Payload::UInt(4), Payload::NewId(NewId(3))]);
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(compositor_name), Payload::String(std::string::String::from("wl_compositor")), Payload::UInt(4), Payload::NewId(NewId(3))]);
         // wl_registry.bind(shm → id=4)
-        send_wayland(&wayland, 2, 0, &[Payload::UInt(shm_name_id), Payload::String(alloc::string::String::from("wl_shm")), Payload::UInt(1), Payload::NewId(NewId(4))]);
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(shm_name_id), Payload::String(std::string::String::from("wl_shm")), Payload::UInt(1), Payload::NewId(NewId(4))]);
         // wl_registry.bind(xdg_wm_base → id=5)
-        send_wayland(&wayland, 2, 0, &[Payload::UInt(xdg_name), Payload::String(alloc::string::String::from("xdg_wm_base")), Payload::UInt(2), Payload::NewId(NewId(5))]);
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(xdg_name), Payload::String(std::string::String::from("xdg_wm_base")), Payload::UInt(2), Payload::NewId(NewId(5))]);
         // wl_registry.bind(wl_seat → id=6)
         if seat_name != 0 {
-            send_wayland(&wayland, 2, 0, &[Payload::UInt(seat_name), Payload::String(alloc::string::String::from("wl_seat")), Payload::UInt(7), Payload::NewId(NewId(6))]);
+            send_wayland(&wayland, 2, 0, &[Payload::UInt(seat_name), Payload::String(std::string::String::from("wl_seat")), Payload::UInt(7), Payload::NewId(NewId(6))]);
         }
 
         // wl_compositor.create_surface(id=7)
@@ -313,7 +313,7 @@ impl TerminalApp {
         send_wayland(&wayland, 10, 1, &[Payload::NewId(NewId(11))]);
 
         // xdg_toplevel.set_title("Terminal")
-        send_wayland(&wayland, 11, 2, &[Payload::String(alloc::string::String::from("Terminal"))]);
+        send_wayland(&wayland, 11, 2, &[Payload::String(std::string::String::from("Terminal"))]);
 
         // wl_seat.get_keyboard(id=12)
         if seat_name != 0 {
@@ -325,7 +325,7 @@ impl TerminalApp {
         send_wayland(&wayland, 7, 6, &[]); // wl_surface.commit
 
         // ── 4. Surface state + os-terminal setup ──────────────────────────
-        let shared_state = alloc::rc::Rc::new(core::cell::RefCell::new(SurfaceBacking {
+        let shared_state = std::rc::Rc::new(core::cell::RefCell::new(SurfaceBacking {
             ptr: vaddr as *mut u32,
             width: win_w as usize,
             height: win_h as usize,
@@ -482,7 +482,7 @@ impl TerminalApp {
                 if let Some(title) = extract_osc_title(&pty_buf[..n]) {
                     if title != self.last_title {
                         // xdg_toplevel.set_title
-                        let title_str = alloc::string::String::from(
+                        let title_str = std::string::String::from(
                             core::str::from_utf8(&title).unwrap_or("Terminal")
                         );
                         send_wayland(&self.wayland, self.toplevel_id, 2, &[Payload::String(title_str)]);
@@ -526,7 +526,7 @@ impl TerminalApp {
 /// Send a Wayland message on the Unix socket connection.
 #[cfg(target_vendor = "eclipse")]
 fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
-    use smallvec::SmallVec;
+    // let _ = SmallVec::<[Payload; 4]>::new(); // removed unused/missing dependency
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
 }
 

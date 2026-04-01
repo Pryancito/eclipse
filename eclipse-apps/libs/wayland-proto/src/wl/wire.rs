@@ -320,8 +320,9 @@ impl RawMessage {
                         .consume_le_u32()
                         .map_err(DeserializeError::ReaderError)?
                         as usize;
-                    if str_len < 1 {
-                        return Err(DeserializeError::NonTerminatedString);
+                    if str_len == 0 {
+                        args.push(Payload::String(String::new()));
+                        continue;
                     }
                     let rem = reader.remaining();
                     if rem.len() < str_len {
