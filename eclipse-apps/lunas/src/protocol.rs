@@ -360,8 +360,253 @@ pub fn make_wayland_window(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Tests
+// Shared keyboard registry
 // ────────────────────────────────────────────────────────────────────────────
+
+/// Maps `ClientId → wl_keyboard ObjectId` so the compositor can send key events.
+pub type SharedKeyboards = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgWmBase  (xdg_wm_base)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgWmBase {
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasXdgWmBase {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // get_xdg_surface(id: new_id, surface: object_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let surface_id = match args.get(1) {
+                    Some(Payload::ObjectId(v)) => *v,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let xdg_surf = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgSurface {
+                    id: id.as_id(),
+                    surface_id,
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                })));
+                client.add_object(id, Object::new::<xdg_wm_base::XdgWmBase>(id, xdg_surf));
+                Ok(())
+            }
+            2 => Ok(()), // pong — ignored
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgSurface  (xdg_surface)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgSurface {
+    pub id: ObjectId,
+    /// The underlying wl_surface this xdg_surface wraps.
+    pub surface_id: ObjectId,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasXdgSurface {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // get_toplevel(id: new_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let toplevel = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgToplevel {
+                    id: id.as_id(),
+                    xdg_surface_id: self.id,
+                    surface_id: self.surface_id,
+                    title: alloc::string::String::from("Wayland Window"),
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                })));
+                client.add_object(id, Object::new::<xdg_toplevel::XdgToplevel>(id, toplevel));
+
+                // Send initial configure sequence:
+                // 1. xdg_toplevel.configure(0, 0, []) — client picks its own size
+                let tl_cfg = xdg_toplevel::Event::Configure {
+                    width: 0, height: 0,
+                    states: wayland_proto::wl::wire::Array(alloc::vec::Vec::new()),
+                };
+                client.send_event(id, tl_cfg)?;
+
+                // 2. xdg_surface.configure(serial=1)
+                let surf_cfg = xdg_surface::Event::Configure { serial: 1 };
+                client.send_event(self.id, surf_cfg)?;
+
+                Ok(())
+            }
+            2 => Ok(()), // get_popup — not implemented
+            3 => Ok(()), // set_window_geometry — ignored for now
+            4 => Ok(()), // ack_configure — acknowledged
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgToplevel  (xdg_toplevel)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgToplevel {
+    pub id: ObjectId,
+    pub xdg_surface_id: ObjectId,
+    pub surface_id: ObjectId,
+    pub title: alloc::string::String,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasXdgToplevel {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => Ok(()), // set_parent
+            2 => {
+                // set_title(title: string)
+                if let Some(Payload::String(t)) = args.first() {
+                    self.title = t.clone();
+                }
+                Ok(())
+            }
+            3 => Ok(()), // set_app_id
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasSeat  (wl_seat)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasSeat {
+    pub keyboard_registry: SharedKeyboards,
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+impl ObjectLogic for LunasSeat {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // get_pointer — not implemented
+            1 => {
+                // get_keyboard(id: new_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                self.keyboard_registry.borrow_mut().insert(client.client_id(), id.as_id());
+                let kb = ObjectInner::Rc(Rc::new(RefCell::new(LunasKeyboard {
+                    id: id.as_id(),
+                    client_id: client.client_id(),
+                })));
+                client.add_object(id, Object::new::<wl_keyboard::WlKeyboard>(id, kb));
+
+                // Send keymap immediately: format=0 (no keymap), fd=-1, size=0
+                // Note: wl_keyboard.keymap carries an fd as ancillary data; for
+                // format=NO_KEYMAP we send fd=-1 which libwayland-client accepts.
+                let keymap = wl_keyboard::Event::Keymap {
+                    format: wl_keyboard::KEYMAP_FORMAT_NO_KEYMAP,
+                    fd: wayland_proto::wl::wire::Handle(-1),
+                    size: 0,
+                };
+                client.send_event(id, keymap)?;
+
+                // Send repeat info: disabled (rate=0)
+                let repeat = wl_keyboard::Event::RepeatInfo { rate: 0, delay: 0 };
+                client.send_event(id, repeat)?;
+
+                Ok(())
+            }
+            2 => Ok(()), // get_touch
+            3 => Ok(()), // release
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasKeyboard  (wl_keyboard)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasKeyboard {
+    pub id: ObjectId,
+    pub client_id: ClientId,
+}
+
+impl ObjectLogic for LunasKeyboard {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // release
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasOutput  (wl_output)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasOutput {
+    pub screen_w: u32,
+    pub screen_h: u32,
+    pub refresh_mhz: i32,
+}
+
+impl ObjectLogic for LunasOutput {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // release
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod wayland_server_tests {

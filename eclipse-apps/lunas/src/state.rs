@@ -8,10 +8,11 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::protocol::{SharedCommits, SharedBuffers, SurfaceCommit};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SurfaceCommit};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
+use wayland_proto::wl::protocols::common::wl_keyboard;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -89,6 +90,8 @@ pub struct LunasState {
     pub pending_surface_commits: SharedCommits,
     /// Shared wl_buffer registry (pid, surface_id → BufferInfo).
     pub buffer_registry: SharedBuffers,
+    /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
+    pub keyboard_registry: SharedKeyboards,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -144,6 +147,7 @@ impl LunasState {
             snp_surfaces: std::collections::BTreeMap::new(),
             pending_surface_commits: Rc::new(RefCell::new(alloc::vec::Vec::new())),
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -192,21 +196,42 @@ impl LunasState {
                 if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
                     if let Some(w_idx) = self.input.focused_window {
                         if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
-                            let ev = SideWindEvent {
-                                event_type: sidewind::SWND_EVENT_TYPE_KEY,
-                                data1: scancode as i32,
-                                data2: state_val as i32,
-                                data3: 0,
-                            };
-                            let _ = unsafe {
-                                eclipse_send(
-                                    pid,
-                                    sidewind::MSG_TYPE_INPUT,
-                                    &ev as *const _ as *const core::ffi::c_void,
-                                    core::mem::size_of::<SideWindEvent>(),
-                                    0,
-                                )
-                            };
+                            let focused_client = ClientId(pid);
+
+                            // If client has a wl_keyboard object, dispatch via Wayland protocol
+                            let keyboard_id = self.keyboard_registry.borrow().get(&focused_client).copied();
+                            if let Some(kb_id) = keyboard_id {
+                                if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                    let key_event = wl_keyboard::Event::Key {
+                                        serial: 0,
+                                        time: 0,
+                                        key: scancode as u32,
+                                        state: if state_val != 0 {
+                                            wl_keyboard::KEY_STATE_PRESSED
+                                        } else {
+                                            wl_keyboard::KEY_STATE_RELEASED
+                                        },
+                                    };
+                                    let _ = client.send_event(kb_id, key_event);
+                                }
+                            } else {
+                                // Fallback: SideWind raw event for Eclipse IPC clients
+                                let ev = SideWindEvent {
+                                    event_type: sidewind::SWND_EVENT_TYPE_KEY,
+                                    data1: scancode as i32,
+                                    data2: state_val as i32,
+                                    data3: 0,
+                                };
+                                let _ = unsafe {
+                                    eclipse_send(
+                                        pid,
+                                        sidewind::MSG_TYPE_INPUT,
+                                        &ev as *const _ as *const core::ffi::c_void,
+                                        core::mem::size_of::<SideWindEvent>(),
+                                        0,
+                                    )
+                                };
+                            }
                         }
                     }
                 }

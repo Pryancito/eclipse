@@ -62,10 +62,119 @@ fn main() {
         );
     }
 
+    // ── Register new standard Wayland globals ────────────────────────────────
+
+    // xdg_wm_base — modern toplevel window management
+    {
+        let c = pending_commits.clone();
+        let b = buffer_registry.clone();
+        state.protocol.register_global(
+            "xdg_wm_base", 2,
+            move || {
+                let xdg = lunas::protocol::LunasXdgWmBase {
+                    pending_commits: c.clone(),
+                    buffer_registry: b.clone(),
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(xdg))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::xdg_wm_base::XdgWmBase
+            >(id, inner),
+        );
+    }
+
+    // wl_seat — keyboard + pointer seat
+    {
+        let kb_reg = state.keyboard_registry.clone();
+        let w = state.backend.fb.info.width;
+        let h = state.backend.fb.info.height;
+        state.protocol.register_global_with_post_bind(
+            "wl_seat", 7,
+            move || {
+                let seat = lunas::protocol::LunasSeat {
+                    keyboard_registry: kb_reg.clone(),
+                    screen_w: w,
+                    screen_h: h,
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(seat))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::wl_seat::WlSeat
+            >(id, inner),
+            Some(alloc::boxed::Box::new(|obj_id, client| {
+                // Send capabilities: keyboard present
+                use wayland_proto::wl::protocols::common::wl_seat::{Event, CAP_KEYBOARD};
+                client.send_event(obj_id, Event::Capabilities { capabilities: CAP_KEYBOARD })
+                    .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
+            })),
+        );
+    }
+
+    // wl_output — display info
+    {
+        let w = state.backend.fb.info.width as i32;
+        let h = state.backend.fb.info.height as i32;
+        state.protocol.register_global_with_post_bind(
+            "wl_output", 4,
+            move || {
+                let out = lunas::protocol::LunasOutput {
+                    screen_w: w as u32,
+                    screen_h: h as u32,
+                    refresh_mhz: 60_000,
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(out))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::wl_output::WlOutput
+            >(id, inner),
+            Some(alloc::boxed::Box::new(move |obj_id, client| {
+                use wayland_proto::wl::protocols::common::wl_output::{
+                    Event, SUBPIXEL_UNKNOWN, TRANSFORM_NORMAL, MODE_CURRENT,
+                };
+                client.send_event(obj_id, Event::Geometry {
+                    x: 0, y: 0,
+                    physical_width: 527, physical_height: 296,
+                    subpixel: SUBPIXEL_UNKNOWN,
+                    make: alloc::string::String::from("Eclipse OS"),
+                    model: alloc::string::String::from("Virtual Display"),
+                    transform: TRANSFORM_NORMAL,
+                }).map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)?;
+                client.send_event(obj_id, Event::Mode {
+                    flags: MODE_CURRENT,
+                    width: w,
+                    height: h,
+                    refresh: 60_000,
+                }).map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)?;
+                client.send_event(obj_id, Event::Scale { factor: 1 })
+                    .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)?;
+                client.send_event(obj_id, Event::Done)
+                    .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
+            })),
+        );
+    }
+
+    // ── Start Wayland Unix socket server ─────────────────────────────────────
+    let mut wayland_socket = lunas::wayland_socket::WaylandSocketServer::new("/tmp/wayland-0");
+    if wayland_socket.is_none() {
+        eprintln!("[LUNAS] Warning: could not bind /tmp/wayland-0 — standard Wayland clients won't connect");
+    }
+
     let self_pid = unsafe { libc::getpid() as u32 };
     let _ = eclipse_syscall::call::register_log_hud(self_pid);
 
     loop {
+        // Accept and process standard Wayland socket clients
+        if let Some(ref mut sock) = wayland_socket {
+            if sock.poll(&mut state.protocol) {
+                state.dirty = true;
+            }
+        }
         state.handle_ipc();
         state.update();
         state.render();
