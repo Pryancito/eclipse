@@ -1,20 +1,30 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_vendor = "eclipse", no_std)]
+#![cfg_attr(target_vendor = "eclipse", no_main)]
 
+#[cfg(target_vendor = "eclipse")]
 extern crate alloc;
+#[cfg(target_vendor = "eclipse")]
 extern crate eclipse_std as std;
 
+#[cfg(target_vendor = "eclipse")]
 use std::prelude::v1::*;
+#[cfg(target_vendor = "eclipse")]
 use alloc::rc::Rc;
 #[cfg(target_vendor = "eclipse")]
 use alloc::vec::Vec;
 #[cfg(target_vendor = "eclipse")]
 use alloc::boxed::Box;
+#[cfg(target_vendor = "eclipse")]
 use core::cell::RefCell;
+#[cfg(target_vendor = "eclipse")]
 use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
+#[cfg(target_vendor = "eclipse")]
 use wayland_proto::EclipseWaylandConnection;
+#[cfg(target_vendor = "eclipse")]
 use wayland_proto::wl::protocols::common::wl_registry;
+#[cfg(target_vendor = "eclipse")]
 use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
+#[cfg(target_vendor = "eclipse")]
 use eclipse_syscall::{self, flag, ProcessInfo};
 use heapless::String as HString;
 
@@ -213,11 +223,13 @@ fn open_sidewind_window(
     Some((vaddr as *mut u32, size_bytes, w, h))
 }
 
+#[cfg(target_vendor = "eclipse")]
 fn process_name_bytes(name: &[u8; 16]) -> &[u8] {
     let end = name.iter().position(|&b| b == 0).unwrap_or(16);
     &name[..end]
 }
 
+#[cfg(target_vendor = "eclipse")]
 fn find_pid_by_name(want: &[u8]) -> Option<u32> {
     let mut list = [ProcessInfo::default(); 48];
     let count = eclipse_syscall::get_process_list(&mut list).ok()?;
@@ -266,6 +278,7 @@ impl DrawTarget for SurfaceDrawTarget {
     }
 }
 
+#[cfg(target_vendor = "eclipse")]
 #[no_mangle]
 pub fn main() {
     std::init_runtime();
@@ -374,7 +387,6 @@ pub fn main() {
 
     // Wayland en Lunas aún no crea ventanas de shell por sí solo; SideWind es la ruta que el
     // compositor usa para mapear /tmp/* y mostrar un marco en el escritorio.
-    #[cfg(target_vendor = "eclipse")]
     {
         let name = sidewind_shm_name(self_pid);
         let name_str = name.as_str();
@@ -643,9 +655,9 @@ pub fn main() {
             }
         }
     }
+}
 
-    #[cfg(not(target_vendor = "eclipse"))]
-    loop {
-        std::thread::yield_now();
-    }
+#[cfg(not(target_vendor = "eclipse"))]
+fn main() {
+    println!("Solo soportado en Eclipse OS");
 }
