@@ -1390,7 +1390,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     // Replace current process with ELF binary
     let current_pid = current_process_id().expect("exec called without current process");
     match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
-        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames)) => {
+        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames, tls_base)) => {
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
@@ -1404,7 +1404,29 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                         r.brk_current = max_vaddr;
                     }
                     proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
+                    // Persist the TLS base so the scheduler restores FS_BASE on
+                    // future context switches back to this process.
+                    if tls_base != 0 {
+                        proc.fs_base = tls_base;
+                    }
                     crate::process::update_process(pid, proc);
+                }
+            }
+
+            // Apply TLS base (FS_BASE MSR) immediately — jump_to_userspace uses
+            // iretq and bypasses the normal scheduler context-switch path that
+            // would otherwise write the MSR.
+            if tls_base != 0 {
+                unsafe {
+                    use core::arch::asm;
+                    let msr_fs_base = 0xC0000100u32;
+                    let low  = tls_base as u32;
+                    let high = (tls_base >> 32) as u32;
+                    asm!("wrmsr",
+                         in("ecx") msr_fs_base,
+                         in("eax") low,
+                         in("edx") high,
+                         options(nomem, nostack, preserves_flags));
                 }
             }
             

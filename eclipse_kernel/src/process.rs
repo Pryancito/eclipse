@@ -381,7 +381,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     crate::serial::serial_printf(format_args!("[spawn] create_process_paging returned cr3=0x{:x}\n", cr3));
 
     crate::serial::serial_print("[spawn] calling load_elf_into_space\n");
-    let (entry_point, max_vaddr, segment_frames) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    let (entry_point, max_vaddr, segment_frames, tls_base) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
     crate::serial::serial_printf(format_args!("[spawn] load_elf_into_space done entry=0x{:x}\n", entry_point));
     let (phdr_va, phnum, phentsize) = crate::elf_loader::get_elf_phdr_info(elf_data)?;
 
@@ -397,6 +397,9 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
             let n = core::cmp::min(name.len(), 16);
             proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
             proc.mem_frames += segment_frames;
+            if tls_base != 0 {
+                proc.fs_base = tls_base;
+            }
             update_process(pid, proc);
         }
         crate::fd::fd_init_stdio(pid);

@@ -41,6 +41,7 @@ struct Elf64ProgramHeader {
 }
 
 const PT_LOAD: u32 = 1;
+const PT_TLS:  u32 = 7;   // Thread-Local Storage template segment
 const PF_X: u32 = 1;  // Segment executable
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
@@ -49,8 +50,9 @@ const MIN_ENTRY_POINT: u64 = 0x80;
 
 
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado
-/// Devuelve Ok((entry_point, max_vaddr, segment_frames))
-pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+/// Devuelve Ok((entry_point, max_vaddr, segment_frames, tls_base))
+/// tls_base is the FS_BASE value (TCB address) for TLS, or 0 if no TLS segment.
+pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64, u64, u64), &'static str> {
     serial::serial_printf(format_args!("[load_elf] start len={} cr3=0x{:x}\n", elf_data.len(), page_table_phys));
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: File too small");
@@ -94,6 +96,25 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
 
     let mut mapped_count = 0;
     let mut max_vaddr: u64 = 0;
+
+    // Collect PT_TLS segment info (if any) for TLS setup after loading.
+    let mut tls_filesz:       u64 = 0;
+    let mut tls_memsz:        u64 = 0;
+    let mut tls_file_offset:  u64 = 0;
+    let mut tls_align:        u64 = 8;
+    let mut has_tls = false;
+    for i in 0..ph_count {
+        let off = ph_offset + i * ph_size;
+        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_TLS {
+            tls_filesz      = ph.p_filesz;
+            tls_memsz       = ph.p_memsz;
+            tls_file_offset = ph.p_offset;
+            tls_align       = if ph.p_align > 1 { ph.p_align } else { 8 };
+            has_tls = true;
+            break;
+        }
+    }
 
     // Iterate over program headers and load segments
     for i in 0..ph_count {
@@ -178,7 +199,98 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
     // Align max_vaddr to next 4KB page
     let max_vaddr_aligned = (max_vaddr + 0xFFF) & !0xFFF;
     serial::serial_printf(format_args!("[load_elf] successfully loaded: entry=0x{:x} max_v=0x{:x} mapped_pages={}\n", header.e_entry, max_vaddr_aligned, mapped_count));
-    Ok((header.e_entry, max_vaddr_aligned, (mapped_count as u64)))
+
+    // ── TLS (Thread-Local Storage) setup ──────────────────────────────────────
+    // x86-64 ELF TLS variant II:
+    //   Layout: [tls_memsz bytes of data/BSS][TCB]
+    //   %fs points to the TCB; the TCB's first word is its own address (self-ptr).
+    //   TLS variables live at *negative* offsets from %fs.
+    //
+    // Without this, any #[thread_local] static (e.g. errno) accessed when
+    // fs_base == 0 will crash at address (0 + negative_offset) e.g. 0xfffffffffffffffc.
+    let mut tls_base: u64 = 0;
+    if has_tls && tls_memsz > 0 {
+        // Sanitize tls_align: ELF requires it to be 0 or a power of 2.
+        // If the value is not a power of 2 (or is 0/1), fall back to 8.
+        let tls_align = if tls_align >= 2 && tls_align.is_power_of_two() { tls_align } else { 8 };
+        // Align memsz up to tls_align so the TCB starts on the right boundary.
+        let aligned_memsz = (tls_memsz + tls_align - 1) & !(tls_align - 1);
+        // TCB (Thread Control Block) is 8 bytes: just the self-pointer mandated by the SV ABI.
+        const TCB_SIZE: u64 = 8;
+        let tls_total = aligned_memsz + TCB_SIZE;
+
+        // Place TLS block one guard page after the last loaded segment.
+        let tls_virt_start = max_vaddr_aligned + 0x1000;
+        let tls_pages = ((tls_total + 0xFFF) & !0xFFF) / 0x1000;
+
+        let mut tls_ok = true;
+        for i in 0..tls_pages as u64 {
+            match crate::memory::alloc_phys_frame_for_anon_mmap() {
+                Some(phys) => {
+                    let vaddr = tls_virt_start + i * 0x1000;
+                    unsafe { core::ptr::write_bytes(crate::memory::phys_to_virt(phys) as *mut u8, 0, 0x1000); }
+                    crate::memory::map_user_page_4kb(
+                        page_table_phys, vaddr, phys,
+                        crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER,
+                    );
+                    mapped_count += 1;
+                }
+                None => { tls_ok = false; break; }
+            }
+        }
+
+        if tls_ok {
+            // Copy TDATA (initialised TLS data) from the ELF file.
+            if tls_filesz > 0 {
+                let src_end = (tls_file_offset as usize).saturating_add(tls_filesz as usize);
+                if src_end <= elf_data.len() {
+                    let mut src_off = 0usize;
+                    while src_off < tls_filesz as usize {
+                        let dst_vaddr  = tls_virt_start + src_off as u64;
+                        let page_vaddr = dst_vaddr & !0xFFF;
+                        let page_off   = (dst_vaddr & 0xFFF) as usize;
+                        if let Some(phys) = crate::memory::get_user_page_phys(page_table_phys, page_vaddr) {
+                            let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
+                            let space  = 0x1000 - page_off;
+                            let remain = tls_filesz as usize - src_off;
+                            let chunk  = space.min(remain);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    elf_data.as_ptr().add(tls_file_offset as usize + src_off),
+                                    kptr.add(page_off),
+                                    chunk,
+                                );
+                            }
+                            src_off += chunk;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Write TCB self-pointer at tls_virt_start + aligned_memsz.
+            let tcb_virt     = tls_virt_start + aligned_memsz;
+            let tcb_pg_vaddr = tcb_virt & !0xFFF;
+            let tcb_pg_off   = (tcb_virt & 0xFFF) as usize;
+            if let Some(phys) = crate::memory::get_user_page_phys(page_table_phys, tcb_pg_vaddr) {
+                let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
+                unsafe {
+                    core::ptr::write_unaligned(kptr.add(tcb_pg_off) as *mut u64, tcb_virt);
+                }
+            }
+
+            tls_base = tcb_virt;
+            serial::serial_printf(format_args!(
+                "[load_elf] TLS: memsz={} filesz={} align={} tls_base=0x{:x}\n",
+                tls_memsz, tls_filesz, tls_align, tls_base,
+            ));
+        } else {
+            serial::serial_print("[load_elf] WARNING: TLS page alloc failed — TLS disabled\n");
+        }
+    }
+
+    Ok((header.e_entry, max_vaddr_aligned, mapped_count as u64, tls_base))
 }
 
 /// Preparar el stack de usuario
@@ -211,7 +323,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     // segments lived in the discarded first cr3 → execution of zero bytes → crash.
     let cr3 = crate::memory::create_process_paging();
 
-    let (entry_point, max_vaddr, segment_frames) = match load_elf_into_space(cr3, elf_data) {
+    let (entry_point, max_vaddr, segment_frames, tls_base) = match load_elf_into_space(cr3, elf_data) {
         Ok(res) => res,
         Err(e) => {
             serial::serial_print("ELF: Load failed: ");
@@ -244,11 +356,14 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         return None;
     }
 
-    // Add segment frames to the process accounting.
+    // Add segment frames and TLS base to the process accounting.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(p) = table[pid as usize].as_mut() {
             p.mem_frames += segment_frames;
+            if tls_base != 0 {
+                p.fs_base = tls_base;
+            }
         }
     });
 
@@ -309,9 +424,9 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static st
 }
 
 /// Replace current process image with ELF binary (for exec())
-/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames))
+/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames, tls_base))
 /// Reemplazar la imagen del proceso actual con un nuevo ELF (backend de exec)
-pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64, u64), &'static str> {
+pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64, u64, u64), &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -390,9 +505,9 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u6
 
 
 
-    let (entry_point, max_vaddr, segment_frames) = load_elf_into_space(page_table_phys, elf_data)?;
+    let (entry_point, max_vaddr, segment_frames, tls_base) = load_elf_into_space(page_table_phys, elf_data)?;
     let (phdr_va, phnum, phentsize) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
-    Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames))
+    Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames, tls_base))
 }
 
 /// Jump to entry point in userspace (Ring 3)
