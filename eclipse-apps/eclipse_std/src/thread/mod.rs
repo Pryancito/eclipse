@@ -18,6 +18,7 @@ pub struct JoinHandle<T> {
 
 impl Thread {
     /// Get the current thread (TID del scheduler).
+    /// Get the current thread (TID del scheduler).
     pub fn current() -> Thread {
         let tid = eclipse_syscall::call::gettid() as u64;
         Thread {
@@ -26,6 +27,13 @@ impl Thread {
                 join_cell: ptr::null_mut(),
             },
         }
+    }
+
+    /// Signal the thread to wake up from a park() call.
+    pub fn unpark(&self) {
+        // En una implementación real, esto interactuaría con un semáforo o condvar por hilo.
+        // Por ahora, como no tenemos un thread-local storage completo que std reconozca,
+        // esto es un NO-OP que permite compilar crates que lo usan (como once_cell).
     }
 
     /// Get thread ID
@@ -114,4 +122,16 @@ pub fn yield_now() {
     unsafe {
         crate::libc::yield_cpu();
     }
+}
+
+/// Block the current thread until another thread calls unpark() on it.
+pub fn park() {
+    // Stub implementation to satisfy once_cell and other crates.
+    // In a real std, this would wait on a thread-local condition variable.
+    yield_now();
+}
+
+/// Block the current thread until another thread calls unpark() or a timeout occurs.
+pub fn park_timeout(_dur: Duration) {
+    yield_now();
 }

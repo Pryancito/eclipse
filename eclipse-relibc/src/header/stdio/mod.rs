@@ -1,8 +1,8 @@
 //! stdio.h - Standard I/O
 use crate::types::*;
-use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close};
-use eclipse_syscall::flag::{O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
-use eclipse_syscall::number::{SYS_OPEN, SYS_LSEEK};
+use crate::eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close};
+use crate::eclipse_syscall::flag::{O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
+use crate::eclipse_syscall::number::{SYS_OPEN, SYS_LSEEK};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, Ordering};
 

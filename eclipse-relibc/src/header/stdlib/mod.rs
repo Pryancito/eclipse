@@ -1,6 +1,6 @@
 //! stdlib.h - Standard library
 use crate::types::*;
-use eclipse_syscall::call::exit as sys_exit;
+use crate::eclipse_syscall::call::exit as sys_exit;
 use crate::header::string::strlen;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]

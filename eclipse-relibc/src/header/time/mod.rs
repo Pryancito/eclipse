@@ -171,7 +171,7 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
     if req.is_null() {
         return -1;
     }
-    use eclipse_syscall::number::SYS_NANOSLEEP;
+    use crate::eclipse_syscall::number::SYS_NANOSLEEP;
     let result = eclipse_syscall::syscall2(
         SYS_NANOSLEEP,
         req as usize,

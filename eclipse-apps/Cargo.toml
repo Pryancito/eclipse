@@ -12,7 +12,7 @@ members = [
     "glxgears",
 ]
 # glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.
-exclude = ["libs/ipc_tests", "xfwl4", "smithay_app"]
+exclude = ["libs/ipc_tests", "smithay_app", "xfwl4"]
 
 [workspace.package]
 version = "0.2.0"
@@ -63,3 +63,55 @@ panic = "abort"
 [patch.crates-io]
 libc = { path = "../eclipse-relibc" }
 std = { package = "eclipse_std", path = "eclipse_std" }
+libloading = { path = "libs/libloading" }
+
+[patch.crates-io.gettext-rs]
+path = "libs/gettext-rs-stub"
+[patch.crates-io.gettext-sys]
+path = "libs/gettext-sys-stub"
+[patch.crates-io.libudev-sys]
+path = "libs/libudev-sys-stub"
+[patch.crates-io.libseat-sys]
+path = "libs/libseat-sys-stub"
+[patch.crates-io.libdisplay-info-sys]
+path = "libs/libdisplay-info-sys-stub"
+[patch.crates-io.input-sys]
+path = "libs/input-sys-stub"
+[patch.crates-io.pixman-sys]
+path = "libs/pixman-sys-stub"
+[patch.crates-io.gbm-sys]
+path = "libs/gbm-sys-stub"
+[patch.crates-io.drm-sys]
+path = "libs/drm-sys-stub"
+[patch.crates-io.glib-sys]
+path = "libs/glib-sys-stub"
+[patch.crates-io.gobject-sys]
+path = "libs/gobject-sys-stub"
+[patch.crates-io.gio-sys]
+path = "libs/gio-sys-stub"
+[patch.crates-io.gmodule-sys]
+path = "libs/gmodule-sys-stub"
+[patch.crates-io.pango-sys]
+path = "libs/pango-sys-stub"
+[patch.crates-io.cairo-sys-rs]
+path = "libs/cairo-sys-stub"
+[patch.crates-io.gdk-pixbuf-sys]
+path = "libs/gdk-pixbuf-sys-stub"
+[patch.crates-io.gdk-sys]
+path = "libs/gdk-sys-stub"
+[patch.crates-io.gtk-sys]
+path = "libs/gtk-sys-stub"
+[patch.crates-io.atk-sys]
+path = "libs/atk-sys-stub"
+[patch.crates-io.once_cell]
+path = "libs/once_cell_stub"
+[patch.crates-io.libxfce4util-sys]
+path = "libs/libxfce4util-sys-stub"
+[patch.crates-io.libxfce4ui-sys]
+path = "libs/libxfce4ui-sys-stub"
+[patch.crates-io.xfconf-sys]
+path = "libs/xfconf-sys-stub"
+[patch.crates-io.libxfce4kbd-private-sys]
+path = "libs/libxfce4kbd-private-sys-stub"
+[patch.crates-io.exo-sys]
+path = "libs/exo-sys-stub"

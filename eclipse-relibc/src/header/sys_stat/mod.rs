@@ -1,5 +1,5 @@
 use crate::types::*;
-use eclipse_syscall::call::mkdir as sys_mkdir;
+use crate::eclipse_syscall::call::mkdir as sys_mkdir;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]

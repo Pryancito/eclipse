@@ -1,9 +1,9 @@
 //! sys/eclipse.rs - Eclipse OS specific extensions
-pub use eclipse_syscall::{SystemStats, InputEvent};
+pub use crate::eclipse_syscall::{SystemStats, InputEvent};
 use crate::types::*;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
-pub use eclipse_syscall::ProcessInfo;
+pub use crate::eclipse_syscall::ProcessInfo;
 
 #[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
 #[derive(Debug, Clone, Copy, Default)]

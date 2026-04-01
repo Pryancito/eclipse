@@ -22,7 +22,7 @@ pub unsafe extern "C" fn signal(_signum: c_int, _handler: Option<OsSigHandlerPtr
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
-    use eclipse_syscall::call::kill;
+    use crate::eclipse_syscall::call::kill;
     match kill(pid as usize, sig as usize) {
         Ok(_) => 0,
         Err(e) => {
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int {
-    use eclipse_syscall::call::sigaction;
+    use crate::eclipse_syscall::call::sigaction;
     match sigaction(signum as usize, act as usize, oldact as usize) {
         Ok(_) => 0,
         Err(e) => {

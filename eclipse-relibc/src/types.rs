@@ -8,6 +8,7 @@ use core::{
     clone::Clone,
     cmp::{PartialEq, Eq},
     default::Default,
+    fmt::Debug,
     marker::Copy,
     option::Option,
     prelude::v1::derive,

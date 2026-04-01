@@ -1,9 +1,10 @@
 [build]
-target = "../x86_64-unknown-eclipse.json"
+target = "/home/moebius/eclipse/x86_64-unknown-eclipse.json"
 
 [target.x86_64-unknown-eclipse]
 rustflags = [
-    "--sysroot", "/home/moebius/eclipse/sysroot-v2",
+    "-Z", "unstable-options",
+    # "--sysroot", "/home/moebius/eclipse/sysroot-v2",
     "-C", "link-arg=-L/home/moebius/eclipse",
     "-C", "link-arg=-Tlinker.ld",
     "-C", "relocation-model=static",

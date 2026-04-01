@@ -36,8 +36,8 @@ pub const IPC_STAT: c_int = 2;
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_int {
-    use eclipse_syscall::call::open;
-    use eclipse_syscall::flag::{O_CREAT, O_EXCL, O_RDWR};
+    use crate::eclipse_syscall::call::open;
+    use crate::eclipse_syscall::flag::{O_CREAT, O_EXCL, O_RDWR};
 
     let mut path = [0u8; 32];
     let prefix = b"shm:";
@@ -78,8 +78,8 @@ pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_in
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn shmat(shmid: c_int, _shmaddr: *const c_void, _shmflg: c_int) -> *mut c_void {
-    use eclipse_syscall::call::{mmap, fstat, Stat};
-    use eclipse_syscall::flag::{PROT_READ, PROT_WRITE, MAP_SHARED};
+    use crate::eclipse_syscall::call::{mmap, fstat, Stat};
+    use crate::eclipse_syscall::flag::{PROT_READ, PROT_WRITE, MAP_SHARED};
 
     let mut st = Stat::default();
     if fstat(shmid as usize, &mut st).is_err() {
@@ -116,7 +116,7 @@ pub unsafe extern "C" fn shmdt(_shmaddr: *const c_void) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn shmctl(shmid: c_int, cmd: c_int, buf: *mut shmid_ds) -> c_int {
-    use eclipse_syscall::call::{fstat, Stat};
+    use crate::eclipse_syscall::call::{fstat, Stat};
     
     if cmd == IPC_RMID {
          // IPC_RMID via shmctl usually unlinks the shared memory segment.

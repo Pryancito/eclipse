@@ -1,2 +1,2 @@
 //! Syscall wrappers for Eclipse OS
-pub use eclipse_syscall::*;
+pub use crate::eclipse_syscall::*;

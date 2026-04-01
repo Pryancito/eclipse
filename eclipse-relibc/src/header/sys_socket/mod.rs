@@ -3,7 +3,7 @@ use crate::types::*;
 use crate::header::sys_uio::iovec;
 use core::ffi::c_int;
 use core::mem::size_of;
-use eclipse_syscall::call::{socket as sys_socket, bind as sys_bind, listen as sys_listen, accept as sys_accept, connect as sys_connect};
+use crate::eclipse_syscall::call::{socket as sys_socket, bind as sys_bind, listen as sys_listen, accept as sys_accept, connect as sys_connect};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn shutdown(_sockfd: c_int, _how: c_int) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn send(sockfd: c_int, buf: *const c_void, len: size_t, _flags: c_int) -> ssize_t {
-    use eclipse_syscall::call::write as sys_write;
+    use crate::eclipse_syscall::call::write as sys_write;
     let slice = core::slice::from_raw_parts(buf as *const u8, len);
     match sys_write(sockfd as usize, slice) {
         Ok(n) => n as ssize_t,
@@ -186,7 +186,7 @@ pub unsafe extern "C" fn send(sockfd: c_int, buf: *const c_void, len: size_t, _f
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn recv(sockfd: c_int, buf: *mut c_void, len: size_t, _flags: c_int) -> ssize_t {
-    use eclipse_syscall::call::read as sys_read;
+    use crate::eclipse_syscall::call::read as sys_read;
     let slice = core::slice::from_raw_parts_mut(buf as *mut u8, len);
     match sys_read(sockfd as usize, slice) {
         Ok(n) => n as ssize_t,

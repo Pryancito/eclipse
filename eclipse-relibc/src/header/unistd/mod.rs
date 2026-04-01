@@ -1,7 +1,7 @@
 //! unistd.h - POSIX OS API
 use crate::types::*;
 use crate::internal_alloc::{malloc, free};
-use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, fstat as sys_fstat, ftruncate as sys_ftruncate, Stat as sys_Stat};
+use crate::eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, fstat as sys_fstat, ftruncate as sys_ftruncate, Stat as sys_Stat};
 use crate::header::time::nanosleep;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn getpid() -> pid_t {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn fork() -> pid_t {
-    use eclipse_syscall::call::fork;
+    use crate::eclipse_syscall::call::fork;
     match fork() {
         Ok(pid) => pid as pid_t,
         Err(e) => {
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn setgid(_gid: gid_t) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
-    use eclipse_syscall::call::unlink;
+    use crate::eclipse_syscall::call::unlink;
     let path_str = core::ffi::CStr::from_ptr(pathname).to_str().unwrap_or("");
     match unlink(path_str) {
         Ok(_) => 0,
@@ -290,7 +290,7 @@ pub unsafe extern "C" fn setegid(_egid: gid_t) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn getppid() -> pid_t {
-    use eclipse_syscall::call::getppid;
+    use crate::eclipse_syscall::call::getppid;
     getppid() as pid_t
 }
 

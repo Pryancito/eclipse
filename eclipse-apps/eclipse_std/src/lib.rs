@@ -12,11 +12,15 @@
 #![no_std]
 #![cfg_attr(not(feature = "std_compat"), feature(alloc_error_handler))]
 #![feature(prelude_import)]
-#![feature(lang_items)]
 #![feature(core_intrinsics)]
+#![feature(panic_info_message)]
+#![feature(lang_items)]
 
 pub extern crate core;
 pub extern crate alloc;
+
+pub use core::panic::PanicInfo;
+pub use crate::env::OsStr;
 
 // Core functionality re-exports
 pub use core::option::Option::{self, Some, None};
@@ -28,27 +32,21 @@ pub use core::default::Default;
 pub use core::convert::{From, Into, AsRef, AsMut, TryFrom, TryInto};
 pub use core::iter::{Iterator, IntoIterator, Extend};
 pub use core::fmt::{self, Debug, Display};
-pub use core::u16;
-pub use core::u32;
-pub use core::u64;
-pub use core::i32;
-pub use core::f32;
-pub use core::f64;
+pub mod u8 { pub use core::u8::*; }
+pub mod u16 { pub use core::u16::*; }
+pub mod u32 { pub use core::u32::*; }
+pub mod u64 { pub use core::u64::*; }
+pub mod i8 { pub use core::i8::*; }
+pub mod i16 { pub use core::i16::*; }
+pub mod i32 { pub use core::i32::*; }
+pub mod f32 { pub use core::f32::*; }
+pub mod f64 { pub use core::f64::*; }
+pub mod usize { pub use core::usize::*; }
+pub mod isize { pub use core::isize::*; }
 
 pub extern crate libc; // This is eclipse-libc-posix from Cargo.toml
 pub use alloc::vec as vec;
 pub use alloc::format as format;
-
-pub mod rc { pub use alloc::rc::*; }
-pub mod boxed { pub use alloc::boxed::*; }
-
-use core::panic::PanicInfo;
-
-pub mod ffi {
-    pub use core::ffi::*;
-    pub use crate::libc::{c_char, c_int, c_long, c_void, size_t, pid_t, FILE};
-    pub use crate::env::{OsStr, OsString};
-}
 
 // Standard module re-exports (bridge to core)
 pub mod result { pub use core::result::*; }
@@ -83,6 +81,22 @@ pub mod fs;
 pub mod path;
 pub mod process;
 pub mod net;
+pub mod rc { pub use alloc::rc::*; }
+pub mod boxed { pub use alloc::boxed::*; }
+pub mod borrow {
+    pub use core::borrow::*;
+    pub use alloc::borrow::Cow;
+}
+pub mod ffi {
+    pub use core::ffi::*;
+    pub use alloc::ffi::{CString, NulError};
+    pub use crate::libc::{c_char, c_int, c_long, c_void, size_t, pid_t, FILE};
+    pub use crate::env::{OsStr, OsString};
+}
+pub mod cfg {
+    // Some crates try to use std::cfg as a module for internal reasons or nightly features.
+    // We provide a stub or re-export core macros if possible.
+}
 pub mod sync;
 pub mod env;
 pub mod time;
@@ -244,8 +258,10 @@ macro_rules! main {
 fn panic(info: &PanicInfo) -> ! {
     crate::eprintln!("\n!!! ECLIPSE APP PANIC !!!");
     if let Some(location) = info.location() {
-        crate::eprintln!("Location: {}:{}:{}", 
-            location.file(), location.line(), location.column());
+        let file = location.file();
+        let line = location.line();
+        let col = location.column();
+        crate::eprintln!("Location: {}:{}:{}", file, line, col);
     }
     
     // Exit with error code

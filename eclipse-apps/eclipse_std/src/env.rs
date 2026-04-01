@@ -1,6 +1,7 @@
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::sync::Mutex;
+use crate::path::PathBuf;
 
 // ============================================================================
 // Argumentos del proceso (argv)
@@ -50,7 +51,7 @@ pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(k: K, v: V) {
 pub fn remove_var<K: AsRef<OsStr>>(k: K) {
     let key = String::from(k.as_ref());
     let mut env = ENV.lock();
-    env.retain(|(a, _)| a != &key);
+    env.retain(|(a, _)| a != &key)
 }
 
 pub fn var<K: AsRef<OsStr>>(k: K) -> core::result::Result<String, VarError> {
@@ -64,12 +65,22 @@ pub fn var<K: AsRef<OsStr>>(k: K) -> core::result::Result<String, VarError> {
     Err(VarError::NotPresent)
 }
 
-pub fn home_dir() -> Option<crate::path::PathBuf> {
-    Some(crate::path::PathBuf::from(String::from("/")))
+pub fn home_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(String::from("/")))
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum VarError {
     NotPresent,
     NotUnicode(OsString),
+}
+
+pub mod consts {
+    pub const ARCH: &str = "x86_64";
+    pub const DLL_PREFIX: &str = "lib";
+    pub const DLL_SUFFIX: &str = ".so";
+    pub const EXE_PREFIX: &str = "";
+    pub const EXE_SUFFIX: &str = "";
+    pub const FAMILY: &str = "unix";
+    pub const OS: &str = "eclipse";
 }

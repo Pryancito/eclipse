@@ -1,2 +1,3 @@
-//! Unix-specific extensions to the standard library
+//! Unix-specific extensions
 pub mod io;
+pub mod ffi;
