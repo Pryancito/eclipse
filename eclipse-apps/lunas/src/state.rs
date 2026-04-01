@@ -92,6 +92,8 @@ pub struct LunasState {
     pub buffer_registry: SharedBuffers,
     /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
     pub keyboard_registry: SharedKeyboards,
+    /// Monotonically increasing serial number for Wayland protocol events.
+    pub wayland_serial: u32,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -148,6 +150,7 @@ impl LunasState {
             pending_surface_commits: Rc::new(RefCell::new(alloc::vec::Vec::new())),
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            wayland_serial: 1,
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -202,9 +205,10 @@ impl LunasState {
                             let keyboard_id = self.keyboard_registry.borrow().get(&focused_client).copied();
                             if let Some(kb_id) = keyboard_id {
                                 if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                    self.wayland_serial = self.wayland_serial.wrapping_add(1);
                                     let key_event = wl_keyboard::Event::Key {
-                                        serial: 0,
-                                        time: 0,
+                                        serial: self.wayland_serial,
+                                        time: self.counter as u32,
                                         key: scancode as u32,
                                         state: if state_val != 0 {
                                             wl_keyboard::KEY_STATE_PRESSED

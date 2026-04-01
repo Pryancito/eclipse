@@ -8,9 +8,6 @@ use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, Serve
 use wayland_proto::wl::protocols::common::*;
 use crate::compositor::{ShellWindow, WindowContent};
 
-#[cfg(target_vendor = "eclipse")]
-use libc::{open, mmap, munmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
-#[cfg(not(target_vendor = "eclipse"))]
 use libc::{open, mmap, munmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -242,7 +239,7 @@ fn map_shm_file(pid: u32, size: usize) -> usize {
         )
     };
     unsafe { close(fd) };
-    if vaddr.is_null() || vaddr == usize::MAX as *mut core::ffi::c_void {
+    if vaddr.is_null() || vaddr == libc::MAP_FAILED {
         0
     } else {
         vaddr as usize
@@ -400,7 +397,7 @@ impl ObjectLogic for LunasXdgWmBase {
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
                 })));
-                client.add_object(id, Object::new::<xdg_wm_base::XdgWmBase>(id, xdg_surf));
+                client.add_object(id, Object::new::<xdg_surface::XdgSurface>(id, xdg_surf));
                 Ok(())
             }
             2 => Ok(()), // pong — ignored

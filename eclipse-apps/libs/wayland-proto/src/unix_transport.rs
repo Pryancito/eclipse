@@ -93,6 +93,7 @@ impl UnixSocketConnection {
 
     /// Set this socket non-blocking.
     pub fn set_nonblocking(&self) {
+        // Ignore errors: a blocking socket is sub-optimal but not fatal.
         unsafe { fcntl(self.fd, F_SETFL, O_NONBLOCK) };
     }
 }
@@ -133,8 +134,7 @@ impl Connection for UnixSocketConnection {
 
         // Return whatever we have; the caller (WaylandServer / handshake loop)
         // will call recv again if it needs more data.
-        let data = buf.clone();
-        buf.clear();
+        let data = core::mem::take(&mut *buf);
         Ok((data, Vec::new()))
     }
 }

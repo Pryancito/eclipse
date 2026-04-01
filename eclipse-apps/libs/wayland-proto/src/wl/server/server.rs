@@ -123,29 +123,21 @@ impl WaylandServer {
              let name = match raw.args[0] { crate::wl::Payload::UInt(n) => n, _ => return Err(ServerError::MessageDeserializeError) };
              let id = match raw.args[3] { crate::wl::Payload::NewId(id) => id, _ => return Err(ServerError::MessageDeserializeError) };
 
-             if let Some(global) = self.globals.iter().find(|g| g.name == name) {
-                  let logic = (global.logic_factory)();
-                  let new_obj = (global.interface_type)(id, logic);
-                  let post_bind = global.post_bind.as_ref().map(|f| {
-                      // We need to call the callback after adding the object.
-                      // Capture a raw function pointer to avoid borrowing `global`
-                      // while we mutably borrow `client` below.
-                      // SAFETY: the Box<dyn Fn> lives as long as self.globals.
-                      let ptr: *const dyn Fn(ObjectId, &mut Client) -> Result<(), ServerError> = &**f;
-                      ptr
-                  });
-                  let client = self.clients.get_mut(&client_id).ok_or(ServerError::ClientNotFound)?;
-                  client.add_object(id, new_obj);
-                  if let Some(cb_ptr) = post_bind {
-                      // SAFETY: the Box<dyn Fn> is owned by self.globals which
-                      // lives for the lifetime of self. We released the borrow on
-                      // self.globals above and now only hold &mut client, so
-                      // there is no aliasing.
-                      let cb = unsafe { &*cb_ptr };
-                      let _ = cb(id.as_id(), client);
-                  }
-             } else {
-                  return Err(ServerError::UnknownGlobal);
+             let global_idx = self.globals.iter().position(|g| g.name == name)
+                  .ok_or(ServerError::UnknownGlobal)?;
+
+             // Call logic_factory and interface_type using index (temporary borrows).
+             let logic = (self.globals[global_idx].logic_factory)();
+             let new_obj = (self.globals[global_idx].interface_type)(id, logic);
+
+             // Add the new object to the client.
+             let client = self.clients.get_mut(&client_id).ok_or(ServerError::ClientNotFound)?;
+             client.add_object(id, new_obj);
+
+             // Invoke post_bind callback if present.
+             // Borrow self.globals immutably (different field from self.clients).
+             if let Some(ref cb) = self.globals[global_idx].post_bind {
+                  let _ = cb(id.as_id(), client);
              }
         }
 

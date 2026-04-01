@@ -48,7 +48,7 @@ impl WaylandSocketServer {
         // ── Accept new clients ──────────────────────────────────────────────
         while let Some(conn) = self.listener.accept_nonblocking() {
             let id = ClientId(self.next_id);
-            self.next_id = self.next_id.wrapping_add(1).max(UNIX_CLIENT_ID_BASE);
+            self.next_id = if self.next_id == u32::MAX { UNIX_CLIENT_ID_BASE } else { self.next_id + 1 };
 
             // Coerce Rc<RefCell<UnixSocketConnection>> → Rc<RefCell<dyn Connection>>
             let conn_rc: Rc<RefCell<dyn Connection>> = Rc::new(RefCell::new(conn));
