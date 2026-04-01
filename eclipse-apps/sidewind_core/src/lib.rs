@@ -66,6 +66,15 @@ impl SideWindMessage {
             name: [0; 32],
         }
     }
+
+    pub fn new_destroy() -> Self {
+        Self {
+            tag: SIDEWIND_TAG,
+            op: SWND_OP_DESTROY,
+            x: 0, y: 0, w: 0, h: 0,
+            name: [0; 32],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +119,18 @@ mod tests {
         let msg = SideWindMessage::new_commit();
         assert_eq!(msg.tag, SIDEWIND_TAG);
         assert_eq!(msg.op, SWND_OP_COMMIT);
+        assert_eq!(msg.x, 0);
+        assert_eq!(msg.y, 0);
+        assert_eq!(msg.w, 0);
+        assert_eq!(msg.h, 0);
+        assert_eq!(msg.name, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_new_destroy() {
+        let msg = SideWindMessage::new_destroy();
+        assert_eq!(msg.tag, SIDEWIND_TAG);
+        assert_eq!(msg.op, SWND_OP_DESTROY);
         assert_eq!(msg.x, 0);
         assert_eq!(msg.y, 0);
         assert_eq!(msg.w, 0);

@@ -5,7 +5,7 @@ use std::prelude::v1::*;
 pub use eclipse_ipc::prelude::*;
 use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
-use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
+use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES, find_next_focusable};
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
@@ -244,8 +244,12 @@ pub fn handle_sidewind_message(
                         }
                     }
                     *window_count = count - 1;
-                    if input_state.focused_window == Some(w_idx) { input_state.focused_window = None; }
-                    else if let Some(f) = input_state.focused_window { if f > w_idx { input_state.focused_window = Some(f - 1); } }
+                    let new_count = *window_count;
+                    if input_state.focused_window == Some(w_idx) {
+                        // The removed window had focus; transfer it to the topmost remaining window.
+                        // After the array shift, windows[0..new_count] no longer contains w_idx.
+                        input_state.focused_window = find_next_focusable(windows, new_count, None);
+                    } else if let Some(f) = input_state.focused_window { if f > w_idx { input_state.focused_window = Some(f - 1); } }
                     if input_state.dragging_window == Some(w_idx) { input_state.dragging_window = None; }
                     else if let Some(d) = input_state.dragging_window { if d > w_idx { input_state.dragging_window = Some(d - 1); } }
                     if input_state.resizing_window == Some(w_idx) { input_state.resizing_window = None; }

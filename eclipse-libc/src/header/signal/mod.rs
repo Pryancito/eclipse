@@ -19,10 +19,11 @@ pub unsafe extern "C" fn signal(_signum: c_int, _handler: Option<OsSigHandlerPtr
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kill(pid: pid_t, _sig: c_int) -> c_int {
-    let res = eclipse_syscall::syscall1(
+pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
+    let res = eclipse_syscall::syscall2(
         eclipse_syscall::number::SYS_KILL,
-        pid as usize
+        pid as usize,
+        sig as usize,
     );
     if res == 0 { 0 } else { -1 }
 }

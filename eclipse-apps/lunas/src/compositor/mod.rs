@@ -184,11 +184,22 @@ impl ExternalSurface {
 pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -> Option<usize> {
     for i in (0..count).rev() {
         let w = &windows[i];
-        if w.content != WindowContent::None && !w.minimized && w.contains(px, py) {
+        if w.content != WindowContent::None && !w.minimized && !w.closing && w.contains(px, py) {
             return Some(i);
         }
     }
     None
+}
+
+/// Find the topmost focusable (non-None, non-minimized, non-closing) window in `windows[..count]`,
+/// optionally excluding the window at index `exclude`.
+pub fn find_next_focusable(windows: &[ShellWindow], count: usize, exclude: Option<usize>) -> Option<usize> {
+    (0..count).rev().find(|&i| {
+        exclude.map_or(true, |ex| i != ex)
+            && windows[i].content != WindowContent::None
+            && !windows[i].minimized
+            && !windows[i].closing
+    })
 }
 
 pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: usize) -> Option<usize> {
@@ -263,6 +274,29 @@ mod tests {
             },
         ];
         assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(1));
+    }
+
+    #[test]
+    fn test_focus_under_cursor_skips_closing() {
+        // A closing window on top should not intercept focus; the window below it should.
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 200, h: 200,
+                content: WindowContent::InternalDemo,
+                ..Default::default()
+            },
+            ShellWindow {
+                x: 50, y: 50, w: 100, h: 100,
+                content: WindowContent::InternalDemo,
+                closing: true, // This window is being closed (invisible)
+                ..Default::default()
+            },
+        ];
+        // The closing window (index 1) overlaps at (75, 75); it must be skipped.
+        // The window below (index 0) should receive focus.
+        assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(0));
+        // Outside both windows → None
+        assert_eq!(focus_under_cursor(250, 250, &windows, 2), None);
     }
 
     #[test]
