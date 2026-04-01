@@ -1,11 +1,8 @@
 use std::rc::Rc;
 use std::vec::Vec;
 use std::boxed::Box;
-use core::cell::{Ref, RefCell};
-use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
+use core::cell::RefCell;
 use wayland_proto::EclipseWaylandConnection;
-use wayland_proto::wl::protocols::common::wl_registry;
-use wayland_proto::wl::protocols::common::wl_display::WlDisplay;
 use eclipse_syscall::{self, flag, ProcessInfo};
 use heapless::String as HString;
 
@@ -204,59 +201,7 @@ impl TerminalApp {
         }
         let lunas_pid = lunas_pid.unwrap();
 
-        // 1. Wayland Handshake
         let connection = Rc::new(RefCell::new(EclipseWaylandConnection::new(lunas_pid, self_pid)));
-        let mut display = WlDisplay::new(connection.clone(), ObjectId(1));
-        if display.get_registry(NewId(2)).is_err() {
-            std::println!("Terminal Error: Failed to get registry");
-            return None;
-        }
-
-        let mut registry = wl_registry::WlRegistry::new(connection.clone(), ObjectId(2));
-        let mut compositor_id = None;
-        let mut shm_id = None;
-
-        std::println!("Terminal: Starting Wayland handshake...");
-        'handshake: loop {
-            let res = (*connection).borrow_mut().recv();
-            if let Err(e) = res {
-                if e == wayland_proto::wl::connection::RecvError::InvalidMessage {
-                    continue;
-                }
-                std::println!("Terminal Error: Wayland recv failed: {:?}", e);
-                return None;
-            }
-            let (data_vec, _) = res.unwrap();
-            let mut rest: &[u8] = &data_vec[..];
-            while rest.len() >= 8 {
-                let header = RawMessage::deserialize_header(rest);
-                if header.is_err() { break; }
-                let (id, op, msg_len) = header.unwrap();
-                if msg_len > rest.len() { break; }
-                let chunk = &rest[..msg_len];
-                rest = &rest[msg_len..];
-
-                if id == ObjectId(2) {
-                    let types = wl_registry::WlRegistry::PAYLOAD_TYPES.get(op.0 as usize);
-                    if types.is_none() { continue; }
-                    let raw = RawMessage::deserialize(chunk, types.unwrap(), &[]);
-                    if raw.is_err() { continue; }
-                    if let Ok(wl_registry::Event::Global { name, interface, version: _ }) = wl_registry::Event::from_raw(connection.clone(), &raw.unwrap()) {
-                        if interface == "wl_compositor" {
-                            let id = NewId(3);
-                            let _ = registry.bind(name, id);
-                            compositor_id = Some(id.as_id());
-                        } else if interface == "wl_shm" {
-                            let id = NewId(4);
-                            let _ = registry.bind(name, id);
-                            shm_id = Some(id.as_id());
-                        }
-                    }
-                }
-            }
-            if compositor_id.is_some() && shm_id.is_some() { break 'handshake; }
-        }
-        std::println!("Terminal: Handshake OK");
 
         // 2. SideWind Window
         let name = sidewind_shm_name(self_pid);
