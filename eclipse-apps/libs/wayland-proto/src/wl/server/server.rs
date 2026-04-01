@@ -12,7 +12,7 @@ pub struct Global {
     pub name: u32,
     pub interface: &'static str,
     pub version: u32,
-    pub logic_factory: fn() -> ObjectInner,
+    pub logic_factory: alloc::boxed::Box<dyn Fn() -> ObjectInner>,
     pub interface_type: fn(NewId, ObjectInner) -> Object,
 }
 
@@ -35,7 +35,7 @@ impl WaylandServer {
         &mut self,
         interface: &'static str,
         version: u32,
-        logic_factory: fn() -> ObjectInner,
+        logic_factory: impl Fn() -> ObjectInner + 'static,
         interface_type: fn(NewId, ObjectInner) -> Object,
     ) {
         let name = self.next_global_id;
@@ -44,7 +44,7 @@ impl WaylandServer {
             name,
             interface,
             version,
-            logic_factory,
+            logic_factory: alloc::boxed::Box::new(logic_factory),
             interface_type,
         });
     }

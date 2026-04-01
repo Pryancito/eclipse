@@ -8,12 +8,14 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
+use crate::protocol::{SharedCommits, SharedBuffers, SurfaceCommit};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
 use std::rc::Rc;
+use alloc::collections::BTreeMap;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
@@ -83,6 +85,10 @@ pub struct LunasState {
     pub protocol: WaylandServer,
     /// Mapped pixel buffers for surfaces, indexed by (pid, surface_id).
     pub snp_surfaces: std::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    /// Shared list of pending wl_surface commits (drained each frame).
+    pub pending_surface_commits: SharedCommits,
+    /// Shared wl_buffer registry (pid, surface_id → BufferInfo).
+    pub buffer_registry: SharedBuffers,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -136,6 +142,8 @@ impl LunasState {
             last_input_tick: 0,
             protocol: WaylandServer::new(),
             snp_surfaces: std::collections::BTreeMap::new(),
+            pending_surface_commits: Rc::new(RefCell::new(alloc::vec::Vec::new())),
+            buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -180,12 +188,25 @@ impl LunasState {
                 );
                 if dirty { self.dirty = true; }
 
-                // Dispatch pending SNP keyboard events
+                // Dispatch pending SNP keyboard events to the focused Wayland window
                 if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
                     if let Some(w_idx) = self.input.focused_window {
-                        if let WindowContent::Snp { surface_id, pid } = self.space.windows[w_idx].content {
-                             // Sending raw events via WaylandServer for now
-                             // We should use client.send_event here.
+                        if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
+                            let ev = SideWindEvent {
+                                event_type: sidewind::SWND_EVENT_TYPE_KEY,
+                                data1: scancode as i32,
+                                data2: state_val as i32,
+                                data3: 0,
+                            };
+                            let _ = unsafe {
+                                eclipse_send(
+                                    pid,
+                                    sidewind::MSG_TYPE_INPUT,
+                                    &ev as *const _ as *const core::ffi::c_void,
+                                    core::mem::size_of::<SideWindEvent>(),
+                                    0,
+                                )
+                            };
                         }
                     }
                 }
@@ -272,17 +293,81 @@ impl LunasState {
             CompositorEvent::Snp(ref data_vec, pid_ref) => {
                 let pid = *pid_ref;
                 let data: &[u8] = &**data_vec;
-                
+
                 // Initialize client if not exists
                 if !self.protocol.clients.contains_key(&ClientId(pid)) {
-                    let connection = Rc::new(RefCell::new(EclipseWaylandConnection::new(pid, 0))); // Lunas PID is 0 or 1
+                    let connection = Rc::new(RefCell::new(EclipseWaylandConnection::new(pid, 0)));
                     self.protocol.add_client(ClientId(pid), connection);
                 }
 
-                if let Err(e) = self.protocol.process_message(ClientId(pid), data) {
-                    // println!("[LUNAS] Wayland process error: {:?}", e);
+                let _ = self.protocol.process_message(ClientId(pid), data);
+
+                // Drain pending wl_surface commits and materialise ShellWindows
+                let commits: alloc::vec::Vec<SurfaceCommit> =
+                    self.pending_surface_commits.borrow_mut().drain(..).collect();
+
+                let fb_w = self.backend.fb.info.width as i32;
+                let fb_h = self.backend.fb.info.height as i32;
+
+                for commit in commits {
+                    // Update / insert the surface pixel buffer
+                    let surface = ExternalSurface {
+                        id: commit.pid,
+                        pid: commit.pid,
+                        vaddr: commit.vaddr,
+                        buffer_size: (commit.width as usize)
+                            .saturating_mul(commit.height as usize)
+                            .saturating_mul(4),
+                        mapped_len: (commit.stride as usize)
+                            .saturating_mul(commit.height as usize),
+                        buffer_w: commit.width,
+                        buffer_h: commit.height,
+                        active: commit.vaddr != 0,
+                        ready_to_flip: true,
+                    };
+                    self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
+
+                    // Create ShellWindow if not yet present
+                    let exists = self.space.windows[..self.space.window_count]
+                        .iter()
+                        .any(|w| matches!(
+                            w.content,
+                            WindowContent::Snp { surface_id, pid }
+                                if pid == commit.pid && surface_id == commit.surface_id
+                        ));
+
+                    if !exists && self.space.window_count < self.space.windows.len() {
+                        let x = 100i32.min((fb_w - commit.width as i32 - 10).max(10));
+                        let y = ShellWindow::TITLE_H
+                            .min((fb_h - commit.height as i32 - 10).max(ShellWindow::TITLE_H));
+                        let w = commit.width as i32;
+                        let h = commit.height as i32;
+                        let mut title = [0u8; 32];
+                        title[..7].copy_from_slice(b"Wayland");
+                        let win = ShellWindow {
+                            x, y, w,
+                            h: h + ShellWindow::TITLE_H,
+                            curr_x: (x + w / 2) as f32,
+                            curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
+                            curr_w: 0.0, curr_h: 0.0,
+                            minimized: false, maximized: false, closing: false,
+                            stored_rect: (x, y, w, h + ShellWindow::TITLE_H),
+                            workspace: self.input.current_workspace,
+                            content: WindowContent::Snp {
+                                surface_id: commit.surface_id,
+                                pid: commit.pid,
+                            },
+                            damage: std::vec::Vec::new(),
+                            buffer_handle: None,
+                            is_dmabuf: false,
+                            title,
+                        };
+                        self.space.windows[self.space.window_count] = win;
+                        self.space.window_count += 1;
+                        self.input.focused_window = Some(self.space.window_count - 1);
+                    }
                 }
-                
+
                 self.dirty = true;
             }
         }

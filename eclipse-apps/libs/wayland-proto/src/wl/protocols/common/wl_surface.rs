@@ -194,3 +194,46 @@ impl Interface for WlSurface {
         NewId(self.id.0)
     }
 }
+
+impl WlSurface {
+    /// Attach a wl_buffer to the surface.
+    pub fn attach(
+        &mut self,
+        buffer: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(1),
+            &[buffer.into(), x.into(), y.into()],
+            &[],
+        )
+    }
+
+    /// Request damage for the given rectangle.
+    pub fn damage(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(2),
+            &[x.into(), y.into(), width.into(), height.into()],
+            &[],
+        )
+    }
+
+    /// Commit the pending surface state.
+    pub fn commit(&mut self) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(self.id, crate::wl::Opcode(6), &[], &[])
+    }
+
+    /// Destroy the surface.
+    pub fn destroy(&mut self) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(self.id, crate::wl::Opcode(0), &[], &[])
+    }
+}

@@ -1,4 +1,5 @@
 use crate::wl::{ObjectId, NewId, Interface, Message, Connection, Payload, PayloadType, DeserializeError, RawMessage};
+use crate::wl::connection::SendError;
 use crate::wl::protocols::common::wl_surface::WlSurface;
 use alloc::rc::Rc;
 use core::cell::RefCell;
@@ -76,5 +77,17 @@ impl Interface for WlCompositor {
 
     fn as_new_id(&self) -> NewId {
         NewId(self.id.0)
+    }
+}
+
+impl WlCompositor {
+    pub fn create_surface(&mut self, id: NewId) -> Result<WlSurface, SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(0),
+            &[id.into()],
+            &[],
+        )?;
+        Ok(WlSurface::new(self.con.clone(), id.as_id()))
     }
 }

@@ -82,3 +82,15 @@ impl Interface for WlBuffer {
         NewId(self.id.0)
     }
 }
+
+impl WlBuffer {
+    /// Get the ObjectId of this buffer (used to pass to wl_surface.attach).
+    pub fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    /// Destroy this buffer.
+    pub fn destroy(&mut self) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(self.id, crate::wl::Opcode(0), &[], &[])
+    }
+}

@@ -218,3 +218,49 @@ impl Interface for WlShmPool {
         NewId(self.id.0)
     }
 }
+
+impl WlShm {
+    /// Send wl_shm.create_pool to the compositor.
+    /// Returns a client-side WlShmPool object.
+    pub fn create_pool(&mut self, id: NewId, fd: i32, size: i32) -> Result<WlShmPool, crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(0),
+            &[id.into(), fd.into(), size.into()],
+            &[],
+        )?;
+        Ok(WlShmPool::new(self.con.clone(), id.as_id()))
+    }
+}
+
+impl WlShmPool {
+    /// Send wl_shm_pool.create_buffer to the compositor.
+    /// Returns a client-side WlBuffer.
+    pub fn create_buffer(
+        &mut self,
+        id: NewId,
+        offset: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        format: u32,
+    ) -> Result<crate::wl::protocols::common::wl_buffer::WlBuffer, crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(0),
+            &[id.into(), offset.into(), width.into(), height.into(), stride.into(), format.into()],
+            &[],
+        )?;
+        Ok(crate::wl::protocols::common::wl_buffer::WlBuffer::new(self.con.clone(), id.as_id()))
+    }
+
+    /// Send wl_shm_pool.destroy.
+    pub fn destroy(&mut self) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(self.id, crate::wl::Opcode(1), &[], &[])
+    }
+
+    /// Send wl_shm_pool.resize.
+    pub fn resize(&mut self, new_size: i32) -> Result<(), crate::wl::connection::SendError> {
+        self.con.borrow_mut().send(self.id, crate::wl::Opcode(2), &[new_size.into()], &[])
+    }
+}
