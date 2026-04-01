@@ -9,23 +9,7 @@ const MUTEX_LOCKED: i32 = 1;
 
 /// Tamaño del stack de hilos creados con `pthread_create` (userspace).
 const PTHREAD_STACK_SIZE: usize = 256 * 1024;
-
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
-pub struct pthread_t {
-    pub thread_id: u64,
-    /// Slot en heap: puntero al valor devuelto por `start_routine` (para `pthread_join`).
-    pub join_cell: *mut *mut c_void,
-}
-
-impl Default for pthread_t {
-    fn default() -> Self {
-        pthread_t {
-            thread_id: 0,
-            join_cell: core::ptr::null_mut(),
-        }
-    }
-}
+// pthread_t, pthread_mutex_t, pthread_cond_t now defined in crate::types
 
 #[repr(C)]
 struct ThreadBootstrap {
@@ -143,37 +127,6 @@ pub type pthread_attr_t = c_void;
 pub type pthread_mutexattr_t = c_void;
 #[allow(non_camel_case_types)]
 pub type pthread_condattr_t = c_void;
-
-/// pthread_mutex_t: uses an AtomicI32 spinlock.
-/// 0 = unlocked, 1 = locked.
-/// AtomicI32 has the same size and alignment as c_int, so the C ABI is compatible.
-#[repr(C)]
-pub struct pthread_mutex_t {
-    pub lock: AtomicI32,
-}
-
-impl Default for pthread_mutex_t {
-    fn default() -> Self {
-        pthread_mutex_t { lock: AtomicI32::new(0) }
-    }
-}
-
-/// pthread_cond_t: uses an AtomicI32 counter for futex-based signalling.
-/// Each signal/broadcast increments the counter; wait checks if the counter
-/// has changed after re-acquiring the mutex.
-#[repr(C)]
-pub struct pthread_cond_t {
-    pub value: AtomicI32,
-}
-
-impl Default for pthread_cond_t {
-    fn default() -> Self {
-        pthread_cond_t { value: AtomicI32::new(0) }
-    }
-}
-
-pub const PTHREAD_MUTEX_INITIALIZER: pthread_mutex_t = pthread_mutex_t { lock: AtomicI32::new(0) };
-pub const PTHREAD_COND_INITIALIZER: pthread_cond_t = pthread_cond_t { value: AtomicI32::new(0) };
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]

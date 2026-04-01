@@ -2,15 +2,6 @@
 //! - Linux (host): mock mode for testing.
 //! - Eclipse: native compositor (DRM, SideWind, IPC).
 
-#![cfg_attr(target_vendor = "eclipse", no_std)]
-
-#[cfg(target_vendor = "eclipse")]
-extern crate alloc;
-#[cfg(target_vendor = "eclipse")]
-extern crate eclipse_std as std;
-
-#[cfg(target_vendor = "eclipse")]
-extern crate eclipse_syscall;
 
 // ---- Entry point Linux: mock mode ----
 #[cfg(not(target_vendor = "eclipse"))]
@@ -20,14 +11,7 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(target_vendor = "eclipse")]
-use std::prelude::v1::*;
-#[cfg(target_vendor = "eclipse")]
-use lunas::libc;
 
-// ---- Entry point Eclipse: native desktop environment ----
-#[cfg(target_vendor = "eclipse")]
-#[cfg(not(test))]
 fn main() {
     use lunas::state::LunasState;
 
@@ -38,12 +22,12 @@ fn main() {
     // Register Wayland globals
     state.protocol.register_global(
         "wl_compositor", 4,
-        || wayland_proto::wl::server::objects::ObjectInner::Rc(alloc::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasCompositor))),
+        || wayland_proto::wl::server::objects::ObjectInner::Rc(std::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasCompositor))),
         |id, inner| wayland_proto::wl::server::objects::Object::new::<wayland_proto::wl::protocols::common::wl_compositor::WlCompositor>(id, inner)
     );
     state.protocol.register_global(
         "wl_shm", 1,
-        || wayland_proto::wl::server::objects::ObjectInner::Rc(alloc::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasShm))),
+        || wayland_proto::wl::server::objects::ObjectInner::Rc(std::rc::Rc::new(core::cell::RefCell::new(lunas::protocol::LunasShm))),
         |id, inner| wayland_proto::wl::server::objects::Object::new::<wayland_proto::wl::protocols::common::wl_shm::WlShm>(id, inner)
     );
 

@@ -9,6 +9,6 @@ heapless = "0.8"
 [target.'cfg(target_vendor = "eclipse")'.dependencies]
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = { version = "0.2", default-features = false }

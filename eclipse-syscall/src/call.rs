@@ -1,4 +1,5 @@
 //! High-level, type-safe syscall wrappers
+use core::result::Result::{Ok, Err};
 use crate::error::{cvt, cvt_unit, Error, Result};
 use crate::number::*;
 use crate::arch::*;

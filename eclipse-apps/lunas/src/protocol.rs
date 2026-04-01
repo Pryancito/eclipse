@@ -1,10 +1,10 @@
 use std::prelude::v1::*;
-use alloc::rc::Rc;
+use std::rc::Rc;
 use core::cell::RefCell;
 use wayland_proto::wl::{ObjectId, NewId, Payload, Message};
 use wayland_proto::wl::server::client::{Client, ClientId};
 use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
-use wayland_proto::wl::protocols::common::{wl_compositor, wl_surface, wl_shm, wl_display, wl_registry};
+use wayland_proto::wl::protocols::common::*;
 use crate::compositor::{ShellWindow, WindowContent};
 
 /// Lunas implementation of wl_compositor.
@@ -125,8 +125,8 @@ pub fn make_wayland_window(
 #[cfg(test)]
 mod wayland_server_tests {
     use super::{LunasCompositor, LunasShm};
-    use alloc::rc::Rc;
-    use alloc::vec::Vec;
+    use std::rc::Rc;
+    use std::vec::Vec;
     use core::cell::RefCell;
     use wayland_proto::eclipse_transport::EclipseWaylandConnection;
     use wayland_proto::wl::protocols::common::wl_compositor::WlCompositor;
@@ -186,7 +186,7 @@ mod wayland_server_tests {
             Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
         );
         let mut comp = LunasCompositor;
-        let args = alloc::vec![
+        let args = std::vec![
             wayland_proto::wl::Payload::NewId(NewId(5)),
         ];
         let r = ObjectLogic::handle_request(&mut comp, &mut client, 0, &args);

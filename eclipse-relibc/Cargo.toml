@@ -11,10 +11,16 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
-eclipse-syscall = { path = "../eclipse-syscall" }
+# eclipse-syscall: solo en builds normales (no en sysroot de std donde aún no existe).
+eclipse-syscall = { path = "../eclipse-syscall", optional = true }
+
+# rustc-std-workspace-core: reemplaza 'core' en modo sysroot (rustc-dep-of-std).
+# Resuelto automáticamente por rustc al compilar la sysroot; no viene de crates.io.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
 
 [features]
-default = ["std", "allocator"]
+eclipse-syscall = ["dep:eclipse-syscall"]
+default = ["std", "allocator", "eclipse-syscall"]
 allocator = []
 no-allocator = []
 panic-handler = []
@@ -24,6 +30,10 @@ extra_traits = []
 use_std = []
 align = []
 const-extern-fn = []
+# rustc-dep-of-std: mode sysroot para que Rust's std compile con eclipse-relibc.
+# Activa no_core + rustc_std_workspace_core, desactiva eclipse-syscall y alloc.
+# Rust's std lo pasa automáticamente: libc = { features = ["rustc-dep-of-std"] }
+rustc-dep-of-std = ["dep:rustc-std-workspace-core", "align"]
 
 [lib]
 # name = "libc" para reemplazar libc vía [patch.crates-io] y que libc::O_RDWR etc. funcionen

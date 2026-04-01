@@ -34,7 +34,7 @@ sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 # Usamos eclipse_std en modo compatibilidad con std para que NO registre su
 # propio panic_handler/alloc_error_handler; dejamos que eclipse-relibc lo haga.
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 # Misma versión que el [patch.crates-io] del workspace → eclipse-relibc.
 libc = { version = "0.2", default-features = false }
 

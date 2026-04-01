@@ -17,7 +17,7 @@ pub struct IpcHandler {
     pub message_count: u64,
     pub recv_attempts: u64,
     #[cfg(test)]
-    pub mock_events: alloc::vec::Vec<CompositorEvent>,
+    pub mock_events: std::vec::Vec<CompositorEvent>,
 }
 
 impl IpcHandler {
@@ -27,7 +27,7 @@ impl IpcHandler {
             message_count: 0,
             recv_attempts: 0,
             #[cfg(test)]
-            mock_events: alloc::vec::Vec::new(),
+            mock_events: std::vec::Vec::new(),
         }
     }
 
@@ -216,7 +216,7 @@ pub fn handle_sidewind_message(
                     stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
                     workspace: input_state.current_workspace,
                     content: WindowContent::External(s_idx as u32),
-                    damage: alloc::vec::Vec::new(),
+                    damage: std::vec::Vec::new(),
                     buffer_handle: None,
                     is_dmabuf: false,
                     title,

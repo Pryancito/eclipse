@@ -50,7 +50,7 @@ impl Widget for ControlCenter {
 }
 
 pub struct WindowSwitcher {}
-impl WindowSwitcher { pub fn new(_windows: alloc::vec::Vec<crate::compositor::ShellWindow>, _idx: usize) -> Self { Self {} } }
+impl WindowSwitcher { pub fn new(_windows: std::vec::Vec<crate::compositor::ShellWindow>, _idx: usize) -> Self { Self {} } }
 impl Widget for WindowSwitcher {
     fn draw(&self, _p: &mut SkiaPainter, _se: &StyleEngine, _b: Rect) {}
 }

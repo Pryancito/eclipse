@@ -1,6 +1,21 @@
 //! C type definitions
 #![allow(non_camel_case_types)]
 
+// En modo rustc-dep-of-std (no_core), los tipos básicos y #[derive] no están
+// en scope automáticamente — deben importarse explícitamente desde core.
+#[cfg(feature = "rustc-dep-of-std")]
+use core::{
+    clone::Clone,
+    cmp::{PartialEq, Eq},
+    default::Default,
+    marker::Copy,
+    option::Option,
+    prelude::v1::derive,
+    sync::atomic::AtomicI32,
+};
+#[cfg(not(feature = "rustc-dep-of-std"))]
+use core::sync::atomic::AtomicI32;
+
 pub type c_char = i8;
 pub type c_int = i32;
 pub type c_uint = u32;
@@ -138,3 +153,98 @@ pub struct group {
     pub gr_gid: gid_t,
     pub gr_mem: *mut *mut c_char,
 }
+
+// ── Tipos necesarios para las declaraciones extern "C" del modo sysroot ───────
+// Disponibles en AMBOS modos (normal y rustc-dep-of-std) para que los módulos
+// de header y el bloque extern "C" de lib.rs compartan las mismas definiciones.
+
+/// Tipo de puntero a función manejadora de señal.
+pub type sighandler_t = *mut c_void;
+
+/// Estructura sigaction — compatible con Linux x86-64.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct sigaction_t {
+    pub sa_sigaction: usize,  // sa_handler / sa_sigaction (union)
+    pub sa_mask:      sigset_t,
+    pub sa_flags:     c_int,
+    pub sa_restorer:  Option<unsafe extern "C" fn()>,
+}
+
+/// pthread_t — identificador de hilo.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct pthread_t {
+    pub thread_id: u64,
+    /// Slot en heap: puntero al valor devuelto por `start_routine` (para `pthread_join`).
+    pub join_cell: *mut *mut c_void,
+}
+impl Default for pthread_t {
+    fn default() -> Self {
+        pthread_t {
+            thread_id: 0,
+            join_cell: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// pthread_mutex_t — mutex de bajo nivel usando AtomicI32.
+#[repr(C)]
+pub struct pthread_mutex_t {
+    pub lock: core::sync::atomic::AtomicI32,
+}
+impl Default for pthread_mutex_t {
+    fn default() -> Self { pthread_mutex_t { lock: core::sync::atomic::AtomicI32::new(0) } }
+}
+
+/// pthread_cond_t — variable de condición usando AtomicI32 (futex).
+#[repr(C)]
+pub struct pthread_cond_t {
+    pub value: core::sync::atomic::AtomicI32,
+}
+impl Default for pthread_cond_t {
+    fn default() -> Self { pthread_cond_t { value: core::sync::atomic::AtomicI32::new(0) } }
+}
+
+pub const PTHREAD_MUTEX_INITIALIZER: pthread_mutex_t =
+    pthread_mutex_t { lock: core::sync::atomic::AtomicI32::new(0) };
+pub const PTHREAD_COND_INITIALIZER: pthread_cond_t =
+    pthread_cond_t { value: core::sync::atomic::AtomicI32::new(0) };
+
+/// pthread_attr_t — opaque (tamaño suficiente para stack_size + detach_state).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct pthread_attr_t {
+    _data: [u8; 56],
+}
+impl Default for pthread_attr_t {
+    fn default() -> Self { pthread_attr_t { _data: [0; 56] } }
+}
+
+/// pthread_mutexattr_t — opaque.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct pthread_mutexattr_t { pub _kind: c_int }
+
+/// pthread_condattr_t — opaque.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct pthread_condattr_t { pub _clock: c_int }
+
+/// pthread_key_t — clave TLS.
+pub type pthread_key_t = usize;
+
+/// FILE — opaque (para el usuario), pero con estructura interna para stdio.
+#[repr(C)]
+pub struct FILE {
+    pub fd: c_int,
+    pub flags: c_int,
+    pub buffer: *mut u8,
+    pub buf_pos: usize,
+    pub buf_size: usize,
+    pub buf_capacity: usize,
+    pub lock: core::sync::atomic::AtomicI32,
+}
+
+/// Constantes pthread
+pub const PTHREAD_STACK_MIN: size_t = 16384;

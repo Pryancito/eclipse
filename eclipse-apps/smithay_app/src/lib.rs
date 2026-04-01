@@ -1,13 +1,4 @@
-#![cfg_attr(target_vendor = "eclipse", no_std)]
 
-#[cfg(target_vendor = "eclipse")]
-extern crate alloc;
-// Make `alloc::` paths work on std targets too (needed by compositor, ipc, render).
-#[cfg(not(target_vendor = "eclipse"))]
-extern crate alloc;
-#[cfg(target_vendor = "eclipse")]
-pub extern crate eclipse_std as std;
-#[cfg(target_vendor = "eclipse")]
 pub use libc;
 
 pub mod backend;

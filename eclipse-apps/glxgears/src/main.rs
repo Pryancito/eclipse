@@ -4,13 +4,7 @@
 //! OpenGL benchmark. Three interlocking gears (red, green, blue) rotate in
 //! real time inside a SideWind window managed by the Lunas compositor.
 
-#![no_std]
-#![no_main]
 
-extern crate alloc;
-extern crate eclipse_std as std;
-
-use std::prelude::v1::*;
 use heapless::String as HString;
 
 #[cfg(target_vendor = "eclipse")]
@@ -420,9 +414,7 @@ fn open_sidewind_window(
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[no_mangle]
-pub fn main() {
-    std::init_runtime();
+fn main() {
 
     #[cfg(target_vendor = "eclipse")]
     {

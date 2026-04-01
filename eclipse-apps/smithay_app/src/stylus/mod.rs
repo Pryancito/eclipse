@@ -44,20 +44,20 @@ pub trait Widget {
 }
 
 pub struct Column {
-    children: alloc::vec::Vec<alloc::boxed::Box<dyn Widget>>,
+    children: std::vec::Vec<std::boxed::Box<dyn Widget>>,
     spacing: f32,
 }
 
 impl Column {
     pub fn new() -> Self {
-        Self { children: alloc::vec::Vec::new(), spacing: 0.0 }
+        Self { children: std::vec::Vec::new(), spacing: 0.0 }
     }
     pub fn spacing(mut self, s: f32) -> Self {
         self.spacing = s;
         self
     }
     pub fn push<W: Widget + 'static>(mut self, child: W) -> Self {
-        self.children.push(alloc::boxed::Box::new(child));
+        self.children.push(std::boxed::Box::new(child));
         self
     }
 }
@@ -76,20 +76,20 @@ impl Widget for Column {
 }
 
 pub struct Row {
-    children: alloc::vec::Vec<alloc::boxed::Box<dyn Widget>>,
+    children: std::vec::Vec<std::boxed::Box<dyn Widget>>,
     spacing: f32,
 }
 
 impl Row {
     pub fn new() -> Self {
-        Self { children: alloc::vec::Vec::new(), spacing: 0.0 }
+        Self { children: std::vec::Vec::new(), spacing: 0.0 }
     }
     pub fn spacing(mut self, s: f32) -> Self {
         self.spacing = s;
         self
     }
     pub fn push<W: Widget + 'static>(mut self, child: W) -> Self {
-        self.children.push(alloc::boxed::Box::new(child));
+        self.children.push(std::boxed::Box::new(child));
         self
     }
 }
@@ -110,7 +110,7 @@ impl Widget for Row {
 }
 
 pub struct Container {
-    child: Option<alloc::boxed::Box<dyn Widget>>,
+    child: Option<std::boxed::Box<dyn Widget>>,
     padding: f32,
 }
 
@@ -123,7 +123,7 @@ impl Container {
         self
     }
     pub fn child<W: Widget + 'static>(mut self, child: W) -> Self {
-        self.child = Some(alloc::boxed::Box::new(child));
+        self.child = Some(std::boxed::Box::new(child));
         self
     }
 }

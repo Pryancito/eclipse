@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 
 [target.'cfg(target_vendor = "eclipse")'.dependencies]
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 
 [lints]

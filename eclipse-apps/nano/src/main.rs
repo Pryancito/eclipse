@@ -12,14 +12,6 @@
 //!   Enter            → nueva línea
 //!   Backspace / Del  → borrar carácter
 
-#![cfg_attr(target_vendor = "eclipse", no_std)]
-#![cfg_attr(not(target_vendor = "eclipse"), no_main)]
-
-#[cfg(target_vendor = "eclipse")]
-extern crate eclipse_std as std;
-
-#[cfg(target_vendor = "eclipse")]
-use std::prelude::v1::*;
 
 // ============================================================================
 // Ancho máximo de línea y tamaño de pantalla por defecto

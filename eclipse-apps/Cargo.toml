@@ -12,7 +12,7 @@ members = [
     "glxgears",
 ]
 # glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.
-exclude = ["libs/ipc_tests", "std_test", "smithay_app", "xfwl4"]
+exclude = ["libs/ipc_tests", "xfwl4", "smithay_app"]
 
 [workspace.package]
 version = "0.2.0"

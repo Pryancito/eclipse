@@ -9,7 +9,7 @@
 #[cfg(target_vendor = "eclipse")]
 use eclipse_syscall as syscall;
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 pub mod buffer {
     /// A handle to a buffer (GEM handle).
@@ -605,7 +605,10 @@ impl DisplayDevice {
                 }
             }
 
-            let conn = active_conn.or_else(|| conns.first().copied()).ok_or(DisplayError::OpenFailed)?;
+            let conn = active_conn.or_else(|| {
+                let first: Option<&control::ConnectorHandle> = conns.first();
+                first.copied()
+            }).ok_or(DisplayError::OpenFailed)?;
             
             // Find an associated CRTC. Mapping follows VirtIO 1000/2000 convention.
             let crtc = if conn.0 >= 1000 && conn.0 < 1016 {
@@ -613,7 +616,8 @@ impl DisplayDevice {
             } else if conn.0 == 6000 {
                 control::CrtcHandle(7000)
             } else {
-                crtcs.first().copied().ok_or(DisplayError::OpenFailed)?
+                let first: Option<&control::CrtcHandle> = crtcs.first();
+                first.copied().ok_or(DisplayError::OpenFailed)?
             };
 
             device.connector = conn;

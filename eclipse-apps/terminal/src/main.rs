@@ -1,15 +1,6 @@
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-extern crate eclipse_std as std;
-
-use std::prelude::v1::*;
-use alloc::rc::Rc;
-#[cfg(target_vendor = "eclipse")]
-use alloc::vec::Vec;
-#[cfg(target_vendor = "eclipse")]
-use alloc::boxed::Box;
+use std::rc::Rc;
+use std::vec::Vec;
+use std::boxed::Box;
 use core::cell::RefCell;
 use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
 use wayland_proto::EclipseWaylandConnection;
@@ -26,22 +17,22 @@ use os_terminal::font::BitmapFont;
 /// funcionan dentro de la misma sesión del terminal.
 #[cfg(target_vendor = "eclipse")]
 struct EclipseClipboard {
-    text: alloc::string::String,
+    text: std::string::String,
 }
 
 #[cfg(target_vendor = "eclipse")]
 impl EclipseClipboard {
     fn new() -> Self {
-        Self { text: alloc::string::String::new() }
+        Self { text: std::string::String::new() }
     }
 }
 
 #[cfg(target_vendor = "eclipse")]
 impl ClipboardHandler for EclipseClipboard {
-    fn get_text(&mut self) -> Option<alloc::string::String> {
+    fn get_text(&mut self) -> Option<std::string::String> {
         if self.text.is_empty() { None } else { Some(self.text.clone()) }
     }
-    fn set_text(&mut self, text: alloc::string::String) {
+    fn set_text(&mut self, text: std::string::String) {
         self.text = text;
     }
 }
@@ -266,9 +257,7 @@ impl DrawTarget for SurfaceDrawTarget {
     }
 }
 
-#[no_mangle]
-pub fn main() {
-    std::init_runtime();
+fn main() {
 
     std::println!("--- Terminal-WB (Kazari-based Wayland) ---");
 
@@ -442,7 +431,7 @@ pub fn main() {
             &mut pair_id as *mut usize as usize,
         );
 
-        let slave_path = alloc::format!("pty:slave/{}", pair_id);
+        let slave_path = std::format!("pty:slave/{}", pair_id);
         let pty_slave_fd = unsafe {
             let mut path_buf = [0u8; 64];
             let bytes = slave_path.as_bytes();

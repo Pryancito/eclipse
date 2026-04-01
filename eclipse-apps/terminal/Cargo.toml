@@ -21,7 +21,7 @@ wayland-proto = { path = "../libs/wayland-proto" }
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
 # Standard library bridge for Eclipse
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = { version = "0.2", default-features = false }
 

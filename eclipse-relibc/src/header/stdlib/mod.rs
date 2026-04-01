@@ -6,7 +6,9 @@ use crate::header::string::strlen;
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn abort() -> ! {
-    sys_exit(1);
+    use crate::header::unistd::_exit;
+    _exit(1);
+    loop {}
 }
 
 #[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
@@ -17,7 +19,9 @@ extern "C" {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn exit(status: c_int) -> ! {
-    sys_exit(status as i32);
+    use crate::header::unistd::_exit;
+    _exit(status);
+    loop {}
 }
 
 // Re-export malloc/free/calloc/realloc from alloc module

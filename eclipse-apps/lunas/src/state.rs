@@ -13,7 +13,7 @@ use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
-use alloc::rc::Rc;
+use std::rc::Rc;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
@@ -82,7 +82,7 @@ pub struct LunasState {
     /// Wayland protocol server: manages protocol state for connected clients.
     pub protocol: WaylandServer,
     /// Mapped pixel buffers for surfaces, indexed by (pid, surface_id).
-    pub snp_surfaces: alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    pub snp_surfaces: std::collections::BTreeMap<(u32, u32), ExternalSurface>,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -135,7 +135,7 @@ impl LunasState {
             log_len: 0,
             last_input_tick: 0,
             protocol: WaylandServer::new(),
-            snp_surfaces: alloc::collections::BTreeMap::new(),
+            snp_surfaces: std::collections::BTreeMap::new(),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],

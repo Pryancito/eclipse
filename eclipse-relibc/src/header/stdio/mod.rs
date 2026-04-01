@@ -20,17 +20,7 @@ const FILE_LOCK_LOCKED: i32 = 1;
 #[cfg(not(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target)))]
 pub type FILE = c_void;
 
-#[cfg(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target))]
-#[repr(C)]
-pub struct FILE {
-    fd: c_int,
-    flags: c_int,
-    buffer: *mut u8,
-    buf_pos: usize,
-    buf_size: usize,
-    buf_capacity: usize,
-    lock: AtomicI32,
-}
+// FILE struct now defined in crate::types
 
 #[cfg(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target))]
 static mut STDIN_STRUCT: FILE = FILE {

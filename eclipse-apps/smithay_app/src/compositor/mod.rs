@@ -4,6 +4,7 @@
 pub mod space;
 pub mod tiling;
 
+use std::vec::Vec;
 pub use space::Space;
 
 pub const MAX_EXTERNAL_SURFACES: usize = 16;
@@ -47,7 +48,7 @@ pub struct ShellWindow {
     pub stored_rect: (i32, i32, i32, i32),
     pub workspace: u8,
     pub content: WindowContent,
-    pub damage: alloc::vec::Vec<(i32, i32, i32, i32)>,
+    pub damage: Vec<(i32, i32, i32, i32)>,
     pub buffer_handle: Option<u32>, // GEM handle for DMABUF
     pub is_dmabuf: bool,
     pub is_panel: bool,
@@ -62,7 +63,7 @@ impl Default for ShellWindow {
             stored_rect: (0, 0, 0, 0),
             workspace: 0,
             content: WindowContent::None,
-            damage: alloc::vec::Vec::new(),
+            damage: Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
@@ -79,7 +80,7 @@ impl ShellWindow {
             stored_rect: (0, 0, 0, 0),
             workspace: 0,
             content: WindowContent::None,
-            damage: alloc::vec::Vec::new(),
+            damage: Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
@@ -208,7 +209,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
         };
@@ -224,7 +225,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
         };
@@ -240,7 +241,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 200, 100), workspace: 0,
             content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
         };
@@ -257,7 +258,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 20, 100, 50), workspace: 0,
             content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
         };
@@ -269,8 +270,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
     #[test]
     fn test_focus_under_cursor_empty() {
         let windows: [ShellWindow; 2] = [
-            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
-            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: std::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: std::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
         ];
         assert_eq!(focus_under_cursor(50, 50, &windows, 0), None);
     }
@@ -284,7 +285,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 200, 200), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -294,7 +295,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (50, 50, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -304,7 +305,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
 
     #[test]
     fn test_next_visible_empty() {
-        let windows: [ShellWindow; 1] = [ShellWindow { damage: alloc::vec::Vec::new(), ..Default::default() }];
+        let windows: [ShellWindow; 1] = [ShellWindow { damage: std::vec::Vec::new(), ..Default::default() }];
         assert_eq!(next_visible(0, true, &windows, 0), None);
     }
 
@@ -317,7 +318,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -327,7 +328,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -344,7 +345,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -354,7 +355,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -371,7 +372,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -388,7 +389,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },
@@ -398,7 +399,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (100, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
             },

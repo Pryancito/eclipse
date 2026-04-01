@@ -10,7 +10,7 @@ static mut FORCE_KEEP: i32 = 0;
 
 #[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
 extern "C" {
-    pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    pub fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
     pub fn close(fd: c_int) -> c_int;
@@ -217,7 +217,8 @@ pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn _exit(status: c_int) -> ! {
-    let _ = sys_exit(status);
+    eclipse_syscall::syscall1(eclipse_syscall::SYS_EXIT, status as usize);
+    loop {}
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]

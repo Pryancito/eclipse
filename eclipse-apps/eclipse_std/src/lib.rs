@@ -37,6 +37,10 @@ pub use core::f64;
 
 pub extern crate libc; // This is eclipse-libc-posix from Cargo.toml
 pub use alloc::vec as vec;
+pub use alloc::format as format;
+
+pub mod rc { pub use alloc::rc::*; }
+pub mod boxed { pub use alloc::boxed::*; }
 
 use core::panic::PanicInfo;
 

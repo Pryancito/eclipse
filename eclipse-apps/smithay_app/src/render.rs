@@ -1,6 +1,6 @@
 use std::prelude::v1::*;
 use core::{matches, format_args, write};
-use alloc::vec::Vec;
+use std::vec::Vec;
 #[cfg(target_vendor = "eclipse")]
 use libc::{
     munmap,
@@ -242,7 +242,7 @@ impl FramebufferState {
             drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
             cursor_handle: display::buffer::Handle(0),
-            planes: alloc::vec::Vec::new(),
+            planes: std::vec::Vec::new(),
             hud_fb_id: display::control::framebuffer::Handle(0),
             hud_handle: display::buffer::Handle(0),
             hud_addr: 0,
@@ -259,7 +259,7 @@ impl FramebufferState {
             drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
             cursor_handle: display::buffer::Handle(0),
-            planes: alloc::vec::Vec::new(),
+            planes: std::vec::Vec::new(),
             hud_fb_id: display::control::framebuffer::Handle(0),
             hud_handle: display::buffer::Handle(0),
             hud_addr: 0,
@@ -975,7 +975,7 @@ fn draw_traffic_monitor(
 pub fn draw_dashboard(
     fb: &mut FramebufferState, 
     style_engine: &StyleEngine,
-    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
+    dashboard_view: Option<&std::boxed::Box<dyn crate::stylus::Widget>>,
     counter: u64, 
     cpu: f32, 
     mem: f32, 
@@ -1371,7 +1371,7 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
 pub fn draw_desktop_shell(
     fb: &mut FramebufferState,
     style_engine: &StyleEngine,
-    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
+    dashboard_view: Option<&std::boxed::Box<dyn crate::stylus::Widget>>,
     windows: &[ShellWindow],
     window_count: usize,
     counter: u64,
@@ -1400,7 +1400,7 @@ pub fn draw_desktop_shell(
 pub fn draw_static_ui(
     fb: &mut FramebufferState, 
     style_engine: &StyleEngine,
-    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
+    dashboard_view: Option<&std::boxed::Box<dyn crate::stylus::Widget>>,
     counter: u64, 
     _cursor_x: i32, 
     _cursor_y: i32, 

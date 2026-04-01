@@ -4,6 +4,7 @@ pub mod space;
 pub mod tiling;
 
 pub use space::Space;
+use std::vec::Vec;
 
 pub const MAX_EXTERNAL_SURFACES: usize = 16;
 pub const MAX_WINDOWS_COUNT: usize = 16;
@@ -46,7 +47,7 @@ pub struct ShellWindow {
     pub stored_rect: (i32, i32, i32, i32),
     pub workspace: u8,
     pub content: WindowContent,
-    pub damage: alloc::vec::Vec<(i32, i32, i32, i32)>,
+    pub damage: Vec<(i32, i32, i32, i32)>,
     pub buffer_handle: Option<u64>,
     pub is_dmabuf: bool,
     pub title: [u8; 32],
@@ -61,7 +62,7 @@ impl Default for ShellWindow {
             stored_rect: (0, 0, 0, 0),
             workspace: 0,
             content: WindowContent::None,
-            damage: alloc::vec::Vec::new(),
+            damage: Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             title: [0; 32],
@@ -78,7 +79,7 @@ impl ShellWindow {
             stored_rect: (0, 0, 0, 0),
             workspace: 0,
             content: WindowContent::None,
-            damage: alloc::vec::Vec::new(),
+            damage: Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             title: [0; 32],

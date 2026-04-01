@@ -8,7 +8,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use eclipse_syscall::call::{mmap, munmap};
 use eclipse_syscall::flag::*;
-use crate::types::*;
+pub use crate::types::*;
+pub use crate::*;
 
 // --- Constantes de Configuración ---
 const ALIGNMENT: usize = 16;

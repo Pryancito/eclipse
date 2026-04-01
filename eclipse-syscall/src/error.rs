@@ -1,4 +1,5 @@
 //! Error handling
+use core::result::Result::{Ok, Err};
 pub const EINTR:  i32 = 4;
 pub const EBADF:  i32 = 9;
 pub const ENOMEM: i32 = 12;

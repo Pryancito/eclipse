@@ -175,8 +175,8 @@ impl Column {
         Self { spacing }
     }
 
-    pub fn layout_bounds(&self, parent: Rect, child_count: usize) -> alloc::vec::Vec<Rect> {
-        let mut bounds = alloc::vec::Vec::new();
+    pub fn layout_bounds(&self, parent: Rect, child_count: usize) -> std::vec::Vec<Rect> {
+        let mut bounds = std::vec::Vec::new();
         if child_count == 0 { return bounds; }
         let child_h = (parent.h - self.spacing * (child_count as f32 - 1.0)) / child_count as f32;
         for i in 0..child_count {
@@ -201,8 +201,8 @@ impl Row {
         Self { spacing }
     }
 
-    pub fn layout_bounds(&self, parent: Rect, child_count: usize) -> alloc::vec::Vec<Rect> {
-        let mut bounds = alloc::vec::Vec::new();
+    pub fn layout_bounds(&self, parent: Rect, child_count: usize) -> std::vec::Vec<Rect> {
+        let mut bounds = std::vec::Vec::new();
         if child_count == 0 { return bounds; }
         let child_w = (parent.w - self.spacing * (child_count as f32 - 1.0)) / child_count as f32;
         for i in 0..child_count {

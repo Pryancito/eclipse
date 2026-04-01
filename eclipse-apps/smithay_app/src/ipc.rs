@@ -20,7 +20,7 @@ pub struct IpcHandler {
     /// Intentos de recv (cada poll_event); si sube pero message_count no, el kernel no nos da mensajes.
     pub recv_attempts: u64,
     #[cfg(test)]
-    pub mock_events: alloc::vec::Vec<CompositorEvent>,
+    pub mock_events: std::vec::Vec<CompositorEvent>,
 }
 
 impl IpcHandler {
@@ -30,7 +30,7 @@ impl IpcHandler {
             message_count: 0,
             recv_attempts: 0,
             #[cfg(test)]
-            mock_events: alloc::vec::Vec::new(),
+            mock_events: std::vec::Vec::new(),
         }
     }
 
@@ -99,7 +99,7 @@ impl IpcHandler {
                     let _ = v.extend_from_slice(&line[..len.min(252)]);
                     return Some(CompositorEvent::KernelLog(v));
                 }
-                Some(EclipseMessage::Wayland { data, len }) => {
+                Some(EclipseMessage::Wayland { data, len, from: _ }) => {
                     self.message_count += 1;
                     let mut vec = heapless::Vec::new();
                     let _ = vec.extend_from_slice(&data[..len]);
@@ -210,7 +210,7 @@ pub fn handle_sidewind_message(
                         stored_rect: (clamped_x, clamped_y, msg.w as i32, win_h),
                         workspace: input_state.current_workspace,
                         content: WindowContent::External(s_idx as u32),
-                        damage: alloc::vec::Vec::new(),
+                        damage: std::vec::Vec::new(),
                         buffer_handle: None,
                         is_dmabuf: false,
                         is_panel,

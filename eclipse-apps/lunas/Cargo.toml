@@ -27,7 +27,7 @@ eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 wayland-proto = { path = "../libs/wayland-proto" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 libc = { version = "0.2", default-features = false }
 
 # Dependencias para target Linux (host) — tests y desarrollo

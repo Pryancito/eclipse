@@ -489,7 +489,7 @@ pub fn draw_desktop_shell(
     net_history: &[f32; 60],
     history_pos: usize,
     cpu_temp: u32,
-    snp_surfaces: &alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
 ) {
     // 1. Blit background
     fb.blit_background();
@@ -1377,7 +1377,7 @@ fn draw_window(
     fb: &mut FramebufferState,
     window: &ShellWindow,
     surfaces: &[ExternalSurface],
-    snp_surfaces: &alloc::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
     focused: bool,
     decoration_style: u8,
 ) {
@@ -2379,7 +2379,7 @@ fn draw_hud_overlay(fb: &mut FramebufferState, log_buf: &[u8], log_len: usize) {
     let log_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(140, 160, 200));
     let safe_len = log_len.min(log_buf.len());
     if let Ok(text) = core::str::from_utf8(&log_buf[..safe_len]) {
-        let lines: alloc::vec::Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        let lines: std::vec::Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         let max_lines = 11;
         let start_idx = if lines.len() > max_lines { lines.len() - max_lines } else { 0 };
         

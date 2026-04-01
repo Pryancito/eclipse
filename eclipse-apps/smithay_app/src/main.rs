@@ -2,15 +2,7 @@
 //! - Linux (host): compositor Wayland con Smithay + winit.
 //! - Eclipse: compositor propio (DRM, SideWind, IPC).
 
-#![cfg_attr(target_vendor = "eclipse", no_std)]
 
-#[cfg(target_vendor = "eclipse")]
-extern crate alloc;
-#[cfg(target_vendor = "eclipse")]
-extern crate eclipse_std as std;
-
-#[cfg(target_vendor = "eclipse")]
-extern crate eclipse_syscall;
 #[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 use smithay_app::smithay_wayland;
 
@@ -30,8 +22,6 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(target_vendor = "eclipse")]
-use std::prelude::v1::*;
 #[cfg(target_vendor = "eclipse")]
 use smithay_app::libc;
 #[cfg(target_vendor = "eclipse")]

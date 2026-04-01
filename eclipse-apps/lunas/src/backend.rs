@@ -12,7 +12,7 @@ use eclipse_syscall::InputEvent;
 #[cfg(not(target_vendor = "eclipse"))]
 use libc::{open, read, O_RDONLY, O_NONBLOCK};
 #[cfg(test)]
-use alloc::collections::VecDeque;
+use std::collections::VecDeque;
 #[cfg(not(test))]
 use heapless::Deque;
 

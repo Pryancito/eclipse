@@ -104,7 +104,7 @@ pub struct SmithayState {
     /// Última vez que se recibió un mensaje IPC (para el heartbeat).
     pub last_ipc_activity: std::time::Instant,
     pub style_engine: crate::style_engine::StyleEngine,
-    pub dashboard_view: Option<alloc::boxed::Box<dyn crate::stylus::Widget>>,
+    pub dashboard_view: Option<std::boxed::Box<dyn crate::stylus::Widget>>,
 }
 
 impl SmithayState {
@@ -233,7 +233,7 @@ impl SmithayState {
 
         root = root.push(row1).push(row2).push(row3);
 
-        self.dashboard_view = Some(alloc::boxed::Box::new(root));
+        self.dashboard_view = Some(std::boxed::Box::new(root));
     }
 
     pub fn handle_event(&mut self, event: &CompositorEvent) {
@@ -929,7 +929,7 @@ impl SmithayState {
                 stored_rect: (0, 0, 0, 0),
                 workspace: self.input.current_workspace,
                 content: crate::compositor::WindowContent::InternalDemo,
-                damage: alloc::vec::Vec::new(),
+                damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
                 is_panel: false,
@@ -1238,7 +1238,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
         });
@@ -1273,7 +1273,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
@@ -1296,7 +1296,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (50, 50, 200, 150), workspace: 0,
             content: WindowContent::InternalDemo,
-            damage: alloc::vec::Vec::new(),
+            damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
