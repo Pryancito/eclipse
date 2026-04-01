@@ -165,8 +165,12 @@ pub static CHILD_WAIT_WAITERS: Mutex<[Option<ProcessId>; MAX_PROCESSES]> =
     Mutex::new([None; MAX_PROCESSES]);
 
 /// Registra un proceso padre como bloqueado esperando a un hijo.
+/// Idempotente: si `parent_pid` ya está en la tabla, no duplica entradas.
 pub fn register_child_waiter(parent_pid: ProcessId) {
     let mut waiters = CHILD_WAIT_WAITERS.lock();
+    if waiters.iter().any(|s| *s == Some(parent_pid)) {
+        return;
+    }
     for slot in waiters.iter_mut() {
         if slot.is_none() {
             *slot = Some(parent_pid);
@@ -175,35 +179,33 @@ pub fn register_child_waiter(parent_pid: ProcessId) {
     }
 }
 
-/// Elimina un proceso de la tabla de espera de hijos (al reanudar o cancelar).
+/// Elimina todas las entradas de `parent_pid` en la tabla de espera de hijos.
 pub fn unregister_child_waiter(parent_pid: ProcessId) {
     let mut waiters = CHILD_WAIT_WAITERS.lock();
     for slot in waiters.iter_mut() {
         if *slot == Some(parent_pid) {
             *slot = None;
-            return;
         }
     }
 }
 
-/// Despierta al proceso `parent_pid` si está bloqueado en sys_wait().
-/// Llamado por exit_process() cuando un proceso hijo termina.
+/// Despierta al proceso `parent_pid` si está en la cola de wait de hijos.
+/// Llamado por exit_process() / sys_kill cuando un hijo termina.
+///
+/// Importante: **no** quitamos aquí a `parent_pid` de `CHILD_WAIT_WAITERS`.
+/// Si lo hiciéramos mientras el padre sigue `Running` (ventana entre
+/// `register_child_waiter` y marcar `Blocked`), el padre podía bloquearse después
+/// sin que volviera a llegar ningún wake → shell colgado tras cerrar glxgears.
+/// La entrada se limpia solo con `unregister_child_waiter` al salir de `sys_wait`.
 pub fn wake_parent_from_wait(parent_pid: ProcessId) {
-    {
-        let mut waiters = CHILD_WAIT_WAITERS.lock();
-        let mut found = false;
-        for slot in waiters.iter_mut() {
-            if *slot == Some(parent_pid) {
-                *slot = None;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return; // Parent was not blocked in sys_wait
-        }
+    let waiting = {
+        let waiters = CHILD_WAIT_WAITERS.lock();
+        waiters.iter().any(|s| *s == Some(parent_pid))
+    };
+    if !waiting {
+        return;
     }
-    // Re-enqueue the parent so it can re-check in sys_wait's loop
+
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
         for slot in table.iter_mut() {
@@ -947,4 +949,99 @@ pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<u64> {
         }
     }
     None
+}
+
+/// POSIX/Linux: señales cuyo `SIG_DFL` es **ignorar** (no terminan el proceso).
+#[inline]
+pub fn signal_default_is_ignore(signum: u8) -> bool {
+    match signum {
+        17 | 23 | 28 => true, // SIGCHLD, SIGURG, SIGWINCH
+        _ => false,
+    }
+}
+
+/// Extrae la señal pendiente de menor número, la borra del bitmask y devuelve (número, handler).
+pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
+    let mut table = PROCESS_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(p) = slot {
+            if p.id != pid || p.pending_signals == 0 {
+                continue;
+            }
+            let bit = p.pending_signals.trailing_zeros();
+            if bit >= 64 {
+                return None;
+            }
+            let sig = bit as u8;
+            let mask = 1u64 << sig;
+            p.pending_signals &= !mask;
+            let handler = p.signal_handlers[sig as usize];
+            return Some((sig, handler));
+        }
+    }
+    None
+}
+
+/// Termina `target_pid` con `exit_code = 128 + sig` (como `sys_kill` fatal).
+/// Devuelve `None` si no existe, `Some(None)` si ya era zombie, `Some(Some(ppid))` si se mató.
+pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Option<Option<ProcessId>> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            if let Some(p) = slot {
+                if p.id == target_pid {
+                    if p.state == ProcessState::Terminated {
+                        return Some(None);
+                    }
+                    p.exit_code = 128 + sig as u64;
+                    p.state = ProcessState::Terminated;
+                    crate::ipc::clear_mailbox_slot(slot_idx);
+                    return Some(p.parent_pid);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Tras cada syscall desde userspace: aplica señales en cola (SIG_IGN, SIG_DFL, SIGKILL).
+/// Los manejadores de usuario (puntero != 0 y != 1) aún **no** se invocan: se tratan como fatal
+/// hasta implementar trampa/sigreturn.
+pub fn deliver_pending_signals_for_current() {
+    let Some(pid) = current_process_id() else { return };
+    if let Some(p) = get_process(pid) {
+        if p.state == ProcessState::Terminated {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    loop {
+        let Some((sig, handler)) = pop_lowest_pending_signal(pid) else {
+            break;
+        };
+
+        if handler == 1 {
+            // SIG_IGN
+            continue;
+        }
+
+        // SIGKILL (9) no se puede ignorar ni capturar.
+        let terminate = sig == 9
+            || handler != 0 // capturado: sin sigreturn → fatal por ahora
+            || !signal_default_is_ignore(sig);
+
+        if !terminate {
+            continue;
+        }
+
+        if let Some(mut proc) = get_process(pid) {
+            proc.exit_code = 128 + sig as u64;
+            update_process(pid, proc);
+        }
+        exit_process();
+        crate::scheduler::yield_cpu();
+        return;
+    }
 }

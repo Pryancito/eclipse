@@ -674,16 +674,6 @@ fn main() {
         let tx_total = device.tx_bytes.load(Ordering::Relaxed);
         let link_up = device.get_link_status();
 
-        // Activity logging (every 10 seconds)
-        if get_now_ms() - last_activity_log > 10000 {
-            println!("[NETWORK-SERVICE] Stats: RX={} TX={} Link={} Mode={}", 
-                rx_total, tx_total, 
-                if link_up { "UP" } else { "DOWN" },
-                if use_dhcp { if current_dhcp_config.is_some() { "BOUND" } else { "SEARCHING" } } else { "STATIC" }
-            );
-            last_activity_log = get_now_ms();
-        }
-
         // 4. Handle IPC messages for socket syscalls
         let (len, sender_pid) = receive_ipc(&mut ipc_buf);
         let mut processed = false;

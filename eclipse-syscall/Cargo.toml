@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
+eclipse-program-codes = { path = "../eclipse-program-codes", default-features = false }
 
 [lib]
 name = "eclipse_syscall"

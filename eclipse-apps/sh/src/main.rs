@@ -434,11 +434,11 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
                         // Mostrar solo el basename (parte después del último '/')
                         let name = raw_name.rsplit('/').next().unwrap_or(raw_name);
                         let name = if name.is_empty() { "<sin nombre>" } else { name };
-                        // Estado: 0=Running 1=Blocked 2=Terminated
+                        // ProcessState del kernel: 0=Ready 1=Running 2=Blocked 3=Terminated (zombie)
                         let stat = match info.state {
-                            0 => "R",
-                            1 => "S",
-                            2 => "Z",
+                            0 | 1 => "R",
+                            2 => "S",
+                            3 => "Z",
                             _ => "?",
                         };
                         sh_println(&format!("  {:3}  {:4}  {}", info.pid, stat, name));
@@ -740,6 +740,33 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
 // Ejecución externa
 // ============================================================================
 
+/// Espera bloqueante al hijo `pid` hasta recogerlo (zombie → slot libre).
+/// Reintenta en `EINTR` y, si `wait_pid` falla, intenta `WNOHANG` al PID y
+/// luego a cualquier hijo (`pid == 0`) para no quedar colgados sin prompt.
+fn wait_for_child(pid: usize) -> i32 {
+    let mut status = 0u32;
+    loop {
+        match eclipse_syscall::call::wait_pid(&mut status, pid) {
+            Ok(_) => {
+                return ((status >> 8) & 0xFF) as i32;
+            }
+            Err(e) if e.errno == eclipse_syscall::error::EINTR => {
+                continue;
+            }
+            Err(_) => {
+                let mut st = 0u32;
+                if let Ok(r) = eclipse_syscall::call::wait_pid_nohang(&mut st, pid) {
+                    if r != 0 {
+                        return ((st >> 8) & 0xFF) as i32;
+                    }
+                }
+                // No usar wait_pid_nohang(0): podría cosechar un job `&` antes que el bucle bg_pids.
+                let _ = eclipse_syscall::call::sched_yield();
+            }
+        }
+    }
+}
+
 fn open_redirect_out(path: &str, append: bool) -> Option<usize> {
     let flags = if append {
         eclipse_syscall::flag::O_WRONLY | eclipse_syscall::flag::O_CREAT | 0x0400
@@ -814,9 +841,7 @@ fn run_simple(cmd: &SimpleCmd, background: bool) -> i32 {
             sh_println(&format!("[bg] pid={}", pid));
             0
         } else {
-            let mut status = 0u32;
-            let _ = eclipse_syscall::call::wait_pid(&mut status, pid);
-            let code = ((status >> 8) & 0xFF) as i32;
+            let code = wait_for_child(pid);
             unsafe { LAST_EXIT = code; }
             code
         }
@@ -865,13 +890,12 @@ fn run_pipeline(pipeline: &Pipeline) -> i32 {
         return 0;
     }
 
-    let mut last_status = 0u32;
+    let mut last_code = 0i32;
     for pid in &pids {
-        let _ = eclipse_syscall::call::wait_pid(&mut last_status, *pid);
+        last_code = wait_for_child(*pid);
     }
-    let code = ((last_status >> 8) & 0xFF) as i32;
-    unsafe { LAST_EXIT = code; }
-    code
+    unsafe { LAST_EXIT = last_code; }
+    last_code
 }
 
 // ============================================================================
@@ -1130,13 +1154,15 @@ fn main() {
         bg_pids.retain(|&pid| {
             let mut status = 0u32;
             match eclipse_syscall::call::wait_pid_nohang(&mut status, pid) {
-                Ok(0) => true,  // todavía en ejecución
+                Ok(0) => true, // sigue vivo
                 Ok(_) => {
                     let code = ((status >> 8) & 0xFF) as i32;
                     sh_println(&format!("[bg done] pid={} exit={}", pid, code));
                     false
                 }
-                Err(_) => false, // ya no existe
+                // Err: no quitar el PID — el hijo puede ser zombie y un wait fallido
+                // temporal; si lo borrábamos del vector, nadie hacía wait y quedaba Z.
+                Err(_) => true,
             }
         });
 
@@ -1188,6 +1214,10 @@ fn main() {
             }
         } else {
             let _ = run_pipeline(&pipeline);
+            // Salto de línea si el hijo no acabó en \n, para que el prompt sea legible.
+            if !pipeline.background {
+                sh_print("\r\n");
+            }
         }
     }
 

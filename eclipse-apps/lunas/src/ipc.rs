@@ -195,8 +195,15 @@ pub fn handle_sidewind_message(
                 }
 
                 surfaces[s_idx] = ExternalSurface {
-                    id: sender_pid, pid: sender_pid, vaddr: vaddr as usize,
-                    buffer_size, mapped_len: buffer_size, active: true, ready_to_flip: false,
+                    id: sender_pid,
+                    pid: sender_pid,
+                    vaddr: vaddr as usize,
+                    buffer_size,
+                    mapped_len: buffer_size,
+                    buffer_w: msg.w,
+                    buffer_h: msg.h,
+                    active: true,
+                    ready_to_flip: false,
                 };
 
                 let margin = 50;
@@ -206,24 +213,53 @@ pub fn handle_sidewind_message(
                 let mut title = [0u8; 32];
                 title[..name_len.min(32)].copy_from_slice(&msg.name[..name_len.min(32)]);
 
-                let new_window = ShellWindow {
-                    x: clamped_x, y: clamped_y,
-                    w: msg.w as i32, h: msg.h as i32 + ShellWindow::TITLE_H,
-                    curr_x: (clamped_x + msg.w as i32 / 2) as f32,
-                    curr_y: (clamped_y + (msg.h as i32 + ShellWindow::TITLE_H) / 2) as f32,
-                    curr_w: 0.0, curr_h: 0.0,
-                    minimized: false, maximized: false, closing: false,
-                    stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
-                    workspace: input_state.current_workspace,
-                    content: WindowContent::External(s_idx as u32),
-                    damage: std::vec::Vec::new(),
-                    buffer_handle: None,
-                    is_dmabuf: false,
-                    title,
+                let new_window = if let Some(w_idx) = existing_window_idx {
+                    // Mismo cliente (p. ej. terminal) cambia tamaño del SHM: conservar posición y metadatos.
+                    let old = &windows[w_idx];
+                    ShellWindow {
+                        x: old.x,
+                        y: old.y,
+                        w: msg.w as i32,
+                        h: msg.h as i32 + ShellWindow::TITLE_H,
+                        curr_x: old.curr_x,
+                        curr_y: old.curr_y,
+                        curr_w: old.curr_w,
+                        curr_h: old.curr_h,
+                        minimized: old.minimized,
+                        maximized: old.maximized,
+                        closing: old.closing,
+                        stored_rect: (old.x, old.y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
+                        workspace: old.workspace,
+                        content: WindowContent::External(s_idx as u32),
+                        damage: std::vec::Vec::new(),
+                        buffer_handle: None,
+                        is_dmabuf: false,
+                        title: old.title,
+                    }
+                } else {
+                    ShellWindow {
+                        x: clamped_x,
+                        y: clamped_y,
+                        w: msg.w as i32,
+                        h: msg.h as i32 + ShellWindow::TITLE_H,
+                        curr_x: (clamped_x + msg.w as i32 / 2) as f32,
+                        curr_y: (clamped_y + (msg.h as i32 + ShellWindow::TITLE_H) / 2) as f32,
+                        curr_w: 0.0,
+                        curr_h: 0.0,
+                        minimized: false,
+                        maximized: false,
+                        closing: false,
+                        stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
+                        workspace: input_state.current_workspace,
+                        content: WindowContent::External(s_idx as u32),
+                        damage: std::vec::Vec::new(),
+                        buffer_handle: None,
+                        is_dmabuf: false,
+                        title,
+                    }
                 };
 
                 if let Some(w_idx) = existing_window_idx {
-                    // Reuse the existing window slot for this PID.
                     windows[w_idx] = new_window;
                 } else {
                     windows[*window_count] = new_window;

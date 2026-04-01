@@ -5,6 +5,7 @@
 
 extern crate std;
 use std::prelude::v1::*;
+use eclipse_program_codes::{spawn_id_to_init_services_index, spawn_service_id, spawn_service_short_name};
 use eclipse_libc::{getpid, sleep_ms, yield_cpu, wait, Spinlock};
 use eclipse_libc::{fork, exec, get_service_binary, get_last_exec_error, exit};
 
@@ -112,24 +113,20 @@ fn main() {
 /// Start essential services
 fn start_essential_services() {
     // Start log server first - critical for debugging
-    let log_pid = start_essential_service(0); // log
+    let log_pid = start_essential_service(spawn_service_id!(log));
     wait_for_ready(log_pid, "log", 5000);
     std::thread::sleep(std::time::Duration::from_millis(5000));
-    let devfs_pid = start_essential_service(1); // devfs
+    let devfs_pid = start_essential_service(spawn_service_id!(devfs));
     wait_for_ready(devfs_pid, "devfs", 5000);
     std::thread::sleep(std::time::Duration::from_millis(5000));
 }
 
 fn start_essential_service(service_id: u32) -> u32 {
-    let name = match service_id {
-        0 => "log",
-        1 => "devfs",
-        _ => "service",
-    };
+    let name = spawn_service_short_name(service_id);
     let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
     if pid != u64::MAX {
         let mut svc = SERVICES.lock();
-        let idx = (service_id + 2) as usize; // log=2, devfs=3
+        let idx = spawn_id_to_init_services_index(service_id);
         svc[idx].pid = pid as i32;
         svc[idx].state = ServiceState::Running;
         println!("  [ESSENTIAL] {} started with PID: {}", svc[idx].name, pid);
@@ -143,8 +140,8 @@ fn start_essential_service(service_id: u32) -> u32 {
 /// Start system services
 fn start_system_services() {
     // Start remaining services in order: filesystem, input, display, audio, network, gui
-    // Indices 4 to 9 in SERVICES match IDs 2 to 7 in sys_spawn_service
-    for i in 5..=9 {
+    // Índices 4..=9 en SERVICES ↔ IDs spawn_service 2..=7 (ver eclipse_program_codes).
+    for i in 4..=9 {
         let (name, pid) = {
             let mut svc = SERVICES.lock();
             let name = svc[i].name;

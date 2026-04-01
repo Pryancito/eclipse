@@ -1479,14 +1479,18 @@ fn draw_window(
             WindowContent::External(s_idx) => {
                 let s = s_idx as usize;
                 if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
-                    let src_w = window.w.max(0) as u32;
-                    let intended_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32).min(content_h as u32);
-                    let max_pixels = (surfaces[s].mapped_len / 4) as u32;
-                    let max_h_for_buffer = if src_w > 0 { max_pixels / src_w } else { 0 };
-                    let src_h = intended_h.min(max_h_for_buffer);
+                    // El SHM tiene stride = buffer_w (CREATE). No usar window.w como stride:
+                    // si el marco es más ancho que el buffer, leer con window.w corrompe filas.
+                    let buf_w = surfaces[s].buffer_w.max(1);
+                    let buf_h = surfaces[s].buffer_h.max(1);
+                    let want_w = window.w.max(0) as u32;
+                    let want_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32)
+                        .min(content_h as u32);
+                    let src_w = want_w.min(buf_w);
+                    let src_h = want_h.min(buf_h);
 
                     if src_w > 0 && src_h > 0 {
-                        fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, src_w, cx, content_y);
+                        fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, buf_w, cx, content_y);
                     }
                 } else {
                     draw_terminal_demo(fb, cx, content_y, cw, content_h);

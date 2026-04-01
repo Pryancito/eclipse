@@ -76,6 +76,11 @@ pub struct DrmCaps {
 
 pub use number::*;
 
+pub use eclipse_program_codes::{
+    spawn_id_to_init_services_index, spawn_service, spawn_service_short_name, SpawnServiceId,
+};
+pub use eclipse_program_codes::{spawn_service_id, spawn_service_name};
+
 #[cfg(target_arch = "x86_64")]
 mod arch {
     #[inline(always)]

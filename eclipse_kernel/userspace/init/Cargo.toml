@@ -7,6 +7,7 @@ edition = "2021"
 eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false, features = ["std"] }
 std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
 eclipse-syscall = { path = "../../../eclipse-syscall" }
+eclipse-program-codes = { path = "../../../eclipse-program-codes", default-features = false }
 
 [[bin]]
 name = "eclipse-init"

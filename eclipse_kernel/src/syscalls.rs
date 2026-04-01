@@ -12,6 +12,7 @@ use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_2
 use crate::serial;
 use spin::Mutex;
 use alloc::sync::Arc;
+use eclipse_program_codes::spawn_service as svc;
 
 /// Debug: último PID y número de syscall (para heartbeat cuando se congela input).
 pub(crate) static LAST_SYSCALL_PID: AtomicU32 = AtomicU32::new(0);
@@ -365,6 +366,12 @@ pub extern "C" fn syscall_handler(
     };
 
     context.rax = final_ret;
+
+    // Entregar señales pendientes antes de volver a userspace (no reentrar tras exit).
+    if syscall_num != 60 && syscall_num != 231 {
+        crate::process::deliver_pending_signals_for_current();
+    }
+
     final_ret
 }
 
@@ -459,8 +466,8 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
 
 /// sys_kill - Terminar un proceso por su PID
 /// sys_kill(pid, sig) — terminar o señalizar un proceso.
-/// Por ahora solo implementa SIGKILL (9) y SIGTERM (15) como terminación forzosa.
-/// Cualquier otra señal es ignorada (devuelve 0).
+/// SIGKILL (9) y SIGTERM (15) terminan al proceso; otras señales van a la cola pendiente.
+/// `sig == 0`: comprobación de existencia (POSIX), sin enviar señal.
 fn sys_kill(pid: u64, sig: u64) -> u64 {
     if pid == 0 || pid == 1 {
         return u64::MAX; // No se puede matar al kernel ni al init
@@ -468,43 +475,27 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 
     let target_pid = pid as crate::process::ProcessId;
 
-    // Señales no fatales: entregarlas como pendientes (EINTR en próximo blocking syscall).
-    if sig != 0 && sig != 9 && sig != 15 {
+    if sig == 0 {
+        return if crate::process::get_process(target_pid).is_some() {
+            0
+        } else {
+            u64::MAX
+        };
+    }
+
+    // Señales no fatales: entregarlas como pendientes (se aplican al volver de syscall).
+    if sig != 9 && sig != 15 {
         crate::process::set_pending_signal(target_pid, sig as u8);
         return 0;
     }
 
     serial::serial_printf(format_args!("[KILL] pid={} sig={}\n", target_pid, sig));
 
-    let parent_pid = {
-        let killed = x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            for (slot_idx, slot) in table.iter_mut().enumerate() {
-                if let Some(p) = slot {
-                    if p.id == target_pid {
-                        if p.state == crate::process::ProcessState::Terminated {
-                            // Ya es zombie (exit() y kill() simultáneos): no actuar.
-                            return Some(None);
-                        }
-                        p.exit_code = 128 + sig; // exit code estándar POSIX para señal
-                        p.state = crate::process::ProcessState::Terminated;
-                        // NO desregistramos el slot: el proceso queda como zombie hasta
-                        // que el padre llame wait() y lo coseche.  El slot se libera en
-                        // sys_wait_impl.  Igual que exit_process().
-                        crate::ipc::clear_mailbox_slot(slot_idx);
-                        return Some(p.parent_pid);
-                    }
-                }
-            }
-            None
-        });
-        match killed {
-            Some(pp) => pp,
-            None => return u64::MAX, // Proceso no encontrado
-        }
+    let parent_pid = match crate::process::terminate_other_process_by_signal(target_pid, sig as u8) {
+        None => return u64::MAX,
+        Some(pp) => pp,
     };
 
-    // Notificar al padre (como hace exit_process) para desbloquear su wait().
     if let Some(ppid) = parent_pid {
         crate::process::wake_parent_from_wait(ppid);
     }
@@ -569,14 +560,14 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
 
     unsafe {
         let (slot, path) = match service_id {
-            0 => (&mut SERVICE_LOG_BIN, "/sbin/log_service"),
-            1 => (&mut SERVICE_DEVFS_BIN, "/sbin/devfs_service"),
-            2 => (&mut SERVICE_FS_BIN, "/sbin/filesystem_service"),
-            3 => (&mut SERVICE_INPUT_BIN, "/sbin/input_service"),
-            4 => (&mut SERVICE_DISPLAY_BIN, "/sbin/display_service"),
-            5 => (&mut SERVICE_AUDIO_BIN, "/sbin/audio_service"),
-            6 => (&mut SERVICE_NET_BIN, "/sbin/network_service"),
-            7 => (&mut SERVICE_GUI_BIN, "/sbin/gui_service"),
+            x if x == svc::LOG as u64 => (&mut SERVICE_LOG_BIN, svc::PATH_LOG),
+            x if x == svc::DEVFS as u64 => (&mut SERVICE_DEVFS_BIN, svc::PATH_DEVFS),
+            x if x == svc::FILESYSTEM as u64 => (&mut SERVICE_FS_BIN, svc::PATH_FILESYSTEM),
+            x if x == svc::INPUT as u64 => (&mut SERVICE_INPUT_BIN, svc::PATH_INPUT),
+            x if x == svc::DISPLAY as u64 => (&mut SERVICE_DISPLAY_BIN, svc::PATH_DISPLAY),
+            x if x == svc::AUDIO as u64 => (&mut SERVICE_AUDIO_BIN, svc::PATH_AUDIO),
+            x if x == svc::NETWORK as u64 => (&mut SERVICE_NET_BIN, svc::PATH_NETWORK),
+            x if x == svc::GUI as u64 => (&mut SERVICE_GUI_BIN, svc::PATH_GUI),
             _ => return None,
         };
 
@@ -627,17 +618,7 @@ fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
     }
     let name_str = core::str::from_utf8(&name_buf).unwrap_or("");
     let name_trimmed = if name_str.trim_matches('\0').is_empty() {
-        match service_id {
-            0 => "log",
-            1 => "devfs",
-            2 => "filesystem",
-            3 => "input",
-            4 => "display",
-            5 => "audio",
-            6 => "network",
-            7 => "gui",
-            _ => "service",
-        }
+        eclipse_program_codes::spawn_service_short_name(service_id as u32)
     } else {
         name_str.trim_matches('\0')
     };
@@ -1249,13 +1230,6 @@ fn sys_receive_fast(context: &mut crate::interrupts::SyscallContext) -> u64 {
     if let Some(client_id) = current_process_id() {
         if let Some((data_size, from, data)) = pop_small_message_24(client_id) {
             RECV_OK.fetch_add(1, Ordering::Relaxed);
-            // Diagnóstico: loguear mensajes recibidos por PID 11 (glxgears).
-            if client_id == 11 {
-                crate::serial::serial_printf(format_args!(
-                    "[RECV-FAST] glxgears pid=11 got msg data_size={} from={} data0={:#x}\n",
-                    data_size, from, u32::from_le_bytes([data[0],data[1],data[2],data[3]])
-                ));
-            }
             // Empaquetar data[0..24] en 3 u64 LE (sin Message en stack → menos riesgo de corrupción/#UD)
             let mut w = [0u64; 3];
             for i in 0..3 {
@@ -1500,15 +1474,13 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
     // Spawn the new process
     match crate::process::spawn_process(elf_data, name_trimmed) {
         Ok(pid) => {
-            // Set parent_pid so the spawning process can wait() for the child.
-            let caller_pid = crate::process::current_process_id();
-            if let Some(cpid) = caller_pid {
-                if let Some(mut child) = crate::process::get_process(pid) {
-                    child.parent_pid = Some(cpid);
-                    crate::process::update_process(pid, child);
-                }
+            // Siempre fijar padre (init=1 si no hay proceso actual) para que wait() pueda cosechar.
+            let parent_pid = crate::process::current_process_id().unwrap_or(1);
+            if let Some(mut child) = crate::process::get_process(pid) {
+                child.parent_pid = Some(parent_pid);
+                crate::process::update_process(pid, child);
             }
-            
+
             // Add to scheduler
             crate::scheduler::enqueue_process(pid);
             
@@ -1592,12 +1564,14 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
 
     match crate::process::spawn_process(&elf_data, name_trimmed) {
         Ok(pid) => {
+            let parent_pid = crate::process::current_process_id().unwrap_or(1);
             crate::process::modify_process(pid, |p| {
-                p.parent_pid = crate::process::current_process_id();
-            }).unwrap();
+                p.parent_pid = Some(parent_pid);
+            })
+            .unwrap();
 
             // Override file descriptors BEFORE enqueuing
-            if let Some(parent_pid) = crate::process::current_process_id() {
+            {
                 let p_fd_in = crate::fd::fd_get(parent_pid, fd_in as usize);
                 let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
                 let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
@@ -1755,6 +1729,22 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
             continue;
         }
 
+        // TRIPLE-CHECK (SMP): entre el double-check y marcar Blocked el hijo puede
+        // terminar y wake_parent_from_wait ejecutarse mientras el padre sigue Running.
+        // Si además consumiéramos el waiter en wake, el padre quedaría Blocked sin wake.
+        // Con wake que ya no borra el waiter, esto acorta la ventana residual.
+        if wait_pid != 0 {
+            let wp = wait_pid as process::ProcessId;
+            if let Some(p) = process::get_process(wp) {
+                if p.state == process::ProcessState::Terminated
+                    && p.parent_pid == Some(current_pid)
+                {
+                    process::unregister_child_waiter(current_pid);
+                    continue;
+                }
+            }
+        }
+
         x86_64::instructions::interrupts::without_interrupts(|| {
             let slot = crate::ipc::pid_to_slot_fast(current_pid);
             let mut table = process::PROCESS_TABLE.lock();
@@ -1772,18 +1762,8 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
 }
 
 /// sys_get_service_binary - Get pointer and size of embedded service binary
-/// Args: service_id (0-4), out_ptr (pointer to store binary pointer), out_size (pointer to store size)
+/// Args: service_id (0-7, ver `eclipse_program_codes::spawn_service`), out_ptr, out_size
 /// Returns: 0 on success, -1 on error
-/// 
-/// Service IDs (matching init startup order):
-/// 0 = log_service (Log Server / Console)
-/// 1 = devfs_service (Device Manager)
-/// 2 = filesystem_service (Filesystem Server)
-/// 3 = input_service (Input Server)
-/// 4 = display_service (Graphics Server)
-/// 5 = audio_service (Audio Server)
-/// 6 = network_service (Network Server)
-/// 7 = gui_service (GUI Launcher)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     // Validate pointers
     if out_ptr == 0 || out_size == 0 {

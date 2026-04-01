@@ -154,13 +154,26 @@ pub struct ExternalSurface {
     /// The actual length of the mmap'd region. Stays constant after CREATE;
     /// `buffer_size` may diverge on UPDATE but the blit is clamped to this.
     pub mapped_len: usize,
+    /// Dimensiones del buffer en el último CREATE (stride del SHM = buffer_w).
+    pub buffer_w: u32,
+    pub buffer_h: u32,
     pub active: bool,
     pub ready_to_flip: bool,
 }
 
 impl Default for ExternalSurface {
     fn default() -> Self {
-        Self { id: 0, pid: 0, vaddr: 0, buffer_size: 0, mapped_len: 0, active: false, ready_to_flip: false }
+        Self {
+            id: 0,
+            pid: 0,
+            vaddr: 0,
+            buffer_size: 0,
+            mapped_len: 0,
+            buffer_w: 0,
+            buffer_h: 0,
+            active: false,
+            ready_to_flip: false,
+        }
     }
 }
 
@@ -174,6 +187,8 @@ impl ExternalSurface {
         self.vaddr = 0;
         self.buffer_size = 0;
         self.mapped_len = 0;
+        self.buffer_w = 0;
+        self.buffer_h = 0;
         self.active = false;
     }
 
@@ -364,8 +379,15 @@ mod tests {
     #[test]
     fn test_unmap_clears_mapped_len() {
         let mut surface = ExternalSurface {
-            id: 1, pid: 100, vaddr: 0, buffer_size: 4096, mapped_len: 4096,
-            active: true, ready_to_flip: true,
+            id: 1,
+            pid: 100,
+            vaddr: 0,
+            buffer_size: 4096,
+            mapped_len: 4096,
+            buffer_w: 64,
+            buffer_h: 16,
+            active: true,
+            ready_to_flip: true,
         };
         surface.unmap();
         assert_eq!(surface.vaddr, 0);

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::vec::Vec;
 use std::boxed::Box;
-use core::cell::RefCell;
+use core::cell::{Ref, RefCell};
 use wayland_proto::wl::{ObjectId, NewId, Message, RawMessage, Interface, connection::Connection};
 use wayland_proto::EclipseWaylandConnection;
 use wayland_proto::wl::protocols::common::wl_registry;
@@ -223,35 +223,43 @@ fn find_pid_by_name(want: &[u8]) -> Option<u32> {
     None
 }
 
+/// Buffer mmap del cliente; se sustituye entero al redimensionar (nuevo SHM + CREATE a Lunas).
 #[cfg(target_vendor = "eclipse")]
-struct SurfaceDrawTarget {
+struct SurfaceBacking {
     ptr: *mut u32,
     width: usize,
     height: usize,
+    size_bytes: usize,
 }
 
 #[cfg(target_vendor = "eclipse")]
-unsafe impl Send for SurfaceDrawTarget {}
+struct SharedSurfaceDrawTarget {
+    state: Rc<RefCell<SurfaceBacking>>,
+}
 
 #[cfg(target_vendor = "eclipse")]
-impl DrawTarget for SurfaceDrawTarget {
+unsafe impl Send for SharedSurfaceDrawTarget {}
+
+#[cfg(target_vendor = "eclipse")]
+impl DrawTarget for SharedSurfaceDrawTarget {
     fn size(&self) -> (usize, usize) {
-        (self.width, self.height)
+        let b: Ref<'_, SurfaceBacking> = RefCell::borrow(&*self.state);
+        (b.width, b.height)
     }
 
     fn draw_pixel(&mut self, x: usize, y: usize, rgb: Rgb) {
-        if x >= self.width || y >= self.height {
+        let b: Ref<'_, SurfaceBacking> = RefCell::borrow(&*self.state);
+        if x >= b.width || y >= b.height {
             return;
         }
-        let idx = y * self.width + x;
-        // Lunas lee ARGB8888 como 0xAARRGGBB (ver FramebufferState::draw_iter/blits).
+        let idx = y * b.width + x;
         let pixel = 0xFF00_0000u32
             | ((rgb.0 as u32) << 16)
             | ((rgb.1 as u32) << 8)
             | (rgb.2 as u32);
         unsafe {
-            if !self.ptr.is_null() {
-                *self.ptr.add(idx) = pixel;
+            if !b.ptr.is_null() {
+                *b.ptr.add(idx) = pixel;
             }
         }
     }
@@ -379,12 +387,15 @@ fn main() {
             }
         };
 
-        // Render real del contenido del terminal con `os-terminal`.
-        // Esto escribe en el buffer ARGB8888 mmap del shm.
-        let draw_target = SurfaceDrawTarget {
+        let surface_state = Rc::new(RefCell::new(SurfaceBacking {
             ptr,
             width: w as usize,
             height: h as usize,
+            size_bytes,
+        }));
+
+        let draw_target = SharedSurfaceDrawTarget {
+            state: surface_state.clone(),
         };
         let font = Box::new(BitmapFont);
         let mut terminal = Terminal::new(draw_target, font);
@@ -530,7 +541,6 @@ fn main() {
         let mut last_title: [u8; 32] = [0; 32];
 
         std::println!("Terminal interactive: teclado (IPC desde Lunas) + shell (PTY).");
-        let _ = size_bytes;
         loop {
             let mut dirty = false;
 
@@ -564,15 +574,43 @@ fn main() {
                                 _ => {}
                             }
                         } else if ev.event_type == SWND_EVENT_TYPE_RESIZE {
-                            // El compositor redimensionó la ventana.
-                            // data1 = nuevo ancho en px, data2 = nuevo alto en px.
-                            let new_w = ev.data1.max(1) as u16;
-                            let new_h = ev.data2.max(1) as u16;
-                            let new_cols = new_w / FONT_CHAR_W;
-                            let new_rows = new_h / FONT_CHAR_H;
-                            set_pty_winsize(pty_master_fd, new_rows, new_cols, new_w, new_h);
-                            std::println!("[TERM] resize → {}x{} chars", new_cols, new_rows);
-                            dirty = true;
+                            // Área de contenido en px (Lunas: data2 ya excluye la barra de título).
+                            let new_w = ev.data1.max(1) as u32;
+                            let new_h = ev.data2.max(1) as u32;
+                            {
+                                let sb = RefCell::borrow_mut(&*surface_state);
+                                unsafe {
+                                    munmap(sb.ptr as *mut core::ffi::c_void, sb.size_bytes);
+                                }
+                            }
+                            if let Some((ptr, size_bytes, w, h)) =
+                                open_sidewind_window(lunas_pid, 0, 0, new_w, new_h, name_str)
+                            {
+                                *RefCell::borrow_mut(&*surface_state) = SurfaceBacking {
+                                    ptr,
+                                    width: w as usize,
+                                    height: h as usize,
+                                    size_bytes,
+                                };
+                                let new_cols = new_w as u16 / FONT_CHAR_W;
+                                let new_rows = new_h as u16 / FONT_CHAR_H;
+                                set_pty_winsize(
+                                    pty_master_fd,
+                                    new_rows,
+                                    new_cols,
+                                    new_w as u16,
+                                    new_h as u16,
+                                );
+                                // Recalcula rejilla de celdas según el nuevo `DrawTarget::size()`.
+                                terminal.set_font_manager(Box::new(BitmapFont));
+                                std::println!(
+                                    "[TERM] resize → {}x{} chars ({}x{} px)",
+                                    new_cols, new_rows, new_w, new_h
+                                );
+                                dirty = true;
+                            } else {
+                                std::println!("[TERM] resize: falló remap SHM / CREATE");
+                            }
                         } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
                             // El usuario cerró la ventana: matar al shell y salir.
                             unsafe { kill(sh_pid as c_int, 9) };
