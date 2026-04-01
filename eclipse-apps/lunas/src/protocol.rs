@@ -363,6 +363,9 @@ pub fn make_wayland_window(
 /// Maps `ClientId → wl_keyboard ObjectId` so the compositor can send key events.
 pub type SharedKeyboards = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
 
+/// Maps `ClientId → wl_pointer ObjectId` for mouse event dispatch.
+pub type SharedPointers = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
+
 // ────────────────────────────────────────────────────────────────────────────
 // LunasXdgWmBase  (xdg_wm_base)
 // ────────────────────────────────────────────────────────────────────────────
@@ -507,6 +510,7 @@ impl ObjectLogic for LunasXdgToplevel {
 
 pub struct LunasSeat {
     pub keyboard_registry: SharedKeyboards,
+    pub pointer_registry: SharedPointers,
     pub screen_w: u32,
     pub screen_h: u32,
 }
@@ -519,7 +523,20 @@ impl ObjectLogic for LunasSeat {
         args: &[Payload],
     ) -> Result<(), ServerError> {
         match opcode {
-            0 => Ok(()), // get_pointer — not implemented
+            0 => {
+                // get_pointer(id: new_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                self.pointer_registry.borrow_mut().insert(client.client_id(), id.as_id());
+                let ptr_obj = ObjectInner::Rc(Rc::new(RefCell::new(LunasPointer {
+                    id: id.as_id(),
+                    client_id: client.client_id(),
+                })));
+                client.add_object(id, Object::new::<wl_pointer::WlPointer>(id, ptr_obj));
+                Ok(())
+            }
             1 => {
                 // get_keyboard(id: new_id)
                 let id = match args.first() {
@@ -551,6 +568,30 @@ impl ObjectLogic for LunasSeat {
             }
             2 => Ok(()), // get_touch
             3 => Ok(()), // release
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasPointer  (wl_pointer)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasPointer {
+    pub id: ObjectId,
+    pub client_id: ClientId,
+}
+
+impl ObjectLogic for LunasPointer {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // set_cursor — ignored for now
+            1 => Ok(()), // release
             _ => Err(ServerError::ObjectMismatch),
         }
     }

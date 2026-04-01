@@ -100,6 +100,10 @@ impl Interface for WlSeat {
 }
 
 impl WlSeat {
+    pub fn get_pointer(&mut self, id: NewId) -> Result<super::wl_pointer::WlPointer, SendError> {
+        self.con.borrow_mut().send(self.id, Opcode(0), &[id.into()], &[])?;
+        Ok(super::wl_pointer::WlPointer::new(self.con.clone(), id.as_id()))
+    }
     pub fn get_keyboard(&mut self, id: NewId) -> Result<super::wl_keyboard::WlKeyboard, SendError> {
         self.con.borrow_mut().send(self.id, Opcode(1), &[id.into()], &[])?;
         Ok(super::wl_keyboard::WlKeyboard::new(self.con.clone(), id.as_id()))

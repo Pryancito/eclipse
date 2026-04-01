@@ -831,6 +831,10 @@ pub struct InputState {
     /// Signal to state.rs to request a DHCP IP renewal via IPC.
     pub renew_dhcp: bool,
     pub pending_snp_key: Option<(usize, u16, u16)>,
+    /// Pending wl_pointer.motion event for the focused SNP window: (surface_x, surface_y).
+    pub pending_snp_mouse_move: Option<(f32, f32)>,
+    /// Pending wl_pointer.button event: (linux_button_code, pressed).
+    pub pending_snp_mouse_button: Option<(u32, bool)>,
 }
 
 impl InputState {
@@ -913,6 +917,8 @@ impl InputState {
             apply_net_static: false,
             renew_dhcp: false,
             pending_snp_key: None,
+            pending_snp_mouse_move: None,
+            pending_snp_mouse_button: None,
         }
     }
 
@@ -1660,6 +1666,12 @@ impl InputState {
                                 };
                             }
                         }
+                        // Forward mouse move to SNP (Wayland) windows via pending field
+                        if let WindowContent::Snp { .. } = windows[focused].content {
+                            let local_x = (self.cursor_x - windows[focused].x) as f32;
+                            let local_y = (self.cursor_y - windows[focused].y - ShellWindow::TITLE_H) as f32;
+                            self.pending_snp_mouse_move = Some((local_x, local_y));
+                        }
                     }
                 }
 
@@ -2288,6 +2300,17 @@ impl InputState {
                                         )
                                     };
                                 }
+                            }
+                            // Forward mouse button to SNP (Wayland) windows
+                            if let WindowContent::Snp { .. } = windows[idx].content {
+                                // Linux evdev button codes: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
+                                let linux_btn = match button {
+                                    1 => 0x110u32,
+                                    3 => 0x111u32,
+                                    2 => 0x112u32,
+                                    _ => 0x110u32 + button as u32 - 1,
+                                };
+                                self.pending_snp_mouse_button = Some((linux_btn, pressed));
                             }
                         } else {
                             self.focused_window = None;

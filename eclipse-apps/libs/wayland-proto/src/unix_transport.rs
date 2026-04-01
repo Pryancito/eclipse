@@ -15,8 +15,6 @@ use smallvec::SmallVec;
 const SEND_BUF_LEN: usize = 4096;
 
 // ── libc bindings ────────────────────────────────────────────────────────────
-// We use raw syscall wrappers since the `libc` crate may not expose all
-// symbols for the Eclipse OS target; these match the POSIX prototypes.
 
 extern "C" {
     fn socket(domain: i32, type_: i32, protocol: i32) -> i32;
@@ -24,18 +22,100 @@ extern "C" {
     fn listen(fd: i32, backlog: i32) -> i32;
     fn accept(fd: i32, addr: *mut SockaddrUn, addrlen: *mut u32) -> i32;
     fn connect(fd: i32, addr: *const SockaddrUn, addrlen: u32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn unlink(path: *const u8) -> i32;
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    fn sendmsg(fd: i32, msg: *const MsgHdr, flags: i32) -> isize;
+    fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> isize;
 }
 
 const AF_UNIX: i32 = 1;
 const SOCK_STREAM: i32 = 1;
-/// Linux/Eclipse `O_NONBLOCK` flag for `fcntl(F_SETFL)`.
 const O_NONBLOCK: i32 = 0o4000;
 const F_SETFL: i32 = 4;
+/// `SOL_SOCKET` level for `cmsghdr`.
+const SOL_SOCKET: i32 = 1;
+/// `SCM_RIGHTS` — pass file descriptors as ancillary data.
+const SCM_RIGHTS: i32 = 1;
+
+// ── POSIX structs for sendmsg/recvmsg ─────────────────────────────────────────
+
+#[repr(C)]
+struct IoVec {
+    iov_base: *mut u8,
+    iov_len:  usize,
+}
+
+#[repr(C)]
+struct MsgHdr {
+    msg_name:       *mut u8,
+    msg_namelen:    u32,
+    msg_iov:        *mut IoVec,
+    msg_iovlen:     usize,
+    msg_control:    *mut u8,
+    msg_controllen: usize,
+    msg_flags:      i32,
+}
+
+/// Control-message header followed by `cmsg_len - sizeof(CmsgHdr)` bytes of data.
+#[repr(C)]
+struct CmsgHdr {
+    cmsg_len:   usize,
+    cmsg_level: i32,
+    cmsg_type:  i32,
+    // fd data follows immediately after this header
+}
+
+/// Align `n` up to pointer size (required for `CMSG_NXTHDR` arithmetic).
+#[inline(always)]
+const fn cmsg_align(n: usize) -> usize {
+    (n + core::mem::size_of::<usize>() - 1) & !(core::mem::size_of::<usize>() - 1)
+}
+
+/// Size of control buffer needed to pass `n` file descriptors.
+#[inline(always)]
+const fn cmsg_space(n: usize) -> usize {
+    cmsg_align(core::mem::size_of::<CmsgHdr>()) + cmsg_align(n * core::mem::size_of::<i32>())
+}
+
+/// Write `fds` into a cmsg control buffer; returns the number of bytes written.
+fn encode_fds(fds: &[i32], buf: &mut [u8]) -> usize {
+    if fds.is_empty() { return 0; }
+    let hdr_size = cmsg_align(core::mem::size_of::<CmsgHdr>());
+    let data_size = fds.len() * core::mem::size_of::<i32>();
+    let total = hdr_size + data_size;
+    if buf.len() < total { return 0; }
+
+    let hdr = CmsgHdr {
+        cmsg_len:   total,
+        cmsg_level: SOL_SOCKET,
+        cmsg_type:  SCM_RIGHTS,
+    };
+    unsafe {
+        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut CmsgHdr, hdr);
+        let data_ptr = buf.as_mut_ptr().add(hdr_size) as *mut i32;
+        for (i, &fd) in fds.iter().enumerate() {
+            core::ptr::write_unaligned(data_ptr.add(i), fd);
+        }
+    }
+    total
+}
+
+/// Read file descriptors from a received control buffer.
+fn decode_fds(buf: &[u8], cmsg_len: usize) -> alloc::vec::Vec<i32> {
+    let mut fds = alloc::vec::Vec::new();
+    let hdr_size = cmsg_align(core::mem::size_of::<CmsgHdr>());
+    if cmsg_len < hdr_size { return fds; }
+    let hdr = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const CmsgHdr) };
+    if hdr.cmsg_level != SOL_SOCKET || hdr.cmsg_type != SCM_RIGHTS { return fds; }
+    let data_len = hdr.cmsg_len.saturating_sub(hdr_size);
+    let n = data_len / core::mem::size_of::<i32>();
+    let data_ptr = unsafe { buf.as_ptr().add(hdr_size) as *const i32 };
+    for i in 0..n {
+        fds.push(unsafe { core::ptr::read_unaligned(data_ptr.add(i)) });
+    }
+    fds
+}
 
 // ── sockaddr_un ───────────────────────────────────────────────────────────────
 
@@ -109,33 +189,82 @@ impl Connection for UnixSocketConnection {
         let mut buf = [0u8; SEND_BUF_LEN];
         let len = raw.serialize(&mut buf, &mut h_vec).map_err(|_| SendError::IoError)?;
 
-        let mut written = 0;
-        while written < len {
-            let n = unsafe { write(self.fd, buf[written..len].as_ptr(), len - written) };
-            if n <= 0 { return Err(SendError::IoError); }
-            written += n as usize;
+        // Build list of raw fds from Handle list.
+        let fds: alloc::vec::Vec<i32> = h_vec.iter().map(|h| h.0).collect();
+
+        if fds.is_empty() {
+            // No ancillary data — simple sendmsg with no control message.
+            let mut iov = IoVec { iov_base: buf.as_ptr() as *mut u8, iov_len: len };
+            let msg = MsgHdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: core::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+            let sent = unsafe { sendmsg(self.fd, &msg, 0) };
+            if sent < 0 { return Err(SendError::IoError); }
+        } else {
+            // Ancillary SCM_RIGHTS data carrying the file descriptors.
+            const MAX_CTRL: usize = cmsg_space(8); // up to 8 fds per message
+            let mut ctrl_buf = [0u8; MAX_CTRL];
+            let ctrl_len = encode_fds(&fds, &mut ctrl_buf);
+
+            let mut iov = IoVec { iov_base: buf.as_ptr() as *mut u8, iov_len: len };
+            let msg = MsgHdr {
+                msg_name: core::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: ctrl_buf.as_mut_ptr(),
+                msg_controllen: ctrl_len,
+                msg_flags: 0,
+            };
+            let sent = unsafe { sendmsg(self.fd, &msg, 0) };
+            if sent < 0 { return Err(SendError::IoError); }
         }
         Ok(())
     }
 
     fn recv(&self) -> Result<(Vec<u8>, Vec<Handle>), RecvError> {
-        let mut tmp = [0u8; 4096];
-        let n = unsafe { read(self.fd, tmp.as_mut_ptr(), tmp.len()) };
+        let mut data_buf = [0u8; 4096];
+        const MAX_CTRL: usize = cmsg_space(8);
+        let mut ctrl_buf = [0u8; MAX_CTRL];
+
+        let mut iov = IoVec { iov_base: data_buf.as_mut_ptr(), iov_len: data_buf.len() };
+        let mut msg = MsgHdr {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: ctrl_buf.as_mut_ptr(),
+            msg_controllen: MAX_CTRL,
+            msg_flags: 0,
+        };
+
+        let n = unsafe { recvmsg(self.fd, &mut msg, 0) };
         if n < 0 {
-            // EAGAIN / EWOULDBLOCK on non-blocking socket → no data yet
-            return Err(RecvError::IoError);
+            return Err(RecvError::IoError); // EAGAIN or error
         }
         if n == 0 {
-            // EOF — peer disconnected
-            return Err(RecvError::IoError);
+            return Err(RecvError::IoError); // EOF
         }
-        let mut buf = self.recv_buf.borrow_mut();
-        buf.extend_from_slice(&tmp[..n as usize]);
 
-        // Return whatever we have; the caller (WaylandServer / handshake loop)
-        // will call recv again if it needs more data.
+        let mut buf = self.recv_buf.borrow_mut();
+        buf.extend_from_slice(&data_buf[..n as usize]);
+
+        // Decode any received file descriptors from ancillary data.
+        let handles: Vec<Handle> = if msg.msg_controllen > 0 {
+            decode_fds(&ctrl_buf[..msg.msg_controllen], msg.msg_controllen)
+                .into_iter().map(Handle).collect()
+        } else {
+            Vec::new()
+        };
+
         let data = core::mem::take(&mut *buf);
-        Ok((data, Vec::new()))
+        Ok((data, handles))
     }
 }
 

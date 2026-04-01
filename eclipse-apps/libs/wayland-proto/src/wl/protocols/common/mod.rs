@@ -6,6 +6,7 @@ pub mod wl_shm;
 pub mod wl_buffer;
 pub mod wl_seat;
 pub mod wl_keyboard;
+pub mod wl_pointer;
 pub mod wl_output;
 pub mod xdg_wm_base;
 pub mod xdg_surface;

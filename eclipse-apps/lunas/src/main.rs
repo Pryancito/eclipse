@@ -88,6 +88,7 @@ fn main() {
     // wl_seat — keyboard + pointer seat
     {
         let kb_reg = state.keyboard_registry.clone();
+        let ptr_reg = state.pointer_registry.clone();
         let w = state.backend.fb.info.width;
         let h = state.backend.fb.info.height;
         state.protocol.register_global_with_post_bind(
@@ -95,6 +96,7 @@ fn main() {
             move || {
                 let seat = lunas::protocol::LunasSeat {
                     keyboard_registry: kb_reg.clone(),
+                    pointer_registry: ptr_reg.clone(),
                     screen_w: w,
                     screen_h: h,
                 };
@@ -106,9 +108,9 @@ fn main() {
                 wayland_proto::wl::protocols::common::wl_seat::WlSeat
             >(id, inner),
             Some(alloc::boxed::Box::new(|obj_id, client| {
-                // Send capabilities: keyboard present
-                use wayland_proto::wl::protocols::common::wl_seat::{Event, CAP_KEYBOARD};
-                client.send_event(obj_id, Event::Capabilities { capabilities: CAP_KEYBOARD })
+                // Send capabilities: keyboard + pointer
+                use wayland_proto::wl::protocols::common::wl_seat::{Event, CAP_KEYBOARD, CAP_POINTER};
+                client.send_event(obj_id, Event::Capabilities { capabilities: CAP_KEYBOARD | CAP_POINTER })
                     .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
             })),
         );

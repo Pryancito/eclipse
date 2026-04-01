@@ -8,11 +8,12 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SurfaceCommit};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SurfaceCommit};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use wayland_proto::wl::protocols::common::wl_keyboard;
+use wayland_proto::wl::protocols::common::wl_pointer;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -92,6 +93,8 @@ pub struct LunasState {
     pub buffer_registry: SharedBuffers,
     /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
     pub keyboard_registry: SharedKeyboards,
+    /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
+    pub pointer_registry: SharedPointers,
     /// Monotonically increasing serial number for Wayland protocol events.
     pub wayland_serial: u32,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
@@ -150,6 +153,7 @@ impl LunasState {
             pending_surface_commits: Rc::new(RefCell::new(alloc::vec::Vec::new())),
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             wayland_serial: 1,
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
@@ -236,6 +240,47 @@ impl LunasState {
                                     )
                                 };
                             }
+                        }
+                    }
+                }
+
+                // Dispatch pending Wayland pointer events (motion + button)
+                if let Some(w_idx) = self.input.focused_window {
+                    if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
+                        let focused_client = ClientId(pid);
+                        let pointer_id = self.pointer_registry.borrow().get(&focused_client).copied();
+
+                        if let Some(ptr_id) = pointer_id {
+                            if let Some((sx, sy)) = self.input.pending_snp_mouse_move.take() {
+                                if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Motion {
+                                        time: self.counter as u32,
+                                        surface_x: sx,
+                                        surface_y: sy,
+                                    });
+                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Frame);
+                                }
+                            }
+                            if let Some((btn, pressed)) = self.input.pending_snp_mouse_button.take() {
+                                if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                    self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Button {
+                                        serial: self.wayland_serial,
+                                        time: self.counter as u32,
+                                        button: btn,
+                                        state: if pressed {
+                                            wl_pointer::BTN_STATE_PRESSED
+                                        } else {
+                                            wl_pointer::BTN_STATE_RELEASED
+                                        },
+                                    });
+                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Frame);
+                                }
+                            }
+                        } else {
+                            // No Wayland pointer — discard
+                            self.input.pending_snp_mouse_move.take();
+                            self.input.pending_snp_mouse_button.take();
                         }
                     }
                 }
