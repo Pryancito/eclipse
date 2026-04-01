@@ -61,6 +61,12 @@ impl IpcChannel {
                 self.message_count += 1;
                 return Some(msg);
             }
+            // Slow-path no reconocido: fallback a Raw para no perder el mensaje.
+            let mut raw_data = [0u8; MAX_MSG_LEN];
+            let copy_len = len.min(MAX_MSG_LEN);
+            raw_data[..copy_len].copy_from_slice(&self.slow_buf[..copy_len]);
+            self.message_count += 1;
+            return Some(EclipseMessage::Raw { data: raw_data, len: copy_len, from });
         }
 
         None

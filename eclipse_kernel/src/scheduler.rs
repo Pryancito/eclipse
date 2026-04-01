@@ -65,6 +65,19 @@ static RUNNABLE_COUNT: AtomicU32 = AtomicU32::new(0);
 static mut AP_IDLE_CONTEXTS: [crate::process::Context; MAX_CPUS] =
     [const { crate::process::Context::new() }; MAX_CPUS];
 
+/// Buffer scratch por CPU para context switch de procesos muertos.
+///
+/// Cuando un proceso termina (exit/kill) su PID slot queda desregistrado ANTES
+/// de que la CPU que lo ejecutaba haya hecho el context switch.  perform_context_switch
+/// busca el contexto del proceso saliente con pid_to_slot_fast; si devuelve None,
+/// usamos este buffer scratch de la CPU para guardar los registros (que son
+/// descartados, ya que el proceso está muerto).  Esto evita que el CPU quede
+/// atascado ejecutando el `loop {}` del proceso muerto indefinidamente.
+///
+/// Safety: idéntica a AP_IDLE_CONTEXTS — cada CPU solo escribe su índice propio.
+static mut SCRATCH_CONTEXTS: [crate::process::Context; MAX_CPUS] =
+    [const { crate::process::Context::new() }; MAX_CPUS];
+
 /// Indica si el contexto idle del AP ya fue guardado al menos una vez.
 static AP_IDLE_CONTEXT_VALID: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
@@ -579,19 +592,24 @@ pub fn schedule() -> u64 {
                         // AP: restaurar el contexto idle guardado.
                         x86_64::instructions::interrupts::without_interrupts(|| {
                             set_current_process(None);
-                            let (from_ptr, clear_ptr) = {
+                            // Si el slot del proceso saliente fue desregistrado (exit/kill antes
+                            // del context switch), usamos el scratch buffer de esta CPU y
+                            // clear_ptr = 0 (sin atomic release de current_cpu, inocuo porque
+                            // el proceso ya está muerto y su slot fue limpiado).
+                            let (from_ptr, clear_ptr): (*mut crate::process::Context, u64) = {
                                 let mut table = crate::process::PROCESS_TABLE.lock();
-                                let slot = match crate::ipc::pid_to_slot_fast(pid) {
-                                    Some(s) => s,
-                                    None => return,
-                                };
-                                match table[slot].as_mut() {
-                                    Some(p) if p.id == pid => {
-                                        let ctx_ptr = &mut p.context as *mut crate::process::Context;
-                                        let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
-                                        (ctx_ptr, cpu_ptr)
+                                match crate::ipc::pid_to_slot_fast(pid) {
+                                    Some(slot) => {
+                                        match table[slot].as_mut() {
+                                            Some(p) if p.id == pid => {
+                                                let ctx_ptr = &mut p.context as *mut crate::process::Context;
+                                                let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
+                                                (ctx_ptr, cpu_ptr)
+                                            },
+                                            _ => (unsafe { &mut SCRATCH_CONTEXTS[cpu_id] as *mut crate::process::Context }, 0),
+                                        }
                                     },
-                                    _ => return,
+                                    None => (unsafe { &mut SCRATCH_CONTEXTS[cpu_id] as *mut crate::process::Context }, 0),
                                 }
                             };
                             let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
@@ -632,15 +650,39 @@ pub fn schedule() -> u64 {
 
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu_id = crate::process::get_cpu_id();
         let mut table = crate::process::PROCESS_TABLE.lock();
         // Use pid_to_slot_fast: PIDs may exceed 63 after slot reuse.
-        let from_slot = match crate::ipc::pid_to_slot_fast(from_pid) {
-            Some(s) => s,
-            None => return,
-        };
-        let from_ptr = match table[from_slot].as_mut() {
-            Some(p) if p.id == from_pid => &mut p.context as *mut crate::process::Context,
-            _ => return, // Process exited, skip switch
+        //
+        // Si el slot del proceso saliente no se encuentra (fue desregistrado porque el
+        // proceso llamó exit() o fue matado por sys_kill antes de que se hiciera el
+        // context switch), usamos el buffer SCRATCH_CONTEXTS de esta CPU para guardar
+        // los registros actuales.  Los datos guardados se descartan — el proceso ya
+        // está muerto — pero esto permite que el context switch continúe y que la CPU
+        // empiece a ejecutar el proceso siguiente en lugar de quedar atascada en el
+        // `loop {}` del proceso muerto.
+        let from_ptr: *mut crate::process::Context = match crate::ipc::pid_to_slot_fast(from_pid) {
+            Some(slot) => {
+                match table[slot].as_mut() {
+                    Some(p) if p.id == from_pid => &mut p.context as *mut crate::process::Context,
+                    _ => {
+                        if cpu_id < MAX_CPUS {
+                            unsafe { &mut SCRATCH_CONTEXTS[cpu_id] as *mut crate::process::Context }
+                        } else {
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {
+                // PID slot unregistered: process already exited or was killed.
+                // Use per-CPU scratch buffer so the switch can still proceed.
+                if cpu_id < MAX_CPUS {
+                    unsafe { &mut SCRATCH_CONTEXTS[cpu_id] as *mut crate::process::Context }
+                } else {
+                    return;
+                }
+            }
         };
         let to_slot = match crate::ipc::pid_to_slot_fast(to_pid) {
             Some(s) => s,

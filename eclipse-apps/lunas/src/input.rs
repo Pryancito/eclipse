@@ -7,7 +7,57 @@ use libc::{InputEvent, eclipse_send};
 use eclipse_syscall::InputEvent;
 #[cfg(not(target_vendor = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON};
+use sidewind::{
+    SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON,
+    SWND_EVENT_TYPE_CLOSE,
+};
+
+/// Envía SWND_EVENT_TYPE_CLOSE al proceso cliente y luego lo mata con SIGKILL.
+/// El evento CLOSE da al proceso la oportunidad de limpiar (atexit, etc.);
+/// el SIGKILL garantiza que el proceso termina aunque no maneje el evento.
+fn notify_window_close(
+    windows: &[ShellWindow],
+    idx: usize,
+    surfaces: &[ExternalSurface],
+) {
+    if idx >= windows.len() {
+        return;
+    }
+    let ev = SideWindEvent { event_type: SWND_EVENT_TYPE_CLOSE, data1: 0, data2: 0, data3: 0 };
+
+    let target_pid: u32 = match windows[idx].content {
+        WindowContent::External(s_idx) => {
+            let s_idx = s_idx as usize;
+            if s_idx < surfaces.len() && surfaces[s_idx].active {
+                surfaces[s_idx].pid
+            } else {
+                return;
+            }
+        }
+        WindowContent::Snp { pid, .. } => pid,
+        _ => return,
+    };
+
+    println!("[LUNAS] sending CLOSE to PID {}", target_pid);
+    let r = unsafe {
+        eclipse_send(
+            target_pid,
+            sidewind::MSG_TYPE_INPUT,
+            &ev as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<SideWindEvent>(),
+            0,
+        )
+    };
+    println!("[LUNAS] CLOSE send result {}", r);
+
+    // Matar el proceso con SIGKILL para garantizar que termina y el padre
+    // (shell) sea notificado, incluso si el proceso no maneja SWND_EVENT_TYPE_CLOSE.
+    #[cfg(target_vendor = "eclipse")]
+    unsafe {
+        libc::kill(target_pid as libc::pid_t, 9);
+    }
+    println!("[LUNAS] SIGKILL sent to PID {}", target_pid);
+}
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
@@ -1191,6 +1241,7 @@ impl InputState {
                             } else if let Some(idx) = self.focused_window {
                                 if idx < *window_count {
                                     windows[idx].closing = true;
+                                    notify_window_close(windows, idx, surfaces);
                                     self.focused_window = None;
                                     dirty = true;
                                 }
@@ -2106,6 +2157,7 @@ impl InputState {
                             match btn {
                                 WindowButton::Close => {
                                     windows[idx].closing = true;
+                                    notify_window_close(windows, idx, surfaces);
                                     self.focused_window = None;
                                 }
                                 WindowButton::Maximize => {
@@ -2401,6 +2453,7 @@ impl InputState {
                     if let TaskbarHit::WindowTask(w_idx) = tb_hit {
                         if w_idx < *window_count {
                             windows[w_idx].closing = true;
+                            notify_window_close(windows, w_idx, surfaces);
                             if self.focused_window == Some(w_idx) {
                                 self.focused_window = None;
                             }

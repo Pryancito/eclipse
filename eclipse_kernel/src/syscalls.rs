@@ -281,7 +281,7 @@ pub extern "C" fn syscall_handler(
         60 => sys_exit(arg1),
         231 => sys_exit(arg1),  // Linux exit_group
         61 => sys_wait(arg1),
-        62 => sys_kill(arg1),
+        62 => sys_kill(arg1, arg2),
         77 => sys_ftruncate(arg1, arg2),
         82 => sys_rename(arg1, arg2),
         83 => sys_mkdir(arg1, arg2),
@@ -452,29 +452,57 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
 }
 
 /// sys_kill - Terminar un proceso por su PID
-fn sys_kill(pid: u64) -> u64 {
+/// sys_kill(pid, sig) — terminar o señalizar un proceso.
+/// Por ahora solo implementa SIGKILL (9) y SIGTERM (15) como terminación forzosa.
+/// Cualquier otra señal es ignorada (devuelve 0).
+fn sys_kill(pid: u64, sig: u64) -> u64 {
     if pid == 0 || pid == 1 {
-        return u64::MAX; // Cannot kill kernel or init
+        return u64::MAX; // No se puede matar al kernel ni al init
     }
 
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        for (slot_idx, slot) in table.iter_mut().enumerate() {
-            if let Some(p) = slot {
-                if p.id == pid as u32 {
-                    p.state = crate::process::ProcessState::Terminated;
-                    // Remove from IPC lookup table so no new messages are routed here.
-                    crate::ipc::unregister_pid_slot(p.id);
-                    // Clear the IPC mailbox so that if this slot index is ever reused
-                    // for a new process it starts with an empty mailbox (consistent with
-                    // exit_process() which calls clear_mailbox_slot() on normal exit).
-                    crate::ipc::clear_mailbox_slot(slot_idx);
-                    return 0;
+    // Señales que no matan: ignorarlas.
+    if sig != 0 && sig != 9 && sig != 15 {
+        return 0;
+    }
+
+    let target_pid = pid as crate::process::ProcessId;
+
+    serial::serial_printf(format_args!("[KILL] pid={} sig={}\n", target_pid, sig));
+
+    let parent_pid = {
+        let killed = x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            for (slot_idx, slot) in table.iter_mut().enumerate() {
+                if let Some(p) = slot {
+                    if p.id == target_pid {
+                        if p.state == crate::process::ProcessState::Terminated {
+                            // Ya es zombie (exit() y kill() simultáneos): no actuar.
+                            return Some(None);
+                        }
+                        p.exit_code = 128 + sig; // exit code estándar POSIX para señal
+                        p.state = crate::process::ProcessState::Terminated;
+                        // NO desregistramos el slot: el proceso queda como zombie hasta
+                        // que el padre llame wait() y lo coseche.  El slot se libera en
+                        // sys_wait_impl.  Igual que exit_process().
+                        crate::ipc::clear_mailbox_slot(slot_idx);
+                        return Some(p.parent_pid);
+                    }
                 }
             }
+            None
+        });
+        match killed {
+            Some(pp) => pp,
+            None => return u64::MAX, // Proceso no encontrado
         }
-        u64::MAX
-    })
+    };
+
+    // Notificar al padre (como hace exit_process) para desbloquear su wait().
+    if let Some(ppid) = parent_pid {
+        crate::process::wake_parent_from_wait(ppid);
+    }
+
+    0
 }
 
 /// sys_set_process_name - Cambiar el nombre del proceso actual
@@ -885,6 +913,8 @@ fn sys_exit(exit_code: u64) -> u64 {
     
     let pid = current_process_id().unwrap_or(0);
 
+    serial::serial_printf(format_args!("[EXIT] pid={} code={}\n", pid, exit_code));
+
     // Store the exit code in the PCB so sys_wait() can report it to the parent.
     if let Some(mut proc) = crate::process::get_process(pid) {
         proc.exit_code = exit_code;
@@ -1154,6 +1184,13 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     if let Some(client_id) = current_process_id() {
         if let Some(msg) = receive_message(client_id) {
             RECV_OK.fetch_add(1, Ordering::Relaxed);
+            // Diagnóstico: loguear mensajes recibidos por PID 11 (glxgears).
+            if client_id == 11 {
+                crate::serial::serial_printf(format_args!(
+                    "[RECV-SLOW] glxgears pid=11 got msg data_size={} from={}\n",
+                    msg.data_size, msg.from
+                ));
+            }
             // Calcular cuántos bytes copiar al buffer del usuario
             let data_len = (msg.data_size as usize).min(msg.data.len());
             let copy_len = core::cmp::min(size as usize, data_len);
@@ -1176,6 +1213,16 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
             return copy_len as u64;
         }
         RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
+        // Diagnóstico (solo una vez por segundo aproximadamente, usando RECV_EMPTY como throttle).
+        if client_id == 11 {
+            let empty = RECV_EMPTY.load(Ordering::Relaxed);
+            if empty % 50000 == 1 {
+                crate::serial::serial_printf(format_args!(
+                    "[RECV-EMPTY] glxgears pid=11 mailbox empty (current_pid_from_gs={})\n",
+                    client_id
+                ));
+            }
+        }
     }
     0 // No hay mensajes
 }
@@ -1193,6 +1240,13 @@ fn sys_receive_fast(context: &mut crate::interrupts::SyscallContext) -> u64 {
     if let Some(client_id) = current_process_id() {
         if let Some((data_size, from, data)) = pop_small_message_24(client_id) {
             RECV_OK.fetch_add(1, Ordering::Relaxed);
+            // Diagnóstico: loguear mensajes recibidos por PID 11 (glxgears).
+            if client_id == 11 {
+                crate::serial::serial_printf(format_args!(
+                    "[RECV-FAST] glxgears pid=11 got msg data_size={} from={} data0={:#x}\n",
+                    data_size, from, u32::from_le_bytes([data[0],data[1],data[2],data[3]])
+                ));
+            }
             // Empaquetar data[0..24] en 3 u64 LE (sin Message en stack → menos riesgo de corrupción/#UD)
             let mut w = [0u64; 3];
             for i in 0..3 {
@@ -1557,6 +1611,10 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
                         process::unregister_child_waiter(current_pid);
                         proc.parent_pid = None;
                         process::update_process(wp, proc);
+                        // Cosechar el zombie: liberar el slot ahora que el padre leyó
+                        // el exit_code.  Se llama DESPUÉS de update_process porque
+                        // update_process usa pid_to_slot_fast internamente.
+                        crate::ipc::unregister_pid_slot(wp);
                         return wp as u64;
                     }
                 }
@@ -1588,6 +1646,8 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
                             process::unregister_child_waiter(current_pid);
                             proc.parent_pid = None;
                             process::update_process(*pid, proc);
+                            // Cosechar el zombie: liberar slot después de update_process.
+                            crate::ipc::unregister_pid_slot(*pid);
                             return *pid as u64;
                         }
                     }
@@ -1604,7 +1664,37 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64) -> u64 {
             return u64::MAX;
         }
 
+        // Registrar ANTES de marcar como Blocked para evitar la race condition
+        // "lost wakeup": si el hijo termina entre la comprobación inicial y el
+        // registro, wake_parent_from_wait() nos encontrará en la lista de
+        // espera y no perderemos la notificación.
         process::register_child_waiter(current_pid);
+
+        // DOUBLE-CHECK: el hijo puede haber terminado entre la comprobación
+        // inicial (arriba) y register_child_waiter.  Si ya está Terminated,
+        // cancelamos el sueño y volvemos al inicio del loop (que lo recogerá).
+        //
+        // Nota: sólo hacemos el double-check para wait_pid != 0 (hijo concreto).
+        // Para wait_pid == 0 (cualquier hijo) omitimos el double-check con
+        // list_processes() para evitar una gran asignación en el stack del kernel.
+        // En ese caso, la race es tolerable: el bucle se despertará igualmente
+        // por el siguiente tick del temporizador.
+        let child_done = if wait_pid != 0 {
+            let wp = wait_pid as process::ProcessId;
+            process::get_process(wp).map_or(false, |p| {
+                p.state == process::ProcessState::Terminated
+                    && p.parent_pid == Some(current_pid)
+            })
+        } else {
+            false
+        };
+
+        if child_done {
+            // El hijo terminó mientras nos registrábamos: cancelar el sueño
+            // y dejar que el siguiente ciclo del loop recoja el resultado.
+            process::unregister_child_waiter(current_pid);
+            continue;
+        }
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             let slot = crate::ipc::pid_to_slot_fast(current_pid);

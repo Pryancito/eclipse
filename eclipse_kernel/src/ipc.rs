@@ -187,7 +187,9 @@ static IPC_SYSTEM: Mutex<IpcSystem> = Mutex::new(IpcSystem::new());
 /// same index) would silently route IPC messages for PID A to whatever
 /// slot PID B registered — a silent data corruption bug that manifests
 /// after ~256 process lifecycle events.
-const PID_MAP_SIZE: usize = 256;
+// 4096 entradas: PIDs secuenciales < 4096 nunca colisionan (pid % 4096 == pid).
+// Subir este valor si en el futuro los PIDs superan 4096.
+const PID_MAP_SIZE: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct PidSlotEntry {
@@ -222,24 +224,18 @@ pub fn unregister_pid_slot(pid: crate::process::ProcessId) {
 }
 
 /// Lookup O(1): PID → slot index via the inverse map.
-/// Falls back to O(N) linear scan over PROCESS_TABLE only if the entry is
-/// empty or belongs to a different PID (hash collision / stale entry).
+///
+/// Con PID_MAP_SIZE = 4096 y PIDs secuenciales pequeños, `pid % 4096 == pid`
+/// → nunca hay colisión. NO hace fallback a PROCESS_TABLE (que puede estar
+/// bloqueada por el scheduler/spawn y provocar deadlock de spinlock).
 pub fn pid_to_slot_fast(pid: crate::process::ProcessId) -> Option<usize> {
     let idx = pid as usize % PID_MAP_SIZE;
     let entry = run_critical(|| {
         PID_SLOT_MAP.lock()[idx]
     });
-    // Validate that the stored pid matches (detects hash collisions / stale entries).
     if entry.pid == pid && entry.slot != 0xFF {
-        return Some(entry.slot as usize);
-    }
-    // Fallback: entry empty or belongs to a different PID — use O(N) scan.
-    #[cfg(not(test))]
-    {
-        crate::process::pid_to_slot(pid)
-    }
-    #[cfg(test)]
-    {
+        Some(entry.slot as usize)
+    } else {
         None
     }
 }
@@ -406,7 +402,16 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     // O(1): precalcular slot antes de cualquier lock.
     // Ahora intentamos entrega P2P para CUALQUIER tipo de mensaje si el destino es un PID válido.
     // Esto permite que procesos como 'init' reciban mensajes de sistema/usuario sin ser servidores registrados.
-    let dest_slot = pid_to_slot_fast(to).map(|s| s as u8).unwrap_or(0xFF);
+    let mut dest_slot = pid_to_slot_fast(to).map(|s| s as u8).unwrap_or(0xFF);
+    // Importante: si el mapa O(1) falla (colisión / PID aún no registrado en la tabla rápida),
+    // y el mensaje es P2P (Input/Signal), NO podemos caer a la cola global: `receive()` del
+    // proceso solo drena PROCESS_MAILBOXES, y la cola global requiere `process_messages()`.
+    // Hacemos fallback a la búsqueda lenta en la tabla de procesos.
+    if dest_slot == 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
+        if let Some(s) = crate::process::pid_to_slot(to) {
+            dest_slot = s as u8;
+        }
+    }
 
     // Construir mensaje (sin ningún lock aún)
     let mut msg = Message::new();
@@ -420,23 +425,19 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
 
     // --- Direct delivery para P2P / Process Mailbox: bypass de cola global ---
     // Si conocemos el slot del proceso, enviamos directamente a su buzón.
+    //
+    // IMPORTANTE: NO re-verificamos el slot dentro de run_critical llamando a
+    // pid_to_slot() porque eso intenta bloquear PROCESS_TABLE, que puede estar
+    // ya bloqueada por spawn/fork → deadlock de spinlock en single-CPU.
+    // dest_slot fue calculado arriba de forma segura (fuera de cualquier lock
+    // de PROCESS_TABLE), así que lo usamos directamente.
     if dest_slot != 0xFF {
         return run_critical(|| {
-            // Re-verify inside critical section to close TOCTOU window
-            let live_slot = {
-                let map = PID_SLOT_MAP.lock();
-                let idx = to as usize % PID_MAP_SIZE;
-                let e = map[idx];
-                if e.pid == to && e.slot != 0xFF { e.slot } else { 0xFF }
-            };
-            if live_slot == 0xFF {
-                return false;
-            }
             static P2P_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            m.dest_slot = live_slot;
-            let ok = PROCESS_MAILBOXES.lock()[live_slot as usize].push(m);
+            m.dest_slot = dest_slot;
+            let ok = PROCESS_MAILBOXES.lock()[dest_slot as usize].push(m);
             if ok {
                 P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
             } else {

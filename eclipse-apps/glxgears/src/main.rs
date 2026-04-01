@@ -18,11 +18,11 @@ use libc::{c_int, close, mmap, munmap, open};
 #[cfg(target_vendor = "eclipse")]
 use eclipse_ipc::prelude::EclipseMessage;
 #[cfg(target_vendor = "eclipse")]
-use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY};
+use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE};
 #[cfg(target_vendor = "eclipse")]
 use eclipse_syscall::{self, flag, ProcessInfo};
 #[cfg(target_vendor = "eclipse")]
-use eclipse_syscall::call::sched_yield;
+use eclipse_syscall::call::{sched_yield, exit as syscall_exit};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math helpers (no libm, no_std)
@@ -465,22 +465,42 @@ pub fn main() {
 
         let mut ipc_ch = IpcChannel::new();
         let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
+        let mut frame: u64 = 0;
 
         loop {
+            frame += 1;
+            // Diagnóstico: confirmar que el render loop sigue vivo cada 300 frames.
+            if frame % 300 == 0 {
+                std::println!("glxgears: alive frame={}", frame);
+            }
+
             // Handle incoming IPC events (key press, resize, close).
             while let Some(msg) = ipc_ch.recv() {
+                match &msg {
+                    EclipseMessage::Raw { len, .. } => {
+                        std::println!("glxgears: recv Raw len={}", len);
+                    }
+                    _ => {
+                        std::println!("glxgears: recv non-Raw");
+                    }
+                }
                 if let EclipseMessage::Raw { data, len, .. } = msg {
                     if len == sw_ev_sz {
                         let ev = unsafe {
                             core::ptr::read_unaligned(data.as_ptr() as *const SideWindEvent)
                         };
+                        std::println!("glxgears: SideWindEvent type={} d1={} d2={} d3={}", ev.event_type, ev.data1, ev.data2, ev.data3);
                         if ev.event_type == SWND_EVENT_TYPE_KEY {
                             // Q or Escape → exit.
                             let sc = ev.data1 as u8;
                             if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
                                 unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
-                                return;
+                                syscall_exit(0);
                             }
+                        } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
+                            std::println!("glxgears: received CLOSE, exiting.");
+                            unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
+                            syscall_exit(0);
                         }
                     }
                 }
@@ -506,8 +526,6 @@ pub fn main() {
     #[cfg(not(target_vendor = "eclipse"))]
     {
         std::println!("glxgears: host-testing stub — no rendering outside Eclipse OS.");
-        loop {
-            std::thread::yield_now();
-        }
+        syscall_exit(0);
     }
 }

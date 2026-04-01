@@ -719,10 +719,13 @@ pub fn exit_process() {
                 if let Some(p) = slot {
                     if p.id == pid {
                         p.state = ProcessState::Terminated;
-                        // Eliminar de la tabla inversa PID → slot (O(1) para IPC)
-                        crate::ipc::unregister_pid_slot(pid);
-                        // Limpiar el buzón IPC para que el próximo proceso del slot
-                        // no reciba mensajes del anterior.
+                        // NO llamamos a unregister_pid_slot aquí: el proceso queda
+                        // como zombie (slot registrado, estado=Terminated) hasta que
+                        // el padre llame wait().  Esto permite que sys_wait_impl
+                        // encuentre al hijo mediante get_process() y lea su exit_code.
+                        // El slot se libera en sys_wait_impl al cosechar el zombie.
+                        //
+                        // Limpiar el buzón IPC para que no lleguen mensajes nuevos.
                         crate::ipc::clear_mailbox_slot(slot_idx);
                         break;
                     }

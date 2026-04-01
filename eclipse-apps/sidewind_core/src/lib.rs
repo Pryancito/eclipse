@@ -21,6 +21,7 @@ pub const SWND_EVENT_TYPE_KEY: u32 = 1;
 pub const SWND_EVENT_TYPE_MOUSE_MOVE: u32 = 2;
 pub const SWND_EVENT_TYPE_MOUSE_BUTTON: u32 = 3;
 pub const SWND_EVENT_TYPE_RESIZE: u32 = 4;
+pub const SWND_EVENT_TYPE_CLOSE: u32 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +82,7 @@ mod tests {
         assert_eq!(SWND_OP_COMMIT, 4);
         assert_eq!(SWND_EVENT_TYPE_KEY, 1);
         assert_eq!(SWND_EVENT_TYPE_RESIZE, 4);
+        assert_eq!(SWND_EVENT_TYPE_CLOSE, 5);
     }
 
     #[test]

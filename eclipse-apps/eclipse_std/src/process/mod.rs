@@ -99,8 +99,8 @@ impl Child {
     /// Waits for the child to exit completely, returning the status that it exited with.
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let mut status = 0u32;
-        // La syscall devuleve PID cuando retorna
-        match eclipse_syscall::call::waitpid(&mut status as *mut u32) {
+        // Esperar a ESTE hijo (no “cualquier hijo”), para evitar recolectar un thread/pthread.
+        match eclipse_syscall::call::wait_pid(&mut status as *mut u32, self.pid as usize) {
             Ok(_ret_pid) => Ok(ExitStatus { code: (status >> 8) as i32 }),
             Err(_) => Err(Error::new(ErrorKind::Other, "waitpid failed")),
         }
