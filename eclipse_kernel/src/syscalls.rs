@@ -1609,6 +1609,18 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
                         if let Some(fd) = p_fd_err { tables[child_fd_idx].fds[2] = fd; }
                     }
                 }
+
+                // Notify each scheme that its handle has been inherited by the child process.
+                // This increments the ref count so that when the child exits and closes its
+                // fds, the underlying resource (e.g. PTY channel) is not destroyed while the
+                // parent still holds a reference to the same handle.
+                for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {
+                    if let Some(fd) = fd_opt {
+                        if fd.in_use {
+                            let _ = crate::scheme::dup(fd.scheme_id, fd.resource_id);
+                        }
+                    }
+                }
             }
 
             // Now it's safely configured, we can let the scheduler run it
