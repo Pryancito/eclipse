@@ -14,7 +14,7 @@ use wayland_proto::unix_transport::UnixSocketConnection;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::connection::Connection;
-use wayland_proto::wl::wire::RawMessage;
+use wayland_proto::wl::wire::{RawMessage, Handle};
 
 /// Unix socket client IDs start here to avoid collisions with Eclipse IPC
 /// clients (which use the process PID, always < 2^31).
@@ -80,14 +80,19 @@ impl WaylandSocketServer {
             // Try to receive data from this client's socket.
             let recv_res = (*conn_rc).borrow().recv();
             match recv_res {
-                Ok((data, _handles)) => {
+                Ok((data, handles)) => {
                     // There may be multiple Wayland messages concatenated.
+                    // Handles (fds via SCM_RIGHTS) arrive with the batch; associate them
+                    // with the first message that expects them (wl_shm.create_pool uses fd).
                     let mut pos = 0usize;
+                    let mut handles_remaining = handles;
                     while pos + 8 <= data.len() {
                         match RawMessage::deserialize_header(&data[pos..]) {
                             Ok((_, _, msg_len)) if pos + msg_len <= data.len() => {
                                 let chunk = &data[pos..pos + msg_len];
-                                let _ = protocol.process_message(id, chunk);
+                                let _ = protocol.process_message(id, chunk, &handles_remaining);
+                                // Consume handles after first message that could use them.
+                                handles_remaining = &[];
                                 pos += msg_len;
                                 any = true;
                             }

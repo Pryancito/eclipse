@@ -2,7 +2,7 @@ use crate::wl::server::client::{Client, ClientId};
 use crate::wl::server::objects::{Object, ObjectInner, ServerError};
 use crate::wl::{ObjectId, NewId, Message};
 use crate::wl::connection::Connection;
-use crate::wl::wire::RawMessage;
+use crate::wl::wire::{RawMessage, Handle};
 use core::cell::RefCell;
 use alloc::rc::Rc;
 use alloc::collections::BTreeMap;
@@ -75,6 +75,7 @@ impl WaylandServer {
         &mut self,
         client_id: ClientId,
         message: &[u8],
+        handles: &[Handle],
     ) -> Result<(), ServerError> {
         let (object_id, opcode, _len) = RawMessage::deserialize_header(message)
             .map_err(|_| ServerError::MessageDeserializeError)?;
@@ -92,13 +93,13 @@ impl WaylandServer {
             (inner, interface_name, payload_types)
         };
 
-        let raw = RawMessage::deserialize(message, payload_types, &[])
+        let raw = RawMessage::deserialize(message, payload_types, handles)
             .map_err(|_| ServerError::MessageDeserializeError)?;
 
         let mut res = Ok(());
         {
             let client = self.clients.get_mut(&client_id).ok_or(ServerError::ClientNotFound)?;
-            res = inner.borrow_mut().handle_request(client, opcode.0, &raw.args);
+            res = inner.borrow_mut().handle_request(client, opcode.0, &raw.args, handles);
         }
 
         // Intercept get_registry on display (id=1, opcode=1) to broadcast globals

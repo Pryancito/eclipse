@@ -85,7 +85,7 @@ impl Interface for WlShm {
     const NAME: &'static str = "wl_shm";
     const VERSION: u32 = 1;
     const PAYLOAD_TYPES: &'static [&'static [PayloadType]] = &[
-        &[PayloadType::NewId, PayloadType::Int, PayloadType::Int], // create_pool
+        &[PayloadType::NewId, PayloadType::Handle, PayloadType::Int], // create_pool(id, fd, size)
     ];
 
     fn new(con: Rc<RefCell<dyn Connection>>, id: ObjectId) -> Self {

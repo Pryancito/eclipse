@@ -3,6 +3,7 @@ use std::rc::Rc;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use wayland_proto::wl::{ObjectId, NewId, Payload};
+use wayland_proto::wl::wire::Handle;
 use wayland_proto::wl::server::client::{Client, ClientId};
 use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
 use wayland_proto::wl::protocols::common::*;
@@ -59,6 +60,7 @@ impl ObjectLogic for LunasCompositor {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => {
@@ -101,6 +103,7 @@ impl ObjectLogic for LunasSurface {
         _client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // destroy — nothing to do yet
@@ -150,25 +153,34 @@ impl ObjectLogic for LunasShm {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => {
-                // create_pool(id: new_id, fd: int, size: int)
+                // create_pool(id: new_id, fd: handle, size: int)
                 let id = match args.first() {
                     Some(Payload::NewId(id)) => *id,
                     _ => return Err(ServerError::MessageDeserializeError),
+                };
+                // args[1] is Handle (the shm fd via SCM_RIGHTS), args[2] is size.
+                let fd = match args.get(1) {
+                    Some(Payload::Handle(h)) => h.0,
+                    _ => -1,
                 };
                 let size = match args.get(2) {
                     Some(Payload::Int(s)) => *s,
                     _ => return Err(ServerError::MessageDeserializeError),
                 };
 
-                // On Eclipse OS the fd argument is the client's fd for the
-                // shared /tmp file.  Since fd namespaces are per-process, we
-                // derive the path from the client PID using the established
-                // naming convention: /tmp/twb_{pid}.
-                let pid = client.client_id().0;
-                let vaddr = map_shm_file(pid, size as usize);
+                // Map the shared-memory file descriptor directly (standard Wayland approach)
+                // or fall back to the /tmp/twb_{pid} path for legacy IPC clients where the
+                // client_id is the process PID (not a synthetic UNIX_CLIENT_ID_BASE value).
+                let vaddr = if fd >= 0 {
+                    map_shm_fd(fd, size as usize)
+                } else {
+                    let pid = client.client_id().0;
+                    map_shm_file(pid, size as usize)
+                };
 
                 let pool = ObjectInner::Rc(Rc::new(RefCell::new(LunasShmPool {
                     vaddr,
@@ -246,6 +258,29 @@ fn map_shm_file(pid: u32, size: usize) -> usize {
     }
 }
 
+/// Map a shared-memory fd (received via SCM_RIGHTS in wl_shm.create_pool) into
+/// the compositor's address space.  Closes the fd after mapping (mmap retains
+/// a reference to the underlying file object).  Returns 0 on failure.
+fn map_shm_fd(fd: i32, size: usize) -> usize {
+    if fd < 0 || size == 0 { return 0; }
+    let vaddr = unsafe {
+        mmap(
+            core::ptr::null_mut(),
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    let _ = unsafe { close(fd) };
+    if vaddr.is_null() || vaddr == libc::MAP_FAILED {
+        0
+    } else {
+        vaddr as usize
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // LunasShmPool  (wl_shm_pool)
 // ────────────────────────────────────────────────────────────────────────────
@@ -262,6 +297,7 @@ impl ObjectLogic for LunasShmPool {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => {
@@ -320,6 +356,7 @@ impl ObjectLogic for LunasBuffer {
         _client: &mut Client,
         opcode: u16,
         _args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // destroy — buffer registry cleanup could happen here
@@ -381,6 +418,7 @@ impl ObjectLogic for LunasXdgWmBase {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // destroy
@@ -427,6 +465,7 @@ impl ObjectLogic for LunasXdgSurface {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // destroy
@@ -487,6 +526,7 @@ impl ObjectLogic for LunasXdgToplevel {
         _client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // destroy
@@ -521,6 +561,7 @@ impl ObjectLogic for LunasSeat {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => {
@@ -588,6 +629,7 @@ impl ObjectLogic for LunasPointer {
         _client: &mut Client,
         opcode: u16,
         _args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // set_cursor — ignored for now
@@ -612,6 +654,7 @@ impl ObjectLogic for LunasKeyboard {
         _client: &mut Client,
         opcode: u16,
         _args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // release
@@ -636,6 +679,7 @@ impl ObjectLogic for LunasOutput {
         _client: &mut Client,
         opcode: u16,
         _args: &[Payload],
+        _handles: &[Handle],
     ) -> Result<(), ServerError> {
         match opcode {
             0 => Ok(()), // release
@@ -713,7 +757,7 @@ mod wayland_server_tests {
         let mut buf = [0u8; 256];
         let mut handles = Vec::new();
         let len = msg.serialize(&mut buf, &mut handles).expect("serialize get_registry");
-        let r = server.process_message(ClientId(42), &buf[..len]);
+        let r = server.process_message(ClientId(42), &buf[..len], &handles);
         assert!(r.is_ok(), "process_message: {:?}", r);
         let client = server
             .clients
@@ -739,7 +783,7 @@ mod wayland_server_tests {
         let args = std::vec![
             wayland_proto::wl::Payload::NewId(NewId(5)),
         ];
-        let r = ObjectLogic::handle_request(&mut comp, &mut client, 0, &args);
+        let r = ObjectLogic::handle_request(&mut comp, &mut client, 0, &args, &[]);
         assert!(r.is_ok(), "create_surface: {:?}", r);
         assert!(client.object_mut(ObjectId(5)).is_ok());
     }
