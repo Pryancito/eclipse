@@ -3674,9 +3674,14 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
                         let fds = scheme.socket_dequeue_fds(fd_info.resource_id);
                         (written, fds)
                     }
-                    Err(_) => {
-                        // EAGAIN → return -1 so libc sets errno = EAGAIN
-                        return u64::MAX;
+                    Err(e) => {
+                        // Return the Linux-ABI negative error code so libc sets errno
+                        // correctly.  For EAGAIN (e=11): kernel returns -11 (as u64),
+                        // relibc decodes that as errno=11 and returns -1 to the caller.
+                        // Previously u64::MAX (-1) was returned, which relibc decoded as
+                        // errno=1 (EPERM), causing the Wayland socket server to treat a
+                        // "no data yet" condition as a real disconnect.
+                        return (-(e as i64)) as u64;
                     }
                 }
             } else { return u64::MAX; }
