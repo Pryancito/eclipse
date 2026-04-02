@@ -7,7 +7,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::eclipse_syscall::call::{mmap, munmap};
-use crate::eclipse_syscall::flag::*;
+use crate::eclipse_syscall::flag as syscall_flag;
 pub use crate::types::*;
 pub use crate::*;
 
@@ -75,7 +75,7 @@ unsafe impl GlobalAlloc for Allocator {
         // --- Caso 1: Asignación Grande (Directa a mmap) ---
         if total_size >= LARGE_THRESHOLD {
             let map_size = round_up_page(total_size);
-            match eclipse_syscall::call::mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) {
+            match eclipse_syscall::call::mmap(0, map_size, syscall_flag::PROT_READ | syscall_flag::PROT_WRITE, syscall_flag::MAP_PRIVATE | syscall_flag::MAP_ANONYMOUS, -1, 0) {
                 Ok(addr) => {
                     let header = addr as *mut BlockHeader;
                     (*header).size = map_size; // Guardamos el tamaño total para munmap
@@ -109,7 +109,7 @@ unsafe impl GlobalAlloc for Allocator {
 
             // No hay espacio o no hay chunk: Mapear uno nuevo
             let map_size = round_up_page(CHUNK_SIZE);
-            match eclipse_syscall::call::mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) {
+            match eclipse_syscall::call::mmap(0, map_size, syscall_flag::PROT_READ | syscall_flag::PROT_WRITE, syscall_flag::MAP_PRIVATE | syscall_flag::MAP_ANONYMOUS, -1, 0) {
                 Ok(addr) => {
                     // Establecemos el nuevo chunk. El remanente es map_size - lo que usamos ahora.
                     self.current_chunk.store((addr as *mut u8).add(total_size), Ordering::Release);

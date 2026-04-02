@@ -187,21 +187,15 @@ fn main() {
     eprintln!("[LUNAS] HUD registered.");
 
     loop {
-        unsafe { libc::write(2, "[LUNAS-LOOP] Start\n".as_ptr() as *const _, 19); }
         // Accept and process standard Wayland socket clients
         if let Some(ref mut sock) = wayland_socket {
-            unsafe { libc::write(2, "[LUNAS-LOOP] Poll Wayland\n".as_ptr() as *const _, 26); }
             if sock.poll(&mut state.protocol) {
                 state.dirty = true;
             }
         }
-        unsafe { libc::write(2, "[LUNAS-LOOP] Handle IPC\n".as_ptr() as *const _, 24); }
         state.handle_ipc();
-        unsafe { libc::write(2, "[LUNAS-LOOP] Update\n".as_ptr() as *const _, 20); }
         state.update();
-        unsafe { libc::write(2, "[LUNAS-LOOP] Render\n".as_ptr() as *const _, 20); }
         state.render();
-        unsafe { libc::write(2, "[LUNAS-LOOP] Sleep\n".as_ptr() as *const _, 19); }
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }

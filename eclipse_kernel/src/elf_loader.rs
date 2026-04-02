@@ -648,13 +648,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             // but valid for stripped-down binaries), since writing 0 would be a
             // no-op while unnecessarily serialising the pipeline.
             "test r11, r11",
-            "jz 1f",
+            "jz 2f",
             "mov ecx, 0xC0000100",  // IA32_FS_BASE MSR
             "mov rax, r11",
             "mov rdx, r11",
             "shr rdx, 32",
             "wrmsr",
-            "1:",
+            "2:",
             // Limpiar todos los registros GP antes de entrar a userspace
             "xor rax, rax",
             "xor rbx, rbx",

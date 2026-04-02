@@ -524,21 +524,17 @@ pub fn draw_desktop_shell(
     snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
 ) {
     // 1. Blit background
-    unsafe { libc::write(2, "[LUNAS-R] Blit BG\n".as_ptr() as *const _, 18); }
     fb.blit_background();
 
     // 1.5. Draw HUD overlay (kernel log) — placed in background so it doesn't block windows
     if log_len > 0 {
-        unsafe { libc::write(2, "[LUNAS-R] HUD\n".as_ptr() as *const _, 14); }
         draw_hud_overlay(fb, log_buf, log_len);
     }
 
     // 2. Draw taskbar
-    unsafe { libc::write(2, "[LUNAS-R] Taskbar\n".as_ptr() as *const _, 18); }
     draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
-    unsafe { libc::write(2, "[LUNAS-R] Windows\n".as_ptr() as *const _, 18); }
     for i in 0..window_count {
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
