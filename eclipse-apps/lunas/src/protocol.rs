@@ -122,6 +122,11 @@ impl ObjectLogic for LunasSurface {
             6 => {
                 // commit — publish a new frame
                 if let Some(info) = self.attached_buffer {
+                    {
+                        let msg = alloc::format!("[LUNAS-SURF] commit: pid={} surface_id={} vaddr=0x{:x} {}x{}\n",
+                            self.pid, self.id.0, info.vaddr, info.width, info.height);
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                    }
                     (*self.pending_commits).borrow_mut().push(SurfaceCommit {
                         pid: self.pid,
                         surface_id: self.id.0,
@@ -130,6 +135,9 @@ impl ObjectLogic for LunasSurface {
                         height: info.height,
                         stride: info.stride,
                     });
+                } else {
+                    let msg = b"[LUNAS-SURF] commit: no attached buffer!\n";
+                    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
                 }
                 Ok(())
             }
@@ -158,33 +166,61 @@ impl ObjectLogic for LunasShm {
         match opcode {
             0 => {
                 // create_pool(id: new_id, fd: handle, size: int)
+                //
+                // Wire layout per PAYLOAD_TYPES: [NewId, Handle, Int]
+                // The Handle is inserted into args[1] by RawMessage::deserialize
+                // (it pulls it out of the SCM_RIGHTS handles slice).
                 let id = match args.first() {
                     Some(Payload::NewId(id)) => *id,
                     _ => return Err(ServerError::MessageDeserializeError),
                 };
-                // args[1] is Handle (the shm fd via SCM_RIGHTS), args[2] is size.
                 let fd = match args.get(1) {
                     Some(Payload::Handle(h)) => h.0,
-                    _ => -1,
+                    got => {
+                        // Log what we actually got to diagnose the mismatch.
+                        let msg = alloc::format!("[LUNAS-SHM] create_pool: args[1] is not Handle: {:?}\n", got);
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                        -1
+                    },
                 };
                 let size = match args.get(2) {
-                    Some(Payload::Int(s)) => *s,
-                    _ => return Err(ServerError::MessageDeserializeError),
+                    Some(Payload::Int(s)) => *s as usize,
+                    got => {
+                        let msg = alloc::format!("[LUNAS-SHM] create_pool: args[2] is not Int: {:?} (args={:?})\n", got, args);
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                        return Err(ServerError::MessageDeserializeError);
+                    },
                 };
 
-                // Map the shared-memory file descriptor directly (standard Wayland approach)
-                // or fall back to the /tmp/twb_{pid} path for legacy IPC clients where the
-                // client_id is the process PID (not a synthetic UNIX_CLIENT_ID_BASE value).
                 let vaddr = if fd >= 0 {
-                    map_shm_fd(fd, size as usize)
+                    // Standard Wayland: mmap the received shm fd directly.
+                    let v = map_shm_fd(fd, size);
+                    {
+                        let msg = alloc::format!("[LUNAS-SHM] create_pool: fd={} size={} vaddr=0x{:x}\n", fd, size, v);
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                    }
+                    v
                 } else {
+                    // No fd (Handle(-1)) — Eclipse OS doesn't support SCM_RIGHTS.
+                    // Try the PID-based path first (Eclipse IPC clients), then scan
+                    // /tmp/twb_* to find the terminal's shared buffer.
                     let pid = client.client_id().0;
-                    map_shm_file(pid, size as usize)
+                    let v = if pid < 0x8000_0000 {
+                        // Eclipse IPC client: pid IS the process pid.
+                        let v = map_shm_file(pid, size);
+                        let msg = alloc::format!("[LUNAS-SHM] create_pool fallback IPC: pid={} vaddr=0x{:x}\n", pid, v);
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                        v
+                    } else {
+                        // Unix socket client with no fd: scan /tmp/twb_{1..64}.
+                        scan_twb_files(size)
+                    };
+                    v
                 };
 
                 let pool = ObjectInner::Rc(Rc::new(RefCell::new(LunasShmPool {
                     vaddr,
-                    size: size as usize,
+                    size,
                     buffer_registry: self.buffer_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<wl_shm::WlShmPool>(id, pool));
@@ -256,6 +292,47 @@ fn map_shm_file(pid: u32, size: usize) -> usize {
     } else {
         vaddr as usize
     }
+}
+
+/// Scan /tmp/twb_{2..64} and mmap the first file found.
+/// Used when Handle fd=-1 (Eclipse OS Unix sockets don't carry SCM_RIGHTS ancilla data).
+fn scan_twb_files(size: usize) -> usize {
+    let prefix = b"/tmp/twb_";
+    for pid in 2u32..=64 {
+        let mut path = [0u8; 32];
+        path[..prefix.len()].copy_from_slice(prefix);
+        let mut n = pid;
+        let mut tmp_digits = [0u8; 10];
+        let mut i = 0usize;
+        if n == 0 { tmp_digits[0] = b'0'; i = 1; } else {
+            while n > 0 && i < tmp_digits.len() {
+                tmp_digits[i] = b'0' + (n % 10) as u8; n /= 10; i += 1;
+            }
+        }
+        let mut lo = 0usize; let mut hi = i.saturating_sub(1);
+        while lo < hi { tmp_digits.swap(lo, hi); lo += 1; hi -= 1; }
+        let end = prefix.len() + i;
+        if end >= path.len() { continue; }
+        path[prefix.len()..end].copy_from_slice(&tmp_digits[..i]);
+
+        let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
+        if fd < 0 { continue; }
+        let vaddr = unsafe {
+            mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+        };
+        unsafe { close(fd) };
+        if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
+            let msg = alloc::format!(
+                "[LUNAS-SHM] scan_twb: found /tmp/twb_{} size={} vaddr=0x{:x}\n",
+                pid, size, vaddr as usize
+            );
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            return vaddr as usize;
+        }
+    }
+    let msg = b"[LUNAS-SHM] scan_twb: no twb file found!\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+    0
 }
 
 /// Map a shared-memory fd (received via SCM_RIGHTS in wl_shm.create_pool) into

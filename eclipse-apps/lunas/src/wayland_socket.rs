@@ -7,13 +7,13 @@
 //! This module is polled every frame from the Lunas main loop.
 
 use std::prelude::v1::*;
-use std::rc::Rc;
+use alloc::rc::Rc;
 use core::cell::RefCell;
 use wayland_proto::UnixSocketServer;
 use wayland_proto::unix_transport::UnixSocketConnection;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::wl::server::server::WaylandServer;
-use wayland_proto::wl::connection::Connection;
+use wayland_proto::wl::connection::{Connection, RecvError};
 use wayland_proto::wl::wire::{RawMessage, Handle};
 
 /// Unix socket client IDs start here to avoid collisions with Eclipse IPC
@@ -92,7 +92,7 @@ impl WaylandSocketServer {
                                 let chunk = &data[pos..pos + msg_len];
                                 let _ = protocol.process_message(id, chunk, &handles_remaining);
                                 // Consume handles after first message that could use them.
-                                handles_remaining = &[];
+                                handles_remaining = (&[]).to_vec();
                                 pos += msg_len;
                                 any = true;
                             }
@@ -100,8 +100,12 @@ impl WaylandSocketServer {
                         }
                     }
                 }
+                Err(RecvError::WouldBlock) => {
+                    // Non-blocking socket: no data ready yet.  The client is still
+                    // alive — do nothing and check again next frame.
+                }
                 Err(_) => {
-                    // No data or peer disconnected — mark for cleanup
+                    // Fatal I/O error or EOF — client disconnected.
                     disconnected.push(id);
                 }
             }

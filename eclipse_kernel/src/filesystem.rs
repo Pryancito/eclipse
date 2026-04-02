@@ -1186,7 +1186,6 @@ impl Scheme for FileSystemScheme {
                 }
 
                 if vtmp.contains_key(&key) {
-                    serial::serial_printf(format_args!("[FS-SCHEME] open({}) success\n", clean_path));
                     drop(vtmp);
                     let mut open_files = OPEN_FILES_SCHEME.lock();
                     for (i, slot) in open_files.iter_mut().enumerate() {
@@ -1199,7 +1198,6 @@ impl Scheme for FileSystemScheme {
                     open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
                     Ok(id)
                 } else {
-                    serial::serial_printf(format_args!("[FS-SCHEME] open({}) failed: ENOENT\n", clean_path));
                     Err(scheme_error::ENOENT)
                 }
             },
@@ -1372,10 +1370,8 @@ impl Scheme for FileSystemScheme {
                 let mut vtmp = VIRTUAL_TMP.lock();
                 if let Some(content) = vtmp.get_mut(&path_clone) {
                     content.resize(len, 0);
-                    serial::serial_printf(format_args!("[FS-SCHEME] ftruncate({}, {}) success\n", path_clone, len));
                     Ok(0)
                 } else {
-                    serial::serial_printf(format_args!("[FS-SCHEME] ftruncate({}, {}) failed: ENOENT\n", path_clone, len));
                     Err(scheme_error::ENOENT)
                 }
             }
@@ -1552,14 +1548,11 @@ impl Scheme for FileSystemScheme {
                 if let Some(content) = vtmp.get(path) {
                     let ptr = content.as_ptr() as u64;
                     if content.is_empty() {
-                         serial::serial_printf(format_args!("[FS-SCHEME] fmap({}) failed: EMPTY\n", path));
                          return Err(scheme_error::EINVAL);
                     }
                     let phys = crate::memory::virt_to_phys(ptr);
-                    serial::serial_printf(format_args!("[FS-SCHEME] fmap({}) -> phys 0x{:x}\n", path, phys));
                     Ok(phys as usize)
                 } else {
-                    serial::serial_printf(format_args!("[FS-SCHEME] fmap({}) failed: ENOENT\n", path));
                     Err(scheme_error::ENOENT)
                 }
             }

@@ -1483,23 +1483,33 @@ fn draw_window(
             WindowContent::Snp { surface_id, pid } => {
                 if let Some(surface) = snp_surfaces.get(&(pid, surface_id)) {
                     if surface.active && surface.vaddr != 0 {
-                        let mut src_ptr = surface.vaddr as *const u32;
                         let fb_ptr = fb.back_addr as *mut u32;
                         let fb_stride = fb.info.width as usize;
-                        
-                        for row in 0..content_h {
+
+                        // Use the surface's own buffer_w as the row stride and only
+                        // copy min(cw, buf_w) pixels per row so we never read past
+                        // the end of the client's allocated buffer.
+                        let buf_w = surface.buffer_w as i32;
+                        let buf_h = surface.buffer_h as i32;
+                        let copy_w = cw.min(buf_w).max(0) as usize;
+                        let copy_h = content_h.min(buf_h).max(0);
+                        let src_stride = buf_w as usize; // pixels per source row
+
+                        for row in 0..copy_h {
                             let dy = content_y + row;
                             if dy < 0 || dy >= fb.info.height as i32 { continue; }
-                            
-                            let dest_idx = (dy as usize) * fb_stride + (cx as usize);
-                            let _ = unsafe {
+                            let dst_x = cx.max(0) as usize;
+                            if dst_x >= fb.info.width as usize { continue; }
+                            let actual_copy = copy_w.min(fb.info.width as usize - dst_x);
+                            let dest_idx = (dy as usize) * fb_stride + dst_x;
+                            let src_idx  = (row as usize) * src_stride;
+                            unsafe {
                                 core::ptr::copy_nonoverlapping(
-                                    src_ptr,
+                                    (surface.vaddr as *const u32).add(src_idx),
                                     fb_ptr.add(dest_idx),
-                                    cw as usize
-                                )
-                            };
-                            src_ptr = unsafe { src_ptr.add(cw as usize) };
+                                    actual_copy,
+                                );
+                            }
                         }
                     } else {
                         draw_terminal_demo(fb, cx, content_y, cw, content_h);

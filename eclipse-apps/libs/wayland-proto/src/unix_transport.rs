@@ -27,6 +27,14 @@ extern "C" {
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn sendmsg(fd: i32, msg: *const MsgHdr, flags: i32) -> isize;
     fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> isize;
+    /// POSIX `errno` — only valid immediately after a syscall returns -1.
+    fn __errno_location() -> *mut i32;
+}
+
+/// Read the current `errno` value.
+#[inline(always)]
+fn errno() -> i32 {
+    unsafe { *__errno_location() }
 }
 
 const AF_UNIX: i32 = 1;
@@ -37,6 +45,9 @@ const F_SETFL: i32 = 4;
 const SOL_SOCKET: i32 = 1;
 /// `SCM_RIGHTS` — pass file descriptors as ancillary data.
 const SCM_RIGHTS: i32 = 1;
+/// EAGAIN / EWOULDBLOCK — non-blocking socket has no data.
+const EAGAIN: i32 = 11;
+const EWOULDBLOCK: i32 = 11; // same value on Linux
 
 // ── POSIX structs for sendmsg/recvmsg ─────────────────────────────────────────
 
@@ -246,10 +257,19 @@ impl Connection for UnixSocketConnection {
 
         let n = unsafe { recvmsg(self.fd, &mut msg, 0) };
         if n < 0 {
-            return Err(RecvError::IoError); // EAGAIN or error
+            // Check whether this is a transient "no data" condition (EAGAIN/EWOULDBLOCK)
+            // rather than a real I/O error or peer disconnect.  Non-blocking sockets
+            // return EAGAIN constantly whenever no message is queued; the caller must
+            // NOT treat this as a disconnect.
+            let err = errno();
+            if err == EAGAIN || err == EWOULDBLOCK {
+                return Err(RecvError::WouldBlock);
+            }
+            return Err(RecvError::IoError);
         }
         if n == 0 {
-            return Err(RecvError::IoError); // EOF
+            // Orderly shutdown — the peer closed the connection.
+            return Err(RecvError::IoError);
         }
 
         let mut buf = self.recv_buf.borrow_mut();

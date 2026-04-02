@@ -8,6 +8,7 @@
 //! - DRM/KMS rendering pipeline
 
 
+extern crate alloc;
 pub use libc;
 
 pub mod backend;

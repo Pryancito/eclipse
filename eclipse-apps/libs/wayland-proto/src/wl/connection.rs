@@ -9,7 +9,10 @@ pub enum SendError {
 
 #[derive(Debug, PartialEq)]
 pub enum RecvError {
+    /// Fatal I/O error or peer disconnected.
     IoError,
+    /// No data available right now (EAGAIN / EWOULDBLOCK) — not fatal.
+    WouldBlock,
     InvalidMessage,
 }
 

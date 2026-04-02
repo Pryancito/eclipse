@@ -220,9 +220,18 @@ impl TerminalApp {
             return None;
         }
 
-        // ── 2. Connect to Wayland compositor (/tmp/wayland-0) ────────────
-        let wayland = UnixSocketConnection::connect("/tmp/wayland-0")?;
+        // ── 2. Connect to Wayland compositor (/tmp/wayland-0) ────────────────
+        let wayland = match UnixSocketConnection::connect("/tmp/wayland-0") {
+            Some(c) => c,
+            None => {
+                let msg = b"[TERMINAL] FAILED to connect to /tmp/wayland-0\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                return None;
+            }
+        };
         wayland.set_nonblocking();
+        let msg = b"[TERMINAL] Connected to /tmp/wayland-0\n";
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
 
         // ── 3. Wayland handshake ──────────────────────────────────────────
         // Object ID allocation (client-side, starting at 2):
@@ -275,7 +284,18 @@ impl TerminalApp {
             let _ = eclipse_syscall::call::sched_yield();
         }
 
-        if compositor_name == 0 { return None; }
+        if compositor_name == 0 {
+            let msg = b"[TERMINAL] TIMEOUT: never received wl_registry globals\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            return None;
+        }
+        {
+            use core::fmt::Write as _;
+            let mut buf = heapless::String::<128>::new();
+            let _ = write!(buf, "[TERMINAL] Globals: compositor={} shm={} xdg={} seat={}\n",
+                compositor_name, shm_name_id, xdg_name, seat_name);
+            unsafe { libc::write(2, buf.as_bytes().as_ptr() as *const _, buf.len()); }
+        }
 
         // wl_registry.bind(compositor → id=3)
         send_wayland(&wayland, 2, 0, &[Payload::UInt(compositor_name), Payload::String(std::string::String::from("wl_compositor")), Payload::UInt(4), Payload::NewId(NewId(3))]);
@@ -292,8 +312,19 @@ impl TerminalApp {
         send_wayland(&wayland, 3, 0, &[Payload::NewId(NewId(7))]);
 
         // wl_shm.create_pool(id=8, fd=shm_fd, size=size_bytes)
-        // The fd is passed as ancillary SCM_RIGHTS data via the Handle mechanism.
-        send_wayland_with_fd(&wayland, 4, 0, &[Payload::NewId(NewId(8)), Payload::Int(size_bytes as i32)], shm_fd);
+        // The Wayland wire protocol signature is (new_id<wl_shm_pool>, fd, int).
+        // The fd must sit at arg position 1 as Payload::Handle so the server's
+        // RawMessage::deserialize finds it there (PAYLOAD_TYPES = [NewId, Handle, Int]).
+        // We also pass it as SCM_RIGHTS ancilla for the actual transfer.
+        {
+            let msg = b"[TERMINAL] Sending create_pool with fd\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+        }
+        send_wayland_with_fd(&wayland, 4, 0, &[
+            Payload::NewId(NewId(8)),
+            Payload::Handle(wayland_proto::wl::wire::Handle(shm_fd)),
+            Payload::Int(size_bytes as i32),
+        ], shm_fd);
         unsafe { close(shm_fd) };
 
         // wl_shm_pool.create_buffer(id=9, offset=0, width, height, stride, format=1=XRGB8888)

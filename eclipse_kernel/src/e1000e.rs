@@ -892,9 +892,8 @@ impl E1000EInner {
             for _ in 0..10_000 { core::hint::spin_loop(); }
             
             self.write32(REG_CTRL_EXT, ctrl_ext_tmp | CTRL_EXT_DRV_LOAD);
-            // Increased ME-handoff settling time (10_000_000 × PAUSE ≈ 100 ms @ 3 GHz)
-            // Some I219-V systems need more than 20ms to release DHCP filters.
-            for _ in 0..10_000_000 { core::hint::spin_loop(); }
+            // Reduced settlement time for QEMU (100_000 × PAUSE)
+            for _ in 0..100_000 { core::hint::spin_loop(); }
         }
 
         // 3c. Scan for the PHY address, then check and clear the Power-Down
