@@ -226,74 +226,35 @@ extern "C" {
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn sendmsg(sockfd: c_int, msg: *const msghdr, _flags: c_int) -> ssize_t {
-    use crate::eclipse_syscall::call::write as sys_write;
-    if msg.is_null() {
-        return -1;
+pub unsafe extern "C" fn sendmsg(sockfd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t {
+    // Use sys_sendmsg (syscall 46) so the kernel's SCM_RIGHTS control-message
+    // path (fd passing) is exercised.  The previous implementation used
+    // sys_write which silently dropped the ancillary data.
+    let result = eclipse_syscall::syscall3(46, sockfd as usize, msg as usize, flags as usize);
+    let signed = result as isize;
+    if signed < 0 && signed >= -4096 {
+        *crate::header::errno::__errno_location() = (-signed) as c_int;
+        -1
+    } else {
+        result as ssize_t
     }
-    let m = &*msg;
-    let mut sent: ssize_t = 0;
-    'outer: for i in 0..(m.msg_iovlen as usize) {
-        let iov = &*m.msg_iov.add(i);
-        if iov.iov_len == 0 {
-            continue;
-        }
-        // Retry partial writes within each iov so no bytes are silently dropped.
-        let base = iov.iov_base as *const u8;
-        let len = iov.iov_len as usize;
-        let mut offset = 0usize;
-        while offset < len {
-            let slice = core::slice::from_raw_parts(base.add(offset), len - offset);
-            match sys_write(sockfd as usize, slice) {
-                Ok(0) => break 'outer, // peer closed
-                Ok(n) => {
-                    offset += n;
-                    sent += n as ssize_t;
-                }
-                Err(_) => {
-                    if sent == 0 { return -1; }
-                    break 'outer;
-                }
-            }
-        }
-    }
-    sent
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn recvmsg(sockfd: c_int, msg: *mut msghdr, _flags: c_int) -> ssize_t {
-    use crate::eclipse_syscall::call::read as sys_read;
-    if msg.is_null() {
-        return -1;
+pub unsafe extern "C" fn recvmsg(sockfd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t {
+    // Use sys_recvmsg (syscall 47) so that:
+    //   1. errno is set correctly (previously -1 was returned without setting
+    //      errno, so stale errno caused EAGAIN to be misidentified as a fatal
+    //      error, triggering a spurious Wayland client disconnect).
+    //   2. SCM_RIGHTS ancillary data (fd passing) is delivered via the kernel's
+    //      control-buffer path instead of being silently discarded.
+    let result = eclipse_syscall::syscall3(47, sockfd as usize, msg as usize, flags as usize);
+    let signed = result as isize;
+    if signed < 0 && signed >= -4096 {
+        *crate::header::errno::__errno_location() = (-signed) as c_int;
+        -1
+    } else {
+        result as ssize_t
     }
-    let m = &mut *msg;
-    let mut received: ssize_t = 0;
-    for i in 0..(m.msg_iovlen as usize) {
-        let iov = &*m.msg_iov.add(i);
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let slice = core::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len as usize);
-        match sys_read(sockfd as usize, slice) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                received += n as ssize_t;
-                // If the read didn't fill this iov the socket buffer is empty;
-                // stop so the caller sees a consistent message boundary.
-                if n < iov.iov_len as usize {
-                    break;
-                }
-                // Iov fully filled — try to continue into the next one.
-            }
-            Err(_) => {
-                // EAGAIN or real error: return what we have (or -1 if nothing yet).
-                if received == 0 { return -1; }
-                break;
-            }
-        }
-    }
-    // No ancillary-data support yet; tell the caller the control buffer is empty.
-    m.msg_controllen = 0;
-    received
 }

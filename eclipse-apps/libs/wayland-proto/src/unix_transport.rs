@@ -256,17 +256,25 @@ impl Connection for UnixSocketConnection {
         };
 
         let n = unsafe { recvmsg(self.fd, &mut msg, 0) };
-        if n <= 0 {
-            // Eclipse OS non-blocking sockets may return 0 or negative values
-            // (instead of -1+EAGAIN) when no data is available.  Treat all
-            // such cases as WouldBlock to prevent false client disconnects.
-            // Real disconnects are detected via process-level checks.
+        if n < 0 {
+            // Check whether this is a transient "no data" condition (EAGAIN/EWOULDBLOCK)
+            // rather than a real I/O error or peer disconnect.  Non-blocking sockets
+            // return EAGAIN constantly whenever no message is queued; the caller must
+            // NOT treat this as a disconnect.
+            // relibc's recvmsg (syscall 47) sets errno correctly before returning -1.
             let err = errno();
             if n < 0 && err != EAGAIN && err != EWOULDBLOCK && err != 0 {
                 // Genuine I/O error (e.g., ECONNRESET, EPIPE) — real disconnect.
                 return Err(RecvError::IoError);
             }
-            return Err(RecvError::WouldBlock);
+            return Err(RecvError::IoError);
+        }
+        if n == 0 {
+            // recvmsg returning 0 bytes means orderly shutdown: the peer closed its
+            // end of the connection.  With the correct syscall-47 path in relibc,
+            // an empty-but-alive non-blocking socket returns -1/EAGAIN instead, so
+            // n==0 here is always a real EOF.
+            return Err(RecvError::IoError);
         }
 
         let mut buf = self.recv_buf.borrow_mut();
