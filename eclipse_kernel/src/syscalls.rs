@@ -1672,12 +1672,8 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
                             }
                         }
                         process::unregister_child_waiter(current_pid);
-                        proc.parent_pid = None;
-                        process::update_process(wp, proc);
-                        // Cosechar el zombie: liberar el slot ahora que el padre leyó
-                        // el exit_code.  Se llama DESPUÉS de update_process porque
-                        // update_process usa pid_to_slot_fast internamente.
-                        crate::ipc::unregister_pid_slot(wp);
+                        // Reap zombie: free PROCESS_TABLE slot and PID map entry.
+                        process::remove_process(wp);
                         return wp as u64;
                     }
                 }
@@ -1707,10 +1703,8 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
                             }
 
                             process::unregister_child_waiter(current_pid);
-                            proc.parent_pid = None;
-                            process::update_process(*pid, proc);
-                            // Cosechar el zombie: liberar slot después de update_process.
-                            crate::ipc::unregister_pid_slot(*pid);
+                            // Reap zombie: free PROCESS_TABLE slot and PID map entry.
+                            process::remove_process(*pid);
                             return *pid as u64;
                         }
                     }

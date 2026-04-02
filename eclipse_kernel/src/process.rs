@@ -752,6 +752,29 @@ pub fn exit_process() {
     }
 }
 
+/// Remove a reaped zombie process from PROCESS_TABLE and from the PID→slot map.
+///
+/// Must be called only after the parent has successfully read the exit code via
+/// wait().  Clears both the PID_SLOT_MAP entry and the PROCESS_TABLE slot so
+/// that the process no longer appears in `ps` or any other process list query.
+pub fn remove_process(pid: ProcessId) {
+    // Retrieve the slot index while the PID is still registered.
+    let slot = crate::ipc::pid_to_slot_fast(pid);
+    // Remove the PID→slot mapping first.
+    crate::ipc::unregister_pid_slot(pid);
+    // Now null out the PROCESS_TABLE slot so the entry is truly gone.
+    if let Some(slot_idx) = slot {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(p) = table[slot_idx].as_ref() {
+                if p.id == pid {
+                    table[slot_idx] = None;
+                }
+            }
+        });
+    }
+}
+
 /// Listar todos los procesos
 pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
     x86_64::instructions::interrupts::without_interrupts(|| {
