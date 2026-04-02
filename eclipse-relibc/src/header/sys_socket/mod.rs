@@ -1,9 +1,13 @@
 //! sys/socket.h - Socket interface
 use crate::types::*;
 use crate::header::sys_uio::iovec;
+use crate::header::net_inet::in_addr;
 use core::ffi::c_int;
 use core::mem::size_of;
 use crate::eclipse_syscall::call::{socket as sys_socket, bind as sys_bind, listen as sys_listen, accept as sys_accept, connect as sys_connect};
+
+/// Type alias for address family (compatible with Linux/POSIX for rustix).
+pub type sa_family_t = c_ushort;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -11,6 +15,107 @@ pub struct sockaddr {
     pub sa_family: c_ushort,
     pub sa_data: [c_char; 14],
 }
+
+/// Unix domain socket address (compatible with Linux/POSIX for rustix and x11rb).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct sockaddr_un {
+    pub sun_family: sa_family_t,
+    pub sun_path: [c_char; 108],
+}
+
+// Note: in6_addr and sockaddr_in6 are defined in crate::types.
+
+/// Linger option for SO_LINGER (compatible with Linux/POSIX for rustix).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct linger {
+    pub l_onoff: c_int,
+    pub l_linger: c_int,
+}
+
+/// IPv4 multicast request (compatible with Linux/POSIX for rustix).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ip_mreq {
+    pub imr_multiaddr: in_addr,
+    pub imr_interface: in_addr,
+}
+
+/// IPv6 multicast request (compatible with Linux/POSIX for rustix).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ipv6_mreq {
+    pub ipv6mr_multiaddr: in6_addr,
+    pub ipv6mr_interface: c_uint,
+}
+
+// --- Socket type flags (compatible with Linux for rustix/x11rb) ---
+pub const SOCK_CLOEXEC:  c_int = 0o2000000;  // 524288
+pub const SOCK_NONBLOCK: c_int = 0o4000;     // 2048
+
+// --- Socket option levels ---
+pub const SOL_SOCKET: c_int = 1;
+
+// --- Ancillary data types ---
+pub const SCM_RIGHTS: c_int = 1;
+
+// --- SO_* socket options ---
+pub const SO_DEBUG:       c_int = 1;
+pub const SO_REUSEADDR:   c_int = 2;
+pub const SO_TYPE:        c_int = 3;
+pub const SO_ERROR:       c_int = 4;
+pub const SO_DONTROUTE:   c_int = 5;
+pub const SO_BROADCAST:   c_int = 6;
+pub const SO_SNDBUF:      c_int = 7;
+pub const SO_RCVBUF:      c_int = 8;
+pub const SO_KEEPALIVE:   c_int = 9;
+pub const SO_OOBINLINE:   c_int = 10;
+pub const SO_NO_CHECK:    c_int = 11;
+pub const SO_PRIORITY:    c_int = 12;
+pub const SO_LINGER:      c_int = 13;
+pub const SO_BSDCOMPAT:   c_int = 14;
+pub const SO_REUSEPORT:   c_int = 15;
+pub const SO_PASSCRED:    c_int = 16;
+pub const SO_PEERCRED:    c_int = 17;
+pub const SO_RCVLOWAT:    c_int = 18;
+pub const SO_SNDLOWAT:    c_int = 19;
+pub const SO_RCVTIMEO:    c_int = 20;
+pub const SO_SNDTIMEO:    c_int = 21;
+pub const SO_ACCEPTCONN:  c_int = 30;
+pub const SO_SNDBUFFORCE: c_int = 32;
+pub const SO_RCVBUFFORCE: c_int = 33;
+pub const SO_DOMAIN:      c_int = 39;
+pub const SO_NOSIGPIPE:   c_int = 67;
+
+// --- Protocol numbers ---
+pub const IPPROTO_IP:   c_int = 0;
+pub const IPPROTO_TCP:  c_int = 6;
+pub const IPPROTO_UDP:  c_int = 17;
+pub const IPPROTO_IPV6: c_int = 41;
+
+// --- TCP socket options ---
+pub const TCP_NODELAY:   c_int = 1;
+pub const TCP_KEEPIDLE:  c_int = 4;
+pub const TCP_KEEPINTVL: c_int = 5;
+pub const TCP_KEEPCNT:   c_int = 6;
+
+// --- IP socket options ---
+pub const IP_TTL:           c_int = 2;
+pub const IP_MULTICAST_IF:  c_int = 32;
+pub const IP_MULTICAST_TTL: c_int = 33;
+pub const IP_MULTICAST_LOOP:c_int = 34;
+pub const IP_ADD_MEMBERSHIP:c_int = 35;
+pub const IP_DROP_MEMBERSHIP:c_int = 36;
+
+// --- IPv6 socket options ---
+pub const IPV6_V6ONLY:         c_int = 26;
+pub const IPV6_MULTICAST_IF:   c_int = 17;
+pub const IPV6_MULTICAST_HOPS: c_int = 18;
+pub const IPV6_MULTICAST_LOOP: c_int = 19;
+pub const IPV6_ADD_MEMBERSHIP: c_int = 20;
+pub const IPV6_DROP_MEMBERSHIP:c_int = 21;
+pub const IPV6_TCLASS:         c_int = 67;
 
 /// Message header para sendmsg/recvmsg (compatible con Linux/POSIX para rustix).
 #[repr(C)]
@@ -209,13 +314,13 @@ pub unsafe extern "C" fn getpeername(_sockfd: c_int, _addr: *mut sockaddr, _addr
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn setsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *const c_void, _optlen: socklen_t) -> c_int {
-    -1
+    0
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
 pub unsafe extern "C" fn getsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *mut c_void, _optlen: *mut socklen_t) -> c_int {
-    -1
+    0
 }
 
 #[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]

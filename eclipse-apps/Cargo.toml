@@ -11,6 +11,7 @@ members = [
     "rust-shell",
     "nano",
     "glxgears",
+    "xeyes",
 ]
 # glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.
 exclude = ["libs/ipc_tests", "smithay_app", "nanorust"]
