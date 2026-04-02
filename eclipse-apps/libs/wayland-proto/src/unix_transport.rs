@@ -268,7 +268,14 @@ impl Connection for UnixSocketConnection {
             return Err(RecvError::IoError);
         }
         if n == 0 {
-            // Orderly shutdown — the peer closed the connection.
+            // On standard Linux, n==0 means orderly shutdown (peer called close/shutdown).
+            // On Eclipse OS with O_NONBLOCK, recvmsg may return 0 instead of -1+EAGAIN
+            // when the socket buffer is empty.  Check errno to distinguish the two cases.
+            let err = errno();
+            if err == EAGAIN || err == EWOULDBLOCK || err == 0 {
+                return Err(RecvError::WouldBlock);
+            }
+            // Real EOF: peer closed the connection.
             return Err(RecvError::IoError);
         }
 

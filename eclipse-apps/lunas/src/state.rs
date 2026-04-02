@@ -14,6 +14,7 @@ use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use wayland_proto::wl::protocols::common::wl_keyboard;
 use wayland_proto::wl::protocols::common::wl_pointer;
+use wayland_proto::wl::wire::ObjectId;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
@@ -203,28 +204,50 @@ impl LunasState {
 
                 // Dispatch pending SNP keyboard events to the focused Wayland window
                 if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
+                    eprintln!("[LUNAS-KEY] pending_snp_key: sc=0x{:02x} st={}", scancode, state_val);
                     if let Some(w_idx) = self.input.focused_window {
                         if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
                             let focused_client = ClientId(pid);
 
                             // If client has a wl_keyboard object, dispatch via Wayland protocol
                             let keyboard_id = (*self.keyboard_registry).borrow().get(&focused_client).copied();
+                            eprintln!("[LUNAS-KEY] client=0x{:x} kb_id={:?}", pid, keyboard_id);
                             if let Some(kb_id) = keyboard_id {
                                 if let Some(client) = self.protocol.clients.get(&focused_client) {
                                     self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                    // wl_keyboard.key uses Linux/evdev keycodes.
+                                    // evdev keycode = PS/2 scancode + 8.
+                                    // Strip the PS/2 break-bit (0x80) since state is
+                                    // already encoded in KEY_STATE_PRESSED/RELEASED.
+                                    let ps2_code = (scancode & 0x7F) as u32;
+                                    let evdev_key = ps2_code + 8;
                                     let key_event = wl_keyboard::Event::Key {
                                         serial: self.wayland_serial,
                                         time: self.counter as u32,
-                                        key: scancode as u32,
+                                        key: evdev_key,
                                         state: if state_val != 0 {
                                             wl_keyboard::KEY_STATE_PRESSED
                                         } else {
                                             wl_keyboard::KEY_STATE_RELEASED
                                         },
                                     };
-                                    let _ = client.send_event(kb_id, key_event);
+                                    let send_res = client.send_event(kb_id, key_event);
+                                    eprintln!("[LUNAS-KEY] send_event kb={} evdev={} res={:?}", kb_id.0, evdev_key, send_res);
+                                    // ── wl_keyboard.modifiers: required by Wayland spec alongside key events ──
+                                    // We don't track XKB-level modifiers yet, so send zeros.
+                                    // Clients need this to track Shift/Ctrl state correctly.
+                                    self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                    let mods = wl_keyboard::Event::Modifiers {
+                                        serial: self.wayland_serial,
+                                        mods_depressed: 0,
+                                        mods_latched: 0,
+                                        mods_locked: 0,
+                                        group: 0,
+                                    };
+                                    let _ = client.send_event(kb_id, mods);
                                 }
                             } else {
+                                eprintln!("[LUNAS-KEY] no kb_id in registry → SideWind fallback");
                                 // Fallback: SideWind raw event for Eclipse IPC clients
                                 let ev = SideWindEvent {
                                     event_type: sidewind::SWND_EVENT_TYPE_KEY,
@@ -456,7 +479,26 @@ impl LunasState {
                 };
                 self.space.windows[self.space.window_count] = win;
                 self.space.window_count += 1;
-                self.input.focused_window = Some(self.space.window_count - 1);
+                let new_idx = self.space.window_count - 1;
+                self.input.focused_window = Some(new_idx);
+
+                // ── Wayland protocol: send wl_keyboard.enter when surface gains focus ──
+                // Per spec, the compositor MUST send enter before any wl_keyboard.key events.
+                let focused_client = ClientId(commit.pid);
+                let keyboard_id = (*self.keyboard_registry).borrow().get(&focused_client).copied();
+                if let Some(kb_id) = keyboard_id {
+                    if let Some(client) = self.protocol.clients.get(&focused_client) {
+                        self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                        let enter = wl_keyboard::Event::Enter {
+                            serial: self.wayland_serial,
+                            surface: ObjectId(commit.surface_id),
+                            keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                        };
+                        let _ = client.send_event(kb_id, enter);
+                        eprintln!("[LUNAS-KEY] sent wl_keyboard.enter surface={} kb={}",
+                            commit.surface_id, kb_id.0);
+                    }
+                }
             }
         }
         self.dirty = true;
@@ -500,6 +542,27 @@ impl LunasState {
         // inline in handle_event(CompositorEvent::Snp); Unix socket clients don't
         // generate that event, so we drain here every frame.
         self.drain_pending_wayland_commits();
+
+        // Dispatch xdg_toplevel.close to any Wayland/Snp windows that are being closed.
+        {
+            use wayland_proto::wl::protocols::common::xdg_toplevel;
+            use wayland_proto::wl::server::client::ClientId;
+            use wayland_proto::wl::ObjectId;
+            for i in 0..self.space.window_count {
+                let w = &self.space.windows[i];
+                if w.closing {
+                    if let crate::compositor::WindowContent::Snp { pid, .. } = w.content {
+                        // Unix socket clients have pid = 0x8000_0000+N.
+                        // Their xdg_toplevel is always object id 11 (terminal wire protocol).
+                        let client_id = ClientId(pid);
+                        if let Some(client) = self.protocol.clients.get(&client_id) {
+                            let _ = client.send_event(ObjectId(11), xdg_toplevel::Event::Close);
+                        }
+                    }
+                }
+            }
+        }
+
 
         // Update window animations
         let animating = self.space.update_animations(&mut self.surfaces);

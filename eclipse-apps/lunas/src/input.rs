@@ -34,11 +34,18 @@ fn notify_window_close(
                 return;
             }
         }
-        WindowContent::Snp { pid, .. } => pid,
+        WindowContent::Snp { pid, .. } => {
+            // Unix socket clients (pid >= 0x8000_0000) are NOT real process PIDs.
+            // They will receive xdg_toplevel.close via the Wayland protocol from
+            // state.rs. No SIGKILL needed here — just return.
+            if pid >= 0x8000_0000 {
+                return;
+            }
+            pid
+        }
         _ => return,
     };
 
-    println!("[LUNAS] sending CLOSE to PID {}", target_pid);
     let r = unsafe {
         eclipse_send(
             target_pid,
@@ -48,15 +55,13 @@ fn notify_window_close(
             0,
         )
     };
-    println!("[LUNAS] CLOSE send result {}", r);
+    let _ = r;
 
-    // Matar el proceso con SIGKILL para garantizar que termina y el padre
-    // (shell) sea notificado, incluso si el proceso no maneja SWND_EVENT_TYPE_CLOSE.
+    // SIGKILL only for real process PIDs (IPC / External clients).
     #[cfg(target_vendor = "eclipse")]
     unsafe {
         libc::kill(target_pid as libc::pid_t, 9);
     }
-    println!("[LUNAS] SIGKILL sent to PID {}", target_pid);
 }
 /// Envía SWND_EVENT_TYPE_RESIZE al cliente externo de la ventana `idx`.
 /// Se llama al terminar un resize (botón liberado) con las dimensiones finales.
@@ -654,7 +659,10 @@ fn sidewind_keyboard_client_focused(
     if f >= window_count {
         return false;
     }
-    !windows[f].closing && matches!(windows[f].content, WindowContent::External(_))
+    !windows[f].closing && matches!(
+        windows[f].content,
+        WindowContent::External(_) | WindowContent::Snp { .. }
+    )
 }
 
 /// Teclas que en Lunas tienen `KeyAction != None` pero el **keydown** debe llegar igual al cliente
@@ -1207,32 +1215,40 @@ impl InputState {
                         }
                     }
 
-                    // Si el foco está en una ventana `External` (p.ej. el terminal-wb),
-                    // reenvía la tecla al cliente y evita que Lunas ejecute atajos globales
-                    // (por ejemplo, `L` puede togglear el lock-screen).
+                    // Si el foco está en una ventana `External` (p.ej. el terminal-wb) o
+                    // `Snp` (Wayland / terminal nativo), reenvía la tecla al cliente y evita
+                    // que Lunas ejecute atajos globales (por ejemplo `L` → lock-screen).
                     if sidewind_keyboard_client_focused(self.focused_window, *window_count, windows) {
                         if let Some(focused) = self.focused_window {
                             if focused < *window_count {
                                 use crate::compositor::WindowContent;
-                                if let WindowContent::External(s_idx) = windows[focused].content {
-                                    let s_idx = s_idx as usize;
-                                    if s_idx < surfaces.len() && surfaces[s_idx].active {
-                                        let ev = SideWindEvent {
-                                            event_type: SWND_EVENT_TYPE_KEY,
-                                            data1: scancode as i32,
-                                            data2: if pressed { 1 } else { 0 },
-                                            data3: self.modifiers as i32,
-                                        };
-                                        let _ = unsafe {
-                                            eclipse_send(
-                                                surfaces[s_idx].pid,
-                                                sidewind::MSG_TYPE_INPUT,
-                                                &ev as *const _ as *const core::ffi::c_void,
-                                                core::mem::size_of::<SideWindEvent>(),
-                                                0,
-                                            )
-                                        };
+                                match &windows[focused].content {
+                                    WindowContent::External(s_idx) => {
+                                        let s_idx = *s_idx as usize;
+                                        if s_idx < surfaces.len() && surfaces[s_idx].active {
+                                            let ev = SideWindEvent {
+                                                event_type: SWND_EVENT_TYPE_KEY,
+                                                data1: scancode as i32,
+                                                data2: if pressed { 1 } else { 0 },
+                                                data3: self.modifiers as i32,
+                                            };
+                                            let _ = unsafe {
+                                                eclipse_send(
+                                                    surfaces[s_idx].pid,
+                                                    sidewind::MSG_TYPE_INPUT,
+                                                    &ev as *const _ as *const core::ffi::c_void,
+                                                    core::mem::size_of::<SideWindEvent>(),
+                                                    0,
+                                                )
+                                            };
+                                        }
                                     }
+                                    WindowContent::Snp { .. } => {
+                                        // Wayland client: ALL key events (press + release).
+                                        let state_flag = if pressed { 1u16 } else { 0u16 };
+                                        self.pending_snp_key = Some((focused, scancode, state_flag));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1508,46 +1524,7 @@ impl InputState {
                     }
                 }
 
-                // ── Forward Wayland keyboard events + SideWind external key events ──
-                let action = scancode_to_action(scancode, self.modifiers);
-                let forward_press_extra = pressed
-                    && sidewind_keyboard_client_focused(self.focused_window, *window_count, windows)
-                    && forward_key_press_for_sidewind_client(action, scancode, self.modifiers);
-                if !pressed || action == KeyAction::None || forward_press_extra {
-                    if let Some(focused) = self.focused_window {
-                        if focused < *window_count {
-                            use crate::compositor::WindowContent;
-                            match &windows[focused].content {
-                                WindowContent::Snp { .. } => {
-                                    let state_flag = if pressed { 1 } else { 0 };
-                                    // For SNP we use the focused index as conn_idx for simplicity in state.rs search
-                                    self.pending_snp_key = Some((focused, scancode, state_flag));
-                                }
-                                WindowContent::External(s_idx) => {
-                                    let s_idx = *s_idx as usize;
-                                    if s_idx < surfaces.len() && surfaces[s_idx].active {
-                                        let ev = SideWindEvent {
-                                            event_type: SWND_EVENT_TYPE_KEY,
-                                            data1: scancode as i32,
-                                            data2: if pressed { 1 } else { 0 },
-                                            data3: self.modifiers as i32,
-                                        };
-                                        let _ = unsafe {
-                                            eclipse_send(
-                                                surfaces[s_idx].pid,
-                                                sidewind::MSG_TYPE_INPUT,
-                                                &ev as *const _ as *const core::ffi::c_void,
-                                                core::mem::size_of::<SideWindEvent>(),
-                                                0,
-                                            )
-                                        };
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+
             }
             // Mouse move
             1 => {

@@ -100,6 +100,25 @@ impl DrawTarget for SharedSurfaceDrawTarget {
 // Constantes y Helpers
 // ============================================================================
 
+/// Write a u32 as decimal ASCII into `buf`, return number of bytes written.
+fn write_u32(buf: &mut [u8], mut v: u32) -> usize {
+    if buf.is_empty() { return 0; }
+    let mut tmp = [0u8; 10];
+    let mut i = 0usize;
+    if v == 0 { tmp[0] = b'0'; i = 1; } else {
+        while v > 0 && i < tmp.len() { tmp[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        let (mut lo, mut hi) = (0, i.saturating_sub(1));
+        while lo < hi { tmp.swap(lo, hi); lo += 1; hi -= 1; }
+    }
+    let n = i.min(buf.len()); buf[..n].copy_from_slice(&tmp[..n]); n
+}
+
+/// Write a u8 as 2-digit hex ASCII into `buf`, return 2.
+fn write_u8_hex(buf: &mut [u8], v: u8) -> usize {
+    const HEX: &[u8] = b"0123456789abcdef";
+    if buf.len() >= 2 { buf[0] = HEX[(v >> 4) as usize]; buf[1] = HEX[(v & 0xf) as usize]; 2 } else { 0 }
+}
+
 const FONT_CHAR_W: u16 = 8;
 const FONT_CHAR_H: u16 = 16;
 
@@ -280,8 +299,36 @@ impl TerminalApp {
                     } else { break; }
                 }
             }
+            // Break as soon as the 3 core globals are received.
+            // wl_seat is optional here; we drain for it below.
             if compositor_name != 0 && shm_name_id != 0 && xdg_name != 0 { break; }
             let _ = eclipse_syscall::call::sched_yield();
+        }
+
+        // Drain additional events to pick up wl_seat (and wl_output) that may arrive
+        // in the same batch as the 3 core globals or one yield later.
+        if seat_name == 0 {
+            for _ in 0..500 {
+                if let Ok((data, _)) = wayland.recv() {
+                    let mut pos = 0usize;
+                    while pos + 8 <= data.len() {
+                        if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                            let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                            if sender == ObjectId(2) && opcode == Opcode(0) {
+                                let pts: &[PayloadType] = &[PayloadType::UInt, PayloadType::String, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let name = match raw.args.get(0) { Some(Payload::UInt(n)) => *n, _ => 0 };
+                                    let iface = match raw.args.get(1) { Some(Payload::String(s)) => s.as_str(), _ => "" };
+                                    if iface == "wl_seat" { seat_name = name; }
+                                }
+                            }
+                            pos += msg_len.min(data.len() - pos);
+                        } else { break; }
+                    }
+                }
+                if seat_name != 0 { break; }
+                let _ = eclipse_syscall::call::sched_yield();
+            }
         }
 
         if compositor_name == 0 {
@@ -435,6 +482,22 @@ impl TerminalApp {
                     match RawMessage::deserialize_header(&data[pos..]) {
                         Ok((sender, opcode, msg_len)) if pos + msg_len <= data.len() => {
                             let chunk = &data[pos..pos + msg_len];
+                            // Log every received Wayland event for debugging
+                            {
+                                let mut buf = [0u8; 80];
+                                let mut n = 0usize;
+                                let pref = b"[TERM-WL] recv sender=";
+                                buf[n..n+pref.len()].copy_from_slice(pref); n += pref.len();
+                                n += write_u32(&mut buf[n..], sender.0);
+                                let op = b" op=";
+                                buf[n..n+op.len()].copy_from_slice(op); n += op.len();
+                                n += write_u32(&mut buf[n..], opcode.0 as u32);
+                                let kb = b" kb=";
+                                buf[n..n+kb.len()].copy_from_slice(kb); n += kb.len();
+                                n += write_u32(&mut buf[n..], self.keyboard_id as u32);
+                                buf[n] = b'\n'; n += 1;
+                                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                            }
 
                             // xdg_wm_base.ping(serial) → pong
                             if sender == ObjectId(5) && opcode == Opcode(0) {
@@ -481,10 +544,24 @@ impl TerminalApp {
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                                     let state = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
-                                    // Convert Linux keycode to PS/2 scancode (simple mapping)
-                                    // Linux keycode = PS/2 scancode + 8 (for set-1 subset)
+                                    // Convert evdev keycode → PS/2 scancode → pc_keyboard state machine
                                     let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
+                                    {
+                                        let mut buf = [0u8; 80];
+                                        let mut n = 0usize;
+                                        let pref = b"[TERM-KB] key=";
+                                        buf[n..n+pref.len()].copy_from_slice(pref); n += pref.len();
+                                        n += write_u32(&mut buf[n..], key);
+                                        let st = b" st=";
+                                        buf[n..n+st.len()].copy_from_slice(st); n += st.len();
+                                        n += write_u32(&mut buf[n..], state);
+                                        let ps = b" ps2=0x";
+                                        buf[n..n+ps.len()].copy_from_slice(ps); n += ps.len();
+                                        n += write_u8_hex(&mut buf[n..], ps2);
+                                        buf[n] = b'\n'; n += 1;
+                                        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
+                                    }
                                     let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
                                 }

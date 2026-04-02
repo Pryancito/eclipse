@@ -54,6 +54,7 @@ impl WaylandSocketServer {
             // Coerce Rc<RefCell<UnixSocketConnection>> → Rc<RefCell<dyn Connection>>
             let conn_rc: Rc<RefCell<dyn Connection>> = Rc::new(RefCell::new(conn));
             protocol.add_client(id, conn_rc);
+            eprintln!("[WL-SOCK] new client 0x{:x}", id.0);
             any = true;
         }
 
@@ -90,7 +91,10 @@ impl WaylandSocketServer {
                         match RawMessage::deserialize_header(&data[pos..]) {
                             Ok((_, _, msg_len)) if pos + msg_len <= data.len() => {
                                 let chunk = &data[pos..pos + msg_len];
-                                let _ = protocol.process_message(id, chunk, &handles_remaining);
+                                let res = protocol.process_message(id, chunk, &handles_remaining);
+                                if let Err(e) = &res {
+                                    eprintln!("[WL-SOCK] process_message 0x{:x} err={:?}", id.0, e);
+                                }
                                 // Consume handles after first message that could use them.
                                 handles_remaining = (&[]).to_vec();
                                 pos += msg_len;
@@ -112,8 +116,9 @@ impl WaylandSocketServer {
         }
 
         // Remove disconnected clients
-        for id in disconnected {
-            protocol.clients.remove(&id);
+        for id in &disconnected {
+            eprintln!("[WL-SOCK] client 0x{:x} disconnected/error → removing", id.0);
+            protocol.clients.remove(id);
         }
 
         any
