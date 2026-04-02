@@ -65,6 +65,10 @@ pub fn var<K: AsRef<OsStr>>(k: K) -> core::result::Result<String, VarError> {
     Err(VarError::NotPresent)
 }
 
+pub fn vars() -> Vec<(String, String)> {
+    ENV.lock().clone()
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     Some(PathBuf::from(String::from("/")))
 }

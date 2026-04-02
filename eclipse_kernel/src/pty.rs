@@ -8,6 +8,45 @@ use spin::Mutex;
 use crate::scheme::{Scheme, error, Stat};
 use alloc::sync::Arc;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 32],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+impl Default for Termios {
+    fn default() -> Self {
+        let mut cc = [0u8; 32];
+        // Standard defaults: VINTR=^C, VQUIT=^\, VERASE=^H, VKILL=^U, VEOF=^D, VEOL=0, VEOL2=0, VSTART=^Q, VSTOP=^S, VSUSP=^Z
+        cc[0] = 3;  // VINTR
+        cc[1] = 28; // VQUIT
+        cc[2] = 8;  // VERASE
+        cc[3] = 21; // VKILL
+        cc[4] = 4;  // VEOF
+        cc[8] = 17; // VSTART
+        cc[9] = 19; // VSTOP
+        cc[10] = 26; // VSUSP
+
+        Self {
+            c_iflag: 0x0500, // ICRNL | IXON
+            c_oflag: 0x0005, // OPOST | ONLCR
+            c_cflag: 0x00BF, // B38400 | CS8 | CREAD | HUPCL
+            c_lflag: 0x8A3B, // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN | ECHOCTL | ECHOKE
+            c_line: 0,
+            c_cc: cc,
+            c_ispeed: 15, // B38400
+            c_ospeed: 15, // B38400
+        }
+    }
+}
+
 pub struct PtyChannel {
     pub master_in: VecDeque<u8>, // Master reads from here, Slave writes to here
     pub slave_in: VecDeque<u8>,  // Slave reads from here, Master writes to here
@@ -23,6 +62,8 @@ pub struct PtyChannel {
     /// PID del proceso que tiene abierto el extremo esclavo (0 = no registrado).
     /// Se establece automáticamente en la primera apertura de "pty:slave/N".
     pub slave_pid: crate::process::ProcessId,
+    /// Terminal state (flags, control characters)
+    pub termios: Termios,
 }
 
 impl PtyChannel {
@@ -37,6 +78,7 @@ impl PtyChannel {
             ws_xpixel: 0,
             ws_ypixel: 0,
             slave_pid: 0,
+            termios: Termios::default(),
         }
     }
 }
@@ -178,12 +220,68 @@ impl Scheme for PtyScheme {
             return Err(error::EPIPE);
         }
 
-        let queue = if handle.is_master { &mut channel.slave_in } else { &mut channel.master_in };
-        for &byte in buffer {
-            queue.push_back(byte);
+        let slave_pid = channel.slave_pid;
+        let is_master = handle.is_master;
+        let lflag = channel.termios.c_lflag;
+        let oflag = channel.termios.c_oflag;
+        let cc = channel.termios.c_cc;
+        
+        let mut written = 0;
+        let mut i = 0;
+        while i < buffer.len() {
+            let byte = buffer[i];
+            i += 1;
+
+            if is_master {
+                // Master writing to Slave (User typing)
+                
+                // 1. Check for signals (ISIG)
+                if (lflag & 0x0001) != 0 { // ISIG
+                    let signo = if byte == cc[0] { // VINTR
+                        Some(2) // SIGINT
+                    } else if byte == cc[1] { // VQUIT
+                        Some(3) // SIGQUIT
+                    } else if byte == cc[10] { // VSUSP
+                        Some(20) // SIGTSTP
+                    } else {
+                        None
+                    };
+
+                    if let Some(s) = signo {
+                        if channel.slave_pid != 0 {
+                            crate::process::set_pending_signal(channel.slave_pid, s as u8);
+                        }
+                        written += 1;
+                        continue;
+                    }
+                }
+
+                // 2. Echo (ECHO)
+                if (lflag & 0x0008) != 0 { // ECHO
+                    channel.master_in.push_back(byte);
+                }
+
+                channel.slave_in.push_back(byte);
+                written += 1;
+            } else {
+                // Slave writing to Master (App output)
+                
+                // 3. Output Processing (OPOST)
+                if (oflag & 0x0001) != 0 { // OPOST
+                    if byte == b'\n' && (oflag & 0x0004) != 0 { // ONLCR
+                        channel.master_in.push_back(b'\r');
+                        channel.master_in.push_back(b'\n');
+                        written += 1;
+                        continue;
+                    }
+                }
+
+                channel.master_in.push_back(byte);
+                written += 1;
+            }
         }
         
-        Ok(buffer.len())
+        Ok(written)
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
@@ -210,6 +308,11 @@ impl Scheme for PtyScheme {
                 let mut channel = arc.lock();
                 if is_master {
                     channel.master_closed = true;
+                    // Send SIGHUP (1) to the foreground process group (slave_pid)
+                    let slave_pid = channel.slave_pid;
+                    if slave_pid != 0 {
+                        crate::process::set_pending_signal(slave_pid, 1);
+                    }
                 } else {
                     channel.slave_closed = true;
                 }
@@ -292,6 +395,58 @@ impl Scheme for PtyScheme {
                 *ptr.add(1)   = channel.ws_cols;
                 *ptr.add(2)   = channel.ws_xpixel;
                 *ptr.add(3)   = channel.ws_ypixel;
+            }
+            Ok(0)
+        } else if request == 5 {
+            // TIOCSPGRP: establecer PID del proceso en primer plano.
+            if arg == 0 { return Err(error::EINVAL); }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let mut channel = channel_arc.lock();
+            let pid_ptr = arg as *const u32;
+            unsafe {
+                channel.slave_pid = *pid_ptr;
+            }
+            Ok(0)
+        } else if request == 6 {
+            // TIOCGPGRP: obtener PID del proceso en primer plano.
+            if arg == 0 { return Err(error::EINVAL); }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let channel = channel_arc.lock();
+            let pid_ptr = arg as *mut u32;
+            unsafe {
+                *pid_ptr = channel.slave_pid;
+            }
+            Ok(0)
+        } else if request == 0x5401 {
+            // TCGETS: Read termios structure.
+            if arg == 0 { return Err(error::EINVAL); }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let channel = channel_arc.lock();
+            let ptr = arg as *mut Termios;
+            unsafe {
+                *ptr = channel.termios;
+            }
+            Ok(0)
+        } else if request == 0x5402 {
+            // TCSETS: Write termios structure.
+            if arg == 0 { return Err(error::EINVAL); }
+            let channel_arc = {
+                let channels = self.channels.lock();
+                channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+            };
+            let mut channel = channel_arc.lock();
+            let ptr = arg as *const Termios;
+            unsafe {
+                channel.termios = *ptr;
             }
             Ok(0)
         } else {

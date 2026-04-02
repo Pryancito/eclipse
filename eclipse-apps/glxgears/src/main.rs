@@ -7,6 +7,17 @@
 
 use heapless::String as HString;
 
+use core::time::Duration;
+use std::time::Instant;
+use embedded_graphics::{
+    prelude::*,
+    pixelcolor::Rgb888,
+    text::Text,
+    mono_font::MonoTextStyle,
+};
+#[cfg(target_vendor = "eclipse")]
+use sidewind::font_terminus_16;
+
 #[cfg(target_vendor = "eclipse")]
 use libc::{c_int, close, mmap, munmap, open, exit};
 #[cfg(target_vendor = "eclipse")]
@@ -14,9 +25,9 @@ use eclipse_ipc::prelude::EclipseMessage;
 #[cfg(target_vendor = "eclipse")]
 use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE};
 #[cfg(target_vendor = "eclipse")]
-use eclipse_syscall::{self, flag, ProcessInfo};
+use eclipse_syscall::{self, flag, ProcessInfo, SystemStats};
 #[cfg(target_vendor = "eclipse")]
-use eclipse_syscall::call::{sched_yield, exit as syscall_exit};
+use eclipse_syscall::call::{sched_yield, exit as syscall_exit, get_system_stats};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math helpers (no libm, no_std)
@@ -290,6 +301,57 @@ fn render_frame(buf: &mut [u32], w: u32, h: u32, angle: f32) {
     }
 }
 
+/// A DrawTarget implementation for a raw ARGB8888 buffer.
+struct BufferTarget<'a> {
+    words: &'a mut [u32],
+    width: u32,
+    height: u32,
+}
+
+impl<'a> DrawTarget for BufferTarget<'a> {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(coord, color) in pixels.into_iter() {
+            if coord.x >= 0 && coord.x < self.width as i32 && coord.y >= 0 && coord.y < self.height as i32 {
+                let index = (coord.y as usize * self.width as usize) + coord.x as usize;
+                // Convert Rgb888 to ARGB8888 (0xFFRRGGBB)
+                let argb = 0xFF00_0000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+                self.words[index] = argb;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> OriginDimensions for BufferTarget<'a> {
+    fn size(&self) -> Size {
+        Size::new(self.width, self.height)
+    }
+}
+
+/// Draw the FPS overlay on the buffer.
+#[cfg(target_vendor = "eclipse")]
+fn draw_fps_overlay(buf: &mut [u32], w: u32, h: u32, fps: u32) {
+    let mut target = BufferTarget { words: buf, width: w, height: h };
+    let mut fps_str = HString::<32>::new();
+    let _ = core::fmt::write(&mut fps_str, format_args!("FPS: {}", fps));
+
+    // Draw background for contrast (glow/outline logic).
+    let backdrop_style = MonoTextStyle::new(&font_terminus_16::FONT_TERMINUS_16, Rgb888::new(0, 0, 0));
+    for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let _ = Text::new(fps_str.as_str(), Point::new(10 + dx, 25 + dy), backdrop_style).draw(&mut target);
+    }
+
+    // Draw text (Bright Cyan).
+    let text_style = MonoTextStyle::new(&font_terminus_16::FONT_TERMINUS_16, Rgb888::new(100, 255, 255));
+    let _ = Text::new(fps_str.as_str(), Point::new(10, 25), text_style).draw(&mut target);
+}
+
 /// PS/2 scancode for the Q key (press).
 const SCANCODE_Q: u8 = 0x10;
 /// PS/2 scancode for the Escape key (press).
@@ -450,7 +512,21 @@ fn main() {
         let mut ipc_ch = IpcChannel::new();
         let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
 
+        // FPS tracking
+        let mut last_second = Instant::now();
+        let mut frames = 0;
+        let mut current_fps = 0;
+
         loop {
+            frames += 1;
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_second).as_millis();
+            if elapsed >= 1000 {
+                current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
+                frames = 0;
+                last_second = now;
+            }
+
             // Handle incoming IPC events (key press, resize, close).
             while let Some(msg) = ipc_ch.recv() {
                 if let EclipseMessage::Raw { data, len, .. } = msg {
@@ -477,6 +553,9 @@ fn main() {
 
             // Render the current frame.
             render_frame(buf, win_w, win_h, angle);
+
+            // Draw FPS overlay.
+            draw_fps_overlay(buf, win_w, win_h, current_fps);
 
             // Commit to compositor.
             let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_commit());

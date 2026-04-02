@@ -218,7 +218,7 @@ build_sidewind_project() {
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
-        local BINS="lunas sh nano terminal glxgears"
+        local BINS="lunas nano terminal glxgears rust-shell"
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
@@ -230,16 +230,24 @@ build_sidewind_project() {
             fi
         done
 
+        if [ -f "$_sw_rel/rust-shell" ]; then
+            cp "$_sw_rel/rust-shell" "$BASE_DIR/$BUILD_DIR/sysroot/bin/rust-shell"
+            print_status "Instalado en sysroot: /usr/bin/rust-shell (desde rust-shell)"
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                cp "$_sw_rel/rust-shell" "$BASE_DIR/$BUILD_DIR/bin/rust-shell"
+            fi
+        fi
+        if [ -f "$_sw_rel/glxgears" ]; then
+            cp "$_sw_rel/glxgears" "$BASE_DIR/$BUILD_DIR/sysroot/bin/glxgears"
+            print_status "Instalado en sysroot: /usr/bin/glxgears (desde glxgears)"
+            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                cp "$_sw_rel/glxgears" "$BASE_DIR/$BUILD_DIR/bin/glxgears"
+            fi
+        fi
         # terminal: el crate se llama terminal; en sysroot debe existir como 'terminal'
         if [ -f "$_sw_rel/terminal" ]; then
             cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
             print_status "Instalado en sysroot: /usr/bin/terminal (desde terminal)"
-            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
-            fi
-        elif [ -f "$_sw_rel/terminal" ]; then
-            cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
-            print_status "Instalado en sysroot: /usr/bin/terminal"
             if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
                 cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
             fi

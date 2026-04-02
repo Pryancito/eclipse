@@ -1629,23 +1629,23 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
     }
 }
 
-
 /// sys_wait - Wait for child process to terminate
 /// arg1: pointer to status variable (or 0 for non-blocking poll / WNOHANG semantics)
 /// Returns: PID of terminated child, or -1 on error
 fn sys_wait(status_ptr: u64) -> u64 {
-    sys_wait_impl(status_ptr, 0, false)
+    sys_wait_impl(status_ptr, 0, 0)
 }
 
 /// Esperar hijo concreto (`wait_pid == 0` → cualquier hijo).
-/// flags: bit 0 = WNOHANG (retornar 0 inmediatamente si ningún hijo ha terminado).
+/// flags: bit 0 = WNOHANG, bit 1 = WUNTRACED
 fn sys_wait_pid(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
-    let wnohang = (flags & 1) != 0;
-    sys_wait_impl(status_ptr, wait_pid, wnohang)
+    sys_wait_impl(status_ptr, wait_pid, flags)
 }
 
-fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
+fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
     use crate::process;
+    let wnohang = (flags & 1) != 0;
+    let wuntraced = (flags & 2) != 0;
 
     let mut stats = SYSCALL_STATS.lock();
     stats.wait_calls += 1;
@@ -1664,22 +1664,30 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
             let wp = wait_pid as process::ProcessId;
             match process::get_process(wp) {
                 Some(mut proc) if proc.parent_pid == Some(current_pid) => {
-                    if proc.state == process::ProcessState::Terminated {
-                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                            let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
-                            unsafe {
-                                core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                        if proc.state == process::ProcessState::Terminated {
+                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
+                                unsafe {
+                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                }
                             }
+                            process::unregister_child_waiter(current_pid);
+                            // Reap zombie: free PROCESS_TABLE slot and PID map entry.
+                            process::remove_process(wp);
+                            return wp as u64;
                         }
-                        process::unregister_child_waiter(current_pid);
-                        proc.parent_pid = None;
-                        process::update_process(wp, proc);
-                        // Cosechar el zombie: liberar el slot ahora que el padre leyó
-                        // el exit_code.  Se llama DESPUÉS de update_process porque
-                        // update_process usa pid_to_slot_fast internamente.
-                        crate::ipc::unregister_pid_slot(wp);
-                        return wp as u64;
-                    }
+
+                        if wuntraced && proc.state == process::ProcessState::Stopped {
+                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
+                                unsafe {
+                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                }
+                            }
+                            process::unregister_child_waiter(current_pid);
+                            // NO cosechamos: el proceso sigue vivo aunque detenido
+                            return wp as u64;
+                        }
                 }
                 _ => {
                     process::unregister_child_waiter(current_pid);
@@ -1707,10 +1715,20 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, wnohang: bool) -> u64 {
                             }
 
                             process::unregister_child_waiter(current_pid);
-                            proc.parent_pid = None;
-                            process::update_process(*pid, proc);
-                            // Cosechar el zombie: liberar slot después de update_process.
-                            crate::ipc::unregister_pid_slot(*pid);
+                            // Reap zombie: free PROCESS_TABLE slot and PID map entry.
+                            process::remove_process(*pid);
+                            return *pid as u64;
+                        }
+
+                        if wuntraced && state == &process::ProcessState::Stopped {
+                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
+                                unsafe {
+                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                }
+                            }
+                            process::unregister_child_waiter(current_pid);
+                            // NO cosechamos
                             return *pid as u64;
                         }
                     }

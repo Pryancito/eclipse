@@ -20,24 +20,31 @@ pub struct termios {
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn tcgetattr(_fd: c_int, _termios_p: *mut termios) -> c_int {
-    -1
+pub unsafe extern "C" fn tcgetattr(fd: c_int, termios_p: *mut termios) -> c_int {
+    crate::header::sys_ioctl::ioctl(fd, 0x5401, termios_p as *mut c_void)
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn tcsetattr(_fd: c_int, _optional_actions: c_int, _termios_p: *const termios) -> c_int {
-    -1
+pub unsafe extern "C" fn tcsetattr(fd: c_int, _optional_actions: c_int, termios_p: *const termios) -> c_int {
+    // We ignore _optional_actions for now and just set it.
+    crate::header::sys_ioctl::ioctl(fd, 0x5402, termios_p as *mut c_void)
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn cfsetispeed(_termios_p: *mut termios, _speed: speed_t) -> c_int {
+pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+    if !termios_p.is_null() {
+        (*termios_p).c_ispeed = speed;
+    }
     0
 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn cfsetospeed(_termios_p: *mut termios, _speed: speed_t) -> c_int {
+pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+    if !termios_p.is_null() {
+        (*termios_p).c_ospeed = speed;
+    }
     0
 }

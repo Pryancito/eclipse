@@ -183,6 +183,7 @@ struct TerminalApp {
     last_title: [u8; 32],
     /// Serial counter for protocol events.
     serial: u32,
+    ctrl_pressed: bool,
 }
 
 impl TerminalApp {
@@ -208,6 +209,11 @@ impl TerminalApp {
         if vaddr.is_null() || vaddr == libc::MAP_FAILED {
             unsafe { close(shm_fd) };
             return None;
+        }
+
+        // Zero out the framebuffer explicitly to clear old content
+        unsafe {
+            core::ptr::write_bytes(vaddr as *mut u8, 0, size_bytes);
         }
 
         // ── 2. Connect to Wayland compositor (/tmp/wayland-0) ────────────────
@@ -400,11 +406,11 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read("/bin/sh");
+        let sh_res = std::fs::read("/bin/rust-shell");
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("rust-shell"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
             let _ = sys_close(pty_slave_fd);
             return None;
@@ -433,6 +439,7 @@ impl TerminalApp {
             sh_bytes,
             last_title: [0; 32],
             serial: 1,
+            ctrl_pressed: false,
         })
     }
 
@@ -494,14 +501,15 @@ impl TerminalApp {
                                         let rows = h as u16 / FONT_CHAR_H;
                                         set_pty_winsize(self.pty_master_fd, rows, cols, w as u16, h as u16);
                                         
-                                        // Update internal terminal size
-                                        // os-terminal 0.7.x might not have set_size; recreating for now
+                                        // Inform shell of the change
+                                        let _ = eclipse_syscall::call::kill(self.sh_pid, 28); // SIGWINCH
+
+                                        // Update internal terminal size (recreate because os-terminal 0.7 has no resize)
                                         let draw_target = SharedSurfaceDrawTarget { state: self.surface_state.clone() };
                                         let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
                                         terminal.set_crnl_mapping(true);
                                         terminal.set_clipboard(Box::new(EclipseClipboard::new()));
                                         terminal.set_auto_flush(false);
-                                        // TODO: copy contents from old terminal if possible
                                         self.terminal = terminal;
                                         let pfd = self.pty_master_fd;
                                         self.terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
@@ -510,8 +518,6 @@ impl TerminalApp {
                                         let new_size = (w as usize) * (h as usize) * 4;
                                         let mut state = (*self.surface_state).borrow_mut();
                                         
-                                        // For now, let's keep the old pointer if the new size fits (or just redo it for safety)
-                                        // In Eclipse OS, re-mmapping is more reliable for resizing
                                         let shm_name = sidewind_shm_name(eclipse_syscall::getpid() as u32);
                                         let shm_path = format!("/tmp/{}\0", shm_name.as_str());
                                         let fd = unsafe { open(shm_path.as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644) };
@@ -556,6 +562,15 @@ impl TerminalApp {
                                     // Convert evdev keycode → PS/2 scancode → pc_keyboard state machine
                                     let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
+
+                                    // Handle Ctrl state for signal propagation
+                                    if sc == 0x1D { // Left Ctrl
+                                        self.ctrl_pressed = state != 0;
+                                    }
+                                    if self.ctrl_pressed && sc == 0x2E && state != 0 { // Ctrl+C Make
+                                        let _ = sys_write(self.pty_master_fd, b"\x03");
+                                    }
+
                                     let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
                                 }
@@ -601,7 +616,7 @@ impl TerminalApp {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("rust-shell"), fd, fd, fd) {
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;

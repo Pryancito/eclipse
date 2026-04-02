@@ -91,12 +91,9 @@ impl WaylandSocketServer {
                         match RawMessage::deserialize_header(&data[pos..]) {
                             Ok((_, _, msg_len)) if pos + msg_len <= data.len() => {
                                 let chunk = &data[pos..pos + msg_len];
-                                let res = protocol.process_message(id, chunk, &handles_remaining);
-                                if let Err(e) = &res {
-                                    eprintln!("[WL-SOCK] process_message 0x{:x} err={:?}", id.0, e);
-                                }
+                                let _ = protocol.process_message(id, chunk, &handles_remaining);
                                 // Consume handles after first message that could use them.
-                                handles_remaining = (&[]).to_vec();
+                                handles_remaining = Vec::new();
                                 pos += msg_len;
                                 any = true;
                             }

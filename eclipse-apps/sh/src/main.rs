@@ -389,7 +389,11 @@ fn wait_for_child(pid: usize) -> i32 {
     loop {
         match eclipse_syscall::call::wait_pid(&mut status, pid) {
             Ok(_) => return ((status >> 8) & 0xFF) as i32,
-            Err(e) if e.errno == eclipse_syscall::error::EINTR => continue,
+            Err(e) if e.errno == eclipse_syscall::error::EINTR => {
+                // Propagate SIGINT to child
+                let _ = eclipse_syscall::call::kill(pid, 2);
+                continue;
+            }
             Err(_) => {
                 let mut st = 0u32;
                 if let Ok(r) = eclipse_syscall::call::wait_pid_nohang(&mut st, pid) {
@@ -614,5 +618,13 @@ fn main() {
         let pl = parse_pipeline(tokenize(line));
         let _ = run_pipeline(&pl, &mut bg_pids);
     }
+
+    // ── Cleanup: kill and reap all background processes ─────────────────────
+    for p in bg_pids {
+        let _ = eclipse_syscall::call::kill(p, 9);
+        let mut status = 0u32;
+        let _ = eclipse_syscall::call::wait_pid(&mut status, p);
+    }
+
     eclipse_syscall::call::exit(0);
 }

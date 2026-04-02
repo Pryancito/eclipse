@@ -1488,7 +1488,7 @@ pub fn get_stats() -> InterruptStats {
 /// On BSP: runs full system tick (TIMER_TICKS, process_messages, wake_sleeping, schedule).
 /// On APs: only calls schedule(). The BSP drives the global heartbeat so sleep/wake and IPC
 /// work correctly on SMP even when PIT (IRQ 0) delivery is unreliable.
-extern "C" fn apic_timer_handler() {
+extern "C" fn apic_timer_handler(cs: u64) {
     // 1. Re-trigger the timer if in non-periodic mode
     let mode = crate::apic::get_timer_mode();
     if mode == crate::apic::ApicTimerMode::OneShot {
@@ -1528,6 +1528,13 @@ extern "C" fn apic_timer_handler() {
 
     // Per-CPU scheduling tick (handles 10ms quantum before calling schedule())
     crate::scheduler::local_tick();
+
+    // Deliver signals for CPU-bound processes before returning to userspace.
+    // Signals MUST NOT be delivered when returning to Ring 0 (kernel) as it
+    // could interrupt a kernel critical section or lock acquisition.
+    if (cs & 3) == 3 {
+        crate::process::deliver_pending_signals_for_current();
+    }
 }
 
 /// Naked trampoline for the APIC timer interrupt (saves/restores caller-saved regs).
@@ -1553,6 +1560,8 @@ unsafe extern "C" fn apic_timer_irq() {
         "push r9",
         "push r10",
         "push r11",
+        // Pass saved CS (at [rbp + 16]) as first argument (rdi) to check for Ring 3
+        "mov rdi, [rbp + 16]",
         "sub rsp, 8",
         "call {}",
         "add rsp, 8",

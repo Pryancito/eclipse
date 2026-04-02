@@ -172,6 +172,12 @@ pub fn sigaction(signum: usize, act: usize, oldact: usize) -> Result<()> {
     unsafe { cvt_unit(syscall3(SYS_SIGACTION, signum, act, oldact)) }
 }
 
+/// Change signal mask (blocked signals)
+/// how: 0=BLOCK, 1=UNBLOCK, 2=SETMASK
+pub fn sigprocmask(how: usize, set: usize, oldset: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall3(SYS_SIGPROCMASK, how, set, oldset)) }
+}
+
 /// Create an anonymous pipe.
 /// On return, fds[0] is the read end and fds[1] is the write end.
 pub fn pipe(fds: &mut [u32; 2]) -> Result<()> {
@@ -389,4 +395,7 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
 pub fn gpu_get_backend() -> Result<usize> {
     unsafe { cvt(syscall0(SYS_GET_GPU_BACKEND)) }
 }
-
+/// Get system-wide statistics (uptime, memory, CPU load, etc.)
+pub fn get_system_stats(stats: &mut crate::SystemStats) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_GET_SYSTEM_STATS, stats as *mut _ as usize)) }
+}

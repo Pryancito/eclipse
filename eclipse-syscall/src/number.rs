@@ -18,6 +18,7 @@ pub const SYS_MMAP: usize = 9;
 pub const SYS_MUNMAP: usize = 11;
 pub const SYS_BRK: usize = 12;
 pub const SYS_SIGACTION: usize = 13;
+pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_IOCTL: usize = 16;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_YIELD: usize = 24;

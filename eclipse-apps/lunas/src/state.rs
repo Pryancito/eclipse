@@ -208,14 +208,12 @@ impl LunasState {
 
                 // Dispatch pending SNP keyboard events to the focused Wayland window
                 if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
-                    eprintln!("[LUNAS-KEY] pending_snp_key: sc=0x{:02x} st={}", scancode, state_val);
                     if let Some(w_idx) = self.input.focused_window {
                         if let WindowContent::Snp { pid, surface_id } = self.space.windows[w_idx].content {
                             let focused_client = ClientId(pid);
 
                             // If client has a wl_keyboard object, dispatch via Wayland protocol
                             let keyboard_id = (*self.keyboard_registry).borrow().get(&focused_client).copied();
-                            eprintln!("[LUNAS-KEY] client=0x{:x} kb_id={:?}", pid, keyboard_id);
                             if let Some(kb_id) = keyboard_id {
                                 if let Some(client) = self.protocol.clients.get(&focused_client) {
                                     // ── wl_keyboard.enter: send before first key if not yet sent ──
@@ -228,8 +226,6 @@ impl LunasState {
                                         };
                                         let _ = client.send_event(kb_id, enter);
                                         self.keyboard_entered.insert(focused_client);
-                                        eprintln!("[LUNAS-KEY] sent wl_keyboard.enter (lazy) surface={} kb={}",
-                                            surface_id, kb_id.0);
                                     }
 
                                     self.wayland_serial = self.wayland_serial.wrapping_add(1);
@@ -250,7 +246,6 @@ impl LunasState {
                                         },
                                     };
                                     let send_res = client.send_event(kb_id, key_event);
-                                    eprintln!("[LUNAS-KEY] send_event kb={} evdev={} res={:?}", kb_id.0, evdev_key, send_res);
                                     // ── wl_keyboard.modifiers: required by Wayland spec alongside key events ──
                                     // We don't track XKB-level modifiers yet, so send zeros.
                                     // Clients need this to track Shift/Ctrl state correctly.
@@ -265,7 +260,6 @@ impl LunasState {
                                     let _ = client.send_event(kb_id, mods);
                                 }
                             } else {
-                                eprintln!("[LUNAS-KEY] no kb_id in registry → SideWind fallback");
                                 // Fallback: SideWind raw event for Eclipse IPC clients
                                 let ev = SideWindEvent {
                                     event_type: sidewind::SWND_EVENT_TYPE_KEY,

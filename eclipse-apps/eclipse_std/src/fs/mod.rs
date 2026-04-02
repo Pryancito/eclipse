@@ -8,6 +8,63 @@ use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::io::{Read, Write, Result, Error, ErrorKind};
 
+/// Options for opening files
+#[derive(Debug, Clone, Copy)]
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+        }
+    }
+
+    pub fn read(&mut self, read: bool) -> &mut Self { self.read = read; self }
+    pub fn write(&mut self, write: bool) -> &mut Self { self.write = write; self }
+    pub fn append(&mut self, append: bool) -> &mut Self { self.append = append; self }
+    pub fn truncate(&mut self, truncate: bool) -> &mut Self { self.truncate = truncate; self }
+    pub fn create(&mut self, create: bool) -> &mut Self { self.create = create; self }
+
+    pub fn open(&self, path: &str) -> Result<File> {
+        let mut c_path = Vec::from(path.as_bytes());
+        c_path.push(0);
+
+        // Determine mode string
+        let mode: &[u8] = if self.append {
+            if self.read { b"a+\0" } else { b"a\0" }
+        } else if self.write {
+            if self.truncate {
+                if self.read { b"w+\0" } else { b"w\0" }
+            } else {
+                if self.read { b"r+\0" } else { b"r\0" }
+            }
+        } else {
+            b"r\0"
+        };
+
+        unsafe {
+            let ptr = crate::libc::fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
+            if ptr.is_null() {
+                return Err(Error::new(ErrorKind::Other, "could not open file"));
+            }
+            Ok(File {
+                ptr,
+                path: String::from(path),
+            })
+        }
+    }
+}
+
 /// File handle wrapping eclipse-libc FILE*
 pub struct File {
     ptr: *mut FILE,
@@ -58,6 +115,10 @@ impl File {
 
     pub fn as_raw_fd(&self) -> crate::os::unix::io::RawFd {
         unsafe { crate::libc::fileno(self.ptr) }
+    }
+
+    pub fn options() -> OpenOptions {
+        OpenOptions::new()
     }
 }
 

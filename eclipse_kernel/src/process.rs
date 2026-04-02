@@ -16,6 +16,7 @@ pub enum ProcessState {
     Running,
     Blocked,
     Terminated,
+    Stopped, // For Job Control (SIGSTOP/SIGTSTP)
 }
 
 /// Virtual Memory Area (VMA) region
@@ -108,12 +109,14 @@ pub struct Process {
     pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
     pub last_cpu: u32,                    // Last CPU that executed this process (for cache affinity)
     pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
+    pub exit_signal: u8,                  // Signal that caused termination or stopping
     pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
     pub ai_profile: crate::ai_core::ProcessProfile, // AI Behavior statistics
     /// Máscara de señales pendientes (bit N = señal N pendiente).
     pub pending_signals: u64,
+    /// Máscara de señales bloqueadas (bit N = señal N bloqueada).
+    pub signal_mask: u64,
     /// Manejadores de señal registrados por el proceso vía sys_sigaction.
-    /// 0 = SIG_DFL (acción por defecto), 1 = SIG_IGN, otro = puntero a función.
     pub signal_handlers: [u64; 64],
 }
 
@@ -144,6 +147,7 @@ impl Process {
             current_cpu: NO_CPU,
             last_cpu: NO_CPU,
             exit_code: 0,
+            exit_signal: 0,
             cpu_affinity: None,
             ai_profile: crate::ai_core::ProcessProfile::new(),
             pending_signals: 0,
@@ -206,17 +210,6 @@ pub fn wake_parent_from_wait(parent_pid: ProcessId) {
         return;
     }
 
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut table = PROCESS_TABLE.lock();
-        for slot in table.iter_mut() {
-            if let Some(p) = slot {
-                if p.id == parent_pid && p.state == ProcessState::Blocked {
-                    p.state = ProcessState::Ready;
-                    break;
-                }
-            }
-        }
-    });
     crate::scheduler::enqueue_process(parent_pid);
 }
 
@@ -763,6 +756,29 @@ pub fn exit_process() {
     }
 }
 
+/// Remove a reaped zombie process from PROCESS_TABLE and from the PID→slot map.
+///
+/// Must be called only after the parent has successfully read the exit code via
+/// wait().  Clears both the PID_SLOT_MAP entry and the PROCESS_TABLE slot so
+/// that the process no longer appears in `ps` or any other process list query.
+pub fn remove_process(pid: ProcessId) {
+    // Retrieve the slot index while the PID is still registered.
+    let slot = crate::ipc::pid_to_slot_fast(pid);
+    // Remove the PID→slot mapping first.
+    crate::ipc::unregister_pid_slot(pid);
+    // Now null out the PROCESS_TABLE slot so the entry is truly gone.
+    if let Some(slot_idx) = slot {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(p) = table[slot_idx].as_ref() {
+                if p.id == pid {
+                    table[slot_idx] = None;
+                }
+            }
+        });
+    }
+}
+
 /// Listar todos los procesos
 pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -863,6 +879,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.stack_size = parent.stack_size;
                 child.mem_frames = parent.mem_frames;
                 child.cpu_affinity = parent.cpu_affinity;
+                child.exit_signal = 0;
 
                 // Keep parent name (child will overwrite it with set_process_name if needed)
                 let mut name = [0u8; 16];
@@ -927,9 +944,28 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
         if let Some(p) = slot {
             if p.id == pid {
                 p.pending_signals |= 1u64 << signum;
-                // Despertar al proceso si está bloqueado
-                if p.state == ProcessState::Blocked {
-                    p.state = ProcessState::Ready;
+                
+                // Job Control: handle stop/cont signals
+                if signum == 19 || signum == 20 { // SIGSTOP or SIGTSTP
+                    p.state = ProcessState::Stopped;
+                    p.exit_signal = signum;
+                    let parent_pid = p.parent_pid;
+                    if let Some(ppid) = parent_pid {
+                        wake_parent_from_wait(ppid);
+                    }
+                } else if signum == 18 { // SIGCONT
+                    if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
+                        p.state = ProcessState::Ready;
+                        let parent_pid = p.parent_pid;
+                        if let Some(ppid) = parent_pid {
+                            wake_parent_from_wait(ppid);
+                        }
+                    }
+                } else {
+                    // Despertar al proceso si está bloqueado por otras señales
+                    if p.state == ProcessState::Blocked {
+                        p.state = ProcessState::Ready;
+                    }
                 }
                 return;
             }
@@ -964,6 +1000,7 @@ pub fn signal_default_is_ignore(signum: u8) -> bool {
 }
 
 /// Extrae la señal pendiente de menor número, la borra del bitmask y devuelve (número, handler).
+/// **Respeta la máscara de señales (p.signal_mask)**, excepto para SIGKILL (9) y SIGSTOP (19).
 pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
     let mut table = PROCESS_TABLE.lock();
     for slot in table.iter_mut() {
@@ -971,7 +1008,16 @@ pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
             if p.id != pid || p.pending_signals == 0 {
                 continue;
             }
-            let bit = p.pending_signals.trailing_zeros();
+            // Filtramos las señales que NO están bloqueadas.
+            // SIGKILL (9) y SIGSTOP (19) no se pueden bloquear (máscara 1 << 9 y 1 << 19).
+            let unblockable = (1 << 9) | (1 << 19);
+            let deliverable = p.pending_signals & (!p.signal_mask | unblockable);
+            
+            if deliverable == 0 {
+                return None;
+            }
+            
+            let bit = deliverable.trailing_zeros();
             if bit >= 64 {
                 return None;
             }
@@ -997,6 +1043,7 @@ pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Opti
                         return Some(None);
                     }
                     p.exit_code = 128 + sig as u64;
+                    p.exit_signal = sig;
                     p.state = ProcessState::Terminated;
                     crate::ipc::clear_mailbox_slot(slot_idx);
                     return Some(p.parent_pid);

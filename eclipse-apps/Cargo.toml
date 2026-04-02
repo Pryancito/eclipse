@@ -8,11 +8,12 @@ members = [
     "lunas",
     "terminal",
     "sh",
+    "rust-shell",
     "nano",
     "glxgears",
 ]
 # glium es el crate upstream (winit/glutin/Wayland); no compila para `x86_64-unknown-eclipse`.
-exclude = ["libs/ipc_tests", "smithay_app"]
+exclude = ["libs/ipc_tests", "smithay_app", "nanorust"]
 
 [workspace.package]
 version = "0.2.0"

@@ -122,11 +122,6 @@ impl ObjectLogic for LunasSurface {
             6 => {
                 // commit — publish a new frame
                 if let Some(info) = self.attached_buffer {
-                    {
-                        let msg = alloc::format!("[LUNAS-SURF] commit: pid={} surface_id={} vaddr=0x{:x} {}x{}\n",
-                            self.pid, self.id.0, info.vaddr, info.width, info.height);
-                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
-                    }
                     (*self.pending_commits).borrow_mut().push(SurfaceCommit {
                         pid: self.pid,
                         surface_id: self.id.0,
@@ -135,9 +130,6 @@ impl ObjectLogic for LunasSurface {
                         height: info.height,
                         stride: info.stride,
                     });
-                } else {
-                    let msg = b"[LUNAS-SURF] commit: no attached buffer!\n";
-                    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
                 }
                 Ok(())
             }
