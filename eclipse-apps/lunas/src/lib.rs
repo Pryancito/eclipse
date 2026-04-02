@@ -25,6 +25,7 @@ pub mod style_engine;
 pub mod protocol;
 pub mod widgets;
 pub mod wayland_socket;
+pub mod xwayland;
 
 #[cfg(target_vendor = "eclipse")]
 pub mod getrandom_shim {

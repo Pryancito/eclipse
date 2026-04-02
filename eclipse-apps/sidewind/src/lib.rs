@@ -16,6 +16,7 @@ pub mod font_terminus_20;
 pub mod font_terminus_24;
 pub mod ui;
 pub mod gpu;
+pub mod xwayland;
 
 pub use gpu::{GpuBackend, GpuCommandEncoder, GpuDevice, SurfaceGpuExt};
 /// Canal IPC compartido con el compositor (`send_sidewind`, `send_raw`, etc.).

@@ -522,6 +522,7 @@ pub fn draw_desktop_shell(
     history_pos: usize,
     cpu_temp: u32,
     snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    x11_surfaces: &std::collections::BTreeMap<u32, crate::xwayland::X11PixelBuffer>,
 ) {
     // 1. Blit background
     fb.blit_background();
@@ -539,7 +540,7 @@ pub fn draw_desktop_shell(
         let w = &windows[i];
         if w.content == WindowContent::None || w.minimized || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
-        draw_window(fb, w, surfaces, snp_surfaces, input.focused_window == Some(i), input.window_decoration_style);
+        draw_window(fb, w, surfaces, snp_surfaces, x11_surfaces, input.focused_window == Some(i), input.window_decoration_style);
     }
 
     // 3.5. Draw snap zone guides when dragging a window near screen edges/corners
@@ -1410,6 +1411,7 @@ fn draw_window(
     window: &ShellWindow,
     surfaces: &[ExternalSurface],
     snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
+    x11_surfaces: &std::collections::BTreeMap<u32, crate::xwayland::X11PixelBuffer>,
     focused: bool,
     decoration_style: u8,
 ) {
@@ -1541,8 +1543,35 @@ fn draw_window(
             WindowContent::InternalDemo => {
                 draw_terminal_demo(fb, cx, content_y, cw, content_h);
             }
-            WindowContent::X11 { .. } => {
-                draw_terminal_demo(fb, cx, content_y, cw, content_h);
+            WindowContent::X11 { window_id, .. } => {
+                if let Some(buf) = x11_surfaces.get(&window_id) {
+                    if !buf.pixels.is_empty() && buf.width > 0 && buf.height > 0 {
+                        let fb_ptr = fb.back_addr as *mut u32;
+                        let fb_stride = fb.info.width as usize;
+                        let copy_w = (cw as u32).min(buf.width) as usize;
+                        let copy_h = (content_h as u32).min(buf.height) as usize;
+                        for row in 0..copy_h {
+                            let dy = content_y + row as i32;
+                            if dy < 0 || dy >= fb.info.height as i32 { continue; }
+                            let dst_x = cx.max(0) as usize;
+                            if dst_x >= fb.info.width as usize { continue; }
+                            let actual_copy = copy_w.min(fb.info.width as usize - dst_x);
+                            let dest_idx = (dy as usize) * fb_stride + dst_x;
+                            let src_idx = row * buf.width as usize;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    (buf.pixels.as_ptr() as *const u32).add(src_idx),
+                                    fb_ptr.add(dest_idx),
+                                    actual_copy,
+                                );
+                            }
+                        }
+                    } else {
+                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    }
+                } else {
+                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                }
             }
             WindowContent::None => {}
         }

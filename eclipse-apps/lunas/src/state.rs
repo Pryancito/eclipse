@@ -109,6 +109,10 @@ pub struct LunasState {
     pub net_history: [f32; 60],
     /// Index for the next write position in history buffers.
     pub history_pos: usize,
+    /// X11 server for running legacy X11 applications.
+    pub x11_server: Option<crate::xwayland::X11Server>,
+    /// Pixel buffers for X11 windows (window_id → buffer).
+    pub x11_surfaces: std::collections::BTreeMap<u32, crate::xwayland::X11PixelBuffer>,
 }
 
 impl LunasState {
@@ -165,6 +169,8 @@ impl LunasState {
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
             history_pos: 0,
+            x11_server: crate::xwayland::X11Server::new(fb_w as u16, fb_h as u16),
+            x11_surfaces: std::collections::BTreeMap::new(),
         });
 
         // Pre-render background using the current wallpaper mode and colour.
@@ -537,6 +543,23 @@ impl LunasState {
         // inline in handle_event(CompositorEvent::Snp); Unix socket clients don't
         // generate that event, so we drain here every frame.
         self.drain_pending_wayland_commits();
+
+        // Poll X11 server for new events
+        {
+            let fb_w = self.backend.fb.info.width as u16;
+            let fb_h = self.backend.fb.info.height as u16;
+            let actions = if let Some(ref mut x11_srv) = self.x11_server {
+                x11_srv.poll(fb_w, fb_h)
+            } else {
+                Vec::new()
+            };
+            if !actions.is_empty() {
+                self.process_x11_actions(actions);
+            }
+            if let Some(ref mut x11_srv) = self.x11_server {
+                x11_srv.flush_events();
+            }
+        }
 
         // Dispatch xdg_toplevel.close to any Wayland/Snp windows that are being closed.
         {
@@ -1185,6 +1208,111 @@ impl LunasState {
         self.dirty = true;
     }
 
+    /// Process X11 actions emitted by the X11 server.
+    pub fn process_x11_actions(&mut self, actions: Vec<crate::xwayland::X11Action>) {
+        let fb_w = self.backend.fb.info.width as i32;
+        let fb_h = self.backend.fb.info.height as i32;
+        for action in actions {
+            match action {
+                crate::xwayland::X11Action::MapWindow { window_id, client_id, x, y, width, height, title } => {
+                    let exists = self.space.windows[..self.space.window_count]
+                        .iter()
+                        .any(|w| matches!(w.content, WindowContent::X11 { window_id: wid, .. } if wid == window_id));
+                    if !exists && self.space.window_count < self.space.windows.len() {
+                        let wx = (x as i32).max(0).min((fb_w - width as i32 - 1).max(0));
+                        let wy = (y as i32).max(ShellWindow::TITLE_H).min((fb_h - height as i32 - 1).max(ShellWindow::TITLE_H));
+                        let ww = width as i32;
+                        let wh = height as i32 + ShellWindow::TITLE_H;
+                        let mut win_title = [0u8; 32];
+                        let copy_len = 31.min(title.len());
+                        win_title[..copy_len].copy_from_slice(&title[..copy_len]);
+                        let win = ShellWindow {
+                            x: wx, y: wy, w: ww, h: wh,
+                            curr_x: (wx + ww / 2) as f32,
+                            curr_y: (wy + wh / 2) as f32,
+                            curr_w: 0.0, curr_h: 0.0,
+                            minimized: false, maximized: false, closing: false,
+                            stored_rect: (wx, wy, ww, wh),
+                            workspace: self.input.current_workspace,
+                            content: WindowContent::X11 { window_id, pid: client_id },
+                            damage: std::vec::Vec::new(),
+                            buffer_handle: None,
+                            is_dmabuf: false,
+                            title: win_title,
+                        };
+                        let idx = self.space.window_count;
+                        self.space.windows[idx] = win;
+                        self.space.window_count += 1;
+                        self.input.focused_window = Some(idx);
+                        if let Some(ref mut srv) = self.x11_server {
+                            srv.send_focus_event(window_id, true);
+                        }
+                    }
+                    self.dirty = true;
+                }
+                crate::xwayland::X11Action::UnmapWindow { window_id } => {
+                    for i in 0..self.space.window_count {
+                        if matches!(self.space.windows[i].content, WindowContent::X11 { window_id: wid, .. } if wid == window_id) {
+                            self.space.windows[i].closing = true;
+                            break;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                crate::xwayland::X11Action::DestroyWindow { window_id } => {
+                    self.x11_surfaces.remove(&window_id);
+                    if let Some(pos) = self.space.windows[..self.space.window_count]
+                        .iter()
+                        .position(|w| matches!(w.content, WindowContent::X11 { window_id: wid, .. } if wid == window_id))
+                    {
+                        for j in pos..self.space.window_count - 1 {
+                            self.space.windows[j] = self.space.windows[j + 1].clone();
+                        }
+                        self.space.window_count -= 1;
+                        if let Some(ref mut focused) = self.input.focused_window {
+                            if *focused >= self.space.window_count {
+                                self.input.focused_window = if self.space.window_count > 0 {
+                                    Some(self.space.window_count - 1)
+                                } else {
+                                    None
+                                };
+                            }
+                        }
+                    }
+                    self.dirty = true;
+                }
+                crate::xwayland::X11Action::ConfigureWindow { window_id, x, y, width, height } => {
+                    for i in 0..self.space.window_count {
+                        if matches!(self.space.windows[i].content, WindowContent::X11 { window_id: wid, .. } if wid == window_id) {
+                            if let Some(nx) = x { self.space.windows[i].x = nx as i32; }
+                            if let Some(ny) = y { self.space.windows[i].y = ny as i32; }
+                            if let Some(nw) = width { self.space.windows[i].w = nw as i32; }
+                            if let Some(nh) = height { self.space.windows[i].h = nh as i32 + ShellWindow::TITLE_H; }
+                            break;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                crate::xwayland::X11Action::TitleChanged { window_id, title } => {
+                    for i in 0..self.space.window_count {
+                        if matches!(self.space.windows[i].content, WindowContent::X11 { window_id: wid, .. } if wid == window_id) {
+                            let mut win_title = [0u8; 32];
+                            let copy_len = 31.min(title.len());
+                            win_title[..copy_len].copy_from_slice(&title[..copy_len]);
+                            self.space.windows[i].title = win_title;
+                            break;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                crate::xwayland::X11Action::FrameReady { window_id, pixels, width, height } => {
+                    self.x11_surfaces.insert(window_id, crate::xwayland::X11PixelBuffer { pixels, width, height });
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
     /// Render the desktop to the framebuffer.
     pub fn render(&mut self) {
         render::draw_desktop_shell(
@@ -1208,6 +1336,7 @@ impl LunasState {
             self.history_pos,
             self.cpu_temp,
             &self.snp_surfaces,
+            &self.x11_surfaces,
         );
         self.backend.swap_buffers();
     }
