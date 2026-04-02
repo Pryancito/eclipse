@@ -3523,6 +3523,17 @@ fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u
     0
 }
 
+// Constants shared by sys_sendmsg / sys_recvmsg.
+/// Size of `struct cmsghdr` on x86_64 (cmsg_len:8 + cmsg_level:4 + cmsg_type:4).
+const CMSG_HDR_SIZE: u64 = 16;
+/// `SOL_SOCKET` option level.
+const SOL_SOCKET_LEVEL: i32 = 1;
+/// `SCM_RIGHTS` — pass file descriptors as ancillary data.
+const SCM_RIGHTS_TYPE: i32 = 1;
+/// Maximum number of file descriptors that may be passed in a single sendmsg/recvmsg.
+/// Wayland only ever passes one fd at a time; eight is a generous upper bound.
+const MAX_PASS_FDS: usize = 8;
+
 /// sys_sendmsg - Send a message on a socket (Linux syscall 46).
 ///
 /// Reads the `struct msghdr` layout expected by the x86_64 Linux ABI:
@@ -3565,20 +3576,17 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     // CmsgHdr (x86_64): cmsg_len(8) + cmsg_level(4) + cmsg_type(4) = 16 bytes.
     // FD data starts at offset 16 (cmsg_align(16) == 16 on 64-bit).
     let mut fd_pairs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-    const CMSG_HDR_SIZE: u64 = 16;
-    const SOL_SOCKET: i32 = 1;
-    const SCM_RIGHTS: i32 = 1;
     if msg_control != 0 && msg_controllen as u64 >= CMSG_HDR_SIZE
         && is_user_pointer(msg_control, msg_controllen as u64)
     {
         let cmsg_len    = unsafe { *(msg_control as *const u64) } as u64;
         let cmsg_level  = unsafe { *((msg_control + 8) as *const i32) };
         let cmsg_type   = unsafe { *((msg_control + 12) as *const i32) };
-        if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS && cmsg_len >= CMSG_HDR_SIZE {
+        if cmsg_level == SOL_SOCKET_LEVEL && cmsg_type == SCM_RIGHTS_TYPE && cmsg_len >= CMSG_HDR_SIZE {
             let data_len = (cmsg_len - CMSG_HDR_SIZE) as usize;
             let n_fds    = data_len / core::mem::size_of::<i32>();
             if let Some(sender_pid) = crate::process::current_process_id() {
-                for i in 0..n_fds.min(8) {
+                for i in 0..n_fds.min(MAX_PASS_FDS) {
                     let fd_offset = msg_control + CMSG_HDR_SIZE + (i as u64) * 4;
                     if !is_user_pointer(fd_offset, 4) { break; }
                     let raw_fd = unsafe { *(fd_offset as *const i32) };
@@ -3676,9 +3684,6 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     } else { return u64::MAX; };
 
     // ── Deliver queued file descriptors via control buffer (SCM_RIGHTS) ─────
-    const CMSG_HDR_SIZE: u64 = 16;
-    const SOL_SOCKET: i32 = 1;
-    const SCM_RIGHTS: i32 = 1;
     if let Some(fds) = fd_pairs_opt {
         if !fds.is_empty()
             && msg_control != 0
@@ -3701,8 +3706,8 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
                         let cmsg_len = CMSG_HDR_SIZE as usize + data_size;
                         unsafe {
                             *(msg_control as *mut u64) = cmsg_len as u64;
-                            *((msg_control + 8) as *mut i32) = SOL_SOCKET;
-                            *((msg_control + 12) as *mut i32) = SCM_RIGHTS;
+                            *((msg_control + 8) as *mut i32) = SOL_SOCKET_LEVEL;
+                            *((msg_control + 12) as *mut i32) = SCM_RIGHTS_TYPE;
                             // Write fd values after the header.
                             let fds_ptr = (msg_control + CMSG_HDR_SIZE) as *mut i32;
                             for (i, &fd_val) in new_fds.iter().enumerate() {
