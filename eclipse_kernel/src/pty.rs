@@ -173,7 +173,11 @@ impl Scheme for PtyScheme {
         loop {
             let mut channel = channel_arc.lock();
             let termios = channel.termios;
-            let icanon = (termios.c_lflag & 0x0002) != 0; // ICANON=0x0002
+            // ICANON only applies to slave reads (line discipline on the app side).
+            // The master (terminal emulator) must always read raw data immediately,
+            // regardless of canonical mode, so that output without a trailing newline
+            // (e.g. the shell prompt) is visible at once.
+            let icanon = !handle.is_master && (termios.c_lflag & 0x0002) != 0; // ICANON=0x0002
 
             let queue = if handle.is_master { &mut channel.master_in } else { &mut channel.slave_in };
 
