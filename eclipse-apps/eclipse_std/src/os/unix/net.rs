@@ -48,7 +48,7 @@ impl UnixStream {
         addr.sun_path[path_bytes.len()] = 0;
 
         let addr_len = (core::mem::offset_of!(libc::sockaddr_un, sun_path) + path_bytes.len() + 1)
-            as libc::socklen_t;
+            as libc::socklen_t;  // offset_of! requires Rust ≥ 1.77 (nightly on Eclipse OS)
 
         let ret = unsafe {
             libc::connect(
