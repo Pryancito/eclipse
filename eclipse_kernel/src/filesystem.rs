@@ -1138,6 +1138,7 @@ const O_EXCL: usize = 0x0080;
 /// Virtual files under /tmp (in-memory overlay for O_CREAT)
 static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 
+#[derive(Clone)]
 enum OpenFile {
     Real { 
         inode: u32, 
@@ -1377,6 +1378,26 @@ impl Scheme for FileSystemScheme {
             }
             _ => Err(scheme_error::ENOSYS),
         }
+    }
+
+    fn dup_independent(&self, id: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let existing = open_files
+            .get(id)
+            .and_then(|s| s.as_ref())
+            .ok_or(scheme_error::EBADF)?
+            .clone();
+        // Reuse the first free slot (but not the same slot as id).
+        for (i, slot) in open_files.iter_mut().enumerate() {
+            if i != id && slot.is_none() {
+                *slot = Some(existing);
+                return Ok(i);
+            }
+        }
+        // No free slot found; grow the vector.
+        let new_id = open_files.len();
+        open_files.push(Some(existing));
+        Ok(new_id)
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
