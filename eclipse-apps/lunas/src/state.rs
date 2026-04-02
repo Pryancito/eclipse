@@ -1224,7 +1224,8 @@ impl LunasState {
                         let ww = width as i32;
                         let wh = height as i32 + ShellWindow::TITLE_H;
                         let mut win_title = [0u8; 32];
-                        let copy_len = 31.min(title.len());
+                        let str_len = title.iter().position(|&b| b == 0).unwrap_or(title.len());
+                        let copy_len = 31.min(str_len);
                         win_title[..copy_len].copy_from_slice(&title[..copy_len]);
                         let win = ShellWindow {
                             x: wx, y: wy, w: ww, h: wh,
@@ -1297,7 +1298,8 @@ impl LunasState {
                     for i in 0..self.space.window_count {
                         if matches!(self.space.windows[i].content, WindowContent::X11 { window_id: wid, .. } if wid == window_id) {
                             let mut win_title = [0u8; 32];
-                            let copy_len = 31.min(title.len());
+                            let str_len = title.iter().position(|&b| b == 0).unwrap_or(title.len());
+                            let copy_len = 31.min(str_len);
                             win_title[..copy_len].copy_from_slice(&title[..copy_len]);
                             self.space.windows[i].title = win_title;
                             break;

@@ -313,9 +313,9 @@ impl X11Client {
                 u16::from_be_bytes([self.recv_buf[6], self.recv_buf[7]]) as usize
             };
             let data_len = if order == b'l' {
-                u16::from_le_bytes([self.recv_buf[8], self.recv_buf[8+1]]) as usize  
+                u16::from_le_bytes([self.recv_buf[8], self.recv_buf[9]]) as usize  
             } else {
-                u16::from_be_bytes([self.recv_buf[8], self.recv_buf[8+1]]) as usize
+                u16::from_be_bytes([self.recv_buf[8], self.recv_buf[9]]) as usize
             };
             // name is padded to 4-byte boundary, then data
             let name_pad = (4 - (name_len % 4)) % 4;
