@@ -256,27 +256,17 @@ impl Connection for UnixSocketConnection {
         };
 
         let n = unsafe { recvmsg(self.fd, &mut msg, 0) };
-        if n < 0 {
-            // Check whether this is a transient "no data" condition (EAGAIN/EWOULDBLOCK)
-            // rather than a real I/O error or peer disconnect.  Non-blocking sockets
-            // return EAGAIN constantly whenever no message is queued; the caller must
-            // NOT treat this as a disconnect.
+        if n <= 0 {
+            // Eclipse OS non-blocking sockets may return 0 or negative values
+            // (instead of -1+EAGAIN) when no data is available.  Treat all
+            // such cases as WouldBlock to prevent false client disconnects.
+            // Real disconnects are detected via process-level checks.
             let err = errno();
-            if err == EAGAIN || err == EWOULDBLOCK {
-                return Err(RecvError::WouldBlock);
+            if n < 0 && err != EAGAIN && err != EWOULDBLOCK && err != 0 {
+                // Genuine I/O error (e.g., ECONNRESET, EPIPE) — real disconnect.
+                return Err(RecvError::IoError);
             }
-            return Err(RecvError::IoError);
-        }
-        if n == 0 {
-            // On standard Linux, n==0 means orderly shutdown (peer called close/shutdown).
-            // On Eclipse OS with O_NONBLOCK, recvmsg may return 0 instead of -1+EAGAIN
-            // when the socket buffer is empty.  Check errno to distinguish the two cases.
-            let err = errno();
-            if err == EAGAIN || err == EWOULDBLOCK || err == 0 {
-                return Err(RecvError::WouldBlock);
-            }
-            // Real EOF: peer closed the connection.
-            return Err(RecvError::IoError);
+            return Err(RecvError::WouldBlock);
         }
 
         let mut buf = self.recv_buf.borrow_mut();
