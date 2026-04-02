@@ -479,6 +479,10 @@ struct Connection {
     /// True when one side has closed; the other will see EOF on read.
     closed_by_client: bool,
     closed_by_server: bool,
+    /// File-descriptor batches (scheme_id, resource_id) queued by client for server to receive.
+    fd_queue_to_server: VecDeque<alloc::vec::Vec<(usize, usize)>>,
+    /// File-descriptor batches queued by server for client to receive.
+    fd_queue_to_client: VecDeque<alloc::vec::Vec<(usize, usize)>>,
 }
 
 /// Pending connections: listener socket id -> queue of connection ids waiting for accept().
@@ -699,6 +703,8 @@ impl SocketScheme {
                 server_socket_id: None,
                 closed_by_client: false,
                 closed_by_server: false,
+                fd_queue_to_server: VecDeque::new(),
+                fd_queue_to_client: VecDeque::new(),
             });
             st.pending.entry(listener_id).or_default().push_back(conn_id);
             if let Some(socket) = st.sockets.get_mut(&id) {
@@ -797,6 +803,59 @@ impl SocketScheme {
         st.sockets.remove(&id);
         if both_closed {
             st.connections.remove(&conn_id);
+        }
+    }
+
+    /// Write raw bytes to a socket identified by resource id (for sendmsg).
+    pub fn socket_write_raw(&self, id: usize, buf: &[u8]) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        if socket.domain != 1 {
+            return Err(scheme_error::EAFNOSUPPORT);
+        }
+        Self::write_connection(&mut st, id, buf)
+    }
+
+    /// Read raw bytes from a socket identified by resource id (for recvmsg).
+    pub fn socket_read_raw(&self, id: usize, buf: &mut [u8]) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        if socket.domain != 1 {
+            return Err(scheme_error::EAFNOSUPPORT);
+        }
+        Self::read_connection(&mut st, id, buf)
+    }
+
+    /// Enqueue a batch of file descriptors (as kernel (scheme_id, resource_id) pairs) to be
+    /// delivered to the peer on the next recvmsg call.
+    pub fn socket_enqueue_fds(&self, id: usize, fds: alloc::vec::Vec<(usize, usize)>) {
+        let mut st = self.state.lock();
+        let conn_id = match st.sockets.get(&id).and_then(|s| s.connection_id) {
+            Some(cid) => cid,
+            None => return,
+        };
+        let conn = match st.connections.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return,
+        };
+        if Some(id) == conn.server_socket_id {
+            conn.fd_queue_to_client.push_back(fds);
+        } else if id == conn.client_socket_id {
+            conn.fd_queue_to_server.push_back(fds);
+        }
+    }
+
+    /// Pop the oldest queued FD batch meant for this socket's reader.
+    pub fn socket_dequeue_fds(&self, id: usize) -> Option<alloc::vec::Vec<(usize, usize)>> {
+        let mut st = self.state.lock();
+        let conn_id = st.sockets.get(&id)?.connection_id?;
+        let conn = st.connections.get_mut(&conn_id)?;
+        if Some(id) == conn.server_socket_id {
+            conn.fd_queue_to_server.pop_front()
+        } else if id == conn.client_socket_id {
+            conn.fd_queue_to_client.pop_front()
+        } else {
+            None
         }
     }
 }

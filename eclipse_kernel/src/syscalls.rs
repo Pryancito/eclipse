@@ -273,6 +273,8 @@ pub extern "C" fn syscall_handler(
         41 => sys_socket(arg1, arg2, arg3),
         42 => sys_connect(arg1, arg2, arg3),
         43 => sys_accept(arg1, arg2, arg3),
+        46 => sys_sendmsg(arg1, arg2, arg3),
+        47 => sys_recvmsg(arg1, arg2, arg3),
         49 => sys_bind(arg1, arg2, arg3),
         50 => sys_listen(arg1, arg2),
         54 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
@@ -3395,7 +3397,8 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
         
         // Create the file node (only for non-abstract)
         if !is_abstract {
-            if let Ok((_scheme_id, _resource_id)) = crate::scheme::open(&final_path_str, 0x40 | 0x80, 0o777) {
+            let file_path = alloc::format!("file:{}", final_path_str);
+            if let Ok((_scheme_id, _resource_id)) = crate::scheme::open(&file_path, 0x40 | 0x80, 0o777) {
                  // Successfully created file node. 
             } else {
                 serial::serial_print("[SYSCALL] bind failed to create file node for path\n");
@@ -3518,6 +3521,216 @@ fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u
 fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u64) -> u64 {
     // Stub: Always return success
     0
+}
+
+/// sys_sendmsg - Send a message on a socket (Linux syscall 46).
+///
+/// Reads the `struct msghdr` layout expected by the x86_64 Linux ABI:
+///   offset  0 : msg_name       (*mut u8,  8 bytes)
+///   offset  8 : msg_namelen    (u32,      4 bytes + 4 padding)
+///   offset 16 : msg_iov        (*mut IoVec, 8 bytes)
+///   offset 24 : msg_iovlen     (usize,    8 bytes)
+///   offset 32 : msg_control    (*mut u8,  8 bytes)
+///   offset 40 : msg_controllen (usize,    8 bytes)
+///   offset 48 : msg_flags      (i32,      4 bytes)
+///
+/// For AF_UNIX sockets only SCM_RIGHTS ancillary data (fd passing) is
+/// handled; everything else is silently ignored.
+fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
+    if msg_ptr == 0 || !is_user_pointer(msg_ptr, 56) {
+        return u64::MAX;
+    }
+
+    // Read iov pointer + length (offsets 16, 24).
+    let msg_iov_ptr     = unsafe { *((msg_ptr + 16) as *const u64) };
+    let msg_iovlen      = unsafe { *((msg_ptr + 24) as *const u64) } as usize;
+    let msg_control     = unsafe { *((msg_ptr + 32) as *const u64) };
+    let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
+
+    // ── Gather payload from iovec array ────────────────────────────────────
+    let mut all_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let max_iov = msg_iovlen.min(64);
+    for i in 0..max_iov {
+        let iov_entry = msg_iov_ptr + (i as u64) * 16;
+        if !is_user_pointer(iov_entry, 16) { break; }
+        let iov_base = unsafe { *(iov_entry as *const u64) };
+        let iov_len  = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+        if iov_base == 0 || iov_len == 0 { continue; }
+        if !is_user_pointer(iov_base, iov_len as u64) { continue; }
+        let slice = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+        all_data.extend_from_slice(slice);
+    }
+
+    // ── Extract file descriptors from SCM_RIGHTS control message ───────────
+    // CmsgHdr (x86_64): cmsg_len(8) + cmsg_level(4) + cmsg_type(4) = 16 bytes.
+    // FD data starts at offset 16 (cmsg_align(16) == 16 on 64-bit).
+    let mut fd_pairs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    const CMSG_HDR_SIZE: u64 = 16;
+    const SOL_SOCKET: i32 = 1;
+    const SCM_RIGHTS: i32 = 1;
+    if msg_control != 0 && msg_controllen as u64 >= CMSG_HDR_SIZE
+        && is_user_pointer(msg_control, msg_controllen as u64)
+    {
+        let cmsg_len    = unsafe { *(msg_control as *const u64) } as u64;
+        let cmsg_level  = unsafe { *((msg_control + 8) as *const i32) };
+        let cmsg_type   = unsafe { *((msg_control + 12) as *const i32) };
+        if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS && cmsg_len >= CMSG_HDR_SIZE {
+            let data_len = (cmsg_len - CMSG_HDR_SIZE) as usize;
+            let n_fds    = data_len / core::mem::size_of::<i32>();
+            if let Some(sender_pid) = crate::process::current_process_id() {
+                for i in 0..n_fds.min(8) {
+                    let fd_offset = msg_control + CMSG_HDR_SIZE + (i as u64) * 4;
+                    if !is_user_pointer(fd_offset, 4) { break; }
+                    let raw_fd = unsafe { *(fd_offset as *const i32) };
+                    if let Some(fi) = crate::fd::fd_get(sender_pid, raw_fd as usize) {
+                        fd_pairs.push((fi.scheme_id, fi.resource_id));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Write payload to socket connection buffer ───────────────────────────
+    let total_written = if let Some(pid) = crate::process::current_process_id() {
+        if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+            if let Some(scheme) = crate::servers::get_socket_scheme() {
+                // Enqueue FDs before writing data so the peer can retrieve them
+                // alongside the bytes it reads next.
+                if !fd_pairs.is_empty() {
+                    scheme.socket_enqueue_fds(fd_info.resource_id, fd_pairs);
+                }
+                match scheme.socket_write_raw(fd_info.resource_id, &all_data) {
+                    Ok(n) => n,
+                    Err(_) => return u64::MAX,
+                }
+            } else { return u64::MAX; }
+        } else { return u64::MAX; }
+    } else { return u64::MAX; };
+
+    total_written as u64
+}
+
+/// sys_recvmsg - Receive a message from a socket (Linux syscall 47).
+///
+/// Mirrors the layout described in sys_sendmsg.  Scatters incoming bytes
+/// across the iovec array and delivers any pending SCM_RIGHTS fd batches
+/// into the control buffer.
+fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
+    if msg_ptr == 0 || !is_user_pointer(msg_ptr, 56) {
+        return u64::MAX;
+    }
+
+    let msg_iov_ptr     = unsafe { *((msg_ptr + 16) as *const u64) };
+    let msg_iovlen      = unsafe { *((msg_ptr + 24) as *const u64) } as usize;
+    let msg_control     = unsafe { *((msg_ptr + 32) as *const u64) };
+    let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
+
+    // ── Determine total iov capacity ────────────────────────────────────────
+    let max_iov = msg_iovlen.min(64);
+    let mut total_cap: usize = 0;
+    for i in 0..max_iov {
+        let iov_entry = msg_iov_ptr + (i as u64) * 16;
+        if !is_user_pointer(iov_entry, 16) { break; }
+        let iov_len = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+        total_cap = total_cap.saturating_add(iov_len);
+    }
+    if total_cap == 0 { return 0; }
+
+    // ── Read from socket connection buffer ──────────────────────────────────
+    let (n_read, fd_pairs_opt) = if let Some(pid) = crate::process::current_process_id() {
+        if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+            if let Some(scheme) = crate::servers::get_socket_scheme() {
+                let mut tmp = alloc::vec![0u8; total_cap];
+                match scheme.socket_read_raw(fd_info.resource_id, &mut tmp) {
+                    Ok(n) => {
+                        // Scatter bytes into iovec entries.
+                        let mut written = 0usize;
+                        for i in 0..max_iov {
+                            if written >= n { break; }
+                            let iov_entry = msg_iov_ptr + (i as u64) * 16;
+                            if !is_user_pointer(iov_entry, 16) { break; }
+                            let iov_base = unsafe { *(iov_entry as *const u64) };
+                            let iov_len  = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+                            if iov_base == 0 || iov_len == 0 { continue; }
+                            if !is_user_pointer(iov_base, iov_len as u64) { continue; }
+                            let chunk = (n - written).min(iov_len);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    tmp[written..].as_ptr(),
+                                    iov_base as *mut u8,
+                                    chunk,
+                                );
+                            }
+                            written += chunk;
+                        }
+                        let fds = scheme.socket_dequeue_fds(fd_info.resource_id);
+                        (written, fds)
+                    }
+                    Err(_) => {
+                        // EAGAIN → return -1 so libc sets errno = EAGAIN
+                        return u64::MAX;
+                    }
+                }
+            } else { return u64::MAX; }
+        } else { return u64::MAX; }
+    } else { return u64::MAX; };
+
+    // ── Deliver queued file descriptors via control buffer (SCM_RIGHTS) ─────
+    const CMSG_HDR_SIZE: u64 = 16;
+    const SOL_SOCKET: i32 = 1;
+    const SCM_RIGHTS: i32 = 1;
+    if let Some(fds) = fd_pairs_opt {
+        if !fds.is_empty()
+            && msg_control != 0
+            && is_user_pointer(msg_control, msg_controllen as u64)
+        {
+            let needed = CMSG_HDR_SIZE as usize + fds.len() * core::mem::size_of::<i32>();
+            if msg_controllen >= needed {
+                if let Some(receiver_pid) = crate::process::current_process_id() {
+                    // Allocate new fds in the receiving process for each (scheme_id, resource_id).
+                    let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+                    for (s_id, r_id) in &fds {
+                        if let Some(new_fd) = crate::fd::fd_open(receiver_pid, *s_id, *r_id, 0) {
+                            new_fds.push(new_fd as i32);
+                        }
+                    }
+
+                    if !new_fds.is_empty() {
+                        // Write CmsgHdr.
+                        let data_size = new_fds.len() * core::mem::size_of::<i32>();
+                        let cmsg_len = CMSG_HDR_SIZE as usize + data_size;
+                        unsafe {
+                            *(msg_control as *mut u64) = cmsg_len as u64;
+                            *((msg_control + 8) as *mut i32) = SOL_SOCKET;
+                            *((msg_control + 12) as *mut i32) = SCM_RIGHTS;
+                            // Write fd values after the header.
+                            let fds_ptr = (msg_control + CMSG_HDR_SIZE) as *mut i32;
+                            for (i, &fd_val) in new_fds.iter().enumerate() {
+                                core::ptr::write_unaligned(fds_ptr.add(i), fd_val);
+                            }
+                        }
+                        // Update msg_controllen in the MsgHdr to reflect actual data written.
+                        unsafe { *((msg_ptr + 40) as *mut u64) = cmsg_len as u64; }
+                    } else {
+                        // No fds were dup'd; clear controllen.
+                        unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
+                    }
+                }
+            } else {
+                // Control buffer too small; discard fds.
+                unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
+            }
+        } else {
+            // No control buffer; discard fds.
+        }
+    } else {
+        // No pending fds; report controllen = 0.
+        if msg_control != 0 {
+            unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
+        }
+    }
+
+    n_read as u64
 }
 
 fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
