@@ -80,6 +80,6 @@ mod tests {
     #[test]
     fn compositor_path_absolute() {
         assert!(COMPOSITOR_PATH.starts_with("file:/"));
-        assert!(COMPOSITOR_PATH.contains("smithay_app"));
+        assert!(COMPOSITOR_PATH.contains("lunas"));
     }
 }
