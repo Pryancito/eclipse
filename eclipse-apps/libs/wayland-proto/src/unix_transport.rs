@@ -261,6 +261,7 @@ impl Connection for UnixSocketConnection {
             // rather than a real I/O error or peer disconnect.  Non-blocking sockets
             // return EAGAIN constantly whenever no message is queued; the caller must
             // NOT treat this as a disconnect.
+            // relibc's recvmsg (syscall 47) sets errno correctly before returning -1.
             let err = errno();
             if err == EAGAIN || err == EWOULDBLOCK {
                 return Err(RecvError::WouldBlock);
@@ -268,14 +269,10 @@ impl Connection for UnixSocketConnection {
             return Err(RecvError::IoError);
         }
         if n == 0 {
-            // On standard Linux, n==0 means orderly shutdown (peer called close/shutdown).
-            // On Eclipse OS with O_NONBLOCK, recvmsg may return 0 instead of -1+EAGAIN
-            // when the socket buffer is empty.  Check errno to distinguish the two cases.
-            let err = errno();
-            if err == EAGAIN || err == EWOULDBLOCK || err == 0 {
-                return Err(RecvError::WouldBlock);
-            }
-            // Real EOF: peer closed the connection.
+            // recvmsg returning 0 bytes means orderly shutdown: the peer closed its
+            // end of the connection.  With the correct syscall-47 path in relibc,
+            // an empty-but-alive non-blocking socket returns -1/EAGAIN instead, so
+            // n==0 here is always a real EOF.
             return Err(RecvError::IoError);
         }
 
