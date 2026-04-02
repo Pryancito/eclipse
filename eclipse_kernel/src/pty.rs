@@ -172,22 +172,43 @@ impl Scheme for PtyScheme {
 
         loop {
             let mut channel = channel_arc.lock();
+            let termios = channel.termios;
+            let icanon = (termios.c_lflag & 0x0002) != 0; // ICANON=0x0002
+
             let queue = if handle.is_master { &mut channel.master_in } else { &mut channel.slave_in };
-            
+
             if !queue.is_empty() {
-                let mut read = 0;
-                while read < buffer.len() && !queue.is_empty() {
-                    if let Some(byte) = queue.pop_front() {
-                        buffer[read] = byte;
-                        read += 1;
+                // Si ICANON está activo, solo leemos si hay un newline en la cola
+                let mut has_newline = false;
+                if icanon {
+                    for &byte in queue.iter() {
+                        if byte == b'\n' || byte == b'\r' {
+                            has_newline = true;
+                            break;
+                        }
                     }
                 }
-                return Ok(read);
-            } else {
-                // EOF when the other side has fully closed
-                let eof = if handle.is_master { channel.slave_closed } else { channel.master_closed };
-                if eof { return Ok(0); }
+
+                if !icanon || has_newline {
+                    let mut read = 0;
+                    while read < buffer.len() && !queue.is_empty() {
+                        if let Some(byte) = queue.pop_front() {
+                            buffer[read] = byte;
+                            read += 1;
+                            // En modo canónico, dejamos de leer tras el newline
+                            if icanon && (byte == b'\n' || byte == b'\r') {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(read);
+                }
             }
+            
+            // EOF when the other side has fully closed
+            let eof = if handle.is_master { channel.slave_closed } else { channel.master_closed };
+            if eof { return Ok(0); }
+
             drop(channel);
 
             // Comprobar señales pendientes antes de bloquearse: devolver EINTR
