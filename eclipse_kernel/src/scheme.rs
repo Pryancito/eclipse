@@ -120,6 +120,13 @@ pub trait Scheme: Send + Sync {
     fn dup(&self, _id: usize) -> Result<usize, usize> {
         Ok(0) // default: no-op for schemes without ref counting
     }
+
+    /// Create a fully independent copy of resource `id` for delivery via SCM_RIGHTS.
+    /// Returns a new resource id that is independent of the original; closing either
+    /// one does not affect the other.  Returns `Err(ENOSYS)` if not supported.
+    fn dup_independent(&self, _id: usize) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
 }
 
 /// Registry for all system schemes
@@ -311,6 +318,18 @@ pub fn dup(scheme_idx: usize, id: usize) -> Result<usize, usize> {
         Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
     };
     scheme.dup(id)
+}
+
+/// Create an independent copy of a resource for SCM_RIGHTS delivery.
+/// Returns a new resource id that is independent of the original (closing one
+/// does not affect the other).  Falls back to the original id for schemes that
+/// do not support independent duplication.
+pub fn dup_independent(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+    };
+    scheme.dup_independent(id)
 }
 
 /// Create a directory by routing to the appropriate scheme

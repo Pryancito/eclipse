@@ -1932,7 +1932,9 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
         match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                if e != crate::scheme::error::EAGAIN {
+                if e != crate::scheme::error::EAGAIN
+                    && !(e == crate::scheme::error::ENOENT && path.starts_with("/tmp/"))
+                {
                     serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
                 }
                 return u64::MAX;
@@ -3720,7 +3722,11 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
                     // Allocate new fds in the receiving process for each (scheme_id, resource_id).
                     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
                     for (s_id, r_id) in &fds {
-                        if let Some(new_fd) = crate::fd::fd_open(receiver_pid, *s_id, *r_id, 0) {
+                        // Create an independent resource copy so closing the
+                        // receiver's fd doesn't destroy the sender's resource.
+                        let recv_r_id = crate::scheme::dup_independent(*s_id, *r_id)
+                            .unwrap_or(*r_id);
+                        if let Some(new_fd) = crate::fd::fd_open(receiver_pid, *s_id, recv_r_id, 0) {
                             new_fds.push(new_fd as i32);
                         }
                     }

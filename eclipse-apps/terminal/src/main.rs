@@ -349,7 +349,10 @@ impl TerminalApp {
             Payload::Handle(wayland_proto::wl::wire::Handle(shm_fd)),
             Payload::Int(size_bytes as i32),
         ], shm_fd);
-        unsafe { close(shm_fd) };
+        // Do NOT close shm_fd here: it is stored in SurfaceBacking and must
+        // remain open so that the compositor can call fmap() when it processes
+        // the create_pool message.  The fd is closed in the resize path (below)
+        // before a new fd replaces it, and implicitly on process exit.
 
         // wl_shm_pool.create_buffer(id=9, offset=0, width, height, stride, format=1=XRGB8888)
         let stride = (win_w * 4) as i32;
@@ -380,12 +383,16 @@ impl TerminalApp {
         send_wayland(&wayland, 7, 6, &[]); // wl_surface.commit
 
         // ── 4. Surface state + os-terminal setup ──────────────────────────
+        // Keep shm_fd open so the compositor can still call fmap() when it
+        // processes the create_pool message.  On Eclipse OS, closing the fd
+        // removes the OPEN_FILES_SCHEME entry, causing fmap() to fail with
+        // EBADF when the compositor later calls mmap(MAP_SHARED, received_fd).
         let shared_state = std::rc::Rc::new(core::cell::RefCell::new(SurfaceBacking {
             ptr: vaddr as *mut u32,
             width: win_w as usize,
             height: win_h as usize,
             size_bytes,
-            shm_fd: -1,
+            shm_fd,
         }));
         let draw_target = SharedSurfaceDrawTarget { state: shared_state.clone() };
         let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
@@ -525,10 +532,19 @@ impl TerminalApp {
                                             let _ = eclipse_syscall::ftruncate(fd as usize, new_size);
                                             let vaddr = unsafe { mmap(core::ptr::null_mut(), new_size, (flag::PROT_READ|flag::PROT_WRITE) as c_int, flag::MAP_SHARED as c_int, fd, 0) };
                                             if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
+                                                // Close the previous shm_fd now that we have a
+                                                // new mapping.  The compositor will process the
+                                                // new create_pool with the new fd below; the old
+                                                // pool (pool 8) is no longer the active buffer.
+                                                if state.shm_fd >= 0 {
+                                                    unsafe { close(state.shm_fd) };
+                                                }
                                                 state.ptr = vaddr as *mut u32;
                                                 state.width = w as usize;
                                                 state.height = h as usize;
                                                 state.size_bytes = new_size;
+                                                // Keep fd alive until compositor processes create_pool.
+                                                state.shm_fd = fd;
                                                 
                                                 // Inform compositor of the new buffer
                                                 // create_pool (use id 13 for new pool)
@@ -538,8 +554,10 @@ impl TerminalApp {
                                                 send_wayland(&self.wayland, 13, 0, &[Payload::NewId(NewId(14)), Payload::Int(0), Payload::Int(w), Payload::Int(h), Payload::Int(stride), Payload::UInt(1)]);
                                                 
                                                 self.buffer_id = 14;
+                                            } else {
+                                                // mmap failed — close fd immediately, nothing to keep.
+                                                unsafe { close(fd) };
                                             }
-                                            unsafe { close(fd) };
                                         }
                                         dirty = true;
                                     }
