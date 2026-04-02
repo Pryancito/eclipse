@@ -101,8 +101,8 @@ impl WaylandServer {
             res = inner.borrow_mut().handle_request(client, opcode.0, &raw.args);
         }
 
-        // Intercept get_registry on display (id=1, opcode=2) to broadcast globals
-        if object_id == crate::wl::ObjectId(1) && opcode.0 == 2 {
+        // Intercept get_registry on display (id=1, opcode=1) to broadcast globals
+        if object_id == crate::wl::ObjectId(1) && opcode.0 == 1 {
              let registry_id = match raw.args[0] {
                   crate::wl::Payload::NewId(id) => id.as_id(),
                   _ => return Err(ServerError::MessageDeserializeError),

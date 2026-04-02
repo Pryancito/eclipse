@@ -35,12 +35,12 @@ impl Message for Request {
         match self {
             Request::Sync { callback } => RawMessage {
                 sender,
-                opcode: Opcode(1),
+                opcode: Opcode(0),
                 args: smallvec![callback.into()],
             },
             Request::GetRegistry { registry } => RawMessage {
                 sender,
-                opcode: Opcode(2),
+                opcode: Opcode(1),
                 args: smallvec![registry.into()],
             },
         }
@@ -51,10 +51,10 @@ impl Message for Request {
         m: &RawMessage,
     ) -> Result<Request, DeserializeError> {
         match m.opcode {
-            Opcode(1) => Ok(Request::Sync {
+            Opcode(0) => Ok(Request::Sync {
                 callback: from_payload!(NewId, m.args[0]),
             }),
-            Opcode(2) => Ok(Request::GetRegistry {
+            Opcode(1) => Ok(Request::GetRegistry {
                 registry: from_payload!(NewId, m.args[0]),
             }),
             _ => Err(DeserializeError::UnknownOpcode),
@@ -123,12 +123,12 @@ impl Interface for WlDisplay {
     type Request = Request;
     const NAME: &'static str = "wl_display";
     const VERSION: u32 = 1;
-    /// Indexed by **client request opcode** (server-side deserialize). Opcode 1 = sync, 2 = get_registry.
-    /// Opcodes 3–4 are display *events* (error, delete_id); clients must not send them as requests — leave empty.
+    /// Indexed by **client request opcode** (server-side deserialize). Opcode 0 = sync, 1 = get_registry.
+    /// Opcodes 2–3 are display *events* (error, delete_id); clients must not send them as requests — leave empty.
     const PAYLOAD_TYPES: &'static [&'static [PayloadType]] = &[
+        &[PayloadType::NewId],
+        &[PayloadType::NewId],
         &[],
-        &[PayloadType::NewId],
-        &[PayloadType::NewId],
         &[],
         &[],
     ];
@@ -154,7 +154,7 @@ impl WlDisplay {
     pub fn get_registry(&mut self, registry: NewId) -> Result<(), SendError> {
         self.con.borrow_mut().send(
             self.object_id,
-            Opcode(2),
+            Opcode(1),
             &[registry.into()],
             &[],
         )
