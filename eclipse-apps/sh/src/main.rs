@@ -8,7 +8,9 @@ use eclipse_syscall;
 // Constantes
 // ============================================================================
 const TIOCGWINSZ: usize = 4;
+const FIONREAD:   usize = 2;
 const HISTORY_MAX: usize = 100;
+const CMD_NOT_FOUND: i32 = 127;
 
 // ============================================================================
 // Estado global del shell
@@ -264,18 +266,6 @@ fn sh_eprintln(s: &str){ sh_eprint(s); sh_eprint("\n"); }
 // Builtins
 // ============================================================================
 
-fn read_fd_to_string(fd: usize) -> String {
-    let mut content = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match eclipse_syscall::call::read(fd, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => content.extend_from_slice(&buf[..n]),
-        }
-    }
-    String::from_utf8_lossy(&content).into_owned()
-}
-
 fn try_builtin(argv: &[String]) -> Option<i32> {
     if argv.is_empty() { return Some(0); }
     match argv[0].as_str() {
@@ -320,7 +310,7 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             let new_path = resolve_path(dest);
             let mut buf = [0u8; 1];
             match eclipse_syscall::call::readdir(&new_path, &mut buf) {
-                Ok(_) | Err(eclipse_syscall::error::Error { errno: 22 }) => {
+                Ok(_) => {
                     unsafe { CWD = new_path; }
                     std::env::set_var("PWD", unsafe { &CWD });
                 }
@@ -412,8 +402,11 @@ fn wait_for_child(pid: usize) -> i32 {
 }
 
 fn open_redirect_out(path: &str, append: bool) -> Option<usize> {
-    let flags = if append { eclipse_syscall::flag::O_WRONLY | eclipse_syscall::flag::O_CREAT | 0x0400 }
-    else { eclipse_syscall::flag::O_WRONLY | eclipse_syscall::flag::O_CREAT | eclipse_syscall::flag::O_TRUNC };
+    let flags = if append {
+        eclipse_syscall::flag::O_WRONLY | eclipse_syscall::flag::O_CREAT | eclipse_syscall::flag::O_APPEND
+    } else {
+        eclipse_syscall::flag::O_WRONLY | eclipse_syscall::flag::O_CREAT | eclipse_syscall::flag::O_TRUNC
+    };
     eclipse_syscall::call::open(path, flags).ok()
 }
 
@@ -421,7 +414,7 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
     if cmd.argv.is_empty() { return None; }
     let prog = &cmd.argv[0];
     let mut path = format!("/bin/{}", prog);
-    let mut buf = std::fs::read(&path).ok().or_else(|| {
+    let buf = std::fs::read(&path).ok().or_else(|| {
         path = resolve_path(prog);
         std::fs::read(&path).ok()
     });
@@ -431,7 +424,7 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
             open_redirect_out(p, app).unwrap_or(fd_out)
         } else { fd_out };
 
-        let res = eclipse_syscall::call::spawn_with_stdio(&data, Some(&path), fd_in, eff_out, fd_err);
+        let res = eclipse_syscall::call::spawn_with_stdio(&data, None, fd_in, eff_out, fd_err);
         if cmd.redirect_out.is_some() && eff_out != fd_out { let _ = eclipse_syscall::call::close(eff_out); }
 
         if let Ok(pid) = res {
@@ -444,17 +437,22 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
     None
 }
 
-fn run_pipeline(pl: &Pipeline) -> i32 {
+fn run_pipeline(pl: &Pipeline, bg_pids: &mut Vec<usize>) -> i32 {
     let n = pl.cmds.len();
     if n == 0 { return 0; }
     if n == 1 {
         if let Some(c) = try_builtin(&pl.cmds[0].argv) { return c; }
         if let Some(pid) = spawn_stage(&pl.cmds[0], 0, 1, 2) {
-            if pl.background { sh_println(&format!("[bg] {}", pid)); return 0; }
+            if pl.background {
+                sh_println(&format!("[bg] {}", pid));
+                bg_pids.push(pid);
+                return 0;
+            }
             let c = wait_for_child(pid); unsafe { LAST_EXIT = c; }
             return c;
         }
-        return unsafe { LAST_EXIT };
+        unsafe { LAST_EXIT = CMD_NOT_FOUND; }
+        return CMD_NOT_FOUND;
     }
 
     let mut pids = Vec::new();
@@ -473,7 +471,13 @@ fn run_pipeline(pl: &Pipeline) -> i32 {
             prev_fd = fds[0] as usize;
         }
     }
-    if pl.background { return 0; }
+    if pl.background {
+        for &p in &pids {
+            sh_println(&format!("[bg] {}", p));
+            bg_pids.push(p);
+        }
+        return 0;
+    }
     let mut lc = 0;
     for p in pids { lc = wait_for_child(p); }
     unsafe { LAST_EXIT = lc; }
@@ -500,22 +504,38 @@ fn readline(hist: &mut History, prompt: &str) -> Option<String> {
                 4 => if input.is_empty() { sh_print("\n"); return None; },
                 8 | 127 => if !input.is_empty() { let _ = input.pop(); sh_print("\x08 \x08"); },
                 27 => {
-                    let mut seq = [0u8; 2];
-                    if eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() && seq[0] == b'['
-                       && eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() {
-                        match seq[0] {
-                            b'A' => {
-                                if saved.is_none() { saved = Some(input.clone()); }
-                                if let Some(p) = hist.up() { clear_line(&input); input = p.to_string(); sh_print(&input); }
+                    // Check if there are bytes available before reading the escape
+                    // sequence. Without this check, a lone ESC key press (no following
+                    // bytes) would block forever on the next read call.
+                    let mut avail: usize = 0;
+                    // FIONREAD: if the call fails, avail stays 0
+                    // which is safe — we just treat the ESC as a lone key press
+                    // rather than risk blocking on a read that may never return.
+                    let _ = eclipse_syscall::call::ioctl(0, FIONREAD, &mut avail as *mut _ as usize);
+                    if avail >= 1 {
+                        let mut seq = [0u8; 2];
+                        if eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() && seq[0] == b'[' {
+                            let mut avail2: usize = 0;
+                            // Second FIONREAD to guard the command-byte read.  If it
+                            // fails we conservatively skip rather than block.
+                            let _ = eclipse_syscall::call::ioctl(0, FIONREAD, &mut avail2 as *mut _ as usize);
+                            if avail2 >= 1 && eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() {
+                                match seq[0] {
+                                    b'A' => {
+                                        if saved.is_none() { saved = Some(input.clone()); }
+                                        if let Some(p) = hist.up() { clear_line(&input); input = p.to_string(); sh_print(&input); }
+                                    }
+                                    b'B' => {
+                                        let n = hist.down().to_string();
+                                        let n = if n.is_empty() { saved.take().unwrap_or_default() } else { saved = None; n };
+                                        clear_line(&input); input = n; sh_print(&input);
+                                    }
+                                    _ => {}
+                                }
                             }
-                            b'B' => {
-                                let n = hist.down().to_string();
-                                let n = if n.is_empty() { saved.take().unwrap_or_default() } else { saved = None; n };
-                                clear_line(&input); input = n; sh_print(&input);
-                            }
-                            _ => {}
                         }
                     }
+                    // Lone ESC key press (avail == 0): silently ignored.
                 }
                 b if b >= 0x20 => { input.push(b as char); let _ = eclipse_syscall::call::write(1, &[b]); }
                 _ => {}
@@ -567,15 +587,7 @@ fn main() {
 
         hist.push(line);
         let pl = parse_pipeline(tokenize(line));
-        if pl.background && pl.cmds.len() == 1 {
-            if let Some(pid) = spawn_stage(&pl.cmds[0], 0, 1, 2) {
-                sh_println(&format!("[bg] {}", pid));
-                bg_pids.push(pid);
-            }
-        } else {
-            let _ = run_pipeline(&pl);
-            if !pl.background { sh_print("\r\n"); }
-        }
+        let _ = run_pipeline(&pl, &mut bg_pids);
     }
     eclipse_syscall::call::exit(0);
 }

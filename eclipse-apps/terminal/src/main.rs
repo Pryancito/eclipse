@@ -2,14 +2,14 @@ use std::vec::Vec;
 use std::boxed::Box;
 use std::rc::Rc;
 use core::cell::RefCell;
-use eclipse_syscall::{self, flag, ProcessInfo};
+use eclipse_syscall::{self, flag};
 use heapless::String as HString;
 
-use os_terminal::{ClipboardHandler, DrawTarget, MouseInput, Rgb, Terminal};
+use os_terminal::{ClipboardHandler, DrawTarget, Rgb, Terminal};
 use os_terminal::font::BitmapFont;
 
 #[cfg(target_vendor = "eclipse")]
-use libc::{c_int, close, kill, mmap, munmap, open};
+use libc::{c_int, close, kill, mmap, open};
 #[cfg(target_vendor = "eclipse")]
 use eclipse_syscall::call::{
     close as sys_close,
@@ -100,25 +100,6 @@ impl DrawTarget for SharedSurfaceDrawTarget {
 // Constantes y Helpers
 // ============================================================================
 
-/// Write a u32 as decimal ASCII into `buf`, return number of bytes written.
-fn write_u32(buf: &mut [u8], mut v: u32) -> usize {
-    if buf.is_empty() { return 0; }
-    let mut tmp = [0u8; 10];
-    let mut i = 0usize;
-    if v == 0 { tmp[0] = b'0'; i = 1; } else {
-        while v > 0 && i < tmp.len() { tmp[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-        let (mut lo, mut hi) = (0, i.saturating_sub(1));
-        while lo < hi { tmp.swap(lo, hi); lo += 1; hi -= 1; }
-    }
-    let n = i.min(buf.len()); buf[..n].copy_from_slice(&tmp[..n]); n
-}
-
-/// Write a u8 as 2-digit hex ASCII into `buf`, return 2.
-fn write_u8_hex(buf: &mut [u8], v: u8) -> usize {
-    const HEX: &[u8] = b"0123456789abcdef";
-    if buf.len() >= 2 { buf[0] = HEX[(v >> 4) as usize]; buf[1] = HEX[(v & 0xf) as usize]; 2 } else { 0 }
-}
-
 const FONT_CHAR_W: u16 = 8;
 const FONT_CHAR_H: u16 = 16;
 
@@ -178,17 +159,6 @@ fn sidewind_shm_name(pid: u32) -> HString<24> {
     for j in 0..i / 2 { tmp.swap(j, i - 1 - j); }
     let _ = s.push_str(unsafe { core::str::from_utf8_unchecked(&tmp[..i]) });
     s
-}
-
-fn find_pid_by_name(want: &[u8]) -> Option<u32> {
-    let mut list = [ProcessInfo::default(); 48];
-    let count = eclipse_syscall::get_process_list(&mut list).ok()?;
-    for info in list.iter().take(count) {
-        if info.pid == 0 { continue; }
-        let end = info.name.iter().position(|&b| b == 0).unwrap_or(16);
-        if &info.name[..end] == want { return Some(info.pid); }
-    }
-    None
 }
 
 // ============================================================================
@@ -426,12 +396,13 @@ impl TerminalApp {
 
         let slave_path = format!("pty:slave/{}\0", pty_pair_id);
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
+        if pty_slave_fd == !0 { return None; }
 
         let sh_res = std::fs::read("/bin/sh");
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, None, pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
             let _ = sys_close(pty_slave_fd);
             return None;
@@ -451,7 +422,7 @@ impl TerminalApp {
             surface_id: 7,
             buffer_id: 9,
             toplevel_id: 11,
-            keyboard_id: 12,
+            keyboard_id: if seat_name != 0 { 12 } else { 0 },
             surface_state: core::cell::RefCell::new(SurfaceBacking {
                 ptr: vaddr as *mut u32,
                 width: win_w as usize,
@@ -482,22 +453,6 @@ impl TerminalApp {
                     match RawMessage::deserialize_header(&data[pos..]) {
                         Ok((sender, opcode, msg_len)) if pos + msg_len <= data.len() => {
                             let chunk = &data[pos..pos + msg_len];
-                            // Log every received Wayland event for debugging
-                            {
-                                let mut buf = [0u8; 80];
-                                let mut n = 0usize;
-                                let pref = b"[TERM-WL] recv sender=";
-                                buf[n..n+pref.len()].copy_from_slice(pref); n += pref.len();
-                                n += write_u32(&mut buf[n..], sender.0);
-                                let op = b" op=";
-                                buf[n..n+op.len()].copy_from_slice(op); n += op.len();
-                                n += write_u32(&mut buf[n..], opcode.0 as u32);
-                                let kb = b" kb=";
-                                buf[n..n+kb.len()].copy_from_slice(kb); n += kb.len();
-                                n += write_u32(&mut buf[n..], self.keyboard_id as u32);
-                                buf[n] = b'\n'; n += 1;
-                                unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
-                            }
 
                             // xdg_wm_base.ping(serial) → pong
                             if sender == ObjectId(5) && opcode == Opcode(0) {
@@ -539,7 +494,7 @@ impl TerminalApp {
                             }
 
                             // wl_keyboard.key (opcode=3): serial, time, key, state
-                            if sender == ObjectId(self.keyboard_id) && opcode == Opcode(3) {
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(3) {
                                 let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
@@ -547,28 +502,13 @@ impl TerminalApp {
                                     // Convert evdev keycode → PS/2 scancode → pc_keyboard state machine
                                     let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
-                                    {
-                                        let mut buf = [0u8; 80];
-                                        let mut n = 0usize;
-                                        let pref = b"[TERM-KB] key=";
-                                        buf[n..n+pref.len()].copy_from_slice(pref); n += pref.len();
-                                        n += write_u32(&mut buf[n..], key);
-                                        let st = b" st=";
-                                        buf[n..n+st.len()].copy_from_slice(st); n += st.len();
-                                        n += write_u32(&mut buf[n..], state);
-                                        let ps = b" ps2=0x";
-                                        buf[n..n+ps.len()].copy_from_slice(ps); n += ps.len();
-                                        n += write_u8_hex(&mut buf[n..], ps2);
-                                        buf[n] = b'\n'; n += 1;
-                                        unsafe { libc::write(2, buf.as_ptr() as *const _, n); }
-                                    }
                                     let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
                                 }
                             }
 
                             // wl_keyboard.keymap (opcode=0): format, fd, size — just close the fd
-                            if sender == ObjectId(self.keyboard_id) && opcode == Opcode(0) {
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(0) {
                                 // handles contains the fd if format != 0; we don't need it
                             }
 
@@ -589,10 +529,9 @@ impl TerminalApp {
                 self.terminal.process(&pty_buf[..n]);
                 if let Some(title) = extract_osc_title(&pty_buf[..n]) {
                     if title != self.last_title {
-                        // xdg_toplevel.set_title
-                        let title_str = std::string::String::from(
-                            core::str::from_utf8(&title).unwrap_or("Terminal")
-                        );
+                        // xdg_toplevel.set_title — strip NUL padding before sending
+                        let end = title.iter().position(|&b| b == 0).unwrap_or(32);
+                        let title_str = core::str::from_utf8(&title[..end]).unwrap_or("Terminal").to_string();
                         send_wayland(&self.wayland, self.toplevel_id, 2, &[Payload::String(title_str)]);
                         self.last_title = title;
                     }
@@ -608,7 +547,7 @@ impl TerminalApp {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, None, fd, fd, fd) {
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;
