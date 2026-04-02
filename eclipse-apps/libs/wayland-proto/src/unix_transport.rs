@@ -263,8 +263,9 @@ impl Connection for UnixSocketConnection {
             // NOT treat this as a disconnect.
             // relibc's recvmsg (syscall 47) sets errno correctly before returning -1.
             let err = errno();
-            if err == EAGAIN || err == EWOULDBLOCK {
-                return Err(RecvError::WouldBlock);
+            if n < 0 && err != EAGAIN && err != EWOULDBLOCK && err != 0 {
+                // Genuine I/O error (e.g., ECONNRESET, EPIPE) — real disconnect.
+                return Err(RecvError::IoError);
             }
             return Err(RecvError::IoError);
         }

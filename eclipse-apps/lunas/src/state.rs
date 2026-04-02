@@ -98,6 +98,9 @@ pub struct LunasState {
     pub pointer_registry: SharedPointers,
     /// Monotonically increasing serial number for Wayland protocol events.
     pub wayland_serial: u32,
+    /// Tracks which Wayland keyboard clients have already received wl_keyboard.enter.
+    /// Enter is sent lazily: just before the first wl_keyboard.key event.
+    pub keyboard_entered: std::collections::BTreeSet<ClientId>,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -157,6 +160,7 @@ impl LunasState {
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             wayland_serial: 1,
+            keyboard_entered: std::collections::BTreeSet::new(),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -206,7 +210,7 @@ impl LunasState {
                 if let Some((_conn_idx, scancode, state_val)) = self.input.pending_snp_key.take() {
                     eprintln!("[LUNAS-KEY] pending_snp_key: sc=0x{:02x} st={}", scancode, state_val);
                     if let Some(w_idx) = self.input.focused_window {
-                        if let WindowContent::Snp { pid, .. } = self.space.windows[w_idx].content {
+                        if let WindowContent::Snp { pid, surface_id } = self.space.windows[w_idx].content {
                             let focused_client = ClientId(pid);
 
                             // If client has a wl_keyboard object, dispatch via Wayland protocol
@@ -214,6 +218,20 @@ impl LunasState {
                             eprintln!("[LUNAS-KEY] client=0x{:x} kb_id={:?}", pid, keyboard_id);
                             if let Some(kb_id) = keyboard_id {
                                 if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                    // ── wl_keyboard.enter: send before first key if not yet sent ──
+                                    if !self.keyboard_entered.contains(&focused_client) {
+                                        self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                        let enter = wl_keyboard::Event::Enter {
+                                            serial: self.wayland_serial,
+                                            surface: ObjectId(surface_id),
+                                            keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                                        };
+                                        let _ = client.send_event(kb_id, enter);
+                                        self.keyboard_entered.insert(focused_client);
+                                        eprintln!("[LUNAS-KEY] sent wl_keyboard.enter (lazy) surface={} kb={}",
+                                            surface_id, kb_id.0);
+                                    }
+
                                     self.wayland_serial = self.wayland_serial.wrapping_add(1);
                                     // wl_keyboard.key uses Linux/evdev keycodes.
                                     // evdev keycode = PS/2 scancode + 8.
@@ -481,24 +499,7 @@ impl LunasState {
                 self.space.window_count += 1;
                 let new_idx = self.space.window_count - 1;
                 self.input.focused_window = Some(new_idx);
-
-                // ── Wayland protocol: send wl_keyboard.enter when surface gains focus ──
-                // Per spec, the compositor MUST send enter before any wl_keyboard.key events.
-                let focused_client = ClientId(commit.pid);
-                let keyboard_id = (*self.keyboard_registry).borrow().get(&focused_client).copied();
-                if let Some(kb_id) = keyboard_id {
-                    if let Some(client) = self.protocol.clients.get(&focused_client) {
-                        self.wayland_serial = self.wayland_serial.wrapping_add(1);
-                        let enter = wl_keyboard::Event::Enter {
-                            serial: self.wayland_serial,
-                            surface: ObjectId(commit.surface_id),
-                            keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
-                        };
-                        let _ = client.send_event(kb_id, enter);
-                        eprintln!("[LUNAS-KEY] sent wl_keyboard.enter surface={} kb={}",
-                            commit.surface_id, kb_id.0);
-                    }
-                }
+                // wl_keyboard.enter is sent lazily at first key event (see handle_event).
             }
         }
         self.dirty = true;
