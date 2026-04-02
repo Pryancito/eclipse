@@ -376,77 +376,90 @@ impl LunasState {
                     self.protocol.add_client(ClientId(pid), connection);
                 }
 
-                let _ = self.protocol.process_message(ClientId(pid), data);
+                let _ = self.protocol.process_message(ClientId(pid), data, &[]);
 
-                // Drain pending wl_surface commits and materialise ShellWindows
-                let commits: Vec<SurfaceCommit> =
-                    (*self.pending_surface_commits).borrow_mut().drain(..).collect();
-
-                let fb_w = self.backend.fb.info.width as i32;
-                let fb_h = self.backend.fb.info.height as i32;
-
-                for commit in commits {
-                    // Update / insert the surface pixel buffer
-                    let surface = ExternalSurface {
-                        id: commit.pid,
-                        pid: commit.pid,
-                        vaddr: commit.vaddr,
-                        buffer_size: (commit.width as usize)
-                            .saturating_mul(commit.height as usize)
-                            .saturating_mul(4),
-                        mapped_len: (commit.stride as usize)
-                            .saturating_mul(commit.height as usize),
-                        buffer_w: commit.width,
-                        buffer_h: commit.height,
-                        active: commit.vaddr != 0,
-                        ready_to_flip: true,
-                    };
-                    self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
-
-                    // Create ShellWindow if not yet present
-                    let exists = self.space.windows[..self.space.window_count]
-                        .iter()
-                        .any(|w| matches!(
-                            w.content,
-                            WindowContent::Snp { surface_id, pid }
-                                if pid == commit.pid && surface_id == commit.surface_id
-                        ));
-
-                    if !exists && self.space.window_count < self.space.windows.len() {
-                        let x = 100i32.min((fb_w - commit.width as i32 - 10).max(10));
-                        let y = ShellWindow::TITLE_H
-                            .min((fb_h - commit.height as i32 - 10).max(ShellWindow::TITLE_H));
-                        let w = commit.width as i32;
-                        let h = commit.height as i32;
-                        let mut title = [0u8; 32];
-                        title[..7].copy_from_slice(b"Wayland");
-                        let win = ShellWindow {
-                            x, y, w,
-                            h: h + ShellWindow::TITLE_H,
-                            curr_x: (x + w / 2) as f32,
-                            curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
-                            curr_w: 0.0, curr_h: 0.0,
-                            minimized: false, maximized: false, closing: false,
-                            stored_rect: (x, y, w, h + ShellWindow::TITLE_H),
-                            workspace: self.input.current_workspace,
-                            content: WindowContent::Snp {
-                                surface_id: commit.surface_id,
-                                pid: commit.pid,
-                            },
-                            damage: std::vec::Vec::new(),
-                            buffer_handle: None,
-                            is_dmabuf: false,
-                            title,
-                        };
-                        self.space.windows[self.space.window_count] = win;
-                        self.space.window_count += 1;
-                        self.input.focused_window = Some(self.space.window_count - 1);
-                    }
-                }
+                // Drain and materialise any pending wl_surface commits.
+                self.drain_pending_wayland_commits();
 
                 self.dirty = true;
             }
         }
+    }
+
+    /// Drain pending wl_surface commits (queued by either the Unix socket path or the
+    /// IPC/SNP path) and materialise ShellWindows for any new surfaces.
+    ///
+    /// Called from `update()` every frame (covers Unix socket clients) and inline
+    /// in `handle_event(CompositorEvent::Snp)` (covers legacy IPC clients).
+    pub fn drain_pending_wayland_commits(&mut self) {
+        let commits: Vec<SurfaceCommit> =
+            (*self.pending_surface_commits).borrow_mut().drain(..).collect();
+        if commits.is_empty() {
+            return;
+        }
+
+        let fb_w = self.backend.fb.info.width as i32;
+        let fb_h = self.backend.fb.info.height as i32;
+
+        for commit in commits {
+            // Update / insert the surface pixel buffer
+            let surface = ExternalSurface {
+                id: commit.pid,
+                pid: commit.pid,
+                vaddr: commit.vaddr,
+                buffer_size: (commit.width as usize)
+                    .saturating_mul(commit.height as usize)
+                    .saturating_mul(4),
+                mapped_len: (commit.stride as usize)
+                    .saturating_mul(commit.height as usize),
+                buffer_w: commit.width,
+                buffer_h: commit.height,
+                active: commit.vaddr != 0,
+                ready_to_flip: true,
+            };
+            self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
+
+            // Create ShellWindow if not yet present
+            let exists = self.space.windows[..self.space.window_count]
+                .iter()
+                .any(|w| matches!(
+                    w.content,
+                    WindowContent::Snp { surface_id, pid }
+                        if pid == commit.pid && surface_id == commit.surface_id
+                ));
+
+            if !exists && self.space.window_count < self.space.windows.len() {
+                let x = 100i32.min((fb_w - commit.width as i32 - 10).max(10));
+                let y = ShellWindow::TITLE_H
+                    .min((fb_h - commit.height as i32 - 10).max(ShellWindow::TITLE_H));
+                let w = commit.width as i32;
+                let h = commit.height as i32;
+                let mut title = [0u8; 32];
+                title[..7].copy_from_slice(b"Wayland");
+                let win = ShellWindow {
+                    x, y, w,
+                    h: h + ShellWindow::TITLE_H,
+                    curr_x: (x + w / 2) as f32,
+                    curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
+                    curr_w: 0.0, curr_h: 0.0,
+                    minimized: false, maximized: false, closing: false,
+                    stored_rect: (x, y, w, h + ShellWindow::TITLE_H),
+                    workspace: self.input.current_workspace,
+                    content: WindowContent::Snp {
+                        surface_id: commit.surface_id,
+                        pid: commit.pid,
+                    },
+                    damage: std::vec::Vec::new(),
+                    buffer_handle: None,
+                    is_dmabuf: false,
+                    title,
+                };
+                self.space.windows[self.space.window_count] = win;
+                self.space.window_count += 1;
+                self.input.focused_window = Some(self.space.window_count - 1);
+            }
+        }
+        self.dirty = true;
     }
 
     /// Get the PID of the currently focused window if it is an SNP window.
@@ -481,6 +494,12 @@ impl LunasState {
     /// Update animations, metrics, and layout. Returns true if rendering is needed.
     pub fn update(&mut self) -> bool {
         self.counter += 1;
+
+        // Drain any pending wl_surface commits that arrived via the Unix socket
+        // (Wayland clients connecting to /tmp/wayland-0).  IPC/SNP clients drain
+        // inline in handle_event(CompositorEvent::Snp); Unix socket clients don't
+        // generate that event, so we drain here every frame.
+        self.drain_pending_wayland_commits();
 
         // Update window animations
         let animating = self.space.update_animations(&mut self.surfaces);

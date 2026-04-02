@@ -1,4 +1,5 @@
 use crate::wl::{ObjectId, NewId, Interface, RawMessage, Connection, Payload};
+use crate::wl::wire::Handle;
 use crate::wl::interface::{construct_interface_wrapper, InterfaceWrapper};
 use crate::wl::server::client::Client;
 use alloc::boxed::Box;
@@ -14,6 +15,7 @@ pub trait ObjectLogic: 'static {
         client: &mut Client,
         opcode: u16,
         args: &[Payload],
+        handles: &[Handle],
     ) -> Result<(), ServerError>;
 }
 
@@ -52,7 +54,7 @@ impl Object {
 
 pub struct DisplayObject;
 impl ObjectLogic for DisplayObject {
-    fn handle_request(&mut self, client: &mut Client, opcode: u16, args: &[Payload]) -> Result<(), ServerError> {
+    fn handle_request(&mut self, client: &mut Client, opcode: u16, args: &[Payload], _handles: &[Handle]) -> Result<(), ServerError> {
         match opcode {
             1 => { // get_registry
                 let registry_id = match args[0] {
@@ -76,19 +78,9 @@ impl ObjectLogic for DisplayObject {
 
 pub struct RegistryObject;
 impl ObjectLogic for RegistryObject {
-    fn handle_request(&mut self, client: &mut Client, opcode: u16, args: &[Payload]) -> Result<(), ServerError> {
-        match opcode {
-            0 => { // bind
-                let name = match args[0] { Payload::UInt(n) => n, _ => return Err(ServerError::MessageDeserializeError) };
-                let interface = match &args[1] { Payload::String(s) => s, _ => return Err(ServerError::MessageDeserializeError) };
-                let version = match args[2] { Payload::UInt(v) => v, _ => return Err(ServerError::MessageDeserializeError) };
-                let id = match args[3] { Payload::NewId(id) => id, _ => return Err(ServerError::MessageDeserializeError) };
-                
-                // We'll need a way to look up the global factory here.
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+    fn handle_request(&mut self, _client: &mut Client, _opcode: u16, _args: &[Payload], _handles: &[Handle]) -> Result<(), ServerError> {
+        // bind is handled directly by WaylandServer::process_message; nothing to do here.
+        Ok(())
     }
 }
 
