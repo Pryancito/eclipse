@@ -43,20 +43,26 @@ impl Command {
     
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
-        // Eclipse OS currently spawns from an ELF buffer
-        let _buf = fs::read(&self.program)?;
-        
-        unsafe {
-            let pid = crate::libc::spawn(
-                self.program.as_ptr() as *const c_char,
-                core::ptr::null(),
-                core::ptr::null()
-            );
-            if pid < 0 {
-                return Err(Error::new(ErrorKind::Other, "spawn failed"));
-            }
-            
-            Ok(Child { pid })
+        let buf = fs::read(&self.program)?;
+
+        // Build a NUL-terminated name for the kernel from the program basename.
+        // We use a 16-byte stack buffer that is zero-initialised; after copying
+        // up to 15 bytes of the basename the byte at index copy_len (and beyond)
+        // is always 0, acting as the NUL terminator the kernel expects when it
+        // reads from name_buf[0] via the raw pointer.
+        let name_start = self.program.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let base = &self.program[name_start..];
+        let mut name_buf = [0u8; 16];
+        let copy_len = base.len().min(15);
+        name_buf[..copy_len].copy_from_slice(&base.as_bytes()[..copy_len]);
+        // Validate the copied bytes as UTF-8 (program names are always ASCII in
+        // practice; the fallback "?" ensures the process always gets a visible
+        // name even if something unexpected occurs).
+        let name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("?");
+
+        match eclipse_syscall::call::spawn(&buf, Some(name)) {
+            Ok(pid) => Ok(Child { pid: pid as pid_t }),
+            Err(_) => Err(Error::new(ErrorKind::Other, "spawn failed")),
         }
     }
 
