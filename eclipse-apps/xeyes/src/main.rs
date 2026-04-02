@@ -211,6 +211,8 @@ fn shm_name(pid: u32) -> HString<24> {
     for j in 0..i / 2 {
         tmp.swap(j, i - 1 - j);
     }
+    // SAFETY: `tmp[..i]` contains only ASCII decimal digits (b'0'..=b'9'),
+    // each of which is a single-byte valid UTF-8 code point.
     let _ = s.push_str(unsafe { core::str::from_utf8_unchecked(&tmp[..i]) });
     s
 }

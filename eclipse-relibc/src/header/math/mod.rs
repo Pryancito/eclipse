@@ -406,7 +406,8 @@ mod imp {
 
     #[no_mangle]
     pub unsafe extern "C" fn round(x: c_double) -> c_double {
-        ifloor64(x + 0.5)
+        // Round half away from zero (C standard).
+        if x >= 0.0 { ifloor64(x + 0.5) } else { -ifloor64(-x + 0.5) }
     }
 
     #[no_mangle]
@@ -596,7 +597,7 @@ mod imp {
             *exp = 0;
             return 0.0;
         }
-        let bits = core::mem::transmute::<f64, u64>(x);
+        let bits = x.to_bits();
         let mut e = (((bits >> 52) & 0x7FF) as i32) - 1022;
         let mut m = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000;
         if e == -1022 {
@@ -612,7 +613,7 @@ mod imp {
         *exp = e;
         let res_bits =
             (bits & 0x8000_0000_0000_0000) | (1022 << 52) | (m & 0x000F_FFFF_FFFF_FFFF);
-        core::mem::transmute::<u64, f64>(res_bits)
+        f64::from_bits(res_bits)
     }
 
     #[no_mangle]
