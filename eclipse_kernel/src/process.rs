@@ -151,6 +151,7 @@ impl Process {
             cpu_affinity: None,
             ai_profile: crate::ai_core::ProcessProfile::new(),
             pending_signals: 0,
+            signal_mask: 0,
             signal_handlers: [0u64; 64],
         }
     }

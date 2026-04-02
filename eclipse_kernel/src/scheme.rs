@@ -15,6 +15,7 @@ use alloc::collections::BTreeMap;
 /// Error codes matching POSIX/Redox
 pub mod error {
     pub const ENOENT: usize = 2;   // No such file or directory
+    pub const ESRCH: usize = 3;    // No such process
     pub const EIO: usize = 5;      // I/O error
     pub const EEXIST: usize = 17;  // File exists (e.g. O_CREAT | O_EXCL)
     pub const EBADF: usize = 9;   // Bad file descriptor

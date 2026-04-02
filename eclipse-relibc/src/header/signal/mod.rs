@@ -65,6 +65,16 @@ pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int {
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn sigprocmask(_how: c_int, _set: *const sigset_t, _oldset: *mut sigset_t) -> c_int {
-    0 // Stub
+pub unsafe extern "C" fn sigprocmask(how: c_int, set: *const sigset_t, oldset: *mut sigset_t) -> c_int {
+    use crate::eclipse_syscall::call::sigprocmask;
+    let set_ptr = if set.is_null() { 0 } else { set as usize };
+    let oldset_ptr = if oldset.is_null() { 0 } else { oldset as usize };
+    
+    match sigprocmask(how as usize, set_ptr, oldset_ptr) {
+        Ok(_) => 0,
+        Err(e) => {
+            *crate::header::errno::__errno_location() = e.errno as c_int;
+            -1
+        }
+    }
 }

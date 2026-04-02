@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::process::{ProcessId, exit_process, current_process_id};
+use crate::process::{self, ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
 use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_24};
 use crate::serial;
@@ -40,6 +40,7 @@ pub enum SyscallNumber {
     Munmap = 11,
     Brk = 12,
     SigAction = 13,
+    Sigprocmask = 14,
     Ioctl = 16,
     Yield = 24,
     Nanosleep = 35,
@@ -265,6 +266,7 @@ pub extern "C" fn syscall_handler(
         11 => sys_munmap(arg1, arg2),
         12 => sys_brk(arg1),
         13 => sys_sigaction(arg1, arg2, arg3),
+        14 => sys_sigprocmask(arg1, arg2, arg3),
         16 => sys_ioctl(arg1, arg2, arg3),
         22 => sys_pipe(arg1),
         24 => sys_yield(),
@@ -4006,6 +4008,48 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
 ///   [0..8]  → handler (usize): 0 = SIG_DFL, 1 = SIG_IGN, else = fn ptr
 ///
 /// Devuelve 0 en éxito, u64::MAX en error.
+/// sys_sigprocmask - change signal mask
+/// how: 0=SIG_BLOCK, 1=SIG_UNBLOCK, 2=SIG_SETMASK
+fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
+    let Some(pid) = current_process_id() else { return -(crate::scheme::error::ESRCH as isize) as u64 };
+    
+    let mut old_mask = 0u64;
+    let mut new_set = 0u64;
+
+    if set_ptr != 0 {
+        new_set = unsafe { *(set_ptr as *const u64) };
+    }
+
+    let mut table = process::PROCESS_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(p) = slot {
+            if p.id == pid {
+                old_mask = p.signal_mask;
+                
+                if set_ptr != 0 {
+                    match how {
+                        0 => p.signal_mask |= new_set, // SIG_BLOCK
+                        1 => p.signal_mask &= !new_set, // SIG_UNBLOCK
+                        2 => p.signal_mask = new_set,  // SIG_SETMASK
+                        _ => return -(crate::scheme::error::EINVAL as isize) as u64,
+                    }
+                    // SIGKILL and SIGSTOP cannot be blocked
+                    p.signal_mask &= !((1 << 9) | (1 << 19));
+                }
+                break;
+            }
+        }
+    }
+
+    if oldset_ptr != 0 {
+        unsafe {
+            *(oldset_ptr as *mut u64) = old_mask;
+        }
+    }
+
+    0
+}
+
 fn sys_sigaction(signum: u64, new_action_ptr: u64, old_action_ptr: u64) -> u64 {
     if signum >= 64 {
         return u64::MAX;
