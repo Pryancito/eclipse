@@ -61,6 +61,7 @@ struct SurfaceBacking {
     width: usize,
     height: usize,
     size_bytes: usize,
+    shm_fd: i32,
 }
 
 #[cfg(target_vendor = "eclipse")]
@@ -173,7 +174,7 @@ struct TerminalApp {
     buffer_id: u32,
     toplevel_id: u32,
     keyboard_id: u32,
-    surface_state: core::cell::RefCell<SurfaceBacking>,
+    surface_state: Rc<RefCell<SurfaceBacking>>,
     terminal: Terminal<SharedSurfaceDrawTarget>,
     pty_master_fd: usize,
     pty_pair_id: usize,
@@ -378,6 +379,7 @@ impl TerminalApp {
             width: win_w as usize,
             height: win_h as usize,
             size_bytes,
+            shm_fd: -1,
         }));
         let draw_target = SharedSurfaceDrawTarget { state: shared_state.clone() };
         let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
@@ -402,7 +404,7 @@ impl TerminalApp {
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, None, pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
             let _ = sys_close(pty_slave_fd);
             return None;
@@ -423,12 +425,7 @@ impl TerminalApp {
             buffer_id: 9,
             toplevel_id: 11,
             keyboard_id: if seat_name != 0 { 12 } else { 0 },
-            surface_state: core::cell::RefCell::new(SurfaceBacking {
-                ptr: vaddr as *mut u32,
-                width: win_w as usize,
-                height: win_h as usize,
-                size_bytes,
-            }),
+            surface_state: shared_state.clone(),
             terminal,
             pty_master_fd,
             pty_pair_id,
@@ -483,7 +480,64 @@ impl TerminalApp {
 
                             // xdg_toplevel.configure(w, h, states) → resize if needed
                             if sender == ObjectId(self.toplevel_id) && opcode == Opcode(0) {
-                                // new size from compositor — for now ignore (use our preferred size)
+                                let pts = &[PayloadType::Int, PayloadType::Int, PayloadType::Array];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let mut w = match raw.args.get(0) { Some(Payload::Int(v)) => *v, _ => 0 };
+                                    let mut h = match raw.args.get(1) { Some(Payload::Int(v)) => *v, _ => 0 };
+                                    
+                                    // Compositor might send 0,0 to mean we should decide
+                                    if w == 0 { w = (*self.surface_state).borrow().width as i32; }
+                                    if h == 0 { h = (*self.surface_state).borrow().height as i32; }
+
+                                    if w > 0 && h > 0 && (w != (*self.surface_state).borrow().width as i32 || h != (*self.surface_state).borrow().height as i32) {
+                                        let cols = w as u16 / FONT_CHAR_W;
+                                        let rows = h as u16 / FONT_CHAR_H;
+                                        set_pty_winsize(self.pty_master_fd, rows, cols, w as u16, h as u16);
+                                        
+                                        // Update internal terminal size
+                                        // os-terminal 0.7.x might not have set_size; recreating for now
+                                        let draw_target = SharedSurfaceDrawTarget { state: self.surface_state.clone() };
+                                        let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
+                                        terminal.set_crnl_mapping(true);
+                                        terminal.set_clipboard(Box::new(EclipseClipboard::new()));
+                                        terminal.set_auto_flush(false);
+                                        // TODO: copy contents from old terminal if possible
+                                        self.terminal = terminal;
+                                        let pfd = self.pty_master_fd;
+                                        self.terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
+
+                                        // Reallocate SHM buffer if needed
+                                        let new_size = (w as usize) * (h as usize) * 4;
+                                        let mut state = (*self.surface_state).borrow_mut();
+                                        
+                                        // For now, let's keep the old pointer if the new size fits (or just redo it for safety)
+                                        // In Eclipse OS, re-mmapping is more reliable for resizing
+                                        let shm_name = sidewind_shm_name(eclipse_syscall::getpid() as u32);
+                                        let shm_path = format!("/tmp/{}\0", shm_name.as_str());
+                                        let fd = unsafe { open(shm_path.as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644) };
+                                        if fd >= 0 {
+                                            let _ = eclipse_syscall::ftruncate(fd as usize, new_size);
+                                            let vaddr = unsafe { mmap(core::ptr::null_mut(), new_size, (flag::PROT_READ|flag::PROT_WRITE) as c_int, flag::MAP_SHARED as c_int, fd, 0) };
+                                            if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
+                                                state.ptr = vaddr as *mut u32;
+                                                state.width = w as usize;
+                                                state.height = h as usize;
+                                                state.size_bytes = new_size;
+                                                
+                                                // Inform compositor of the new buffer
+                                                // create_pool (use id 13 for new pool)
+                                                send_wayland_with_fd(&self.wayland, 4, 0, &[Payload::NewId(NewId(13)), Payload::Handle(wayland_proto::wl::wire::Handle(fd)), Payload::Int(new_size as i32)], fd);
+                                                // create_buffer (use id 14)
+                                                let stride = (w * 4) as i32;
+                                                send_wayland(&self.wayland, 13, 0, &[Payload::NewId(NewId(14)), Payload::Int(0), Payload::Int(w), Payload::Int(h), Payload::Int(stride), Payload::UInt(1)]);
+                                                
+                                                self.buffer_id = 14;
+                                            }
+                                            unsafe { close(fd) };
+                                        }
+                                        dirty = true;
+                                    }
+                                }
                             }
 
                             // xdg_toplevel.close → exit
@@ -547,7 +601,7 @@ impl TerminalApp {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, None, fd, fd, fd) {
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;

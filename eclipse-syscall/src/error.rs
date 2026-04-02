@@ -1,6 +1,7 @@
 //! Error handling
 use core::result::Result::{Ok, Err};
 pub const EINTR:  i32 = 4;
+pub const EAGAIN: i32 = 11;
 pub const EBADF:  i32 = 9;
 pub const ENOMEM: i32 = 12;
 pub const EPIPE:  i32 = 32;

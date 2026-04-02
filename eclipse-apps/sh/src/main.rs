@@ -298,7 +298,7 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         "env" | "printenv" => {
-            for key in &["TERM", "HOME", "PATH", "LINES", "COLUMNS", "SHELL", "USER", "PWD"] {
+            for key in &["TERM", "HOME", "PATH", "LINES", "COLUMNS", "SHELL", "USER", "PWD", "EDITOR"] {
                 if let Ok(val) = std::env::var(key) { sh_println(&format!("{}={}", key, val)); }
             }
             sh_println(&format!("?={}", unsafe { LAST_EXIT }));
@@ -424,7 +424,7 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
             open_redirect_out(p, app).unwrap_or(fd_out)
         } else { fd_out };
 
-        let res = eclipse_syscall::call::spawn_with_stdio(&data, None, fd_in, eff_out, fd_err);
+        let res = eclipse_syscall::call::spawn_with_stdio(&data, Some(prog), fd_in, eff_out, fd_err);
         if cmd.redirect_out.is_some() && eff_out != fd_out { let _ = eclipse_syscall::call::close(eff_out); }
 
         if let Ok(pid) = res {
@@ -485,8 +485,38 @@ fn run_pipeline(pl: &Pipeline, bg_pids: &mut Vec<usize>) -> i32 {
 }
 
 // ============================================================================
-// Readline / History
+// Readline / History / Completion
 // ============================================================================
+
+fn complete_at_cursor(input: &mut String) {
+    let word_start = input.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    let prefix = &input[word_start..];
+    if prefix.is_empty() { return; }
+
+    let (dir_path, file_prefix) = if let Some(last_slash) = prefix.rfind('/') {
+        (&prefix[..last_slash + 1], &prefix[last_slash + 1..])
+    } else { (".", prefix) };
+
+    let abs_dir = resolve_path(dir_path);
+    let mut buf = [0u8; 8192];
+    if let Ok(n) = eclipse_syscall::call::readdir(&abs_dir, &mut buf) {
+        let matches: Vec<&str> = buf[..n].split(|&b| b == b'\n')
+            .filter_map(|s| core::str::from_utf8(s).ok())
+            .filter(|name| name.starts_with(file_prefix) && !name.is_empty())
+            .collect();
+
+        if matches.len() == 1 {
+            let matched = matches[0];
+            let remaining = &matched[file_prefix.len()..];
+            input.push_str(remaining);
+            sh_print(remaining);
+            // If it's a directory (we don't know for sure but we can guess or just add space)
+            // For now, don't add space automatically.
+        } else if matches.len() > 1 {
+            // Optional: Find common prefix and complete that
+        }
+    }
+}
 
 fn clear_line(curr: &str) { for _ in 0..curr.len() { sh_print("\x08 \x08"); } }
 
@@ -498,26 +528,21 @@ fn readline(hist: &mut History, prompt: &str) -> Option<String> {
 
     loop {
         match eclipse_syscall::call::read(0, &mut b1) {
+            Ok(0) => return None, // EOF: exit shell
             Ok(1) => match b1[0] {
                 b'\n' | b'\r' => { sh_print("\n"); return Some(input); }
-                3 => { sh_print("^C\n"); return Some(String::new()); }
-                4 => if input.is_empty() { sh_print("\n"); return None; },
+                3 => { sh_print("^C\n"); input.clear(); return Some(input); }
+                4 => if input.is_empty() { sh_print("\n"); return None; } else { /* ignore EOT in middle of line */ },
+                9 => complete_at_cursor(&mut input),
                 8 | 127 => if !input.is_empty() { let _ = input.pop(); sh_print("\x08 \x08"); },
                 27 => {
-                    // Check if there are bytes available before reading the escape
-                    // sequence. Without this check, a lone ESC key press (no following
-                    // bytes) would block forever on the next read call.
+                    // ... (rest of ESC handling remains same)
                     let mut avail: usize = 0;
-                    // FIONREAD: if the call fails, avail stays 0
-                    // which is safe — we just treat the ESC as a lone key press
-                    // rather than risk blocking on a read that may never return.
                     let _ = eclipse_syscall::call::ioctl(0, FIONREAD, &mut avail as *mut _ as usize);
                     if avail >= 1 {
                         let mut seq = [0u8; 2];
                         if eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() && seq[0] == b'[' {
                             let mut avail2: usize = 0;
-                            // Second FIONREAD to guard the command-byte read.  If it
-                            // fails we conservatively skip rather than block.
                             let _ = eclipse_syscall::call::ioctl(0, FIONREAD, &mut avail2 as *mut _ as usize);
                             if avail2 >= 1 && eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() {
                                 match seq[0] {
@@ -535,13 +560,13 @@ fn readline(hist: &mut History, prompt: &str) -> Option<String> {
                             }
                         }
                     }
-                    // Lone ESC key press (avail == 0): silently ignored.
                 }
                 b if b >= 0x20 => { input.push(b as char); let _ = eclipse_syscall::call::write(1, &[b]); }
                 _ => {}
             },
             Err(e) if e.errno == eclipse_syscall::error::EINTR => update_terminal_size(),
-            _ => { let _ = eclipse_syscall::call::sched_yield(); }
+            Err(e) if e.errno == eclipse_syscall::error::EAGAIN => { let _ = eclipse_syscall::call::sched_yield(); }
+            _ => return None, // Exit on permanent error
         }
     }
 }
