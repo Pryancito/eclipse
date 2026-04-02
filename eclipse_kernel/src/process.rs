@@ -206,17 +206,6 @@ pub fn wake_parent_from_wait(parent_pid: ProcessId) {
         return;
     }
 
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut table = PROCESS_TABLE.lock();
-        for slot in table.iter_mut() {
-            if let Some(p) = slot {
-                if p.id == parent_pid && p.state == ProcessState::Blocked {
-                    p.state = ProcessState::Ready;
-                    break;
-                }
-            }
-        }
-    });
     crate::scheduler::enqueue_process(parent_pid);
 }
 
