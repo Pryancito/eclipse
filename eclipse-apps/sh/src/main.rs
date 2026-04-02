@@ -454,7 +454,8 @@ fn run_pipeline(pl: &Pipeline) -> i32 {
             let c = wait_for_child(pid); unsafe { LAST_EXIT = c; }
             return c;
         }
-        return unsafe { LAST_EXIT };
+        unsafe { LAST_EXIT = 127; }
+        return 127;
     }
 
     let mut pids = Vec::new();
@@ -500,22 +501,38 @@ fn readline(hist: &mut History, prompt: &str) -> Option<String> {
                 4 => if input.is_empty() { sh_print("\n"); return None; },
                 8 | 127 => if !input.is_empty() { let _ = input.pop(); sh_print("\x08 \x08"); },
                 27 => {
-                    let mut seq = [0u8; 2];
-                    if eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() && seq[0] == b'['
-                       && eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() {
-                        match seq[0] {
-                            b'A' => {
-                                if saved.is_none() { saved = Some(input.clone()); }
-                                if let Some(p) = hist.up() { clear_line(&input); input = p.to_string(); sh_print(&input); }
+                    // Check if there are bytes available before reading the escape
+                    // sequence. Without this check, a lone ESC key press (no following
+                    // bytes) would block forever on the next read call.
+                    let mut avail: usize = 0;
+                    // FIONREAD (ioctl cmd 2): if the call fails, avail stays 0
+                    // which is safe — we just treat the ESC as a lone key press
+                    // rather than risk blocking on a read that may never return.
+                    let _ = eclipse_syscall::call::ioctl(0, 2, &mut avail as *mut _ as usize);
+                    if avail >= 1 {
+                        let mut seq = [0u8; 2];
+                        if eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() && seq[0] == b'[' {
+                            let mut avail2: usize = 0;
+                            // Second FIONREAD to guard the command-byte read.  If it
+                            // fails we conservatively skip rather than block.
+                            let _ = eclipse_syscall::call::ioctl(0, 2, &mut avail2 as *mut _ as usize);
+                            if avail2 >= 1 && eclipse_syscall::call::read(0, &mut seq[..1]).is_ok() {
+                                match seq[0] {
+                                    b'A' => {
+                                        if saved.is_none() { saved = Some(input.clone()); }
+                                        if let Some(p) = hist.up() { clear_line(&input); input = p.to_string(); sh_print(&input); }
+                                    }
+                                    b'B' => {
+                                        let n = hist.down().to_string();
+                                        let n = if n.is_empty() { saved.take().unwrap_or_default() } else { saved = None; n };
+                                        clear_line(&input); input = n; sh_print(&input);
+                                    }
+                                    _ => {}
+                                }
                             }
-                            b'B' => {
-                                let n = hist.down().to_string();
-                                let n = if n.is_empty() { saved.take().unwrap_or_default() } else { saved = None; n };
-                                clear_line(&input); input = n; sh_print(&input);
-                            }
-                            _ => {}
                         }
                     }
+                    // Lone ESC key press (avail == 0): silently ignored.
                 }
                 b if b >= 0x20 => { input.push(b as char); let _ = eclipse_syscall::call::write(1, &[b]); }
                 _ => {}
@@ -574,7 +591,6 @@ fn main() {
             }
         } else {
             let _ = run_pipeline(&pl);
-            if !pl.background { sh_print("\r\n"); }
         }
     }
     eclipse_syscall::call::exit(0);
