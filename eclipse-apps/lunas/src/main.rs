@@ -169,6 +169,26 @@ fn main() {
         eprintln!("[LUNAS] Registered wl_output");
     }
 
+    // xwayland_shell_v1 — association of X11 windows to Wayland surfaces
+    {
+        let s = state.xwayland_serials.clone();
+        state.protocol.register_global(
+            "xwayland_shell_v1", 1,
+            move || {
+                let shell = lunas::protocol::LunasXwaylandShell {
+                    xwayland_serials: s.clone(),
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(shell))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::xwayland_shell::XwaylandShellV1
+            >(id, inner),
+        );
+        eprintln!("[LUNAS] Registered xwayland_shell_v1");
+    }
+
     eprintln!("[LUNAS] All globals registered, entering main loop...");
 
     // ── Start Wayland Unix socket server ─────────────────────────────────────
@@ -176,6 +196,9 @@ fn main() {
     let mut wayland_socket = lunas::wayland_socket::WaylandSocketServer::new("/tmp/wayland-0");
     if wayland_socket.is_none() {
         eprintln!("[LUNAS] Warning: could not bind /tmp/wayland-0 — standard Wayland clients won't connect");
+    } else {
+        // Start Xwayland now that the socket is ready
+        state.start_xwayland();
     }
 
     eprintln!("[LUNAS] Getting self PID...");

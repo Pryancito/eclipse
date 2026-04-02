@@ -173,7 +173,7 @@ impl Scheme for PtyScheme {
         loop {
             let mut channel = channel_arc.lock();
             let termios = channel.termios;
-            let icanon = (termios.c_lflag & 0x0002) != 0; // ICANON=0x0002
+            let icanon = !handle.is_master && (termios.c_lflag & 0x0002) != 0; // ICANON=0x0002
 
             let queue = if handle.is_master { &mut channel.master_in } else { &mut channel.slave_in };
 

@@ -12,6 +12,7 @@ use crate::fs;
 pub struct Command {
     program: String,
     args: Vec<String>,
+    envs: Vec<(String, String)>,
 }
 
 impl Command {
@@ -20,6 +21,7 @@ impl Command {
         Command {
             program: String::from(program),
             args: Vec::new(),
+            envs: Vec::new(),
         }
     }
     
@@ -41,6 +43,12 @@ impl Command {
         self
     }
     
+    /// Adds an environment variable to pass to the program.
+    pub fn env(&mut self, key: &str, val: &str) -> &mut Self {
+        self.envs.push((String::from(key), String::from(val)));
+        self
+    }
+
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
         let buf = fs::read(&self.program)?;

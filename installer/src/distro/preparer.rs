@@ -61,11 +61,12 @@ impl DistroPreparer {
             ("../eclipse_kernel/userspace/network_service/target/x86_64-unknown-eclipse/release/network_service", "sbin/network_service"),
             ("../eclipse_kernel/userspace/gui_service/target/x86_64-unknown-eclipse/release/gui_service", "sbin/gui_service"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "usr/bin/smithay_app"),
-            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "usr/bin/demo_client"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "bin/demo_client"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/lunas", "usr/bin/lunas"),
-            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/terminal", "usr/bin/terminal"),
-            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/sh", "usr/bin/sh"),
-            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/nano", "usr/bin/nano"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/terminal", "bin/terminal"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/rust-shell", "bin/rust-shell"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/nano", "bin/nano"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/glxgears", "bin/glxgears"),
         ];
 
         for (src, dest) in binaries {
