@@ -45,6 +45,10 @@ pub type SharedBuffers = Rc<RefCell<BTreeMap<ObjectId, BufferInfo>>>;
 /// Shared list of pending surface commits.
 pub type SharedCommits = Rc<RefCell<std::vec::Vec<SurfaceCommit>>>;
 
+/// Shared mapping of Xwayland serials (64-bit) to wl_surface ObjectIds.
+pub type SharedXwaylandSerials = Rc<RefCell<BTreeMap<u64, ObjectId>>>;
+
+
 // ────────────────────────────────────────────────────────────────────────────
 // LunasCompositor  (wl_compositor)
 // ────────────────────────────────────────────────────────────────────────────
@@ -757,9 +761,91 @@ impl ObjectLogic for LunasOutput {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXwaylandShell  (xwayland_shell_v1)
+// ────────────────────────────────────────────────────────────────────────────
 
+pub struct LunasXwaylandShell {
+    pub xwayland_serials: SharedXwaylandSerials,
+}
+
+impl ObjectLogic for LunasXwaylandShell {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // get_xwayland_surface(id: new_id, surface: object_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let surface_id = match args.get(1) {
+                    Some(Payload::ObjectId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let xwayland_surface = ObjectInner::Rc(Rc::new(RefCell::new(LunasXwaylandSurface {
+                    surface_id,
+                    xwayland_serials: self.xwayland_serials.clone(),
+                })));
+                client.add_object(id, Object::new::<xwayland_shell::XwaylandSurfaceV1>(id, xwayland_surface));
+                Ok(())
+            }
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXwaylandSurface  (xwayland_surface_v1)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXwaylandSurface {
+    pub surface_id: ObjectId,
+    pub xwayland_serials: SharedXwaylandSerials,
+}
+
+impl ObjectLogic for LunasXwaylandSurface {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // set_serial(serial_lo: uint, serial_hi: uint)
+                let lo = match args.first() {
+                    Some(Payload::UInt(v)) => *v,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let hi = match args.get(1) {
+                    Some(Payload::UInt(v)) => *v,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let serial = ((hi as u64) << 32) | (lo as u64);
+                (*self.xwayland_serials).borrow_mut().insert(serial, self.surface_id);
+                
+                // Log the association for debugging
+                let msg = alloc::format!("[LUNAS-XWAYLAND] Associated serial 0x{:x} with surface id {}\n", serial, self.surface_id.0);
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                
+                Ok(())
+            }
+            _ => Err(ServerError::ObjectMismatch),
+        }
+    }
+}
 
 #[cfg(test)]
+
 mod wayland_server_tests {
     use super::{LunasCompositor, LunasShm, SharedBuffers, SharedCommits};
     use std::rc::Rc;

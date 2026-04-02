@@ -348,7 +348,7 @@ impl AhciPort {
         //    standard SATA devices.  Reducing from 500 M avoids wasting ~2.5 s
         //    per empty port when all implemented ports are probed.
         let mut ready = false;
-        let mut i = 50_000_000u32;
+        let mut i = HBA_LINK_WAIT_ITERATIONS;
         loop {
             let ssts = self.preg(PORT_SSTS);
             if ssts & 0x0F == 3 {

@@ -11,6 +11,8 @@ pub mod wl_output;
 pub mod xdg_wm_base;
 pub mod xdg_surface;
 pub mod xdg_toplevel;
+pub mod xwayland_shell;
+
 
 pub enum EventSet {
     WlDisplay(wl_display::WlDisplay, wl_display::Event),

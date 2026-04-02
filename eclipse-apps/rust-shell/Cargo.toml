@@ -1,0 +1,17 @@
+[package]
+name = "rust-shell"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Use workspace dependencies for common crates (e.g. bitflags)
+bitflags = { workspace = true }
+
+[target.'cfg(target_vendor = "eclipse")'.dependencies]
+std = { package = "eclipse_std", path = "../eclipse_std" }
+eclipse-syscall = { path = "../../eclipse-syscall" }
+
+[lints]
+workspace = true

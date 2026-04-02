@@ -70,6 +70,7 @@ pub struct LunasState {
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
     pub network_pid: Option<u32>,
+    pub xwayland_pid: Option<u32>,
     pub net_rx: u64,
     pub net_tx: u64,
     pub prev_net_rx: u64,
@@ -96,7 +97,10 @@ pub struct LunasState {
     pub keyboard_registry: SharedKeyboards,
     /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
     pub pointer_registry: SharedPointers,
+    /// Maps Xwayland X11 window serials (64-bit) to Wayland wl_surface IDs.
+    pub xwayland_serials: crate::protocol::SharedXwaylandSerials,
     /// Monotonically increasing serial number for Wayland protocol events.
+
     pub wayland_serial: u32,
     /// Tracks which Wayland keyboard clients have already received wl_keyboard.enter.
     /// Enter is sent lazily: just before the first wl_keyboard.key event.
@@ -139,6 +143,7 @@ impl LunasState {
             anomaly_count: 0,
             heap_fragmentation: 0,
             network_pid: None,
+            xwayland_pid: None,
             net_rx: 0,
             net_tx: 0,
             prev_net_rx: 0,
@@ -159,7 +164,9 @@ impl LunasState {
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            xwayland_serials: Rc::new(RefCell::new(BTreeMap::new())),
             wayland_serial: 1,
+
             keyboard_entered: std::collections::BTreeSet::new(),
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
@@ -1110,6 +1117,35 @@ impl LunasState {
         #[cfg(not(target_vendor = "eclipse"))]
         {
             // No-op: app launching is only available on Eclipse OS
+        }
+        self.dirty = true;
+    }
+
+    pub fn start_xwayland(&mut self) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            eprintln!("[LUNAS] Starting Xwayland...");
+            // Use DISPLAY=:0 and WAYLAND_DISPLAY=wayland-0
+            // We use -rootless so X11 windows are managed as individual Wayland surfaces.
+            let xwayland_res = std::process::Command::new("Xwayland")
+                .arg(":0")
+                .arg("-rootless")
+                .arg("-terminate")
+                .arg("-accessx")
+                .arg("-core")
+                .env("WAYLAND_DISPLAY", "wayland-0")
+                .spawn();
+
+            match xwayland_res {
+                Ok(child) => {
+                    let pid: u32 = child.id();
+                    self.xwayland_pid = Some(pid);
+                    eprintln!("[LUNAS] Xwayland started with PID: {}", pid);
+                }
+                Err(e) => {
+                    eprintln!("[LUNAS] Error: Failed to start Xwayland: {}", e);
+                }
+            }
         }
         self.dirty = true;
     }
