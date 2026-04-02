@@ -699,7 +699,7 @@ mod wayland_server_tests {
         server
     }
 
-    /// Regression: `wl_display::PAYLOAD_TYPES[2]` must be a single `NewId`
+    /// Regression: `wl_display::PAYLOAD_TYPES[1]` must be a single `NewId`
     /// (get_registry), not the error-event layout.
     #[test]
     fn get_registry_deserializes_and_creates_registry_object() {

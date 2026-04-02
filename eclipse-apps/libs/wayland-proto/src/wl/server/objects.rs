@@ -54,7 +54,7 @@ pub struct DisplayObject;
 impl ObjectLogic for DisplayObject {
     fn handle_request(&mut self, client: &mut Client, opcode: u16, args: &[Payload]) -> Result<(), ServerError> {
         match opcode {
-            2 => { // get_registry
+            1 => { // get_registry
                 let registry_id = match args[0] {
                     Payload::NewId(id) => id,
                     _ => return Err(ServerError::MessageDeserializeError),
