@@ -196,9 +196,6 @@ fn main() {
     let mut wayland_socket = lunas::wayland_socket::WaylandSocketServer::new("/tmp/wayland-0");
     if wayland_socket.is_none() {
         eprintln!("[LUNAS] Warning: could not bind /tmp/wayland-0 — standard Wayland clients won't connect");
-    } else {
-        // Start Xwayland now that the socket is ready
-        state.start_xwayland();
     }
 
     eprintln!("[LUNAS] Getting self PID...");

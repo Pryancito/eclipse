@@ -1,6 +1,8 @@
 //! X11 server for Eclipse OS (XWayland compatibility layer).
 use std::prelude::v1::*;
 use std::collections::BTreeMap;
+use alloc::vec::Vec;
+use alloc::vec;
 
 // ── libc bindings ─────────────────────────────────────────────────────────────
 extern "C" {

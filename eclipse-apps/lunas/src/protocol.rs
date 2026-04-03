@@ -845,7 +845,6 @@ impl ObjectLogic for LunasXwaylandSurface {
 }
 
 #[cfg(test)]
-
 mod wayland_server_tests {
     use super::{LunasCompositor, LunasShm, SharedBuffers, SharedCommits};
     use std::rc::Rc;

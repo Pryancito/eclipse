@@ -1144,35 +1144,6 @@ impl LunasState {
         self.dirty = true;
     }
 
-    pub fn start_xwayland(&mut self) {
-        #[cfg(target_vendor = "eclipse")]
-        {
-            eprintln!("[LUNAS] Starting Xwayland...");
-            // Use DISPLAY=:0 and WAYLAND_DISPLAY=wayland-0
-            // We use -rootless so X11 windows are managed as individual Wayland surfaces.
-            let xwayland_res = std::process::Command::new("Xwayland")
-                .arg(":0")
-                .arg("-rootless")
-                .arg("-terminate")
-                .arg("-accessx")
-                .arg("-core")
-                .env("WAYLAND_DISPLAY", "wayland-0")
-                .spawn();
-
-            match xwayland_res {
-                Ok(child) => {
-                    let pid: u32 = child.id();
-                    self.xwayland_pid = Some(pid);
-                    eprintln!("[LUNAS] Xwayland started with PID: {}", pid);
-                }
-                Err(e) => {
-                    eprintln!("[LUNAS] Error: Failed to start Xwayland: {}", e);
-                }
-            }
-        }
-        self.dirty = true;
-    }
-
     /// Update system metrics at a throttled rate.
     fn update_metrics_if_needed(&mut self) {
         let interval_ms = if self.input.dashboard_active || self.input.system_central_active {

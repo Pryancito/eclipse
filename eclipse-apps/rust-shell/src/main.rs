@@ -1,4 +1,3 @@
-#![no_std]
 extern crate alloc;
 
 use std::prelude::v1::*;
