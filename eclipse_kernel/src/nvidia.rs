@@ -216,7 +216,7 @@ pub fn handle_interrupt() {
     // of currently pending interrupt sources; writing back the same value clears
     // those bits and de-asserts the MSI line.
     for slot in &GPU_BAR0_VADDRS {
-        let bar0 = slot.load(AtomicOrdering::Relaxed);
+        let bar0 = slot.load(AtomicOrdering::Acquire);
         if bar0 == 0 {
             continue;
         }
@@ -1178,7 +1178,7 @@ pub fn init() {
         // Register BAR0 in the lock-free array so handle_interrupt() can clear
         // NV_PMC_INTR_0 without taking any lock (safe from interrupt context).
         if index < GPU_BAR0_VADDRS.len() {
-            GPU_BAR0_VADDRS[index].store(bar0_virt, AtomicOrdering::Relaxed);
+            GPU_BAR0_VADDRS[index].store(bar0_virt, AtomicOrdering::Release);
         }
 
         // Cross-validate architecture from hardware register
