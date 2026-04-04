@@ -109,7 +109,7 @@ impl Scheme for DrmScheme {
                 }
                 let info = unsafe { &mut *(arg as *mut DrmModeCreateDumb) };
                 let bytes_per_pixel = (info.bpp + 7) / 8;
-                let pitch = info.width * bytes_per_pixel;
+                let pitch = (info.width * bytes_per_pixel + 255) & !255;
                 let size = (pitch * info.height) as usize;
                 
                 if let Some(handle) = drm::alloc_buffer(size) {
@@ -364,7 +364,19 @@ impl Scheme for DrmScheme {
         // Offset here is what was returned in DRM_IOCTL_MODE_MAP_DUMB
         let handle_id = offset as u32;
         if let Some(handle) = drm::get_handle(handle_id) {
-            Ok(handle.phys_addr as usize)
+            let mut phys = handle.phys_addr as usize;
+            
+            // If the buffer is in VRAM (BAR1), signal that we want Write-Combining (WC)
+            // by setting the highest bit of the physical address (which is unused on x86_64).
+            if let Some(fb_info) = crate::nvidia::get_nvidia_fb_info() {
+                let (_, bar1_phys, _, _, _) = fb_info;
+                let bar1_size = 256 * 1024 * 1024; // Standard BAR1 size assumption
+                if handle.phys_addr >= bar1_phys && handle.phys_addr < bar1_phys + bar1_size as u64 {
+                    phys |= 1 << 63;
+                }
+            }
+            
+            Ok(phys)
         } else {
             Err(scheme_error::EINVAL)
         }

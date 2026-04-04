@@ -122,17 +122,18 @@ pub fn get_framebuffer_info() -> u64 {
 }
 
 /// Try to get framebuffer info. Prefer GOP (bootloader) over VirtIO for real hardware (e.g. NVIDIA).
-pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
+pub fn get_fb_info() -> Option<(u64, u32, u32, u32, usize, FbSource)> {
     // 1. NVIDIA BAR1 (linear VRAM aperture) – real hardware without EFI GOP or when native driver is loaded
     if let Some((phys, _bar1_phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
         if phys != 0 && w > 0 && h > 0 {
-            return Some((phys, w, h, pitch, FbSource::Nvidia));
+            let size = (pitch * h) as usize;
+            return Some((phys, w, h, pitch, size, FbSource::Nvidia));
         }
     }
     // 2. VirtIO display (e.g. QEMU)
-    if let Some((phys, w, h, pitch, _size)) = crate::virtio::get_primary_virtio_display() {
+    if let Some((phys, w, h, pitch, size)) = crate::virtio::get_primary_virtio_display() {
         if phys != 0 && w > 0 && h > 0 {
-            return Some((phys, w, h, pitch, FbSource::VirtIO));
+            return Some((phys, w, h, pitch, size, FbSource::VirtIO));
         }
     }
     // 3. GOP framebuffer from bootloader (UEFI) - fallback
@@ -144,7 +145,8 @@ pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
             fi.base_address
         };
         let pitch = fi.pixels_per_scan_line * 4;
-        return Some((phys, fi.width, fi.height, pitch, FbSource::Uefi));
+        let size = (pitch * fi.height) as usize;
+        return Some((phys, fi.width, fi.height, pitch, size, FbSource::Uefi));
     }
     None
 }

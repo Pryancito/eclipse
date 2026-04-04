@@ -65,6 +65,19 @@ struct NvidiaFbInfo {
 
 static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
 
+/// GSP RPC Client and CE status per-GPU.
+struct NvidiaGpuResources {
+    rpc: Option<RpcClient>,
+    bar0_virt: u64,
+    pci_bus: u8,
+}
+
+/// Global list of active NVIDIA GPU resources.
+static NVIDIA_RESOURCES: Mutex<Vec<NvidiaGpuResources>> = Mutex::new(Vec::new());
+
+/// Index of the primary display GPU within NVIDIA_RESOURCES.
+static PRIMARY_RESOURCE_INDEX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Kernel virtual address of the BAR1 mapping created by map_framebuffer_kernel().
 /// All kernel-side VRAM access (fill_rect, blit_rect, page_flip shadow-blit) uses
 /// this base instead of PHYS_MEM_OFFSET + phys, which only works when the HHDM
@@ -190,22 +203,21 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         }
     }
     fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
-        // Prefer system DMA memory for fast CPU access (Write-Back).
-        // Reading from VRAM (Write-Combining) is extremely slow (UC-like),
-        // which kills performance in software-assisted rendering/compositing.
-        unsafe {
-            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
-                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
+        // Step 1: Try allocating from VRAM (BAR1/Write-Combining)
+        // This places the render target on the GPU for zero-copy/fast-path flips.
+        {
+            let mut vram = VRAM_ALLOCATOR.lock();
+            if let Some(alloc) = vram.as_mut() {
+                if let Some(phys) = alloc.alloc(size, 4096) {
+                    return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
+                }
             }
         }
 
-        // Fallback to VRAM (BAR1 aperture) only if System RAM is exhausted
-        {
-            let mut allocator = VRAM_ALLOCATOR.lock();
-            if let Some(ref mut a) = *allocator {
-                if let Some(phys) = a.alloc(size, 4096) {
-                    return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
-                }
+        // Step 2: Fallback to system DMA memory
+        unsafe {
+            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
+                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
             }
         }
 
@@ -244,6 +256,7 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
             return true;
         }
 
+        // --- Software Fallback / Fast-Path: Contiguous MEMCPY ---
         let src_vaddr = if fb_phys >= bar1_phys && fb_phys < bar1_phys + bar1_size {
             // Source is in VRAM (BAR1)
             let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
@@ -266,12 +279,23 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         let dst_pitch = pitch as usize;
         let copy_width = (width as usize * 4).min(src_pitch).min(dst_pitch);
 
-        for py in 0..height as usize {
+        // Fast-path: Single block copy if pitches match and width is full
+        if src_pitch == dst_pitch && copy_width == src_pitch {
             unsafe {
-                let src_row = src_vaddr.add(py * src_pitch);
-                let dst_row = dst_vaddr.add(py * dst_pitch);
-                core::ptr::copy_nonoverlapping(src_row, dst_row, copy_width);
+                core::ptr::copy_nonoverlapping(src_vaddr, dst_vaddr, src_pitch * height as usize);
+                // Memory Barrier: Ensure all WC writes are flushed to VRAM
+                core::arch::x86_64::_mm_sfence();
             }
+        } else {
+            // Standard row-by-row copy
+            for py in 0..height as usize {
+                unsafe {
+                    let src_row = src_vaddr.add(py * src_pitch);
+                    let dst_row = dst_vaddr.add(py * dst_pitch);
+                    core::ptr::copy_nonoverlapping(src_row, dst_row, copy_width);
+                }
+            }
+            unsafe { core::arch::x86_64::_mm_sfence(); }
         }
         true
     }
@@ -284,9 +308,24 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         false
     }
     fn wait_vblank(&self, _crtc_id: u32) -> bool {
-        // Simplified: wait_vblank currently just yields if the driver doesn't have 
-        // a real hardware vblank interrupt implemented yet.
-        crate::scheduler::yield_cpu();
+        // Target 60 FPS (16ms per frame)
+        static LAST_VBLANK_TICK: AtomicU64 = AtomicU64::new(0);
+        
+        let now = crate::interrupts::ticks();
+        let last = LAST_VBLANK_TICK.load(AtomicOrdering::Relaxed);
+        
+        if now < last + 16 {
+            let delay = (last + 16) - now;
+            // For small delays, just yield. Longer delays are handled by the scheduler.
+            if delay < 5 {
+                crate::cpu::pause();
+            } else {
+                crate::scheduler::yield_cpu();
+            }
+            return true;
+        }
+
+        LAST_VBLANK_TICK.store(now, AtomicOrdering::Relaxed);
         true
     }
     fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
@@ -868,6 +907,11 @@ pub struct RpcClient {
     pub next_seq: u32,
 }
 
+// Safety: RpcClient contains a raw pointer to a GSP RPC queue.
+// Since we wrap the RpcClient in a Mutex, it is safe to Send and Sync.
+unsafe impl Send for RpcClient {}
+unsafe impl Sync for RpcClient {}
+
 impl RpcClient {
     pub fn new(phys_base: u64) -> Self {
         let virt = (PHYS_MEM_OFFSET + phys_base) as *mut GspRpcQueue;
@@ -922,7 +966,7 @@ pub fn init() {
     
     // Pre-identify the primary GPU by matching BAR1 with UEFI GOP address.
     // If no match is found, default to the first GPU (index 0).
-    let gop_phys = crate::boot::get_fb_info().and_then(|(phys, _, _, _, source)| {
+    let gop_phys = crate::boot::get_fb_info().and_then(|(phys, _, _, _, _, source)| {
         if source == crate::boot::FbSource::Uefi { Some(phys) } else { None }
     });
 
@@ -1110,7 +1154,7 @@ pub fn init() {
                 let mut fb_phys = bar1_phys;
                 
                 // Inherit from GOP if possible
-                if let Some((phys, w, h, p, source)) = crate::boot::get_fb_info() {
+                if let Some((phys, w, h, p, size, source)) = crate::boot::get_fb_info() {
                     if source == crate::boot::FbSource::Uefi {
                         width = w;
                         height = h;
@@ -1346,12 +1390,33 @@ pub fn init() {
                                 }
                                 if !found {
                                     serial::serial_print(" ⚠ RPC response timeout\n");
+                                } else {
+                                    // Store this GPU's resources
+                                    {
+                                        let mut res_guard = NVIDIA_RESOURCES.lock();
+                                        if index == primary_index {
+                                            PRIMARY_RESOURCE_INDEX.store(res_guard.len(), AtomicOrdering::SeqCst);
+                                        }
+                                        res_guard.push(NvidiaGpuResources {
+                                            rpc: Some(rpc),
+                                            bar0_virt,
+                                            pci_bus: gpu.bus,
+                                        });
+                                    }
                                 }
                             }
                             Err(e) => {
                                 serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
                                 serial::serial_print_dec(e as u64);
                                 serial::serial_print("\n");
+                                
+                                // Store minimal resources even if RPC fails
+                                let mut res_guard = NVIDIA_RESOURCES.lock();
+                                res_guard.push(NvidiaGpuResources {
+                                    rpc: None,
+                                    bar0_virt,
+                                    pci_bus: gpu.bus,
+                                });
                             }
                         }
 
@@ -1429,16 +1494,9 @@ pub fn update_all_gpu_vitals() {
 
     crate::ai_core::set_gpu_vram_stats(total_vram_bytes_all, used_vram_bytes_primary);
 
-    let gpus = find_nvidia_gpus();
-    for (i, pci_dev) in gpus.iter().enumerate().take(4) {
-        // We need BAR0 to read registers (temperature/engine heuristic).
-        // Here we rely on the HHDM phys->virt mapping.
-        let mut bar0 = 0u64;
-        let pci_bar0 = pci_dev.bar0;
-        if pci_bar0 != 0 {
-            bar0 = crate::memory::phys_to_virt(pci_bar0 & !0xF);
-        }
-
+    let resources = NVIDIA_RESOURCES.lock();
+    for res in resources.iter().take(4) {
+        let bar0 = res.bar0_virt;
         if bar0 != 0 {
             if let Some(temp) = read_temperature(bar0) {
                 // For load, we don't have a simple register yet, but we can 
@@ -1449,8 +1507,8 @@ pub fn update_all_gpu_vitals() {
                 let load = if raw_pmc & 0x1 != 0 { 45 } else { 2 }; // Heuristic/Mock for now
 
                 // Report temperature in Tenths of Celsius (450 = 45.0 C)
-                let mem_used = if i == 0 { used_vram_bytes_primary } else { 0 };
-                crate::ai_core::update_gpu_metrics_by_bus(pci_dev.bus, load, mem_used, (temp as u32) * 10);
+                // Note: Only the primary GPU's mem_used is currently tracked accurately.
+                crate::ai_core::update_gpu_metrics_by_bus(res.pci_bus, load, 0, (temp as u32) * 10);
             }
         }
     }

@@ -4,6 +4,7 @@ members = [
     "eclipse_std",
     "sidewind",
     "sidewind_core",
+    "sidewind_nvidia",
     "libs/ipc",
     "lunas",
     "terminal",

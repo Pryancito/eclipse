@@ -43,6 +43,8 @@ pub struct FramebufferState {
     pub background_addr: usize,
     pub drm_fd: usize,
     pub drm_crtc: display::control::CrtcHandle,
+    pub is_fallback: bool,
+    pub fb_ptr: Option<*mut u8>,
     pub gpu: Option<sidewind::gpu::GpuDevice>,
 }
 
@@ -111,6 +113,8 @@ impl FramebufferState {
                 background_addr,
                 drm_fd: dev.fd as usize,
                 drm_crtc: dev.crtc,
+                is_fallback: dev.is_fallback,
+                fb_ptr: dev.fb_ptr,
                 gpu: Some(sidewind::gpu::GpuDevice::new()),
             })
         }
@@ -150,9 +154,17 @@ impl FramebufferState {
         {
             let dev = DisplayDevice {
                 fd: self.drm_fd,
-                caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                caps: DisplayCaps { 
+                    width: self.info.width, 
+                    height: self.info.height, 
+                    max_width: self.info.width, 
+                    max_height: self.info.height, 
+                    pitch: self.info.pitch 
+                },
                 crtc: self.drm_crtc,
                 connector: display::control::ConnectorHandle(0),
+                is_fallback: self.is_fallback,
+                fb_ptr: self.fb_ptr,
             };
 
             let _ = dev.page_flip(self.back_fb_id);

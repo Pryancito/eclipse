@@ -172,7 +172,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // here because no IDT is loaded yet; a page fault would triple-fault and freeze
     // the system with no serial output.
     unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+        if let Some((fb_base, _, _, pitch, _, _)) = boot::get_fb_info() {
             let fb = fb_base as *mut u32;
             // CYAN square at x=40
             for y in 0..10 {

@@ -36,6 +36,7 @@ const PCI_VENDOR_QEMU: u16 = 0x1AF4; // Red Hat (QEMU VirtIO)
 const PCI_VENDOR_NVIDIA: u16 = 0x10DE; // NVIDIA Corporation
 const PCI_VENDOR_INTEL: u16 = 0x8086; // Intel Corporation
 const PCI_VENDOR_AMD: u16 = 0x1022; // AMD
+const PCI_VENDOR_VBOX: u16 = 0x80EE; // VirtualBox
 
 /// PCI Device Classes
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -44,6 +45,17 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 const PCI_CLASS_MULTIMEDIA: u8 = 0x04;  // Audio/Video devices
 const PCI_CLASS_BRIDGE: u8 = 0x06;  // Bridge devices
 const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;  // Serial bus controllers (USB, etc.)
+
+/// VirtIO PCI Device IDs (Modern/Non-Transitional)
+pub const VIRTIO_DEV_NET: u16 = 0x1041;
+pub const VIRTIO_DEV_BLOCK: u16 = 0x1042;
+pub const VIRTIO_DEV_GPU: u16 = 0x1050;
+
+/// VirtIO PCI Device IDs (Legacy/Transitional)
+pub const VIRTIO_DEV_NET_LEGACY: u16 = 0x1000;
+pub const VIRTIO_DEV_BLOCK_LEGACY: u16 = 0x1001;
+pub const VIRTIO_DEV_GPU_LEGACY: u16 = 0x1010;
+pub const VIRTIO_DEV_VGA_MODERN: u16 = 0x1050; // Often shared with GPU
 
 /// PCI Multimedia Subclasses
 const PCI_SUBCLASS_AUDIO_AC97: u8 = 0x01;  // AC97 Audio Controller
@@ -131,6 +143,16 @@ impl PciDevice {
         self.vendor_id == PCI_VENDOR_NVIDIA && self.class_code == PCI_CLASS_DISPLAY
     }
 
+    /// Check if this is a VirtIO GPU
+    pub fn is_virtio_gpu(&self) -> bool {
+        self.is_virtio() && (self.device_id == VIRTIO_DEV_GPU || self.device_id == VIRTIO_DEV_GPU_LEGACY)
+    }
+
+    /// Check if this is a VirtualBox VGA device
+    pub fn is_vbox_gpu(&self) -> bool {
+        self.vendor_id == PCI_VENDOR_VBOX && self.device_id == 0xBEEF
+    }
+
     /// Get the device type string
     pub fn device_type(&self) -> &'static str {
         match (self.class_code, self.subclass) {
@@ -153,7 +175,18 @@ impl PciDevice {
                 PCI_PROGIF_USB_XHCI => "USB XHCI Controller",
                 _ => "USB Controller",
             },
-            _ => "Unknown Device",
+            _ => {
+                if self.is_virtio() {
+                    match self.device_id {
+                        VIRTIO_DEV_NET | VIRTIO_DEV_NET_LEGACY => "VirtIO Network Card",
+                        VIRTIO_DEV_BLOCK | VIRTIO_DEV_BLOCK_LEGACY => "VirtIO Block Device",
+                        VIRTIO_DEV_GPU => "VirtIO GPU",
+                        _ => "VirtIO Device",
+                    }
+                } else {
+                    "Unknown Device"
+                }
+            },
         }
     }
     
@@ -473,10 +506,11 @@ pub fn init() {
             } else if dev.is_virtio() {
                 serial::serial_print(" [VirtIO");
                 // Identify specific VirtIO device types
-                if dev.device_id == 0x1001 || dev.device_id == 0x1042 {
-                    serial::serial_print(" Block]");
-                } else {
-                    serial::serial_print("]");
+                match dev.device_id {
+                    VIRTIO_DEV_BLOCK | VIRTIO_DEV_BLOCK_LEGACY => serial::serial_print(" Block]"),
+                    VIRTIO_DEV_NET | VIRTIO_DEV_NET_LEGACY => serial::serial_print(" Net]"),
+                    VIRTIO_DEV_GPU => serial::serial_print(" GPU]"),
+                    _ => serial::serial_print("]"),
                 }
             }
             serial::serial_print("\n");

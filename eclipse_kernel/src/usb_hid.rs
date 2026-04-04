@@ -1987,7 +1987,7 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
     state.max_ports = max_ports;
     state.context_size = if csz == 1 { 64 } else { 32 };
     // Read framebuffer size for tablet absolute-to-relative conversion
-    if let Some((_phys, fb_w, fb_h, _pitch, _src)) = crate::boot::get_fb_info() {
+    if let Some((_phys, fb_w, fb_h, _pitch, _size, _src)) = crate::boot::get_fb_info() {
         state.fb_width  = fb_w;
         state.fb_height = fb_h;
     }

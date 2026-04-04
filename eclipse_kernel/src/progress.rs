@@ -100,7 +100,7 @@ static LOG_HUD_PID: AtomicU32 = AtomicU32::new(0);
 /// Initialize the dedicated WC framebuffer mapping.
 /// Should be called AFTER memory::init() so the heap is available for page tables.
 pub fn init() {
-    if let Some((phys, _, height, pitch, _)) = get_fb_info() {
+    if let Some((phys, _, height, pitch, _, _)) = get_fb_info() {
         let size = (pitch as usize) * (height as usize);
         crate::serial::serial_print("[PROGRESS] Mapping dedicated FB: phys=");
         crate::serial::serial_print_hex(phys);
@@ -212,7 +212,7 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
     let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
@@ -370,7 +370,7 @@ pub fn log(msg: &str) {
                 let logging_enabled = LOGGING_ENABLED.load(Ordering::SeqCst);
                 let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
                 if logging_enabled && mapped != 0 {
-                    if let Some((phys, width, height, pitch, source)) = get_fb_info() {
+                    if let Some((phys, width, height, pitch, size, source)) = get_fb_info() {
                         if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
                             render_log_line(line, source, width, height, pitch, phys);
                         }
@@ -492,7 +492,7 @@ pub fn bsod(info: &BsodInfo) {
     }
     let _lock_guard = guard; // Hold for the remainder of bsod() to serialise FB access.
 
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
     
     // Safety check: Verificar que la dirección física del FB no sea nula y esté
     // dentro de un rango razonable para evitar un Triple Fault si phys_to_virt falla.
@@ -640,7 +640,7 @@ pub unsafe fn force_unlock_all() {
 /// Actualiza la caché del framebuffer mapeado si el driver gráfico cambia en caliente
 /// (ej. cuando VirtIOGPU o NVIDIA toman control del GOP UEFI).
 pub fn update_fb_mapping() {
-    if let Some((phys_addr, _w, _h, _pitch, _source)) = get_fb_info() {
+    if let Some((phys_addr, _w, _h, _pitch, _size, _source)) = get_fb_info() {
         let virt = if phys_addr >= crate::memory::PHYS_MEM_OFFSET {
             phys_addr // Ya está mapeada en HH
         } else {

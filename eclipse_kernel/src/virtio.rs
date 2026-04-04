@@ -3258,9 +3258,9 @@ pub fn init() {
         }
     }
 
-    // Search for VirtIO network devices (0x1000 legacy, 0x1041 modern)
+    // Search for VirtIO network devices
     for dev in crate::pci::get_all_devices() {
-        if dev.is_virtio() && (dev.device_id == 0x1000 || dev.device_id == 0x1041) {
+        if dev.is_virtio() && (dev.device_id == crate::pci::VIRTIO_DEV_NET_LEGACY || dev.device_id == crate::pci::VIRTIO_DEV_NET) {
             serial::serial_print("[VirtIO-Net] Found network device on PCI! Bus=");
             serial::serial_print_dec(dev.bus as u64);
             serial::serial_print(" Dev=");
@@ -3270,9 +3270,9 @@ pub fn init() {
             unsafe {
                 crate::pci::enable_device(&dev, true);
 
-                // For modern devices (VirtIO 1.0, device_id 0x1041), use the capability-based
+                // For modern devices (VirtIO 1.0), use the capability-based
                 // modern PCI initialization path which locates BARs via the capabilities list.
-                if dev.device_id == 0x1041 {
+                if dev.device_id == crate::pci::VIRTIO_DEV_NET {
                     if let Some(virt_dev) = VirtIONetDevice::init_from_pci_modern(&dev) {
                         let arc_dev = alloc::sync::Arc::new(virt_dev);
                         NET_DEVICES.lock().push(arc_dev.clone());
@@ -3325,9 +3325,9 @@ pub fn init() {
         }
     }
 
-    // Search for VirtIO GPU devices (PCI 0x1050 = virtio-gpu, virtio-vga, virtio-vga-gl)
+    // Search for VirtIO GPU devices
     for dev in crate::pci::get_all_devices() {
-        if dev.is_virtio() && dev.device_id == 0x1050 {
+        if dev.is_virtio_gpu() {
             serial::serial_print("[VirtIO-GPU] Found virtio-gpu on PCI Bus=");
             serial::serial_print_dec(dev.bus as u64);
             serial::serial_print(" Dev=");
@@ -3399,7 +3399,7 @@ pub fn init() {
                                 serial::serial_print("\n");
                                 
                                 // Sync with boot resolution if GOP is active
-                                if let Some((_, boot_w, boot_h, _, _)) = crate::boot::get_fb_info() {
+                                if let Some((_, boot_w, boot_h, _, _, _)) = crate::boot::get_fb_info() {
                                     if w != boot_w || h != boot_h {
                                         serial::serial_print("[VirtIO-GPU] Resizing to match boot: ");
                                         serial::serial_print_dec(boot_w as u64);
@@ -3815,7 +3815,7 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
 pub fn gpu_flush_primary() {
     if let Some(mut devices) = GPU_DEVICES.try_lock() {
         if let Some(gpu) = devices.get_mut(0) {
-            if let Some((_, w, h, _, _)) = crate::boot::get_fb_info() {
+            if let Some((_, w, h, _, _, _)) = crate::boot::get_fb_info() {
                 let _ = gpu.resource_flush(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, w, h);
             }
         }

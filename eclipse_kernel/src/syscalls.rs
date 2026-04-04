@@ -2678,6 +2678,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
 
         // Try to use fmap for shared mappings
         let mut fmap_phys_base = None;
+        let mut mmap_prot = prot;
+
         if is_shared {
             if let Some(ref fde) = fd_entry {
                 if let Ok(phys) = crate::scheme::fmap(
@@ -2686,7 +2688,11 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                     offset as usize,
                     aligned_length as usize,
                 ) {
-                    fmap_phys_base = Some(phys as u64);
+                    // Detect Write-Combining (WC) signal in bit 63
+                    if (phys >> 63) != 0 {
+                        mmap_prot |= 0x08; // PAGE_WRITE_THROUGH -> PAT index 1 (WC)
+                    }
+                    fmap_phys_base = Some((phys & !(1 << 63)) as u64);
                 }
             }
         }
@@ -2726,7 +2732,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 0 // map to 0 as fallback
             };
 
-            memory::map_user_page_4kb(page_table_phys, current, frame_phys, prot);
+            memory::map_user_page_4kb(page_table_phys, current, frame_phys, mmap_prot);
             current += 4096;
         }
 
