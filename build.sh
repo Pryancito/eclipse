@@ -107,7 +107,7 @@ build_eclipse_syscall() {
     cd eclipse-syscall
     
     print_status "Compilando eclipse-syscall..."
-    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
+    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo +nightly -Z unstable-options -Z json-target-spec build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-syscall compilado exitosamente"
@@ -141,7 +141,7 @@ build_eclipse_libc() {
     cd eclipse-relibc
     
     print_status "Compilando eclipse-relibc..."
-    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
+    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options -Z json-target-spec build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-relibc compilado exitosamente"
@@ -196,7 +196,7 @@ build_sidewind_project() {
     
     # Construir eclipse_std primero para tener el bridge de la librería estándar
     print_status "Construyendo eclipse_std (std bridge)..."
-    cargo +nightly build -p eclipse_std --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
+    cargo +nightly -Z json-target-spec build -p eclipse_std --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
     
     # La std sustituta es eclipse_std vía [patch.crates-io] en eclipse-apps/Cargo.toml.
     # NO usar RUSTFLAGS='--extern std=...libstd-....rlib': en nightly reciente provoca ICE en
@@ -204,7 +204,7 @@ build_sidewind_project() {
 
     set +e
     WAYLAND_CLIENT_NO_PKG_CONFIG=1 LIBUDEV_NO_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1 \
-    cargo +nightly build --workspace --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
+    cargo +nightly -Z json-target-spec build --workspace --target "$ECLIPSE_TARGET" -Z build-std=core,alloc --release
     _sidewind_build_status=$?
     set -e
 
@@ -300,7 +300,7 @@ build_eclipse_std() {
     cd eclipse-apps/eclipse_std
     
     print_status "Compilando eclipse_std (y deps: eclipse-syscall, eclipse-libc)..."
-    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
+    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options -Z json-target-spec build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse_std compilado exitosamente"
@@ -406,7 +406,7 @@ build_eclipse_init() {
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
+    RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly -Z json-target-spec build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"
@@ -460,7 +460,7 @@ build_userspace_services() {
         fi
         
         # Todos los servicios usan eclipse_std (target x86_64-unknown-eclipse, fn main)
-        RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
+        RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly -Z json-target-spec build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
         local build_ok=$?
         local service_path="target/x86_64-unknown-eclipse/release/$service"
         

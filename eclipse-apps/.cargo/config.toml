@@ -1,11 +1,17 @@
+[unstable]
+# Habilita el uso de archivos .json como especificación de target (requerido en nightly reciente)
+json-target-spec = true
+# Compila core y alloc desde fuente para el target personalizado
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
 [build]
-target = "/home/moebius/eclipse/x86_64-unknown-eclipse.json"
+# El JSON del target Eclipse OS está en el mismo directorio eclipse-apps/
+target = "./x86_64-unknown-eclipse.json"
 
 [target.x86_64-unknown-eclipse]
 rustflags = [
     "-Z", "unstable-options",
-    # "--sysroot", "/home/moebius/eclipse/sysroot-v2",
-    "-C", "link-arg=-L/home/moebius/eclipse",
-    "-C", "link-arg=-Tlinker.ld",
+    # El linker script se provee vía build.rs de cada crate binario (ruta absoluta)
     "-C", "relocation-model=static",
 ]
