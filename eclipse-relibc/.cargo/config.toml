@@ -1,0 +1,13 @@
+[unstable]
+json-target-spec = true
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "../x86_64-unknown-eclipse.json"
+
+[target.x86_64-unknown-eclipse]
+rustflags = [
+    "-Zunstable-options",
+    "--cfg", "eclipse_target",
+]
