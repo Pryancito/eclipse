@@ -84,6 +84,9 @@ static PRIMARY_RESOURCE_INDEX: core::sync::atomic::AtomicUsize = core::sync::ato
 /// covers the physical address (it does NOT for high-address BARs ≥ top-of-RAM).
 static NVIDIA_BAR1_KERNEL_VADDR: AtomicU64 = AtomicU64::new(0);
 
+/// Page granularity used by the VRAM bitmap allocator (4 KiB).
+const VRAM_PAGE_SIZE: u64 = 4096;
+
 /// Simple chunk-based VRAM allocator for BAR1 aperture
 /// Bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
 struct NvidiaVramAllocator {
@@ -94,7 +97,7 @@ struct NvidiaVramAllocator {
 
 impl NvidiaVramAllocator {
     fn new(base_phys: u64, total_size: u64) -> Self {
-        let num_pages = (total_size / 4096) as usize;
+        let num_pages = (total_size / VRAM_PAGE_SIZE) as usize;
         let num_u64s = (num_pages + 63) / 64;
         Self {
             base_phys,
@@ -104,10 +107,10 @@ impl NvidiaVramAllocator {
     }
 
     fn alloc(&mut self, size: usize, align: usize) -> Option<u64> {
-        let num_pages = (size + 4095) / 4096;
-        let align_pages = (align.max(4096) / 4096).max(1);
+        let num_pages = (size + VRAM_PAGE_SIZE as usize - 1) / VRAM_PAGE_SIZE as usize;
+        let align_pages = (align.max(VRAM_PAGE_SIZE as usize) / VRAM_PAGE_SIZE as usize).max(1);
         
-        let total_bits = (self.total_size / 4096) as usize;
+        let total_bits = (self.total_size / VRAM_PAGE_SIZE) as usize;
         
         // Find a contiguous range of free bits
         let mut count = 0;
@@ -134,7 +137,7 @@ impl NvidiaVramAllocator {
                         let b = start_bit + i;
                         self.bitmap[b / 64] |= 1 << (b % 64);
                     }
-                    return Some(self.base_phys + (start_bit as u64 * 4096));
+                    return Some(self.base_phys + (start_bit as u64 * VRAM_PAGE_SIZE));
                 }
             } else {
                 count = 0;
@@ -147,8 +150,8 @@ impl NvidiaVramAllocator {
     /// Used to prevent GEM buffer allocations from landing on top of the display
     /// scanout framebuffer that was set up by the UEFI GOP.
     fn reserve_region(&mut self, offset: u64, size: u64) {
-        let start_page = (offset / 4096) as usize;
-        let num_pages = ((size + 4095) / 4096) as usize;
+        let start_page = (offset / VRAM_PAGE_SIZE) as usize;
+        let num_pages = ((size + VRAM_PAGE_SIZE - 1) / VRAM_PAGE_SIZE) as usize;
         for i in 0..num_pages {
             let bit = start_page + i;
             if bit / 64 < self.bitmap.len() {
@@ -161,8 +164,8 @@ impl NvidiaVramAllocator {
         let offset = phys_addr.saturating_sub(self.base_phys);
         if offset >= self.total_size { return; }
         
-        let start_bit = (offset / 4096) as usize;
-        let num_pages = (size + 4095) / 4096;
+        let start_bit = (offset / VRAM_PAGE_SIZE) as usize;
+        let num_pages = (size + VRAM_PAGE_SIZE as usize - 1) / VRAM_PAGE_SIZE as usize;
         
         for i in 0..num_pages {
             let b = start_bit + i;
@@ -182,7 +185,7 @@ impl NvidiaVramAllocator {
     }
 
     fn used_bytes(&self) -> u64 {
-        self.used_pages().saturating_mul(4096)
+        self.used_pages().saturating_mul(VRAM_PAGE_SIZE)
     }
 }
 
