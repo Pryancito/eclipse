@@ -1,4 +1,4 @@
-/* Linker script for smithay_app (Eclipse compositor) - dirección fija para evitar PIE/reloc */
+/* Linker script for wayland_calculator - dirección fija para evitar PIE/reloc */
 
 ENTRY(_start)
 
