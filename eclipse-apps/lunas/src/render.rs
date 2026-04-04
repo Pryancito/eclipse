@@ -99,7 +99,7 @@ impl FramebufferState {
                 address: fb_front.addr as u64,
                 width: dev.caps.width,
                 height: dev.caps.height,
-                pitch: dev.caps.pitch,
+                pitch: fb_front.pitch,
                 bpp: 32,
                 ..Default::default()
             };
@@ -361,18 +361,29 @@ impl FramebufferState {
             // read fewer pixels than expected rather than overrunning into the wrong row.
             let stride = src_stride.max(src_w) as usize;
 
-            for row in 0..src_h as i32 {
-                let dy = dst_y + row;
-                if dy < 0 || dy >= fb_h { continue; }
-                for col in 0..src_w as i32 {
-                    let dx = dst_x + col;
-                    if dx < 0 || dx >= fb_w { continue; }
-                    let src_offset = (row as usize) * stride + (col as usize);
-                    let dst_offset = (dy as usize) * pitch_px + (dx as usize);
-                    unsafe {
-                        let pixel = core::ptr::read_volatile((vaddr as *const u32).add(src_offset));
-                        core::ptr::write_volatile((self.back_addr as *mut u32).add(dst_offset), pixel);
-                    }
+            // Compute the clipped copy region once, then do a single
+            // copy_nonoverlapping per row.  This replaces the previous per-pixel
+            // volatile loop and lets the compiler emit SIMD memcpy instructions,
+            // which is ~10–50× faster — critical when writing to a large back buffer.
+            let row_start = if dst_y < 0 { (-dst_y) as u32 } else { 0 };
+            let row_end = src_h.min((fb_h - dst_y.max(0)).max(0) as u32);
+            let col_start = if dst_x < 0 { (-dst_x) as u32 } else { 0 };
+            let col_end = src_w.min((fb_w - dst_x.max(0)).max(0) as u32);
+
+            if row_start >= row_end || col_start >= col_end {
+                return;
+            }
+            let copy_w = (col_end - col_start) as usize;
+
+            unsafe {
+                for row in row_start..row_end {
+                    let dy = (dst_y + row as i32) as usize;
+                    let dx = (dst_x + col_start as i32) as usize;
+                    let src_ptr = (vaddr as *const u32)
+                        .add(row as usize * stride + col_start as usize);
+                    let dst_ptr = (self.back_addr as *mut u32)
+                        .add(dy * pitch_px + dx);
+                    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_w);
                 }
             }
         }
@@ -1498,11 +1509,7 @@ fn draw_window(
                 if let Some(surface) = snp_surfaces.get(&(pid, surface_id)) {
                     if surface.active && surface.vaddr != 0 {
                         let fb_ptr = fb.back_addr as *mut u32;
-                        let fb_stride = fb.info.width as usize;
-
-                        // Use the surface's own buffer_w as the row stride and only
-                        // copy min(cw, buf_w) pixels per row so we never read past
-                        // the end of the client's allocated buffer.
+                        let fb_stride = fb.info.pitch as usize / 4;
                         let buf_w = surface.buffer_w as i32;
                         let buf_h = surface.buffer_h as i32;
                         let copy_w = cw.min(buf_w).max(0) as usize;
@@ -1559,7 +1566,7 @@ fn draw_window(
                 if let Some(buf) = x11_surfaces.get(&window_id) {
                     if !buf.pixels.is_empty() && buf.width > 0 && buf.height > 0 {
                         let fb_ptr = fb.back_addr as *mut u32;
-                        let fb_stride = fb.info.width as usize;
+                        let fb_stride = fb.info.pitch as usize / 4;
                         let copy_w = (cw as u32).min(buf.width) as usize;
                         let copy_h = (content_h as u32).min(buf.height) as usize;
                         for row in 0..copy_h {

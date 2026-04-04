@@ -143,6 +143,20 @@ impl NvidiaVramAllocator {
         None
     }
 
+    /// Mark a region of VRAM (by offset from base_phys) as permanently reserved.
+    /// Used to prevent GEM buffer allocations from landing on top of the display
+    /// scanout framebuffer that was set up by the UEFI GOP.
+    fn reserve_region(&mut self, offset: u64, size: u64) {
+        let start_page = (offset / 4096) as usize;
+        let num_pages = ((size + 4095) / 4096) as usize;
+        for i in 0..num_pages {
+            let bit = start_page + i;
+            if bit / 64 < self.bitmap.len() {
+                self.bitmap[bit / 64] |= 1u64 << (bit % 64);
+            }
+        }
+    }
+
     fn free(&mut self, phys_addr: u64, size: usize) {
         let offset = phys_addr.saturating_sub(self.base_phys);
         if offset >= self.total_size { return; }
@@ -203,21 +217,34 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         }
     }
     fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
-        // Step 1: Try allocating from VRAM (BAR1/Write-Combining)
-        // This places the render target on the GPU for zero-copy/fast-path flips.
+        // Prefer system RAM for compositor GEM buffers.
+        //
+        // When a GEM buffer is placed in VRAM at the same physical address as the
+        // GOP scanout, page_flip short-circuits (fb_phys == scanout_phys) and the
+        // compositor writes directly to the display scanout using caps.pitch =
+        // visible_width * 4, while the GPU display controller reads with
+        // pixels_per_scan_line * 4 set by UEFI.  If those differ, every row is
+        // offset → parallelogram / skewed-window artefact.
+        //
+        // Allocating from RAM guarantees fb_phys != scanout_phys, so page_flip
+        // always performs the correct row-by-row pitch-converting copy from RAM
+        // into the VRAM scanout region.  RAM → VRAM via the WC BAR1 mapping is
+        // also faster than the previous VRAM-sourced copy path.
+        unsafe {
+            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
+                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
+            }
+        }
+
+        // Fallback: VRAM (BAR1) if system RAM is exhausted.
+        // The scanout region is reserved in the bitmap, so allocations here
+        // will never alias the display framebuffer.
         {
             let mut vram = VRAM_ALLOCATOR.lock();
             if let Some(alloc) = vram.as_mut() {
                 if let Some(phys) = alloc.alloc(size, 4096) {
                     return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
                 }
-            }
-        }
-
-        // Step 2: Fallback to system DMA memory
-        unsafe {
-            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
-                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
             }
         }
 
@@ -1201,6 +1228,18 @@ pub fn init() {
                 
                 let mut vram_guard = VRAM_ALLOCATOR.lock();
                 *vram_guard = Some(NvidiaVramAllocator::new(bar1_phys, alloc_size));
+
+                // Reserve the GOP/UEFI scanout region inside the VRAM bitmap so that
+                // compositor GEM buffer allocations never land on top of the display
+                // framebuffer.  Without this reservation the allocator returns
+                // bar1_phys (== fb_phys), causing page_flip to short-circuit and the
+                // compositor to write directly to scanout memory with the wrong pitch.
+                if let Some(ref mut allocator) = *vram_guard {
+                    let scanout_offset = fb_phys.saturating_sub(bar1_phys);
+                    let scanout_size = (pitch as u64) * (height as u64);
+                    allocator.reserve_region(scanout_offset, scanout_size);
+                    serial::serial_print("[NVIDIA]   Scanout region reserved in VRAM allocator\n");
+                }
                 
                 serial::serial_print("[NVIDIA]   ✓ Primary Display initialized (GPU ");
                 serial::serial_print_dec(index as u64);
