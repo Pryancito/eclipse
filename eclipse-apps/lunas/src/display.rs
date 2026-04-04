@@ -852,7 +852,7 @@ impl DisplayDevice {
                 addr,
                 width: self.caps.width,
                 height: self.caps.height,
-                pitch: self.caps.pitch,
+                pitch: db.pitch,
             })
         }
         #[cfg(not(target_vendor = "eclipse"))]
