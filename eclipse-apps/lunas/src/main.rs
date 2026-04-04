@@ -214,8 +214,9 @@ fn main() {
             }
         }
         state.handle_ipc();
-        state.update();
-        state.render();
+        if state.update() {
+            state.render();
+        }
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }

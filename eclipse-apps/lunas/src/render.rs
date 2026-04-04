@@ -38,9 +38,15 @@ pub struct FramebufferState {
     pub info: FramebufferInfo,
     pub back_fb_id: display::control::framebuffer::Handle,
     pub front_fb_id: display::control::framebuffer::Handle,
+    /// DRM dumb buffer addresses (GPU / uncached memory).  Never write pixels
+    /// directly here; use `shadow_buf` instead and let `present()` flush.
     pub back_addr: usize,
     pub front_addr: usize,
-    pub background_addr: usize,
+    /// CPU-side (heap-allocated, cache-friendly) render target.
+    /// All drawing happens here; flushed to `back_addr` once per `present()`.
+    pub shadow_buf: Vec<u32>,
+    /// CPU-side pre-rendered background (heap-allocated, cache-friendly).
+    pub background_buf: Vec<u32>,
     pub drm_fd: usize,
     pub drm_crtc: display::control::CrtcHandle,
     pub is_fallback: bool,
@@ -77,23 +83,10 @@ impl FramebufferState {
                 }
             };
 
-            let background_addr = if let Ok(db) = dev.create_dumb_buffer(dev.caps.width, dev.caps.height, 32) {
-                match dev.map_buffer(db.handle, db.size) {
-                    Ok(ptr) => ptr as usize,
-                    Err(e) => {
-                        eprintln!("[LUNAS] Failed to map background buffer: {:?}", e);
-                        0
-                    }
-                }
-            } else {
-                eprintln!("[LUNAS] Failed to create background dumb buffer");
-                0
-            };
-            
-            if background_addr == 0 {
-                return None;
-            }
-            eprintln!("[LUNAS] Framebuffers and background buffer initialized.");
+            let fb_size = (dev.caps.pitch / 4 * dev.caps.height) as usize;
+            let shadow_buf = vec![0u32; fb_size];
+            let background_buf = vec![0u32; fb_size];
+            eprintln!("[LUNAS] Framebuffers and shadow/background buffers initialized ({}×{}).", dev.caps.width, dev.caps.height);
 
             let info = FramebufferInfo {
                 address: fb_front.addr as u64,
@@ -110,7 +103,8 @@ impl FramebufferState {
                 front_fb_id: fb_front.fb_id,
                 back_addr: fb_back.addr,
                 front_addr: fb_front.addr,
-                background_addr,
+                shadow_buf,
+                background_buf,
                 drm_fd: dev.fd as usize,
                 drm_crtc: dev.crtc,
                 is_fallback: dev.is_fallback,
@@ -135,15 +129,19 @@ impl FramebufferState {
             bpp: 32,
             address: 0,
         };
+        let fb_size = (DEFAULT_WIDTH * DEFAULT_HEIGHT) as usize;
         Self {
             info,
             back_fb_id: display::control::framebuffer::Handle(0),
             front_fb_id: display::control::framebuffer::Handle(0),
             back_addr: 0x1000,
             front_addr: 0x2000,
-            background_addr: 0x3000,
+            shadow_buf: vec![0u32; fb_size],
+            background_buf: vec![0u32; fb_size],
             drm_fd: 0,
             drm_crtc: display::control::CrtcHandle(0),
+            is_fallback: false,
+            fb_ptr: None,
             gpu: None,
         }
     }
@@ -152,6 +150,15 @@ impl FramebufferState {
     pub fn present(&mut self) -> bool {
         #[cfg(all(not(test), target_vendor = "eclipse"))]
         {
+            // Flush the CPU-side shadow buffer (cached system RAM) to the DRM
+            // dumb buffer (potentially uncached GPU memory) in one bulk copy.
+            // This is far faster than writing individual pixels to uncached
+            // memory, which is the primary cause of slowness on NVIDIA hardware.
+            let size = (self.info.pitch * self.info.height) as usize;
+            let src = self.shadow_buf.as_ptr() as *const u8;
+            let dst = self.back_addr as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(src, dst, size); }
+
             let dev = DisplayDevice {
                 fd: self.drm_fd,
                 caps: DisplayCaps { 
@@ -183,15 +190,7 @@ impl FramebufferState {
         #[cfg(not(test))]
         {
             let pixel = 0xFF00_0000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let pitch_px = self.info.pitch as usize / 4;
-            let ptr = self.back_addr as *mut u32;
-            for y in 0..self.info.height as usize {
-                for x in 0..self.info.width as usize {
-                    unsafe {
-                        core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel);
-                    }
-                }
-            }
+            self.shadow_buf.fill(pixel);
         }
     }
 
@@ -207,7 +206,6 @@ impl FramebufferState {
         #[cfg(not(test))]
         {
             let pitch_px = self.info.pitch as usize / 4;
-            let ptr = self.background_addr as *mut u32;
             let h = self.info.height as usize;
             let w = self.info.width as usize;
 
@@ -217,11 +215,7 @@ impl FramebufferState {
                         | ((color.0 as u32) << 16)
                         | ((color.1 as u32) << 8)
                         | (color.2 as u32);
-                    for y in 0..h {
-                        for x in 0..w {
-                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
-                        }
-                    }
+                    self.background_buf.fill(pixel);
                 }
                 WallpaperMode::Gradient => {
                     // Top: base colour; bottom: darkened by ~50 %.
@@ -240,7 +234,7 @@ impl FramebufferState {
                         let b = lerp(b0, b1, t);
                         let pixel = 0xFF00_0000u32 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
                         for x in 0..w {
-                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
+                            self.background_buf[y * pitch_px + x] = pixel;
                         }
                     }
                 }
@@ -255,7 +249,7 @@ impl FramebufferState {
                                 | ((r as u32) << 16)
                                 | ((g as u32) << 8)
                                 | (b as u32);
-                            unsafe { core::ptr::write_volatile(ptr.add(y * pitch_px + x), pixel); }
+                            self.background_buf[y * pitch_px + x] = pixel;
                         }
                     }
                     // Deterministic starfield.
@@ -270,25 +264,18 @@ impl FramebufferState {
                             | ((brightness as u32) << 16)
                             | ((brightness as u32) << 8)
                             | (brightness as u32);
-                        unsafe { core::ptr::write_volatile(ptr.add(sy * pitch_px + sx), star_pixel); }
+                        self.background_buf[sy * pitch_px + sx] = star_pixel;
                     }
                 }
             }
         }
     }
 
-    /// Blit the pre-rendered background to the back buffer.
+    /// Blit the pre-rendered background to the shadow buffer.
     pub fn blit_background(&mut self) {
         #[cfg(not(test))]
         {
-            let size = (self.info.pitch * self.info.height) as usize;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.background_addr as *const u8,
-                    self.back_addr as *mut u8,
-                    size,
-                );
-            }
+            self.shadow_buf.copy_from_slice(&self.background_buf);
         }
     }
 
@@ -298,21 +285,18 @@ impl FramebufferState {
         #[cfg(not(test))]
         {
             let pitch_px = self.info.pitch as usize / 4;
-            let ptr = self.back_addr as *mut u32;
             let reduction = (strength as u32 * NIGHT_LIGHT_MAX_BLUE_REDUCTION) / 100;
             let red_boost = (strength as u32 * NIGHT_LIGHT_RED_WARMTH) / 100;
             for y in 0..self.info.height as usize {
                 for x in 0..self.info.width as usize {
-                    unsafe {
-                        let pixel = core::ptr::read_volatile(ptr.add(y * pitch_px + x));
-                        let r = (pixel >> 16) & 0xFF;
-                        let g = (pixel >> 8) & 0xFF;
-                        let b = pixel & 0xFF;
-                        let new_r = (r + red_boost).min(255);
-                        let new_b = b.saturating_sub(reduction);
-                        let new_pixel = (pixel & 0xFF000000) | (new_r << 16) | (g << 8) | new_b;
-                        core::ptr::write_volatile(ptr.add(y * pitch_px + x), new_pixel);
-                    }
+                    let pixel = self.shadow_buf[y * pitch_px + x];
+                    let r = (pixel >> 16) & 0xFF;
+                    let g = (pixel >> 8) & 0xFF;
+                    let b = pixel & 0xFF;
+                    let new_r = (r + red_boost).min(255);
+                    let new_b = b.saturating_sub(reduction);
+                    let new_pixel = (pixel & 0xFF000000) | (new_r << 16) | (g << 8) | new_b;
+                    self.shadow_buf[y * pitch_px + x] = new_pixel;
                 }
             }
         }
@@ -326,11 +310,14 @@ impl FramebufferState {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create("/tmp/screenshot.raw") {
             let pitch = self.info.pitch as usize;
+            let pitch_px = pitch / 4;
             let h = self.info.height as usize;
-            let ptr = self.back_addr as *const u8;
             for row in 0..h {
                 let row_slice = unsafe {
-                    core::slice::from_raw_parts(ptr.add(row * pitch), pitch)
+                    core::slice::from_raw_parts(
+                        self.shadow_buf.as_ptr().add(row * pitch_px) as *const u8,
+                        pitch,
+                    )
                 };
                 let _ = f.write_all(row_slice);
             }
@@ -381,7 +368,7 @@ impl FramebufferState {
                     let dx = (dst_x + col_start as i32) as usize;
                     let src_ptr = (vaddr as *const u32)
                         .add(row as usize * stride + col_start as usize);
-                    let dst_ptr = (self.back_addr as *mut u32)
+                    let dst_ptr = self.shadow_buf.as_mut_ptr()
                         .add(dy * pitch_px + dx);
                     core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_w);
                 }
@@ -401,15 +388,12 @@ impl DrawTarget for FramebufferState {
         #[cfg(not(test))]
         {
             let pitch_px = self.info.pitch as usize / 4;
-            let ptr = self.back_addr as *mut u32;
             for embedded_graphics::Pixel(coord, color) in pixels {
                 let x = coord.x;
                 let y = coord.y;
                 if x >= 0 && (x as u32) < self.info.width && y >= 0 && (y as u32) < self.info.height {
                     let pixel = 0xFF00_0000u32 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
-                    unsafe {
-                        core::ptr::write_volatile(ptr.add(y as usize * pitch_px + x as usize), pixel);
-                    }
+                    self.shadow_buf[y as usize * pitch_px + x as usize] = pixel;
                 }
             }
         }
@@ -1508,7 +1492,7 @@ fn draw_window(
             WindowContent::Snp { surface_id, pid } => {
                 if let Some(surface) = snp_surfaces.get(&(pid, surface_id)) {
                     if surface.active && surface.vaddr != 0 {
-                        let fb_ptr = fb.back_addr as *mut u32;
+                        let fb_ptr = fb.shadow_buf.as_mut_ptr();
                         let fb_stride = fb.info.pitch as usize / 4;
                         let buf_w = surface.buffer_w as i32;
                         let buf_h = surface.buffer_h as i32;
@@ -1565,7 +1549,7 @@ fn draw_window(
             WindowContent::X11 { window_id, .. } => {
                 if let Some(buf) = x11_surfaces.get(&window_id) {
                     if !buf.pixels.is_empty() && buf.width > 0 && buf.height > 0 {
-                        let fb_ptr = fb.back_addr as *mut u32;
+                        let fb_ptr = fb.shadow_buf.as_mut_ptr();
                         let fb_stride = fb.info.pitch as usize / 4;
                         let copy_w = (cw as u32).min(buf.width) as usize;
                         let copy_h = (content_h as u32).min(buf.height) as usize;
