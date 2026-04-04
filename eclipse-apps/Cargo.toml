@@ -9,12 +9,10 @@ members = [
     "lunas",
     "terminal",
     "sh",
-    "rust-shell",
     "nano",
     "glxgears",
-#    "xeyes",
 ]
-exclude = ["libs/ipc_tests", "smithay_app", "nanorust", "xeyes"]
+exclude = ["libs/ipc_tests", "smithay_app", "nanorust", "xeyes", "rust-shell"]
 
 [workspace.package]
 version = "0.2.0"

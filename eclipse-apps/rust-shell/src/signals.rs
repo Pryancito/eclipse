@@ -11,7 +11,7 @@ pub const SIGWINCH: i32 = 28;
 
 pub static FG_PID: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 #[repr(C)]
@@ -30,7 +30,7 @@ pub extern "C" fn shell_signal_handler(sig: i32) {
     }
     let pid = FG_PID.load(Ordering::SeqCst);
     if pid != 0 {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         unsafe {
             let _ = eclipse_syscall::call::kill(pid, sig as usize);
         }
@@ -38,7 +38,7 @@ pub extern "C" fn shell_signal_handler(sig: i32) {
 }
 
 pub fn setup_signals() {
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     {
         let sa = SigAction {
             sa_handler: Some(shell_signal_handler),
@@ -55,7 +55,7 @@ pub fn setup_signals() {
 
 pub fn set_fg_pid(pid: usize) {
     FG_PID.store(pid, Ordering::SeqCst);
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     unsafe {
         // Fallback to our own PID if pid is 0 (regain control)
         let target = if pid == 0 { 

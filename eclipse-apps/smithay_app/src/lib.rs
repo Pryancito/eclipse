@@ -7,14 +7,14 @@ pub mod input;
 pub mod ipc;
 pub mod render;
 pub mod display;
-#[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
+#[cfg(all(not(target_os = "eclipse"), feature = "wayland"))]
 pub mod smithay_wayland;
 pub mod state;
 pub mod painter;
 pub mod style_engine;
 pub mod stylus;
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 pub mod getrandom_shim {
     use eclipse_syscall::syscall3;
     use eclipse_syscall::SYS_GETRANDOM;

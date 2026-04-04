@@ -15,18 +15,18 @@ use embedded_graphics::{
     text::Text,
     mono_font::MonoTextStyle,
 };
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use sidewind::font_terminus_16;
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::{c_int, close, mmap, munmap, open, exit};
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_ipc::prelude::EclipseMessage;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE};
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall::{self, flag, ProcessInfo, SystemStats};
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall::call::{sched_yield, exit as syscall_exit, get_system_stats};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +335,7 @@ impl<'a> OriginDimensions for BufferTarget<'a> {
 }
 
 /// Draw the FPS overlay on the buffer.
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 fn draw_fps_overlay(buf: &mut [u32], w: u32, h: u32, fps: u32) {
     let mut target = BufferTarget { words: buf, width: w, height: h };
     let mut fps_str = HString::<32>::new();
@@ -416,7 +416,7 @@ fn shm_name(pid: u32) -> HString<24> {
 }
 
 /// Create a shared-memory framebuffer window via SideWind / Lunas IPC.
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 fn open_sidewind_window(
     composer_pid: u32,
     x: i32,
@@ -478,7 +478,7 @@ fn open_sidewind_window(
 
 fn main() {
 
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     {
         let self_pid = eclipse_syscall::getpid() as u32;
         let lunas_pid = find_pid_by_name(b"lunas").or_else(|| find_pid_by_name(b"gui"));
@@ -571,7 +571,7 @@ fn main() {
         }
     }
 
-    #[cfg(not(target_vendor = "eclipse"))]
+    #[cfg(not(target_os = "eclipse"))]
     {
         std::println!("glxgears: host-testing stub — no rendering outside Eclipse OS.");
         unsafe { exit(0); }

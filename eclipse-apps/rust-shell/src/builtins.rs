@@ -134,7 +134,7 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
             };
             
             let mut buf = [0u8; 8192];
-            #[cfg(target_vendor = "eclipse")]
+            #[cfg(target_os = "eclipse")]
             match eclipse_syscall::call::readdir(&abs_path, &mut buf) {
                 Ok(n) if n > 0 => {
                     let mut names: Vec<&str> = buf[..n].split(|&b| b == b'\n')
@@ -153,7 +153,7 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
             Some(0)
         }
         "ps" => {
-            #[cfg(target_vendor = "eclipse")]
+            #[cfg(target_os = "eclipse")]
             {
                 let mut list = [eclipse_syscall::ProcessInfo::default(); 48];
                 if let Ok(n) = eclipse_syscall::get_process_list(&mut list) {
@@ -241,7 +241,7 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
                     println!("[{}] {} &", job.id, job.cmd);
                     job.status = crate::JobStatus::Running;
                     // Send SIGCONT
-                    #[cfg(target_vendor = "eclipse")]
+                    #[cfg(target_os = "eclipse")]
                     let _ = eclipse_syscall::call::kill(job.pid, 18);
                     Some(0)
                 } else {
@@ -261,7 +261,7 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
                     p.push_str(path);
                     p
                 };
-                #[cfg(target_vendor = "eclipse")]
+                #[cfg(target_os = "eclipse")]
                 if let Err(_) = eclipse_syscall::call::mkdir(&abs_path, 0o755) {
                     eprintln!("rs: mkdir: {}: error", path);
                 }
@@ -276,7 +276,7 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
                     p.push_str(path);
                     p
                 };
-                #[cfg(target_vendor = "eclipse")]
+                #[cfg(target_os = "eclipse")]
                 if let Err(_) = eclipse_syscall::call::unlink(&abs_path) {
                     eprintln!("rs: rm: {}: error", path);
                 }

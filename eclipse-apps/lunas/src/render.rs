@@ -51,7 +51,7 @@ pub struct FramebufferState {
 impl FramebufferState {
     #[cfg(not(test))]
     pub fn init() -> Option<Self> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             let dev = match DisplayDevice::open() {
                 Ok(d) => d,
@@ -119,7 +119,7 @@ impl FramebufferState {
             })
         }
 
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             None
         }
@@ -150,7 +150,7 @@ impl FramebufferState {
 
     /// Present the back buffer (page flip).
     pub fn present(&mut self) -> bool {
-        #[cfg(all(not(test), target_vendor = "eclipse"))]
+        #[cfg(all(not(test), target_os = "eclipse"))]
         {
             let dev = DisplayDevice {
                 fd: self.drm_fd,
@@ -172,7 +172,7 @@ impl FramebufferState {
             core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
             true
         }
-        #[cfg(any(test, not(target_vendor = "eclipse")))]
+        #[cfg(any(test, not(target_os = "eclipse")))]
         {
             true
         }
@@ -321,7 +321,7 @@ impl FramebufferState {
     }
 
     /// Save the current back buffer to /tmp/screenshot.raw on Eclipse targets.
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     pub fn save_screenshot(&self) {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create("/tmp/screenshot.raw") {

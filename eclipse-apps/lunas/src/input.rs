@@ -1,11 +1,11 @@
 //! Input handling for Lunas desktop — keyboard, mouse, and system events.
 
 use std::prelude::v1::*;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::{InputEvent, eclipse_send};
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 use eclipse_syscall::InputEvent;
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 use sidewind::{
     SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON,
@@ -58,7 +58,7 @@ fn notify_window_close(
     let _ = r;
 
     // SIGKILL only for real process PIDs (IPC / External clients).
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     unsafe {
         libc::kill(target_pid as libc::pid_t, 9);
     }

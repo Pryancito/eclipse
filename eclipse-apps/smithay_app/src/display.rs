@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall as syscall;
 
 use std::vec::Vec;
@@ -181,14 +181,14 @@ pub struct FramebufferDesc {
 
 #[derive(Debug)]
 pub enum DisplayError {
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     Syscall(syscall::Error),
     InvalidMapping,
     OpenFailed,
     NotAvailable,
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 impl From<syscall::Error> for DisplayError {
     fn from(e: syscall::Error) -> Self {
         DisplayError::Syscall(e)
@@ -214,7 +214,7 @@ impl Device for DisplayDevice {
 
 impl ControlDevice for DisplayDevice {
     fn create_dumb_buffer(&self, width: u32, height: u32, bpp: u32) -> Result<buffer::DumbBuffer, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeCreateDumb {
@@ -234,7 +234,7 @@ impl ControlDevice for DisplayDevice {
                 size: args.size as usize,
             })
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = (width, height, bpp);
             Err(DisplayError::NotAvailable)
@@ -242,7 +242,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn map_buffer(&self, handle: buffer::Handle, size: usize) -> Result<*mut u8, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeMapDumb {
@@ -260,7 +260,7 @@ impl ControlDevice for DisplayDevice {
             )?;
             Ok(addr as *mut u8)
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = (handle, size);
             Err(DisplayError::NotAvailable)
@@ -268,7 +268,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn add_framebuffer(&self, handle: buffer::Handle, width: u32, height: u32, pitch: u32) -> Result<control::framebuffer::Handle, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeFbCmd {
@@ -282,7 +282,7 @@ impl ControlDevice for DisplayDevice {
             syscall::ioctl(self.fd, DRM_IOCTL_MODE_ADDFB as usize, &mut args as *mut _ as usize)?;
             Ok(control::framebuffer::Handle(args.fb_id))
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = (handle, width, height, pitch);
             Err(DisplayError::NotAvailable)
@@ -290,7 +290,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn page_flip(&self, fb: control::framebuffer::Handle) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeCrtcPageFlip {
@@ -306,7 +306,7 @@ impl ControlDevice for DisplayDevice {
             syscall::ioctl(self.fd, DRM_IOCTL_MODE_PAGE_FLIP as usize, &args as *const _ as usize)?;
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = fb;
             Err(DisplayError::NotAvailable)
@@ -314,7 +314,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn wait_vblank(&self, crtc: control::CrtcHandle) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmWaitVblank {
@@ -331,7 +331,7 @@ impl ControlDevice for DisplayDevice {
             let _ = syscall::ioctl(self.fd, DRM_IOCTL_WAIT_VBLANK as usize, &mut args as *mut _ as usize);
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = crtc;
             Err(DisplayError::NotAvailable)
@@ -339,7 +339,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn set_cursor(&self, crtc: control::CrtcHandle, x: i32, y: i32, handle: buffer::Handle) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeCursor {
@@ -357,7 +357,7 @@ impl ControlDevice for DisplayDevice {
             let _ = syscall::ioctl(self.fd, DRM_IOCTL_MODE_CURSOR as usize, &args as *const _ as usize);
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = (crtc, x, y, handle);
             Err(DisplayError::NotAvailable)
@@ -365,7 +365,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn gem_close(&self, handle: buffer::Handle) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmGemClose { handle: u32, pad: u32 }
@@ -373,7 +373,7 @@ impl ControlDevice for DisplayDevice {
             syscall::ioctl(self.fd, DRM_IOCTL_GEM_CLOSE as usize, &args as *const _ as usize)?;
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = handle;
             Err(DisplayError::NotAvailable)
@@ -381,12 +381,12 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn destroy_framebuffer(&self, fb: control::framebuffer::Handle) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             syscall::ioctl(self.fd, DRM_IOCTL_MODE_DESTROYFB as usize, &fb.0 as *const _ as usize)?;
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = fb;
             Err(DisplayError::NotAvailable)
@@ -394,7 +394,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn resource_handles(&self) -> Result<(Vec<control::framebuffer::Handle>, Vec<control::CrtcHandle>, Vec<control::ConnectorHandle>), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeCardRes {
@@ -431,14 +431,14 @@ impl ControlDevice for DisplayDevice {
                 conns.into_iter().map(control::ConnectorHandle).collect(),
             ))
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             Err(DisplayError::NotAvailable)
         }
     }
 
     fn plane_resources(&self) -> Result<Vec<control::PlaneHandle>, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeGetPlaneRes {
@@ -461,14 +461,14 @@ impl ControlDevice for DisplayDevice {
             }
             Ok(planes.into_iter().map(control::PlaneHandle).collect())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             Err(DisplayError::NotAvailable)
         }
     }
 
     fn get_plane(&self, plane: control::PlaneHandle) -> Result<control::PlaneInfo, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeGetPlane {
@@ -490,7 +490,7 @@ impl ControlDevice for DisplayDevice {
                 plane_type: 0, 
             })
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = plane;
             Err(DisplayError::NotAvailable)
@@ -505,7 +505,7 @@ impl ControlDevice for DisplayDevice {
         crtc_x: i32, crtc_y: i32, crtc_w: u32, crtc_h: u32,
         src_x: u32, src_y: u32, src_w: u32, src_h: u32,
     ) -> Result<(), Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeSetPlane {
@@ -524,7 +524,7 @@ impl ControlDevice for DisplayDevice {
             syscall::ioctl(self.fd, DRM_IOCTL_MODE_SETPLANE as usize, &args as *const _ as usize)?;
             Ok(())
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = (plane, crtc, fb, crtc_x, crtc_y, crtc_w, crtc_h, src_x, src_y, src_w, src_h);
             Err(DisplayError::NotAvailable)
@@ -532,7 +532,7 @@ impl ControlDevice for DisplayDevice {
     }
 
     fn get_connector(&self, connector: control::ConnectorHandle) -> Result<control::ConnectorInfo, Self::Error> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             #[repr(C)]
             struct DrmModeGetConnector {
@@ -555,7 +555,7 @@ impl ControlDevice for DisplayDevice {
                 height_mm: args.mm_height,
             })
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             let _ = connector;
             Err(DisplayError::NotAvailable)
@@ -566,7 +566,7 @@ impl ControlDevice for DisplayDevice {
 impl DisplayDevice {
     /// Open the DRM device and discover resources.
     pub fn open() -> Result<Self, DisplayError> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             let fd = syscall::open("drm:control", 0).map_err(|_| DisplayError::OpenFailed)?;
             
@@ -621,7 +621,7 @@ impl DisplayDevice {
             
             Ok(device)
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             Err(DisplayError::NotAvailable)
         }
@@ -629,7 +629,7 @@ impl DisplayDevice {
 
     /// Create a framebuffer mapped in user memory.
     pub fn create_framebuffer(&self) -> Result<FramebufferDesc, DisplayError> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             let db = self.create_dumb_buffer(self.caps.width, self.caps.height, 32)?;
             let fb_id = self.add_framebuffer(db.handle, db.width, db.height, db.pitch)?;
@@ -651,7 +651,7 @@ impl DisplayDevice {
                 pitch: self.caps.pitch,
             })
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             Err(DisplayError::NotAvailable)
         }

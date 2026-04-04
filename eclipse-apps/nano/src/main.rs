@@ -523,7 +523,7 @@ fn read_file(path: &str) -> Vec<u8> {
 // Entrada principal
 // ============================================================================
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 fn main() {
     // Leer argumento (nombre del archivo) desde argv del proceso
     let args = std::env::args();
@@ -555,7 +555,7 @@ fn main() {
     eclipse_syscall::call::exit(0);
 }
 
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 fn main() {
-    println!("Solo soportado en Eclipse OS");
+    // Note: This would typically be a stub in a no_std environment
 }

@@ -72,7 +72,7 @@ impl Shell {
     }
 
     pub fn update_terminal_size(&self) {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             let mut winsz = [0u16; 4];
             if eclipse_syscall::call::ioctl(0, 4, winsz.as_mut_ptr() as usize).is_ok() {

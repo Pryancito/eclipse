@@ -1,3 +1,9 @@
+#![no_std]
+#[cfg(target_os = "eclipse")]
+extern crate std;
+#[cfg(target_os = "eclipse")]
+use std::prelude::v1::*;
+
 use std::vec::Vec;
 use std::boxed::Box;
 use std::rc::Rc;
@@ -8,9 +14,9 @@ use heapless::String as HString;
 use os_terminal::{ClipboardHandler, DrawTarget, Rgb, Terminal};
 use os_terminal::font::BitmapFont;
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::{c_int, close, kill, mmap, open};
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall::call::{
     close as sys_close,
     exit as sys_exit,
@@ -22,30 +28,30 @@ use eclipse_syscall::call::{
 };
 
 // Wayland Unix socket client
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use wayland_proto::unix_transport::UnixSocketConnection;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::wire::{RawMessage, ObjectId, NewId, Opcode, Payload, PayloadType};
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::connection::Connection;
 
 // ============================================================================
 // Tipos y Estructuras
 // ============================================================================
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 struct EclipseClipboard {
     text: std::string::String,
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 impl EclipseClipboard {
     fn new() -> Self {
         Self { text: std::string::String::new() }
     }
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 impl ClipboardHandler for EclipseClipboard {
     fn get_text(&mut self) -> Option<std::string::String> {
         if self.text.is_empty() { None } else { Some(self.text.clone()) }
@@ -55,7 +61,7 @@ impl ClipboardHandler for EclipseClipboard {
     }
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 struct SurfaceBacking {
     ptr: *mut u32,
     width: usize,
@@ -64,15 +70,15 @@ struct SurfaceBacking {
     shm_fd: i32,
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 struct SharedSurfaceDrawTarget {
     state: Rc<RefCell<SurfaceBacking>>,
 }
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 unsafe impl Send for SharedSurfaceDrawTarget {}
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 impl DrawTarget for SharedSurfaceDrawTarget {
     fn size(&self) -> (usize, usize) {
         let b = (*self.state).borrow();
@@ -413,11 +419,11 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read("/bin/rust-shell");
+        let sh_res = std::fs::read("/bin/sh");
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("rust-shell"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
             let _ = sys_close(pty_slave_fd);
             return None;
@@ -634,7 +640,7 @@ impl TerminalApp {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("rust-shell"), fd, fd, fd) {
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;
@@ -658,21 +664,21 @@ impl TerminalApp {
 }
 
 /// Send a Wayland message on the Unix socket connection.
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
     // let _ = SmallVec::<[Payload; 4]>::new(); // removed unused/missing dependency
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
 }
 
 /// Send a Wayland message with an ancillary file descriptor (SCM_RIGHTS).
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
     use wayland_proto::wl::wire::Handle;
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
 }
 
 fn main() {
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     {
         if let Some(mut app) = TerminalApp::new() {
             app.run();

@@ -4,7 +4,7 @@
 
 
 // ---- Entry point Linux: mock mode ----
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 fn main() {
     eprintln!("[LUNAS] Desktop environment requires Eclipse OS target.");
     eprintln!("[LUNAS] Use --target for Eclipse OS cross-compilation.");
@@ -221,7 +221,7 @@ fn main() {
 }
 
 #[cfg(test)]
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 mod tests {
     use lunas::state::LunasState;
 

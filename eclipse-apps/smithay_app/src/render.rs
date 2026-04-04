@@ -1,15 +1,15 @@
 use std::prelude::v1::*;
 use core::{matches, format_args, write};
 use std::vec::Vec;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::{
     munmap,
     FramebufferInfo,
 };
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 use libc::{mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
 
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FramebufferInfo {
     pub address: u64,
@@ -19,13 +19,13 @@ pub struct FramebufferInfo {
     pub bpp: u8,
 }
 
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
 use micromath::F32Ext;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::ProcessInfo;
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 use eclipse_syscall::ProcessInfo;
 use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
@@ -81,7 +81,7 @@ pub struct FramebufferState {
 
 impl FramebufferState {
     pub fn init() -> Option<Self> {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             let dev = DisplayDevice::open().ok()?;
             let fb_front = dev.create_framebuffer().ok()?;
@@ -134,7 +134,7 @@ impl FramebufferState {
             fb_state.init_hud();
             Some(fb_state)
         }
-        #[cfg(not(target_vendor = "eclipse"))]
+        #[cfg(not(target_os = "eclipse"))]
         {
             None
         }
@@ -147,7 +147,7 @@ impl FramebufferState {
 
     /// Initialize hardware cursor image (64x64)
     pub fn init_cursor(&mut self) {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             if self.drm_fd == 0 { return; }
             
@@ -198,7 +198,7 @@ impl FramebufferState {
 
     /// Initialize HUD secondary framebuffer
     pub fn init_hud(&mut self) {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             if self.drm_fd == 0 { return; }
             let dev = DisplayDevice {
@@ -223,7 +223,7 @@ impl FramebufferState {
             }
         }
     }
-    #[cfg(not(target_vendor = "eclipse"))]
+    #[cfg(not(target_os = "eclipse"))]
     pub fn init_software(width: u32, height: u32) -> Option<Self> {
         let pitch = width * 4;
         let fb_size = (pitch as usize) * (height as usize);
@@ -320,7 +320,7 @@ impl FramebufferState {
 
     pub fn present(&mut self) -> bool {
         if self.back_addr == 0 { return true; }
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             // Perform the page flip.
             match eclipse_syscall::drm_page_flip(self.back_fb_id.0) {
@@ -342,12 +342,12 @@ impl FramebufferState {
                 Err(_) => false,
             }
         }
-        #[cfg(not(target_vendor = "eclipse"))] { true }
+        #[cfg(not(target_os = "eclipse"))] { true }
     }
 
     /// Move hardware cursor
     pub fn set_cursor_position(&self, x: i32, y: i32) {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             if self.drm_fd > 0 {
                 let dev = DisplayDevice {
@@ -365,7 +365,7 @@ impl FramebufferState {
 
     /// Set an overlay plane configuration
     pub fn set_overlay_plane(&self, fb_id: display::control::framebuffer::Handle, x: i32, y: i32, w: u32, h: u32) {
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             // Find an overlay plane (plane_type 0)
             if let Some(plane) = self.planes.iter().find(|p| p.plane_type == 0) {
@@ -1632,9 +1632,9 @@ pub fn draw_system_central(
     // The kernel treats the `gui` service as a one-shot launcher and clears its pid/state
     // after `exec()` into `smithay_app`. For the overlay we still want to show `gui` as
     // active when this compositor process is alive.
-    #[cfg(target_vendor = "eclipse")]
+    #[cfg(target_os = "eclipse")]
     let self_pid: u32 = unsafe { libc::getpid() as u32 };
-    #[cfg(not(target_vendor = "eclipse"))]
+    #[cfg(not(target_os = "eclipse"))]
     let self_pid: u32 = 0;
     let gui_running = self_pid != 0 && processes.iter().any(|p| p.pid == self_pid);
 

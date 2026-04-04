@@ -6,9 +6,9 @@ use crate::ipc::handle_sidewind_message;
 use crate::render;
 use std::prelude::v1::*;
 use core::matches;
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use libc::{eclipse_send, write, ProcessInfo, SystemStats, get_system_stats, get_process_list};
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 use eclipse_syscall::{ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
@@ -18,11 +18,11 @@ use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
 use eclipse_ipc::types::{TAG_WAYL, NetExtendedStats};
 
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(not(target_os = "eclipse"))]
 fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> usize { 0 }
 
 #[derive(Clone, Copy, Default)]
@@ -528,7 +528,7 @@ impl SmithayState {
         let mut vaddr = 0usize;
         let mut size = 0usize;
 
-        #[cfg(target_vendor = "eclipse")]
+        #[cfg(target_os = "eclipse")]
         {
             // On Eclipse OS, we use the shm_pool_fd as a handle to open the shm region.
             // In our prototype, the client passes an ID that we use as a filename in shm: scheme.
@@ -869,7 +869,7 @@ impl SmithayState {
                 }
 
                 // Log de diagnóstico: memoria y CPU de smithay_app y contadores internos, SIEMPRE.
-                #[cfg(target_vendor = "eclipse")]
+                #[cfg(target_os = "eclipse")]
                 {
                     let self_pid = unsafe { libc::getpid() as u32 };
                     let mut _self_mem_kb = 0u64;

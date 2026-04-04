@@ -22,7 +22,7 @@ tiny-skia = { version = "0.11", default-features = false, features = ["no-std-fl
 eclipse-syscall = { path = "../../eclipse-syscall" }
 
 # Dependencias solo para target Eclipse (vendor eclipse).
-[target.'cfg(target_vendor = "eclipse")'.dependencies]
+[target.'cfg(target_os = "eclipse")'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 wayland-proto = { path = "../libs/wayland-proto" }
@@ -31,7 +31,7 @@ std = { package = "eclipse_std", path = "../eclipse_std" }
 libc = { version = "0.2", default-features = false }
 
 # Dependencias para target Linux (host) — tests y desarrollo
-[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
+[target.'cfg(not(target_os = "eclipse"))'.dependencies]
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 wayland-proto = { path = "../libs/wayland-proto" }

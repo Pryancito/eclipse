@@ -3,7 +3,7 @@ use std::prelude::v1::*;
 use std::string::String;
 use std::vec::Vec;
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 pub fn expand(word: &str, shell: &Shell) -> Vec<String> {

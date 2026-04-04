@@ -1,7 +1,10 @@
-use std::vec::Vec;
-use std::string::String;
+#![no_std]
+#[cfg(target_os = "eclipse")]
+extern crate std;
+#[cfg(target_os = "eclipse")]
+use std::prelude::v1::*;
 
-#[cfg(target_vendor = "eclipse")]
+#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 // ============================================================================
@@ -369,7 +372,7 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         "exit" => {
-            let code = argv.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             eclipse_syscall::call::exit(code);
         }
         "help" => {
@@ -432,7 +435,7 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
         if cmd.redirect_out.is_some() && eff_out != fd_out { let _ = eclipse_syscall::call::close(eff_out); }
 
         if let Ok(pid) = res {
-            let mut ab = Vec::new();
+            let mut ab: Vec<u8> = Vec::new();
             for a in &cmd.argv { ab.extend_from_slice(a.as_bytes()); ab.push(0); }
             let _ = eclipse_syscall::call::set_child_args(pid, &ab);
             return Some(pid);
@@ -506,7 +509,7 @@ fn complete_at_cursor(input: &mut String) {
     if let Ok(n) = eclipse_syscall::call::readdir(&abs_dir, &mut buf) {
         let matches: Vec<&str> = buf[..n].split(|&b| b == b'\n')
             .filter_map(|s| core::str::from_utf8(s).ok())
-            .filter(|name| name.starts_with(file_prefix) && !name.is_empty())
+            .filter(|name: &&str| name.starts_with(file_prefix) && !name.is_empty())
             .collect();
 
         if matches.len() == 1 {
