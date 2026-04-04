@@ -1,13 +1,16 @@
 [unstable]
+# Habilita el uso de archivos .json como especificación de target (requerido en nightly reciente)
 json-target-spec = true
+# Compila core y alloc desde fuente para el target personalizado
 build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
 
 [build]
+# El JSON del target Eclipse OS está un nivel arriba (raíz del repositorio)
 target = "../x86_64-unknown-eclipse.json"
 
 [target.x86_64-unknown-eclipse]
 rustflags = [
     "-Zunstable-options",
+    # Activa las rutas de código específicas de Eclipse OS en eclipse-relibc
     "--cfg", "eclipse_target",
 ]
