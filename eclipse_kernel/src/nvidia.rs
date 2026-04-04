@@ -84,6 +84,14 @@ static PRIMARY_RESOURCE_INDEX: core::sync::atomic::AtomicUsize = core::sync::ato
 /// covers the physical address (it does NOT for high-address BARs ≥ top-of-RAM).
 static NVIDIA_BAR1_KERNEL_VADDR: AtomicU64 = AtomicU64::new(0);
 
+/// BAR0 virtual addresses for each detected GPU (max 8), populated during init().
+/// Stored in a lock-free array so they can be safely read from interrupt context
+/// without risking a deadlock on NVIDIA_RESOURCES.
+static GPU_BAR0_VADDRS: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
 /// Page granularity used by the VRAM bitmap allocator (4 KiB).
 const VRAM_PAGE_SIZE: u64 = 4096;
 
@@ -196,12 +204,29 @@ static NVIDIA_BAR1_MAPPED_SIZE: Mutex<Option<usize>> = Mutex::new(None);
 
 pub struct NvidiaDrmDriver;
 
-/// Dynamic interrupt handler for NVIDIA GPUs. 
+/// Dynamic interrupt handler for NVIDIA GPUs.
 /// Called by the assembly stub in interrupts.rs.
+///
+/// Reads and write-clears NV_PMC_INTR_0 (a W1C register) on every known GPU.
+/// Without this, any pending GPU interrupt source would immediately re-assert
+/// the MSI line after the LAPIC EOI, creating an interrupt storm that starves
+/// all other threads and causes the desktop to run extremely slowly.
 pub fn handle_interrupt() {
-    // Current simple implementation: just log that we got an interrupt.
-    // In a full driver, this would signal a condition variable or process RPC responses.
-    // crate::serial::serial_print("[NVIDIA] ⚡ Interrupt received!\n");
+    // NV_PMC_INTR_0 is a Write-1-to-Clear register: reading it returns the set
+    // of currently pending interrupt sources; writing back the same value clears
+    // those bits and de-asserts the MSI line.
+    for slot in &GPU_BAR0_VADDRS {
+        let bar0 = slot.load(AtomicOrdering::Acquire);
+        if bar0 == 0 {
+            continue;
+        }
+        unsafe {
+            let intr = core::ptr::read_volatile((bar0 + NV_PMC_INTR_0 as u64) as *const u32);
+            if intr != 0 {
+                core::ptr::write_volatile((bar0 + NV_PMC_INTR_0 as u64) as *mut u32, intr);
+            }
+        }
+    }
 }
 
 impl crate::drm::DrmDriver for NvidiaDrmDriver {
@@ -442,12 +467,17 @@ pub fn fill_rect(payload: &[u8]) -> bool {
     let pitch_u32 = (pitch as usize / 4).max(1);
     for py in 0..h {
         let row_start = (y + py) as usize * pitch_u32 + (x as usize);
-        for px in 0..w {
-            unsafe {
-                core::ptr::write_volatile(ptr.add(row_start + px as usize), color);
-            }
+        // Use a vectorized fill instead of per-pixel write_volatile.
+        // slice::fill() compiles to SIMD/rep-stosd which fills the WC write-combining
+        // buffer in cache-line-sized chunks — orders of magnitude faster than
+        // individual volatile stores when painting large rectangles over BAR1.
+        unsafe {
+            let row_slice = core::slice::from_raw_parts_mut(ptr.add(row_start), w as usize);
+            row_slice.fill(color);
         }
     }
+    // Flush all pending WC (Write-Combining) buffer entries to VRAM.
+    unsafe { core::arch::x86_64::_mm_sfence(); }
     true
 }
 
@@ -490,13 +520,14 @@ pub fn blit_rect(payload: &[u8]) -> bool {
     let overlap_down = dst_y > src_y && dst_y < src_y + h;
 
     if same_row_overlap {
+        // dst_x > src_x on the same row: must copy right-to-left to avoid
+        // clobbering pixels that haven't been read yet.  ptr::copy is memmove
+        // and handles the overlap direction correctly on its own.
         for py in 0..h {
             let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
             let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
             unsafe {
-                for i in (0..w as usize).rev() {
-                    core::ptr::write(ptr.add(dst_row + i), core::ptr::read(ptr.add(src_row + i)));
-                }
+                core::ptr::copy(ptr.add(src_row), ptr.add(dst_row), w as usize);
             }
         }
     } else if overlap_down {
@@ -516,6 +547,8 @@ pub fn blit_rect(payload: &[u8]) -> bool {
             }
         }
     }
+    // Flush the WC write-combining buffers so all pixel data reaches VRAM.
+    unsafe { core::arch::x86_64::_mm_sfence(); }
     true
 }
 
@@ -1141,6 +1174,12 @@ pub fn init() {
         serial::serial_print("[NVIDIA]   ✓ BAR0 accessible (GPU ID: 0x");
         serial::serial_print_hex(boot_0 as u64);
         serial::serial_print(")\n");
+
+        // Register BAR0 in the lock-free array so handle_interrupt() can clear
+        // NV_PMC_INTR_0 without taking any lock (safe from interrupt context).
+        if index < GPU_BAR0_VADDRS.len() {
+            GPU_BAR0_VADDRS[index].store(bar0_virt, AtomicOrdering::Release);
+        }
 
         // Cross-validate architecture from hardware register
         let hw_arch = arch_from_pmc_boot0(boot_0);
