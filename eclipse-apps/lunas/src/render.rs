@@ -154,10 +154,10 @@ impl FramebufferState {
             // dumb buffer (potentially uncached GPU memory) in one bulk copy.
             // This is far faster than writing individual pixels to uncached
             // memory, which is the primary cause of slowness on NVIDIA hardware.
-            let size = (self.info.pitch * self.info.height) as usize;
+            let shadow_bytes = self.shadow_buf.len() * core::mem::size_of::<u32>();
             let src = self.shadow_buf.as_ptr() as *const u8;
             let dst = self.back_addr as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(src, dst, size); }
+            unsafe { core::ptr::copy_nonoverlapping(src, dst, shadow_bytes); }
 
             let dev = DisplayDevice {
                 fd: self.drm_fd,
