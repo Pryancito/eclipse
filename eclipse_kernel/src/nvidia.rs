@@ -220,34 +220,26 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         }
     }
     fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
-        // Prefer system RAM for compositor GEM buffers.
+        // Step 1: Allocate from VRAM (BAR1 / Write-Combining).
         //
-        // When a GEM buffer is placed in VRAM at the same physical address as the
-        // GOP scanout, page_flip short-circuits (fb_phys == scanout_phys) and the
-        // compositor writes directly to the display scanout using caps.pitch =
-        // visible_width * 4, while the GPU display controller reads with
-        // pixels_per_scan_line * 4 set by UEFI.  If those differ, every row is
-        // offset → parallelogram / skewed-window artefact.
-        //
-        // Allocating from RAM guarantees fb_phys != scanout_phys, so page_flip
-        // always performs the correct row-by-row pitch-converting copy from RAM
-        // into the VRAM scanout region.  RAM → VRAM via the WC BAR1 mapping is
-        // also faster than the previous VRAM-sourced copy path.
-        unsafe {
-            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
-                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
-            }
-        }
-
-        // Fallback: VRAM (BAR1) if system RAM is exhausted.
-        // The scanout region is reserved in the bitmap, so allocations here
-        // will never alias the display framebuffer.
+        // VRAM is preferred because fmap() returns phys|(1<<63) which triggers the
+        // proven WC mmap path in sys_mmap.  The scanout region is reserved in the
+        // VRAM bitmap (see init()), so these allocations will never alias the GOP
+        // display framebuffer — page_flip always performs the pitch-converting row
+        // copy instead of short-circuiting, which fixes the parallelogram artefact.
         {
             let mut vram = VRAM_ALLOCATOR.lock();
             if let Some(alloc) = vram.as_mut() {
-                if let Some(phys) = alloc.alloc(size, 4096) {
+                if let Some(phys) = alloc.alloc(size, VRAM_PAGE_SIZE as usize) {
                     return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
                 }
+            }
+        }
+
+        // Step 2: Fallback to system DMA memory if VRAM is exhausted.
+        unsafe {
+            if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(size, 4096) {
+                return Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys });
             }
         }
 
