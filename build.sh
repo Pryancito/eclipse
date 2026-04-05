@@ -244,12 +244,12 @@ build_sidewind_project() {
                 cp "bash" "$BASE_DIR/$BUILD_DIR/sbin/bash"
                 mkdir -p "$BASE_DIR/$BUILD_DIR/root"
                 mkdir -p "$BASE_DIR/$BUILD_DIR/etc"
-                cat > "$BASE_DIR/$BUILD_DIR/root/.bashrc" <<EOF
+                cat > "$BASE_DIR/$BUILD_DIR/root/.bashrc" <<'EOF'
 # .bashrc
 alias ls='ls --color=auto'
 alias ll='ls -l'
 export PATH=/bin:/sbin
-export PS1='\[\e[32m\]\u@eclipse\[\e[m\]:\[\e[34m\]\w\[\e[m\]\$ '
+export PS1='\[\e[32m\]root@eclipse\[\e[m\]:\[\e[34m\]\w\[\e[m\]\$ '
 EOF
                 touch "$BASE_DIR/$BUILD_DIR/root/.bash_profile"
                 touch "$BASE_DIR/$BUILD_DIR/root/.bash_logout"
