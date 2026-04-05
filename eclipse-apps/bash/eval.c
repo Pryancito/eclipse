@@ -104,6 +104,16 @@ reader_loop (void)
 	    case FORCE_EOF:
 	    case EXITPROG:
 	    case EXITBLTIN:
+	      if (interactive_shell && subshell_environment == 0)
+		{
+		  if (current_command)
+		    {
+		      dispose_command (current_command);
+		      current_command = (COMMAND *)NULL;
+		    }
+		  EOF_Reached = 0;
+		  break;
+		}
 	      current_command = (COMMAND *)NULL;
 	      EOF_Reached = EOF;
 	      goto exec_done;
@@ -190,11 +200,10 @@ reader_loop (void)
 		  dispose_command (current_command);
 		  current_command = (COMMAND *)NULL;
 		}
-	    }
-	  if (EOF_Reached && interactive && ignoreeof && parse_and_execute_level == 0 && code != EXITBLTIN)
-	    {
-	      if (handle_ignoreeof (1))
-		EOF_Reached = 0;
+	      if (EOF_Reached && interactive)
+		{
+		  EOF_Reached = 0;
+		}
 	    }
 	}
       else

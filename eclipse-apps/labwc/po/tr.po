@@ -1,0 +1,72 @@
+# Labwc pot file
+# Copyright (C) 2022
+# This file is distributed under the same license as the labwc package.
+# Oğuz Ersen <oguz@ersen.moe>, 2022.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: labwc\n"
+"Report-Msgid-Bugs-To: https://github.com/labwc/labwc/issues\n"
+"POT-Creation-Date: 2024-01-15 16:00-0500\n"
+"PO-Revision-Date: 2024-02-24 22:23+0000\n"
+"Last-Translator: Sabri Ünal <libreajans@gmail.com>\n"
+"Language-Team: Turkish <https://translate.lxqt-project.org/projects/labwc/"
+"labwc/tr/>\n"
+"Language: tr\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=n != 1;\n"
+"X-Generator: Weblate 4.2.1\n"
+
+#: src/menu/menu.c:697
+msgid "Reconfigure"
+msgstr "Yeniden Yapılandır"
+
+#: src/menu/menu.c:699
+msgid "Exit"
+msgstr "Çıkış"
+
+#: src/menu/menu.c:715
+msgid "Minimize"
+msgstr "Küçült"
+
+#: src/menu/menu.c:717
+msgid "Maximize"
+msgstr "Büyüt"
+
+#: src/menu/menu.c:719
+msgid "Fullscreen"
+msgstr "Tam Ekran"
+
+#: src/menu/menu.c:721
+msgid "Roll up/down"
+msgstr "Yukarı/aşağı katla"
+
+#: src/menu/menu.c:723
+msgid "Decorations"
+msgstr "Süslemeler"
+
+#: src/menu/menu.c:725
+msgid "Always on Top"
+msgstr "Her Zaman Üstte"
+
+#: src/menu/menu.c:730
+msgid "Move left"
+msgstr "Sola taşı"
+
+#: src/menu/menu.c:737
+msgid "Move right"
+msgstr "Sağa taşı"
+
+#: src/menu/menu.c:742
+msgid "Always on Visible Workspace"
+msgstr "Her Zaman Görünür Çalışma Alanında"
+
+#: src/menu/menu.c:745
+msgid "Workspace"
+msgstr "Çalışma Alanı"
+
+#: src/menu/menu.c:748
+msgid "Close"
+msgstr "Kapat"

@@ -839,6 +839,103 @@ pub fn get_user_page_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
     }
 }
 
+/// Linux `PROT_*` to leaf PTE bits for [`mprotect_user_range`]. Not the same encoding as
+/// `map_user_page_4kb`'s `flags` argument (which historically mixed Linux PROT with x86 bits).
+fn linux_prot_to_leaf_pte_bits(prot: u64) -> u64 {
+    const PR_WRITE: u64 = 2;
+    const PR_EXEC: u64 = 4;
+    use x86_64::structures::paging::PageTableFlags as F;
+    if prot == 0 {
+        // PROT_NONE: present kernel mapping only; CPL3 access faults (no USER_ACCESSIBLE).
+        return (F::PRESENT | F::NO_EXECUTE).bits();
+    }
+    let mut f = F::PRESENT | F::USER_ACCESSIBLE;
+    if (prot & PR_WRITE) != 0 {
+        f |= F::WRITABLE;
+    }
+    if (prot & PR_EXEC) == 0 {
+        f |= F::NO_EXECUTE;
+    }
+    f.bits()
+}
+
+/// Linux `mprotect(2)` over 4KB pages: update leaf PTE flags without allocating tables.
+/// `addr` must be page-aligned. `len == 0` succeeds without changes.
+/// Returns `false` if any page in the range is unmapped or is a huge page.
+pub fn mprotect_user_range(pml4_phys: u64, addr: u64, len: u64, prot: u64) -> bool {
+    if (addr & 0xFFF) != 0 {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    if addr >= 0x0000_8000_0000_0000 {
+        return false;
+    }
+    let last = match addr.checked_add(len.saturating_sub(1)) {
+        Some(v) => v,
+        None => return false,
+    };
+    let end_page_start = last & !0xFFF_u64;
+    let leaf_bits = linux_prot_to_leaf_pte_bits(prot);
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let mut cur = addr;
+        while cur <= end_page_start {
+            let ok = unsafe {
+                let pml4_virt = phys_to_virt(pml4_phys);
+                let pml4 = &mut *(pml4_virt as *mut PageTable);
+                let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
+                let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
+                let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+                let pt_idx = ((cur >> 12) & 0x1FF) as usize;
+
+                let pml4_entry = &pml4.entries[pml4_idx];
+                if !pml4_entry.present() {
+                    false
+                } else {
+                    let pdpt = &mut *(phys_to_virt(pml4_entry.get_addr()) as *mut PageTable);
+                    let pdpt_entry = &mut pdpt.entries[pdpt_idx];
+                    if !pdpt_entry.present() || pdpt_entry.is_huge() {
+                        false
+                    } else {
+                        let pd = &mut *(phys_to_virt(pdpt_entry.get_addr()) as *mut PageTable);
+                        let pd_entry = &mut pd.entries[pd_idx];
+                        if !pd_entry.present() || pd_entry.is_huge() {
+                            false
+                        } else {
+                            let pt = &mut *(phys_to_virt(pd_entry.get_addr()) as *mut PageTable);
+                            let pt_entry = &mut pt.entries[pt_idx];
+                            if !pt_entry.present() {
+                                false
+                            } else {
+                                let paddr = pt_entry.get_addr();
+                                pt_entry.set_addr(paddr, leaf_bits);
+                                true
+                            }
+                        }
+                    }
+                }
+            };
+            if !ok {
+                return false;
+            }
+            if pml4_phys == get_cr3() {
+                unsafe {
+                    core::arch::asm!(
+                        "invlpg [{}]",
+                        in(reg) cur,
+                        options(nostack, preserves_flags)
+                    );
+                }
+            }
+            cur += 0x1000;
+        }
+        true
+    })
+}
+
 /// Map a 2MB page in a process's page table
 pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {

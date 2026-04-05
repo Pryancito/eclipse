@@ -122,6 +122,8 @@ pub struct Process {
     pub pgid: ProcessId,
     /// Session ID
     pub sid: ProcessId,
+    /// `Some((AT_BASE, AT_ENTRY))` si el arranque es vía intérprete dinámico (ld-musl).
+    pub dynamic_linker_aux: Option<(u64, u64)>,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -159,6 +161,7 @@ impl Process {
             signal_handlers: [0u64; 64],
             pgid: 0,
             sid: 0,
+            dynamic_linker_aux: None,
         }
     }
 }
@@ -287,11 +290,11 @@ pub fn init_kernel_process() {
 }
 
 /// Crear un nuevo proceso (bajo nivel). phdr_va/phnum/phentsize for auxv (AT_PHDR/AT_PHNUM/AT_PHENT).
-pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64, phentsize: u64, initial_brk: u64) -> Option<ProcessId> {
+pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64, phentsize: u64, initial_brk: u64, tls_base: u64) -> Option<ProcessId> {
     let pid = next_pid();
     let cr3 = crate::memory::create_process_paging();
     
-    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, initial_brk) {
+    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, initial_brk, tls_base, None) {
         Some(pid)
     } else {
         None
@@ -300,7 +303,19 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr
 
 /// Inicializar un proceso con un PID y espacio de direcciones ya creados.
 /// phdr_va, phnum, and phentsize are passed to jump_to_userspace for the auxv (AT_PHDR, AT_PHNUM, AT_PHENT).
-pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64, phentsize: u64, initial_brk: u64) -> bool {
+pub fn create_process_with_pid(
+    pid: ProcessId,
+    cr3: u64,
+    entry_point: u64,
+    stack_base: u64,
+    stack_size: usize,
+    phdr_va: u64,
+    phnum: u64,
+    phentsize: u64,
+    initial_brk: u64,
+    tls_base: u64,
+    dynamic_linker_aux: Option<(u64, u64)>,
+) -> bool {
     // Allocate kernel stack for this process
     let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
@@ -345,16 +360,24 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                 
                 let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-                process.context.rip = crate::elf_loader::jump_to_userspace as *const () as u64;
+                process.dynamic_linker_aux = dynamic_linker_aux;
+                let trampoline: u64 = if dynamic_linker_aux.is_some() {
+                    crate::elf_loader::jump_to_userspace_dynamic_linker as *const () as u64
+                } else {
+                    crate::elf_loader::jump_to_userspace as *const () as u64
+                };
+                process.context.rip = trampoline;
                 process.context.rdi = entry_point;                            
                 process.context.rsi = stack_base + stack_size as u64;         
                 process.context.rdx = phdr_va;                                
                 process.context.rcx = phnum;                                  
                 process.context.r8 = phentsize;                               
+                process.context.r9 = tls_base; // 6th argument: tls_base
                 process.context.rsp = kernel_stack_top_aligned;               
                 process.context.rflags = 0x002; 
                 process.kernel_stack_top = kernel_stack_top_aligned; 
                 process.mem_frames = (stack_size / 4096) as u64; 
+                process.fs_base = tls_base;
                 
                 crate::serial::serial_printf(format_args!(
                     "[PROC] Created process PID: {} slot: {} CR3: {:#018X}\n",
@@ -381,9 +404,11 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     crate::serial::serial_printf(format_args!("[spawn] create_process_paging returned cr3=0x{:x}\n", cr3));
 
     crate::serial::serial_print("[spawn] calling load_elf_into_space\n");
-    let (entry_point, max_vaddr, segment_frames, tls_base) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
-    crate::serial::serial_printf(format_args!("[spawn] load_elf_into_space done entry=0x{:x}\n", entry_point));
-    let (phdr_va, phnum, phentsize) = crate::elf_loader::get_elf_phdr_info(elf_data)?;
+    let loaded = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    crate::serial::serial_printf(format_args!(
+        "[spawn] load_elf_into_space done entry=0x{:x} TLS={:x}\n",
+        loaded.entry_point, loaded.tls_base
+    ));
 
     crate::serial::serial_print("[spawn] calling setup_user_stack\n");
     let stack_base = 0x20000000;
@@ -392,22 +417,44 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     crate::serial::serial_print("[spawn] setup_user_stack done\n");
 
     crate::serial::serial_print("[spawn] calling create_process_with_pid\n");
-    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr) {
-        if let Some(mut proc) = get_process(pid) {
-            let n = core::cmp::min(name.len(), 16);
-            proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
-            proc.mem_frames += segment_frames;
-            if tls_base != 0 {
-                proc.fs_base = tls_base;
+    if create_process_with_pid(
+        pid,
+        cr3,
+        loaded.entry_point,
+        stack_base,
+        stack_size,
+        loaded.phdr_va,
+        loaded.phnum,
+        loaded.phentsize,
+        loaded.max_vaddr,
+        loaded.tls_base,
+        loaded.dynamic_linker,
+    ) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(p) = table.iter_mut().find(|s| s.as_ref().map_or(false, |p| p.id == pid)) {
+                if let Some(proc) = p {
+                    let n = core::cmp::min(name.len(), 16);
+                    proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+                    proc.mem_frames += loaded.segment_frames;
+                    if loaded.tls_base != 0 {
+                        proc.fs_base = loaded.tls_base;
+                    }
+                    proc.dynamic_linker_aux = loaded.dynamic_linker;
+                }
             }
-            update_process(pid, proc);
-        }
+        });
         if let Some(parent_pid) = current_process_id() {
              if let Some(parent) = get_process(parent_pid) {
                  if let Some(mut proc) = get_process(pid) {
                      proc.pgid = parent.pgid;
                      proc.sid = parent.sid;
-                     update_process(pid, proc);
+                     proc.mem_frames = (0x100000 / 4096) + loaded.segment_frames; // stack + segments
+                    if loaded.tls_base != 0 {
+                        proc.fs_base = loaded.tls_base;
+                    }
+                    proc.dynamic_linker_aux = loaded.dynamic_linker;
+                    crate::process::update_process(pid, proc);
                  }
              }
         }
@@ -886,6 +933,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 
                 // Inherit missing fields (CRITICAL for TLS/Libc stability)
                 child.fs_base = parent.fs_base;
+                child.dynamic_linker_aux = parent.dynamic_linker_aux;
                 child.gs_base = parent.gs_base;
                 child.is_linux = parent.is_linux;
                 child.priority = parent.priority;

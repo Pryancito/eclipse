@@ -1160,8 +1160,11 @@ impl Scheme for FileSystemScheme {
         
         serial::serial_printf(format_args!("[FS-SCHEME] open({})\n", path));
 
-        // Clean path to remove leading slash if present
-        let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+        // Strip *all* leading slashes. `file://foo` yields relative_path `//foo`; removing only
+        // one slash left `/foo` and lookup treated `foo` as a child of root. Also, musl may
+        // open `//libfoo.so` (bad search-dir join); trimming yields `libfoo.so` so we can retry
+        // under `lib/` / `usr/lib/` below.
+        let clean_path = path.trim_start_matches('/');
 
         match clean_path {
             p if p == "dev/fb0" => {
@@ -1209,21 +1212,49 @@ impl Scheme for FileSystemScheme {
                     serial::serial_print("[FS-SCHEME] open() failed: physical path requires mount\n");
                     return Err(scheme_error::EIO);
                 }
-                match Filesystem::lookup_path(clean_path) {
-                    Ok(inode) => {
-                        let (data_start, size) = Filesystem::get_file_metadata(inode).map_err(|_| scheme_error::EIO)?;
+                let mut inode = match Filesystem::lookup_path(clean_path) {
+                    Ok(i) => Some(i),
+                    Err(_) => None,
+                };
+                if inode.is_none()
+                    && !clean_path.contains('/')
+                    && clean_path.contains(".so")
+                {
+                    // e.g. musl opened `//libfoo.so.N` → trimmed `libfoo.so.N`; or missing prefix.
+                    if let Ok(i) = Filesystem::lookup_path(&alloc::format!("lib/{clean_path}")) {
+                        inode = Some(i);
+                    } else if let Ok(i) =
+                        Filesystem::lookup_path(&alloc::format!("usr/lib/{clean_path}"))
+                    {
+                        inode = Some(i);
+                    }
+                }
+                match inode {
+                    Some(ino) => {
+                        let (data_start, size) =
+                            Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
                         let mut open_files = OPEN_FILES_SCHEME.lock();
                         for (i, slot) in open_files.iter_mut().enumerate() {
                             if slot.is_none() {
-                                *slot = Some(OpenFile::Real { inode, offset: 0, data_start_abs: data_start, size });
+                                *slot = Some(OpenFile::Real {
+                                    inode: ino,
+                                    offset: 0,
+                                    data_start_abs: data_start,
+                                    size,
+                                });
                                 return Ok(i);
                             }
                         }
                         let id = open_files.len();
-                        open_files.push(Some(OpenFile::Real { inode, offset: 0, data_start_abs: data_start, size }));
+                        open_files.push(Some(OpenFile::Real {
+                            inode: ino,
+                            offset: 0,
+                            data_start_abs: data_start,
+                            size,
+                        }));
                         Ok(id)
                     }
-                    Err(_) => Err(scheme_error::ENOENT)
+                    None => Err(scheme_error::ENOENT),
                 }
             }
         }

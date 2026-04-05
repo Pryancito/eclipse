@@ -1,0 +1,5 @@
+[wrap-file]
+directory = wayland-protocols-1.32
+source_url = https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.32/wayland-protocols-1.32.tar.gz
+source_filename = wayland-protocols-1.32.tar.gz
+source_hash = 444b5d823ad0163dfe505c97ea1a0689ca7e2978a87cf59b03f06573b87db260

@@ -1,9 +1,12 @@
-//! GUI Service - Launches the Sidewind compositor (smithay_app)
+//! GUI Service - Lanza el compositor Wayland desde disco (exec vía mmap).
 //!
-//! Responsibilities:
-//! 1. Wait for filesystem to be ready.
-//! 2. Launch smithay_app from disk.
-//! 3. Exit after successful launch (one-shot supervisor).
+//! Por defecto: **`file:/usr/bin/labwc`** (PIE musl + `PT_INTERP`; requiere intérprete en `/lib`).
+//! Con feature **`compositor-lunas`**: **`file:/usr/bin/lunas`** (ET_EXEC estático).
+//!
+//! Responsabilidades:
+//! 1. Abrir el ELF del compositor vía esquema `file:`.
+//! 2. `mmap` + `exec` en el mismo flujo de arranque.
+//! 3. Salir si falla; si tiene éxito, la imagen del proceso es ya el compositor.
 
 use std::prelude::v1::*;
 
@@ -12,22 +15,22 @@ const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
 static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
+#[cfg(feature = "compositor-lunas")]
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
-
-// No longer needed: we use exec() in main directly
+#[cfg(not(feature = "compositor-lunas"))]
+const COMPOSITOR_PATH: &str = "file:/usr/bin/labwc";
 
 fn main() {
     let pid = unsafe { std::libc::getpid() };
     println!("+--------------------------------------------------------------+");
-    println!("|           GUI SERVICE - Sidewind Compositor Launcher         |");
+    println!("|              GUI SERVICE - Compositor Launcher               |");
     println!("+--------------------------------------------------------------+");
     // En Eclipse init siempre es PID 1.
     println!("[GUI-SERVICE] PID={}, PPID={}", pid, unsafe { std::libc::getppid() });
-    println!("[GUI-SERVICE] Transforming into smithay_app via exec...");
+    println!("[GUI-SERVICE] exec compositor: {}", COMPOSITOR_PATH);
 
-    // Transformar este proceso en smithay_app.
+    // Transformar este proceso en el compositor (labwc o lunas).
     // Al usar exec(), el PID se mantiene pero la imagen del proceso cambia.
-    // 'init' recibirá el READY enviado por smithay_app en su propio arranque.
     unsafe {
         use std::libc::{eclipse_open, eclipse_close, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
         const SEEK_SET: i32 = 0;
@@ -78,8 +81,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compositor_path_absolute() {
-        assert!(COMPOSITOR_PATH.starts_with("file:/"));
-        assert!(COMPOSITOR_PATH.contains("lunas"));
+    fn compositor_path_is_file_uri() {
+        assert!(COMPOSITOR_PATH.starts_with("file:/usr/bin/"));
+        #[cfg(feature = "compositor-lunas")]
+        assert!(COMPOSITOR_PATH.ends_with("/lunas"));
+        #[cfg(not(feature = "compositor-lunas"))]
+        assert!(COMPOSITOR_PATH.ends_with("/labwc"));
     }
 }

@@ -38,6 +38,7 @@ pub enum SyscallNumber {
     Fstat = 5,
     Lseek = 8,
     Mmap = 9,
+    Mprotect = 10,
     Munmap = 11,
     Brk = 12,
     SigAction = 13,
@@ -195,6 +196,26 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
 /// Linux uses PATH_MAX = 4096, we use 1024 as a reasonable compromise
 const MAX_PATH_LENGTH: usize = 1024;
 
+/// Linux ABI: failures return `-errno` in RAX (as unsigned). musl's `__syscall_ret` treats
+/// `r > -4096UL` as error and sets `errno = (int)-r`. A bare `u64::MAX` becomes errno **1 (EPERM)**,
+/// so missing files look like "Operation not permitted" instead of ENOENT.
+#[inline]
+fn linux_abi_error(errno: i32) -> u64 {
+    if errno <= 0 || errno >= 4096 {
+        u64::MAX
+    } else {
+        (-errno) as u64
+    }
+}
+
+#[inline]
+fn syscall_error_for_current_process(errno: i32) -> u64 {
+    match crate::process::current_process_id().and_then(|pid| crate::process::get_process(pid)) {
+        Some(p) if p.is_linux => linux_abi_error(errno),
+        _ => u64::MAX,
+    }
+}
+
 /// Handler principal de syscalls
 pub extern "C" fn syscall_handler(
     syscall_num: u64,
@@ -252,7 +273,13 @@ pub extern "C" fn syscall_handler(
         .unwrap_or(false);
 
     // Auto-detection: if it calls a high Linux-specific syscall, mark it as Linux permanently
-    if !is_linux && (syscall_num == 158 || syscall_num == 231 || syscall_num == 41 || syscall_num == 202) {
+    if !is_linux
+        && (syscall_num == 158
+            || syscall_num == 231
+            || syscall_num == 41
+            || syscall_num == 202
+            || syscall_num == 10)
+    {
          if let Some(pid) = crate::process::current_process_id() {
              if let Some(mut proc) = crate::process::get_process(pid) {
                  proc.is_linux = true;
@@ -273,6 +300,7 @@ pub extern "C" fn syscall_handler(
         5 => sys_fstat(arg1, arg2),
         8 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
         9 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
+        10 => sys_mprotect(arg1, arg2, arg3),
         11 => sys_munmap(arg1, arg2),
         12 => sys_brk(arg1),
         13 => sys_sigaction(arg1, arg2, arg3),
@@ -392,19 +420,16 @@ pub extern "C" fn syscall_handler(
                 crate::process::current_process_id().unwrap_or(0),
                 crate::process::get_cpu_id()
             ));
-            u64::MAX
+            if is_linux {
+                linux_abi_error(38) // ENOSYS
+            } else {
+                u64::MAX
+            }
         }
     };
     
-    // Linux Compatibility: Map results to signed if it's a Linux process
-    // glibc expects -1 for failure and sets errno based on the positive error code.
-    // Our kernel currently returns u64::MAX for error.
-    let final_ret = if is_linux && ret == u64::MAX {
-        // Return -1 (0xFFFFFFFFFFFFFFFF)
-        u64::MAX
-    } else {
-        ret
-    };
+    // Linux: legacy bare `u64::MAX` still decodes as EPERM in musl; prefer `linux_abi_error` per syscall.
+    let final_ret = ret;
 
     context.rax = final_ret;
 
@@ -1426,7 +1451,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     // Replace current process with ELF binary
     let current_pid = current_process_id().expect("exec called without current process");
     match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
-        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames, tls_base)) => {
+        Ok(res) => {
+            serial::serial_printf(format_args!(
+                "[SYSCALL] exec: replace_process_image success, entry={:#x} max_v={:#x} segments={}\n",
+                res.entry_point, res.max_vaddr, res.segment_frames
+            ));
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
@@ -1437,35 +1466,20 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                     {
                         let mut r = proc.resources.lock();
                         r.vmas.clear();
-                        r.brk_current = max_vaddr;
+                        r.brk_current = res.max_vaddr;
                     }
-                    proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
-                    // Persist the TLS base so the scheduler restores FS_BASE on
-                    // future context switches back to this process.
-                    if tls_base != 0 {
-                        proc.fs_base = tls_base;
-                    }
+                    proc.mem_frames = (0x100000 / 4096) + res.segment_frames; // stack + segments
+                    // Intérprete dinámico: dejar %fs en 0 hasta que ld-musl monte TLS (no usar tls_base del main).
+                    proc.fs_base = if res.dynamic_linker.is_some() {
+                        0
+                    } else {
+                        res.tls_base
+                    };
+                    proc.dynamic_linker_aux = res.dynamic_linker;
                     crate::process::update_process(pid, proc);
                 }
             }
 
-            // Apply TLS base (FS_BASE MSR) immediately — jump_to_userspace uses
-            // iretq and bypasses the normal scheduler context-switch path that
-            // would otherwise write the MSR.
-            if tls_base != 0 {
-                unsafe {
-                    use core::arch::asm;
-                    let msr_fs_base = 0xC0000100u32;
-                    let low  = tls_base as u32;
-                    let high = (tls_base >> 32) as u32;
-                    asm!("wrmsr",
-                         in("ecx") msr_fs_base,
-                         in("eax") low,
-                         in("edx") high,
-                         options(nomem, nostack, preserves_flags));
-                }
-            }
-            
             // This doesn't return - we jump to the new process entry point.
             // Map a fresh 1 MB user stack for the exec'd binary.
             // A forked child only inherits the parent's 256 KB stack (up to 0x20040000),
@@ -1482,7 +1496,23 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             }
             unsafe {
                 let stack_top: u64 = USER_STACK_BASE + USER_STACK_SIZE as u64;
-                crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum, phentsize);
+                if res.dynamic_linker.is_some() {
+                    crate::elf_loader::jump_to_userspace_dynamic_linker(
+                        res.entry_point,
+                        stack_top,
+                        res.phdr_va,
+                        res.phnum,
+                        res.phentsize,
+                    );
+                } else {
+                    crate::elf_loader::jump_to_userspace(
+                        res.entry_point,
+                        stack_top,
+                        res.phdr_va,
+                        res.phnum,
+                        res.phentsize,
+                    );
+                }
             }
         }
         Err(msg) => {
@@ -1933,11 +1963,11 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
     
     // Validate parameters
     if path_ptr == 0 || path_len == 0 || path_len > 4096 {
-        return u64::MAX;
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
     }
 
     if !is_user_pointer(path_ptr, path_len) {
-        return u64::MAX;
+        return syscall_error_for_current_process(crate::scheme::error::EFAULT as i32);
     }
     
     // Extract path string
@@ -1957,7 +1987,7 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
                 if e != crate::scheme::error::EAGAIN {
                     serial::serial_printf(format_args!("[SYSCALL] open() dev failed: error {}\n", e));
                 }
-                return u64::MAX;
+                return syscall_error_for_current_process(e as i32);
             }
         }
     } else if path.starts_with('/') {
@@ -1969,7 +1999,7 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
                 {
                     serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
                 }
-                return u64::MAX;
+                return syscall_error_for_current_process(e as i32);
             }
         }
     } else {
@@ -1979,7 +2009,7 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
                 if e != crate::scheme::error::EAGAIN {
                     serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
                 }
-                return u64::MAX;
+                return syscall_error_for_current_process(e as i32);
             }
         }
     };
@@ -1993,13 +2023,13 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
                 // FD table is full (MAX_FD_PER_PROCESS entries in use).
                 // Release the scheme resource so it isn't permanently leaked.
                 let _ = crate::scheme::close(scheme_id, resource_id);
-                u64::MAX
+                syscall_error_for_current_process(24) // EMFILE
             }
         }
     } else {
         // No current process — release the scheme resource to avoid a leak.
         let _ = crate::scheme::close(scheme_id, resource_id);
-        u64::MAX
+        syscall_error_for_current_process(crate::scheme::error::ESRCH as i32)
     }
 }
 
@@ -2649,14 +2679,14 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     use crate::serial;
 
     if length == 0 || length > 0x0000_7FFF_FFFF_FFFF {
-        return u64::MAX;
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
     }
     let aligned_length = (length + 0xFFF) & !0xFFF;
     let num_pages = aligned_length / 4096;
 
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
-        None => return u64::MAX,
+        None => return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32),
     };
 
     // Resolve file descriptor before acquiring process resources.
@@ -2780,7 +2810,25 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         process::update_process(current_pid, proc);
         return target_addr;
     }
-    u64::MAX
+    syscall_error_for_current_process(crate::scheme::error::ESRCH as i32)
+}
+
+/// Linux `mprotect` — used heavily by musl for RELRO (RW → R after relocations).
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    use crate::memory;
+    use crate::process;
+    let Some(pid) = process::current_process_id() else {
+        return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
+    };
+    let Some(proc) = process::get_process(pid) else {
+        return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
+    };
+    let page_table_phys = proc.resources.lock().page_table_phys;
+    if memory::mprotect_user_range(page_table_phys, addr, len, prot) {
+        0
+    } else {
+        syscall_error_for_current_process(crate::scheme::error::EINVAL as i32)
+    }
 }
 
 fn sys_munmap(addr: u64, length: u64) -> u64 {

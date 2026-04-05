@@ -53,9 +53,9 @@ AR = ar
 CC = musl-gcc
 LIBTOOL = @LIBTOOL@
 RANLIB = ranlib
-BISON = :
+BISON = bison
 BISONFLAGS = --name-prefix=__gettext
-YACC = : -y -d
+YACC = bison -y -d
 YFLAGS = --name-prefix=__gettext
 
 ARFLAGS = cr

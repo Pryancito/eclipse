@@ -64,7 +64,7 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("display", false),
     Service::new("audio", false),
     Service::new("network", false),
-    // gui_service is a one-shot launcher: it starts smithay_app and then exits.
+    // gui_service es un lanzador one-shot: arranca el compositor (p. ej. labwc o lunas) y luego sale.
     // Don't enable heartbeat watchdog for it.
     Service::new("gui", false),
 ]);
@@ -187,7 +187,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
                         return;
                     } else {
                         // READY from someone else - might be a service that we aren't waiting for yet,
-                        // or an app like smithay_app. Mark it as READY if it matches any service.
+                        // or the compositor (labwc, lunas, etc.). Mark it as READY if it matches any service.
                         let mut svc = SERVICES.lock();
                         for s in svc.iter_mut() {
                             if s.pid == sender as i32 {
@@ -515,7 +515,7 @@ fn reap_zombies() {
         for service in svc.iter_mut() {
             if service.pid == terminated_pid && service.state == ServiceState::Running {
                 if service.name == "gui" {
-                    // One-shot: gui_service exiting is expected once it has launched smithay_app.
+                    // One-shot: gui_service exiting is expected once it has launched the compositor.
                     println!("[INIT] Service {} (PID {}) has completed (one-shot)", service.name, terminated_pid);
                     service.state = ServiceState::Stopped;
                 } else {

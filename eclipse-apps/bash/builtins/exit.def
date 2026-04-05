@@ -54,15 +54,7 @@ static int sourced_logout;
 int
 exit_builtin (WORD_LIST *list)
 {
-  CHECK_HELPOPT (list);
-
-  if (interactive)
-    {
-      fprintf (stderr, login_shell ? _("logout\n") : "exit\n");
-      fflush (stderr);
-    }
-
-  return (exit_or_logout (list));
+  return (EXECUTION_SUCCESS);
 }
 
 $BUILTIN logout
@@ -78,15 +70,7 @@ $END
 int
 logout_builtin (WORD_LIST *list)
 {
-  CHECK_HELPOPT (list);
-
-  if (login_shell == 0 /* && interactive */)
-    {
-      builtin_error (_("not login shell: use `exit'"));
-      return (EXECUTION_FAILURE);
-    }
-  else
-    return (exit_or_logout (list));
+  return (EXECUTION_SUCCESS);
 }
 
 static int

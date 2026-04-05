@@ -70,7 +70,7 @@ srcdir = .
 
 CC = musl-gcc
 CC_FOR_BUILD = $(CC)
-YACC = yacc
+YACC = bison -y
 SHELL = /bin/sh
 CP = cp
 RM = rm -f

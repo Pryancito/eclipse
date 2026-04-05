@@ -33,6 +33,88 @@ print_step() {
     echo -e "${YELLOW}[STEP]${NC} $1"
 }
 
+print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+# Copia al rootfs staging las .so que `ldd` resuelve para un binario (labwc, etc.).
+# Sin esto, en Eclipse solo están musl/libc y faltan libinput, EGL, cairo, pango…
+eclipse_stage_ldd_libs() {
+    local dest="$1"
+    local bin="$2"
+    [ -z "${ECLIPSE_SKIP_LDD_STAGING:-}" ] || return 0
+    [ -f "$bin" ] || return 0
+    if ! command -v ldd >/dev/null 2>&1; then
+        print_warning "ldd no está en PATH; omito copia de dependencias de $bin. Instala libc-bin o define ECLIPSE_LABWC_LIB_PREFIX."
+        return 0
+    fi
+    mkdir -p "$dest/lib"
+    local line p n
+    n=0
+    while IFS= read -r line; do
+        case "$line" in
+            *"=> /"*)
+                p="${line#*=> }"
+                p="${p%% (*}"
+                case "$p" in
+                    */ld-linux*.so*|*/ld-musl-x86_64.so.1)
+                        continue
+                        ;;
+                esac
+                [ -f "$p" ] || [ -L "$p" ] || continue
+                cp -a "$p" "$dest/lib/"
+                n=$((n + 1))
+                ;;
+        esac
+    done < <(ldd "$bin" 2>/dev/null || true)
+    if [ "$n" -gt 0 ]; then
+        print_status "Staged $n bibliotecas dinámicas (ldd) desde $(basename "$bin") -> lib/"
+    fi
+}
+
+# Si ldd falla (p. ej. musl intentó cargar /lib/.../libc.so script de glibc), copia DT_NEEDED resolviendo rutas.
+eclipse_stage_readelf_needed_libs() {
+    local dest="$1"
+    local bin="$2"
+    [ -z "${ECLIPSE_SKIP_LDD_STAGING:-}" ] || return 0
+    [ -f "$bin" ] || return 0
+    command -v readelf >/dev/null 2>&1 || return 0
+    mkdir -p "$dest/lib"
+    local soname n cand pf d
+    n=0
+    while IFS= read -r soname; do
+        [ -z "$soname" ] && continue
+        case "$soname" in
+            ld-linux*.so*|ld-musl*.so*) continue ;;
+        esac
+        cand=""
+        if command -v musl-gcc >/dev/null 2>&1; then
+            pf="$(musl-gcc -print-file-name="$soname" 2>/dev/null || true)"
+            case "$pf" in
+                /*)
+                    if [ -f "$pf" ] && readelf -h "$pf" >/dev/null 2>&1; then
+                        cand="$pf"
+                    fi
+                    ;;
+            esac
+        fi
+        if [ -z "$cand" ]; then
+            for d in /usr/lib/x86_64-linux-musl /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
+                [ -e "$d/$soname" ] || continue
+                readelf -h "$d/$soname" >/dev/null 2>&1 || continue
+                cand="$d/$soname"
+                break
+            done
+        fi
+        [ -z "$cand" ] && continue
+        cp -a "$cand" "$dest/lib/"
+        n=$((n + 1))
+    done < <(readelf -d "$bin" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
+    if [ "$n" -gt 0 ]; then
+        print_status "Staged $n bibliotecas (readelf NEEDED, sin ldd) desde $(basename "$bin") -> lib/"
+    fi
+}
+
 # Configuración
 KERNEL_TARGET="x86_64-unknown-none"
 UEFI_TARGET="x86_64-unknown-uefi"
@@ -235,7 +317,7 @@ build_sidewind_project() {
             export CC="musl-gcc"
             export CFLAGS="-O2 -static"
             export LDFLAGS="-static"
-            ./configure --prefix=/ --enable-static-link --without-bash-malloc --with-curses=no --disable-nls --enable-job-control --enable-readline --enable-history
+            ./configure --prefix=/ --enable-static-link --without-bash-malloc --with-curses=no --disable-nls
             make
             cp "bash" "$BASE_DIR/$BUILD_DIR/sysroot/bin/bash"
             print_status "Instalado en sysroot: /bin/bash (desde bash)"
@@ -557,7 +639,13 @@ build_userspace_services() {
         fi
         
         # Todos los servicios usan eclipse_std (target x86_64-unknown-eclipse, fn main)
-        RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly -Z json-target-spec build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
+        # gui_service: por defecto labwc; ECLIPSE_COMPOSITOR_LUNAS=1 usa lunas (ET_EXEC estático)
+        local _gui_flags=""
+        if [ "$service" = "gui_service" ] && [ "${ECLIPSE_COMPOSITOR_LUNAS:-}" = "1" ]; then
+            _gui_flags="--features compositor-lunas"
+            print_status "gui_service: compilando con compositor-lunas (file:/usr/bin/lunas)"
+        fi
+        RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly -Z json-target-spec build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc $_gui_flags
         local build_ok=$?
         local service_path="target/x86_64-unknown-eclipse/release/$service"
         
@@ -1005,6 +1093,47 @@ build_cosmic_desktop() {
     cd ../..
 }
 
+# Compositor labwc (wlroots) enlazado con musl-gcc; ver eclipse-apps/labwc/scripts/build-labwc-musl.sh
+# Requiere: meson, ninja, musl-gcc, cmake, pkg-config, hwdata (hwdata.pc). Opcional: SKIP_LABWC=1 ./build.sh
+build_labwc_musl() {
+    print_step "Compilando labwc (linux-musl, Meson)..."
+
+    if [ -n "${SKIP_LABWC:-}" ]; then
+        print_status "SKIP_LABWC definido; omitiendo labwc."
+        return 0
+    fi
+
+    if [ ! -d "$BASE_DIR/eclipse-apps/labwc" ]; then
+        print_status "eclipse-apps/labwc no encontrado, saltando..."
+        return 0
+    fi
+
+    for _need in meson ninja musl-gcc; do
+        if ! command -v "$_need" &>/dev/null; then
+            print_warning "labwc: falta '$_need' en PATH; omitiendo compositor."
+            return 0
+        fi
+    done
+
+    if ! pkg-config --exists hwdata 2>/dev/null; then
+        print_warning "labwc: paquete hwdata no detectado (pkg-config hwdata); el configure de wlroots puede fallar. Instala hwdata."
+    fi
+
+    local _labwc_script="$BASE_DIR/eclipse-apps/labwc/scripts/build-labwc-musl.sh"
+    if [ ! -f "$_labwc_script" ]; then
+        print_warning "labwc: no existe $_labwc_script; omitiendo."
+        return 0
+    fi
+
+    print_status "Ejecutando build-labwc-musl.sh (puede tardar varios minutos)..."
+    if bash "$_labwc_script"; then
+        print_success "labwc compilado: eclipse-apps/labwc/build/labwc"
+    else
+        print_warning "Compilación de labwc falló (componente opcional, continuando)."
+        return 0
+    fi
+}
+
 # Función para compilar todos los módulos userland
 build_userland() {
     print_step "Compilando módulos userland..."
@@ -1024,7 +1153,8 @@ build_userland() {
     build_libxfont15
     build_tinyx_for_eclipse_os
     build_sidewind_project
-    
+    build_labwc_musl
+
     # Aplicaciones
     #build_wayland_apps
     #build_wayland_server
@@ -1482,6 +1612,138 @@ EOF
         cp "$BUILD_DIR/sysroot/usr/bin/smithay_app" "$BUILD_DIR/usr/bin/"
         print_status "smithay_app (Rust Compositor) copiado"
     fi
+
+    # labwc: meson install con prefix=/ libdir=lib bindir=usr/bin → $BUILD_DIR/lib + usr/bin/labwc
+    mkdir -p "$BUILD_DIR/lib" "$BUILD_DIR/usr/bin" "$BUILD_DIR/userland/bin" "$BUILD_DIR/sysroot/usr/bin"
+    if [ -z "${ECLIPSE_SKIP_LABWC_MESON_INSTALL:-}" ] && [ -f "eclipse-apps/labwc/build/build.ninja" ] && command -v meson >/dev/null 2>&1; then
+        if meson install -C eclipse-apps/labwc/build --destdir="$BASE_DIR/$BUILD_DIR" --no-rebuild; then
+            print_status "meson install labwc → $BUILD_DIR/lib y $BUILD_DIR/usr/bin/"
+        else
+            print_warning "meson install labwc falló (¿reconfigura build con scripts/build-labwc-musl.sh?). Copiando binario desde build/."
+            if [ -f "eclipse-apps/labwc/build/labwc" ]; then
+                cp "eclipse-apps/labwc/build/labwc" "$BUILD_DIR/usr/bin/labwc"
+            fi
+        fi
+    elif [ -f "eclipse-apps/labwc/build/labwc" ]; then
+        cp "eclipse-apps/labwc/build/labwc" "$BUILD_DIR/usr/bin/labwc"
+        print_status "labwc copiado a usr/bin (sin meson install; define build.ninja o quita ECLIPSE_SKIP_LABWC_MESON_INSTALL)"
+    fi
+    if [ -f "$BUILD_DIR/usr/bin/labwc" ]; then
+        chmod +x "$BUILD_DIR/usr/bin/labwc"
+        cp "$BUILD_DIR/usr/bin/labwc" "$BUILD_DIR/userland/bin/labwc"
+        cp "$BUILD_DIR/usr/bin/labwc" "$BUILD_DIR/sysroot/usr/bin/labwc"
+        chmod +x "$BUILD_DIR/userland/bin/labwc" "$BUILD_DIR/sysroot/usr/bin/labwc"
+    fi
+
+    # Enlazador dinámico musl en /lib (PT_INTERP de labwc y otros ELF PIE musl).
+    # Sin esto, exec falla con "File not found" al resolver /lib/ld-musl-x86_64.so.1
+    mkdir -p "$BUILD_DIR/lib" "$BUILD_DIR/usr/lib" "$BUILD_DIR/etc"
+    # Rutas donde ld-musl busca shared objects (un directorio por línea).
+    # Sin este fichero, open("/etc/ld-musl-x86_64.path") falla con ENOENT y el linker
+    # solo usa rutas por defecto /lib y /usr/lib internas; conviene tenerlo explícito en el rootfs.
+    # Solo LF, sin líneas vacías (una línea vacía en musl puede provocar búsquedas con "//" y open("//foo.so")).
+    printf '/lib\n/usr/lib\n/usr/local/lib\n' > "$BUILD_DIR/etc/ld-musl-x86_64.path"
+    print_status "Creado etc/ld-musl-x86_64.path (/lib, /usr/lib, /usr/local/lib, LF only)"
+    _eclipse_musl_ld_src=""
+    if [ -n "${ECLIPSE_MUSL_LD:-}" ] && [ -f "${ECLIPSE_MUSL_LD}" ]; then
+        _eclipse_musl_ld_src="${ECLIPSE_MUSL_LD}"
+    elif command -v musl-gcc >/dev/null 2>&1; then
+        for _n in ld-musl-x86_64.so.1 libc.so; do
+            _cand="$(musl-gcc -print-file-name="$_n" 2>/dev/null || true)"
+            case "$_cand" in
+                /*)
+                    if [ -f "$_cand" ]; then
+                        _eclipse_musl_ld_src="$_cand"
+                        break
+                    fi
+                    ;;
+            esac
+        done
+    fi
+    if [ -z "$_eclipse_musl_ld_src" ] || [ ! -f "$_eclipse_musl_ld_src" ]; then
+        for _cand in /usr/lib/x86_64-linux-musl/libc.so /usr/lib/x86_64-linux-musl/ld-musl-x86_64.so.1; do
+            if [ -f "$_cand" ]; then
+                _eclipse_musl_ld_src="$_cand"
+                break
+            fi
+        done
+    fi
+    if [ -n "$_eclipse_musl_ld_src" ] && [ -f "$_eclipse_musl_ld_src" ]; then
+        cp "$_eclipse_musl_ld_src" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
+        chmod 755 "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
+        print_status "Instalado lib/ld-musl-x86_64.so.1 (origen: $_eclipse_musl_ld_src)"
+    else
+        print_warning "No se encontró ld-musl (musl-gcc, rutas Debian o ECLIPSE_MUSL_LD). labwc fallará en exec hasta instalarlo en /lib del rootfs."
+    fi
+
+    # libc.so y demás *.so del mismo árbol musl (necesarios para resolver DT_NEEDED "libc.so", etc.).
+    _eclipse_musl_libdir="${ECLIPSE_MUSL_LIBDIR:-}"
+    if [ -z "$_eclipse_musl_libdir" ] || [ ! -d "$_eclipse_musl_libdir" ]; then
+        if [ -n "${_eclipse_musl_ld_src:-}" ] && [ -f "${_eclipse_musl_ld_src}" ]; then
+            _eclipse_musl_libdir="$(dirname "$_eclipse_musl_ld_src")"
+        fi
+    fi
+    if [ -n "${_eclipse_musl_libdir:-}" ] && [ -d "$_eclipse_musl_libdir" ]; then
+        _musl_n=0
+        for _mf in "$_eclipse_musl_libdir"/*.so; do
+            [ -f "$_mf" ] || continue
+            cp -a "$_mf" "$BUILD_DIR/lib/"
+            _musl_n=$((_musl_n + 1))
+        done
+        if [ "$_musl_n" -gt 0 ]; then
+            print_status "Copiadas $_musl_n bibliotecas musl (*.so) desde $_eclipse_musl_libdir -> lib/"
+        fi
+    fi
+    # Debian: libc.so a menudo está solo bajo /usr/lib/x86_64-linux-musl; el enlazador ya puede estar en /lib.
+    if [ ! -f "$BUILD_DIR/lib/libc.so" ] && [ -f /usr/lib/x86_64-linux-musl/libc.so ]; then
+        cp -a /usr/lib/x86_64-linux-musl/libc.so "$BUILD_DIR/lib/libc.so"
+        print_status "Instalado lib/libc.so desde /usr/lib/x86_64-linux-musl"
+    fi
+
+    # Sysroot musl (Alpine chroot, Buildroot output/target, etc.): libinput, Mesa, cairo… enlazados a musl.
+    _eclipse_used_musl_sysroot=0
+    if [ -n "${ECLIPSE_MUSL_SYSROOT:-}" ] && [ -d "${ECLIPSE_MUSL_SYSROOT}" ]; then
+        if [ -x "$BASE_DIR/scripts/stage_musl_sysroot.sh" ]; then
+            "$BASE_DIR/scripts/stage_musl_sysroot.sh" "$ECLIPSE_MUSL_SYSROOT" "$BASE_DIR/$BUILD_DIR"
+            _eclipse_used_musl_sysroot=1
+        else
+            print_warning "ECLIPSE_MUSL_SYSROOT definido pero falta scripts/stage_musl_sysroot.sh"
+        fi
+    fi
+    if [ "$_eclipse_used_musl_sysroot" = 1 ] && [ "${ECLIPSE_ALLOW_LDD_WITH_SYSROOT:-}" != "1" ]; then
+        ECLIPSE_SKIP_LDD_STAGING=1
+        print_status "Sysroot musl activo → ECLIPSE_SKIP_LDD_STAGING=1 (no mezclar .so glibc del host). Para forzar ldd: ECLIPSE_ALLOW_LDD_WITH_SYSROOT=1"
+    fi
+
+    # labwc: dependencias dinámicas (wlroots → libinput, Mesa → EGL/gbm/GLESv2, cairo, pango, udev, systemd…).
+    # Opción A: prefijo tipo DESTDIR de `meson install` (contiene lib/ o usr/lib/ con .so).
+    if [ -n "${ECLIPSE_LABWC_LIB_PREFIX:-}" ] && [ -d "${ECLIPSE_LABWC_LIB_PREFIX}" ]; then
+        shopt -s nullglob
+        for _d in "${ECLIPSE_LABWC_LIB_PREFIX}/lib" "${ECLIPSE_LABWC_LIB_PREFIX}/usr/lib"; do
+            if [ -d "$_d" ]; then
+                for _so in "$_d"/*.so "$_d"/*.so.*; do
+                    [ -e "$_so" ] || continue
+                    cp -a "$_so" "$BUILD_DIR/lib/"
+                done
+            fi
+        done
+        shopt -u nullglob
+        print_status "Copiadas bibliotecas desde ECLIPSE_LABWC_LIB_PREFIX=$ECLIPSE_LABWC_LIB_PREFIX"
+    fi
+    # Opción B: deducir rutas con ldd sobre el propio labwc (en la máquina de build).
+    _labwc_ldd_target=""
+    if [ -f "eclipse-apps/labwc/build/labwc" ]; then
+        _labwc_ldd_target="eclipse-apps/labwc/build/labwc"
+    elif [ -f "$BUILD_DIR/usr/bin/labwc" ]; then
+        _labwc_ldd_target="$BUILD_DIR/usr/bin/labwc"
+    fi
+    if [ -n "$_labwc_ldd_target" ]; then
+        eclipse_stage_ldd_libs "$BUILD_DIR" "$_labwc_ldd_target"
+    fi
+    for _eb in ${ECLIPSE_LDD_EXTRA_BINS:-}; do
+        [ -z "$_eb" ] && continue
+        [ -f "$_eb" ] && eclipse_stage_ldd_libs "$BUILD_DIR" "$_eb"
+    done
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
@@ -1620,6 +1882,7 @@ show_build_summary() {
     echo "  Terminal Wayland: wayland_apps/wayland_terminal/target/release/wayland_terminal"
     echo "  Editor de texto Wayland: wayland_apps/wayland_text_editor/target/release/wayland_text_editor"
     echo "  Rwaybar: eclipse-apps/target/x86_64-unknown-linux-musl/release/rwaybar"
+    echo "  labwc (musl): eclipse-apps/labwc/build/labwc"
     echo ""
     echo "Desktop Environment:"
     echo "  Nota: Desktop environment no implementado en esta versión"
@@ -1639,6 +1902,7 @@ show_build_summary() {
     echo "  - Editor de texto Wayland: $BUILD_DIR/userland/bin/wayland_text_editor"
     echo "  - Instalador: $BUILD_DIR/userland/bin/eclipse-installer"
     echo "  - Systemd: $BUILD_DIR/userland/bin/eclipse-systemd"
+    echo "  - labwc: $BUILD_DIR/usr/bin/labwc"
     echo ""
     
     # Mostrar imagen USB si existe

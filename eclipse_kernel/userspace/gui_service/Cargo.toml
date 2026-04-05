@@ -4,6 +4,11 @@ version = "0.2.0"
 edition = "2021"
 resolver = "2"
 
+[features]
+default = []
+# Alternativa estática (ET_EXEC) si no usás labwc: cargo build --features compositor-lunas
+compositor-lunas = []
+
 [dependencies]
 std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
 eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false }
