@@ -7,27 +7,27 @@
 
 use heapless::String as HString;
 
-use core::time::Duration;
 use std::time::Instant;
 use embedded_graphics::{
     prelude::*,
     pixelcolor::Rgb888,
     text::Text,
-    mono_font::MonoTextStyle,
+    mono_font::{MonoTextStyle, ascii::FONT_10X20},
 };
 #[cfg(target_os = "eclipse")]
 use sidewind::font_terminus_16;
-
 #[cfg(target_os = "eclipse")]
-use libc::{c_int, close, mmap, munmap, open, exit};
+use libc::{c_char, c_int, close, mmap, open, exit};
 #[cfg(target_os = "eclipse")]
-use eclipse_ipc::prelude::EclipseMessage;
+use wayland_proto::unix_transport::UnixSocketConnection;
 #[cfg(target_os = "eclipse")]
-use sidewind::{IpcChannel, SideWindEvent, SideWindMessage, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_CLOSE};
+use wayland_proto::wl::wire::{RawMessage, ObjectId, NewId, Opcode, Payload, PayloadType};
 #[cfg(target_os = "eclipse")]
-use eclipse_syscall::{self, flag, ProcessInfo, SystemStats};
+use wayland_proto::wl::connection::Connection;
 #[cfg(target_os = "eclipse")]
-use eclipse_syscall::call::{sched_yield, exit as syscall_exit, get_system_stats};
+use eclipse_syscall::{self, flag};
+#[cfg(target_os = "eclipse")]
+use eclipse_syscall::call::sched_yield;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math helpers (no libm, no_std)
@@ -335,20 +335,25 @@ impl<'a> OriginDimensions for BufferTarget<'a> {
 }
 
 /// Draw the FPS overlay on the buffer.
-#[cfg(target_os = "eclipse")]
+#[cfg(any(target_os = "eclipse", target_os = "linux"))]
 fn draw_fps_overlay(buf: &mut [u32], w: u32, h: u32, fps: u32) {
     let mut target = BufferTarget { words: buf, width: w, height: h };
     let mut fps_str = HString::<32>::new();
     let _ = core::fmt::write(&mut fps_str, format_args!("FPS: {}", fps));
 
+    // For Linux or as fallback, use built-in font. 
+    // On eclipse we could still use terminus if we wanted, but let's standardize for now.
+    let font = &FONT_10X20;
+    
     // Draw background for contrast (glow/outline logic).
-    let backdrop_style = MonoTextStyle::new(&font_terminus_16::FONT_TERMINUS_16, Rgb888::new(0, 0, 0));
+    // std::println!("[GLXGEARS-DEBUG] Drawing FPS backdrop...");
+    let backdrop_style = MonoTextStyle::new(font, Rgb888::new(0, 0, 0));
     for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
         let _ = Text::new(fps_str.as_str(), Point::new(10 + dx, 25 + dy), backdrop_style).draw(&mut target);
     }
 
-    // Draw text (Bright Cyan).
-    let text_style = MonoTextStyle::new(&font_terminus_16::FONT_TERMINUS_16, Rgb888::new(100, 255, 255));
+    // std::println!("[GLXGEARS-DEBUG] Drawing FPS text...");
+    let text_style = MonoTextStyle::new(font, Rgb888::new(100, 255, 255));
     let _ = Text::new(fps_str.as_str(), Point::new(10, 25), text_style).draw(&mut target);
 }
 
@@ -356,11 +361,6 @@ fn draw_fps_overlay(buf: &mut [u32], w: u32, h: u32, fps: u32) {
 const SCANCODE_Q: u8 = 0x10;
 /// PS/2 scancode for the Escape key (press).
 const SCANCODE_ESCAPE: u8 = 0x01;
-
-// Maximum length of a SHM name (excluding the '/tmp/' prefix and NUL terminator).
-const MAX_SHM_NAME_LEN: usize = 32;
-// Length of the '/tmp/' prefix in the SHM path.
-const TMP_PREFIX_LEN: usize = 5;
 
 // Half-tooth phase divisor: gears 2 & 3 each have 16 teeth, so one tooth
 // spans 2π/16 radians.  Half of that is π/16 — expressed below as PI/(16×2).
@@ -370,26 +370,21 @@ const GEAR_PHASE_DIVISOR: f32 = 16.0 * 2.0;
 // Eclipse OS helpers (process discovery, shared-memory window)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn process_name_bytes(name: &[u8; 16]) -> &[u8] {
-    let end = name.iter().position(|&b| b == 0).unwrap_or(16);
-    &name[..end]
+/// Send a Wayland message on the Unix socket connection.
+#[cfg(target_os = "eclipse")]
+fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
+    let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
 }
 
-fn find_pid_by_name(want: &[u8]) -> Option<u32> {
-    let mut list = [ProcessInfo::default(); 48];
-    let count = eclipse_syscall::get_process_list(&mut list).ok()?;
-    for info in list.iter().take(count) {
-        if info.pid == 0 {
-            continue;
-        }
-        if process_name_bytes(&info.name) == want {
-            return Some(info.pid);
-        }
-    }
-    None
+/// Send a Wayland message with an ancillary file descriptor (SCM_RIGHTS).
+#[cfg(target_os = "eclipse")]
+fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
+    use wayland_proto::wl::wire::Handle;
+    let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
 }
 
 /// Compute a per-process unique SHM name derived from `pid`.
+#[cfg(target_os = "eclipse")]
 fn shm_name(pid: u32) -> HString<24> {
     let mut s = HString::new();
     let _ = s.push_str("glxg_");
@@ -415,61 +410,180 @@ fn shm_name(pid: u32) -> HString<24> {
     s
 }
 
-/// Create a shared-memory framebuffer window via SideWind / Lunas IPC.
+/// Create a shared-memory framebuffer window via Wayland.
 #[cfg(target_os = "eclipse")]
-fn open_sidewind_window(
-    composer_pid: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    name: &str,
-) -> Option<(*mut u32, usize)> {
-    let mut path = [0u8; 64];
-    path[0..5].copy_from_slice(b"/tmp/");
-    let nb = name.as_bytes();
-    let nlen = nb.len().min(MAX_SHM_NAME_LEN).min(path.len() - TMP_PREFIX_LEN - 1);
-    path[5..5 + nlen].copy_from_slice(&nb[..nlen]);
-    // path[5 + nlen] = 0; // already zero-initialised
+struct GlxGearsApp {
+    wayland: UnixSocketConnection,
+    surface_id: u32,
+    keyboard_id: u32,
+    fb_ptr: *mut u32,
+    width: u32,
+    height: u32,
+}
 
-    let size_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+#[cfg(target_os = "eclipse")]
+impl GlxGearsApp {
+    fn new() -> Option<Self> {
+        let self_pid = eclipse_syscall::getpid() as u32;
+        let win_w = 520u32;
+        let win_h = 380u32;
+        let size_bytes = (win_w as usize) * (win_h as usize) * 4;
 
-    let fd = unsafe {
-        open(
-            path.as_ptr() as *const core::ffi::c_char,
-            (flag::O_RDWR | flag::O_CREAT) as c_int,
-            0o644,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    if eclipse_syscall::ftruncate(fd as usize, size_bytes).is_err() {
-        unsafe { close(fd) };
-        return None;
-    }
-    let vaddr = unsafe {
-        mmap(
-            core::ptr::null_mut(),
-            size_bytes,
-            (flag::PROT_READ | flag::PROT_WRITE) as c_int,
-            flag::MAP_SHARED as c_int,
-            fd,
-            0,
-        )
-    };
-    unsafe { close(fd) };
-    if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
-        return None;
-    }
+        // 1. Allocate shared-memory framebuffer
+        let sname = shm_name(self_pid);
+        let path = format!("/tmp/{}\0", sname.as_str());
+        std::println!("[GLXGEARS] Creating SHM file {}...", path);
+        let fd = unsafe {
+            open(path.as_ptr() as *const c_char, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644)
+        };
+        if fd < 0 { 
+            std::println!("[GLXGEARS] open() failed: {}", fd);
+            return None; 
+        }
+        if eclipse_syscall::ftruncate(fd as usize, size_bytes).is_err() {
+            std::println!("[GLXGEARS] ftruncate() failed!");
+            unsafe { close(fd) };
+            return None;
+        }
+        let vaddr = unsafe {
+            mmap(core::ptr::null_mut(), size_bytes,
+                 (flag::PROT_READ | flag::PROT_WRITE) as c_int,
+                 flag::MAP_SHARED as c_int, fd, 0)
+        };
+        if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
+            std::println!("[GLXGEARS] mmap() failed!");
+            unsafe { close(fd) };
+            return None;
+        }
 
-    let msg = SideWindMessage::new_create(x, y, w, h, name);
-    if !IpcChannel::send_sidewind(composer_pid, &msg) {
-        unsafe { munmap(vaddr, size_bytes) };
-        return None;
-    }
+        // 2. Connect to Wayland
+        std::println!("[GLXGEARS] Connecting to Wayland socket...");
+        let wayland = UnixSocketConnection::connect("/tmp/wayland-0")?;
+        wayland.set_nonblocking();
+        std::println!("[GLXGEARS] Connected to Wayland.");
 
-    Some((vaddr as *mut u32, size_bytes))
+        // 3. Handshake (similar to terminal)
+        // wl_display.get_registry(id=2)
+        std::println!("[GLXGEARS] Handshaking (Registry)...");
+        send_wayland(&wayland, 1, 1, &[Payload::NewId(NewId(2))]);
+
+        let mut compositor_name = 0u32;
+        let mut shm_name_id = 0u32;
+        let mut xdg_name = 0u32;
+        let mut seat_name = 0u32;
+
+        // Lunas solo procesa el socket en `wayland_socket.poll()` una vez por frame
+        // (~16 ms de sleep en el main loop). Hace falta más paciencia que un bucle corto
+        // de yields; el terminal usa 5000 iteraciones por la misma razón.
+        for _ in 0..5000 {
+            if let Ok((data, _)) = wayland.recv() {
+                let mut pos = 0usize;
+                while pos + 8 <= data.len() {
+                    if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                        let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                        if sender == ObjectId(2) && opcode == Opcode(0) {
+                            let pts: &[PayloadType] = &[PayloadType::UInt, PayloadType::String, PayloadType::UInt];
+                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                let name = match raw.args.get(0) { Some(Payload::UInt(n)) => *n, _ => 0 };
+                                let iface = match raw.args.get(1) { Some(Payload::String(s)) => s.as_str(), _ => "" };
+                                if iface == "wl_compositor" { compositor_name = name; }
+                                else if iface == "wl_shm" { shm_name_id = name; }
+                                else if iface == "xdg_wm_base" { xdg_name = name; }
+                                else if iface == "wl_seat" { seat_name = name; }
+                            }
+                        }
+                        pos += msg_len.min(data.len() - pos);
+                    } else { break; }
+                }
+            }
+            if compositor_name != 0 && shm_name_id != 0 && xdg_name != 0 { break; }
+            let _ = sched_yield();
+        }
+
+        // Igual que el terminal: wl_seat puede llegar en el mismo lote o un poco después.
+        if seat_name == 0 {
+            for _ in 0..500 {
+                if let Ok((data, _)) = wayland.recv() {
+                    let mut pos = 0usize;
+                    while pos + 8 <= data.len() {
+                        if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                            let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                            if sender == ObjectId(2) && opcode == Opcode(0) {
+                                let pts: &[PayloadType] = &[PayloadType::UInt, PayloadType::String, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let name = match raw.args.get(0) { Some(Payload::UInt(n)) => *n, _ => 0 };
+                                    let iface = match raw.args.get(1) { Some(Payload::String(s)) => s.as_str(), _ => "" };
+                                    if iface == "wl_seat" { seat_name = name; }
+                                }
+                            }
+                            pos += msg_len.min(data.len() - pos);
+                        } else { break; }
+                    }
+                }
+                if seat_name != 0 { break; }
+                let _ = sched_yield();
+            }
+        }
+
+        if compositor_name == 0 { 
+            std::println!("[GLXGEARS] Failed to discover compositor!");
+            return None; 
+        }
+        std::println!("[GLXGEARS] Globals discovered.");
+
+        // Bind globals
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(compositor_name), Payload::String(std::string::String::from("wl_compositor")), Payload::UInt(4), Payload::NewId(NewId(3))]);
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(shm_name_id), Payload::String(std::string::String::from("wl_shm")), Payload::UInt(1), Payload::NewId(NewId(4))]);
+        send_wayland(&wayland, 2, 0, &[Payload::UInt(xdg_name), Payload::String(std::string::String::from("xdg_wm_base")), Payload::UInt(2), Payload::NewId(NewId(5))]);
+        if seat_name != 0 {
+            send_wayland(&wayland, 2, 0, &[Payload::UInt(seat_name), Payload::String(std::string::String::from("wl_seat")), Payload::UInt(7), Payload::NewId(NewId(6))]);
+        }
+
+        // Create surface
+        send_wayland(&wayland, 3, 0, &[Payload::NewId(NewId(7))]);
+
+        // Create SHM pool
+        std::println!("[GLXGEARS] Creating SHM pool...");
+        send_wayland_with_fd(&wayland, 4, 0, &[
+            Payload::NewId(NewId(8)),
+            Payload::Handle(wayland_proto::wl::wire::Handle(fd)),
+            Payload::Int(size_bytes as i32),
+        ], fd);
+
+        // Create buffer
+        let stride = (win_w * 4) as i32;
+        send_wayland(&wayland, 8, 0, &[
+            Payload::NewId(NewId(9)),
+            Payload::Int(0),
+            Payload::Int(win_w as i32), Payload::Int(win_h as i32),
+            Payload::Int(stride),
+            Payload::UInt(1), // XRGB8888
+        ]);
+
+        // XDG setup
+        send_wayland(&wayland, 5, 1, &[Payload::NewId(NewId(10)), Payload::ObjectId(ObjectId(7))]);
+        send_wayland(&wayland, 10, 1, &[Payload::NewId(NewId(11))]);
+        send_wayland(&wayland, 11, 2, &[Payload::String(std::string::String::from("glxgears"))]);
+
+        if seat_name != 0 {
+            send_wayland(&wayland, 6, 1, &[Payload::NewId(NewId(12))]);
+        }
+
+        // Initial attach & commit
+        send_wayland(&wayland, 7, 1, &[Payload::ObjectId(ObjectId(9)), Payload::Int(0), Payload::Int(0)]);
+        send_wayland(&wayland, 7, 6, &[]);
+
+        std::println!("[GLXGEARS] Application state built.");
+
+        Some(Self {
+            wayland,
+            surface_id: 7,
+            keyboard_id: if seat_name != 0 { 12 } else { 0 },
+            fb_ptr: vaddr as *mut u32,
+            width: win_w,
+            height: win_h,
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,49 +591,129 @@ fn open_sidewind_window(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-
     #[cfg(target_os = "eclipse")]
     {
-        let self_pid = eclipse_syscall::getpid() as u32;
-        let lunas_pid = find_pid_by_name(b"lunas").or_else(|| find_pid_by_name(b"gui"));
-        let Some(lunas_pid) = lunas_pid else {
-            loop {
-                let _ = sched_yield();
-            }
+        std::println!("[GLXGEARS] Starting recruitment of app...");
+        let Some(app) = GlxGearsApp::new() else {
+            std::println!("[GLXGEARS] Failed to initialize GlxGearsApp!");
+            loop { let _ = sched_yield(); }
         };
+        std::println!("[GLXGEARS] App initialized successfully!");
 
-        let win_w = 520u32;
-        let win_h = 380u32;
-        let name = shm_name(self_pid);
-        let name_str = name.as_str();
-
-        let Some((fb_ptr, fb_size)) =
-            open_sidewind_window(lunas_pid, 160, 120, win_w, win_h, name_str)
-        else {
-            loop {
-                let _ = sched_yield();
-            }
-        };
-
-        let buf_len = (win_w as usize).saturating_mul(win_h as usize);
-        let buf: &mut [u32] =
-            unsafe { core::slice::from_raw_parts_mut(fb_ptr, buf_len) };
+        let buf_len = (app.width as usize) * (app.height as usize);
+        let buf: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(app.fb_ptr, buf_len) };
+        std::println!("[GLXGEARS] Buffer mapped at {:p} (len={})", app.fb_ptr, buf_len);
 
         let mut angle = 0.0f32;
-        // Angular step per frame — approximately 1° per frame.
         const STEP: f32 = PI / 180.0;
 
-        let mut ipc_ch = IpcChannel::new();
-        let sw_ev_sz = core::mem::size_of::<SideWindEvent>();
-
-        // FPS tracking
         let mut last_second = Instant::now();
         let mut frames = 0;
         let mut current_fps = 0;
 
+        std::println!("[GLXGEARS] Entering main loop...");
         loop {
             frames += 1;
             let now = Instant::now();
+            let elapsed = now.duration_since(last_second).as_millis();
+            if elapsed >= 1000 {
+                // std::println!("[GLXGEARS] Calculating FPS (frames={}, elapsed={})...", frames, elapsed);
+                current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
+                frames = 0;
+                last_second = now;
+            }
+
+            // Wayland events
+            while let Ok((data, _)) = app.wayland.recv() {
+                let mut pos = 0usize;
+                while pos + 8 <= data.len() {
+                    if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                        let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                        
+                        // xdg_wm_base.ping (sender=5, opcode=0) -> pong
+                        if sender == ObjectId(5) && opcode == Opcode(0) {
+                            let pts = &[PayloadType::UInt];
+                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                                send_wayland(&app.wayland, 5, 3, &[Payload::UInt(serial)]);
+                            }
+                        }
+                        // xdg_surface.configure (sender=10, opcode=0) -> ack_configure
+                        else if sender == ObjectId(10) && opcode == Opcode(0) {
+                            let pts = &[PayloadType::UInt];
+                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                                send_wayland(&app.wayland, 10, 4, &[Payload::UInt(serial)]);
+                            }
+                        }
+                        // xdg_toplevel.close (sender=11, opcode=1)
+                        else if sender == ObjectId(11) && opcode == Opcode(1) {
+                            std::println!("[GLXGEARS] Received close event, exiting.");
+                            unsafe { exit(0); }
+                        }
+                        // wl_keyboard.key
+                        else if app.keyboard_id != 0 && sender == ObjectId(app.keyboard_id) && opcode == Opcode(3) {
+                            let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                let key = match raw.args.get(2) { Some(Payload::UInt(k)) => *k, _ => 0 };
+                                let state = match raw.args.get(3) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                                if state == 1 {
+                                    let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
+                                    if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
+                                        std::println!("[GLXGEARS] Key pressed, exiting.");
+                                        unsafe { exit(0); }
+                                    }
+                                }
+                            }
+                        }
+                        pos += msg_len.min(data.len() - pos);
+                    } else { break; }
+                }
+            }
+
+            render_frame(buf, app.width, app.height, angle);
+            draw_fps_overlay(buf, app.width, app.height, current_fps);
+
+            // Commit Wayland frame
+            send_wayland(&app.wayland, app.surface_id, 2, &[Payload::Int(0), Payload::Int(0), Payload::Int(i32::MAX), Payload::Int(i32::MAX)]);
+            send_wayland(&app.wayland, app.surface_id, 6, &[]);
+
+            angle += STEP;
+            if angle >= TAU { angle -= TAU; }
+            let _ = sched_yield();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use minifb::{Key, Window, WindowOptions};
+
+        let width = 520usize;
+        let height = 380usize;
+        let mut buffer: Vec<u32> = vec![0; width * height];
+
+        let mut window = Window::new(
+            "glxgears — Linux (minifb)",
+            width,
+            height,
+            WindowOptions::default(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("{}", e);
+        });
+
+        window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
+
+        let mut angle = 0.0f32;
+        const STEP: f32 = core::f32::consts::PI / 180.0;
+
+        let mut last_second = std::time::Instant::now();
+        let mut frames = 0;
+        let mut current_fps = 0;
+
+        while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
+            frames += 1;
+            let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_second).as_millis();
             if elapsed >= 1000 {
                 current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
@@ -527,53 +721,19 @@ fn main() {
                 last_second = now;
             }
 
-            // Handle incoming IPC events (key press, resize, close).
-            while let Some(msg) = ipc_ch.recv() {
-                if let EclipseMessage::Raw { data, len, .. } = msg {
-                    if len == sw_ev_sz {
-                        let ev = unsafe {
-                            core::ptr::read_unaligned(data.as_ptr() as *const SideWindEvent)
-                        };
-                        if ev.event_type == SWND_EVENT_TYPE_KEY {
-                            // Q or Escape → exit.
-                            let sc = ev.data1 as u8;
-                            if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
-                                let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
-                                unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
-                                unsafe { exit(0); }
-                            }
-                        } else if ev.event_type == SWND_EVENT_TYPE_CLOSE {
-                            let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_destroy());
-                            unsafe { munmap(fb_ptr as *mut core::ffi::c_void, fb_size) };
-                            unsafe { exit(0); }
-                        }
-                    }
-                }
-            }
+            render_frame(&mut buffer, width as u32, height as u32, angle);
+            draw_fps_overlay(&mut buffer, width as u32, height as u32, current_fps);
+            
+            // Draw FPS (rudimentary Linux overlay)
+            let fps_msg = format!("FPS: {}", current_fps);
+            window.set_title(&format!("glxgears — Linux (minifb) | {}", fps_msg));
 
-            // Render the current frame.
-            render_frame(buf, win_w, win_h, angle);
+            window
+                .update_with_buffer(&buffer, width, height)
+                .unwrap_or_else(|e| { panic!("{}", e); });
 
-            // Draw FPS overlay.
-            draw_fps_overlay(buf, win_w, win_h, current_fps);
-
-            // Commit to compositor.
-            let _ = IpcChannel::send_sidewind(lunas_pid, &SideWindMessage::new_commit());
-
-            // Advance gear rotation.
             angle += STEP;
-            if angle >= TAU {
-                angle -= TAU;
-            }
-
-            // Yield the CPU briefly to avoid starving other processes.
-            let _ = sched_yield();
+            if angle >= core::f32::consts::TAU { angle -= core::f32::consts::TAU; }
         }
-    }
-
-    #[cfg(not(target_os = "eclipse"))]
-    {
-        std::println!("glxgears: host-testing stub — no rendering outside Eclipse OS.");
-        unsafe { exit(0); }
     }
 }

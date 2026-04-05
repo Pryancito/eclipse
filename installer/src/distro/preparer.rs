@@ -65,6 +65,7 @@ impl DistroPreparer {
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/lunas", "usr/bin/lunas"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/terminal", "bin/terminal"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/rust-shell", "bin/rust-shell"),
+            ("../eclipse-apps/target/x86_64-unknown-eclipse/release/sh", "bin/sh"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/nano", "bin/nano"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/glxgears", "bin/glxgears"),
         ];

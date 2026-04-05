@@ -126,14 +126,16 @@ impl ObjectLogic for LunasSurface {
             6 => {
                 // commit — publish a new frame
                 if let Some(info) = self.attached_buffer {
-                    (*self.pending_commits).borrow_mut().push(SurfaceCommit {
-                        pid: self.pid,
-                        surface_id: self.id.0,
-                        vaddr: info.vaddr,
-                        width: info.width,
-                        height: info.height,
-                        stride: info.stride,
-                    });
+                    if info.vaddr != 0 {
+                        (*self.pending_commits).borrow_mut().push(SurfaceCommit {
+                            pid: self.pid,
+                            surface_id: self.id.0,
+                            vaddr: info.vaddr,
+                            width: info.width,
+                            height: info.height,
+                            stride: info.stride,
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -208,8 +210,8 @@ impl ObjectLogic for LunasShm {
                         unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
                         v
                     } else {
-                        // Unix socket client with no fd: scan /tmp/twb_{1..64}.
-                        scan_twb_files(size)
+                        // Unix socket client with no fd: scan for shared buffer files.
+                        scan_shm_files(size)
                     };
                     v
                 };
@@ -290,43 +292,51 @@ fn map_shm_file(pid: u32, size: usize) -> usize {
     }
 }
 
-/// Scan /tmp/twb_{2..64} and mmap the first file found.
-/// Used when Handle fd=-1 (Eclipse OS Unix sockets don't carry SCM_RIGHTS ancilla data).
-fn scan_twb_files(size: usize) -> usize {
-    let prefix = b"/tmp/twb_";
-    for pid in 2u32..=64 {
-        let mut path = [0u8; 32];
-        path[..prefix.len()].copy_from_slice(prefix);
-        let mut n = pid;
-        let mut tmp_digits = [0u8; 10];
-        let mut i = 0usize;
-        if n == 0 { tmp_digits[0] = b'0'; i = 1; } else {
-            while n > 0 && i < tmp_digits.len() {
-                tmp_digits[i] = b'0' + (n % 10) as u8; n /= 10; i += 1;
+/// Scan /tmp/ for shared-memory buffer files (twb_, glxg_, etc.) and mmap the
+/// first matching one. Used when Handle fd=-1 (Eclipse OS Unix sockets don't
+/// carry SCM_RIGHTS ancilla data yet).
+fn scan_shm_files(size: usize) -> usize {
+    let prefixes: &[&[u8]] = &[b"/tmp/glxg_", b"/tmp/twb_", b"/tmp/sn_"];
+    
+    for &prefix in prefixes {
+        for pid in 2u32..=64 {
+            let mut path = [0u8; 32];
+            path[..prefix.len()].copy_from_slice(prefix);
+            let mut n = pid;
+            let mut tmp_digits = [0u8; 10];
+            let mut i = 0usize;
+            if n == 0 { tmp_digits[0] = b'0'; i = 1; } else {
+                while n > 0 && i < tmp_digits.len() {
+                    tmp_digits[i] = b'0' + (n % 10) as u8; n /= 10; i += 1;
+                }
+            }
+            let mut lo = 0usize; let mut hi = i.saturating_sub(1);
+            while lo < hi { tmp_digits.swap(lo, hi); lo += 1; hi -= 1; }
+            let end = prefix.len() + i;
+            if end >= path.len() { continue; }
+            path[prefix.len()..end].copy_from_slice(&tmp_digits[..i]);
+
+            let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
+            if fd < 0 { continue; }
+            
+            // Check size of the file to verify it's the right one (loose check)
+            // Lunas could do fstat here if needed.
+            
+            let vaddr = unsafe {
+                mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+            };
+            unsafe { close(fd) };
+            if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
+                let msg = alloc::format!(
+                    "[LUNAS-SHM] scan_shm: found {} size={} vaddr=0x{:x}\n",
+                    core::str::from_utf8(&prefix[5..]).unwrap_or("?"), size, vaddr as usize
+                );
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                return vaddr as usize;
             }
         }
-        let mut lo = 0usize; let mut hi = i.saturating_sub(1);
-        while lo < hi { tmp_digits.swap(lo, hi); lo += 1; hi -= 1; }
-        let end = prefix.len() + i;
-        if end >= path.len() { continue; }
-        path[prefix.len()..end].copy_from_slice(&tmp_digits[..i]);
-
-        let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
-        if fd < 0 { continue; }
-        let vaddr = unsafe {
-            mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-        };
-        unsafe { close(fd) };
-        if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
-            let msg = alloc::format!(
-                "[LUNAS-SHM] scan_twb: found /tmp/twb_{} size={} vaddr=0x{:x}\n",
-                pid, size, vaddr as usize
-            );
-            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
-            return vaddr as usize;
-        }
     }
-    let msg = b"[LUNAS-SHM] scan_twb: no twb file found!\n";
+    let msg = b"[LUNAS-SHM] scan_shm: no SHM file found!\n";
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     0
 }

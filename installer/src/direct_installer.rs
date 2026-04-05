@@ -733,6 +733,25 @@ args=quiet splash
         fs::write(format!("{}/boot.conf", self.efi_mount_point), boot_conf)
             .map_err(|e| format!("Error creando boot.conf: {}", e))?;
 
+        // --- Identity Files (root only, no password) ---
+        println!("   Configurando identidad root...");
+        let etc_dir = format!("{}/etc", self.root_mount_point);
+        let root_home = format!("{}/root", self.root_mount_point);
+        
+        fs::create_dir_all(&etc_dir).map_err(|e| format!("Error creando /etc: {}", e))?;
+        fs::create_dir_all(&root_home).map_err(|e| format!("Error creando /root: {}", e))?;
+
+        let passwd_content = "root:x:0:0:root:/root:/bin/bash\n";
+        let group_content = "root:x:0:\nbin:x:1:\ndaemon:x:2:\nsys:x:3:\nadm:x:4:\ntty:x:5:\ndisk:x:6:\nlp:x:7:\nwheel:x:10:root\n";
+        let shadow_content = "root::19000:0:99999:7:::\n";
+
+        fs::write(format!("{}/passwd", etc_dir), passwd_content)
+            .map_err(|e| format!("Error creando /etc/passwd: {}", e))?;
+        fs::write(format!("{}/group", etc_dir), group_content)
+            .map_err(|e| format!("Error creando /etc/group: {}", e))?;
+        fs::write(format!("{}/shadow", etc_dir), shadow_content)
+            .map_err(|e| format!("Error creando /etc/shadow: {}", e))?;
+
         // README
         let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
 =====================================
@@ -1247,8 +1266,43 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         fs::create_dir_all(&etc_dir)
             .map_err(|e| format!("Error creando {}: {}", etc_dir, e))?;
 
+        let root_dir = format!("{}/root", temp_dir);
+        fs::create_dir_all(&root_dir)
+            .map_err(|e| format!("Error creando {}: {}", root_dir, e))?;
+
+        let tmp_dir = format!("{}/tmp", temp_dir);
+        fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("Error creando {}: {}", tmp_dir, e))?;
+
         fs::write(format!("{}/etc/fstab", temp_dir), fstab_content)
             .map_err(|e| format!("Error creando /etc/fstab: {}", e))?;
+
+        // etc/termcap
+        let termcap_content = r#"xterm|xterm-color|X Window System terminal emulator: :am:bs:km:mi:ms:pc:pt:qe:sr:ut:xo:co#80:li#25:it#8:RA:RS:kh=\EOH:kb=^H:ku=\EOA:kd=\EOB:kl=\EOD:kr=\EOC:eo:ho=\E[H:cl=\E[H\E[2J:cm=\E[%i%d;%dH:nd=\E[C:up=\E[A:ce=\E[K:cd=\E[J:so=\E[7m:se=\E[27m:md=\E[1m:me=\E[m:mr=\E[7m:mb=\E[5m:al=\E[L:dl=\E[M:dc=\E[P:ic=\E[@:vi=\E[?25l:ve=\E[?25h:ks=\E[?1h\E=:ke=\E[?1l\E>:te=\E[?1049l:ti=\E[?1049h:ut:
+"#;
+        fs::write(format!("{}/etc/termcap", temp_dir), termcap_content)
+            .map_err(|e| format!("Error creando /etc/termcap: {}", e))?;
+
+        // etc/inputrc
+        let inputrc_content = "\
+set editing-mode emacs
+set show-all-if-ambiguous on
+set completion-ignore-case on
+\"\\e[A\": history-search-backward
+\"\\e[B\": history-search-forward
+";
+        fs::write(format!("{}/etc/inputrc", temp_dir), inputrc_content)
+            .map_err(|e| format!("Error creando /etc/inputrc: {}", e))?;
+
+        // root/.bashrc
+        let bashrc_content = r#"# .bashrc
+alias ls='ls --color=auto'
+alias ll='ls -l'
+export PATH=/bin:/sbin
+export PS1='\[\e[32m\]\u@eclipse\[\e[m\]:\[\e[34m\]\w\[\e[m\]\$ '
+"#;
+        fs::write(format!("{}/root/.bashrc", temp_dir), bashrc_content)
+            .map_err(|e| format!("Error creando /root/.bashrc: {}", e))?;
 
         Ok(())
     }
@@ -2040,27 +2094,6 @@ tmpfs           /tmp            tmpfs   defaults        0       0
 ";
         eclipsefs.create_file("/etc/hosts", hosts_content.as_bytes().to_vec())?;
         println!("         ✅ /etc/hosts creado");
-        
-        // Crear /etc/passwd básico
-        let passwd_content = "root:x:0:0:root:/root:/bin/bash
-nobody:x:65534:65534:nobody:/nonexistent:/bin/false
-";
-        eclipsefs.create_file("/etc/passwd", passwd_content.as_bytes().to_vec())?;
-        println!("         ✅ /etc/passwd creado");
-        
-        // Crear /etc/group básico
-        let group_content = "root:x:0:
-nogroup:x:65534:
-";
-        eclipsefs.create_file("/etc/group", group_content.as_bytes().to_vec())?;
-        println!("         ✅ /etc/group creado");
-        
-        // Crear /etc/shadow básico (sin contraseñas)
-        let shadow_content = "root:*:0:0:99999:7:::
-nobody:*:65534:0:99999:7:::
-";
-        eclipsefs.create_file("/etc/shadow", shadow_content.as_bytes().to_vec())?;
-        println!("         ✅ /etc/shadow creado");
         
         println!("       ✅ Archivos de configuración del sistema creados");
         Ok(())

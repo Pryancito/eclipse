@@ -118,6 +118,10 @@ pub struct Process {
     pub signal_mask: u64,
     /// Manejadores de señal registrados por el proceso vía sys_sigaction.
     pub signal_handlers: [u64; 64],
+    /// Process Group ID
+    pub pgid: ProcessId,
+    /// Session ID
+    pub sid: ProcessId,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -153,6 +157,8 @@ impl Process {
             pending_signals: 0,
             signal_mask: 0,
             signal_handlers: [0u64; 64],
+            pgid: 0,
+            sid: 0,
         }
     }
 }
@@ -396,6 +402,15 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
             }
             update_process(pid, proc);
         }
+        if let Some(parent_pid) = current_process_id() {
+             if let Some(parent) = get_process(parent_pid) {
+                 if let Some(mut proc) = get_process(pid) {
+                     proc.pgid = parent.pgid;
+                     proc.sid = parent.sid;
+                     update_process(pid, proc);
+                 }
+             }
+        }
         crate::fd::fd_init_stdio(pid);
         crate::serial::serial_printf(format_args!("[spawn] SUCCESS for process: {}\n", name));
         Ok(pid)
@@ -405,7 +420,6 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     }
 }
 
-/// Obtener proceso actual (O(1) vía GS segment, sin lock)
 pub fn current_process_id() -> Option<ProcessId> {
     let pid: u32;
     unsafe {

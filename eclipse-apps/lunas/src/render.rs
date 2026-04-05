@@ -349,6 +349,7 @@ impl FramebufferState {
     ///                  Pass the same value as `src_w` when the buffer is tightly packed.
     /// - `dst_x/y`    — destination top-left corner in the framebuffer.
     pub fn blit_buffer(&mut self, vaddr: usize, src_w: u32, src_h: u32, src_stride: u32, dst_x: i32, dst_y: i32) {
+        if vaddr == 0 { return; }
         // src_stride must be at least as wide as the copy region; a smaller stride would mean
         // reading wrong pixels from adjacent rows.
         debug_assert!(src_stride >= src_w, "blit_buffer: src_stride ({}) must be >= src_w ({})", src_stride, src_w);

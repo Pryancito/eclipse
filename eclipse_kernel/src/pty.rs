@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::collections::VecDeque;
 use spin::Mutex;
 use crate::scheme::{Scheme, error, Stat};
+use crate::serial;
 use alloc::sync::Arc;
 
 #[repr(C)]
@@ -61,9 +62,13 @@ pub struct PtyChannel {
     pub ws_ypixel: u16,
     /// PID del proceso que tiene abierto el extremo esclavo (0 = no registrado).
     /// Se establece automáticamente en la primera apertura de "pty:slave/N".
-    pub slave_pid: crate::process::ProcessId,
+    pub slave_pid: u32,
+    pub foreground_pgrp: u32,
     /// Terminal state (flags, control characters)
     pub termios: Termios,
+    /// Reference counts for master and slave sides
+    pub master_open_count: usize,
+    pub slave_open_count: usize,
 }
 
 impl PtyChannel {
@@ -78,7 +83,10 @@ impl PtyChannel {
             ws_xpixel: 0,
             ws_ypixel: 0,
             slave_pid: 0,
+            foreground_pgrp: 0,
             termios: Termios::default(),
+            master_open_count: 0,
+            slave_open_count: 0,
         }
     }
 }
@@ -136,6 +144,10 @@ impl Scheme for PtyScheme {
                 channels.push(Some(Arc::new(Mutex::new(PtyChannel::new()))));
                 id
             });
+            // Update channel counters
+            if let Some(arc) = &channels[pair_id] {
+                arc.lock().master_open_count += 1;
+            }
             return Ok(self.new_handle(pair_id, true));
         } else if path.starts_with("slave/") {
             let id_str = &path[6..];
@@ -148,6 +160,7 @@ impl Scheme for PtyScheme {
                     ch.slave_pid = caller_pid;
                     // Reset slave_closed when a new slave handle is opened (e.g. shell respawn).
                     ch.slave_closed = false;
+                    ch.slave_open_count += 1;
                     drop(ch);
                     return Ok(self.new_handle(pair_id, false));
                 }
@@ -328,14 +341,20 @@ impl Scheme for PtyScheme {
             if let Some(arc) = channel_arc {
                 let mut channel = arc.lock();
                 if is_master {
-                    channel.master_closed = true;
-                    // Send SIGHUP (1) to the foreground process group (slave_pid)
-                    let slave_pid = channel.slave_pid;
-                    if slave_pid != 0 {
-                        crate::process::set_pending_signal(slave_pid, 1);
+                    channel.master_open_count = channel.master_open_count.saturating_sub(1);
+                    if channel.master_open_count == 0 {
+                        channel.master_closed = true;
+                        // Send SIGHUP (1) to the foreground process group (slave_pid)
+                        let slave_pid = channel.slave_pid;
+                        if slave_pid != 0 {
+                            crate::process::set_pending_signal(slave_pid, 1);
+                        }
                     }
                 } else {
-                    channel.slave_closed = true;
+                    channel.slave_open_count = channel.slave_open_count.saturating_sub(1);
+                    if channel.slave_open_count == 0 {
+                        channel.slave_closed = true;
+                    }
                 }
             }
         }
@@ -349,6 +368,17 @@ impl Scheme for PtyScheme {
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
             PtyHandle { pair_id: h.pair_id, is_master: h.is_master, ref_count: h.ref_count }
         };
+        // Map Linux-standard ioctl numbers to internal ones
+        let request = match request {
+            0x5413 => 4, // TIOCGWINSZ
+            0x5414 => 3, // TIOCSWINSZ
+            0x540F => 6, // TIOCGPGRP
+            0x5410 => 5, // TIOCSPGRP
+            0x541B => 2, // FIONREAD
+            0x5403 | 0x5404 => 0x5402, // TCSETSW/F -> TCSETS
+            _ => request,
+        };
+
         // Request 1: TIOCGPTN (Get PTY Number)
         if request == 1 {
             if arg != 0 {
@@ -418,9 +448,9 @@ impl Scheme for PtyScheme {
                 *ptr.add(3)   = channel.ws_ypixel;
             }
             Ok(0)
-        } else if request == 5 {
+        } else if request == 5 || request == 0x5410 { // TIOCSPGRP
             // TIOCSPGRP: establecer PID del proceso en primer plano.
-            if arg == 0 { return Err(error::EINVAL); }
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 4) { return Err(error::EINVAL); }
             let channel_arc = {
                 let channels = self.channels.lock();
                 channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
@@ -428,12 +458,13 @@ impl Scheme for PtyScheme {
             let mut channel = channel_arc.lock();
             let pid_ptr = arg as *const u32;
             unsafe {
-                channel.slave_pid = *pid_ptr;
+                channel.foreground_pgrp = pid_ptr.read_unaligned();
+                serial::serial_printf(format_args!("[PTY] TIOCSPGRP: foreground_pgrp set to {}\n", channel.foreground_pgrp));
             }
             Ok(0)
-        } else if request == 6 {
+        } else if request == 6 || request == 0x540F { // TIOCGPGRP
             // TIOCGPGRP: obtener PID del proceso en primer plano.
-            if arg == 0 { return Err(error::EINVAL); }
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 4) { return Err(error::EINVAL); }
             let channel_arc = {
                 let channels = self.channels.lock();
                 channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
@@ -441,7 +472,7 @@ impl Scheme for PtyScheme {
             let channel = channel_arc.lock();
             let pid_ptr = arg as *mut u32;
             unsafe {
-                *pid_ptr = channel.slave_pid;
+                pid_ptr.write_unaligned(channel.foreground_pgrp);
             }
             Ok(0)
         } else if request == 0x5401 {
@@ -476,7 +507,7 @@ impl Scheme for PtyScheme {
     }
 
     fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
-        stat.mode = 0o666 | 0x2000; // Character device
+        stat.mode = 0o620 | 0x2000; // Character device, rw for user, w for group
         stat.size = 0;
         Ok(0)
     }
@@ -489,7 +520,21 @@ impl Scheme for PtyScheme {
         let mut handles = self.handles.lock();
         if let Some(Some(h)) = handles.get_mut(id) {
             h.ref_count += 1;
-            Ok(0)
+            // Also increment the channel's side counter
+            let is_master = h.is_master;
+            let pair_id = h.pair_id;
+            drop(handles);
+            
+            let channels = self.channels.lock();
+            if let Some(Some(arc)) = channels.get(pair_id) {
+                let mut channel = arc.lock();
+                if is_master {
+                    channel.master_open_count += 1;
+                } else {
+                    channel.slave_open_count += 1;
+                }
+            }
+            Ok(id)
         } else {
             Err(error::EBADF)
         }

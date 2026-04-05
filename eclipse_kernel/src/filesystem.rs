@@ -596,7 +596,8 @@ impl Filesystem {
             tlv_pos += 6 + length;
         }
         
-        Err("CONTENT TLV not found")
+        // Fallback for empty files (no CONTENT TLV yet)
+        Ok((abs_disk_offset + 8, 0))
     }
 
     /// Returns the content length from the CONTENT TLV
@@ -1595,12 +1596,28 @@ impl Scheme for DevScheme {
         if clean_path.is_empty() || clean_path == "/" {
             return Ok(DEVDIR_LIST_ID);
         }
-        if lookup_device(clean_path).is_some() || clean_path == "keyboard" {
+        let is_dev = lookup_device(clean_path).is_some() || clean_path == "keyboard" 
+            || clean_path == "null" || clean_path == "zero" || clean_path == "tty" 
+            || clean_path == "random" || clean_path == "urandom";
+
+        if is_dev {
             if clean_path == "fb0" {
                 return Ok(100); // Magic ID for fb0
             }
             if clean_path == "keyboard" {
                 return Ok(101); // Magic ID for keyboard
+            }
+            if clean_path == "null" {
+                return Ok(102);
+            }
+            if clean_path == "zero" {
+                return Ok(103);
+            }
+            if clean_path == "tty" {
+                return Ok(104);
+            }
+            if clean_path == "random" || clean_path == "urandom" {
+                return Ok(105);
             }
             Ok(0)
         } else {
@@ -1633,6 +1650,34 @@ impl Scheme for DevScheme {
             }
         }
         
+        if id == 102 { // null
+            return Ok(0);
+        }
+        
+        if id == 103 { // zero
+            for b in buffer.iter_mut() {
+                *b = 0;
+            }
+            return Ok(buffer.len());
+        }
+
+        if id == 104 { // tty
+            // Map /dev/tty roughly to stdin for reading (not quite POSIX, but works for most)
+            return Ok(0); // EOF for now
+        }
+
+        if id == 105 { // random / urandom
+            // Use TSC as a simple entropy source
+            let mut tsc: u64;
+            for b in buffer.iter_mut() {
+                unsafe {
+                    core::arch::asm!("rdtsc", out("rax") tsc, out("rdx") _, options(nomem, nostack));
+                }
+                *b = (tsc & 0xFF) as u8 ^ ((tsc >> 8) & 0xFF) as u8;
+            }
+            return Ok(buffer.len());
+        }
+
         if id == DEVDIR_LIST_ID {
             let names = list_device_names();
             let mut s = alloc::string::String::new();
@@ -1648,8 +1693,17 @@ impl Scheme for DevScheme {
         Ok(0) // Placeholder for device handles
     }
 
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
-        Ok(_buffer.len()) // Placeholder
+    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+        if id == 102 || id == 103 || id == 105 { // null, zero, random
+            return Ok(buffer.len());
+        }
+        if id == 104 { // tty
+            if let Ok(s) = core::str::from_utf8(buffer) {
+                crate::serial::serial_print(s);
+                return Ok(buffer.len());
+            }
+        }
+        Ok(buffer.len()) // Placeholder for others
     }
 
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {

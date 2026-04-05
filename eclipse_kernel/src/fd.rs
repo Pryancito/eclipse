@@ -155,14 +155,52 @@ pub fn fd_update_offset(pid: ProcessId, fd: usize, new_offset: u64) -> bool {
     false
 }
 
-/// Close a file descriptor for a process
+// Close a file descriptor for a process
 pub fn fd_close(pid: ProcessId, fd: usize) -> bool {
     let pid_idx = match pid_to_fd_idx(pid) {
         Some(i) => i,
         None => return false,
     };
     let mut tables = FD_TABLES.lock();
-    tables[pid_idx].close(fd)
+    if tables[pid_idx].close(fd) {
+        // Also notify scheme
+        let (scheme_id, resource_id) = (tables[pid_idx].fds[fd].scheme_id, tables[pid_idx].fds[fd].resource_id);
+        let _ = crate::scheme::close(scheme_id, resource_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Push an existing file descriptor entry into a new slot
+pub fn fd_push(pid: ProcessId, fd_entry: FileDescriptor) -> Option<usize> {
+    let pid_idx = pid_to_fd_idx(pid)?;
+    let mut tables = FD_TABLES.lock();
+    for fd in 3..MAX_FDS_PER_PROCESS {
+        if !tables[pid_idx].fds[fd].in_use {
+            tables[pid_idx].fds[fd] = fd_entry;
+            tables[pid_idx].fds[fd].in_use = true;
+            // Increment ref count
+            let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+            return Some(fd);
+        }
+    }
+    None
+}
+
+/// Push an existing file descriptor entry into a specific slot
+pub fn fd_push_at(pid: ProcessId, target_fd: usize, fd_entry: FileDescriptor) -> bool {
+    if target_fd >= MAX_FDS_PER_PROCESS { return false; }
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut tables = FD_TABLES.lock();
+    tables[pid_idx].fds[target_fd] = fd_entry;
+    tables[pid_idx].fds[target_fd].in_use = true;
+    // Increment ref count
+    let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+    true
 }
 
 /// Initialize FD system

@@ -557,5 +557,5 @@ fn main() {
 
 #[cfg(not(target_os = "eclipse"))]
 fn main() {
-    // Note: This would typically be a stub in a no_std environment
+    println!("Solo soportado en Eclipse OS");
 }

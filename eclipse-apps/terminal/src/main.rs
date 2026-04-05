@@ -1,9 +1,3 @@
-#![no_std]
-#[cfg(target_os = "eclipse")]
-extern crate std;
-#[cfg(target_os = "eclipse")]
-use std::prelude::v1::*;
-
 use std::vec::Vec;
 use std::boxed::Box;
 use std::rc::Rc;
@@ -419,11 +413,11 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read("/bin/sh");
+        let sh_res = std::fs::read("/bin/bash");
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("bash"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if sh_spawn.is_err() {
             let _ = sys_close(pty_slave_fd);
             return None;
@@ -640,7 +634,7 @@ impl TerminalApp {
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("bash"), fd, fd, fd) {
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;

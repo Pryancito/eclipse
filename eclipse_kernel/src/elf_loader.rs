@@ -546,35 +546,15 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     //   [RSP + ...] = AT_NULL (0) to terminate auxv
     //   [RSP + ...] = 0 (value for AT_NULL)
     
-    // For argc=0 with auxv so glibc works.
-    // - 1 qword: argc = 0
-    // - 1 qword: argv[0] = NULL (argv terminator)
-    // - 1 qword: envp[0] = NULL (envp terminator)
-    // - auxv: AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
-    // - 16 bytes for AT_RANDOM data
-    // Total: 3 (argc/argv/envp) + 12 qwords (6 auxv entries × 2 qwords) + 2 (random data) = 17 quadwords = 136 bytes.
-    // We subtract 144 bytes to keep 16-byte alignment.
-    const AT_PAGESZ: u64 = 6;
-    const AT_PHDR: u64 = 3;
-    const AT_PHENT: u64 = 4;
-    const AT_PHNUM: u64 = 5;
-    const AT_RANDOM: u64 = 25;
-    const AT_NULL: u64 = 0;
-    // System V ABI for x86-64 at program entry specifies RSP is 16-byte aligned (RSP % 16 == 0).
-    // Previous code was subtracting 8, which is only for function calls, not process entry.
-    let adjusted_stack = (stack_top - 144) & !0xF;
+    // Strings: "bash\0" (5) + "-i\0" (3) + "TERM=xterm\0" (11) + "HOME=/root\0" (11) + "PATH=/bin:/usr/bin\0" (19) + "USER=root\0" (10) + "LOGNAME=root\0" (13) = 72 bytes
+    // Space for vectors (argc/argv/envp/auxv ~256 bytes) + strings (~100 bytes) + random data (16 bytes).
+    // We use a safe margin of 1024 bytes from the top of the stack.
+    let adjusted_stack = (stack_top - 1024) & !0xF;
 
     let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x}\n", _pid, entry_point, adjusted_stack));
 
-    // Always reload CR3 to flush the TLB. exec remaps code pages via
-    // map_user_page_4kb but the TLB may still cache the old fork'd PTEs.
-    // A CR3 write flushes all non-global TLB entries.
-    //
-    // Also read proc.fs_base now, before entering the noreturn asm block.
-    // "mov fs, ax" (ax=0) below zeroes the hidden FS base register (same as
-    // FS_BASE MSR), overwriting the wrmsr done by sys_exec / the scheduler.
-    // We must re-apply it inside the asm after the segment reload.
+    // ... (CR3 and FS_BASE logic remains same) ...
     let tls_base: u64 = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
             let cr3 = proc.resources.lock().page_table_phys;
@@ -583,27 +563,66 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         } else { 0 }
     } else { 0 };
 
-    // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHENT/AT_PHNUM first (some glibc inits use them early).
+    // Write argc/argv/envp/auxv and strings.
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
-        write_volatile(stack_ptr.offset(0), 0u64);         // argc = 0
-        write_volatile(stack_ptr.offset(1), 0u64);        // argv[0] = NULL (end of argv)
-        write_volatile(stack_ptr.offset(2), 0u64);        // envp[0] = NULL (end of envp)
-        write_volatile(stack_ptr.offset(3), AT_PHDR);
-        write_volatile(stack_ptr.offset(4), phdr_va);
-        write_volatile(stack_ptr.offset(5), AT_PHENT);
-        write_volatile(stack_ptr.offset(6), phentsize);
-        write_volatile(stack_ptr.offset(7), AT_PHNUM);
-        write_volatile(stack_ptr.offset(8), phnum);
-        write_volatile(stack_ptr.offset(9), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(10), 4096u64);
-        write_volatile(stack_ptr.offset(11), AT_RANDOM);
-        write_volatile(stack_ptr.offset(12), (adjusted_stack + 15 * 8) as u64); // Address of random data at offset 15
-        write_volatile(stack_ptr.offset(13), AT_NULL);
-        write_volatile(stack_ptr.offset(14), 0u64);
-        // Random data (16 bytes)
-        write_volatile(stack_ptr.offset(15), 0x12345678_9ABCDEF0u64);
-        write_volatile(stack_ptr.offset(16), 0x0FEDCBA9_87654321u64);
+        // Move strings further down to stay well away from vectors and ensure 8-byte alignment
+        let str_ptr = (adjusted_stack + 512) as *mut u8; 
+        
+        // 1. Copy strings (now at offset 512)
+        core::ptr::copy_nonoverlapping(b"bash\0".as_ptr(), str_ptr, 5);
+        core::ptr::copy_nonoverlapping(b"-i\0".as_ptr(), str_ptr.add(8), 3); // 8-byte aligned
+        core::ptr::copy_nonoverlapping(b"TERM=xterm\0".as_ptr(), str_ptr.add(16), 11);
+        core::ptr::copy_nonoverlapping(b"HOME=/root\0".as_ptr(), str_ptr.add(32), 11);
+        core::ptr::copy_nonoverlapping(b"PATH=/bin:/usr/bin\0".as_ptr(), str_ptr.add(48), 19);
+        core::ptr::copy_nonoverlapping(b"USER=root\0".as_ptr(), str_ptr.add(80), 10);
+        core::ptr::copy_nonoverlapping(b"LOGNAME=root\0".as_ptr(), str_ptr.add(96), 13);
+
+        let bash_str_va = (adjusted_stack + 512) as u64;
+        let i_str_va = (adjusted_stack + 512 + 8) as u64;
+        let term_str_va = (adjusted_stack + 512 + 16) as u64;
+        let home_str_va = (adjusted_stack + 512 + 32) as u64;
+        let path_str_va = (adjusted_stack + 512 + 48) as u64;
+        let user_str_va = (adjusted_stack + 512 + 80) as u64;
+        let logname_str_va = (adjusted_stack + 512 + 96) as u64;
+
+        // 2. Set up pointers
+        write_volatile(stack_ptr.offset(0), 2u64);         // argc = 2
+        write_volatile(stack_ptr.offset(1), bash_str_va);  // argv[0] = "bash"
+        write_volatile(stack_ptr.offset(2), i_str_va);     // argv[1] = "-i"
+        write_volatile(stack_ptr.offset(3), 0u64);         // argv[2] = NULL
+
+        write_volatile(stack_ptr.offset(4), term_str_va);  // envp[0] = "TERM=xterm"
+        write_volatile(stack_ptr.offset(5), home_str_va);  // envp[1] = "HOME=/root"
+        write_volatile(stack_ptr.offset(6), path_str_va);  // envp[2] = "PATH=/bin:/usr/bin"
+        write_volatile(stack_ptr.offset(7), user_str_va);  // envp[3] = "USER=root"
+        write_volatile(stack_ptr.offset(8), logname_str_va); // envp[4] = "LOGNAME=root"
+        write_volatile(stack_ptr.offset(9), 0u64);         // envp[5] = NULL
+
+        // 3. Auxv entries starting at offset 10
+        const AT_PAGESZ: u64 = 6;
+        const AT_PHDR:   u64 = 3;
+        const AT_PHENT:  u64 = 4;
+        const AT_PHNUM:  u64 = 5;
+        const AT_RANDOM: u64 = 25;
+        const AT_NULL:   u64 = 0;
+
+        write_volatile(stack_ptr.offset(10), AT_PHDR);
+        write_volatile(stack_ptr.offset(11), phdr_va);
+        write_volatile(stack_ptr.offset(12), AT_PHENT);
+        write_volatile(stack_ptr.offset(13), phentsize);
+        write_volatile(stack_ptr.offset(14), AT_PHNUM);
+        write_volatile(stack_ptr.offset(15), phnum);
+        write_volatile(stack_ptr.offset(16), AT_PAGESZ);
+        write_volatile(stack_ptr.offset(17), 4096u64);
+        write_volatile(stack_ptr.offset(18), AT_RANDOM);
+        write_volatile(stack_ptr.offset(19), (adjusted_stack + 32 * 8) as u64); // Random at offset 32 (safe)
+        write_volatile(stack_ptr.offset(20), AT_NULL);
+        write_volatile(stack_ptr.offset(21), 0u64);
+
+        // 4. Random data (16 bytes) at offset 32/33
+        write_volatile(stack_ptr.offset(32), 0x12345678_9ABCDEF0u64);
+        write_volatile(stack_ptr.offset(33), 0x0FEDCBA9_87654321u64);
     }
 
     // Construir el frame iretq directamente en el stack del kernel (por-CPU).

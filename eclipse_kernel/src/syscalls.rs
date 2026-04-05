@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::process::{self, ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
 use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_24};
+use crate::scheme::{Scheme, error, Stat};
 use crate::serial;
 use spin::Mutex;
 use alloc::sync::Arc;
@@ -63,10 +64,18 @@ pub enum SyscallNumber {
     Mkdir = 83,
     Unlink = 87,
     Getppid = 110,
+    Setpgid = 109,
+    Setsid = 112,
+    SetHostName = 170,
     ArchPrctl = 158,
     Gettid = 186,
     Futex = 202,
-    Fstatat = 262,
+    Getpgid = 121,
+    Getuid = 102,
+    Getgid = 104,
+    Geteuid = 107,
+    Getegid = 108,
+    GetLogin = 247,
     GetRandom = 318,
 
     // Eclipse-specific (500+)
@@ -260,6 +269,7 @@ pub extern "C" fn syscall_handler(
         1 => sys_write(arg1, arg2, arg3),
         2 => sys_open(arg1, arg2, arg3),
         3 => sys_close(arg1),
+        4 => sys_stat(arg1, arg2),
         5 => sys_fstat(arg1, arg2),
         8 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
         9 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
@@ -268,7 +278,10 @@ pub extern "C" fn syscall_handler(
         13 => sys_sigaction(arg1, arg2, arg3),
         14 => sys_sigprocmask(arg1, arg2, arg3),
         16 => sys_ioctl(arg1, arg2, arg3),
+        20 => sys_writev(arg1, arg2, arg3),
         22 => sys_pipe(arg1),
+        32 => sys_dup(arg1),
+        33 => sys_dup2(arg1, arg2),
         24 => sys_yield(),
         35 => sys_nanosleep(arg1),
         39 => sys_getpid(),
@@ -287,16 +300,38 @@ pub extern "C" fn syscall_handler(
         60 => sys_exit(arg1),
         231 => sys_exit(arg1),  // Linux exit_group
         61 => sys_wait(arg1),
+        63 => sys_uname(arg1),
+        79 => sys_getcwd(arg1, arg2),
+        72 => sys_fcntl(arg1, arg2, arg3),
+        89 => sys_readlink(arg1, arg2, arg3),
+        109 => sys_setpgid(arg1, arg2),
+        110 => sys_getppid(),
+        112 => sys_setsid(),
+        170 => sys_sethostname(arg1, arg2),
         62 => sys_kill(arg1, arg2),
         77 => sys_ftruncate(arg1, arg2),
         82 => sys_rename(arg1, arg2),
         83 => sys_mkdir(arg1, arg2),
         87 => sys_unlink(arg1),
-        110 => sys_getppid(),
+        118 => sys_getresuid(arg1, arg2, arg3),
+        120 => sys_getresgid(arg1, arg2, arg3),
+        121 => sys_getpgid(arg1),
+        102 => sys_getuid(),
+        104 => sys_getgid(),
+        107 => sys_geteuid(),
+        108 => sys_getegid(),
+        247 => sys_getlogin(arg1, arg2),
         158 => sys_arch_prctl(arg1, arg2),
         186 => sys_gettid(),
+        218 => sys_set_tid_address(arg1),
         202 => sys_futex(arg1, arg2, arg3, arg4),
+        228 => sys_clock_gettime(arg1, arg2),
+        270 => sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6),
+        292 => sys_dup3(arg1, arg2, arg3),
+        302 => sys_prlimit64(arg1, arg2, arg3, arg4),
         262 => sys_fstatat(arg1, arg2, arg3, arg4),
+        269 => sys_faccessat(arg1, arg2, arg3, arg4),
+        439 => sys_faccessat(arg1, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
 
         // Eclipse-specific (500+)
@@ -346,6 +381,8 @@ pub extern "C" fn syscall_handler(
         542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context), // set_child_args(pid, ptr, len)
         543 => sys_get_process_args(arg1, arg2),
         600 => sys_receive_fast(context),
+        601 => sys_setpgid(arg1, arg2),
+        602 => sys_setsid(),
         _ => {
             serial::serial_printf(format_args!(
                 "[SYSCALL] Unknown syscall: {}{}{} from process {} on CPU {}\n",
@@ -871,7 +908,7 @@ fn user_path_to_scheme_path(path_str: &str) -> String {
 /// Verify if a pointer range points to valid user memory
 /// User memory range: 0x0000_0000_0000_0000 to 0x0000_7FFF_FFFF_FFFF
 #[inline(never)]
-fn is_user_pointer(ptr: u64, len: u64) -> bool {
+pub fn is_user_pointer(ptr: u64, len: u64) -> bool {
     // Check for null pointer or pointers in the first page (usually unmapped)
     if ptr < 0x1000 {
         return false;
@@ -1057,11 +1094,6 @@ fn sys_read_mouse_packet() -> u64 {
 
 /// sys_ioctl - Device control (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc.)
 fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
-    // Only check pointer if arg is likely a pointer (non-zero and in user range)
-    // Some ioctls take integer args, so strictly enforcing is_user_pointer might be wrong.
-    // However, if it IS a pointer, verify it.
-    // Let's rely on Scheme to validate, or just do range check if it LOOKS like a pointer?
-    // Safer: if arg looks like a kernel address, reject it.
     if arg >= 0xFFFF800000000000 { // Kernel Higher Half
         crate::serial::serial_print("[SYSCALL] sys_ioctl rejected kernel arg\n");
         return -(crate::scheme::error::EFAULT as isize) as u64;
@@ -1077,7 +1109,7 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
             ) {
                 Ok(ret) => return ret as u64,
                 Err(e) => {
-                     if e != crate::scheme::error::EAGAIN {
+                     if e != crate::scheme::error::EAGAIN && e != crate::scheme::error::ENOSYS {
                          serial::serial_printf(format_args!(
                              "[SYSCALL] sys_ioctl failed: {} for fd {} req {:#018X}\n",
                              e, fd, request
@@ -2635,7 +2667,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     const MMAP_MAX_FD: u64 = crate::fd::MAX_FDS_PER_PROCESS as u64;
     let fd_entry = if (flags & MMAP_MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
         crate::fd::fd_get(current_pid, fd as usize)
-    } else {
+} else {
         None
     };
 
@@ -3775,9 +3807,32 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     n_read as u64
 }
 
+/// Linux-compatible stat structure for x86_64
+#[repr(C)]
+struct LinuxStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: u64,
+    st_atime_nsec: u64,
+    st_mtime: u64,
+    st_mtime_nsec: u64,
+    st_ctime: u64,
+    st_ctime_nsec: u64,
+    __unused: [i64; 3],
+}
+
 fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     if path_ptr == 0 || stat_ptr == 0 { return u64::MAX; }
-    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<LinuxStat>() as u64) {
         return u64::MAX;
     }
     
@@ -3801,8 +3856,28 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
         let mut stat = crate::scheme::Stat::default();
         let res = if crate::scheme::fstat(scheme_id, resource_id, &mut stat).is_ok() {
+            let lstat = LinuxStat {
+                st_dev: stat.dev,
+                st_ino: stat.ino,
+                st_nlink: stat.nlink as u64,
+                st_mode: stat.mode,
+                st_uid: stat.uid,
+                st_gid: stat.gid,
+                __pad0: 0,
+                st_rdev: 0,
+                st_size: stat.size as i64,
+                st_blksize: stat.blksize as i64,
+                st_blocks: stat.blocks as i64,
+                st_atime: stat.atime as u64,
+                st_atime_nsec: 0,
+                st_mtime: stat.mtime as u64,
+                st_mtime_nsec: 0,
+                st_ctime: stat.ctime as u64,
+                st_ctime_nsec: 0,
+                __unused: [0; 3],
+            };
             unsafe {
-                *(stat_ptr as *mut crate::scheme::Stat) = stat;
+                core::ptr::write_unaligned(stat_ptr as *mut LinuxStat, lstat);
             }
             0
         } else {
@@ -3813,6 +3888,168 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     }
     
     u64::MAX
+}
+
+/// sys_stat - Get file status by path
+fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
+    // Linux stat(path, stat_ptr) is fstatat(AT_FDCWD, path, stat_ptr, 0)
+    // We treat all paths as relative to root or absolute for now.
+    sys_fstatat(0, path_ptr, stat_ptr, 0)
+}
+
+/// sys_writev - Vectorized write
+fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
+    if iov_ptr == 0 || iov_cnt == 0 || iov_cnt > 1024 {
+        return u64::MAX;
+    }
+    
+    // iovec struct size is 16 bytes on x86_64
+    if !is_user_pointer(iov_ptr, iov_cnt * 16) {
+        return u64::MAX;
+    }
+    
+    let mut total_written = 0;
+    for i in 0..iov_cnt {
+        let (base, len): (u64, u64) = unsafe {
+            let ptr = (iov_ptr + i * 16) as *const u64;
+            (ptr.read_unaligned(), ptr.add(1).read_unaligned())
+        };
+        
+        if len == 0 { continue; }
+        let ret = sys_write(fd, base, len);
+        if ret == u64::MAX {
+            return if total_written > 0 { total_written } else { u64::MAX };
+        }
+        total_written += ret;
+    }
+    
+    total_written
+}
+
+/// struct utsname - used by sys_uname
+#[repr(C)]
+struct Utsname {
+    sysname: [u8; 65],
+    nodename: [u8; 65],
+    release: [u8; 65],
+    version: [u8; 65],
+    machine: [u8; 65],
+    domainname: [u8; 65],
+}
+
+/// sys_uname - Get system information
+fn sys_uname(buf_ptr: u64) -> u64 {
+    if !is_user_pointer(buf_ptr, core::mem::size_of::<Utsname>() as u64) {
+        return u64::MAX;
+    }
+    
+    let mut uts = unsafe { core::mem::zeroed::<Utsname>() };
+    
+    let fill = |buf: &mut [u8; 65], s: &str| {
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(64);
+        buf[..len].copy_from_slice(&bytes[..len]);
+    };
+    
+    fill(&mut uts.sysname, "EclipseOS");
+    fill(&mut uts.nodename, "eclipse");
+    fill(&mut uts.release, "0.2.0");
+    fill(&mut uts.version, "Eclipse Microkernel v0.2.0");
+    fill(&mut uts.machine, "x86_64");
+    fill(&mut uts.domainname, "(none)");
+    
+    unsafe {
+        *(buf_ptr as *mut Utsname) = uts;
+    }
+    
+    0
+}
+
+/// sys_getcwd - Get current working directory
+fn sys_getcwd(buf_ptr: u64, size: u64) -> u64 {
+    if buf_ptr == 0 || size < 2 {
+        return u64::MAX;
+    }
+    
+    if !is_user_pointer(buf_ptr, 2) {
+        return u64::MAX;
+    }
+    
+    unsafe {
+        let ptr = buf_ptr as *mut u8;
+        *ptr = b'/';
+        *ptr.add(1) = 0;
+    }
+    
+    buf_ptr
+}
+
+/// sys_getresuid / sys_getresgid - Get identity (stubbed to 0)
+fn sys_getuid() -> u64 { 0 }
+fn sys_geteuid() -> u64 { 0 }
+fn sys_getgid() -> u64 { 0 }
+fn sys_getegid() -> u64 { 0 }
+
+fn sys_getresuid(ruid_ptr: u64, euid_ptr: u64, suid_ptr: u64) -> u64 {
+    for ptr in &[ruid_ptr, euid_ptr, suid_ptr] {
+        if *ptr != 0 && is_user_pointer(*ptr, 4) {
+            unsafe { *(*ptr as *mut u32) = 0; }
+        }
+    }
+    0
+}
+
+fn sys_getresgid(rgid_ptr: u64, egid_ptr: u64, sgid_ptr: u64) -> u64 {
+    for ptr in &[rgid_ptr, egid_ptr, sgid_ptr] {
+        if *ptr != 0 && is_user_pointer(*ptr, 4) {
+            unsafe { *(*ptr as *mut u32) = 0; }
+        }
+    }
+    0
+}
+
+/// sys_getlogin - Get user name
+fn sys_getlogin(buf: u64, len: u64) -> u64 {
+    if buf == 0 || len < 5 || !is_user_pointer(buf, 5) {
+        return u64::MAX;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(b"root\0".as_ptr(), buf as *mut u8, 5);
+    }
+    0
+}
+
+/// sys_set_tid_address - Stub for thread-local storage setup
+fn sys_set_tid_address(tid_ptr: u64) -> u64 {
+    // Return current TID (stubbed to PID)
+    sys_getpid()
+}
+
+/// sys_clock_gettime - Get real or monotonic time
+fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
+    if !is_user_pointer(tp_ptr, 16) {
+        return u64::MAX;
+    }
+    
+    let uptime_ms = crate::scheduler::get_stats().total_ticks;
+    let (sec, nsec) = match clk_id {
+        0 => { // CLOCK_REALTIME
+            let offset = WALL_TIME_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+            (offset + (uptime_ms / 1000), (uptime_ms % 1000) * 1_000_000)
+        }
+        1 | 4 => { // CLOCK_MONOTONIC | CLOCK_BOOTTIME
+            (uptime_ms / 1000, (uptime_ms % 1000) * 1_000_000)
+        }
+        _ => return u64::MAX,
+    };
+    
+    unsafe {
+        let ptr = tp_ptr as *mut u64;
+        ptr.write_unaligned(sec);
+        ptr.add(1).write_unaligned(nsec);
+    }
+    
+    0
 }
 
 /// sys_mkdir - Create a directory
@@ -4089,4 +4326,171 @@ fn sys_sigaction(signum: u64, new_action_ptr: u64, old_action_ptr: u64) -> u64 {
     } else {
         u64::MAX
     }
+}
+
+/// sys_dup - Duplicate a file descriptor
+fn sys_dup(oldfd: u64) -> u64 {
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, oldfd as usize) {
+            // Notificar al esquema de que el recurso ahora tiene un nuevo FD apuntándole.
+            let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+            match crate::fd::fd_push(pid, fd_entry) {
+                Some(newfd) => return newfd as u64,
+                None => {
+                    // Si falló el push (tabla llena), debemos cerrar el recurso recién duppeado.
+                    let _ = crate::scheme::close(fd_entry.scheme_id, fd_entry.resource_id);
+                    return u64::MAX;
+                }
+            }
+        }
+    }
+    u64::MAX
+}
+
+/// sys_dup2 - Duplicate a file descriptor to a specific one
+fn sys_dup2(oldfd: u64, new_dest_fd: u64) -> u64 {
+    if oldfd == new_dest_fd { return new_dest_fd; }
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, oldfd as usize) {
+            // First close new_dest_fd if open
+            crate::fd::fd_close(pid, new_dest_fd as usize);
+            // Notificar al esquema: nueva referencia al recurso.
+            let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+            if crate::fd::fd_push_at(pid, new_dest_fd as usize, fd_entry) {
+                return new_dest_fd;
+            }
+        }
+    }
+    u64::MAX
+}
+
+/// sys_dup3 - Like dup2 but with flags (O_CLOEXEC)
+fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
+    // We ignore O_CLOEXEC (0x80000) for now as we don't implement FD_CLOEXEC properly yet
+    sys_dup2(oldfd, newfd)
+}
+
+/// sys_fcntl - File control
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    // Linux fcntl cmds: F_GETFL=3, F_SETFL=4, F_DUPFD=0, F_DUPFD_CLOEXEC=1030
+    match cmd {
+        0 | 1030 => sys_dup(fd),
+        3 => { // F_GETFL
+            if let Some(pid) = current_process_id() {
+                if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+                    return fd_entry.flags as u64;
+                }
+            }
+            2 // Default: O_RDWR
+        }
+        4 => 0, // F_SETFL: success
+        1 | 2 => 0, // F_GETFD / F_SETFD
+        _ => 0, // Stub other cmds
+    }
+}
+
+/// sys_readlink - Read value of a symbolic link
+fn sys_readlink(path_ptr: u64, buf_ptr: u64, size: u64) -> u64 {
+    // Basic stub: return EINVAL (not a symlink) or ENOENT
+    u64::MAX
+}
+
+/// sys_setpgid - Establishes a process group ID.
+fn sys_setpgid(pid_arg: u64, pgid_arg: u64) -> u64 {
+    let current_pid = current_process_id().unwrap_or(0);
+    let pid = if pid_arg == 0 { current_pid } else { pid_arg as u32 };
+    let pgid = if pgid_arg == 0 { pid } else { pgid_arg as u32 };
+    
+    if let Some(mut proc) = crate::process::get_process(pid) {
+        // En una implementación real, deberíamos verificar que 'pid' es el proceso actual
+        // o un hijo en la misma sesión. Para Eclipse single-user, permitimos el cambio.
+        proc.pgid = pgid;
+        crate::process::update_process(pid, proc);
+        serial::serial_printf(format_args!("[SYSCALL] setpgid(pid={}, pgid={}) OK\n", pid, pgid));
+        return 0;
+    }
+    u64::MAX
+}
+
+/// sys_setsid - Creates a new session.
+fn sys_setsid() -> u64 {
+    if let Some(pid) = current_process_id() {
+        if let Some(mut proc) = crate::process::get_process(pid) {
+            proc.sid = pid;
+            proc.pgid = pid;
+            crate::process::update_process(pid, proc);
+            serial::serial_printf(format_args!("[SYSCALL] setsid() -> {}\n", pid));
+            return pid as u64;
+        }
+    }
+    u64::MAX
+}
+
+/// sys_getpgid - Get the process group ID.
+fn sys_getpgid(pid_arg: u64) -> u64 {
+    let pid = if pid_arg == 0 { current_process_id().unwrap_or(0) } else { pid_arg as u32 };
+    if let Some(proc) = crate::process::get_process(pid) {
+        return proc.pgid as u64;
+    }
+    u64::MAX
+}
+
+/// sys_getpgrp - Get process group ID of current process.
+fn sys_getpgrp() -> u64 {
+    sys_getpgid(0)
+}
+
+/// sys_sethostname - Set system hostname
+fn sys_sethostname(name_ptr: u64, len: u64) -> u64 {
+    0 // Stub
+}
+
+/// sys_prlimit64 - Get/set resource limits
+fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64 {
+    // If old_limit is provided, return some huge default limits
+    if old_limit != 0 && is_user_pointer(old_limit, 16) {
+        unsafe {
+            let ptr = old_limit as *mut u64;
+            ptr.write_unaligned(1024 * 1024); // soft
+            ptr.add(1).write_unaligned(1024 * 1024); // hard
+        }
+    }
+    0
+}
+
+/// sys_pselect6 - Synchronous I/O multiplexing
+fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, sigmask: u64) -> u64 {
+    // Very basic stub: if it's used for sleeping (no FDs), use sys_nanosleep or just yield
+    if nfds == 0 && timeout != 0 {
+        return sys_nanosleep(timeout);
+    }
+    0 // Return 0 (no FDs ready)
+}
+/// sys_faccessat - Check file permissions
+fn sys_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
+    if path_ptr == 0 { return u64::MAX; }
+    
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return u64::MAX; }
+    
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 { return u64::MAX; }
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    path_buf[path_len as usize] = 0;
+    
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    let scheme_path = user_path_to_scheme_path(path_str);
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
+        crate::scheme::close(scheme_id, resource_id).ok();
+        return 0; // File exists, permit access for now
+    }
+    
+    u64::MAX // ENOENT or EACCES fallback
 }

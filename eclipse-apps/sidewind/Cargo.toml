@@ -22,7 +22,7 @@ libc = { version = "0.2", default-features = false }
 
 [features]
 default = []
-host-testing = ["libc/host-testing"]
+host-testing = []
 
 [dev-dependencies]
-libc = { version = "0.2", default-features = false, features = ["host-testing"] }
+libc = { version = "0.2", default-features = false }

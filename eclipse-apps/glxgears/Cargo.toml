@@ -8,8 +8,12 @@ heapless = "0.8"
 embedded-graphics = "0.8.1"
 
 [target.'cfg(target_os = "eclipse")'.dependencies]
+wayland-proto = { path = "../libs/wayland-proto" }
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
 std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = { version = "0.2", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+minifb = "0.28"
