@@ -1092,10 +1092,19 @@ pub fn deliver_pending_signals_for_current() {
             continue;
         }
 
-        // SIGKILL (9) no se puede ignorar ni capturar.
-        let terminate = sig == 9
-            || handler != 0 // capturado: sin sigreturn → fatal por ahora
-            || !signal_default_is_ignore(sig);
+        // If the process has installed a custom signal handler (handler != 0),
+        // we cannot invoke it properly without a full sigframe/sigreturn
+        // implementation.  Rather than killing the process (which caused bash
+        // and other programs to die the moment they received any signal they
+        // had registered a handler for), silently skip the delivery.  The
+        // signal has already been removed from pending_signals above, so the
+        // process will not be bothered by it again.
+        if handler != 0 && sig != 9 {
+            continue;
+        }
+
+        // SIGKILL (9) cannot be ignored or caught.
+        let terminate = sig == 9 || !signal_default_is_ignore(sig);
 
         if !terminate {
             continue;

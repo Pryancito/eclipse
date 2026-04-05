@@ -519,21 +519,13 @@ impl Scheme for PtyScheme {
     fn dup(&self, id: usize) -> Result<usize, usize> {
         let mut handles = self.handles.lock();
         if let Some(Some(h)) = handles.get_mut(id) {
+            // Only increment the reference count of the existing handle.
+            // Do NOT increment master_open_count / slave_open_count: those track
+            // the number of unique logical opens (one per pty::open call), not the
+            // total reference count.  Incrementing them here caused a leak where
+            // open_count never reached 0, so slave_closed / master_closed was never
+            // set after the last user closed their fds.
             h.ref_count += 1;
-            // Also increment the channel's side counter
-            let is_master = h.is_master;
-            let pair_id = h.pair_id;
-            drop(handles);
-            
-            let channels = self.channels.lock();
-            if let Some(Some(arc)) = channels.get(pair_id) {
-                let mut channel = arc.lock();
-                if is_master {
-                    channel.master_open_count += 1;
-                } else {
-                    channel.slave_open_count += 1;
-                }
-            }
             Ok(id)
         } else {
             Err(error::EBADF)

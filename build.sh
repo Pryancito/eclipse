@@ -257,7 +257,7 @@ EOF
                 cat > "$BASE_DIR/$BUILD_DIR/etc/termcap" <<EOF
 xterm|xterm-color|X Window System terminal emulator: :am:bs:km:mi:ms:pc:pt:qe:sr:ut:xo:co#80:li#25:it#8:RA:RS:kh=\EOH:kb=^H:ku=\EOA:kd=\EOB:kl=\EOD:kr=\EOC:eo:ho=\E[H:cl=\E[H\E[2J:cm=\E[%i%d;%dH:nd=\E[C:up=\E[A:ce=\E[K:cd=\E[J:so=\E[7m:se=\E[27m:md=\E[1m:me=\E[m:mr=\E[7m:mb=\E[5m:al=\E[L:dl=\E[M:dc=\E[P:ic=\E[@:vi=\E[?25l:ve=\E[?25h:ks=\E[?1h\E=:ke=\E[?1l\E>:te=\E[?1049l:ti=\E[?1049h:ut:
 EOF
-                cat > "$BASE_DIR/$BUILD_DIR/etc/inputrc" <<'EOF'
+                cat > "$BASE_DIR/$BUILD_DIR/etc/inputrc" <<'INPUTRC_EOF'
 # /etc/inputrc - global inputrc for libreadline
 # See readline(3readline) and `info rluserman' for more information.
 
@@ -320,6 +320,8 @@ $if term=rxvt
 "\eOd": backward-word
 $endif
 
+$endif
+INPUTRC_EOF
                 # /etc/passwd - user account information
                 cat > "$BASE_DIR/$BUILD_DIR/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/bash
