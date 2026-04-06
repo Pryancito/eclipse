@@ -15,7 +15,10 @@ const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
 static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
+#[cfg(feature = "compositor-lunas")]
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
+#[cfg(not(feature = "compositor-lunas"))]
+const COMPOSITOR_PATH: &str = "file:/usr/bin/labwc";
 
 fn main() {
     let pid = unsafe { std::libc::getpid() };

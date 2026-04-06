@@ -644,83 +644,42 @@ impl Filesystem {
         None
     }
 
-    /// Returns the content length from the CONTENT TLV
+    /// Returns the content length from the CONTENT TLV.
+    /// Uses the same scan logic as `get_file_metadata` to stay consistent.
     pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             let _ = FS.header.as_ref().ok_or("FS not mounted")?;
         }
-        
-        // Read the inode entry from the inode table
+
         let entry = Self::read_inode_entry(inode)?;
-        // Calculate record location
         let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-        
+
         let mut header_buf = [0u8; 8];
-        if let Err(e) = read_bytes_at(abs_disk_offset, &mut header_buf) {
-            return Err(e);
-        }
-        
-        // Get record total size
-        let mut record_size = u32::from_le_bytes([
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
+
+        let raw_record_size = u32::from_le_bytes([
             header_buf[4], header_buf[5],
             header_buf[6], header_buf[7]
         ]) as usize;
-        
-        let mut explicit_record_scan = false;
 
-        if record_size < 8 || record_size > MAX_RECORD_SIZE {
-             crate::serial::serial_print("[FS] get_file_size: Suspicious record size (");
-             crate::serial::serial_print_dec(record_size as u64);
-             crate::serial::serial_print("), enabling fallback scan\n");
-             // Force a scan of the first block size, minus header
-             record_size = BLOCK_SIZE; 
-             explicit_record_scan = true;
-        }
-        
-        // Read the record data
-        let mut record_data = vec![0u8; record_size];
-        if let Err(e) = read_bytes_at(abs_disk_offset, &mut record_data) {
-            return Err(e);
-        }
-        
-        // Parse TLVs
-        // If explicit scan, use record_data directly, starting after 16 bytes (suspected header)
-        // If normal, use record_data, starting after 8 bytes (standard header)
-        
-        let (buffer_to_scan, buffer_offset) = if explicit_record_scan {
-            (&record_data, 0) // read_bytes_at already read from abs_disk_offset
+        let scan_len = if raw_record_size < 8 {
+            BLOCK_SIZE
+        } else if raw_record_size > MAX_RECORD_SIZE {
+            2 * BLOCK_SIZE
         } else {
-            (&record_data, 0)
+            core::cmp::min(raw_record_size, 2 * BLOCK_SIZE)
         };
-        
-        let mut scan_offset = if explicit_record_scan {
-             16 // Skip 16 bytes (ID + Offset?)
-        } else {
-             8 // Skip 8 bytes (Standard Header)
-        };
-        
-        while scan_offset + 6 <= buffer_to_scan.len() - buffer_offset {
-             let idx = buffer_offset + scan_offset;
-             if idx + 6 > buffer_to_scan.len() { break; }
 
-             let tag = u16::from_le_bytes([
-                 buffer_to_scan[idx], buffer_to_scan[idx+1]
-             ]);
-             
-             let length = u32::from_le_bytes([
-                 buffer_to_scan[idx+2], buffer_to_scan[idx+3],
-                 buffer_to_scan[idx+4], buffer_to_scan[idx+5]
-             ]) as usize;
-             
-             if tag == tlv_tags::CONTENT {
-                 return Ok(length as u64);
-             }
-             
-             scan_offset += 6 + length;
+        let mut scan_buf = vec![0u8; scan_len];
+        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
+
+        // CONTENT tag checked before value-bounds guard so large files are handled correctly.
+        if let Some((_data_start, size)) = Self::scan_for_content_tlv(&scan_buf, 8, abs_disk_offset) {
+            return Ok(size);
         }
-        
-        // Not found / Empty file
+
+        // Not found / empty file
         Ok(0)
     }
 
