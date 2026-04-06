@@ -53,6 +53,8 @@ impl Connection for EclipseWaylandConnection {
                 EclipseMessage::Wayland { data, len, from: _ } => {
                     let mut payload = Vec::with_capacity(len);
                     payload.extend_from_slice(&data[..len]);
+                    // Fase A (Unix): SCM_RIGHTS via sendmsg/recvmsg. IPC path still has no fd
+                    // attachment in EclipseMessage — compositor keeps shm fallbacks for IPC clients.
                     Ok((payload, Vec::new()))
                 }
                 _ => Err(RecvError::InvalidMessage),

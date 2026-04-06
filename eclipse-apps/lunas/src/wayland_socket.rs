@@ -82,18 +82,23 @@ impl WaylandSocketServer {
             let recv_res = (*conn_rc).borrow().recv();
             match recv_res {
                 Ok((data, handles)) => {
-                    // There may be multiple Wayland messages concatenated.
-                    // Handles (fds via SCM_RIGHTS) arrive with the batch; associate them
-                    // with the first message that expects them (wl_shm.create_pool uses fd).
+                    // Several Wayland frames may arrive in one read; SCM_RIGHTS fds are ordered
+                    // to match Handle arguments in those frames. Advance the fd slice per message
+                    // using each request's payload layout (not "all fds on first message").
                     let mut pos = 0usize;
-                    let mut handles_remaining = handles;
+                    let mut handle_off = 0usize;
                     while pos + 8 <= data.len() {
                         match RawMessage::deserialize_header(&data[pos..]) {
                             Ok((_, _, msg_len)) if pos + msg_len <= data.len() => {
                                 let chunk = &data[pos..pos + msg_len];
-                                let _ = protocol.process_message(id, chunk, &handles_remaining);
-                                // Consume handles after first message that could use them.
-                                handles_remaining = Vec::new();
+                                let slots = protocol
+                                    .clients
+                                    .get(&id)
+                                    .and_then(|c| c.handle_arg_count_for_message(chunk).ok())
+                                    .unwrap_or(0);
+                                let tail = &handles[handle_off..];
+                                let _ = protocol.process_message(id, chunk, tail);
+                                handle_off += slots.min(tail.len());
                                 pos += msg_len;
                                 any = true;
                             }

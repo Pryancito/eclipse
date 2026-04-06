@@ -199,9 +199,8 @@ impl ObjectLogic for LunasShm {
                     }
                     v
                 } else {
-                    // No fd (Handle(-1)) — Eclipse OS doesn't support SCM_RIGHTS.
-                    // Try the PID-based path first (Eclipse IPC clients), then scan
-                    // /tmp/twb_* to find the terminal's shared buffer.
+                    // No fd (Handle(-1)): Unix client without SCM_RIGHTS delivery, or IPC client.
+                    // Try PID-based /tmp/twb_{pid} for native IPC clients, else scan /tmp.
                     let pid = client.client_id().0;
                     let v = if pid < 0x8000_0000 {
                         // Eclipse IPC client: pid IS the process pid.
@@ -293,8 +292,8 @@ fn map_shm_file(pid: u32, size: usize) -> usize {
 }
 
 /// Scan /tmp/ for shared-memory buffer files (twb_, glxg_, etc.) and mmap the
-/// first matching one. Used when Handle fd=-1 (Eclipse OS Unix sockets don't
-/// carry SCM_RIGHTS ancilla data yet).
+/// first matching one. Used when `create_pool` has no fd (e.g. Unix client
+/// before SCM_RIGHTS is wired, or mis-ordered fds).
 fn scan_shm_files(size: usize) -> usize {
     let prefixes: &[&[u8]] = &[b"/tmp/glxg_", b"/tmp/twb_", b"/tmp/sn_"];
     

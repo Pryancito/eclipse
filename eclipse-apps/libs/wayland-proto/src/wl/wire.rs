@@ -292,9 +292,9 @@ impl RawMessage {
                 }
                 PayloadType::Handle => {
                     // Consume from SCM_RIGHTS if available; fall back to Handle(-1) if not.
-                    // Eclipse OS does not support ancilla fd passing in its Unix socket
-                    // implementation, so handles is often empty.  The compositor handles
-                    // Handle(-1) by using the /tmp/twb_{pid} fallback path.
+                    // When the Unix socket path uses sendmsg/recvmsg (relibc syscalls 46/47),
+                    // fds are delivered here. Empty slice is still valid for clients that
+                    // cannot pass fds (e.g. Eclipse IPC transport) — compositor may fall back.
                     let handle = handles_iter
                         .next()
                         .copied()

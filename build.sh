@@ -1150,10 +1150,7 @@ build_userland() {
     prepare_sysroot
     build_eclipse_libc
     build_eclipse_std
-    build_libxfont15
-    build_tinyx_for_eclipse_os
     build_sidewind_project
-    build_labwc_musl
 
     # Aplicaciones
     #build_wayland_apps
@@ -1613,28 +1610,6 @@ EOF
         print_status "smithay_app (Rust Compositor) copiado"
     fi
 
-    # labwc: meson install con prefix=/ libdir=lib bindir=usr/bin → $BUILD_DIR/lib + usr/bin/labwc
-    mkdir -p "$BUILD_DIR/lib" "$BUILD_DIR/usr/bin" "$BUILD_DIR/userland/bin" "$BUILD_DIR/sysroot/usr/bin"
-    if [ -z "${ECLIPSE_SKIP_LABWC_MESON_INSTALL:-}" ] && [ -f "eclipse-apps/labwc/build/build.ninja" ] && command -v meson >/dev/null 2>&1; then
-        if meson install -C eclipse-apps/labwc/build --destdir="$BASE_DIR/$BUILD_DIR" --no-rebuild; then
-            print_status "meson install labwc → $BUILD_DIR/lib y $BUILD_DIR/usr/bin/"
-        else
-            print_warning "meson install labwc falló (¿reconfigura build con scripts/build-labwc-musl.sh?). Copiando binario desde build/."
-            if [ -f "eclipse-apps/labwc/build/labwc" ]; then
-                cp "eclipse-apps/labwc/build/labwc" "$BUILD_DIR/usr/bin/labwc"
-            fi
-        fi
-    elif [ -f "eclipse-apps/labwc/build/labwc" ]; then
-        cp "eclipse-apps/labwc/build/labwc" "$BUILD_DIR/usr/bin/labwc"
-        print_status "labwc copiado a usr/bin (sin meson install; define build.ninja o quita ECLIPSE_SKIP_LABWC_MESON_INSTALL)"
-    fi
-    if [ -f "$BUILD_DIR/usr/bin/labwc" ]; then
-        chmod +x "$BUILD_DIR/usr/bin/labwc"
-        cp "$BUILD_DIR/usr/bin/labwc" "$BUILD_DIR/userland/bin/labwc"
-        cp "$BUILD_DIR/usr/bin/labwc" "$BUILD_DIR/sysroot/usr/bin/labwc"
-        chmod +x "$BUILD_DIR/userland/bin/labwc" "$BUILD_DIR/sysroot/usr/bin/labwc"
-    fi
-
     # Enlazador dinámico musl en /lib (PT_INTERP de labwc y otros ELF PIE musl).
     # Sin esto, exec falla con "File not found" al resolver /lib/ld-musl-x86_64.so.1
     mkdir -p "$BUILD_DIR/lib" "$BUILD_DIR/usr/lib" "$BUILD_DIR/etc"
@@ -1730,20 +1705,6 @@ EOF
         shopt -u nullglob
         print_status "Copiadas bibliotecas desde ECLIPSE_LABWC_LIB_PREFIX=$ECLIPSE_LABWC_LIB_PREFIX"
     fi
-    # Opción B: deducir rutas con ldd sobre el propio labwc (en la máquina de build).
-    _labwc_ldd_target=""
-    if [ -f "eclipse-apps/labwc/build/labwc" ]; then
-        _labwc_ldd_target="eclipse-apps/labwc/build/labwc"
-    elif [ -f "$BUILD_DIR/usr/bin/labwc" ]; then
-        _labwc_ldd_target="$BUILD_DIR/usr/bin/labwc"
-    fi
-    if [ -n "$_labwc_ldd_target" ]; then
-        eclipse_stage_ldd_libs "$BUILD_DIR" "$_labwc_ldd_target"
-    fi
-    for _eb in ${ECLIPSE_LDD_EXTRA_BINS:-}; do
-        [ -z "$_eb" ] && continue
-        [ -f "$_eb" ] && eclipse_stage_ldd_libs "$BUILD_DIR" "$_eb"
-    done
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF

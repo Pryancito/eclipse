@@ -1,9 +1,0 @@
-# Herramientas de compilación en el host. wayland-scanner >= 1.25 (el del sistema suele ser más viejo).
-# Generar con: ver scripts/build-musl.sh (build-wayland-host + ninja install).
-[binaries]
-wayland-scanner = 'host-tools/prefix/bin/wayland-scanner'
-bison = '/usr/bin/bison'
-
-[properties]
-# Sin /usr/share/pkgconfig pkg-config no ve hwdata.pc (wlroots DRM); sin host-tools no hay wayland-scanner 1.25.
-pkg_config_libdir = 'host-tools/prefix/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig'

@@ -1,6 +1,7 @@
 use crate::wl::server::objects::{Object, ObjectInner, DisplayObject, ServerError};
 use crate::wl::protocols::common::wl_display::WlDisplay;
-use crate::wl::{ObjectId, NewId, Connection, Message, interface::InterfaceWrapper};
+use crate::wl::{ObjectId, NewId, Connection, Message, RawMessage, interface::InterfaceWrapper};
+use crate::wl::wire::PayloadType;
 use alloc::rc::Rc;
 use core::cell::RefCell;
 use alloc::collections::BTreeMap;
@@ -38,6 +39,22 @@ impl Client {
 
     pub fn object_mut(&mut self, id: ObjectId) -> Result<&mut Object, ServerError> {
         self.objects.get_mut(&id).ok_or(ServerError::UnknownObjectId(id))
+    }
+
+    /// How many `fd` arguments (SCM_RIGHTS slots) this wire message expects, in order.
+    /// Used by the Unix transport to split one `recvmsg` batch across several Wayland messages.
+    pub fn handle_arg_count_for_message(&self, message: &[u8]) -> Result<usize, ServerError> {
+        let (object_id, opcode, _len) =
+            RawMessage::deserialize_header(message).map_err(|_| ServerError::MessageDeserializeError)?;
+        let object = self
+            .objects
+            .get(&object_id)
+            .ok_or(ServerError::UnknownObjectId(object_id))?;
+        let payload_types = object.interface().payload_types(opcode.0);
+        Ok(payload_types
+            .iter()
+            .filter(|t| **t == PayloadType::Handle)
+            .count())
     }
 
     pub fn send_event<E: Message>(&self, object: ObjectId, event: E) -> Result<(), ServerError> {
