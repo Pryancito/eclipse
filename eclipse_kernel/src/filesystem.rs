@@ -572,32 +572,76 @@ impl Filesystem {
         let mut header_buf = [0u8; 8];
         read_bytes_at(abs_disk_offset, &mut header_buf)?;
         
-        let record_size = u32::from_le_bytes([
+        let raw_record_size = u32::from_le_bytes([
             header_buf[4], header_buf[5],
             header_buf[6], header_buf[7]
         ]) as usize;
 
-        let scan_len = min(record_size, 2 * BLOCK_SIZE);
+        // Read just enough bytes to scan metadata TLVs and find the CONTENT TLV header.
+        // All metadata TLVs (NODE_TYPE…NLINK) total ~103 bytes; CONTENT header is 6 bytes at ~111.
+        // Two blocks (8192 bytes) is always sufficient for any valid node record.
+        // If record_size is bogus (< 8) we use one block and do an explicit scan.
+        let mut explicit_record_scan = false;
+        let scan_len = if raw_record_size < 8 {
+            explicit_record_scan = true;
+            BLOCK_SIZE
+        } else if raw_record_size > MAX_RECORD_SIZE {
+            2 * BLOCK_SIZE
+        } else {
+            core::cmp::min(raw_record_size, 2 * BLOCK_SIZE)
+        };
+
         let mut scan_buf = vec![0u8; scan_len];
         read_bytes_at(abs_disk_offset, &mut scan_buf)?;
-        
-        let mut tlv_pos = 8usize;
-        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= scan_buf.len() {
-            let tag = u16::from_le_bytes([scan_buf[tlv_pos], scan_buf[tlv_pos + 1]]);
+
+        // Scan TLVs. IMPORTANT: check the tag BEFORE the value-bounds guard so that
+        // large-content files (where CONTENT.length >> scan_buf.len()) are found correctly.
+        // We only need the 6-byte CONTENT TLV header to learn the file size; the content
+        // bytes themselves are read lazily via scheme::read during mmap/read calls.
+        let scan_start = if explicit_record_scan { 16usize } else { 8usize };
+        let found = Self::scan_for_content_tlv(&scan_buf, scan_start, abs_disk_offset);
+        if found.is_some() {
+            return Ok(found.unwrap());
+        }
+
+        // Suspicious header: retry from offset 8 as a fallback.
+        if explicit_record_scan {
+            let found = Self::scan_for_content_tlv(&scan_buf, 8, abs_disk_offset);
+            if found.is_some() {
+                return Ok(found.unwrap());
+            }
+        }
+
+        // Fallback for empty files (no CONTENT TLV yet)
+        Ok((abs_disk_offset + 8, 0))
+    }
+
+    /// Scan `buf` for a CONTENT TLV starting at `start_pos`.
+    /// Returns `Some((data_start_abs, size))` when found, or `None`.
+    /// The CONTENT tag is checked BEFORE the value-bounds guard so that files whose
+    /// content is larger than the scan buffer are still correctly identified.
+    fn scan_for_content_tlv(buf: &[u8], start_pos: usize, abs_disk_offset: u64) -> Option<(u64, u64)> {
+        let mut tlv_pos = start_pos;
+        while tlv_pos + 6 <= buf.len() {
+            let tag = u16::from_le_bytes([buf[tlv_pos], buf[tlv_pos + 1]]);
             let length = u32::from_le_bytes([
-                scan_buf[tlv_pos + 2], scan_buf[tlv_pos + 3],
-                scan_buf[tlv_pos + 4], scan_buf[tlv_pos + 5],
+                buf[tlv_pos + 2], buf[tlv_pos + 3],
+                buf[tlv_pos + 4], buf[tlv_pos + 5],
             ]) as usize;
             if tag == tlv_tags::CONTENT {
-                // data_start_abs is the absolute disk offset where CONTENT data begins
+                // Found: return data start and size. The content bytes themselves are
+                // not required to be in `buf`; callers read them via scheme::read.
                 let data_start_abs = abs_disk_offset + (tlv_pos + 6) as u64;
-                return Ok((data_start_abs, length as u64));
+                return Some((data_start_abs, length as u64));
+            }
+            // For non-CONTENT TLVs: if the value extends past the scan buffer the
+            // record is either corrupt or this TLV is not a known fixed-size type.
+            if tlv_pos + 6 + length > buf.len() {
+                break;
             }
             tlv_pos += 6 + length;
         }
-        
-        // Fallback for empty files (no CONTENT TLV yet)
-        Ok((abs_disk_offset + 8, 0))
+        None
     }
 
     /// Returns the content length from the CONTENT TLV

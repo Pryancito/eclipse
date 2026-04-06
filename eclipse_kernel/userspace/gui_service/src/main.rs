@@ -39,8 +39,9 @@ fn main() {
             unsafe { std::libc::exit(1); }
         }
 
+        // lseek returns (off_t)-1 on error; 0 is valid for an empty file.
         let sz = lseek(fd, 0, SEEK_END);
-        // Reset to beginning; mmap uses explicit offset=0 so this is diagnostic only.
+        // Always reset position; mmap uses explicit offset=0 so this is also diagnostic.
         let _ = lseek(fd, 0, SEEK_SET);
         if sz < 0 {
             println!("[GUI-SERVICE] FATAL: lseek(SEEK_END) failed for {} for exec", COMPOSITOR_PATH);
