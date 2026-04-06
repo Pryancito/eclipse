@@ -39,22 +39,21 @@ fn main() {
             unsafe { std::libc::exit(1); }
         }
 
-        // lseek returns (off_t)-1 on error; 0 is a valid result for an empty file (size 0).
+        // lseek returns (off_t)-1 on error; 0 is valid for an empty file.
         let sz = lseek(fd, 0, SEEK_END);
+        // Always reset position; mmap uses explicit offset=0 so this is also diagnostic.
+        let _ = lseek(fd, 0, SEEK_SET);
         if sz < 0 {
             println!("[GUI-SERVICE] FATAL: lseek(SEEK_END) failed for {} for exec", COMPOSITOR_PATH);
             eclipse_close(fd);
             unsafe { std::libc::exit(1); }
         }
-        let _ = lseek(fd, 0, SEEK_SET);
-        let size = sz as usize;
-        if size == 0 {
-            println!(
-                "[GUI-SERVICE] FATAL: compositor file has size 0 (check FS CONTENT TLV / image build)"
-            );
+        if sz == 0 {
+            println!("[GUI-SERVICE] FATAL: compositor file has size 0 (check FS CONTENT TLV / image build)");
             eclipse_close(fd);
             unsafe { std::libc::exit(1); }
         }
+        let size = sz as usize;
 
         let mapped = mmap(
             core::ptr::null_mut(),
