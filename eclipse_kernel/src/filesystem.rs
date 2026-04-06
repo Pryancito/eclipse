@@ -572,30 +572,67 @@ impl Filesystem {
         let mut header_buf = [0u8; 8];
         read_bytes_at(abs_disk_offset, &mut header_buf)?;
         
-        let record_size = u32::from_le_bytes([
+        // Mirror get_file_size for small/bogus headers; for declared size > MAX, still cap read
+        // to MAX_RECORD_SIZE (do not shrink to one block — large ELF inodes need a wide scan).
+        let raw_record_size = u32::from_le_bytes([
             header_buf[4], header_buf[5],
             header_buf[6], header_buf[7]
         ]) as usize;
 
-        let scan_len = min(record_size, 2 * BLOCK_SIZE);
-        let mut scan_buf = vec![0u8; scan_len];
+        let mut explicit_record_scan = false;
+        let record_size = if raw_record_size < 8 {
+            explicit_record_scan = true;
+            BLOCK_SIZE
+        } else if raw_record_size > MAX_RECORD_SIZE {
+            MAX_RECORD_SIZE
+        } else {
+            raw_record_size
+        };
+
+        // Was: min(record_size, 2 * BLOCK_SIZE). That breaks inode records where TLVs before
+        // CONTENT span more than 8 KiB → reported size 0 → lseek(SEEK_END)==0 and exec fails.
+        let read_len = record_size;
+        let mut scan_buf = vec![0u8; read_len];
         read_bytes_at(abs_disk_offset, &mut scan_buf)?;
-        
-        let mut tlv_pos = 8usize;
-        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= scan_buf.len() {
+
+        // Same scan roots as get_file_size so metadata and size stay consistent.
+        let mut tlv_pos = if explicit_record_scan { 16usize } else { 8usize };
+        while tlv_pos + 6 <= scan_buf.len() {
             let tag = u16::from_le_bytes([scan_buf[tlv_pos], scan_buf[tlv_pos + 1]]);
             let length = u32::from_le_bytes([
                 scan_buf[tlv_pos + 2], scan_buf[tlv_pos + 3],
                 scan_buf[tlv_pos + 4], scan_buf[tlv_pos + 5],
             ]) as usize;
+            if tlv_pos + 6 + length > scan_buf.len() {
+                break;
+            }
             if tag == tlv_tags::CONTENT {
-                // data_start_abs is the absolute disk offset where CONTENT data begins
                 let data_start_abs = abs_disk_offset + (tlv_pos + 6) as u64;
                 return Ok((data_start_abs, length as u64));
             }
             tlv_pos += 6 + length;
         }
-        
+
+        // Suspicious header path starts at 16; retry from 8 if nothing found (common layout).
+        if explicit_record_scan {
+            tlv_pos = 8usize;
+            while tlv_pos + 6 <= scan_buf.len() {
+                let tag = u16::from_le_bytes([scan_buf[tlv_pos], scan_buf[tlv_pos + 1]]);
+                let length = u32::from_le_bytes([
+                    scan_buf[tlv_pos + 2], scan_buf[tlv_pos + 3],
+                    scan_buf[tlv_pos + 4], scan_buf[tlv_pos + 5],
+                ]) as usize;
+                if tlv_pos + 6 + length > scan_buf.len() {
+                    break;
+                }
+                if tag == tlv_tags::CONTENT {
+                    let data_start_abs = abs_disk_offset + (tlv_pos + 6) as u64;
+                    return Ok((data_start_abs, length as u64));
+                }
+                tlv_pos += 6 + length;
+            }
+        }
+
         // Fallback for empty files (no CONTENT TLV yet)
         Ok((abs_disk_offset + 8, 0))
     }
