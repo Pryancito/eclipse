@@ -119,12 +119,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if entry.file_type().is_file() {
+        // Use fs::metadata (follows symlinks) so that symlinks to regular files
+        // are included with their actual binary content, not as symlink nodes.
+        let is_regular_file = if entry.file_type().is_file() {
+            true
+        } else if entry.file_type().is_symlink() {
+            path.metadata().map(|m| m.is_file()).unwrap_or(false)
+        } else {
+            false
+        };
+        if is_regular_file {
             let relative = path.strip_prefix(&args.source)?;
             let fs_path = PathBuf::from("/").join(relative);
 
-            // Read file content
+            // Read file content; fs::read follows symlinks automatically.
             let content = fs::read(path)?;
+
+            // Executables in bin directories must never be 0 bytes — a 0-byte
+            // binary means the cross-compilation failed or was not run before
+            // populate.  Fail loudly here rather than silently building a broken
+            // filesystem image that only manifests at runtime.
+            if content.is_empty() {
+                let components: Vec<_> = fs_path.components().collect();
+                let in_bin_dir = components.windows(2).any(|w| {
+                    let parent_name = w[0].as_os_str().to_str().unwrap_or("");
+                    let file_name   = w[1].as_os_str().to_str().unwrap_or("");
+                    (parent_name == "bin" || parent_name == "sbin") && !file_name.is_empty()
+                }) || components.windows(3).any(|w| {
+                    let grandparent = w[0].as_os_str().to_str().unwrap_or("");
+                    let parent      = w[1].as_os_str().to_str().unwrap_or("");
+                    let file_name   = w[2].as_os_str().to_str().unwrap_or("");
+                    grandparent == "usr" && (parent == "bin" || parent == "sbin") && !file_name.is_empty()
+                });
+                if in_bin_dir {
+                    eprintln!(
+                        "ERROR: {:?} is 0 bytes — binary not built or build failed. \
+                         Aborting populate to prevent a broken filesystem image.",
+                        fs_path
+                    );
+                    std::process::exit(1);
+                }
+            }
+
             total_bytes += content.len() as u64;
 
             // Create file node
@@ -161,6 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = entry.path();
         println!("  Processing path: {:?}", path);
         if entry.file_type().is_symlink() {
+            // Skip symlinks that resolve to regular files — they were already
+            // stored with their actual binary content in the file pass above.
+            if path.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                continue;
+            }
+
             let relative = path.strip_prefix(&args.source)?;
             let fs_path = PathBuf::from("/").join(relative);
 
