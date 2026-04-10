@@ -1408,15 +1408,11 @@ pub fn draw_desktop_shell(
     cpu_temp: u32, gpu_load: u32, gpu_temp: u32,
     anomalies: u32, frag: u32, uptime_ticks: u64,
     cpu_count: u64, mem_total_kb: u64, gpu_vram_total_kb: u64,
-    services: &[ServiceInfo],
-    processes: &[ProcessInfo],
-    process_cpu: &[f32; 32],
-    process_mem: &[u64; 32],
 ) {
     draw_static_ui(fb, style_engine, dashboard_view, counter, cursor_x, cursor_y, log_buf, log_len, 
         dashboard_active, sys_central_active, network_active,
         cpu, mem, net, cpu_temp, gpu_load, gpu_temp, anomalies, frag, uptime_ticks,
-        cpu_count, mem_total_kb, gpu_vram_total_kb, services, processes, process_cpu, process_mem);
+        cpu_count, mem_total_kb, gpu_vram_total_kb);
 }
 
 pub fn draw_static_ui(
@@ -1435,10 +1431,6 @@ pub fn draw_static_ui(
     cpu_temp: u32, gpu_load: u32, gpu_temp: u32,
     anomalies: u32, frag: u32, uptime_ticks: u64,
     cpu_count: u64, mem_total_kb: u64, gpu_vram_total_kb: u64,
-    services: &[ServiceInfo],
-    processes: &[ProcessInfo],
-    process_cpu: &[f32; 32],
-    process_mem: &[u64; 32],
 ) {
     fb.blit_background();
 
@@ -1493,10 +1485,6 @@ pub fn draw_static_ui(
     if dashboard_active {
         draw_dashboard(fb, style_engine, dashboard_view, counter, cpu, mem, net, cpu_temp, gpu_load, gpu_temp, 
             anomalies, frag, uptime_ticks, cpu_count, mem_total_kb, gpu_vram_total_kb);
-    }
-
-    if sys_central_active {
-        draw_system_central(fb, counter, services, processes, process_cpu, process_mem, uptime_ticks);
     }
 }
 

@@ -1136,6 +1136,8 @@ impl SmithayState {
                 self.input.network_active = false;
                 // Force immediate metrics update
                 self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
+                // Request service list immediately so it is ready by the next render frame.
+                let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
             }
             self.dirty = true;
         }
@@ -1209,10 +1211,6 @@ impl SmithayState {
                 self.cpu_count,
                 self.mem_total_kb,
                 self.gpu_vram_total_kb,
-                &self.service_list,
-                &self.process_list,
-                &self.process_cpu_usage,
-                &self.process_mem_kb,
             );
 
             if self.input.network_active {
