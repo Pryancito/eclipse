@@ -2791,7 +2791,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 phys
             } else {
                 serial::serial_print("[SYSCALL] mmap: physical frame pool exhausted\n");
-                0 // map to 0 as fallback
+                // Never map to physical address 0 as a fallback: that turns allocation
+                // failures into NULL dereferences in userspace (hard to debug).
+                return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
             };
 
             memory::map_user_page_4kb(page_table_phys, current, frame_phys, mmap_prot);

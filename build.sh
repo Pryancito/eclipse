@@ -1391,7 +1391,7 @@ echo "Iniciando Eclipse OS con sistema DRM..."
 if [ ! -w /dev/dri/card0 ]; then
     echo "Error: Sin permisos para acceder a DRM"
     echo "Ejecutar como root o agregar usuario al grupo video"
-    exit 1
+    
 fi
 
 # Iniciar sistema DRM
@@ -1609,102 +1609,6 @@ EOF
         cp "$BUILD_DIR/sysroot/usr/bin/smithay_app" "$BUILD_DIR/usr/bin/"
         print_status "smithay_app (Rust Compositor) copiado"
     fi
-
-    # Enlazador dinámico musl en /lib (PT_INTERP de labwc y otros ELF PIE musl).
-    # Sin esto, exec falla con "File not found" al resolver /lib/ld-musl-x86_64.so.1
-    mkdir -p "$BUILD_DIR/lib" "$BUILD_DIR/usr/lib" "$BUILD_DIR/etc"
-    # Rutas donde ld-musl busca shared objects (un directorio por línea).
-    # Sin este fichero, open("/etc/ld-musl-x86_64.path") falla con ENOENT y el linker
-    # solo usa rutas por defecto /lib y /usr/lib internas; conviene tenerlo explícito en el rootfs.
-    # Solo LF, sin líneas vacías (una línea vacía en musl puede provocar búsquedas con "//" y open("//foo.so")).
-    printf '/lib\n/usr/lib\n/usr/local/lib\n' > "$BUILD_DIR/etc/ld-musl-x86_64.path"
-    print_status "Creado etc/ld-musl-x86_64.path (/lib, /usr/lib, /usr/local/lib, LF only)"
-    _eclipse_musl_ld_src=""
-    if [ -n "${ECLIPSE_MUSL_LD:-}" ] && [ -f "${ECLIPSE_MUSL_LD}" ]; then
-        _eclipse_musl_ld_src="${ECLIPSE_MUSL_LD}"
-    elif command -v musl-gcc >/dev/null 2>&1; then
-        for _n in ld-musl-x86_64.so.1 libc.so; do
-            _cand="$(musl-gcc -print-file-name="$_n" 2>/dev/null || true)"
-            case "$_cand" in
-                /*)
-                    if [ -f "$_cand" ]; then
-                        _eclipse_musl_ld_src="$_cand"
-                        break
-                    fi
-                    ;;
-            esac
-        done
-    fi
-    if [ -z "$_eclipse_musl_ld_src" ] || [ ! -f "$_eclipse_musl_ld_src" ]; then
-        for _cand in /usr/lib/x86_64-linux-musl/libc.so /usr/lib/x86_64-linux-musl/ld-musl-x86_64.so.1; do
-            if [ -f "$_cand" ]; then
-                _eclipse_musl_ld_src="$_cand"
-                break
-            fi
-        done
-    fi
-    if [ -n "$_eclipse_musl_ld_src" ] && [ -f "$_eclipse_musl_ld_src" ]; then
-        cp "$_eclipse_musl_ld_src" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
-        chmod 755 "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
-        print_status "Instalado lib/ld-musl-x86_64.so.1 (origen: $_eclipse_musl_ld_src)"
-    else
-        print_warning "No se encontró ld-musl (musl-gcc, rutas Debian o ECLIPSE_MUSL_LD). labwc fallará en exec hasta instalarlo en /lib del rootfs."
-    fi
-
-    # libc.so y demás *.so del mismo árbol musl (necesarios para resolver DT_NEEDED "libc.so", etc.).
-    _eclipse_musl_libdir="${ECLIPSE_MUSL_LIBDIR:-}"
-    if [ -z "$_eclipse_musl_libdir" ] || [ ! -d "$_eclipse_musl_libdir" ]; then
-        if [ -n "${_eclipse_musl_ld_src:-}" ] && [ -f "${_eclipse_musl_ld_src}" ]; then
-            _eclipse_musl_libdir="$(dirname "$_eclipse_musl_ld_src")"
-        fi
-    fi
-    if [ -n "${_eclipse_musl_libdir:-}" ] && [ -d "$_eclipse_musl_libdir" ]; then
-        _musl_n=0
-        for _mf in "$_eclipse_musl_libdir"/*.so; do
-            [ -f "$_mf" ] || continue
-            cp -a "$_mf" "$BUILD_DIR/lib/"
-            _musl_n=$((_musl_n + 1))
-        done
-        if [ "$_musl_n" -gt 0 ]; then
-            print_status "Copiadas $_musl_n bibliotecas musl (*.so) desde $_eclipse_musl_libdir -> lib/"
-        fi
-    fi
-    # Debian: libc.so a menudo está solo bajo /usr/lib/x86_64-linux-musl; el enlazador ya puede estar en /lib.
-    if [ ! -f "$BUILD_DIR/lib/libc.so" ] && [ -f /usr/lib/x86_64-linux-musl/libc.so ]; then
-        cp -a /usr/lib/x86_64-linux-musl/libc.so "$BUILD_DIR/lib/libc.so"
-        print_status "Instalado lib/libc.so desde /usr/lib/x86_64-linux-musl"
-    fi
-
-    # Sysroot musl (Alpine chroot, Buildroot output/target, etc.): libinput, Mesa, cairo… enlazados a musl.
-    _eclipse_used_musl_sysroot=0
-    if [ -n "${ECLIPSE_MUSL_SYSROOT:-}" ] && [ -d "${ECLIPSE_MUSL_SYSROOT}" ]; then
-        if [ -x "$BASE_DIR/scripts/stage_musl_sysroot.sh" ]; then
-            "$BASE_DIR/scripts/stage_musl_sysroot.sh" "$ECLIPSE_MUSL_SYSROOT" "$BASE_DIR/$BUILD_DIR"
-            _eclipse_used_musl_sysroot=1
-        else
-            print_warning "ECLIPSE_MUSL_SYSROOT definido pero falta scripts/stage_musl_sysroot.sh"
-        fi
-    fi
-    if [ "$_eclipse_used_musl_sysroot" = 1 ] && [ "${ECLIPSE_ALLOW_LDD_WITH_SYSROOT:-}" != "1" ]; then
-        ECLIPSE_SKIP_LDD_STAGING=1
-        print_status "Sysroot musl activo → ECLIPSE_SKIP_LDD_STAGING=1 (no mezclar .so glibc del host). Para forzar ldd: ECLIPSE_ALLOW_LDD_WITH_SYSROOT=1"
-    fi
-
-    # labwc: dependencias dinámicas (wlroots → libinput, Mesa → EGL/gbm/GLESv2, cairo, pango, udev, systemd…).
-    # Opción A: prefijo tipo DESTDIR de `meson install` (contiene lib/ o usr/lib/ con .so).
-    if [ -n "${ECLIPSE_LABWC_LIB_PREFIX:-}" ] && [ -d "${ECLIPSE_LABWC_LIB_PREFIX}" ]; then
-        shopt -s nullglob
-        for _d in "${ECLIPSE_LABWC_LIB_PREFIX}/lib" "${ECLIPSE_LABWC_LIB_PREFIX}/usr/lib"; do
-            if [ -d "$_d" ]; then
-                for _so in "$_d"/*.so "$_d"/*.so.*; do
-                    [ -e "$_so" ] || continue
-                    cp -a "$_so" "$BUILD_DIR/lib/"
-                done
-            fi
-        done
-        shopt -u nullglob
-        print_status "Copiadas bibliotecas desde ECLIPSE_LABWC_LIB_PREFIX=$ECLIPSE_LABWC_LIB_PREFIX"
-    fi
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
@@ -1796,14 +1700,14 @@ EOF
     # 3. Ensamblar la imagen final con tabla GPT
     print_status "Ensamblando imagen final $IMG_FILE..."
     rm -f "$IMG_FILE"
-    truncate -s 512M "$IMG_FILE"
+    truncate -s 1536M "$IMG_FILE"
     
     # Usar parted en el archivo local (no requiere sudo para archivos)
     PARTED_CMD="parted"
     "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
     "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 64MiB
     "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 65MiB 465MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 65MiB 1465MiB
     
     # Escribir las particiones en los offsets correctos usando dd
     print_status "Escribiendo particiones en la imagen final..."

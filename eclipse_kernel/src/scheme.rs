@@ -26,6 +26,9 @@ pub mod error {
     pub const EFAULT: usize = 14;  // Bad address
     pub const EISCONN: usize = 106; // Transport endpoint is already connected
     pub const ENOTCONN: usize = 107; // Transport endpoint is not connected
+    pub const ENOMEM: usize = 12;  // Out of memory
+    pub const EACCES: usize = 13;  // Permission denied
+    pub const EBUSY: usize = 16;   // Device or resource busy
     pub const EPIPE: usize = 32;   // Broken pipe
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
 }
