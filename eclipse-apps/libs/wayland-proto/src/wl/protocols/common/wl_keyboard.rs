@@ -81,12 +81,42 @@ impl Message for Event {
 
     fn from_raw(_con: Rc<RefCell<dyn Connection>>, m: &RawMessage) -> Result<Self, DeserializeError> {
         match m.opcode.0 {
+            0 => {
+                let format = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let fd     = match m.args.get(1) { Some(Payload::Handle(v)) => *v, _ => crate::wl::wire::Handle(-1) };
+                let size   = match m.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Event::Keymap { format, fd, size })
+            }
+            1 => {
+                let serial  = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let surface = match m.args.get(1) { Some(Payload::ObjectId(v)) => *v, _ => ObjectId::null() };
+                let keys    = match m.args.get(2) { Some(Payload::Array(v)) => v.clone(), _ => Array(alloc::vec::Vec::new()) };
+                Ok(Event::Enter { serial, surface, keys })
+            }
+            2 => {
+                let serial  = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let surface = match m.args.get(1) { Some(Payload::ObjectId(v)) => *v, _ => ObjectId::null() };
+                Ok(Event::Leave { serial, surface })
+            }
             3 => {
                 let serial = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let time   = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let key    = match m.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let state  = match m.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 Ok(Event::Key { serial, time, key, state })
+            }
+            4 => {
+                let serial         = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let mods_depressed = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let mods_latched   = match m.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let mods_locked    = match m.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let group          = match m.args.get(4) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Event::Modifiers { serial, mods_depressed, mods_latched, mods_locked, group })
+            }
+            5 => {
+                let rate  = match m.args.get(0) { Some(Payload::Int(v)) => *v, _ => 0 };
+                let delay = match m.args.get(1) { Some(Payload::Int(v)) => *v, _ => 0 };
+                Ok(Event::RepeatInfo { rate, delay })
             }
             _ => Err(DeserializeError::UnknownOpcode),
         }

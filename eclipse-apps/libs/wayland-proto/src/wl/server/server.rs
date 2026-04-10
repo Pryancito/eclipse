@@ -121,11 +121,16 @@ impl WaylandServer {
 
         // Intercept bind on registry (opcode=0) to instantiate objects from globals
         if interface_name == "wl_registry" && opcode.0 == 0 {
+             if raw.args.len() < 4 { return Err(ServerError::MessageDeserializeError); }
              let name = match raw.args[0] { crate::wl::Payload::UInt(n) => n, _ => return Err(ServerError::MessageDeserializeError) };
+             let _interface_str = match &raw.args[1] { crate::wl::Payload::String(s) => s, _ => return Err(ServerError::MessageDeserializeError) };
+             let _version = match raw.args[2] { crate::wl::Payload::UInt(v) => v, _ => return Err(ServerError::MessageDeserializeError) };
              let id = match raw.args[3] { crate::wl::Payload::NewId(id) => id, _ => return Err(ServerError::MessageDeserializeError) };
 
              let global_idx = self.globals.iter().position(|g| g.name == name)
                   .ok_or(ServerError::UnknownGlobal)?;
+
+             // TODO: Verify interface_str matches global.interface and version is compatible.
 
              // Call logic_factory and interface_type using index (temporary borrows).
              let logic = (self.globals[global_idx].logic_factory)();
@@ -136,7 +141,6 @@ impl WaylandServer {
              client.add_object(id, new_obj);
 
              // Invoke post_bind callback if present.
-             // Borrow self.globals immutably (different field from self.clients).
              if let Some(ref cb) = self.globals[global_idx].post_bind {
                   let _ = cb(id.as_id(), client);
              }

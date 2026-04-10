@@ -83,12 +83,12 @@ impl Message for Event {
                 message,
             } => RawMessage {
                 sender,
-                opcode: Opcode(3),
+                opcode: Opcode(0),
                 args: smallvec![object_id.into(), code.into(), message.into()],
             },
             Event::DeleteId { id } => RawMessage {
                 sender,
-                opcode: Opcode(4),
+                opcode: Opcode(1),
                 args: smallvec![id.into()],
             },
         }
@@ -99,12 +99,12 @@ impl Message for Event {
         m: &RawMessage,
     ) -> Result<Event, DeserializeError> {
         match m.opcode {
-            Opcode(3) => Ok(Event::Error {
+            Opcode(0) => Ok(Event::Error {
                 object_id: from_payload!(ObjectId, m.args[0]),
                 code: from_payload!(UInt, m.args[1]),
                 message: from_payload!(String, m.args[2]),
             }),
-            Opcode(4) => Ok(Event::DeleteId {
+            Opcode(1) => Ok(Event::DeleteId {
                 id: from_payload!(UInt, m.args[0]),
             }),
             _ => Err(DeserializeError::UnknownOpcode),

@@ -1,7 +1,7 @@
 use crate::backend::Backend;
 use crate::compositor::Space;
 use crate::input::{InputState, CompositorEvent};
-use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
+use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use std::prelude::v1::*;
@@ -16,7 +16,19 @@ use core::default::Default;
 use core::iter::Iterator;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
-use eclipse_ipc::types::{TAG_WAYL, NetExtendedStats};
+use wayland_proto::wl::server::server::WaylandServer;
+use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
+use wayland_proto::wl::protocols::common::{wl_pointer, wl_keyboard, xdg_surface, xdg_toplevel, xdg_wm_base, wl_compositor, wl_shm, wl_seat};
+use wayland_proto::wl::protocols::common::*;
+use wayland_proto::EclipseWaylandConnection;
+use crate::wayland_socket::WaylandSocketServer;
+use crate::xwayland::{X11Server, X11Action};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SharedXwaylandSerials};
+use crate::protocol::{AppCompositor, AppShm, AppSeat, AppXdgWmBase};
+use eclipse_ipc::types::{NetExtendedStats, TAG_WAYL};
+use std::rc::Rc;
+use core::cell::RefCell;
+use std::collections::BTreeMap;
 
 #[cfg(not(target_os = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
@@ -98,13 +110,23 @@ pub struct SmithayState {
     /// los eventos de ratón han dejado de llegar (IPC muerto o input_service bloqueado).
     pub last_input_tick: u64,
     #[cfg(any(not(target_os = "linux"), test))]
-    pub wayland_connections: [Option<sidewind::wayland::WaylandConnection>; 32],
+    pub wayland_connections: [Option<EclipseWaylandConnection>; 32],
     #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
     /// Última vez que se recibió un mensaje IPC (para el heartbeat).
     pub last_ipc_activity: std::time::Instant,
     pub style_engine: crate::style_engine::StyleEngine,
     pub dashboard_view: Option<std::boxed::Box<dyn crate::stylus::Widget>>,
+
+    // --- New Wayland/XWayland fields ---
+    pub wayland_server: WaylandServer,
+    pub wayland_socket: Option<WaylandSocketServer>,
+    pub x11_server: Option<X11Server>,
+    pub shared_commits: SharedCommits,
+    pub shared_buffers: SharedBuffers,
+    pub kb_registry: SharedKeyboards,
+    pub ptr_registry: SharedPointers,
+    pub x11_serials: SharedXwaylandSerials,
 }
 
 impl SmithayState {
@@ -196,7 +218,79 @@ impl SmithayState {
             last_ipc_activity: std::time::Instant::now(),
             style_engine,
             dashboard_view: None,
+
+            wayland_server: WaylandServer::new(),
+            wayland_socket: None, // initialized below
+            x11_server: None,     // initialized below
+            shared_commits: Rc::new(RefCell::new(Vec::new())),
+            shared_buffers: Rc::new(RefCell::new(BTreeMap::new())),
+            kb_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            ptr_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            x11_serials: Rc::new(RefCell::new(BTreeMap::new())),
         });
+
+        // Initialize Wayland Standard Socket (/tmp/wayland-0)
+        state.wayland_socket = WaylandSocketServer::new("/tmp/wayland-0");
+
+        // Initialize X11 Server (:0)
+        state.x11_server = X11Server::new(state.backend.fb.info.width as u16, state.backend.fb.info.height as u16);
+
+        // Register Global Interfaces
+        let sc = state.shared_commits.clone();
+        let sb = state.shared_buffers.clone();
+        let sc2 = state.shared_commits.clone();
+        let sb2 = state.shared_buffers.clone();
+        let sc3 = state.shared_commits.clone();
+        let sb3 = state.shared_buffers.clone();
+        let kr = state.kb_registry.clone();
+        let pr = state.ptr_registry.clone();
+
+        state.wayland_server.register_global(
+            "wl_compositor", 4,
+            move || {
+                let sc = sc.clone();
+                let sb = sb.clone();
+                ObjectInner::Rc(Rc::new(RefCell::new(AppCompositor {
+                    pending_commits: sc,
+                    buffer_registry: sb,
+                })))
+            },
+            Object::new::<wl_compositor::WlCompositor>
+        );
+        state.wayland_server.register_global(
+            "wl_shm", 1,
+            move || {
+                let sb2 = sb2.clone();
+                ObjectInner::Rc(Rc::new(RefCell::new(AppShm {
+                    buffer_registry: sb2,
+                })))
+            },
+            Object::new::<wl_shm::WlShm>
+        );
+        state.wayland_server.register_global(
+            "wl_seat", 7,
+            move || {
+                let kr = kr.clone();
+                let pr = pr.clone();
+                ObjectInner::Rc(Rc::new(RefCell::new(AppSeat {
+                    keyboard_registry: kr,
+                    pointer_registry: pr,
+                })))
+            },
+            Object::new::<wl_seat::WlSeat>
+        );
+        state.wayland_server.register_global(
+            "xdg_wm_base", 2,
+            move || {
+                let sc3 = sc3.clone();
+                let sb3 = sb3.clone();
+                ObjectInner::Rc(Rc::new(RefCell::new(AppXdgWmBase {
+                    pending_commits: sc3,
+                    buffer_registry: sb3,
+                })))
+            },
+            Object::new::<xdg_wm_base::XdgWmBase>
+        );
 
         state.rebuild_dashboard();
         Some(state)
@@ -251,14 +345,54 @@ impl SmithayState {
                     &self.surfaces,
                 );
                 
-                // If it was a mouse move, update hardware cursor position immediately
-                if ev.event_type == 1 {
-                    self.backend.fb.set_cursor_position(self.input.cursor_x, self.input.cursor_y);
+                // Route to Wayland
+                let (cx, cy) = (self.input.cursor_x, self.input.cursor_y);
+                match ev.event_type {
+                    1 => { // Move
+                        for (&client_id, &ptr_id) in (*self.ptr_registry).borrow().iter() {
+                            if let Some(client) = self.wayland_server.clients.get(&client_id) {
+                                let event = wl_pointer::Event::Motion {
+                                    time: self.counter as u32,
+                                    surface_x: cx as f32,
+                                    surface_y: cy as f32,
+                                };
+                                let _ = client.send_event(ptr_id, event);
+                            }
+                        }
+                    }
+                    2 | 3 => { // Button
+                        let btn = if ev.event_type == 2 { 0x110 } else { 0 }; // BTN_LEFT approx
+                        let btn_state = if ev.code != 0 { 1 } else { 0 };
+                        for (&client_id, &ptr_id) in (*self.ptr_registry).borrow().iter() {
+                            if let Some(client) = self.wayland_server.clients.get(&client_id) {
+                                let event = wl_pointer::Event::Button {
+                                    serial: self.counter as u32,
+                                    time: self.counter as u32,
+                                    button: btn,
+                                    state: btn_state,
+                                };
+                                let _ = client.send_event(ptr_id, event);
+                            }
+                        }
+                    }
+                    4 | 5 => { // Key
+                        let key = ev.code as u32;
+                        let key_state = if ev.value != 0 { 1 } else { 0 };
+                        for (&client_id, &kb_id) in (*self.kb_registry).borrow().iter() {
+                            if let Some(client) = self.wayland_server.clients.get(&client_id) {
+                                let event = wl_keyboard::Event::Key {
+                                    serial: self.counter as u32,
+                                    time: self.counter as u32,
+                                    key,
+                                    state: key_state,
+                                };
+                                let _ = client.send_event(kb_id, event);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                
-                // If we are dragging a window or cursor moved, full redraw
-                // For now, if anything but move happened, we might need more.
-                // Move is the most common.
+
                 self.dirty = true;
             }
             CompositorEvent::SideWind(sw, sender_pid) => {
@@ -339,39 +473,18 @@ impl SmithayState {
                 self.dirty = true;
             }
             #[cfg(any(not(target_os = "linux"), test))]
+            #[cfg(any(not(target_os = "linux"), test))]
             CompositorEvent::Wayland(data, sender_pid) => {
-                // Find or create connection for this PID
-                let conn_idx = self.wayland_connections.iter().position(|c| {
-                    if let Some(_conn) = c {
-                        // We need a way to associate connection with PID.
-                        // For now, let's assume one client per PID and use a simple search or index.
-                        // Actually, wayland_connections doesn't store the PID yet.
-                        // Let's use a simpler mapping for now.
-                        false // TODO: Fix mapping
-                    } else { false }
-                });
-
-                // Since we don't have a good mapping yet, let's just use the first available or a hash.
-                let idx = (*sender_pid as usize) % 32;
-                if self.wayland_connections[idx].is_none() {
-                    self.wayland_connections[idx] = Some(sidewind::wayland::WaylandConnection::new());
+                let client_id = wayland_proto::wl::server::client::ClientId(*sender_pid);
+                if !self.wayland_server.clients.contains_key(&client_id) {
+                    let conn = Rc::new(RefCell::new(EclipseWaylandConnection::new(*sender_pid, 0)));
+                    self.wayland_server.add_client(client_id, conn);
                 }
-
-                if let Some(conn) = self.wayland_connections[idx].as_mut() {
-                    let _ = conn.process_message(&data);
-                }
-                self.process_wayland_events(idx);
                 
-                // Process any pending events and send them back
-                if let Some(conn) = self.wayland_connections[idx].as_mut() {
-                    while let Some(msg_payload) = conn.pending_events.pop_front() {
-                        let mut tagged_msg = [0u8; 256];
-                        tagged_msg[0..4].copy_from_slice(TAG_WAYL);
-                        let p_len = msg_payload.len().min(252);
-                        tagged_msg[4..4+p_len].copy_from_slice(&msg_payload[..p_len]);
-                        let _ = unsafe { eclipse_send(*sender_pid, sidewind::MSG_TYPE_WAYLAND, tagged_msg.as_ptr() as *const core::ffi::c_void, 4 + p_len, 0) };
-                    }
-                }
+                let _ = self.wayland_server.process_message(client_id, &data, &[]);
+                
+                // Process output events/buffers (this is now mostly handled by WaylandServer internally
+                // and drip_commits for rendering). We don't need a legacy process_wayland_events loop.
                 self.dirty = true;
             }
             _ => {} // Handle X11 if needed
@@ -397,174 +510,115 @@ impl SmithayState {
         }
     }
 
-    #[cfg(any(not(target_os = "linux"), test))]
-    fn process_wayland_events(&mut self, conn_idx: usize) {
-        let mut count = 0usize;
-        loop {
-            let ev = if let Some(conn) = self.wayland_connections[conn_idx].as_mut() {
-                conn.internal_events.pop_front()
-            } else {
-                None
-            };
-            
-            let ev = if let Some(ev) = ev { ev } else { break };
+    fn handle_wayland_socket(&mut self) {
+        if let Some(socket) = self.wayland_socket.as_mut() {
+            if socket.poll(&mut self.wayland_server) {
+                self.dirty = true;
+            }
+        }
+    }
 
-            match ev {
-                #[cfg(any(not(target_os = "linux"), test))]
-                sidewind::wayland::WaylandInternalEvent::ShellSurfaceCreated { surface_id, .. } => {
-                    println!("[SMITHAY] WaylandInternalEvent::ShellSurfaceCreated surface_id={} conn_idx={}", surface_id, conn_idx);
-                    if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
-                        let win_idx = self.space.window_count;
-                        let win = crate::compositor::ShellWindow {
-                            x: 100 + (win_idx as i32) * 20,
-                            y: 100 + (win_idx as i32) * 20,
-                            w: 640,
-                            h: 480 + crate::compositor::ShellWindow::TITLE_H,
-                            curr_x: (100 + (win_idx as i32) * 20 + 320) as f32, // Start at center
-                            curr_y: (100 + (win_idx as i32) * 20 + 240) as f32,
-                            curr_w: 0.0,
-                            curr_h: 0.0,
-                            workspace: self.input.current_workspace,
-                            content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
-                            buffer_handle: None,
-                            is_dmabuf: false,
-                            ..Default::default()
-                        };
-                        self.space.map_window(win);
-                        self.input.focused_window = Some(win_idx);
-                        self.dirty = true;
+    fn handle_x11(&mut self) {
+        if let Some(server) = self.x11_server.as_mut() {
+            let actions = server.poll(self.backend.fb.info.width as u16, self.backend.fb.info.height as u16);
+            for action in actions {
+                match action {
+                    X11Action::MapWindow { window_id, client_id, x, y, width, height, title } => {
+                         if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
+                             let win_idx = self.space.window_count;
+                             let mut win = ShellWindow::new_empty();
+                             win.x = x as i32;
+                             win.y = y as i32;
+                             win.w = width as i32;
+                             win.h = (height as i32) + ShellWindow::TITLE_H;
+                             win.curr_x = win.x as f32;
+                             win.curr_y = win.y as f32;
+                             win.workspace = self.input.current_workspace;
+                             win.content = WindowContent::Wayland { surface_id: window_id, conn_idx: 0 }; 
+                             self.space.map_window(win);
+                             self.input.focused_window = Some(win_idx);
+                         }
                     }
-                }
-                #[cfg(any(not(target_os = "linux"), test))]
-                sidewind::wayland::WaylandInternalEvent::XdgSurfaceCreated { surface_id, xdg_surface_id } => {
-                    println!("[SMITHAY] WaylandInternalEvent::XdgSurfaceCreated surface_id={} xdg_surface_id={} conn_idx={}", surface_id, xdg_surface_id, conn_idx);
-                    // No mapeamos todavía, esperamos a que sea un toplevel o popup.
-                }
-                #[cfg(any(not(target_os = "linux"), test))]
-                sidewind::wayland::WaylandInternalEvent::XdgToplevelCreated { xdg_surface_id, toplevel_id, surface_id } => {
-                    println!("[SMITHAY] WaylandInternalEvent::XdgToplevelCreated xdg_surface_id={} toplevel_id={} surface_id={} conn_idx={}", xdg_surface_id, toplevel_id, surface_id, conn_idx);
-                    
-                    if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
-                        let win_idx = self.space.window_count;
-                        let win = crate::compositor::ShellWindow {
-                            x: 100 + (win_idx as i32) * 20,
-                            y: 100 + (win_idx as i32) * 20,
-                            w: 640,
-                            h: 480 + crate::compositor::ShellWindow::TITLE_H,
-                            curr_x: (100 + (win_idx as i32) * 20 + 320) as f32, // Pop-in start
-                            curr_y: (100 + (win_idx as i32) * 20 + 240) as f32,
-                            curr_w: 0.0,
-                            curr_h: 0.0,
-                            workspace: self.input.current_workspace,
-                            content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
-                            buffer_handle: None,
-                            is_dmabuf: false,
-                            ..Default::default()
-                        };
-                        self.space.map_window(win);
-                        self.input.focused_window = Some(win_idx);
-                        self.dirty = true;
-                    }
-                }
-                #[cfg(any(not(target_os = "linux"), test))]
-                sidewind::wayland::WaylandInternalEvent::SurfaceCommitted { surface_id, buffer_id, damage } => {
-                    println!(
-                        "[SMITHAY] WaylandInternalEvent::SurfaceCommitted surface_id={} conn_idx={} buffer_id={:?} damage_len={}",
-                        surface_id,
-                        conn_idx,
-                        buffer_id,
-                        damage.len()
-                    );
-                    // Ensure the buffer's pool is mapped (for SHM) or record handle (for DMABUF)
-                    let mut is_dmabuf = false;
-                    let mut gem_handle = None;
-
-                    if let Some(buf_id) = buffer_id {
-                        let dmabuf_info = self.wayland_connections[conn_idx].as_ref()
-                            .and_then(|c| c.registry.get(buf_id))
-                            .and_then(|obj| obj.as_dmabuf_buffer());
-
-                        if let Some(info) = dmabuf_info {
-                            is_dmabuf = true;
-                            gem_handle = Some(info.handle);
-                        } else {
-                            self.ensure_wayland_pool_mapped(conn_idx, buf_id);
-                        }
-                    }
-
-                    // Find the window for this surface and update it
-                    for i in 0..self.space.window_count {
-                        let w = &mut self.space.windows[i];
-                        if let crate::compositor::WindowContent::Wayland { surface_id: s_id, conn_idx: c_idx } = w.content {
-                            if s_id == surface_id && c_idx == conn_idx {
-                                w.damage.extend(damage);
-                                w.is_dmabuf = is_dmabuf;
-                                w.buffer_handle = gem_handle;
-                                break;
+                    X11Action::FrameReady { window_id, pixels, width, height } => {
+                        for i in 0..self.space.window_count {
+                            if let WindowContent::Wayland { surface_id, .. } = self.space.windows[i].content {
+                                if surface_id == window_id {
+                                     let win = &mut self.space.windows[i];
+                                     win.wayland_vaddr = pixels.as_ptr() as usize; 
+                                     win.wayland_w = width;
+                                     win.wayland_h = height;
+                                     win.wayland_stride = width * 4;
+                                     // In this toy implementation, we probably need to keep the Vec alive.
+                                     // For now we just blit it eventually.
+                                     break;
+                                }
                             }
                         }
                     }
-                    // Trigger repaint
-                    self.dirty = true;
+                    _ => {}
                 }
+                self.dirty = true;
             }
-            count += 1;
+            server.flush_events();
+        }
+    }
+
+    fn drip_commits(&mut self) {
+        if (*self.shared_commits).borrow().is_empty() { return; }
+
+        let mut commits_vec: std::vec::Vec<_> = (*self.shared_commits).borrow_mut().drain(..).collect();
+        for commit in commits_vec {
+             let mut found = false;
+             for i in 0..self.space.window_count {
+                 if let crate::compositor::WindowContent::Wayland { surface_id, .. } = self.space.windows[i].content {
+                     if surface_id == commit.surface_id {
+                         let win = &mut self.space.windows[i];
+                         win.wayland_vaddr = commit.vaddr;
+                         win.wayland_w = commit.width;
+                         win.wayland_h = commit.height;
+                         win.wayland_stride = commit.stride;
+                         found = true;
+                         break;
+                     }
+                 }
+             }
+
+             if !found && self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
+                 let win_idx = self.space.window_count;
+                 let mut win = ShellWindow::new_empty();
+                 win.x = 100 + (win_idx as i32) * 30;
+                 win.y = 100 + (win_idx as i32) * 30;
+                 win.w = commit.width as i32;
+                 win.h = (commit.height as i32) + ShellWindow::TITLE_H;
+                 win.curr_x = win.x as f32;
+                 win.curr_y = win.y as f32;
+                 win.workspace = self.input.current_workspace;
+                 win.content = crate::compositor::WindowContent::Wayland { surface_id: commit.surface_id, conn_idx: 0 };
+                 win.wayland_vaddr = commit.vaddr;
+                 win.wayland_w = commit.width;
+                 win.wayland_h = commit.height;
+                 win.wayland_stride = commit.stride;
+                 self.space.map_window(win);
+                 self.input.focused_window = Some(win_idx);
+             }
+             self.dirty = true;
         }
     }
 
     #[cfg(any(not(target_os = "linux"), test))]
-    fn ensure_wayland_pool_mapped(&mut self, conn_idx: usize, buffer_id: u32) {
-        let info = {
-            let conn = if let Some(c) = &mut self.wayland_connections[conn_idx] { c } else { return };
-            if let Some(obj) = conn.registry.get_mut(buffer_id) {
-                obj.as_buffer()
-            } else { None }
-        };
-        let info = if let Some(i) = info { i } else { return };
-        if self.wayland_pool_maps.iter().any(|m| m.conn_idx == conn_idx && m.pool_id == info.pool_id) {
-            return;
-        }
-
-        let mut vaddr = 0usize;
-        let mut size = 0usize;
-
-        #[cfg(target_os = "eclipse")]
-        {
-            // On Eclipse OS, we use the shm_pool_fd as a handle to open the shm region.
-            // In our prototype, the client passes an ID that we use as a filename in shm: scheme.
-            let path = format!("shm:/{}", info.shm_pool_fd);
-            if let Ok(fd) = eclipse_syscall::open(&path, eclipse_syscall::flag::O_RDWR) {
-                let mut st = eclipse_syscall::Stat::default();
-                if let Ok(()) = eclipse_syscall::fstat(fd, &mut st) {
-                    size = st.size as usize;
-                    if let Ok(mapped) = eclipse_syscall::mmap(
-                        0, 
-                        size, 
-                        eclipse_syscall::flag::PROT_READ | eclipse_syscall::flag::PROT_WRITE, 
-                        eclipse_syscall::flag::MAP_SHARED, 
-                        fd as isize, 
-                        0
-                    ) {
-                        vaddr = mapped;
-                    }
-                }
-                let _ = eclipse_syscall::close(fd);
-            }
-        }
-
-        if vaddr != 0 {
-            self.wayland_pool_maps.push(WaylandPoolMap {
-                conn_idx,
-                pool_id: info.pool_id,
-                vaddr,
-                size,
-            });
-        }
+    fn ensure_wayland_pool_mapped(&mut self, _conn_idx: usize, _buffer_id: u32) {
+        // This is now handled by AppShm in protocol.rs
     }
 
     pub fn update(&mut self) -> bool {
         self.counter = self.counter.wrapping_add(1);
         self.handle_requests();
+        
+        // --- Process Wayland/X11 ---
+        self.handle_wayland_socket();
+        self.handle_x11();
+        self.drip_commits();
+
         let window_count_before = self.space.window_count;
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
@@ -924,15 +978,22 @@ impl SmithayState {
                 y: 160 + (idx as i32) * 15,
                 w: 600,
                 h: 380,
-                curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+                curr_x: 60.0 + (idx as f32) * 20.0 + 300.0,
+                curr_y: 160.0 + (idx as f32) * 15.0 + 190.0,
+                curr_w: 0.0, curr_h: 0.0,
                 minimized: false, maximized: false, closing: false,
-                stored_rect: (0, 0, 0, 0),
+                stored_rect: (60 + (idx as i32) * 20, 160 + (idx as i32) * 15, 600, 380),
                 workspace: self.input.current_workspace,
                 content: crate::compositor::WindowContent::InternalDemo,
                 damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
                 is_panel: false,
+                wayland_vaddr: 0,
+                wayland_w: 0,
+                wayland_h: 0,
+                wayland_stride: 0,
+                ..Default::default()
             };
             self.space.map_window(win);
             self.input.focused_window = Some(idx);

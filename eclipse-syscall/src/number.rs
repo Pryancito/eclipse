@@ -22,6 +22,7 @@ pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_IOCTL: usize = 16;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_YIELD: usize = 24;
+pub const SYS_PAUSE: usize = 34;
 pub const SYS_NANOSLEEP: usize = 35;
 pub const SYS_GETPID: usize = 39;
 pub const SYS_SOCKET: usize = 41;

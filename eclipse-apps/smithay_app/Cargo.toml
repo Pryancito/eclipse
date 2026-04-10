@@ -32,6 +32,7 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
+wayland-proto = { path = "../libs/wayland-proto" }
 # Usamos eclipse_std en modo compatibilidad con std para que NO registre su
 # propio panic_handler/alloc_error_handler; dejamos que eclipse-relibc lo haga.
 std = { package = "eclipse_std", path = "../eclipse_std" }

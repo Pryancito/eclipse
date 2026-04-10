@@ -18,7 +18,7 @@ static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spi
 #[cfg(feature = "compositor-lunas")]
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 #[cfg(not(feature = "compositor-lunas"))]
-const COMPOSITOR_PATH: &str = "file:/usr/bin/labwc";
+const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
 
 fn main() {
     let pid = unsafe { std::libc::getpid() };

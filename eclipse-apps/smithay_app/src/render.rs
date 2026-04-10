@@ -1276,7 +1276,29 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
             // Ventanas Wayland se dibujan a través del pipeline de sidewind/wayland y damage;
             // aquí solo mantenemos la decoración y dejamos el contenido como está.
             WindowContent::Wayland { .. } => {
-                // No hacemos nada especial en el cuerpo: el contenido ya debería estar en el framebuffer.
+                if w.wayland_vaddr != 0 && w.wayland_w > 0 && w.wayland_h > 0 {
+                    let wx = x;
+                    let wy = w.curr_y as i32;
+                    let ww = (w.curr_w as i32).max(0);
+                    let wh = (w.curr_h as i32).max(0);
+                    let content_w = (ww - 10).max(0) as u32; // same logic as External
+                    let content_h = (wh - ShellWindow::TITLE_H - 10).max(0) as u32;
+                    
+                    if content_w > 0 && content_h > 0 {
+                        // Use the smaller of window size or committed buffer size
+                        let draw_w = content_w.min(w.wayland_w);
+                        let draw_h = content_h.min(w.wayland_h);
+                        
+                        fb.blit_buffer(
+                            wx + 5, 
+                            wy + ShellWindow::TITLE_H + 5, 
+                            draw_w, 
+                            draw_h, 
+                            w.wayland_vaddr as *const u32, 
+                            (w.wayland_stride as usize).saturating_mul(w.wayland_h as usize)
+                        );
+                    }
+                }
             }
             WindowContent::None => {}
         }
@@ -1764,19 +1786,35 @@ pub fn draw_system_central(
             None => p_name_raw,
         }.trim();
         
-        let mut is_service = false;
-        for s in services {
+        let is_service = services.iter().any(|s| {
+            if p.pid != 0 && s.pid != 0 && p.pid == s.pid {
+                return true;
+            }
             let s_name_raw = core::str::from_utf8(&s.name).unwrap_or("?");
             let s_name = match s_name_raw.find('\0') {
                 Some(pos) => &s_name_raw[..pos],
                 None => s_name_raw,
-            }.trim();
-            if (p.pid != 0 && p.pid == s.pid) || p_name == s_name {
-                is_service = true;
-                break;
             }
+            .trim();
+
+            if p_name == s_name {
+                return true;
+            }
+
+            let p_base = p_name
+                .trim_end_matches("_service")
+                .trim_end_matches("-service")
+                .trim_end_matches("service");
+            let s_base = s_name
+                .trim_end_matches("_service")
+                .trim_end_matches("-service")
+                .trim_end_matches("service");
+
+            !p_base.is_empty() && p_base == s_base
+        });
+        if is_service {
+            continue;
         }
-        if is_service { continue; }
 
         let y = start_y_prog + 25 + (display_idx * row_h);
         if y > h - 20 { break; }

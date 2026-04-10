@@ -93,8 +93,12 @@ impl Message for Request {
                 Ok(Request::Attach { buffer, x, y })
             }
             2 => {
-                 // Damage
-                 Ok(Request::Damage { x: 0, y: 0, width: 0, height: 0 }) // Placeholder for brevity
+                 if m.args.len() < 4 { return Err(DeserializeError::InvalidLength); }
+                 let x = match m.args[0] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let y = match m.args[1] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let width = match m.args[2] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let height = match m.args[3] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::Damage { x, y, width, height })
             }
             3 => {
                 if m.args.len() != 1 { return Err(DeserializeError::InvalidLength); }
@@ -104,7 +108,35 @@ impl Message for Request {
                 };
                 Ok(Request::Frame { callback })
             }
+            4 => {
+                 if m.args.is_empty() { return Err(DeserializeError::InvalidLength); }
+                 let region = match m.args[0] { Payload::ObjectId(id) => id, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::SetOpaqueRegion { region })
+            }
+            5 => {
+                 if m.args.is_empty() { return Err(DeserializeError::InvalidLength); }
+                 let region = match m.args[0] { Payload::ObjectId(id) => id, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::SetInputRegion { region })
+            }
             6 => Ok(Request::Commit),
+            7 => {
+                 if m.args.is_empty() { return Err(DeserializeError::InvalidLength); }
+                 let transform = match m.args[0] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::SetBufferTransform { transform })
+            }
+            8 => {
+                 if m.args.is_empty() { return Err(DeserializeError::InvalidLength); }
+                 let scale = match m.args[0] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::SetBufferScale { scale })
+            }
+            9 => {
+                 if m.args.len() < 4 { return Err(DeserializeError::InvalidLength); }
+                 let x = match m.args[0] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let y = match m.args[1] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let width = match m.args[2] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 let height = match m.args[3] { Payload::Int(v) => v, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Request::DamageBuffer { x, y, width, height })
+            }
             _ => Err(DeserializeError::UnknownOpcode),
         }
     }

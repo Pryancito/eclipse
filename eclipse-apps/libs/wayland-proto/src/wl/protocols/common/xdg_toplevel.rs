@@ -16,13 +16,15 @@ pub enum Request {
     SetParent { parent: ObjectId },
     SetTitle { title: String },
     SetAppId { app_id: String },
+    Move { seat: ObjectId, serial: u32 },
+    Resize { seat: ObjectId, serial: u32, edges: u32 },
+    SetMinSize { width: i32, height: i32 },
+    SetMaxSize { width: i32, height: i32 },
     SetMaximized,
     UnsetMaximized,
     SetFullscreen { output: ObjectId },
     UnsetFullscreen,
     SetMinimized,
-    SetMinSize { width: i32, height: i32 },
-    SetMaxSize { width: i32, height: i32 },
 }
 
 impl Message for Request {
@@ -32,13 +34,15 @@ impl Message for Request {
             Request::SetParent { parent } => RawMessage { sender, opcode: Opcode(1), args: smallvec![parent.into()] },
             Request::SetTitle { title } => RawMessage { sender, opcode: Opcode(2), args: smallvec![title.into()] },
             Request::SetAppId { app_id } => RawMessage { sender, opcode: Opcode(3), args: smallvec![app_id.into()] },
+            Request::Move { seat, serial } => RawMessage { sender, opcode: Opcode(4), args: smallvec![seat.into(), serial.into()] },
+            Request::Resize { seat, serial, edges } => RawMessage { sender, opcode: Opcode(5), args: smallvec![seat.into(), serial.into(), edges.into()] },
+            Request::SetMinSize { width, height } => RawMessage { sender, opcode: Opcode(7), args: smallvec![width.into(), height.into()] },
+            Request::SetMaxSize { width, height } => RawMessage { sender, opcode: Opcode(8), args: smallvec![width.into(), height.into()] },
             Request::SetMaximized => RawMessage { sender, opcode: Opcode(9), args: smallvec![] },
             Request::UnsetMaximized => RawMessage { sender, opcode: Opcode(10), args: smallvec![] },
             Request::SetFullscreen { output } => RawMessage { sender, opcode: Opcode(11), args: smallvec![output.into()] },
             Request::UnsetFullscreen => RawMessage { sender, opcode: Opcode(12), args: smallvec![] },
             Request::SetMinimized => RawMessage { sender, opcode: Opcode(13), args: smallvec![] },
-            Request::SetMinSize { width, height } => RawMessage { sender, opcode: Opcode(7), args: smallvec![width.into(), height.into()] },
-            Request::SetMaxSize { width, height } => RawMessage { sender, opcode: Opcode(8), args: smallvec![width.into(), height.into()] },
         }
     }
 
@@ -57,14 +61,36 @@ impl Message for Request {
                 let app_id = match m.args.get(0) { Some(Payload::String(s)) => s.clone(), _ => String::new() };
                 Ok(Request::SetAppId { app_id })
             }
-            7 => Ok(Request::SetMinSize { width: 0, height: 0 }),
-            8 => Ok(Request::SetMaxSize { width: 0, height: 0 }),
+            4 => {
+                let seat = match m.args.get(0) { Some(Payload::ObjectId(v)) => *v, _ => ObjectId::null() };
+                let serial = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Request::Move { seat, serial })
+            }
+            5 => {
+                let seat = match m.args.get(0) { Some(Payload::ObjectId(v)) => *v, _ => ObjectId::null() };
+                let serial = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let edges = match m.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Request::Resize { seat, serial, edges })
+            }
+            7 => {
+                let width = match m.args.get(0) { Some(Payload::Int(v)) => *v, _ => 0 };
+                let height = match m.args.get(1) { Some(Payload::Int(v)) => *v, _ => 0 };
+                Ok(Request::SetMinSize { width, height })
+            }
+            8 => {
+                let width = match m.args.get(0) { Some(Payload::Int(v)) => *v, _ => 0 };
+                let height = match m.args.get(1) { Some(Payload::Int(v)) => *v, _ => 0 };
+                Ok(Request::SetMaxSize { width, height })
+            }
             9 => Ok(Request::SetMaximized),
             10 => Ok(Request::UnsetMaximized),
-            11 => Ok(Request::SetFullscreen { output: ObjectId::null() }),
+            11 => {
+                let output = match m.args.get(0) { Some(Payload::ObjectId(v)) => *v, _ => ObjectId::null() };
+                Ok(Request::SetFullscreen { output })
+            }
             12 => Ok(Request::UnsetFullscreen),
             13 => Ok(Request::SetMinimized),
-            _ => Ok(Request::Destroy), // ignore unknown requests gracefully
+            _ => Err(DeserializeError::UnknownOpcode),
         }
     }
 }
@@ -98,8 +124,20 @@ impl Message for Event {
 
     fn from_raw(_con: Rc<RefCell<dyn Connection>>, m: &RawMessage) -> Result<Self, DeserializeError> {
         match m.opcode.0 {
-            0 => Ok(Event::Configure { width: 0, height: 0, states: Array(alloc::vec::Vec::new()) }),
+            0 => {
+                if m.args.len() < 3 { return Err(DeserializeError::InvalidLength); }
+                let width  = match m.args[0] { Payload::Int(v) => v, _ => 0 };
+                let height = match m.args[1] { Payload::Int(v) => v, _ => 0 };
+                let states = match &m.args[2] { Payload::Array(v) => v.clone(), _ => Array(alloc::vec::Vec::new()) };
+                Ok(Event::Configure { width, height, states })
+            }
             1 => Ok(Event::Close),
+            2 => {
+                 if m.args.len() < 2 { return Err(DeserializeError::InvalidLength); }
+                 let width  = match m.args[0] { Payload::Int(v) => v, _ => 0 };
+                 let height = match m.args[1] { Payload::Int(v) => v, _ => 0 };
+                 Ok(Event::ConfigureBounds { width, height })
+            }
             _ => Err(DeserializeError::UnknownOpcode),
         }
     }

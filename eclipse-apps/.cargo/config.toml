@@ -2,8 +2,8 @@
 # Habilita el uso de archivos .json como especificación de target (requerido en nightly reciente)
 json-target-spec = true 
 # NOTA: build-std se define en la línea de comandos para evitar conflictos con el target Linux
-build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
+# build-std = ["core", "alloc"]
+# build-std-features = ["compiler-builtins-mem"]
 
 [build]
 # El JSON del target Eclipse OS está en el mismo directorio eclipse-apps/

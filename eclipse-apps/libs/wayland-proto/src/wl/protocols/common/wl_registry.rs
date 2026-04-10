@@ -24,6 +24,8 @@ macro_rules! from_payload {
 pub enum Request {
     Bind {
         name: u32,
+        interface: String,
+        version: u32,
         id: NewId,
     },
 }
@@ -31,10 +33,10 @@ pub enum Request {
 impl Message for Request {
     fn into_raw(self, sender: ObjectId) -> RawMessage {
         match self {
-            Request::Bind { name, id } => RawMessage {
+            Request::Bind { name, interface, version, id } => RawMessage {
                 sender,
                 opcode: Opcode(0),
-                args: smallvec![name.into(), id.into()],
+                args: smallvec![name.into(), interface.into(), version.into(), id.into()],
             },
         }
     }
@@ -44,10 +46,15 @@ impl Message for Request {
         m: &RawMessage,
     ) -> Result<Request, DeserializeError> {
         match m.opcode {
-            Opcode(0) => Ok(Request::Bind {
-                name: from_payload!(UInt, m.args[0]),
-                id: from_payload!(NewId, m.args[1]),
-            }),
+            Opcode(0) => {
+                if m.args.len() < 4 { return Err(DeserializeError::InvalidLength); }
+                Ok(Request::Bind {
+                    name: from_payload!(UInt, m.args[0]),
+                    interface: from_payload!(String, m.args[1]),
+                    version: from_payload!(UInt, m.args[2]),
+                    id: from_payload!(NewId, m.args[3]),
+                })
+            },
             _ => Err(DeserializeError::UnknownOpcode),
         }
     }

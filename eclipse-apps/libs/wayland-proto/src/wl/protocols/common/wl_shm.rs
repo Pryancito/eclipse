@@ -3,9 +3,11 @@ use alloc::rc::Rc;
 use core::cell::RefCell;
 use smallvec::smallvec;
 
+use crate::wl::wire::Handle as WlHandle;
+
 #[derive(Debug)]
 pub enum Request {
-    CreatePool { id: NewId, fd: i32, size: i32 },
+    CreatePool { id: NewId, fd: WlHandle, size: i32 },
 }
 
 impl Message for Request {
@@ -14,7 +16,7 @@ impl Message for Request {
             Request::CreatePool { id, fd, size } => RawMessage {
                 sender,
                 opcode: crate::wl::Opcode(0),
-                args: smallvec![id.into(), fd.into(), size.into()],
+                args: smallvec![id.into(), Payload::Handle(fd), size.into()],
             },
         }
     }
@@ -28,7 +30,7 @@ impl Message for Request {
                     _ => return Err(DeserializeError::UnexpectedType),
                 };
                 let fd = match m.args[1] {
-                    Payload::Int(fd) => fd,
+                    Payload::Handle(fd) => fd,
                     _ => return Err(DeserializeError::UnexpectedType),
                 };
                 let size = match m.args[2] {
@@ -222,11 +224,11 @@ impl Interface for WlShmPool {
 impl WlShm {
     /// Send wl_shm.create_pool to the compositor.
     /// Returns a client-side WlShmPool object.
-    pub fn create_pool(&mut self, id: NewId, fd: i32, size: i32) -> Result<WlShmPool, crate::wl::connection::SendError> {
+    pub fn create_pool(&mut self, id: NewId, fd: WlHandle, size: i32) -> Result<WlShmPool, crate::wl::connection::SendError> {
         self.con.borrow_mut().send(
             self.id,
             crate::wl::Opcode(0),
-            &[id.into(), fd.into(), size.into()],
+            &[id.into(), Payload::Handle(fd), size.into()],
             &[],
         )?;
         Ok(WlShmPool::new(self.con.clone(), id.as_id()))

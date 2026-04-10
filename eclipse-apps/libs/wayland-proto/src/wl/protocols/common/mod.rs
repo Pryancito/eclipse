@@ -8,6 +8,7 @@ pub mod wl_seat;
 pub mod wl_keyboard;
 pub mod wl_pointer;
 pub mod wl_output;
+pub mod wl_callback;
 pub mod xdg_wm_base;
 pub mod xdg_surface;
 pub mod xdg_toplevel;
@@ -22,6 +23,15 @@ pub enum EventSet {
     WlShm(wl_shm::WlShm, wl_shm::Event),
     WlShmPool(wl_shm::WlShmPool, wl_shm::PoolEvent),
     WlBuffer(wl_buffer::WlBuffer, wl_buffer::Event),
+    WlSeat(wl_seat::WlSeat, wl_seat::Event),
+    WlKeyboard(wl_keyboard::WlKeyboard, wl_keyboard::Event),
+    WlPointer(wl_pointer::WlPointer, wl_pointer::Event),
+    WlOutput(wl_output::WlOutput, wl_output::Event),
+    WlCallback(wl_callback::WlCallback, wl_callback::Event),
+    XdgWmBase(xdg_wm_base::XdgWmBase, xdg_wm_base::Event),
+    XdgSurface(xdg_surface::XdgSurface, xdg_surface::Event),
+    XdgToplevel(xdg_toplevel::XdgToplevel, xdg_toplevel::Event),
+    XwaylandShell(xwayland_shell::XwaylandShellV1, xwayland_shell::Event),
 }
 
 pub enum RequestSet {
@@ -32,4 +42,13 @@ pub enum RequestSet {
     WlShm(wl_shm::Request),
     WlShmPool(wl_shm::PoolRequest),
     WlBuffer(wl_buffer::Request),
+    WlSeat(wl_seat::Request),
+    WlKeyboard(wl_keyboard::Request),
+    WlPointer(wl_pointer::Request),
+    WlOutput(wl_output::Request),
+    WlCallback(wl_callback::Request),
+    XdgWmBase(xdg_wm_base::Request),
+    XdgSurface(xdg_surface::Request),
+    XdgToplevel(xdg_toplevel::Request),
+    XwaylandShell(xwayland_shell::Request),
 }

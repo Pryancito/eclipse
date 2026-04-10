@@ -42,7 +42,14 @@ impl Message for Request {
                 let id = match m.args.get(0) { Some(Payload::NewId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 Ok(Request::GetToplevel { id })
             }
-            3 => Ok(Request::SetWindowGeometry { x: 0, y: 0, width: 0, height: 0 }),
+            3 => {
+                 if m.args.len() < 4 { return Err(DeserializeError::InvalidLength); }
+                 let x = match m.args[0] { Payload::Int(v) => v, _ => 0 };
+                 let y = match m.args[1] { Payload::Int(v) => v, _ => 0 };
+                 let width = match m.args[2] { Payload::Int(v) => v, _ => 0 };
+                 let height = match m.args[3] { Payload::Int(v) => v, _ => 0 };
+                 Ok(Request::SetWindowGeometry { x, y, width, height })
+            }
             4 => {
                 let serial = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 Ok(Request::AckConfigure { serial })

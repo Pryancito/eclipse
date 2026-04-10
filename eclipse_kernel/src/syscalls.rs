@@ -45,6 +45,7 @@ pub enum SyscallNumber {
     Sigprocmask = 14,
     Ioctl = 16,
     Yield = 24,
+    Pause = 34,
     Nanosleep = 35,
     GetPid = 39,
     Socket = 41,
@@ -310,6 +311,7 @@ pub extern "C" fn syscall_handler(
         22 => sys_pipe(arg1),
         32 => sys_dup(arg1),
         33 => sys_dup2(arg1, arg2),
+        34 => sys_pause(),
         24 => sys_yield(),
         35 => sys_nanosleep(arg1),
         39 => sys_getpid(),
@@ -1316,6 +1318,14 @@ fn sys_yield() -> u64 {
     stats.yield_calls += 1;
     drop(stats);
     
+    yield_cpu();
+    0
+}
+
+/// sys_pause - Suspend calling thread until a signal is received (Linux pause ABI)
+fn sys_pause() -> u64 {
+    // Basic implementation: yield and return 0. 
+    // In a fuller implementation, this would block the thread until its signal queue is non-empty.
     yield_cpu();
     0
 }
@@ -3960,9 +3970,19 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
     
     let mut total_written = 0;
     for i in 0..iov_cnt {
+        // IMPORTANT: `is_user_pointer()` only validates the range, not that the page is mapped.
+        // A malicious/buggy process can pass an unmapped iovec pointer and trigger a kernel #PF.
+        // Use the kernel fault-recovery mechanism to turn that into a normal syscall failure.
         let (base, len): (u64, u64) = unsafe {
+            if crate::interrupts::set_recovery_point() {
+                crate::interrupts::clear_recovery_point();
+                return if total_written > 0 { total_written } else { u64::MAX };
+            }
             let ptr = (iov_ptr + i * 16) as *const u64;
-            (ptr.read_unaligned(), ptr.add(1).read_unaligned())
+            let base = ptr.read_unaligned();
+            let len = ptr.add(1).read_unaligned();
+            crate::interrupts::clear_recovery_point();
+            (base, len)
         };
         
         if len == 0 { continue; }

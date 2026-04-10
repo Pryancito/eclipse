@@ -120,12 +120,51 @@ impl Message for Event {
 
     fn from_raw(_con: Rc<RefCell<dyn Connection>>, m: &RawMessage) -> Result<Self, DeserializeError> {
         match m.opcode.0 {
+            0 => {
+                let serial    = match m.args.get(0) { Some(Payload::UInt(v))  => *v, _ => 0 };
+                let surface   = match m.args.get(1) { Some(Payload::ObjectId(v))=> *v, _ => ObjectId::null() };
+                let surface_x = match m.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                let surface_y = match m.args.get(3) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                Ok(Event::Enter { serial, surface, surface_x, surface_y })
+            }
+            1 => {
+                let serial    = match m.args.get(0) { Some(Payload::UInt(v))  => *v, _ => 0 };
+                let surface   = match m.args.get(1) { Some(Payload::ObjectId(v))=> *v, _ => ObjectId::null() };
+                Ok(Event::Leave { serial, surface })
+            }
+            2 => {
+                let time      = match m.args.get(0) { Some(Payload::UInt(v))  => *v, _ => 0 };
+                let surface_x = match m.args.get(1) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                let surface_y = match m.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                Ok(Event::Motion { time, surface_x, surface_y })
+            }
             3 => {
                 let serial = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let time   = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let button = match m.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 let state  = match m.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
                 Ok(Event::Button { serial, time, button, state })
+            }
+            4 => {
+                let time   = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let axis   = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let value  = match m.args.get(2) { Some(Payload::Fixed(v))=> *v, _ => 0.0 };
+                Ok(Event::Axis { time, axis, value })
+            }
+            5 => Ok(Event::Frame),
+            6 => {
+                let axis_source = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Event::AxisSource { axis_source })
+            }
+            7 => {
+                let time = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let axis = match m.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                Ok(Event::AxisStop { time, axis })
+            }
+            8 => {
+                let axis = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                let discrete = match m.args.get(1) { Some(Payload::Int(v)) => *v, _ => 0 };
+                Ok(Event::AxisDiscrete { axis, discrete })
             }
             _ => Err(DeserializeError::UnknownOpcode),
         }

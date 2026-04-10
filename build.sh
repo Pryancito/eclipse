@@ -300,7 +300,7 @@ build_sidewind_project() {
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
-        local BINS="lunas nano terminal glxgears rust-shell"
+        local BINS="lunas nano terminal glxgears smithay_app"
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
@@ -311,124 +311,6 @@ build_sidewind_project() {
                 fi
             fi
         done
-
-        if [ -d "bash" ]; then
-            cd bash
-            export CC="musl-gcc"
-            export CFLAGS="-O2 -static"
-            export LDFLAGS="-static"
-            ./configure --prefix=/ --enable-static-link --without-bash-malloc --with-curses=no --disable-nls
-            make
-            cp "bash" "$BASE_DIR/$BUILD_DIR/sysroot/bin/bash"
-            print_status "Instalado en sysroot: /bin/bash (desde bash)"
-            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                cp "bash" "$BASE_DIR/$BUILD_DIR/bin/bash"
-                cp "bash" "$BASE_DIR/$BUILD_DIR/sbin/bash"
-                mkdir -p "$BASE_DIR/$BUILD_DIR/root"
-                mkdir -p "$BASE_DIR/$BUILD_DIR/etc"
-                cat > "$BASE_DIR/$BUILD_DIR/root/.bashrc" <<'EOF'
-# .bashrc
-alias ls='ls --color=auto'
-alias ll='ls -l'
-export PATH=/bin:/sbin
-export PS1='\[\e[32m\]root@eclipse\[\e[m\]:\[\e[34m\]\w\[\e[m\]\$ '
-EOF
-                touch "$BASE_DIR/$BUILD_DIR/root/.bash_profile"
-                touch "$BASE_DIR/$BUILD_DIR/root/.bash_logout"
-                touch "$BASE_DIR/$BUILD_DIR/root/.bash_history"
-                cat > "$BASE_DIR/$BUILD_DIR/etc/termcap" <<EOF
-xterm|xterm-color|X Window System terminal emulator: :am:bs:km:mi:ms:pc:pt:qe:sr:ut:xo:co#80:li#25:it#8:RA:RS:kh=\EOH:kb=^H:ku=\EOA:kd=\EOB:kl=\EOD:kr=\EOC:eo:ho=\E[H:cl=\E[H\E[2J:cm=\E[%i%d;%dH:nd=\E[C:up=\E[A:ce=\E[K:cd=\E[J:so=\E[7m:se=\E[27m:md=\E[1m:me=\E[m:mr=\E[7m:mb=\E[5m:al=\E[L:dl=\E[M:dc=\E[P:ic=\E[@:vi=\E[?25l:ve=\E[?25h:ks=\E[?1h\E=:ke=\E[?1l\E>:te=\E[?1049l:ti=\E[?1049h:ut:
-EOF
-                cat > "$BASE_DIR/$BUILD_DIR/etc/inputrc" <<'EOF'
-# /etc/inputrc - global inputrc for libreadline
-# See readline(3readline) and `info rluserman' for more information.
-
-# Be 8 bit clean.
-set input-meta on
-set output-meta on
-
-# To allow the use of 8bit-characters like the german umlauts, uncomment
-# the line below. However this makes the meta key not work as a meta key,
-# which is annoying to those which don't need to type in 8-bit characters.
-
-# set convert-meta off
-
-# try to enable the application keypad when it is called.  Some systems
-# need this to enable the arrow keys.
-# set enable-keypad on
-
-# see /usr/share/doc/bash/inputrc.arrows for other codes of arrow keys
-
-# do not bell on tab-completion
-# set bell-style none
-# set bell-style visible
-
-# make autocompletion case insensitive and display suggestions
-# set completion-ignore-case On
-# set show-all-if-ambiguous On
-
-# some defaults / modifications for the emacs mode
-$if mode=emacs
-
-# allow the use of the Home/End keys
-"\e[1~": beginning-of-line
-"\e[4~": end-of-line
-
-# allow the use of the Delete/Insert keys
-"\e[3~": delete-char
-"\e[2~": quoted-insert
-
-# mappings for "page up" and "page down" to step to the beginning/end
-# of the history
-# "\e[5~": beginning-of-history
-# "\e[6~": end-of-history
-
-# alternate mappings for "page up" and "page down" to search the history
-# "\e[5~": history-search-backward
-# "\e[6~": history-search-forward
-
-# mappings for Ctrl-left-arrow and Ctrl-right-arrow for word moving
-"\e[1;5C": forward-word
-"\e[1;5D": backward-word
-"\e[5C": forward-word
-"\e[5D": backward-word
-"\e\e[C": forward-word
-"\e\e[D": backward-word
-
-$if term=rxvt
-"\e[7~": beginning-of-line
-"\e[8~": end-of-line
-"\eOc": forward-word
-"\eOd": backward-word
-$endif
-
-                # /etc/passwd - user account information
-                cat > "$BASE_DIR/$BUILD_DIR/etc/passwd" <<'EOF'
-root:x:0:0:root:/root:/bin/bash
-EOF
-                # /etc/group - group account information
-                cat > "$BASE_DIR/$BUILD_DIR/etc/group" <<'EOF'
-root:x:0:
-bin:x:1:
-daemon:x:2:
-sys:x:3:
-adm:x:4:
-tty:x:5:
-disk:x:6:
-lp:x:7:
-wheel:x:10:root
-EOF
-                # /etc/shadow - secure user account information (no password)
-                cat > "$BASE_DIR/$BUILD_DIR/etc/shadow" <<'EOF'
-root::19000:0:99999:7:::
-EOF
-                # Ensure /root exists
-                mkdir -p "$BASE_DIR/$BUILD_DIR/root"
-
-                print_status "Identity files generated in /etc/"
-            fi
-            cd ..
-        fi
         if [ -f "$_sw_rel/glxgears" ]; then
             cp "$_sw_rel/glxgears" "$BASE_DIR/$BUILD_DIR/sysroot/bin/glxgears"
             print_status "Instalado en sysroot: /usr/bin/glxgears (desde glxgears)"

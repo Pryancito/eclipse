@@ -11,8 +11,9 @@ members = [
     "sh",
     "nano",
     "glxgears",
+    "smithay_app",
 ]
-exclude = ["libs/ipc_tests", "smithay_app", "xeyes", "rust-shell"]
+exclude = ["libs/ipc_tests", "xeyes", "rust-shell"]
 
 [workspace.package]
 version = "0.2.0"
@@ -62,4 +63,3 @@ panic = "abort"
 
 [patch.crates-io]
 libc = { path = "../eclipse-relibc" }
-std = { package = "eclipse_std", path = "eclipse_std" }

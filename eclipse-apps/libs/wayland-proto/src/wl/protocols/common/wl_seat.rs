@@ -67,7 +67,14 @@ impl Message for Event {
 
     fn from_raw(_con: Rc<RefCell<dyn Connection>>, m: &RawMessage) -> Result<Self, DeserializeError> {
         match m.opcode.0 {
-            0 => { let c = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) }; Ok(Event::Capabilities { capabilities: c }) }
+            0 => {
+                 let c = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Event::Capabilities { capabilities: c })
+            }
+            1 => {
+                 let name = match m.args.get(0) { Some(Payload::String(s)) => s.clone(), _ => return Err(DeserializeError::UnexpectedType) };
+                 Ok(Event::Name { name })
+            }
             _ => Err(DeserializeError::UnknownOpcode),
         }
     }

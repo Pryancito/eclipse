@@ -12,18 +12,18 @@ use smallvec::smallvec;
 // ── xwayland_shell_v1 (Manager Interface) ──────────────────────────────────
 
 #[derive(Debug)]
-pub enum ShellRequest {
+pub enum Request {
     /// opcode 0 — destroy the manager
     Destroy,
     /// opcode 1 — create an xwayland_surface for a wl_surface
     GetXwaylandSurface { id: NewId, surface: ObjectId },
 }
 
-impl Message for ShellRequest {
+impl Message for Request {
     fn into_raw(self, sender: ObjectId) -> RawMessage {
         match self {
-            ShellRequest::Destroy => RawMessage { sender, opcode: Opcode(0), args: smallvec![] },
-            ShellRequest::GetXwaylandSurface { id, surface } => RawMessage {
+            Request::Destroy => RawMessage { sender, opcode: Opcode(0), args: smallvec![] },
+            Request::GetXwaylandSurface { id, surface } => RawMessage {
                 sender, opcode: Opcode(1),
                 args: smallvec![id.into(), surface.into()],
             },
@@ -32,15 +32,21 @@ impl Message for ShellRequest {
 
     fn from_raw(_con: Rc<RefCell<dyn Connection>>, m: &RawMessage) -> Result<Self, DeserializeError> {
         match m.opcode.0 {
-            0 => Ok(ShellRequest::Destroy),
+            0 => Ok(Request::Destroy),
             1 => {
                 let id = match m.args.get(0) { Some(Payload::NewId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 let surface = match m.args.get(1) { Some(Payload::ObjectId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
-                Ok(ShellRequest::GetXwaylandSurface { id, surface })
+                Ok(Request::GetXwaylandSurface { id, surface })
             }
             _ => Err(DeserializeError::UnknownOpcode),
         }
     }
+}
+
+pub enum Event {}
+impl Message for Event {
+    fn into_raw(self, _sender: ObjectId) -> RawMessage { unreachable!() }
+    fn from_raw(_con: Rc<RefCell<dyn Connection>>, _m: &RawMessage) -> Result<Self, DeserializeError> { Err(DeserializeError::UnknownOpcode) }
 }
 
 pub struct XwaylandShellV1 {
@@ -49,8 +55,8 @@ pub struct XwaylandShellV1 {
 }
 
 impl Interface for XwaylandShellV1 {
-    type Event = crate::wl::protocols::common::wl_display::Event; // No events for this manager
-    type Request = ShellRequest;
+    type Event = Event;
+    type Request = Request;
 
     const NAME: &'static str = "xwayland_shell_v1";
     const VERSION: u32 = 1;
@@ -104,8 +110,14 @@ pub struct XwaylandSurfaceV1 {
     id: ObjectId,
 }
 
+pub enum SurfaceEvent {}
+impl Message for SurfaceEvent {
+    fn into_raw(self, _sender: ObjectId) -> RawMessage { unreachable!() }
+    fn from_raw(_con: Rc<RefCell<dyn Connection>>, _m: &RawMessage) -> Result<Self, DeserializeError> { Err(DeserializeError::UnknownOpcode) }
+}
+
 impl Interface for XwaylandSurfaceV1 {
-    type Event = crate::wl::protocols::common::wl_display::Event; // No events for this surface
+    type Event = SurfaceEvent;
     type Request = SurfaceRequest;
 
     const NAME: &'static str = "xwayland_surface_v1";
@@ -141,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_xwayland_shell_request_into_raw() {
-        let req = ShellRequest::GetXwaylandSurface { id: NewId(10), surface: ObjectId(5) };
+        let req = Request::GetXwaylandSurface { id: NewId(10), surface: ObjectId(5) };
         let raw = req.into_raw(ObjectId(2));
         assert_eq!(raw.sender, ObjectId(2));
         assert_eq!(raw.opcode, Opcode(1));

@@ -8,6 +8,7 @@ use smallvec::smallvec;
 #[derive(Debug)]
 pub enum Request {
     CreateSurface { id: NewId },
+    CreateRegion { id: NewId },
 }
 
 impl Message for Request {
@@ -16,6 +17,11 @@ impl Message for Request {
             Request::CreateSurface { id } => RawMessage {
                 sender,
                 opcode: crate::wl::Opcode(0),
+                args: smallvec![id.into()],
+            },
+            Request::CreateRegion { id } => RawMessage {
+                sender,
+                opcode: crate::wl::Opcode(1),
                 args: smallvec![id.into()],
             },
         }
@@ -30,6 +36,14 @@ impl Message for Request {
                     _ => return Err(DeserializeError::UnexpectedType),
                 };
                 Ok(Request::CreateSurface { id })
+            }
+            1 => {
+                if m.args.len() != 1 { return Err(DeserializeError::InvalidLength); }
+                let id = match m.args[0] {
+                    Payload::NewId(id) => id,
+                    _ => return Err(DeserializeError::UnexpectedType),
+                };
+                Ok(Request::CreateRegion { id })
             }
             _ => Err(DeserializeError::UnknownOpcode),
         }
@@ -89,5 +103,14 @@ impl WlCompositor {
             &[],
         )?;
         Ok(WlSurface::new(self.con.clone(), id.as_id()))
+    }
+
+    pub fn create_region(&mut self, id: NewId) -> Result<(), SendError> {
+        self.con.borrow_mut().send(
+            self.id,
+            crate::wl::Opcode(1),
+            &[id.into()],
+            &[],
+        )
     }
 }

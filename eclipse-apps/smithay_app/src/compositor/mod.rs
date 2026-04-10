@@ -52,6 +52,10 @@ pub struct ShellWindow {
     pub buffer_handle: Option<u32>, // GEM handle for DMABUF
     pub is_dmabuf: bool,
     pub is_panel: bool,
+    pub wayland_vaddr: usize,
+    pub wayland_w: u32,
+    pub wayland_h: u32,
+    pub wayland_stride: u32,
 }
 
 impl Default for ShellWindow {
@@ -67,6 +71,10 @@ impl Default for ShellWindow {
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
+            wayland_vaddr: 0,
+            wayland_w: 0,
+            wayland_h: 0,
+            wayland_stride: 0,
         }
     }
 }
@@ -84,6 +92,10 @@ impl ShellWindow {
             buffer_handle: None,
             is_dmabuf: false,
             is_panel: false,
+            wayland_vaddr: 0,
+            wayland_w: 0,
+            wayland_h: 0,
+            wayland_stride: 0,
         }
     }
 
@@ -212,6 +224,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            ..Default::default()
         };
         assert!(win.contains(50, 50));
         assert!(!win.contains(9, 50));
@@ -228,6 +241,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            ..Default::default()
         };
         assert!(win.title_bar_contains(50, 20));
         assert!(!win.title_bar_contains(50, 50));
@@ -244,6 +258,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            ..Default::default()
         };
         assert_eq!(win.check_button_click(285, 110), WindowButton::Close);
         assert_eq!(win.check_button_click(264, 110), WindowButton::Maximize);
@@ -261,6 +276,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             damage: std::vec::Vec::new(),
             buffer_handle: None,
             is_dmabuf: false,
+            ..Default::default()
         };
         assert!(win.contains(10, 20));
         assert!(win.contains(109, 69));
@@ -288,6 +304,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
+                ..Default::default()
             },
             ShellWindow {
                 x: 50, y: 50, w: 100, h: 100,
@@ -298,6 +315,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 damage: std::vec::Vec::new(),
                 buffer_handle: None,
                 is_dmabuf: false,
+                ..Default::default()
             },
         ];
         assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(1));

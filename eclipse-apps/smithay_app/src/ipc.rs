@@ -214,6 +214,10 @@ pub fn handle_sidewind_message(
                         buffer_handle: None,
                         is_dmabuf: false,
                         is_panel,
+                        wayland_vaddr: 0,
+                        wayland_w: 0,
+                        wayland_h: 0,
+                        wayland_stride: 0,
                     };
                     let _new_idx = *window_count;
                     *window_count += 1;

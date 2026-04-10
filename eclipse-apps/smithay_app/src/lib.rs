@@ -1,4 +1,3 @@
-
 pub use libc;
 
 pub mod backend;
@@ -13,6 +12,9 @@ pub mod state;
 pub mod painter;
 pub mod style_engine;
 pub mod stylus;
+pub mod protocol;
+pub mod xwayland;
+pub mod wayland_socket;
 
 #[cfg(target_os = "eclipse")]
 pub mod getrandom_shim {
