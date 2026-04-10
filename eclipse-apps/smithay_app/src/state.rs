@@ -299,7 +299,7 @@ impl SmithayState {
         // call in the main loop will pick up the SVCS response and populate
         // service_list / service_count before any render happens.
         #[cfg(target_os = "eclipse")]
-        let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
+        let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, b"GET_SERVICES_INFO\0".len(), 0) };
 
         Some(state)
 
@@ -950,7 +950,7 @@ impl SmithayState {
             // Siempre pedimos info de servicios para mantener la lista actualizada,
             // de modo que esté lista cuando se abra System Central.
             #[cfg(target_os = "eclipse")]
-            let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
+            let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, b"GET_SERVICES_INFO\0".len(), 0) };
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
             self.prev_stats = Some(current);
