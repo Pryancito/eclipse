@@ -238,18 +238,89 @@ struct TerminalApp {
     pty_pair_id: usize,
     sh_pid: usize,
     sh_bytes: Vec<u8>,
+    /// argv[0] (name) to pass when restarting the shell/command.
+    sh_name: Vec<u8>,
+    /// Full argv (NUL-separated) to set on child restart via set_child_args.
+    sh_argv: Vec<u8>,
+    /// When true, do not auto-restart the child after it exits.
+    no_restart: bool,
     last_title: [u8; 32],
     /// Serial counter for protocol events.
     serial: u32,
     /// Whether Left-Alt or Right-Alt is currently held down.
     /// Used to prefix key sequences with ESC (xterm Meta mode).
     alt_pressed: bool,
+    /// Whether any Shift key is currently held down.
+    shift_pressed: bool,
+    /// Whether any Ctrl key is currently held down.
+    ctrl_pressed: bool,
     /// Tracks CSI ?1004 h/l in PTY output to gate focus-event forwarding.
     focus_tracker: FocusModeTracker,
 }
 
 impl TerminalApp {
     fn new() -> Option<Self> {
+        // ── 0. Parse own argv ─────────────────────────────────────────────
+        // Supported forms:
+        //   terminal                        → launch default shell (rust-shell or sh)
+        //   terminal -e <prog> [args...]    → launch <prog> with optional args
+        //   terminal -- <prog> [args...]    → same, alternate separator
+        let own_argv = {
+            let mut buf = [0u8; 4096];
+            let n = eclipse_syscall::call::get_process_args(&mut buf);
+            buf[..n].split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| std::string::String::from(core::str::from_utf8(s).unwrap_or("")))
+                .collect::<Vec<std::string::String>>()
+        };
+
+        // Determine shell/program to run.
+        // custom_cmd: (program_path, name_for_kernel, full_argv_nul_list, no_restart)
+        let (exec_path, exec_name, exec_argv_bytes, no_restart): (std::string::String, std::string::String, Vec<u8>, bool) = {
+            let mut custom: Option<(Vec<std::string::String>, bool)> = None;
+            let mut i = 1;
+            while i < own_argv.len() {
+                match own_argv[i].as_str() {
+                    "-e" | "--" => {
+                        if i + 1 < own_argv.len() {
+                            // Collect args after -e/-- as the command argv
+                            custom = Some((own_argv[i + 1..].to_vec(), true));
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if let Some((cmd_args, one_shot)) = custom {
+                // cmd_args[0] is the program, cmd_args[1..] are its arguments.
+                let prog = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+                // Resolve the executable path using PATH search
+                let prog_path = resolve_exec_path(prog);
+                // Extract basename for the kernel process name
+                let name = prog.rsplit('/').next().unwrap_or(prog);
+                let mut argv_bytes = Vec::<u8>::new();
+                for arg in &cmd_args {
+                    argv_bytes.extend_from_slice(arg.as_bytes());
+                    argv_bytes.push(0);
+                }
+                (prog_path, name.to_string(), argv_bytes, one_shot)
+            } else {
+                // Default: prefer rust-shell, fallback to sh
+                let default_shell = if std::fs::metadata("/bin/rust-shell").is_ok() {
+                    "/bin/rust-shell"
+                } else {
+                    "/bin/sh"
+                };
+                let shell_name = default_shell.rsplit('/').next().unwrap_or("sh").to_string();
+                let mut argv_bytes = Vec::<u8>::new();
+                argv_bytes.extend_from_slice(shell_name.as_bytes());
+                argv_bytes.push(0);
+                (default_shell.to_string(), shell_name, argv_bytes, false)
+            }
+        };
+
         let self_pid = eclipse_syscall::getpid() as u32;
         let win_w = 640u32;
         let win_h = 400u32;
@@ -487,19 +558,30 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read("/bin/sh");
+        let sh_res = std::fs::read(&exec_path);
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        // Build kernel name (≤15 bytes) from exec_name
+        let mut name_buf = [0u8; 16];
+        let copy_len = exec_name.len().min(15);
+        name_buf[..copy_len].copy_from_slice(&exec_name.as_bytes()[..copy_len]);
+        let kernel_name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("sh");
+
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some(kernel_name), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if let Ok(pid) = sh_spawn {
-            let _ = sys_set_child_args(pid, b"sh\0");
+            let _ = sys_set_child_args(pid, &exec_argv_bytes);
         } else {
             let _ = sys_close(pty_slave_fd);
             return None;
         }
         let sh_pid = sh_spawn.unwrap();
         let _ = sys_close(pty_slave_fd);
+
+        // Build sh_name for restart (NUL-terminated kernel name)
+        let mut sh_name = Vec::<u8>::new();
+        sh_name.extend_from_slice(kernel_name.as_bytes());
+        sh_name.push(0);
 
         let init_cols = win_w as u16 / FONT_CHAR_W;
         let init_rows = win_h as u16 / FONT_CHAR_H;
@@ -524,9 +606,14 @@ impl TerminalApp {
             pty_pair_id,
             sh_pid,
             sh_bytes,
+            sh_name,
+            sh_argv: exec_argv_bytes,
+            no_restart,
             last_title: [0; 32],
             serial: 1,
             alt_pressed: false,
+            shift_pressed: false,
+            ctrl_pressed: false,
             focus_tracker: FocusModeTracker::new(),
         })
     }
@@ -665,33 +752,96 @@ impl TerminalApp {
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                                     let state = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
-                                    // Convert evdev keycode → PS/2 Set-1 scancode expected by pc_keyboard.
-                                    // Lunas sends evdev_key = ps2_code + 8, so we subtract 8 to recover the
-                                    // PS/2 code.  Set the break-bit (0x80) on key-release.
-                                    let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
+                                    // Wayland sends XKB keycodes (= evdev + 8).
+                                    // For standard non-extended keys, evdev == PS/2 Set-1 make code,
+                                    // so sc == PS/2 and handle_keyboard() works correctly.
+                                    // Navigation keys (evdev ≥ 102) don't share PS/2 codes and are
+                                    // intercepted below with proper ANSI escape sequences.
+                                    let sc  = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
 
-                                    // ── Alt key tracking (xterm Meta mode) ─────────────
-                                    // PS/2 0x38 = L-Alt, 0x64 = R-Alt.
-                                    if sc == 0x38 || sc == 0x64 {
-                                        self.alt_pressed = state != 0;
+                                    // ── Modifier tracking (fallback; authoritative state from opcode=4) ─
+                                    if sc == 0x38 || sc == 0x64 { self.alt_pressed  = state != 0; }
+                                    if sc == 0x2A || sc == 0x36 { self.shift_pressed = state != 0; }
+                                    if sc == 0x1D || sc == 0x61 { self.ctrl_pressed  = state != 0; }
+
+                                    // ── Navigation / extended-key intercept ─────────────────────────
+                                    // Navigation keys have evdev codes that don't map to valid PS/2
+                                    // Set-1 codes via the XKB-8 formula.  We handle them here and
+                                    // emit the correct xterm ANSI escape sequences directly to the PTY.
+                                    let mut handled = false;
+                                    if state != 0 && !MODIFIER_SC.contains(&sc) {
+                                        let (sh, al, ct) = (self.shift_pressed, self.alt_pressed, self.ctrl_pressed);
+                                        match sc {
+                                            // ── Cursor keys (evdev 103-106 → sc 0x67/0x6C/0x6A/0x69) ──
+                                            0x67 => { write_key_seq(self.pty_master_fd, b'A', false, sh, al, ct); handled = true; } // Up
+                                            0x6C => { write_key_seq(self.pty_master_fd, b'B', false, sh, al, ct); handled = true; } // Down
+                                            0x6A => { write_key_seq(self.pty_master_fd, b'C', false, sh, al, ct); handled = true; } // Right
+                                            0x69 => { write_key_seq(self.pty_master_fd, b'D', false, sh, al, ct); handled = true; } // Left
+
+                                            // ── Page scroll / navigation ─────────────────────────────
+                                            0x68 => { // PageUp (evdev 104)
+                                                if sh {
+                                                    for _ in 0..8 { self.terminal.handle_mouse(MouseInput::Scroll(-1)); }
+                                                } else {
+                                                    write_key_seq(self.pty_master_fd, b'5', true, false, al, ct);
+                                                }
+                                                handled = true;
+                                            }
+                                            0x6D => { // PageDown (evdev 109)
+                                                if sh {
+                                                    for _ in 0..8 { self.terminal.handle_mouse(MouseInput::Scroll(1)); }
+                                                } else {
+                                                    write_key_seq(self.pty_master_fd, b'6', true, false, al, ct);
+                                                }
+                                                handled = true;
+                                            }
+                                            0x66 => { write_key_seq(self.pty_master_fd, b'H', false, sh, al, ct); handled = true; } // Home
+                                            0x6B => { write_key_seq(self.pty_master_fd, b'F', false, sh, al, ct); handled = true; } // End
+                                            0x6E => { write_key_seq(self.pty_master_fd, b'2', true,  sh, al, ct); handled = true; } // Insert
+                                            0x6F => { write_key_seq(self.pty_master_fd, b'3', true,  sh, al, ct); handled = true; } // Delete
+
+                                            // ── Function keys F1–F12 with modifier support ──────────
+                                            0x3B => { write_fn_key(self.pty_master_fd,  1, sh, al, ct); handled = true; }
+                                            0x3C => { write_fn_key(self.pty_master_fd,  2, sh, al, ct); handled = true; }
+                                            0x3D => { write_fn_key(self.pty_master_fd,  3, sh, al, ct); handled = true; }
+                                            0x3E => { write_fn_key(self.pty_master_fd,  4, sh, al, ct); handled = true; }
+                                            0x3F => { write_fn_key(self.pty_master_fd,  5, sh, al, ct); handled = true; }
+                                            0x40 => { write_fn_key(self.pty_master_fd,  6, sh, al, ct); handled = true; }
+                                            0x41 => { write_fn_key(self.pty_master_fd,  7, sh, al, ct); handled = true; }
+                                            0x42 => { write_fn_key(self.pty_master_fd,  8, sh, al, ct); handled = true; }
+                                            0x43 => { write_fn_key(self.pty_master_fd,  9, sh, al, ct); handled = true; }
+                                            0x44 => { write_fn_key(self.pty_master_fd, 10, sh, al, ct); handled = true; }
+                                            0x57 => { write_fn_key(self.pty_master_fd, 11, sh, al, ct); handled = true; }
+                                            0x58 => { write_fn_key(self.pty_master_fd, 12, sh, al, ct); handled = true; }
+
+                                            _ => {}
+                                        }
                                     }
 
-                                    // ── ESC prefix for Alt+key (Meta mode) ─────────────
-                                    // When Alt is held and a non-modifier key is pressed,
-                                    // xterm prefixes the key sequence with ESC.
-                                    if self.alt_pressed && state != 0
-                                        && !MODIFIER_SC.contains(&sc)
-                                    {
-                                        let _ = sys_write(self.pty_master_fd, b"\x1b");
+                                    if !handled {
+                                        // ── ESC prefix for Alt+key (xterm Meta mode) ────────────────
+                                        if self.alt_pressed && state != 0 && !MODIFIER_SC.contains(&sc) {
+                                            let _ = sys_write(self.pty_master_fd, b"\x1b");
+                                        }
+                                        // Feed PS/2 scancode to os-terminal; it handles Ctrl+letter,
+                                        // Shift+letter, Ctrl+Shift, and clipboard via the pty_writer.
+                                        let _ = self.terminal.handle_keyboard(ps2);
                                     }
-
-                                    // handle_keyboard feeds the PS/2 scancode into pc_keyboard which
-                                    // tracks modifier state internally (Ctrl, Shift, Alt, …) and
-                                    // writes the resulting ANSI/Unicode string directly to the PTY via
-                                    // the pty_writer closure — no extra manual write needed here.
-                                    let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
+                                }
+                            }
+
+                            // wl_keyboard.modifiers (opcode=4): serial, mods_depressed, mods_latched,
+                            // mods_locked, group — authoritative XKB modifier state.
+                            // Standard XKB bits: bit0=Shift, bit2=Control, bit3=Mod1(Alt).
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(4) {
+                                let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let mods = match raw.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    self.shift_pressed = (mods & 0x01) != 0;
+                                    self.ctrl_pressed  = (mods & 0x04) != 0;
+                                    self.alt_pressed   = (mods & 0x08) != 0;
                                 }
                             }
 
@@ -702,9 +852,11 @@ impl TerminalApp {
                                 }
                             }
 
-                            // wl_keyboard.leave (opcode=2) — keyboard focus lost
+                            // wl_keyboard.leave (opcode=2) — keyboard focus lost; clear all modifier state
                             if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(2) {
-                                self.alt_pressed = false; // clear Alt state on focus loss
+                                self.alt_pressed   = false;
+                                self.shift_pressed = false;
+                                self.ctrl_pressed  = false;
                                 if self.focus_tracker.enabled {
                                     let _ = sys_write(self.pty_master_fd, b"\x1b[O");
                                 }
@@ -812,11 +964,19 @@ impl TerminalApp {
             // ── 3. Shell Restart ───────────────────────────────────────────
             let mut status = 0u32;
             if sys_wait_pid_nohang(&mut status, self.sh_pid as usize).map_or(false, |p| p != 0) {
+                if self.no_restart {
+                    // One-shot command finished — close PTY and exit
+                    let _ = sys_close(self.pty_master_fd);
+                    sys_exit(0);
+                }
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
-                        let _ = sys_set_child_args(pid, b"sh\0");
+                    // Derive kernel name from sh_name (strip NUL)
+                    let name_end = self.sh_name.iter().position(|&b| b == 0).unwrap_or(self.sh_name.len());
+                    let kname = core::str::from_utf8(&self.sh_name[..name_end]).unwrap_or("sh");
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some(kname), fd, fd, fd) {
+                        let _ = sys_set_child_args(pid, &self.sh_argv);
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;
@@ -851,6 +1011,109 @@ fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[P
 fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
     use wayland_proto::wl::wire::Handle;
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
+}
+
+/// Resolve an executable name to a full path by searching $PATH directories.
+/// Searched order:
+///   1. Absolute path given directly (starts with '/')
+///   2. Relative path starting with "./" or "../"
+///   3. Directories in PATH env var (colon-separated)
+///   4. Default well-known directories: /bin, /usr/bin, /root/.cargo/bin, /usr/local/bin
+#[cfg(target_os = "eclipse")]
+fn resolve_exec_path(prog: &str) -> std::string::String {
+    if prog.is_empty() {
+        return std::string::String::from("/bin/sh");
+    }
+    // Already absolute or relative
+    if prog.starts_with('/') || prog.starts_with("./") || prog.starts_with("../") {
+        return std::string::String::from(prog);
+    }
+
+    // Build the list of search directories
+    let mut dirs: Vec<std::string::String> = Vec::new();
+
+    // Add PATH env dirs first
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            if !dir.is_empty() {
+                dirs.push(std::string::String::from(dir));
+            }
+        }
+    }
+
+    // Always include these well-known directories
+    for d in &["/bin", "/usr/bin", "/root/.cargo/bin", "/usr/local/bin", "/usr/local/sbin"] {
+        let ds = std::string::String::from(*d);
+        if !dirs.contains(&ds) {
+            dirs.push(ds);
+        }
+    }
+
+    for dir in &dirs {
+        let mut full = std::string::String::from(dir.as_str());
+        if !full.ends_with('/') { full.push('/'); }
+        full.push_str(prog);
+        if std::fs::metadata(&full).is_ok() {
+            return full;
+        }
+    }
+
+    // Fallback: return the name as-is so the caller sees a "not found" error
+    // with the original program name rather than a confusing /bin/<prog> path.
+    std::string::String::from(prog)
+}
+
+/// Write an xterm-style escape sequence for a cursor/navigation key with optional modifiers.
+///
+/// For cursor keys (tilde=false): `\x1b[X`  or  `\x1b[1;<mod>X`  where X ∈ {A,B,C,D,H,F}
+/// For tilde keys   (tilde=true):  `\x1b[N~` or  `\x1b[N;<mod>~` where N is the VT sequence number
+///
+/// The xterm modifier code is:  1 + shift + 2*alt + 4*ctrl
+#[cfg(target_os = "eclipse")]
+fn write_key_seq(fd: usize, code: u8, tilde: bool, shift: bool, alt: bool, ctrl: bool) {
+    let mod_code = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
+    if mod_code == 0 {
+        if tilde {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code, b'~']);
+        } else {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code]);
+        }
+    } else {
+        // xterm modifier encoding: 1=plain, 2=Shift, 3=Alt, 4=Shift+Alt,
+        // 5=Ctrl, 6=Shift+Ctrl, 7=Alt+Ctrl, 8=Shift+Alt+Ctrl
+        let xterm_mod: u8 = mod_code + 1; // 1..=8
+        let m = b'0' + xterm_mod;         // ASCII '2'..'8'
+        if tilde {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code, b';', m, b'~']);
+        } else {
+            let _ = sys_write(fd, &[b'\x1b', b'[', b'1', b';', m, code]);
+        }
+    }
+}
+
+/// Write an xterm-style function-key escape sequence for F1–F12.
+///
+/// xterm F-key VT codes (with optional modifier):
+///   F1=11, F2=12, F3=13, F4=14, F5=15, F6=17, F7=18, F8=19, F9=20, F10=21, F11=23, F12=24
+///   Plain:      \x1b[<N>~
+///   With mod:   \x1b[<N>;<mod>~
+#[cfg(target_os = "eclipse")]
+fn write_fn_key(fd: usize, fnum: u8, shift: bool, alt: bool, ctrl: bool) {
+    // VT sequence numbers for F1–F12 (F6 skips 16 to 17, etc.)
+    const VT_FN: [u8; 12] = [11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24];
+    let idx = (fnum as usize).saturating_sub(1);
+    if idx >= VT_FN.len() { return; }
+    let n = VT_FN[idx];
+    let tens = b'0' + n / 10;
+    let ones = b'0' + n % 10;
+    let mod_code = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
+    if mod_code == 0 {
+        let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b'~']);
+    } else {
+        let xterm_mod: u8 = mod_code + 1; // 2=Shift, 3=Alt, 5=Ctrl, 6=Shift+Ctrl, …
+        let m = b'0' + xterm_mod;
+        let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b';', m, b'~']);
+    }
 }
 
 fn main() {
