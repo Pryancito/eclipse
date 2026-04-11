@@ -100,7 +100,10 @@ impl ShellWindow {
         }
     }
 
-    /// Default title-bar height (matched to `SsdTheme::labwc_default().titlebar_height`).
+    /// Default title-bar height used for hit-testing and layout.
+    /// Chosen to match `SsdTheme::labwc_default().titlebar_height`; if that
+    /// constant is ever changed, update this value too (and see the
+    /// `debug_assert_eq!` in `window_rules.rs`).
     pub const TITLE_H: i32 = 24;
 
     pub fn title_bar_contains(&self, px: i32, py: i32) -> bool {

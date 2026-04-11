@@ -91,10 +91,9 @@ pub fn build_window_menu(
             let mut label = [0u8; 24];
             let prefix = b"To Workspace ";
             label[..prefix.len()].copy_from_slice(prefix);
-            // Safe digit encoding: workspace numbers are always 0-9, write as "1".."9"
-            // (we guard against ws ≥ 9 with a saturating fallback).
-            let digit = if ws < 9 { b'1' + ws } else { b'0' + (ws % 10) };
-            label[prefix.len()] = digit;
+            // Display number is 1-based.  N_WORKSPACES ≤ 4, so ws is always 0–3,
+            // and `b'1' + ws` is always a valid ASCII digit '1'–'4'.
+            label[prefix.len()] = b'1' + ws.min(8);
             menu.add_item_raw(label, ContextAction::MoveWindowToWorkspace(window_idx, ws));
         }
     }

@@ -146,14 +146,21 @@ pub fn draw_switcher(
                 if is_selected { Rgb888::WHITE } else { Rgb888::new(180, 190, 220) },
             );
             // Truncate title to at most `max_chars` characters to fit the card width
-            // (FONT_6X12 = 6 px/char).  We use char_indices to stay at safe UTF-8
-            // boundaries even for multi-byte characters.
+            // (FONT_6X12 = 6 px/char).  When the title is longer than the card we
+            // reserve the last position for the Unicode ellipsis '…' (U+2026, 3 bytes
+            // in UTF-8) so the user can see the title was truncated.
             let max_chars = (ENTRY_W / 6) as usize;
+            // Scratch buffer for the possibly-truncated title.
+            let truncated_buf: alloc::string::String;
             let display: &str = if let Some((byte_idx, _)) = title.char_indices().nth(max_chars) {
-                // There are more than max_chars chars — slice at the safe byte boundary.
-                &title[..byte_idx]
+                // Title is longer than the card — cut at a safe UTF-8 boundary and
+                // append an ellipsis in the reserved last character slot.
+                let cut = max_chars.saturating_sub(1);
+                let safe_idx = title.char_indices().nth(cut).map_or(byte_idx, |(i, _)| i);
+                truncated_buf = alloc::format!("{}\u{2026}", &title[..safe_idx]);
+                &truncated_buf
             } else {
-                // Title fits entirely.
+                // Title fits entirely — no allocation needed.
                 title
             };
             let text_x = ex + 4;

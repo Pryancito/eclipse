@@ -226,9 +226,14 @@ pub struct MenuItem {
 /// Per-window placement and state rules applied at map time.
 #[derive(Debug, Clone)]
 pub struct WindowRule {
-    /// Application identifier to match (empty = match any).
+    /// Case-insensitive *prefix* of the window title to match against.
+    /// Leave empty to match any window.
+    ///
+    /// Note: this matches against the window title string (not the Wayland
+    /// `app_id`).  Use the `title` field for a substring match inside the
+    /// full title.
     pub identifier: heapless::String<32>,
-    /// Optional title substring match (empty = match any).
+    /// Optional substring of the window title to match (empty = match any).
     pub title: heapless::String<32>,
     /// Override initial x position.
     pub x: Option<i32>,

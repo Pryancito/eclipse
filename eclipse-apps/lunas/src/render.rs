@@ -1663,18 +1663,17 @@ fn draw_window(
     }
 
     // ── Bottom resize handle ───────────────────────────────────────────────────
-    // The handle is rendered slightly darker than the titlebar to visually
-    // distinguish it from the window content area (60% brightness).
-    /// Brightness factor for the resize handle relative to the title bar color
-    /// (numerator of the `× N / 10` scale, clamped to [0, 10]).
-    const HANDLE_DARKEN_FACTOR_NUM: u16 = 6;
+    // The handle is rendered at 60% of the titlebar brightness to visually
+    // distinguish it from the window content area.
+    /// Resize-handle brightness as a percentage of the titlebar colour.
+    const HANDLE_BRIGHTNESS_PERCENT: u16 = 60;
     if theme.handle_width > 0 {
         let handle_y = cy + ch - bw - theme.handle_width;
         let handle_rgb = if focused { theme.title_active_bg } else { theme.title_inactive_bg };
         let handle_color = Rgb888::new(
-            (handle_rgb.r as u16 * HANDLE_DARKEN_FACTOR_NUM / 10) as u8,
-            (handle_rgb.g as u16 * HANDLE_DARKEN_FACTOR_NUM / 10) as u8,
-            (handle_rgb.b as u16 * HANDLE_DARKEN_FACTOR_NUM / 10) as u8,
+            (handle_rgb.r as u16 * HANDLE_BRIGHTNESS_PERCENT / 100) as u8,
+            (handle_rgb.g as u16 * HANDLE_BRIGHTNESS_PERCENT / 100) as u8,
+            (handle_rgb.b as u16 * HANDLE_BRIGHTNESS_PERCENT / 100) as u8,
         );
         let handle_style = PrimitiveStyleBuilder::new().fill_color(handle_color).build();
         let _ = Rectangle::new(
