@@ -77,6 +77,11 @@ pub struct ExecLoadResult {
     pub tls_base: u64,
     /// `Some((AT_BASE, AT_ENTRY))` cuando el arranque es el intérprete (p. ej. ld-musl).
     pub dynamic_linker: Option<(u64, u64)>,
+    /// Rangos de memoria virtual ocupados por los segmentos ELF cargados (para registrar como VMAs).
+    /// Para binarios estáticos: 1 rango [inicio_segmento, max_vaddr).
+    /// Para binarios dinámicos: hasta 2 rangos (binario principal + intérprete).
+    pub loaded_vma_ranges: [(u64, u64); 2],
+    pub loaded_vma_count: usize,
 }
 
 #[repr(C)]
@@ -156,6 +161,26 @@ fn write_user_u64(page_table_phys: u64, vaddr: u64, value: u64) -> Result<(), &'
         kptr.add(page_off / 8).write_volatile(value);
     }
     Ok(())
+}
+
+fn min_load_vaddr(
+    elf_data: &[u8],
+    ph_offset: usize,
+    ph_count: usize,
+    ph_size: usize,
+    load_bias: u64,
+) -> u64 {
+    for i in 0..ph_count {
+        let off = ph_offset + i * ph_size;
+        if off + ph_size > elf_data.len() {
+            break;
+        }
+        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_LOAD {
+            return ph.p_vaddr.wrapping_add(load_bias);
+        }
+    }
+    0
 }
 
 fn extract_interp_path<'a>(
@@ -715,6 +740,8 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
         segment_frames: mapped as u64,
         tls_base,
         dynamic_linker: Some((interp_bias, main_entry_va)),
+        loaded_vma_ranges: [(main_bias, max_v_main_al), (interp_bias, max_v_interp_al)],
+        loaded_vma_count: 2,
     })
 }
 
@@ -797,6 +824,8 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
         entry_point, max_vaddr_aligned, mapped
     ));
 
+    let min_vaddr = min_load_vaddr(elf_data, ph_offset, ph_count, ph_size, load_bias);
+
     Ok(ExecLoadResult {
         entry_point,
         max_vaddr: max_vaddr_aligned,
@@ -806,6 +835,8 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
         segment_frames: mapped as u64,
         tls_base,
         dynamic_linker: None,
+        loaded_vma_ranges: [(min_vaddr, max_vaddr_aligned), (0, 0)],
+        loaded_vma_count: 1,
     })
 }
 
