@@ -92,33 +92,33 @@ impl SsdTheme {
     /// dark colours suitable for Eclipse OS.
     pub fn labwc_default() -> Self {
         Self {
-            // Dark navy title bars — active slightly lighter
-            title_active_bg: Rgb24::new(37, 38, 51),
-            title_inactive_bg: Rgb24::new(22, 23, 33),
+            // Dark slate title bars — active noticeably lighter than inactive
+            title_active_bg: Rgb24::new(42, 46, 64),
+            title_inactive_bg: Rgb24::new(24, 26, 36),
 
             // Title text
-            label_active_color: Rgb24::new(210, 215, 230),
-            label_inactive_color: Rgb24::new(110, 115, 135),
+            label_active_color: Rgb24::new(220, 225, 240),
+            label_inactive_color: Rgb24::new(100, 108, 128),
 
-            // Window borders
-            border_active_color: Rgb24::new(70, 100, 160),
-            border_inactive_color: Rgb24::new(40, 44, 60),
+            // Window borders — thin crisp line; active gets a blue accent
+            border_active_color: Rgb24::new(80, 120, 200),
+            border_inactive_color: Rgb24::new(38, 42, 58),
 
-            // Buttons (traffic-light style)
-            button_close_active: Rgb24::new(220, 60, 60),
-            button_max_active: Rgb24::new(220, 180, 50),
-            button_min_active: Rgb24::new(50, 200, 80),
-            button_inactive: Rgb24::new(70, 75, 90),
-            button_hover: Rgb24::new(255, 255, 255),
+            // Buttons — macOS-style traffic lights
+            button_close_active: Rgb24::new(235, 64,  52),
+            button_max_active:   Rgb24::new(230, 185, 40),
+            button_min_active:   Rgb24::new(40,  200, 75),
+            button_inactive:     Rgb24::new(58,  62,  78),
+            button_hover:        Rgb24::new(255, 255, 255),
 
             // Metrics
-            border_width: 1,
-            padding_height: 4,
-            handle_width: 6,
-            titlebar_height: 24,
-            button_size: 12,
-            button_gap: 5,
-            button_margin: 6,
+            border_width:    1,
+            padding_height:  4,
+            handle_width:    5,
+            titlebar_height: 26,
+            button_size:     12,
+            button_gap:       6,
+            button_margin:    8,
         }
     }
 

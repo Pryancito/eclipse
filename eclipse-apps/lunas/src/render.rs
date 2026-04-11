@@ -5,7 +5,7 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, Circle, PrimitiveStyleBuilder};
+use embedded_graphics::primitives::{Rectangle, Circle, Line, PrimitiveStyleBuilder};
 use embedded_graphics::mono_font::{ascii::FONT_6X12, MonoTextStyle};
 use embedded_graphics::text::Text;
 use embedded_graphics::geometry::{Point, Size};
@@ -1555,16 +1555,24 @@ fn draw_window(
 
     let theme = SsdTheme::by_index(decoration_style);
 
-    // ── Shadow (offset copy of window rect) ──────────────────────────────────
-    let shadow_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb888::new(0, 0, 0))
-        .build();
-    let _ = Rectangle::new(
-        Point::new(cx + 3, cy + 3),
-        Size::new(cw as u32, ch as u32),
-    )
-    .into_styled(shadow_style)
-    .draw(fb);
+    // ── Shadow — three-layer soft drop shadow ─────────────────────────────────
+    // Outermost layer first (lightest), innermost last (darkest).
+    // Each layer overwrites the previous so the visible fringe fades outward.
+    for (off, (sr, sg, sb)) in [
+        (7i32, (22u8, 22u8, 38u8)),  // outer fringe — darkest navy visible far from window
+        (5i32, (12u8, 12u8, 22u8)),  // middle ring
+        (3i32, (4u8,  4u8,  8u8)),   // inner core — darkest, closest to window
+    ] {
+        let shadow_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(sr, sg, sb))
+            .build();
+        let _ = Rectangle::new(
+            Point::new(cx + off, cy + off),
+            Size::new(cw as u32, ch as u32),
+        )
+        .into_styled(shadow_style)
+        .draw(fb);
+    }
 
     // ── Window border ─────────────────────────────────────────────────────────
     let bw = theme.border_width;
@@ -1603,6 +1611,39 @@ fn draw_window(
         .draw(fb);
     }
 
+    // Title bar highlight — 1px brighter line at the very top (gives depth/glass feel).
+    // Only shown for the focused window on themes 0 and 1.
+    if focused && decoration_style != 2 {
+        let hl_r = title_rgb.r.saturating_add(35);
+        let hl_g = title_rgb.g.saturating_add(35);
+        let hl_b = title_rgb.b.saturating_add(55);
+        let hl_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(hl_r, hl_g, hl_b))
+            .build();
+        let _ = Rectangle::new(
+            Point::new(cx + bw, cy + bw),
+            Size::new((cw - bw * 2).max(0) as u32, 1),
+        )
+        .into_styled(hl_style)
+        .draw(fb);
+    }
+
+    // Title bar bottom separator — 1px slightly darker/bluer line between title bar and content.
+    {
+        let sep_r = title_rgb.r.saturating_sub(5);
+        let sep_g = title_rgb.g.saturating_sub(5);
+        let sep_b = title_rgb.b.saturating_add(25).min(255);
+        let sep_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(sep_r, sep_g, sep_b))
+            .build();
+        let _ = Rectangle::new(
+            Point::new(cx + bw, cy + bw + tb_h - 1),
+            Size::new((cw - bw * 2).max(0) as u32, 1),
+        )
+        .into_styled(sep_style)
+        .draw(fb);
+    }
+
     // ── Window buttons ────────────────────────────────────────────────────────
     // labwc default: Close → Maximize → Minimize on the right side.
     let btn_size = theme.button_size;
@@ -1636,6 +1677,47 @@ fn draw_window(
     let _ = Circle::new(Point::new(min_x, btn_y), btn_size as u32)
         .into_styled(min_style)
         .draw(fb);
+
+    // ── Window button icons (focused state) ──────────────────────────────────
+    // When focused, draw a small symbol inside each button circle:
+    //   Close    → × (two crossing diagonal lines)
+    //   Maximize → □ (small square outline)
+    //   Minimize → − (short horizontal dash)
+    if focused {
+        let half = (btn_size / 4).max(2);   // 3 px for btn_size=12
+        let icon_stroke = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(255, 255, 255))
+            .stroke_width(1)
+            .build();
+
+        // Close: ×
+        let ccx = close_x + btn_size / 2;
+        let ccy = btn_y    + btn_size / 2;
+        let _ = Line::new(Point::new(ccx - half, ccy - half), Point::new(ccx + half, ccy + half))
+            .into_styled(icon_stroke).draw(fb);
+        let _ = Line::new(Point::new(ccx + half, ccy - half), Point::new(ccx - half, ccy + half))
+            .into_styled(icon_stroke).draw(fb);
+
+        // Maximize: □
+        let mcx = max_x + btn_size / 2;
+        let mcy = btn_y + btn_size / 2;
+        let _ = Rectangle::new(
+            Point::new(mcx - half, mcy - half),
+            Size::new((half * 2) as u32, (half * 2) as u32),
+        )
+        .into_styled(icon_stroke)
+        .draw(fb);
+
+        // Minimize: −
+        let nicx = min_x + btn_size / 2;
+        let nicy = btn_y + btn_size / 2;
+        let dash_style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb888::new(255, 255, 255))
+            .stroke_width(2)
+            .build();
+        let _ = Line::new(Point::new(nicx - half, nicy), Point::new(nicx + half, nicy))
+            .into_styled(dash_style).draw(fb);
+    }
 
     // ── Title text ────────────────────────────────────────────────────────────
     let label_rgb = if focused { theme.label_active_color } else { theme.label_inactive_color };
