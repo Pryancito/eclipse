@@ -2,6 +2,9 @@ use crate::wl::{ObjectId, NewId, Interface, RawMessage, Connection, Payload};
 use crate::wl::wire::Handle;
 use crate::wl::interface::{construct_interface_wrapper, InterfaceWrapper};
 use crate::wl::server::client::Client;
+use crate::wl::protocols::common::wl_callback::WlCallback;
+use crate::wl::protocols::common::wl_display;
+use crate::wl::protocols::common::wl_registry::WlRegistry;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::RefCell;
@@ -56,19 +59,35 @@ pub struct DisplayObject;
 impl ObjectLogic for DisplayObject {
     fn handle_request(&mut self, client: &mut Client, opcode: u16, args: &[Payload], _handles: &[Handle]) -> Result<(), ServerError> {
         match opcode {
-            1 => { // get_registry
-                let registry_id = match args[0] {
-                    Payload::NewId(id) => id,
+            0 => {
+                // sync(callback: new_id) — create a wl_callback, fire Done immediately,
+                // then delete the object so the client can recycle the ID.
+                // This is how wl_display_roundtrip() knows the server has caught up.
+                let callback_id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
                     _ => return Err(ServerError::MessageDeserializeError),
                 };
-                
-                // We need access to server.globals here... 
-                // But wait, the client belongs to the server.
-                // For now, let's just create the registry object.
-                // The actual global broadcasting should probably happen in WaylandServer.
-                
+                let cb_inner = ObjectInner::Rc(Rc::new(RefCell::new(CallbackObject)));
+                client.add_object(callback_id, Object::new::<WlCallback>(callback_id, cb_inner));
+                // Fire Done — clients use this to detect the roundtrip has completed.
+                client.send_event(
+                    callback_id.as_id(),
+                    crate::wl::protocols::common::wl_callback::Event::Done { callback_data: 0 },
+                )?;
+                // Delete the one-shot object so the client can reuse the ID.
+                client.send_event(
+                    ObjectId(1),
+                    wl_display::Event::DeleteId { id: callback_id.0 },
+                )?;
+                Ok(())
+            }
+            1 => { // get_registry
+                let registry_id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
                 let registry = ObjectInner::Rc(Rc::new(RefCell::new(RegistryObject)));
-                client.add_object(registry_id, Object::new::<crate::wl::protocols::common::wl_registry::WlRegistry>(registry_id, registry));
+                client.add_object(registry_id, Object::new::<WlRegistry>(registry_id, registry));
                 Ok(())
             }
             _ => Ok(()),
@@ -80,6 +99,15 @@ pub struct RegistryObject;
 impl ObjectLogic for RegistryObject {
     fn handle_request(&mut self, _client: &mut Client, _opcode: u16, _args: &[Payload], _handles: &[Handle]) -> Result<(), ServerError> {
         // bind is handled directly by WaylandServer::process_message; nothing to do here.
+        Ok(())
+    }
+}
+
+/// No-op handler for wl_callback objects.
+/// The compositor fires `wl_callback.done` externally; the object itself has no requests.
+pub struct CallbackObject;
+impl ObjectLogic for CallbackObject {
+    fn handle_request(&mut self, _client: &mut Client, _opcode: u16, _args: &[Payload], _handles: &[Handle]) -> Result<(), ServerError> {
         Ok(())
     }
 }

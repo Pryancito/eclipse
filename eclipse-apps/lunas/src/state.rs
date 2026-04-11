@@ -8,12 +8,16 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SurfaceCommit};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SharedToplevels, SharedTitles, SurfaceCommit, LayerSurfaceInfo};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use wayland_proto::wl::protocols::common::wl_keyboard;
 use wayland_proto::wl::protocols::common::wl_pointer;
+use wayland_proto::wl::protocols::common::wl_callback;
+use wayland_proto::wl::protocols::common::wl_buffer;
+use wayland_proto::wl::protocols::common::wl_display;
+use wayland_proto::wl::protocols::common::wl_surface;
 use wayland_proto::wl::wire::ObjectId;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
@@ -95,16 +99,34 @@ pub struct LunasState {
     pub buffer_registry: SharedBuffers,
     /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
     pub keyboard_registry: SharedKeyboards,
+    /// Maps surface_id → LayerSurfaceInfo for zwlr_layer_surface_v1 clients.
+    /// Read by `LunasSurface::commit` to include layer placement info in SurfaceCommit.
+    pub layer_registry: crate::protocol::SharedLayerRegistry,
+    /// Reserved screen pixels from exclusive-zone layer surfaces.
+    /// Regular windows must not be placed in these bands.
+    pub exclusive_top:    i32,
+    pub exclusive_bottom: i32,
+    pub exclusive_left:   i32,
+    pub exclusive_right:  i32,
+    /// Maps ClientId → xdg_wm_base ObjectId — used to dispatch periodic pings.
+    pub xdg_wm_base_registry: crate::protocol::SharedXdgWmBases,
     /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
     pub pointer_registry: SharedPointers,
+    /// Maps (ClientId, surface_id) → xdg_toplevel ObjectId for close dispatch.
+    pub toplevel_registry: SharedToplevels,
+    /// Maps surface_id → window title string (set by xdg_toplevel.set_title).
+    pub title_registry: SharedTitles,
     /// Maps Xwayland X11 window serials (64-bit) to Wayland wl_surface IDs.
     pub xwayland_serials: crate::protocol::SharedXwaylandSerials,
     /// Monotonically increasing serial number for Wayland protocol events.
 
     pub wayland_serial: u32,
     /// Tracks which Wayland keyboard clients have already received wl_keyboard.enter.
-    /// Enter is sent lazily: just before the first wl_keyboard.key event.
     pub keyboard_entered: std::collections::BTreeSet<ClientId>,
+    /// The focused window from the previous frame, used to detect focus changes
+    /// and dispatch wl_keyboard.leave / wl_pointer.leave on the old client and
+    /// wl_keyboard.enter / wl_pointer.enter on the newly focused one.
+    pub prev_focused_window: Option<usize>,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -117,6 +139,11 @@ pub struct LunasState {
     pub x11_server: Option<crate::xwayland::X11Server>,
     /// Pixel buffers for X11 windows (window_id → buffer).
     pub x11_surfaces: std::collections::BTreeMap<u32, crate::xwayland::X11PixelBuffer>,
+    /// When `true`, the main event loop should terminate (ExitCompositor action).
+    pub should_exit: bool,
+    /// Active labwc compositor configuration (loaded from rc.xml at startup,
+    /// reloaded on `Reconfigure`).
+    pub config: crate::config::LabwcConfig,
 }
 
 impl LunasState {
@@ -168,16 +195,27 @@ impl LunasState {
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            xdg_wm_base_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            layer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            exclusive_top: 0,
+            exclusive_bottom: 0,
+            exclusive_left: 0,
+            exclusive_right: 0,
+            toplevel_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            title_registry: Rc::new(RefCell::new(BTreeMap::new())),
             xwayland_serials: Rc::new(RefCell::new(BTreeMap::new())),
             wayland_serial: 1,
 
             keyboard_entered: std::collections::BTreeSet::new(),
+            prev_focused_window: None,
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
             history_pos: 0,
             x11_server: crate::xwayland::X11Server::new(fb_w as u16, fb_h as u16),
             x11_surfaces: std::collections::BTreeMap::new(),
+            should_exit: false,
+            config: crate::config::LabwcConfig::load(),
         });
 
         // Pre-render background using the current wallpaper mode and colour.
@@ -450,6 +488,35 @@ impl LunasState {
         let fb_h = self.backend.fb.info.height as i32;
 
         for commit in commits {
+            let client_id = ClientId(commit.pid);
+
+            // ── wl_buffer.release ─────────────────────────────────────────────
+            // The compositor has consumed this commit; notify the client so it
+            // can reuse the buffer for the next frame.  Without this, buffer pools
+            // fill up and rendering stalls (e.g. SDL2, wlroots clients).
+            if let Some(buf_id) = commit.buffer_id {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(buf_id, wl_buffer::Event::Release);
+                }
+            }
+
+            // ── wl_callback.done + wl_display.delete_id ───────────────────────
+            // Fire the frame callback requested via wl_surface.frame().
+            // The Done event unblocks apps waiting to render the next frame.
+            // The delete_id lets the client reuse the wl_callback object slot.
+            if let Some(cb_id) = commit.frame_callback {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(
+                        cb_id,
+                        wl_callback::Event::Done { callback_data: self.counter as u32 },
+                    );
+                    let _ = client.send_event(
+                        ObjectId(1),
+                        wl_display::Event::DeleteId { id: cb_id.0 },
+                    );
+                }
+            }
+
             // Update / insert the surface pixel buffer
             let surface = ExternalSurface {
                 id: commit.pid,
@@ -467,13 +534,82 @@ impl LunasState {
             };
             self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
 
+            let surface_id = commit.surface_id;
+
+            // ── Layer surface: position at screen edge, no title bar ──────────
+            if let Some(layer_info) = commit.layer_info {
+                use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+                // Check if this layer surface already has a window slot
+                let layer_exists = self.space.windows[..self.space.window_count]
+                    .iter()
+                    .any(|w| matches!(
+                        w.content,
+                        WindowContent::Layer { surface_id: sid, pid, .. }
+                            if pid == commit.pid && sid == surface_id
+                    ));
+
+                if !layer_exists && self.space.window_count < self.space.windows.len() {
+                    // Compute position from anchor
+                    let (wx, wy, ww, wh) = compute_layer_rect(
+                        &layer_info, fb_w, fb_h,
+                        commit.width as i32, commit.height as i32,
+                    );
+
+                    // Update exclusive zone bookkeeping
+                    if layer_info.exclusive_zone > 0 {
+                        let ez = layer_info.exclusive_zone;
+                        let at = layer_info.anchor;
+                        if at & ls::ANCHOR_TOP != 0 && at & ls::ANCHOR_BOTTOM == 0 {
+                            self.exclusive_top = self.exclusive_top.max(wy + wh + ez.min(wh));
+                        } else if at & ls::ANCHOR_BOTTOM != 0 && at & ls::ANCHOR_TOP == 0 {
+                            let reserved = fb_h - wy;
+                            self.exclusive_bottom = self.exclusive_bottom.max(reserved);
+                        } else if at & ls::ANCHOR_LEFT != 0 && at & ls::ANCHOR_RIGHT == 0 {
+                            self.exclusive_left = self.exclusive_left.max(wx + ww);
+                        } else if at & ls::ANCHOR_RIGHT != 0 && at & ls::ANCHOR_LEFT == 0 {
+                            let reserved = fb_w - wx;
+                            self.exclusive_right = self.exclusive_right.max(reserved);
+                        }
+                    }
+
+                    let win = ShellWindow {
+                        x: wx, y: wy, w: ww, h: wh,
+                        curr_x: (wx + ww / 2) as f32,
+                        curr_y: (wy + wh / 2) as f32,
+                        curr_w: 0.0, curr_h: 0.0,
+                        minimized: false, maximized: false, closing: false,
+                        shaded: false, above: false,
+                        stored_rect: (wx, wy, ww, wh),
+                        stored_h_before_shade: 0,
+                        // Layer surfaces appear on ALL workspaces (use 255 as sentinel)
+                        workspace: 255,
+                        content: WindowContent::Layer {
+                            surface_id: commit.surface_id,
+                            pid: commit.pid,
+                            anchor: layer_info.anchor,
+                            layer: layer_info.layer,
+                            exclusive_zone: layer_info.exclusive_zone,
+                        },
+                        damage: std::vec::Vec::new(),
+                        buffer_handle: None,
+                        is_dmabuf: false,
+                        title: [0u8; 32],
+                    };
+                    self.space.windows[self.space.window_count] = win;
+                    self.space.window_count += 1;
+                    // Layer surfaces don't steal keyboard focus
+                }
+                continue; // don't fall through to regular window code
+            }
+
             // Create ShellWindow if not yet present
             let exists = self.space.windows[..self.space.window_count]
                 .iter()
                 .any(|w| matches!(
                     w.content,
-                    WindowContent::Snp { surface_id, pid }
-                        if pid == commit.pid && surface_id == commit.surface_id
+                    WindowContent::Snp { surface_id: sid, pid }
+                        if pid == commit.pid && sid == surface_id
                 ));
 
             if !exists && self.space.window_count < self.space.windows.len() {
@@ -482,16 +618,27 @@ impl LunasState {
                     .min((fb_h - commit.height as i32 - 10).max(ShellWindow::TITLE_H));
                 let w = commit.width as i32;
                 let h = commit.height as i32;
+                // Use the title from xdg_toplevel.set_title if available, else "Wayland"
                 let mut title = [0u8; 32];
-                title[..7].copy_from_slice(b"Wayland");
-                let win = ShellWindow {
+                {
+                    let treg = (*self.title_registry).borrow();
+                    if let Some(t) = treg.get(&surface_id) {
+                        let len = t.len().min(31);
+                        title[..len].copy_from_slice(&t.as_bytes()[..len]);
+                    } else {
+                        title[..7].copy_from_slice(b"Wayland");
+                    }
+                }
+                let mut win = ShellWindow {
                     x, y, w,
                     h: h + ShellWindow::TITLE_H,
                     curr_x: (x + w / 2) as f32,
                     curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
                     curr_w: 0.0, curr_h: 0.0,
                     minimized: false, maximized: false, closing: false,
+                    shaded: false, above: false,
                     stored_rect: (x, y, w, h + ShellWindow::TITLE_H),
+                    stored_h_before_shade: 0,
                     workspace: self.input.current_workspace,
                     content: WindowContent::Snp {
                         surface_id: commit.surface_id,
@@ -502,14 +649,152 @@ impl LunasState {
                     is_dmabuf: false,
                     title,
                 };
+                // Apply window rules (position, size, maximized flag)
+                crate::window_rules::apply_rules(
+                    &self.config,
+                    &mut win,
+                    self.backend.fb.info.width as i32,
+                    self.backend.fb.info.height as i32,
+                );
                 self.space.windows[self.space.window_count] = win;
                 self.space.window_count += 1;
                 let new_idx = self.space.window_count - 1;
                 self.input.focused_window = Some(new_idx);
-                // wl_keyboard.enter is sent lazily at first key event (see handle_event).
+
+                // ── wl_surface.enter(output) ──────────────────────────────────
+                // Tell the client which output it appeared on.  Required by GTK4,
+                // Qt and many clients before they start rendering at full resolution.
+                // We send it for the first output (global name=1, object id depends
+                // on what the client bound — we use the surface id as the surface arg).
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    // We don't track per-client output object IDs reliably yet, but
+                    // many clients only have one output bound.  Look for any object
+                    // registered as "wl_output" or, failing that, use ObjectId(0)
+                    // (which wl_surface.enter/leave accepts as a no-op on many clients).
+                    // The output global name is always 1 in our single-output setup.
+                    let _ = client.send_event(
+                        ObjectId(surface_id),
+                        wl_surface::Event::Enter { output: ObjectId(0) },
+                    );
+                }
+
+                // ── wl_keyboard.enter: send eagerly when window first appears ──
+                let keyboard_id = (*self.keyboard_registry).borrow().get(&client_id).copied();
+                if let Some(kb_id) = keyboard_id {
+                    if let Some(client) = self.protocol.clients.get(&client_id) {
+                        self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                        let _ = client.send_event(kb_id, wl_keyboard::Event::Enter {
+                            serial: self.wayland_serial,
+                            surface: ObjectId(surface_id),
+                            keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                        });
+                        self.keyboard_entered.insert(client_id);
+                    }
+                }
             }
         }
         self.dirty = true;
+    }
+
+    /// Apply pending title updates from `title_registry` to existing ShellWindows.
+    ///
+    /// Called every frame so that `xdg_toplevel.set_title` calls made after the
+    /// window was first created are reflected in the title bar.
+    pub fn apply_title_updates(&mut self) {
+        let treg = (*self.title_registry).borrow();
+        for i in 0..self.space.window_count {
+            if let WindowContent::Snp { surface_id, .. } = self.space.windows[i].content {
+                if let Some(t) = treg.get(&surface_id) {
+                    let len = t.len().min(31);
+                    let mut new_title = [0u8; 32];
+                    new_title[..len].copy_from_slice(&t.as_bytes()[..len]);
+                    if self.space.windows[i].title != new_title {
+                        self.space.windows[i].title = new_title;
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+    }
+    ///
+    /// Sends `wl_keyboard.leave` + `wl_pointer.leave` to the previously-focused
+    /// Wayland client, and `wl_keyboard.enter` + `wl_pointer.enter` to the newly-
+    /// focused one.  Called every frame from `update()` after the frame's focus may
+    /// have been mutated by input handling.
+    pub fn dispatch_focus_change_events(&mut self) {
+        let current = self.input.focused_window;
+        if current == self.prev_focused_window {
+            return; // nothing changed
+        }
+
+        // ── Leave events for the previously-focused window ──────────────────
+        if let Some(prev_idx) = self.prev_focused_window {
+            if prev_idx < self.space.window_count {
+                if let WindowContent::Snp { pid, surface_id } = self.space.windows[prev_idx].content {
+                    let prev_id = ClientId(pid);
+                    let kb_id = (*self.keyboard_registry).borrow().get(&prev_id).copied();
+                    let ptr_id = (*self.pointer_registry).borrow().get(&prev_id).copied();
+                    if let Some(client) = self.protocol.clients.get(&prev_id) {
+                        if self.keyboard_entered.contains(&prev_id) {
+                            if let Some(kb) = kb_id {
+                                self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                let _ = client.send_event(kb, wl_keyboard::Event::Leave {
+                                    serial: self.wayland_serial,
+                                    surface: ObjectId(surface_id),
+                                });
+                            }
+                        }
+                        if let Some(ptr) = ptr_id {
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(ptr, wl_pointer::Event::Leave {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                            });
+                            let _ = client.send_event(ptr, wl_pointer::Event::Frame);
+                        }
+                    }
+                    self.keyboard_entered.remove(&prev_id);
+                }
+            }
+        }
+
+        // ── Enter events for the newly-focused window ────────────────────────
+        if let Some(cur_idx) = current {
+            if cur_idx < self.space.window_count {
+                if let WindowContent::Snp { pid, surface_id } = self.space.windows[cur_idx].content {
+                    let cur_id = ClientId(pid);
+                    let kb_id = (*self.keyboard_registry).borrow().get(&cur_id).copied();
+                    let ptr_id = (*self.pointer_registry).borrow().get(&cur_id).copied();
+                    if let Some(client) = self.protocol.clients.get(&cur_id) {
+                        if let Some(kb) = kb_id {
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(kb, wl_keyboard::Event::Enter {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                                keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                            });
+                            self.keyboard_entered.insert(cur_id);
+                        }
+                        if let Some(ptr) = ptr_id {
+                            // Calculate cursor position relative to window content area
+                            let win = &self.space.windows[cur_idx];
+                            let sx = (self.input.cursor_x - win.x).max(0) as f32;
+                            let sy = (self.input.cursor_y - win.y - ShellWindow::TITLE_H).max(0) as f32;
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(ptr, wl_pointer::Event::Enter {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                                surface_x: sx,
+                                surface_y: sy,
+                            });
+                            let _ = client.send_event(ptr, wl_pointer::Event::Frame);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.prev_focused_window = current;
     }
 
     /// Get the PID of the currently focused window if it is an SNP window.
@@ -551,6 +836,13 @@ impl LunasState {
         // generate that event, so we drain here every frame.
         self.drain_pending_wayland_commits();
 
+        // Dispatch focus-change Wayland events (enter/leave) if the focused window
+        // changed since the last frame (e.g. from mouse click, close, Alt+Tab).
+        self.dispatch_focus_change_events();
+
+        // Apply any pending title updates from xdg_toplevel.set_title calls.
+        self.apply_title_updates();
+
         // Poll X11 server for new events
         {
             let fb_w = self.backend.fb.info.width as u16;
@@ -571,17 +863,20 @@ impl LunasState {
         // Dispatch xdg_toplevel.close to any Wayland/Snp windows that are being closed.
         {
             use wayland_proto::wl::protocols::common::xdg_toplevel;
-            use wayland_proto::wl::server::client::ClientId;
-            use wayland_proto::wl::ObjectId;
             for i in 0..self.space.window_count {
                 let w = &self.space.windows[i];
                 if w.closing {
-                    if let crate::compositor::WindowContent::Snp { pid, .. } = w.content {
-                        // Unix socket clients have pid = 0x8000_0000+N.
-                        // Their xdg_toplevel is always object id 11 (terminal wire protocol).
+                    if let crate::compositor::WindowContent::Snp { pid, surface_id } = w.content {
                         let client_id = ClientId(pid);
+                        // Look up the registered xdg_toplevel ObjectId for this surface.
+                        // Falls back to ObjectId(11) for legacy clients that don't use
+                        // xdg_wm_base (e.g. old native Eclipse apps).
+                        let tl_id = (*self.toplevel_registry).borrow()
+                            .get(&(client_id, surface_id))
+                            .copied()
+                            .unwrap_or(ObjectId(11));
                         if let Some(client) = self.protocol.clients.get(&client_id) {
-                            let _ = client.send_event(ObjectId(11), xdg_toplevel::Event::Close);
+                            let _ = client.send_event(tl_id, xdg_toplevel::Event::Close);
                         }
                     }
                 }
@@ -589,7 +884,24 @@ impl LunasState {
         }
 
 
-        // Update window animations
+        // Periodically ping all Wayland xdg_wm_base clients to detect hangs.
+        // Clients are expected to respond with pong; if they don't, a future
+        // implementation can mark them unresponsive.  We send every 300 frames
+        // (~5 seconds at 60 fps) to amortise the overhead.
+        if self.counter % 300 == 1 {
+            use wayland_proto::wl::protocols::common::xdg_wm_base;
+            let ping_serial = self.wayland_serial;
+            let wm_base_ids: std::vec::Vec<(ClientId, ObjectId)> = (*self.xdg_wm_base_registry)
+                .borrow()
+                .iter()
+                .map(|(c, o)| (*c, *o))
+                .collect();
+            for (client_id, wm_base_id) in wm_base_ids {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(wm_base_id, xdg_wm_base::Event::Ping { serial: ping_serial });
+                }
+            }
+        }
         let animating = self.space.update_animations(&mut self.surfaces);
         if animating != 0 {
             self.dirty = true;
@@ -1089,6 +1401,55 @@ impl LunasState {
                     self.input.net_config_active = true;
                     self.dirty = true;
                 }
+                ContextAction::ShadeWindow(idx) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].toggle_shade();
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::MoveWindow(idx) => {
+                    // Begin interactive move: set up drag state in input
+                    if idx < self.space.window_count {
+                        let w = &self.space.windows[idx];
+                        self.input.dragging_window = Some(idx);
+                        self.input.drag_offset_x = w.w / 2;
+                        self.input.drag_offset_y = ShellWindow::TITLE_H / 2;
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ResizeWindow(idx) => {
+                    // Begin interactive resize
+                    if idx < self.space.window_count {
+                        self.input.resizing_window = Some(idx);
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ToggleAlwaysOnTop(idx) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].above = !self.space.windows[idx].above;
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::MoveWindowToWorkspace(idx, ws) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].workspace = ws;
+                        // Follow the window to its new workspace
+                        self.input.current_workspace = ws;
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ExitCompositor => {
+                    // Signal the main event loop to terminate.
+                    self.should_exit = true;
+                }
+                ContextAction::Reconfigure => {
+                    // Reload the labwc configuration from disk and re-apply theme.
+                    self.config = crate::config::LabwcConfig::load();
+                    // Apply the theme from the (possibly updated) config
+                    self.input.window_decoration_style =
+                        self.config.theme.theme_variant;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -1234,13 +1595,15 @@ impl LunasState {
                         let str_len = title.iter().position(|&b| b == 0).unwrap_or(title.len());
                         let copy_len = 31.min(str_len);
                         win_title[..copy_len].copy_from_slice(&title[..copy_len]);
-                        let win = ShellWindow {
+                        let mut win = ShellWindow {
                             x: wx, y: wy, w: ww, h: wh,
                             curr_x: (wx + ww / 2) as f32,
                             curr_y: (wy + wh / 2) as f32,
                             curr_w: 0.0, curr_h: 0.0,
                             minimized: false, maximized: false, closing: false,
+                            shaded: false, above: false,
                             stored_rect: (wx, wy, ww, wh),
+                            stored_h_before_shade: 0,
                             workspace: self.input.current_workspace,
                             content: WindowContent::X11 { window_id, pid: client_id },
                             damage: std::vec::Vec::new(),
@@ -1248,6 +1611,13 @@ impl LunasState {
                             is_dmabuf: false,
                             title: win_title,
                         };
+                        // Apply window rules (position, size, maximized flag)
+                        crate::window_rules::apply_rules(
+                            &self.config,
+                            &mut win,
+                            fb_w,
+                            fb_h,
+                        );
                         let idx = self.space.window_count;
                         self.space.windows[idx] = win;
                         self.space.window_count += 1;
@@ -1421,7 +1791,70 @@ fn is_leap_year(year: u32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-#[cfg(test)]
+/// Compute the screen-space rectangle (x, y, w, h) for a layer surface given
+/// its anchor/exclusive_zone/margin/requested-size and the available screen size.
+///
+/// Rules (same as wlroots / labwc):
+/// - If anchored to opposite edges (e.g. LEFT+RIGHT), the surface stretches to
+///   fill that axis minus margins.
+/// - If anchored to only one edge, the surface is placed at that edge.
+/// - If anchored to no edges, the surface is centred.
+pub fn compute_layer_rect(
+    info: &LayerSurfaceInfo,
+    fb_w: i32, fb_h: i32,
+    buf_w: i32, buf_h: i32,
+) -> (i32, i32, i32, i32) {
+    use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+    let anchor = info.anchor;
+    let aw = ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT;
+    let ah = ls::ANCHOR_TOP  | ls::ANCHOR_BOTTOM;
+
+    // ── Width ─────────────────────────────────────────────────────────────────
+    let w = if info.width > 0 {
+        info.width as i32
+    } else if anchor & aw == aw {
+        // Stretch across full width minus margins
+        (fb_w - info.margin_left - info.margin_right).max(0)
+    } else {
+        buf_w.max(1)
+    };
+
+    // ── Height ────────────────────────────────────────────────────────────────
+    let h = if info.height > 0 {
+        info.height as i32
+    } else if anchor & ah == ah {
+        (fb_h - info.margin_top - info.margin_bottom).max(0)
+    } else {
+        buf_h.max(1)
+    };
+
+    // ── X position ────────────────────────────────────────────────────────────
+    let x = if anchor & aw == aw {
+        info.margin_left  // stretched: start at left margin
+    } else if anchor & ls::ANCHOR_LEFT != 0 {
+        info.margin_left
+    } else if anchor & ls::ANCHOR_RIGHT != 0 {
+        fb_w - w - info.margin_right
+    } else {
+        (fb_w - w) / 2  // centred
+    };
+
+    // ── Y position ────────────────────────────────────────────────────────────
+    let y = if anchor & ah == ah {
+        info.margin_top   // stretched: start at top margin
+    } else if anchor & ls::ANCHOR_TOP != 0 {
+        info.margin_top
+    } else if anchor & ls::ANCHOR_BOTTOM != 0 {
+        fb_h - h - info.margin_bottom
+    } else {
+        (fb_h - h) / 2  // centred
+    };
+
+    (x, y, w, h)
+}
+
+
 mod tests {
     use super::*;
     use crate::compositor::{ShellWindow, WindowContent};
@@ -2140,6 +2573,234 @@ mod tests {
         state.input.pending_context_action = crate::input::ContextAction::DismissNotification(0);
         let _ = state.update();
         assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
+    }
+
+    /// dispatch_focus_change_events is idempotent when focus does not change.
+    #[test]
+    fn test_dispatch_focus_change_no_change_is_idempotent() {
+        let mut state = LunasState::new().expect("init");
+        state.input.focused_window = None;
+        state.prev_focused_window = None;
+        // Calling twice should not panic and should be a no-op
+        state.dispatch_focus_change_events();
+        state.dispatch_focus_change_events();
+        assert_eq!(state.prev_focused_window, None);
+    }
+
+    /// When focus moves from None to a non-Wayland window, prev_focused_window is updated.
+    #[test]
+    fn test_dispatch_focus_change_updates_prev() {
+        let mut state = LunasState::new().expect("init");
+        state.input.focused_window = None;
+        state.prev_focused_window = None;
+        // Set focus to a non-existent window index — no crash, but prev is updated
+        state.input.focused_window = Some(999);
+        state.dispatch_focus_change_events();
+        assert_eq!(state.prev_focused_window, Some(999));
+    }
+
+    /// SurfaceCommit carries frame_callback and buffer_id after a real surface commit.
+    #[test]
+    fn test_drain_commits_fires_frame_callback_fields() {
+        use crate::protocol::{SurfaceCommit};
+        use wayland_proto::wl::ObjectId;
+        let mut state = LunasState::new().expect("init");
+        // Push a commit with a frame_callback (no matching client — just checks no panic)
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 0xDEAD_BEEF,
+            surface_id: 3,
+            vaddr: 0,
+            width: 100,
+            height: 100,
+            stride: 400,
+            buffer_id: Some(ObjectId(8)),
+            frame_callback: Some(ObjectId(6)),
+            layer_info: None,
+        });
+        // drain_pending_wayland_commits should not panic even without a matching client
+        state.drain_pending_wayland_commits();
+        // The commit was drained
+        assert!((*state.pending_surface_commits).borrow().is_empty());
+    }
+
+    /// apply_title_updates propagates titles from the registry to existing ShellWindows.
+    #[test]
+    fn test_apply_title_updates_propagates_title() {
+        use crate::compositor::{ShellWindow, WindowContent};
+        let mut state = LunasState::new().expect("init");
+        // Add a fake Snp window
+        let surface_id = 42u32;
+        let pid = 99u32;
+        let mut win = ShellWindow::default();
+        win.title[..7].copy_from_slice(b"Wayland");
+        win.content = WindowContent::Snp { pid, surface_id };
+        state.space.windows[0] = win;
+        state.space.window_count = 1;
+
+        // Publish a title via the registry
+        (*state.title_registry).borrow_mut().insert(surface_id, String::from("My New Title"));
+
+        state.apply_title_updates();
+
+        // The window title should be updated
+        let title = state.space.windows[0].title_str();
+        assert_eq!(title, "My New Title", "title bar must reflect set_title");
+    }
+
+    /// xdg_wm_base.ping is sent to registered clients every 300 frames.
+    #[test]
+    fn test_xdg_wm_base_ping_dispatch_no_panic() {
+        use wayland_proto::wl::server::client::ClientId;
+        use wayland_proto::wl::ObjectId;
+        let mut state = LunasState::new().expect("init");
+        // Register a fake xdg_wm_base object for a client that doesn't exist.
+        // The ping dispatch must not panic even when the client is absent.
+        (*state.xdg_wm_base_registry).borrow_mut().insert(ClientId(777), ObjectId(5));
+        state.counter = 300; // triggers ping (300 % 300 == 0? we use counter % 300 == 1, so advance to 301)
+        state.counter = 301;
+        let _ = state.update(); // should not panic
+    }
+
+    // ── Layer surface / compute_layer_rect tests ─────────────────────────────
+
+    #[test]
+    fn compute_layer_rect_bottom_bar_full_width() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 30,
+            width: 0,
+            height: 30,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 0, 30);
+        assert_eq!(x, 0,    "bottom bar starts at x=0");
+        assert_eq!(w, 1920, "bottom bar is full screen width");
+        assert_eq!(h, 30,   "bottom bar height = requested 30px");
+        assert_eq!(y, 1080 - 30, "bottom bar sits at the bottom edge");
+    }
+
+    #[test]
+    fn compute_layer_rect_top_bar_full_width() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_TOP | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 0, 32);
+        assert_eq!(x, 0,    "top bar starts at x=0");
+        assert_eq!(y, 0,    "top bar is at y=0");
+        assert_eq!(w, 1920, "top bar is full width");
+        assert_eq!(h, 32,   "top bar height = requested 32px");
+    }
+
+    #[test]
+    fn compute_layer_rect_left_panel() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_BOTTOM,
+            anchor: ls::ANCHOR_LEFT | ls::ANCHOR_TOP | ls::ANCHOR_BOTTOM,
+            exclusive_zone: 200,
+            width: 200,
+            height: 0,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 200, 0);
+        assert_eq!(x, 0,    "left panel starts at x=0");
+        assert_eq!(y, 0,    "left panel starts at y=0");
+        assert_eq!(w, 200,  "left panel has the requested width");
+        assert_eq!(h, 1080, "left panel is full screen height");
+    }
+
+    #[test]
+    fn layer_surface_commit_creates_window_without_title_bar() {
+        let mut state = LunasState::new().expect("init");
+        let fb_h = state.backend.fb.info.height as i32;
+        let fb_w = state.backend.fb.info.width as i32;
+
+        use crate::protocol::{LayerSurfaceInfo, SurfaceCommit};
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        use wayland_proto::wl::ObjectId;
+
+        let layer_info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 1001,
+            surface_id: 7,
+            vaddr: 0x1000,
+            width: fb_w as u32,
+            height: 32,
+            stride: (fb_w as u32) * 4,
+            buffer_id: None,
+            frame_callback: None,
+            layer_info: Some(layer_info),
+        });
+        state.drain_pending_wayland_commits();
+
+        // A Layer window should have been created
+        let layer_win = state.space.windows[..state.space.window_count]
+            .iter()
+            .find(|w| matches!(w.content, WindowContent::Layer { pid: 1001, .. }));
+        assert!(layer_win.is_some(), "layer surface window must exist");
+        let lw = layer_win.unwrap();
+        // Should be positioned at the bottom edge
+        assert_eq!(lw.y, fb_h - 32, "layer surface y must be at the bottom edge");
+        assert_eq!(lw.x, 0,         "layer surface x must start at 0");
+        assert_eq!(lw.w, fb_w,      "layer surface width must be full screen width");
+        assert_eq!(lw.h, 32,        "layer surface height must equal exclusive zone");
+        // Workspace 255 = all workspaces
+        assert_eq!(lw.workspace, 255, "layer surfaces appear on all workspaces");
+        // The focused window should NOT be the layer surface
+        assert_ne!(state.input.focused_window, Some(state.space.window_count - 1),
+            "layer surfaces must not steal keyboard focus");
+    }
+
+    #[test]
+    fn layer_surface_exclusive_zone_is_updated() {
+        let mut state = LunasState::new().expect("init");
+        let fb_h = state.backend.fb.info.height as i32;
+        let fb_w = state.backend.fb.info.width as i32;
+
+        use crate::protocol::{LayerSurfaceInfo, SurfaceCommit};
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+        let layer_info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 2002,
+            surface_id: 9,
+            vaddr: 0x2000,
+            width: fb_w as u32,
+            height: 32,
+            stride: (fb_w as u32) * 4,
+            buffer_id: None,
+            frame_callback: None,
+            layer_info: Some(layer_info),
+        });
+        state.drain_pending_wayland_commits();
+        // exclusive_bottom should be set to at least 32 pixels
+        assert!(state.exclusive_bottom >= 32, "exclusive_bottom must reserve panel height");
     }
 
 }

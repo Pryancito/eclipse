@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use wayland_proto::wl::{ObjectId, NewId, Payload};
 use wayland_proto::wl::wire::Handle;
 use wayland_proto::wl::server::client::{Client, ClientId};
-use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
+use wayland_proto::wl::server::objects::{CallbackObject, Object, ObjectInner, ObjectLogic, ServerError};
 use wayland_proto::wl::protocols::common::*;
 use crate::compositor::{ShellWindow, WindowContent};
 
@@ -28,6 +28,37 @@ pub struct BufferInfo {
     pub format: u32,
 }
 
+/// Geometry and placement metadata for a `zwlr_layer_surface_v1`.
+///
+/// Stored in `SharedLayerRegistry` keyed by `surface_id` and embedded in
+/// every `SurfaceCommit` that originates from a layer surface so the
+/// compositor can correctly position/size the surface and reserve exclusive
+/// zones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSurfaceInfo {
+    /// Which compositor layer (BACKGROUND=0, BOTTOM=1, TOP=2, OVERLAY=3).
+    pub layer: u32,
+    /// Anchor bitfield: ANCHOR_TOP=1, ANCHOR_BOTTOM=2, ANCHOR_LEFT=4, ANCHOR_RIGHT=8.
+    pub anchor: u32,
+    /// Exclusive zone in pixels.  Positive values reserve space at the anchored edge;
+    /// -1 means "don't compute an exclusive zone but don't be constrained either".
+    pub exclusive_zone: i32,
+    /// Client-requested dimensions.  0 means "compositor picks".
+    pub width: u32,
+    pub height: u32,
+    pub margin_top:    i32,
+    pub margin_right:  i32,
+    pub margin_bottom: i32,
+    pub margin_left:   i32,
+}
+
+/// Shared registry mapping `surface_id` → `LayerSurfaceInfo`.
+///
+/// Written by `LunasLayerSurface` whenever the client calls `set_anchor`,
+/// `set_size`, etc.  Read by `LunasSurface` at commit time to embed the
+/// geometry into `SurfaceCommit`.
+pub type SharedLayerRegistry = Rc<RefCell<BTreeMap<u32, LayerSurfaceInfo>>>;
+
 /// Pending surface commit: posted by LunasSurface on commit and drained by
 /// LunasState to create / update ShellWindows.
 pub struct SurfaceCommit {
@@ -37,6 +68,16 @@ pub struct SurfaceCommit {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    /// wl_buffer ObjectId that was attached — the compositor sends `wl_buffer.release`
+    /// after it's done with this commit so the client can reuse the buffer.
+    pub buffer_id: Option<wayland_proto::wl::ObjectId>,
+    /// Pending `wl_surface.frame` callback ObjectId to fire `wl_callback.done` after
+    /// this commit has been rendered.  None if the client did not request a callback.
+    pub frame_callback: Option<wayland_proto::wl::ObjectId>,
+    /// Present when the surface is a `zwlr_layer_surface_v1`.
+    /// Used by `drain_pending_wayland_commits` to place the surface at the
+    /// correct screen edge without a title bar.
+    pub layer_info: Option<LayerSurfaceInfo>,
 }
 
 /// Shared registry of live wl_buffer objects, keyed by ObjectId.
@@ -48,6 +89,18 @@ pub type SharedCommits = Rc<RefCell<std::vec::Vec<SurfaceCommit>>>;
 /// Shared mapping of Xwayland serials (64-bit) to wl_surface ObjectIds.
 pub type SharedXwaylandSerials = Rc<RefCell<BTreeMap<u64, ObjectId>>>;
 
+/// Shared registry mapping (ClientId, surface_id) → xdg_toplevel ObjectId.
+/// Used so the compositor can dispatch `xdg_toplevel.close` to the correct object.
+pub type SharedToplevels = Rc<RefCell<BTreeMap<(ClientId, u32), ObjectId>>>;
+
+/// Shared registry mapping surface_id → window title string.
+/// Populated by `xdg_toplevel.set_title`; read by the compositor to keep title bars fresh.
+pub type SharedTitles = Rc<RefCell<BTreeMap<u32, std::string::String>>>;
+
+/// Shared registry mapping ClientId → xdg_wm_base ObjectId.
+/// Used by the compositor to send `xdg_wm_base.ping` and verify client responsiveness.
+pub type SharedXdgWmBases = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // LunasCompositor  (wl_compositor)
@@ -56,6 +109,7 @@ pub type SharedXwaylandSerials = Rc<RefCell<BTreeMap<u64, ObjectId>>>;
 pub struct LunasCompositor {
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub layer_registry: SharedLayerRegistry,
 }
 
 impl ObjectLogic for LunasCompositor {
@@ -77,14 +131,45 @@ impl ObjectLogic for LunasCompositor {
                     id: id.as_id(),
                     pid: client.client_id().0,
                     attached_buffer: None,
+                    attached_buffer_id: None,
+                    pending_frame_callback: None,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    layer_registry: self.layer_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<wl_surface::WlSurface>(id, surface));
                 Ok(())
             }
+            1 => {
+                // create_region(id: new_id) — region is a no-op; just register the object
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let region = ObjectInner::Rc(Rc::new(RefCell::new(LunasRegion)));
+                client.add_object(id, Object::new::<wl_region::WlRegion>(id, region));
+                Ok(())
+            }
             _ => Err(ServerError::ObjectMismatch),
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasRegion  (wl_region) — no-op; compositor ignores all region hints
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasRegion;
+
+impl ObjectLogic for LunasRegion {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        _opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        Ok(()) // destroy / add / subtract — all ignored
     }
 }
 
@@ -97,14 +182,22 @@ pub struct LunasSurface {
     pub pid: u32,
     /// The buffer currently attached (set by opcode 1 = attach).
     pub attached_buffer: Option<BufferInfo>,
+    /// ObjectId of the currently attached wl_buffer (for release signalling).
+    pub attached_buffer_id: Option<ObjectId>,
+    /// Pending frame-callback ObjectId registered via wl_surface.frame(callback).
+    /// Cleared after each commit by moving it into SurfaceCommit.
+    pub pending_frame_callback: Option<NewId>,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    /// Maps surface_id → LayerSurfaceInfo.  Present when this surface is the
+    /// underlying wl_surface for a zwlr_layer_surface_v1.
+    pub layer_registry: SharedLayerRegistry,
 }
 
 impl ObjectLogic for LunasSurface {
     fn handle_request(
         &mut self,
-        _client: &mut Client,
+        client: &mut Client,
         opcode: u16,
         args: &[Payload],
         _handles: &[Handle],
@@ -115,18 +208,48 @@ impl ObjectLogic for LunasSurface {
                 // attach(buffer: object_id, x: int, y: int)
                 let buffer_id = match args.first() {
                     Some(Payload::ObjectId(id)) => *id,
-                    _ => return Ok(()), // null buffer is valid (detach)
+                    _ => {
+                        // null buffer (ObjectId(0)) is valid — detaches the buffer.
+                        self.attached_buffer = None;
+                        self.attached_buffer_id = None;
+                        return Ok(());
+                    }
                 };
                 self.attached_buffer = (*self.buffer_registry).borrow().get(&buffer_id).copied();
+                self.attached_buffer_id = Some(buffer_id);
                 Ok(())
             }
             2 | 9 => Ok(()), // damage / damage_buffer — ignore for now
-            3 => Ok(()), // frame — callback not implemented yet
+            3 => {
+                // frame(callback: new_id)
+                // Register a frame callback.  We store it and fire wl_callback.done
+                // in drain_pending_wayland_commits() after the frame is rendered.
+                // If the client registered multiple callbacks before committing, the
+                // last one wins (the spec says only one per commit is sensible).
+                let callback_id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                // Create the WlCallback object so the client can track it.
+                let cb_inner = ObjectInner::Rc(Rc::new(RefCell::new(CallbackObject)));
+                client.add_object(
+                    callback_id,
+                    Object::new::<wl_callback::WlCallback>(callback_id, cb_inner),
+                );
+                self.pending_frame_callback = Some(callback_id);
+                Ok(())
+            }
             4 | 5 => Ok(()), // set_opaque_region / set_input_region — ignore
             6 => {
                 // commit — publish a new frame
+                let frame_callback = self.pending_frame_callback.take()
+                    .map(|id| id.as_id());
+                let buffer_id = self.attached_buffer_id;
                 if let Some(info) = self.attached_buffer {
                     if info.vaddr != 0 {
+                        let layer_info = (*self.layer_registry).borrow()
+                            .get(&self.id.0)
+                            .copied();
                         (*self.pending_commits).borrow_mut().push(SurfaceCommit {
                             pid: self.pid,
                             surface_id: self.id.0,
@@ -134,6 +257,9 @@ impl ObjectLogic for LunasSurface {
                             width: info.width,
                             height: info.height,
                             stride: info.stride,
+                            buffer_id,
+                            frame_callback,
+                            layer_info,
                         });
                     }
                 }
@@ -476,6 +602,53 @@ pub fn make_wayland_window(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// LunasXdgPositioner  (xdg_positioner) — no-op; all positioning hints ignored
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgPositioner;
+
+impl ObjectLogic for LunasXdgPositioner {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        _opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        Ok(()) // set_size / set_anchor_rect / etc. — all ignored
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgPopup  (xdg_popup) — minimal; sends configure(0,0,w,h) immediately
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgPopup {
+    pub id: ObjectId,
+    pub xdg_surface_id: ObjectId,
+    pub surface_id: ObjectId,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasXdgPopup {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => Ok(()), // grab
+            2 => Ok(()), // reposition
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Shared keyboard registry
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -492,6 +665,10 @@ pub type SharedPointers = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
 pub struct LunasXdgWmBase {
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
+    /// Tracks this client's own ObjectId so the compositor can send ping.
+    pub xdg_wm_base_registry: SharedXdgWmBases,
 }
 
 impl ObjectLogic for LunasXdgWmBase {
@@ -505,6 +682,16 @@ impl ObjectLogic for LunasXdgWmBase {
         match opcode {
             0 => Ok(()), // destroy
             1 => {
+                // create_positioner(id: new_id) — creates an xdg_positioner object
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let pos = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgPositioner)));
+                client.add_object(id, Object::new::<xdg_popup::XdgPositioner>(id, pos));
+                Ok(())
+            }
+            2 => {
                 // get_xdg_surface(id: new_id, surface: object_id)
                 let id = match args.first() {
                     Some(Payload::NewId(id)) => *id,
@@ -519,11 +706,13 @@ impl ObjectLogic for LunasXdgWmBase {
                     surface_id,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    toplevel_registry: self.toplevel_registry.clone(),
+                    title_registry: self.title_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<xdg_surface::XdgSurface>(id, xdg_surf));
                 Ok(())
             }
-            2 => Ok(()), // pong — ignored
+            3 => Ok(()), // pong — ignored (we don't track pending pings)
             _ => Err(ServerError::ObjectMismatch),
         }
     }
@@ -539,6 +728,8 @@ pub struct LunasXdgSurface {
     pub surface_id: ObjectId,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
 }
 
 impl ObjectLogic for LunasXdgSurface {
@@ -562,26 +753,59 @@ impl ObjectLogic for LunasXdgSurface {
                     xdg_surface_id: self.id,
                     surface_id: self.surface_id,
                     title: std::string::String::from("Wayland Window"),
+                    app_id: std::string::String::new(),
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    toplevel_registry: self.toplevel_registry.clone(),
+                    title_registry: self.title_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<xdg_toplevel::XdgToplevel>(id, toplevel));
 
+                // Register the toplevel so the compositor can send close events to it.
+                (*self.toplevel_registry).borrow_mut().insert(
+                    (client.client_id(), self.surface_id.0),
+                    id.as_id(),
+                );
+
                 // Send initial configure sequence:
-                // 1. xdg_toplevel.configure(0, 0, []) — client picks its own size
+                // 1. xdg_toplevel.configure(0, 0, [ACTIVATED]) — client picks its own size
+                let mut states_buf = std::vec::Vec::new();
+                // XDG_TOPLEVEL_STATE_ACTIVATED = 4
+                states_buf.extend_from_slice(&4u32.to_ne_bytes());
                 let tl_cfg = xdg_toplevel::Event::Configure {
                     width: 0, height: 0,
-                    states: wayland_proto::wl::wire::Array(std::vec::Vec::new()),
+                    states: wayland_proto::wl::wire::Array(states_buf),
                 };
                 client.send_event(id.as_id(), tl_cfg)?;
 
-                // 2. xdg_surface.configure(serial=1)
-                let surf_cfg = xdg_surface::Event::Configure { serial: 1 };
+                // 2. xdg_surface.configure(serial) — use the surface id as a simple serial
+                let serial = self.surface_id.0;
+                let surf_cfg = xdg_surface::Event::Configure { serial };
                 client.send_event(self.id, surf_cfg)?;
 
                 Ok(())
             }
-            2 => Ok(()), // get_popup — not implemented
+            2 => {
+                // get_popup(id: new_id, parent: object_id, positioner: object_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let popup = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgPopup {
+                    id: id.as_id(),
+                    xdg_surface_id: self.id,
+                    surface_id: self.surface_id,
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                })));
+                client.add_object(id, Object::new::<xdg_popup::XdgPopup>(id, popup));
+                // Send popup configure(x=0, y=0, width=0, height=0) + xdg_surface.configure
+                let pop_cfg = xdg_popup::PopupEvent::Configure { x: 0, y: 0, width: 0, height: 0 };
+                client.send_event(id.as_id(), pop_cfg)?;
+                let surf_cfg = xdg_surface::Event::Configure { serial: self.surface_id.0 };
+                client.send_event(self.id, surf_cfg)?;
+                Ok(())
+            }
             3 => Ok(()), // set_window_geometry — ignored for now
             4 => Ok(()), // ack_configure — acknowledged
             _ => Ok(()),
@@ -598,8 +822,11 @@ pub struct LunasXdgToplevel {
     pub xdg_surface_id: ObjectId,
     pub surface_id: ObjectId,
     pub title: std::string::String,
+    pub app_id: std::string::String,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
 }
 
 impl ObjectLogic for LunasXdgToplevel {
@@ -617,10 +844,18 @@ impl ObjectLogic for LunasXdgToplevel {
                 // set_title(title: string)
                 if let Some(Payload::String(t)) = args.first() {
                     self.title = t.clone();
+                    // Publish to shared title registry for compositor to apply to title bar
+                    (*self.title_registry).borrow_mut().insert(self.surface_id.0, t.clone());
                 }
                 Ok(())
             }
-            3 => Ok(()), // set_app_id
+            3 => {
+                // set_app_id(app_id: string)
+                if let Some(Payload::String(a)) = args.first() {
+                    self.app_id = a.clone();
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -853,6 +1088,524 @@ impl ObjectLogic for LunasXwaylandSurface {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// LunasDecorationManager  (zxdg_decoration_manager_v1)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// labwc is a server-side-decoration (SSD) compositor.  The decoration manager
+// protocol lets clients negotiate with the compositor to agree on who draws
+// the window border.  Lunas always responds with MODE_SERVER_SIDE.
+
+pub struct LunasDecorationManager;
+
+impl ObjectLogic for LunasDecorationManager {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // get_toplevel_decoration(id: new_id, toplevel: object)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let decoration_obj = ObjectInner::Rc(Rc::new(RefCell::new(LunasTopLevelDecoration {
+                    id: id.as_id(),
+                })));
+                client.add_object(
+                    id,
+                    Object::new::<xdg_decoration::ZxdgToplevelDecorationV1>(id, decoration_obj),
+                );
+                // Immediately tell the client to use server-side decorations.
+                client.send_event(
+                    id.as_id(),
+                    xdg_decoration::DecorationEvent::Configure {
+                        mode: xdg_decoration::MODE_SERVER_SIDE,
+                    },
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasTopLevelDecoration  (zxdg_toplevel_decoration_v1)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasTopLevelDecoration {
+    pub id: ObjectId,
+}
+
+impl ObjectLogic for LunasTopLevelDecoration {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 | 2 => {
+                // set_mode(mode) or unset_mode — client preference; we always
+                // enforce server-side decorations as labwc does.
+                client.send_event(
+                    self.id,
+                    xdg_decoration::DecorationEvent::Configure {
+                        mode: xdg_decoration::MODE_SERVER_SIDE,
+                    },
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasWlShell  (wl_shell)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Legacy shell used by old GTK2/Qt4 clients.  Creates a wl_shell_surface and
+// sends an initial configure event so the client can present its window.
+
+pub struct LunasWlShell {
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasWlShell {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => {
+                // get_shell_surface(id: new_id, surface: object)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let surface_id = match args.get(1) {
+                    Some(Payload::ObjectId(s)) => *s,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let shell_surface = ObjectInner::Rc(Rc::new(RefCell::new(LunasWlShellSurface {
+                    id: id.as_id(),
+                    surface_id,
+                    title: std::string::String::new(),
+                    class: std::string::String::new(),
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                })));
+                client.add_object(id, Object::new::<wl_shell::WlShellSurface>(id, shell_surface));
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasWlShellSurface  (wl_shell_surface)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasWlShellSurface {
+    pub id: ObjectId,
+    pub surface_id: ObjectId,
+    pub title: std::string::String,
+    pub class: std::string::String,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasWlShellSurface {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => {
+                // pong(serial) — reply to a ping
+                Ok(())
+            }
+            1 | 2 => {
+                // move / resize — forward to input system later; no-op for now
+                Ok(())
+            }
+            3 => {
+                // set_toplevel — treat as a normal managed window; no-op here,
+                // windows become visible on the next wl_surface.commit.
+                Ok(())
+            }
+            4 | 5 | 6 | 7 => {
+                // set_transient / set_fullscreen / set_popup / set_maximized
+                Ok(())
+            }
+            8 => {
+                // set_title(title: string)
+                if let Some(Payload::String(t)) = args.first() {
+                    self.title = t.clone();
+                }
+                Ok(())
+            }
+            9 => {
+                // set_class(class: string)
+                if let Some(Payload::String(c)) = args.first() {
+                    self.class = c.clone();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgOutputManager  (zxdg_output_manager_v1)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Provides logical coordinates for the output.  Many modern Wayland clients
+// (waybar, foot, swaybg) query this before rendering.
+
+pub struct LunasXdgOutputManager {
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+impl ObjectLogic for LunasXdgOutputManager {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => {
+                // get_xdg_output(id: new_id, output: object) — `output` arg is
+                // the wl_output object; we ignore it (single-output compositor).
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let out = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgOutput {
+                    id: id.as_id(),
+                    screen_w: self.screen_w,
+                    screen_h: self.screen_h,
+                })));
+                client.add_object(id, Object::new::<xdg_output::ZxdgOutputV1>(id, out));
+                // Immediately send all the logical output events then Done.
+                client.send_event(id.as_id(), xdg_output::OutputEvent::LogicalPosition { x: 0, y: 0 })?;
+                client.send_event(id.as_id(), xdg_output::OutputEvent::LogicalSize {
+                    width: self.screen_w as i32,
+                    height: self.screen_h as i32,
+                })?;
+                client.send_event(id.as_id(), xdg_output::OutputEvent::Name {
+                    name: std::string::String::from("Virtual-1"),
+                })?;
+                client.send_event(id.as_id(), xdg_output::OutputEvent::Description {
+                    description: std::string::String::from("Eclipse OS Virtual Display"),
+                })?;
+                client.send_event(id.as_id(), xdg_output::OutputEvent::Done)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgOutput  (zxdg_output_v1)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgOutput {
+    pub id: ObjectId,
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+impl ObjectLogic for LunasXdgOutput {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasLayerShell  (zwlr_layer_shell_v1)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Lets panel / overlay clients (waybar, swaylock, swaybg, mako …) request a
+// dedicated layer surface on a particular compositor layer.
+
+pub struct LunasLayerShell {
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+    pub screen_w: u32,
+    pub screen_h: u32,
+    pub layer_registry: SharedLayerRegistry,
+}
+
+impl ObjectLogic for LunasLayerShell {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => {
+                // get_layer_surface(id, surface, output, layer, namespace)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let surface_id = match args.get(1) {
+                    Some(Payload::ObjectId(s)) => *s,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let layer = match args.get(3) {
+                    Some(Payload::UInt(l)) => *l,
+                    _ => zwlr_layer_shell::LAYER_TOP,
+                };
+                let namespace = match args.get(4) {
+                    Some(Payload::String(s)) => s.clone(),
+                    _ => std::string::String::new(),
+                };
+                // Register a default LayerSurfaceInfo entry immediately so that
+                // `LunasSurface::commit` can include it even before set_anchor / set_size.
+                let default_info = LayerSurfaceInfo {
+                    layer,
+                    anchor: 0,
+                    exclusive_zone: 0,
+                    width: 0,
+                    height: 0,
+                    margin_top: 0,
+                    margin_right: 0,
+                    margin_bottom: 0,
+                    margin_left: 0,
+                };
+                (*self.layer_registry).borrow_mut().insert(surface_id.0, default_info);
+                let layer_surf = ObjectInner::Rc(Rc::new(RefCell::new(LunasLayerSurface {
+                    id: id.as_id(),
+                    surface_id,
+                    layer,
+                    namespace,
+                    anchor: 0,
+                    exclusive_zone: 0,
+                    margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+                    width: 0,
+                    height: 0,
+                    keyboard_interactivity: zwlr_layer_shell::KEYBOARD_INTERACTIVITY_NONE,
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                    layer_registry: self.layer_registry.clone(),
+                    screen_w: self.screen_w,
+                    screen_h: self.screen_h,
+                })));
+                client.add_object(id, Object::new::<zwlr_layer_shell::ZwlrLayerSurfaceV1>(id, layer_surf));
+                // Initial configure: send full-screen size; client will immediately
+                // call set_anchor / set_size and then ack_configure.
+                client.send_event(id.as_id(), zwlr_layer_shell::SurfaceEvent::Configure {
+                    serial: surface_id.0,
+                    width: self.screen_w,
+                    height: self.screen_h,
+                })?;
+                Ok(())
+            }
+            1 => Ok(()), // destroy
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasLayerSurface  (zwlr_layer_surface_v1)
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasLayerSurface {
+    pub id: ObjectId,
+    pub surface_id: ObjectId,
+    pub layer: u32,
+    pub namespace: std::string::String,
+    pub anchor: u32,
+    pub exclusive_zone: i32,
+    pub margin_top: i32,
+    pub margin_right: i32,
+    pub margin_bottom: i32,
+    pub margin_left: i32,
+    pub width: u32,
+    pub height: u32,
+    pub keyboard_interactivity: u32,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+    pub layer_registry: SharedLayerRegistry,
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+impl LunasLayerSurface {
+    /// Synchronise the current state into `layer_registry` and compute the
+    /// compositor-assigned size based on anchor and exclusive_zone.
+    fn sync_registry(&self) {
+        let info = LayerSurfaceInfo {
+            layer: self.layer,
+            anchor: self.anchor,
+            exclusive_zone: self.exclusive_zone,
+            width: self.width,
+            height: self.height,
+            margin_top: self.margin_top,
+            margin_right: self.margin_right,
+            margin_bottom: self.margin_bottom,
+            margin_left: self.margin_left,
+        };
+        (*self.layer_registry).borrow_mut().insert(self.surface_id.0, info);
+    }
+
+    /// Compute the configure size the compositor should send for this layer surface.
+    ///
+    /// Rules:
+    /// - If the client set width/height to 0 we fill the relevant axis based on anchor.
+    /// - Horizontally stretched (LEFT|RIGHT anchored): width = screen_w - margins
+    /// - Vertically stretched (TOP|BOTTOM anchored): height = screen_h - margins
+    fn compute_configured_size(&self) -> (u32, u32) {
+        let anchor = self.anchor;
+        let aw = zwlr_layer_shell::ANCHOR_LEFT | zwlr_layer_shell::ANCHOR_RIGHT;
+        let ah = zwlr_layer_shell::ANCHOR_TOP  | zwlr_layer_shell::ANCHOR_BOTTOM;
+
+        let conf_w = if self.width > 0 {
+            self.width
+        } else if anchor & aw == aw {
+            let m = (self.margin_left + self.margin_right).max(0) as u32;
+            self.screen_w.saturating_sub(m)
+        } else {
+            self.screen_w
+        };
+
+        let conf_h = if self.height > 0 {
+            self.height
+        } else if anchor & ah == ah {
+            let m = (self.margin_top + self.margin_bottom).max(0) as u32;
+            self.screen_h.saturating_sub(m)
+        } else {
+            self.screen_h
+        };
+
+        (conf_w, conf_h)
+    }
+}
+
+impl ObjectLogic for LunasLayerSurface {
+    fn handle_request(
+        &mut self,
+        client: &mut Client,
+        opcode: u16,
+        args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => {
+                // set_size(width, height)
+                if let (Some(Payload::UInt(w)), Some(Payload::UInt(h))) = (args.get(0), args.get(1)) {
+                    self.width = *w;
+                    self.height = *h;
+                }
+                self.sync_registry();
+                Ok(())
+            }
+            1 => {
+                // set_anchor(anchor)
+                if let Some(Payload::UInt(a)) = args.first() {
+                    self.anchor = *a;
+                }
+                self.sync_registry();
+                Ok(())
+            }
+            2 => {
+                // set_exclusive_zone(zone)
+                if let Some(Payload::Int(z)) = args.first() {
+                    self.exclusive_zone = *z;
+                }
+                self.sync_registry();
+                Ok(())
+            }
+            3 => {
+                // set_margin(top, right, bottom, left)
+                if let (Some(Payload::Int(t)), Some(Payload::Int(r)),
+                        Some(Payload::Int(b)), Some(Payload::Int(l)))
+                    = (args.get(0), args.get(1), args.get(2), args.get(3))
+                {
+                    self.margin_top = *t;
+                    self.margin_right = *r;
+                    self.margin_bottom = *b;
+                    self.margin_left = *l;
+                }
+                self.sync_registry();
+                Ok(())
+            }
+            4 => {
+                // set_keyboard_interactivity
+                if let Some(Payload::UInt(k)) = args.first() {
+                    self.keyboard_interactivity = *k;
+                }
+                Ok(())
+            }
+            5 => Ok(()), // get_popup — not implemented
+            6 => {
+                // ack_configure — client acknowledged our configure.
+                // Send a new configure with the correctly computed size so the
+                // client knows the compositor-chosen dimensions.
+                let (cw, ch) = self.compute_configured_size();
+                client.send_event(self.id, zwlr_layer_shell::SurfaceEvent::Configure {
+                    serial: self.surface_id.0.wrapping_add(1),
+                    width: cw,
+                    height: ch,
+                })?;
+                Ok(())
+            }
+            7 => {
+                // destroy — remove from layer registry
+                (*self.layer_registry).borrow_mut().remove(&self.surface_id.0);
+                Ok(())
+            }
+            8 => {
+                // set_layer(layer)
+                if let Some(Payload::UInt(l)) = args.first() {
+                    self.layer = *l;
+                }
+                self.sync_registry();
+                Ok(())
+            }
+            9 => Ok(()), // set_exclusive_edge — ignore
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod wayland_server_tests {
     use super::{LunasCompositor, LunasShm, SharedBuffers, SharedCommits};
@@ -876,18 +1629,25 @@ mod wayland_server_tests {
         )
     }
 
+    fn make_layer_registry() -> super::SharedLayerRegistry {
+        Rc::new(RefCell::new(BTreeMap::new()))
+    }
+
     fn sample_server() -> WaylandServer {
         let (commits, buffers) = make_shared();
+        let lr = make_layer_registry();
         let mut server = WaylandServer::new();
         {
             let c = commits.clone();
             let b = buffers.clone();
+            let l = lr.clone();
             server.register_global(
                 "wl_compositor",
                 4,
                 move || ObjectInner::Rc(Rc::new(RefCell::new(LunasCompositor {
                     pending_commits: c.clone(),
                     buffer_registry: b.clone(),
+                    layer_registry: l.clone(),
                 }))),
                 |id, inner| Object::new::<WlCompositor>(id, inner),
             );
@@ -942,6 +1702,7 @@ mod wayland_server_tests {
         let mut comp = LunasCompositor {
             pending_commits: commits,
             buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
         };
         let args = std::vec![
             wayland_proto::wl::Payload::NewId(NewId(5)),
@@ -949,6 +1710,394 @@ mod wayland_server_tests {
         let r = ObjectLogic::handle_request(&mut comp, &mut client, 0, &args, &[]);
         assert!(r.is_ok(), "create_surface: {:?}", r);
         assert!(client.object_mut(ObjectId(5)).is_ok());
+    }
+
+    // ── New protocol handler tests ───────────────────────────────────────────
+
+    #[test]
+    fn decoration_manager_get_toplevel_returns_server_side_mode() {
+        use super::{LunasDecorationManager};
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(1),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut mgr = LunasDecorationManager;
+        // opcode 1 = get_toplevel_decoration(id: new_id, toplevel: object)
+        let args = std::vec![
+            wayland_proto::wl::Payload::NewId(NewId(10)),
+            wayland_proto::wl::Payload::ObjectId(ObjectId(5)),
+        ];
+        let r = ObjectLogic::handle_request(&mut mgr, &mut client, 1, &args, &[]);
+        assert!(r.is_ok(), "get_toplevel_decoration: {:?}", r);
+        // A zxdg_toplevel_decoration_v1 object should have been registered.
+        assert!(client.object_mut(ObjectId(10)).is_ok(), "decoration object must exist");
+    }
+
+    #[test]
+    fn decoration_manager_destroy_is_noop() {
+        use super::LunasDecorationManager;
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(2),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut mgr = LunasDecorationManager;
+        let r = ObjectLogic::handle_request(&mut mgr, &mut client, 0, &[], &[]);
+        assert!(r.is_ok(), "destroy: {:?}", r);
+    }
+
+    #[test]
+    fn wl_shell_get_shell_surface_creates_object() {
+        use super::LunasWlShell;
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(3),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut shell = LunasWlShell {
+            pending_commits: commits,
+            buffer_registry: buffers,
+        };
+        // opcode 0 = get_shell_surface(id: new_id, surface: object)
+        let args = std::vec![
+            wayland_proto::wl::Payload::NewId(NewId(20)),
+            wayland_proto::wl::Payload::ObjectId(ObjectId(7)),
+        ];
+        let r = ObjectLogic::handle_request(&mut shell, &mut client, 0, &args, &[]);
+        assert!(r.is_ok(), "get_shell_surface: {:?}", r);
+        assert!(client.object_mut(ObjectId(20)).is_ok(), "wl_shell_surface must be registered");
+    }
+
+    #[test]
+    fn xdg_output_manager_get_xdg_output_creates_object_and_sends_events() {
+        use super::LunasXdgOutputManager;
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(4),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut mgr = LunasXdgOutputManager { screen_w: 1920, screen_h: 1080 };
+        // opcode 1 = get_xdg_output(id: new_id, output: object)
+        let args = std::vec![
+            wayland_proto::wl::Payload::NewId(NewId(30)),
+            wayland_proto::wl::Payload::ObjectId(ObjectId(9)),
+        ];
+        let r = ObjectLogic::handle_request(&mut mgr, &mut client, 1, &args, &[]);
+        assert!(r.is_ok(), "get_xdg_output: {:?}", r);
+        assert!(client.object_mut(ObjectId(30)).is_ok(), "zxdg_output_v1 must be registered");
+    }
+
+    #[test]
+    fn layer_shell_get_layer_surface_creates_object_and_sends_configure() {
+        use super::LunasLayerShell;
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(5),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut shell = LunasLayerShell {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
+            screen_w: 1920,
+            screen_h: 1080,
+        };
+        // opcode 0 = get_layer_surface(id, surface, output, layer, namespace)
+        let args = std::vec![
+            wayland_proto::wl::Payload::NewId(NewId(40)),
+            wayland_proto::wl::Payload::ObjectId(ObjectId(11)),
+            wayland_proto::wl::Payload::ObjectId(ObjectId(12)), // output (may be null)
+            wayland_proto::wl::Payload::UInt(
+                wayland_proto::wl::protocols::common::zwlr_layer_shell::LAYER_TOP
+            ),
+            wayland_proto::wl::Payload::String(String::from("waybar")),
+        ];
+        let r = ObjectLogic::handle_request(&mut shell, &mut client, 0, &args, &[]);
+        assert!(r.is_ok(), "get_layer_surface: {:?}", r);
+        assert!(client.object_mut(ObjectId(40)).is_ok(), "zwlr_layer_surface_v1 must be registered");
+    }
+
+    #[test]
+    fn xdg_toplevel_stores_app_id() {
+        use super::{LunasXdgToplevel, SharedCommits, SharedBuffers};
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(6),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut toplevel = LunasXdgToplevel {
+            id: ObjectId(50),
+            xdg_surface_id: ObjectId(49),
+            surface_id: ObjectId(48),
+            title: String::from("My App"),
+            app_id: String::new(),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+        };
+        // opcode 3 = set_app_id(app_id: string)
+        let args = std::vec![
+            wayland_proto::wl::Payload::String(String::from("com.example.myapp")),
+        ];
+        let r = ObjectLogic::handle_request(&mut toplevel, &mut client, 3, &args, &[]);
+        assert!(r.is_ok(), "set_app_id: {:?}", r);
+        assert_eq!(toplevel.app_id, "com.example.myapp");
+    }
+
+    /// wl_display.sync must immediately fire wl_callback.done and wl_display.delete_id.
+    /// Without this, wl_display_roundtrip() in libwayland-client stalls forever.
+    #[test]
+    fn wl_display_sync_fires_done_and_delete_id() {
+        use wayland_proto::wl::protocols::common::wl_display;
+        let mut server = sample_server();
+        let con = Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2)));
+        server.add_client(ClientId(99), con);
+
+        // Build a wl_display.sync(callback=NewId(5)) request
+        let msg = wl_display::Request::Sync { callback: NewId(5) }
+            .into_raw(ObjectId(1));
+        let mut buf = [0u8; 256];
+        let mut handles = Vec::new();
+        let len = msg.serialize(&mut buf, &mut handles).expect("serialize sync");
+        let r = server.process_message(ClientId(99), &buf[..len], &[]);
+        assert!(r.is_ok(), "wl_display.sync: {:?}", r);
+        // The callback object must have been created
+        let client = server.clients.get_mut(&ClientId(99)).expect("client");
+        assert!(
+            client.object_mut(ObjectId(5)).is_ok(),
+            "wl_callback object id 5 must exist after sync"
+        );
+    }
+
+    /// wl_surface.frame must register a WlCallback object and include it in the
+    /// SurfaceCommit so the compositor can fire done after rendering.
+    #[test]
+    fn wl_surface_frame_creates_callback_in_commit() {
+        use super::LunasSurface;
+        use wayland_proto::wl::server::objects::CallbackObject;
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(7),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut surface = LunasSurface {
+            id: ObjectId(3),
+            pid: 7,
+            attached_buffer: None,
+            attached_buffer_id: None,
+            pending_frame_callback: None,
+            pending_commits: commits.clone(),
+            buffer_registry: buffers.clone(),
+            layer_registry: make_layer_registry(),
+        };
+
+        // opcode 3 = frame(callback: new_id(6))
+        let r = ObjectLogic::handle_request(
+            &mut surface,
+            &mut client,
+            3,
+            &[wayland_proto::wl::Payload::NewId(NewId(6))],
+            &[],
+        );
+        assert!(r.is_ok(), "frame: {:?}", r);
+        assert_eq!(surface.pending_frame_callback, Some(NewId(6)));
+        // WlCallback object must have been registered in client
+        assert!(client.object_mut(ObjectId(6)).is_ok(), "wl_callback must exist");
+
+        // Inject a buffer so commit does something
+        let info = super::BufferInfo { vaddr: 0xDEAD, width: 64, height: 64, stride: 256, format: 1 };
+        (*buffers).borrow_mut().insert(ObjectId(8), info);
+        surface.attached_buffer = Some(info);
+        surface.attached_buffer_id = Some(ObjectId(8));
+
+        // opcode 6 = commit
+        let r = ObjectLogic::handle_request(&mut surface, &mut client, 6, &[], &[]);
+        assert!(r.is_ok(), "commit: {:?}", r);
+
+        // Commit must carry the frame callback
+        let pending = (*commits).borrow();
+        assert_eq!(pending.len(), 1, "one commit expected");
+        assert_eq!(pending[0].frame_callback, Some(ObjectId(6)), "commit must carry callback id");
+        assert_eq!(pending[0].buffer_id, Some(ObjectId(8)), "commit must carry buffer id");
+        // Pending callback cleared after commit
+        assert_eq!(surface.pending_frame_callback, None, "pending_frame_callback must be cleared after commit");
+    }
+
+    /// wl_compositor.create_region (opcode 1) must register a LunasRegion object.
+    /// Previously this returned ObjectMismatch, causing crashes in GTK4/Qt clients.
+    #[test]
+    fn compositor_create_region_registers_object() {
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(8),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut comp = super::LunasCompositor {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
+        };
+        let args = std::vec![wayland_proto::wl::Payload::NewId(NewId(55))];
+        let r = ObjectLogic::handle_request(&mut comp, &mut client, 1, &args, &[]);
+        assert!(r.is_ok(), "create_region: {:?}", r);
+        assert!(client.object_mut(ObjectId(55)).is_ok(), "wl_region object must exist");
+    }
+
+    /// xdg_toplevel.set_title must publish to the shared title registry.
+    #[test]
+    fn xdg_toplevel_set_title_publishes_to_registry() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry: super::SharedTitles = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(9),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut toplevel = super::LunasXdgToplevel {
+            id: ObjectId(60),
+            xdg_surface_id: ObjectId(59),
+            surface_id: ObjectId(58),
+            title: String::new(),
+            app_id: String::new(),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry: title_registry.clone(),
+        };
+        let r = ObjectLogic::handle_request(
+            &mut toplevel,
+            &mut client,
+            2, // set_title
+            &[wayland_proto::wl::Payload::String(String::from("My Wayland App"))],
+            &[],
+        );
+        assert!(r.is_ok(), "set_title: {:?}", r);
+        let reg = (*title_registry).borrow();
+        assert_eq!(reg.get(&58u32).map(|s| s.as_str()), Some("My Wayland App"));
+    }
+
+    /// LunasXdgSurface.get_toplevel must register the toplevel in toplevel_registry.
+    #[test]
+    fn xdg_surface_get_toplevel_registers_toplevel_id() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry: super::SharedToplevels = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry: super::SharedTitles = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(10),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut xdg_surf = super::LunasXdgSurface {
+            id: ObjectId(70),
+            surface_id: ObjectId(71),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry: toplevel_registry.clone(),
+            title_registry,
+        };
+        let r = ObjectLogic::handle_request(
+            &mut xdg_surf,
+            &mut client,
+            1, // get_toplevel
+            &[wayland_proto::wl::Payload::NewId(NewId(72))],
+            &[],
+        );
+        assert!(r.is_ok(), "get_toplevel: {:?}", r);
+        // The registry must now contain (ClientId(10), 71) → ObjectId(72)
+        use wayland_proto::wl::server::client::ClientId;
+        let reg = (*toplevel_registry).borrow();
+        assert_eq!(reg.get(&(ClientId(10), 71u32)), Some(&ObjectId(72)));
+    }
+
+    /// xdg_wm_base opcode 1 (create_positioner) must register an XdgPositioner object.
+    #[test]
+    fn xdg_wm_base_create_positioner_registers_object() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let xdg_wm_base_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(11),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut wm_base = super::LunasXdgWmBase {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+            xdg_wm_base_registry,
+        };
+        // opcode 1 = create_positioner(id: new_id(80))
+        let r = ObjectLogic::handle_request(
+            &mut wm_base, &mut client, 1,
+            &[wayland_proto::wl::Payload::NewId(NewId(80))],
+            &[],
+        );
+        assert!(r.is_ok(), "create_positioner: {:?}", r);
+        assert!(client.object_mut(ObjectId(80)).is_ok(), "xdg_positioner must exist");
+    }
+
+    /// xdg_wm_base opcode 2 (get_xdg_surface) must register an XdgSurface object.
+    #[test]
+    fn xdg_wm_base_get_xdg_surface_uses_opcode_2() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let xdg_wm_base_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(12),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut wm_base = super::LunasXdgWmBase {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+            xdg_wm_base_registry,
+        };
+        // opcode 2 = get_xdg_surface(id: new_id(81), surface: ObjectId(82))
+        let r = ObjectLogic::handle_request(
+            &mut wm_base, &mut client, 2,
+            &[
+                wayland_proto::wl::Payload::NewId(NewId(81)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(82)),
+            ],
+            &[],
+        );
+        assert!(r.is_ok(), "get_xdg_surface: {:?}", r);
+        assert!(client.object_mut(ObjectId(81)).is_ok(), "xdg_surface must exist");
+    }
+
+    /// xdg_surface.get_popup (opcode 2) must create an XdgPopup and send configure.
+    #[test]
+    fn xdg_surface_get_popup_creates_popup_object() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(13),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut xdg_surf = super::LunasXdgSurface {
+            id: ObjectId(90),
+            surface_id: ObjectId(91),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+        };
+        // opcode 2 = get_popup(id: new_id(92), parent: ObjectId(93), positioner: ObjectId(94))
+        let r = ObjectLogic::handle_request(
+            &mut xdg_surf, &mut client, 2,
+            &[
+                wayland_proto::wl::Payload::NewId(NewId(92)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(93)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(94)),
+            ],
+            &[],
+        );
+        assert!(r.is_ok(), "get_popup: {:?}", r);
+        assert!(client.object_mut(ObjectId(92)).is_ok(), "xdg_popup must exist");
     }
 }
 

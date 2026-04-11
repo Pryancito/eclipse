@@ -13,18 +13,22 @@ pub use libc;
 
 pub mod backend;
 pub mod compositor;
+pub mod config;
 pub mod desktop;
 pub mod display;
 pub mod input;
 pub mod ipc;
+pub mod menu;
 pub mod painter;
 pub mod render;
 pub mod state;
 pub mod assets;
 pub mod style_engine;
 pub mod protocol;
+pub mod switcher;
 pub mod widgets;
 pub mod wayland_socket;
+pub mod window_rules;
 pub mod xwayland;
 
 #[cfg(target_os = "eclipse")]

@@ -49,6 +49,8 @@ impl Space {
     pub fn window_under_cursor(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.window_count).rev() {
             let w = &self.windows[i];
+            // Layer surfaces don't receive regular window focus
+            if matches!(w.content, WindowContent::Layer { .. }) { continue; }
             if !matches!(w.content, WindowContent::None) && !w.minimized && !w.closing && w.contains(px, py) {
                 return Some(i);
             }

@@ -75,6 +75,7 @@ impl Interface for WlCompositor {
     const VERSION: u32 = 4;
     const PAYLOAD_TYPES: &'static [&'static [PayloadType]] = &[
         &[PayloadType::NewId], // create_surface
+        &[PayloadType::NewId], // create_region
     ];
 
     fn new(con: Rc<RefCell<dyn Connection>>, id: ObjectId) -> Self {
