@@ -62,6 +62,10 @@ pub type SharedToplevels = Rc<RefCell<BTreeMap<(ClientId, u32), ObjectId>>>;
 /// Populated by `xdg_toplevel.set_title`; read by the compositor to keep title bars fresh.
 pub type SharedTitles = Rc<RefCell<BTreeMap<u32, std::string::String>>>;
 
+/// Shared registry mapping ClientId → xdg_wm_base ObjectId.
+/// Used by the compositor to send `xdg_wm_base.ping` and verify client responsiveness.
+pub type SharedXdgWmBases = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // LunasCompositor  (wl_compositor)
@@ -572,6 +576,8 @@ pub struct LunasXdgWmBase {
     pub buffer_registry: SharedBuffers,
     pub toplevel_registry: SharedToplevels,
     pub title_registry: SharedTitles,
+    /// Tracks this client's own ObjectId so the compositor can send ping.
+    pub xdg_wm_base_registry: SharedXdgWmBases,
 }
 
 impl ObjectLogic for LunasXdgWmBase {

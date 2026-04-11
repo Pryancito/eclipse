@@ -99,6 +99,8 @@ pub struct LunasState {
     pub buffer_registry: SharedBuffers,
     /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
     pub keyboard_registry: SharedKeyboards,
+    /// Maps ClientId → xdg_wm_base ObjectId — used to dispatch periodic pings.
+    pub xdg_wm_base_registry: crate::protocol::SharedXdgWmBases,
     /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
     pub pointer_registry: SharedPointers,
     /// Maps (ClientId, surface_id) → xdg_toplevel ObjectId for close dispatch.
@@ -184,6 +186,7 @@ impl LunasState {
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            xdg_wm_base_registry: Rc::new(RefCell::new(BTreeMap::new())),
             toplevel_registry: Rc::new(RefCell::new(BTreeMap::new())),
             title_registry: Rc::new(RefCell::new(BTreeMap::new())),
             xwayland_serials: Rc::new(RefCell::new(BTreeMap::new())),
@@ -799,7 +802,24 @@ impl LunasState {
         }
 
 
-        // Update window animations
+        // Periodically ping all Wayland xdg_wm_base clients to detect hangs.
+        // Clients are expected to respond with pong; if they don't, a future
+        // implementation can mark them unresponsive.  We send every 300 frames
+        // (~5 seconds at 60 fps) to amortise the overhead.
+        if self.counter % 300 == 1 {
+            use wayland_proto::wl::protocols::common::xdg_wm_base;
+            let ping_serial = self.wayland_serial;
+            let wm_base_ids: std::vec::Vec<(ClientId, ObjectId)> = (*self.xdg_wm_base_registry)
+                .borrow()
+                .iter()
+                .map(|(c, o)| (*c, *o))
+                .collect();
+            for (client_id, wm_base_id) in wm_base_ids {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(wm_base_id, xdg_wm_base::Event::Ping { serial: ping_serial });
+                }
+            }
+        }
         let animating = self.space.update_animations(&mut self.surfaces);
         if animating != 0 {
             self.dirty = true;
@@ -2479,6 +2499,20 @@ mod tests {
         // The window title should be updated
         let title = state.space.windows[0].title_str();
         assert_eq!(title, "My New Title", "title bar must reflect set_title");
+    }
+
+    /// xdg_wm_base.ping is sent to registered clients every 300 frames.
+    #[test]
+    fn test_xdg_wm_base_ping_dispatch_no_panic() {
+        use wayland_proto::wl::server::client::ClientId;
+        use wayland_proto::wl::ObjectId;
+        let mut state = LunasState::new().expect("init");
+        // Register a fake xdg_wm_base object for a client that doesn't exist.
+        // The ping dispatch must not panic even when the client is absent.
+        (*state.xdg_wm_base_registry).borrow_mut().insert(ClientId(777), ObjectId(5));
+        state.counter = 300; // triggers ping (300 % 300 == 0? we use counter % 300 == 1, so advance to 301)
+        state.counter = 301;
+        let _ = state.update(); // should not panic
     }
 
 }

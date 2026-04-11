@@ -31,6 +31,7 @@ fn main() {
     let buffer_registry = state.buffer_registry.clone();
     let toplevel_registry = state.toplevel_registry.clone();
     let title_registry = state.title_registry.clone();
+    let xdg_wm_base_registry = state.xdg_wm_base_registry.clone();
 
     {
         let c = pending_commits.clone();
@@ -78,7 +79,9 @@ fn main() {
         let b = buffer_registry.clone();
         let tl = toplevel_registry.clone();
         let ti = title_registry.clone();
-        state.protocol.register_global(
+        let wmb = xdg_wm_base_registry.clone();
+        let wmb2 = xdg_wm_base_registry.clone();
+        state.protocol.register_global_with_post_bind(
             "xdg_wm_base", 2,
             move || {
                 let xdg = lunas::protocol::LunasXdgWmBase {
@@ -86,6 +89,7 @@ fn main() {
                     buffer_registry: b.clone(),
                     toplevel_registry: tl.clone(),
                     title_registry: ti.clone(),
+                    xdg_wm_base_registry: wmb.clone(),
                 };
                 wayland_proto::wl::server::objects::ObjectInner::Rc(
                     std::rc::Rc::new(core::cell::RefCell::new(xdg))
@@ -94,6 +98,11 @@ fn main() {
             |id, inner| wayland_proto::wl::server::objects::Object::new::<
                 wayland_proto::wl::protocols::common::xdg_wm_base::XdgWmBase
             >(id, inner),
+            // Post-bind: register this client's xdg_wm_base ObjectId for ping dispatch.
+            Some(Box::new(move |obj_id, client: &mut wayland_proto::wl::server::client::Client| {
+                (*wmb2).borrow_mut().insert(client.client_id(), obj_id);
+                Ok(())
+            })),
         );
         eprintln!("[LUNAS] Registered xdg_wm_base");
     }
