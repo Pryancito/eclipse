@@ -33,10 +33,14 @@ trampoline_start:
     mov eax, [0x1000 + T_CR3]
     mov cr3, eax
 
-    # 3. Enable Long Mode (EFER.LME)
+    # 3. Enable Long Mode (EFER.LME) and No-Execute Enable (EFER.NXE)
+    # NXE (bit 11 = 0x800) must be set alongside LME so that the NX bit (bit 63)
+    # in page-table entries is valid. Without NXE, bit 63 is a reserved bit and
+    # any PTE written with NX=1 (e.g. by mprotect for RELRO) causes a #PF with
+    # error code RSVD=1 on this AP core.
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 0x100
+    or eax, 0x900
     wrmsr
 
     # 4. Enable Paging and Protected Mode
