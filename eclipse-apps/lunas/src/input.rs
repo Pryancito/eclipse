@@ -946,6 +946,10 @@ pub struct InputState {
     pub pending_snp_mouse_move: Option<(f32, f32)>,
     /// Pending wl_pointer.button event: (linux_button_code, pressed).
     pub pending_snp_mouse_button: Option<(u32, bool)>,
+    /// Pending vertical scroll (wl_pointer.axis) event for the focused SNP window.
+    /// evdev REL_WHEEL convention: positive = toward user (scroll up),
+    ///                              negative = away from user (scroll down).
+    pub pending_snp_scroll: Option<i32>,
     /// Whether the Alt-Tab window switcher overlay is active.
     pub alt_tab_active: bool,
     /// Index into alt_tab_indices of the currently highlighted window.
@@ -1042,6 +1046,7 @@ impl InputState {
             pending_snp_key: None,
             pending_snp_mouse_move: None,
             pending_snp_mouse_button: None,
+            pending_snp_scroll: None,
             alt_tab_active: false,
             alt_tab_index: 0,
             alt_tab_indices: [0usize; 16],
@@ -1887,6 +1892,12 @@ impl InputState {
                                             )
                                         };
                                     }
+                                }
+                                // Forward scroll to Wayland/SNP windows via pending field.
+                                // evdev REL_WHEEL: value > 0 = toward user (scroll up),
+                                //                  value < 0 = away (scroll down).
+                                if let WindowContent::Snp { .. } = windows[focused].content {
+                                    self.pending_snp_scroll = Some(event.value);
                                 }
                             }
                         }
