@@ -172,7 +172,20 @@ impl Filesystem for EclipseFSFuse {
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
         let mut reader = self.reader.lock().unwrap();
         
-        // Use read_file_content: symlinks store their target as content.
+        // Validate that the inode is a symlink before reading its content.
+        match reader.read_node_metadata(ino as u32) {
+            Ok(node) => {
+                if node.kind != NodeKind::Symlink {
+                    reply.error(ENOENT);
+                    return;
+                }
+            }
+            Err(_) => {
+                reply.error(ENOENT);
+                return;
+            }
+        }
+        // Node is confirmed to be a symlink; read its target (stored as content).
         match reader.read_file_content(ino as u32) {
             Ok(data) => {
                 reply.data(&data);

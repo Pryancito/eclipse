@@ -227,8 +227,11 @@ impl EclipseFSReader {
                 break;
             }
 
-            let tag = self.file.read_u16::<LittleEndian>()?;
-            let length = self.file.read_u32::<LittleEndian>()? as usize;
+            // Read the 6-byte TLV header in a single operation and parse it.
+            let mut tlv_hdr = [0u8; 6];
+            self.file.read_exact(&mut tlv_hdr)?;
+            let tag = u16::from_le_bytes([tlv_hdr[0], tlv_hdr[1]]);
+            let length = u32::from_le_bytes([tlv_hdr[2], tlv_hdr[3], tlv_hdr[4], tlv_hdr[5]]) as usize;
             consumed += 6;
 
             if consumed + length > tlv_total {
@@ -406,7 +409,9 @@ impl EclipseFSReader {
         if !self.content_offset_cache.contains_key(&inode) {
             self.read_node_internal(inode, false)?;
         }
-        match self.content_offset_cache.get(&inode).copied() {
+        // Use a direct copy to avoid a second HashMap lookup.
+        let cached = self.content_offset_cache.get(&inode).copied();
+        match cached {
             None => Ok(Vec::new()),
             Some((content_offset, content_length)) => {
                 self.file.seek(SeekFrom::Start(content_offset))?;
@@ -434,7 +439,9 @@ impl EclipseFSReader {
         if !self.content_offset_cache.contains_key(&inode) {
             self.read_node_internal(inode, false)?;
         }
-        match self.content_offset_cache.get(&inode).copied() {
+        // Use a direct copy to avoid a second HashMap lookup.
+        let cached = self.content_offset_cache.get(&inode).copied();
+        match cached {
             None => Ok(Vec::new()),
             Some((content_offset, content_length)) => {
                 if offset >= content_length as u64 {
