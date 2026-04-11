@@ -250,6 +250,10 @@ struct TerminalApp {
     /// Whether Left-Alt or Right-Alt is currently held down.
     /// Used to prefix key sequences with ESC (xterm Meta mode).
     alt_pressed: bool,
+    /// Whether any Shift key is currently held down.
+    shift_pressed: bool,
+    /// Whether any Ctrl key is currently held down.
+    ctrl_pressed: bool,
     /// Tracks CSI ?1004 h/l in PTY output to gate focus-event forwarding.
     focus_tracker: FocusModeTracker,
 }
@@ -608,6 +612,8 @@ impl TerminalApp {
             last_title: [0; 32],
             serial: 1,
             alt_pressed: false,
+            shift_pressed: false,
+            ctrl_pressed: false,
             focus_tracker: FocusModeTracker::new(),
         })
     }
@@ -746,33 +752,96 @@ impl TerminalApp {
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                                     let state = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
-                                    // Convert evdev keycode → PS/2 Set-1 scancode expected by pc_keyboard.
-                                    // Lunas sends evdev_key = ps2_code + 8, so we subtract 8 to recover the
-                                    // PS/2 code.  Set the break-bit (0x80) on key-release.
-                                    let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
+                                    // Wayland sends XKB keycodes (= evdev + 8).
+                                    // For standard non-extended keys, evdev == PS/2 Set-1 make code,
+                                    // so sc == PS/2 and handle_keyboard() works correctly.
+                                    // Navigation keys (evdev ≥ 102) don't share PS/2 codes and are
+                                    // intercepted below with proper ANSI escape sequences.
+                                    let sc  = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
 
-                                    // ── Alt key tracking (xterm Meta mode) ─────────────
-                                    // PS/2 0x38 = L-Alt, 0x64 = R-Alt.
-                                    if sc == 0x38 || sc == 0x64 {
-                                        self.alt_pressed = state != 0;
+                                    // ── Modifier tracking (fallback; authoritative state from opcode=4) ─
+                                    if sc == 0x38 || sc == 0x64 { self.alt_pressed  = state != 0; }
+                                    if sc == 0x2A || sc == 0x36 { self.shift_pressed = state != 0; }
+                                    if sc == 0x1D || sc == 0x61 { self.ctrl_pressed  = state != 0; }
+
+                                    // ── Navigation / extended-key intercept ─────────────────────────
+                                    // Navigation keys have evdev codes that don't map to valid PS/2
+                                    // Set-1 codes via the XKB-8 formula.  We handle them here and
+                                    // emit the correct xterm ANSI escape sequences directly to the PTY.
+                                    let mut handled = false;
+                                    if state != 0 && !MODIFIER_SC.contains(&sc) {
+                                        let (sh, al, ct) = (self.shift_pressed, self.alt_pressed, self.ctrl_pressed);
+                                        match sc {
+                                            // ── Cursor keys (evdev 103-106 → sc 0x67/0x6C/0x6A/0x69) ──
+                                            0x67 => { write_key_seq(self.pty_master_fd, b'A', false, sh, al, ct); handled = true; } // Up
+                                            0x6C => { write_key_seq(self.pty_master_fd, b'B', false, sh, al, ct); handled = true; } // Down
+                                            0x6A => { write_key_seq(self.pty_master_fd, b'C', false, sh, al, ct); handled = true; } // Right
+                                            0x69 => { write_key_seq(self.pty_master_fd, b'D', false, sh, al, ct); handled = true; } // Left
+
+                                            // ── Page scroll / navigation ─────────────────────────────
+                                            0x68 => { // PageUp (evdev 104)
+                                                if sh {
+                                                    for _ in 0..8 { self.terminal.handle_mouse(MouseInput::Scroll(-1)); }
+                                                } else {
+                                                    write_key_seq(self.pty_master_fd, b'5', true, false, al, ct);
+                                                }
+                                                handled = true;
+                                            }
+                                            0x6D => { // PageDown (evdev 109)
+                                                if sh {
+                                                    for _ in 0..8 { self.terminal.handle_mouse(MouseInput::Scroll(1)); }
+                                                } else {
+                                                    write_key_seq(self.pty_master_fd, b'6', true, false, al, ct);
+                                                }
+                                                handled = true;
+                                            }
+                                            0x66 => { write_key_seq(self.pty_master_fd, b'H', false, sh, al, ct); handled = true; } // Home
+                                            0x6B => { write_key_seq(self.pty_master_fd, b'F', false, sh, al, ct); handled = true; } // End
+                                            0x6E => { write_key_seq(self.pty_master_fd, b'2', true,  sh, al, ct); handled = true; } // Insert
+                                            0x6F => { write_key_seq(self.pty_master_fd, b'3', true,  sh, al, ct); handled = true; } // Delete
+
+                                            // ── Function keys F1–F12 with modifier support ──────────
+                                            0x3B => { write_fn_key(self.pty_master_fd,  1, sh, al, ct); handled = true; }
+                                            0x3C => { write_fn_key(self.pty_master_fd,  2, sh, al, ct); handled = true; }
+                                            0x3D => { write_fn_key(self.pty_master_fd,  3, sh, al, ct); handled = true; }
+                                            0x3E => { write_fn_key(self.pty_master_fd,  4, sh, al, ct); handled = true; }
+                                            0x3F => { write_fn_key(self.pty_master_fd,  5, sh, al, ct); handled = true; }
+                                            0x40 => { write_fn_key(self.pty_master_fd,  6, sh, al, ct); handled = true; }
+                                            0x41 => { write_fn_key(self.pty_master_fd,  7, sh, al, ct); handled = true; }
+                                            0x42 => { write_fn_key(self.pty_master_fd,  8, sh, al, ct); handled = true; }
+                                            0x43 => { write_fn_key(self.pty_master_fd,  9, sh, al, ct); handled = true; }
+                                            0x44 => { write_fn_key(self.pty_master_fd, 10, sh, al, ct); handled = true; }
+                                            0x57 => { write_fn_key(self.pty_master_fd, 11, sh, al, ct); handled = true; }
+                                            0x58 => { write_fn_key(self.pty_master_fd, 12, sh, al, ct); handled = true; }
+
+                                            _ => {}
+                                        }
                                     }
 
-                                    // ── ESC prefix for Alt+key (Meta mode) ─────────────
-                                    // When Alt is held and a non-modifier key is pressed,
-                                    // xterm prefixes the key sequence with ESC.
-                                    if self.alt_pressed && state != 0
-                                        && !MODIFIER_SC.contains(&sc)
-                                    {
-                                        let _ = sys_write(self.pty_master_fd, b"\x1b");
+                                    if !handled {
+                                        // ── ESC prefix for Alt+key (xterm Meta mode) ────────────────
+                                        if self.alt_pressed && state != 0 && !MODIFIER_SC.contains(&sc) {
+                                            let _ = sys_write(self.pty_master_fd, b"\x1b");
+                                        }
+                                        // Feed PS/2 scancode to os-terminal; it handles Ctrl+letter,
+                                        // Shift+letter, Ctrl+Shift, and clipboard via the pty_writer.
+                                        let _ = self.terminal.handle_keyboard(ps2);
                                     }
-
-                                    // handle_keyboard feeds the PS/2 scancode into pc_keyboard which
-                                    // tracks modifier state internally (Ctrl, Shift, Alt, …) and
-                                    // writes the resulting ANSI/Unicode string directly to the PTY via
-                                    // the pty_writer closure — no extra manual write needed here.
-                                    let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
+                                }
+                            }
+
+                            // wl_keyboard.modifiers (opcode=4): serial, mods_depressed, mods_latched,
+                            // mods_locked, group — authoritative XKB modifier state.
+                            // Standard XKB bits: bit0=Shift, bit2=Control, bit3=Mod1(Alt).
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(4) {
+                                let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let mods = match raw.args.get(1) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    self.shift_pressed = (mods & 0x01) != 0;
+                                    self.ctrl_pressed  = (mods & 0x04) != 0;
+                                    self.alt_pressed   = (mods & 0x08) != 0;
                                 }
                             }
 
@@ -783,9 +852,11 @@ impl TerminalApp {
                                 }
                             }
 
-                            // wl_keyboard.leave (opcode=2) — keyboard focus lost
+                            // wl_keyboard.leave (opcode=2) — keyboard focus lost; clear all modifier state
                             if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(2) {
-                                self.alt_pressed = false; // clear Alt state on focus loss
+                                self.alt_pressed   = false;
+                                self.shift_pressed = false;
+                                self.ctrl_pressed  = false;
                                 if self.focus_tracker.enabled {
                                     let _ = sys_write(self.pty_master_fd, b"\x1b[O");
                                 }
@@ -989,6 +1060,55 @@ fn resolve_exec_path(prog: &str) -> std::string::String {
 
     // Fallback: assume /bin/<prog>
     format!("/bin/{}", prog)
+}
+
+/// Write an xterm-style escape sequence for a cursor/navigation key with optional modifiers.
+///
+/// For cursor keys (tilde=false): `\x1b[X`  or  `\x1b[1;<mod>X`  where X ∈ {A,B,C,D,H,F}
+/// For tilde keys   (tilde=true):  `\x1b[N~` or  `\x1b[N;<mod>~` where N is the VT sequence number
+///
+/// The xterm modifier code is:  1 + shift + 2*alt + 4*ctrl
+#[cfg(target_os = "eclipse")]
+fn write_key_seq(fd: usize, code: u8, tilde: bool, shift: bool, alt: bool, ctrl: bool) {
+    let mod_code = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
+    if mod_code == 0 {
+        if tilde {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code, b'~']);
+        } else {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code]);
+        }
+    } else {
+        let m = b'0' + mod_code + 1; // xterm modifier: shift=2, alt=3, ctrl=5, …
+        if tilde {
+            let _ = sys_write(fd, &[b'\x1b', b'[', code, b';', m, b'~']);
+        } else {
+            let _ = sys_write(fd, &[b'\x1b', b'[', b'1', b';', m, code]);
+        }
+    }
+}
+
+/// Write an xterm-style function-key escape sequence for F1–F12.
+///
+/// xterm F-key VT codes (with optional modifier):
+///   F1=11, F2=12, F3=13, F4=14, F5=15, F6=17, F7=18, F8=19, F9=20, F10=21, F11=23, F12=24
+///   Plain:      \x1b[<N>~
+///   With mod:   \x1b[<N>;<mod>~
+#[cfg(target_os = "eclipse")]
+fn write_fn_key(fd: usize, fnum: u8, shift: bool, alt: bool, ctrl: bool) {
+    // VT sequence numbers for F1–F12 (F6 skips 16 to 17, etc.)
+    const VT_FN: [u8; 12] = [11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24];
+    let idx = (fnum as usize).saturating_sub(1);
+    if idx >= VT_FN.len() { return; }
+    let n = VT_FN[idx];
+    let tens = b'0' + n / 10;
+    let ones = b'0' + n % 10;
+    let mod_code = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
+    if mod_code == 0 {
+        let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b'~']);
+    } else {
+        let m = b'0' + mod_code + 1;
+        let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b';', m, b'~']);
+    }
 }
 
 fn main() {
