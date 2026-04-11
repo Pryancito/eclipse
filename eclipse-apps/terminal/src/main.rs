@@ -16,6 +16,7 @@ use eclipse_syscall::call::{
     exit as sys_exit,
     ioctl as sys_ioctl,
     read as sys_read,
+    set_child_args as sys_set_child_args,
     spawn_with_stdio as sys_spawn_with_stdio,
     wait_pid_nohang as sys_wait_pid_nohang,
     write as sys_write,
@@ -418,7 +419,9 @@ impl TerminalApp {
         let sh_bytes = sh_res.unwrap();
 
         let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
-        if sh_spawn.is_err() {
+        if let Ok(pid) = sh_spawn {
+            let _ = sys_set_child_args(pid, b"sh\0");
+        } else {
             let _ = sys_close(pty_slave_fd);
             return None;
         }
@@ -635,6 +638,7 @@ impl TerminalApp {
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
                     if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
+                        let _ = sys_set_child_args(pid, b"sh\0");
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;

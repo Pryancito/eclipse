@@ -278,13 +278,17 @@ pub extern "C" fn syscall_handler(
         4   => sys_stat(arg1, arg2),
         5   => sys_fstat(arg1, arg2),
         6   => sys_fstatat(0, arg1, arg2, 0x100), // lstat -> AT_SYMLINK_NOFOLLOW (0x100)
+        7   => sys_poll(arg1, arg2, arg3),
         8   => sys_lseek(arg1, arg2 as i64, arg3 as usize),
         9   => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
+        // pread64(fd, buf, count, pos): 4th arg is r10 — musl ld.so lo usa al leer ELF/.so
+        17  => sys_pread64(arg1, arg2, arg3, arg4),
         10  => sys_mprotect(arg1, arg2, arg3),
         11  => sys_munmap(arg1, arg2),
         12  => sys_brk(arg1),
         13  => sys_sigaction(arg1, arg2, arg3),
         14  => sys_sigprocmask(arg1, arg2, arg3),
+        28  => sys_madvise(arg1, arg2, arg3),
         16  => sys_ioctl(arg1, arg2, arg3),
         20  => sys_writev(arg1, arg2, arg3),
         21  => sys_faccessat(0, arg1, arg2, 0),
@@ -328,14 +332,18 @@ pub extern "C" fn syscall_handler(
         118 => sys_getresuid(arg1, arg2, arg3),
         120 => sys_getresgid(arg1, arg2, arg3),
         121 => sys_getpgid(arg1),
+        131 => sys_sigaltstack(arg1, arg2),
         158 => sys_arch_prctl(arg1, arg2),
         170 => sys_sethostname(arg1, arg2),
         186 => sys_gettid(),
+        200 => sys_tkill(arg1, arg2),
         202 => sys_futex(arg1, arg2, arg3, arg4),
         218 => sys_set_tid_address(arg1),
         228 => sys_clock_gettime(arg1, arg2),
         231 => sys_exit(arg1), // Linux exit_group
         247 => sys_getlogin(arg1, arg2),
+        // openat(dirfd, path, flags, mode): mode en r10 — imprescindible para musl (cargar .so)
+        257 => sys_openat(arg1, arg2, arg3, arg4),
         262 => sys_fstatat(arg1, arg2, arg3, arg4),
         269 => sys_faccessat(arg1, arg2, arg3, arg4),
         270 => sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6),
@@ -1054,6 +1062,60 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     u64::MAX
 }
 
+/// pread64(fd, buf, count, offset) — lectura sin avanzar el offset del descriptor (ld-musl / libc).
+fn sys_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
+    if buf_ptr == 0 || count == 0 || count > 32 * 1024 * 1024 {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+    if !is_user_pointer(buf_ptr, count) {
+        return syscall_error_for_current_process(crate::scheme::error::EFAULT as i32);
+    }
+    let Some(pid) = current_process_id() else {
+        return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
+    };
+    let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) else {
+        return syscall_error_for_current_process(crate::scheme::error::EBADF as i32);
+    };
+    let scheme_id = fd_entry.scheme_id;
+    let resource_id = fd_entry.resource_id;
+
+    let saved = match crate::scheme::lseek(scheme_id, resource_id, 0, 1) {
+        Ok(p) => p,
+        Err(_) => return syscall_error_for_current_process(crate::scheme::error::ESPIPE as i32),
+    };
+
+    if crate::scheme::lseek(scheme_id, resource_id, offset as isize, 0).is_err() {
+        let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+
+    let mut total = 0usize;
+    while total < count as usize {
+        let rem = (count as usize) - total;
+        unsafe {
+            let slice =
+                core::slice::from_raw_parts_mut((buf_ptr as *mut u8).add(total), rem);
+            match crate::scheme::read(scheme_id, resource_id, slice) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => {
+                    let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
+                    if e != crate::scheme::error::EAGAIN {
+                        crate::serial::serial_printf(format_args!(
+                            "[SYSCALL] pread64() scheme error: {}\n",
+                            e
+                        ));
+                    }
+                    return (-(e as isize)) as u64;
+                }
+            }
+        }
+    }
+
+    let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
+    total as u64
+}
+
 /// sys_get_last_exec_error - Copy last exec() failure message to user buffer (for init/services)
 fn sys_get_last_exec_error(out_ptr: u64, out_len: u64) -> u64 {
     if out_ptr == 0 || out_len == 0 || out_len > 256 {
@@ -1553,9 +1615,8 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
                 crate::process::update_process(pid, child);
             }
 
-            // Add to scheduler
-            crate::scheduler::enqueue_process(pid);
-            
+            // We do NOT enqueue yet! The caller must call set_child_args (542)
+            // if they want the process to start.
             pid as u64
         },
         Err(e) => {
@@ -1594,6 +1655,9 @@ fn sys_spawn_with_stdio_args(
         core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize)
     }.to_vec();
     PROCESS_ARGS.lock().insert(child_pid_arg as crate::process::ProcessId, args_data);
+    
+    // Now that arguments are registered, we can safely start the process.
+    crate::scheduler::enqueue_process(child_pid_arg as crate::process::ProcessId);
     0
 }
 
@@ -1669,8 +1733,8 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
                 }
             }
 
-            // Now it's safely configured, we can let the scheduler run it
-            crate::scheduler::enqueue_process(pid);
+            // We do NOT enqueue yet! The parent must call set_child_args (542)
+            // to register argv and finally enqueue the process.
             pid as u64
         }
         Err(_) => u64::MAX,
@@ -2015,6 +2079,18 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
         let _ = crate::scheme::close(scheme_id, resource_id);
         syscall_error_for_current_process(crate::scheme::error::ESRCH as i32)
     }
+}
+
+/// Linux `AT_FDCWD` (-100): rutas absolutas/relativas al cwd del proceso (aquí raíz del VFS).
+const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+
+/// openat(dirfd, pathname, flags, mode) — requerido por musl para abrir bibliotecas compartidas.
+fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
+    if dirfd != LINUX_AT_FDCWD {
+        // Sin fd de directorio real: solo soportamos AT_FDCWD (caso habitual de ld-musl).
+        return syscall_error_for_current_process(crate::scheme::error::EBADF as i32);
+    }
+    sys_open(path_ptr, flags, mode)
 }
 
 /// sys_close - Close a file descriptor
@@ -2711,6 +2787,22 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             target_addr = candidate;
         }
 
+        // MAP_FIXED (0x10): ld-musl fija la dirección de carga de DSO; hay que sustituir cualquier
+        // mapeo previo en ese rango (PTE + VMA) para que el enlace dinámico funcione.
+        const MAP_FIXED: u64 = 0x10;
+        if addr != 0 && (flags & MAP_FIXED) != 0 {
+            if (addr & 0xFFF) != 0 {
+                drop(r);
+                drop(proc);
+                return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+            }
+            target_addr = addr;
+            memory::unmap_user_range(page_table_phys, target_addr, aligned_length);
+            let t0 = target_addr;
+            let t1 = target_addr.saturating_add(aligned_length);
+            r.vmas.retain(|vma| vma.end <= t0 || vma.start >= t1);
+        }
+
         // Map pages with real physical frames. For shared file-backed mappings, we attempt
         // to use fmap to get the direct physical address. For private mappings (anonymous 
         // or file-backed), we allocate new frames and copy data if needed.
@@ -3128,6 +3220,38 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, _timeout: u64) -> u64 {
     }
 }
 
+/// Block the current process for `ms` timer ticks (1 ms per tick at 1000 Hz PIT).
+/// Used by `nanosleep` and Linux `poll`.
+fn process_sleep_ms(ms: u64) -> u64 {
+    if ms == 0 {
+        yield_cpu();
+        return 0;
+    }
+
+    let current_tick = crate::interrupts::ticks();
+    let wake_tick = current_tick.saturating_add(ms);
+
+    if let Some(pid) = current_process_id() {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let slot = crate::ipc::pid_to_slot_fast(pid);
+            {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(slot_idx) = slot {
+                    if let Some(p) = table[slot_idx].as_mut() {
+                        if p.id == pid {
+                            p.state = crate::process::ProcessState::Blocked;
+                        }
+                    }
+                }
+            }
+            crate::scheduler::add_sleep(pid, wake_tick);
+        });
+    }
+
+    yield_cpu();
+    0
+}
+
 /// sys_nanosleep - Sleep for specified time
 /// 
 /// Arguments:
@@ -3158,46 +3282,94 @@ fn sys_nanosleep(req: u64) -> u64 {
         .saturating_mul(1000)
         .saturating_add(tv_nsec as u64 / 1_000_000);
 
-    if ms == 0 {
-        // Zero-duration sleep: just yield once to be cooperative
-        yield_cpu();
+    process_sleep_ms(ms)
+}
+
+/// Linux `tkill` / `tgkill`-style: señal a un hilo por TID (aquí mismo modelo de proceso que `kill`).
+fn sys_tkill(tid: u64, sig: u64) -> u64 {
+    let target = tid as ProcessId;
+    if crate::process::get_process(target).is_none() {
+        return syscall_error_for_current_process(3); // ESRCH
+    }
+    sys_kill(tid, sig)
+}
+
+/// Linux `poll(2)` — multiplexación mínima para musl/cargo (POLLIN/POLLOUT en fds válidos).
+fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
+    const POLLIN: i16 = 0x0001;
+    const POLLPRI: i16 = 0x0002;
+    const POLLOUT: i16 = 0x0004;
+    const POLLNVAL: i16 = 0x0020;
+
+    let timeout = timeout_raw as i32;
+    let Some(pid) = current_process_id() else {
+        return linux_abi_error(9);
+    };
+
+    // `poll(NULL, 0, timeout)` se usa como temporizador.
+    if nfds == 0 {
+        if timeout == 0 {
+            return 0;
+        }
+        if timeout < 0 {
+            process_sleep_ms(u64::saturating_sub(u64::MAX, 1) / 2);
+            return 0;
+        }
+        process_sleep_ms(timeout as u32 as u64);
         return 0;
     }
 
-    let current_tick = crate::interrupts::ticks();
-    let wake_tick = current_tick.saturating_add(ms);
-
-    // Mark process as Blocked and register in the sleep queue.
-    // The timer interrupt will re-enqueue it when wake_tick is reached.
-    // NOTE: We set the state directly in PROCESS_TABLE because update_process()
-    // intentionally preserves the original state (to protect against races).
-    if let Some(pid) = current_process_id() {
-        // PROCESS_TABLE is indexed by slot, not by PID value.  After slot reuse,
-        // a process can have PID ≥ 64, so table[pid as usize] would be out-of-bounds.
-        // Use pid_to_slot_fast() to obtain the correct slot index.
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let slot = crate::ipc::pid_to_slot_fast(pid);
-            {
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(slot_idx) = slot {
-                    if let Some(p) = table[slot_idx].as_mut() {
-                        // Safety check: ensure we are still targeting the correct PID
-                        if p.id == pid {
-                             p.state = crate::process::ProcessState::Blocked;
-                        }
-                    }
-                }
-            } // Release PROCESS_TABLE lock before add_sleep to avoid deadlock
-            
-            // Add to sleep queue while still in the interrupt-disabled section
-            // to prevent preemption between marking as Blocked and enqueuing.
-            crate::scheduler::add_sleep(pid, wake_tick);
-        });
+    let Some(total) = nfds.checked_mul(8) else {
+        return linux_abi_error(22);
+    };
+    if total > 1024 * 1024 {
+        return linux_abi_error(22);
+    }
+    if fds_ptr == 0 || !is_user_pointer(fds_ptr, total) {
+        return linux_abi_error(14);
     }
 
-    // Yield CPU; we will be rescheduled by the timer once the sleep expires.
-    yield_cpu();
-    0
+    let mut ready: u64 = 0;
+    for i in 0..nfds {
+        let base = fds_ptr + i * 8;
+        let fd = unsafe { (base as *const i32).read_unaligned() };
+        let events = unsafe { ((base + 4) as *const i16).read_unaligned() };
+        let revents_ptr = (base + 6) as *mut i16;
+
+        if fd < 0 {
+            unsafe { revents_ptr.write_unaligned(0) };
+            continue;
+        }
+
+        let fd_u = fd as usize;
+        let rev = if crate::fd::fd_get(pid, fd_u).is_none() {
+            ready = ready.saturating_add(1);
+            POLLNVAL
+        } else {
+            let mut r: i16 = 0;
+            if events & POLLIN != 0 || events & POLLPRI != 0 {
+                r |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                r |= POLLOUT;
+            }
+            if r != 0 {
+                ready = ready.saturating_add(1);
+            }
+            r
+        };
+        unsafe { revents_ptr.write_unaligned(rev) };
+    }
+
+    if ready == 0 && timeout != 0 {
+        if timeout < 0 {
+            process_sleep_ms(u64::saturating_sub(u64::MAX, 1) / 2);
+        } else {
+            process_sleep_ms(timeout as u32 as u64);
+        }
+    }
+
+    ready
 }
 
 
@@ -4312,6 +4484,32 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
 ///   [0..8]  → handler (usize): 0 = SIG_DFL, 1 = SIG_IGN, else = fn ptr
 ///
 /// Devuelve 0 en éxito, u64::MAX en error.
+/// Linux `madvise(2)` — sin efecto en Eclipse; musl/cargo lo usan (p. ej. MADV_DONTNEED).
+fn sys_madvise(_addr: u64, _len: u64, _advice: u64) -> u64 {
+    0
+}
+
+/// Linux `sigaltstack(2)` — pila alternativa para manejadores; stub para musl.
+fn sys_sigaltstack(ss: u64, oss: u64) -> u64 {
+    // stack_t: ss_sp (8), ss_flags (4), padding (4), ss_size (8)
+    const STACK_T_BYTES: u64 = 24;
+    const SS_DISABLE: u32 = 2;
+
+    if ss != 0 && !is_user_pointer(ss, STACK_T_BYTES) {
+        return linux_abi_error(14);
+    }
+    if oss != 0 {
+        if !is_user_pointer(oss, STACK_T_BYTES) {
+            return linux_abi_error(14);
+        }
+        unsafe {
+            core::ptr::write_bytes(oss as *mut u8, 0, STACK_T_BYTES as usize);
+            ((oss + 8) as *mut u32).write_unaligned(SS_DISABLE);
+        }
+    }
+    0
+}
+
 /// sys_sigprocmask - change signal mask
 /// how: 0=SIG_BLOCK, 1=SIG_UNBLOCK, 2=SIG_SETMASK
 fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {

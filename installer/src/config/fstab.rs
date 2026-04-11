@@ -20,6 +20,9 @@ tmpfs           /tmp            tmpfs   defaults        0       0
             efi_part, root_part
         );
 
+        if let Some(parent) = fstab_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("Failed to create {:?}", parent))?;
+        }
         fs::write(&fstab_path, content).with_context(|| format!("Failed to write fstab to {:?}", fstab_path))?;
         println!("         ✓ /etc/fstab generado");
         Ok(())

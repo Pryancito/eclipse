@@ -70,7 +70,7 @@ pub fn vars() -> Vec<(String, String)> {
 }
 
 pub fn home_dir() -> Option<PathBuf> {
-    Some(PathBuf::from(String::from("/")))
+    Some(PathBuf::from(String::from("/root")))
 }
 
 #[derive(Debug, PartialEq, Eq)]

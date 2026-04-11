@@ -69,7 +69,18 @@ impl Command {
         let name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("?");
 
         match eclipse_syscall::call::spawn(&buf, Some(name)) {
-            Ok(pid) => Ok(Child { pid: pid as pid_t }),
+            Ok(pid) => {
+                // Ensure the process starts by setting at least argv[0]
+                let mut arg_bytes = Vec::new();
+                arg_bytes.extend_from_slice(self.program.as_bytes());
+                arg_bytes.push(0);
+                for arg in &self.args {
+                    arg_bytes.extend_from_slice(arg.as_bytes());
+                    arg_bytes.push(0);
+                }
+                let _ = eclipse_syscall::call::set_child_args(pid, &arg_bytes);
+                Ok(Child { pid: pid as pid_t })
+            }
             Err(_) => Err(Error::new(ErrorKind::Other, "spawn failed")),
         }
     }
@@ -79,7 +90,18 @@ impl Command {
         let buf = fs::read(&self.program)?;
         
         match eclipse_syscall::call::spawn_with_stdio(&buf, Some(&self.program), fd_in, fd_out, fd_err) {
-            Ok(pid) => Ok(Child { pid: pid as pid_t }),
+            Ok(pid) => {
+                // Ensure the process starts by setting at least argv[0]
+                let mut arg_bytes = Vec::new();
+                arg_bytes.extend_from_slice(self.program.as_bytes());
+                arg_bytes.push(0);
+                for arg in &self.args {
+                    arg_bytes.extend_from_slice(arg.as_bytes());
+                    arg_bytes.push(0);
+                }
+                let _ = eclipse_syscall::call::set_child_args(pid, &arg_bytes);
+                Ok(Child { pid: pid as pid_t })
+            }
             Err(_) => Err(Error::new(ErrorKind::Other, "spawn_with_stdio syscall failed")),
         }
     }

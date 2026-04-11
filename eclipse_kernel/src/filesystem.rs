@@ -644,6 +644,83 @@ impl Filesystem {
         None
     }
 
+    /// Lee el TLV NODE_TYPE (1=file, 2=directorio, 3=symlink). Sin TLV se asume fichero.
+    fn scan_node_type_from_buf(buf: &[u8], start_pos: usize) -> Option<u8> {
+        let mut tlv_pos = start_pos;
+        while tlv_pos + 6 <= buf.len() {
+            let tag = u16::from_le_bytes([buf[tlv_pos], buf[tlv_pos + 1]]);
+            let length = u32::from_le_bytes([
+                buf[tlv_pos + 2],
+                buf[tlv_pos + 3],
+                buf[tlv_pos + 4],
+                buf[tlv_pos + 5],
+            ]) as usize;
+            if tag == tlv_tags::NODE_TYPE && length >= 1 && tlv_pos + 6 + length <= buf.len() {
+                return Some(buf[tlv_pos + 6]);
+            }
+            if tlv_pos + 6 + length > buf.len() {
+                break;
+            }
+            tlv_pos += 6 + length;
+        }
+        None
+    }
+
+    pub fn inode_kind(inode: u32) -> Result<NodeKind, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        let entry = Self::read_inode_entry(inode)?;
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
+        let raw_record_size = u32::from_le_bytes([
+            header_buf[4], header_buf[5], header_buf[6], header_buf[7],
+        ]) as usize;
+        let scan_len = if raw_record_size < 8 {
+            BLOCK_SIZE
+        } else if raw_record_size > MAX_RECORD_SIZE {
+            2 * BLOCK_SIZE
+        } else {
+            core::cmp::min(raw_record_size, 2 * BLOCK_SIZE)
+        };
+        let mut scan_buf = vec![0u8; scan_len];
+        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
+        let start = if raw_record_size < 8 { 16usize } else { 8usize };
+        if let Some(k) = Self::scan_node_type_from_buf(&scan_buf, start) {
+            return Ok(match k {
+                1 => NodeKind::File,
+                2 => NodeKind::Directory,
+                3 => NodeKind::Symlink,
+                _ => NodeKind::File,
+            });
+        }
+        if raw_record_size < 8 {
+            if let Some(k) = Self::scan_node_type_from_buf(&scan_buf, 8) {
+                return Ok(match k {
+                    1 => NodeKind::File,
+                    2 => NodeKind::Directory,
+                    3 => NodeKind::Symlink,
+                    _ => NodeKind::File,
+                });
+            }
+        }
+        Ok(NodeKind::File)
+    }
+
+    /// Destino UTF-8 del symlink (TLV CONTENT del nodo).
+    pub fn read_symlink_target(inode: u32) -> Result<String, &'static str> {
+        let len = Self::content_len_by_inode(inode)?;
+        if len == 0 {
+            return Err("Empty symlink");
+        }
+        if len > 4096 {
+            return Err("Symlink target too long");
+        }
+        let mut buf = vec![0u8; len];
+        let n = Self::read_file_by_inode_at(inode, &mut buf, 0)?;
+        buf.truncate(n);
+        String::from_utf8(buf).map_err(|_| "Symlink target not UTF-8")
+    }
+
     /// Returns the content length from the CONTENT TLV.
     /// Uses the same scan logic as `get_file_metadata` to stay consistent.
     pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
@@ -968,9 +1045,29 @@ pub fn mkdir_path(path: &str, _mode: u32) -> Result<(), usize> {
     }
 }
 
-/// Leer un fichero completo asignando un buffer del tamaño exacto del TLV `CONTENT`.
-pub fn read_file_alloc(path: &str) -> Result<Vec<u8>, &'static str> {
-    let inode = Filesystem::lookup_path(path)?;
+/// Resuelve ruta de symlink relativo/absoluto (comportamiento tipo open(2)).
+fn resolve_symlink_path(link_path: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        return String::from(target);
+    }
+    let link_path = link_path.trim_end_matches('/');
+    let parent = if let Some((p, _name)) = link_path.rsplit_once('/') {
+        if p.is_empty() {
+            "/"
+        } else {
+            p
+        }
+    } else {
+        "/"
+    };
+    if parent == "/" {
+        alloc::format!("/{}", target)
+    } else {
+        alloc::format!("{}/{}", parent, target)
+    }
+}
+
+fn read_file_alloc_inode(inode: u32) -> Result<Vec<u8>, &'static str> {
     let len = Filesystem::content_len_by_inode(inode)?;
     if len == 0 {
         return Err("Empty file");
@@ -982,6 +1079,28 @@ pub fn read_file_alloc(path: &str) -> Result<Vec<u8>, &'static str> {
     let n = Filesystem::read_file_by_inode_at(inode, &mut buf, 0)?;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// Leer un fichero completo; sigue cadenas de symlinks (p. ej. `/lib/ld-musl-x86_64.so.1`).
+pub fn read_file_alloc(path: &str) -> Result<Vec<u8>, &'static str> {
+    read_file_alloc_follow(path, 0)
+}
+
+fn read_file_alloc_follow(path: &str, depth: usize) -> Result<Vec<u8>, &'static str> {
+    const MAX_SYMLINK_DEPTH: usize = 16;
+    if depth >= MAX_SYMLINK_DEPTH {
+        return Err("Too many symlink levels");
+    }
+    let inode = Filesystem::lookup_path(path)?;
+    match Filesystem::inode_kind(inode)? {
+        NodeKind::Symlink => {
+            let target = Filesystem::read_symlink_target(inode)?;
+            let next = resolve_symlink_path(path, target.as_str());
+            read_file_alloc_follow(next.as_str(), depth + 1)
+        }
+        NodeKind::Directory => Err("Path is a directory"),
+        NodeKind::File => read_file_alloc_inode(inode),
+    }
 }
 
 /// Check if filesystem is mounted

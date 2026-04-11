@@ -1664,7 +1664,7 @@ EOF
     rm boot_temp.cfg
     
     # 2. Crear la partición EclipseFS
-    local ROOT_SIZE=4096
+    local ROOT_SIZE=8192
     local ROOT_OFFSET=130
     print_status "Creando partición EclipseFS (${ROOT_SIZE}MB) sin root..."
     rm -f "$ROOT_IMG"

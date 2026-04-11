@@ -584,10 +584,11 @@ fn readline(hist: &mut History, prompt: &str) -> Option<String> {
 
 fn main() {
     sh_println("Eclipse OS v3 Shell (sh)");
-    unsafe { CWD = String::from("/"); }
+    unsafe { CWD = String::from("/root"); }
+    std::env::set_var("HOME", "/root");
     std::env::set_var("SHELL", "/bin/sh");
-    std::env::set_var("USER", "moebius");
-    std::env::set_var("PWD", "/");
+    std::env::set_var("USER", "root");
+    std::env::set_var("PWD", "/root");
     update_terminal_size();
 
     let mut hist = History::new();

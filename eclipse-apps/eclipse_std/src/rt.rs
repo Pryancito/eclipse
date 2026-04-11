@@ -29,8 +29,10 @@ pub fn init_runtime() {
     crate::heap::init_heap();
     // Variables de entorno por defecto para todos los procesos de Eclipse OS
     crate::env::set_var("TERM", "xterm-256color");
-    crate::env::set_var("HOME", "/");
-    crate::env::set_var("PATH", "/bin");
+    crate::env::set_var("HOME", "/root");
+    crate::env::set_var("USER", "root");
+    crate::env::set_var("SHELL", "/bin/sh");
+    crate::env::set_var("PATH", "/bin:/usr/bin");
     // Leer argv del kernel (registrado por el padre al hacer spawn)
     crate::env::init_args();
     unsafe {
