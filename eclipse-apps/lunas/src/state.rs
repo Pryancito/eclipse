@@ -368,14 +368,16 @@ impl LunasState {
                             // Dispatch pending vertical scroll (wl_pointer.axis).
                             // evdev REL_WHEEL: value > 0 = toward user (up); Wayland axis positive = down.
                             if let Some(scroll_val) = self.input.pending_snp_scroll.take() {
-                                if let Some(client) = self.protocol.clients.get(&focused_client) {
-                                    let axis_value: f32 = if scroll_val > 0 { -15.0 } else { 15.0 };
-                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Axis {
-                                        time: self.counter as u32,
-                                        axis: wl_pointer::AXIS_VERTICAL_SCROLL,
-                                        value: axis_value,
-                                    });
-                                    let _ = client.send_event(ptr_id, wl_pointer::Event::Frame);
+                                if scroll_val != 0 {
+                                    if let Some(client) = self.protocol.clients.get(&focused_client) {
+                                        let axis_value: f32 = if scroll_val > 0 { -15.0 } else { 15.0 };
+                                        let _ = client.send_event(ptr_id, wl_pointer::Event::Axis {
+                                            time: self.counter as u32,
+                                            axis: wl_pointer::AXIS_VERTICAL_SCROLL,
+                                            value: axis_value,
+                                        });
+                                        let _ = client.send_event(ptr_id, wl_pointer::Event::Frame);
+                                    }
                                 }
                             }
                         } else {

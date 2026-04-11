@@ -672,7 +672,7 @@ impl TerminalApp {
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let axis  = match raw.args.get(1) { Some(Payload::UInt(v))  => *v, _ => 0 };
                                     let value = match raw.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
-                                    if axis == 0 {
+                                    if axis == 0 && value != 0.0 {
                                         // Normalise to ±1 lines per wheel click
                                         let lines: isize = if value > 0.0 { 1 } else { -1 };
                                         self.terminal.handle_mouse(MouseInput::Scroll(lines));

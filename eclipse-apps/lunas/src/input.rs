@@ -946,8 +946,9 @@ pub struct InputState {
     pub pending_snp_mouse_move: Option<(f32, f32)>,
     /// Pending wl_pointer.button event: (linux_button_code, pressed).
     pub pending_snp_mouse_button: Option<(u32, bool)>,
-    /// Pending wl_pointer.axis (vertical scroll) event for the focused SNP window.
-    /// Positive = scroll down, negative = scroll up (same convention as evdev REL_WHEEL).
+    /// Pending vertical scroll (wl_pointer.axis) event for the focused SNP window.
+    /// evdev REL_WHEEL convention: positive = toward user (scroll up),
+    ///                              negative = away from user (scroll down).
     pub pending_snp_scroll: Option<i32>,
     /// Whether the Alt-Tab window switcher overlay is active.
     pub alt_tab_active: bool,
