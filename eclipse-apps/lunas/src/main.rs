@@ -189,6 +189,93 @@ fn main() {
         eprintln!("[LUNAS] Registered xwayland_shell_v1");
     }
 
+    // ── zxdg_decoration_manager_v1 — SSD negotiation (core labwc protocol) ──
+    {
+        state.protocol.register_global(
+            "zxdg_decoration_manager_v1", 1,
+            || {
+                let mgr = lunas::protocol::LunasDecorationManager;
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(mgr))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::xdg_decoration::ZxdgDecorationManagerV1
+            >(id, inner),
+        );
+        eprintln!("[LUNAS] Registered zxdg_decoration_manager_v1");
+    }
+
+    // ── wl_shell — legacy shell for old GTK2/Qt4 clients ─────────────────
+    {
+        let c = pending_commits.clone();
+        let b = buffer_registry.clone();
+        state.protocol.register_global(
+            "wl_shell", 1,
+            move || {
+                let shell = lunas::protocol::LunasWlShell {
+                    pending_commits: c.clone(),
+                    buffer_registry: b.clone(),
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(shell))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::wl_shell::WlShell
+            >(id, inner),
+        );
+        eprintln!("[LUNAS] Registered wl_shell");
+    }
+
+    // ── zxdg_output_manager_v1 — extended output info ─────────────────────
+    {
+        let w = state.backend.fb.info.width as u32;
+        let h = state.backend.fb.info.height as u32;
+        state.protocol.register_global(
+            "zxdg_output_manager_v1", 3,
+            move || {
+                let mgr = lunas::protocol::LunasXdgOutputManager {
+                    screen_w: w,
+                    screen_h: h,
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(mgr))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::xdg_output::ZxdgOutputManagerV1
+            >(id, inner),
+        );
+        eprintln!("[LUNAS] Registered zxdg_output_manager_v1");
+    }
+
+    // ── zwlr_layer_shell_v1 — layer shell for panels / overlays ──────────
+    {
+        let c = pending_commits.clone();
+        let b = buffer_registry.clone();
+        let w = state.backend.fb.info.width as u32;
+        let h = state.backend.fb.info.height as u32;
+        state.protocol.register_global(
+            "zwlr_layer_shell_v1", 4,
+            move || {
+                let shell = lunas::protocol::LunasLayerShell {
+                    pending_commits: c.clone(),
+                    buffer_registry: b.clone(),
+                    screen_w: w,
+                    screen_h: h,
+                };
+                wayland_proto::wl::server::objects::ObjectInner::Rc(
+                    std::rc::Rc::new(core::cell::RefCell::new(shell))
+                )
+            },
+            |id, inner| wayland_proto::wl::server::objects::Object::new::<
+                wayland_proto::wl::protocols::common::zwlr_layer_shell::ZwlrLayerShellV1
+            >(id, inner),
+        );
+        eprintln!("[LUNAS] Registered zwlr_layer_shell_v1");
+    }
+
     eprintln!("[LUNAS] All globals registered, entering main loop...");
 
     // ── Start Wayland Unix socket server ─────────────────────────────────────
