@@ -810,17 +810,17 @@ fn draw_taskbar(
     let bar_h = TASKBAR_HEIGHT;
     let bar_y = fb_h - bar_h;
 
-    // Taskbar background
+    // Taskbar background — dark steel teal
     let taskbar_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb888::new(15, 18, 35))
+        .fill_color(Rgb888::new(34, 44, 52))
         .build();
     let _ = Rectangle::new(Point::new(0, bar_y), Size::new(fb_w as u32, bar_h as u32))
         .into_styled(taskbar_style)
         .draw(fb);
 
-    // Top border accent line
+    // Top border accent line — subtle steel separator
     let border_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb888::new(0, 100, 200))
+        .fill_color(Rgb888::new(52, 70, 82))
         .build();
     let _ = Rectangle::new(Point::new(0, bar_y), Size::new(fb_w as u32, 1))
         .into_styled(border_style)
@@ -829,9 +829,9 @@ fn draw_taskbar(
     // ── Launcher button ──
     let launcher_is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::Launcher;
     let launcher_bg = if input.launcher_active {
-        Rgb888::new(0, 128, 255)
+        Rgb888::new(62, 95, 118)   // active — brighter steel accent
     } else {
-        Rgb888::new(30, 40, 60)
+        Rgb888::new(42, 56, 66)    // resting — matches titlebar palette
     };
     let launcher_style = PrimitiveStyleBuilder::new().fill_color(launcher_bg).build();
     let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
@@ -840,7 +840,7 @@ fn draw_taskbar(
     // Hover border when not active
     if launcher_is_hovered && !input.launcher_active {
         let launcher_hover_style = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(0, 140, 255))
+            .stroke_color(Rgb888::new(85, 115, 138))
             .stroke_width(1)
             .build();
         let _ = Rectangle::new(Point::new(4, bar_y + 6), Size::new(36, 32))
@@ -865,9 +865,9 @@ fn draw_taskbar(
         let ws_x = 48 + (ws as i32) * 26;
         let active = ws == input.current_workspace;
         let ws_color = if active {
-            Rgb888::new(0, 128, 255)
+            Rgb888::new(62, 95, 118)   // active workspace — steel-blue highlight
         } else {
-            Rgb888::new(40, 50, 70)
+            Rgb888::new(42, 56, 66)    // inactive
         };
         let ws_style = PrimitiveStyleBuilder::new().fill_color(ws_color).build();
         let _ = Rectangle::new(Point::new(ws_x, bar_y + 12), Size::new(20, 20))
@@ -876,9 +876,9 @@ fn draw_taskbar(
 
         // Workspace number label
         let ws_label_color = if active {
-            Rgb888::WHITE
+            Rgb888::new(215, 222, 232)   // bright when active
         } else {
-            Rgb888::new(120, 130, 160)
+            Rgb888::new(110, 130, 148)   // dim when inactive
         };
         let ws_label_style = MonoTextStyle::new(&FONT_6X12, ws_label_color);
         let ws_char_buf = [b'0' + ws + 1];
@@ -896,7 +896,7 @@ fn draw_taskbar(
             });
             if ws_has_windows {
                 let presence_style = PrimitiveStyleBuilder::new()
-                    .fill_color(Rgb888::new(80, 100, 160))
+                    .fill_color(Rgb888::new(85, 115, 138))
                     .build();
                 let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
                     .into_styled(presence_style)
@@ -905,7 +905,7 @@ fn draw_taskbar(
         } else {
             // Active workspace: always show a bright dot at the bottom of the indicator
             let presence_style = PrimitiveStyleBuilder::new()
-                .fill_color(Rgb888::new(0, 200, 255))
+                .fill_color(Rgb888::new(130, 175, 210))
                 .build();
             let _ = Rectangle::new(Point::new(ws_x + 8, bar_y + 38), Size::new(4, 2))
                 .into_styled(presence_style)
@@ -916,7 +916,7 @@ fn draw_taskbar(
     // ── Separator after workspaces ──
     let sep_x = TASKBAR_APPS_START_X - 6;
     let sep_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb888::new(50, 60, 90))
+        .fill_color(Rgb888::new(52, 68, 80))
         .build();
     let _ = Rectangle::new(Point::new(sep_x, bar_y + 8), Size::new(1, 28))
         .into_styled(sep_style)
@@ -1080,13 +1080,13 @@ fn draw_taskbar(
         let is_minimized = w.minimized;
         let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::WindowTask(w_idx);
         let task_bg = if is_hovered {
-            Rgb888::new(45, 60, 95)
+            Rgb888::new(50, 68, 80)
         } else if focused {
-            Rgb888::new(35, 50, 80)
+            Rgb888::new(44, 60, 72)
         } else if is_minimized {
-            Rgb888::new(18, 22, 38)
+            Rgb888::new(32, 42, 50)
         } else {
-            Rgb888::new(25, 30, 50)
+            Rgb888::new(38, 50, 60)
         };
         let task_style = PrimitiveStyleBuilder::new().fill_color(task_bg).build();
         let _ = Rectangle::new(Point::new(win_x, bar_y + 8), Size::new(win_item_w as u32, 28))
@@ -1096,7 +1096,7 @@ fn draw_taskbar(
         // Left accent bar on focused window task (2px vertical stripe)
         if focused {
             let left_accent_style = PrimitiveStyleBuilder::new()
-                .fill_color(Rgb888::new(0, 150, 255))
+                .fill_color(Rgb888::new(108, 158, 195))
                 .build();
             let _ = Rectangle::new(Point::new(win_x, bar_y + 8), Size::new(2, 28))
                 .into_styled(left_accent_style)
@@ -1157,10 +1157,10 @@ fn draw_taskbar(
             let _ = Text::new("x", Point::new(close_x + 3, bar_y + 22), close_text_style).draw(fb);
         }
 
-        // Bottom focus indicator (full-width blue bar under the button)
+        // Bottom focus indicator (full-width bar under the button)
         if focused {
             let focus_style = PrimitiveStyleBuilder::new()
-                .fill_color(Rgb888::new(0, 128, 255))
+                .fill_color(Rgb888::new(108, 158, 195))
                 .build();
             let _ = Rectangle::new(Point::new(win_x, bar_y + 38), Size::new(win_item_w as u32, 2))
                 .into_styled(focus_style)
@@ -1186,9 +1186,9 @@ fn draw_taskbar(
     // ── System tray area (right side) ──
     let tray_x = tray_start;
 
-    // Subtle tray background tint — visually separates the tray from the window tasks area.
+    // Subtle tray background tint — slightly darker than taskbar.
     let tray_bg_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb888::new(12, 15, 30))
+        .fill_color(Rgb888::new(28, 38, 46))
         .build();
     let _ = Rectangle::new(Point::new(tray_x + 1, bar_y + 1), Size::new((TASKBAR_TRAY_WIDTH - 1) as u32, (bar_h - 1) as u32))
         .into_styled(tray_bg_style)
@@ -1644,89 +1644,113 @@ fn draw_window(
         .draw(fb);
     }
 
-    // ── Window buttons ────────────────────────────────────────────────────────
-    // labwc default: Close → Maximize → Minimize on the right side.
-    let btn_size = theme.button_size;
-    let btn_gap = theme.button_gap;
-    let btn_margin = theme.button_margin;
-    let btn_y = cy + bw + (tb_h - btn_size) / 2;
+    // ── Window buttons — labwc/Openbox flat style ─────────────────────────────
+    // Full-height flat rectangles, flush left/right.
+    // RIGHT:  Minimize | Maximize | Close  (adjacent, flush with right edge)
+    // LEFT:   Window-menu button (flush with left edge, inside border)
+    let btn_w = theme.button_size;   // button width; height = tb_h (full titlebar)
+    let btn_h = tb_h;
+    let close_x = cx + cw - bw - btn_w;
+    let max_x   = close_x - btn_w;
+    let min_x   = max_x   - btn_w;
+    let wmenu_x = cx + bw;           // window-menu flush with left inner edge
 
-    // Close (right-most)
-    let close_x = cx + cw - bw - btn_margin - btn_size;
-    let close_rgb = if focused { theme.button_close_active } else { theme.button_inactive };
-    let close_fill = Rgb888::new(close_rgb.r, close_rgb.g, close_rgb.b);
-    let close_style = PrimitiveStyleBuilder::new().fill_color(close_fill).build();
-    let _ = Circle::new(Point::new(close_x, btn_y), btn_size as u32)
-        .into_styled(close_style)
-        .draw(fb);
-
-    // Maximize
-    let max_x = close_x - btn_gap - btn_size;
-    let max_rgb = if focused { theme.button_max_active } else { theme.button_inactive };
-    let max_fill = Rgb888::new(max_rgb.r, max_rgb.g, max_rgb.b);
-    let max_style = PrimitiveStyleBuilder::new().fill_color(max_fill).build();
-    let _ = Circle::new(Point::new(max_x, btn_y), btn_size as u32)
-        .into_styled(max_style)
-        .draw(fb);
-
-    // Minimize
-    let min_x = max_x - btn_gap - btn_size;
-    let min_rgb = if focused { theme.button_min_active } else { theme.button_inactive };
-    let min_fill = Rgb888::new(min_rgb.r, min_rgb.g, min_rgb.b);
-    let min_style = PrimitiveStyleBuilder::new().fill_color(min_fill).build();
-    let _ = Circle::new(Point::new(min_x, btn_y), btn_size as u32)
-        .into_styled(min_style)
-        .draw(fb);
-
-    // ── Window button icons (focused state) ──────────────────────────────────
-    // When focused, draw a small symbol inside each button circle:
-    //   Close    → × (two crossing diagonal lines)
-    //   Maximize → □ (small square outline)
-    //   Minimize → − (short horizontal dash)
-    if focused {
-        let half = (btn_size / 4).max(2);   // 3 px for btn_size=12
-        let icon_stroke = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(255, 255, 255))
-            .stroke_width(1)
-            .build();
-
-        // Close: ×
-        let ccx = close_x + btn_size / 2;
-        let ccy = btn_y    + btn_size / 2;
-        let _ = Line::new(Point::new(ccx - half, ccy - half), Point::new(ccx + half, ccy + half))
-            .into_styled(icon_stroke).draw(fb);
-        let _ = Line::new(Point::new(ccx + half, ccy - half), Point::new(ccx - half, ccy + half))
-            .into_styled(icon_stroke).draw(fb);
-
-        // Maximize: □
-        let mcx = max_x + btn_size / 2;
-        let mcy = btn_y + btn_size / 2;
+    // Button background — match titlebar (flat/invisible), 6 shades darker
+    let bb_r = title_rgb.r.saturating_sub(6);
+    let bb_g = title_rgb.g.saturating_sub(6);
+    let bb_b = title_rgb.b.saturating_sub(6);
+    let btn_bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(bb_r, bb_g, bb_b))
+        .build();
+    for &bx in &[wmenu_x, min_x, max_x, close_x] {
         let _ = Rectangle::new(
-            Point::new(mcx - half, mcy - half),
-            Size::new((half * 2) as u32, (half * 2) as u32),
+            Point::new(bx, cy + bw),
+            Size::new(btn_w.max(0) as u32, btn_h.max(0) as u32),
         )
+        .into_styled(btn_bg_style)
+        .draw(fb);
+    }
+
+    // 1-px vertical separators between / around the right buttons and after wmenu
+    let sep_r = title_rgb.r.saturating_sub(18);
+    let sep_g = title_rgb.g.saturating_sub(18);
+    let sep_b = title_rgb.b.saturating_sub(18);
+    let sep_btn_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(sep_r, sep_g, sep_b))
+        .build();
+    let _ = Rectangle::new(Point::new(wmenu_x + btn_w, cy + bw),
+        Size::new(1, btn_h.max(0) as u32)).into_styled(sep_btn_style).draw(fb);
+    for &sx in &[min_x, max_x, close_x] {
+        let _ = Rectangle::new(Point::new(sx, cy + bw),
+            Size::new(1, btn_h.max(0) as u32)).into_styled(sep_btn_style).draw(fb);
+    }
+
+    // Button icons — using light icon colour on all states
+    let icon_rgb = if focused { theme.label_active_color } else { theme.label_inactive_color };
+    let icon_color = Rgb888::new(icon_rgb.r, icon_rgb.g, icon_rgb.b);
+    let icon_y_center = cy + bw + btn_h / 2;
+    let half = (btn_w / 4).max(2);
+
+    // Window-menu: ● small filled circle
+    let dot_r: i32 = 3;
+    let dot_cx = wmenu_x + btn_w / 2;
+    let dot_style = PrimitiveStyleBuilder::new().fill_color(icon_color).build();
+    let _ = Circle::new(
+        Point::new(dot_cx - dot_r, icon_y_center - dot_r),
+        (dot_r * 2) as u32,
+    )
+    .into_styled(dot_style)
+    .draw(fb);
+
+    // Minimize: − horizontal dash
+    let dash_style = PrimitiveStyleBuilder::new()
+        .stroke_color(icon_color)
+        .stroke_width(2)
+        .build();
+    let dash_cx = min_x + btn_w / 2;
+    let _ = Line::new(
+        Point::new(dash_cx - half, icon_y_center),
+        Point::new(dash_cx + half, icon_y_center),
+    )
+    .into_styled(dash_style)
+    .draw(fb);
+
+    // Maximize: □ small rectangle outline
+    let icon_stroke = PrimitiveStyleBuilder::new()
+        .stroke_color(icon_color)
+        .stroke_width(1)
+        .build();
+    let mcx = max_x + btn_w / 2;
+    let mcy = icon_y_center;
+    let _ = Rectangle::new(
+        Point::new(mcx - half, mcy - half),
+        Size::new((half * 2) as u32, (half * 2) as u32),
+    )
+    .into_styled(icon_stroke)
+    .draw(fb);
+
+    // Close: × two crossing diagonal lines
+    let ccx = close_x + btn_w / 2;
+    let ccy = icon_y_center;
+    let _ = Line::new(Point::new(ccx - half, ccy - half), Point::new(ccx + half, ccy + half))
+        .into_styled(icon_stroke)
+        .draw(fb);
+    let _ = Line::new(Point::new(ccx + half, ccy - half), Point::new(ccx - half, ccy + half))
         .into_styled(icon_stroke)
         .draw(fb);
 
-        // Minimize: −
-        let nicx = min_x + btn_size / 2;
-        let nicy = btn_y + btn_size / 2;
-        let dash_style = PrimitiveStyleBuilder::new()
-            .stroke_color(Rgb888::new(255, 255, 255))
-            .stroke_width(2)
-            .build();
-        let _ = Line::new(Point::new(nicx - half, nicy), Point::new(nicx + half, nicy))
-            .into_styled(dash_style).draw(fb);
-    }
-
-    // ── Title text ────────────────────────────────────────────────────────────
+    // ── Title text — centered between window-menu and minimize button ─────────
     let label_rgb = if focused { theme.label_active_color } else { theme.label_inactive_color };
     let label_color = Rgb888::new(label_rgb.r, label_rgb.g, label_rgb.b);
     let title_text_style = MonoTextStyle::new(&FONT_6X12, label_color);
     let title = window.title_str();
-    // Left-aligned title with a margin from the left border
-    let title_x = cx + bw + 8;
-    let title_y = cy + bw + tb_h / 2 + 4; // vertically centred in title bar
+    // Center the title in the space between the window-menu button and the right buttons
+    let title_area_start = wmenu_x + btn_w + 1;
+    let title_area_end   = min_x.max(title_area_start);
+    let title_area_w     = title_area_end - title_area_start;
+    let title_len_px     = title.len() as i32 * 6;   // FONT_6X12: 6 px/char
+    let title_x = title_area_start + (title_area_w - title_len_px).max(0) / 2;
+    let title_y = cy + bw + tb_h / 2 + 4; // vertically centred
     let _ = Text::new(title, Point::new(title_x, title_y), title_text_style).draw(fb);
 
     // ── Shaded: only title bar visible ───────────────────────────────────────

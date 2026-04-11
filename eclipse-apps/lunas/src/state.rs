@@ -2157,15 +2157,15 @@ mod tests {
         use crate::input::ContextAction;
         use crate::desktop::WallpaperMode;
         let mut state = LunasState::new().expect("init");
-        assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::CosmicTheme);
-
-        state.input.pending_context_action = ContextAction::CycleWallpaper;
-        let _ = state.update();
         assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::SolidColor);
 
         state.input.pending_context_action = ContextAction::CycleWallpaper;
         let _ = state.update();
         assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::Gradient);
+
+        state.input.pending_context_action = ContextAction::CycleWallpaper;
+        let _ = state.update();
+        assert_eq!(state.desktop.wallpaper_mode, WallpaperMode::CosmicTheme);
     }
 
     #[test]

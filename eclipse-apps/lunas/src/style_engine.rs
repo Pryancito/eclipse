@@ -88,37 +88,40 @@ pub struct SsdTheme {
 }
 
 impl SsdTheme {
-    /// labwc "default" theme — based on the Openbox "Clearlooks" look with
-    /// dark colours suitable for Eclipse OS.
+    /// labwc "default" theme — steel-teal palette matching the BL-Lithium / labwc
+    /// look.  Flat full-height title-bar buttons (no coloured circles); consistent
+    /// dark steel-blue throughout.
     pub fn labwc_default() -> Self {
         Self {
-            // Dark slate title bars — active noticeably lighter than inactive
-            title_active_bg: Rgb24::new(42, 46, 64),
-            title_inactive_bg: Rgb24::new(24, 26, 36),
+            // Steel-teal title bars — active slightly lighter than inactive
+            title_active_bg:   Rgb24::new(44, 56, 66),
+            title_inactive_bg: Rgb24::new(36, 46, 54),
 
-            // Title text
-            label_active_color: Rgb24::new(220, 225, 240),
-            label_inactive_color: Rgb24::new(100, 108, 128),
+            // Title text — off-white active, muted grey inactive
+            label_active_color:   Rgb24::new(215, 222, 232),
+            label_inactive_color: Rgb24::new(130, 145, 160),
 
-            // Window borders — thin crisp line; active gets a blue accent
-            border_active_color: Rgb24::new(80, 120, 200),
-            border_inactive_color: Rgb24::new(38, 42, 58),
+            // Window borders — subtle steel; active slightly lighter
+            border_active_color:   Rgb24::new(62, 82, 98),
+            border_inactive_color: Rgb24::new(44, 56, 66),
 
-            // Buttons — macOS-style traffic lights
-            button_close_active: Rgb24::new(235, 64,  52),
-            button_max_active:   Rgb24::new(230, 185, 40),
-            button_min_active:   Rgb24::new(40,  200, 75),
-            button_inactive:     Rgb24::new(58,  62,  78),
-            button_hover:        Rgb24::new(255, 255, 255),
+            // Flat buttons: same fill as title bar — icons carry the visual weight.
+            // button_close_active / button_max_active / button_min_active are the
+            // button background colours; for the flat style they blend into the bar.
+            button_close_active: Rgb24::new(44, 56, 66),
+            button_max_active:   Rgb24::new(44, 56, 66),
+            button_min_active:   Rgb24::new(44, 56, 66),
+            button_inactive:     Rgb24::new(36, 46, 54),
+            button_hover:        Rgb24::new(62, 82, 98),
 
-            // Metrics
+            // Metrics — tight/flat: full-height buttons, no gap, flush with edge
             border_width:    1,
-            padding_height:  4,
-            handle_width:    5,
-            titlebar_height: 26,
-            button_size:     12,
-            button_gap:       6,
-            button_margin:    8,
+            padding_height:  0,
+            handle_width:    4,
+            titlebar_height: 22,
+            button_size:     16,  // button *width* (height = titlebar_height)
+            button_gap:       0,
+            button_margin:    0,
         }
     }
 

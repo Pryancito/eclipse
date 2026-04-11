@@ -145,8 +145,8 @@ impl DesktopShell {
             pinned_count: 0,
             notifications: core::array::from_fn(|_| Notification::default()),
             notification_count: 0,
-            wallpaper_mode: WallpaperMode::CosmicTheme,
-            wallpaper_color: (10, 15, 30),
+            wallpaper_mode: WallpaperMode::SolidColor,
+            wallpaper_color: (58, 78, 88),
             show_clock: true,
             show_battery: true,
             volume_level: 75,
@@ -257,7 +257,7 @@ mod tests {
         let shell = DesktopShell::new();
         assert_eq!(shell.pinned_count, 5);
         assert_eq!(shell.notification_count, 0);
-        assert_eq!(shell.wallpaper_mode, WallpaperMode::CosmicTheme);
+        assert_eq!(shell.wallpaper_mode, WallpaperMode::SolidColor);
     }
 
     #[test]
