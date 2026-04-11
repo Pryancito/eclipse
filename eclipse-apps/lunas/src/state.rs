@@ -491,7 +491,9 @@ impl LunasState {
                     curr_y: (y + (h + ShellWindow::TITLE_H) / 2) as f32,
                     curr_w: 0.0, curr_h: 0.0,
                     minimized: false, maximized: false, closing: false,
+                    shaded: false, above: false,
                     stored_rect: (x, y, w, h + ShellWindow::TITLE_H),
+                    stored_h_before_shade: 0,
                     workspace: self.input.current_workspace,
                     content: WindowContent::Snp {
                         surface_id: commit.surface_id,
@@ -1089,6 +1091,35 @@ impl LunasState {
                     self.input.net_config_active = true;
                     self.dirty = true;
                 }
+                ContextAction::ShadeWindow(idx) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].toggle_shade();
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::MoveWindow(idx) => {
+                    // Begin interactive move: set up drag state in input
+                    if idx < self.space.window_count {
+                        let w = &self.space.windows[idx];
+                        self.input.dragging_window = Some(idx);
+                        self.input.drag_offset_x = w.w / 2;
+                        self.input.drag_offset_y = ShellWindow::TITLE_H / 2;
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ResizeWindow(idx) => {
+                    // Begin interactive resize
+                    if idx < self.space.window_count {
+                        self.input.resizing_window = Some(idx);
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ToggleAlwaysOnTop(idx) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].above = !self.space.windows[idx].above;
+                        self.dirty = true;
+                    }
+                }
                 ContextAction::None => {}
             }
         }
@@ -1240,7 +1271,9 @@ impl LunasState {
                             curr_y: (wy + wh / 2) as f32,
                             curr_w: 0.0, curr_h: 0.0,
                             minimized: false, maximized: false, closing: false,
+                            shaded: false, above: false,
                             stored_rect: (wx, wy, ww, wh),
+                            stored_h_before_shade: 0,
                             workspace: self.input.current_workspace,
                             content: WindowContent::X11 { window_id, pid: client_id },
                             damage: std::vec::Vec::new(),

@@ -29,6 +29,10 @@ pub enum WindowButton {
     Minimize,
     Maximize,
     Close,
+    /// Roll the window up to just its title bar (shade / unshade).
+    Shade,
+    /// Open the window action menu.
+    WindowMenu,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +48,13 @@ pub struct ShellWindow {
     pub minimized: bool,
     pub maximized: bool,
     pub closing: bool,
+    /// When `true` the window is "shaded" — only the title bar is visible.
+    pub shaded: bool,
+    /// When `true` the window stays on top of all other windows.
+    pub above: bool,
     pub stored_rect: (i32, i32, i32, i32),
+    /// Saved height before shading, so we can restore on unshade.
+    pub stored_h_before_shade: i32,
     pub workspace: u8,
     pub content: WindowContent,
     pub damage: Vec<(i32, i32, i32, i32)>,
@@ -59,7 +69,9 @@ impl Default for ShellWindow {
             x: 0, y: 0, w: 0, h: 0,
             curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
             minimized: false, maximized: false, closing: false,
+            shaded: false, above: false,
             stored_rect: (0, 0, 0, 0),
+            stored_h_before_shade: 0,
             workspace: 0,
             content: WindowContent::None,
             damage: Vec::new(),
@@ -76,7 +88,9 @@ impl ShellWindow {
             x: 0, y: 0, w: 0, h: 0,
             curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
             minimized: false, maximized: false, closing: false,
+            shaded: false, above: false,
             stored_rect: (0, 0, 0, 0),
+            stored_h_before_shade: 0,
             workspace: 0,
             content: WindowContent::None,
             damage: Vec::new(),
@@ -86,7 +100,8 @@ impl ShellWindow {
         }
     }
 
-    pub const TITLE_H: i32 = 28;
+    /// Default title-bar height (matched to `SsdTheme::labwc_default().titlebar_height`).
+    pub const TITLE_H: i32 = 24;
 
     pub fn title_bar_contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.x + self.w
@@ -98,19 +113,51 @@ impl ShellWindow {
             && py >= self.y && py < self.y + self.h
     }
 
+    /// Test which title-bar button (if any) was clicked.
+    ///
+    /// Uses the labwc default layout: Close → Maximize → Minimize on the **right**
+    /// side of the title bar.  Each button is 12 px square with a 5 px margin
+    /// from the edge and a 5 px gap between buttons.
     pub fn check_button_click(&self, px: i32, py: i32) -> WindowButton {
         if !self.title_bar_contains(px, py) { return WindowButton::None; }
-        let btn_y = self.y + (Self::TITLE_H - 16) / 2;
-        let btn_margin = 5;
-        let btn_size = 16;
+
+        let btn_size = 12i32;
+        let btn_margin = 6i32;
+        let btn_gap = 5i32;
+        let btn_y = self.y + (Self::TITLE_H - btn_size) / 2;
+
         if py < btn_y || py >= btn_y + btn_size { return WindowButton::None; }
-        let close_x = self.x + self.w - btn_size - btn_margin;
-        if px >= close_x && px < close_x + btn_size { return WindowButton::Close; }
-        let max_x = close_x - btn_size - btn_margin;
-        if px >= max_x && px < max_x + btn_size { return WindowButton::Maximize; }
-        let min_x = max_x - btn_size - btn_margin;
-        if px >= min_x && px < min_x + btn_size { return WindowButton::Minimize; }
+
+        // Right-side buttons (Close, then Maximize, then Minimize from right edge)
+        let close_x = self.x + self.w - btn_margin - btn_size;
+        if px >= close_x && px < close_x + btn_size {
+            return WindowButton::Close;
+        }
+        let max_x = close_x - btn_gap - btn_size;
+        if px >= max_x && px < max_x + btn_size {
+            return WindowButton::Maximize;
+        }
+        let min_x = max_x - btn_gap - btn_size;
+        if px >= min_x && px < min_x + btn_size {
+            return WindowButton::Minimize;
+        }
         WindowButton::None
+    }
+
+    /// Toggle the shaded (roll-up) state.  When shading, the window height is
+    /// reduced to just the title bar; the original height is saved so it can be
+    /// restored on unshade.
+    pub fn toggle_shade(&mut self) {
+        if self.shaded {
+            // Restore
+            self.h = self.stored_h_before_shade.max(Self::TITLE_H * 2);
+            self.shaded = false;
+        } else {
+            // Shade
+            self.stored_h_before_shade = self.h;
+            self.h = Self::TITLE_H;
+            self.shaded = true;
+        }
     }
 
     pub const RESIZE_HANDLE_SIZE: i32 = 16;
@@ -264,9 +311,30 @@ mod tests {
             content: WindowContent::InternalDemo,
             ..Default::default()
         };
-        assert_eq!(win.check_button_click(285, 110), WindowButton::Close);
-        assert_eq!(win.check_button_click(264, 110), WindowButton::Maximize);
-        assert_eq!(win.check_button_click(243, 110), WindowButton::Minimize);
+        // New layout: btn_size=12, btn_margin=6, btn_gap=5, TITLE_H=24
+        // close_x = 100+200-6-12 = 282  → [282..294), centre 288
+        // max_x   = 282-5-12     = 265  → [265..277), centre 271
+        // min_x   = 265-5-12     = 248  → [248..260), centre 254
+        // btn_y   = 100+(24-12)/2 = 106 → [106..118), use 110
+        assert_eq!(win.check_button_click(288, 110), WindowButton::Close);
+        assert_eq!(win.check_button_click(271, 110), WindowButton::Maximize);
+        assert_eq!(win.check_button_click(254, 110), WindowButton::Minimize);
+    }
+
+    #[test]
+    fn test_toggle_shade() {
+        let mut win = ShellWindow {
+            x: 0, y: 0, w: 400, h: 300,
+            content: WindowContent::InternalDemo,
+            ..Default::default()
+        };
+        assert!(!win.shaded);
+        win.toggle_shade();
+        assert!(win.shaded);
+        assert_eq!(win.h, ShellWindow::TITLE_H, "shaded height should be TITLE_H");
+        win.toggle_shade();
+        assert!(!win.shaded);
+        assert_eq!(win.h, 300, "unshaded height should be restored");
     }
 
     #[test]

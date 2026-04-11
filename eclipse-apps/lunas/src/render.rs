@@ -145,6 +145,8 @@ impl FramebufferState {
             drm_fd: 0,
             drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
+            fb_ptr: None,
+            is_fallback: false,
         }
     }
 
@@ -560,11 +562,17 @@ pub fn draw_desktop_shell(
     draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
     // 3. Draw windows (painter's algorithm: back to front)
-    for i in 0..window_count {
-        let w = &windows[i];
-        if w.content == WindowContent::None || w.minimized || w.closing { continue; }
-        if w.workspace != input.current_workspace { continue; }
-        draw_window(fb, w, surfaces, snp_surfaces, x11_surfaces, input.focused_window == Some(i), input.window_decoration_style);
+    // Non-above windows first, then always-on-top windows on top.
+    for pass in 0..2usize {
+        for i in 0..window_count {
+            let w = &windows[i];
+            if w.content == WindowContent::None || w.minimized || w.closing { continue; }
+            if w.workspace != input.current_workspace { continue; }
+            // pass 0 = normal windows; pass 1 = always-on-top
+            if pass == 0 && w.above { continue; }
+            if pass == 1 && !w.above { continue; }
+            draw_window(fb, w, surfaces, snp_surfaces, x11_surfaces, input.focused_window == Some(i), input.window_decoration_style);
+        }
     }
 
     // 3.5. Draw snap zone guides when dragging a window near screen edges/corners
@@ -624,6 +632,12 @@ pub fn draw_desktop_shell(
 
     if input.net_config_active {
         draw_network_config_panel(fb, input);
+    }
+
+    // Alt-Tab switcher overlay (rendered above everything except the cursor)
+    if input.alt_tab_active && input.alt_tab_count > 0 {
+        let indices = &input.alt_tab_indices[..input.alt_tab_count];
+        crate::switcher::draw_switcher(fb, windows, indices, input.alt_tab_index);
     }
 
     // 5. Draw cursor
@@ -1428,8 +1442,14 @@ fn draw_terminal_demo(
     }
 }
 
-/// Draw a single window with decorations.
-/// `decoration_style`: 0 = default (dark blue), 1 = minimal (charcoal), 2 = neon (cyan accent).
+/// Draw a single window with labwc-style Server-Side Decorations (SSD).
+///
+/// The decoration uses `SsdTheme` colours from the active `StyleEngine`.
+/// Layout from top to bottom:
+///   - Border (border_width px) around the entire window
+///   - Title bar (titlebar_height px) with title text and window buttons
+///   - Content area (client-drawn pixels)
+///   - Bottom resize handle (handle_width px) — drawn inside the window rect
 fn draw_window(
     fb: &mut FramebufferState,
     window: &ShellWindow,
@@ -1439,6 +1459,8 @@ fn draw_window(
     focused: bool,
     decoration_style: u8,
 ) {
+    use crate::style_engine::SsdTheme;
+
     let cx = window.curr_x as i32;
     let cy = window.curr_y as i32;
     let cw = window.curr_w as i32;
@@ -1446,64 +1468,110 @@ fn draw_window(
 
     if cw <= 0 || ch <= 0 { return; }
 
-    // Window shadow
+    let theme = SsdTheme::by_index(decoration_style);
+
+    // ── Shadow (offset copy of window rect) ──────────────────────────────────
     let shadow_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb888::new(0, 0, 0))
         .build();
-    let _ = Rectangle::new(Point::new(cx + 4, cy + 4), Size::new(cw as u32, ch as u32))
-        .into_styled(shadow_style)
+    let _ = Rectangle::new(
+        Point::new(cx + 3, cy + 3),
+        Size::new(cw as u32, ch as u32),
+    )
+    .into_styled(shadow_style)
+    .draw(fb);
+
+    // ── Window border ─────────────────────────────────────────────────────────
+    let bw = theme.border_width;
+    let border_rgb = if focused { theme.border_active_color } else { theme.border_inactive_color };
+    let border_color = Rgb888::new(border_rgb.r, border_rgb.g, border_rgb.b);
+    let border_style = PrimitiveStyleBuilder::new()
+        .stroke_color(border_color)
+        .stroke_width(bw as u32)
+        .build();
+    let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ch as u32))
+        .into_styled(border_style)
         .draw(fb);
 
-    // Title bar — colour varies with decoration style
-    let title_color = match decoration_style {
-        1 => if focused { TITLE_MINIMAL_FOCUSED } else { TITLE_MINIMAL_UNFOCUSED }, // minimal
-        2 => if focused { TITLE_NEON_FOCUSED } else { TITLE_NEON_UNFOCUSED },       // neon
-        _ => if focused { TITLE_DEFAULT_FOCUSED } else { TITLE_DEFAULT_UNFOCUSED }, // default
-    };
-    let title_style = PrimitiveStyleBuilder::new().fill_color(title_color).build();
-    let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ShellWindow::TITLE_H as u32))
-        .into_styled(title_style)
-        .draw(fb);
+    // ── Title bar ─────────────────────────────────────────────────────────────
+    let tb_h = theme.titlebar_height;
+    let title_rgb = if focused { theme.title_active_bg } else { theme.title_inactive_bg };
+    let title_bg = Rgb888::new(title_rgb.r, title_rgb.g, title_rgb.b);
+    let title_style = PrimitiveStyleBuilder::new().fill_color(title_bg).build();
+    let _ = Rectangle::new(
+        Point::new(cx + bw, cy + bw),
+        Size::new((cw - bw * 2).max(0) as u32, tb_h.max(0) as u32),
+    )
+    .into_styled(title_style)
+    .draw(fb);
 
-    // Neon style: a bright accent line at the top of the title bar
+    // Neon style: bright accent line at the top
     if decoration_style == 2 {
-        let neon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 240, 220)).build();
-        let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, 2))
-            .into_styled(neon_style)
-            .draw(fb);
+        let neon_style = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb888::new(0, 240, 220))
+            .build();
+        let _ = Rectangle::new(
+            Point::new(cx + bw, cy + bw),
+            Size::new((cw - bw * 2).max(0) as u32, 2),
+        )
+        .into_styled(neon_style)
+        .draw(fb);
     }
 
-    // Title text
-    let title_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
-    let title = window.title_str();
-    let _ = Text::new(title, Point::new(cx + 8, cy + 18), title_text_style).draw(fb);
+    // ── Window buttons ────────────────────────────────────────────────────────
+    // labwc default: Close → Maximize → Minimize on the right side.
+    let btn_size = theme.button_size;
+    let btn_gap = theme.button_gap;
+    let btn_margin = theme.button_margin;
+    let btn_y = cy + bw + (tb_h - btn_size) / 2;
 
-    // Window control buttons
-    let close_x = cx + cw - 21;
-    let btn_y = cy + 6;
-    let btn_size = 12;
-    
-    // Close (Red)
-    let close_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(220, 50, 50)).build();
-    let _ = Circle::new(Point::new(close_x + 2, btn_y + 2), btn_size)
+    // Close (right-most)
+    let close_x = cx + cw - bw - btn_margin - btn_size;
+    let close_rgb = if focused { theme.button_close_active } else { theme.button_inactive };
+    let close_fill = Rgb888::new(close_rgb.r, close_rgb.g, close_rgb.b);
+    let close_style = PrimitiveStyleBuilder::new().fill_color(close_fill).build();
+    let _ = Circle::new(Point::new(close_x, btn_y), btn_size as u32)
         .into_styled(close_style)
         .draw(fb);
 
-    // Maximize (Yellow)
-    let max_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(230, 180, 50)).build();
-    let _ = Circle::new(Point::new(close_x - 19, btn_y + 2), btn_size)
+    // Maximize
+    let max_x = close_x - btn_gap - btn_size;
+    let max_rgb = if focused { theme.button_max_active } else { theme.button_inactive };
+    let max_fill = Rgb888::new(max_rgb.r, max_rgb.g, max_rgb.b);
+    let max_style = PrimitiveStyleBuilder::new().fill_color(max_fill).build();
+    let _ = Circle::new(Point::new(max_x, btn_y), btn_size as u32)
         .into_styled(max_style)
         .draw(fb);
 
-    // Minimize (Green)
-    let min_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(50, 200, 80)).build();
-    let _ = Circle::new(Point::new(close_x - 40, btn_y + 2), btn_size)
+    // Minimize
+    let min_x = max_x - btn_gap - btn_size;
+    let min_rgb = if focused { theme.button_min_active } else { theme.button_inactive };
+    let min_fill = Rgb888::new(min_rgb.r, min_rgb.g, min_rgb.b);
+    let min_style = PrimitiveStyleBuilder::new().fill_color(min_fill).build();
+    let _ = Circle::new(Point::new(min_x, btn_y), btn_size as u32)
         .into_styled(min_style)
         .draw(fb);
 
-    let content_y = cy + ShellWindow::TITLE_H;
-    let content_h = ch - ShellWindow::TITLE_H;
-    
+    // ── Title text ────────────────────────────────────────────────────────────
+    let label_rgb = if focused { theme.label_active_color } else { theme.label_inactive_color };
+    let label_color = Rgb888::new(label_rgb.r, label_rgb.g, label_rgb.b);
+    let title_text_style = MonoTextStyle::new(&FONT_6X12, label_color);
+    let title = window.title_str();
+    // Left-aligned title with a margin from the left border
+    let title_x = cx + bw + 8;
+    let title_y = cy + bw + tb_h / 2 + 4; // vertically centred in title bar
+    let _ = Text::new(title, Point::new(title_x, title_y), title_text_style).draw(fb);
+
+    // ── Shaded: only title bar visible ───────────────────────────────────────
+    if window.shaded {
+        // No content area to draw — we're done
+        return;
+    }
+
+    // ── Content area ──────────────────────────────────────────────────────────
+    let content_y = cy + bw + tb_h;
+    let content_h = ch - bw * 2 - tb_h - theme.handle_width;
+
     if content_h > 0 {
         match window.content {
             WindowContent::Snp { surface_id, pid } => {
@@ -1515,7 +1583,7 @@ fn draw_window(
                         let buf_h = surface.buffer_h as i32;
                         let copy_w = cw.min(buf_w).max(0) as usize;
                         let copy_h = content_h.min(buf_h).max(0);
-                        let src_stride = buf_w as usize; // pixels per source row
+                        let src_stride = buf_w as usize;
 
                         for row in 0..copy_h {
                             let dy = content_y + row;
@@ -1534,34 +1602,31 @@ fn draw_window(
                             }
                         }
                     } else {
-                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                        draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
                     }
                 } else {
-                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
                 }
             }
             WindowContent::External(s_idx) => {
                 let s = s_idx as usize;
                 if s < surfaces.len() && surfaces[s].active && surfaces[s].ready_to_flip {
-                    // El SHM tiene stride = buffer_w (CREATE). No usar window.w como stride:
-                    // si el marco es más ancho que el buffer, leer con window.w corrompe filas.
                     let buf_w = surfaces[s].buffer_w.max(1);
                     let buf_h = surfaces[s].buffer_h.max(1);
                     let want_w = window.w.max(0) as u32;
-                    let want_h = ((window.h - ShellWindow::TITLE_H).max(0) as u32)
+                    let want_h = ((window.h - bw * 2 - tb_h - theme.handle_width).max(0) as u32)
                         .min(content_h as u32);
                     let src_w = want_w.min(buf_w);
                     let src_h = want_h.min(buf_h);
-
                     if src_w > 0 && src_h > 0 {
-                        fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, buf_w, cx, content_y);
+                        fb.blit_buffer(surfaces[s].vaddr, src_w, src_h, buf_w, cx + bw, content_y);
                     }
                 } else {
-                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
                 }
             }
             WindowContent::InternalDemo => {
-                draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
             }
             WindowContent::X11 { window_id, .. } => {
                 if let Some(buf) = x11_surfaces.get(&window_id) {
@@ -1587,30 +1652,32 @@ fn draw_window(
                             }
                         }
                     } else {
-                        draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                        draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
                     }
                 } else {
-                    draw_terminal_demo(fb, cx, content_y, cw, content_h);
+                    draw_terminal_demo(fb, cx + bw, content_y, cw - bw * 2, content_h);
                 }
             }
             WindowContent::None => {}
         }
     }
 
-    // Focus highlight border
-    if focused {
-        let highlight_color = match decoration_style {
-            1 => Rgb888::new(100, 110, 140),
-            2 => Rgb888::new(0, 240, 220),
-            _ => Rgb888::new(0, 128, 255),
-        };
-        let highlight_style = PrimitiveStyleBuilder::new()
-            .stroke_color(highlight_color)
-            .stroke_width(2)
-            .build();
-        let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw as u32, ch as u32))
-            .into_styled(highlight_style)
-            .draw(fb);
+    // ── Bottom resize handle ───────────────────────────────────────────────────
+    if theme.handle_width > 0 {
+        let handle_y = cy + ch - bw - theme.handle_width;
+        let handle_rgb = if focused { theme.title_active_bg } else { theme.title_inactive_bg };
+        let handle_color = Rgb888::new(
+            (handle_rgb.r as u16 * 6 / 10) as u8,
+            (handle_rgb.g as u16 * 6 / 10) as u8,
+            (handle_rgb.b as u16 * 6 / 10) as u8,
+        );
+        let handle_style = PrimitiveStyleBuilder::new().fill_color(handle_color).build();
+        let _ = Rectangle::new(
+            Point::new(cx + bw, handle_y),
+            Size::new((cw - bw * 2).max(0) as u32, theme.handle_width.max(0) as u32),
+        )
+        .into_styled(handle_style)
+        .draw(fb);
     }
 }
 
