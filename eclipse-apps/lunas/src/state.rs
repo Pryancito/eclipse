@@ -8,7 +8,7 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SurfaceCommit};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SharedToplevels, SharedTitles, SurfaceCommit};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
@@ -101,6 +101,10 @@ pub struct LunasState {
     pub keyboard_registry: SharedKeyboards,
     /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
     pub pointer_registry: SharedPointers,
+    /// Maps (ClientId, surface_id) → xdg_toplevel ObjectId for close dispatch.
+    pub toplevel_registry: SharedToplevels,
+    /// Maps surface_id → window title string (set by xdg_toplevel.set_title).
+    pub title_registry: SharedTitles,
     /// Maps Xwayland X11 window serials (64-bit) to Wayland wl_surface IDs.
     pub xwayland_serials: crate::protocol::SharedXwaylandSerials,
     /// Monotonically increasing serial number for Wayland protocol events.
@@ -180,6 +184,8 @@ impl LunasState {
             buffer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            toplevel_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            title_registry: Rc::new(RefCell::new(BTreeMap::new())),
             xwayland_serials: Rc::new(RefCell::new(BTreeMap::new())),
             wayland_serial: 1,
 
@@ -527,8 +533,17 @@ impl LunasState {
                     .min((fb_h - commit.height as i32 - 10).max(ShellWindow::TITLE_H));
                 let w = commit.width as i32;
                 let h = commit.height as i32;
+                // Use the title from xdg_toplevel.set_title if available, else "Wayland"
                 let mut title = [0u8; 32];
-                title[..7].copy_from_slice(b"Wayland");
+                {
+                    let treg = (*self.title_registry).borrow();
+                    if let Some(t) = treg.get(&surface_id) {
+                        let len = t.len().min(31);
+                        title[..len].copy_from_slice(&t.as_bytes()[..len]);
+                    } else {
+                        title[..7].copy_from_slice(b"Wayland");
+                    }
+                }
                 let mut win = ShellWindow {
                     x, y, w,
                     h: h + ShellWindow::TITLE_H,
@@ -596,7 +611,26 @@ impl LunasState {
         self.dirty = true;
     }
 
-    /// Dispatch Wayland focus-change events when the focused window has changed.
+    /// Apply pending title updates from `title_registry` to existing ShellWindows.
+    ///
+    /// Called every frame so that `xdg_toplevel.set_title` calls made after the
+    /// window was first created are reflected in the title bar.
+    pub fn apply_title_updates(&mut self) {
+        let treg = (*self.title_registry).borrow();
+        for i in 0..self.space.window_count {
+            if let WindowContent::Snp { surface_id, .. } = self.space.windows[i].content {
+                if let Some(t) = treg.get(&surface_id) {
+                    let len = t.len().min(31);
+                    let mut new_title = [0u8; 32];
+                    new_title[..len].copy_from_slice(&t.as_bytes()[..len]);
+                    if self.space.windows[i].title != new_title {
+                        self.space.windows[i].title = new_title;
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+    }
     ///
     /// Sends `wl_keyboard.leave` + `wl_pointer.leave` to the previously-focused
     /// Wayland client, and `wl_keyboard.enter` + `wl_pointer.enter` to the newly-
@@ -721,6 +755,9 @@ impl LunasState {
         // changed since the last frame (e.g. from mouse click, close, Alt+Tab).
         self.dispatch_focus_change_events();
 
+        // Apply any pending title updates from xdg_toplevel.set_title calls.
+        self.apply_title_updates();
+
         // Poll X11 server for new events
         {
             let fb_w = self.backend.fb.info.width as u16;
@@ -741,17 +778,20 @@ impl LunasState {
         // Dispatch xdg_toplevel.close to any Wayland/Snp windows that are being closed.
         {
             use wayland_proto::wl::protocols::common::xdg_toplevel;
-            use wayland_proto::wl::server::client::ClientId;
-            use wayland_proto::wl::ObjectId;
             for i in 0..self.space.window_count {
                 let w = &self.space.windows[i];
                 if w.closing {
-                    if let crate::compositor::WindowContent::Snp { pid, .. } = w.content {
-                        // Unix socket clients have pid = 0x8000_0000+N.
-                        // Their xdg_toplevel is always object id 11 (terminal wire protocol).
+                    if let crate::compositor::WindowContent::Snp { pid, surface_id } = w.content {
                         let client_id = ClientId(pid);
+                        // Look up the registered xdg_toplevel ObjectId for this surface.
+                        // Falls back to ObjectId(11) for legacy clients that don't use
+                        // xdg_wm_base (e.g. old native Eclipse apps).
+                        let tl_id = (*self.toplevel_registry).borrow()
+                            .get(&(client_id, surface_id))
+                            .copied()
+                            .unwrap_or(ObjectId(11));
                         if let Some(client) = self.protocol.clients.get(&client_id) {
-                            let _ = client.send_event(ObjectId(11), xdg_toplevel::Event::Close);
+                            let _ = client.send_event(tl_id, xdg_toplevel::Event::Close);
                         }
                     }
                 }
@@ -2415,6 +2455,30 @@ mod tests {
         state.drain_pending_wayland_commits();
         // The commit was drained
         assert!((*state.pending_surface_commits).borrow().is_empty());
+    }
+
+    /// apply_title_updates propagates titles from the registry to existing ShellWindows.
+    #[test]
+    fn test_apply_title_updates_propagates_title() {
+        use crate::compositor::{ShellWindow, WindowContent};
+        let mut state = LunasState::new().expect("init");
+        // Add a fake Snp window
+        let surface_id = 42u32;
+        let pid = 99u32;
+        let mut win = ShellWindow::default();
+        win.title[..7].copy_from_slice(b"Wayland");
+        win.content = WindowContent::Snp { pid, surface_id };
+        state.space.windows[0] = win;
+        state.space.window_count = 1;
+
+        // Publish a title via the registry
+        (*state.title_registry).borrow_mut().insert(surface_id, String::from("My New Title"));
+
+        state.apply_title_updates();
+
+        // The window title should be updated
+        let title = state.space.windows[0].title_str();
+        assert_eq!(title, "My New Title", "title bar must reflect set_title");
     }
 
 }

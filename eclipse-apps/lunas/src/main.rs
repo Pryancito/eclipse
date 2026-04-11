@@ -29,6 +29,8 @@ fn main() {
     // LunasState drains every frame.
     let pending_commits = state.pending_surface_commits.clone();
     let buffer_registry = state.buffer_registry.clone();
+    let toplevel_registry = state.toplevel_registry.clone();
+    let title_registry = state.title_registry.clone();
 
     {
         let c = pending_commits.clone();
@@ -74,12 +76,16 @@ fn main() {
     {
         let c = pending_commits.clone();
         let b = buffer_registry.clone();
+        let tl = toplevel_registry.clone();
+        let ti = title_registry.clone();
         state.protocol.register_global(
             "xdg_wm_base", 2,
             move || {
                 let xdg = lunas::protocol::LunasXdgWmBase {
                     pending_commits: c.clone(),
                     buffer_registry: b.clone(),
+                    toplevel_registry: tl.clone(),
+                    title_registry: ti.clone(),
                 };
                 wayland_proto::wl::server::objects::ObjectInner::Rc(
                     std::rc::Rc::new(core::cell::RefCell::new(xdg))
@@ -118,6 +124,10 @@ fn main() {
                 // Send capabilities: keyboard + pointer
                 use wayland_proto::wl::protocols::common::wl_seat::{Event, CAP_KEYBOARD, CAP_POINTER};
                 client.send_event(obj_id, Event::Capabilities { capabilities: CAP_KEYBOARD | CAP_POINTER })
+                    .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)?;
+                // Send seat name — required by GTK4, weston, and other clients that
+                // call wl_seat.get_name() to identify the seat.
+                client.send_event(obj_id, Event::Name { name: String::from("seat0") })
                     .map_err(|_| wayland_proto::wl::server::objects::ServerError::IoError)
             })),
         );

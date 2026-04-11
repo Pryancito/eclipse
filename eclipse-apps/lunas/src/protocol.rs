@@ -54,6 +54,14 @@ pub type SharedCommits = Rc<RefCell<std::vec::Vec<SurfaceCommit>>>;
 /// Shared mapping of Xwayland serials (64-bit) to wl_surface ObjectIds.
 pub type SharedXwaylandSerials = Rc<RefCell<BTreeMap<u64, ObjectId>>>;
 
+/// Shared registry mapping (ClientId, surface_id) → xdg_toplevel ObjectId.
+/// Used so the compositor can dispatch `xdg_toplevel.close` to the correct object.
+pub type SharedToplevels = Rc<RefCell<BTreeMap<(ClientId, u32), ObjectId>>>;
+
+/// Shared registry mapping surface_id → window title string.
+/// Populated by `xdg_toplevel.set_title`; read by the compositor to keep title bars fresh.
+pub type SharedTitles = Rc<RefCell<BTreeMap<u32, std::string::String>>>;
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // LunasCompositor  (wl_compositor)
@@ -91,8 +99,36 @@ impl ObjectLogic for LunasCompositor {
                 client.add_object(id, Object::new::<wl_surface::WlSurface>(id, surface));
                 Ok(())
             }
+            1 => {
+                // create_region(id: new_id) — region is a no-op; just register the object
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let region = ObjectInner::Rc(Rc::new(RefCell::new(LunasRegion)));
+                client.add_object(id, Object::new::<wl_region::WlRegion>(id, region));
+                Ok(())
+            }
             _ => Err(ServerError::ObjectMismatch),
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasRegion  (wl_region) — no-op; compositor ignores all region hints
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasRegion;
+
+impl ObjectLogic for LunasRegion {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        _opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        Ok(()) // destroy / add / subtract — all ignored
     }
 }
 
@@ -534,6 +570,8 @@ pub type SharedPointers = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
 pub struct LunasXdgWmBase {
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
 }
 
 impl ObjectLogic for LunasXdgWmBase {
@@ -561,6 +599,8 @@ impl ObjectLogic for LunasXdgWmBase {
                     surface_id,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    toplevel_registry: self.toplevel_registry.clone(),
+                    title_registry: self.title_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<xdg_surface::XdgSurface>(id, xdg_surf));
                 Ok(())
@@ -581,6 +621,8 @@ pub struct LunasXdgSurface {
     pub surface_id: ObjectId,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
 }
 
 impl ObjectLogic for LunasXdgSurface {
@@ -607,19 +649,31 @@ impl ObjectLogic for LunasXdgSurface {
                     app_id: std::string::String::new(),
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    toplevel_registry: self.toplevel_registry.clone(),
+                    title_registry: self.title_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<xdg_toplevel::XdgToplevel>(id, toplevel));
 
+                // Register the toplevel so the compositor can send close events to it.
+                (*self.toplevel_registry).borrow_mut().insert(
+                    (client.client_id(), self.surface_id.0),
+                    id.as_id(),
+                );
+
                 // Send initial configure sequence:
-                // 1. xdg_toplevel.configure(0, 0, []) — client picks its own size
+                // 1. xdg_toplevel.configure(0, 0, [ACTIVATED]) — client picks its own size
+                let mut states_buf = std::vec::Vec::new();
+                // XDG_TOPLEVEL_STATE_ACTIVATED = 4
+                states_buf.extend_from_slice(&4u32.to_ne_bytes());
                 let tl_cfg = xdg_toplevel::Event::Configure {
                     width: 0, height: 0,
-                    states: wayland_proto::wl::wire::Array(std::vec::Vec::new()),
+                    states: wayland_proto::wl::wire::Array(states_buf),
                 };
                 client.send_event(id.as_id(), tl_cfg)?;
 
-                // 2. xdg_surface.configure(serial=1)
-                let surf_cfg = xdg_surface::Event::Configure { serial: 1 };
+                // 2. xdg_surface.configure(serial) — use the surface id as a simple serial
+                let serial = self.surface_id.0;
+                let surf_cfg = xdg_surface::Event::Configure { serial };
                 client.send_event(self.id, surf_cfg)?;
 
                 Ok(())
@@ -644,6 +698,8 @@ pub struct LunasXdgToplevel {
     pub app_id: std::string::String,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub toplevel_registry: SharedToplevels,
+    pub title_registry: SharedTitles,
 }
 
 impl ObjectLogic for LunasXdgToplevel {
@@ -661,6 +717,8 @@ impl ObjectLogic for LunasXdgToplevel {
                 // set_title(title: string)
                 if let Some(Payload::String(t)) = args.first() {
                     self.title = t.clone();
+                    // Publish to shared title registry for compositor to apply to title bar
+                    (*self.title_registry).borrow_mut().insert(self.surface_id.0, t.clone());
                 }
                 Ok(())
             }
@@ -1534,6 +1592,8 @@ mod wayland_server_tests {
     fn xdg_toplevel_stores_app_id() {
         use super::{LunasXdgToplevel, SharedCommits, SharedBuffers};
         let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let mut client = wayland_proto::wl::server::client::Client::new(
             ClientId(6),
             Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
@@ -1546,6 +1606,8 @@ mod wayland_server_tests {
             app_id: String::new(),
             pending_commits: commits,
             buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
         };
         // opcode 3 = set_app_id(app_id: string)
         let args = std::vec![
@@ -1632,6 +1694,87 @@ mod wayland_server_tests {
         assert_eq!(pending[0].buffer_id, Some(ObjectId(8)), "commit must carry buffer id");
         // Pending callback cleared after commit
         assert_eq!(surface.pending_frame_callback, None, "pending_frame_callback must be cleared after commit");
+    }
+
+    /// wl_compositor.create_region (opcode 1) must register a LunasRegion object.
+    /// Previously this returned ObjectMismatch, causing crashes in GTK4/Qt clients.
+    #[test]
+    fn compositor_create_region_registers_object() {
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(8),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut comp = super::LunasCompositor { pending_commits: commits, buffer_registry: buffers };
+        let args = std::vec![wayland_proto::wl::Payload::NewId(NewId(55))];
+        let r = ObjectLogic::handle_request(&mut comp, &mut client, 1, &args, &[]);
+        assert!(r.is_ok(), "create_region: {:?}", r);
+        assert!(client.object_mut(ObjectId(55)).is_ok(), "wl_region object must exist");
+    }
+
+    /// xdg_toplevel.set_title must publish to the shared title registry.
+    #[test]
+    fn xdg_toplevel_set_title_publishes_to_registry() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry: super::SharedTitles = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(9),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut toplevel = super::LunasXdgToplevel {
+            id: ObjectId(60),
+            xdg_surface_id: ObjectId(59),
+            surface_id: ObjectId(58),
+            title: String::new(),
+            app_id: String::new(),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry: title_registry.clone(),
+        };
+        let r = ObjectLogic::handle_request(
+            &mut toplevel,
+            &mut client,
+            2, // set_title
+            &[wayland_proto::wl::Payload::String(String::from("My Wayland App"))],
+            &[],
+        );
+        assert!(r.is_ok(), "set_title: {:?}", r);
+        let reg = (*title_registry).borrow();
+        assert_eq!(reg.get(&58u32).map(|s| s.as_str()), Some("My Wayland App"));
+    }
+
+    /// LunasXdgSurface.get_toplevel must register the toplevel in toplevel_registry.
+    #[test]
+    fn xdg_surface_get_toplevel_registers_toplevel_id() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry: super::SharedToplevels = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry: super::SharedTitles = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(10),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut xdg_surf = super::LunasXdgSurface {
+            id: ObjectId(70),
+            surface_id: ObjectId(71),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry: toplevel_registry.clone(),
+            title_registry,
+        };
+        let r = ObjectLogic::handle_request(
+            &mut xdg_surf,
+            &mut client,
+            1, // get_toplevel
+            &[wayland_proto::wl::Payload::NewId(NewId(72))],
+            &[],
+        );
+        assert!(r.is_ok(), "get_toplevel: {:?}", r);
+        // The registry must now contain (ClientId(10), 71) → ObjectId(72)
+        use wayland_proto::wl::server::client::ClientId;
+        let reg = (*toplevel_registry).borrow();
+        assert_eq!(reg.get(&(ClientId(10), 71u32)), Some(&ObjectId(72)));
     }
 }
 
