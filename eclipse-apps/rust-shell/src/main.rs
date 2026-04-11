@@ -67,8 +67,11 @@ impl Shell {
         std::env::set_var("SHELL", "/bin/rust-shell");
         std::env::set_var("USER", "moebius");
         std::env::set_var("PWD", &self.cwd);
-        std::env::set_var("PATH", "/bin:/usr/bin");
+        std::env::set_var("PATH", "/bin:/usr/bin:/usr/local/bin:/root/.cargo/bin:/root/.local/bin");
         std::env::set_var("TERM", "xterm-256color");
+        std::env::set_var("HOME", "/root");
+        std::env::set_var("CARGO_HOME", "/root/.cargo");
+        std::env::set_var("RUSTUP_HOME", "/root/.rustup");
     }
 
     pub fn update_terminal_size(&self) {

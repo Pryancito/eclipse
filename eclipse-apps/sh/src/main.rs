@@ -371,12 +371,41 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             }
             Some(0)
         }
+        "export" => {
+            // export VAR=value  or  export VAR (just mark as exported — same effect here)
+            for arg in &argv[1..] {
+                if let Some(eq) = arg.find('=') {
+                    let key = &arg[..eq];
+                    let val = &arg[eq + 1..];
+                    std::env::set_var(key, val);
+                } else {
+                    // export VAR with no value: ensure it exists (no-op if already set)
+                    let _ = std::env::var(arg.as_str());
+                }
+            }
+            Some(0)
+        }
+        "unset" => {
+            for arg in &argv[1..] { std::env::remove_var(arg.as_str()); }
+            Some(0)
+        }
+        "which" => {
+            for prog in &argv[1..] {
+                let path = resolve_exec(prog.as_str());
+                if std::fs::metadata(&path).is_ok() {
+                    sh_println(&path);
+                } else {
+                    sh_eprintln(&format!("which: {} not found", prog));
+                }
+            }
+            Some(0)
+        }
         "exit" => {
             let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             eclipse_syscall::call::exit(code);
         }
         "help" => {
-            sh_println("Builtins: echo, printf, env, pwd, cd, ls, cat, ps, exit, help, history...");
+            sh_println("Builtins: echo, printf, env, export, unset, which, pwd, cd, ls, cat, ps, exit, help, history...");
             Some(0)
         }
         _ => None,
@@ -420,11 +449,10 @@ fn open_redirect_out(path: &str, append: bool) -> Option<usize> {
 fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> Option<usize> {
     if cmd.argv.is_empty() { return None; }
     let prog = &cmd.argv[0];
-    let mut path = format!("/bin/{}", prog);
-    let buf = std::fs::read(&path).ok().or_else(|| {
-        path = resolve_path(prog);
-        std::fs::read(&path).ok()
-    });
+
+    // Resolve executable path: absolute/relative first, then PATH search, then /bin fallback
+    let path = resolve_exec(prog);
+    let buf = std::fs::read(&path).ok();
 
     if let Some(data) = buf {
         let eff_out = if let Some((ref p, app)) = cmd.redirect_out {
@@ -442,6 +470,32 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
         }
     } else { sh_eprintln(&format!("sh: {}: no encontrado", prog)); }
     None
+}
+
+fn resolve_exec(prog: &str) -> String {
+    if prog.is_empty() { return String::new(); }
+    // Absolute or explicit relative path — use as-is
+    if prog.starts_with('/') || prog.starts_with("./") || prog.starts_with("../") {
+        return String::from(prog);
+    }
+    // Search PATH directories
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            if dir.is_empty() { continue; }
+            let mut full = String::from(dir);
+            if !full.ends_with('/') { full.push('/'); }
+            full.push_str(prog);
+            if std::fs::metadata(&full).is_ok() {
+                return full;
+            }
+        }
+    }
+    // Fallback: try /bin/<prog> and then CWD-relative
+    let bin_path = format!("/bin/{}", prog);
+    if std::fs::metadata(&bin_path).is_ok() {
+        return bin_path;
+    }
+    resolve_path(prog)
 }
 
 fn run_pipeline(pl: &Pipeline, bg_pids: &mut Vec<usize>) -> i32 {
@@ -589,6 +643,8 @@ fn main() {
     std::env::set_var("SHELL", "/bin/sh");
     std::env::set_var("USER", "root");
     std::env::set_var("PWD", "/root");
+    std::env::set_var("PATH", "/bin:/usr/bin:/usr/local/bin:/root/.cargo/bin:/root/.local/bin");
+    std::env::set_var("TERM", "xterm-256color");
     update_terminal_size();
 
     let mut hist = History::new();
@@ -604,7 +660,7 @@ fn main() {
             }
         });
 
-        let prompt = "> ";
+        let prompt = format!("\x1b[32mroot@eclipse\x1b[0m:\x1b[34;1m{}\x1b[0m$ ", unsafe { &CWD });
 
         let line = match readline(&mut hist, &prompt) { Some(l) => l, None => break };
         let line = line.trim();

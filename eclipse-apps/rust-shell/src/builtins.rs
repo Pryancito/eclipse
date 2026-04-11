@@ -2,11 +2,12 @@ use crate::parser::SimpleCommand;
 use crate::Shell;
 use std::prelude::v1::*;
 use std::env;
+use std::fs;
 
 pub fn is_builtin(name: &str) -> bool {
     match name {
         "cd" | "pwd" | "exit" | "export" | "alias" | "unalias" | "history" | "jobs" | "fg" | "bg" |
-        "ls" | "ps" | "cat" | "echo" | "printf" | "mkdir" | "rm" | "env" | "printenv" => true,
+        "ls" | "ps" | "cat" | "echo" | "printf" | "mkdir" | "rm" | "env" | "printenv" | "which" | "unset" => true,
         _ => false,
     }
 }
@@ -40,11 +41,12 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
             }
         }
         "export" => {
-            if cmd.argv.len() > 1 {
-                let parts: Vec<&str> = cmd.argv[1].splitn(2, '=').collect();
+            for arg in cmd.argv.iter().skip(1) {
+                let parts: Vec<&str> = arg.splitn(2, '=').collect();
                 if parts.len() == 2 {
                     env::set_var(parts[0], parts[1]);
                 }
+                // export VAR (no value) — already in env, nothing to do
             }
             Some(0)
         }
@@ -286,6 +288,35 @@ pub fn try_execute(cmd: &SimpleCommand, shell: &mut Shell) -> Option<i32> {
         "env" | "printenv" => {
             for (key, value) in std::env::vars() {
                 println!("{}={}", key, value);
+            }
+            Some(0)
+        }
+        "unset" => {
+            for arg in cmd.argv.iter().skip(1) {
+                std::env::remove_var(arg.as_str());
+            }
+            Some(0)
+        }
+        "which" => {
+            let path_env = std::env::var("PATH").unwrap_or_default();
+            for prog in cmd.argv.iter().skip(1) {
+                let mut found = false;
+                for dir in path_env.split(':') {
+                    if dir.is_empty() { continue; }
+                    let full = if dir.ends_with('/') {
+                        format!("{}{}", dir, prog)
+                    } else {
+                        format!("{}/{}", dir, prog)
+                    };
+                    if fs::metadata(&full).is_ok() {
+                        println!("{}", full);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    eprintln!("rs: which: {}: not found", prog);
+                }
             }
             Some(0)
         }

@@ -238,6 +238,12 @@ struct TerminalApp {
     pty_pair_id: usize,
     sh_pid: usize,
     sh_bytes: Vec<u8>,
+    /// argv[0] (name) to pass when restarting the shell/command.
+    sh_name: Vec<u8>,
+    /// Full argv (NUL-separated) to set on child restart via set_child_args.
+    sh_argv: Vec<u8>,
+    /// When true, do not auto-restart the child after it exits.
+    no_restart: bool,
     last_title: [u8; 32],
     /// Serial counter for protocol events.
     serial: u32,
@@ -250,6 +256,69 @@ struct TerminalApp {
 
 impl TerminalApp {
     fn new() -> Option<Self> {
+        // ── 0. Parse own argv ─────────────────────────────────────────────
+        // Supported forms:
+        //   terminal                        → launch default shell (rust-shell or sh)
+        //   terminal -e <prog> [args...]    → launch <prog> with optional args
+        //   terminal -- <prog> [args...]    → same, alternate separator
+        let own_argv = {
+            let mut buf = [0u8; 4096];
+            let n = eclipse_syscall::call::get_process_args(&mut buf);
+            buf[..n].split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| std::string::String::from(core::str::from_utf8(s).unwrap_or("")))
+                .collect::<Vec<std::string::String>>()
+        };
+
+        // Determine shell/program to run.
+        // custom_cmd: (program_path, name_for_kernel, full_argv_nul_list, no_restart)
+        let (exec_path, exec_name, exec_argv_bytes, no_restart): (std::string::String, std::string::String, Vec<u8>, bool) = {
+            let mut custom: Option<(std::string::String, bool)> = None;
+            let mut i = 1;
+            while i < own_argv.len() {
+                match own_argv[i].as_str() {
+                    "-e" | "--" => {
+                        if i + 1 < own_argv.len() {
+                            // Collect everything from i+1 onwards as the command + args
+                            let cmd_args = &own_argv[i + 1..];
+                            let full = cmd_args.join(" ");
+                            custom = Some((full, true)); // no_restart=true for one-shot commands
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if let Some((cmd, one_shot)) = custom {
+                // cmd may be "cargo --version" or just "cargo" etc.
+                // We need to find the executable and build argv.
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let prog = if parts.is_empty() { "" } else { parts[0] };
+                let prog_path = resolve_exec_path(prog);
+                let name = parts.first().copied().unwrap_or("cmd").rsplit('/').next().unwrap_or("cmd").to_string();
+                let mut argv_bytes = Vec::<u8>::new();
+                for p in &parts {
+                    argv_bytes.extend_from_slice(p.as_bytes());
+                    argv_bytes.push(0);
+                }
+                (prog_path, name.to_string(), argv_bytes, one_shot)
+            } else {
+                // Default: prefer rust-shell, fallback to sh
+                let default_shell = if std::fs::metadata("/bin/rust-shell").is_ok() {
+                    "/bin/rust-shell"
+                } else {
+                    "/bin/sh"
+                };
+                let shell_name = default_shell.rsplit('/').next().unwrap_or("sh").to_string();
+                let mut argv_bytes = Vec::<u8>::new();
+                argv_bytes.extend_from_slice(shell_name.as_bytes());
+                argv_bytes.push(0);
+                (default_shell.to_string(), shell_name, argv_bytes, false)
+            }
+        };
+
         let self_pid = eclipse_syscall::getpid() as u32;
         let win_w = 640u32;
         let win_h = 400u32;
@@ -487,19 +556,30 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read("/bin/sh");
+        let sh_res = std::fs::read(&exec_path);
         if sh_res.is_err() { return None; }
         let sh_bytes = sh_res.unwrap();
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some("sh"), pty_slave_fd, pty_slave_fd, pty_slave_fd);
+        // Build kernel name (≤15 bytes) from exec_name
+        let mut name_buf = [0u8; 16];
+        let copy_len = exec_name.len().min(15);
+        name_buf[..copy_len].copy_from_slice(&exec_name.as_bytes()[..copy_len]);
+        let kernel_name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("sh");
+
+        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some(kernel_name), pty_slave_fd, pty_slave_fd, pty_slave_fd);
         if let Ok(pid) = sh_spawn {
-            let _ = sys_set_child_args(pid, b"sh\0");
+            let _ = sys_set_child_args(pid, &exec_argv_bytes);
         } else {
             let _ = sys_close(pty_slave_fd);
             return None;
         }
         let sh_pid = sh_spawn.unwrap();
         let _ = sys_close(pty_slave_fd);
+
+        // Build sh_name for restart (NUL-terminated kernel name)
+        let mut sh_name = Vec::<u8>::new();
+        sh_name.extend_from_slice(kernel_name.as_bytes());
+        sh_name.push(0);
 
         let init_cols = win_w as u16 / FONT_CHAR_W;
         let init_rows = win_h as u16 / FONT_CHAR_H;
@@ -524,6 +604,9 @@ impl TerminalApp {
             pty_pair_id,
             sh_pid,
             sh_bytes,
+            sh_name,
+            sh_argv: exec_argv_bytes,
+            no_restart,
             last_title: [0; 32],
             serial: 1,
             alt_pressed: false,
@@ -812,11 +895,19 @@ impl TerminalApp {
             // ── 3. Shell Restart ───────────────────────────────────────────
             let mut status = 0u32;
             if sys_wait_pid_nohang(&mut status, self.sh_pid as usize).map_or(false, |p| p != 0) {
+                if self.no_restart {
+                    // One-shot command finished — close PTY and exit
+                    let _ = sys_close(self.pty_master_fd);
+                    sys_exit(0);
+                }
                 let slave_path = format!("pty:slave/{}\0", self.pty_pair_id);
                 let fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
                 if fd != !0 {
-                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some("sh"), fd, fd, fd) {
-                        let _ = sys_set_child_args(pid, b"sh\0");
+                    // Derive kernel name from sh_name (strip NUL)
+                    let name_end = self.sh_name.iter().position(|&b| b == 0).unwrap_or(self.sh_name.len());
+                    let kname = core::str::from_utf8(&self.sh_name[..name_end]).unwrap_or("sh");
+                    if let Ok(pid) = sys_spawn_with_stdio(&self.sh_bytes, Some(kname), fd, fd, fd) {
+                        let _ = sys_set_child_args(pid, &self.sh_argv);
                         self.sh_pid = pid;
                         self.terminal.process(b"\r\n\x1b[1;33m[shell restarted]\x1b[0m\r\n");
                         dirty = true;
@@ -851,6 +942,55 @@ fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[P
 fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
     use wayland_proto::wl::wire::Handle;
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
+}
+
+/// Resolve an executable name to a full path by searching $PATH directories.
+/// Searched order:
+///   1. Absolute path given directly (starts with '/')
+///   2. Relative path starting with "./" or "../"
+///   3. Directories in PATH env var (colon-separated)
+///   4. Default well-known directories: /bin, /usr/bin, /root/.cargo/bin, /usr/local/bin
+#[cfg(target_os = "eclipse")]
+fn resolve_exec_path(prog: &str) -> std::string::String {
+    if prog.is_empty() {
+        return std::string::String::from("/bin/sh");
+    }
+    // Already absolute or relative
+    if prog.starts_with('/') || prog.starts_with("./") || prog.starts_with("../") {
+        return std::string::String::from(prog);
+    }
+
+    // Build the list of search directories
+    let mut dirs: Vec<std::string::String> = Vec::new();
+
+    // Add PATH env dirs first
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            if !dir.is_empty() {
+                dirs.push(std::string::String::from(dir));
+            }
+        }
+    }
+
+    // Always include these well-known directories
+    for d in &["/bin", "/usr/bin", "/root/.cargo/bin", "/usr/local/bin", "/usr/local/sbin"] {
+        let ds = std::string::String::from(*d);
+        if !dirs.contains(&ds) {
+            dirs.push(ds);
+        }
+    }
+
+    for dir in &dirs {
+        let mut full = std::string::String::from(dir.as_str());
+        if !full.ends_with('/') { full.push('/'); }
+        full.push_str(prog);
+        if std::fs::metadata(&full).is_ok() {
+            return full;
+        }
+    }
+
+    // Fallback: assume /bin/<prog>
+    format!("/bin/{}", prog)
 }
 
 fn main() {
