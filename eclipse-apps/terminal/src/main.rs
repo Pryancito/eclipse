@@ -202,6 +202,18 @@ impl FocusModeTracker {
     }
 }
 
+// PS/2 Set-1 scancodes that are pure modifier keys and produce no character
+// output from pc_keyboard.  Defined at module level to avoid re-creating the
+// slice on every keyboard event.
+#[cfg(target_os = "eclipse")]
+const MODIFIER_SC: &[u8] = &[
+    0x1D, 0x61, // L-Ctrl, R-Ctrl
+    0x2A, 0x36, // L-Shift, R-Shift
+    0x38, 0x64, // L-Alt, R-Alt
+    0x5B, 0x5C, 0x5D, // L-Win, R-Win, Menu
+    0x3A, 0x45, 0x46, // CapsLk, NumLk, ScrLk
+];
+
 // ============================================================================
 // TerminalApp
 // ============================================================================
@@ -668,16 +680,6 @@ impl TerminalApp {
                                     // ── ESC prefix for Alt+key (Meta mode) ─────────────
                                     // When Alt is held and a non-modifier key is pressed,
                                     // xterm prefixes the key sequence with ESC.
-                                    // Modifier key PS/2 scancodes: Shift(0x2A,0x36),
-                                    // Ctrl(0x1D,0x61), Alt(0x38,0x64), Win(0x5B,0x5C,0x5D),
-                                    // CapsLk(0x3A), NumLk(0x45), ScrLk(0x46).
-                                    const MODIFIER_SC: &[u8] = &[
-                                        0x1D, 0x61, // L-Ctrl, R-Ctrl
-                                        0x2A, 0x36, // L-Shift, R-Shift
-                                        0x38, 0x64, // L-Alt, R-Alt
-                                        0x5B, 0x5C, 0x5D, // L-Win, R-Win, Menu
-                                        0x3A, 0x45, 0x46, // CapsLk, NumLk, ScrLk
-                                    ];
                                     if self.alt_pressed && state != 0
                                         && !MODIFIER_SC.contains(&sc)
                                     {
@@ -768,9 +770,9 @@ impl TerminalApp {
                                     let axis  = match raw.args.get(1) { Some(Payload::UInt(v))  => *v, _ => 0 };
                                     let value = match raw.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
                                     if axis == 0 && value != 0.0 {
-                                        // Normalise to ±1 lines per wheel click
-                                        let lines: isize = if value > 0.0 { 1 } else { -1 };
-                                        self.terminal.handle_mouse(MouseInput::Scroll(lines));
+                                        // Normalize to ±1 lines per wheel click
+                                        let direction: isize = if value > 0.0 { 1 } else { -1 };
+                                        self.terminal.handle_mouse(MouseInput::Scroll(direction));
                                         dirty = true;
                                     }
                                 }
