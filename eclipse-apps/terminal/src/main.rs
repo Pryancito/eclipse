@@ -164,6 +164,45 @@ fn sidewind_shm_name(pid: u32) -> HString<24> {
 }
 
 // ============================================================================
+// Focus-event mode tracker
+// ============================================================================
+
+/// Watches raw PTY output bytes for `\x1b[?1004h` (enable focus events) and
+/// `\x1b[?1004l` (disable).  xterm only forwards focus-in/out events to the
+/// running application when focus-event mode is enabled.
+#[cfg(target_os = "eclipse")]
+struct FocusModeTracker {
+    state:   u8,
+    enabled: bool,
+}
+
+#[cfg(target_os = "eclipse")]
+impl FocusModeTracker {
+    const fn new() -> Self { Self { state: 0, enabled: false } }
+
+    #[inline]
+    fn feed(&mut self, data: &[u8]) {
+        for &b in data { self.step(b); }
+    }
+
+    fn step(&mut self, b: u8) {
+        // Sequence: ESC [ ? 1 0 0 4 h/l
+        self.state = match (self.state, b) {
+            (_, b'\x1b') => 1,
+            (1, b'[')    => 2,
+            (2, b'?')    => 3,
+            (3, b'1')    => 4,
+            (4, b'0')    => 5,
+            (5, b'0')    => 6,
+            (6, b'4')    => 7,
+            (7, b'h')    => { self.enabled = true;  0 }
+            (7, b'l')    => { self.enabled = false; 0 }
+            _            => if b == b'\x1b' { 1 } else { 0 },
+        };
+    }
+}
+
+// ============================================================================
 // TerminalApp
 // ============================================================================
 
@@ -190,6 +229,11 @@ struct TerminalApp {
     last_title: [u8; 32],
     /// Serial counter for protocol events.
     serial: u32,
+    /// Whether Left-Alt or Right-Alt is currently held down.
+    /// Used to prefix key sequences with ESC (xterm Meta mode).
+    alt_pressed: bool,
+    /// Tracks CSI ?1004 h/l in PTY output to gate focus-event forwarding.
+    focus_tracker: FocusModeTracker,
 }
 
 impl TerminalApp {
@@ -379,6 +423,9 @@ impl TerminalApp {
         // xdg_toplevel.set_title("Terminal")
         send_wayland(&wayland, 11, 2, &[Payload::String(std::string::String::from("Terminal"))]);
 
+        // xdg_toplevel.set_app_id("terminal")  — lets WMs apply per-class rules
+        send_wayland(&wayland, 11, 3, &[Payload::String(std::string::String::from("terminal"))]);
+
         // wl_seat.get_keyboard(id=12)
         if seat_name != 0 {
             send_wayland(&wayland, 6, 1, &[Payload::NewId(NewId(12))]);
@@ -411,6 +458,9 @@ impl TerminalApp {
         terminal.set_clipboard(Box::new(EclipseClipboard::new()));
         terminal.set_auto_flush(false);
         terminal.set_history_size(1000);
+        terminal.set_scroll_speed(3);
+        // Acknowledge BEL without letting an unhandled character bleed through
+        terminal.set_bell_handler(Box::new(|| {}));
 
         // ── 6. PTY & Shell ────────────────────────────────────────────────
         let pty_master_fd = unsafe {
@@ -464,12 +514,14 @@ impl TerminalApp {
             sh_bytes,
             last_title: [0; 32],
             serial: 1,
+            alt_pressed: false,
+            focus_tracker: FocusModeTracker::new(),
         })
     }
 
     fn run(&mut self) {
         self.terminal.process(b"\x1b[1;36mEclipse OS Terminal v3\x1b[0m\r\n");
-        let mut pty_buf = [0u8; 1024];
+        let mut pty_buf = [0u8; 4096];
 
         loop {
             let mut dirty = false;
@@ -534,6 +586,9 @@ impl TerminalApp {
                                         terminal.set_crnl_mapping(true);
                                         terminal.set_clipboard(Box::new(EclipseClipboard::new()));
                                         terminal.set_auto_flush(false);
+                                        terminal.set_history_size(1000);
+                                        terminal.set_scroll_speed(3);
+                                        terminal.set_bell_handler(Box::new(|| {}));
                                         self.terminal = terminal;
                                         let pfd = self.pty_master_fd;
                                         self.terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
@@ -604,12 +659,52 @@ impl TerminalApp {
                                     let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
 
+                                    // ── Alt key tracking (xterm Meta mode) ─────────────
+                                    // PS/2 0x38 = L-Alt, 0x64 = R-Alt.
+                                    if sc == 0x38 || sc == 0x64 {
+                                        self.alt_pressed = state != 0;
+                                    }
+
+                                    // ── ESC prefix for Alt+key (Meta mode) ─────────────
+                                    // When Alt is held and a non-modifier key is pressed,
+                                    // xterm prefixes the key sequence with ESC.
+                                    // Modifier key PS/2 scancodes: Shift(0x2A,0x36),
+                                    // Ctrl(0x1D,0x61), Alt(0x38,0x64), Win(0x5B,0x5C,0x5D),
+                                    // CapsLk(0x3A), NumLk(0x45), ScrLk(0x46).
+                                    const MODIFIER_SC: &[u8] = &[
+                                        0x1D, 0x61, // L-Ctrl, R-Ctrl
+                                        0x2A, 0x36, // L-Shift, R-Shift
+                                        0x38, 0x64, // L-Alt, R-Alt
+                                        0x5B, 0x5C, 0x5D, // L-Win, R-Win, Menu
+                                        0x3A, 0x45, 0x46, // CapsLk, NumLk, ScrLk
+                                    ];
+                                    if self.alt_pressed && state != 0
+                                        && !MODIFIER_SC.contains(&sc)
+                                    {
+                                        let _ = sys_write(self.pty_master_fd, b"\x1b");
+                                    }
+
                                     // handle_keyboard feeds the PS/2 scancode into pc_keyboard which
                                     // tracks modifier state internally (Ctrl, Shift, Alt, …) and
                                     // writes the resulting ANSI/Unicode string directly to the PTY via
                                     // the pty_writer closure — no extra manual write needed here.
                                     let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
+                                }
+                            }
+
+                            // wl_keyboard.enter (opcode=1) — keyboard focus gained
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(1) {
+                                if self.focus_tracker.enabled {
+                                    let _ = sys_write(self.pty_master_fd, b"\x1b[I");
+                                }
+                            }
+
+                            // wl_keyboard.leave (opcode=2) — keyboard focus lost
+                            if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(2) {
+                                self.alt_pressed = false; // clear Alt state on focus loss
+                                if self.focus_tracker.enabled {
+                                    let _ = sys_write(self.pty_master_fd, b"\x1b[O");
                                 }
                             }
 
@@ -695,6 +790,8 @@ impl TerminalApp {
                 let limit = pty_buf.len();
                 let n = sys_read(self.pty_master_fd, &mut pty_buf[..(available.min(limit))]).unwrap_or(0);
                 if n == 0 { break; }
+                // Track focus-event mode (CSI ?1004 h/l) in the raw output stream.
+                self.focus_tracker.feed(&pty_buf[..n]);
                 self.terminal.process(&pty_buf[..n]);
                 if let Some(title) = extract_osc_title(&pty_buf[..n]) {
                     if title != self.last_title {
