@@ -2778,26 +2778,31 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 let frame_virt = memory::PHYS_MEM_OFFSET + phys;
                 unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
 
-                // For private file-backed mappings, read the next 4 KB of file data into the private frame.
-                if let Some(ref fde) = fd_entry {
-                    let remaining = file_len.saturating_sub(file_offset);
-                    if remaining > 0 {
-                        let to_read = remaining.min(4096);
-                        let frame_slice = unsafe {
-                            core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
-                        };
-                        match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice) {
-                            Ok(n) => { file_offset += n; }
-                            Err(e) => {
-                                serial::serial_printf(format_args!(
-                                    "[SYSCALL] mmap: file read error at offset {}: {}\n",
-                                    file_offset, e
-                                ));
-                                file_offset += to_read;
-                            }
+            // For private file-backed mappings, read the next 4 KB of file data into the private frame.
+            if let Some(ref fde) = fd_entry {
+                let bytes_mapped = (current - target_addr) as usize;
+                let current_offset = offset as usize + bytes_mapped;
+                
+                // Set file position to the correct offset before reading
+                let _ = crate::scheme::lseek(fde.scheme_id, fde.resource_id, current_offset as isize, 0); // SEEK_SET=0
+
+                let remaining = file_len.saturating_sub(bytes_mapped);
+                if remaining > 0 {
+                    let to_read = remaining.min(4096);
+                    let frame_slice = unsafe {
+                        core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
+                    };
+                    match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice) {
+                        Ok(n) => { /* file_offset ignored since we explicitly lseek every page */ }
+                        Err(e) => {
+                            serial::serial_printf(format_args!(
+                                "[SYSCALL] mmap: file read error at offset {}: {}\n",
+                                current_offset, e
+                            ));
                         }
                     }
                 }
+            }
                 phys
             } else {
                 serial::serial_print("[SYSCALL] mmap: physical frame pool exhausted\n");

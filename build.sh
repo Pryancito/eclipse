@@ -57,7 +57,7 @@ eclipse_stage_ldd_libs() {
                 p="${line#*=> }"
                 p="${p%% (*}"
                 case "$p" in
-                    */ld-linux*.so*|*/ld-musl-x86_64.so.1)
+                    */ld-linux*.so*)
                         continue
                         ;;
                 esac
@@ -85,7 +85,7 @@ eclipse_stage_readelf_needed_libs() {
     while IFS= read -r soname; do
         [ -z "$soname" ] && continue
         case "$soname" in
-            ld-linux*.so*|ld-musl*.so*) continue ;;
+            ld-linux*.so*) continue ;;
         esac
         cand=""
         if command -v musl-gcc >/dev/null 2>&1; then
@@ -300,7 +300,7 @@ build_sidewind_project() {
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
-        local BINS="lunas nano terminal glxgears smithay_app"
+        local BINS="lunas smithay_app"
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
@@ -311,36 +311,17 @@ build_sidewind_project() {
                 fi
             fi
         done
-        if [ -f "$_sw_rel/glxgears" ]; then
-            cp "$_sw_rel/glxgears" "$BASE_DIR/$BUILD_DIR/sysroot/bin/glxgears"
-            print_status "Instalado en sysroot: /usr/bin/glxgears (desde glxgears)"
-            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                cp "$_sw_rel/glxgears" "$BASE_DIR/$BUILD_DIR/bin/glxgears"
-            fi
-        fi
-        # terminal: el crate se llama terminal; en sysroot debe existir como 'terminal'
-        if [ -f "$_sw_rel/terminal" ]; then
-            cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal"
-            print_status "Instalado en sysroot: /usr/bin/terminal (desde terminal)"
-            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                cp "$_sw_rel/terminal" "$BASE_DIR/$BUILD_DIR/usr/bin/terminal"
-            fi
-        fi
+        local APPS="nano terminal glxgears sh"
 
-        # Enlazar /usr/bin/terminal a /bin/terminal para conveniencia del usuario (Solaris/Unix style)
-        # NOTA: Usamos copia en lugar de ln -s porque el cargador kernel no soporta symlinks todavía.
-        if [ -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" ]; then
-            mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/bin"
-            rm -f "$BASE_DIR/$BUILD_DIR/sysroot/bin/terminal"
-            cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" "$BASE_DIR/$BUILD_DIR/sysroot/bin/terminal"
-            print_status "Copiado: /bin/terminal -> /usr/bin/terminal (sysroot)"
-            
-            if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-                mkdir -p "$BASE_DIR/$BUILD_DIR/bin"
-                rm -f "$BASE_DIR/$BUILD_DIR/bin/terminal"
-                cp -f "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/terminal" "$BASE_DIR/$BUILD_DIR/bin/terminal"
+        for bin in $APPS; do
+            if [ -f "$_sw_rel/$bin" ]; then
+                cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/bin/$bin"
+                print_status "Instalado en sysroot: /bin/$bin"
+                if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                    cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/bin/$bin"
+                fi
             fi
-        fi
+        done
     else
         print_error "Error al compilar el proyecto Sidewind"
         cd "$BASE_DIR"
@@ -1175,9 +1156,20 @@ create_basic_distribution() {
             print_status "COSMIC Desktop (C) copiado"
         fi
 
-        # Crear directorios /usr/bin y /usr/sbin si no existen
+        # Crear directorios base si no existen
         mkdir -p "$BUILD_DIR/usr/bin"
         mkdir -p "$BUILD_DIR/usr/sbin"
+        mkdir -p "$BUILD_DIR/lib"
+
+        # Forzar la inclusión del intérprete musl (necesario para binarios dinámicos)
+        # El kernel busca /lib/ld-musl-x86_64.so.1 para cargar el ELF dinámico
+        for ld in /usr/lib/x86_64-linux-musl/ld-musl-x86_64.so.1 /usr/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1; do
+            if [ -f "$ld" ]; then
+                cp -a "$ld" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
+                print_status "Intérprete musl instalado: $ld -> /lib/"
+                break
+            fi
+        done
         
         # Copiar systemd si existe
         if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
@@ -1540,9 +1532,11 @@ create_bootable_image() {
     local ROOT_IMG="root_temp.img"
     
     # 1. Crear la partición ESP (FAT32) con mtools
-    print_status "Creando partición ESP (100MB) sin root..."
+    local ESP_SIZE=128
+    local ESP_OFFSET=1
+    print_status "Creando partición ESP (${ESP_SIZE}MB) sin root..."
     rm -f "$ESP_IMG"
-    truncate -s 100M "$ESP_IMG"
+    truncate -s ${ESP_SIZE}M "$ESP_IMG"
     mkfs.fat -F32 -n "ECLIPSE_OS" "$ESP_IMG" > /dev/null
     
     # Crear directorios en la imagen FAT32 usando mtools
@@ -1566,9 +1560,11 @@ EOF
     rm boot_temp.cfg
     
     # 2. Crear la partición EclipseFS
-    print_status "Creando partición EclipseFS (500MB) sin root..."
+    local ROOT_SIZE=4096
+    local ROOT_OFFSET=130
+    print_status "Creando partición EclipseFS (${ROOT_SIZE}MB) sin root..."
     rm -f "$ROOT_IMG"
-    truncate -s 500M "$ROOT_IMG"
+    truncate -s ${ROOT_SIZE}M "$ROOT_IMG"
     
     if [ -f "mkfs-eclipsefs/target/release/mkfs-eclipsefs" ]; then
         ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "EclipseOS" -N 10000 "$ROOT_IMG" > /dev/null
@@ -1580,23 +1576,27 @@ EOF
     fi
     
     # 3. Ensamblar la imagen final con tabla GPT
-    print_status "Ensamblando imagen final $IMG_FILE..."
+    local IMAGE_SIZE=$((ROOT_OFFSET + ROOT_SIZE + 10))
+    print_status "Ensamblando imagen final $IMG_FILE (${IMAGE_SIZE}MB)..."
     rm -f "$IMG_FILE"
-    truncate -s 1536M "$IMG_FILE"
+    truncate -s ${IMAGE_SIZE}M "$IMG_FILE"
     
+    # Calcular marcas de fin para parted
+    local ESP_END=$((ESP_OFFSET + ESP_SIZE))
+    local ROOT_END=$((ROOT_OFFSET + ROOT_SIZE))
+
     # Usar parted en el archivo local (no requiere sudo para archivos)
     PARTED_CMD="parted"
     "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 64MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 ${ESP_OFFSET}MiB ${ESP_END}MiB
     "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 65MiB 1465MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 ${ROOT_OFFSET}MiB ${ROOT_END}MiB
     
     # Escribir las particiones en los offsets correctos usando dd
     print_status "Escribiendo particiones en la imagen final..."
-    # Offset 1MiB = seek 1 con bs=1M
-    dd if="$ESP_IMG" of="$IMG_FILE" bs=1M seek=1 conv=notrunc status=none
-    # Offset 65MiB = seek 65 con bs=1M
-    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=65 conv=notrunc status=none
+    # Offset MiB match seek con bs=1M
+    dd if="$ESP_IMG" of="$IMG_FILE" bs=1M seek=$ESP_OFFSET conv=notrunc status=none
+    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=$ROOT_OFFSET conv=notrunc status=none
     
     # Limpieza de archivos temporales
     rm -f "$ESP_IMG" "$ROOT_IMG"

@@ -677,14 +677,14 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
         interp_et_dyn,
     )?;
     mapped = mapped.saturating_add(mapped_i);
-    apply_relocations_for_load_base(
-        page_table_phys,
-        &interp_elf,
-        interp_ph_off,
-        interp_ph_count,
-        interp_ph_size,
-        interp_bias,
-    )?;
+    // apply_relocations_for_load_base(
+    //     page_table_phys,
+    //     &interp_elf,
+    //     interp_ph_off,
+    //     interp_ph_count,
+    //     interp_ph_size,
+    //     interp_bias,
+    // )?;
 
     let interp_entry = if interp_et_dyn {
         interp_bias.wrapping_add(interp_h.e_entry)

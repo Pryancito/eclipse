@@ -603,10 +603,7 @@ fn main() {
             }
         });
 
-        let prompt = unsafe {
-            if LAST_EXIT != 0 { format!("\x1b[31moebius@eclipse:{} [{}]\x1b[0m$ ", CWD.as_str(), LAST_EXIT) }
-            else { format!("moebius@eclipse:{}$ ", CWD.as_str()) }
-        };
+        let prompt = "> ";
 
         let line = match readline(&mut hist, &prompt) { Some(l) => l, None => break };
         let line = line.trim();
