@@ -1058,8 +1058,9 @@ fn resolve_exec_path(prog: &str) -> std::string::String {
         }
     }
 
-    // Fallback: assume /bin/<prog>
-    format!("/bin/{}", prog)
+    // Fallback: return the name as-is so the caller sees a "not found" error
+    // with the original program name rather than a confusing /bin/<prog> path.
+    std::string::String::from(prog)
 }
 
 /// Write an xterm-style escape sequence for a cursor/navigation key with optional modifiers.
@@ -1078,7 +1079,10 @@ fn write_key_seq(fd: usize, code: u8, tilde: bool, shift: bool, alt: bool, ctrl:
             let _ = sys_write(fd, &[b'\x1b', b'[', code]);
         }
     } else {
-        let m = b'0' + mod_code + 1; // xterm modifier: shift=2, alt=3, ctrl=5, …
+        // xterm modifier encoding: 1=plain, 2=Shift, 3=Alt, 4=Shift+Alt,
+        // 5=Ctrl, 6=Shift+Ctrl, 7=Alt+Ctrl, 8=Shift+Alt+Ctrl
+        let xterm_mod: u8 = mod_code + 1; // 1..=8
+        let m = b'0' + xterm_mod;         // ASCII '2'..'8'
         if tilde {
             let _ = sys_write(fd, &[b'\x1b', b'[', code, b';', m, b'~']);
         } else {
@@ -1106,7 +1110,8 @@ fn write_fn_key(fd: usize, fnum: u8, shift: bool, alt: bool, ctrl: bool) {
     if mod_code == 0 {
         let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b'~']);
     } else {
-        let m = b'0' + mod_code + 1;
+        let xterm_mod: u8 = mod_code + 1; // 2=Shift, 3=Alt, 5=Ctrl, 6=Shift+Ctrl, …
+        let m = b'0' + xterm_mod;
         let _ = sys_write(fd, &[b'\x1b', b'[', tens, ones, b';', m, b'~']);
     }
 }
