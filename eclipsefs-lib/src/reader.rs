@@ -44,6 +44,10 @@ pub struct EclipseFSReader {
     sequential_access_count: u32,
     /// Readahead window size (number of nodes to prefetch)
     readahead_window: usize,
+    /// Cache mapping inode -> (file_offset_of_content_bytes, content_length).
+    /// Populated by read_node and read_node_metadata so that read_file_content_range
+    /// can seek directly to the content without re-reading metadata TLVs.
+    content_offset_cache: HashMap<u32, (u64, usize)>,
 }
 
 impl EclipseFSReader {
@@ -84,6 +88,7 @@ impl EclipseFSReader {
             last_accessed_inode: None,
             sequential_access_count: 0,
             readahead_window: 8,
+            content_offset_cache: HashMap::new(),
         })
     }
 
@@ -114,6 +119,7 @@ impl EclipseFSReader {
             last_accessed_inode: None,
             sequential_access_count: 0,
             readahead_window: 8,
+            content_offset_cache: HashMap::new(),
         })
     }
 
@@ -164,58 +170,46 @@ impl EclipseFSReader {
         Ok(entries)
     }
 
-    /// Leer un nodo por su inode
-    pub fn read_node(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
-        // Check cache first based on cache type
-        match self.cache_type {
-            CacheType::ARC => {
-                if let Some(ref mut arc) = self.arc_cache {
-                    if let Some(node) = arc.get(inode) {
-                        return Ok(node);
-                    }
-                }
-            }
-            CacheType::LRU => {
-                if let Some(cached_node) = self.lru_cache.get(&inode) {
-                    // Update LRU access order - O(n) due to retain, but necessary
-                    // TODO: Consider using a more efficient data structure for true O(1)
-                    self.lru_access_order.retain(|&i| i != inode);
-                    self.lru_access_order.push_back(inode);
-                    return Ok(cached_node.clone());
-                }
-            }
-        }
-
-        let entry = self
+    /// Core streaming TLV parser.
+    ///
+    /// Reads the node record for `inode` entry-by-entry without allocating a
+    /// single buffer for the whole record.  When `load_content` is `false` the
+    /// CONTENT TLV payload is **skipped** with a cheap forward seek instead of
+    /// being read into memory; the file offset and length of the content bytes
+    /// are stored in `content_offset_cache` so that `read_file_content_range`
+    /// can later seek directly to them.
+    fn read_node_internal(&mut self, inode: u32, load_content: bool) -> EclipseFSResult<EclipseFSNode> {
+        let entry_offset = self
             .inode_table
             .get(inode as usize - 1)
-            .ok_or(EclipseFSError::NotFound)?;
+            .ok_or(EclipseFSError::NotFound)?
+            .offset;
 
-        self.file.seek(SeekFrom::Start(entry.offset))?;
+        self.file.seek(SeekFrom::Start(entry_offset))?;
 
-        let mut header = [0u8; constants::NODE_RECORD_HEADER_SIZE];
-        self.file.read_exact(&mut header)?;
+        let mut hdr = [0u8; constants::NODE_RECORD_HEADER_SIZE];
+        self.file.read_exact(&mut hdr)?;
 
-        let recorded_inode = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let record_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let recorded_inode = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let record_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
 
         if recorded_inode != inode {
             return Err(EclipseFSError::InvalidFormat);
         }
-
         if record_size < constants::NODE_RECORD_HEADER_SIZE {
             return Err(EclipseFSError::InvalidFormat);
         }
 
-        let tlv_size = record_size - constants::NODE_RECORD_HEADER_SIZE;
-        let mut tlv_data = vec![0u8; tlv_size];
-        self.file.read_exact(&mut tlv_data)?;
+        // File offset just after the 8-byte node-record header — where TLVs begin.
+        let tlv_start = entry_offset + constants::NODE_RECORD_HEADER_SIZE as u64;
+        // Total bytes occupied by TLV entries in this record.
+        let tlv_total = record_size - constants::NODE_RECORD_HEADER_SIZE;
 
-        // Leer TLV entries
+        // Variables for the decoded metadata.
         let mut node_type = NodeKind::File;
-        let mut mode = 0o100644;
-        let mut uid = 0;
-        let mut gid = 0;
+        let mut mode = 0o100644u32;
+        let mut uid = 0u32;
+        let mut gid = 0u32;
         let mut size = 0u64;
         let mut atime = 0u64;
         let mut mtime = 0u64;
@@ -224,105 +218,120 @@ impl EclipseFSReader {
         let mut data = Vec::new();
         let mut children = std::collections::HashMap::new();
 
-        let mut offset = 0;
+        // Number of TLV bytes consumed so far (used to compute file offsets).
+        let mut consumed: usize = 0;
 
         loop {
-            if offset + 6 > tlv_data.len() {
+            // Need at least 6 bytes for a TLV header (2-byte tag + 4-byte length).
+            if consumed + 6 > tlv_total {
                 break;
             }
 
-            let tag = u16::from_le_bytes([tlv_data[offset], tlv_data[offset + 1]]);
-            let length = u32::from_le_bytes([
-                tlv_data[offset + 2],
-                tlv_data[offset + 3],
-                tlv_data[offset + 4],
-                tlv_data[offset + 5],
-            ]) as usize;
-            offset += 6;
+            // Read the 6-byte TLV header in a single operation and parse it.
+            let mut tlv_hdr = [0u8; 6];
+            self.file.read_exact(&mut tlv_hdr)?;
+            let tag = u16::from_le_bytes([tlv_hdr[0], tlv_hdr[1]]);
+            let length = u32::from_le_bytes([tlv_hdr[2], tlv_hdr[3], tlv_hdr[4], tlv_hdr[5]]) as usize;
+            consumed += 6;
 
-            if offset + length > tlv_data.len() {
-                break;
+            if consumed + length > tlv_total {
+                break; // Malformed record – stop safely.
             }
 
-            let value = &tlv_data[offset..offset + length];
-            offset += length;
+            if tag == tlv_tags::CONTENT {
+                // Record the file position of the content bytes so that
+                // read_file_content_range can seek directly to them later.
+                let content_file_offset = tlv_start + consumed as u64;
+                self.content_offset_cache.insert(inode, (content_file_offset, length));
 
-            match tag {
-                tlv_tags::NODE_TYPE => {
-                    if !value.is_empty() {
-                        node_type = match value[0] {
-                            1 => NodeKind::File,
-                            2 => NodeKind::Directory,
-                            3 => NodeKind::Symlink,
-                            _ => return Err(EclipseFSError::InvalidFormat),
-                        };
+                if load_content {
+                    data = vec![0u8; length];
+                    self.file.read_exact(&mut data)?;
+                } else {
+                    // Skip the payload with a cheap forward seek — no data read.
+                    self.file.seek_relative(length as i64)?;
+                }
+            } else {
+                // Read the (small) value into a temporary buffer and decode it.
+                let mut value = vec![0u8; length];
+                self.file.read_exact(&mut value)?;
+
+                match tag {
+                    tlv_tags::NODE_TYPE => {
+                        if !value.is_empty() {
+                            node_type = match value[0] {
+                                1 => NodeKind::File,
+                                2 => NodeKind::Directory,
+                                3 => NodeKind::Symlink,
+                                _ => return Err(EclipseFSError::InvalidFormat),
+                            };
+                        }
                     }
-                }
-                tlv_tags::MODE => {
-                    if value.len() >= 4 {
-                        mode = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    tlv_tags::MODE => {
+                        if value.len() >= 4 {
+                            mode = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                        }
                     }
-                }
-                tlv_tags::UID => {
-                    if value.len() >= 4 {
-                        uid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    tlv_tags::UID => {
+                        if value.len() >= 4 {
+                            uid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                        }
                     }
-                }
-                tlv_tags::GID => {
-                    if value.len() >= 4 {
-                        gid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    tlv_tags::GID => {
+                        if value.len() >= 4 {
+                            gid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                        }
                     }
-                }
-                tlv_tags::SIZE => {
-                    if value.len() >= 8 {
-                        size = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6],
-                            value[7],
-                        ]);
+                    tlv_tags::SIZE => {
+                        if value.len() >= 8 {
+                            size = u64::from_le_bytes([
+                                value[0], value[1], value[2], value[3],
+                                value[4], value[5], value[6], value[7],
+                            ]);
+                        }
                     }
-                }
-                tlv_tags::ATIME => {
-                    if value.len() >= 8 {
-                        atime = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6],
-                            value[7],
-                        ]);
+                    tlv_tags::ATIME => {
+                        if value.len() >= 8 {
+                            atime = u64::from_le_bytes([
+                                value[0], value[1], value[2], value[3],
+                                value[4], value[5], value[6], value[7],
+                            ]);
+                        }
                     }
-                }
-                tlv_tags::MTIME => {
-                    if value.len() >= 8 {
-                        mtime = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6],
-                            value[7],
-                        ]);
+                    tlv_tags::MTIME => {
+                        if value.len() >= 8 {
+                            mtime = u64::from_le_bytes([
+                                value[0], value[1], value[2], value[3],
+                                value[4], value[5], value[6], value[7],
+                            ]);
+                        }
                     }
-                }
-                tlv_tags::CTIME => {
-                    if value.len() >= 8 {
-                        ctime = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6],
-                            value[7],
-                        ]);
+                    tlv_tags::CTIME => {
+                        if value.len() >= 8 {
+                            ctime = u64::from_le_bytes([
+                                value[0], value[1], value[2], value[3],
+                                value[4], value[5], value[6], value[7],
+                            ]);
+                        }
                     }
-                }
-                tlv_tags::NLINK => {
-                    if value.len() >= 4 {
-                        nlink = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    tlv_tags::NLINK => {
+                        if value.len() >= 4 {
+                            nlink = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                        }
                     }
-                }
-                tlv_tags::CONTENT => {
-                    data = value.to_vec();
-                }
-                tlv_tags::DIRECTORY_ENTRIES => {
-                    children = Self::deserialize_directory_entries(value)?;
-                }
-                _ => {
-                    // Ignorar tags desconocidos
+                    tlv_tags::DIRECTORY_ENTRIES => {
+                        children = Self::deserialize_directory_entries(&value)?;
+                    }
+                    _ => {
+                        // Unknown tag – already read and discarded above.
+                    }
                 }
             }
+
+            consumed += length;
         }
 
-        let node = EclipseFSNode {
+        Ok(EclipseFSNode {
             kind: node_type,
             data,
             children,
@@ -343,7 +352,31 @@ impl EclipseFSReader {
             // Extent-based allocation
             extent_tree: crate::extent::ExtentTree::new(),
             use_extents: false,
-        };
+        })
+    }
+
+    /// Leer un nodo por su inode (including file content).
+    pub fn read_node(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
+        // Check cache first based on cache type
+        match self.cache_type {
+            CacheType::ARC => {
+                if let Some(ref mut arc) = self.arc_cache {
+                    if let Some(node) = arc.get(inode) {
+                        return Ok(node);
+                    }
+                }
+            }
+            CacheType::LRU => {
+                if let Some(cached_node) = self.lru_cache.get(&inode) {
+                    // Update LRU access order - O(n) due to retain, but necessary
+                    self.lru_access_order.retain(|&i| i != inode);
+                    self.lru_access_order.push_back(inode);
+                    return Ok(cached_node.clone());
+                }
+            }
+        }
+
+        let node = self.read_node_internal(inode, true)?;
 
         // Cache the node for future reads
         self.cache_node(inode, node.clone());
@@ -352,6 +385,76 @@ impl EclipseFSReader {
         self.detect_and_readahead(inode);
 
         Ok(node)
+    }
+
+    /// Read only the metadata TLVs for a node, **skipping** the CONTENT payload.
+    ///
+    /// This is dramatically faster for large files because it performs a single
+    /// forward seek over the content bytes rather than reading megabytes of data
+    /// into memory.  The returned `EclipseFSNode` has an empty `data` field; use
+    /// `read_file_content` or `read_file_content_range` to obtain file content.
+    ///
+    /// The file offset of the content bytes is stored in `content_offset_cache`
+    /// so subsequent calls to `read_file_content_range` are direct seeks.
+    pub fn read_node_metadata(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
+        self.read_node_internal(inode, false)
+    }
+
+    /// Read the complete content of a file node without loading its metadata.
+    ///
+    /// On the first call for a given inode the function scans only the metadata
+    /// TLVs (via `read_node_metadata`) to locate the CONTENT TLV, then seeks
+    /// directly to it.  Subsequent calls reuse the cached file offset.
+    pub fn read_file_content(&mut self, inode: u32) -> EclipseFSResult<Vec<u8>> {
+        if !self.content_offset_cache.contains_key(&inode) {
+            self.read_node_internal(inode, false)?;
+        }
+        // Use a direct copy to avoid a second HashMap lookup.
+        let cached = self.content_offset_cache.get(&inode).copied();
+        match cached {
+            None => Ok(Vec::new()),
+            Some((content_offset, content_length)) => {
+                self.file.seek(SeekFrom::Start(content_offset))?;
+                let mut data = vec![0u8; content_length];
+                self.file.read_exact(&mut data)?;
+                Ok(data)
+            }
+        }
+    }
+
+    /// Read a byte range `[offset, offset + length)` from a file node's content.
+    ///
+    /// This is the most efficient path for FUSE `read` requests: it seeks
+    /// directly to the requested position within the CONTENT TLV and reads only
+    /// the bytes that are actually needed, regardless of total file size.
+    ///
+    /// Returns the bytes that were available (may be shorter than `length` when
+    /// reading near the end of the file, or empty when `offset >= file_size`).
+    pub fn read_file_content_range(
+        &mut self,
+        inode: u32,
+        offset: u64,
+        length: usize,
+    ) -> EclipseFSResult<Vec<u8>> {
+        if !self.content_offset_cache.contains_key(&inode) {
+            self.read_node_internal(inode, false)?;
+        }
+        // Use a direct copy to avoid a second HashMap lookup.
+        let cached = self.content_offset_cache.get(&inode).copied();
+        match cached {
+            None => Ok(Vec::new()),
+            Some((content_offset, content_length)) => {
+                if offset >= content_length as u64 {
+                    return Ok(Vec::new());
+                }
+                let available = content_length as u64 - offset;
+                let to_read = length.min(available as usize);
+                self.file.seek(SeekFrom::Start(content_offset + offset))?;
+                let mut data = vec![0u8; to_read];
+                self.file.read_exact(&mut data)?;
+                Ok(data)
+            }
+        }
     }
 
     /// Detect sequential access patterns and trigger intelligent readahead

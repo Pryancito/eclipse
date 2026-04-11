@@ -72,7 +72,8 @@ impl Filesystem for EclipseFSFuse {
         match self.lookup_node(parent, &name_str) {
             Ok(child_inode) => {
                 let mut reader = self.reader.lock().unwrap();
-                match reader.read_node(child_inode) {
+                // Use read_node_metadata: we only need attributes, not file content.
+                match reader.read_node_metadata(child_inode) {
                     Ok(node) => {
                         let attr = self.node_to_attr(&node, child_inode as u64);
                         reply.entry(&TTL, &attr, 0);
@@ -91,7 +92,8 @@ impl Filesystem for EclipseFSFuse {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let mut reader = self.reader.lock().unwrap();
         
-        match reader.read_node(ino as u32) {
+        // Use read_node_metadata: getattr only needs metadata, not file content.
+        match reader.read_node_metadata(ino as u32) {
             Ok(node) => {
                 let attr = self.node_to_attr(&node, ino);
                 reply.attr(&TTL, &attr);
@@ -105,16 +107,13 @@ impl Filesystem for EclipseFSFuse {
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let mut reader = self.reader.lock().unwrap();
         
-        match reader.read_node(ino as u32) {
+        // read_node_metadata reads directory entries but skips file content.
+        match reader.read_node_metadata(ino as u32) {
             Ok(node) => {
                 if node.kind != NodeKind::Directory {
                     reply.error(ENOENT);
                     return;
                 }
-                
-                // Prefetch all child nodes at once for much better performance
-                let child_inodes: Vec<u32> = node.get_children().values().copied().collect();
-                let _ = reader.prefetch_nodes(&child_inodes);
                 
                 let mut entries = Vec::new();
                 
@@ -122,9 +121,10 @@ impl Filesystem for EclipseFSFuse {
                 entries.push((".", ino, fuse::FileType::Directory));
                 entries.push(("..", if ino == constants::ROOT_INODE as u64 { ino } else { 1 }, fuse::FileType::Directory));
                 
-                // Agregar entradas del directorio (now much faster due to cache)
+                // For each child we only need the node kind — use read_node_metadata
+                // to avoid loading file content for every child in the directory.
                 for (name, child_inode) in node.get_children().iter() {
-                    let file_type = match reader.read_node(*child_inode) {
+                    let file_type = match reader.read_node_metadata(*child_inode) {
                         Ok(child_node) => match child_node.kind {
                             NodeKind::File => fuse::FileType::RegularFile,
                             NodeKind::Directory => fuse::FileType::Directory,
@@ -156,21 +156,12 @@ impl Filesystem for EclipseFSFuse {
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
         let mut reader = self.reader.lock().unwrap();
         
-        match reader.read_node(ino as u32) {
-            Ok(node) => {
-                if node.kind == NodeKind::File || node.kind == NodeKind::Symlink {
-                    let data = node.get_data();
-                    let start = offset as usize;
-                    let end = std::cmp::min(start + size as usize, data.len());
-                    
-                    if start < data.len() {
-                        reply.data(&data[start..end]);
-                    } else {
-                        reply.data(&[]);
-                    }
-                } else {
-                    reply.error(ENOENT);
-                }
+        // Use read_file_content_range: reads only the requested byte range,
+        // not the entire file.  This is the key performance improvement for
+        // large files — previously the whole file was loaded into memory first.
+        match reader.read_file_content_range(ino as u32, offset as u64, size as usize) {
+            Ok(data) => {
+                reply.data(&data);
             }
             Err(_) => {
                 reply.error(ENOENT);
@@ -181,14 +172,23 @@ impl Filesystem for EclipseFSFuse {
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
         let mut reader = self.reader.lock().unwrap();
         
-        match reader.read_node(ino as u32) {
+        // Validate that the inode is a symlink before reading its content.
+        match reader.read_node_metadata(ino as u32) {
             Ok(node) => {
-                if node.kind == NodeKind::Symlink {
-                    let data = node.get_data();
-                    reply.data(data);
-                } else {
+                if node.kind != NodeKind::Symlink {
                     reply.error(ENOENT);
+                    return;
                 }
+            }
+            Err(_) => {
+                reply.error(ENOENT);
+                return;
+            }
+        }
+        // Node is confirmed to be a symlink; read its target (stored as content).
+        match reader.read_file_content(ino as u32) {
+            Ok(data) => {
+                reply.data(&data);
             }
             Err(_) => {
                 reply.error(ENOENT);
@@ -199,7 +199,8 @@ impl Filesystem for EclipseFSFuse {
     fn open(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let mut reader = self.reader.lock().unwrap();
         
-        match reader.read_node(ino as u32) {
+        // Use read_node_metadata: open only checks the node kind.
+        match reader.read_node_metadata(ino as u32) {
             Ok(node) => {
                 if node.kind == NodeKind::File {
                     reply.opened(ino, 0);
