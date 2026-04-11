@@ -21,6 +21,17 @@ pub enum WindowContent {
     External(u32),
     Snp { surface_id: u32, pid: u32 },
     X11 { window_id: u32, pid: u32 },
+    /// A `zwlr_layer_surface_v1`: no title bar, positioned at the screen edge.
+    Layer {
+        surface_id: u32,
+        pid:        u32,
+        /// zwlr_layer_shell anchor bitfield
+        anchor:     u32,
+        /// Which compositor layer (BACKGROUND=0, BOTTOM=1, TOP=2, OVERLAY=3)
+        layer:      u32,
+        /// Pixels reserved at the anchored edge (exclusive zone).
+        exclusive_zone: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -189,6 +200,8 @@ impl ShellWindow {
             }
             WindowContent::Snp { .. } => true,
             WindowContent::X11 { .. } => true,
+            // Layer surfaces are transparent (composited on top by the compositor)
+            WindowContent::Layer { .. } => false,
             WindowContent::None => false,
         }
     }
@@ -254,6 +267,8 @@ impl ExternalSurface {
 pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -> Option<usize> {
     for i in (0..count).rev() {
         let w = &windows[i];
+        // Layer surfaces do not receive keyboard focus
+        if matches!(w.content, WindowContent::Layer { .. }) { continue; }
         if w.content != WindowContent::None && !w.minimized && !w.closing && w.contains(px, py) {
             return Some(i);
         }
@@ -266,6 +281,7 @@ pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usiz
 pub fn find_next_focusable(windows: &[ShellWindow], count: usize, exclude: Option<usize>) -> Option<usize> {
     (0..count).rev().find(|&i| {
         exclude.map_or(true, |ex| i != ex)
+            && !matches!(windows[i].content, WindowContent::Layer { .. })
             && windows[i].content != WindowContent::None
             && !windows[i].minimized
             && !windows[i].closing

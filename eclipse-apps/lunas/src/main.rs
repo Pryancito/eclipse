@@ -32,16 +32,19 @@ fn main() {
     let toplevel_registry = state.toplevel_registry.clone();
     let title_registry = state.title_registry.clone();
     let xdg_wm_base_registry = state.xdg_wm_base_registry.clone();
+    let layer_registry = state.layer_registry.clone();
 
     {
         let c = pending_commits.clone();
         let b = buffer_registry.clone();
+        let lr = layer_registry.clone();
         state.protocol.register_global(
             "wl_compositor", 4,
             move || {
                 let compositor = lunas::protocol::LunasCompositor {
                     pending_commits: c.clone(),
                     buffer_registry: b.clone(),
+                    layer_registry: lr.clone(),
                 };
                 wayland_proto::wl::server::objects::ObjectInner::Rc(
                     std::rc::Rc::new(core::cell::RefCell::new(compositor))
@@ -274,6 +277,7 @@ fn main() {
     {
         let c = pending_commits.clone();
         let b = buffer_registry.clone();
+        let lr = layer_registry.clone();
         let w = state.backend.fb.info.width as u32;
         let h = state.backend.fb.info.height as u32;
         state.protocol.register_global(
@@ -282,6 +286,7 @@ fn main() {
                 let shell = lunas::protocol::LunasLayerShell {
                     pending_commits: c.clone(),
                     buffer_registry: b.clone(),
+                    layer_registry: lr.clone(),
                     screen_w: w,
                     screen_h: h,
                 };

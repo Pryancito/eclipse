@@ -527,6 +527,52 @@ fn draw_snap_guides(fb: &mut FramebufferState, input: &InputState) {
     }
 }
 
+/// Blit a layer surface (zwlr_layer_surface_v1) directly onto the framebuffer.
+///
+/// Unlike `draw_window`, layer surfaces have no title bar, shadow, or border —
+/// they render their pixel buffer flush at the computed position.
+fn draw_layer_surface(
+    fb: &mut FramebufferState,
+    window: &ShellWindow,
+    snp_surfaces: &std::collections::BTreeMap<(u32, u32), ExternalSurface>,
+) {
+    if let WindowContent::Layer { surface_id, pid, .. } = window.content {
+        let cx = window.curr_x as i32;
+        let cy = window.curr_y as i32;
+        let cw = window.curr_w as i32;
+        let ch = window.curr_h as i32;
+        if cw <= 0 || ch <= 0 { return; }
+
+        if let Some(surface) = snp_surfaces.get(&(pid, surface_id)) {
+            if !surface.active || surface.vaddr == 0 { return; }
+            let fb_ptr    = fb.back_addr as *mut u32;
+            let fb_stride = fb.info.pitch as usize / 4;
+            let buf_w     = surface.buffer_w as i32;
+            let buf_h     = surface.buffer_h as i32;
+            let copy_w    = cw.min(buf_w).max(0) as usize;
+            let copy_h    = ch.min(buf_h).max(0);
+            let src_stride = buf_w as usize;
+
+            for row in 0..copy_h {
+                let dy = cy + row;
+                if dy < 0 || dy >= fb.info.height as i32 { continue; }
+                let dst_x = cx.max(0) as usize;
+                if dst_x >= fb.info.width as usize { continue; }
+                let actual_copy = copy_w.min(fb.info.width as usize - dst_x);
+                let dest_idx = (dy as usize) * fb_stride + dst_x;
+                let src_idx  = (row as usize) * src_stride;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (surface.vaddr as *const u32).add(src_idx),
+                        fb_ptr.add(dest_idx),
+                        actual_copy,
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn draw_desktop_shell(
     fb: &mut FramebufferState,
     input: &InputState,
@@ -558,6 +604,17 @@ pub fn draw_desktop_shell(
         draw_hud_overlay(fb, log_buf, log_len);
     }
 
+    // 1.6. Draw BACKGROUND and BOTTOM layer surfaces (below taskbar and windows)
+    for i in 0..window_count {
+        let w = &windows[i];
+        if let WindowContent::Layer { layer, .. } = w.content {
+            use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+            if layer == ls::LAYER_BACKGROUND || layer == ls::LAYER_BOTTOM {
+                draw_layer_surface(fb, w, snp_surfaces);
+            }
+        }
+    }
+
     // 2. Draw taskbar
     draw_taskbar(fb, input, desktop, windows, window_count, net_usage);
 
@@ -566,8 +623,10 @@ pub fn draw_desktop_shell(
     for pass in 0..2usize {
         for i in 0..window_count {
             let w = &windows[i];
+            if matches!(w.content, WindowContent::Layer { .. }) { continue; }
             if w.content == WindowContent::None || w.minimized || w.closing { continue; }
-            if w.workspace != input.current_workspace { continue; }
+            // Layer surfaces appear on all workspaces (sentinel 255)
+            if w.workspace != input.current_workspace && w.workspace != 255 { continue; }
             // pass 0 = normal windows; pass 1 = always-on-top
             if pass == 0 && w.above { continue; }
             if pass == 1 && !w.above { continue; }
@@ -578,6 +637,17 @@ pub fn draw_desktop_shell(
     // 3.5. Draw snap zone guides when dragging a window near screen edges/corners
     if input.dragging_window.is_some() {
         draw_snap_guides(fb, input);
+    }
+
+    // 3.6. Draw TOP layer surfaces (above windows, below overlays)
+    for i in 0..window_count {
+        let w = &windows[i];
+        if let WindowContent::Layer { layer, .. } = w.content {
+            use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+            if layer == ls::LAYER_TOP {
+                draw_layer_surface(fb, w, snp_surfaces);
+            }
+        }
     }
 
     // 4. Draw overlays
@@ -638,6 +708,17 @@ pub fn draw_desktop_shell(
     if input.alt_tab_active && input.alt_tab_count > 0 {
         let indices = &input.alt_tab_indices[..input.alt_tab_count];
         crate::switcher::draw_switcher(fb, windows, indices, input.alt_tab_index);
+    }
+
+    // 4.6. Draw OVERLAY layer surfaces (topmost, above all internal overlays)
+    for i in 0..window_count {
+        let w = &windows[i];
+        if let WindowContent::Layer { layer, .. } = w.content {
+            use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+            if layer == ls::LAYER_OVERLAY {
+                draw_layer_surface(fb, w, snp_surfaces);
+            }
+        }
     }
 
     // 5. Draw cursor
@@ -810,7 +891,8 @@ fn draw_taskbar(
         if !active {
             let ws_has_windows = (0..window_count).any(|wi| {
                 let w = &windows[wi];
-                w.content != WindowContent::None && !w.closing && w.workspace == ws
+                !matches!(w.content, WindowContent::Layer { .. })
+                    && w.content != WindowContent::None && !w.closing && w.workspace == ws
             });
             if ws_has_windows {
                 let presence_style = PrimitiveStyleBuilder::new()
@@ -850,6 +932,7 @@ fn draw_taskbar(
         let app_name = app.name_str();
         let run_count = (0..window_count).filter(|&w_idx| {
             let w = &windows[w_idx];
+            if matches!(w.content, WindowContent::Layer { .. }) { return false; }
             if w.content == WindowContent::None || w.closing { return false; }
             if w.workspace != input.current_workspace { return false; }
             let w_title = w.title_str();
@@ -968,6 +1051,8 @@ fn draw_taskbar(
 
     for w_idx in 0..window_count {
         let w = &windows[w_idx];
+        // Skip layer surfaces — they are not shown as taskbar tasks
+        if matches!(w.content, WindowContent::Layer { .. }) { continue; }
         if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
 
@@ -1659,6 +1744,8 @@ fn draw_window(
                 }
             }
             WindowContent::None => {}
+            // Layer surfaces are rendered by draw_layer_surface, not here
+            WindowContent::Layer { .. } => {}
         }
     }
 

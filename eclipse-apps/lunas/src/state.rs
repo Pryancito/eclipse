@@ -8,7 +8,7 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNA
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::desktop::DesktopShell;
-use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SharedToplevels, SharedTitles, SurfaceCommit};
+use crate::protocol::{SharedCommits, SharedBuffers, SharedKeyboards, SharedPointers, SharedToplevels, SharedTitles, SurfaceCommit, LayerSurfaceInfo};
 use wayland_proto::wl::server::server::WaylandServer;
 use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
@@ -99,6 +99,15 @@ pub struct LunasState {
     pub buffer_registry: SharedBuffers,
     /// Maps ClientId → wl_keyboard ObjectId for keyboard event dispatch.
     pub keyboard_registry: SharedKeyboards,
+    /// Maps surface_id → LayerSurfaceInfo for zwlr_layer_surface_v1 clients.
+    /// Read by `LunasSurface::commit` to include layer placement info in SurfaceCommit.
+    pub layer_registry: crate::protocol::SharedLayerRegistry,
+    /// Reserved screen pixels from exclusive-zone layer surfaces.
+    /// Regular windows must not be placed in these bands.
+    pub exclusive_top:    i32,
+    pub exclusive_bottom: i32,
+    pub exclusive_left:   i32,
+    pub exclusive_right:  i32,
     /// Maps ClientId → xdg_wm_base ObjectId — used to dispatch periodic pings.
     pub xdg_wm_base_registry: crate::protocol::SharedXdgWmBases,
     /// Maps ClientId → wl_pointer ObjectId for mouse event dispatch.
@@ -187,6 +196,11 @@ impl LunasState {
             keyboard_registry: Rc::new(RefCell::new(BTreeMap::new())),
             pointer_registry: Rc::new(RefCell::new(BTreeMap::new())),
             xdg_wm_base_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            layer_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            exclusive_top: 0,
+            exclusive_bottom: 0,
+            exclusive_left: 0,
+            exclusive_right: 0,
             toplevel_registry: Rc::new(RefCell::new(BTreeMap::new())),
             title_registry: Rc::new(RefCell::new(BTreeMap::new())),
             xwayland_serials: Rc::new(RefCell::new(BTreeMap::new())),
@@ -520,8 +534,76 @@ impl LunasState {
             };
             self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
 
-            // Create ShellWindow if not yet present
             let surface_id = commit.surface_id;
+
+            // ── Layer surface: position at screen edge, no title bar ──────────
+            if let Some(layer_info) = commit.layer_info {
+                use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+                // Check if this layer surface already has a window slot
+                let layer_exists = self.space.windows[..self.space.window_count]
+                    .iter()
+                    .any(|w| matches!(
+                        w.content,
+                        WindowContent::Layer { surface_id: sid, pid, .. }
+                            if pid == commit.pid && sid == surface_id
+                    ));
+
+                if !layer_exists && self.space.window_count < self.space.windows.len() {
+                    // Compute position from anchor
+                    let (wx, wy, ww, wh) = compute_layer_rect(
+                        &layer_info, fb_w, fb_h,
+                        commit.width as i32, commit.height as i32,
+                    );
+
+                    // Update exclusive zone bookkeeping
+                    if layer_info.exclusive_zone > 0 {
+                        let ez = layer_info.exclusive_zone;
+                        let at = layer_info.anchor;
+                        if at & ls::ANCHOR_TOP != 0 && at & ls::ANCHOR_BOTTOM == 0 {
+                            self.exclusive_top = self.exclusive_top.max(wy + wh + ez.min(wh));
+                        } else if at & ls::ANCHOR_BOTTOM != 0 && at & ls::ANCHOR_TOP == 0 {
+                            let reserved = fb_h - wy;
+                            self.exclusive_bottom = self.exclusive_bottom.max(reserved);
+                        } else if at & ls::ANCHOR_LEFT != 0 && at & ls::ANCHOR_RIGHT == 0 {
+                            self.exclusive_left = self.exclusive_left.max(wx + ww);
+                        } else if at & ls::ANCHOR_RIGHT != 0 && at & ls::ANCHOR_LEFT == 0 {
+                            let reserved = fb_w - wx;
+                            self.exclusive_right = self.exclusive_right.max(reserved);
+                        }
+                    }
+
+                    let win = ShellWindow {
+                        x: wx, y: wy, w: ww, h: wh,
+                        curr_x: (wx + ww / 2) as f32,
+                        curr_y: (wy + wh / 2) as f32,
+                        curr_w: 0.0, curr_h: 0.0,
+                        minimized: false, maximized: false, closing: false,
+                        shaded: false, above: false,
+                        stored_rect: (wx, wy, ww, wh),
+                        stored_h_before_shade: 0,
+                        // Layer surfaces appear on ALL workspaces (use 255 as sentinel)
+                        workspace: 255,
+                        content: WindowContent::Layer {
+                            surface_id: commit.surface_id,
+                            pid: commit.pid,
+                            anchor: layer_info.anchor,
+                            layer: layer_info.layer,
+                            exclusive_zone: layer_info.exclusive_zone,
+                        },
+                        damage: std::vec::Vec::new(),
+                        buffer_handle: None,
+                        is_dmabuf: false,
+                        title: [0u8; 32],
+                    };
+                    self.space.windows[self.space.window_count] = win;
+                    self.space.window_count += 1;
+                    // Layer surfaces don't steal keyboard focus
+                }
+                continue; // don't fall through to regular window code
+            }
+
+            // Create ShellWindow if not yet present
             let exists = self.space.windows[..self.space.window_count]
                 .iter()
                 .any(|w| matches!(
@@ -1709,7 +1791,70 @@ fn is_leap_year(year: u32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-#[cfg(test)]
+/// Compute the screen-space rectangle (x, y, w, h) for a layer surface given
+/// its anchor/exclusive_zone/margin/requested-size and the available screen size.
+///
+/// Rules (same as wlroots / labwc):
+/// - If anchored to opposite edges (e.g. LEFT+RIGHT), the surface stretches to
+///   fill that axis minus margins.
+/// - If anchored to only one edge, the surface is placed at that edge.
+/// - If anchored to no edges, the surface is centred.
+pub fn compute_layer_rect(
+    info: &LayerSurfaceInfo,
+    fb_w: i32, fb_h: i32,
+    buf_w: i32, buf_h: i32,
+) -> (i32, i32, i32, i32) {
+    use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+    let anchor = info.anchor;
+    let aw = ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT;
+    let ah = ls::ANCHOR_TOP  | ls::ANCHOR_BOTTOM;
+
+    // ── Width ─────────────────────────────────────────────────────────────────
+    let w = if info.width > 0 {
+        info.width as i32
+    } else if anchor & aw == aw {
+        // Stretch across full width minus margins
+        (fb_w - info.margin_left - info.margin_right).max(0)
+    } else {
+        buf_w.max(1)
+    };
+
+    // ── Height ────────────────────────────────────────────────────────────────
+    let h = if info.height > 0 {
+        info.height as i32
+    } else if anchor & ah == ah {
+        (fb_h - info.margin_top - info.margin_bottom).max(0)
+    } else {
+        buf_h.max(1)
+    };
+
+    // ── X position ────────────────────────────────────────────────────────────
+    let x = if anchor & aw == aw {
+        info.margin_left  // stretched: start at left margin
+    } else if anchor & ls::ANCHOR_LEFT != 0 {
+        info.margin_left
+    } else if anchor & ls::ANCHOR_RIGHT != 0 {
+        fb_w - w - info.margin_right
+    } else {
+        (fb_w - w) / 2  // centred
+    };
+
+    // ── Y position ────────────────────────────────────────────────────────────
+    let y = if anchor & ah == ah {
+        info.margin_top   // stretched: start at top margin
+    } else if anchor & ls::ANCHOR_TOP != 0 {
+        info.margin_top
+    } else if anchor & ls::ANCHOR_BOTTOM != 0 {
+        fb_h - h - info.margin_bottom
+    } else {
+        (fb_h - h) / 2  // centred
+    };
+
+    (x, y, w, h)
+}
+
+
 mod tests {
     use super::*;
     use crate::compositor::{ShellWindow, WindowContent};
@@ -2470,6 +2615,7 @@ mod tests {
             stride: 400,
             buffer_id: Some(ObjectId(8)),
             frame_callback: Some(ObjectId(6)),
+            layer_info: None,
         });
         // drain_pending_wayland_commits should not panic even without a matching client
         state.drain_pending_wayland_commits();
@@ -2513,6 +2659,148 @@ mod tests {
         state.counter = 300; // triggers ping (300 % 300 == 0? we use counter % 300 == 1, so advance to 301)
         state.counter = 301;
         let _ = state.update(); // should not panic
+    }
+
+    // ── Layer surface / compute_layer_rect tests ─────────────────────────────
+
+    #[test]
+    fn compute_layer_rect_bottom_bar_full_width() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 30,
+            width: 0,
+            height: 30,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 0, 30);
+        assert_eq!(x, 0,    "bottom bar starts at x=0");
+        assert_eq!(w, 1920, "bottom bar is full screen width");
+        assert_eq!(h, 30,   "bottom bar height = requested 30px");
+        assert_eq!(y, 1080 - 30, "bottom bar sits at the bottom edge");
+    }
+
+    #[test]
+    fn compute_layer_rect_top_bar_full_width() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_TOP | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 0, 32);
+        assert_eq!(x, 0,    "top bar starts at x=0");
+        assert_eq!(y, 0,    "top bar is at y=0");
+        assert_eq!(w, 1920, "top bar is full width");
+        assert_eq!(h, 32,   "top bar height = requested 32px");
+    }
+
+    #[test]
+    fn compute_layer_rect_left_panel() {
+        use crate::protocol::LayerSurfaceInfo;
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        let info = LayerSurfaceInfo {
+            layer: ls::LAYER_BOTTOM,
+            anchor: ls::ANCHOR_LEFT | ls::ANCHOR_TOP | ls::ANCHOR_BOTTOM,
+            exclusive_zone: 200,
+            width: 200,
+            height: 0,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        let (x, y, w, h) = compute_layer_rect(&info, 1920, 1080, 200, 0);
+        assert_eq!(x, 0,    "left panel starts at x=0");
+        assert_eq!(y, 0,    "left panel starts at y=0");
+        assert_eq!(w, 200,  "left panel has the requested width");
+        assert_eq!(h, 1080, "left panel is full screen height");
+    }
+
+    #[test]
+    fn layer_surface_commit_creates_window_without_title_bar() {
+        let mut state = LunasState::new().expect("init");
+        let fb_h = state.backend.fb.info.height as i32;
+        let fb_w = state.backend.fb.info.width as i32;
+
+        use crate::protocol::{LayerSurfaceInfo, SurfaceCommit};
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+        use wayland_proto::wl::ObjectId;
+
+        let layer_info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 1001,
+            surface_id: 7,
+            vaddr: 0x1000,
+            width: fb_w as u32,
+            height: 32,
+            stride: (fb_w as u32) * 4,
+            buffer_id: None,
+            frame_callback: None,
+            layer_info: Some(layer_info),
+        });
+        state.drain_pending_wayland_commits();
+
+        // A Layer window should have been created
+        let layer_win = state.space.windows[..state.space.window_count]
+            .iter()
+            .find(|w| matches!(w.content, WindowContent::Layer { pid: 1001, .. }));
+        assert!(layer_win.is_some(), "layer surface window must exist");
+        let lw = layer_win.unwrap();
+        // Should be positioned at the bottom edge
+        assert_eq!(lw.y, fb_h - 32, "layer surface y must be at the bottom edge");
+        assert_eq!(lw.x, 0,         "layer surface x must start at 0");
+        assert_eq!(lw.w, fb_w,      "layer surface width must be full screen width");
+        assert_eq!(lw.h, 32,        "layer surface height must equal exclusive zone");
+        // Workspace 255 = all workspaces
+        assert_eq!(lw.workspace, 255, "layer surfaces appear on all workspaces");
+        // The focused window should NOT be the layer surface
+        assert_ne!(state.input.focused_window, Some(state.space.window_count - 1),
+            "layer surfaces must not steal keyboard focus");
+    }
+
+    #[test]
+    fn layer_surface_exclusive_zone_is_updated() {
+        let mut state = LunasState::new().expect("init");
+        let fb_h = state.backend.fb.info.height as i32;
+        let fb_w = state.backend.fb.info.width as i32;
+
+        use crate::protocol::{LayerSurfaceInfo, SurfaceCommit};
+        use wayland_proto::wl::protocols::common::zwlr_layer_shell as ls;
+
+        let layer_info = LayerSurfaceInfo {
+            layer: ls::LAYER_TOP,
+            anchor: ls::ANCHOR_BOTTOM | ls::ANCHOR_LEFT | ls::ANCHOR_RIGHT,
+            exclusive_zone: 32,
+            width: 0,
+            height: 32,
+            margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0,
+        };
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 2002,
+            surface_id: 9,
+            vaddr: 0x2000,
+            width: fb_w as u32,
+            height: 32,
+            stride: (fb_w as u32) * 4,
+            buffer_id: None,
+            frame_callback: None,
+            layer_info: Some(layer_info),
+        });
+        state.drain_pending_wayland_commits();
+        // exclusive_bottom should be set to at least 32 pixels
+        assert!(state.exclusive_bottom >= 32, "exclusive_bottom must reserve panel height");
     }
 
 }

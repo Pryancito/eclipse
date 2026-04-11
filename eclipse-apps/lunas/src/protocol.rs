@@ -28,6 +28,37 @@ pub struct BufferInfo {
     pub format: u32,
 }
 
+/// Geometry and placement metadata for a `zwlr_layer_surface_v1`.
+///
+/// Stored in `SharedLayerRegistry` keyed by `surface_id` and embedded in
+/// every `SurfaceCommit` that originates from a layer surface so the
+/// compositor can correctly position/size the surface and reserve exclusive
+/// zones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSurfaceInfo {
+    /// Which compositor layer (BACKGROUND=0, BOTTOM=1, TOP=2, OVERLAY=3).
+    pub layer: u32,
+    /// Anchor bitfield: ANCHOR_TOP=1, ANCHOR_BOTTOM=2, ANCHOR_LEFT=4, ANCHOR_RIGHT=8.
+    pub anchor: u32,
+    /// Exclusive zone in pixels.  Positive values reserve space at the anchored edge;
+    /// -1 means "don't compute an exclusive zone but don't be constrained either".
+    pub exclusive_zone: i32,
+    /// Client-requested dimensions.  0 means "compositor picks".
+    pub width: u32,
+    pub height: u32,
+    pub margin_top:    i32,
+    pub margin_right:  i32,
+    pub margin_bottom: i32,
+    pub margin_left:   i32,
+}
+
+/// Shared registry mapping `surface_id` → `LayerSurfaceInfo`.
+///
+/// Written by `LunasLayerSurface` whenever the client calls `set_anchor`,
+/// `set_size`, etc.  Read by `LunasSurface` at commit time to embed the
+/// geometry into `SurfaceCommit`.
+pub type SharedLayerRegistry = Rc<RefCell<BTreeMap<u32, LayerSurfaceInfo>>>;
+
 /// Pending surface commit: posted by LunasSurface on commit and drained by
 /// LunasState to create / update ShellWindows.
 pub struct SurfaceCommit {
@@ -43,6 +74,10 @@ pub struct SurfaceCommit {
     /// Pending `wl_surface.frame` callback ObjectId to fire `wl_callback.done` after
     /// this commit has been rendered.  None if the client did not request a callback.
     pub frame_callback: Option<wayland_proto::wl::ObjectId>,
+    /// Present when the surface is a `zwlr_layer_surface_v1`.
+    /// Used by `drain_pending_wayland_commits` to place the surface at the
+    /// correct screen edge without a title bar.
+    pub layer_info: Option<LayerSurfaceInfo>,
 }
 
 /// Shared registry of live wl_buffer objects, keyed by ObjectId.
@@ -74,6 +109,7 @@ pub type SharedXdgWmBases = Rc<RefCell<BTreeMap<ClientId, ObjectId>>>;
 pub struct LunasCompositor {
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub layer_registry: SharedLayerRegistry,
 }
 
 impl ObjectLogic for LunasCompositor {
@@ -99,6 +135,7 @@ impl ObjectLogic for LunasCompositor {
                     pending_frame_callback: None,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    layer_registry: self.layer_registry.clone(),
                 })));
                 client.add_object(id, Object::new::<wl_surface::WlSurface>(id, surface));
                 Ok(())
@@ -152,6 +189,9 @@ pub struct LunasSurface {
     pub pending_frame_callback: Option<NewId>,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    /// Maps surface_id → LayerSurfaceInfo.  Present when this surface is the
+    /// underlying wl_surface for a zwlr_layer_surface_v1.
+    pub layer_registry: SharedLayerRegistry,
 }
 
 impl ObjectLogic for LunasSurface {
@@ -207,6 +247,9 @@ impl ObjectLogic for LunasSurface {
                 let buffer_id = self.attached_buffer_id;
                 if let Some(info) = self.attached_buffer {
                     if info.vaddr != 0 {
+                        let layer_info = (*self.layer_registry).borrow()
+                            .get(&self.id.0)
+                            .copied();
                         (*self.pending_commits).borrow_mut().push(SurfaceCommit {
                             pid: self.pid,
                             surface_id: self.id.0,
@@ -216,6 +259,7 @@ impl ObjectLogic for LunasSurface {
                             stride: info.stride,
                             buffer_id,
                             frame_callback,
+                            layer_info,
                         });
                     }
                 }
@@ -1322,6 +1366,7 @@ pub struct LunasLayerShell {
     pub buffer_registry: SharedBuffers,
     pub screen_w: u32,
     pub screen_h: u32,
+    pub layer_registry: SharedLayerRegistry,
 }
 
 impl ObjectLogic for LunasLayerShell {
@@ -1351,6 +1396,20 @@ impl ObjectLogic for LunasLayerShell {
                     Some(Payload::String(s)) => s.clone(),
                     _ => std::string::String::new(),
                 };
+                // Register a default LayerSurfaceInfo entry immediately so that
+                // `LunasSurface::commit` can include it even before set_anchor / set_size.
+                let default_info = LayerSurfaceInfo {
+                    layer,
+                    anchor: 0,
+                    exclusive_zone: 0,
+                    width: 0,
+                    height: 0,
+                    margin_top: 0,
+                    margin_right: 0,
+                    margin_bottom: 0,
+                    margin_left: 0,
+                };
+                (*self.layer_registry).borrow_mut().insert(surface_id.0, default_info);
                 let layer_surf = ObjectInner::Rc(Rc::new(RefCell::new(LunasLayerSurface {
                     id: id.as_id(),
                     surface_id,
@@ -1364,13 +1423,15 @@ impl ObjectLogic for LunasLayerShell {
                     keyboard_interactivity: zwlr_layer_shell::KEYBOARD_INTERACTIVITY_NONE,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
+                    layer_registry: self.layer_registry.clone(),
+                    screen_w: self.screen_w,
+                    screen_h: self.screen_h,
                 })));
                 client.add_object(id, Object::new::<zwlr_layer_shell::ZwlrLayerSurfaceV1>(id, layer_surf));
-                // Send initial configure: compositor chooses the size based on
-                // anchor/exclusive zone, but since the client hasn't set those
-                // yet we send (0,0) and let it issue set_size first.
+                // Initial configure: send full-screen size; client will immediately
+                // call set_anchor / set_size and then ack_configure.
                 client.send_event(id.as_id(), zwlr_layer_shell::SurfaceEvent::Configure {
-                    serial: 1,
+                    serial: surface_id.0,
                     width: self.screen_w,
                     height: self.screen_h,
                 })?;
@@ -1402,12 +1463,66 @@ pub struct LunasLayerSurface {
     pub keyboard_interactivity: u32,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
+    pub layer_registry: SharedLayerRegistry,
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+impl LunasLayerSurface {
+    /// Synchronise the current state into `layer_registry` and compute the
+    /// compositor-assigned size based on anchor and exclusive_zone.
+    fn sync_registry(&self) {
+        let info = LayerSurfaceInfo {
+            layer: self.layer,
+            anchor: self.anchor,
+            exclusive_zone: self.exclusive_zone,
+            width: self.width,
+            height: self.height,
+            margin_top: self.margin_top,
+            margin_right: self.margin_right,
+            margin_bottom: self.margin_bottom,
+            margin_left: self.margin_left,
+        };
+        (*self.layer_registry).borrow_mut().insert(self.surface_id.0, info);
+    }
+
+    /// Compute the configure size the compositor should send for this layer surface.
+    ///
+    /// Rules:
+    /// - If the client set width/height to 0 we fill the relevant axis based on anchor.
+    /// - Horizontally stretched (LEFT|RIGHT anchored): width = screen_w - margins
+    /// - Vertically stretched (TOP|BOTTOM anchored): height = screen_h - margins
+    fn compute_configured_size(&self) -> (u32, u32) {
+        let anchor = self.anchor;
+        let aw = zwlr_layer_shell::ANCHOR_LEFT | zwlr_layer_shell::ANCHOR_RIGHT;
+        let ah = zwlr_layer_shell::ANCHOR_TOP  | zwlr_layer_shell::ANCHOR_BOTTOM;
+
+        let conf_w = if self.width > 0 {
+            self.width
+        } else if anchor & aw == aw {
+            let m = (self.margin_left + self.margin_right).max(0) as u32;
+            self.screen_w.saturating_sub(m)
+        } else {
+            self.screen_w
+        };
+
+        let conf_h = if self.height > 0 {
+            self.height
+        } else if anchor & ah == ah {
+            let m = (self.margin_top + self.margin_bottom).max(0) as u32;
+            self.screen_h.saturating_sub(m)
+        } else {
+            self.screen_h
+        };
+
+        (conf_w, conf_h)
+    }
 }
 
 impl ObjectLogic for LunasLayerSurface {
     fn handle_request(
         &mut self,
-        _client: &mut Client,
+        client: &mut Client,
         opcode: u16,
         args: &[Payload],
         _handles: &[Handle],
@@ -1419,6 +1534,7 @@ impl ObjectLogic for LunasLayerSurface {
                     self.width = *w;
                     self.height = *h;
                 }
+                self.sync_registry();
                 Ok(())
             }
             1 => {
@@ -1426,6 +1542,7 @@ impl ObjectLogic for LunasLayerSurface {
                 if let Some(Payload::UInt(a)) = args.first() {
                     self.anchor = *a;
                 }
+                self.sync_registry();
                 Ok(())
             }
             2 => {
@@ -1433,6 +1550,7 @@ impl ObjectLogic for LunasLayerSurface {
                 if let Some(Payload::Int(z)) = args.first() {
                     self.exclusive_zone = *z;
                 }
+                self.sync_registry();
                 Ok(())
             }
             3 => {
@@ -1446,6 +1564,7 @@ impl ObjectLogic for LunasLayerSurface {
                     self.margin_bottom = *b;
                     self.margin_left = *l;
                 }
+                self.sync_registry();
                 Ok(())
             }
             4 => {
@@ -1456,13 +1575,29 @@ impl ObjectLogic for LunasLayerSurface {
                 Ok(())
             }
             5 => Ok(()), // get_popup — not implemented
-            6 => Ok(()), // ack_configure
-            7 => Ok(()), // destroy
+            6 => {
+                // ack_configure — client acknowledged our configure.
+                // Send a new configure with the correctly computed size so the
+                // client knows the compositor-chosen dimensions.
+                let (cw, ch) = self.compute_configured_size();
+                client.send_event(self.id, zwlr_layer_shell::SurfaceEvent::Configure {
+                    serial: self.surface_id.0.wrapping_add(1),
+                    width: cw,
+                    height: ch,
+                })?;
+                Ok(())
+            }
+            7 => {
+                // destroy — remove from layer registry
+                (*self.layer_registry).borrow_mut().remove(&self.surface_id.0);
+                Ok(())
+            }
             8 => {
                 // set_layer(layer)
                 if let Some(Payload::UInt(l)) = args.first() {
                     self.layer = *l;
                 }
+                self.sync_registry();
                 Ok(())
             }
             9 => Ok(()), // set_exclusive_edge — ignore
@@ -1494,18 +1629,25 @@ mod wayland_server_tests {
         )
     }
 
+    fn make_layer_registry() -> super::SharedLayerRegistry {
+        Rc::new(RefCell::new(BTreeMap::new()))
+    }
+
     fn sample_server() -> WaylandServer {
         let (commits, buffers) = make_shared();
+        let lr = make_layer_registry();
         let mut server = WaylandServer::new();
         {
             let c = commits.clone();
             let b = buffers.clone();
+            let l = lr.clone();
             server.register_global(
                 "wl_compositor",
                 4,
                 move || ObjectInner::Rc(Rc::new(RefCell::new(LunasCompositor {
                     pending_commits: c.clone(),
                     buffer_registry: b.clone(),
+                    layer_registry: l.clone(),
                 }))),
                 |id, inner| Object::new::<WlCompositor>(id, inner),
             );
@@ -1560,6 +1702,7 @@ mod wayland_server_tests {
         let mut comp = LunasCompositor {
             pending_commits: commits,
             buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
         };
         let args = std::vec![
             wayland_proto::wl::Payload::NewId(NewId(5)),
@@ -1653,6 +1796,7 @@ mod wayland_server_tests {
         let mut shell = LunasLayerShell {
             pending_commits: commits,
             buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
             screen_w: 1920,
             screen_h: 1080,
         };
@@ -1745,6 +1889,7 @@ mod wayland_server_tests {
             pending_frame_callback: None,
             pending_commits: commits.clone(),
             buffer_registry: buffers.clone(),
+            layer_registry: make_layer_registry(),
         };
 
         // opcode 3 = frame(callback: new_id(6))
@@ -1788,7 +1933,11 @@ mod wayland_server_tests {
             ClientId(8),
             Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
         );
-        let mut comp = super::LunasCompositor { pending_commits: commits, buffer_registry: buffers };
+        let mut comp = super::LunasCompositor {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            layer_registry: make_layer_registry(),
+        };
         let args = std::vec![wayland_proto::wl::Payload::NewId(NewId(55))];
         let r = ObjectLogic::handle_request(&mut comp, &mut client, 1, &args, &[]);
         assert!(r.is_ok(), "create_region: {:?}", r);
