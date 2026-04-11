@@ -39,6 +39,7 @@ print_warning() {
 
 # Copia al rootfs staging las .so que `ldd` resuelve para un binario (labwc, etc.).
 # Sin esto, en Eclipse solo están musl/libc y faltan libinput, EGL, cairo, pango…
+# Solo copia bibliotecas musl-compatibles: omite ld-linux*.so* y las compiladas contra glibc.
 eclipse_stage_ldd_libs() {
     local dest="$1"
     local bin="$2"
@@ -62,6 +63,11 @@ eclipse_stage_ldd_libs() {
                         ;;
                 esac
                 [ -f "$p" ] || [ -L "$p" ] || continue
+                # No copiar bibliotecas que dependan de glibc (incompatibles con musl)
+                if eclipse_is_glibc_lib "$p"; then
+                    print_warning "Omitiendo $(basename "$p") de ldd (dependencia glibc)"
+                    continue
+                fi
                 cp -a "$p" "$dest/lib/"
                 n=$((n + 1))
                 ;;
@@ -72,7 +78,15 @@ eclipse_stage_ldd_libs() {
     fi
 }
 
+# Devuelve 0 (éxito) si el ELF $1 está enlazado dinámicamente con glibc (NEEDED libc.so.6).
+# Se usa para NO copiar bibliotecas glibc al rootfs musl de Eclipse.
+eclipse_is_glibc_lib() {
+    local f="$1"
+    readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libc\.so\.6'
+}
+
 # Si ldd falla (p. ej. musl intentó cargar /lib/.../libc.so script de glibc), copia DT_NEEDED resolviendo rutas.
+# Solo copia bibliotecas musl-compatibles: omite ld-linux*.so*, libc.so.6 y cualquier .so glibc.
 eclipse_stage_readelf_needed_libs() {
     local dest="$1"
     local bin="$2"
@@ -85,9 +99,15 @@ eclipse_stage_readelf_needed_libs() {
     while IFS= read -r soname; do
         [ -z "$soname" ] && continue
         case "$soname" in
+            # Nunca incluir el intérprete glibc ni libc.so.6 en el rootfs musl
             ld-linux*.so*) continue ;;
+            libc.so.*) continue ;;
+            libdl.so.*) continue ;;
+            libpthread.so.*) continue ;;
+            librt.so.*) continue ;;
         esac
         cand=""
+        # 1) Preferir versión musl-gcc
         if command -v musl-gcc >/dev/null 2>&1; then
             pf="$(musl-gcc -print-file-name="$soname" 2>/dev/null || true)"
             case "$pf" in
@@ -98,10 +118,27 @@ eclipse_stage_readelf_needed_libs() {
                     ;;
             esac
         fi
+        # 2) Buscar en directorios musl conocidos antes que en glibc
         if [ -z "$cand" ]; then
-            for d in /usr/lib/x86_64-linux-musl /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
+            for d in /usr/lib/x86_64-linux-musl \
+                     /usr/lib/musl/lib \
+                     /usr/x86_64-linux-musl/lib; do
                 [ -e "$d/$soname" ] || continue
                 readelf -h "$d/$soname" >/dev/null 2>&1 || continue
+                cand="$d/$soname"
+                break
+            done
+        fi
+        # 3) Solo si NO es glibc, buscar en rutas genéricas
+        if [ -z "$cand" ]; then
+            for d in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib /lib; do
+                [ -e "$d/$soname" ] || continue
+                readelf -h "$d/$soname" >/dev/null 2>&1 || continue
+                # Rechazar bibliotecas que dependan de glibc
+                if eclipse_is_glibc_lib "$d/$soname"; then
+                    print_warning "Omitiendo $soname de $d (dependencia glibc, incompatible con musl)"
+                    continue
+                fi
                 cand="$d/$soname"
                 break
             done
@@ -111,7 +148,66 @@ eclipse_stage_readelf_needed_libs() {
         n=$((n + 1))
     done < <(readelf -d "$bin" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
     if [ "$n" -gt 0 ]; then
-        print_status "Staged $n bibliotecas (readelf NEEDED, sin ldd) desde $(basename "$bin") -> lib/"
+        print_status "Staged $n bibliotecas (readelf NEEDED, musl-compatible) desde $(basename "$bin") -> lib/"
+    fi
+}
+
+# Comprueba si un ELF tiene PT_INTERP (binario dinámicamente enlazado).
+eclipse_is_dynamic_elf() {
+    local f="$1"
+    readelf -l "$f" 2>/dev/null | grep -q 'INTERP'
+}
+
+# Para cada binario dinámicamente enlazado en $dest/bin/, llama a
+# eclipse_stage_readelf_needed_libs con preferencia musl.
+eclipse_stage_all_dynamic_bin_libs() {
+    local dest="$1"
+    command -v readelf >/dev/null 2>&1 || return 0
+    local b
+    for b in "$dest/bin/"*; do
+        [ -f "$b" ] || continue
+        file "$b" 2>/dev/null | grep -q 'ELF' || continue
+        eclipse_is_dynamic_elf "$b" || continue
+        print_status "Staging musl libs para binario dinámico: $(basename "$b")"
+        eclipse_stage_readelf_needed_libs "$dest" "$b"
+    done
+}
+
+# Elimina del rootfs staging las bibliotecas incompatibles con musl:
+#   - ld-linux-x86-64.so.2  (intérprete glibc, nunca necesario en entorno musl)
+#   - libgcc_s.so.1 glibc   (se intenta reemplazar con versión musl si está disponible)
+eclipse_sanitize_staged_libs() {
+    local dest="$1"
+    command -v readelf >/dev/null 2>&1 || return 0
+
+    # Eliminar siempre el intérprete glibc
+    if [ -e "$dest/lib/ld-linux-x86-64.so.2" ]; then
+        rm -f "$dest/lib/ld-linux-x86-64.so.2"
+        print_status "Eliminado ld-linux-x86-64.so.2 (intérprete glibc, incompatible con Eclipse musl)"
+    fi
+
+    # Reemplazar libgcc_s.so.1 glibc con versión musl si está disponible
+    local gcc_staged="$dest/lib/libgcc_s.so.1"
+    if [ -f "$gcc_staged" ] && eclipse_is_glibc_lib "$gcc_staged"; then
+        print_warning "libgcc_s.so.1 staged es versión glibc; buscando versión musl..."
+        local musl_gcc_s=""
+        local d
+        for d in /usr/lib/x86_64-linux-musl \
+                 /usr/lib/musl/lib \
+                 /usr/x86_64-linux-musl/lib; do
+            if [ -f "$d/libgcc_s.so.1" ] && ! eclipse_is_glibc_lib "$d/libgcc_s.so.1"; then
+                musl_gcc_s="$d/libgcc_s.so.1"
+                break
+            fi
+        done
+        if [ -n "$musl_gcc_s" ]; then
+            cp -a "$musl_gcc_s" "$gcc_staged"
+            print_status "Reemplazado libgcc_s.so.1 con versión musl desde $musl_gcc_s"
+        else
+            # No encontramos versión musl: eliminar la glibc para evitar errores de relocación
+            rm -f "$gcc_staged"
+            print_warning "libgcc_s.so.1 musl no encontrada; eliminada versión glibc del rootfs"
+        fi
     fi
 }
 
@@ -1504,7 +1600,15 @@ EOF
         cp -f eclipse-apps/sources/* "$BUILD_DIR/usr/share/fonts/X11/misc/"
         print_status "Copiado de fuentes a $BUILD_DIR/usr/share/fonts/X11/misc/"
     fi
-    
+
+    # Para binarios dinámicamente enlazados en /bin, staging de dependencias musl-compatibles.
+    # Esto garantiza que cualquier binario dinámico (p.ej. cargo) tenga las .so correctas
+    # en lugar de versiones glibc incompatibles.
+    eclipse_stage_all_dynamic_bin_libs "$BUILD_DIR"
+
+    # Eliminar bibliotecas incompatibles con musl (ld-linux-x86-64.so.2, libgcc_s.so.1 glibc).
+    eclipse_sanitize_staged_libs "$BUILD_DIR"
+
     print_success "Distribución básica creada en $BUILD_DIR"
 }
 
