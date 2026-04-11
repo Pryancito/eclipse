@@ -1673,7 +1673,13 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
             crate::scheduler::enqueue_process(pid);
             pid as u64
         }
-        Err(_) => u64::MAX,
+        Err(e) => {
+            serial::serial_printf(format_args!(
+                "[spawn] spawn_with_stdio failed for \"{}\": {}\n",
+                name_trimmed, e
+            ));
+            u64::MAX
+        }
     }
 }
 

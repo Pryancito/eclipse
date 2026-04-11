@@ -274,17 +274,11 @@ impl Filesystem {
             let mut entry_buffer = [0u8; 8];
             read_bytes_at(abs_disk_offset, &mut entry_buffer)?;
             
-            let inode_num = u32::from_le_bytes([
-                entry_buffer[0], entry_buffer[1], 
-                entry_buffer[2], entry_buffer[3]
-            ]) as u64;
-            
-            let rel_offset = u32::from_le_bytes([
-                entry_buffer[4], entry_buffer[5], 
-                entry_buffer[6], entry_buffer[7]
-            ]) as u64;
-             
-            let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
+            // Each inode table entry is 8 bytes containing the absolute file offset
+            // of the node record as a little-endian u64.
+            // (A previous format stored [inode: u32][rel_offset: u32] but rel_offset
+            // truncated silently on filesystems > 4 GB.)
+            let absolute_offset = u64::from_le_bytes(entry_buffer);
             
             // 2. Update Inode Cache (LRU)
             let mut victim_idx = 0;
@@ -310,7 +304,7 @@ impl Filesystem {
                 last_access: FS.inode_cache.access_counter,
             };
 
-            Ok(InodeTableEntry::new(inode_num, absolute_offset))
+            Ok(InodeTableEntry::new(inode as u64, absolute_offset))
         }
     }
     

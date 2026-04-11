@@ -439,6 +439,8 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
             for a in &cmd.argv { ab.extend_from_slice(a.as_bytes()); ab.push(0); }
             let _ = eclipse_syscall::call::set_child_args(pid, &ab);
             return Some(pid);
+        } else {
+            sh_eprintln(&format!("sh: {}: error al iniciar el proceso", prog));
         }
     } else { sh_eprintln(&format!("sh: {}: no encontrado", prog)); }
     None

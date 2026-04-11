@@ -611,7 +611,16 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
         "[load_elf] dynamic: loading interpreter \"{}\"\n",
         interp_path
     ));
-    let interp_elf: Vec<u8> = filesystem::read_file_alloc(interp_path)?;
+    let interp_elf: Vec<u8> = match filesystem::read_file_alloc(interp_path) {
+        Ok(v) => v,
+        Err(e) => {
+            serial::serial_printf(format_args!(
+                "[load_elf] dynamic: failed to read interpreter \"{}\": {}\n",
+                interp_path, e
+            ));
+            return Err(e);
+        }
+    };
     if interp_elf.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: interpreter too small");
     }

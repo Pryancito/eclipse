@@ -108,10 +108,13 @@ impl EclipseFSWriter {
         nodes_sorted.sort_by_key(|(inode, _)| *inode);
 
         let mut current_offset = nodes_start;
-        for (inode, size) in nodes_sorted.iter() {
-            self.file.write_u32::<LittleEndian>(*inode)?;
-            let relative_offset = (current_offset - nodes_start) as u32;
-            self.file.write_u32::<LittleEndian>(relative_offset)?;
+        for (_inode, size) in nodes_sorted.iter() {
+            // Store the absolute file offset as a u64 (8 bytes).
+            // An earlier format stored [inode: u32][rel_offset: u32] but rel_offset
+            // silently truncated on filesystems larger than ~4 GB, causing wrong
+            // disk addresses for late inodes.  The absolute offset fits in u64 and
+            // the entry size (8 bytes) is unchanged so inode_table_size is unaffected.
+            self.file.write_u64::<LittleEndian>(current_offset)?;
             current_offset += *size as u64;
         }
 
