@@ -13,7 +13,7 @@ sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
 std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { version = "0.2", default-features = false }
+libc = { path = "../../eclipse-relibc" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 minifb = "0.28"

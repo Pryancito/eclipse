@@ -4,6 +4,8 @@
 //! with defaults that match labwc's out-of-the-box behaviour.
 
 use std::prelude::v1::*;
+use alloc::vec;
+
 
 // ── Button identifiers ──────────────────────────────────────────────────────
 

@@ -6,7 +6,7 @@
 extern crate std;
 use std::prelude::v1::*;
 use eclipse_program_codes::{spawn_id_to_init_services_index, spawn_service_id, spawn_service_short_name};
-use eclipse_libc::{getpid, sleep_ms, yield_cpu, wait, Spinlock};
+use eclipse_libc::{getpid, yield_cpu, wait, Spinlock};
 use eclipse_libc::{fork, exec, get_service_binary, get_last_exec_error, exit};
 
 /// Service state
@@ -169,7 +169,7 @@ fn start_system_services() {
 }
 
 /// Wait for a service to signal READY via IPC.
-/// Uses a tight poll with yield_cpu + periodic sleep_ms to balance
+/// Uses a tight poll with yield_cpu + periodic short sleep to balance
 /// responsiveness with CPU efficiency on SMP.
 fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
     let mut buffer = [0u8; 128];

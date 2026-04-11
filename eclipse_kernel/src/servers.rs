@@ -40,16 +40,12 @@ static mut SYSTEM_SERVERS: SystemServers = SystemServers {
 
 /// Inicializar todos los servidores del sistema
 pub fn init_servers() {
-    serial::serial_print("Initializing system servers...\n");
-    
+
     // Registrar servidor de FileSystem
     if let Some(fs_id) = register_server(b"FileSystem", MessageType::FileSystem, 10) {
         unsafe {
             SYSTEM_SERVERS.filesystem = Some(fs_id);
         }
-        serial::serial_print("FileSystem server registered with ID: ");
-        serial::serial_print_dec(fs_id as u64);
-        serial::serial_print("\n");
         
         /*
         if let Some(_pid) = create_process(filesystem_server as *const () as u64, 0x500000, 0x10000, 0, 0) {
@@ -63,9 +59,6 @@ pub fn init_servers() {
         unsafe {
             SYSTEM_SERVERS.graphics = Some(gfx_id);
         }
-        serial::serial_print("Graphics server registered with ID: ");
-        serial::serial_print_dec(gfx_id as u64);
-        serial::serial_print("\n");
         
         /*
         if let Some(_pid) = create_process(graphics_server as *const () as u64, 0x600000, 0x10000, 0, 0) {
@@ -79,12 +72,7 @@ pub fn init_servers() {
         unsafe {
             SYSTEM_SERVERS.network = Some(net_id);
         }
-        serial::serial_print("Network server registered with ID: ");
-        serial::serial_print_dec(net_id as u64);
-        serial::serial_print("\n");
     }
-    
-    serial::serial_print("System servers initialized\n");
 }
 
 pub fn get_filesystem_server() -> Option<ServerId> {
@@ -104,7 +92,6 @@ pub fn get_network_server() -> Option<ServerId> {
 // ============================================================================
 
 extern "C" fn filesystem_server() -> ! {
-    serial::serial_print("FileSystem server started\n");
     
     loop {
         // Procesar mensajes IPC

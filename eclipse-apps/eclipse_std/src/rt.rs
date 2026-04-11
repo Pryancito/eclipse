@@ -19,7 +19,7 @@ pub fn argc() -> u64 {
 /// Lee argc del stack tal como lo dejó el kernel.
 /// Layout: [RSP+0] = argc, [RSP+8] = argv[0], ...
 #[inline(always)]
-unsafe fn read_argc_from_stack(rsp: *const u64) -> u64 {
+pub unsafe fn read_argc_from_stack(rsp: *const u64) -> u64 {
     rsp.read()
 }
 

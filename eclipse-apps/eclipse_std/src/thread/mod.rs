@@ -106,14 +106,31 @@ impl<T> JoinHandle<T> {
 
 use crate::time::Duration;
 
-/// Sleep for a duration
+/// Duerme el hilo actual durante `dur`.
+///
+/// No llama a `libc::nanosleep` directamente: con LTO/`opt-level=z` LLVM a veces integra
+/// la preparación del `timespec` y el `syscall` de forma que la pila queda en un layout
+/// que en Eclipse OS acaba en **#GP en ring 3** (p. ej. al escribir el segundo campo).
+/// Usar [`eclipse_syscall::call::syscall2`] mantiene el tramo crítico estable y alineado
+/// con el manejador del kernel (`SYS_NANOSLEEP` = 35).
+#[inline(never)]
 pub fn sleep(dur: Duration) {
     unsafe {
-        let ts = timespec {
-            tv_sec: dur.secs as i64,
-            tv_nsec: dur.nanos as i64,
+        let mut ts = timespec {
+            tv_sec: dur.secs as time_t,
+            tv_nsec: dur.nanos as c_long,
         };
-        nanosleep(&ts as *const timespec, ptr::null_mut());
+        let extra_secs = ts.tv_nsec / 1_000_000_000;
+        if extra_secs != 0 {
+            ts.tv_nsec %= 1_000_000_000;
+            ts.tv_sec = ts.tv_sec.saturating_add(extra_secs);
+        }
+        let ts_ptr = &ts as *const timespec as usize;
+        let _ = eclipse_syscall::syscall2(
+            eclipse_syscall::number::SYS_NANOSLEEP,
+            ts_ptr,
+            0,
+        );
     }
 }
 

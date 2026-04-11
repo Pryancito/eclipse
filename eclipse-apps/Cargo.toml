@@ -54,8 +54,10 @@ panic = "abort"
 lto = "off"
 opt-level = "s"
 codegen-units = 1
-debug = false
-strip = "symbols"
+# debug = false
+# strip = "symbols"
+debug = true
+strip = "none"
 
 [profile.dev]
 opt-level = "s"
@@ -63,3 +65,4 @@ panic = "abort"
 
 [patch.crates-io]
 libc = { path = "../eclipse-relibc" }
+std = { package = "eclipse_std", path = "eclipse_std" }
