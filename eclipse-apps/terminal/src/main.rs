@@ -5,7 +5,7 @@ use core::cell::RefCell;
 use eclipse_syscall::{self, flag};
 use heapless::String as HString;
 
-use os_terminal::{ClipboardHandler, DrawTarget, Rgb, Terminal};
+use os_terminal::{ClipboardHandler, DrawTarget, MouseButton, MouseInput, Rgb, Terminal};
 use os_terminal::font::BitmapFont;
 
 #[cfg(target_os = "eclipse")]
@@ -175,6 +175,12 @@ struct TerminalApp {
     buffer_id: u32,
     toplevel_id: u32,
     keyboard_id: u32,
+    pointer_id: u32,
+    /// Next available Wayland object ID for dynamic allocation.
+    next_obj_id: u32,
+    /// Current pointer position in surface coordinates.
+    pointer_x: f32,
+    pointer_y: f32,
     surface_state: Rc<RefCell<SurfaceBacking>>,
     terminal: Terminal<SharedSurfaceDrawTarget>,
     pty_master_fd: usize,
@@ -184,7 +190,6 @@ struct TerminalApp {
     last_title: [u8; 32],
     /// Serial counter for protocol events.
     serial: u32,
-    ctrl_pressed: bool,
 }
 
 impl TerminalApp {
@@ -379,6 +384,11 @@ impl TerminalApp {
             send_wayland(&wayland, 6, 1, &[Payload::NewId(NewId(12))]);
         }
 
+        // wl_seat.get_pointer(id=13)
+        if seat_name != 0 {
+            send_wayland(&wayland, 6, 0, &[Payload::NewId(NewId(13))]);
+        }
+
         // wl_surface.attach(buffer=9, x=0, y=0) + commit → triggers initial configure
         send_wayland(&wayland, 7, 1, &[Payload::ObjectId(ObjectId(9)), Payload::Int(0), Payload::Int(0)]);
         send_wayland(&wayland, 7, 6, &[]); // wl_surface.commit
@@ -400,6 +410,7 @@ impl TerminalApp {
         terminal.set_crnl_mapping(true);
         terminal.set_clipboard(Box::new(EclipseClipboard::new()));
         terminal.set_auto_flush(false);
+        terminal.set_history_size(1000);
 
         // ── 6. PTY & Shell ────────────────────────────────────────────────
         let pty_master_fd = unsafe {
@@ -441,6 +452,10 @@ impl TerminalApp {
             buffer_id: 9,
             toplevel_id: 11,
             keyboard_id: if seat_name != 0 { 12 } else { 0 },
+            pointer_id: if seat_name != 0 { 13 } else { 0 },
+            next_obj_id: 14,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
             surface_state: shared_state.clone(),
             terminal,
             pty_master_fd,
@@ -449,7 +464,6 @@ impl TerminalApp {
             sh_bytes,
             last_title: [0; 32],
             serial: 1,
-            ctrl_pressed: false,
         })
     }
 
@@ -550,13 +564,17 @@ impl TerminalApp {
                                                 state.shm_fd = fd;
                                                 
                                                 // Inform compositor of the new buffer
-                                                // create_pool (use id 13 for new pool)
-                                                send_wayland_with_fd(&self.wayland, 4, 0, &[Payload::NewId(NewId(13)), Payload::Handle(wayland_proto::wl::wire::Handle(fd)), Payload::Int(new_size as i32)], fd);
-                                                // create_buffer (use id 14)
+                                                // Allocate fresh IDs for pool and buffer to avoid
+                                                // reusing already-registered IDs (pointer=13, etc.)
+                                                let pool_id  = self.next_obj_id;
+                                                let buf_id   = self.next_obj_id + 1;
+                                                self.next_obj_id += 2;
+                                                send_wayland_with_fd(&self.wayland, 4, 0, &[Payload::NewId(NewId(pool_id)), Payload::Handle(wayland_proto::wl::wire::Handle(fd)), Payload::Int(new_size as i32)], fd);
+                                                // create_buffer
                                                 let stride = (w * 4) as i32;
-                                                send_wayland(&self.wayland, 13, 0, &[Payload::NewId(NewId(14)), Payload::Int(0), Payload::Int(w), Payload::Int(h), Payload::Int(stride), Payload::UInt(1)]);
+                                                send_wayland(&self.wayland, pool_id, 0, &[Payload::NewId(NewId(buf_id)), Payload::Int(0), Payload::Int(w), Payload::Int(h), Payload::Int(stride), Payload::UInt(1)]);
                                                 
-                                                self.buffer_id = 14;
+                                                self.buffer_id = buf_id;
                                             } else {
                                                 // mmap failed — close fd immediately, nothing to keep.
                                                 unsafe { close(fd) };
@@ -580,18 +598,16 @@ impl TerminalApp {
                                 if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
                                     let key   = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
                                     let state = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
-                                    // Convert evdev keycode → PS/2 scancode → pc_keyboard state machine
+                                    // Convert evdev keycode → PS/2 Set-1 scancode expected by pc_keyboard.
+                                    // Lunas sends evdev_key = ps2_code + 8, so we subtract 8 to recover the
+                                    // PS/2 code.  Set the break-bit (0x80) on key-release.
                                     let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
                                     let ps2 = if state != 0 { sc } else { sc | 0x80 };
 
-                                    // Handle Ctrl state for signal propagation
-                                    if sc == 0x1D { // Left Ctrl
-                                        self.ctrl_pressed = state != 0;
-                                    }
-                                    if self.ctrl_pressed && sc == 0x2E && state != 0 { // Ctrl+C Make
-                                        let _ = sys_write(self.pty_master_fd, b"\x03");
-                                    }
-
+                                    // handle_keyboard feeds the PS/2 scancode into pc_keyboard which
+                                    // tracks modifier state internally (Ctrl, Shift, Alt, …) and
+                                    // writes the resulting ANSI/Unicode string directly to the PTY via
+                                    // the pty_writer closure — no extra manual write needed here.
                                     let _ = self.terminal.handle_keyboard(ps2);
                                     dirty = true;
                                 }
@@ -600,6 +616,69 @@ impl TerminalApp {
                             // wl_keyboard.keymap (opcode=0): format, fd, size — just close the fd
                             if self.keyboard_id != 0 && sender == ObjectId(self.keyboard_id) && opcode == Opcode(0) {
                                 // handles contains the fd if format != 0; we don't need it
+                            }
+
+                            // wl_pointer.enter (opcode=0): serial, surface, surface_x (fixed), surface_y (fixed)
+                            if self.pointer_id != 0 && sender == ObjectId(self.pointer_id) && opcode == Opcode(0) {
+                                let pts = &[PayloadType::UInt, PayloadType::ObjectId, PayloadType::Fixed, PayloadType::Fixed];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    self.pointer_x = match raw.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                                    self.pointer_y = match raw.args.get(3) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                                }
+                            }
+
+                            // wl_pointer.motion (opcode=2): time, surface_x (fixed), surface_y (fixed)
+                            if self.pointer_id != 0 && sender == ObjectId(self.pointer_id) && opcode == Opcode(2) {
+                                let pts = &[PayloadType::UInt, PayloadType::Fixed, PayloadType::Fixed];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    self.pointer_x = match raw.args.get(1) { Some(Payload::Fixed(v)) => *v, _ => self.pointer_x };
+                                    self.pointer_y = match raw.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => self.pointer_y };
+                                    let col = (self.pointer_x as usize) / (FONT_CHAR_W as usize);
+                                    let row = (self.pointer_y as usize) / (FONT_CHAR_H as usize);
+                                    self.terminal.handle_mouse(MouseInput::Move(col, row));
+                                    dirty = true;
+                                }
+                            }
+
+                            // wl_pointer.button (opcode=3): serial, time, button, state
+                            // Linux button codes: 0x110=BTN_LEFT, 0x111=BTN_RIGHT, 0x112=BTN_MIDDLE
+                            if self.pointer_id != 0 && sender == ObjectId(self.pointer_id) && opcode == Opcode(3) {
+                                let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let button = match raw.args.get(2) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    let state  = match raw.args.get(3) { Some(Payload::UInt(v)) => *v, _ => 0 };
+                                    let mb = match button {
+                                        0x110 => Some(MouseButton::Left),
+                                        0x111 => Some(MouseButton::Right),
+                                        0x112 => Some(MouseButton::Middle),
+                                        _     => None,
+                                    };
+                                    if let Some(btn) = mb {
+                                        let input = if state != 0 {
+                                            MouseInput::Pressed(btn)
+                                        } else {
+                                            MouseInput::Released(btn)
+                                        };
+                                        self.terminal.handle_mouse(input);
+                                        dirty = true;
+                                    }
+                                }
+                            }
+
+                            // wl_pointer.axis (opcode=4): time, axis, value (fixed)
+                            // axis=0 → vertical scroll; value > 0 → scroll down, < 0 → scroll up
+                            if self.pointer_id != 0 && sender == ObjectId(self.pointer_id) && opcode == Opcode(4) {
+                                let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::Fixed];
+                                if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                                    let axis  = match raw.args.get(1) { Some(Payload::UInt(v))  => *v, _ => 0 };
+                                    let value = match raw.args.get(2) { Some(Payload::Fixed(v)) => *v, _ => 0.0 };
+                                    if axis == 0 {
+                                        // Normalise to ±1 lines per wheel click
+                                        let lines: isize = if value > 0.0 { 1 } else { -1 };
+                                        self.terminal.handle_mouse(MouseInput::Scroll(lines));
+                                        dirty = true;
+                                    }
+                                }
                             }
 
                             pos += msg_len;
