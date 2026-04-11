@@ -15,9 +15,11 @@ use smallvec::smallvec;
 pub enum Request {
     /// opcode 0
     Destroy,
-    /// opcode 1 — create an xdg_surface for a wl_surface
+    /// opcode 1 — create an xdg_positioner
+    CreatePositioner { id: NewId },
+    /// opcode 2 — create an xdg_surface for a wl_surface
     GetXdgSurface { id: NewId, surface: ObjectId },
-    /// opcode 2 — reply to a ping event
+    /// opcode 3 — reply to a ping event
     Pong { serial: u32 },
 }
 
@@ -25,12 +27,15 @@ impl Message for Request {
     fn into_raw(self, sender: ObjectId) -> RawMessage {
         match self {
             Request::Destroy => RawMessage { sender, opcode: Opcode(0), args: smallvec![] },
+            Request::CreatePositioner { id } => RawMessage {
+                sender, opcode: Opcode(1), args: smallvec![id.into()],
+            },
             Request::GetXdgSurface { id, surface } => RawMessage {
-                sender, opcode: Opcode(1),
+                sender, opcode: Opcode(2),
                 args: smallvec![id.into(), surface.into()],
             },
             Request::Pong { serial } => RawMessage {
-                sender, opcode: Opcode(2),
+                sender, opcode: Opcode(3),
                 args: smallvec![serial.into()],
             },
         }
@@ -41,10 +46,14 @@ impl Message for Request {
             0 => Ok(Request::Destroy),
             1 => {
                 let id = match m.args.get(0) { Some(Payload::NewId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
+                Ok(Request::CreatePositioner { id })
+            }
+            2 => {
+                let id = match m.args.get(0) { Some(Payload::NewId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 let surface = match m.args.get(1) { Some(Payload::ObjectId(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 Ok(Request::GetXdgSurface { id, surface })
             }
-            2 => {
+            3 => {
                 let serial = match m.args.get(0) { Some(Payload::UInt(v)) => *v, _ => return Err(DeserializeError::UnexpectedType) };
                 Ok(Request::Pong { serial })
             }
@@ -94,11 +103,12 @@ impl Interface for XdgWmBase {
     type Request = Request;
 
     const NAME: &'static str = "xdg_wm_base";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     const PAYLOAD_TYPES: &'static [&'static [PayloadType]] = &[
         &[],                                          // 0: destroy
-        &[PayloadType::NewId, PayloadType::ObjectId], // 1: get_xdg_surface
-        &[PayloadType::UInt],                         // 2: pong
+        &[PayloadType::NewId],                        // 1: create_positioner
+        &[PayloadType::NewId, PayloadType::ObjectId], // 2: get_xdg_surface
+        &[PayloadType::UInt],                         // 3: pong
     ];
 
     fn new(con: Rc<RefCell<dyn Connection>>, id: ObjectId) -> Self { Self { con, id } }
@@ -108,6 +118,11 @@ impl Interface for XdgWmBase {
 }
 
 impl XdgWmBase {
+    /// Create an xdg_positioner.
+    pub fn create_positioner(&mut self, id: NewId) -> Result<(), SendError> {
+        self.con.borrow_mut().send(self.id, Opcode(1), &[id.into()], &[])
+    }
+
     /// Send xdg_wm_base.get_xdg_surface — creates an xdg_surface for `surface`.
     pub fn get_xdg_surface(
         &mut self,
@@ -115,7 +130,7 @@ impl XdgWmBase {
         surface: ObjectId,
     ) -> Result<super::xdg_surface::XdgSurface, SendError> {
         self.con.borrow_mut().send(
-            self.id, Opcode(1),
+            self.id, Opcode(2),
             &[id.into(), surface.into()],
             &[],
         )?;
@@ -124,7 +139,7 @@ impl XdgWmBase {
 
     /// Reply to a `ping` event.
     pub fn pong(&mut self, serial: u32) -> Result<(), SendError> {
-        self.con.borrow_mut().send(self.id, Opcode(2), &[serial.into()], &[])
+        self.con.borrow_mut().send(self.id, Opcode(3), &[serial.into()], &[])
     }
 
     pub fn destroy(&mut self) -> Result<(), SendError> {

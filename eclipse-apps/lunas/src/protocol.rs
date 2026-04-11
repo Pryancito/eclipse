@@ -558,6 +558,53 @@ pub fn make_wayland_window(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// LunasXdgPositioner  (xdg_positioner) — no-op; all positioning hints ignored
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgPositioner;
+
+impl ObjectLogic for LunasXdgPositioner {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        _opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        Ok(()) // set_size / set_anchor_rect / etc. — all ignored
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LunasXdgPopup  (xdg_popup) — minimal; sends configure(0,0,w,h) immediately
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct LunasXdgPopup {
+    pub id: ObjectId,
+    pub xdg_surface_id: ObjectId,
+    pub surface_id: ObjectId,
+    pub pending_commits: SharedCommits,
+    pub buffer_registry: SharedBuffers,
+}
+
+impl ObjectLogic for LunasXdgPopup {
+    fn handle_request(
+        &mut self,
+        _client: &mut Client,
+        opcode: u16,
+        _args: &[Payload],
+        _handles: &[Handle],
+    ) -> Result<(), ServerError> {
+        match opcode {
+            0 => Ok(()), // destroy
+            1 => Ok(()), // grab
+            2 => Ok(()), // reposition
+            _ => Ok(()),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Shared keyboard registry
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -591,6 +638,16 @@ impl ObjectLogic for LunasXdgWmBase {
         match opcode {
             0 => Ok(()), // destroy
             1 => {
+                // create_positioner(id: new_id) — creates an xdg_positioner object
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let pos = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgPositioner)));
+                client.add_object(id, Object::new::<xdg_popup::XdgPositioner>(id, pos));
+                Ok(())
+            }
+            2 => {
                 // get_xdg_surface(id: new_id, surface: object_id)
                 let id = match args.first() {
                     Some(Payload::NewId(id)) => *id,
@@ -611,7 +668,7 @@ impl ObjectLogic for LunasXdgWmBase {
                 client.add_object(id, Object::new::<xdg_surface::XdgSurface>(id, xdg_surf));
                 Ok(())
             }
-            2 => Ok(()), // pong — ignored
+            3 => Ok(()), // pong — ignored (we don't track pending pings)
             _ => Err(ServerError::ObjectMismatch),
         }
     }
@@ -684,7 +741,27 @@ impl ObjectLogic for LunasXdgSurface {
 
                 Ok(())
             }
-            2 => Ok(()), // get_popup — not implemented
+            2 => {
+                // get_popup(id: new_id, parent: object_id, positioner: object_id)
+                let id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                let popup = ObjectInner::Rc(Rc::new(RefCell::new(LunasXdgPopup {
+                    id: id.as_id(),
+                    xdg_surface_id: self.id,
+                    surface_id: self.surface_id,
+                    pending_commits: self.pending_commits.clone(),
+                    buffer_registry: self.buffer_registry.clone(),
+                })));
+                client.add_object(id, Object::new::<xdg_popup::XdgPopup>(id, popup));
+                // Send popup configure(x=0, y=0, width=0, height=0) + xdg_surface.configure
+                let pop_cfg = xdg_popup::PopupEvent::Configure { x: 0, y: 0, width: 0, height: 0 };
+                client.send_event(id.as_id(), pop_cfg)?;
+                let surf_cfg = xdg_surface::Event::Configure { serial: self.surface_id.0 };
+                client.send_event(self.id, surf_cfg)?;
+                Ok(())
+            }
             3 => Ok(()), // set_window_geometry — ignored for now
             4 => Ok(()), // ack_configure — acknowledged
             _ => Ok(()),
@@ -1781,6 +1858,97 @@ mod wayland_server_tests {
         use wayland_proto::wl::server::client::ClientId;
         let reg = (*toplevel_registry).borrow();
         assert_eq!(reg.get(&(ClientId(10), 71u32)), Some(&ObjectId(72)));
+    }
+
+    /// xdg_wm_base opcode 1 (create_positioner) must register an XdgPositioner object.
+    #[test]
+    fn xdg_wm_base_create_positioner_registers_object() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let xdg_wm_base_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(11),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut wm_base = super::LunasXdgWmBase {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+            xdg_wm_base_registry,
+        };
+        // opcode 1 = create_positioner(id: new_id(80))
+        let r = ObjectLogic::handle_request(
+            &mut wm_base, &mut client, 1,
+            &[wayland_proto::wl::Payload::NewId(NewId(80))],
+            &[],
+        );
+        assert!(r.is_ok(), "create_positioner: {:?}", r);
+        assert!(client.object_mut(ObjectId(80)).is_ok(), "xdg_positioner must exist");
+    }
+
+    /// xdg_wm_base opcode 2 (get_xdg_surface) must register an XdgSurface object.
+    #[test]
+    fn xdg_wm_base_get_xdg_surface_uses_opcode_2() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let xdg_wm_base_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(12),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut wm_base = super::LunasXdgWmBase {
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+            xdg_wm_base_registry,
+        };
+        // opcode 2 = get_xdg_surface(id: new_id(81), surface: ObjectId(82))
+        let r = ObjectLogic::handle_request(
+            &mut wm_base, &mut client, 2,
+            &[
+                wayland_proto::wl::Payload::NewId(NewId(81)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(82)),
+            ],
+            &[],
+        );
+        assert!(r.is_ok(), "get_xdg_surface: {:?}", r);
+        assert!(client.object_mut(ObjectId(81)).is_ok(), "xdg_surface must exist");
+    }
+
+    /// xdg_surface.get_popup (opcode 2) must create an XdgPopup and send configure.
+    #[test]
+    fn xdg_surface_get_popup_creates_popup_object() {
+        let (commits, buffers) = make_shared();
+        let toplevel_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let title_registry = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(13),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut xdg_surf = super::LunasXdgSurface {
+            id: ObjectId(90),
+            surface_id: ObjectId(91),
+            pending_commits: commits,
+            buffer_registry: buffers,
+            toplevel_registry,
+            title_registry,
+        };
+        // opcode 2 = get_popup(id: new_id(92), parent: ObjectId(93), positioner: ObjectId(94))
+        let r = ObjectLogic::handle_request(
+            &mut xdg_surf, &mut client, 2,
+            &[
+                wayland_proto::wl::Payload::NewId(NewId(92)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(93)),
+                wayland_proto::wl::Payload::ObjectId(ObjectId(94)),
+            ],
+            &[],
+        );
+        assert!(r.is_ok(), "get_popup: {:?}", r);
+        assert!(client.object_mut(ObjectId(92)).is_ok(), "xdg_popup must exist");
     }
 }
 

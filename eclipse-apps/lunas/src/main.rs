@@ -82,7 +82,7 @@ fn main() {
         let wmb = xdg_wm_base_registry.clone();
         let wmb2 = xdg_wm_base_registry.clone();
         state.protocol.register_global_with_post_bind(
-            "xdg_wm_base", 2,
+            "xdg_wm_base", 3,
             move || {
                 let xdg = lunas::protocol::LunasXdgWmBase {
                     pending_commits: c.clone(),

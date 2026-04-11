@@ -14,6 +14,7 @@ pub mod wl_shell;
 pub mod xdg_wm_base;
 pub mod xdg_surface;
 pub mod xdg_toplevel;
+pub mod xdg_popup;
 pub mod xdg_decoration;
 pub mod xdg_output;
 pub mod xwayland_shell;
@@ -38,6 +39,8 @@ pub enum EventSet {
     XdgWmBase(xdg_wm_base::XdgWmBase, xdg_wm_base::Event),
     XdgSurface(xdg_surface::XdgSurface, xdg_surface::Event),
     XdgToplevel(xdg_toplevel::XdgToplevel, xdg_toplevel::Event),
+    XdgPositioner(xdg_popup::XdgPositioner, xdg_popup::PositionerEvent),
+    XdgPopup(xdg_popup::XdgPopup, xdg_popup::PopupEvent),
     XdgDecorationManager(xdg_decoration::ZxdgDecorationManagerV1, xdg_decoration::ManagerEvent),
     XdgToplevelDecoration(xdg_decoration::ZxdgToplevelDecorationV1, xdg_decoration::DecorationEvent),
     XdgOutputManager(xdg_output::ZxdgOutputManagerV1, xdg_output::ManagerEvent),
@@ -65,6 +68,8 @@ pub enum RequestSet {
     XdgWmBase(xdg_wm_base::Request),
     XdgSurface(xdg_surface::Request),
     XdgToplevel(xdg_toplevel::Request),
+    XdgPositioner(xdg_popup::PositionerRequest),
+    XdgPopup(xdg_popup::PopupRequest),
     XdgDecorationManager(xdg_decoration::ManagerRequest),
     XdgToplevelDecoration(xdg_decoration::DecorationRequest),
     XdgOutputManager(xdg_output::ManagerRequest),
