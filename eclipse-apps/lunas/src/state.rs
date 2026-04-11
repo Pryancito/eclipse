@@ -117,6 +117,11 @@ pub struct LunasState {
     pub x11_server: Option<crate::xwayland::X11Server>,
     /// Pixel buffers for X11 windows (window_id → buffer).
     pub x11_surfaces: std::collections::BTreeMap<u32, crate::xwayland::X11PixelBuffer>,
+    /// When `true`, the main event loop should terminate (ExitCompositor action).
+    pub should_exit: bool,
+    /// Active labwc compositor configuration (loaded from rc.xml at startup,
+    /// reloaded on `Reconfigure`).
+    pub config: crate::config::LabwcConfig,
 }
 
 impl LunasState {
@@ -178,6 +183,8 @@ impl LunasState {
             history_pos: 0,
             x11_server: crate::xwayland::X11Server::new(fb_w as u16, fb_h as u16),
             x11_surfaces: std::collections::BTreeMap::new(),
+            should_exit: false,
+            config: crate::config::LabwcConfig::load(),
         });
 
         // Pre-render background using the current wallpaper mode and colour.
@@ -484,7 +491,7 @@ impl LunasState {
                 let h = commit.height as i32;
                 let mut title = [0u8; 32];
                 title[..7].copy_from_slice(b"Wayland");
-                let win = ShellWindow {
+                let mut win = ShellWindow {
                     x, y, w,
                     h: h + ShellWindow::TITLE_H,
                     curr_x: (x + w / 2) as f32,
@@ -504,6 +511,13 @@ impl LunasState {
                     is_dmabuf: false,
                     title,
                 };
+                // Apply window rules (position, size, maximized flag)
+                crate::window_rules::apply_rules(
+                    &self.config,
+                    &mut win,
+                    self.backend.fb.info.width as i32,
+                    self.backend.fb.info.height as i32,
+                );
                 self.space.windows[self.space.window_count] = win;
                 self.space.window_count += 1;
                 let new_idx = self.space.window_count - 1;
@@ -1120,6 +1134,26 @@ impl LunasState {
                         self.dirty = true;
                     }
                 }
+                ContextAction::MoveWindowToWorkspace(idx, ws) => {
+                    if idx < self.space.window_count {
+                        self.space.windows[idx].workspace = ws;
+                        // Follow the window to its new workspace
+                        self.input.current_workspace = ws;
+                        self.dirty = true;
+                    }
+                }
+                ContextAction::ExitCompositor => {
+                    // Signal the main event loop to terminate.
+                    self.should_exit = true;
+                }
+                ContextAction::Reconfigure => {
+                    // Reload the labwc configuration from disk and re-apply theme.
+                    self.config = crate::config::LabwcConfig::load();
+                    // Apply the theme from the (possibly updated) config
+                    self.input.window_decoration_style =
+                        self.config.theme.theme_variant;
+                    self.dirty = true;
+                }
                 ContextAction::None => {}
             }
         }
@@ -1265,7 +1299,7 @@ impl LunasState {
                         let str_len = title.iter().position(|&b| b == 0).unwrap_or(title.len());
                         let copy_len = 31.min(str_len);
                         win_title[..copy_len].copy_from_slice(&title[..copy_len]);
-                        let win = ShellWindow {
+                        let mut win = ShellWindow {
                             x: wx, y: wy, w: ww, h: wh,
                             curr_x: (wx + ww / 2) as f32,
                             curr_y: (wy + wh / 2) as f32,
@@ -1281,6 +1315,13 @@ impl LunasState {
                             is_dmabuf: false,
                             title: win_title,
                         };
+                        // Apply window rules (position, size, maximized flag)
+                        crate::window_rules::apply_rules(
+                            &self.config,
+                            &mut win,
+                            fb_w,
+                            fb_h,
+                        );
                         let idx = self.space.window_count;
                         self.space.windows[idx] = win;
                         self.space.window_count += 1;

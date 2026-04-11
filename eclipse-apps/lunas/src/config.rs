@@ -266,13 +266,34 @@ impl Default for DesktopsConfig {
     }
 }
 
+// ── Theme configuration ──────────────────────────────────────────────────────
+
+/// Theme selection stored in the config.
+///
+/// Corresponds to the `<theme><name>` key in labwc's rc.xml.  The index
+/// maps to the variants defined in `StyleEngine::SsdTheme`:
+/// * `0` = labwc default
+/// * `1` = minimal
+/// * `2` = neon
+#[derive(Debug, Clone, Copy)]
+pub struct ThemeConfig {
+    /// Index of the built-in SSD theme variant to use (0 = labwc default).
+    pub theme_variant: u8,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self { theme_variant: 0 }
+    }
+}
+
 // ── Main configuration struct ────────────────────────────────────────────────
 
 /// Full compositor configuration (analogous to labwc's rc.xml + menu.xml).
 ///
-/// Created via `LabwcConfig::default_labwc()` which populates labwc-compatible
-/// defaults.  In the future this struct can be populated by parsing
-/// `~/.config/lunas/rc.xml` and `~/.config/lunas/menu.xml`.
+/// Obtain via `LabwcConfig::load()` which tries to read `~/.config/lunas/rc.xml`
+/// (not yet implemented; currently falls back to `default_labwc()`) and
+/// populates labwc-compatible defaults.
 pub struct LabwcConfig {
     /// Virtual desktop configuration.
     pub desktops: DesktopsConfig,
@@ -298,6 +319,8 @@ pub struct LabwcConfig {
     pub key_bindings: Vec<KeyBinding>,
     /// Mouse bindings.
     pub mouse_bindings: Vec<MouseBinding>,
+    /// Theme selection.
+    pub theme: ThemeConfig,
 }
 
 impl LabwcConfig {
@@ -435,7 +458,22 @@ impl LabwcConfig {
             root_menu,
             key_bindings,
             mouse_bindings,
+            theme: ThemeConfig::default(),
         }
+    }
+
+    /// Load the compositor configuration.
+    ///
+    /// Tries to read `~/.config/lunas/rc.xml`; falls back to `default_labwc()`
+    /// when the file cannot be read (file not found, parse error, etc.).
+    ///
+    /// Currently the XML parser is a stub — the function always returns the
+    /// built-in defaults.  The `load()` entry-point is wired up so that when
+    /// a full parser is added, the rest of the compositor picks it up
+    /// automatically via `LunasState::config`.
+    pub fn load() -> Self {
+        // TODO: parse ~/.config/lunas/rc.xml and ~/.config/lunas/menu.xml
+        Self::default_labwc()
     }
 
     /// Apply a window rule matching `title` to fill in initial placement for a new window.

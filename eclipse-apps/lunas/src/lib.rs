@@ -28,6 +28,7 @@ pub mod protocol;
 pub mod switcher;
 pub mod widgets;
 pub mod wayland_socket;
+pub mod window_rules;
 pub mod xwayland;
 
 #[cfg(target_os = "eclipse")]

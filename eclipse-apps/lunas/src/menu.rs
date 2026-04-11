@@ -7,23 +7,31 @@
 use crate::input::{ContextMenu, ContextAction};
 use crate::compositor::ShellWindow;
 
+/// Number of virtual workspaces available (matches labwc default of 4).
+pub const N_WORKSPACES: u8 = 4;
+
 // ── Root / Desktop menu ──────────────────────────────────────────────────────
 
 /// Populate `menu` with the labwc-style **root menu** entries shown when the
 /// user right-clicks on the empty desktop.
 ///
-/// The items mirror the default `menu.xml` shipped with labwc.
+/// The items mirror the default `menu.xml` shipped with labwc:
+/// ```
+/// Terminal / Launch...
+/// ─────────────
+/// Reconfigure
+/// Exit
+/// ```
 pub fn build_root_menu(menu: &mut ContextMenu, x: i32, y: i32, fb_w: i32, fb_h: i32) {
     menu.show(x, y);
-    menu.add_item("New Window",     ContextAction::NewWindow);
+    menu.add_item("New Window",       ContextAction::NewWindow);
+    menu.add_item("Launcher",         ContextAction::ToggleLauncher);
     menu.add_separator();
     menu.add_item("Change Wallpaper", ContextAction::CycleWallpaper);
+    menu.add_item("Show Desktop",     ContextAction::ShowDesktop);
     menu.add_separator();
-    menu.add_item("Show Desktop",   ContextAction::ShowDesktop);
-    menu.add_separator();
-    menu.add_item("Launcher",       ContextAction::ToggleLauncher);
-    menu.add_separator();
-    menu.add_item("Exit",           ContextAction::ShowDesktop); // placeholder — labwc Exit action
+    menu.add_item("Reconfigure",      ContextAction::Reconfigure);
+    menu.add_item("Exit",             ContextAction::ExitCompositor);
     menu.clamp_to_screen(fb_w, fb_h);
 }
 
@@ -76,6 +84,18 @@ pub fn build_window_menu(
         window.above,
     );
 
+    // Move to workspace sub-items (one per workspace, skip current)
+    menu.add_separator();
+    for ws in 0..N_WORKSPACES {
+        if ws != window.workspace {
+            let mut label = [0u8; 24];
+            let prefix = b"To Workspace ";
+            label[..prefix.len()].copy_from_slice(prefix);
+            label[prefix.len()] = b'1' + ws;
+            menu.add_item_raw(label, ContextAction::MoveWindowToWorkspace(window_idx, ws));
+        }
+    }
+
     menu.add_separator();
 
     // Close
@@ -106,6 +126,24 @@ mod tests {
     }
 
     #[test]
+    fn test_root_menu_has_exit() {
+        let mut m = make_menu();
+        build_root_menu(&mut m, 100, 100, 1920, 1080);
+        let has_exit = (0..m.item_count)
+            .any(|i| m.items[i].action == ContextAction::ExitCompositor);
+        assert!(has_exit, "root menu should contain ExitCompositor");
+    }
+
+    #[test]
+    fn test_root_menu_has_reconfigure() {
+        let mut m = make_menu();
+        build_root_menu(&mut m, 100, 100, 1920, 1080);
+        let has_rec = (0..m.item_count)
+            .any(|i| m.items[i].action == ContextAction::Reconfigure);
+        assert!(has_rec, "root menu should contain Reconfigure");
+    }
+
+    #[test]
     fn test_window_menu_has_close() {
         let win = ShellWindow {
             x: 100, y: 100, w: 400, h: 300,
@@ -119,6 +157,22 @@ mod tests {
             matches!(m.items[i].action, ContextAction::CloseWindow(_))
         });
         assert!(has_close, "window menu should contain Close action");
+    }
+
+    #[test]
+    fn test_window_menu_has_move_to_workspace() {
+        let win = ShellWindow {
+            x: 0, y: 0, w: 400, h: 300,
+            content: WindowContent::InternalDemo,
+            ..Default::default() // workspace = 0
+        };
+        let mut m = make_menu();
+        build_window_menu(&mut m, 0, 0, 0, &win, 1920, 1080);
+        // Should have N_WORKSPACES-1 move-to-workspace entries (skips current)
+        let move_count = (0..m.item_count)
+            .filter(|&i| matches!(m.items[i].action, ContextAction::MoveWindowToWorkspace(_, _)))
+            .count();
+        assert_eq!(move_count, (N_WORKSPACES - 1) as usize);
     }
 
     #[test]

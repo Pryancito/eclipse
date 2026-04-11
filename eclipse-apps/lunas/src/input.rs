@@ -190,6 +190,8 @@ pub enum KeyAction {
     WindowMenu,
     /// Toggle shade (roll-up) of the focused window.
     ToggleShade,
+    /// Move the focused window to a specific workspace.
+    MoveWindowToWs(u8),
 }
 
 /// Represents what element was clicked on the taskbar.
@@ -224,7 +226,7 @@ pub enum TaskbarHit {
 }
 
 /// Maximum number of items in a context menu (includes separators).
-pub const CONTEXT_MENU_MAX_ITEMS: usize = 12;
+pub const CONTEXT_MENU_MAX_ITEMS: usize = 16;
 
 /// Number of distinct window decoration styles (0 = default, 1 = minimal, 2 = neon).
 /// Used by `CycleWindowVisual` action to wrap the style index.
@@ -293,6 +295,12 @@ pub enum ContextAction {
     ResizeWindow(usize),
     /// Toggle the always-on-top state of a window.
     ToggleAlwaysOnTop(usize),
+    /// Move a window to a specific workspace.
+    MoveWindowToWorkspace(usize, u8),
+    /// Exit / quit the compositor (labwc: SessionLogout).
+    ExitCompositor,
+    /// Reload the compositor configuration (labwc: Reconfigure).
+    Reconfigure,
 }
 
 /// A single context menu item.
@@ -381,6 +389,15 @@ impl ContextMenu {
         if self.item_count < CONTEXT_MENU_MAX_ITEMS {
             let mut item = ContextMenuItem::default();
             item.separator = true;
+            self.items[self.item_count] = item;
+            self.item_count += 1;
+        }
+    }
+
+    /// Add a regular item using a pre-formatted raw label byte array.
+    pub fn add_item_raw(&mut self, label: [u8; 24], action: ContextAction) {
+        if self.item_count < CONTEXT_MENU_MAX_ITEMS {
+            let item = ContextMenuItem { label, action, separator: false, checked: false };
             self.items[self.item_count] = item;
             self.item_count += 1;
         }
@@ -631,25 +648,48 @@ pub fn launcher_hit_test(
 
 pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
     let code = (scancode & 0x7FFF) as u8;
+    let alt   = (modifiers & 4) != 0;
+    let shift = (modifiers & 1) != 0;
+    let sup   = (modifiers & 8) != 0;
     match code {
         0x2E => KeyAction::Clear,
-        0x02 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(0) } else { KeyAction::SetColor(0) },
-        0x03 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(1) } else { KeyAction::SetColor(1) },
-        0x04 => KeyAction::SetColor(2),
-        0x05 => KeyAction::SetColor(3),
+        // Number keys 1-4
+        // Super+1..4 → SwitchWorkspace (existing)
+        // Alt+1..4   → SwitchWorkspace (labwc default)
+        // Alt+Shift+1..4 → MoveWindowToWs
+        0x02 => {
+            if alt && shift { KeyAction::MoveWindowToWs(0) }
+            else if alt || sup { KeyAction::SwitchWorkspace(0) }
+            else { KeyAction::SetColor(0) }
+        }
+        0x03 => {
+            if alt && shift { KeyAction::MoveWindowToWs(1) }
+            else if alt || sup { KeyAction::SwitchWorkspace(1) }
+            else { KeyAction::SetColor(1) }
+        }
+        0x04 => {
+            if alt && shift { KeyAction::MoveWindowToWs(2) }
+            else if alt || sup { KeyAction::SwitchWorkspace(2) }
+            else { KeyAction::SetColor(2) }
+        }
+        0x05 => {
+            if alt && shift { KeyAction::MoveWindowToWs(3) }
+            else if alt || sup { KeyAction::SwitchWorkspace(3) }
+            else { KeyAction::SetColor(3) }
+        }
         0x06 => KeyAction::SetColor(4),
         0x0B => KeyAction::CycleStrokeSize,
         0x0D => KeyAction::SensitivityPlus,
         0x0C => KeyAction::SensitivityMinus,
         0x17 => KeyAction::InvertY,
-        0x47 => if (modifiers & 8) != 0 { KeyAction::SnapTopLeft } else { KeyAction::CenterCursor },
-        0x31 => if (modifiers & 8) != 0 { KeyAction::ToggleNightLight } else { KeyAction::NewWindow },
+        0x47 => if sup { KeyAction::SnapTopLeft } else { KeyAction::CenterCursor },
+        0x31 => if sup { KeyAction::ToggleNightLight } else { KeyAction::NewWindow },
         0x01 => KeyAction::CloseWindow,
-        // Tab: Alt+Tab → AltTabForward, Alt+Shift+Tab → AltTabBackward, Alt → CycleWindowVisual, else forward
+        // Tab: Alt+Tab → AltTabForward, Alt+Shift+Tab → AltTabBackward, else forward
         0x0F => {
-            if (modifiers & 4) != 0 && (modifiers & 1) != 0 {
+            if alt && shift {
                 KeyAction::AltTabBackward
-            } else if (modifiers & 4) != 0 {
+            } else if alt {
                 KeyAction::AltTabForward
             } else {
                 KeyAction::CycleForward
@@ -658,16 +698,16 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x29 => KeyAction::CycleBackward,
         0x32 => KeyAction::Minimize,
         // Super+R = Restore focused window
-        0x13 => if (modifiers & 8) != 0 { KeyAction::Restore } else { KeyAction::None },
+        0x13 => if sup { KeyAction::Restore } else { KeyAction::None },
         0x5B => KeyAction::ToggleDashboard,
         0x26 => KeyAction::ToggleLock,
         0x1E => KeyAction::ToggleLauncher,
-        0x1F => if (modifiers & 8) != 0 { KeyAction::ToggleSystemCentral } else { KeyAction::None },
+        0x1F => if sup { KeyAction::ToggleSystemCentral } else { KeyAction::None },
         // Space: Alt+Space → WindowMenu, Super+Space → ToggleSearch
         0x39 => {
-            if (modifiers & 4) != 0 {
+            if alt {
                 KeyAction::WindowMenu
-            } else if (modifiers & 8) != 0 {
+            } else if sup {
                 KeyAction::ToggleSearch
             } else {
                 KeyAction::None
@@ -675,30 +715,34 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         },
         0x4B => KeyAction::SnapLeft,
         0x4D => KeyAction::SnapRight,
-        0x14 => if (modifiers & 8) != 0 { KeyAction::ToggleTiling } else { KeyAction::None },
+        0x14 => if sup { KeyAction::ToggleTiling } else { KeyAction::None },
         // Super+Up = Maximize, plain Up = ArrowUp
-        0x48 => if (modifiers & 8) != 0 { KeyAction::Maximize } else { KeyAction::ArrowUp },
+        0x48 => if sup { KeyAction::Maximize } else { KeyAction::ArrowUp },
         // Super+Down = Restore (un-maximize/un-minimize), plain Down = ArrowDown
-        0x50 => if (modifiers & 8) != 0 { KeyAction::Restore } else { KeyAction::ArrowDown },
+        0x50 => if sup { KeyAction::Restore } else { KeyAction::ArrowDown },
         0x1C => KeyAction::Enter,
         0x0E => KeyAction::Backspace,
-        0x36 => if (modifiers & 8) != 0 { KeyAction::ToggleNotifications } else { KeyAction::None },
-        0x12 => if (modifiers & 8) != 0 { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
+        0x36 => if sup { KeyAction::ToggleNotifications } else { KeyAction::None },
+        0x12 => if sup { KeyAction::ToggleNetworkDetails } else { KeyAction::None },
         // Brightness keys (F5=0x3F = down, F6=0x40 = up)
         0x3F => KeyAction::BrightnessDown,
         0x40 => KeyAction::BrightnessUp,
         // Super+Home/PgUp/End/PgDn = snap to screen quarters
-        0x49 => if (modifiers & 8) != 0 { KeyAction::SnapTopRight } else { KeyAction::None },
-        0x4F => if (modifiers & 8) != 0 { KeyAction::SnapBottomLeft } else { KeyAction::None },
-        0x51 => if (modifiers & 8) != 0 { KeyAction::SnapBottomRight } else { KeyAction::None },
+        0x49 => if sup { KeyAction::SnapTopRight } else { KeyAction::None },
+        0x4F => if sup { KeyAction::SnapBottomLeft } else { KeyAction::None },
+        0x51 => if sup { KeyAction::SnapBottomRight } else { KeyAction::None },
         // Super+D = Do Not Disturb toggle
-        0x20 => if (modifiers & 8) != 0 { KeyAction::ToggleDoNotDisturb } else { KeyAction::None },
+        0x20 => if sup { KeyAction::ToggleDoNotDisturb } else { KeyAction::None },
         // Super+Q = Quick Settings panel
-        0x10 => if (modifiers & 8) != 0 { KeyAction::ToggleQuickSettings } else { KeyAction::None },
+        0x10 => if sup { KeyAction::ToggleQuickSettings } else { KeyAction::None },
         // PrintScreen = Screenshot
         0x37 => KeyAction::Screenshot,
+        // F2: Alt+F2 → open launcher/run dialog (labwc default)
+        0x3C => if alt { KeyAction::ToggleLauncher } else { KeyAction::None },
+        // F3: unused for now
+        0x3D => KeyAction::None,
         // F4: Alt+F4 → close window (labwc default)
-        0x3E => if (modifiers & 4) != 0 { KeyAction::AltClose } else { KeyAction::None },
+        0x3E => if alt { KeyAction::AltClose } else { KeyAction::None },
         _ => KeyAction::None,
     }
 }
@@ -1717,6 +1761,17 @@ impl InputState {
                                 }
                             }
                         }
+                        // ── Move focused window to workspace (Alt+Shift+1..4) ─────────────
+                        KeyAction::MoveWindowToWs(ws) => {
+                            if let Some(idx) = self.focused_window {
+                                if idx < *window_count {
+                                    windows[idx].workspace = ws;
+                                    // After moving, switch to that workspace so the user follows
+                                    self.current_workspace = ws;
+                                    dirty = true;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1787,27 +1842,50 @@ impl InputState {
                     // Convenio evdev: value > 0 = hacia el usuario (scroll up),
                     //                 value < 0 = alejándose (scroll down).
                     // Convenio X11 / terminal: botón 4 = scroll up, botón 5 = scroll down.
+
+                    // labwc: scroll wheel on a window title bar → shade / unshade
+                    let scroll_up = event.value > 0;
+                    let mut handled_by_titlebar = false;
                     if let Some(focused) = self.focused_window {
                         if focused < *window_count {
-                            if let WindowContent::External(s_idx) = windows[focused].content {
-                                let s_idx = s_idx as usize;
-                                if s_idx < surfaces.len() && surfaces[s_idx].active {
-                                    let button = if event.value > 0 { 4i32 } else { 5i32 };
-                                    let ev = SideWindEvent {
-                                        event_type: SWND_EVENT_TYPE_MOUSE_BUTTON,
-                                        data1: button,
-                                        data2: event.value.abs(),
-                                        data3: 0,
-                                    };
-                                    let _ = unsafe {
-                                        eclipse_send(
-                                            surfaces[s_idx].pid,
-                                            sidewind::MSG_TYPE_INPUT,
-                                            &ev as *const _ as *const core::ffi::c_void,
-                                            core::mem::size_of::<SideWindEvent>(),
-                                            0,
-                                        )
-                                    };
+                            let w = &windows[focused];
+                            if w.title_bar_contains(self.cursor_x, self.cursor_y) {
+                                if scroll_up && !w.shaded {
+                                    windows[focused].toggle_shade();
+                                    handled_by_titlebar = true;
+                                    dirty = true;
+                                } else if !scroll_up && windows[focused].shaded {
+                                    windows[focused].toggle_shade();
+                                    handled_by_titlebar = true;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !handled_by_titlebar {
+                        if let Some(focused) = self.focused_window {
+                            if focused < *window_count {
+                                if let WindowContent::External(s_idx) = windows[focused].content {
+                                    let s_idx = s_idx as usize;
+                                    if s_idx < surfaces.len() && surfaces[s_idx].active {
+                                        let button = if event.value > 0 { 4i32 } else { 5i32 };
+                                        let ev = SideWindEvent {
+                                            event_type: SWND_EVENT_TYPE_MOUSE_BUTTON,
+                                            data1: button,
+                                            data2: event.value.abs(),
+                                            data3: 0,
+                                        };
+                                        let _ = unsafe {
+                                            eclipse_send(
+                                                surfaces[s_idx].pid,
+                                                sidewind::MSG_TYPE_INPUT,
+                                                &ev as *const _ as *const core::ffi::c_void,
+                                                core::mem::size_of::<SideWindEvent>(),
+                                                0,
+                                            )
+                                        };
+                                    }
                                 }
                             }
                         }
