@@ -280,12 +280,16 @@ mod tests {
     #[test]
     fn test_set_ssd_theme_changes_variant() {
         let mut se = StyleEngine::new();
-        let orig_h = se.ssd.titlebar_height;
+        // Default theme
+        assert_eq!(se.ssd.titlebar_height, SsdTheme::labwc_default().titlebar_height);
+        // Switch to minimal (index 1)
         se.set_ssd_theme(1);
-        // Minimal has a different height from default
-        let _ = orig_h; // just confirm it compiles
-        // neon has a taller bar
+        let minimal = SsdTheme::minimal();
+        assert_eq!(se.ssd.titlebar_height, minimal.titlebar_height);
+        // Switch to neon (index 2) — has a taller title bar than default
         se.set_ssd_theme(2);
+        let neon = SsdTheme::neon();
+        assert_eq!(se.ssd.titlebar_height, neon.titlebar_height);
         assert!(se.ssd.titlebar_height >= 24);
     }
 }

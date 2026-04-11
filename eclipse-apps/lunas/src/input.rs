@@ -16,6 +16,14 @@ use sidewind::{
 /// El evento CLOSE da al proceso la oportunidad de limpiar (atexit, etc.);
 /// el SIGKILL garantiza que el proceso termina aunque no maneje el evento.
 
+/// Maximum tick delta between two left-button presses on the same title bar
+/// for the second press to be counted as a double-click (and trigger maximize).
+///
+/// A "tick" is one input event processed by `monotonic_tick`; at 60 fps with
+/// an average of ~1 event per frame this is roughly 45/60 ≈ 0.75 s, which
+/// matches common double-click windows of 0.3–0.8 s.
+const DOUBLE_CLICK_TICK_THRESHOLD: u64 = 45;
+
 /// A simple monotonically incrementing counter used for coarse double-click detection.
 ///
 /// Each call increments by one.  The absolute value is not meaningful; only
@@ -2457,7 +2465,7 @@ impl InputState {
                                         // A "double-click" is two clicks on the same window within ~30 ticks.
                                         let tick = crate::input::monotonic_tick();
                                         let same_win = self.last_titlebar_click_win == Some(idx);
-                                        let close_in_time = tick.wrapping_sub(self.last_titlebar_click_tick) < 45;
+                                        let close_in_time = tick.wrapping_sub(self.last_titlebar_click_tick) < DOUBLE_CLICK_TICK_THRESHOLD;
                                         if same_win && close_in_time {
                                             // Double-click → toggle maximize
                                             let w = &mut windows[idx];

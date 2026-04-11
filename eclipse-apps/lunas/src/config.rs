@@ -450,12 +450,9 @@ impl LabwcConfig {
     ) -> (i32, i32, i32, i32, bool, bool) {
         for rule in &self.window_rules {
             let id_match = rule.identifier.is_empty()
-                || title
-                    .len()
-                    .min(rule.identifier.len())
-                    .eq(&rule.identifier.len())
+                || (title.len() >= rule.identifier.len()
                     && title[..rule.identifier.len()]
-                        .eq_ignore_ascii_case(rule.identifier.as_str());
+                        .eq_ignore_ascii_case(rule.identifier.as_str()));
             if !id_match {
                 continue;
             }
