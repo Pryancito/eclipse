@@ -378,10 +378,8 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
                     let key = &arg[..eq];
                     let val = &arg[eq + 1..];
                     std::env::set_var(key, val);
-                } else {
-                    // export VAR with no value: ensure it exists (no-op if already set)
-                    let _ = std::env::var(arg.as_str());
                 }
+                // export VAR without value: no-op (env vars are process-local; value is unchanged)
             }
             Some(0)
         }

@@ -273,16 +273,14 @@ impl TerminalApp {
         // Determine shell/program to run.
         // custom_cmd: (program_path, name_for_kernel, full_argv_nul_list, no_restart)
         let (exec_path, exec_name, exec_argv_bytes, no_restart): (std::string::String, std::string::String, Vec<u8>, bool) = {
-            let mut custom: Option<(std::string::String, bool)> = None;
+            let mut custom: Option<(Vec<std::string::String>, bool)> = None;
             let mut i = 1;
             while i < own_argv.len() {
                 match own_argv[i].as_str() {
                     "-e" | "--" => {
                         if i + 1 < own_argv.len() {
-                            // Collect everything from i+1 onwards as the command + args
-                            let cmd_args = &own_argv[i + 1..];
-                            let full = cmd_args.join(" ");
-                            custom = Some((full, true)); // no_restart=true for one-shot commands
+                            // Collect args after -e/-- as the command argv
+                            custom = Some((own_argv[i + 1..].to_vec(), true));
                         }
                         break;
                     }
@@ -291,16 +289,16 @@ impl TerminalApp {
                 i += 1;
             }
 
-            if let Some((cmd, one_shot)) = custom {
-                // cmd may be "cargo --version" or just "cargo" etc.
-                // We need to find the executable and build argv.
-                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                let prog = if parts.is_empty() { "" } else { parts[0] };
+            if let Some((cmd_args, one_shot)) = custom {
+                // cmd_args[0] is the program, cmd_args[1..] are its arguments.
+                let prog = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+                // Resolve the executable path using PATH search
                 let prog_path = resolve_exec_path(prog);
-                let name = parts.first().copied().unwrap_or("cmd").rsplit('/').next().unwrap_or("cmd").to_string();
+                // Extract basename for the kernel process name
+                let name = prog.rsplit('/').next().unwrap_or(prog);
                 let mut argv_bytes = Vec::<u8>::new();
-                for p in &parts {
-                    argv_bytes.extend_from_slice(p.as_bytes());
+                for arg in &cmd_args {
+                    argv_bytes.extend_from_slice(arg.as_bytes());
                     argv_bytes.push(0);
                 }
                 (prog_path, name.to_string(), argv_bytes, one_shot)
