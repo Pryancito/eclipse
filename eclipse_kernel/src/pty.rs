@@ -25,21 +25,29 @@ pub struct Termios {
 impl Default for Termios {
     fn default() -> Self {
         let mut cc = [0u8; 32];
-        // Standard defaults: VINTR=^C, VQUIT=^\, VERASE=^H, VKILL=^U, VEOF=^D, VEOL=0, VEOL2=0, VSTART=^Q, VSTOP=^S, VSUSP=^Z
-        cc[0] = 3;  // VINTR
-        cc[1] = 28; // VQUIT
-        cc[2] = 8;  // VERASE
-        cc[3] = 21; // VKILL
-        cc[4] = 4;  // VEOF
-        cc[8] = 17; // VSTART
-        cc[9] = 19; // VSTOP
+        // Standard defaults: VINTR=^C, VQUIT=^\, VERASE=DEL, VKILL=^U, VEOF=^D, VEOL=0, VEOL2=0, VSTART=^Q, VSTOP=^S, VSUSP=^Z
+        cc[0] = 3;   // VINTR
+        cc[1] = 28;  // VQUIT
+        cc[2] = 127; // VERASE = DEL (0x7f) — matches what terminal emulators send for Backspace
+        cc[3] = 21;  // VKILL
+        cc[4] = 4;   // VEOF
+        cc[8] = 17;  // VSTART
+        cc[9] = 19;  // VSTOP
         cc[10] = 26; // VSUSP
 
         Self {
             c_iflag: 0x0500, // ICRNL | IXON
             c_oflag: 0x0005, // OPOST | ONLCR
             c_cflag: 0x00BF, // B38400 | CS8 | CREAD | HUPCL
-            c_lflag: 0x8A3B, // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN | ECHOCTL | ECHOKE
+            // Raw mode: no canonical line buffering (ICANON), no automatic echo (ECHO).
+            // Terminal emulators like xterm open PTYs in raw mode so that the shell
+            // (or any other app) can handle each byte as it arrives and manage its own
+            // echoing and line editing.  With ICANON=ON the slave read() would block
+            // until a newline, meaning the shell's readline() couldn't process
+            // individual keystrokes (backspace, arrows…) until Enter was pressed.
+            // With ECHO=ON the PTY would echo every typed byte immediately AND the
+            // shell would echo it again after processing → double echo after Enter.
+            c_lflag: 0x0000, // raw: no ISIG, no ICANON, no ECHO
             c_line: 0,
             c_cc: cc,
             c_ispeed: 15, // B38400
