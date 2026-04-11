@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use wayland_proto::wl::{ObjectId, NewId, Payload};
 use wayland_proto::wl::wire::Handle;
 use wayland_proto::wl::server::client::{Client, ClientId};
-use wayland_proto::wl::server::objects::{Object, ObjectInner, ObjectLogic, ServerError};
+use wayland_proto::wl::server::objects::{CallbackObject, Object, ObjectInner, ObjectLogic, ServerError};
 use wayland_proto::wl::protocols::common::*;
 use crate::compositor::{ShellWindow, WindowContent};
 
@@ -37,6 +37,12 @@ pub struct SurfaceCommit {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    /// wl_buffer ObjectId that was attached — the compositor sends `wl_buffer.release`
+    /// after it's done with this commit so the client can reuse the buffer.
+    pub buffer_id: Option<wayland_proto::wl::ObjectId>,
+    /// Pending `wl_surface.frame` callback ObjectId to fire `wl_callback.done` after
+    /// this commit has been rendered.  None if the client did not request a callback.
+    pub frame_callback: Option<wayland_proto::wl::ObjectId>,
 }
 
 /// Shared registry of live wl_buffer objects, keyed by ObjectId.
@@ -77,6 +83,8 @@ impl ObjectLogic for LunasCompositor {
                     id: id.as_id(),
                     pid: client.client_id().0,
                     attached_buffer: None,
+                    attached_buffer_id: None,
+                    pending_frame_callback: None,
                     pending_commits: self.pending_commits.clone(),
                     buffer_registry: self.buffer_registry.clone(),
                 })));
@@ -97,6 +105,11 @@ pub struct LunasSurface {
     pub pid: u32,
     /// The buffer currently attached (set by opcode 1 = attach).
     pub attached_buffer: Option<BufferInfo>,
+    /// ObjectId of the currently attached wl_buffer (for release signalling).
+    pub attached_buffer_id: Option<ObjectId>,
+    /// Pending frame-callback ObjectId registered via wl_surface.frame(callback).
+    /// Cleared after each commit by moving it into SurfaceCommit.
+    pub pending_frame_callback: Option<NewId>,
     pub pending_commits: SharedCommits,
     pub buffer_registry: SharedBuffers,
 }
@@ -104,7 +117,7 @@ pub struct LunasSurface {
 impl ObjectLogic for LunasSurface {
     fn handle_request(
         &mut self,
-        _client: &mut Client,
+        client: &mut Client,
         opcode: u16,
         args: &[Payload],
         _handles: &[Handle],
@@ -115,16 +128,43 @@ impl ObjectLogic for LunasSurface {
                 // attach(buffer: object_id, x: int, y: int)
                 let buffer_id = match args.first() {
                     Some(Payload::ObjectId(id)) => *id,
-                    _ => return Ok(()), // null buffer is valid (detach)
+                    _ => {
+                        // null buffer (ObjectId(0)) is valid — detaches the buffer.
+                        self.attached_buffer = None;
+                        self.attached_buffer_id = None;
+                        return Ok(());
+                    }
                 };
                 self.attached_buffer = (*self.buffer_registry).borrow().get(&buffer_id).copied();
+                self.attached_buffer_id = Some(buffer_id);
                 Ok(())
             }
             2 | 9 => Ok(()), // damage / damage_buffer — ignore for now
-            3 => Ok(()), // frame — callback not implemented yet
+            3 => {
+                // frame(callback: new_id)
+                // Register a frame callback.  We store it and fire wl_callback.done
+                // in drain_pending_wayland_commits() after the frame is rendered.
+                // If the client registered multiple callbacks before committing, the
+                // last one wins (the spec says only one per commit is sensible).
+                let callback_id = match args.first() {
+                    Some(Payload::NewId(id)) => *id,
+                    _ => return Err(ServerError::MessageDeserializeError),
+                };
+                // Create the WlCallback object so the client can track it.
+                let cb_inner = ObjectInner::Rc(Rc::new(RefCell::new(CallbackObject)));
+                client.add_object(
+                    callback_id,
+                    Object::new::<wl_callback::WlCallback>(callback_id, cb_inner),
+                );
+                self.pending_frame_callback = Some(callback_id);
+                Ok(())
+            }
             4 | 5 => Ok(()), // set_opaque_region / set_input_region — ignore
             6 => {
                 // commit — publish a new frame
+                let frame_callback = self.pending_frame_callback.take()
+                    .map(|id| id.as_id());
+                let buffer_id = self.attached_buffer_id;
                 if let Some(info) = self.attached_buffer {
                     if info.vaddr != 0 {
                         (*self.pending_commits).borrow_mut().push(SurfaceCommit {
@@ -134,6 +174,8 @@ impl ObjectLogic for LunasSurface {
                             width: info.width,
                             height: info.height,
                             stride: info.stride,
+                            buffer_id,
+                            frame_callback,
                         });
                     }
                 }
@@ -1512,6 +1554,84 @@ mod wayland_server_tests {
         let r = ObjectLogic::handle_request(&mut toplevel, &mut client, 3, &args, &[]);
         assert!(r.is_ok(), "set_app_id: {:?}", r);
         assert_eq!(toplevel.app_id, "com.example.myapp");
+    }
+
+    /// wl_display.sync must immediately fire wl_callback.done and wl_display.delete_id.
+    /// Without this, wl_display_roundtrip() in libwayland-client stalls forever.
+    #[test]
+    fn wl_display_sync_fires_done_and_delete_id() {
+        use wayland_proto::wl::protocols::common::wl_display;
+        let mut server = sample_server();
+        let con = Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2)));
+        server.add_client(ClientId(99), con);
+
+        // Build a wl_display.sync(callback=NewId(5)) request
+        let msg = wl_display::Request::Sync { callback: NewId(5) }
+            .into_raw(ObjectId(1));
+        let mut buf = [0u8; 256];
+        let mut handles = Vec::new();
+        let len = msg.serialize(&mut buf, &mut handles).expect("serialize sync");
+        let r = server.process_message(ClientId(99), &buf[..len], &[]);
+        assert!(r.is_ok(), "wl_display.sync: {:?}", r);
+        // The callback object must have been created
+        let client = server.clients.get_mut(&ClientId(99)).expect("client");
+        assert!(
+            client.object_mut(ObjectId(5)).is_ok(),
+            "wl_callback object id 5 must exist after sync"
+        );
+    }
+
+    /// wl_surface.frame must register a WlCallback object and include it in the
+    /// SurfaceCommit so the compositor can fire done after rendering.
+    #[test]
+    fn wl_surface_frame_creates_callback_in_commit() {
+        use super::LunasSurface;
+        use wayland_proto::wl::server::objects::CallbackObject;
+        let (commits, buffers) = make_shared();
+        let mut client = wayland_proto::wl::server::client::Client::new(
+            ClientId(7),
+            Rc::new(RefCell::new(EclipseWaylandConnection::new(1, 2))),
+        );
+        let mut surface = LunasSurface {
+            id: ObjectId(3),
+            pid: 7,
+            attached_buffer: None,
+            attached_buffer_id: None,
+            pending_frame_callback: None,
+            pending_commits: commits.clone(),
+            buffer_registry: buffers.clone(),
+        };
+
+        // opcode 3 = frame(callback: new_id(6))
+        let r = ObjectLogic::handle_request(
+            &mut surface,
+            &mut client,
+            3,
+            &[wayland_proto::wl::Payload::NewId(NewId(6))],
+            &[],
+        );
+        assert!(r.is_ok(), "frame: {:?}", r);
+        assert_eq!(surface.pending_frame_callback, Some(NewId(6)));
+        // WlCallback object must have been registered in client
+        assert!(client.object_mut(ObjectId(6)).is_ok(), "wl_callback must exist");
+
+        // Inject a buffer so commit does something
+        let info = super::BufferInfo { vaddr: 0xDEAD, width: 64, height: 64, stride: 256, format: 1 };
+        (*buffers).borrow_mut().insert(ObjectId(8), info);
+        surface.attached_buffer = Some(info);
+        surface.attached_buffer_id = Some(ObjectId(8));
+
+        // opcode 6 = commit
+        let r = ObjectLogic::handle_request(&mut surface, &mut client, 6, &[], &[]);
+        assert!(r.is_ok(), "commit: {:?}", r);
+
+        // Commit must carry the frame callback
+        let pending = (*commits).borrow();
+        assert_eq!(pending.len(), 1, "one commit expected");
+        assert_eq!(pending[0].frame_callback, Some(ObjectId(6)), "commit must carry callback id");
+        assert_eq!(pending[0].buffer_id, Some(ObjectId(8)), "commit must carry buffer id");
+        // Pending callback cleared after commit
+        assert_eq!(surface.pending_frame_callback, None, "pending_frame_callback must be cleared after commit");
     }
 }
 

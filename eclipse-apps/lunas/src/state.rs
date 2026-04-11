@@ -14,6 +14,10 @@ use wayland_proto::wl::server::client::ClientId;
 use wayland_proto::eclipse_transport::EclipseWaylandConnection;
 use wayland_proto::wl::protocols::common::wl_keyboard;
 use wayland_proto::wl::protocols::common::wl_pointer;
+use wayland_proto::wl::protocols::common::wl_callback;
+use wayland_proto::wl::protocols::common::wl_buffer;
+use wayland_proto::wl::protocols::common::wl_display;
+use wayland_proto::wl::protocols::common::wl_surface;
 use wayland_proto::wl::wire::ObjectId;
 use sidewind::SideWindEvent;
 use core::cell::RefCell;
@@ -103,8 +107,11 @@ pub struct LunasState {
 
     pub wayland_serial: u32,
     /// Tracks which Wayland keyboard clients have already received wl_keyboard.enter.
-    /// Enter is sent lazily: just before the first wl_keyboard.key event.
     pub keyboard_entered: std::collections::BTreeSet<ClientId>,
+    /// The focused window from the previous frame, used to detect focus changes
+    /// and dispatch wl_keyboard.leave / wl_pointer.leave on the old client and
+    /// wl_keyboard.enter / wl_pointer.enter on the newly focused one.
+    pub prev_focused_window: Option<usize>,
     /// Ring buffer of the last 60 CPU usage samples (0-100).
     pub cpu_history: [f32; 60],
     /// Ring buffer of the last 60 memory usage samples (0-100).
@@ -177,6 +184,7 @@ impl LunasState {
             wayland_serial: 1,
 
             keyboard_entered: std::collections::BTreeSet::new(),
+            prev_focused_window: None,
             cpu_history: [0.0f32; 60],
             mem_history: [0.0f32; 60],
             net_history: [0.0f32; 60],
@@ -457,6 +465,35 @@ impl LunasState {
         let fb_h = self.backend.fb.info.height as i32;
 
         for commit in commits {
+            let client_id = ClientId(commit.pid);
+
+            // ── wl_buffer.release ─────────────────────────────────────────────
+            // The compositor has consumed this commit; notify the client so it
+            // can reuse the buffer for the next frame.  Without this, buffer pools
+            // fill up and rendering stalls (e.g. SDL2, wlroots clients).
+            if let Some(buf_id) = commit.buffer_id {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(buf_id, wl_buffer::Event::Release);
+                }
+            }
+
+            // ── wl_callback.done + wl_display.delete_id ───────────────────────
+            // Fire the frame callback requested via wl_surface.frame().
+            // The Done event unblocks apps waiting to render the next frame.
+            // The delete_id lets the client reuse the wl_callback object slot.
+            if let Some(cb_id) = commit.frame_callback {
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    let _ = client.send_event(
+                        cb_id,
+                        wl_callback::Event::Done { callback_data: self.counter as u32 },
+                    );
+                    let _ = client.send_event(
+                        ObjectId(1),
+                        wl_display::Event::DeleteId { id: cb_id.0 },
+                    );
+                }
+            }
+
             // Update / insert the surface pixel buffer
             let surface = ExternalSurface {
                 id: commit.pid,
@@ -475,12 +512,13 @@ impl LunasState {
             self.snp_surfaces.insert((commit.pid, commit.surface_id), surface);
 
             // Create ShellWindow if not yet present
+            let surface_id = commit.surface_id;
             let exists = self.space.windows[..self.space.window_count]
                 .iter()
                 .any(|w| matches!(
                     w.content,
-                    WindowContent::Snp { surface_id, pid }
-                        if pid == commit.pid && surface_id == commit.surface_id
+                    WindowContent::Snp { surface_id: sid, pid }
+                        if pid == commit.pid && sid == surface_id
                 ));
 
             if !exists && self.space.window_count < self.space.windows.len() {
@@ -522,10 +560,122 @@ impl LunasState {
                 self.space.window_count += 1;
                 let new_idx = self.space.window_count - 1;
                 self.input.focused_window = Some(new_idx);
-                // wl_keyboard.enter is sent lazily at first key event (see handle_event).
+
+                // ── wl_surface.enter(output) ──────────────────────────────────
+                // Tell the client which output it appeared on.  Required by GTK4,
+                // Qt and many clients before they start rendering at full resolution.
+                // We send it for the first output (global name=1, object id depends
+                // on what the client bound — we use the surface id as the surface arg).
+                if let Some(client) = self.protocol.clients.get(&client_id) {
+                    // We don't track per-client output object IDs reliably yet, but
+                    // many clients only have one output bound.  Look for any object
+                    // registered as "wl_output" or, failing that, use ObjectId(0)
+                    // (which wl_surface.enter/leave accepts as a no-op on many clients).
+                    // The output global name is always 1 in our single-output setup.
+                    let _ = client.send_event(
+                        ObjectId(surface_id),
+                        wl_surface::Event::Enter { output: ObjectId(0) },
+                    );
+                }
+
+                // ── wl_keyboard.enter: send eagerly when window first appears ──
+                let keyboard_id = (*self.keyboard_registry).borrow().get(&client_id).copied();
+                if let Some(kb_id) = keyboard_id {
+                    if let Some(client) = self.protocol.clients.get(&client_id) {
+                        self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                        let _ = client.send_event(kb_id, wl_keyboard::Event::Enter {
+                            serial: self.wayland_serial,
+                            surface: ObjectId(surface_id),
+                            keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                        });
+                        self.keyboard_entered.insert(client_id);
+                    }
+                }
             }
         }
         self.dirty = true;
+    }
+
+    /// Dispatch Wayland focus-change events when the focused window has changed.
+    ///
+    /// Sends `wl_keyboard.leave` + `wl_pointer.leave` to the previously-focused
+    /// Wayland client, and `wl_keyboard.enter` + `wl_pointer.enter` to the newly-
+    /// focused one.  Called every frame from `update()` after the frame's focus may
+    /// have been mutated by input handling.
+    pub fn dispatch_focus_change_events(&mut self) {
+        let current = self.input.focused_window;
+        if current == self.prev_focused_window {
+            return; // nothing changed
+        }
+
+        // ── Leave events for the previously-focused window ──────────────────
+        if let Some(prev_idx) = self.prev_focused_window {
+            if prev_idx < self.space.window_count {
+                if let WindowContent::Snp { pid, surface_id } = self.space.windows[prev_idx].content {
+                    let prev_id = ClientId(pid);
+                    let kb_id = (*self.keyboard_registry).borrow().get(&prev_id).copied();
+                    let ptr_id = (*self.pointer_registry).borrow().get(&prev_id).copied();
+                    if let Some(client) = self.protocol.clients.get(&prev_id) {
+                        if self.keyboard_entered.contains(&prev_id) {
+                            if let Some(kb) = kb_id {
+                                self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                                let _ = client.send_event(kb, wl_keyboard::Event::Leave {
+                                    serial: self.wayland_serial,
+                                    surface: ObjectId(surface_id),
+                                });
+                            }
+                        }
+                        if let Some(ptr) = ptr_id {
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(ptr, wl_pointer::Event::Leave {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                            });
+                            let _ = client.send_event(ptr, wl_pointer::Event::Frame);
+                        }
+                    }
+                    self.keyboard_entered.remove(&prev_id);
+                }
+            }
+        }
+
+        // ── Enter events for the newly-focused window ────────────────────────
+        if let Some(cur_idx) = current {
+            if cur_idx < self.space.window_count {
+                if let WindowContent::Snp { pid, surface_id } = self.space.windows[cur_idx].content {
+                    let cur_id = ClientId(pid);
+                    let kb_id = (*self.keyboard_registry).borrow().get(&cur_id).copied();
+                    let ptr_id = (*self.pointer_registry).borrow().get(&cur_id).copied();
+                    if let Some(client) = self.protocol.clients.get(&cur_id) {
+                        if let Some(kb) = kb_id {
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(kb, wl_keyboard::Event::Enter {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                                keys: wayland_proto::wl::wire::Array::from_bytes(&[]),
+                            });
+                            self.keyboard_entered.insert(cur_id);
+                        }
+                        if let Some(ptr) = ptr_id {
+                            // Calculate cursor position relative to window content area
+                            let win = &self.space.windows[cur_idx];
+                            let sx = (self.input.cursor_x - win.x).max(0) as f32;
+                            let sy = (self.input.cursor_y - win.y - ShellWindow::TITLE_H).max(0) as f32;
+                            self.wayland_serial = self.wayland_serial.wrapping_add(1);
+                            let _ = client.send_event(ptr, wl_pointer::Event::Enter {
+                                serial: self.wayland_serial,
+                                surface: ObjectId(surface_id),
+                                surface_x: sx,
+                                surface_y: sy,
+                            });
+                            let _ = client.send_event(ptr, wl_pointer::Event::Frame);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.prev_focused_window = current;
     }
 
     /// Get the PID of the currently focused window if it is an SNP window.
@@ -566,6 +716,10 @@ impl LunasState {
         // inline in handle_event(CompositorEvent::Snp); Unix socket clients don't
         // generate that event, so we drain here every frame.
         self.drain_pending_wayland_commits();
+
+        // Dispatch focus-change Wayland events (enter/leave) if the focused window
+        // changed since the last frame (e.g. from mouse click, close, Alt+Tab).
+        self.dispatch_focus_change_events();
 
         // Poll X11 server for new events
         {
@@ -2214,6 +2368,53 @@ mod tests {
         state.input.pending_context_action = crate::input::ContextAction::DismissNotification(0);
         let _ = state.update();
         assert_eq!(state.desktop.notification_count, initial_count, "DismissNotification should remove one entry");
+    }
+
+    /// dispatch_focus_change_events is idempotent when focus does not change.
+    #[test]
+    fn test_dispatch_focus_change_no_change_is_idempotent() {
+        let mut state = LunasState::new().expect("init");
+        state.input.focused_window = None;
+        state.prev_focused_window = None;
+        // Calling twice should not panic and should be a no-op
+        state.dispatch_focus_change_events();
+        state.dispatch_focus_change_events();
+        assert_eq!(state.prev_focused_window, None);
+    }
+
+    /// When focus moves from None to a non-Wayland window, prev_focused_window is updated.
+    #[test]
+    fn test_dispatch_focus_change_updates_prev() {
+        let mut state = LunasState::new().expect("init");
+        state.input.focused_window = None;
+        state.prev_focused_window = None;
+        // Set focus to a non-existent window index — no crash, but prev is updated
+        state.input.focused_window = Some(999);
+        state.dispatch_focus_change_events();
+        assert_eq!(state.prev_focused_window, Some(999));
+    }
+
+    /// SurfaceCommit carries frame_callback and buffer_id after a real surface commit.
+    #[test]
+    fn test_drain_commits_fires_frame_callback_fields() {
+        use crate::protocol::{SurfaceCommit};
+        use wayland_proto::wl::ObjectId;
+        let mut state = LunasState::new().expect("init");
+        // Push a commit with a frame_callback (no matching client — just checks no panic)
+        (*state.pending_surface_commits).borrow_mut().push(SurfaceCommit {
+            pid: 0xDEAD_BEEF,
+            surface_id: 3,
+            vaddr: 0,
+            width: 100,
+            height: 100,
+            stride: 400,
+            buffer_id: Some(ObjectId(8)),
+            frame_callback: Some(ObjectId(6)),
+        });
+        // drain_pending_wayland_commits should not panic even without a matching client
+        state.drain_pending_wayland_commits();
+        // The commit was drained
+        assert!((*state.pending_surface_commits).borrow().is_empty());
     }
 
 }

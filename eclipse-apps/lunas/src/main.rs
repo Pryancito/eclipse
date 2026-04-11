@@ -12,6 +12,7 @@ fn main() {
 }
 
 
+#[cfg(target_os = "eclipse")]
 fn main() {
     eprintln!("[LUNAS] Starting Lunas Desktop Environment...");
     use lunas::state::LunasState;
