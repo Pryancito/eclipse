@@ -196,9 +196,16 @@ pub fn init() {
         KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_3 | IDT_INTERRUPT_GATE);
         
         // --- Habilitar Syscall Instruction ---
-        // 1. Enable SCE in EFER
+        // 1. Enable SCE (bit 0) and NXE (bit 11) in EFER.
+        // NXE must be set so that the No-Execute bit (bit 63) in PTEs is valid.
+        // Without NXE, any PTE written with NX=1 (e.g. by mprotect for RELRO pages)
+        // causes a #PF with error code RSVD=1 when user-space accesses those pages.
+        // The bootloader typically sets NXE on the BSP, but we set it explicitly here
+        // to be safe and consistent with AP init.
+        const EFER_SCE: u64 = 1 << 0;  // System Call Extensions
+        const EFER_NXE: u64 = 1 << 11; // No-Execute Enable
         let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | 1);
+        wrmsr(MSR_EFER, efer | EFER_SCE | EFER_NXE);
 
         // 2. Setup STAR
         // 63:48 = Sysret CS (0x08) -> Not used due to GDT layout, we use iretq
@@ -245,9 +252,14 @@ pub fn init() {
 /// or PIT timer since those are legacy shared devices managed only by the BSP.
 pub fn init_ap() {
     unsafe {
-        // Enable SYSCALL/SYSRET (SCE bit in EFER)
+        // Enable SYSCALL/SYSRET (SCE, bit 0) and No-Execute Enable (NXE, bit 11) in EFER.
+        // APs start from reset with EFER=0; the trampoline sets LME+NXE, but we set NXE
+        // here too as a belt-and-suspenders measure so it's always present by the time
+        // user processes run on this core.
+        const EFER_SCE: u64 = 1 << 0;
+        const EFER_NXE: u64 = 1 << 11;
         let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | 1);
+        wrmsr(MSR_EFER, efer | EFER_SCE | EFER_NXE);
 
         // STAR: ring 0 CS selector (bits 47:32) and ring 3 base CS (bits 63:48).
         // This kernel uses IRETQ (not SYSRET) to return from syscalls, so the
