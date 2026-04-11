@@ -459,6 +459,34 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
              }
         }
         crate::fd::fd_init_stdio(pid);
+        // Registrar VMAs para las regiones ocupadas por los segmentos ELF y el stack.
+        // Esto evita que sys_mmap devuelva direcciones que colisionan con el binario cargado.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            if let Some(mut proc) = get_process(pid) {
+                let mut r = proc.resources.lock();
+                // Registrar cada rango de segmentos ELF cargados
+                for i in 0..loaded.loaded_vma_count {
+                    let (start, end) = loaded.loaded_vma_ranges[i];
+                    if start < end {
+                        r.vmas.push(crate::process::VMARegion {
+                            start,
+                            end,
+                            flags: 0x5, // PROT_READ | PROT_EXEC
+                            file_backed: true,
+                        });
+                    }
+                }
+                // Registrar el stack como VMA
+                r.vmas.push(crate::process::VMARegion {
+                    start: stack_base,
+                    end: stack_base + stack_size as u64,
+                    flags: 0x3, // PROT_READ | PROT_WRITE
+                    file_backed: false,
+                });
+                drop(r);
+                crate::process::update_process(pid, proc);
+            }
+        });
         crate::serial::serial_printf(format_args!("[spawn] SUCCESS for process: {}\n", name));
         Ok(pid)
     } else {
