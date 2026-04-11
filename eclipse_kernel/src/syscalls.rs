@@ -266,105 +266,85 @@ pub extern "C" fn syscall_handler(
     let mut stats = SYSCALL_STATS.lock();
     stats.total_calls += 1;
     drop(stats);
- 
-    // Linux ABI: translate only if process is marked as Linux (e.g. Xfbdev)
-    let mut is_linux = crate::process::current_process_id()
-        .and_then(|pid| crate::process::get_process(pid))
-        .map(|p| p.is_linux)
-        .unwrap_or(false);
-
-    // Auto-detection: if it calls a high Linux-specific syscall, mark it as Linux permanently
-    if !is_linux
-        && (syscall_num == 158
-            || syscall_num == 231
-            || syscall_num == 41
-            || syscall_num == 202
-            || syscall_num == 10)
-    {
-         if let Some(pid) = crate::process::current_process_id() {
-             if let Some(mut proc) = crate::process::get_process(pid) {
-                 proc.is_linux = true;
-                 crate::process::update_process(pid, proc);
-                 is_linux = true;
-             }
-         }
-    }
 
     let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     let ret = match syscall_num {
-        0 => sys_read(arg1, arg2, arg3),
-        1 => sys_write(arg1, arg2, arg3),
-        2 => sys_open(arg1, arg2, arg3),
-        3 => sys_close(arg1),
-        4 => sys_stat(arg1, arg2),
-        5 => sys_fstat(arg1, arg2),
-        8 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
-        9 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
-        10 => sys_mprotect(arg1, arg2, arg3),
-        11 => sys_munmap(arg1, arg2),
-        12 => sys_brk(arg1),
-        13 => sys_sigaction(arg1, arg2, arg3),
-        14 => sys_sigprocmask(arg1, arg2, arg3),
-        16 => sys_ioctl(arg1, arg2, arg3),
-        20 => sys_writev(arg1, arg2, arg3),
-        22 => sys_pipe(arg1),
-        32 => sys_dup(arg1),
-        33 => sys_dup2(arg1, arg2),
-        34 => sys_pause(),
-        24 => sys_yield(),
-        35 => sys_nanosleep(arg1),
-        39 => sys_getpid(),
-        41 => sys_socket(arg1, arg2, arg3),
-        42 => sys_connect(arg1, arg2, arg3),
-        43 => sys_accept(arg1, arg2, arg3),
-        46 => sys_sendmsg(arg1, arg2, arg3),
-        47 => sys_recvmsg(arg1, arg2, arg3),
-        49 => sys_bind(arg1, arg2, arg3),
-        50 => sys_listen(arg1, arg2),
-        54 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
-        55 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
-        56 => sys_clone(arg1, arg2, arg3),
-        57 => sys_fork(&process_context),
-        59 => sys_exec(arg1, arg2),
-        60 => sys_exit(arg1),
-        231 => sys_exit(arg1),  // Linux exit_group
-        61 => sys_wait(arg1),
-        63 => sys_uname(arg1),
-        79 => sys_getcwd(arg1, arg2),
-        72 => sys_fcntl(arg1, arg2, arg3),
-        89 => sys_readlink(arg1, arg2, arg3),
-        109 => sys_setpgid(arg1, arg2),
-        110 => sys_getppid(),
-        112 => sys_setsid(),
-        170 => sys_sethostname(arg1, arg2),
-        62 => sys_kill(arg1, arg2),
-        77 => sys_ftruncate(arg1, arg2),
-        82 => sys_rename(arg1, arg2),
-        83 => sys_mkdir(arg1, arg2),
-        87 => sys_unlink(arg1),
-        118 => sys_getresuid(arg1, arg2, arg3),
-        120 => sys_getresgid(arg1, arg2, arg3),
-        121 => sys_getpgid(arg1),
+        // --- Linux Compatibility Syscalls (x86_64) ---
+        0   => sys_read(arg1, arg2, arg3),
+        1   => sys_write(arg1, arg2, arg3),
+        2   => sys_open(arg1, arg2, arg3),
+        3   => sys_close(arg1),
+        4   => sys_stat(arg1, arg2),
+        5   => sys_fstat(arg1, arg2),
+        6   => sys_fstatat(0, arg1, arg2, 0x100), // lstat -> AT_SYMLINK_NOFOLLOW (0x100)
+        8   => sys_lseek(arg1, arg2 as i64, arg3 as usize),
+        9   => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
+        10  => sys_mprotect(arg1, arg2, arg3),
+        11  => sys_munmap(arg1, arg2),
+        12  => sys_brk(arg1),
+        13  => sys_sigaction(arg1, arg2, arg3),
+        14  => sys_sigprocmask(arg1, arg2, arg3),
+        16  => sys_ioctl(arg1, arg2, arg3),
+        20  => sys_writev(arg1, arg2, arg3),
+        21  => sys_faccessat(0, arg1, arg2, 0),
+        22  => sys_pipe(arg1),
+        24  => sys_yield(),
+        32  => sys_dup(arg1),
+        33  => sys_dup2(arg1, arg2),
+        34  => sys_pause(),
+        35  => sys_nanosleep(arg1),
+        39  => sys_getpid(),
+        41  => sys_socket(arg1, arg2, arg3),
+        42  => sys_connect(arg1, arg2, arg3),
+        43  => sys_accept(arg1, arg2, arg3),
+        46  => sys_sendmsg(arg1, arg2, arg3),
+        47  => sys_recvmsg(arg1, arg2, arg3),
+        49  => sys_bind(arg1, arg2, arg3),
+        50  => sys_listen(arg1, arg2),
+        54  => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
+        55  => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
+        56  => sys_clone(arg1, arg2, arg3),
+        57  => sys_fork(&process_context),
+        59  => sys_exec(arg1, arg2),
+        60  => sys_exit(arg1),
+        61  => sys_wait(arg1),
+        62  => sys_kill(arg1, arg2),
+        63  => sys_uname(arg1),
+        72  => sys_fcntl(arg1, arg2, arg3),
+        77  => sys_ftruncate(arg1, arg2),
+        79  => sys_getcwd(arg1, arg2),
+        82  => sys_rename(arg1, arg2),
+        83  => sys_mkdir(arg1, arg2),
+        87  => sys_unlink(arg1),
+        89  => sys_readlink(arg1, arg2, arg3),
         102 => sys_getuid(),
         104 => sys_getgid(),
         107 => sys_geteuid(),
         108 => sys_getegid(),
-        247 => sys_getlogin(arg1, arg2),
+        109 => sys_setpgid(arg1, arg2),
+        110 => sys_getppid(),
+        112 => sys_setsid(),
+        118 => sys_getresuid(arg1, arg2, arg3),
+        120 => sys_getresgid(arg1, arg2, arg3),
+        121 => sys_getpgid(arg1),
         158 => sys_arch_prctl(arg1, arg2),
+        170 => sys_sethostname(arg1, arg2),
         186 => sys_gettid(),
-        218 => sys_set_tid_address(arg1),
         202 => sys_futex(arg1, arg2, arg3, arg4),
+        218 => sys_set_tid_address(arg1),
         228 => sys_clock_gettime(arg1, arg2),
+        231 => sys_exit(arg1), // Linux exit_group
+        247 => sys_getlogin(arg1, arg2),
+        262 => sys_fstatat(arg1, arg2, arg3, arg4),
+        269 => sys_faccessat(arg1, arg2, arg3, arg4),
         270 => sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6),
         292 => sys_dup3(arg1, arg2, arg3),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
-        262 => sys_fstatat(arg1, arg2, arg3, arg4),
-        269 => sys_faccessat(arg1, arg2, arg3, arg4),
-        439 => sys_faccessat(arg1, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
+        439 => sys_faccessat(arg1, arg2, arg3, arg4),
 
-        // Eclipse-specific (500+)
+        // --- Eclipse Native Syscalls (500+) ---
         500 => sys_send(arg1, arg2, arg3, arg4),
         501 => sys_receive(arg1, arg2, arg3),
         502 => sys_get_service_binary(arg1, arg2, arg3),
@@ -384,7 +364,7 @@ pub extern "C" fn syscall_handler(
         516 => sys_set_cursor_position(arg1, arg2),
         517 => sys_gpu_alloc_display_buffer(arg1, arg2, arg3),
         518 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),
-        250 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5), // Legacy alias
+        250 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5), // Legacy alias for compatibility
         519 => sys_get_logs(arg1, arg2),
         520 => sys_get_storage_device_count(),
         521 => sys_get_system_stats(arg1),
@@ -408,21 +388,18 @@ pub extern "C" fn syscall_handler(
         539 => sys_readdir(arg1, arg2, arg3),
         540 => sys_unlink(arg1),
         541 => sys_mkdir(arg1, arg2),
-        542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context), // set_child_args(pid, ptr, len)
+        542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context),
         543 => sys_get_process_args(arg1, arg2),
         600 => sys_receive_fast(context),
-        601 => sys_setpgid(arg1, arg2),
-        602 => sys_setsid(),
         _ => {
             serial::serial_printf(format_args!(
-                "[SYSCALL] Unknown syscall: {}{}{} from process {} on CPU {}\n",
+                "[SYSCALL] Unknown syscall: {}{} from process {} on CPU {}\n",
                 syscall_num,
-                if is_linux { " (Linux translated)" } else { "" },
-                "", // Padding if needed
+                if syscall_num < 500 { " (Linux Range)" } else { " (Eclipse Range)" },
                 crate::process::current_process_id().unwrap_or(0),
                 crate::process::get_cpu_id()
             ));
-            if is_linux {
+            if syscall_num < 500 {
                 linux_abi_error(38) // ENOSYS
             } else {
                 u64::MAX
@@ -430,17 +407,14 @@ pub extern "C" fn syscall_handler(
         }
     };
     
-    // Linux: legacy bare `u64::MAX` still decodes as EPERM in musl; prefer `linux_abi_error` per syscall.
-    let final_ret = ret;
-
-    context.rax = final_ret;
+    context.rax = ret;
 
     // Entregar señales pendientes antes de volver a userspace (no reentrar tras exit).
     if syscall_num != 60 && syscall_num != 231 {
         crate::process::deliver_pending_signals_for_current();
     }
 
-    final_ret
+    ret
 }
 
 
@@ -806,9 +780,9 @@ fn sys_drm_map_handle(handle_id: u64) -> u64 {
         
         let aligned_length = (handle.size + 0xFFF) & !0xFFF;
         
-        // Find a free VMA spot (0x40000000 to 0x70000000)
+        // Find a free VMA spot (0x60000000 to 0x70000000)
         let mut target_addr: u64 = 0;
-        let mut candidate = 0x40000000u64;
+        let mut candidate = 0x60000000;
         let mut found = false;
         while !found && candidate < 0x70000000 {
             let mut overlap = false;
@@ -1409,7 +1383,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1541,7 +1515,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
     }
@@ -2718,7 +2692,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         let mut target_addr = addr;
         if target_addr == 0 {
             // Find a free spot
-            let mut candidate = 0x40000000;
+            let mut candidate = 0x60000000;
             let mut found = false;
             while !found && candidate < 0x70000000 {
                 let mut overlap = false;
@@ -2915,6 +2889,12 @@ fn sys_brk(addr: u64) -> u64 {
             drop(r);
             process::update_process(pid, proc);
             return addr;
+        }
+    }
+    // Return the current break on error, per POSIX convention
+    if let Some(pid) = process::current_process_id() {
+        if let Some(proc) = process::get_process(pid) {
+            return proc.resources.lock().brk_current;
         }
     }
     u64::MAX

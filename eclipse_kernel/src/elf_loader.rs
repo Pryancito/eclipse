@@ -1025,7 +1025,10 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
 
-    let adjusted_stack = (stack_top - 192) & !0xF;
+    // Stack layout: argc (1), argv[0] (ptr), NULL (argv term), NULL (envp term), auxv...
+    let adjusted_stack = (stack_top - 256) & !0xF;
+    let program_ptr = adjusted_stack + 240;
+    let random_ptr = adjusted_stack + 224;
 
     let (tls_base, at_base, at_entry) = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
@@ -1048,33 +1051,38 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
         (0u64, 0u64, 0u64)
     };
 
-    let random_ptr = adjusted_stack + 19 * 8;
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
-        write_volatile(stack_ptr.offset(0), 0u64);
-        write_volatile(stack_ptr.offset(1), 0u64);
-        write_volatile(stack_ptr.offset(2), 0u64);
-        write_volatile(stack_ptr.offset(3), AT_PHDR);
-        write_volatile(stack_ptr.offset(4), phdr_va);
-        write_volatile(stack_ptr.offset(5), AT_PHENT);
-        write_volatile(stack_ptr.offset(6), phentsize);
-        write_volatile(stack_ptr.offset(7), AT_PHNUM);
-        write_volatile(stack_ptr.offset(8), phnum);
-        write_volatile(stack_ptr.offset(9), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(10), 4096u64);
-        write_volatile(stack_ptr.offset(11), AT_BASE);
-        write_volatile(stack_ptr.offset(12), at_base);
-        write_volatile(stack_ptr.offset(13), AT_FLAGS);
-        write_volatile(stack_ptr.offset(14), 0u64);
-        write_volatile(stack_ptr.offset(15), AT_ENTRY);
-        write_volatile(stack_ptr.offset(16), at_entry);
-        write_volatile(stack_ptr.offset(17), AT_RANDOM);
-        write_volatile(stack_ptr.offset(18), random_ptr);
-        write_volatile(stack_ptr.offset(19), 0x12345678_9ABCDEF0u64);
-        write_volatile(stack_ptr.offset(20), 0x0FEDCBA9_87654321u64);
-        write_volatile(stack_ptr.offset(21), AT_NULL);
-        write_volatile(stack_ptr.offset(22), 0u64);
-        write_volatile(stack_ptr.offset(23), 0u64);
+        write_volatile(stack_ptr.offset(0), 1u64);         // argc = 1
+        write_volatile(stack_ptr.offset(1), program_ptr); // argv[0] = "program"
+        write_volatile(stack_ptr.offset(2), 0u64);         // argv[1] = NULL
+        write_volatile(stack_ptr.offset(3), 0u64);         // envp[0] = NULL
+        
+        write_volatile(stack_ptr.offset(4), AT_PHDR);
+        write_volatile(stack_ptr.offset(5), phdr_va);
+        write_volatile(stack_ptr.offset(6), AT_PHENT);
+        write_volatile(stack_ptr.offset(7), phentsize);
+        write_volatile(stack_ptr.offset(8), AT_PHNUM);
+        write_volatile(stack_ptr.offset(9), phnum);
+        write_volatile(stack_ptr.offset(10), AT_PAGESZ);
+        write_volatile(stack_ptr.offset(11), 4096u64);
+        write_volatile(stack_ptr.offset(12), AT_BASE);
+        write_volatile(stack_ptr.offset(13), at_base);
+        write_volatile(stack_ptr.offset(14), AT_FLAGS);
+        write_volatile(stack_ptr.offset(15), 0u64);
+        write_volatile(stack_ptr.offset(16), AT_ENTRY);
+        write_volatile(stack_ptr.offset(17), at_entry);
+        write_volatile(stack_ptr.offset(18), AT_RANDOM);
+        write_volatile(stack_ptr.offset(19), random_ptr);
+        write_volatile(stack_ptr.offset(20), AT_NULL);
+        write_volatile(stack_ptr.offset(21), 0u64);
+
+        // Random data (16 bytes) at adjusted_stack + 224
+        let random_data = adjusted_stack as *mut u8;
+        core::ptr::copy_nonoverlapping(b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(), random_data.add(224), 16);
+        
+        // Program name string at adjusted_stack + 240
+        core::ptr::copy_nonoverlapping(b"program\0".as_ptr(), random_data.add(240), 8);
     }
 
     unsafe {
@@ -1185,7 +1193,9 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_NULL: u64 = 0;
     // System V ABI for x86-64 at program entry specifies RSP is 16-byte aligned (RSP % 16 == 0).
     // Previous code was subtracting 8, which is only for function calls, not process entry.
-    let adjusted_stack = (stack_top - 144) & !0xF;
+    let adjusted_stack = (stack_top - 256) & !0xF;
+    let program_ptr = adjusted_stack + 240;
+    let random_ptr = adjusted_stack + 224;
 
     let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x}\n", _pid, entry_point, adjusted_stack));
@@ -1207,24 +1217,30 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHENT/AT_PHNUM first (some glibc inits use them early).
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
-        write_volatile(stack_ptr.offset(0), 0u64);         // argc = 0
-        write_volatile(stack_ptr.offset(1), 0u64);        // argv[0] = NULL (end of argv)
-        write_volatile(stack_ptr.offset(2), 0u64);        // envp[0] = NULL (end of envp)
-        write_volatile(stack_ptr.offset(3), AT_PHDR);
-        write_volatile(stack_ptr.offset(4), phdr_va);
-        write_volatile(stack_ptr.offset(5), AT_PHENT);
-        write_volatile(stack_ptr.offset(6), phentsize);
-        write_volatile(stack_ptr.offset(7), AT_PHNUM);
-        write_volatile(stack_ptr.offset(8), phnum);
-        write_volatile(stack_ptr.offset(9), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(10), 4096u64);
-        write_volatile(stack_ptr.offset(11), AT_RANDOM);
-        write_volatile(stack_ptr.offset(12), (adjusted_stack + 15 * 8) as u64); // Address of random data at offset 15
-        write_volatile(stack_ptr.offset(13), AT_NULL);
-        write_volatile(stack_ptr.offset(14), 0u64);
-        // Random data (16 bytes)
-        write_volatile(stack_ptr.offset(15), 0x12345678_9ABCDEF0u64);
-        write_volatile(stack_ptr.offset(16), 0x0FEDCBA9_87654321u64);
+        write_volatile(stack_ptr.offset(0), 1u64);         // argc = 1
+        write_volatile(stack_ptr.offset(1), program_ptr); // argv[0] = "program"
+        write_volatile(stack_ptr.offset(2), 0u64);         // argv[1] = NULL
+        write_volatile(stack_ptr.offset(3), 0u64);         // envp[0] = NULL
+
+        write_volatile(stack_ptr.offset(4), AT_PHDR);
+        write_volatile(stack_ptr.offset(5), phdr_va);
+        write_volatile(stack_ptr.offset(6), AT_PHENT);
+        write_volatile(stack_ptr.offset(7), phentsize);
+        write_volatile(stack_ptr.offset(8), AT_PHNUM);
+        write_volatile(stack_ptr.offset(9), phnum);
+        write_volatile(stack_ptr.offset(10), AT_PAGESZ);
+        write_volatile(stack_ptr.offset(11), 4096u64);
+        write_volatile(stack_ptr.offset(12), AT_RANDOM);
+        write_volatile(stack_ptr.offset(13), random_ptr);
+        write_volatile(stack_ptr.offset(14), AT_NULL);
+        write_volatile(stack_ptr.offset(15), 0u64);
+
+        // Random data (16 bytes) at adjusted_stack + 224
+        let random_data = adjusted_stack as *mut u8;
+        core::ptr::copy_nonoverlapping(b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(), random_data.add(224), 16);
+        
+        // Program name string at adjusted_stack + 240
+        core::ptr::copy_nonoverlapping(b"program\0".as_ptr(), random_data.add(240), 8);
     }
 
     // Construir el frame iretq directamente en el stack del kernel (por-CPU).
