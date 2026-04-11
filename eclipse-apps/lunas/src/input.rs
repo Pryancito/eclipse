@@ -1848,13 +1848,14 @@ impl InputState {
                     let mut handled_by_titlebar = false;
                     if let Some(focused) = self.focused_window {
                         if focused < *window_count {
-                            let w = &windows[focused];
-                            if w.title_bar_contains(self.cursor_x, self.cursor_y) {
-                                if scroll_up && !w.shaded {
+                            let on_titlebar = windows[focused].title_bar_contains(self.cursor_x, self.cursor_y);
+                            let is_shaded   = windows[focused].shaded;
+                            if on_titlebar {
+                                if scroll_up && !is_shaded {
                                     windows[focused].toggle_shade();
                                     handled_by_titlebar = true;
                                     dirty = true;
-                                } else if !scroll_up && windows[focused].shaded {
+                                } else if !scroll_up && is_shaded {
                                     windows[focused].toggle_shade();
                                     handled_by_titlebar = true;
                                     dirty = true;

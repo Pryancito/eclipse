@@ -145,22 +145,16 @@ pub fn draw_switcher(
                 &FONT_6X12,
                 if is_selected { Rgb888::WHITE } else { Rgb888::new(180, 190, 220) },
             );
-            // Truncate title safely to fit in the card width (FONT_6X12 = 6 px/char).
-            // We scan for a safe UTF-8 char boundary to avoid a panic on multi-byte chars.
+            // Truncate title to at most `max_chars` characters to fit the card width
+            // (FONT_6X12 = 6 px/char).  We use char_indices to stay at safe UTF-8
+            // boundaries even for multi-byte characters.
             let max_chars = (ENTRY_W / 6) as usize;
-            let display: &str = {
-                if title.len() <= max_chars {
-                    title
-                } else {
-                    // Walk char boundaries to find the largest safe slice ≤ max_chars bytes.
-                    let safe_end = title
-                        .char_indices()
-                        .map(|(byte_idx, _)| byte_idx)
-                        .take_while(|&i| i < max_chars)
-                        .last()
-                        .unwrap_or(0);
-                    &title[..safe_end]
-                }
+            let display: &str = if let Some((byte_idx, _)) = title.char_indices().nth(max_chars) {
+                // There are more than max_chars chars — slice at the safe byte boundary.
+                &title[..byte_idx]
+            } else {
+                // Title fits entirely.
+                title
             };
             let text_x = ex + 4;
             let text_y = ey + ENTRY_H - 8;

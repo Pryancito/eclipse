@@ -286,10 +286,10 @@ mod tests {
         se.set_ssd_theme(1);
         let minimal = SsdTheme::minimal();
         assert_eq!(se.ssd.titlebar_height, minimal.titlebar_height);
-        // Switch to neon (index 2) — has a taller title bar than default
+        // Switch to neon (index 2)
         se.set_ssd_theme(2);
         let neon = SsdTheme::neon();
         assert_eq!(se.ssd.titlebar_height, neon.titlebar_height);
-        assert!(se.ssd.titlebar_height >= 24);
+        assert_eq!(se.ssd.titlebar_height, 26, "neon theme has 26px titlebar");
     }
 }

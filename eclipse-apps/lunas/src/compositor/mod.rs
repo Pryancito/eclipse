@@ -144,13 +144,17 @@ impl ShellWindow {
         WindowButton::None
     }
 
+    /// Minimum window height after unshading (prevents windows from becoming
+    /// invisible if shaded before they had a chance to resize).
+    pub const MIN_RESTORED_HEIGHT: i32 = Self::TITLE_H * 2;
+
     /// Toggle the shaded (roll-up) state.  When shading, the window height is
     /// reduced to just the title bar; the original height is saved so it can be
     /// restored on unshade.
     pub fn toggle_shade(&mut self) {
         if self.shaded {
             // Restore
-            self.h = self.stored_h_before_shade.max(Self::TITLE_H * 2);
+            self.h = self.stored_h_before_shade.max(Self::MIN_RESTORED_HEIGHT);
             self.shaded = false;
         } else {
             // Shade

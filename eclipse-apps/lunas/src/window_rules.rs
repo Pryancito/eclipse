@@ -27,16 +27,18 @@ pub fn apply_rules(config: &LabwcConfig, window: &mut ShellWindow, fb_w: i32, fb
     let (new_x, new_y, new_w, new_h, maximized, _fullscreen) =
         config.apply_window_rules(title, window.x, window.y, window.w, window.h);
 
-    // Apply position / size only when the rule actually changed them.
+    // Apply size first (so position clamping uses the updated dimensions).
+    if new_w != window.w || new_h != window.h {
+        window.w = new_w.max(config.min_window_width);
+        window.h = new_h.max(config.min_window_height);
+    }
+
+    // Apply position after size so the clamp range is correct.
     if new_x != window.x || new_y != window.y {
         window.x = new_x.max(0).min((fb_w - window.w).max(0));
         window.y = new_y
             .max(ShellWindow::TITLE_H)
             .min((fb_h - window.h).max(ShellWindow::TITLE_H));
-    }
-    if new_w != window.w || new_h != window.h {
-        window.w = new_w.max(config.min_window_width);
-        window.h = new_h.max(config.min_window_height);
     }
 
     if maximized && !window.maximized {
