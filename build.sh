@@ -37,180 +37,6 @@ print_warning() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-# Copia al rootfs staging las .so que `ldd` resuelve para un binario (labwc, etc.).
-# Sin esto, en Eclipse solo están musl/libc y faltan libinput, EGL, cairo, pango…
-# Solo copia bibliotecas musl-compatibles: omite ld-linux*.so* y las compiladas contra glibc.
-eclipse_stage_ldd_libs() {
-    local dest="$1"
-    local bin="$2"
-    [ -z "${ECLIPSE_SKIP_LDD_STAGING:-}" ] || return 0
-    [ -f "$bin" ] || return 0
-    if ! command -v ldd >/dev/null 2>&1; then
-        print_warning "ldd no está en PATH; omito copia de dependencias de $bin. Instala libc-bin o define ECLIPSE_LABWC_LIB_PREFIX."
-        return 0
-    fi
-    mkdir -p "$dest/lib"
-    local line p n
-    n=0
-    while IFS= read -r line; do
-        case "$line" in
-            *"=> /"*)
-                p="${line#*=> }"
-                p="${p%% (*}"
-                case "$p" in
-                    */ld-linux*.so*)
-                        continue
-                        ;;
-                esac
-                [ -f "$p" ] || [ -L "$p" ] || continue
-                # No copiar bibliotecas que dependan de glibc (incompatibles con musl)
-                if eclipse_is_glibc_lib "$p"; then
-                    print_warning "Omitiendo $(basename "$p") de ldd (dependencia glibc)"
-                    continue
-                fi
-                cp -a "$p" "$dest/lib/"
-                n=$((n + 1))
-                ;;
-        esac
-    done < <(ldd "$bin" 2>/dev/null || true)
-    if [ "$n" -gt 0 ]; then
-        print_status "Staged $n bibliotecas dinámicas (ldd) desde $(basename "$bin") -> lib/"
-    fi
-}
-
-# Devuelve 0 (éxito) si el ELF $1 está enlazado dinámicamente con glibc (NEEDED libc.so.6).
-# Se usa para NO copiar bibliotecas glibc al rootfs musl de Eclipse.
-eclipse_is_glibc_lib() {
-    local f="$1"
-    readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libc\.so\.6'
-}
-
-# Si ldd falla (p. ej. musl intentó cargar /lib/.../libc.so script de glibc), copia DT_NEEDED resolviendo rutas.
-# Solo copia bibliotecas musl-compatibles: omite ld-linux*.so*, libc.so.6 y cualquier .so glibc.
-eclipse_stage_readelf_needed_libs() {
-    local dest="$1"
-    local bin="$2"
-    [ -z "${ECLIPSE_SKIP_LDD_STAGING:-}" ] || return 0
-    [ -f "$bin" ] || return 0
-    command -v readelf >/dev/null 2>&1 || return 0
-    mkdir -p "$dest/lib"
-    local soname n cand pf d
-    n=0
-    while IFS= read -r soname; do
-        [ -z "$soname" ] && continue
-        case "$soname" in
-            # Nunca incluir el intérprete glibc ni libc.so.6 en el rootfs musl
-            ld-linux*.so*) continue ;;
-            libc.so.*) continue ;;
-            libdl.so.*) continue ;;
-            libpthread.so.*) continue ;;
-            librt.so.*) continue ;;
-        esac
-        cand=""
-        # 1) Preferir versión musl-gcc
-        if command -v musl-gcc >/dev/null 2>&1; then
-            pf="$(musl-gcc -print-file-name="$soname" 2>/dev/null || true)"
-            case "$pf" in
-                /*)
-                    if [ -f "$pf" ] && readelf -h "$pf" >/dev/null 2>&1; then
-                        cand="$pf"
-                    fi
-                    ;;
-            esac
-        fi
-        # 2) Buscar en directorios musl conocidos antes que en glibc
-        if [ -z "$cand" ]; then
-            for d in /usr/lib/x86_64-linux-musl \
-                     /usr/lib/musl/lib \
-                     /usr/x86_64-linux-musl/lib; do
-                [ -e "$d/$soname" ] || continue
-                readelf -h "$d/$soname" >/dev/null 2>&1 || continue
-                cand="$d/$soname"
-                break
-            done
-        fi
-        # 3) Solo si NO es glibc, buscar en rutas genéricas
-        if [ -z "$cand" ]; then
-            for d in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib /lib; do
-                [ -e "$d/$soname" ] || continue
-                readelf -h "$d/$soname" >/dev/null 2>&1 || continue
-                # Rechazar bibliotecas que dependan de glibc
-                if eclipse_is_glibc_lib "$d/$soname"; then
-                    print_warning "Omitiendo $soname de $d (dependencia glibc, incompatible con musl)"
-                    continue
-                fi
-                cand="$d/$soname"
-                break
-            done
-        fi
-        [ -z "$cand" ] && continue
-        cp -a "$cand" "$dest/lib/"
-        n=$((n + 1))
-    done < <(readelf -d "$bin" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
-    if [ "$n" -gt 0 ]; then
-        print_status "Staged $n bibliotecas (readelf NEEDED, musl-compatible) desde $(basename "$bin") -> lib/"
-    fi
-}
-
-# Comprueba si un ELF tiene PT_INTERP (binario dinámicamente enlazado).
-eclipse_is_dynamic_elf() {
-    local f="$1"
-    readelf -l "$f" 2>/dev/null | grep -q 'INTERP'
-}
-
-# Para cada binario dinámicamente enlazado en $dest/bin/, llama a
-# eclipse_stage_readelf_needed_libs con preferencia musl.
-eclipse_stage_all_dynamic_bin_libs() {
-    local dest="$1"
-    command -v readelf >/dev/null 2>&1 || return 0
-    local b
-    for b in "$dest/bin/"*; do
-        [ -f "$b" ] || continue
-        file "$b" 2>/dev/null | grep -q 'ELF' || continue
-        eclipse_is_dynamic_elf "$b" || continue
-        print_status "Staging musl libs para binario dinámico: $(basename "$b")"
-        eclipse_stage_readelf_needed_libs "$dest" "$b"
-    done
-}
-
-# Elimina del rootfs staging las bibliotecas incompatibles con musl:
-#   - ld-linux-x86-64.so.2  (intérprete glibc, nunca necesario en entorno musl)
-#   - libgcc_s.so.1 glibc   (se intenta reemplazar con versión musl si está disponible)
-eclipse_sanitize_staged_libs() {
-    local dest="$1"
-    command -v readelf >/dev/null 2>&1 || return 0
-
-    # Eliminar siempre el intérprete glibc
-    if [ -e "$dest/lib/ld-linux-x86-64.so.2" ]; then
-        rm -f "$dest/lib/ld-linux-x86-64.so.2"
-        print_status "Eliminado ld-linux-x86-64.so.2 (intérprete glibc, incompatible con Eclipse musl)"
-    fi
-
-    # Reemplazar libgcc_s.so.1 glibc con versión musl si está disponible
-    local gcc_staged="$dest/lib/libgcc_s.so.1"
-    if [ -f "$gcc_staged" ] && eclipse_is_glibc_lib "$gcc_staged"; then
-        print_warning "libgcc_s.so.1 staged es versión glibc; buscando versión musl..."
-        local musl_gcc_s=""
-        local d
-        for d in /usr/lib/x86_64-linux-musl \
-                 /usr/lib/musl/lib \
-                 /usr/x86_64-linux-musl/lib; do
-            if [ -f "$d/libgcc_s.so.1" ] && ! eclipse_is_glibc_lib "$d/libgcc_s.so.1"; then
-                musl_gcc_s="$d/libgcc_s.so.1"
-                break
-            fi
-        done
-        if [ -n "$musl_gcc_s" ]; then
-            cp -a "$musl_gcc_s" "$gcc_staged"
-            print_status "Reemplazado libgcc_s.so.1 con versión musl desde $musl_gcc_s"
-        else
-            # No encontramos versión musl: eliminar la glibc para evitar errores de relocación
-            rm -f "$gcc_staged"
-            print_warning "libgcc_s.so.1 musl no encontrada; eliminada versión glibc del rootfs"
-        fi
-    fi
-}
-
 # Configuración
 KERNEL_TARGET="x86_64-unknown-none"
 UEFI_TARGET="x86_64-unknown-uefi"
@@ -296,6 +122,51 @@ build_eclipse_syscall() {
     fi
     
     cd ..
+}
+
+# Rust nightly (target host musl) y toolchain C musl.cc, descargados con wget bajo eclipse-os-build/host-toolchains.
+download_host_musl_toolchains() {
+    print_step "Descargando host toolchains con wget (Rust nightly musl + musl.cc native)..."
+    if ! command -v wget >/dev/null 2>&1; then
+        print_error "wget no está instalado; hace falta para descargar los toolchains."
+        return 1
+    fi
+    local DL="$BASE_DIR/$BUILD_DIR/.downloads"
+    local DEST="$BASE_DIR/$BUILD_DIR/host-toolchains"
+    mkdir -p "$DL" "$DEST"
+
+    local RUST_URL="https://static.rust-lang.org/dist/rust-nightly-x86_64-unknown-linux-musl.tar.xz"
+    local MUSL_URL="https://musl.cc/x86_64-linux-musl-native.tgz"
+    local RUST_XZ="$DL/rust-nightly-x86_64-unknown-linux-musl.tar.xz"
+    local MUSL_TGZ="$DL/x86_64-linux-musl-native.tgz"
+
+    local RUST_PREFIX="$DEST/rust-nightly-x86_64-unknown-linux-musl"
+    local MUSL_PREFIX="$DEST/x86_64-linux-musl-native"
+    local MUSL_GCC="$MUSL_PREFIX/usr/bin/x86_64-linux-musl-gcc"
+
+    print_status "wget (continuar si existe): $RUST_URL"
+    wget -c --progress=dot:giga -O "$RUST_XZ" "$RUST_URL"
+
+    print_status "wget (continuar si existe): $MUSL_URL"
+    wget -c --progress=dot:giga -O "$MUSL_TGZ" "$MUSL_URL"
+
+    if [ ! -x "$RUST_PREFIX/bin/rustc" ] || [ "$RUST_XZ" -nt "$RUST_PREFIX/bin/rustc" ]; then
+        print_status "Extrayendo Rust nightly musl en $DEST..."
+        rm -rf "$RUST_PREFIX"
+        tar -xJf "$RUST_XZ" -C "$DEST"
+    else
+        print_status "Rust nightly musl ya extraído y actualizado ($RUST_PREFIX)"
+    fi
+
+    if [ ! -x "$MUSL_GCC" ] || [ "$MUSL_TGZ" -nt "$MUSL_GCC" ]; then
+        print_status "Extrayendo x86_64-linux-musl-native en $DEST..."
+        rm -rf "$MUSL_PREFIX"
+        tar -xzf "$MUSL_TGZ" -C "$DEST"
+    else
+        print_status "musl.cc native ya extraído y actualizado ($MUSL_PREFIX)"
+    fi
+
+    print_success "Toolchains en $DEST (rustc: $RUST_PREFIX/bin, gcc musl: $MUSL_PREFIX/usr/bin)"
 }
 
 # Función para preparar el sysroot
@@ -1576,14 +1447,6 @@ EOF
         print_status "Copiado de fuentes a $BUILD_DIR/usr/share/fonts/X11/misc/"
     fi
 
-    # Para binarios dinámicamente enlazados en /bin, staging de dependencias musl-compatibles.
-    # Esto garantiza que cualquier binario dinámico (p.ej. cargo) tenga las .so correctas
-    # en lugar de versiones glibc incompatibles.
-    eclipse_stage_all_dynamic_bin_libs "$BUILD_DIR"
-
-    # Eliminar bibliotecas incompatibles con musl (ld-linux-x86-64.so.2, libgcc_s.so.1 glibc).
-    eclipse_sanitize_staged_libs "$BUILD_DIR"
-
     print_success "Distribución básica creada en $BUILD_DIR"
 }
 
@@ -1843,6 +1706,7 @@ build_eclipsefs_cli() {
 # Función principal
 main() {
     # Ejecutar pasos de construcción
+    download_host_musl_toolchains
     build_eclipsefs_lib
     build_mkfs_eclipsefs
     build_populate_eclipsefs
