@@ -2896,12 +2896,20 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             && addr
                 .checked_add(aligned_length)
                 .map_or(false, |end| end <= USER_ARENA_HI);
+        use linux_mmap_abi::PROT_EXEC;
         let anon_slack: u64 = if (flags & MAP_ANONYMOUS) != 0 && fd_entry.is_none() {
+            // Anonymous mappings always get slack (unless MAP_FIXED outside the arena).
             if (flags & MAP_FIXED) == 0 || map_fixed_in_mmap_arena {
                 ANON_SLACK_BYTES
             } else {
                 0
             }
+        } else if fd_entry.is_some() && (prot & PROT_EXEC) != 0 && (flags & MAP_FIXED) == 0 {
+            // Non-MAP_FIXED file-backed PROT_EXEC mappings (e.g. library text segments
+            // chosen by the kernel) also need slack pages so that multi-byte instructions
+            // at the very end of the last mapped page can be fetched without a page fault.
+            // Pages beyond file_len are already zeroed by the frame-allocation path.
+            ANON_SLACK_BYTES
         } else {
             0
         };
@@ -3055,6 +3063,36 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             }
             memory::map_user_page_4kb(page_table_phys, current, frame_phys, pte_leaf);
             current += 4096;
+        }
+
+        // MAP_FIXED file-backed PROT_EXEC: add zeroed executable slack pages right
+        // after the file mapping so that multi-byte instructions at the last byte of
+        // the last mapped page (e.g. RIP=0x…fff, CR2=0x…000 of next page) can be
+        // fetched without a #PF.  This mirrors the ANON_SLACK_BYTES mechanism that
+        // already protects anonymous mappings.
+        //
+        // We do NOT include these pages in the VMA so they stay invisible to
+        // mmap_find_free and the munmap path.  A subsequent MAP_FIXED from ld-musl
+        // (e.g. the data segment immediately after the text segment) will
+        // unmap_user_range over them if they happen to overlap — which is correct.
+        if (flags & MAP_FIXED) != 0
+            && fd_entry.is_some()
+            && (linux_p & PROT_EXEC) != 0
+            && anon_slack == 0
+        {
+            let slack_end = map_end.saturating_add(ANON_SLACK_BYTES);
+            let mut sv = map_end;
+            while sv < slack_end {
+                if memory::get_user_page_phys(page_table_phys, sv).is_none() {
+                    if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                        let fv = memory::PHYS_MEM_OFFSET + phys;
+                        unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
+                        let sp = memory::linux_prot_to_leaf_pte_bits(linux_p | PROT_EXEC);
+                        memory::map_user_page_4kb(page_table_phys, sv, phys, sp);
+                    }
+                }
+                sv = sv.saturating_add(4096);
+            }
         }
 
         r.vmas.push(VMARegion {

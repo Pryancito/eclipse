@@ -37,6 +37,50 @@ impl InodeCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Directory content cache
+// ---------------------------------------------------------------------------
+// Caches raw TLV record data for directory inodes so that `lookup_path` does
+// not re-read the same directory from disk on every path traversal.  From the
+// logs, the root (inode 1), /bin (inode 3), /lib (inode 12), /etc (inode 5)
+// and several others were re-read on every single open() call.
+//
+// Cache entry layout: (inode_id, last_access_tick, record_bytes).
+// Policy: LRU eviction once DIR_CACHE_SIZE entries are in use.
+// ---------------------------------------------------------------------------
+
+const DIR_CACHE_SIZE: usize = 16;
+
+struct DirCacheState {
+    entries: Vec<(u32, u64, Vec<u8>)>,
+    access_counter: u64,
+}
+
+impl DirCacheState {
+    const fn new() -> Self {
+        Self { entries: Vec::new(), access_counter: 0 }
+    }
+
+    fn insert(&mut self, inode_id: u32, data: Vec<u8>) {
+        if self.entries.iter().any(|e| e.0 == inode_id) {
+            return;
+        }
+        self.access_counter = self.access_counter.wrapping_add(1);
+        let ac = self.access_counter;
+        if self.entries.len() < DIR_CACHE_SIZE {
+            self.entries.push((inode_id, ac, data));
+        } else {
+            let victim = self.entries.iter().enumerate()
+                .min_by_key(|(_, e)| e.1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.entries[victim] = (inode_id, ac, data);
+        }
+    }
+}
+
+static DIR_CACHE: spin::Mutex<DirCacheState> = spin::Mutex::new(DirCacheState::new());
+
 /// Global lock for filesystem operations to prevent SMP race conditions.
 /// This protects the static `FS` state and ensures atomicity of `lseek` + `read/write` sequences.
 static FILESYSTEM_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
@@ -797,33 +841,54 @@ impl Filesystem {
         for part in parts {
             serial::serial_printf(format_args!("[FS] Looking up '{}' in inode {}\n", part, current_inode));
 
-            let entry = Self::read_inode_entry(current_inode)?;
-            let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-            
-            let mut header_buf = [0u8; 8];
-            read_bytes_at(abs_disk_offset, &mut header_buf)?;
-            
-            let record_size = u32::from_le_bytes([
-                header_buf[4], header_buf[5],
-                header_buf[6], header_buf[7]
-            ]) as usize;
-            
-            serial::serial_printf(format_args!("[FS] Dir record={} offset=0x{:x} size={}\n", current_inode, abs_disk_offset, record_size));
+            // Check the directory content cache first to avoid a disk read.
+            let cached = {
+                let mut dc = DIR_CACHE.lock();
+                if let Some(idx) = dc.entries.iter().position(|e| e.0 == current_inode) {
+                    dc.access_counter = dc.access_counter.wrapping_add(1);
+                    dc.entries[idx].1 = dc.access_counter;
+                    Some(dc.entries[idx].2.clone())
+                } else {
+                    None
+                }
+            };
 
-            if record_size < 8 {
-                serial::serial_printf(format_args!("[FS] Error: Record {} too small ({})\n", current_inode, record_size));
-                return Err("Invalid directory record size (too small)");
-            }
-            
-            if record_size > MAX_RECORD_SIZE {
-                 serial::serial_printf(format_args!("[FS] Error: Record {} too large ({})\n", current_inode, record_size));
-                 return Err("Directory record too large");
-            }
-            
-            let mut record_data = vec![0u8; record_size];
-            serial::serial_printf(format_args!("[FS] Reading directory data ({} bytes)...\n", record_size));
-            read_bytes_at(abs_disk_offset, &mut record_data)?;
-            serial::serial_print("[FS] Data read complete\n");
+            let record_data = if let Some(data) = cached {
+                data
+            } else {
+                let entry = Self::read_inode_entry(current_inode)?;
+                let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+
+                let mut header_buf = [0u8; 8];
+                read_bytes_at(abs_disk_offset, &mut header_buf)?;
+
+                let record_size = u32::from_le_bytes([
+                    header_buf[4], header_buf[5],
+                    header_buf[6], header_buf[7]
+                ]) as usize;
+
+                serial::serial_printf(format_args!("[FS] Dir record={} offset=0x{:x} size={}\n", current_inode, abs_disk_offset, record_size));
+
+                if record_size < 8 {
+                    serial::serial_printf(format_args!("[FS] Error: Record {} too small ({})\n", current_inode, record_size));
+                    return Err("Invalid directory record size (too small)");
+                }
+
+                if record_size > MAX_RECORD_SIZE {
+                    serial::serial_printf(format_args!("[FS] Error: Record {} too large ({})\n", current_inode, record_size));
+                    return Err("Directory record too large");
+                }
+
+                let mut data = vec![0u8; record_size];
+                serial::serial_printf(format_args!("[FS] Reading directory data ({} bytes)...\n", record_size));
+                read_bytes_at(abs_disk_offset, &mut data)?;
+                serial::serial_print("[FS] Data read complete\n");
+
+                // Cache the record for subsequent lookups of siblings/the same directory.
+                DIR_CACHE.lock().insert(current_inode, data.clone());
+
+                data
+            };
          
             if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
                 serial::serial_printf(format_args!("[FS] Found '{}' -> inode {}\n", part, inode));
