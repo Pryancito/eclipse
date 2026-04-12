@@ -3071,28 +3071,59 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         // fetched without a #PF.  This mirrors the ANON_SLACK_BYTES mechanism that
         // already protects anonymous mappings.
         //
-        // We do NOT include these pages in the VMA so they stay invisible to
-        // mmap_find_free and the munmap path.  A subsequent MAP_FIXED from ld-musl
-        // (e.g. the data segment immediately after the text segment) will
-        // unmap_user_range over them if they happen to overlap — which is correct.
+        // Two bugs fixed here vs the original approach:
+        //
+        // 1. The old code skipped pages that were already present (e.g. a PROT_NONE
+        //    page left by musl's initial `mmap(NULL, total, PROT_NONE)` reservation).
+        //    Our kernel eagerly allocates physical frames for PROT_NONE pages (unlike
+        //    Linux which defers them), so `get_user_page_phys` returns Some for those
+        //    frames.  Skipping them leaves the page mapped with NX set — an instruction
+        //    fetch through the boundary gives error 0x15 (present, NX violation), and
+        //    if the page is later stolen and freed the error becomes 0x14 (not present).
+        //    Fix: always remap any existing page with exec permission.
+        //
+        // 2. The old code did NOT add the slack region to the VMA list, so
+        //    `mmap_find_free` could silently place a new anonymous allocation there.
+        //    This happens when the data PT_LOAD segment is far from text (e.g. 2 MB
+        //    alignment): the gap between the text VMA and the data VMA is large enough
+        //    that `mmap_find_free(ANON_SLACK_BYTES + aligned_len)` returns an address
+        //    inside the slack.  The resulting `unmap_user_range` frees the slack page,
+        //    and a subsequent `munmap` of that allocation leaves it "not present"
+        //    (error 0x14) at the moment the CPU fetches instruction bytes across the
+        //    page boundary.  Fix: register the slack region as a VMA entry.
         if (flags & MAP_FIXED) != 0
             && fd_entry.is_some()
             && (linux_p & PROT_EXEC) != 0
             && anon_slack == 0
         {
             let slack_end = map_end.saturating_add(ANON_SLACK_BYTES);
+            let slack_prot = memory::linux_prot_to_leaf_pte_bits(linux_p | PROT_EXEC);
             let mut sv = map_end;
             while sv < slack_end {
-                if memory::get_user_page_phys(page_table_phys, sv).is_none() {
-                    if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
-                        let fv = memory::PHYS_MEM_OFFSET + phys;
-                        unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
-                        let sp = memory::linux_prot_to_leaf_pte_bits(linux_p | PROT_EXEC);
-                        memory::map_user_page_4kb(page_table_phys, sv, phys, sp);
-                    }
+                if let Some(existing_phys) = memory::get_user_page_phys(page_table_phys, sv) {
+                    // Page already present (e.g. PROT_NONE from the initial musl
+                    // reservation).  Remap it with exec permission so that instruction
+                    // decoding across the page boundary succeeds.
+                    memory::map_user_page_4kb(page_table_phys, sv, existing_phys, slack_prot);
+                } else if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                    let fv = memory::PHYS_MEM_OFFSET + phys;
+                    unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
+                    memory::map_user_page_4kb(page_table_phys, sv, phys, slack_prot);
                 }
                 sv = sv.saturating_add(4096);
             }
+            // Register the slack region as a VMA so that mmap_find_free does not
+            // allocate into this window.  Without this, a large gap between the text
+            // and data PT_LOAD segments (common with 2 MB-aligned shared libraries)
+            // lets the allocator reuse the slack address, and a later munmap of that
+            // allocation leaves the page absent (error 0x14 on instruction fetch).
+            r.vmas.push(VMARegion {
+                start:             map_end,
+                end:               slack_end,
+                flags:             prot,
+                file_backed:       false,
+                anon_kernel_slack: ANON_SLACK_BYTES,
+            });
         }
 
         r.vmas.push(VMARegion {
