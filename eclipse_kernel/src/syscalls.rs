@@ -2941,7 +2941,46 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             let t0 = addr;
             let t1 = addr.saturating_add(aligned_length);
             let t1_ext = t1.saturating_add(anon_slack);
-            r.vmas.retain(|vma| vma.end <= t0 || vma.start >= t1_ext);
+            // Rebuild the VMA list, removing entries that overlap [t0, t1_ext).
+            // Exception: exec-slack VMAs (kernel-injected, not file-backed, exec
+            // permission) are *split* rather than removed entirely.  This preserves
+            // the portion of the slack window that lies outside the new mapping so
+            // that mmap_find_free cannot place a new anonymous allocation there.
+            //
+            // Without this, a small gap between a text segment end and the next
+            // MAP_FIXED data segment (e.g. 1-page gap at [text_end, data_start))
+            // loses its VMA guard after the data MAP_FIXED removes the slack VMA.
+            // A subsequent file-backed mmap (anon_slack=0) then lands exactly in
+            // that gap; when that mapping is later munmapped the page becomes
+            // absent, and a multi-byte instruction fetch across the boundary
+            // crashes with #PF error 0x14 (not-present instruction fetch).
+            {
+                use linux_mmap_abi::PROT_EXEC;
+                use crate::process::VMARegion;
+                let old_vmas: alloc::vec::Vec<VMARegion> = core::mem::take(&mut r.vmas);
+                for vma in old_vmas {
+                    if vma.end <= t0 || vma.start >= t1_ext {
+                        // No overlap — keep as-is.
+                        r.vmas.push(vma);
+                    } else {
+                        // VMA overlaps [t0, t1_ext).  For exec-slack VMAs preserve
+                        // the non-overlapping left and right remnants; discard all
+                        // other VMAs that fall inside the replaced range.
+                        let is_exec_slack = !vma.file_backed
+                            && vma.anon_kernel_slack > 0
+                            && (vma.flags & PROT_EXEC) != 0;
+                        if is_exec_slack {
+                            if vma.start < t0 {
+                                r.vmas.push(VMARegion { end: t0, ..vma });
+                            }
+                            if vma.end > t1_ext {
+                                r.vmas.push(VMARegion { start: t1_ext, ..vma });
+                            }
+                        }
+                        // else: discard entirely.
+                    }
+                }
+            }
             (addr, t1)
         } else if addr != 0 {
             let ms = addr & !0xFFF;
