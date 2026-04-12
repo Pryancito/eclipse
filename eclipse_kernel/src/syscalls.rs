@@ -118,6 +118,8 @@ pub enum SyscallNumber {
     RegisterLogHud = 534,
     SetTime = 535,
     SpawnWithStdio = 536,
+    /// ELF cargado desde ruta VFS en el kernel (ver `sys_spawn_with_stdio_path`).
+    SpawnWithStdioPath = 544,
     ThreadCreate = 537,
     WaitPid = 538,
     ReceiveFast = 600,
@@ -129,6 +131,71 @@ pub enum SyscallNumber {
 pub const SEEK_SET: u64 = 0; // Absolute position
 pub const SEEK_CUR: u64 = 1; // Relative to current position  
 pub const SEEK_END: u64 = 2; // Relative to end of file
+
+/// Constantes Linux para `mmap` / `mprotect` (x86_64, musl).
+///
+/// `ANON_SLACK_BYTES`: páginas extra en `mmap` anónimo para desbordes lógicos y trampolines;
+/// ver `mmap_pte_linux_prot` y `mprotect_expand_anon_slack`.
+mod linux_mmap_abi {
+    pub const PROT_MASK: u64 = 7;
+    pub const PROT_EXEC: u64 = 4;
+    pub const MAP_FIXED: u64 = 0x10;
+    pub const MAP_SHARED: u64 = 0x01;
+    pub const MAP_ANONYMOUS: u64 = 0x20;
+    /// Donde `mmap_find_free` coloca `mmap(NULL, …)` anónimo.
+    pub const USER_ARENA_LO: u64 = 0x6000_0000;
+    pub const USER_ARENA_HI: u64 = 0x7000_0000;
+    /// Páginas extra más allá del tamaño redondeado (trampolines / desbordes de musl).
+    /// Incluye margen para fetch de instrucción de hasta 15 B en el último byte de página
+    /// (p. ej. RIP=0x…3fff y CR2=0x…4000: hacía falta >4 páginas de colchón).
+    pub const ANON_SLACK_BYTES: u64 = 0x8000;
+}
+
+/// Si `PROT_EXEC` y el rango toca un VMA anónimo con colchón del kernel, amplía a todo el VMA.
+fn mprotect_expand_anon_slack(
+    vmas: &[crate::process::VMARegion],
+    mut lo: u64,
+    mut hi: u64,
+    prot: u64,
+) -> (u64, u64) {
+    use linux_mmap_abi::PROT_EXEC;
+    if (prot & PROT_EXEC) == 0 || hi <= lo {
+        return (lo, hi);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for vma in vmas.iter() {
+            if vma.file_backed || vma.anon_kernel_slack == 0 {
+                continue;
+            }
+            if lo < vma.end && hi > vma.start {
+                let na = lo.min(vma.start);
+                let ne = hi.max(vma.end);
+                if na != lo || ne != hi {
+                    lo = na;
+                    hi = ne;
+                    changed = true;
+                }
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// `prot` Linux para una página de `mmap`: el colchón anónimo lleva siempre bit ejecutable.
+fn mmap_pte_linux_prot(base_prot: u64, anon_slack: u64, map_end: u64, page_vaddr: u64) -> u64 {
+    use linux_mmap_abi::PROT_EXEC;
+    if anon_slack == 0 {
+        return base_prot;
+    }
+    let slack_lo = map_end.saturating_sub(anon_slack);
+    if page_vaddr >= slack_lo {
+        base_prot | PROT_EXEC
+    } else {
+        base_prot
+    }
+}
 
 /// Estadísticas de syscalls
 pub struct SyscallStats {
@@ -398,6 +465,7 @@ pub extern "C" fn syscall_handler(
         541 => sys_mkdir(arg1, arg2),
         542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context),
         543 => sys_get_process_args(arg1, arg2),
+        544 => sys_spawn_with_stdio_path(arg1, arg2, arg3, arg4, arg5, arg6),
         600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
@@ -835,6 +903,7 @@ fn sys_drm_map_handle(handle_id: u64) -> u64 {
             end: target_addr + aligned_length as u64,
             flags: flags, 
             file_backed: false,
+            anon_kernel_slack: 0,
         });
         
         proc.mem_frames += (aligned_length as u64 + 4095) / 4096;
@@ -1680,24 +1749,58 @@ fn sys_get_process_args(buf_ptr: u64, buf_size: u64) -> u64 {
     }
 }
 
-fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, fd_out: u64, fd_err: u64) -> u64 {
-    // Re-implement the base logic to avoid the race condition!
-    // We cannot call sys_spawn directly because it enqueues the process, 
-    // making it runnable before we replace its FDs.
-    
+/// arg1: ruta absoluta NUL (`/bin/foo`), arg2: nombre proceso (opcional, hasta 16 bytes + NUL), arg3–5: fds stdio.
+fn sys_spawn_with_stdio_path(
+    path_ptr: u64,
+    name_ptr: u64,
+    fd_in: u64,
+    fd_out: u64,
+    fd_err: u64,
+    _a6: u64,
+) -> u64 {
     use alloc::vec::Vec;
-    let elf_slice = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
-    let mut elf_data = Vec::with_capacity(elf_size as usize);
-    elf_data.extend_from_slice(elf_slice);
-    
+    const MAX_PATH: usize = 1024;
+    let path_len = strlen_user_unique(path_ptr, MAX_PATH);
+    if path_ptr == 0 || path_len == 0 || path_len >= MAX_PATH as u64 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(path_ptr, path_len + 1) {
+        return u64::MAX;
+    }
+    let path_str = unsafe {
+        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        match core::str::from_utf8(slice) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return u64::MAX,
+        }
+    };
+
+    let elf_data: Vec<u8> = match crate::filesystem::read_file_alloc(path_str) {
+        Ok(v) => v,
+        Err(_) => return u64::MAX,
+    };
+
     let name_trimmed = if name_ptr != 0 {
+        if !is_user_pointer(name_ptr, 16) {
+            return u64::MAX;
+        }
         let name_slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, 16) };
         let len = name_slice.iter().position(|&b| b == 0).unwrap_or(16);
         core::str::from_utf8(&name_slice[..len]).unwrap_or("unknown")
     } else {
-        "unknown"
+        path_str.rsplit('/').next().unwrap_or(path_str)
     };
 
+    sys_spawn_with_stdio_from_elf(elf_data, name_trimmed, fd_in, fd_out, fd_err)
+}
+
+fn sys_spawn_with_stdio_from_elf(
+    elf_data: alloc::vec::Vec<u8>,
+    name_trimmed: &str,
+    fd_in: u64,
+    fd_out: u64,
+    fd_err: u64,
+) -> u64 {
     match crate::process::spawn_process(&elf_data, name_trimmed) {
         Ok(pid) => {
             let parent_pid = crate::process::current_process_id().unwrap_or(1);
@@ -1706,7 +1809,6 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
             })
             .unwrap();
 
-            // Override file descriptors BEFORE enqueuing
             {
                 let p_fd_in = crate::fd::fd_get(parent_pid, fd_in as usize);
                 let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
@@ -1720,10 +1822,6 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
                     }
                 }
 
-                // Notify each scheme that its handle has been inherited by the child process.
-                // This increments the ref count so that when the child exits and closes its
-                // fds, the underlying resource (e.g. PTY channel) is not destroyed while the
-                // parent still holds a reference to the same handle.
                 for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {
                     if let Some(fd) = fd_opt {
                         if fd.in_use {
@@ -1733,12 +1831,40 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
                 }
             }
 
-            // We do NOT enqueue yet! The parent must call set_child_args (542)
-            // to register argv and finally enqueue the process.
             pid as u64
         }
         Err(_) => u64::MAX,
     }
+}
+
+fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, fd_out: u64, fd_err: u64) -> u64 {
+    // Re-implement the base logic to avoid the race condition!
+    // We cannot call sys_spawn directly because it enqueues the process,
+    // making it runnable before we replace its FDs.
+
+    use alloc::vec::Vec;
+    if elf_ptr == 0 || elf_size == 0 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(elf_ptr, elf_size) {
+        return u64::MAX;
+    }
+    let elf_slice = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
+    let mut elf_data = Vec::with_capacity(elf_size as usize);
+    elf_data.extend_from_slice(elf_slice);
+
+    let name_trimmed = if name_ptr != 0 {
+        if !is_user_pointer(name_ptr, 16) {
+            return u64::MAX;
+        }
+        let name_slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, 16) };
+        let len = name_slice.iter().position(|&b| b == 0).unwrap_or(16);
+        core::str::from_utf8(&name_slice[..len]).unwrap_or("unknown")
+    } else {
+        "unknown"
+    };
+
+    sys_spawn_with_stdio_from_elf(elf_data, name_trimmed, fd_in, fd_out, fd_err)
 }
 
 /// sys_wait - Wait for child process to terminate
@@ -2742,7 +2868,6 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
     }
     let aligned_length = (length + 0xFFF) & !0xFFF;
-    let num_pages = aligned_length / 4096;
 
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
@@ -2751,11 +2876,12 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
 
     // Resolve file descriptor before acquiring process resources.
     // A file-backed mapping populates each page with content from the open file.
-    // MAP_ANONYMOUS (0x20) means the mapping is not backed by a file.
-    // The fd limit matches the per-process FD table size.
-    const MMAP_MAP_ANONYMOUS: u64 = 0x20;
+    // MAP_ANONYMOUS: mapping is not backed by a file.
+    use linux_mmap_abi::{
+        ANON_SLACK_BYTES, MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, USER_ARENA_HI, USER_ARENA_LO,
+    };
     const MMAP_MAX_FD: u64 = crate::fd::MAX_FDS_PER_PROCESS as u64;
-    let fd_entry = if (flags & MMAP_MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
+    let fd_entry = if (flags & MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
         crate::fd::fd_get(current_pid, fd as usize)
 } else {
         None
@@ -2765,58 +2891,100 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         let mut r = proc.resources.lock();
         let page_table_phys = r.page_table_phys;
 
-        let mut target_addr = addr;
-        if target_addr == 0 {
-            // Find a free spot
-            let mut candidate = 0x60000000;
-            let mut found = false;
-            while !found && candidate < 0x70000000 {
-                let mut overlap = false;
-                for vma in r.vmas.iter() {
-                    if candidate < vma.end && (candidate + aligned_length) > vma.start {
-                        overlap = true;
-                        break;
-                    }
-                }
-                if !overlap {
-                    found = true;
-                } else {
-                    candidate += 0x1000;
-                }
+        let map_fixed_in_mmap_arena = (flags & MAP_FIXED) != 0
+            && addr >= USER_ARENA_LO
+            && addr
+                .checked_add(aligned_length)
+                .map_or(false, |end| end <= USER_ARENA_HI);
+        let anon_slack: u64 = if (flags & MAP_ANONYMOUS) != 0 && fd_entry.is_none() {
+            if (flags & MAP_FIXED) == 0 || map_fixed_in_mmap_arena {
+                ANON_SLACK_BYTES
+            } else {
+                0
             }
-            target_addr = candidate;
+        } else {
+            0
+        };
+
+        /// Rango [candidate, candidate+span) libre respecto a `vmas`.
+        fn mmap_find_free(r: &crate::process::ProcessResources, span: u64) -> Option<u64> {
+            let mut candidate = linux_mmap_abi::USER_ARENA_LO;
+            while candidate < linux_mmap_abi::USER_ARENA_HI {
+                let overlap = r.vmas.iter().any(|vma| {
+                    candidate < vma.end && candidate.saturating_add(span) > vma.start
+                });
+                if !overlap {
+                    return Some(candidate);
+                }
+                candidate += 0x1000;
+            }
+            None
         }
 
-        // MAP_FIXED (0x10): ld-musl fija la dirección de carga de DSO; hay que sustituir cualquier
-        // mapeo previo en ese rango (PTE + VMA) para que el enlace dinámico funcione.
-        const MAP_FIXED: u64 = 0x10;
-        if addr != 0 && (flags & MAP_FIXED) != 0 {
+        // Intervalo de páginas a mapear: como Linux, redondeo inferior de addr y superior de addr+len.
+        let (map_start, map_end) = if addr != 0 && (flags & MAP_FIXED) != 0 {
             if (addr & 0xFFF) != 0 {
                 drop(r);
                 drop(proc);
                 return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
             }
-            target_addr = addr;
-            memory::unmap_user_range(page_table_phys, target_addr, aligned_length);
-            let t0 = target_addr;
-            let t1 = target_addr.saturating_add(aligned_length);
-            r.vmas.retain(|vma| vma.end <= t0 || vma.start >= t1);
-        }
+            let unmap_span = aligned_length.saturating_add(anon_slack);
+            memory::unmap_user_range(page_table_phys, addr, unmap_span);
+            let t0 = addr;
+            let t1 = addr.saturating_add(aligned_length);
+            let t1_ext = t1.saturating_add(anon_slack);
+            r.vmas.retain(|vma| vma.end <= t0 || vma.start >= t1_ext);
+            (addr, t1)
+        } else if addr != 0 {
+            let ms = addr & !0xFFF;
+            let me = (addr.saturating_add(length).saturating_add(0xFFF)) & !0xFFF;
+            if me <= ms {
+                drop(r);
+                drop(proc);
+                return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+            }
+            let span = me - ms;
+            let need = span.saturating_add(anon_slack);
+            let hint_ok = !r
+                .vmas
+                .iter()
+                .any(|vma| ms < vma.end && me.saturating_add(anon_slack) > vma.start);
+            if hint_ok {
+                (ms, me)
+            } else if let Some(c) = mmap_find_free(&r, need) {
+                (c, c + span)
+            } else {
+                drop(r);
+                drop(proc);
+                return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
+            }
+        } else if let Some(c) = mmap_find_free(&r, aligned_length.saturating_add(anon_slack)) {
+            (c, c + aligned_length)
+        } else {
+            drop(r);
+            drop(proc);
+            return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
+        };
+
+        let mut map_end = map_end;
+        map_end = map_end.saturating_add(anon_slack);
+
+        let map_total = map_end - map_start;
+        let num_pages_mapped = map_total / 4096;
 
         // Map pages with real physical frames. For shared file-backed mappings, we attempt
         // to use fmap to get the direct physical address. For private mappings (anonymous 
         // or file-backed), we allocate new frames and copy data if needed.
-        let mut current = target_addr;
-        let end = target_addr + aligned_length;
+        let mut current = map_start;
+        let end = map_end;
         let file_len = length as usize;
         let mut file_offset: usize = 0;
 
-        const MAP_SHARED: u64 = 0x01;
         let is_shared = (flags & MAP_SHARED) != 0;
 
         // Try to use fmap for shared mappings
         let mut fmap_phys_base = None;
-        let mut mmap_prot = prot;
+        let mut wc_write_through = false;
 
         if is_shared {
             if let Some(ref fde) = fd_entry {
@@ -2824,21 +2992,24 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                     fde.scheme_id,
                     fde.resource_id,
                     offset as usize,
-                    aligned_length as usize,
+                    map_total as usize,
                 ) {
                     // Detect Write-Combining (WC) signal in bit 63
                     if (phys >> 63) != 0 {
-                        mmap_prot |= 0x08; // PAGE_WRITE_THROUGH -> PAT index 1 (WC)
+                        wc_write_through = true;
                     }
                     fmap_phys_base = Some((phys & !(1 << 63)) as u64);
                 }
             }
         }
 
+        use linux_mmap_abi::PROT_MASK;
+        let linux_p = prot & PROT_MASK;
+
         while current < end {
             let frame_phys = if let Some(base) = fmap_phys_base {
                 // Use physical frame directly from fmap
-                base + (current - target_addr)
+                base + (current - map_start)
             } else if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
                 // Zero the frame via the higher-half direct mapping.
                 let frame_virt = memory::PHYS_MEM_OFFSET + phys;
@@ -2846,7 +3017,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
 
             // For private file-backed mappings, read the next 4 KB of file data into the private frame.
             if let Some(ref fde) = fd_entry {
-                let bytes_mapped = (current - target_addr) as usize;
+                let bytes_mapped = (current - map_start) as usize;
                 let current_offset = offset as usize + bytes_mapped;
                 
                 // Set file position to the correct offset before reading
@@ -2877,21 +3048,27 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
             };
 
-            memory::map_user_page_4kb(page_table_phys, current, frame_phys, mmap_prot);
+            let page_prot = mmap_pte_linux_prot(linux_p, anon_slack, map_end, current);
+            let mut pte_leaf = memory::linux_prot_to_leaf_pte_bits(page_prot);
+            if wc_write_through {
+                pte_leaf |= x86_64::structures::paging::PageTableFlags::WRITE_THROUGH.bits();
+            }
+            memory::map_user_page_4kb(page_table_phys, current, frame_phys, pte_leaf);
             current += 4096;
         }
 
         r.vmas.push(VMARegion {
-            start: target_addr,
-            end: target_addr + aligned_length,
+            start: map_start,
+            end: map_end,
             flags: prot,
             file_backed: fd_entry.is_some(),
+            anon_kernel_slack: anon_slack,
         });
-        
-        proc.mem_frames += num_pages;
+
+        proc.mem_frames += num_pages_mapped;
         drop(r);
         process::update_process(current_pid, proc);
-        return target_addr;
+        return map_start;
     }
     syscall_error_for_current_process(crate::scheme::error::ESRCH as i32)
 }
@@ -2906,8 +3083,23 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let Some(proc) = process::get_process(pid) else {
         return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
     };
-    let page_table_phys = proc.resources.lock().page_table_phys;
-    if memory::mprotect_user_range(page_table_phys, addr, len, prot) {
+    let (page_table_phys, eff_addr, eff_len) = {
+        let r = proc.resources.lock();
+        let pt = r.page_table_phys;
+        if len == 0 {
+            (pt, addr, 0u64)
+        } else {
+            let Some(req_end) = addr.checked_add(len) else {
+                drop(r);
+                return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+            };
+            let (eff_addr, eff_end) =
+                mprotect_expand_anon_slack(&r.vmas, addr, req_end, prot);
+            let el = eff_end.saturating_sub(eff_addr);
+            (pt, eff_addr, el)
+        }
+    };
+    if memory::mprotect_user_range(page_table_phys, eff_addr, eff_len, prot) {
         0
     } else {
         syscall_error_for_current_process(crate::scheme::error::EINVAL as i32)
@@ -2958,7 +3150,12 @@ fn sys_brk(addr: u64) -> u64 {
                             // Zero the new heap page before handing it to userspace.
                             let frame_virt = memory::PHYS_MEM_OFFSET + frame_phys;
                             unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
-                            memory::map_user_page_4kb(r.page_table_phys, curr, frame_phys, 0x7);
+                            memory::map_user_page_4kb(
+                                r.page_table_phys,
+                                curr,
+                                frame_phys,
+                                memory::linux_prot_to_leaf_pte_bits(3),
+                            );
                             proc.mem_frames += 1;
                         }
                         None => {

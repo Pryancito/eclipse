@@ -9,12 +9,28 @@ const MAX_USER_PATH: usize = 1023;
 
 #[inline]
 fn path_to_nul_stack(path: &str, buf: &mut [u8; 1024]) -> Result<*const u8> {
+    if path.is_empty() {
+        return Err(Error::new(crate::error::EINVAL));
+    }
     if path.len() > MAX_USER_PATH {
         return Err(Error::new(crate::error::EINVAL));
     }
     buf[..path.len()].copy_from_slice(path.as_bytes());
     buf[path.len()] = 0;
     Ok(buf.as_ptr())
+}
+
+/// El kernel lee hasta 16 bytes buscando NUL; un `&str` corto no garantiza 16 bytes mapeados.
+#[inline]
+fn spawn_name_ptr(name: Option<&str>, name_buf: &mut [u8; 16]) -> usize {
+    match name {
+        None => 0,
+        Some(n) => {
+            let clen = n.len().min(15);
+            name_buf[..clen].copy_from_slice(&n.as_bytes()[..clen]);
+            name_buf.as_ptr() as usize
+        }
+    }
 }
 
 /// Write to a file descriptor
@@ -110,13 +126,15 @@ pub fn sched_yield() -> Result<()> {
 
 /// Spawn a new process from an ELF buffer with an optional name
 pub fn spawn(buf: &[u8], name: Option<&str>) -> Result<usize> {
-    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    let mut name_buf = [0u8; 16];
+    let name_ptr = spawn_name_ptr(name, &mut name_buf);
     unsafe { cvt(syscall3(SYS_SPAWN, buf.as_ptr() as usize, buf.len(), name_ptr)) }
 }
 
 /// Spawn a new process from an ELF buffer, replacing stdin/stdout/stderr
 pub fn spawn_with_stdio(buf: &[u8], name: Option<&str>, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<usize> {
-    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    let mut name_buf = [0u8; 16];
+    let name_ptr = spawn_name_ptr(name, &mut name_buf);
     unsafe {
         cvt(syscall6(
             SYS_SPAWN_WITH_STDIO,
@@ -126,6 +144,25 @@ pub fn spawn_with_stdio(buf: &[u8], name: Option<&str>, fd_in: usize, fd_out: us
             fd_in,
             fd_out,
             fd_err,
+        ))
+    }
+}
+
+/// Spawn leyendo el ejecutable desde el VFS en el kernel (recomendado para binarios grandes, p. ej. cargo).
+pub fn spawn_with_stdio_path(path: &str, name: Option<&str>, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<usize> {
+    let mut path_buf = [0u8; 1024];
+    let path_ptr = path_to_nul_stack(path, &mut path_buf)? as usize;
+    let mut name_buf = [0u8; 16];
+    let name_ptr = spawn_name_ptr(name, &mut name_buf);
+    unsafe {
+        cvt(syscall6(
+            SYS_SPAWN_WITH_STDIO_PATH,
+            path_ptr,
+            name_ptr,
+            fd_in,
+            fd_out,
+            fd_err,
+            0,
         ))
     }
 }

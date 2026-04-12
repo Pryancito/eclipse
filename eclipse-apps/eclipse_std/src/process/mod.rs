@@ -6,7 +6,6 @@ use crate::libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::io::{Result, Error, ErrorKind};
-use crate::fs;
 
 /// A process builder, providing fine-grained control over how a new process should be spawned.
 pub struct Command {
@@ -51,24 +50,16 @@ impl Command {
 
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
-        let buf = fs::read(&self.program)?;
-
-        // Build a NUL-terminated name for the kernel from the program basename.
-        // We use a 16-byte stack buffer that is zero-initialised; after copying
-        // up to 15 bytes of the basename the byte at index copy_len (and beyond)
-        // is always 0, acting as the NUL terminator the kernel expects when it
-        // reads from name_buf[0] via the raw pointer.
         let name_start = self.program.rfind('/').map(|i| i + 1).unwrap_or(0);
         let base = &self.program[name_start..];
-        let mut name_buf = [0u8; 16];
-        let copy_len = base.len().min(15);
-        name_buf[..copy_len].copy_from_slice(&base.as_bytes()[..copy_len]);
-        // Validate the copied bytes as UTF-8 (program names are always ASCII in
-        // practice; the fallback "?" ensures the process always gets a visible
-        // name even if something unexpected occurs).
-        let name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("?");
 
-        match eclipse_syscall::call::spawn(&buf, Some(name)) {
+        match eclipse_syscall::call::spawn_with_stdio_path(
+            &self.program,
+            Some(base),
+            0,
+            1,
+            2,
+        ) {
             Ok(pid) => {
                 // Ensure the process starts by setting at least argv[0]
                 let mut arg_bytes = Vec::new();
@@ -87,9 +78,16 @@ impl Command {
 
     /// Executes the command replacing stdin, stdout, stderr with specific file descriptors
     pub fn spawn_with_stdio(&mut self, fd_in: usize, fd_out: usize, fd_err: usize) -> Result<Child> {
-        let buf = fs::read(&self.program)?;
-        
-        match eclipse_syscall::call::spawn_with_stdio(&buf, Some(&self.program), fd_in, fd_out, fd_err) {
+        let name_start = self.program.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let base = &self.program[name_start..];
+
+        match eclipse_syscall::call::spawn_with_stdio_path(
+            &self.program,
+            Some(base),
+            fd_in,
+            fd_out,
+            fd_err,
+        ) {
             Ok(pid) => {
                 // Ensure the process starts by setting at least argv[0]
                 let mut arg_bytes = Vec::new();

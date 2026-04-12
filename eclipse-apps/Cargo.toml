@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "libs/os-terminal",
     "eclipse_std",
     "sidewind",
     "sidewind_core",

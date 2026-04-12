@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-os-terminal = { version = "0.7.3" }
+os-terminal = { path = "../libs/os-terminal" }
 bitflags = "2.4"
 # No-std heapless structures for event handling
 heapless = "0.8"

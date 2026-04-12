@@ -839,9 +839,9 @@ pub fn get_user_page_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
     }
 }
 
-/// Linux `PROT_*` to leaf PTE bits for [`mprotect_user_range`]. Not the same encoding as
-/// `map_user_page_4kb`'s `flags` argument (which historically mixed Linux PROT with x86 bits).
-fn linux_prot_to_leaf_pte_bits(prot: u64) -> u64 {
+/// Linux `PROT_READ|WRITE|EXEC` (bits 0–2) → bits de PTE de hoja para usuario.
+/// Sin `PROT_EXEC` se marca `NO_EXECUTE` (coherente con [`mprotect_user_range`] y Linux).
+pub fn linux_prot_to_leaf_pte_bits(prot: u64) -> u64 {
     const PR_WRITE: u64 = 2;
     const PR_EXEC: u64 = 4;
     use x86_64::structures::paging::PageTableFlags as F;

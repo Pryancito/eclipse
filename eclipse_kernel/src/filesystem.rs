@@ -1072,8 +1072,10 @@ fn read_file_alloc_inode(inode: u32) -> Result<Vec<u8>, &'static str> {
     if len == 0 {
         return Err("Empty file");
     }
-    if len > MAX_RECORD_SIZE {
-        return Err("File too large (exceeds MAX_RECORD_SIZE)");
+    // Binarios grandes (p. ej. cargo ~50 MiB): límite propio del contenido, no del TLV de metadatos.
+    const MAX_WHOLE_FILE_READ: usize = 128 * 1024 * 1024;
+    if len > MAX_WHOLE_FILE_READ {
+        return Err("File too large");
     }
     let mut buf = vec![0u8; len];
     let n = Filesystem::read_file_by_inode_at(inode, &mut buf, 0)?;

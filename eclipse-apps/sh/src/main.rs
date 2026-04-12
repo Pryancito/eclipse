@@ -389,8 +389,7 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
         }
         "which" => {
             for prog in &argv[1..] {
-                let path = resolve_exec(prog.as_str());
-                if std::fs::metadata(&path).is_ok() {
+                if let Some(path) = first_existing_candidate(prog.as_str()) {
                     sh_println(&path);
                 } else {
                     sh_eprintln(&format!("which: {} not found", prog));
@@ -448,52 +447,85 @@ fn spawn_stage(cmd: &SimpleCmd, fd_in: usize, fd_out: usize, fd_err: usize) -> O
     if cmd.argv.is_empty() { return None; }
     let prog = &cmd.argv[0];
 
-    // Resolve executable path: absolute/relative first, then PATH search, then /bin fallback
-    let path = resolve_exec(prog);
-    let buf = std::fs::read(&path).ok();
+    let candidates = exec_candidate_paths(prog);
+    if candidates.is_empty() {
+        sh_eprintln(&format!("sh: {}: no encontrado", prog));
+        return None;
+    }
 
-    if let Some(data) = buf {
-        let eff_out = if let Some((ref p, app)) = cmd.redirect_out {
-            open_redirect_out(p, app).unwrap_or(fd_out)
-        } else { fd_out };
+    let eff_out = if let Some((ref p, app)) = cmd.redirect_out {
+        open_redirect_out(p, app).unwrap_or(fd_out)
+    } else {
+        fd_out
+    };
 
-        let res = eclipse_syscall::call::spawn_with_stdio(&data, Some(prog), fd_in, eff_out, fd_err);
-        if cmd.redirect_out.is_some() && eff_out != fd_out { let _ = eclipse_syscall::call::close(eff_out); }
-
-        if let Ok(pid) = res {
-            let mut ab: Vec<u8> = Vec::new();
-            for a in &cmd.argv { ab.extend_from_slice(a.as_bytes()); ab.push(0); }
-            let _ = eclipse_syscall::call::set_child_args(pid, &ab);
-            return Some(pid);
+    for path in &candidates {
+        let res =
+            eclipse_syscall::call::spawn_with_stdio_path(path, Some(prog), fd_in, eff_out, fd_err);
+        match res {
+            Ok(pid) => {
+                if cmd.redirect_out.is_some() && eff_out != fd_out {
+                    let _ = eclipse_syscall::call::close(eff_out);
+                }
+                let mut ab: Vec<u8> = Vec::new();
+                for a in &cmd.argv {
+                    ab.extend_from_slice(a.as_bytes());
+                    ab.push(0);
+                }
+                let _ = eclipse_syscall::call::set_child_args(pid, &ab);
+                return Some(pid);
+            }
+            Err(_) => {}
         }
-    } else { sh_eprintln(&format!("sh: {}: no encontrado", prog)); }
+    }
+
+    if cmd.redirect_out.is_some() && eff_out != fd_out {
+        let _ = eclipse_syscall::call::close(eff_out);
+    }
+    sh_eprintln(&format!("sh: {}: error al ejecutar", prog));
     None
 }
 
-fn resolve_exec(prog: &str) -> String {
-    if prog.is_empty() { return String::new(); }
-    // Absolute or explicit relative path — use as-is
-    if prog.starts_with('/') || prog.starts_with("./") || prog.starts_with("../") {
-        return String::from(prog);
+/// Orden POSIX: rutas absolutas/relativas explícitas, luego PATH, `/bin/<prog>`, CWD.
+fn exec_candidate_paths(prog: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_unique = |s: String| {
+        if !s.is_empty() && !out.iter().any(|x| x == &s) {
+            out.push(s);
+        }
+    };
+    if prog.is_empty() {
+        return out;
     }
-    // Search PATH directories
+    if prog.starts_with('/') || prog.starts_with("./") || prog.starts_with("../") {
+        push_unique(String::from(prog));
+        return out;
+    }
     if let Ok(path_env) = std::env::var("PATH") {
         for dir in path_env.split(':') {
-            if dir.is_empty() { continue; }
-            let mut full = String::from(dir);
-            if !full.ends_with('/') { full.push('/'); }
-            full.push_str(prog);
-            if std::fs::metadata(&full).is_ok() {
-                return full;
+            if dir.is_empty() {
+                continue;
             }
+            let mut full = String::from(dir);
+            if !full.ends_with('/') {
+                full.push('/');
+            }
+            full.push_str(prog);
+            push_unique(full);
         }
     }
-    // Fallback: try /bin/<prog> and then CWD-relative
-    let bin_path = format!("/bin/{}", prog);
-    if std::fs::metadata(&bin_path).is_ok() {
-        return bin_path;
+    push_unique(format!("/bin/{}", prog));
+    push_unique(resolve_path(prog));
+    out
+}
+
+fn first_existing_candidate(prog: &str) -> Option<String> {
+    for p in exec_candidate_paths(prog) {
+        if std::fs::metadata(&p).is_ok() {
+            return Some(p);
+        }
     }
-    resolve_path(prog)
+    None
 }
 
 fn run_pipeline(pl: &Pipeline, bg_pids: &mut Vec<usize>) -> i32 {

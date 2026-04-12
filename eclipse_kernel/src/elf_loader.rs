@@ -1,4 +1,6 @@
-//! ELF Loader para cargar binarios en userspace
+//! ELF Loader para cargar binarios en userspace.
+//!
+//! División kernel vs ld.so y rutas de spawn: ver `ELF_LOADING.md` en este crate.
 
 use crate::process::{current_process_id, get_process, ProcessId};
 use crate::filesystem;
@@ -46,7 +48,10 @@ const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_DYNAMIC: u32 = 2;
 const PT_TLS:  u32 = 7;   // Thread-Local Storage template segment
-const PF_X: u32 = 1;  // Segment executable
+// p_flags (ELF): R=4 W=2 X=1
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 
@@ -119,6 +124,53 @@ const DYNAMIC_MAIN_LOAD_BIAS: u64 = 0x4000_0000;
 /// Separación mínima entre fin de imagen principal e intérprete.
 const DYNAMIC_INTERP_GAP: u64 = 0x1000_0000;
 
+const PHDR_MIN_SIZE: usize = core::mem::size_of::<Elf64ProgramHeader>();
+
+fn assert_ph_table_in_bounds(
+    elf_len: usize,
+    ph_offset: usize,
+    ph_count: usize,
+    ph_size: usize,
+) -> Result<(), &'static str> {
+    if ph_size < PHDR_MIN_SIZE {
+        return Err("ELF: phentsize too small");
+    }
+    let bytes = ph_count
+        .checked_mul(ph_size)
+        .ok_or("ELF: ph table size overflow")?;
+    let end = ph_offset
+        .checked_add(bytes)
+        .ok_or("ELF: ph table end overflow")?;
+    if end > elf_len {
+        return Err("ELF: program headers out of bounds");
+    }
+    Ok(())
+}
+
+fn program_header_at(
+    elf_data: &[u8],
+    ph_offset: usize,
+    index: usize,
+    ph_ent_size: usize,
+) -> Result<&Elf64ProgramHeader, &'static str> {
+    if ph_ent_size < PHDR_MIN_SIZE {
+        return Err("ELF: phentsize too small");
+    }
+    let idx_mul = index
+        .checked_mul(ph_ent_size)
+        .ok_or("ELF: ph table overflow")?;
+    let base = ph_offset
+        .checked_add(idx_mul)
+        .ok_or("ELF: ph table overflow")?;
+    let end = base
+        .checked_add(PHDR_MIN_SIZE)
+        .ok_or("ELF: ph table overflow")?;
+    if end > elf_data.len() {
+        return Err("ELF: program header out of bounds");
+    }
+    Ok(unsafe { &*(elf_data.as_ptr().add(base) as *const Elf64ProgramHeader) })
+}
+
 fn r_sym(info: u64) -> usize {
     (info >> 32) as usize
 }
@@ -135,11 +187,7 @@ fn va_to_file_off(
     vaddr: u64,
 ) -> Option<usize> {
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        if off + ph_size > elf_data.len() {
-            return None;
-        }
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size).ok()?;
         if ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr.saturating_add(ph.p_filesz) {
             return Some((ph.p_offset + (vaddr - ph.p_vaddr)) as usize);
         }
@@ -171,11 +219,9 @@ fn min_load_vaddr(
     load_bias: u64,
 ) -> u64 {
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        if off + ph_size > elf_data.len() {
+        let Ok(ph) = program_header_at(elf_data, ph_offset, i, ph_size) else {
             break;
-        }
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        };
         if ph.p_type == PT_LOAD {
             return ph.p_vaddr.wrapping_add(load_bias);
         }
@@ -190,10 +236,18 @@ fn extract_interp_path<'a>(
     ph_size: usize,
 ) -> Result<Option<&'a str>, &'static str> {
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type != PT_INTERP {
             continue;
+        }
+        if ph.p_filesz > ph.p_memsz {
+            return Err("ELF: PT_INTERP p_filesz > p_memsz");
+        }
+        let Some(file_end) = ph.p_offset.checked_add(ph.p_filesz) else {
+            return Err("ELF: PT_INTERP file span overflow");
+        };
+        if file_end > elf_data.len() as u64 {
+            return Err("ELF: PT_INTERP out of bounds");
         }
         let start = ph.p_offset as usize;
         let end = start.saturating_add(ph.p_filesz as usize);
@@ -237,8 +291,7 @@ fn validate_entry_for_load(
     }
     let mut ok = false;
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD && (ph.p_flags & PF_X) != 0 {
             let base = if et_dyn {
                 ph.p_vaddr.wrapping_add(load_bias)
@@ -271,10 +324,18 @@ fn map_pt_load_segments(
     let mut mapped_count: u32 = 0;
     let mut max_vaddr: u64 = 0;
     for i in 0..ph_count {
-        let ph_offset_entry = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[ph_offset_entry..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type != PT_LOAD {
             continue;
+        }
+        if ph.p_filesz > ph.p_memsz {
+            return Err("ELF: PT_LOAD p_filesz > p_memsz");
+        }
+        let Some(file_span_end) = ph.p_offset.checked_add(ph.p_filesz) else {
+            return Err("ELF: PT_LOAD file span overflow");
+        };
+        if file_span_end > elf_data.len() as u64 {
+            return Err("ELF: PT_LOAD segment data out of file");
         }
         let vaddr_start = if et_dyn {
             ph.p_vaddr.wrapping_add(load_bias)
@@ -315,14 +376,9 @@ fn map_pt_load_segments(
                 unsafe { core::ptr::write_bytes(kptr, 0, 0x1000) };
                 mapped_count = mapped_count.saturating_add(1);
             }
-            // Always (re)map: if the VPN already had a PTE (e.g. leftover from a prior mapping),
-            // we must refresh WRITABLE|USER or segment BSS writes fault with #PF err=protection.
-            crate::memory::map_user_page_4kb(
-                page_table_phys,
-                current_vaddr,
-                phys,
-                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER,
-            );
+            // Permisos alineados con p_flags (NX en segmentos sin PF_X); coherente con mprotect/mmap.
+            let pte = crate::memory::linux_prot_to_leaf_pte_bits(ph_flags_to_linux_prot(ph.p_flags));
+            crate::memory::map_user_page_4kb(page_table_phys, current_vaddr, phys, pte);
             if file_size > 0 {
                 let page_vaddr_start = current_vaddr;
                 let page_vaddr_end = current_vaddr + 0x1000;
@@ -348,6 +404,24 @@ fn map_pt_load_segments(
         }
     }
     Ok((max_vaddr, mapped_count))
+}
+
+/// Convierte `p_flags` de un `PT_LOAD` a máscara Linux `PROT_*` para [`memory::linux_prot_to_leaf_pte_bits`].
+fn ph_flags_to_linux_prot(p_flags: u32) -> u64 {
+    let mut p = 0u64;
+    if (p_flags & PF_R) != 0 {
+        p |= 1;
+    } // PROT_READ
+    if (p_flags & PF_W) != 0 {
+        p |= 2;
+    } // PROT_WRITE
+    if (p_flags & PF_X) != 0 {
+        p |= 4;
+    } // PROT_EXEC
+    if p == 0 {
+        p = 1;
+    }
+    p
 }
 
 fn tls_setup_after_load(
@@ -386,7 +460,7 @@ fn tls_setup_after_load(
                     page_table_phys,
                     vaddr,
                     phys,
-                    crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER,
+                    crate::memory::linux_prot_to_leaf_pte_bits(3), // RW, NX
                 );
                 *mapped_count = mapped_count.saturating_add(1);
             }
@@ -455,8 +529,9 @@ fn collect_tls_phdr(
     let mut tls_align = 8u64;
     let mut has_tls = false;
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let Ok(ph) = program_header_at(elf_data, ph_offset, i, ph_size) else {
+            break;
+        };
         if ph.p_type == PT_TLS {
             tls_filesz = ph.p_filesz;
             tls_memsz = ph.p_memsz;
@@ -479,8 +554,7 @@ fn apply_relocations_for_load_base(
 ) -> Result<(), &'static str> {
     let mut dyn_file_off: Option<(u64, u64)> = None;
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type == PT_DYNAMIC {
             dyn_file_off = Some((ph.p_offset, ph.p_filesz));
             break;
@@ -585,13 +659,10 @@ fn phdr_va_biased(elf_data: &[u8], load_bias: u64, et_dyn: bool) -> Result<(u64,
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    if elf_data.len() < ph_offset + ph_count * ph_size {
-        return Err("ELF: phdr out of bounds");
-    }
+    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
     let mut first_load_vaddr = None;
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD {
             first_load_vaddr = Some(ph.p_vaddr);
             break;
@@ -629,6 +700,8 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
     let interp_ph_off = interp_h.e_phoff as usize;
     let interp_ph_count = interp_h.e_phnum as usize;
     let interp_ph_size = interp_h.e_phentsize as usize;
+    assert_ph_table_in_bounds(main_elf.len(), main_ph_off, main_ph_count, main_ph_size)?;
+    assert_ph_table_in_bounds(interp_elf.len(), interp_ph_off, interp_ph_count, interp_ph_size)?;
 
     if has_pt_interp(&interp_elf, interp_ph_off, interp_ph_count, interp_ph_size) {
         return Err("ELF: nested PT_INTERP in interpreter");
@@ -765,16 +838,18 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    if elf_data.len() < ph_offset + ph_count * ph_size {
-        return Err("ELF: Program headers out of bounds");
-    }
+    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
 
     if let Some(interp_path) = extract_interp_path(elf_data, ph_offset, ph_count, ph_size)? {
         return load_elf_dynamic_pair(page_table_phys, elf_data, interp_path);
     }
 
     let et_dyn = header.e_type == ET_DYN;
-    let load_bias = 0u64;
+    let load_bias = if et_dyn {
+        DYNAMIC_MAIN_LOAD_BIAS
+    } else {
+        0u64
+    };
     if header.e_type != ET_EXEC && !et_dyn {
         return Err("ELF: not ET_EXEC/ET_DYN");
     }
@@ -847,10 +922,10 @@ pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize
         if let Some(phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
             let offset = (i as u64) * 0x1000;
             crate::memory::map_user_page_4kb(
-                page_table_phys, 
-                stack_base + offset, 
-                phys, 
-                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
+                page_table_phys,
+                stack_base + offset,
+                phys,
+                crate::memory::linux_prot_to_leaf_pte_bits(3), // RW, NX
             );
         } else {
             serial::serial_printf(format_args!("[setup_stack] alloc failed at page {}\n", i));
@@ -962,13 +1037,10 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static st
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    if elf_data.len() < ph_offset + ph_count * ph_size {
-        return Err("ELF: phdr out of bounds");
-    }
+    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
     let mut first_load_vaddr = None;
     for i in 0..ph_count {
-        let off = ph_offset + i * ph_size;
-        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD {
             first_load_vaddr = Some(ph.p_vaddr);
             break;

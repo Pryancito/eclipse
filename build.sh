@@ -1256,31 +1256,6 @@ create_basic_distribution() {
         mkdir -p "$BUILD_DIR/usr/bin"
         mkdir -p "$BUILD_DIR/usr/sbin"
         mkdir -p "$BUILD_DIR/lib"
-
-        # Forzar la inclusión del intérprete musl (necesario para binarios dinámicos)
-        # El kernel busca /lib/ld-musl-x86_64.so.1 para cargar el ELF dinámico
-        for ld in /usr/lib/x86_64-linux-musl/ld-musl-x86_64.so.1 /usr/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1; do
-            if [ -f "$ld" ]; then
-                cp -a "$ld" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
-                print_status "Intérprete musl instalado: $ld -> /lib/"
-                break
-            fi
-        done
-        
-        # Copiar systemd si existe
-        if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
-            cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/"
-            chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
-            print_status "Systemd copiado e instalado en /usr/sbin/"
-        fi
-        
-
-        # Copiar Xfbdev (TinyX) si existe
-        if [ -f "eclipse-apps/tinyx/kdrive/fbdev/Xfbdev" ]; then
-            cp "eclipse-apps/tinyx/kdrive/fbdev/Xfbdev" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/Xfbdev"
-            print_status "Xfbdev (TinyX) copiado e instalado en /usr/bin/"
-        fi
         
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
         # Nota: Estos binarios no existen en la versión actual del proyecto

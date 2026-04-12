@@ -26,6 +26,9 @@ pub struct VMARegion {
     pub end: u64,
     pub flags: u64,
     pub file_backed: bool,
+    /// Bytes mapeados de más en `mmap` anónimo (colchón del kernel). `mprotect` de musl solo
+    /// cubre la longitud pedida; hay que extender el rango para quitar NX en esas páginas.
+    pub anon_kernel_slack: u64,
 }
 
 /// Estructura de contexto salvado de un proceso
@@ -394,7 +397,9 @@ pub fn create_process_with_pid(
     })
 }
 
-/// Ejecutar un binario ELF como un nuevo proceso
+/// Ejecutar un binario ELF como un nuevo proceso.
+///
+/// Responsabilidades kernel vs ld.so: `ELF_LOADING.md` en este crate.
 pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static str> {
     crate::serial::serial_printf(format_args!("[spawn] ENTERED for process: {}\n", name));
     let pid = next_pid();
@@ -473,6 +478,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                             end,
                             flags: 0x5, // PROT_READ | PROT_EXEC
                             file_backed: true,
+                            anon_kernel_slack: 0,
                         });
                     }
                 }
@@ -482,6 +488,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                     end: stack_base + stack_size as u64,
                     flags: 0x3, // PROT_READ | PROT_WRITE
                     file_backed: false,
+                    anon_kernel_slack: 0,
                 });
                 drop(r);
                 crate::process::update_process(pid, proc);
