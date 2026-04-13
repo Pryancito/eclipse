@@ -10,6 +10,20 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr::write_volatile;
 
+/// Minimal envp strings injected into all freshly-spawned processes so that
+/// bash/musl and other Linux-ABI programs can find binaries and terminals.
+pub const MINIMAL_ENVP: &[&[u8]] = &[
+    b"PATH=/bin:/usr/bin\0",
+    b"HOME=/\0",
+    b"TERM=xterm-256color\0",
+    b"USER=root\0",
+    b"SHELL=/bin/bash\0",
+    b"LANG=C\0",
+];
+
+/// Number of entries in MINIMAL_ENVP.
+pub const MINIMAL_ENVP_COUNT: usize = MINIMAL_ENVP.len();
+
 /// ELF Header (64-bit)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1097,10 +1111,31 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
 
-    // Stack layout: argc (1), argv[0] (ptr), NULL (argv term), NULL (envp term), auxv...
-    let adjusted_stack = (stack_top - 256) & !0xF;
-    let program_ptr = adjusted_stack + 240;
-    let random_ptr = adjusted_stack + 224;
+    // Build argv[0] from process name.
+    let mut argv0_buf = [0u8; 20];
+    let argv0_len = if let Some(pid) = current_process_id() {
+        if let Some(p) = get_process(pid) {
+            let n = p.name.iter().position(|&b| b == 0).unwrap_or(16).min(16);
+            argv0_buf[..n].copy_from_slice(&p.name[..n]);
+            argv0_buf[n] = 0;
+            n + 1
+        } else { 8 }
+    } else { 8 };
+    if argv0_len == 8 { argv0_buf[..8].copy_from_slice(b"program\0"); }
+
+    let mut str_total: usize = argv0_len;
+    for e in MINIMAL_ENVP { str_total += e.len(); }
+    str_total += 16; // AT_RANDOM
+    let str_area_size = (str_total + 15) & !15usize;
+
+    const AUXV_ENTRIES: usize = 7; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_ENTRY,AT_RANDOM
+    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_bytes = table_slots * 8;
+
+    let strings_base_raw = (stack_top as usize).wrapping_sub(str_area_size);
+    let rsp_raw = strings_base_raw.wrapping_sub(table_bytes);
+    let adjusted_stack = (rsp_raw & !0xF) as u64;
+    let strings_base = adjusted_stack + table_bytes as u64;
 
     let (tls_base, at_base, at_entry) = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
@@ -1124,37 +1159,50 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     };
 
     unsafe {
-        let stack_ptr = adjusted_stack as *mut u64;
-        write_volatile(stack_ptr.offset(0), 1u64);         // argc = 1
-        write_volatile(stack_ptr.offset(1), program_ptr); // argv[0] = "program"
-        write_volatile(stack_ptr.offset(2), 0u64);         // argv[1] = NULL
-        write_volatile(stack_ptr.offset(3), 0u64);         // envp[0] = NULL
-        
-        write_volatile(stack_ptr.offset(4), AT_PHDR);
-        write_volatile(stack_ptr.offset(5), phdr_va);
-        write_volatile(stack_ptr.offset(6), AT_PHENT);
-        write_volatile(stack_ptr.offset(7), phentsize);
-        write_volatile(stack_ptr.offset(8), AT_PHNUM);
-        write_volatile(stack_ptr.offset(9), phnum);
-        write_volatile(stack_ptr.offset(10), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(11), 4096u64);
-        write_volatile(stack_ptr.offset(12), AT_BASE);
-        write_volatile(stack_ptr.offset(13), at_base);
-        write_volatile(stack_ptr.offset(14), AT_FLAGS);
-        write_volatile(stack_ptr.offset(15), 0u64);
-        write_volatile(stack_ptr.offset(16), AT_ENTRY);
-        write_volatile(stack_ptr.offset(17), at_entry);
-        write_volatile(stack_ptr.offset(18), AT_RANDOM);
-        write_volatile(stack_ptr.offset(19), random_ptr);
-        write_volatile(stack_ptr.offset(20), AT_NULL);
-        write_volatile(stack_ptr.offset(21), 0u64);
+        let mut str_off: u64 = strings_base;
 
-        // Random data (16 bytes) at adjusted_stack + 224
-        let random_data = adjusted_stack as *mut u8;
-        core::ptr::copy_nonoverlapping(b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(), random_data.add(224), 16);
-        
-        // Program name string at adjusted_stack + 240
-        core::ptr::copy_nonoverlapping(b"program\0".as_ptr(), random_data.add(240), 8);
+        let argv0_ptr = str_off;
+        core::ptr::copy_nonoverlapping(argv0_buf.as_ptr(), str_off as *mut u8, argv0_len);
+        str_off += argv0_len as u64;
+
+        let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
+        for (i, e) in MINIMAL_ENVP.iter().enumerate() {
+            env_ptrs[i] = str_off;
+            core::ptr::copy_nonoverlapping(e.as_ptr(), str_off as *mut u8, e.len());
+            str_off += e.len() as u64;
+        }
+
+        let random_ptr = str_off;
+        core::ptr::copy_nonoverlapping(
+            b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(),
+            str_off as *mut u8, 16,
+        );
+
+        let table = adjusted_stack as *mut u64;
+        let mut i: isize = 0;
+        write_volatile(table.offset(i), 1u64); i += 1;
+        write_volatile(table.offset(i), argv0_ptr); i += 1;
+        write_volatile(table.offset(i), 0u64); i += 1;
+        for ep in env_ptrs.iter() { write_volatile(table.offset(i), *ep); i += 1; }
+        write_volatile(table.offset(i), 0u64); i += 1;
+        write_volatile(table.offset(i), AT_PHDR);   i += 1;
+        write_volatile(table.offset(i), phdr_va);   i += 1;
+        write_volatile(table.offset(i), AT_PHENT);  i += 1;
+        write_volatile(table.offset(i), phentsize); i += 1;
+        write_volatile(table.offset(i), AT_PHNUM);  i += 1;
+        write_volatile(table.offset(i), phnum);     i += 1;
+        write_volatile(table.offset(i), AT_PAGESZ); i += 1;
+        write_volatile(table.offset(i), 4096u64);   i += 1;
+        write_volatile(table.offset(i), AT_BASE);   i += 1;
+        write_volatile(table.offset(i), at_base);   i += 1;
+        write_volatile(table.offset(i), AT_FLAGS);  i += 1;
+        write_volatile(table.offset(i), 0u64);      i += 1;
+        write_volatile(table.offset(i), AT_ENTRY);  i += 1;
+        write_volatile(table.offset(i), at_entry);  i += 1;
+        write_volatile(table.offset(i), AT_RANDOM); i += 1;
+        write_volatile(table.offset(i), random_ptr); i += 1;
+        write_volatile(table.offset(i), AT_NULL);   i += 1;
+        write_volatile(table.offset(i), 0u64);
     }
 
     unsafe {
@@ -1263,21 +1311,48 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_PHNUM: u64 = 5;
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
-    // System V ABI for x86-64 at program entry specifies RSP is 16-byte aligned (RSP % 16 == 0).
-    // Previous code was subtracting 8, which is only for function calls, not process entry.
-    let adjusted_stack = (stack_top - 256) & !0xF;
-    let program_ptr = adjusted_stack + 240;
-    let random_ptr = adjusted_stack + 224;
+
+    // Build argv[0] from the process name stored in Process.name.
+    let mut argv0_buf = [0u8; 20]; // "bash\0" etc.
+    let argv0_len = if let Some(pid) = current_process_id() {
+        if let Some(p) = get_process(pid) {
+            let n = p.name.iter().position(|&b| b == 0).unwrap_or(16).min(16);
+            argv0_buf[..n].copy_from_slice(&p.name[..n]);
+            argv0_buf[n] = 0;
+            n + 1 // include null terminator
+        } else { 8 }
+    } else { 8 };
+    if argv0_len == 8 {
+        argv0_buf[..8].copy_from_slice(b"program\0");
+    }
+
+    // Layout (growing down from stack_top):
+    //   strings area: argv0 + env strings + 16-byte AT_RANDOM data
+    //   pointer+auxv table at adjusted_stack (RSP)
+    //
+    // Calculate total string bytes.
+    let mut str_total: usize = argv0_len; // argv[0]
+    for e in MINIMAL_ENVP { str_total += e.len(); }
+    str_total += 16; // AT_RANDOM data
+    // Align up to 16 bytes.
+    let str_area_size = (str_total + 15) & !15usize;
+
+    // Number of 8-byte slots needed for the pointer table:
+    //   1 (argc) + 2 (argv[0]+NULL) + MINIMAL_ENVP_COUNT+1 (envp+NULL) + 2*(5 auxv + AT_NULL)
+    const AUXV_ENTRIES: usize = 5; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM
+    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_bytes = table_slots * 8;
+
+    // RSP: place table right below the strings area, aligned to 16.
+    let strings_base = (stack_top as usize).wrapping_sub(str_area_size);
+    let rsp_raw = strings_base.wrapping_sub(table_bytes);
+    let adjusted_stack = (rsp_raw & !0xF) as u64;
+    let strings_base = adjusted_stack + table_bytes as u64;
 
     let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x}\n", _pid, entry_point, adjusted_stack));
 
-    // Always reload CR3 to flush the TLB. exec remaps code pages via
-    // map_user_page_4kb but the TLB may still cache the old fork'd PTEs.
-    // A CR3 write flushes all non-global TLB entries.
-    //
-    // Leer proc.fs_base antes del asm: tras `mov fs,0` hay que hacer wrmsr a IA32_FS_BASE
-    // (en long mode el selector no limpia el MSR); tls_base==0 debe escribirse explícitamente.
+    // Always reload CR3 to flush the TLB.
     let tls_base: u64 = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
             let cr3 = proc.resources.lock().page_table_phys;
@@ -1286,79 +1361,76 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         } else { 0 }
     } else { 0 };
 
-    // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHENT/AT_PHNUM first (some glibc inits use them early).
+    // Write strings into user stack.
     unsafe {
-        let stack_ptr = adjusted_stack as *mut u64;
-        write_volatile(stack_ptr.offset(0), 1u64);         // argc = 1
-        write_volatile(stack_ptr.offset(1), program_ptr); // argv[0] = "program"
-        write_volatile(stack_ptr.offset(2), 0u64);         // argv[1] = NULL
-        write_volatile(stack_ptr.offset(3), 0u64);         // envp[0] = NULL
+        let mut str_off: u64 = strings_base;
 
-        write_volatile(stack_ptr.offset(4), AT_PHDR);
-        write_volatile(stack_ptr.offset(5), phdr_va);
-        write_volatile(stack_ptr.offset(6), AT_PHENT);
-        write_volatile(stack_ptr.offset(7), phentsize);
-        write_volatile(stack_ptr.offset(8), AT_PHNUM);
-        write_volatile(stack_ptr.offset(9), phnum);
-        write_volatile(stack_ptr.offset(10), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(11), 4096u64);
-        write_volatile(stack_ptr.offset(12), AT_RANDOM);
-        write_volatile(stack_ptr.offset(13), random_ptr);
-        write_volatile(stack_ptr.offset(14), AT_NULL);
-        write_volatile(stack_ptr.offset(15), 0u64);
+        // argv[0] string
+        let argv0_ptr = str_off;
+        core::ptr::copy_nonoverlapping(argv0_buf.as_ptr(), str_off as *mut u8, argv0_len);
+        str_off += argv0_len as u64;
 
-        // Random data (16 bytes) at adjusted_stack + 224
-        let random_data = adjusted_stack as *mut u8;
-        core::ptr::copy_nonoverlapping(b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(), random_data.add(224), 16);
-        
-        // Program name string at adjusted_stack + 240
-        core::ptr::copy_nonoverlapping(b"program\0".as_ptr(), random_data.add(240), 8);
+        // envp strings
+        let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
+        for (i, e) in MINIMAL_ENVP.iter().enumerate() {
+            env_ptrs[i] = str_off;
+            core::ptr::copy_nonoverlapping(e.as_ptr(), str_off as *mut u8, e.len());
+            str_off += e.len() as u64;
+        }
+
+        // AT_RANDOM data (16 bytes)
+        let random_ptr = str_off;
+        core::ptr::copy_nonoverlapping(
+            b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(),
+            str_off as *mut u8, 16,
+        );
+
+        // Write argc/argv/envp/auxv table.
+        let table = adjusted_stack as *mut u64;
+        let mut i: isize = 0;
+        write_volatile(table.offset(i), 1u64); i += 1;      // argc = 1
+        write_volatile(table.offset(i), argv0_ptr); i += 1; // argv[0]
+        write_volatile(table.offset(i), 0u64); i += 1;       // argv NULL
+        for ep in env_ptrs.iter() {
+            write_volatile(table.offset(i), *ep); i += 1;
+        }
+        write_volatile(table.offset(i), 0u64); i += 1;       // envp NULL
+        // auxv
+        write_volatile(table.offset(i), AT_PHDR);   i += 1;
+        write_volatile(table.offset(i), phdr_va);   i += 1;
+        write_volatile(table.offset(i), AT_PHENT);  i += 1;
+        write_volatile(table.offset(i), phentsize); i += 1;
+        write_volatile(table.offset(i), AT_PHNUM);  i += 1;
+        write_volatile(table.offset(i), phnum);     i += 1;
+        write_volatile(table.offset(i), AT_PAGESZ); i += 1;
+        write_volatile(table.offset(i), 4096u64);   i += 1;
+        write_volatile(table.offset(i), AT_RANDOM); i += 1;
+        write_volatile(table.offset(i), random_ptr); i += 1;
+        write_volatile(table.offset(i), AT_NULL);   i += 1;
+        write_volatile(table.offset(i), 0u64);
     }
 
-    // Construir el frame iretq directamente en el stack del kernel (por-CPU).
-    // Evitamos un static mut compartido que causaría una carrera SMP cuando
-    // dos CPUs ejecutan jump_to_userspace simultáneamente (exec concurrente).
-    //
-    // Diseño del frame en memoria (iretq hace pop de abajo arriba):
-    //   [RSP+0]:  RIP       = entry_point  (primero en ser procesado por iretq)
-    //   [RSP+8]:  CS        = 0x1b         (user code segment, DPL3)
-    //   [RSP+16]: RFLAGS    = 0x202        (IF=1, bit reservado)
-    //   [RSP+24]: RSP       = adjusted_stack
-    //   [RSP+32]: SS        = 0x23         (user data segment, DPL3)
-    //
-    // Para construir este layout, hacemos PUSH en orden inverso al de pop
-    // (SS primero → queda en la dirección más alta; RIP último → en la más baja).
+    // Build iretq frame and jump to userspace.
     unsafe {
         asm!(
             "cli",
-            // Construir frame en el stack del kernel (privado por CPU)
-            "push {ss}",    // SS   = 0x23
-            "push {usp}",   // RSP  = adjusted_stack
-            "push {rfl}",   // RFLAGS = 0x202
-            "push {cs}",    // CS   = 0x1b
-            "push {rip}",   // RIP  = entry_point
-            // Cargar selectores de segmento de usuario
+            "push {ss}",
+            "push {usp}",
+            "push {rfl}",
+            "push {cs}",
+            "push {rip}",
             "mov ax, 0x23",
             "mov ds, ax",
             "mov es, ax",
-            
-            // CRITICAL: Al igual que en fork_child_trampoline, el kernel GS base 
-            // debe protegerse en IA32_KERNEL_GS_BASE antes de tocar el selector GS.
             "swapgs",
-            
             "xor ax, ax",
             "mov fs, ax",
             "mov gs, ax",
-            // En modo largo, `mov fs, 0` no pone IA32_FS_BASE a 0: hay que usar wrmsr.
-            // Si omitimos wrmsr con tls_base==0, queda el FS_BASE del proceso anterior
-            // (p. ej. exec dinámico tras gui_service) y %fs: sigue apuntando al TCB viejo → #PF.
-            // r11 = tls_base (0 si ld-musl debe instalar TLS).
             "mov ecx, 0xC0000100",
             "mov rax, r11",
             "mov rdx, r11",
             "shr rdx, 32",
             "wrmsr",
-            // Limpiar todos los registros GP antes de entrar a userspace
             "xor rax, rax",
             "xor rbx, rbx",
             "xor rcx, rcx",
@@ -1384,4 +1456,157 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             options(noreturn)
         );
     }
+}
+/// Jump to userspace with explicit argv and envp (used by execve syscall).
+/// Must be called AFTER replace_process_image has reloaded the ELF and
+/// AFTER setup_user_stack has mapped the new stack region.
+///
+/// `argv_strings` and `envp_strings` are null-terminated byte slices stored in kernel memory.
+/// `res` is the ExecLoadResult from replace_process_image.
+/// `tls_base` is the new TLS base (0 if dynamic linker will install TLS).
+pub unsafe fn jump_to_userspace_with_argv_envp(
+    res: &ExecLoadResult,
+    stack_top: u64,
+    argv_strings: &[alloc::vec::Vec<u8>],
+    envp_strings: &[alloc::vec::Vec<u8>],
+    tls_base: u64,
+) -> ! {
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
+    const AT_FLAGS: u64 = 8;
+    const AT_ENTRY: u64 = 9;
+    const AT_RANDOM: u64 = 25;
+    const AT_NULL: u64 = 0;
+
+    let argc = argv_strings.len();
+    let envc = envp_strings.len();
+
+    // Calculate string bytes needed (each is already null-terminated).
+    let mut str_bytes: usize = 16; // AT_RANDOM data
+    for s in argv_strings.iter().chain(envp_strings.iter()) {
+        str_bytes += s.len();
+    }
+    let str_area = (str_bytes + 15) & !15usize;
+
+    // Auxv entry count (type+val pairs): AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM,
+    // optionally AT_BASE,AT_FLAGS,AT_ENTRY, then AT_NULL.
+    let has_interp = res.dynamic_linker.is_some();
+    let auxv_count = if has_interp { 8 + 1 } else { 5 + 1 }; // +1 for AT_NULL
+
+    // Table slots: 1(argc) + argc+1(argv) + envc+1(envp) + auxv_count*2
+    let table_slots = 1 + (argc + 1) + (envc + 1) + auxv_count * 2;
+    let table_bytes = table_slots * 8;
+
+    // Strings sit above the table.
+    let strings_base = (stack_top as usize).wrapping_sub(str_area);
+    let rsp_raw = strings_base.wrapping_sub(table_bytes);
+    let rsp = (rsp_raw & !0xF) as u64;
+    let strings_base = rsp + table_bytes as u64;
+
+    // Switch CR3 to the (already-replaced) user page table.
+    if let Some(pid) = current_process_id() {
+        if let Some(proc) = get_process(pid) {
+            let cr3 = proc.resources.lock().page_table_phys;
+            memory::set_cr3(cr3);
+        }
+    }
+
+    // Write strings and collect pointers.
+    let mut str_off: u64 = strings_base;
+    let mut argv_ptrs = alloc::vec::Vec::with_capacity(argc);
+    for s in argv_strings {
+        argv_ptrs.push(str_off);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), str_off as *mut u8, s.len());
+        str_off += s.len() as u64;
+    }
+    let mut envp_ptrs = alloc::vec::Vec::with_capacity(envc);
+    for s in envp_strings {
+        envp_ptrs.push(str_off);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), str_off as *mut u8, s.len());
+        str_off += s.len() as u64;
+    }
+    let random_ptr = str_off;
+    core::ptr::copy_nonoverlapping(
+        b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0\x0F\xED\xCB\xA9\x87\x65\x43\x21".as_ptr(),
+        str_off as *mut u8, 16,
+    );
+
+    // Write table.
+    let table = rsp as *mut u64;
+    let mut idx: isize = 0;
+    write_volatile(table.offset(idx), argc as u64); idx += 1;
+    for p in &argv_ptrs { write_volatile(table.offset(idx), *p); idx += 1; }
+    write_volatile(table.offset(idx), 0u64); idx += 1; // argv NULL
+    for p in &envp_ptrs { write_volatile(table.offset(idx), *p); idx += 1; }
+    write_volatile(table.offset(idx), 0u64); idx += 1; // envp NULL
+    // auxv
+    write_volatile(table.offset(idx), AT_PHDR);       idx += 1;
+    write_volatile(table.offset(idx), res.phdr_va);   idx += 1;
+    write_volatile(table.offset(idx), AT_PHENT);      idx += 1;
+    write_volatile(table.offset(idx), res.phentsize);  idx += 1;
+    write_volatile(table.offset(idx), AT_PHNUM);      idx += 1;
+    write_volatile(table.offset(idx), res.phnum);     idx += 1;
+    write_volatile(table.offset(idx), AT_PAGESZ);     idx += 1;
+    write_volatile(table.offset(idx), 4096u64);       idx += 1;
+    if let Some((at_base, at_entry)) = res.dynamic_linker {
+        write_volatile(table.offset(idx), AT_BASE);   idx += 1;
+        write_volatile(table.offset(idx), at_base);   idx += 1;
+        write_volatile(table.offset(idx), AT_ENTRY);  idx += 1;
+        write_volatile(table.offset(idx), at_entry);  idx += 1;
+        write_volatile(table.offset(idx), AT_FLAGS);  idx += 1;
+        write_volatile(table.offset(idx), 0u64);      idx += 1;
+    }
+    write_volatile(table.offset(idx), AT_RANDOM);     idx += 1;
+    write_volatile(table.offset(idx), random_ptr);    idx += 1;
+    write_volatile(table.offset(idx), AT_NULL);       idx += 1;
+    write_volatile(table.offset(idx), 0u64);
+
+    let entry_point = res.entry_point;
+
+    asm!(
+        "cli",
+        "push {ss}",
+        "push {usp}",
+        "push {rfl}",
+        "push {cs}",
+        "push {rip}",
+        "mov ax, 0x23",
+        "mov ds, ax",
+        "mov es, ax",
+        "swapgs",
+        "xor ax, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        "mov ecx, 0xC0000100",
+        "mov rax, r11",
+        "mov rdx, r11",
+        "shr rdx, 32",
+        "wrmsr",
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rcx, rcx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        "xor rbp, rbp",
+        "iretq",
+        rip = in(reg) entry_point,
+        cs  = in(reg) 0x1bu64,
+        rfl = in(reg) 0x202u64,
+        usp = in(reg) rsp,
+        ss  = in(reg) 0x23u64,
+        in("r11") tls_base,
+        options(noreturn)
+    );
 }

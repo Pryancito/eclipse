@@ -384,6 +384,7 @@ impl Scheme for PtyScheme {
             0x5410 => 5, // TIOCSPGRP
             0x541B => 2, // FIONREAD
             0x5403 | 0x5404 => 0x5402, // TCSETSW/F -> TCSETS
+            0x540E => 7, // TIOCSCTTY
             _ => request,
         };
 
@@ -507,6 +508,22 @@ impl Scheme for PtyScheme {
             let ptr = arg as *const Termios;
             unsafe {
                 channel.termios = *ptr;
+            }
+            Ok(0)
+        } else if request == 7 { // TIOCSCTTY
+            // Set controlling terminal: associate the PTY slave with the calling process's session.
+            // arg == 0: steal ctty if needed; arg == 1: fail if already has ctty.
+            // For now: record the calling process as the PTY's controlling process.
+            let current_pid = crate::process::current_process_id().unwrap_or(0);
+            if !handle.is_master && current_pid != 0 {
+                let channel_arc = {
+                    let channels = self.channels.lock();
+                    channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
+                };
+                let mut channel = channel_arc.lock();
+                channel.slave_pid = current_pid;
+                channel.foreground_pgrp = current_pid;
+                serial::serial_printf(format_args!("[PTY] TIOCSCTTY: pid={} is now ctty owner\n", current_pid));
             }
             Ok(0)
         } else {

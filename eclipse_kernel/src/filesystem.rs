@@ -2055,3 +2055,48 @@ pub fn parse_device_name(path: &str) -> Option<&str> {
         None
     }
 }
+/// Get directory children by filesystem scheme resource_id.
+/// Returns the list of child names if the resource is a directory, or Err otherwise.
+pub fn get_dir_children_by_resource(resource_id: usize) -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    let open_files = OPEN_FILES_SCHEME.lock();
+    match open_files.get(resource_id).and_then(|s| s.as_ref()) {
+        Some(OpenFile::Real { inode, .. }) => {
+            let ino = *inode;
+            drop(open_files);
+            list_dir_children_by_inode(ino)
+        }
+        Some(OpenFile::Virtual { path, .. }) => {
+            // Virtual paths under /tmp: list VIRTUAL_TMP keys with this prefix.
+            let prefix = path.clone();
+            drop(open_files);
+            let vtmp = VIRTUAL_TMP.lock();
+            let children: alloc::vec::Vec<alloc::string::String> = vtmp.keys()
+                .filter(|k| {
+                    if prefix == "tmp" {
+                        // List direct children of /tmp
+                        let rest = k.strip_prefix("tmp/").unwrap_or("");
+                        !rest.is_empty() && !rest.contains('/')
+                    } else {
+                        k.starts_with(&alloc::format!("{}/", prefix))
+                            && !k[prefix.len()+1..].contains('/')
+                    }
+                })
+                .map(|k| {
+                    let slash_pos = k.rfind('/').map(|p| p + 1).unwrap_or(0);
+                    alloc::string::String::from(&k[slash_pos..])
+                })
+                .collect();
+            Ok(children)
+        }
+        _ => Err("not a directory or not open"),
+    }
+}
+
+/// Get the inode for a filesystem scheme resource, if it's a Real file.
+pub fn get_resource_inode(resource_id: usize) -> Option<u32> {
+    let open_files = OPEN_FILES_SCHEME.lock();
+    match open_files.get(resource_id).and_then(|s| s.as_ref()) {
+        Some(OpenFile::Real { inode, .. }) => Some(*inode),
+        _ => None,
+    }
+}

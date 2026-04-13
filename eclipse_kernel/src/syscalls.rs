@@ -379,6 +379,7 @@ pub extern "C" fn syscall_handler(
         12  => sys_brk(arg1),
         13  => sys_sigaction(arg1, arg2, arg3),
         14  => sys_sigprocmask(arg1, arg2, arg3),
+        15  => sys_rt_sigreturn(),
         28  => sys_madvise(arg1, arg2, arg3),
         16  => sys_ioctl(arg1, arg2, arg3),
         20  => sys_writev(arg1, arg2, arg3),
@@ -401,14 +402,16 @@ pub extern "C" fn syscall_handler(
         55  => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
         56  => sys_clone(arg1, arg2, arg3),
         57  => sys_fork(&process_context),
-        59  => sys_exec(arg1, arg2),
+        59  => sys_execve(arg1, arg2, arg3),
         60  => sys_exit(arg1),
-        61  => sys_wait(arg1),
+        61  => sys_wait4_linux(arg1, arg2, arg3),
         62  => sys_kill(arg1, arg2),
         63  => sys_uname(arg1),
         72  => sys_fcntl(arg1, arg2, arg3),
         77  => sys_ftruncate(arg1, arg2),
         79  => sys_getcwd(arg1, arg2),
+        80  => sys_chdir(arg1),
+        81  => sys_fchdir(arg1),
         82  => sys_rename(arg1, arg2),
         83  => sys_mkdir(arg1, arg2),
         87  => sys_unlink(arg1),
@@ -430,6 +433,7 @@ pub extern "C" fn syscall_handler(
         200 => sys_tkill(arg1, arg2),
         202 => sys_futex(arg1, arg2, arg3, arg4),
         218 => sys_set_tid_address(arg1),
+        217 => sys_getdents64(arg1, arg2, arg3),
         228 => sys_clock_gettime(arg1, arg2),
         231 => sys_exit(arg1), // Linux exit_group
         247 => sys_getlogin(arg1, arg2),
@@ -439,6 +443,7 @@ pub extern "C" fn syscall_handler(
         269 => sys_faccessat(arg1, arg2, arg3, arg4),
         270 => sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6),
         292 => sys_dup3(arg1, arg2, arg3),
+        293 => sys_pipe2(arg1, arg2),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
         439 => sys_faccessat(arg1, arg2, arg3, arg4),
@@ -5038,4 +5043,348 @@ fn sys_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
     }
     
     u64::MAX // ENOENT or EACCES fallback
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bash / musl compatibility syscalls
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// sys_rt_sigreturn — stub; proper implementation would restore signal context.
+fn sys_rt_sigreturn() -> u64 {
+    0
+}
+
+/// sys_wait4 — Linux wait4(pid, *wstatus, options, *rusage).
+/// arg1 = pid  (-1 = any child, 0 = any in group, >0 = specific)
+/// arg2 = *wstatus pointer (may be 0)
+/// arg3 = options (WNOHANG=1, WUNTRACED=2, WCONTINUED=8)
+fn sys_wait4_linux(pid: u64, status_ptr: u64, options: u64) -> u64 {
+    // Map pid to wait_pid: negative/zero means "any child" (0 in our impl).
+    let wait_pid: u64 = if (pid as i64) <= 0 {
+        0 // wait for any child
+    } else {
+        pid
+    };
+    sys_wait_impl(status_ptr, wait_pid, options)
+}
+
+/// sys_execve — Linux execve(path, argv[], envp[]).
+/// Reads the executable file, replaces the current process image, sets up
+/// argc/argv/envp/auxv on the user stack and jumps to the new entry point.
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    set_last_exec_error(b"execve: (no reason)");
+
+    // 1. Read path from userspace.
+    const MAX_PATH: usize = 1024;
+    let path_len = strlen_user_unique(path_ptr, MAX_PATH);
+    if path_ptr == 0 || path_len == 0 || path_len >= MAX_PATH as u64 {
+        set_last_exec_error(b"execve: invalid path pointer");
+        return linux_abi_error(14); // EFAULT
+    }
+    if !is_user_pointer(path_ptr, path_len + 1) {
+        return linux_abi_error(14);
+    }
+    let path_str = unsafe {
+        let s = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        match core::str::from_utf8(s) {
+            Ok(v) => v,
+            Err(_) => return linux_abi_error(22), // EINVAL
+        }
+    };
+
+    // Resolve path against cwd if relative.
+    let resolved_path: alloc::string::String;
+    let path = if path_str.starts_with('/') {
+        path_str
+    } else {
+        if let Some(pid) = current_process_id() {
+            resolved_path = crate::process::resolve_path_cwd(pid, path_str);
+            &resolved_path
+        } else {
+            path_str
+        }
+    };
+
+    // 2. Read argv[] from userspace (null-terminated array of char* pointers).
+    let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if argv_ptr != 0 {
+        let mut ptr_off: u64 = argv_ptr;
+        for _ in 0..256usize {
+            if !is_user_pointer(ptr_off, 8) { break; }
+            let arg_ptr = unsafe { *(ptr_off as *const u64) };
+            if arg_ptr == 0 { break; }
+            let arg_len = strlen_user_unique(arg_ptr, 4096);
+            if arg_len == 0 || !is_user_pointer(arg_ptr, arg_len + 1) {
+                argv_strings.push(b"\0".to_vec());
+            } else {
+                let mut s = unsafe {
+                    core::slice::from_raw_parts(arg_ptr as *const u8, arg_len as usize).to_vec()
+                };
+                s.push(0); // null-terminate
+                argv_strings.push(s);
+            }
+            ptr_off += 8;
+        }
+    }
+    if argv_strings.is_empty() {
+        // argv[0] = basename of path
+        let base = path.rsplit('/').next().unwrap_or(path);
+        let mut s = base.as_bytes().to_vec();
+        s.push(0);
+        argv_strings.push(s);
+    }
+
+    // 3. Read envp[] from userspace.
+    let mut envp_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if envp_ptr != 0 {
+        let mut ptr_off: u64 = envp_ptr;
+        for _ in 0..1024usize {
+            if !is_user_pointer(ptr_off, 8) { break; }
+            let env_ptr = unsafe { *(ptr_off as *const u64) };
+            if env_ptr == 0 { break; }
+            let env_len = strlen_user_unique(env_ptr, 65536);
+            if env_len == 0 { ptr_off += 8; continue; }
+            if !is_user_pointer(env_ptr, env_len + 1) { ptr_off += 8; continue; }
+            let mut s = unsafe {
+                core::slice::from_raw_parts(env_ptr as *const u8, env_len as usize).to_vec()
+            };
+            s.push(0);
+            envp_strings.push(s);
+            ptr_off += 8;
+        }
+    }
+    // Ensure minimal envp for bash if none provided.
+    if envp_strings.is_empty() {
+        for e in crate::elf_loader::MINIMAL_ENVP {
+            envp_strings.push(e.to_vec());
+        }
+    }
+
+    // 4. Read ELF from filesystem.
+    let elf_data = match crate::filesystem::read_file_alloc(path) {
+        Ok(v) => v,
+        Err(_) => {
+            set_last_exec_error(b"execve: file not found");
+            return linux_abi_error(2); // ENOENT
+        }
+    };
+    if elf_data.len() < 4 || elf_data[0] != 0x7f || elf_data[1] != b'E' {
+        set_last_exec_error(b"execve: not an ELF");
+        return linux_abi_error(8); // ENOEXEC
+    }
+
+    // 5. Replace current process image.
+    let current_pid = match current_process_id() {
+        Some(p) => p,
+        None => return linux_abi_error(3), // ESRCH
+    };
+    let res = match crate::elf_loader::replace_process_image(current_pid, &elf_data) {
+        Ok(r) => r,
+        Err(msg) => {
+            set_last_exec_error(msg.as_bytes());
+            return linux_abi_error(8); // ENOEXEC
+        }
+    };
+
+    // 6. Update process metadata.
+    if let Some(mut proc) = crate::process::get_process(current_pid) {
+        {
+            let mut r = proc.resources.lock();
+            r.vmas.clear();
+            r.brk_current = res.max_vaddr;
+        }
+        proc.mem_frames = (0x100000 / 4096) + res.segment_frames;
+        proc.fs_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
+        proc.dynamic_linker_aux = res.dynamic_linker;
+        // Update process name from argv[0].
+        if let Some(first_arg) = argv_strings.first() {
+            let base = first_arg.iter().rposition(|&b| b == b'/').map(|p| p + 1).unwrap_or(0);
+            let name_bytes = &first_arg[base..];
+            let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len()).min(16);
+            proc.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+            if name_len < 16 { proc.name[name_len] = 0; }
+        }
+        crate::process::update_process(current_pid, proc);
+    }
+    crate::process::clear_pending_process_args(current_pid);
+
+    // 7. Allocate a fresh user stack.
+    const USER_STACK_BASE: u64 = 0x2000_0000;
+    const USER_STACK_SIZE: usize = 0x10_0000; // 1 MB
+    let cr3 = crate::memory::get_cr3();
+    if let Err(e) = crate::elf_loader::setup_user_stack(cr3, USER_STACK_BASE, USER_STACK_SIZE) {
+        set_last_exec_error(b"execve: stack alloc failed");
+        serial::serial_print("[SYSCALL] execve: failed to allocate stack: ");
+        serial::serial_print(e);
+        serial::serial_print("\n");
+        return linux_abi_error(12); // ENOMEM
+    }
+    let stack_top = USER_STACK_BASE + USER_STACK_SIZE as u64;
+
+    // 8. Set up user stack with argv/envp/auxv and jump.
+    let tls_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
+    unsafe {
+        crate::elf_loader::jump_to_userspace_with_argv_envp(
+            &res, stack_top, &argv_strings, &envp_strings, tls_base,
+        );
+    }
+}
+
+/// sys_chdir — Linux chdir(path).
+fn sys_chdir(path_ptr: u64) -> u64 {
+    const MAX_PATH: usize = 1024;
+    let path_len = strlen_user_unique(path_ptr, MAX_PATH);
+    if path_ptr == 0 || path_len == 0 || path_len >= MAX_PATH as u64 {
+        return linux_abi_error(14); // EFAULT
+    }
+    if !is_user_pointer(path_ptr, path_len + 1) {
+        return linux_abi_error(14);
+    }
+    let path_str = unsafe {
+        let s = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        match core::str::from_utf8(s) {
+            Ok(v) => alloc::string::String::from(v),
+            Err(_) => return linux_abi_error(22), // EINVAL
+        }
+    };
+
+    // Resolve against current cwd.
+    let pid = match current_process_id() {
+        Some(p) => p,
+        None => return linux_abi_error(3),
+    };
+    let new_path = if path_str.starts_with('/') {
+        path_str
+    } else {
+        crate::process::resolve_path_cwd(pid, &path_str)
+    };
+
+    // Normalize: remove trailing slash (except root).
+    let normalized = normalize_path(&new_path);
+
+    // Verify the directory exists.
+    match crate::filesystem::list_dir_children(&normalized) {
+        Ok(_) => {
+            if crate::process::set_process_cwd(pid, &normalized) {
+                serial::serial_printf(format_args!("[SYSCALL] chdir -> {}\n", normalized));
+                0
+            } else {
+                linux_abi_error(36) // ENAMETOOLONG
+            }
+        }
+        Err(_) => linux_abi_error(2), // ENOENT
+    }
+}
+
+/// Normalize a path: collapse double slashes, remove trailing slash (except root).
+fn normalize_path(path: &str) -> alloc::string::String {
+    if path.is_empty() { return alloc::string::String::from("/"); }
+    let mut result = alloc::string::String::new();
+    // Remove duplicate slashes.
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if !prev_slash { result.push('/'); }
+            prev_slash = true;
+        } else {
+            result.push(ch);
+            prev_slash = false;
+        }
+    }
+    // Remove trailing slash unless it's the root.
+    if result.len() > 1 && result.ends_with('/') {
+        result.pop();
+    }
+    if result.is_empty() { result.push('/'); }
+    result
+}
+
+/// sys_fchdir — Linux fchdir(fd): change cwd to the directory referenced by fd.
+fn sys_fchdir(_fd: u64) -> u64 {
+    // Not yet implemented; return ENOSYS.
+    linux_abi_error(38) // ENOSYS
+}
+
+/// sys_pipe2 — Linux pipe2(pipefd[2], flags).
+/// Flags: O_CLOEXEC=0x80000, O_NONBLOCK=0x800. We support O_CLOEXEC only.
+fn sys_pipe2(pipefd_ptr: u64, _flags: u64) -> u64 {
+    // Create pipe (same as sys_pipe for now; cloexec tracking is a future enhancement).
+    sys_pipe(pipefd_ptr)
+}
+
+/// sys_getdents64 — Linux getdents64(fd, buf, count).
+/// Returns total bytes written into buf, or -errno on error.
+///
+/// struct linux_dirent64 {
+///   ino64_t  d_ino;      // 8 bytes
+///   off64_t  d_off;      // 8 bytes
+///   u16      d_reclen;   // 2 bytes
+///   u8       d_type;     // 1 byte
+///   char     d_name[];   // null-terminated name
+/// };
+fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+    if buf_ptr == 0 || count < 20 { return linux_abi_error(22); } // EINVAL
+    if !is_user_pointer(buf_ptr, count) { return linux_abi_error(14); } // EFAULT
+
+    let pid = match current_process_id() {
+        Some(p) => p,
+        None => return linux_abi_error(3),
+    };
+
+    let fd_entry = match crate::fd::fd_get(pid, fd as usize) {
+        Some(e) => e,
+        None => return linux_abi_error(9), // EBADF
+    };
+
+    // Get directory children via filesystem resource_id (for the FS scheme).
+    let children = match crate::filesystem::get_dir_children_by_resource(fd_entry.resource_id) {
+        Ok(names) => names,
+        Err(_) => return linux_abi_error(20), // ENOTDIR
+    };
+
+    // Use the FD's offset field as directory position.
+    let offset = crate::fd::fd_get_offset(pid, fd as usize).unwrap_or(0);
+    let start_idx = offset as usize;
+    if start_idx >= children.len() {
+        return 0; // No more entries.
+    }
+
+    let buf = buf_ptr as *mut u8;
+    let mut written: usize = 0;
+    let mut idx = start_idx;
+
+    while idx < children.len() {
+        let name = &children[idx];
+        let name_len = name.len();
+        // struct linux_dirent64: d_ino(8)+d_off(8)+d_reclen(2)+d_type(1)+d_name(name+NUL), align 8
+        let rec_size = (8 + 8 + 2 + 1 + name_len + 1 + 7) & !7usize;
+        if written + rec_size > count as usize {
+            break;
+        }
+        unsafe {
+            let entry = buf.add(written);
+            (entry as *mut u64).write_unaligned(idx as u64 + 1);                 // d_ino
+            ((entry.add(8)) as *mut u64).write_unaligned(idx as u64 + 2);        // d_off (next)
+            ((entry.add(16)) as *mut u16).write_unaligned(rec_size as u16);      // d_reclen
+            *(entry.add(18)) = 0u8; // d_type: DT_UNKNOWN=0 (future: DT_DIR=4, DT_REG=8)
+            core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), entry.add(19), name_len);
+            *(entry.add(19 + name_len)) = 0u8;                                   // NUL
+            // Zero padding bytes
+            for p in (19 + name_len + 1)..rec_size {
+                *(entry.add(p)) = 0u8;
+            }
+        }
+        written += rec_size;
+        idx += 1;
+    }
+
+    crate::fd::fd_set_offset(pid, fd as usize, idx as u64);
+    written as u64
+}
+
+/// Get the filesystem path associated with an open file descriptor (unused for now).
+fn get_path_from_fd(pid: u32, fd: usize) -> Option<alloc::string::String> {
+    use crate::fd::fd_get;
+    let fd_entry = fd_get(pid, fd)?;
+    crate::scheme::get_resource_path(fd_entry.scheme_id, fd_entry.resource_id)
 }

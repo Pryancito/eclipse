@@ -396,6 +396,24 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<usize, usize> {
     scheme.rename(old_rel, new_rel)
 }
 
+/// Get the path/name of a resource for directory listing purposes.
+/// Returns the path if available (filesystem scheme stores inode info).
+pub fn get_resource_path(scheme_idx: usize, resource_id: usize) -> Option<alloc::string::String> {
+    // Only the filesystem scheme tracks path information via inodes.
+    let scheme_name = {
+        let reg = REGISTRY.lock();
+        reg.schemes.get(scheme_idx).map(|(name, _)| name.clone())
+    };
+    if scheme_name.as_deref() == Some("file") {
+        // Use the inode to reconstruct the path is complex; instead provide directory listing
+        // via get_dir_children_by_resource which uses the resource_id directly.
+        // Return a sentinel value that the caller can use to identify this as a FS resource.
+        Some(alloc::format!("__fs_resource:{}", resource_id))
+    } else {
+        None
+    }
+}
+
 // --- SHM Scheme ---
 
 pub struct ShmRegion {
