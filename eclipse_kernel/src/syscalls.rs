@@ -1148,13 +1148,30 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
 
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            unsafe {
-                let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                match crate::scheme::write(fd_entry.scheme_id, fd_entry.resource_id, slice) {
-                    Ok(written) => return written as u64,
-                    Err(_) => return u64::MAX,
+            // SAFETY: Use a kernel-space bounce buffer to avoid direct driver access to user memory.
+            let mut total = 0usize;
+            while total < len as usize {
+                let chunk_len = core::cmp::min((len as usize) - total, 4096);
+                let mut bounce = [0u8; 4096];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (buf_ptr as *const u8).add(total),
+                        bounce.as_mut_ptr(),
+                        chunk_len,
+                    );
+                }
+                
+                match crate::scheme::write(fd_entry.scheme_id, fd_entry.resource_id, &bounce[..chunk_len]) {
+                    Ok(n) => {
+                        total += n;
+                        if n < chunk_len { break; } // Short write
+                    }
+                    Err(_) => {
+                        return if total > 0 { total as u64 } else { u64::MAX };
+                    }
                 }
             }
+            return total as u64;
         }
     }
     
@@ -1177,23 +1194,29 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            unsafe {
-                let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
-                match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
-                    Ok(bytes_read) => {
-                        if bytes_read == 0 && pid >= 10 && pid <= 20 {
-                             serial::serial_printf(format_args!("[SYSCALL] read(fd={}) returned EOF (0 bytes) for pid={}\n", fd, pid));
+            // SAFETY: Use a kernel-space bounce buffer. Drivers and schemes must not
+            // access user-space memory directly via slices, as it may cause #PF 
+            // if the page is not present or SMAP is enabled.
+            let mut bounce = [0u8; 4096]; // 4 KB bounce buffer on stack (safer)
+            let read_len = core::cmp::min(len as usize, bounce.len());
+
+            match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, &mut bounce[..read_len]) {
+                Ok(bytes_read) => {
+                    if bytes_read > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf_ptr as *mut u8, bytes_read);
                         }
-                        return bytes_read as u64
-                    },
-                    Err(e) => {
-                        // Propagar el errno real (EINTR=4, EAGAIN=11, etc.) como valor negativo,
-                        // igual que Linux: -(errno) en complemento a dos (u64).
-                        if e != crate::scheme::error::EAGAIN {
-                            serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
-                        }
-                        return (-(e as isize)) as u64;
                     }
+                    if bytes_read == 0 && pid >= 10 && pid <= 20 {
+                         serial::serial_printf(format_args!("[SYSCALL] read(fd={}) returned EOF (0 bytes) for pid={}\n", fd, pid));
+                    }
+                    return bytes_read as u64;
+                },
+                Err(e) => {
+                    if e != crate::scheme::error::EAGAIN {
+                        serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
+                    }
+                    return (-(e as isize)) as u64;
                 }
             }
         } else {
@@ -1233,23 +1256,31 @@ fn sys_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
 
     let mut total = 0usize;
     while total < count as usize {
-        let rem = (count as usize) - total;
-        unsafe {
-            let slice =
-                core::slice::from_raw_parts_mut((buf_ptr as *mut u8).add(total), rem);
-            match crate::scheme::read(scheme_id, resource_id, slice) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) => {
-                    let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
-                    if e != crate::scheme::error::EAGAIN {
-                        crate::serial::serial_printf(format_args!(
-                            "[SYSCALL] pread64() scheme error: {}\n",
-                            e
-                        ));
-                    }
-                    return (-(e as isize)) as u64;
+        let chunk_len = core::cmp::min((count as usize) - total, 4096);
+        let mut bounce = [0u8; 4096];
+        
+        match crate::scheme::read(scheme_id, resource_id, &mut bounce[..chunk_len]) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bounce.as_ptr(),
+                        (buf_ptr as *mut u8).add(total),
+                        n,
+                    );
                 }
+                total += n;
+                if n < chunk_len { break; } // Short read
+            }
+            Err(e) => {
+                let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
+                if e != crate::scheme::error::EAGAIN {
+                    crate::serial::serial_printf(format_args!(
+                        "[SYSCALL] pread64() scheme error: {}\n",
+                        e
+                    ));
+                }
+                return (-(e as isize)) as u64;
             }
         }
     }
@@ -1438,7 +1469,11 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
 
                 // Escribir el PID del remitente si se solicitó
                 if sender_pid_ptr != 0 {
-                    *(sender_pid_ptr as *mut u32) = msg.from;
+                    if is_user_pointer(sender_pid_ptr, 4) {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(&msg.from, sender_pid_ptr as *mut u32, 1);
+                        }
+                    }
                 }
             }
             return copy_len as u64;
@@ -1971,7 +2006,11 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                                        }
+                                    }
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -1984,7 +2023,11 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                                        }
+                                    }
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2013,7 +2056,11 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                                        }
+                                    }
                                 }
                             }
 
@@ -2027,7 +2074,11 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    core::ptr::write_unaligned(status_ptr as *mut u32, wait_status);
+                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                                        }
+                                    }
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2146,8 +2197,8 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     
     // Write pointer and size to user-provided addresses
     unsafe {
-        *(out_ptr as *mut u64) = bin_ptr;
-        *(out_size as *mut u64) = bin_size;
+        core::ptr::copy_nonoverlapping(&bin_ptr, out_ptr as *mut u64, 1);
+        core::ptr::copy_nonoverlapping(&bin_size, out_size as *mut u64, 1);
     }
     
     0 // Success
@@ -3727,9 +3778,14 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
             // Call scheme fstat
             match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat) {
                 Ok(_) => {
-                    // Copy to user memory
+                    // SAFETY: Copy to user memory via safe raw pointer copy.
+                    // stat_ptr has been validated by is_user_pointer above.
                     unsafe {
-                        *(stat_ptr as *mut crate::scheme::Stat) = stat;
+                        core::ptr::copy_nonoverlapping(
+                            &stat as *const crate::scheme::Stat,
+                            stat_ptr as *mut crate::scheme::Stat,
+                            1
+                        );
                     }
                     return 0;
                 }
@@ -4543,10 +4599,10 @@ fn sys_getcwd(buf_ptr: u64, size: u64) -> u64 {
         return u64::MAX;
     }
     
+    let kpath = b"/";
     unsafe {
-        let ptr = buf_ptr as *mut u8;
-        *ptr = b'/';
-        *ptr.add(1) = 0;
+        core::ptr::copy_nonoverlapping(kpath.as_ptr(), buf_ptr as *mut u8, 1);
+        *((buf_ptr as *mut u8).add(1)) = 0;
     }
     
     buf_ptr
@@ -4561,7 +4617,8 @@ fn sys_getegid() -> u64 { 0 }
 fn sys_getresuid(ruid_ptr: u64, euid_ptr: u64, suid_ptr: u64) -> u64 {
     for ptr in &[ruid_ptr, euid_ptr, suid_ptr] {
         if *ptr != 0 && is_user_pointer(*ptr, 4) {
-            unsafe { *(*ptr as *mut u32) = 0; }
+            let zero: u32 = 0;
+            unsafe { core::ptr::copy_nonoverlapping(&zero, *ptr as *mut u32, 1); }
         }
     }
     0
@@ -5393,7 +5450,7 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         return 0; // No more entries.
     }
 
-    let buf = buf_ptr as *mut u8;
+    let mut kbuf = alloc::vec![0u8; count as usize];
     let mut written: usize = 0;
     let mut idx = start_idx;
 
@@ -5405,21 +5462,31 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         if written + rec_size > count as usize {
             break;
         }
+        
+        // Build the entry in the kernel buffer
         unsafe {
-            let entry = buf.add(written);
-            (entry as *mut u64).write_unaligned(idx as u64 + 1);                 // d_ino
-            ((entry.add(8)) as *mut u64).write_unaligned(idx as u64 + 2);        // d_off (next)
-            ((entry.add(16)) as *mut u16).write_unaligned(rec_size as u16);      // d_reclen
-            *(entry.add(18)) = 0u8; // d_type: DT_UNKNOWN=0 (future: DT_DIR=4, DT_REG=8)
-            core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), entry.add(19), name_len);
-            *(entry.add(19 + name_len)) = 0u8;                                   // NUL
-            // Zero padding bytes
-            for p in (19 + name_len + 1)..rec_size {
-                *(entry.add(p)) = 0u8;
+            let p = kbuf.as_mut_ptr().add(written);
+            (p as *mut u64).write_unaligned(idx as u64 + 1);                 // d_ino
+            (p.add(8) as *mut u64).write_unaligned(idx as u64 + 2);          // d_off (next)
+            (p.add(16) as *mut u16).write_unaligned(rec_size as u16);        // d_reclen
+            *(p.add(18)) = 0u8; // d_type: DT_UNKNOWN=0
+            core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), p.add(19), name_len);
+            *(p.add(19 + name_len)) = 0u8;                                   // NUL
+            // Zero padding
+            for i in (19 + name_len + 1)..rec_size {
+                *(p.add(i)) = 0u8;
             }
         }
+        
         written += rec_size;
         idx += 1;
+    }
+
+    // Copy the entire kernel buffer to user memory at once
+    if written > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, written);
+        }
     }
 
     crate::fd::fd_set_offset(pid, fd as usize, idx as u64);

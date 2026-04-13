@@ -20,7 +20,7 @@ pub fn args() -> Vec<String> {
 pub(crate) fn init_args() {
     let mut buf = [0u8; 4096];
     let n = eclipse_syscall::call::get_process_args(&mut buf);
-    if n > 0 {
+    if n > 0 && n <= buf.len() {
         let mut argv: Vec<String> = buf[..n]
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())

@@ -1,9 +1,9 @@
 use crate::serial;
 use core::cmp::min;
 use alloc::vec::Vec;
-use alloc::vec;
+use alloc::{vec, format};
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags, constants};
 use eclipsefs_lib::NodeKind;
 
@@ -350,21 +350,25 @@ impl Filesystem {
             // Each entry is 8 bytes.
             // inode indices are 1-based, table is 0-indexed (inode 1 is at index 0)
             let index = (inode - 1) as u64;
-            let entry_offset = FS.inode_table_offset + (index * 8);
+            let entry_offset = FS.inode_table_offset + (index * constants::INODE_TABLE_ENTRY_SIZE as u64);
             let abs_disk_offset = entry_offset + (FS.partition_offset * BLOCK_SIZE as u64);
             
-            let mut entry_buffer = [0u8; 8];
+            let mut entry_buffer = [0u8; 16];
             read_bytes_at(abs_disk_offset, &mut entry_buffer)?;
             
-            let inode_num = u32::from_le_bytes([
+            let inode_num = u64::from_le_bytes([
                 entry_buffer[0], entry_buffer[1], 
-                entry_buffer[2], entry_buffer[3]
-            ]) as u64;
-            
-            let rel_offset = u32::from_le_bytes([
+                entry_buffer[2], entry_buffer[3],
                 entry_buffer[4], entry_buffer[5], 
                 entry_buffer[6], entry_buffer[7]
-            ]) as u64;
+            ]);
+            
+            let rel_offset = u64::from_le_bytes([
+                entry_buffer[8], entry_buffer[9], 
+                entry_buffer[10], entry_buffer[11],
+                entry_buffer[12], entry_buffer[13], 
+                entry_buffer[14], entry_buffer[15]
+            ]);
              
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
             
@@ -1431,28 +1435,46 @@ impl Scheme for FileSystemScheme {
                     serial::serial_print("[FS-SCHEME] open() failed: physical path requires mount\n");
                     return Err(scheme_error::EIO);
                 }
-                let mut inode = match Filesystem::lookup_path(clean_path) {
-                    Ok(i) => Some(i),
-                    Err(_) => {
-                        // Synthetic bootstrap files (termcap, inputrc)
-                        if clean_path == "etc/termcap" || clean_path == "etc/terminfo" {
-                            let mut vtmp = VIRTUAL_TMP.lock();
-                            if !vtmp.contains_key(clean_path) {
-                                let content = b"linux|linux console:\\\n\t:am:eo:mi:ms:ut:it#8:\\\n\t:Co#8:pa#64:\\\n\t:AB=\\E[4%dm:AF=\\E[3%dm:op=\\E[39;49m:\\\n\t:AL=\\E[%dL:DC=\\E[%dP:DL=\\E[%dM:IC=\\E[%dG:\\\n\t:ho=\\E[H:cl=\\E[H\\E[J:cm=\\E[%i%d;%dH:ce=\\E[K:cd=\\E[J:\\\n\t:nd=\\E[C:le=\\E[D:up=\\E[A:do=\\B:\\\n\t:kb=\\u007f:kcuu1=\\E[A:kcud1=\\E[B:kcuf1=\\E[C:kcub1=\\E[D:vt#3:";
-                                vtmp.insert(String::from(clean_path), content.to_vec());
+                
+                // Bootstrap: si /etc/termcap o /etc/inputrc no existen, proveemos versiones sintéticas
+                // para que bash y musl funcionen correctamente.
+                let mut res = Filesystem::lookup_path(clean_path);
+                if res.is_err() {
+                    if path == "etc/termcap" || path == "/etc/termcap" || 
+                       path == "etc/inputrc" || path == "/etc/inputrc" ||
+                       path == "dev/null"    || path == "/dev/null"    ||
+                       path == "dev/zero"    || path == "/dev/zero"     {
+                        
+                        let content = match path {
+                            p if p.contains("termcap") => "xterm|xterm-256color:am:bs:km:mi:ms:co#80:li#24:it#8:cl=\\E[H\\E[J:cm=\\E[%i%d;%dH:nd=\\E[C:up=\\E[A:ce=\\E[K:cd=\\E[J:so=\\E[7m:se=\\E[m:md=\\E[1m:me=\\E[m:ti=\\E[?1049h:te=\\E[?1049l:ks=\\E[?1;2l:ke=\\E[?1;2h:kb=\\x08:ku=\\E[A:kd=\\E[B:kl=\\E[D:kr=\\E[C:ho=\\E[H:ks=\\E[?1h\\E=:ke=\\E[?1l\\E>:sc=\\E7:rc=\\E8:al=\\E[L:dl=\\E[M:AL=\\E[%dL:DL=\\E[%dM:ic=\\E[@:dc=\\E[P:IC=\\E[%d@:DC=\\E[%dP:us=\\E[4m:ue=\\E[24m:so=\\E[7m:se=\\E[27m:op=\\E[39;49m:kb=\\x08:kd=\\E[B:kl=\\E[D:kr=\\E[C:ku=\\E[A:le=^H:nd=\\E[C:up=\\E[A:upn=\\E[%dA:dn=\\E[B:dnn=\\E[%dB:le=\\E[D:len=\\E[%dD:ri=\\E[C:rin=\\E[%dC:ho=\\E[H:cr=^M:nl=^J:bl=^G:ta=^I:",
+                            p if p.contains("inputrc") => "set bell-style none\nset editing-mode emacs\n",
+                            p if p.contains("null")    => "",
+                            p if p.contains("zero")    => "\0",
+                            _ => ""
+                        };
+                        
+                        let synthetic_path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
+                        let mut vtmp = VIRTUAL_TMP.lock();
+                        vtmp.insert(synthetic_path.clone(), content.as_bytes().to_vec());
+                        drop(vtmp);
+                        
+                        // Encontrar un slot libre en OPEN_FILES_SCHEME y devolver su ID
+                        let mut open_files = OPEN_FILES_SCHEME.lock();
+                        for (i, slot) in open_files.iter_mut().enumerate() {
+                            if slot.is_none() {
+                                *slot = Some(OpenFile::Virtual { path: synthetic_path, offset: 0 });
+                                return Ok(i);
                             }
-                            None
-                        } else if clean_path == "etc/inputrc" {
-                            let mut vtmp = VIRTUAL_TMP.lock();
-                            if !vtmp.contains_key(clean_path) {
-                                let content = b"set editing-mode emacs\nset horizontal-scroll-mode Off\n";
-                                vtmp.insert(String::from(clean_path), content.to_vec());
-                            }
-                            None
-                        } else {
-                            None
                         }
+                        let id = open_files.len();
+                        open_files.push(Some(OpenFile::Virtual { path: synthetic_path, offset: 0 }));
+                        return Ok(id);
                     }
+                }
+                
+                let mut inode = match res {
+                    Ok(i) => Some(i),
+                    Err(_) => None,
                 };
                 
                 // If it's one of our synthetic files, redirect to Virtual

@@ -188,7 +188,7 @@ fn format_device(args: &Args) -> io::Result<()> {
     println!("📋 Inicializando tabla de inodos ({} inodes)...", total_inodes);
     file.seek(SeekFrom::Start(header.inode_table_offset))?;
     
-    let inode_size = 128;
+    let inode_size = 16;
     let empty_inode = vec![0u8; inode_size];
     
     for i in 0..total_inodes {

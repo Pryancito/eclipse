@@ -221,7 +221,8 @@ impl EclipseFSHeader {
 }
 
 /// Entrada en la tabla de inodos
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct InodeTableEntry {
     pub inode: u64,
     pub offset: u64,
@@ -252,8 +253,8 @@ pub mod tlv_tags {
 /// Constantes del formato
 pub mod constants {
 
-    /// Tamaño de una entrada de tabla de inodos
-    pub const INODE_TABLE_ENTRY_SIZE: usize = 8;
+    /// Tamaño de una entrada de tabla de inodos (u64 inode + u64 offset)
+    pub const INODE_TABLE_ENTRY_SIZE: usize = 16;
     /// Tamaño del encabezado de un registro de nodo (inode + tamaño del registro)
     pub const NODE_RECORD_HEADER_SIZE: usize = 8;
 

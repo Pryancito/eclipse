@@ -109,9 +109,9 @@ impl EclipseFSWriter {
 
         let mut current_offset = nodes_start;
         for (inode, size) in nodes_sorted.iter() {
-            self.file.write_u32::<LittleEndian>(*inode)?;
-            let relative_offset = (current_offset - nodes_start) as u32;
-            self.file.write_u32::<LittleEndian>(relative_offset)?;
+            self.file.write_u64::<LittleEndian>(*inode as u64)?;
+            let relative_offset = current_offset - nodes_start;
+            self.file.write_u64::<LittleEndian>(relative_offset)?;
             current_offset += *size as u64;
         }
 
