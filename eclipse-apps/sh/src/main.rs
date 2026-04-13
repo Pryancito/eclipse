@@ -322,6 +322,17 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         "ls" => {
+            // Con flags u otros argumentos (p. ej. `ls -la`, `ls a b`) usar el binario real.
+            if argv.len() > 2 {
+                return None;
+            }
+            if argv
+                .get(1)
+                .map(|s| s.starts_with('-'))
+                .unwrap_or(false)
+            {
+                return None;
+            }
             let path = argv.get(1).map(|s| s.as_str()).unwrap_or(".");
             let abs_path = resolve_path(path);
             let mut buf = [0u8; 8192];
@@ -341,6 +352,10 @@ fn try_builtin(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         "cat" => {
+            // Opciones tipo `cat -n` → `/bin/cat` (el builtin solo concatena ficheros).
+            if argv.iter().skip(1).any(|a| a.starts_with('-')) {
+                return None;
+            }
             for path in &argv[1..] {
                 let abs = resolve_path(path);
                 if let Ok(fd) = eclipse_syscall::call::open(&abs, 0) {

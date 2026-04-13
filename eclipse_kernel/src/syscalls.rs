@@ -1595,6 +1595,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                 }
             }
 
+            // Misma PID, nueva imagen: no reutilizar argv del binario anterior (p. ej. sh → exec).
+            crate::process::clear_pending_process_args(current_pid);
+
             // This doesn't return - we jump to the new process entry point.
             // Map a fresh 1 MB user stack for the exec'd binary.
             // A forked child only inherits the parent's 256 KB stack (up to 0x20040000),
@@ -1704,13 +1707,6 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
 /// arg4: fd to map to stdin (0)
 /// arg5: fd to map to stdout (1)
 /// arg6: fd to map to stderr (2)
-// ---------------------------------------------------------------------------
-// Mapa de argumentos pendientes por proceso (syscalls 542/543)
-// Clave: PID hijo, valor: bytes NUL-separados con argv[0] argv[1] ...
-// ---------------------------------------------------------------------------
-static PROCESS_ARGS: spin::Mutex<alloc::collections::BTreeMap<crate::process::ProcessId, alloc::vec::Vec<u8>>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
-
 /// sys_set_child_args (542): el padre llama esto justo después de spawn_with_stdio
 /// para registrar el argv del hijo antes de que el scheduler lo ejecute.
 fn sys_spawn_with_stdio_args(
@@ -1723,8 +1719,8 @@ fn sys_spawn_with_stdio_args(
     let args_data = unsafe {
         core::slice::from_raw_parts(args_ptr as *const u8, args_len as usize)
     }.to_vec();
-    PROCESS_ARGS.lock().insert(child_pid_arg as crate::process::ProcessId, args_data);
-    
+    crate::process::set_pending_process_args(child_pid_arg as crate::process::ProcessId, args_data);
+
     // Now that arguments are registered, we can safely start the process.
     crate::scheduler::enqueue_process(child_pid_arg as crate::process::ProcessId);
     0
@@ -1732,6 +1728,8 @@ fn sys_spawn_with_stdio_args(
 
 /// sys_get_process_args (543): el proceso llama esto al inicio para leer su argv.
 /// Devuelve el número de bytes escritos en buf (formato: NUL-separados).
+/// La entrada del kernel no se consume: varias lecturas devuelven los mismos datos
+/// hasta que el proceso termina (`exit_process` libera la copia).
 fn sys_get_process_args(buf_ptr: u64, buf_size: u64) -> u64 {
     if buf_ptr == 0 || buf_size == 0 { return 0; }
     if !is_user_pointer(buf_ptr, buf_size) { return 0; }
@@ -1739,14 +1737,8 @@ fn sys_get_process_args(buf_ptr: u64, buf_size: u64) -> u64 {
         Some(p) => p,
         None => return 0,
     };
-    let mut map = PROCESS_ARGS.lock();
-    if let Some(args) = map.remove(&pid) {
-        let n = args.len().min(buf_size as usize);
-        unsafe { core::ptr::copy_nonoverlapping(args.as_ptr(), buf_ptr as *mut u8, n); }
-        n as u64
-    } else {
-        0
-    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_size as usize) };
+    crate::process::copy_pending_process_args(pid, buf) as u64
 }
 
 /// arg1: ruta absoluta NUL (`/bin/foo`), arg2: nombre proceso (opcional, hasta 16 bytes + NUL), arg3–5: fds stdio.
@@ -3065,11 +3057,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             current += 4096;
         }
 
-        // MAP_FIXED file-backed PROT_EXEC: add zeroed executable slack pages right
-        // after the file mapping so that multi-byte instructions at the last byte of
-        // the last mapped page (e.g. RIP=0x…fff, CR2=0x…000 of next page) can be
-        // fetched without a #PF.  This mirrors the ANON_SLACK_BYTES mechanism that
-        // already protects anonymous mappings.
+        // MAP_FIXED + PROT_EXEC with no kernel slack yet (`anon_slack == 0`): add zeroed
+        // executable slack pages after the mapping so multi-byte instructions at the last
+        // byte of the last page (e.g. RIP=0x…1fff, CR2=0x…2000) do not #PF.
+        //
+        // Applies to (1) file-backed PT_LOAD-style maps (ld.so) and (2) anonymous MAP_FIXED
+        // **outside** [USER_ARENA_LO, USER_ARENA_HI), where we intentionally omit
+        // ANON_SLACK_BYTES — musl/cargo still need a tail guard for decode past page end.
         //
         // Two bugs fixed here vs the original approach:
         //
@@ -3092,7 +3086,6 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         //    (error 0x14) at the moment the CPU fetches instruction bytes across the
         //    page boundary.  Fix: register the slack region as a VMA entry.
         if (flags & MAP_FIXED) != 0
-            && fd_entry.is_some()
             && (linux_p & PROT_EXEC) != 0
             && anon_slack == 0
         {

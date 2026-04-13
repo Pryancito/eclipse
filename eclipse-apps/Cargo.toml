@@ -13,8 +13,9 @@ members = [
     "nano",
     "glxgears",
     "smithay_app",
+    "rust-shell",
 ]
-exclude = ["libs/ipc_tests", "xeyes", "rust-shell"]
+exclude = ["libs/ipc_tests", "xeyes"]
 
 [workspace.package]
 version = "0.2.0"

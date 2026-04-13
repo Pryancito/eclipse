@@ -13,7 +13,7 @@ pub const BLOCK_SIZE: usize = 4096;
 /// Maximum record size to prevent OOM (32 MiB)
 pub const MAX_RECORD_SIZE: usize = 32 * 1024 * 1024;
 
-const INODE_CACHE_SIZE: usize = 64;
+const INODE_CACHE_SIZE: usize = 128;
 
 #[derive(Clone, Copy)]
 pub struct InodeCacheEntry {
@@ -49,7 +49,7 @@ impl InodeCache {
 // Policy: LRU eviction once DIR_CACHE_SIZE entries are in use.
 // ---------------------------------------------------------------------------
 
-const DIR_CACHE_SIZE: usize = 16;
+const DIR_CACHE_SIZE: usize = 32;
 
 struct DirCacheState {
     entries: Vec<(u32, u64, Vec<u8>)>,
@@ -85,55 +85,6 @@ static DIR_CACHE: spin::Mutex<DirCacheState> = spin::Mutex::new(DirCacheState::n
 /// This protects the static `FS` state and ensures atomicity of `lseek` + `read/write` sequences.
 static FILESYSTEM_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
 
-/// Read a block from the underlying block device using the scheme system
-fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    // The caller of this internal helper should already hold FILESYSTEM_LOCK
-    // if it's coordinating multiple related I/O ops, but for safety we also lock here.
-    let _lock = FILESYSTEM_LOCK.lock();
-    unsafe {
-        if !FS.mounted && FS.disk_resource_id == 0 && FS.disk_scheme_id == 0 {
-            // During mount, we might not have a handle yet.
-        }
-
-        let offset = block_num * 4096;
-        if let Err(e) = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0) {
-            serial::serial_printf(format_args!("[FS-DEBUG] read_block lseek failed: block={} err={}\n", block_num, e));
-            return Err("Disk seek error");
-        }
-        
-        // AI-Core: Record block access in current process profile
-        if let Some(pid) = crate::process::current_process_id() {
-             if let Some(mut proc) = crate::process::get_process(pid) {
-                 proc.ai_profile.record_block_access(block_num);
-                 crate::process::update_process(pid, proc);
-             }
-        }
-
-        match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                serial::serial_printf(format_args!("[FS-DEBUG] read_block read failed: block={} err={}\n", block_num, e));
-                Err("Disk read error")
-            }
-        }
-    }
-}
-
-/// Write a block to the underlying block device using the scheme system
-fn write_block_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    let _lock = FILESYSTEM_LOCK.lock();
-    unsafe {
-        let offset = block_num * 4096;
-        let _ = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0)
-            .map_err(|_| "Disk seek error")?;
-        
-        match crate::scheme::write(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
-            Ok(_) => Ok(()),
-            Err(_) => Err("Disk write error"),
-        }
-    }
-}
-
 /// Filesystem state
 pub struct Filesystem {
     mounted: bool,
@@ -156,25 +107,109 @@ static mut FS: Filesystem = Filesystem {
 };
 
 /// Read a range of bytes directly from disk, potentially spanning block boundaries.
+/// Un solo `lseek` + `scheme::read`: `DiskScheme::read` rellena todo el buffer cruzando bloques.
 fn read_bytes_at(abs_offset: u64, dest: &mut [u8]) -> Result<(), &'static str> {
-    let mut bytes_read = 0;
-    let mut block_buffer = vec![0u8; BLOCK_SIZE];
-    
-    while bytes_read < dest.len() {
-        let current_pos = abs_offset + bytes_read as u64;
-        let block_num = current_pos / BLOCK_SIZE as u64;
-        let offset_in_block = (current_pos % BLOCK_SIZE as u64) as usize;
-        
-        // serial::serial_printf(format_args!("[FS] read_bytes_at: block={} offset_in_block={}\n", block_num, offset_in_block));
-        read_block_from_device(block_num, &mut block_buffer)?;
-        
-        let chunk_size = min(dest.len() - bytes_read, BLOCK_SIZE - offset_in_block);
-        dest[bytes_read..bytes_read + chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block + chunk_size]);
-        
-        bytes_read += chunk_size;
+    if dest.is_empty() {
+        return Ok(());
     }
-    
-    Ok(())
+    let _lock = FILESYSTEM_LOCK.lock();
+    unsafe {
+        if let Err(e) =
+            crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, abs_offset as isize, 0)
+        {
+            serial::serial_printf(format_args!(
+                "[FS-DEBUG] read_bytes_at lseek failed: off={} err={}\n",
+                abs_offset,
+                e
+            ));
+            return Err("Disk seek error");
+        }
+
+        if let Some(pid) = crate::process::current_process_id() {
+            let start_b = abs_offset / BLOCK_SIZE as u64;
+            let end_b = (abs_offset + dest.len() as u64 - 1) / BLOCK_SIZE as u64;
+            for block_num in start_b..=end_b {
+                if let Some(mut proc) = crate::process::get_process(pid) {
+                    proc.ai_profile.record_block_access(block_num);
+                    crate::process::update_process(pid, proc);
+                }
+            }
+        }
+
+        match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, dest) {
+            Ok(n) if n == dest.len() => Ok(()),
+            Ok(n) => {
+                serial::serial_printf(format_args!(
+                    "[FS-DEBUG] read_bytes_at short read: off={} want={} got={}\n",
+                    abs_offset,
+                    dest.len(),
+                    n
+                ));
+                Err("Disk read error")
+            }
+            Err(e) => {
+                serial::serial_printf(format_args!(
+                    "[FS-DEBUG] read_bytes_at read failed: off={} err={}\n",
+                    abs_offset,
+                    e
+                ));
+                Err("Disk read error")
+            }
+        }
+    }
+}
+
+/// Escribe un rango contiguo en el disco (cruza límites de bloque).
+/// Un solo `lseek` + `scheme::write`: `DiskScheme::write` reparte en trozos de bloque.
+fn write_bytes_at(abs_offset: u64, src: &[u8]) -> Result<(), &'static str> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let _lock = FILESYSTEM_LOCK.lock();
+    unsafe {
+        if let Err(e) =
+            crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, abs_offset as isize, 0)
+        {
+            serial::serial_printf(format_args!(
+                "[FS-DEBUG] write_bytes_at lseek failed: off={} err={}\n",
+                abs_offset,
+                e
+            ));
+            return Err("Disk seek error");
+        }
+
+        if let Some(pid) = crate::process::current_process_id() {
+            let start_b = abs_offset / BLOCK_SIZE as u64;
+            let end_b = (abs_offset + src.len() as u64 - 1) / BLOCK_SIZE as u64;
+            for block_num in start_b..=end_b {
+                if let Some(mut proc) = crate::process::get_process(pid) {
+                    proc.ai_profile.record_block_access(block_num);
+                    crate::process::update_process(pid, proc);
+                }
+            }
+        }
+
+        match crate::scheme::write(FS.disk_scheme_id, FS.disk_resource_id, src) {
+            Ok(n) if n == src.len() => Ok(()),
+            Ok(n) => {
+                serial::serial_printf(format_args!(
+                    "[FS-DEBUG] write_bytes_at short write: off={} want={} got={}\n",
+                    abs_offset,
+                    src.len(),
+                    n
+                ));
+                Err("Disk write error")
+            }
+            Err(e) => {
+                serial::serial_printf(format_args!(
+                    "[FS-DEBUG] write_bytes_at write failed: off={} err={}\n",
+                    abs_offset,
+                    e
+                ));
+                Err("Disk write error")
+            }
+        }
+    }
 }
 
 impl Filesystem {
@@ -235,7 +270,10 @@ impl Filesystem {
         let mut superblock = vec![0u8; 4096];
         
         serial::serial_print("[FS] Reading superblock from block device...\n");
-        read_block_from_device(part_offset, &mut superblock)?;
+        read_bytes_at(
+            part_offset.saturating_mul(BLOCK_SIZE as u64),
+            &mut superblock,
+        )?;
         serial::serial_print("[FS] Superblock read successfully\n");
         
         // Parse header using library
@@ -425,6 +463,8 @@ impl Filesystem {
     /// 
     /// This is a simplified implementation that writes data to an existing file
     /// without extending it. It modifies the file content in-place.
+    /// No materializa el registro completo en un `Vec`: recorre TLVs leyendo cabeceras
+    /// de 6 bytes desde disco y hace read-modify-write solo en bloques 4 KiB tocados.
     /// 
     /// Limitations:
     /// - Cannot extend file beyond current size
@@ -441,9 +481,6 @@ impl Filesystem {
         let _lock = FILESYSTEM_LOCK.lock();
         let entry = Self::read_inode_entry(inode)?;
         
-        // Read the full node record
-        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
         
         let mut header_buf = [0u8; 8];
@@ -454,90 +491,65 @@ impl Filesystem {
             header_buf[6], header_buf[7]
         ]) as usize;
         
-        // OOM Protection
         if record_size > MAX_RECORD_SIZE {
             return Err("File record too large (exceeds MAX_RECORD_SIZE)");
         }
-        
-        let mut record_data = vec![0u8; record_size];
-        read_bytes_at(abs_disk_offset, &mut record_data)?;
-        
-        // Find CONTENT TLV and modify it
-        let mut tlv_offset = 8; // Skip 8-byte header
-        let mut content_found = false;
-        let mut content_tlv_offset = 0;
-        let mut content_length = 0;
-        
-        while tlv_offset + 6 <= record_data.len() {
-            let tag = u16::from_le_bytes([record_data[tlv_offset], record_data[tlv_offset+1]]);
-            let length = u32::from_le_bytes([
-                record_data[tlv_offset+2], record_data[tlv_offset+3], 
-                record_data[tlv_offset+4], record_data[tlv_offset+5]
-            ]) as usize;
-            
-            if tag == tlv_tags::CONTENT {
-                content_found = true;
-                content_tlv_offset = tlv_offset + 6; // Offset to actual content data
-                content_length = length;
-                break;
-            }
-            
-            tlv_offset += 6 + length;
+        if record_size < 8 {
+            return Err("Invalid record size");
         }
+
+        let (content_data_abs, content_length_u64) = Self::scan_content_tlv_disk(
+            abs_disk_offset,
+            record_size,
+        )?
+        .ok_or("No CONTENT TLV found in file")?;
+        let content_data_start = (content_data_abs - abs_disk_offset) as usize;
+        let content_length = usize::try_from(content_length_u64).map_err(|_| "Content size too large")?;
         
-        if !content_found {
-            return Err("No CONTENT TLV found in file");
-        }
-        
-        // Check bounds
         if offset as usize >= content_length {
             return Err("Write offset beyond file content");
         }
         
-        let write_start = content_tlv_offset + offset as usize;
         let max_write = min(data.len(), content_length - offset as usize);
         
         if max_write == 0 {
             return Ok(0);
         }
-        
-        // Modify the record data
-        record_data[write_start..write_start+max_write].copy_from_slice(&data[..max_write]);
-        
-        // Write the modified record back to disk
-        // We need to write all blocks that the record spans
-        let start_block = block_num;
-        let start_offset = offset_in_block;
-        
-        // Prepare first block with modified data
-        let mut write_buffer = vec![0u8; 4096];
-        read_block_from_device(start_block, &mut write_buffer)?;
-        
-        let first_write_size = min(record_size, 4096 - start_offset);
-        write_buffer[start_offset..start_offset+first_write_size].copy_from_slice(&record_data[0..first_write_size]);
-        
-        write_block_to_device(start_block, &write_buffer)?;
-        
-        // Write remaining blocks if record spans multiple blocks
-        let mut bytes_written = first_write_size;
-        let mut write_block_num = start_block + 1;
-        
-        while bytes_written < record_size {
-            let chunk_size = min(4096, record_size - bytes_written);
-            
-            // Read existing block (to preserve data we're not modifying)
-            read_block_from_device(write_block_num, &mut write_buffer)?;
-            
-            // Overwrite with our new data
-            write_buffer[0..chunk_size].copy_from_slice(&record_data[bytes_written..bytes_written+chunk_size]);
-            
-            // Write back to disk
-            write_block_to_device(write_block_num, &write_buffer)?;
-            
-            bytes_written += chunk_size;
-            write_block_num += 1;
+
+        // Byte offset within the EclipseFS record where user data maps.
+        let write_start_in_record = content_data_start
+            .checked_add(offset as usize)
+            .ok_or("Write offset overflow")?;
+        if write_start_in_record
+            .checked_add(max_write)
+            .map(|e| e > record_size)
+            .unwrap_or(true)
+        {
+            return Err("Write spans past record end");
         }
-        
+
+        let disk_write_start = abs_disk_offset
+            .checked_add(write_start_in_record as u64)
+            .ok_or("Disk offset overflow")?;
+
+        // RMW solo bloques tocados (sin Vec del tamaño del registro).
+        let mut cur = disk_write_start;
+        let end = disk_write_start + max_write as u64;
+        let mut src = 0usize;
+        while cur < end {
+            let block_base = (cur / BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+            let off_in_blk = (cur % BLOCK_SIZE as u64) as usize;
+            let take = min((end - cur) as usize, BLOCK_SIZE - off_in_blk);
+
+            let mut blk = [0u8; BLOCK_SIZE];
+            read_bytes_at(block_base, &mut blk)?;
+            blk[off_in_blk..off_in_blk + take].copy_from_slice(&data[src..src + take]);
+            write_bytes_at(block_base, &blk)?;
+
+            cur += take as u64;
+            src += take;
+        }
+
         Ok(max_write)
     }
 
@@ -621,10 +633,19 @@ impl Filesystem {
             header_buf[6], header_buf[7]
         ]) as usize;
 
+        // Intento rápido desde disco (cabeceras de 6 B), mismo criterio que `write_file_by_inode`.
+        // Si devuelve None o Err, NO marcar el fichero como vacío: imágenes reales pueden tener
+        // cadenas TLV donde algún paso choca con `record_size` pero el CONTENT sigue siendo
+        // localizable con el escaneo en buffer (que acepta CONTENT aunque el payload no quepa
+        // en los 8 KiB del scan).
+        if (8..=MAX_RECORD_SIZE).contains(&raw_record_size) {
+            if let Ok(Some(found)) = Self::scan_content_tlv_disk(abs_disk_offset, raw_record_size) {
+                return Ok(found);
+            }
+        }
+
+        // Legacy: cabecera inválida, registro > MAX_RECORD_SIZE, o fallback tras disco.
         // Read just enough bytes to scan metadata TLVs and find the CONTENT TLV header.
-        // All metadata TLVs (NODE_TYPE…NLINK) total ~103 bytes; CONTENT header is 6 bytes at ~111.
-        // Two blocks (8192 bytes) is always sufficient for any valid node record.
-        // If record_size is bogus (< 8) we use one block and do an explicit scan.
         let mut explicit_record_scan = false;
         let scan_len = if raw_record_size < 8 {
             explicit_record_scan = true;
@@ -660,10 +681,9 @@ impl Filesystem {
         Ok((abs_disk_offset + 8, 0))
     }
 
-    /// Scan `buf` for a CONTENT TLV starting at `start_pos`.
-    /// Returns `Some((data_start_abs, size))` when found, or `None`.
-    /// The CONTENT tag is checked BEFORE the value-bounds guard so that files whose
-    /// content is larger than the scan buffer are still correctly identified.
+    /// Scan en buffer para cabeceras anómalas o `record_size` > MAX_RECORD_SIZE.
+    /// En registros normales se usa `scan_content_tlv_disk` desde `get_file_metadata`.
+    /// El tag CONTENT se comprueba antes del límite del buffer para ficheros muy grandes.
     fn scan_for_content_tlv(buf: &[u8], start_pos: usize, abs_disk_offset: u64) -> Option<(u64, u64)> {
         let mut tlv_pos = start_pos;
         while tlv_pos + 6 <= buf.len() {
@@ -686,6 +706,45 @@ impl Filesystem {
             tlv_pos += 6 + length;
         }
         None
+    }
+
+    /// Recorre la cadena TLV leyendo solo cabeceras de 6 B desde disco (`read_bytes_at`).
+    /// `record_size` es el tamaño total del registro según la cabecera de 8 B.
+    /// Devuelve posición absoluta del primer byte del payload `CONTENT` y su longitud.
+    fn scan_content_tlv_disk(
+        abs_record_start: u64,
+        record_size: usize,
+    ) -> Result<Option<(u64, u64)>, &'static str> {
+        if record_size < 8 {
+            return Ok(None);
+        }
+        let mut pos = 8usize;
+        while pos + 6 <= record_size {
+            let mut hdr = [0u8; 6];
+            read_bytes_at(abs_record_start + pos as u64, &mut hdr)?;
+            let tag = u16::from_le_bytes([hdr[0], hdr[1]]);
+            let length = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]) as usize;
+
+            if length == 0 && tag != tlv_tags::DIRECTORY_ENTRIES && tag != tlv_tags::CONTENT {
+                serial::serial_print("[FS] scan_content_tlv_disk: Zero-length TLV, stopping\n");
+                return Ok(None);
+            }
+
+            let next = pos
+                .checked_add(6)
+                .and_then(|p| p.checked_add(length))
+                .ok_or("Corrupt record TLV chain")?;
+            if next > record_size {
+                return Err("TLV length exceeds record");
+            }
+
+            if tag == tlv_tags::CONTENT {
+                let data_abs = abs_record_start + (pos + 6) as u64;
+                return Ok(Some((data_abs, length as u64)));
+            }
+            pos = next;
+        }
+        Ok(None)
     }
 
     /// Lee el TLV NODE_TYPE (1=file, 2=directorio, 3=symlink). Sin TLV se asume fichero.
@@ -765,43 +824,14 @@ impl Filesystem {
         String::from_utf8(buf).map_err(|_| "Symlink target not UTF-8")
     }
 
-    /// Returns the content length from the CONTENT TLV.
-    /// Uses the same scan logic as `get_file_metadata` to stay consistent.
+    /// Longitud del payload `CONTENT` (misma ruta que `get_file_metadata`).
     pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             let _ = FS.header.as_ref().ok_or("FS not mounted")?;
         }
-
-        let entry = Self::read_inode_entry(inode)?;
-        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-
-        let mut header_buf = [0u8; 8];
-        read_bytes_at(abs_disk_offset, &mut header_buf)?;
-
-        let raw_record_size = u32::from_le_bytes([
-            header_buf[4], header_buf[5],
-            header_buf[6], header_buf[7]
-        ]) as usize;
-
-        let scan_len = if raw_record_size < 8 {
-            BLOCK_SIZE
-        } else if raw_record_size > MAX_RECORD_SIZE {
-            2 * BLOCK_SIZE
-        } else {
-            core::cmp::min(raw_record_size, 2 * BLOCK_SIZE)
-        };
-
-        let mut scan_buf = vec![0u8; scan_len];
-        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
-
-        // CONTENT tag checked before value-bounds guard so large files are handled correctly.
-        if let Some((_data_start, size)) = Self::scan_for_content_tlv(&scan_buf, 8, abs_disk_offset) {
-            return Ok(size);
-        }
-
-        // Not found / empty file
-        Ok(0)
+        let (_data_abs, size) = Self::get_file_metadata(inode)?;
+        Ok(size)
     }
 
     /// Lookup functionality

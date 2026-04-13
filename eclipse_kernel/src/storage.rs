@@ -137,67 +137,100 @@ impl Scheme for DiskScheme {
         if avail_in_partition == 0 { return Ok(0); }
         let read_len = core::cmp::min(buffer.len() as u64, avail_in_partition) as usize;
 
-        let abs_offset = disk.partition_offset + disk.offset;
-        let block_num = abs_offset / 4096;
-        let offset_in_block = (abs_offset % 4096) as usize;
+        let mut total = 0usize;
+        while total < read_len {
+            let abs_offset = disk.partition_offset + disk.offset;
+            let block_num = abs_offset / 4096;
+            let offset_in_block = (abs_offset % 4096) as usize;
 
-        let mut temp = [0u8; 4096];
-        let ok = crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_ok();
+            let mut temp = [0u8; 4096];
+            if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
+                crate::serial::serial_print("[DISK-SCHEME] read failed: disk:");
+                crate::serial::serial_print_dec(disk.disk_idx as u64);
+                crate::serial::serial_print(" block=");
+                crate::serial::serial_print_dec(block_num);
+                crate::serial::serial_print("\n");
+                return if total > 0 {
+                    Ok(total)
+                } else {
+                    Err(scheme_error::EIO)
+                };
+            }
 
-        if !ok {
-            crate::serial::serial_print("[DISK-SCHEME] read failed: disk:");
-            crate::serial::serial_print_dec(disk.disk_idx as u64);
-            crate::serial::serial_print(" block=");
-            crate::serial::serial_print_dec(block_num);
-            crate::serial::serial_print("\n");
-            return Err(scheme_error::EIO);
+            let chunk_remaining = read_len - total;
+            let available = 4096 - offset_in_block;
+            let to_copy = core::cmp::min(chunk_remaining, available);
+            buffer[total..total + to_copy]
+                .copy_from_slice(&temp[offset_in_block..offset_in_block + to_copy]);
+            disk.offset += to_copy as u64;
+            total += to_copy;
         }
-
-        let available = 4096 - offset_in_block;
-        let to_copy = core::cmp::min(read_len, available);
-        buffer[..to_copy].copy_from_slice(&temp[offset_in_block..offset_in_block + to_copy]);
-        disk.offset += to_copy as u64;
-        Ok(to_copy)
+        Ok(total)
     }
 
     fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
-        if buffer.is_empty() { return Ok(0); }
+        if buffer.is_empty() {
+            return Ok(0);
+        }
 
         let mut open_disks = OPEN_DISKS.lock();
         let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
 
-        // Clamp to partition bounds
         let avail_in_partition = if disk.partition_size == u64::MAX {
             buffer.len() as u64
         } else {
             disk.partition_size.saturating_sub(disk.offset)
         };
-        if avail_in_partition == 0 { return Ok(0); }
+        if avail_in_partition == 0 {
+            return Ok(0);
+        }
         let write_len = core::cmp::min(buffer.len() as u64, avail_in_partition) as usize;
 
-        let abs_offset = disk.partition_offset + disk.offset;
-        let block_num = abs_offset / 4096;
-        let offset_in_block = (abs_offset % 4096) as usize;
-        let to_copy = core::cmp::min(write_len, 4096 - offset_in_block);
+        let mut total = 0usize;
+        while total < write_len {
+            let abs_offset = disk.partition_offset + disk.offset;
+            let block_num = abs_offset / 4096;
+            let offset_in_block = (abs_offset % 4096) as usize;
+            let chunk_remaining = write_len - total;
+            let available = 4096 - offset_in_block;
+            let to_copy = core::cmp::min(chunk_remaining, available);
 
-        // Read-modify-write for partial blocks
-        if offset_in_block != 0 || to_copy != 4096 {
-            let mut temp = [0u8; 4096];
-            if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
-                return Err(scheme_error::EIO);
+            let full_aligned_block = offset_in_block == 0 && to_copy == 4096;
+            let write_failed = if full_aligned_block {
+                crate::bcache::write_block(
+                    disk.disk_idx,
+                    block_num,
+                    &buffer[total..total + 4096],
+                )
+                .is_err()
+            } else {
+                let mut temp = [0u8; 4096];
+                if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
+                    true
+                } else {
+                    temp[offset_in_block..offset_in_block + to_copy]
+                        .copy_from_slice(&buffer[total..total + to_copy]);
+                    crate::bcache::write_block(disk.disk_idx, block_num, &temp).is_err()
+                }
+            };
+
+            if write_failed {
+                return if total > 0 {
+                    Ok(total)
+                } else {
+                    crate::serial::serial_print("[DISK-SCHEME] write failed: disk:");
+                    crate::serial::serial_print_dec(disk.disk_idx as u64);
+                    crate::serial::serial_print(" block=");
+                    crate::serial::serial_print_dec(block_num);
+                    crate::serial::serial_print("\n");
+                    Err(scheme_error::EIO)
+                };
             }
-            temp[offset_in_block..offset_in_block + to_copy].copy_from_slice(&buffer[..to_copy]);
-            if crate::bcache::write_block(disk.disk_idx, block_num, &temp).is_err() {
-                return Err(scheme_error::EIO);
-            }
-        } else {
-            if crate::bcache::write_block(disk.disk_idx, block_num, buffer).is_err() {
-                return Err(scheme_error::EIO);
-            }
+
+            disk.offset += to_copy as u64;
+            total += to_copy;
         }
-
-        disk.offset += to_copy as u64;
-        Ok(to_copy)
+        Ok(total)
     }
 
     fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {

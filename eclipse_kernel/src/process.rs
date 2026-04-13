@@ -2,11 +2,39 @@
 
 use core::arch::asm;
 use spin::Mutex;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// ID de proceso
 pub type ProcessId = u32;
+
+// argv pendiente (syscalls 542/543): el padre registra bytes NUL-separados antes de
+// encolar al hijo. No se consume al leer (varios lectores / crt + libc); se libera
+// en `exit_process` para el PID que termina.
+static PENDING_PROCESS_ARGS: Mutex<BTreeMap<ProcessId, Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+/// syscall 542: guardar argv del hijo (reemplaza entrada previa si existía).
+pub fn set_pending_process_args(pid: ProcessId, data: Vec<u8>) {
+    PENDING_PROCESS_ARGS.lock().insert(pid, data);
+}
+
+/// syscall 543: copiar argv NUL-separado al buffer; devuelve bytes copiados (≤ buf.len).
+/// No elimina la entrada (lecturas idempotentes).
+pub fn copy_pending_process_args(pid: ProcessId, buf: &mut [u8]) -> usize {
+    let map = PENDING_PROCESS_ARGS.lock();
+    if let Some(args) = map.get(&pid) {
+        let n = args.len().min(buf.len());
+        buf[..n].copy_from_slice(&args[..n]);
+        n
+    } else {
+        0
+    }
+}
+
+pub fn clear_pending_process_args(pid: ProcessId) {
+    PENDING_PROCESS_ARGS.lock().remove(&pid);
+}
 pub const KERNEL_STACK_SIZE: usize = 32768; // 32KB stack for kernel operations
 
 /// Estado de un proceso
@@ -777,6 +805,8 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
 /// Terminar proceso actual
 pub fn exit_process() {
     if let Some(pid) = current_process_id() {
+        clear_pending_process_args(pid);
+
         // Collect open file descriptors so we can close them outside the lock
         let mut to_close: [(usize, usize); crate::fd::MAX_FDS_PER_PROCESS] =
             [(0, 0); crate::fd::MAX_FDS_PER_PROCESS];

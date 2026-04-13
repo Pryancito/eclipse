@@ -44,6 +44,8 @@ ECLIPSE_TARGET="$(pwd)/x86_64-unknown-eclipse.json"
 ECLIPSE_TARGET_NAME="x86_64-unknown-eclipse"
 BUILD_DIR="eclipse-os-build"
 BASE_DIR=$(pwd)
+# Caché de toolchains host: descargas (.downloads) y extracción (.stage); la instalación va a eclipse-os-build.
+HOST_TOOLCHAINS_DIR="$BASE_DIR/host-toolchains"
 mkdir -p "$BUILD_DIR"
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
@@ -124,25 +126,26 @@ build_eclipse_syscall() {
     cd ..
 }
 
-# Rust nightly (target host musl) y toolchain C musl.cc, descargados con wget bajo eclipse-os-build/host-toolchains.
+# Rust nightly (host musl) y musl.cc: DL+STAGE en host-toolchains/; bin/, lib/, … en eclipse-os-build/.
 download_host_musl_toolchains() {
     print_step "Descargando host toolchains con wget (Rust nightly musl + musl.cc native)..."
     if ! command -v wget >/dev/null 2>&1; then
         print_error "wget no está instalado; hace falta para descargar los toolchains."
         return 1
     fi
-    local DL="$BASE_DIR/$BUILD_DIR/.downloads"
-    local DEST="$BASE_DIR/$BUILD_DIR/host-toolchains"
-    mkdir -p "$DL" "$DEST"
+    local INSTALL_PREFIX="$BASE_DIR/$BUILD_DIR"
+    local DL="$HOST_TOOLCHAINS_DIR/.downloads"
+    local STAGE="$HOST_TOOLCHAINS_DIR/.stage"
+    mkdir -p "$DL" "$STAGE"
 
     local RUST_URL="https://static.rust-lang.org/dist/rust-nightly-x86_64-unknown-linux-musl.tar.xz"
     local MUSL_URL="https://musl.cc/x86_64-linux-musl-native.tgz"
     local RUST_XZ="$DL/rust-nightly-x86_64-unknown-linux-musl.tar.xz"
     local MUSL_TGZ="$DL/x86_64-linux-musl-native.tgz"
 
-    local RUST_PREFIX="$DEST/rust-nightly-x86_64-unknown-linux-musl"
-    local MUSL_PREFIX="$DEST/x86_64-linux-musl-native"
-    local MUSL_GCC="$MUSL_PREFIX/usr/bin/x86_64-linux-musl-gcc"
+    local RUST_PKG="$STAGE/rust-nightly-x86_64-unknown-linux-musl"
+    local MUSL_PKG="$STAGE/x86_64-linux-musl-native"
+    local MUSL_GCC="$MUSL_PKG/bin/x86_64-linux-musl-gcc"
 
     print_status "wget (continuar si existe): $RUST_URL"
     wget -c --progress=dot:giga -O "$RUST_XZ" "$RUST_URL"
@@ -150,23 +153,51 @@ download_host_musl_toolchains() {
     print_status "wget (continuar si existe): $MUSL_URL"
     wget -c --progress=dot:giga -O "$MUSL_TGZ" "$MUSL_URL"
 
-    if [ ! -x "$RUST_PREFIX/bin/rustc" ] || [ "$RUST_XZ" -nt "$RUST_PREFIX/bin/rustc" ]; then
-        print_status "Extrayendo Rust nightly musl en $DEST..."
-        rm -rf "$RUST_PREFIX"
-        tar -xJf "$RUST_XZ" -C "$DEST"
+    if [ ! -f "$RUST_PKG/install.sh" ] || [ "$RUST_XZ" -nt "$RUST_PKG/install.sh" ]; then
+        print_status "Extrayendo Rust nightly musl en $STAGE..."
+        rm -rf "$RUST_PKG"
+        tar -xJf "$RUST_XZ" -C "$STAGE"
     else
-        print_status "Rust nightly musl ya extraído y actualizado ($RUST_PREFIX)"
+        print_status "Rust nightly (staging) ya extraído ($RUST_PKG)"
     fi
 
     if [ ! -x "$MUSL_GCC" ] || [ "$MUSL_TGZ" -nt "$MUSL_GCC" ]; then
-        print_status "Extrayendo x86_64-linux-musl-native en $DEST..."
-        rm -rf "$MUSL_PREFIX"
-        tar -xzf "$MUSL_TGZ" -C "$DEST"
+        print_status "Extrayendo x86_64-linux-musl-native en $STAGE..."
+        rm -rf "$MUSL_PKG"
+        tar -xzf "$MUSL_TGZ" -C "$STAGE"
     else
-        print_status "musl.cc native ya extraído y actualizado ($MUSL_PREFIX)"
+        print_status "musl.cc native (staging) ya extraído ($MUSL_PKG)"
     fi
 
-    print_success "Toolchains en $DEST (rustc: $RUST_PREFIX/bin, gcc musl: $MUSL_PREFIX/usr/bin)"
+    mkdir -p "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/include"
+
+    local RUSTC_INST="$INSTALL_PREFIX/bin/rustc"
+    if [ ! -x "$RUSTC_INST" ] || [ "$RUST_XZ" -nt "$RUSTC_INST" ]; then
+        print_status "Instalando Rust en $INSTALL_PREFIX (install.sh --prefix, sin ldconfig)..."
+        ( cd "$RUST_PKG" && sh ./install.sh --prefix="$INSTALL_PREFIX" --disable-ldconfig )
+    else
+        print_status "Rust ya instalado en $INSTALL_PREFIX/bin"
+    fi
+
+    local MUSL_GCC_INST="$INSTALL_PREFIX/bin/x86_64-linux-musl-gcc"
+    if [ ! -x "$MUSL_GCC_INST" ] || [ "$MUSL_TGZ" -nt "$MUSL_GCC_INST" ]; then
+        print_status "Instalando musl.cc en $INSTALL_PREFIX/{bin,lib,include,libexec,share,x86_64-linux-musl}..."
+        local d
+        for d in bin lib include libexec share; do
+            if [ -d "$MUSL_PKG/$d" ]; then
+                mkdir -p "$INSTALL_PREFIX/$d"
+                cp -a "$MUSL_PKG/$d/." "$INSTALL_PREFIX/$d/"
+            fi
+        done
+        if [ -d "$MUSL_PKG/x86_64-linux-musl" ]; then
+            mkdir -p "$INSTALL_PREFIX/x86_64-linux-musl"
+            cp -a "$MUSL_PKG/x86_64-linux-musl/." "$INSTALL_PREFIX/x86_64-linux-musl/"
+        fi
+    else
+        print_status "Toolchain musl.cc ya copiado bajo $INSTALL_PREFIX"
+    fi
+
+    print_success "Prefijo de build: $INSTALL_PREFIX (p. ej. bin/rustc, bin/cargo, lib/rustlib, bin/x86_64-linux-musl-gcc)"
 }
 
 # Función para preparar el sysroot
@@ -263,7 +294,7 @@ build_sidewind_project() {
         local _sw_rel="target/${ECLIPSE_TARGET_NAME}/release"
         mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
         if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-            mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
+            mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin" "$BASE_DIR/$BUILD_DIR/bin"
         fi
 
         # Binarios del workspace Eclipse (ruta = target triple del JSON, no musl)
@@ -271,18 +302,16 @@ build_sidewind_project() {
 
         for bin in $BINS; do
             if [ -f "$_sw_rel/$bin" ]; then
-                cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
                 print_status "Instalado en sysroot: /usr/bin/$bin"
                 if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
                     cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
                 fi
             fi
         done
-        local APPS="nano terminal glxgears sh"
+        local APPS="terminal glxgears sh rust-shell"
 
         for bin in $APPS; do
             if [ -f "$_sw_rel/$bin" ]; then
-                cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/bin/$bin"
                 print_status "Instalado en sysroot: /bin/$bin"
                 if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
                     cp "$_sw_rel/$bin" "$BASE_DIR/$BUILD_DIR/bin/$bin"
@@ -998,6 +1027,34 @@ create_basic_distribution() {
     
     # Crear directorio de distribución
     mkdir -p "$BUILD_DIR"/{boot,efi/boot,userland/{bin,lib,config,systemd/{services,targets}}}
+
+    # Cuentas del sistema: únicamente root, sin contraseña, home /root (solo desarrollo / imagen QEMU).
+    mkdir -p "$BUILD_DIR/root" "$BUILD_DIR/etc" "$BUILD_DIR/root/.cargo"
+    cat > "$BUILD_DIR/root/.cargo/config.toml" << 'EOF'
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+EOF
+    cat > "$BUILD_DIR/etc/passwd" << 'EOF'
+root:x:0:0:root:/root:/bin/sh
+EOF
+    cat > "$BUILD_DIR/etc/group" << 'EOF'
+root:x:0:
+EOF
+    # Contraseña vacía en shadow → sin contraseña para login por consola (no usar en producción).
+    cat > "$BUILD_DIR/etc/shadow" << 'EOF'
+root::19000:0:99999:7:::
+EOF
+    cat > "$BUILD_DIR/etc/gshadow" << 'EOF'
+root:::
+EOF
+    cat > "$BUILD_DIR/etc/nsswitch.conf" << 'EOF'
+passwd: files
+group: files
+shadow: files
+EOF
+    chmod 644 "$BUILD_DIR/etc/passwd" "$BUILD_DIR/etc/group" "$BUILD_DIR/etc/nsswitch.conf"
+    chmod 600 "$BUILD_DIR/etc/shadow" "$BUILD_DIR/etc/gshadow"
+    print_status "Creados /etc/passwd, group, shadow, gshadow, nsswitch.conf y directorio /root"
     
     # Copiar el kernel
     if [ -f "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
@@ -1445,6 +1502,63 @@ EOF
     if [ -d "eclipse-apps/sources/" ]; then
         cp -f eclipse-apps/sources/* "$BUILD_DIR/usr/share/fonts/X11/misc/"
         print_status "Copiado de fuentes a $BUILD_DIR/usr/share/fonts/X11/misc/"
+    fi
+
+    # Binarios musl dinámicos (p. ej. cargo/rustc del tarball): ld-musl usa /etc/ld-musl-x86_64.path
+    # para rutas extra; libgcc_s.so.1 aporta símbolos _Unwind_* (si falta: "relocating" + a veces EPERM por errno mal propagado).
+    mkdir -p "$BUILD_DIR/etc" "$BUILD_DIR/lib" "$BUILD_DIR/usr/lib"
+    if [ ! -s "$BUILD_DIR/etc/ld-musl-x86_64.path" ]; then
+        printf '%s\n' "/lib" "/usr/lib" > "$BUILD_DIR/etc/ld-musl-x86_64.path"
+        print_status "Instalado /etc/ld-musl-x86_64.path (/lib y /usr/lib)"
+    fi
+    local _musl_native_lib="$HOST_TOOLCHAINS_DIR/.stage/x86_64-linux-musl-native/lib"
+    if [ -f "$_musl_native_lib/libgcc_s.so.1" ]; then
+        cp -a "$_musl_native_lib"/libgcc_s.so* "$BUILD_DIR/lib/" 2>/dev/null || true
+        cp -a "$_musl_native_lib"/libgcc_s.so* "$BUILD_DIR/usr/lib/" 2>/dev/null || true
+        print_status "libgcc_s.so* (toolchain musl.cc) copiado a lib/ y usr/lib/"
+    elif [ -f "$BUILD_DIR/lib/libgcc_s.so.1" ]; then
+        print_status "libgcc_s.so.1 ya en $BUILD_DIR/lib (p. ej. por instalación previa del toolchain)"
+    else
+        print_warning "No hay libgcc_s.so.1 en $_musl_native_lib — ejecuta el paso de descarga musl o copia manual para cargo dinámico"
+    fi
+
+    # Árbol lib/gcc (specs, crt, includes): gcc en la imagen lo necesita; musl.cc no siempre trae `specs` en el .tgz.
+    local _musl_stage="$HOST_TOOLCHAINS_DIR/.stage/x86_64-linux-musl-native"
+    if [ -d "$_musl_stage/lib/gcc" ]; then
+        mkdir -p "$BUILD_DIR/lib"
+        cp -a "$_musl_stage/lib/gcc" "$BUILD_DIR/lib/"
+        print_status "Copiado lib/gcc desde musl.cc staging → $BUILD_DIR/lib/gcc"
+        local _mgcc="$_musl_stage/bin/x86_64-linux-musl-gcc"
+        if [ -x "$_mgcc" ]; then
+            shopt -s nullglob
+            for _specdir in "$BUILD_DIR"/lib/gcc/x86_64-linux-musl/*/; do
+                if [ -d "$_specdir" ] && [ ! -s "${_specdir}specs" ]; then
+                    if "$_mgcc" -dumpspecs > "${_specdir}specs" 2>/dev/null; then
+                        print_status "Generado ${_specdir}specs (x86_64-linux-musl-gcc -dumpspecs)"
+                    fi
+                fi
+            done
+            shopt -u nullglob
+        fi
+    fi
+
+    # OpenSSL / libssl buscan este fichero por defecto (cargo, curl, etc.).
+    mkdir -p "$BUILD_DIR/usr/local/ssl"
+    if [ ! -s "$BUILD_DIR/usr/local/ssl/openssl.cnf" ]; then
+        cat > "$BUILD_DIR/usr/local/ssl/openssl.cnf" << 'EOF'
+# Mínimo para que exista la ruta por defecto (ajusta según necesidad).
+openssl_conf = openssl_init
+
+[openssl_init]
+EOF
+        print_status "Creado /usr/local/ssl/openssl.cnf (stub)"
+    fi
+
+    # terminal prefiere /bin/rust-shell; si no se compiló, enlace a sh.
+    mkdir -p "$BUILD_DIR/bin"
+    if [ ! -e "$BUILD_DIR/bin/rust-shell" ] && [ -f "$BUILD_DIR/bin/sh" ]; then
+        ln -sf sh "$BUILD_DIR/bin/rust-shell"
+        print_status "rust-shell → enlace simbólico a sh (compila rust-shell en Sidewind para shell completo)"
     fi
 
     print_success "Distribución básica creada en $BUILD_DIR"

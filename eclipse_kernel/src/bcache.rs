@@ -1,7 +1,7 @@
 //! Buffer Cache (Block Cache)
 //! 
 //! Improves I/O performance by caching disk blocks in RAM.
-//! - Cache Size: 128 blocks (512 KB)
+//! - Cache Size: `CACHE_SIZE` blocks (ver constante; p. ej. 1024 × 4 KiB = 4 MiB)
 //! - Policy: Write-Back (dirty blocks are written on eviction/sync)
 //! - Replacement: LRU (Least Recently Used)
 
@@ -9,7 +9,8 @@ use spin::Mutex;
 use alloc::vec::Vec;
 use alloc::vec;
 
-const CACHE_SIZE: usize = 512; // 512 * 4KB = 2MB cache
+/// Entradas de 4 KiB; más entradas = menos misses en lecturas repetidas (coste RAM: × 4096).
+const CACHE_SIZE: usize = 1024;
 const BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,12 +57,14 @@ static CACHE: Mutex<BufferCache> = Mutex::new(BufferCache {
 /// Initialize the buffer cache
 pub fn init() {
     let mut cache = CACHE.lock();
-    // Pre-allocate the data buffer (512KB)
-    // We explicitly push 128 blocks of 4096 bytes.
     for _ in 0..CACHE_SIZE {
         cache.data.push([0u8; BLOCK_SIZE]);
     }
-    crate::serial::serial_print("[BCACHE] Buffer Cache initialized (512KB)\n");
+    crate::serial::serial_printf(format_args!(
+        "[BCACHE] Buffer Cache initialized ({} blocks, {} KiB)\n",
+        CACHE_SIZE,
+        CACHE_SIZE * BLOCK_SIZE / 1024
+    ));
 }
 
 /// Helper to read from underlying device
