@@ -1054,7 +1054,23 @@ shadow: files
 EOF
     chmod 644 "$BUILD_DIR/etc/passwd" "$BUILD_DIR/etc/group" "$BUILD_DIR/etc/nsswitch.conf"
     chmod 600 "$BUILD_DIR/etc/shadow" "$BUILD_DIR/etc/gshadow"
-    print_status "Creados /etc/passwd, group, shadow, gshadow, nsswitch.conf y directorio /root"
+    # Configuración básica de bash para root (~/.bashrc) y readline (/etc/inputrc).
+    # Sin estos ficheros bash imprime "Operation not permitted" al iniciarse porque
+    # intenta abrirlos y recibe EPERM en lugar de ENOENT.
+    cat > "$BUILD_DIR/root/.bashrc" << 'EOF'
+# .bashrc - bash interactive shell configuration for Eclipse OS
+PS1='\u@\h:\w\$ '
+export TERM=xterm-256color
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+EOF
+    chmod 644 "$BUILD_DIR/root/.bashrc"
+    cat > "$BUILD_DIR/etc/inputrc" << 'EOF'
+# /etc/inputrc - readline configuration for Eclipse OS
+set bell-style none
+set editing-mode emacs
+EOF
+    chmod 644 "$BUILD_DIR/etc/inputrc"
+    print_status "Creados /etc/passwd, group, shadow, gshadow, nsswitch.conf, /root/.bashrc, /etc/inputrc y directorio /root"
     
     # Copiar el kernel
     if [ -f "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
