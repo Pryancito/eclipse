@@ -5155,8 +5155,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
     // Ensure minimal envp for bash if none provided.
     if envp_strings.is_empty() {
-        for e in &[b"PATH=/bin:/usr/bin\0" as &[u8], b"HOME=/\0", b"TERM=xterm-256color\0",
-                   b"USER=root\0", b"SHELL=/bin/bash\0", b"LANG=C\0"] {
+        for e in crate::elf_loader::MINIMAL_ENVP {
             envp_strings.push(e.to_vec());
         }
     }
@@ -5255,7 +5254,7 @@ fn sys_chdir(path_ptr: u64) -> u64 {
         None => return linux_abi_error(3),
     };
     let new_path = if path_str.starts_with('/') {
-        path_str.clone()
+        path_str
     } else {
         crate::process::resolve_path_cwd(pid, &path_str)
     };
@@ -5302,8 +5301,8 @@ fn normalize_path(path: &str) -> alloc::string::String {
 
 /// sys_fchdir — Linux fchdir(fd): change cwd to the directory referenced by fd.
 fn sys_fchdir(_fd: u64) -> u64 {
-    // Stub: fchdir on a real fd is complex; return EBADF for now.
-    linux_abi_error(9) // EBADF
+    // Not yet implemented; return ENOSYS.
+    linux_abi_error(38) // ENOSYS
 }
 
 /// sys_pipe2 — Linux pipe2(pipefd[2], flags).
@@ -5367,7 +5366,7 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             (entry as *mut u64).write_unaligned(idx as u64 + 1);                 // d_ino
             ((entry.add(8)) as *mut u64).write_unaligned(idx as u64 + 2);        // d_off (next)
             ((entry.add(16)) as *mut u16).write_unaligned(rec_size as u16);      // d_reclen
-            *(entry.add(18)) = 0u8;                                               // d_type DT_UNKNOWN
+            *(entry.add(18)) = 0u8; // d_type: DT_UNKNOWN=0 (future: DT_DIR=4, DT_REG=8)
             core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), entry.add(19), name_len);
             *(entry.add(19 + name_len)) = 0u8;                                   // NUL
             // Zero padding bytes

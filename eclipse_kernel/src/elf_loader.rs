@@ -10,6 +10,20 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr::write_volatile;
 
+/// Minimal envp strings injected into all freshly-spawned processes so that
+/// bash/musl and other Linux-ABI programs can find binaries and terminals.
+pub const MINIMAL_ENVP: &[&[u8]] = &[
+    b"PATH=/bin:/usr/bin\0",
+    b"HOME=/\0",
+    b"TERM=xterm-256color\0",
+    b"USER=root\0",
+    b"SHELL=/bin/bash\0",
+    b"LANG=C\0",
+];
+
+/// Number of entries in MINIMAL_ENVP.
+pub const MINIMAL_ENVP_COUNT: usize = MINIMAL_ENVP.len();
+
 /// ELF Header (64-bit)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1109,23 +1123,13 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     } else { 8 };
     if argv0_len == 8 { argv0_buf[..8].copy_from_slice(b"program\0"); }
 
-    const ENV_STRINGS: &[&[u8]] = &[
-        b"PATH=/bin:/usr/bin\0",
-        b"HOME=/\0",
-        b"TERM=xterm-256color\0",
-        b"USER=root\0",
-        b"SHELL=/bin/bash\0",
-        b"LANG=C\0",
-    ];
-    const ENV_COUNT: usize = 6;
-
     let mut str_total: usize = argv0_len;
-    for e in ENV_STRINGS { str_total += e.len(); }
+    for e in MINIMAL_ENVP { str_total += e.len(); }
     str_total += 16; // AT_RANDOM
     let str_area_size = (str_total + 15) & !15usize;
 
     const AUXV_ENTRIES: usize = 7; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_ENTRY,AT_RANDOM
-    let table_slots = 1 + 2 + (ENV_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
     let strings_base_raw = (stack_top as usize).wrapping_sub(str_area_size);
@@ -1161,8 +1165,8 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
         core::ptr::copy_nonoverlapping(argv0_buf.as_ptr(), str_off as *mut u8, argv0_len);
         str_off += argv0_len as u64;
 
-        let mut env_ptrs = [0u64; ENV_COUNT];
-        for (i, e) in ENV_STRINGS.iter().enumerate() {
+        let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
+        for (i, e) in MINIMAL_ENVP.iter().enumerate() {
             env_ptrs[i] = str_off;
             core::ptr::copy_nonoverlapping(e.as_ptr(), str_off as *mut u8, e.len());
             str_off += e.len() as u64;
@@ -1322,32 +1326,21 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         argv0_buf[..8].copy_from_slice(b"program\0");
     }
 
-    // Minimal envp strings for bash/musl compatibility.
-    const ENV_STRINGS: &[&[u8]] = &[
-        b"PATH=/bin:/usr/bin\0",
-        b"HOME=/\0",
-        b"TERM=xterm-256color\0",
-        b"USER=root\0",
-        b"SHELL=/bin/bash\0",
-        b"LANG=C\0",
-    ];
-    const ENV_COUNT: usize = 6;
-
     // Layout (growing down from stack_top):
     //   strings area: argv0 + env strings + 16-byte AT_RANDOM data
     //   pointer+auxv table at adjusted_stack (RSP)
     //
     // Calculate total string bytes.
     let mut str_total: usize = argv0_len; // argv[0]
-    for e in ENV_STRINGS { str_total += e.len(); }
+    for e in MINIMAL_ENVP { str_total += e.len(); }
     str_total += 16; // AT_RANDOM data
     // Align up to 16 bytes.
     let str_area_size = (str_total + 15) & !15usize;
 
     // Number of 8-byte slots needed for the pointer table:
-    //   1 (argc) + 2 (argv[0]+NULL) + ENV_COUNT+1 (envp+NULL) + 2*(5 auxv entries) + 2 (AT_NULL)
+    //   1 (argc) + 2 (argv[0]+NULL) + MINIMAL_ENVP_COUNT+1 (envp+NULL) + 2*(5 auxv + AT_NULL)
     const AUXV_ENTRIES: usize = 5; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM
-    let table_slots = 1 + 2 + (ENV_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
     // RSP: place table right below the strings area, aligned to 16.
@@ -1378,8 +1371,8 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         str_off += argv0_len as u64;
 
         // envp strings
-        let mut env_ptrs = [0u64; ENV_COUNT];
-        for (i, e) in ENV_STRINGS.iter().enumerate() {
+        let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
+        for (i, e) in MINIMAL_ENVP.iter().enumerate() {
             env_ptrs[i] = str_off;
             core::ptr::copy_nonoverlapping(e.as_ptr(), str_off as *mut u8, e.len());
             str_off += e.len() as u64;
