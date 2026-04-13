@@ -515,6 +515,10 @@ pub extern "C" fn syscall_handler(
         543 => sys_get_process_args(arg1, arg2),
         544 => sys_spawn_with_stdio_path(arg1, arg2, arg3, arg4, arg5, arg6),
         545 => sys_strace(arg1, arg2),
+        // Eclipse-native exec: replace current process with a raw ELF buffer.
+        // Syscall 59 is the Linux-compatible execve(path, argv, envp); this slot
+        // keeps the original Eclipse API (elf_ptr: u64, elf_size: u64) alive.
+        546 => sys_exec(arg1, arg2),
         600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
