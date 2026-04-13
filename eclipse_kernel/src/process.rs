@@ -474,6 +474,11 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                         proc.fs_base = loaded.tls_base;
                     }
                     proc.dynamic_linker_aux = loaded.dynamic_linker;
+                    // All user-space binaries (both Eclipse-native and Linux/musl cross-compiled)
+                    // use the Linux ABI error convention (-errno in RAX).  Setting is_linux=true
+                    // makes the kernel return proper Linux errno values (e.g. ENOENT = -2) instead
+                    // of the generic u64::MAX (= EPERM) that was returned before.
+                    proc.is_linux = true;
                 }
             }
         });
