@@ -1205,6 +1205,59 @@ static KEY_BUFFER: Mutex<[u8; KEY_BUFFER_SIZE]> = Mutex::new([0; KEY_BUFFER_SIZE
 static KEY_HEAD: Mutex<usize> = Mutex::new(0);
 static KEY_TAIL: Mutex<usize> = Mutex::new(0);
 
+/// Scancode translation table (US-QWERTY Set 1)
+/// Index is scancode, value is (normal, shifted)
+static SCANCODE_MAP: [(char, char); 128] = [
+    ('\0', '\0'), ('\x1B', '\x1B'), ('1', '!'), ('2', '@'), ('3', '#'), ('4', '$'), ('5', '%'), ('6', '^'), // 0x00-0x07
+    ('7', '&'), ('8', '*'), ('9', '('), ('0', ')'), ('-', '_'), ('=', '+'), ('\x08', '\x08'), ('\t', '\t'), // 0x08-0x0F
+    ('q', 'Q'), ('w', 'W'), ('e', 'E'), ('r', 'R'), ('t', 'T'), ('y', 'Y'), ('u', 'U'), ('i', 'I'), // 0x10-0x17
+    ('o', 'O'), ('p', 'P'), ('[', '{'), (']', '}'), ('\n', '\n'), ('\0', '\0'), ('a', 'A'), ('s', 'S'), // 0x18-0x1F
+    ('d', 'D'), ('f', 'F'), ('g', 'G'), ('h', 'H'), ('j', 'J'), ('k', 'K'), ('l', 'L'), (';', ':'), // 0x20-0x27
+    ('\'', '\"'), ('`', '~'), ('\0', '\0'), ('\\', '|'), ('z', 'Z'), ('x', 'X'), ('c', 'C'), ('v', 'V'), // 0x28-0x2F
+    ('b', 'B'), ('n', 'N'), ('m', 'M'), (',', '<'), ('.', '>'), ('/', '?'), ('\0', '\0'), ('*', '*'), // 0x30-0x37
+    ('\0', '\0'), (' ', ' '), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x38-0x3F
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x40-0x47
+    ('\0', '\0'), ('\0', '\0'), ('-', '-'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('+', '+'), ('\0', '\0'), // 0x48-0x4F
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x50-0x57
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x58-0x5F
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x60-0x67
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x68-0x6F
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x70-0x77
+    ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), ('\0', '\0'), // 0x78-0x7F
+];
+
+static LSHIFT_PRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static RSHIFT_PRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CAPS_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Translate scancode to ASCII, tracking modifier state.
+/// Returns None if scancode is a modifier or release.
+pub fn scancode_to_ascii(scancode: u8) -> Option<char> {
+    match scancode {
+        0x2A => { LSHIFT_PRESSED.store(true, Ordering::SeqCst); None }
+        0xAA => { LSHIFT_PRESSED.store(false, Ordering::SeqCst); None }
+        0x36 => { RSHIFT_PRESSED.store(true, Ordering::SeqCst); None }
+        0xB6 => { RSHIFT_PRESSED.store(false, Ordering::SeqCst); None }
+        0x3A => { // Caps Lock
+            CAPS_LOCK.store(!CAPS_LOCK.load(Ordering::SeqCst), Ordering::SeqCst);
+            None
+        }
+        _ if scancode < 128 => {
+            let shift = LSHIFT_PRESSED.load(Ordering::SeqCst) || RSHIFT_PRESSED.load(Ordering::SeqCst);
+            let caps = CAPS_LOCK.load(Ordering::SeqCst);
+            let (normal, shifted) = SCANCODE_MAP[scancode as usize];
+            if normal == '\0' { return None; }
+            
+            if normal.is_ascii_alphabetic() {
+                if shift ^ caps { Some(shifted) } else { Some(normal) }
+            } else {
+                if shift { Some(shifted) } else { Some(normal) }
+            }
+        }
+        _ => None // Release codes (except shift) or extended
+    }
+}
+
 extern "C" fn keyboard_handler() {
     let scancode: u8;
     unsafe {

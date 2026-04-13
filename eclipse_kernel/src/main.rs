@@ -42,6 +42,7 @@ mod storage;
 mod progress;
 mod fd;  // File descriptor management
 mod scheme; // Redox-style scheme system
+mod tty;    // Dedicated TTY Scheme
 mod pty;    // PTY Scheme
 mod pipe;   // Pipe anónimas (sys_pipe / POSIX pipe)
 mod bcache; // Buffer Cache

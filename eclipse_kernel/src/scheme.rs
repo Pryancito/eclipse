@@ -183,6 +183,7 @@ impl Scheme for LogScheme {
 
 pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
+    register_scheme("tty", Arc::new(crate::tty::TtyScheme::new()));
     register_scheme("shm", Arc::new(ShmScheme::new()));
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     register_scheme("eth", Arc::new(crate::eth::EthScheme));

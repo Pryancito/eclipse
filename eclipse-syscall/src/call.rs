@@ -436,3 +436,9 @@ pub fn gpu_get_backend() -> Result<usize> {
 pub fn get_system_stats(stats: &mut crate::SystemStats) -> Result<usize> {
     unsafe { cvt(syscall1(SYS_GET_SYSTEM_STATS, stats as *mut _ as usize)) }
 }
+
+/// Permite habilitar o deshabilitar el rastreo de syscalls para un proceso.
+/// Si pid == 0, se aplica al proceso actual.
+pub fn strace(pid: u32, enable: bool) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_STRACE, pid as usize, if enable { 1 } else { 0 })) }
+}

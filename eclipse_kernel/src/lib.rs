@@ -37,6 +37,7 @@ pub mod storage;
 pub mod fd;
 pub mod progress;
 pub mod scheme;
+pub mod tty;
 pub mod pty;
 pub mod pipe;
 pub mod bcache;

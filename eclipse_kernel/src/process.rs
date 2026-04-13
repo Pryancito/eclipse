@@ -158,6 +158,8 @@ pub struct Process {
     /// Current working directory (null-terminated, max 511 chars + NUL).
     pub cwd: [u8; 512],
     pub cwd_len: usize,
+    /// Si es true, cada syscall de este proceso se registra en serial (syscall `strace`, 545).
+    pub syscall_trace: bool,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -202,6 +204,7 @@ impl Process {
                 buf
             },
             cwd_len: 1,
+            syscall_trace: false,
         }
     }
 }
@@ -1022,6 +1025,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.mem_frames = parent.mem_frames;
                 child.cpu_affinity = parent.cpu_affinity;
                 child.exit_signal = 0;
+                child.syscall_trace = parent.syscall_trace;
 
                 // Keep parent name (child will overwrite it with set_process_name if needed)
                 let mut name = [0u8; 16];

@@ -1433,8 +1433,44 @@ impl Scheme for FileSystemScheme {
                 }
                 let mut inode = match Filesystem::lookup_path(clean_path) {
                     Ok(i) => Some(i),
-                    Err(_) => None,
+                    Err(_) => {
+                        // Synthetic bootstrap files (termcap, inputrc)
+                        if clean_path == "etc/termcap" || clean_path == "etc/terminfo" {
+                            let mut vtmp = VIRTUAL_TMP.lock();
+                            if !vtmp.contains_key(clean_path) {
+                                let content = b"linux|linux console:\\\n\t:am:eo:mi:ms:ut:it#8:\\\n\t:Co#8:pa#64:\\\n\t:AB=\\E[4%dm:AF=\\E[3%dm:op=\\E[39;49m:\\\n\t:AL=\\E[%dL:DC=\\E[%dP:DL=\\E[%dM:IC=\\E[%dG:\\\n\t:ho=\\E[H:cl=\\E[H\\E[J:cm=\\E[%i%d;%dH:ce=\\E[K:cd=\\E[J:\\\n\t:nd=\\E[C:le=\\E[D:up=\\E[A:do=\\B:\\\n\t:kb=\\u007f:kcuu1=\\E[A:kcud1=\\E[B:kcuf1=\\E[C:kcub1=\\E[D:vt#3:";
+                                vtmp.insert(String::from(clean_path), content.to_vec());
+                            }
+                            None
+                        } else if clean_path == "etc/inputrc" {
+                            let mut vtmp = VIRTUAL_TMP.lock();
+                            if !vtmp.contains_key(clean_path) {
+                                let content = b"set editing-mode emacs\nset horizontal-scroll-mode Off\n";
+                                vtmp.insert(String::from(clean_path), content.to_vec());
+                            }
+                            None
+                        } else {
+                            None
+                        }
+                    }
                 };
+                
+                // If it's one of our synthetic files, redirect to Virtual
+                if inode.is_none() {
+                    let vtmp = VIRTUAL_TMP.lock();
+                    if vtmp.contains_key(clean_path) {
+                        drop(vtmp);
+                        let key = String::from(clean_path);
+                        let mut open_files = OPEN_FILES_SCHEME.lock();
+                        for (i, slot) in open_files.iter_mut().enumerate() {
+                            if slot.is_none() {
+                                *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                                return Ok(i);
+                            }
+                        }
+                    }
+                }
+
                 if inode.is_none()
                     && !clean_path.contains('/')
                     && clean_path.contains(".so")

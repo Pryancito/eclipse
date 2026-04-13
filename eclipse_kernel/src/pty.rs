@@ -228,7 +228,11 @@ impl Scheme for PtyScheme {
             
             // EOF when the other side has fully closed
             let eof = if handle.is_master { channel.slave_closed } else { channel.master_closed };
-            if eof { return Ok(0); }
+            if eof { 
+                serial::serial_printf(format_args!("[PTY] read() returned EOF for channel {} (is_master={}, master_closed={}, slave_closed={})\n", 
+                    handle.channel_id, handle.is_master, channel.master_closed, channel.slave_closed));
+                return Ok(0); 
+            }
 
             drop(channel);
 

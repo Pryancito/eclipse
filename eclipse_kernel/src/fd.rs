@@ -250,7 +250,7 @@ pub fn fd_init_stdio(pid: ProcessId) {
         Some(i) => i,
         None => return,
     };
-    if let Ok((scheme_id, resource_id)) = crate::scheme::open("log:", 0, 0) {
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open("tty:", 0, 0) {
         let mut tables = FD_TABLES.lock();
         // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
         tables[pid_idx].fds[0] = FileDescriptor {

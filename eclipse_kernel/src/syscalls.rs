@@ -120,6 +120,7 @@ pub enum SyscallNumber {
     SpawnWithStdio = 536,
     /// ELF cargado desde ruta VFS en el kernel (ver `sys_spawn_with_stdio_path`).
     SpawnWithStdioPath = 544,
+    Strace = 545,
     ThreadCreate = 537,
     WaitPid = 538,
     ReceiveFast = 600,
@@ -360,6 +361,24 @@ pub extern "C" fn syscall_handler(
 
     let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
 
+    // Tracing logic
+    let trace = crate::process::get_process(pid).map_or(false, |p| p.syscall_trace);
+    if trace {
+        let p_name = crate::process::get_process(pid).map(|p| {
+            let mut n = String::new();
+            for &b in p.name.iter() {
+                if b == 0 { break; }
+                n.push(b as char);
+            }
+            n
+        }).unwrap_or_else(|| String::from("unknown"));
+        
+        serial::serial_printf(format_args!(
+            "[strace] pid={} ({}) call {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})\n",
+            pid, p_name, syscall_num, arg1, arg2, arg3, arg4, arg5, arg6
+        ));
+    }
+
     let ret = match syscall_num {
         // --- Linux Compatibility Syscalls (x86_64) ---
         0   => sys_read(arg1, arg2, arg3),
@@ -495,6 +514,7 @@ pub extern "C" fn syscall_handler(
         542 => sys_spawn_with_stdio_args(arg1, arg2, arg3, arg4, arg5, arg6, context),
         543 => sys_get_process_args(arg1, arg2),
         544 => sys_spawn_with_stdio_path(arg1, arg2, arg3, arg4, arg5, arg6),
+        545 => sys_strace(arg1, arg2),
         600 => sys_receive_fast(context),
         _ => {
             serial::serial_printf(format_args!(
@@ -512,6 +532,10 @@ pub extern "C" fn syscall_handler(
         }
     };
     
+    if trace {
+        serial::serial_printf(format_args!("[strace] pid={} returns {:#x}\n", pid, ret));
+    }
+
     context.rax = ret;
 
     // Entregar señales pendientes antes de volver a userspace (no reentrar tras exit).
@@ -609,6 +633,23 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
     });
     
     count as u64
+}
+
+/// sys_strace - Habilitar/deshabilitar rastreo de syscalls
+fn sys_strace(pid: u64, enable: u64) -> u64 {
+    let target_pid = if pid == 0 {
+        crate::process::current_process_id().unwrap_or(0)
+    } else {
+        pid as crate::process::ProcessId
+    };
+
+    if let Some(mut p) = crate::process::get_process(target_pid) {
+        p.syscall_trace = enable != 0;
+        crate::process::update_process(target_pid, p);
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 /// sys_kill - Terminar un proceso por su PID
@@ -1140,6 +1181,9 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                 let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
                     Ok(bytes_read) => {
+                        if bytes_read == 0 && pid >= 10 && pid <= 20 {
+                             serial::serial_printf(format_args!("[SYSCALL] read(fd={}) returned EOF (0 bytes) for pid={}\n", fd, pid));
+                        }
                         return bytes_read as u64
                     },
                     Err(e) => {

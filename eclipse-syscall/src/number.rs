@@ -104,5 +104,6 @@ pub const SYS_GET_PROCESS_ARGS: usize = 543;
 /// Spawn como `SYS_SPAWN_WITH_STDIO` pero el ELF se lee en el kernel desde la ruta (evita ~50MB en el heap del padre).
 /// Args: (path_cstr, name_ptr, fd_in, fd_out, fd_err) — mismo layout de nombre/stdfds que 536.
 pub const SYS_SPAWN_WITH_STDIO_PATH: usize = 544;
+pub const SYS_STRACE: usize = 545;
 
 pub const SYS_RECEIVE_FAST: usize = 600;
