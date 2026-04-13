@@ -151,6 +151,30 @@ mod linux_mmap_abi {
     pub const ANON_SLACK_BYTES: u64 = 0x8000;
 }
 
+/// Remove the range `[lo, hi)` from the VMA list, splitting VMAs that partially overlap it.
+///
+/// Unlike a simple `retain`, this preserves portions of VMAs that lie outside the removed range
+/// so that kernel-managed slack pages (instruction-decode guards) are not orphaned when a
+/// subsequent `MAP_FIXED` or `munmap` covers only part of a slack VMA.
+fn vma_remove_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo: u64, hi: u64) {
+    if hi <= lo {
+        return;
+    }
+    let old: alloc::vec::Vec<crate::process::VMARegion> = core::mem::take(vmas);
+    for vma in old {
+        if vma.end <= lo || vma.start >= hi {
+            vmas.push(vma);
+        } else {
+            if vma.start < lo {
+                vmas.push(crate::process::VMARegion { end: lo, ..vma });
+            }
+            if vma.end > hi {
+                vmas.push(crate::process::VMARegion { start: hi, ..vma });
+            }
+        }
+    }
+}
+
 /// Si `PROT_EXEC` y el rango toca un VMA anónimo con colchón del kernel, amplía a todo el VMA.
 fn mprotect_expand_anon_slack(
     vmas: &[crate::process::VMARegion],
@@ -2933,7 +2957,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             let t0 = addr;
             let t1 = addr.saturating_add(aligned_length);
             let t1_ext = t1.saturating_add(anon_slack);
-            r.vmas.retain(|vma| vma.end <= t0 || vma.start >= t1_ext);
+            // Split VMAs that partially overlap [t0, t1_ext) instead of removing them
+            // entirely.  A file-backed MAP_FIXED text segment may start inside a kernel
+            // slack VMA; dropping the whole VMA leaves the preceding slack page untracked
+            // and mmap_find_free then reuses it, causing a subsequent unmap that removes
+            // the instruction-decode guard page → page-fault #14 on multi-byte instructions
+            // at the last byte of the last mapped text page.
+            vma_remove_range(&mut r.vmas, t0, t1_ext);
             (addr, t1)
         } else if addr != 0 {
             let ms = addr & !0xFFF;
@@ -3177,10 +3207,13 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
             let mut r = proc.resources.lock();
             let page_table_phys = r.page_table_phys;
             memory::unmap_user_range(page_table_phys, addr, length);
-            r.vmas.retain(|vma| {
-                let overlap = core::cmp::max(addr, vma.start) < core::cmp::min(addr + length, vma.end);
-                !overlap
-            });
+            // Split VMAs that partially overlap [addr, addr+length) instead of removing
+            // them entirely.  Removing a whole VMA on partial overlap (e.g. munmap of a
+            // sub-range of a kernel slack VMA) leaves the remaining pages untracked:
+            // mmap_find_free then treats them as free, the next allocation calls
+            // unmap_user_range on them, and subsequent instruction-decode across a page
+            // boundary causes a page-not-present fault (#14).
+            vma_remove_range(&mut r.vmas, addr, addr.saturating_add(length));
             proc.mem_frames = proc.mem_frames.saturating_sub((length + 4095) / 4096);
             drop(r);
             process::update_process(pid, proc);
