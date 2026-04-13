@@ -155,6 +155,9 @@ pub struct Process {
     pub sid: ProcessId,
     /// `Some((AT_BASE, AT_ENTRY))` si el arranque es vía intérprete dinámico (ld-musl).
     pub dynamic_linker_aux: Option<(u64, u64)>,
+    /// Current working directory (null-terminated, max 511 chars + NUL).
+    pub cwd: [u8; 512],
+    pub cwd_len: usize,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -193,6 +196,12 @@ impl Process {
             pgid: 0,
             sid: 0,
             dynamic_linker_aux: None,
+            cwd: {
+                let mut buf = [0u8; 512];
+                buf[0] = b'/';
+                buf
+            },
+            cwd_len: 1,
         }
     }
 }
@@ -1226,5 +1235,42 @@ pub fn deliver_pending_signals_for_current() {
         exit_process();
         crate::scheduler::yield_cpu();
         return;
+    }
+}
+
+/// Get the current working directory of a process as a &str (from its cwd buffer).
+pub fn get_process_cwd(pid: ProcessId) -> alloc::string::String {
+    if let Some(p) = get_process(pid) {
+        let len = p.cwd_len.min(511);
+        alloc::string::String::from_utf8_lossy(&p.cwd[..len]).into_owned()
+    } else {
+        alloc::string::String::from("/")
+    }
+}
+
+/// Set the current working directory of a process.
+/// Returns true on success, false if path is too long.
+pub fn set_process_cwd(pid: ProcessId, new_cwd: &str) -> bool {
+    let bytes = new_cwd.as_bytes();
+    if bytes.len() > 511 {
+        return false;
+    }
+    modify_process(pid, |p| {
+        p.cwd_len = bytes.len();
+        p.cwd[..bytes.len()].copy_from_slice(bytes);
+        p.cwd[bytes.len()] = 0;
+    }).is_ok()
+}
+
+/// Resolve a path against a process's cwd (for relative paths).
+pub fn resolve_path_cwd(pid: ProcessId, path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        return alloc::string::String::from(path);
+    }
+    let cwd = get_process_cwd(pid);
+    if cwd == "/" {
+        alloc::format!("/{}", path)
+    } else {
+        alloc::format!("{}/{}", cwd, path)
     }
 }

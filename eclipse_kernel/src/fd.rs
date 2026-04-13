@@ -278,3 +278,25 @@ pub fn fd_init_stdio(pid: ProcessId) {
         };
     }
 }
+
+/// Get the current offset of an open file descriptor.
+pub fn fd_get_offset(pid: ProcessId, fd: usize) -> Option<u64> {
+    let pid_idx = pid_to_fd_idx(pid)?;
+    let tables = FD_TABLES.lock();
+    if fd < MAX_FDS_PER_PROCESS && tables[pid_idx].fds[fd].in_use {
+        return Some(tables[pid_idx].fds[fd].offset);
+    }
+    None
+}
+
+/// Set the offset of an open file descriptor.
+pub fn fd_set_offset(pid: ProcessId, fd: usize, offset: u64) {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return,
+    };
+    let mut tables = FD_TABLES.lock();
+    if fd < MAX_FDS_PER_PROCESS && tables[pid_idx].fds[fd].in_use {
+        tables[pid_idx].fds[fd].offset = offset;
+    }
+}
