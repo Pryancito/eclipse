@@ -34,7 +34,10 @@ pub const SYS_SETSOCKOPT: usize = 54;
 pub const SYS_GETSOCKOPT: usize = 55;
 pub const SYS_CLONE: usize = 56;
 pub const SYS_FORK: usize = 57;
-pub const SYS_EXEC: usize = 59;
+/// Eclipse-native exec: replace the current process image with a raw ELF buffer
+/// (elf_ptr: *const u8, elf_size: usize).  Syscall 59 is the Linux-compatible
+/// execve(path, argv, envp) — do NOT use 59 for this binary-exec path.
+pub const SYS_EXEC: usize = 546;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_WAIT: usize = 61;
 pub const SYS_KILL: usize = 62;
