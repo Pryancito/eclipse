@@ -8,12 +8,12 @@ members = [
     "sidewind_nvidia",
     "libs/ipc",
     "lunas",
-    "terminal",
     "sh",
     "nano",
     "glxgears",
     "smithay_app",
     "rust-shell",
+    "terminal",
 ]
 exclude = ["libs/ipc_tests", "xeyes"]
 

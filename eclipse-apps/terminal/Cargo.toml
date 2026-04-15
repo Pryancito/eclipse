@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-os-terminal = { path = "../libs/os-terminal" }
-bitflags = "2.4"
+#alacritty_terminal = { path = "../libs/alacritty_terminal", default-features = false }
+bitflags = { version = "2.4", default-features = false }
 # No-std heapless structures for event handling
 heapless = "0.8"
 # Use wayland-proto from the local workspace
@@ -15,8 +15,9 @@ sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
 # Standard library bridge for Eclipse
 std = { package = "eclipse_std", path = "../eclipse_std" }
-eclipse-syscall = { path = "../../eclipse-syscall" }
+eclipse_syscall = { package = "eclipse-syscall", path = "../../eclipse-syscall" }
 libc = { path = "../../eclipse-relibc" }
+os-terminal = { path = "../libs/os-terminal" }
 
 [features]
 default = []

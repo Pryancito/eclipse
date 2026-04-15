@@ -22,7 +22,7 @@ path = "src/lib.rs"
 heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
-bitflags = "2.4"
+bitflags = { version = "2.4", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 # Dependencias solo para target Eclipse (vendor eclipse).

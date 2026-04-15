@@ -10,7 +10,7 @@ sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
 heapless = "0.8"
 micromath = "2.1.0"
-bitflags = "2.4"
+bitflags = { version = "2.4", default-features = false }
 
 eclipse-syscall = { path = "../../eclipse-syscall" }
 

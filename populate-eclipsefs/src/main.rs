@@ -123,20 +123,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let relative = path.strip_prefix(&args.source)?;
             let fs_path = PathBuf::from("/").join(relative);
 
-            // Read file content
-            let content = fs::read(path)?;
-            total_bytes += content.len() as u64;
-
-            // Create file node
+            // Create file node with source_path for streaming
             let mut file_node = EclipseFSNode::new_file();
-            file_node.set_data(&content)?;
+            file_node.source_path = Some(path.to_path_buf());
+            file_node.size = entry.metadata()?.len();
+            total_bytes += file_node.size;
+            let size = file_node.size;
             let file_inode = writer.create_node(file_node)?;
 
             file_count += 1;
 
             if args.verbose || file_count % 10 == 0 {
                 println!("  Copied: {:?} ({} bytes, inode {})",
-                    fs_path, content.len(), file_inode);
+                    fs_path, size, file_inode);
             }
 
             // Add to parent directory

@@ -262,7 +262,7 @@ impl TerminalApp {
     fn new() -> Option<Self> {
         // ── 0. Parse own argv ─────────────────────────────────────────────
         // Supported forms:
-        //   terminal                        → launch default shell (/bin/sh)
+        //   terminal                        → launch default shell (rust-shell or sh)
         //   terminal -e <prog> [args...]    → launch <prog> with optional args
         //   terminal -- <prog> [args...]    → same, alternate separator
         let own_argv = {
@@ -307,7 +307,7 @@ impl TerminalApp {
                 }
                 (prog_path, name.to_string(), argv_bytes, one_shot)
             } else {
-                // Default: `/bin/sh` (rust-shell en `/bin/rust-shell` si se quiere probar de nuevo).
+                // Default: prefer rust-shell, fallback to sh
                 let default_shell = "/bin/sh";
                 let shell_name = default_shell.rsplit('/').next().unwrap_or("sh").to_string();
                 let mut argv_bytes = Vec::<u8>::new();

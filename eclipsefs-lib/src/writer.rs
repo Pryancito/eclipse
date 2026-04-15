@@ -11,6 +11,8 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 
 /// Buffer size for I/O operations (512KB for better performance on large writes)
 const BUFFER_SIZE: usize = 512 * 1024;
+#[cfg(feature = "std")]
+use std::io::Read;
 
 /// Escritor de imágenes EclipseFS
 pub struct EclipseFSWriter {
@@ -177,7 +179,9 @@ impl EclipseFSWriter {
         self.write_tlv_entry(tlv_tags::NLINK, &node.nlink.to_le_bytes())?;
 
         // CONTENT
-        if !node.data.is_empty() {
+        if let Some(source_path) = &node.source_path {
+            self.write_tlv_from_file(tlv_tags::CONTENT, source_path)?;
+        } else if !node.data.is_empty() {
             self.write_tlv_entry(tlv_tags::CONTENT, &node.data)?;
         }
 
@@ -195,6 +199,27 @@ impl EclipseFSWriter {
         self.file.write_u16::<LittleEndian>(tag)?;
         self.file.write_u32::<LittleEndian>(value.len() as u32)?;
         self.file.write_all(value)?;
+        Ok(())
+    }
+
+    /// Escribir una entrada TLV desde un archivo (streaming)
+    fn write_tlv_from_file(&mut self, tag: u16, path: &std::path::Path) -> EclipseFSResult<()> {
+        let mut f = File::open(path)?;
+        let metadata = f.metadata()?;
+        let size = metadata.len();
+
+        self.file.write_u16::<LittleEndian>(tag)?;
+        self.file.write_u32::<LittleEndian>(size as u32)?;
+
+        let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+        loop {
+            let n = f.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            self.file.write_all(&buffer[..n])?;
+        }
+
         Ok(())
     }
 
@@ -255,7 +280,9 @@ impl EclipseFSWriter {
         size += 10;
 
         // CONTENT (2 + 4 + data_len)
-        if !node.data.is_empty() {
+        if node.source_path.is_some() {
+            size += 6 + node.size as usize;
+        } else if !node.data.is_empty() {
             size += 6 + node.data.len();
         }
 

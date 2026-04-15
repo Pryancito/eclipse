@@ -47,6 +47,7 @@ pub struct EclipseFSNode {
     // Nuevos campos para extent-based allocation (ext4/XFS)
     pub extent_tree: ExtentTree,   // Árbol de extents para archivos grandes
     pub use_extents: bool,         // Si este nodo usa extents o datos inline
+    pub source_path: Option<std::path::PathBuf>, // Ruta al archivo original
 }
 
 #[cfg(not(feature = "std"))]
@@ -105,6 +106,8 @@ impl EclipseFSNode {
             extent_tree: ExtentTree::new(),
             use_extents: false,
             checksum: 0,
+            #[cfg(feature = "std")]
+            source_path: None,
         };
         node.update_checksum();
         node
@@ -140,6 +143,8 @@ impl EclipseFSNode {
             extent_tree: ExtentTree::new(),
             use_extents: false,
             checksum: 0,
+            #[cfg(feature = "std")]
+            source_path: None,
         };
         node.update_checksum();
         node
@@ -179,6 +184,8 @@ impl EclipseFSNode {
             extent_tree: ExtentTree::new(),
             use_extents: false,
             checksum: 0,
+            #[cfg(feature = "std")]
+            source_path: None,
         };
         node.update_checksum();
         node

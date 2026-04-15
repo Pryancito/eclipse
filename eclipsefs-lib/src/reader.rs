@@ -161,10 +161,10 @@ impl EclipseFSReader {
 
         let mut entries = Vec::new();
         for _ in 0..header.total_inodes {
-            let inode = file.read_u32::<LittleEndian>()? as u64;
-            let rel_offset = file.read_u32::<LittleEndian>()? as u64;
+            let inode = file.read_u64::<LittleEndian>()?;
+            let rel_offset = file.read_u64::<LittleEndian>()?;
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
-            entries.push(InodeTableEntry::new(inode, absolute_offset));
+            entries.push(InodeTableEntry::new(inode as u64, absolute_offset));
         }
 
         Ok(entries)
@@ -352,6 +352,8 @@ impl EclipseFSReader {
             // Extent-based allocation
             extent_tree: crate::extent::ExtentTree::new(),
             use_extents: false,
+            #[cfg(feature = "std")]
+            source_path: None,
         })
     }
 
