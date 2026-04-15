@@ -46,6 +46,9 @@ pub struct FramebufferState {
     pub is_fallback: bool,
     pub fb_ptr: Option<*mut u8>,
     pub gpu: Option<sidewind::gpu::GpuDevice>,
+    /// Set to `true` after the first page-flip failure so the error message is
+    /// only printed once rather than once per frame (~60/sec).
+    pub flip_error_logged: bool,
 }
 
 impl FramebufferState {
@@ -115,6 +118,7 @@ impl FramebufferState {
                 is_fallback: dev.is_fallback,
                 fb_ptr: dev.fb_ptr,
                 gpu: Some(sidewind::gpu::GpuDevice::new()),
+                flip_error_logged: false,
             })
         }
     }
@@ -141,6 +145,7 @@ impl FramebufferState {
             gpu: None,
             fb_ptr: None,
             is_fallback: false,
+            flip_error_logged: false,
         }
     }
 
@@ -162,7 +167,25 @@ impl FramebufferState {
                 fb_ptr: self.fb_ptr,
             };
 
-            let _ = dev.page_flip(self.back_fb_id);
+            if let Err(e) = dev.page_flip(self.back_fb_id) {
+                // Only log EBADF once — the DRM fd has become invalid (e.g. a
+                // child process that inherited the fd has already exited and
+                // closed it).  Continuing to flip silently would spam the log.
+                if !self.flip_error_logged {
+                    self.flip_error_logged = true;
+                    let is_ebadf = matches!(
+                        &e,
+                        display::DisplayError::Syscall(se) if se.errno == eclipse_syscall::error::EBADF
+                    );
+                    if is_ebadf {
+                        eprintln!("[LUNAS] page_flip: DRM fd {} is no longer valid (EBADF); display output suspended", self.drm_fd);
+                    } else {
+                        eprintln!("[LUNAS] page_flip failed on DRM fd {}; display output suspended", self.drm_fd);
+                    }
+                }
+                return false;
+            }
+            self.flip_error_logged = false;
             core::mem::swap(&mut self.back_addr, &mut self.front_addr);
             core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
             true
