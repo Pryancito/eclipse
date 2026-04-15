@@ -934,6 +934,20 @@ pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize
     serial::serial_printf(format_args!("[setup_stack] start base=0x{:x} size={} pages={}\n", stack_base, stack_size, stack_size / 4096));
     for i in 0..(stack_size / 4096) {
         if let Some(phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
+            // Zero the frame before mapping: freed frames returned by unmap_user_range
+            // may contain stale data from previous processes.  Leaving them unzeroed
+            // lets old stack values (including non-canonical pointers) bleed into the
+            // new process's stack, corrupting callee-saved registers on function return
+            // and causing a #GP fault.  All other alloc_phys_frame_for_anon_mmap call
+            // sites (ELF segments, TLS, sys_mmap) already zero the frame; stack pages
+            // must do the same.
+            unsafe {
+                core::ptr::write_bytes(
+                    crate::memory::phys_to_virt(phys) as *mut u8,
+                    0,
+                    0x1000,
+                );
+            }
             let offset = (i as u64) * 0x1000;
             crate::memory::map_user_page_4kb(
                 page_table_phys,
