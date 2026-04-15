@@ -207,6 +207,38 @@ pub use header::sys_eventfd::*;
 #[cfg(not(feature = "rustc-dep-of-std"))]
 pub use header::sys_eclipse::*;
 
+// ── C runtime bootstrap for programs compiled against eclipse-relibc ─────────
+// `__libc_start_main` is called by our assembly `_start`.  It initialises the
+// environ table from the kernel-provided envp and then calls main().
+#[cfg(all(
+    not(feature = "rustc-dep-of-std"),
+    not(any(test, feature = "host-testing")),
+    any(target_os = "eclipse", eclipse_target,
+        not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))
+))]
+#[no_mangle]
+pub unsafe extern "C" fn __libc_start_main(
+    argc: isize,
+    argv: *const *const types::c_char,
+    envp: *const *const types::c_char,
+) -> types::c_int {
+    // Initialise the heap before anything else (including environ_init which
+    // calls malloc).
+    internal_alloc::init_heap_if_needed();
+
+    // Initialise the environ table from the kernel-supplied envp.
+    header::stdlib::environ_init(envp);
+
+    // Declare the application's main() symbol.
+    extern "C" {
+        fn main(argc: isize, argv: *const *const types::c_char, envp: *const *const types::c_char) -> types::c_int;
+    }
+
+    let ret = main(argc, argv, envp);
+    // _exit skips atexit handlers; use exit() for proper cleanup.
+    header::stdlib::exit(ret);
+}
+
 // ── Constantes de archivo (modo normal vía eclipse-syscall) ──────────────────
 #[cfg(not(feature = "rustc-dep-of-std"))]
 pub use types::*;

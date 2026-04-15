@@ -105,3 +105,56 @@ pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) ->
     }
     0
 }
+
+pub const TCSANOW:   c_int = 0;
+pub const TCSADRAIN: c_int = 1;
+pub const TCSAFLUSH: c_int = 2;
+
+pub const B0:     speed_t = 0;
+pub const B50:    speed_t = 1;
+pub const B75:    speed_t = 2;
+pub const B110:   speed_t = 3;
+pub const B134:   speed_t = 4;
+pub const B150:   speed_t = 5;
+pub const B200:   speed_t = 6;
+pub const B300:   speed_t = 7;
+pub const B600:   speed_t = 8;
+pub const B1200:  speed_t = 9;
+pub const B1800:  speed_t = 10;
+pub const B2400:  speed_t = 11;
+pub const B4800:  speed_t = 12;
+pub const B9600:  speed_t = 13;
+pub const B19200: speed_t = 14;
+pub const B38400: speed_t = 15;
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn tcdrain(fd: c_int) -> c_int {
+    crate::header::sys_ioctl::ioctl(fd, 0x5409, core::ptr::null_mut())
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn tcflush(fd: c_int, queue_selector: c_int) -> c_int {
+    crate::header::sys_ioctl::ioctl(fd, 0x540B, queue_selector as *mut c_void)
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn tcflow(fd: c_int, action: c_int) -> c_int {
+    crate::header::sys_ioctl::ioctl(fd, 0x540C, action as *mut c_void)
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
+    if termios_p.is_null() { return B9600; }
+    (*termios_p).c_ispeed
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
+    if termios_p.is_null() { return B9600; }
+    (*termios_p).c_ospeed
+}

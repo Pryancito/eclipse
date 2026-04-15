@@ -409,3 +409,84 @@ pub unsafe extern "C" fn strncasecmp(s1: *const c_char, s2: *const c_char, n: si
     }
     0
 }
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn strndup(s: *const c_char, n: size_t) -> *mut c_char {
+    use crate::internal_alloc::malloc;
+    if s.is_null() { return core::ptr::null_mut(); }
+    let slen = strlen(s);
+    let copy_len = if n < slen { n } else { slen };
+    let buf = malloc(copy_len + 1) as *mut c_char;
+    if buf.is_null() { return core::ptr::null_mut(); }
+    core::ptr::copy_nonoverlapping(s, buf, copy_len);
+    *buf.add(copy_len) = 0;
+    buf
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn strerror(errnum: c_int) -> *mut c_char {
+    // Return a static string for common errors.
+    let msg: &[u8] = match errnum {
+        0  => b"Success\0",
+        1  => b"Operation not permitted\0",
+        2  => b"No such file or directory\0",
+        3  => b"No such process\0",
+        4  => b"Interrupted system call\0",
+        5  => b"Input/output error\0",
+        6  => b"No such device or address\0",
+        7  => b"Argument list too long\0",
+        8  => b"Exec format error\0",
+        9  => b"Bad file descriptor\0",
+        10 => b"No child processes\0",
+        11 => b"Resource temporarily unavailable\0",
+        12 => b"Cannot allocate memory\0",
+        13 => b"Permission denied\0",
+        14 => b"Bad address\0",
+        16 => b"Device or resource busy\0",
+        17 => b"File exists\0",
+        19 => b"No such device\0",
+        20 => b"Not a directory\0",
+        21 => b"Is a directory\0",
+        22 => b"Invalid argument\0",
+        24 => b"Too many open files\0",
+        25 => b"Inappropriate ioctl for device\0",
+        28 => b"No space left on device\0",
+        29 => b"Illegal seek\0",
+        30 => b"Read-only file system\0",
+        32 => b"Broken pipe\0",
+        34 => b"Numerical result out of range\0",
+        35 => b"Resource deadlock avoided\0",
+        36 => b"File name too long\0",
+        38 => b"Function not implemented\0",
+        61 => b"No data available\0",
+        _  => b"Unknown error\0",
+    };
+    msg.as_ptr() as *mut c_char
+}
+
+/// strsignal — return signal description string.
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[no_mangle]
+pub unsafe extern "C" fn strsignal(sig: c_int) -> *mut c_char {
+    let msg: &[u8] = match sig {
+        1  => b"Hangup\0",
+        2  => b"Interrupt\0",
+        3  => b"Quit\0",
+        4  => b"Illegal instruction\0",
+        6  => b"Aborted\0",
+        8  => b"Floating point exception\0",
+        9  => b"Killed\0",
+        11 => b"Segmentation fault\0",
+        13 => b"Broken pipe\0",
+        14 => b"Alarm clock\0",
+        15 => b"Terminated\0",
+        17 => b"Child exited\0",
+        18 => b"Continued\0",
+        19 => b"Stopped (signal)\0",
+        20 => b"Stopped\0",
+        _  => b"Unknown signal\0",
+    };
+    msg.as_ptr() as *mut c_char
+}

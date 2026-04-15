@@ -187,6 +187,66 @@ pub fn getppid() -> usize {
     unsafe { syscall0(SYS_GETPPID) }
 }
 
+/// execve(path, argv, envp) — replace current process image (Linux-compatible syscall 59).
+/// `argv` and `envp` are NULL-terminated arrays of NUL-terminated C strings.
+pub fn execve(path: usize, argv: usize, envp: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_EXECVE, path, argv, envp)) }
+}
+
+/// dup(oldfd) — duplicate a file descriptor to the lowest available fd.
+pub fn dup(oldfd: usize) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_DUP, oldfd)) }
+}
+
+/// dup2(oldfd, newfd) — duplicate oldfd to newfd (closes newfd first if open).
+pub fn dup2(oldfd: usize, newfd: usize) -> Result<usize> {
+    unsafe { cvt(syscall2(SYS_DUP2, oldfd, newfd)) }
+}
+
+/// access(path, mode) — check file accessibility (uses faccessat with dirfd=0).
+pub fn access(path: &str, mode: usize) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall3(21, 0usize.wrapping_sub(100), ptr as usize, mode)) }
+}
+
+/// chdir(path) — change current working directory.
+pub fn chdir(path: &str) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    let ptr = path_to_nul_stack(path, &mut buf)?;
+    unsafe { cvt_unit(syscall1(SYS_CHDIR, ptr as usize)) }
+}
+
+/// getcwd(buf, size) — get current working directory into buffer.
+pub fn getcwd(buf_ptr: usize, size: usize) -> Result<usize> {
+    unsafe { cvt(syscall2(SYS_GETCWD, buf_ptr, size)) }
+}
+
+/// fcntl(fd, cmd, arg) — file control.
+pub fn fcntl(fd: usize, cmd: usize, arg: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_FCNTL, fd, cmd, arg)) }
+}
+
+/// pipe2(fds, flags) — create pipe with flags (O_CLOEXEC=0x80000, O_NONBLOCK=0x800).
+pub fn pipe2(fds: &mut [u32; 2], flags: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_PIPE2, fds.as_mut_ptr() as usize, flags)) }
+}
+
+/// setpgid(pid, pgid) — set process group ID.
+pub fn setpgid(pid: usize, pgid: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_SETPGID, pid, pgid)) }
+}
+
+/// getpgid(pid) — get process group ID of pid (0 = current process).
+pub fn getpgid(pid: usize) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_GETPGID, pid)) }
+}
+
+/// setsid() — create new session and set process group.
+pub fn setsid() -> Result<usize> {
+    unsafe { cvt(syscall0(SYS_SETSID)) }
+}
+
 // unlink definido más abajo junto con mkdir (versión con path+len)
 
 /// rename(2): rutas terminadas en NUL (copiadas a buffer interno).
