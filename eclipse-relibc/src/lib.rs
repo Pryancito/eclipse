@@ -556,9 +556,12 @@ pub unsafe extern "C" fn syscall(_num: c_long, _args: ...) -> c_long { 0 }
 extern "C" { pub fn syscall(num: c_long, _args: ...) -> c_long; }
 
 // ── Stubs de unwind (solo en builds de Eclipse, no en modo sysroot) ───────────
+// En host `*-linux-musl` + `std`, el enlazador ya trae `libunwind`/`libc` reales;
+// estos `#[no_mangle]` duplican símbolos (fallo de link al `cargo test` de lunas, etc.).
 #[cfg(all(
     not(feature = "use_std"),
-    not(any(test, feature = "host-testing"))
+    not(any(test, feature = "host-testing")),
+    eclipse_target
 ))]
 mod unwind_stubs {
     #[no_mangle] pub unsafe extern "C" fn _Unwind_GetRegionStart() -> usize { 0 }

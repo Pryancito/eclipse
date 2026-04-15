@@ -2,12 +2,22 @@
 
 use tiny_skia::*;
 
+/// tiny-skia (highp) usa `movaps` con offsets fijos sobre RSP; sin RSP%16==0 en este marco puede #GP(13).
+#[repr(align(16))]
+struct TinySkiaRspAlign([u8; 16]);
+
+#[inline]
+fn tiny_skia_rsp_guard() -> TinySkiaRspAlign {
+    TinySkiaRspAlign([0; 16])
+}
+
 pub struct SkiaPainter<'a> {
     pub pixmap: PixmapMut<'a>,
 }
 
 impl<'a> SkiaPainter<'a> {
     pub fn new(data: &'a mut [u8], width: u32, height: u32) -> Option<Self> {
+        let _rsp = tiny_skia_rsp_guard();
         let pixmap = PixmapMut::from_bytes(data, width, height)?;
         Some(Self { pixmap })
     }
@@ -17,6 +27,7 @@ impl<'a> SkiaPainter<'a> {
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        let _rsp = tiny_skia_rsp_guard();
         if let Some(rect) = Rect::from_xywh(x, y, w, h) {
             let mut paint = Paint::default();
             paint.set_color(color);
@@ -26,6 +37,7 @@ impl<'a> SkiaPainter<'a> {
     }
 
     pub fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
+        let _rsp = tiny_skia_rsp_guard();
         if let Some(path) = self.create_round_rect_path(x, y, w, h, radius) {
             let mut paint = Paint::default();
             paint.set_color(color);
@@ -35,6 +47,7 @@ impl<'a> SkiaPainter<'a> {
     }
 
     pub fn stroke_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, thickness: f32, color: Color) {
+        let _rsp = tiny_skia_rsp_guard();
         if let Some(path) = self.create_round_rect_path(x, y, w, h, radius) {
             let mut paint = Paint::default();
             paint.set_color(color);
@@ -69,6 +82,7 @@ impl<'a> SkiaPainter<'a> {
     }
 
     pub fn draw_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) {
+        let _rsp = tiny_skia_rsp_guard();
         let mut pb = PathBuilder::new();
         pb.move_to(x1, y1);
         pb.line_to(x2, y2);

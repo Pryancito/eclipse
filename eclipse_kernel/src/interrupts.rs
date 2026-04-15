@@ -697,7 +697,8 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     let cs  = context.cs;
     let ss  = context.ss;
 
-    if cr2 < 4096 && pid != 0 {
+    // CR2 is only defined for #PF (14); on other faults it is stale — do not imply a page fault.
+    if num == 14 && cr2 < 4096 && pid != 0 {
         crate::serial::serial_printf(format_args!(
             "\n[PF] CR2={:#x} in first page: likely NULL+offset in userspace (e.g. /dev/fb0 failed?)\n", cr2));
     }

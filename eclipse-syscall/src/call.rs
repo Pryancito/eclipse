@@ -301,8 +301,19 @@ pub fn set_child_args(child_pid: usize, args: &[u8]) -> Result<()> {
 
 /// Obtener los argumentos del proceso actual. Devuelve los bytes escritos.
 /// Formato: argv[0]\0argv[1]\0... (NUL-separados).
+///
+/// En **Eclipse OS** el kernel implementa este syscall y devuelve un contador ≥ 0.
+/// En otros kernels (p. ej. Linux si se invoca el mismo número por error), `rax` puede
+/// llevar un errno con signo (`-ENOSYS`, etc.); se trata como fallo (`0`) para que los
+/// llamadores no hagan `buf[..n]` con un `n` inválido. El `.min(buf.len())` acota éxito
+/// anómalo por si el valor superara el buffer.
 pub fn get_process_args(buf: &mut [u8]) -> usize {
-    unsafe { syscall2(SYS_GET_PROCESS_ARGS, buf.as_mut_ptr() as usize, buf.len()) }
+    let raw = unsafe { syscall2(SYS_GET_PROCESS_ARGS, buf.as_mut_ptr() as usize, buf.len()) };
+    let signed = raw as isize;
+    if signed < 0 {
+        return 0;
+    }
+    (raw as usize).min(buf.len())
 }
 
 /// Remove a file. Only /tmp/* paths supported currently.

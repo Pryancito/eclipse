@@ -326,7 +326,10 @@ fn main() {
 mod tests {
     use lunas::state::LunasState;
 
+    /// En host (p. ej. `cargo test`) no hay framebuffer Eclipse; `Backend::new` falla.
+    /// En dispositivo: `cargo test -p lunas --bin lunas -- --ignored`.
     #[test]
+    #[ignore = "Requiere framebuffer/display Eclipse (Backend::new en host sin dispositivo)"]
     fn main_loop_iterations_complete_without_hanging() {
         let mut state = LunasState::new().expect("state");
         const N: u64 = 10_000;

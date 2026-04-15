@@ -16,9 +16,9 @@ pub const N_WORKSPACES: u8 = 4;
 /// user right-clicks on the empty desktop.
 ///
 /// The items mirror the default `menu.xml` shipped with labwc:
-/// ```
+/// ```text
 /// Terminal / Launch...
-/// ─────────────
+/// ---------------
 /// Reconfigure
 /// Exit
 /// ```

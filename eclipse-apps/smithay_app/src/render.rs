@@ -36,6 +36,18 @@ const SIDEBAR_ICON_TYPES: [ui::TechCardIconType; 5] = [
     ui::TechCardIconType::Network,
 ];
 
+/// Fuerza alineación de pila a 16 B en este marco. tiny-skia (p. ej. `highp::reflect`) emite
+/// `movaps` con direcciones `RSP+K`; en SysV amd64, si `RSP % 16 != 0`, esas direcciones dejan
+/// de ser múltiplo de 16 y la CPU puede lanzar **#GP(13)** al abrir ventanas (p. ej. `/bin/terminal`)
+/// y redibujar decoración con Skia.
+#[repr(align(16))]
+struct TinySkiaRspAlign([u8; 16]);
+
+#[inline]
+fn tiny_skia_rsp_guard() -> TinySkiaRspAlign {
+    TinySkiaRspAlign([0u8; 16])
+}
+
 pub const STROKE_COLORS: [Rgb888; 5] = [
     colors::ACCENT_BLUE,
     colors::ACCENT_RED,
@@ -936,6 +948,7 @@ pub fn draw_dashboard(
     mem_total_kb: u64,
     gpu_vram_total_kb: u64,
 ) {
+    let _skia_rsp = tiny_skia_rsp_guard();
     let cpu = if cpu.is_finite() { cpu } else { 0.0 };
     let mem = if mem.is_finite() { mem } else { 0.0 };
     let net = if net.is_finite() { net } else { 0.0 };
@@ -1253,6 +1266,7 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
 }
 
 pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, x: i32, button_hover: Option<WindowButton>) {
+    let _skia_rsp = tiny_skia_rsp_guard();
     let wx = x;
     let wy = w.curr_y as i32;
     let ww = w.curr_w as i32;
@@ -1378,6 +1392,7 @@ pub fn draw_static_ui(
     anomalies: u32, frag: u32, uptime_ticks: u64,
     cpu_count: u64, mem_total_kb: u64, gpu_vram_total_kb: u64,
 ) {
+    let _skia_rsp = tiny_skia_rsp_guard();
     fb.blit_background();
 
     // SideBar background with glass effect using tiny-skia
@@ -1440,6 +1455,7 @@ pub fn draw_hud_overlay(
     log_buf: &[u8],
     log_len: &usize,
 ) {
+    let _skia_rsp = tiny_skia_rsp_guard();
     let w = target.width as i32;
     let h = target.height as i32;
 

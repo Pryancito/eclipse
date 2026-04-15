@@ -3572,6 +3572,13 @@ fn sys_thread_create(stack_top: u64, entry: u64, arg: u64) -> u64 {
         return u64::MAX;
     }
 
+    // RSP inicial debe ser múltiplo de 16: el ABI SysV amd64 y código SIMD (p. ej. tiny-skia
+    // con `movaps` respecto a RSP) asumen alineación; un `stack_top` arbitrario provoca #GP en ring 3.
+    let stack_top = stack_top & !0xF;
+    if stack_top < 0x1000 {
+        return u64::MAX;
+    }
+
     if let Some(parent_pid) = process::current_process_id() {
         if let Some(parent) = process::get_process(parent_pid) {
             let resources = Arc::clone(&parent.resources);

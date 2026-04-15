@@ -3144,7 +3144,7 @@ mod tests {
         let apps: [PinnedApp; 8] = core::array::from_fn(|_| PinnedApp::default());
         let mut apps = apps;
         apps[0] = PinnedApp::with_exec("Terminal", 0, 200, 100, "/bin/terminal");
-        apps[1] = PinnedApp::with_exec("Files", 100, 150, 255, "/bin/files");
+        apps[1] = PinnedApp::with_exec("GLXGears", 100, 150, 255, "/bin/glxgears");
 
         let fb_height = 1080;
         // Panel is at y = 1080 - 44 - 400 - 10 = 626, x=10, w=300

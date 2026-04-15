@@ -14,7 +14,9 @@ bitflags = { version = "2.4", default-features = false }
 
 eclipse-syscall = { path = "../../eclipse-syscall" }
 
-libc = { path = "../../eclipse-relibc" }
+# Sin features por defecto: el default de eclipse-relibc incluye `panic-handler`, incompatible
+# con crates que enlazan `std` (p. ej. tests de lunas en host: E0152 duplicate panic_impl).
+libc = { path = "../../eclipse-relibc", default-features = false, features = ["allocator", "eclipse-syscall"] }
 
 [features]
 default = []

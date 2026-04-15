@@ -91,14 +91,24 @@ pub unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char, _args
     -1 // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
+// Linux musl + host std ya enlazan `execv*` desde libc estático del toolchain;
+// exportarlas aquí provoca símbolos duplicados al `cargo test` del workspace.
+#[cfg(all(
+    not(any(test, feature = "host-testing")),
+    not(feature = "use_std"),
+    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+))]
 #[no_mangle]
 pub unsafe extern "C" fn execv(path: *const c_char, argv: *const *const c_char) -> c_int {
     let envp = crate::header::stdlib::environ_ptr();
     execve(path, argv, envp)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
+#[cfg(all(
+    not(any(test, feature = "host-testing")),
+    not(feature = "use_std"),
+    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+))]
 #[no_mangle]
 pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
     let envp = crate::header::stdlib::environ_ptr();
@@ -106,7 +116,11 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
 }
 
 /// execvpe: search PATH for `file` if it contains no slash, then execve.
-#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
+#[cfg(all(
+    not(any(test, feature = "host-testing")),
+    not(feature = "use_std"),
+    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+))]
 #[no_mangle]
 pub unsafe extern "C" fn execvpe(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int {
     if file.is_null() {

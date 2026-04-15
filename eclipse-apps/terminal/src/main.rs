@@ -250,13 +250,25 @@ impl TerminalApp {
         //   terminal                        → launch default shell (rust-shell or sh)
         //   terminal -e <prog> [args...]    → launch <prog> with optional args
         //   terminal -- <prog> [args...]    → same, alternate separator
-        let own_argv = {
-            let mut buf = [0u8; 4096];
-            let n = eclipse_syscall::call::get_process_args(&mut buf);
-            buf[..n].split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| std::string::String::from(core::str::from_utf8(s).unwrap_or("")))
-                .collect::<Vec<std::string::String>>()
+        // Eclipse OS: argv lo sirve el kernel con `sys_get_process_args` (syscall 543); es el camino
+        // previsto y probado en el sistema.
+        // Linux (p. ej. musl host para probar el binario): ese número de syscall no es el nuestro; el
+        // kernel devuelve error y además conviene usar `std::env::args()` como en cualquier proceso Unix.
+        let own_argv: Vec<std::string::String> = {
+            #[cfg(target_os = "linux")]
+            {
+                std::env::args().collect()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut buf = [0u8; 4096];
+                let n = eclipse_syscall::call::get_process_args(&mut buf).min(buf.len());
+                buf[..n]
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| std::string::String::from(core::str::from_utf8(s).unwrap_or("")))
+                    .collect()
+            }
         };
 
         // Determine shell/program to run.
@@ -539,9 +551,7 @@ impl TerminalApp {
         let pty_slave_fd = unsafe { open(slave_path.as_ptr() as *const _, flag::O_RDWR as c_int, 0) } as usize;
         if pty_slave_fd == !0 { return None; }
 
-        let sh_res = std::fs::read(&exec_path);
-        if sh_res.is_err() { return None; }
-        let sh_bytes = sh_res.unwrap();
+        let sh_bytes = std::fs::read(&exec_path).ok()?;
 
         // Build kernel name (≤15 bytes) from exec_name
         let mut name_buf = [0u8; 16];
@@ -549,14 +559,16 @@ impl TerminalApp {
         name_buf[..copy_len].copy_from_slice(&exec_name.as_bytes()[..copy_len]);
         let kernel_name = core::str::from_utf8(&name_buf[..copy_len]).unwrap_or("sh");
 
-        let sh_spawn = sys_spawn_with_stdio(&sh_bytes, Some(kernel_name), pty_slave_fd, pty_slave_fd, pty_slave_fd);
-        if let Ok(pid) = sh_spawn {
-            let _ = sys_set_child_args(pid, &exec_argv_bytes);
-        } else {
-            let _ = sys_close(pty_slave_fd);
-            return None;
-        }
-        let sh_pid = sh_spawn.unwrap();
+        let sh_pid = match sys_spawn_with_stdio(&sh_bytes, Some(kernel_name), pty_slave_fd, pty_slave_fd, pty_slave_fd) {
+            Ok(pid) => {
+                let _ = sys_set_child_args(pid, &exec_argv_bytes);
+                pid
+            }
+            Err(_) => {
+                let _ = sys_close(pty_slave_fd);
+                return None;
+            }
+        };
         let _ = sys_close(pty_slave_fd);
 
         // Build sh_name for restart (NUL-terminated kernel name)
@@ -653,69 +665,61 @@ impl TerminalApp {
                                     if h == 0 { h = (*self.surface_state).borrow().height as i32; }
 
                                     if w > 0 && h > 0 && (w != (*self.surface_state).borrow().width as i32 || h != (*self.surface_state).borrow().height as i32) {
-                                        let cols = w as u16 / FONT_CHAR_W;
-                                        let rows = h as u16 / FONT_CHAR_H;
-                                        set_pty_winsize(self.pty_master_fd, rows, cols, w as u16, h as u16);
-                                        
-                                        // Inform shell of the change
-                                        let _ = eclipse_syscall::call::kill(self.sh_pid, 28); // SIGWINCH
-
-                                        // Update internal terminal size (recreate because os-terminal 0.7 has no resize)
-                                        let draw_target = SharedSurfaceDrawTarget { state: self.surface_state.clone() };
-                                        let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
-                                        terminal.set_crnl_mapping(true);
-                                        terminal.set_clipboard(Box::new(EclipseClipboard::new()));
-                                        terminal.set_auto_flush(false);
-                                        terminal.set_history_size(1000);
-                                        terminal.set_scroll_speed(3);
-                                        terminal.set_bell_handler(Box::new(|| {}));
-                                        self.terminal = terminal;
-                                        let pfd = self.pty_master_fd;
-                                        self.terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
-
-                                        // Reallocate SHM buffer if needed
                                         let new_size = (w as usize) * (h as usize) * 4;
-                                        let mut state = (*self.surface_state).borrow_mut();
-                                        
                                         let shm_name = sidewind_shm_name(eclipse_syscall::getpid() as u32);
                                         let shm_path = format!("/tmp/{}\0", shm_name.as_str());
                                         let fd = unsafe { open(shm_path.as_ptr() as *const _, (flag::O_RDWR | flag::O_CREAT) as c_int, 0o644) };
-                                        if fd >= 0 {
+                                        let resize_ok = if fd >= 0 {
                                             let _ = eclipse_syscall::ftruncate(fd as usize, new_size);
                                             let vaddr = unsafe { mmap(core::ptr::null_mut(), new_size, (flag::PROT_READ|flag::PROT_WRITE) as c_int, flag::MAP_SHARED as c_int, fd, 0) };
                                             if !vaddr.is_null() && vaddr != libc::MAP_FAILED {
-                                                // Close the previous shm_fd now that we have a
-                                                // new mapping.  The compositor will process the
-                                                // new create_pool with the new fd below; the old
-                                                // pool (pool 8) is no longer the active buffer.
-                                                if state.shm_fd >= 0 {
-                                                    unsafe { close(state.shm_fd) };
+                                                {
+                                                    let mut state = (*self.surface_state).borrow_mut();
+                                                    if state.shm_fd >= 0 {
+                                                        unsafe { close(state.shm_fd) };
+                                                    }
+                                                    state.ptr = vaddr as *mut u32;
+                                                    state.width = w as usize;
+                                                    state.height = h as usize;
+                                                    state.size_bytes = new_size;
+                                                    state.shm_fd = fd;
                                                 }
-                                                state.ptr = vaddr as *mut u32;
-                                                state.width = w as usize;
-                                                state.height = h as usize;
-                                                state.size_bytes = new_size;
-                                                // Keep fd alive until compositor processes create_pool.
-                                                state.shm_fd = fd;
-                                                
-                                                // Inform compositor of the new buffer
-                                                // Allocate fresh IDs for pool and buffer to avoid
-                                                // reusing already-registered IDs (pointer=13, etc.)
-                                                let pool_id  = self.next_obj_id;
-                                                let buf_id   = self.next_obj_id + 1;
+                                                let pool_id = self.next_obj_id;
+                                                let buf_id = self.next_obj_id + 1;
                                                 self.next_obj_id += 2;
                                                 send_wayland_with_fd(&self.wayland, 4, 0, &[Payload::NewId(NewId(pool_id)), Payload::Handle(wayland_proto::wl::wire::Handle(fd)), Payload::Int(new_size as i32)], fd);
-                                                // create_buffer
                                                 let stride = (w * 4) as i32;
                                                 send_wayland(&self.wayland, pool_id, 0, &[Payload::NewId(NewId(buf_id)), Payload::Int(0), Payload::Int(w), Payload::Int(h), Payload::Int(stride), Payload::UInt(1)]);
-                                                
                                                 self.buffer_id = buf_id;
+                                                true
                                             } else {
-                                                // mmap failed — close fd immediately, nothing to keep.
                                                 unsafe { close(fd) };
+                                                false
                                             }
+                                        } else {
+                                            false
+                                        };
+
+                                        if resize_ok {
+                                            let cols = w as u16 / FONT_CHAR_W;
+                                            let rows = h as u16 / FONT_CHAR_H;
+                                            set_pty_winsize(self.pty_master_fd, rows, cols, w as u16, h as u16);
+                                            let _ = eclipse_syscall::call::kill(self.sh_pid, 28); // SIGWINCH
+
+                                            // Tras actualizar SurfaceBacking: `Terminal::new` lee el tamaño correcto en `DrawTarget::size`.
+                                            let draw_target = SharedSurfaceDrawTarget { state: self.surface_state.clone() };
+                                            let mut terminal = Terminal::new(draw_target, Box::new(BitmapFont));
+                                            terminal.set_crnl_mapping(true);
+                                            terminal.set_clipboard(Box::new(EclipseClipboard::new()));
+                                            terminal.set_auto_flush(false);
+                                            terminal.set_history_size(1000);
+                                            terminal.set_scroll_speed(3);
+                                            terminal.set_bell_handler(Box::new(|| {}));
+                                            self.terminal = terminal;
+                                            let pfd = self.pty_master_fd;
+                                            self.terminal.set_pty_writer(Box::new(move |s| { let _ = sys_write(pfd, s.as_bytes()); }));
+                                            dirty = true;
                                         }
-                                        dirty = true;
                                     }
                                 }
                             }
