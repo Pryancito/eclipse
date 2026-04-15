@@ -8,8 +8,19 @@ use spin::Mutex;
 pub struct DrmScheme;
 
 #[derive(Clone, Copy)]
-enum DrmResource {
+enum DrmResourceKind {
     Control,
+}
+
+/// A DRM resource handle with a reference count.
+/// The resource is kept alive until `ref_count` reaches zero.
+#[derive(Clone, Copy)]
+struct DrmResource {
+    _kind: DrmResourceKind,
+    /// Number of processes (or duplicated fds) that currently hold this resource.
+    /// Starts at 1 on open, incremented on dup, decremented on close.
+    /// The slot is freed when it reaches 0.
+    ref_count: usize,
 }
 
 static OPEN_RESOURCES: Mutex<Vec<Option<DrmResource>>> = Mutex::new(Vec::new());
@@ -18,12 +29,13 @@ impl Scheme for DrmScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
         serial::serial_printf(format_args!("[DRM-SCHEME] open({})\n", path));
         
-        let resource = if path.is_empty() || path == "/" || path == "control" {
-            DrmResource::Control
+        let kind = if path.is_empty() || path == "/" || path == "control" {
+            DrmResourceKind::Control
         } else {
             return Err(scheme_error::ENOENT);
         };
 
+        let resource = DrmResource { _kind: kind, ref_count: 1 };
         let mut resources = OPEN_RESOURCES.lock();
         for (i, slot) in resources.iter_mut().enumerate() {
             if slot.is_none() {
@@ -38,12 +50,19 @@ impl Scheme for DrmScheme {
 
     fn close(&self, id: usize) -> Result<usize, usize> {
         let mut resources = OPEN_RESOURCES.lock();
-        if id < resources.len() {
+        let slot = resources.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        slot.ref_count = slot.ref_count.saturating_sub(1);
+        if slot.ref_count == 0 {
             resources[id] = None;
-            Ok(0)
-        } else {
-            Err(scheme_error::EBADF)
         }
+        Ok(0)
+    }
+
+    fn dup(&self, id: usize) -> Result<usize, usize> {
+        let mut resources = OPEN_RESOURCES.lock();
+        let slot = resources.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        slot.ref_count += 1;
+        Ok(0)
     }
 
     fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
