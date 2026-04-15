@@ -13,8 +13,13 @@ pub const FD_CLOEXEC: c_int = 1;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
 #[no_mangle]
-pub unsafe extern "C" fn fcntl(_fd: c_int, _cmd: c_int, _arg: ...) -> c_int {
-    // Stub — Eclipse OS does not have a fcntl syscall yet.
-    // F_SETFL/F_GETFL succeed silently; non-blocking mode is not yet enforced.
-    0
+pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, mut arg: ...) -> c_int {
+    let extra: usize = arg.arg::<usize>();
+    match crate::eclipse_syscall::call::fcntl(fd as usize, cmd as usize, extra) {
+        Ok(v) => v as c_int,
+        Err(e) => {
+            *crate::header::errno::__errno_location() = e.errno as c_int;
+            -1
+        }
+    }
 }

@@ -20,8 +20,11 @@ pub const SYS_BRK: usize = 12;
 pub const SYS_SIGACTION: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_IOCTL: usize = 16;
+pub const SYS_ACCESS: usize = 21;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_YIELD: usize = 24;
+pub const SYS_DUP: usize = 32;
+pub const SYS_DUP2: usize = 33;
 pub const SYS_PAUSE: usize = 34;
 pub const SYS_NANOSLEEP: usize = 35;
 pub const SYS_GETPID: usize = 39;
@@ -34,6 +37,8 @@ pub const SYS_SETSOCKOPT: usize = 54;
 pub const SYS_GETSOCKOPT: usize = 55;
 pub const SYS_CLONE: usize = 56;
 pub const SYS_FORK: usize = 57;
+/// Linux-compatible execve(path, argv, envp) — replaces process image.
+pub const SYS_EXECVE: usize = 59;
 /// Eclipse-native exec: replace the current process image with a raw ELF buffer
 /// (elf_ptr: *const u8, elf_size: usize).  Syscall 59 is the Linux-compatible
 /// execve(path, argv, envp) — do NOT use 59 for this binary-exec path.
@@ -41,17 +46,24 @@ pub const SYS_EXEC: usize = 546;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_WAIT: usize = 61;
 pub const SYS_KILL: usize = 62;
+pub const SYS_FCNTL: usize = 72;
 pub const SYS_FTRUNCATE: usize = 77;
+pub const SYS_GETCWD: usize = 79;
+pub const SYS_CHDIR: usize = 80;
 /// rename(oldpath, newpath) — mismos argumentos que Linux x86-64 (punteros a C-strings).
 pub const SYS_RENAME: usize = 82;
-pub const SYS_MKDIR: usize = 541;
-pub const SYS_UNLINK: usize = 540;
+pub const SYS_SETPGID: usize = 109;
 pub const SYS_GETPPID: usize = 110;
+pub const SYS_SETSID: usize = 112;
+pub const SYS_GETPGID: usize = 121;
 pub const SYS_ARCH_PRCTL: usize = 158;
 pub const SYS_GETTID: usize = 186;
 pub const SYS_FUTEX: usize = 202;
 pub const SYS_FSTATAT: usize = 262;
 pub const SYS_GETRANDOM: usize = 318;
+pub const SYS_PIPE2: usize = 293;
+pub const SYS_MKDIR: usize = 541;
+pub const SYS_UNLINK: usize = 540;
 
 // Eclipse-specific syscalls (Range 500+)
 pub const SYS_SEND: usize = 500;

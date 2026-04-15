@@ -47,6 +47,14 @@ pub struct Allocator {
 #[cfg_attr(all(feature = "allocator", not(feature = "no-allocator")), global_allocator)]
 static ALLOCATOR: Allocator = Allocator::new();
 
+/// Idempotent heap initialisation: a no-op on Eclipse OS because the allocator
+/// is lazy (it calls mmap on the first allocation).  Present so that
+/// `__libc_start_main` can call it unconditionally.
+#[inline(always)]
+pub fn init_heap_if_needed() {
+    // Nothing needed — the bump allocator maps memory on demand.
+}
+
 impl Allocator {
     pub const fn new() -> Self {
         Self {
