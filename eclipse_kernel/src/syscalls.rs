@@ -1917,17 +1917,49 @@ fn sys_spawn_with_stdio_from_elf(
             .unwrap();
 
             {
-                let p_fd_in = crate::fd::fd_get(parent_pid, fd_in as usize);
+                let p_fd_in  = crate::fd::fd_get(parent_pid, fd_in  as usize);
                 let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
                 let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
 
+                // Collect the old (fd_init_stdio) entries that will be replaced so
+                // we can close their scheme resources afterward.  We must close them
+                // OUTSIDE the FD_TABLES lock and BEFORE calling dup on the new ones
+                // to keep ref-counts balanced.
+                // fd_init_stdio opens the TTY once and shares the same resource_id
+                // across FDs 0/1/2, so we deduplicate before closing.
+                let mut old_to_close: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
+
                 if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
                     let mut tables = crate::fd::FD_TABLES.lock();
-                    if let Some(fd) = p_fd_in { tables[child_fd_idx].fds[0] = fd; }
-                    if let Some(fd) = p_fd_out { tables[child_fd_idx].fds[1] = fd; }
-                    if let Some(fd) = p_fd_err { tables[child_fd_idx].fds[2] = fd; }
+                    if let Some(ref new_fd) = p_fd_in {
+                        let old = &tables[child_fd_idx].fds[0];
+                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                        tables[child_fd_idx].fds[0] = *new_fd;
+                    }
+                    if let Some(ref new_fd) = p_fd_out {
+                        let old = &tables[child_fd_idx].fds[1];
+                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                        tables[child_fd_idx].fds[1] = *new_fd;
+                    }
+                    if let Some(ref new_fd) = p_fd_err {
+                        let old = &tables[child_fd_idx].fds[2];
+                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                        tables[child_fd_idx].fds[2] = *new_fd;
+                    }
                 }
 
+                // Close old (init) handles outside the lock; skip duplicates so a
+                // resource shared across multiple FDs (e.g. the single TTY handle
+                // placed into all three FDs by fd_init_stdio) is closed only once.
+                let mut closed: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
+                for pair in old_to_close {
+                    if !closed.contains(&pair) {
+                        let _ = crate::scheme::close(pair.0, pair.1);
+                        closed.push(pair);
+                    }
+                }
+
+                // Increment ref-counts for the newly inherited handles.
                 for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {
                     if let Some(fd) = fd_opt {
                         if fd.in_use {

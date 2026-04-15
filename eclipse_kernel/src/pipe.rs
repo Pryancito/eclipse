@@ -232,22 +232,15 @@ impl Scheme for PipeScheme {
     }
 
     fn dup(&self, id: usize) -> Result<usize, usize> {
-        let (channel_id, is_write) = {
-            let mut handles = self.handles.lock();
-            let h = handles.get_mut(id).and_then(|x| x.as_mut()).ok_or(error::EBADF)?;
-            h.ref_count += 1;
-            (h.channel_id, h.is_write)
-        };
-        // Mirror the ref-count increment on the channel side so that the
-        // write_ends / read_ends counters stay accurate.
-        if let Some(arc) = self.get_channel(channel_id) {
-            let mut ch = arc.lock();
-            if is_write {
-                ch.write_ends += 1;
-            } else {
-                ch.read_ends += 1;
-            }
-        }
+        let mut handles = self.handles.lock();
+        let h = handles.get_mut(id).and_then(|x| x.as_mut()).ok_or(error::EBADF)?;
+        // Only increment the per-handle ref_count.  write_ends / read_ends on
+        // the channel count distinct open handle *slots*, not individual
+        // references.  They are decremented only when the last reference to a
+        // slot disappears (ref_count → 0 in close).  Incrementing them here
+        // would cause the counter to permanently exceed the true number of
+        // open handles, preventing readers from ever seeing EOF.
+        h.ref_count += 1;
         Ok(0)
     }
 
