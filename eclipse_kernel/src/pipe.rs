@@ -36,6 +36,9 @@ impl PipeChannel {
 pub struct PipeHandle {
     pub channel_id: usize,
     pub is_write:   bool,
+    /// Number of open references to this handle slot (incremented by dup, decremented by close).
+    /// The channel side counter is only decremented when this reaches 0.
+    pub ref_count:  usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,12 +80,12 @@ impl PipeScheme {
         let mut handles = self.handles.lock();
         for (i, slot) in handles.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(PipeHandle { channel_id, is_write });
+                *slot = Some(PipeHandle { channel_id, is_write, ref_count: 1 });
                 return i;
             }
         }
         let id = handles.len();
-        handles.push(Some(PipeHandle { channel_id, is_write }));
+        handles.push(Some(PipeHandle { channel_id, is_write, ref_count: 1 }));
         id
     }
 
@@ -192,28 +195,59 @@ impl Scheme for PipeScheme {
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
-        let handle = {
+        // Decrement ref_count; only release the channel end when it reaches 0.
+        let (channel_id, is_write, last_ref) = {
             let mut handles = self.handles.lock();
-            handles.get_mut(id).and_then(|h| h.take()).ok_or(error::EBADF)?
+            let h = handles.get_mut(id).and_then(|x| x.as_mut()).ok_or(error::EBADF)?;
+            h.ref_count = h.ref_count.saturating_sub(1);
+            let last = h.ref_count == 0;
+            let channel_id = h.channel_id;
+            let is_write = h.is_write;
+            if last {
+                handles[id] = None;
+            }
+            (channel_id, is_write, last)
         };
 
-        if let Some(arc) = self.get_channel(handle.channel_id) {
-            let mut ch = arc.lock();
-            if handle.is_write {
-                ch.write_ends = ch.write_ends.saturating_sub(1);
-            } else {
-                ch.read_ends = ch.read_ends.saturating_sub(1);
-            }
-            // Si ningún extremo sigue abierto, podemos liberar el canal
-            if ch.write_ends == 0 && ch.read_ends == 0 {
-                drop(ch); // soltar el lock antes de mutar channels
-                let mut channels = self.channels.lock();
-                if handle.channel_id < channels.len() {
-                    channels[handle.channel_id] = None;
+        if last_ref {
+            if let Some(arc) = self.get_channel(channel_id) {
+                let mut ch = arc.lock();
+                if is_write {
+                    ch.write_ends = ch.write_ends.saturating_sub(1);
+                } else {
+                    ch.read_ends = ch.read_ends.saturating_sub(1);
+                }
+                // Si ningún extremo sigue abierto, podemos liberar el canal
+                if ch.write_ends == 0 && ch.read_ends == 0 {
+                    drop(ch); // soltar el lock antes de mutar channels
+                    let mut channels = self.channels.lock();
+                    if channel_id < channels.len() {
+                        channels[channel_id] = None;
+                    }
                 }
             }
         }
 
+        Ok(0)
+    }
+
+    fn dup(&self, id: usize) -> Result<usize, usize> {
+        let (channel_id, is_write) = {
+            let mut handles = self.handles.lock();
+            let h = handles.get_mut(id).and_then(|x| x.as_mut()).ok_or(error::EBADF)?;
+            h.ref_count += 1;
+            (h.channel_id, h.is_write)
+        };
+        // Mirror the ref-count increment on the channel side so that the
+        // write_ends / read_ends counters stay accurate.
+        if let Some(arc) = self.get_channel(channel_id) {
+            let mut ch = arc.lock();
+            if is_write {
+                ch.write_ends += 1;
+            } else {
+                ch.read_ends += 1;
+            }
+        }
         Ok(0)
     }
 
