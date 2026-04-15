@@ -1071,6 +1071,55 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<ExecLoad
     load_elf_into_space(crate::memory::get_cr3(), elf_data)
 }
 
+/// Maximum bytes in a kernel process name (16 chars + NUL = 17, padded to 20 for alignment).
+const MAX_PROCESS_NAME_LEN: usize = 16;
+/// Buffer size for argv0 fallback (name + NUL, rounded up).
+const ARGV0_BUF_LEN: usize = 20;
+
+/// Build the full argv list for a process from its pending args registered by the parent via
+/// `set_child_args` (syscall 542).  Each returned `Vec<u8>` is a NUL-terminated string.
+///
+/// If no pending args exist (e.g. the process was spawned without `set_child_args`), the list
+/// falls back to a single argv[0] built from the kernel process name.
+fn build_argv_from_pending(pid: crate::process::ProcessId) -> Vec<Vec<u8>> {
+    // Read the NUL-separated pending args registered by the parent.
+    let mut pending_buf = [0u8; 4096];
+    let n = crate::process::copy_pending_process_args(pid, &mut pending_buf);
+
+    if n > 0 {
+        // Parse "arg0\0arg1\0arg2\0..." into individual NUL-terminated byte vectors.
+        let args: Vec<Vec<u8>> = pending_buf[..n]
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let mut v = s.to_vec();
+                v.push(0); // ensure NUL-terminated
+                v
+            })
+            .collect();
+        if !args.is_empty() {
+            return args;
+        }
+    }
+
+    // Fallback: use process name as argv[0].
+    let mut argv0 = [0u8; ARGV0_BUF_LEN];
+    let argv0_len = if let Some(p) = get_process(pid) {
+        let n = p.name.iter().position(|&b| b == 0).unwrap_or(MAX_PROCESS_NAME_LEN).min(MAX_PROCESS_NAME_LEN);
+        argv0[..n].copy_from_slice(&p.name[..n]);
+        argv0[n] = 0;
+        n + 1
+    } else {
+        argv0[..8].copy_from_slice(b"program\0");
+        8
+    };
+    let mut v = argv0[..argv0_len].to_vec();
+    if v.last() != Some(&0) { v.push(0); }
+    let mut result = Vec::with_capacity(1);
+    result.push(v);
+    result
+}
+
 /// Salto al intérprete dinámico (p. ej. ld-musl): mismo ABI de args que [`jump_to_userspace`],
 /// más `AT_BASE` / `AT_ENTRY` en auxv leídos de `Process::dynamic_linker_aux`.
 ///
@@ -1111,25 +1160,18 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
 
-    // Build argv[0] from process name.
-    let mut argv0_buf = [0u8; 20];
-    let argv0_len = if let Some(pid) = current_process_id() {
-        if let Some(p) = get_process(pid) {
-            let n = p.name.iter().position(|&b| b == 0).unwrap_or(16).min(16);
-            argv0_buf[..n].copy_from_slice(&p.name[..n]);
-            argv0_buf[n] = 0;
-            n + 1
-        } else { 8 }
-    } else { 8 };
-    if argv0_len == 8 { argv0_buf[..8].copy_from_slice(b"program\0"); }
+    // Build full argv from pending args registered by parent (set_child_args syscall).
+    let argv_strings = build_argv_from_pending(_pid as crate::process::ProcessId);
+    let argc = argv_strings.len();
 
-    let mut str_total: usize = argv0_len;
+    let mut str_total: usize = 0;
+    for s in &argv_strings { str_total += s.len(); }
     for e in MINIMAL_ENVP { str_total += e.len(); }
     str_total += 16; // AT_RANDOM
     let str_area_size = (str_total + 15) & !15usize;
 
     const AUXV_ENTRIES: usize = 7; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_ENTRY,AT_RANDOM
-    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_slots = 1 + (argc + 1) + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
     let strings_base_raw = (stack_top as usize).wrapping_sub(str_area_size);
@@ -1161,9 +1203,13 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     unsafe {
         let mut str_off: u64 = strings_base;
 
-        let argv0_ptr = str_off;
-        core::ptr::copy_nonoverlapping(argv0_buf.as_ptr(), str_off as *mut u8, argv0_len);
-        str_off += argv0_len as u64;
+        // Write all argv strings and collect their pointers.
+        let mut argv_ptrs = Vec::with_capacity(argc);
+        for s in &argv_strings {
+            argv_ptrs.push(str_off);
+            core::ptr::copy_nonoverlapping(s.as_ptr(), str_off as *mut u8, s.len());
+            str_off += s.len() as u64;
+        }
 
         let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
         for (i, e) in MINIMAL_ENVP.iter().enumerate() {
@@ -1180,8 +1226,8 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
 
         let table = adjusted_stack as *mut u64;
         let mut i: isize = 0;
-        write_volatile(table.offset(i), 1u64); i += 1;
-        write_volatile(table.offset(i), argv0_ptr); i += 1;
+        write_volatile(table.offset(i), argc as u64); i += 1;
+        for p in &argv_ptrs { write_volatile(table.offset(i), *p); i += 1; }
         write_volatile(table.offset(i), 0u64); i += 1;
         for ep in env_ptrs.iter() { write_volatile(table.offset(i), *ep); i += 1; }
         write_volatile(table.offset(i), 0u64); i += 1;
@@ -1276,35 +1322,6 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         loop { core::arch::asm!("hlt"); }
     }
     
-    // System V ABI x86-64 stack alignment requirements:
-    // - At program entry: RSP must be 16-byte aligned (RSP & 0xF == 0)
-    // - Before CALL instruction: Stack arranged so (RSP+8) is 16-byte aligned
-    //   (because CALL pushes return address, making RSP misaligned after)
-    //
-    // We're at program entry (not a function call), so RSP should be 16-byte aligned.
-    // Stack layout at program start (System V ABI):
-    //   [RSP+0]  = argc
-    //   [RSP+8]  = argv[0] (or NULL if no args)
-    //   [RSP+16] = argv[1] (or NULL as terminator)
-    //   ...
-    //   [RSP + 8*(argc+1)] = NULL (end of argv)
-    //   [RSP + 8*(argc+2)] = envp[0] (or NULL)
-    //   ...
-    //   [RSP + 8*(argc+2+envc)] = NULL (end of envp)
-    //   [RSP + ...] = auxv[0].a_type (auxiliary vector entries)
-    //   [RSP + ...] = auxv[0].a_val
-    //   ...
-    //   [RSP + ...] = AT_NULL (0) to terminate auxv
-    //   [RSP + ...] = 0 (value for AT_NULL)
-    
-    // For argc=0 with auxv so glibc works.
-    // - 1 qword: argc = 0
-    // - 1 qword: argv[0] = NULL (argv terminator)
-    // - 1 qword: envp[0] = NULL (envp terminator)
-    // - auxv: AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
-    // - 16 bytes for AT_RANDOM data
-    // Total: 3 (argc/argv/envp) + 12 qwords (6 auxv entries × 2 qwords) + 2 (random data) = 17 quadwords = 136 bytes.
-    // We subtract 144 bytes to keep 16-byte alignment.
     const AT_PAGESZ: u64 = 6;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -1312,35 +1329,20 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
 
-    // Build argv[0] from the process name stored in Process.name.
-    let mut argv0_buf = [0u8; 20]; // "bash\0" etc.
-    let argv0_len = if let Some(pid) = current_process_id() {
-        if let Some(p) = get_process(pid) {
-            let n = p.name.iter().position(|&b| b == 0).unwrap_or(16).min(16);
-            argv0_buf[..n].copy_from_slice(&p.name[..n]);
-            argv0_buf[n] = 0;
-            n + 1 // include null terminator
-        } else { 8 }
-    } else { 8 };
-    if argv0_len == 8 {
-        argv0_buf[..8].copy_from_slice(b"program\0");
-    }
+    // Build full argv from pending args registered by parent (set_child_args syscall).
+    let argv_strings = build_argv_from_pending(_pid as crate::process::ProcessId);
+    let argc = argv_strings.len();
 
-    // Layout (growing down from stack_top):
-    //   strings area: argv0 + env strings + 16-byte AT_RANDOM data
-    //   pointer+auxv table at adjusted_stack (RSP)
-    //
-    // Calculate total string bytes.
-    let mut str_total: usize = argv0_len; // argv[0]
+    // Calculate total string bytes needed.
+    let mut str_total: usize = 0;
+    for s in &argv_strings { str_total += s.len(); }
     for e in MINIMAL_ENVP { str_total += e.len(); }
     str_total += 16; // AT_RANDOM data
-    // Align up to 16 bytes.
     let str_area_size = (str_total + 15) & !15usize;
 
-    // Number of 8-byte slots needed for the pointer table:
-    //   1 (argc) + 2 (argv[0]+NULL) + MINIMAL_ENVP_COUNT+1 (envp+NULL) + 2*(5 auxv + AT_NULL)
+    // Number of 8-byte slots: 1(argc) + argc+1(argv+NULL) + MINIMAL_ENVP_COUNT+1(envp+NULL) + 2*(5 auxv + AT_NULL)
     const AUXV_ENTRIES: usize = 5; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM
-    let table_slots = 1 + 2 + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
+    let table_slots = 1 + (argc + 1) + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
     // RSP: place table right below the strings area, aligned to 16.
@@ -1349,7 +1351,6 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     let adjusted_stack = (rsp_raw & !0xF) as u64;
     let strings_base = adjusted_stack + table_bytes as u64;
 
-    let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x}\n", _pid, entry_point, adjusted_stack));
 
     // Always reload CR3 to flush the TLB.
@@ -1365,10 +1366,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     unsafe {
         let mut str_off: u64 = strings_base;
 
-        // argv[0] string
-        let argv0_ptr = str_off;
-        core::ptr::copy_nonoverlapping(argv0_buf.as_ptr(), str_off as *mut u8, argv0_len);
-        str_off += argv0_len as u64;
+        // Write all argv strings and collect their pointers.
+        let mut argv_ptrs = Vec::with_capacity(argc);
+        for s in &argv_strings {
+            argv_ptrs.push(str_off);
+            core::ptr::copy_nonoverlapping(s.as_ptr(), str_off as *mut u8, s.len());
+            str_off += s.len() as u64;
+        }
 
         // envp strings
         let mut env_ptrs = [0u64; MINIMAL_ENVP_COUNT];
@@ -1388,8 +1392,8 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         // Write argc/argv/envp/auxv table.
         let table = adjusted_stack as *mut u64;
         let mut i: isize = 0;
-        write_volatile(table.offset(i), 1u64); i += 1;      // argc = 1
-        write_volatile(table.offset(i), argv0_ptr); i += 1; // argv[0]
+        write_volatile(table.offset(i), argc as u64); i += 1;
+        for p in &argv_ptrs { write_volatile(table.offset(i), *p); i += 1; }
         write_volatile(table.offset(i), 0u64); i += 1;       // argv NULL
         for ep in env_ptrs.iter() {
             write_volatile(table.offset(i), *ep); i += 1;
