@@ -1071,6 +1071,11 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<ExecLoad
     load_elf_into_space(crate::memory::get_cr3(), elf_data)
 }
 
+/// Maximum bytes in a kernel process name (16 chars + NUL = 17, padded to 20 for alignment).
+const MAX_PROCESS_NAME_LEN: usize = 16;
+/// Buffer size for argv0 fallback (name + NUL, rounded up).
+const ARGV0_BUF_LEN: usize = 20;
+
 /// Build the full argv list for a process from its pending args registered by the parent via
 /// `set_child_args` (syscall 542).  Each returned `Vec<u8>` is a NUL-terminated string.
 ///
@@ -1098,9 +1103,9 @@ fn build_argv_from_pending(pid: crate::process::ProcessId) -> Vec<Vec<u8>> {
     }
 
     // Fallback: use process name as argv[0].
-    let mut argv0 = [0u8; 20];
+    let mut argv0 = [0u8; ARGV0_BUF_LEN];
     let argv0_len = if let Some(p) = get_process(pid) {
-        let n = p.name.iter().position(|&b| b == 0).unwrap_or(16).min(16);
+        let n = p.name.iter().position(|&b| b == 0).unwrap_or(MAX_PROCESS_NAME_LEN).min(MAX_PROCESS_NAME_LEN);
         argv0[..n].copy_from_slice(&p.name[..n]);
         argv0[n] = 0;
         n + 1
