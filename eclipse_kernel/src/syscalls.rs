@@ -1921,12 +1921,11 @@ fn sys_spawn_with_stdio_from_elf(
                 let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
                 let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
 
-                if let Some(mut tables) = crate::fd::get_fd_table(pid as u32) {
-                    if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
-                        if let Some(fd) = p_fd_in { tables[child_fd_idx].fds[0] = fd; }
-                        if let Some(fd) = p_fd_out { tables[child_fd_idx].fds[1] = fd; }
-                        if let Some(fd) = p_fd_err { tables[child_fd_idx].fds[2] = fd; }
-                    }
+                if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
+                    let mut tables = crate::fd::FD_TABLES.lock();
+                    if let Some(fd) = p_fd_in { tables[child_fd_idx].fds[0] = fd; }
+                    if let Some(fd) = p_fd_out { tables[child_fd_idx].fds[1] = fd; }
+                    if let Some(fd) = p_fd_err { tables[child_fd_idx].fds[2] = fd; }
                 }
 
                 for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {

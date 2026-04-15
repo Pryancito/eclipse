@@ -1170,7 +1170,7 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     str_total += 16; // AT_RANDOM
     let str_area_size = (str_total + 15) & !15usize;
 
-    const AUXV_ENTRIES: usize = 7; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_ENTRY,AT_RANDOM
+    const AUXV_ENTRIES: usize = 8; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_FLAGS,AT_ENTRY,AT_RANDOM
     let table_slots = 1 + (argc + 1) + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
