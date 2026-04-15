@@ -185,7 +185,6 @@ impl FramebufferState {
                 }
                 return false;
             }
-            self.flip_error_logged = false;
             core::mem::swap(&mut self.back_addr, &mut self.front_addr);
             core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
             true
