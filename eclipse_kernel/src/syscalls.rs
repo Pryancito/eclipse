@@ -419,7 +419,7 @@ pub extern "C" fn syscall_handler(
         50  => sys_listen(arg1, arg2),
         54  => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         55  => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
-        56  => sys_clone(arg1, arg2, arg3),
+        56  => sys_clone(arg1, arg2, arg3, &process_context),
         57  => sys_fork(&process_context),
         59  => sys_execve(arg1, arg2, arg3),
         60  => sys_exit(arg1),
@@ -3397,9 +3397,10 @@ fn sys_brk(addr: u64) -> u64 {
 ///   flags: CLONE_* flags determining what is shared
 ///   stack: Stack pointer for new thread (0 = kernel allocates)
 ///   parent_tid: Where to store TID in parent (can be 0)
+///   context: Current process register context (needed for fork-style clone)
 /// 
 /// Returns: TID of new thread/process, or u64::MAX on error
-fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
+fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process::Context) -> u64 {
     use crate::process;
     
     // Linux encodes exit signal in the low byte of flags.
@@ -3414,20 +3415,35 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
     const CLONE_FS: u64 = 0x00000200;
     const CLONE_FILES: u64 = 0x00000400;
     const CLONE_SIGHAND: u64 = 0x00000800;
+    const CLONE_VFORK: u64 = 0x00004000;
     const CLONE_SYSVSEM: u64 = 0x00040000;
     const CLONE_SETTLS: u64 = 0x00080000;
     const CLONE_PARENT_SETTID: u64 = 0x00100000;
     const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
     const CLONE_CHILD_SETTID: u64 = 0x01000000;
 
-    // We only implement thread-style clone. Extra flags above are tolerated.
-    if (flags & (CLONE_VM | CLONE_THREAD)) != (CLONE_VM | CLONE_THREAD) {
-        serial::serial_printf(format_args!(
-            "sys_clone: only thread-style clone supported (need CLONE_VM|CLONE_THREAD); flags={:#x} exit_signal={}\n",
-            flags,
-            exit_signal
-        ));
-        return u64::MAX;
+    // Fork-style clone: CLONE_THREAD not set → treat as fork/vfork.
+    // This handles relibc's vfork() (CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD)
+    // and plain fork() (exit_signal=SIGCHLD only).  We implement vfork as a
+    // regular fork (without the "parent suspended" semantics) because the child
+    // will exec immediately.
+    if (flags & CLONE_THREAD) == 0 {
+        let mut child_context = *context;
+        child_context.rax = 0; // child sees 0 as fork() return value
+        match process::fork_process(&child_context) {
+            Some(child_pid) => {
+                crate::scheduler::enqueue_process(child_pid);
+                return child_pid as u64;
+            }
+            None => {
+                serial::serial_printf(format_args!(
+                    "sys_clone: fork-style clone failed; flags={:#x} exit_signal={}\n",
+                    flags,
+                    exit_signal
+                ));
+                return u64::MAX;
+            }
+        }
     }
 
     // Reject any other unknown flags to surface unexpected ABI changes early.
@@ -3436,6 +3452,7 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
         | CLONE_FS
         | CLONE_FILES
         | CLONE_SIGHAND
+        | CLONE_VFORK
         | CLONE_SYSVSEM
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
