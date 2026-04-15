@@ -96,7 +96,6 @@ int   tcsetpgrp(int fd, pid_t pgrp);
 unsigned int sleep(unsigned int seconds);
 int usleep(unsigned int usec);
 long sysconf(int name);
-int confstr(int name, char *buf, size_t len);
 size_t confstr(int name, char *buf, size_t len);
 
 #endif /* _UNISTD_H */

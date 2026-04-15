@@ -6,10 +6,7 @@ use crate::ipc::handle_sidewind_message;
 use crate::render;
 use std::prelude::v1::*;
 use core::matches;
-#[cfg(target_os = "eclipse")]
 use libc::{eclipse_send, write, ProcessInfo, SystemStats, get_system_stats, get_process_list};
-#[cfg(not(target_os = "eclipse"))]
-use eclipse_syscall::{ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
 use core::default::Default;
@@ -30,12 +27,6 @@ use std::rc::Rc;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 
-#[cfg(not(target_os = "eclipse"))]
-unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-#[cfg(not(target_os = "eclipse"))]
-fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
-#[cfg(not(target_os = "eclipse"))]
-fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> usize { 0 }
 
 #[derive(Clone, Copy, Default)]
 pub struct ServiceInfo {
@@ -109,9 +100,7 @@ pub struct SmithayState {
     /// Sirve de watchdog: si el main loop sigue avanzando pero este valor no cambia,
     /// los eventos de ratón han dejado de llegar (IPC muerto o input_service bloqueado).
     pub last_input_tick: u64,
-    #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_connections: [Option<EclipseWaylandConnection>; 32],
-    #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
     /// Última vez que se recibió un mensaje IPC (para el heartbeat).
     pub last_ipc_activity: std::time::Instant,
@@ -211,9 +200,7 @@ impl SmithayState {
             log_buf: [0; 512],
             log_len: 0,
             last_input_tick: 0,
-            #[cfg(any(not(target_os = "linux"), test))]
             wayland_connections: [const { None }; 32],
-            #[cfg(any(not(target_os = "linux"), test))]
             wayland_pool_maps: Vec::new(),
             last_ipc_activity: std::time::Instant::now(),
             style_engine,
@@ -298,7 +285,6 @@ impl SmithayState {
         // first opened.  init (PID 1) replies asynchronously; the first handle_ipc()
         // call in the main loop will pick up the SVCS response and populate
         // service_list / service_count before any render happens.
-        #[cfg(target_os = "eclipse")]
         let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, b"GET_SERVICES_INFO\0".len(), 0) };
 
         Some(state)
@@ -480,8 +466,6 @@ impl SmithayState {
                 }
                 self.dirty = true;
             }
-            #[cfg(any(not(target_os = "linux"), test))]
-            #[cfg(any(not(target_os = "linux"), test))]
             CompositorEvent::Wayland(data, sender_pid) => {
                 let client_id = wayland_proto::wl::server::client::ClientId(*sender_pid);
                 if !self.wayland_server.clients.contains_key(&client_id) {
@@ -502,7 +486,6 @@ impl SmithayState {
     /// Procesa IPC sin colgar el frame: drena el buzón del kernel (evita "buzon lleno")
     /// pero limita eventos procesados por frame para seguir haciendo render/update a ~60 FPS.
     pub fn handle_ipc(&mut self) {
-        #[cfg(not(test))]
         self.backend.drain_ipc_into_pending(128);
         const EVENTS_PER_FRAME: usize = 64;
         let mut events_processed = 0usize;
@@ -613,7 +596,6 @@ impl SmithayState {
         }
     }
 
-    #[cfg(any(not(target_os = "linux"), test))]
     fn ensure_wayland_pool_mapped(&mut self, _conn_idx: usize, _buffer_id: u32) {
         // This is now handled by AppShm in protocol.rs
     }
@@ -931,7 +913,6 @@ impl SmithayState {
                 }
 
                 // Log de diagnóstico: memoria y CPU de smithay_app y contadores internos, SIEMPRE.
-                #[cfg(target_os = "eclipse")]
                 {
                     let self_pid = unsafe { libc::getpid() as u32 };
                     let mut _self_mem_kb = 0u64;
@@ -949,7 +930,6 @@ impl SmithayState {
 
             // Siempre pedimos info de servicios para mantener la lista actualizada,
             // de modo que esté lista cuando se abra System Central.
-            #[cfg(target_os = "eclipse")]
             let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, b"GET_SERVICES_INFO\0".len(), 0) };
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos

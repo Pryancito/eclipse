@@ -2,10 +2,10 @@
 pub use crate::eclipse_syscall::{SystemStats, InputEvent};
 use crate::types::*;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 pub use crate::eclipse_syscall::ProcessInfo;
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -15,7 +15,7 @@ pub struct ProcessInfo {
     pub mem_frames: u64,
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 impl ProcessInfo {
     pub const fn new() -> Self {
         Self {
@@ -28,7 +28,7 @@ impl ProcessInfo {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int {
     if stats.is_null() { return -1; }
@@ -36,22 +36,22 @@ pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int {
     if res == 0 { 0 } else { -1 }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int { -1 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn set_time(secs: u64) -> c_int {
     let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_SET_TIME, secs as usize);
     if res == 0 { 0 } else { -1 }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn set_time(_secs: u64) -> c_int { -1 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn get_process_list(buf: *mut ProcessInfo, max_count: usize) -> isize {
     if buf.is_null() { return -1; }
@@ -59,22 +59,22 @@ pub unsafe extern "C" fn get_process_list(buf: *mut ProcessInfo, max_count: usiz
     res as isize
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_process_list(_buf: *mut ProcessInfo, _max_count: usize) -> isize { -1 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn eclipse_kill(pid: u32, sig: u32) -> c_int {
     let res = eclipse_syscall::syscall2(eclipse_syscall::number::SYS_KILL, pid as usize, sig as usize);
     if res == 0 { 0 } else { -1 }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn eclipse_kill(_pid: u32, _sig: u32) -> c_int { -1 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn set_process_name(name: *const c_char) -> c_int {
     if name.is_null() { return -1; }
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn set_process_name(name: *const c_char) -> c_int {
     if res == 0 { 0 } else { -1 }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn set_process_name(_name: *const c_char) -> c_int { -1 }
 
@@ -113,7 +113,7 @@ pub struct FramebufferInfo {
     pub blue_mask_shift: u8,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn get_framebuffer_info() -> core::option::Option<FramebufferInfo> {
     let mut fb_info = FramebufferInfo::default();
@@ -121,18 +121,18 @@ pub unsafe extern "C" fn get_framebuffer_info() -> core::option::Option<Framebuf
     if res == 0 { core::option::Option::Some(fb_info) } else { core::option::Option::None }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_framebuffer_info() -> core::option::Option<FramebufferInfo> { core::option::Option::None }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn map_framebuffer() -> core::option::Option<usize> {
     let res = eclipse_syscall::syscall0(eclipse_syscall::number::SYS_MAP_FRAMEBUFFER);
     if res != 0 { core::option::Option::Some(res as usize) } else { core::option::Option::None }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn map_framebuffer() -> core::option::Option<usize> { core::option::Option::None }
 
@@ -145,18 +145,18 @@ pub struct GpuDisplayBufferInfo {
     pub size: u64,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn get_gpu_display_info(out: *mut [u32; 2]) -> bool {
     let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_GET_GPU_DISPLAY_INFO, out as usize);
     res != usize::MAX
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_gpu_display_info(_out: *mut [u32; 2]) -> bool { false }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn gpu_alloc_display_buffer(width: u32, height: u32) -> core::option::Option<GpuDisplayBufferInfo> {
     let mut out = GpuDisplayBufferInfo::default();
@@ -164,33 +164,33 @@ pub unsafe extern "C" fn gpu_alloc_display_buffer(width: u32, height: u32) -> co
     if res == 0 { core::option::Option::Some(out) } else { core::option::Option::None }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn gpu_alloc_display_buffer(_width: u32, _height: u32) -> core::option::Option<GpuDisplayBufferInfo> { core::option::Option::None }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
     let res = eclipse_syscall::syscall5(eclipse_syscall::number::SYS_GPU_PRESENT, resource_id as usize, x as usize, y as usize, w as usize, h as usize);
     res != usize::MAX
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn gpu_present(_resource_id: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> bool { false }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn eclipse_send(target: u32, msg_type: u32, data: *const c_void, len: size_t, _flags: i32) -> isize {
     let res = eclipse_syscall::syscall4(eclipse_syscall::number::SYS_SEND, target as usize, msg_type as usize, data as usize, len);
     res as isize
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn eclipse_send(_target: u32, _msg_type: u32, _data: *const c_void, _len: size_t, _flags: i32) -> isize { -1 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn receive(buffer: *mut u8, len: size_t, sender_pid: *mut u32) -> usize {
     let mut pid_temp: u64 = 0;
@@ -199,22 +199,22 @@ pub unsafe extern "C" fn receive(buffer: *mut u8, len: size_t, sender_pid: *mut 
     res
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn receive(_buffer: *mut u8, _len: size_t, _sender_pid: *mut u32) -> usize { 0 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn get_logs(buf: *mut u8, len: size_t) -> usize {
     let res = eclipse_syscall::syscall2(eclipse_syscall::number::SYS_GET_LOGS, buf as usize, len);
     res
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_logs(_buf: *mut u8, _len: size_t) -> usize { 0 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
     let size: usize;
@@ -231,21 +231,22 @@ pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
     } else { core::option::Option::None }
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> { core::option::Option::None }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn yield_cpu() {
     let _ = eclipse_syscall::syscall0(eclipse_syscall::number::SYS_YIELD);
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), not(any(target_os = "eclipse", eclipse_target))))]
+#[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn yield_cpu() {}
 
 #[inline]
+#[cfg(any(eclipse_target, feature = "eclipse-syscall"))]
 pub fn receive_ipc(buffer: &mut [u8]) -> (usize, u32) {
     let mut sender_pid: u32 = 0;
     let len = unsafe { receive(buffer.as_mut_ptr(), buffer.len(), &mut sender_pid) };
@@ -253,8 +254,21 @@ pub fn receive_ipc(buffer: &mut [u8]) -> (usize, u32) {
 }
 
 #[inline]
+#[cfg(not(any(eclipse_target, feature = "eclipse-syscall")))]
+pub fn receive_ipc(_buffer: &mut [u8]) -> (usize, u32) {
+    (0, 0)
+}
+
+#[inline]
+#[cfg(any(eclipse_target, feature = "eclipse-syscall"))]
 pub fn send_ipc(server_id: u32, msg_type: u32, data: &[u8]) -> isize {
     unsafe { eclipse_send(server_id, msg_type, data.as_ptr() as *const _, data.len(), 0) }
+}
+
+#[inline]
+#[cfg(not(any(eclipse_target, feature = "eclipse-syscall")))]
+pub fn send_ipc(_server_id: u32, _msg_type: u32, _data: &[u8]) -> isize {
+    -1
 }
 
 #[inline]
@@ -555,6 +569,7 @@ pub fn set_cursor_position(x: u32, y: u32) {
     }
 }
 
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn sleep_ms(ms: u32) {
     let ts = timespec {

@@ -447,6 +447,9 @@ pub extern "C" fn syscall_handler(
         121 => sys_getpgid(arg1),
         131 => sys_sigaltstack(arg1, arg2),
         158 => sys_arch_prctl(arg1, arg2),
+        // clock_nanosleep(clockid, flags, req, rem) — usado por std/musl para sleep.
+        // En Eclipse tratamos esto como nanosleep(req) e ignoramos clockid/flags/rem.
+        230 => sys_nanosleep(arg3),
         170 => sys_sethostname(arg1, arg2),
         186 => sys_gettid(),
         200 => sys_tkill(arg1, arg2),
@@ -3399,12 +3402,50 @@ fn sys_brk(addr: u64) -> u64 {
 fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
     use crate::process;
     
+    // Linux encodes exit signal in the low byte of flags.
+    let exit_signal = flags & 0xFF;
+    let flags = flags & !0xFF;
+
     // CLONE_VM (0x100) and CLONE_THREAD (0x10000)
     const CLONE_VM: u64 = 0x00000100;
     const CLONE_THREAD: u64 = 0x00010000;
+    // Flags commonly used by pthreads/musl/glibc. For now we accept them and
+    // either already behave as-if shared (single address space) or we ignore.
+    const CLONE_FS: u64 = 0x00000200;
+    const CLONE_FILES: u64 = 0x00000400;
+    const CLONE_SIGHAND: u64 = 0x00000800;
+    const CLONE_SYSVSEM: u64 = 0x00040000;
+    const CLONE_SETTLS: u64 = 0x00080000;
+    const CLONE_PARENT_SETTID: u64 = 0x00100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    const CLONE_CHILD_SETTID: u64 = 0x01000000;
 
-    if flags & (CLONE_VM | CLONE_THREAD) != (CLONE_VM | CLONE_THREAD) {
-        serial::serial_print("sys_clone: Only CLONE_VM | CLONE_THREAD supported for now (threading)\n");
+    // We only implement thread-style clone. Extra flags above are tolerated.
+    if (flags & (CLONE_VM | CLONE_THREAD)) != (CLONE_VM | CLONE_THREAD) {
+        serial::serial_printf(format_args!(
+            "sys_clone: only thread-style clone supported (need CLONE_VM|CLONE_THREAD); flags={:#x} exit_signal={}\n",
+            flags,
+            exit_signal
+        ));
+        return u64::MAX;
+    }
+
+    // Reject any other unknown flags to surface unexpected ABI changes early.
+    let allowed = CLONE_VM
+        | CLONE_THREAD
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID;
+    if flags & !allowed != 0 {
+        serial::serial_printf(format_args!(
+            "sys_clone: unsupported flags {:#x}\n",
+            flags & !allowed
+        ));
         return u64::MAX;
     }
 

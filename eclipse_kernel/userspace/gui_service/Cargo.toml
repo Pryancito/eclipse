@@ -10,8 +10,7 @@ default = []
 compositor-lunas = []
 
 [dependencies]
-std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
-eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false }
+eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false, features = ["allocator", "eclipse-syscall", "use_std"] }
 eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 [[bin]]

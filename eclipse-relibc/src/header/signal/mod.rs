@@ -55,7 +55,7 @@ pub struct sigaction {
     pub sa_restorer: Option<unsafe extern "C" fn()>,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn signal(signum: c_int, handler: Option<OsSigHandlerPtr>) -> Option<OsSigHandlerPtr> {
     use crate::eclipse_syscall::call::sigaction as sys_sigaction;
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn signal(signum: c_int, handler: Option<OsSigHandlerPtr>)
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(feature = "eclipse-syscall", eclipse_target)))]
 #[no_mangle]
 pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
     use crate::eclipse_syscall::call::kill;
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn kill(pid: pid_t, sig: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int {
     use crate::eclipse_syscall::call::sigaction;
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn sigaction(signum: c_int, act: *const sigaction, oldact:
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
     if !set.is_null() {
@@ -104,7 +104,7 @@ pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int {
     if !set.is_null() && signum > 0 && signum <= 64 {
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigprocmask(how: c_int, set: *const sigset_t, oldset: *mut sigset_t) -> c_int {
     use crate::eclipse_syscall::call::sigprocmask;
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn sigprocmask(how: c_int, set: *const sigset_t, oldset: *
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigdelset(set: *mut sigset_t, signum: c_int) -> c_int {
     if !set.is_null() && signum > 0 && signum <= 64 {
@@ -138,14 +138,14 @@ pub unsafe extern "C" fn sigdelset(set: *mut sigset_t, signum: c_int) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigismember(set: *const sigset_t, signum: c_int) -> c_int {
     if set.is_null() || signum <= 0 || signum > 64 { return 0; }
     if ((*set).sig[0] & (1u64 << (signum - 1))) != 0 { 1 } else { 0 }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigfillset(set: *mut sigset_t) -> c_int {
     if !set.is_null() {
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn sigfillset(set: *mut sigset_t) -> c_int {
 }
 
 /// sigpending — get set of pending signals.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
     if !set.is_null() { (*set).sig[0] = 0; }
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
 }
 
 /// sigsuspend — wait for signal.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sigsuspend(_mask: *const sigset_t) -> c_int {
     // Block forever (pause) — the kernel will wake us on signal delivery.
@@ -173,14 +173,14 @@ pub unsafe extern "C" fn sigsuspend(_mask: *const sigset_t) -> c_int {
 }
 
 /// alarm — set an alarm signal after `seconds` seconds.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn alarm(_seconds: crate::types::c_uint) -> crate::types::c_uint {
     0 // Stub: alarm not yet implemented
 }
 
 /// raise — send signal to the current process.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn raise(sig: c_int) -> c_int {
     use crate::eclipse_syscall::call::kill;

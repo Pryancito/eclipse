@@ -6,7 +6,6 @@ use std::prelude::v1::*;
 use std::string::String;
 use std::fs;
 
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 pub fn execute_line(line: &str, shell: &mut Shell) {

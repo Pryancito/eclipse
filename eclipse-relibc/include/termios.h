@@ -100,6 +100,12 @@ struct termios {
 #define TCSADRAIN 1
 #define TCSAFLUSH 2
 
+/* tcflow actions */
+#define TCOOFF 0
+#define TCOON  1
+#define TCIOFF 2
+#define TCION  3
+
 /* Baud rates */
 #define B0     0
 #define B50    1

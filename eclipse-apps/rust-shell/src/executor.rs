@@ -6,7 +6,6 @@ use std::string::String;
 use std::fs;
 use std::collections::BTreeSet;
 
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 pub fn execute_statement(statement: Statement, shell: &mut Shell) -> i32 {

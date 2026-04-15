@@ -7,7 +7,7 @@ pub const RTLD_GLOBAL: c_int = 256;
 pub const RTLD_LOCAL: c_int = 0;
 pub const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void;
 
-#[cfg(not(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target)))]
+#[cfg(not(any(eclipse_target, target_os = "none")))]
 mod host {
     use super::*;
     extern "C" {
@@ -18,10 +18,10 @@ mod host {
     }
 }
 
-#[cfg(not(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target)))]
+#[cfg(not(any(eclipse_target, target_os = "none")))]
 pub use self::host::*;
 
-#[cfg(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target))]
+#[cfg(any(eclipse_target, target_os = "none"))]
 mod target {
     use super::*;
 
@@ -46,5 +46,5 @@ mod target {
     }
 }
 
-#[cfg(any(target_os = "eclipse", target_os = "none", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), eclipse_target))]
+#[cfg(any(eclipse_target, target_os = "none"))]
 pub use self::target::*;

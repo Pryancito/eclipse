@@ -13,7 +13,7 @@ use std::prelude::v1::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::prelude::*;
-use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info, get_system_stats, SystemStats};
+use eclipse_libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info, get_system_stats, SystemStats};
 use input_service::EventQueue;
 
 const SYS_REGISTER_DEVICE: usize = eclipse_syscall::number::SYS_REGISTER_DEVICE;
@@ -35,12 +35,12 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
 }
 
 fn sys_open(path: &str) -> Option<usize> {
-    let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+    let fd = eclipse_libc::eclipse_open(path, eclipse_libc::O_RDONLY, 0);
     if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    std::libc::eclipse_write(fd as u32, buf) as usize
+    eclipse_libc::eclipse_write(fd as u32, buf) as usize
 }
 
 fn write_input_event_to_scheme(input_fd: Option<usize>, ev: &InputEvent) {
@@ -367,7 +367,7 @@ fn main() {
     println!("[INPUT-SERVICE] Input service ready");
     let ppid = unsafe { getppid() };
     if ppid > 0 {
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
+        let _ = send_ipc(ppid as u32, 255, b"READY");
     }
 
     let _ = register_device("input:keyboard", DeviceType::Input);
@@ -587,7 +587,7 @@ fn main() {
         // Watchdog heartbeat para init (PID 1): cada 500ms para reducir tráfico IPC.
         // Se usa uptime_ticks para que sea independiente de la carga o velocidad del bucle.
         if stats.uptime_ticks >= heartbeat_last_ticks + 500 {
-            let _ = std::libc::send_ipc(1, 0x40, b"HEART");
+            let _ = send_ipc(1, 0x40, b"HEART");
             heartbeat_last_ticks = stats.uptime_ticks;
         }
 

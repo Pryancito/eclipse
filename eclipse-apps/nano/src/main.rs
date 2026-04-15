@@ -523,10 +523,9 @@ fn read_file(path: &str) -> Vec<u8> {
 // Entrada principal
 // ============================================================================
 
-#[cfg(target_os = "eclipse")]
 fn main() {
     // Leer argumento (nombre del archivo) desde argv del proceso
-    let args = std::env::args();
+    let args: Vec<String> = std::env::args().collect();
     let filename_owned: String;
     let filename: &str = if let Some(f) = args.get(1) {
         filename_owned = f.clone();
@@ -543,7 +542,7 @@ fn main() {
     let (rows, cols) = get_terminal_size();
 
     // Limpiar pantalla
-    let _ = eclipse_syscall::call::write(1, b"\x1b[2J\x1b[H");
+    let _ = eclipse_syscall::call::write(1, b"\x1b[2J\x1b[H\x1b[?25h");
 
     // Crear y ejecutar el editor
     let mut ed = Editor::new(filename, &content, rows, cols);
@@ -553,9 +552,4 @@ fn main() {
     // Restaurar terminal al salir
     let _ = eclipse_syscall::call::write(1, b"\x1b[2J\x1b[H\x1b[?25h");
     eclipse_syscall::call::exit(0);
-}
-
-#[cfg(not(target_os = "eclipse"))]
-fn main() {
-    println!("Solo soportado en Eclipse OS");
 }

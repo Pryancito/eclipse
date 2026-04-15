@@ -32,7 +32,7 @@ RELIBC_LIB    := $(RELIBC_DIR)/target/x86_64-unknown-linux-gnu/release/liblibc.a
 # Cross-compiler settings.  We use a plain x86_64-linux-gnu gcc and override
 # the sysroot / libc so that bash links against eclipse-relibc instead of
 # the host glibc.
-CC            := gcc
+CC            := musl-gcc
 AR            := ar
 CFLAGS        := -O2 -static -nostdlib -nostdinc \
                  -I$(RELIBC_DIR)/include \
@@ -116,14 +116,13 @@ CONFIGURE_ENV := \
     bash_cv_func_vsnprintf=yes
 
 CONFIGURE_FLAGS := \
-    --host=x86_64-pc-linux-gnu \
+    --host=x86_64-unknown-linux-musl \
     --build=x86_64-pc-linux-gnu \
     --without-bash-malloc \
     --disable-nls \
     --disable-rpath \
     --enable-static-link \
-    --without-curses \
-    --without-readline
+    --without-curses
 
 .PHONY: all download configure build install clean
 

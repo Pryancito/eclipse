@@ -20,22 +20,10 @@ micromath = "2.1.0"
 bitflags = { version = "2.4", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-
-# Dependencias solo para target Eclipse (vendor eclipse).
-[target.'cfg(target_os = "eclipse")'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 wayland-proto = { path = "../libs/wayland-proto" }
-eclipse-syscall = { path = "../../eclipse-syscall" }
-std = { package = "eclipse_std", path = "../eclipse_std" }
 libc = { version = "0.2", default-features = false }
-
-# Dependencias para target Linux (host) — tests y desarrollo
-[target.'cfg(not(target_os = "eclipse"))'.dependencies]
-sidewind = { path = "../sidewind" }
-eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
-wayland-proto = { path = "../libs/wayland-proto" }
-libc = "0.2"
 
 [features]
 default = []

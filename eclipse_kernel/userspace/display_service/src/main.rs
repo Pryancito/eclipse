@@ -15,6 +15,7 @@
 //! It must start after the input service to handle display events.
 
 use std::prelude::v1::*;
+use eclipse_libc as libc;
 
 use eclipse_syscall::flag::O_RDWR;
 use eclipse_syscall::number::{
@@ -889,7 +890,7 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
 }
 
 fn main() {
-    let pid = unsafe { std::libc::getpid() };
+    let pid = unsafe { libc::getpid() };
     
     println!("+--------------------------------------------------------------+");
     println!("|              GRAPHICS / DISPLAY SERVICE                      |");
@@ -1074,16 +1075,16 @@ fn main() {
 
     println!("[DISPLAY-SERVICE] Display service ready");
     println!("[DISPLAY-SERVICE] Ready to accept rendering requests...");
-    let ppid = unsafe { std::libc::getppid() };
+    let ppid = unsafe { libc::getppid() };
     if ppid > 0 {
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
     }
 
     let mut ipc_buffer = [0u8; 128];
 
     loop {
         loop {
-            let (len, sender) = std::libc::receive_ipc(&mut ipc_buffer);
+            let (len, sender) = libc::receive_ipc(&mut ipc_buffer);
             if len == 0 || sender == 0 {
                 break;
             }

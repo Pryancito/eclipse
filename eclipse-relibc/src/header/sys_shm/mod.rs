@@ -33,7 +33,7 @@ pub const IPC_RMID: c_int = 0;
 pub const IPC_SET:  c_int = 1;
 pub const IPC_STAT: c_int = 2;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_int {
     use crate::eclipse_syscall::call::open;
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_in
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn shmat(shmid: c_int, _shmaddr: *const c_void, _shmflg: c_int) -> *mut c_void {
     use crate::eclipse_syscall::call::{mmap, fstat, Stat};
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn shmat(shmid: c_int, _shmaddr: *const c_void, _shmflg: c
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn shmdt(_shmaddr: *const c_void) -> c_int {
     // In relibc we don't track mmap sizes per pointer here easily,
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn shmdt(_shmaddr: *const c_void) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn shmctl(shmid: c_int, cmd: c_int, buf: *mut shmid_ds) -> c_int {
     use crate::eclipse_syscall::call::{fstat, Stat};

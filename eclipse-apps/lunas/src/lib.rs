@@ -31,7 +31,6 @@ pub mod wayland_socket;
 pub mod window_rules;
 pub mod xwayland;
 
-#[cfg(target_os = "eclipse")]
 pub mod getrandom_shim {
     use eclipse_syscall::syscall3;
     use eclipse_syscall::SYS_GETRANDOM;

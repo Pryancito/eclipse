@@ -5,12 +5,7 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
-#[cfg(target_os = "eclipse")]
 use libc::{open, read, InputEvent, O_RDONLY, O_NONBLOCK};
-#[cfg(not(target_os = "eclipse"))]
-use eclipse_syscall::InputEvent;
-#[cfg(not(target_os = "eclipse"))]
-use libc::{open, read, O_RDONLY, O_NONBLOCK};
 #[cfg(test)]
 use std::collections::VecDeque;
 #[cfg(not(test))]
@@ -39,10 +34,7 @@ impl Backend {
 
         #[cfg(not(test))]
         let input_fd = {
-            #[cfg(target_os = "eclipse")]
             let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY | O_NONBLOCK, 0) };
-            #[cfg(not(target_os = "eclipse"))]
-            let fd = unsafe { open(b"input:\0".as_ptr() as *const i8, O_RDONLY | O_NONBLOCK, 0) };
             if fd >= 0 { Some(fd) } else { None }
         };
         #[cfg(test)]
@@ -94,9 +86,6 @@ impl Backend {
         {
             let fd = self.input_fd?;
             let mut buf = [0u8; core::mem::size_of::<InputEvent>()];
-            #[cfg(target_os = "eclipse")]
-            let n = unsafe { read(fd as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
-            #[cfg(not(target_os = "eclipse"))]
             let n = unsafe { read(fd as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
             if n < 0 {
                 return None;

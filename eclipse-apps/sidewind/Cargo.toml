@@ -14,15 +14,11 @@ bitflags = { version = "2.4", default-features = false }
 
 eclipse-syscall = { path = "../../eclipse-syscall" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-libc = { version = "0.2", default-features = false }
+libc = { path = "../../eclipse-relibc" }
 
 [features]
 default = []
 host-testing = []
 
 [dev-dependencies]
-libc = { version = "0.2", default-features = false }
+libc = { path = "../../eclipse-relibc", default-features = false }

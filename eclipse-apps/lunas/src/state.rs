@@ -24,18 +24,9 @@ use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use core::matches;
-#[cfg(target_os = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
-#[cfg(not(target_os = "eclipse"))]
-use eclipse_syscall::{ProcessInfo, SystemStats};
 use eclipse_ipc::types::NetExtendedStats;
 
-#[cfg(not(target_os = "eclipse"))]
-unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-#[cfg(not(target_os = "eclipse"))]
-fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
-#[cfg(not(target_os = "eclipse"))]
-fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> isize { 0 }
 
 /// Service information for the system central panel.
 #[derive(Clone, Copy, Default)]
@@ -1367,7 +1358,6 @@ impl LunasState {
                 }
                 ContextAction::TakeScreenshot => {
                     // Capture back buffer to disk on Eclipse targets.
-                    #[cfg(target_os = "eclipse")]
                     {
                         self.backend.fb.save_screenshot();
                     }
@@ -1509,14 +1499,8 @@ impl LunasState {
 
     /// Launch an application by its executable path.
     fn launch_app(&mut self, _exec_path: &str) {
-        #[cfg(target_os = "eclipse")]
         {
             let _ = std::process::Command::new(_exec_path).spawn();
-        }
-        // On non-Eclipse targets (tests), we just record the intent
-        #[cfg(not(target_os = "eclipse"))]
-        {
-            // No-op: app launching is only available on Eclipse OS
         }
         self.dirty = true;
     }

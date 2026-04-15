@@ -163,10 +163,7 @@ pub fn expand_word(word: &str, shell: &mut Shell) -> String {
                         result.push_str(&::alloc::format!("{}", shell.last_status));
                         i += 1;
                     } else if i < bytes.len() && bytes[i] == b'$' {
-                        #[cfg(target_os = "eclipse")]
                         result.push_str(&::alloc::format!("{}", eclipse_syscall::call::getpid()));
-                        #[cfg(not(target_os = "eclipse"))]
-                        result.push_str("1234"); // Dummy for testing
                         i += 1;
                     } else {
                         result.push('$');

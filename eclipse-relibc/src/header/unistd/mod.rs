@@ -2,33 +2,17 @@
 use crate::types::*;
 use crate::internal_alloc::{malloc, free};
 use crate::eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, fstat as sys_fstat, ftruncate as sys_ftruncate, Stat as sys_Stat};
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 use crate::header::time::nanosleep;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 static mut FORCE_KEEP: i32 = 0;
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
-extern "C" {
-    pub fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int;
-    pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
-    pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
-    pub fn close(fd: c_int) -> c_int;
-    pub fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t;
-    pub fn getpid() -> pid_t;
-    pub fn getuid() -> uid_t;
-    pub fn getgid() -> gid_t;
-    pub fn setuid(uid: uid_t) -> c_int;
-    pub fn setgid(gid: gid_t) -> c_int;
-}
+// Nota: había stubs/externs para host bajo un cfg imposible (`all(..., not())`).
+// Se eliminan para evitar referencias a `target_os` y porque nunca se compilaban.
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
-#[no_mangle]
-pub unsafe extern "C" fn spawn(_path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
-    -1
-}
-
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -38,7 +22,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> 
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
     let slice = core::slice::from_raw_parts(buf as *const u8, count);
@@ -48,7 +32,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> 
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     let slice = core::slice::from_raw_parts_mut(buf as *mut u8, count);
@@ -58,7 +42,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssi
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     match sys_close(fd as usize) {
@@ -67,7 +51,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
     match sys_lseek(fd as usize, offset as isize, whence as usize) {
@@ -76,13 +60,13 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getpid() -> pid_t {
     sys_getpid() as pid_t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(feature = "eclipse-syscall", eclipse_target)))]
 #[no_mangle]
 pub unsafe extern "C" fn fork() -> pid_t {
     use crate::eclipse_syscall::call::fork;
@@ -95,26 +79,26 @@ pub unsafe extern "C" fn fork() -> pid_t {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn vfork() -> pid_t {
     -1 // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char, _args: ...) -> c_int {
     -1 // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
 #[no_mangle]
 pub unsafe extern "C" fn execv(path: *const c_char, argv: *const *const c_char) -> c_int {
     let envp = crate::header::stdlib::environ_ptr();
     execve(path, argv, envp)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
 #[no_mangle]
 pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
     let envp = crate::header::stdlib::environ_ptr();
@@ -122,7 +106,7 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
 }
 
 /// execvpe: search PATH for `file` if it contains no slash, then execve.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "use_std")))]
 #[no_mangle]
 pub unsafe extern "C" fn execvpe(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int {
     if file.is_null() {
@@ -169,7 +153,7 @@ pub unsafe extern "C" fn execvpe(file: *const c_char, argv: *const *const c_char
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int {
     use crate::eclipse_syscall::call::execve as sys_execve;
@@ -182,7 +166,7 @@ pub unsafe extern "C" fn execve(path: *const c_char, argv: *const *const c_char,
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn pipe(pipefd: *mut c_int) -> c_int {
     if pipefd.is_null() {
@@ -203,7 +187,7 @@ pub unsafe extern "C" fn pipe(pipefd: *mut c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int {
     if pipefd.is_null() {
@@ -224,31 +208,31 @@ pub unsafe extern "C" fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getuid() -> uid_t {
     0 // Root
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getgid() -> gid_t {
     0 // Root
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setuid(_uid: uid_t) -> c_int {
     0 // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setgid(_gid: gid_t) -> c_int {
     0 // Stub
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
     use crate::eclipse_syscall::call::unlink;
@@ -262,7 +246,7 @@ pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn sysconf(name: c_int) -> c_long {
     match name {
@@ -271,13 +255,13 @@ pub unsafe extern "C" fn sysconf(name: c_int) -> c_long {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getdtablesize() -> c_int {
     1024
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     let req = crate::types::timespec {
@@ -288,7 +272,7 @@ pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     let req = crate::types::timespec {
@@ -298,14 +282,20 @@ pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     nanosleep(&req, core::ptr::null_mut())
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(not(eclipse_target))]
+extern "C" {
+    pub fn sleep(seconds: c_uint) -> c_uint;
+    pub fn usleep(usec: useconds_t) -> c_int;
+}
+
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn _exit(status: c_int) -> ! {
     eclipse_syscall::syscall1(eclipse_syscall::SYS_EXIT, status as usize);
     loop {}
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn dup2(old: c_int, new: c_int) -> c_int {
     match crate::eclipse_syscall::call::dup2(old as usize, new as usize) {
@@ -317,7 +307,7 @@ pub unsafe extern "C" fn dup2(old: c_int, new: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn gethostname(name: *mut c_char, len: size_t) -> c_int {
     let s = b"eclipse\0";
@@ -326,7 +316,7 @@ pub unsafe extern "C" fn gethostname(name: *mut c_char, len: size_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -339,7 +329,7 @@ pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char {
     if size < 2 { return core::ptr::null_mut(); }
@@ -354,7 +344,7 @@ pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn isatty(fd: c_int) -> c_int {
     if fd >= 0 && fd <= 2 {
@@ -364,38 +354,38 @@ pub unsafe extern "C" fn isatty(fd: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn geteuid() -> uid_t {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getegid() -> gid_t {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn seteuid(_euid: uid_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setegid(_egid: gid_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getppid() -> pid_t {
     use crate::eclipse_syscall::call::getppid;
     getppid() as pid_t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getpgrp() -> pid_t {
     match crate::eclipse_syscall::call::getpgid(0) {
@@ -404,7 +394,7 @@ pub unsafe extern "C" fn getpgrp() -> pid_t {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setpgid(pid: pid_t, pgid: pid_t) -> c_int {
     match crate::eclipse_syscall::call::setpgid(pid as usize, pgid as usize) {
@@ -416,25 +406,25 @@ pub unsafe extern "C" fn setpgid(pid: pid_t, pgid: pid_t) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn link(_oldpath: *const c_char, _newpath: *const c_char) -> c_int {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn chown(_path: *const c_char, _owner: uid_t, _group: gid_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn fchown(_fd: c_int, _owner: uid_t, _group: gid_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
     // For now, our sys_spawn only takes an ELF buffer. 
@@ -468,7 +458,7 @@ pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char,
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn ftruncate(fd: c_int, length: off_t) -> c_int {
     match sys_ftruncate(fd as usize, length as usize) {
@@ -477,13 +467,13 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, length: off_t) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn readlink(_path: *const c_char, _buf: *mut c_char, _bufsiz: size_t) -> ssize_t {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn dup(oldfd: c_int) -> c_int {
     match crate::eclipse_syscall::call::dup(oldfd as usize) {
@@ -495,13 +485,13 @@ pub unsafe extern "C" fn dup(oldfd: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, _flags: c_int) -> c_int {
     dup2(oldfd, newfd)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -514,7 +504,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setsid() -> pid_t {
     match crate::eclipse_syscall::call::setsid() {
@@ -526,7 +516,7 @@ pub unsafe extern "C" fn setsid() -> pid_t {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getpgid(pid: pid_t) -> pid_t {
     match crate::eclipse_syscall::call::getpgid(pid as usize) {
@@ -538,14 +528,14 @@ pub unsafe extern "C" fn getpgid(pid: pid_t) -> pid_t {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setpgrp() -> c_int {
     setpgid(0, 0)
 }
 
 /// tcgetpgrp — get foreground process group of terminal fd.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn tcgetpgrp(fd: c_int) -> pid_t {
     let mut pgid: pid_t = 0;
@@ -560,7 +550,7 @@ pub unsafe extern "C" fn tcgetpgrp(fd: c_int) -> pid_t {
 }
 
 /// tcsetpgrp — set foreground process group of terminal fd.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn tcsetpgrp(fd: c_int, pgrp: pid_t) -> c_int {
     // TIOCSPGRP = 0x5410
@@ -568,7 +558,7 @@ pub unsafe extern "C" fn tcsetpgrp(fd: c_int, pgrp: pid_t) -> c_int {
 }
 
 /// truncate(path, length) — set file size.
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn truncate(path: *const c_char, length: off_t) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -592,7 +582,7 @@ pub unsafe extern "C" fn truncate(path: *const c_char, length: off_t) -> c_int {
 }
 
 /// symlink — create a symbolic link (stub, Eclipse doesn't support symlinks yet).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn symlink(_target: *const c_char, _linkpath: *const c_char) -> c_int {
     *crate::header::errno::__errno_location() = 38; // ENOSYS
@@ -600,21 +590,21 @@ pub unsafe extern "C" fn symlink(_target: *const c_char, _linkpath: *const c_cha
 }
 
 /// fsync — flush file to disk (stub).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn fsync(_fd: c_int) -> c_int {
     0
 }
 
 /// fdatasync — flush file data to disk (stub).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn fdatasync(_fd: c_int) -> c_int {
     0
 }
 
 /// getlogin_r — get login name (always "root" on Eclipse OS).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getlogin_r(buf: *mut c_char, bufsize: size_t) -> c_int {
     let name = b"root\0";
@@ -624,14 +614,14 @@ pub unsafe extern "C" fn getlogin_r(buf: *mut c_char, bufsize: size_t) -> c_int 
 }
 
 /// confstr — get configuration-defined string values (stub).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn confstr(_name: c_int, _buf: *mut c_char, _len: size_t) -> size_t {
     0
 }
 
 /// getgroups — get supplementary group IDs (Eclipse OS: always just group 0).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn getgroups(size: c_int, list: *mut gid_t) -> c_int {
     if size >= 1 && !list.is_null() {
@@ -641,7 +631,7 @@ pub unsafe extern "C" fn getgroups(size: c_int, list: *mut gid_t) -> c_int {
 }
 
 /// setgroups — set supplementary group IDs (stub).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
 pub unsafe extern "C" fn setgroups(_size: size_t, _list: *const gid_t) -> c_int {
     0

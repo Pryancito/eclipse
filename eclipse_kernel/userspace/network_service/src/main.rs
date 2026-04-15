@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use std::prelude::v1::*;
-use eclipse_libc::{getpid, sleep_ms, ioctl, O_RDWR};
+use eclipse_libc::{getpid, getppid, sleep_ms, ioctl, O_RDWR};
 use eclipse_libc::{send_ipc, receive_ipc, eclipse_open, eclipse_read, eclipse_write};
 use eclipse_libc::{get_system_stats, SystemStats};
 use smoltcp::phy::{self, DeviceCapabilities, Medium, Loopback};
@@ -500,6 +500,13 @@ fn main() {
     println!("|              NETWORK SERVICE (SMOLTCP)                       |");
     println!("+--------------------------------------------------------------+");
     println!("[NETWORK-SERVICE] Starting (PID: {})", pid);
+
+    // Señalizar READY temprano para que init no haga timeout si el enlace/DHCP tarda
+    // o si arrancamos en modo offline.
+    let ppid = unsafe { getppid() };
+    if ppid > 0 {
+        let _ = send_ipc(ppid as u32, 255, b"READY");
+    }
 
     // 1. Open the raw ethernet device
     let mut device = match RawEthernetDevice::new(0) {

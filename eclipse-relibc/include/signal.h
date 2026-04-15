@@ -7,6 +7,7 @@
 
 typedef void (*sighandler_t)(int);
 typedef unsigned long sigset_t;
+typedef int sig_atomic_t;
 
 #define SIG_DFL ((sighandler_t)0)
 #define SIG_IGN ((sighandler_t)1)

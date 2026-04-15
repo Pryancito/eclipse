@@ -7,10 +7,13 @@
 
 #define CLOCKS_PER_SEC 1000000L
 
+#ifndef _STRUCT_TIMESPEC
+#define _STRUCT_TIMESPEC 1
 struct timespec {
     time_t tv_sec;
     long   tv_nsec;
 };
+#endif
 
 struct tm {
     int tm_sec;

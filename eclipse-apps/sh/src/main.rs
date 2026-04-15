@@ -1,10 +1,7 @@
 #![no_std]
-#[cfg(target_os = "eclipse")]
 extern crate std;
-#[cfg(target_os = "eclipse")]
 use std::prelude::v1::*;
 
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall;
 
 // ============================================================================

@@ -3,16 +3,6 @@
 //! - Eclipse: native compositor (DRM, SideWind, IPC).
 
 
-// ---- Entry point Linux: mock mode ----
-#[cfg(not(target_os = "eclipse"))]
-fn main() {
-    eprintln!("[LUNAS] Desktop environment requires Eclipse OS target.");
-    eprintln!("[LUNAS] Use --target for Eclipse OS cross-compilation.");
-    std::process::exit(1);
-}
-
-
-#[cfg(target_os = "eclipse")]
 fn main() {
     eprintln!("[LUNAS] Starting Lunas Desktop Environment...");
     use lunas::state::LunasState;
@@ -333,7 +323,6 @@ fn main() {
 }
 
 #[cfg(test)]
-#[cfg(target_os = "eclipse")]
 mod tests {
     use lunas::state::LunasState;
 

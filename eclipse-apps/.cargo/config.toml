@@ -7,11 +7,5 @@ json-target-spec = true
 
 [build]
 # El JSON del target Eclipse OS está en el mismo directorio eclipse-apps/
-target = "./x86_64-unknown-eclipse.json"
+target = "x86_64-unknown-linux-musl"
 
-[target.x86_64-unknown-eclipse]
-rustflags = [
-    "-Z", "unstable-options",
-    # El linker script se provee vía build.rs de cada crate binario (ruta absoluta)
-    "-C", "relocation-model=static",
-]

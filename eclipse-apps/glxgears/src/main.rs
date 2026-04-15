@@ -14,19 +14,12 @@ use embedded_graphics::{
     text::Text,
     mono_font::{MonoTextStyle, ascii::FONT_10X20},
 };
-#[cfg(target_os = "eclipse")]
 use sidewind::font_terminus_16;
-#[cfg(target_os = "eclipse")]
 use libc::{c_char, c_int, close, mmap, open, exit};
-#[cfg(target_os = "eclipse")]
 use wayland_proto::unix_transport::UnixSocketConnection;
-#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::wire::{RawMessage, ObjectId, NewId, Opcode, Payload, PayloadType};
-#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::connection::Connection;
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall::{self, flag};
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall::call::sched_yield;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +328,6 @@ impl<'a> OriginDimensions for BufferTarget<'a> {
 }
 
 /// Draw the FPS overlay on the buffer.
-#[cfg(any(target_os = "eclipse", target_os = "linux"))]
 fn draw_fps_overlay(buf: &mut [u32], w: u32, h: u32, fps: u32) {
     let mut target = BufferTarget { words: buf, width: w, height: h };
     let mut fps_str = HString::<32>::new();
@@ -371,20 +363,17 @@ const GEAR_PHASE_DIVISOR: f32 = 16.0 * 2.0;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Send a Wayland message on the Unix socket connection.
-#[cfg(target_os = "eclipse")]
 fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
 }
 
 /// Send a Wayland message with an ancillary file descriptor (SCM_RIGHTS).
-#[cfg(target_os = "eclipse")]
 fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
     use wayland_proto::wl::wire::Handle;
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
 }
 
 /// Compute a per-process unique SHM name derived from `pid`.
-#[cfg(target_os = "eclipse")]
 fn shm_name(pid: u32) -> HString<24> {
     let mut s = HString::new();
     let _ = s.push_str("glxg_");
@@ -411,7 +400,6 @@ fn shm_name(pid: u32) -> HString<24> {
 }
 
 /// Create a shared-memory framebuffer window via Wayland.
-#[cfg(target_os = "eclipse")]
 struct GlxGearsApp {
     wayland: UnixSocketConnection,
     surface_id: u32,
@@ -421,7 +409,6 @@ struct GlxGearsApp {
     height: u32,
 }
 
-#[cfg(target_os = "eclipse")]
 impl GlxGearsApp {
     fn new() -> Option<Self> {
         let self_pid = eclipse_syscall::getpid() as u32;
@@ -591,149 +578,93 @@ impl GlxGearsApp {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    #[cfg(target_os = "eclipse")]
-    {
-        std::println!("[GLXGEARS] Starting recruitment of app...");
-        let Some(app) = GlxGearsApp::new() else {
-            std::println!("[GLXGEARS] Failed to initialize GlxGearsApp!");
-            loop { let _ = sched_yield(); }
-        };
-        std::println!("[GLXGEARS] App initialized successfully!");
+    std::println!("[GLXGEARS] Starting recruitment of app...");
+    let Some(app) = GlxGearsApp::new() else {
+        std::println!("[GLXGEARS] Failed to initialize GlxGearsApp!");
+        loop { let _ = sched_yield(); }
+    };
+    std::println!("[GLXGEARS] App initialized successfully!");
 
-        let buf_len = (app.width as usize) * (app.height as usize);
-        let buf: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(app.fb_ptr, buf_len) };
-        std::println!("[GLXGEARS] Buffer mapped at {:p} (len={})", app.fb_ptr, buf_len);
+    let buf_len = (app.width as usize) * (app.height as usize);
+    let buf: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(app.fb_ptr, buf_len) };
+    std::println!("[GLXGEARS] Buffer mapped at {:p} (len={})", app.fb_ptr, buf_len);
 
-        let mut angle = 0.0f32;
-        const STEP: f32 = PI / 180.0;
+    let mut angle = 0.0f32;
+    const STEP: f32 = PI / 180.0;
 
-        let mut last_second = Instant::now();
-        let mut frames = 0;
-        let mut current_fps = 0;
+    let mut last_second = Instant::now();
+    let mut frames = 0;
+    let mut current_fps = 0;
 
-        std::println!("[GLXGEARS] Entering main loop...");
-        loop {
-            frames += 1;
-            let now = Instant::now();
-            let elapsed = now.duration_since(last_second).as_millis();
-            if elapsed >= 1000 {
-                // std::println!("[GLXGEARS] Calculating FPS (frames={}, elapsed={})...", frames, elapsed);
-                current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
-                frames = 0;
-                last_second = now;
-            }
+    std::println!("[GLXGEARS] Entering main loop...");
+    loop {
+        frames += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_second).as_millis();
+        if elapsed >= 1000 {
+            // std::println!("[GLXGEARS] Calculating FPS (frames={}, elapsed={})...", frames, elapsed);
+            current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
+            frames = 0;
+            last_second = now;
+        }
 
-            // Wayland events
-            while let Ok((data, _)) = app.wayland.recv() {
-                let mut pos = 0usize;
-                while pos + 8 <= data.len() {
-                    if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
-                        let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
-                        
-                        // xdg_wm_base.ping (sender=5, opcode=0) -> pong
-                        if sender == ObjectId(5) && opcode == Opcode(0) {
-                            let pts = &[PayloadType::UInt];
-                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
-                                let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
-                                send_wayland(&app.wayland, 5, 3, &[Payload::UInt(serial)]);
-                            }
+        // Wayland events
+        while let Ok((data, _)) = app.wayland.recv() {
+            let mut pos = 0usize;
+            while pos + 8 <= data.len() {
+                if let Ok((sender, opcode, msg_len)) = RawMessage::deserialize_header(&data[pos..]) {
+                    let chunk = &data[pos..pos + msg_len.min(data.len() - pos)];
+                    
+                    // xdg_wm_base.ping (sender=5, opcode=0) -> pong
+                    if sender == ObjectId(5) && opcode == Opcode(0) {
+                        let pts = &[PayloadType::UInt];
+                        if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                            let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                            send_wayland(&app.wayland, 5, 3, &[Payload::UInt(serial)]);
                         }
-                        // xdg_surface.configure (sender=10, opcode=0) -> ack_configure
-                        else if sender == ObjectId(10) && opcode == Opcode(0) {
-                            let pts = &[PayloadType::UInt];
-                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
-                                let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
-                                send_wayland(&app.wayland, 10, 4, &[Payload::UInt(serial)]);
-                            }
+                    }
+                    // xdg_surface.configure (sender=10, opcode=0) -> ack_configure
+                    else if sender == ObjectId(10) && opcode == Opcode(0) {
+                        let pts = &[PayloadType::UInt];
+                        if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                            let serial = match raw.args.get(0) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                            send_wayland(&app.wayland, 10, 4, &[Payload::UInt(serial)]);
                         }
-                        // xdg_toplevel.close (sender=11, opcode=1)
-                        else if sender == ObjectId(11) && opcode == Opcode(1) {
-                            std::println!("[GLXGEARS] Received close event, exiting.");
-                            unsafe { exit(0); }
-                        }
-                        // wl_keyboard.key
-                        else if app.keyboard_id != 0 && sender == ObjectId(app.keyboard_id) && opcode == Opcode(3) {
-                            let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
-                            if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
-                                let key = match raw.args.get(2) { Some(Payload::UInt(k)) => *k, _ => 0 };
-                                let state = match raw.args.get(3) { Some(Payload::UInt(s)) => *s, _ => 0 };
-                                if state == 1 {
-                                    let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
-                                    if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
-                                        std::println!("[GLXGEARS] Key pressed, exiting.");
-                                        unsafe { exit(0); }
-                                    }
+                    }
+                    // xdg_toplevel.close (sender=11, opcode=1)
+                    else if sender == ObjectId(11) && opcode == Opcode(1) {
+                        std::println!("[GLXGEARS] Received close event, exiting.");
+                        unsafe { exit(0); }
+                    }
+                    // wl_keyboard.key
+                    else if app.keyboard_id != 0 && sender == ObjectId(app.keyboard_id) && opcode == Opcode(3) {
+                        let pts = &[PayloadType::UInt, PayloadType::UInt, PayloadType::UInt, PayloadType::UInt];
+                        if let Ok(raw) = RawMessage::deserialize(chunk, pts, &[]) {
+                            let key = match raw.args.get(2) { Some(Payload::UInt(k)) => *k, _ => 0 };
+                            let state = match raw.args.get(3) { Some(Payload::UInt(s)) => *s, _ => 0 };
+                            if state == 1 {
+                                let sc = if key >= 8 { (key - 8) as u8 } else { key as u8 };
+                                if sc == SCANCODE_Q || sc == SCANCODE_ESCAPE {
+                                    std::println!("[GLXGEARS] Key pressed, exiting.");
+                                    unsafe { exit(0); }
                                 }
                             }
                         }
-                        pos += msg_len.min(data.len() - pos);
-                    } else { break; }
-                }
+                    }
+                    pos += msg_len.min(data.len() - pos);
+                } else { break; }
             }
-
-            render_frame(buf, app.width, app.height, angle);
-            draw_fps_overlay(buf, app.width, app.height, current_fps);
-
-            // Commit Wayland frame
-            send_wayland(&app.wayland, app.surface_id, 2, &[Payload::Int(0), Payload::Int(0), Payload::Int(i32::MAX), Payload::Int(i32::MAX)]);
-            send_wayland(&app.wayland, app.surface_id, 6, &[]);
-
-            angle += STEP;
-            if angle >= TAU { angle -= TAU; }
-            let _ = sched_yield();
         }
-    }
 
-    #[cfg(target_os = "linux")]
-    {
-        use minifb::{Key, Window, WindowOptions};
+        render_frame(buf, app.width, app.height, angle);
+        draw_fps_overlay(buf, app.width, app.height, current_fps);
 
-        let width = 520usize;
-        let height = 380usize;
-        let mut buffer: Vec<u32> = vec![0; width * height];
+        // Commit Wayland frame
+        send_wayland(&app.wayland, app.surface_id, 2, &[Payload::Int(0), Payload::Int(0), Payload::Int(i32::MAX), Payload::Int(i32::MAX)]);
+        send_wayland(&app.wayland, app.surface_id, 6, &[]);
 
-        let mut window = Window::new(
-            "glxgears — Linux (minifb)",
-            width,
-            height,
-            WindowOptions::default(),
-        )
-        .unwrap_or_else(|e| {
-            panic!("{}", e);
-        });
-
-        window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
-
-        let mut angle = 0.0f32;
-        const STEP: f32 = core::f32::consts::PI / 180.0;
-
-        let mut last_second = std::time::Instant::now();
-        let mut frames = 0;
-        let mut current_fps = 0;
-
-        while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
-            frames += 1;
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_second).as_millis();
-            if elapsed >= 1000 {
-                current_fps = (frames as f64 * 1000.0 / elapsed as f64) as u32;
-                frames = 0;
-                last_second = now;
-            }
-
-            render_frame(&mut buffer, width as u32, height as u32, angle);
-            draw_fps_overlay(&mut buffer, width as u32, height as u32, current_fps);
-            
-            // Draw FPS (rudimentary Linux overlay)
-            let fps_msg = format!("FPS: {}", current_fps);
-            window.set_title(&format!("glxgears — Linux (minifb) | {}", fps_msg));
-
-            window
-                .update_with_buffer(&buffer, width, height)
-                .unwrap_or_else(|e| { panic!("{}", e); });
-
-            angle += STEP;
-            if angle >= core::f32::consts::TAU { angle -= core::f32::consts::TAU; }
-        }
+        angle += STEP;
+        if angle >= TAU { angle -= TAU; }
+        let _ = sched_yield();
     }
 }

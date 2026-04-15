@@ -43,7 +43,7 @@ pub struct Allocator {
     remaining: AtomicUsize,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(feature = "rustc-dep-of-std")))]
 #[cfg_attr(all(feature = "allocator", not(feature = "no-allocator")), global_allocator)]
 static ALLOCATOR: Allocator = Allocator::new();
 
@@ -150,7 +150,7 @@ unsafe impl GlobalAlloc for Allocator {
 }
 
 // --- Implementación de funciones C (malloc, free, etc.) ---
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 mod imp {
     use super::*;
 
@@ -203,10 +203,10 @@ mod imp {
 }
 
 // Eclipse: usar nuestro allocator; host (tests / Linux sin eclipse_target): usar libc del sistema
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 pub use imp::{malloc, free, calloc, realloc};
 
-#[cfg(any(test, feature = "host-testing", all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing", all(unix, not(eclipse_target))))]
 mod imp {
     use super::*;
 
@@ -239,5 +239,5 @@ mod imp {
     }
 }
 
-#[cfg(any(test, feature = "host-testing", all(any(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))), unix), not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing", all(unix, not(eclipse_target))))]
 pub use imp::{malloc, free, calloc, realloc};

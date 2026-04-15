@@ -9,11 +9,12 @@
 //! 3. Salir si falla; si tiene éxito, la imagen del proceso es ya el compositor.
 
 use std::prelude::v1::*;
+use eclipse_libc as libc;
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
 const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
-static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
+static LOAD_BUF: libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
 #[cfg(feature = "compositor-lunas")]
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
@@ -21,25 +22,32 @@ const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 
 fn main() {
-    let pid = unsafe { std::libc::getpid() };
+    let pid = unsafe { libc::getpid() };
     println!("+--------------------------------------------------------------+");
     println!("|              GUI SERVICE - Compositor Launcher               |");
     println!("+--------------------------------------------------------------+");
     // En Eclipse init siempre es PID 1.
-    println!("[GUI-SERVICE] PID={}, PPID={}", pid, unsafe { std::libc::getppid() });
+    println!("[GUI-SERVICE] PID={}, PPID={}", pid, unsafe { libc::getppid() });
     println!("[GUI-SERVICE] exec compositor: {}", COMPOSITOR_PATH);
+
+    // IMPORTANT: este proceso hace exec() y se transforma en el compositor.
+    // Si esperamos a enviar READY después, nunca ocurrirá. Enviamos READY ahora.
+    let ppid = unsafe { libc::getppid() };
+    if ppid > 0 {
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
+    }
 
     // Transformar este proceso en el compositor (labwc o lunas).
     // Al usar exec(), el PID se mantiene pero la imagen del proceso cambia.
     unsafe {
-        use std::libc::{eclipse_open, eclipse_close, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
+        use eclipse_libc::{eclipse_open, eclipse_close, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
         const SEEK_SET: i32 = 0;
         const SEEK_END: i32 = 2;
 
-        let fd = eclipse_open(COMPOSITOR_PATH, std::libc::O_RDONLY, 0);
+        let fd = eclipse_open(COMPOSITOR_PATH, libc::O_RDONLY, 0);
         if fd < 0 {
             println!("[GUI-SERVICE] FATAL: Cannot open {} for exec", COMPOSITOR_PATH);
-            unsafe { std::libc::exit(1); }
+            unsafe { libc::exit(1); }
         }
 
         // lseek returns (off_t)-1 on error; 0 is valid for an empty file.
@@ -49,12 +57,12 @@ fn main() {
         if sz < 0 {
             println!("[GUI-SERVICE] FATAL: lseek(SEEK_END) failed for {} for exec", COMPOSITOR_PATH);
             eclipse_close(fd);
-            unsafe { std::libc::exit(1); }
+            unsafe { libc::exit(1); }
         }
         if sz == 0 {
             println!("[GUI-SERVICE] FATAL: compositor file has size 0 (check FS CONTENT TLV / image build)");
             eclipse_close(fd);
-            unsafe { std::libc::exit(1); }
+            unsafe { libc::exit(1); }
         }
         let size = sz as usize;
 
@@ -70,16 +78,16 @@ fn main() {
 
         if mapped.is_null() || (mapped as isize) <= 0 {
             println!("[GUI-SERVICE] FATAL: mmap failed for {} for exec", COMPOSITOR_PATH);
-            unsafe { std::libc::exit(1); }
+            unsafe { libc::exit(1); }
         }
 
         let binary = core::slice::from_raw_parts(mapped as *const u8, size);
-        let result = std::libc::exec(binary);
+        let result = libc::exec(binary);
         
         // Si exec() falla, llegamos aquí:
         println!("[GUI-SERVICE] FATAL: exec() failed with code {}", result);
         let _ = munmap(mapped, size);
-        unsafe { std::libc::exit(1); }
+        unsafe { libc::exit(1); }
     }
 }
 

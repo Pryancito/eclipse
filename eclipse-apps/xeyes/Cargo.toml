@@ -5,8 +5,5 @@ edition = "2021"
 
 [dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "shape"] }
-
-[target.'cfg(target_os = "eclipse")'.dependencies]
-std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = { version = "0.2", default-features = false }

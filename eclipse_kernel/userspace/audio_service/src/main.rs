@@ -9,15 +9,16 @@
 //! This is typically one of the last services to start.
 
 use std::prelude::v1::*;
-use std::libc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
+use eclipse_libc as libc;
+use eclipse_libc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 fn sys_open(path: &str) -> Option<usize> {
-    let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+    let fd = libc::eclipse_open(path, libc::O_RDONLY, 0);
     if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    std::libc::eclipse_write(fd as u32, buf) as usize
+    libc::eclipse_write(fd as u32, buf) as usize
 }
 
 /// Audio device types
@@ -299,7 +300,7 @@ fn main() {
         
         // Drain any pending audio commands/data from other processes
         loop {
-            let (len, sender) = std::libc::receive_ipc(&mut ipc_buffer);
+            let (len, sender) = libc::receive_ipc(&mut ipc_buffer);
             if len == 0 || sender == 0 {
                 break;
             }

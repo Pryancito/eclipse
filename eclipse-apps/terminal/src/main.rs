@@ -8,9 +8,7 @@ use heapless::String as HString;
 use os_terminal::{ClipboardHandler, DrawTarget, MouseButton, MouseInput, Rgb, Terminal};
 use os_terminal::font::BitmapFont;
 
-#[cfg(target_os = "eclipse")]
 use libc::{c_int, close, kill, mmap, open};
-#[cfg(target_os = "eclipse")]
 use eclipse_syscall::call::{
     close as sys_close,
     exit as sys_exit,
@@ -23,30 +21,24 @@ use eclipse_syscall::call::{
 };
 
 // Wayland Unix socket client
-#[cfg(target_os = "eclipse")]
 use wayland_proto::unix_transport::UnixSocketConnection;
-#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::wire::{RawMessage, ObjectId, NewId, Opcode, Payload, PayloadType};
-#[cfg(target_os = "eclipse")]
 use wayland_proto::wl::connection::Connection;
 
 // ============================================================================
 // Tipos y Estructuras
 // ============================================================================
 
-#[cfg(target_os = "eclipse")]
 struct EclipseClipboard {
     text: std::string::String,
 }
 
-#[cfg(target_os = "eclipse")]
 impl EclipseClipboard {
     fn new() -> Self {
         Self { text: std::string::String::new() }
     }
 }
 
-#[cfg(target_os = "eclipse")]
 impl ClipboardHandler for EclipseClipboard {
     fn get_text(&mut self) -> Option<std::string::String> {
         if self.text.is_empty() { None } else { Some(self.text.clone()) }
@@ -56,7 +48,6 @@ impl ClipboardHandler for EclipseClipboard {
     }
 }
 
-#[cfg(target_os = "eclipse")]
 struct SurfaceBacking {
     ptr: *mut u32,
     width: usize,
@@ -65,15 +56,12 @@ struct SurfaceBacking {
     shm_fd: i32,
 }
 
-#[cfg(target_os = "eclipse")]
 struct SharedSurfaceDrawTarget {
     state: Rc<RefCell<SurfaceBacking>>,
 }
 
-#[cfg(target_os = "eclipse")]
 unsafe impl Send for SharedSurfaceDrawTarget {}
 
-#[cfg(target_os = "eclipse")]
 impl DrawTarget for SharedSurfaceDrawTarget {
     fn size(&self) -> (usize, usize) {
         let b = (*self.state).borrow();
@@ -170,13 +158,11 @@ fn sidewind_shm_name(pid: u32) -> HString<24> {
 /// Watches raw PTY output bytes for `\x1b[?1004h` (enable focus events) and
 /// `\x1b[?1004l` (disable).  xterm only forwards focus-in/out events to the
 /// running application when focus-event mode is enabled.
-#[cfg(target_os = "eclipse")]
 struct FocusModeTracker {
     state:   u8,
     enabled: bool,
 }
 
-#[cfg(target_os = "eclipse")]
 impl FocusModeTracker {
     const fn new() -> Self { Self { state: 0, enabled: false } }
 
@@ -205,7 +191,6 @@ impl FocusModeTracker {
 // PS/2 Set-1 scancodes that are pure modifier keys and produce no character
 // output from pc_keyboard.  Defined at module level to avoid re-creating the
 // slice on every keyboard event.
-#[cfg(target_os = "eclipse")]
 const MODIFIER_SC: &[u8] = &[
     0x1D, 0x61, // L-Ctrl, R-Ctrl
     0x2A, 0x36, // L-Shift, R-Shift
@@ -996,14 +981,12 @@ impl TerminalApp {
 }
 
 /// Send a Wayland message on the Unix socket connection.
-#[cfg(target_os = "eclipse")]
 fn send_wayland(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload]) {
     // let _ = SmallVec::<[Payload; 4]>::new(); // removed unused/missing dependency
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[]);
 }
 
 /// Send a Wayland message with an ancillary file descriptor (SCM_RIGHTS).
-#[cfg(target_os = "eclipse")]
 fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, args: &[Payload], fd: i32) {
     use wayland_proto::wl::wire::Handle;
     let _ = conn.send(ObjectId(object), Opcode(opcode), args, &[Handle(fd)]);
@@ -1015,7 +998,6 @@ fn send_wayland_with_fd(conn: &UnixSocketConnection, object: u32, opcode: u16, a
 ///   2. Relative path starting with "./" or "../"
 ///   3. Directories in PATH env var (colon-separated)
 ///   4. Default well-known directories: /bin, /usr/bin, /root/.cargo/bin, /usr/local/bin
-#[cfg(target_os = "eclipse")]
 fn resolve_exec_path(prog: &str) -> std::string::String {
     if prog.is_empty() {
         return std::string::String::from("/bin/sh");
@@ -1065,7 +1047,6 @@ fn resolve_exec_path(prog: &str) -> std::string::String {
 /// For tilde keys   (tilde=true):  `\x1b[N~` or  `\x1b[N;<mod>~` where N is the VT sequence number
 ///
 /// The xterm modifier code is:  1 + shift + 2*alt + 4*ctrl
-#[cfg(target_os = "eclipse")]
 fn write_key_seq(fd: usize, code: u8, tilde: bool, shift: bool, alt: bool, ctrl: bool) {
     let mod_code = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
     if mod_code == 0 {
@@ -1093,7 +1074,6 @@ fn write_key_seq(fd: usize, code: u8, tilde: bool, shift: bool, alt: bool, ctrl:
 ///   F1=11, F2=12, F3=13, F4=14, F5=15, F6=17, F7=18, F8=19, F9=20, F10=21, F11=23, F12=24
 ///   Plain:      \x1b[<N>~
 ///   With mod:   \x1b[<N>;<mod>~
-#[cfg(target_os = "eclipse")]
 fn write_fn_key(fd: usize, fnum: u8, shift: bool, alt: bool, ctrl: bool) {
     // VT sequence numbers for F1–F12 (F6 skips 16 to 17, etc.)
     const VT_FN: [u8; 12] = [11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24];
@@ -1113,12 +1093,9 @@ fn write_fn_key(fd: usize, fnum: u8, shift: bool, alt: bool, ctrl: bool) {
 }
 
 fn main() {
-    #[cfg(target_os = "eclipse")]
-    {
-        if let Some(mut app) = TerminalApp::new() {
-            app.run();
-        } else {
-            std::println!("Failed to initialize TerminalApp.");
-        }
+    if let Some(mut app) = TerminalApp::new() {
+        app.run();
+    } else {
+        std::println!("Failed to initialize TerminalApp.");
     }
 }

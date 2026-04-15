@@ -19,6 +19,17 @@ extern FILE *stderr;
 #define EOF (-1)
 #define BUFSIZ 4096
 
+/* fseek/lseek whence values (commonly provided by stdio.h). */
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#endif
+#ifndef SEEK_CUR
+#define SEEK_CUR 1
+#endif
+#ifndef SEEK_END
+#define SEEK_END 2
+#endif
+
 /* Formatting */
 int printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int fprintf(FILE *stream, const char *format, ...) __attribute__((format(printf, 2, 3)));
@@ -31,6 +42,7 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap);
 
 /* I/O */
 int   fputc(int c, FILE *stream);
+int   putc(int c, FILE *stream);
 int   fputs(const char *s, FILE *stream);
 int   fgetc(FILE *stream);
 char *fgets(char *s, int size, FILE *stream);

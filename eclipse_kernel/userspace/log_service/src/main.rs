@@ -1,4 +1,5 @@
 use std::prelude::v1::*;
+use eclipse_libc as libc;
 
 /// Log buffer for storing messages before filesystem is ready
 const LOG_BUFFER_SIZE: usize = 4096;
@@ -8,7 +9,7 @@ struct LogBuffer {
     pos: usize,
 }
 
-static LOG_STATE: std::libc::Spinlock<LogBuffer> = std::libc::Spinlock::new(LogBuffer {
+static LOG_STATE: libc::Spinlock<LogBuffer> = libc::Spinlock::new(LogBuffer {
     buf: [0; LOG_BUFFER_SIZE],
     pos: 0,
 });
@@ -27,13 +28,13 @@ fn flush_log_buffer(state: &mut LogBuffer) {
     if state.pos == 0 {
         return;
     }
-    let fd = -1; //std::libc::eclipse_open("file:/tmp/system.log", std::libc::O_WRONLY | std::libc::O_CREAT | std::libc::O_APPEND, 0o644);
+    let fd = -1; //libc::eclipse_open("file:/tmp/system.log", libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
     if fd >= 0 {
-        let written = std::libc::eclipse_write(fd as u32, &state.buf[..state.pos]);
+        let written = libc::eclipse_write(fd as u32, &state.buf[..state.pos]);
         if written > 0 {
             state.pos = 0;
         }
-        unsafe { std::libc::eclipse_close(fd); }
+        unsafe { libc::eclipse_close(fd); }
     }
 }
 
@@ -54,7 +55,7 @@ fn log_message(msg: &str) {
 }
 
 fn main() {
-    let pid = unsafe { std::libc::getpid() };
+    let pid = unsafe { libc::getpid() };
 
     write_line(b"+--------------------------------------------------------------+");
     write_line(b"|              LOG SERVER / CONSOLE SERVICE                    |");
@@ -70,9 +71,9 @@ fn main() {
     log_message("[LOG-SERVICE] Target log file: /tmp/system.log");
     log_message("[LOG-SERVICE] Ready to accept log messages from other services");
 
-    let ppid = unsafe { std::libc::getppid() };
+    let ppid = unsafe { libc::getppid() };
     if ppid > 0 {
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
         println!("[LOG-SERVICE] Sent READY signal to parent PID: {}", ppid);
         log_message("[LOG-SERVICE] Handshake with init complete");
     } else {
@@ -86,7 +87,7 @@ fn main() {
         flush_counter += 1;
 
         loop {
-            let (len, _sender) = std::libc::receive_ipc(&mut ipc_buffer);
+            let (len, _sender) = libc::receive_ipc(&mut ipc_buffer);
             if len == 0 {
                 break;
             }

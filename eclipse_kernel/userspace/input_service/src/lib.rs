@@ -3,7 +3,7 @@
 extern crate std;
 extern crate alloc;
 
-use std::libc::InputEvent;
+use eclipse_libc::InputEvent;
 
 /// Cola de eventos de entrada (256 slots).
 pub struct EventQueue {

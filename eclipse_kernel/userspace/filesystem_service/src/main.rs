@@ -2,6 +2,7 @@
  
 use std::prelude::v1::*;
 use std::vec;
+use eclipse_libc as libc;
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags};
 
 const SEEK_SET: i32 = 0;
@@ -31,7 +32,7 @@ struct BlockDevice {
 
 impl BlockDevice {
     fn new(path: &str) -> Result<Self, &'static str> {
-        let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+        let fd = libc::eclipse_open(path, libc::O_RDONLY, 0);
         if fd < 0 {
             return Err("Failed to open device");
         }
@@ -43,10 +44,10 @@ impl BlockDevice {
             return Err("Buffer must be BLOCK_SIZE");
         }
         let offset = block_num * BLOCK_SIZE as u64;
-        if std::libc::eclipse_lseek(self.fd, offset as i64, SEEK_SET) < 0 {
+        if libc::eclipse_lseek(self.fd, offset as i64, SEEK_SET) < 0 {
             return Err("Seek failed");
         }
-        if std::libc::eclipse_read(self.fd as u32, buffer) != BLOCK_SIZE as isize {
+        if libc::eclipse_read(self.fd as u32, buffer) != BLOCK_SIZE as isize {
             return Err("Read failed");
         }
         Ok(())
@@ -55,7 +56,7 @@ impl BlockDevice {
 
 impl Drop for BlockDevice {
     fn drop(&mut self) {
-        unsafe { std::libc::eclipse_close(self.fd); }
+        unsafe { libc::eclipse_close(self.fd); }
     }
 }
 
@@ -278,7 +279,7 @@ fn find_eclipsefs_in_gpt(device: &BlockDevice) -> Option<(u64, usize)> {
 }
 
 fn main() {
-    let pid = unsafe { std::libc::getpid() };
+    let pid = unsafe { libc::getpid() };
 
     println!("+--------------------------------------------------------------+");
     println!("|              FILESYSTEM SERVICE (VFS)                        |");
@@ -286,10 +287,17 @@ fn main() {
     println!("[FS-SERVICE] Starting (PID: {})", pid);
     println!("[FS-SERVICE] Will probe disk:0..disk:N via GPT scan + known offsets.");
 
+    // Señalizar READY temprano: el montaje del root puede tardar, pero init debe seguir
+    // arrancando (el servicio seguirá trabajando y logueando el estado).
+    let ppid = unsafe { libc::getppid() };
+    if ppid > 0 {
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
+    }
+
     let mut found = false;
     println!("[FS-SERVICE] Probing for root filesystem...");
 
-    let device_count = std::libc::get_storage_device_count();
+    let device_count = libc::get_storage_device_count();
     println!("[FS-SERVICE] Found {} storage device(s)", device_count);
     if device_count == 0 {
         println!("[FS-SERVICE] CRITICAL: AHCI/NVMe registered zero block devices.");
@@ -321,7 +329,7 @@ fn main() {
 
                         // Notify kernel to mount root with this specific device string
                         println!("[FS-SERVICE] Notifying kernel to mount {} as root...", mount_path.as_str());
-                        if std::libc::mount(&mount_path) == 0 {
+                        if libc::mount(&mount_path) == 0 {
                             println!("[FS-SERVICE] Kernel root mount successful!");
 
                             // List root directory from our side to verify
@@ -357,9 +365,9 @@ fn main() {
     }
 
     println!("[FS-SERVICE] Entering main loop...");
-    let ppid = unsafe { std::libc::getppid() };
+    let ppid = unsafe { libc::getppid() };
     if ppid > 0 {
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
     }
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));

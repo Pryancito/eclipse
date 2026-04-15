@@ -1,10 +1,4 @@
-#[cfg(not(target_os = "linux"))]
 use eclipse_syscall::call::{gpu_command, gpu_get_backend};
-
-#[cfg(target_os = "linux")]
-pub unsafe fn gpu_command(_kind: usize, _command: usize, _payload: &[u8]) -> Result<usize, ()> { Err(()) }
-#[cfg(target_os = "linux")]
-pub fn gpu_get_backend() -> Result<usize, ()> { Ok(2) }
 
 use core::fmt::Debug;
 

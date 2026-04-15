@@ -6,6 +6,11 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+/* Minimal multibyte/locale surface area. */
+#ifndef MB_CUR_MAX
+#define MB_CUR_MAX 1
+#endif
+
 /* Memory allocation */
 void *malloc(size_t size);
 void  free(void *ptr);

@@ -11,7 +11,7 @@ pub const F_SETFL:   c_int = 4;
 // --- File descriptor flags ---
 pub const FD_CLOEXEC: c_int = 1;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, mut arg: ...) -> c_int {
     let extra: usize = arg.arg::<usize>();

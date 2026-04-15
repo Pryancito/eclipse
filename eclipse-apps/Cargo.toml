@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "libs/os-terminal",
-    "eclipse_std",
     "sidewind",
     "sidewind_core",
     "sidewind_nvidia",
@@ -40,6 +39,8 @@ sidewind_core = { path = "sidewind_core" }
 # Sin `std` por defecto: el target Eclipse usa build-std=core,alloc y eclipse_std como `std`
 # solo para binarios que la enlazan; las libs no_std no deben forzar `bitflags/std`.
 bitflags = { version = "2.4", default-features = false }
+libc = { path = "../eclipse-relibc", default-features = false }
+eclipse-syscall = { path = "../eclipse-syscall" }
 
 [profile.release]
 # IMPORTANTE: Este es el lugar correcto para configurar perfiles en un workspace.
@@ -67,4 +68,3 @@ panic = "abort"
 
 [patch.crates-io]
 libc = { path = "../eclipse-relibc" }
-std = { package = "eclipse_std", path = "eclipse_std" }

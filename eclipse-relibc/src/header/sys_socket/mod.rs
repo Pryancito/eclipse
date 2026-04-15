@@ -214,7 +214,7 @@ pub unsafe fn CMSG_NXTHDR(mhdr: *const msghdr, cmsg: *const cmsghdr) -> *mut cms
 }
 
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int;
     pub fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int;
@@ -225,7 +225,7 @@ extern "C" {
     pub fn recv(sockfd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int {
     match sys_socket(domain as usize, type_ as usize, protocol as usize) {
@@ -234,7 +234,7 @@ pub unsafe extern "C" fn socket(domain: c_int, type_: c_int, protocol: c_int) ->
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
     match sys_bind(sockfd as usize, addr as usize, addrlen as usize) {
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: soc
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn listen(sockfd: c_int, backlog: c_int) -> c_int {
     match sys_listen(sockfd as usize, backlog as usize) {
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn listen(sockfd: c_int, backlog: c_int) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
     // Note: addr and addrlen can be null. Our sys_accept wrapper handles it if we pass them.
@@ -262,7 +262,7 @@ pub unsafe extern "C" fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mu
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
     match sys_connect(sockfd as usize, addr as usize, addrlen as usize) {
@@ -271,13 +271,13 @@ pub unsafe extern "C" fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: 
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn shutdown(_sockfd: c_int, _how: c_int) -> c_int {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn send(sockfd: c_int, buf: *const c_void, len: size_t, _flags: c_int) -> ssize_t {
     use crate::eclipse_syscall::call::write as sys_write;
@@ -288,7 +288,7 @@ pub unsafe extern "C" fn send(sockfd: c_int, buf: *const c_void, len: size_t, _f
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn recv(sockfd: c_int, buf: *mut c_void, len: size_t, _flags: c_int) -> ssize_t {
     use crate::eclipse_syscall::call::read as sys_read;
@@ -299,37 +299,37 @@ pub unsafe extern "C" fn recv(sockfd: c_int, buf: *mut c_void, len: size_t, _fla
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn getsockname(_sockfd: c_int, _addr: *mut sockaddr, _addrlen: *mut socklen_t) -> c_int {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn getpeername(_sockfd: c_int, _addr: *mut sockaddr, _addrlen: *mut socklen_t) -> c_int {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn setsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *const c_void, _optlen: socklen_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn getsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *mut c_void, _optlen: *mut socklen_t) -> c_int {
     0
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn sendmsg(sockfd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
     pub fn recvmsg(sockfd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn sendmsg(sockfd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t {
     // Use sys_sendmsg (syscall 46) so the kernel's SCM_RIGHTS control-message
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn sendmsg(sockfd: c_int, msg: *const msghdr, flags: c_int
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn recvmsg(sockfd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t {
     // Use sys_recvmsg (syscall 47) so that:

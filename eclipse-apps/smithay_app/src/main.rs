@@ -3,33 +3,9 @@
 //! - Eclipse: compositor propio (DRM, SideWind, IPC).
 
 
-#[cfg(all(not(target_os = "eclipse"), feature = "wayland"))]
-use smithay_app::smithay_wayland;
-
-// ---- Entry point Linux con feature "wayland": Smithay Wayland ----
-#[cfg(all(not(target_os = "eclipse"), feature = "wayland"))]
-fn main() {
-    if let Err(e) = smithay_wayland::run() {
-        eprintln!("[SMITHAY] Error: {}", e);
-        std::process::exit(1);
-    }
-}
-
-// ---- Entry point Linux sin feature "wayland": informar al usuario ----
-#[cfg(all(not(target_os = "eclipse"), not(feature = "wayland")))]
-fn main() {
-    eprintln!("[SMITHAY] Backend Wayland no habilitado. Compile con --features wayland para usar el compositor Wayland en Linux.");
-    std::process::exit(1);
-}
-
-#[cfg(target_os = "eclipse")]
 use smithay_app::libc;
-#[cfg(target_os = "eclipse")]
 use std::env;
 
-// ---- Entry point Eclipse: compositor propio ----
-#[cfg(target_os = "eclipse")]
-#[cfg(not(test))]
 fn main() {
     use smithay_app::state::SmithayState;
 
@@ -70,7 +46,6 @@ fn main() {
 }
 
 #[cfg(test)]
-#[cfg(target_os = "eclipse")]
 mod tests {
     use smithay_app::state::SmithayState;
 

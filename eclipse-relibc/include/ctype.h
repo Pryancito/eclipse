@@ -5,7 +5,9 @@
 
 int isalnum(int c);
 int isalpha(int c);
+#ifndef isblank
 int isblank(int c);
+#endif
 int iscntrl(int c);
 int isdigit(int c);
 int isgraph(int c);

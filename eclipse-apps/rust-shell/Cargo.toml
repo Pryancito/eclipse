@@ -8,10 +8,8 @@ license.workspace = true
 [dependencies]
 # Use workspace dependencies for common crates (e.g. bitflags)
 bitflags = { workspace = true }
-
-[target.'cfg(target_os = "eclipse")'.dependencies]
-std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
+libc = { workspace = true, features = ["eclipse-syscall", "use_std"] }
 
 [lints]
 workspace = true

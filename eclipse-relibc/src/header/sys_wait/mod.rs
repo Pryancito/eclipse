@@ -32,13 +32,13 @@ pub unsafe fn WSTOPSIG(status: c_int) -> c_int {
     (status >> 8) & 0xff
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn wait(stat_loc: *mut c_int) -> pid_t {
     waitpid(-1, stat_loc, 0)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t {
     let mut st: u32 = 0;
@@ -64,20 +64,20 @@ pub unsafe extern "C" fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_in
 }
 
 /// wait3 — wait with resource usage (rusage ignored).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn wait3(stat_loc: *mut c_int, options: c_int, _rusage: *mut c_void) -> pid_t {
     waitpid(-1, stat_loc, options)
 }
 
 /// wait4 — wait for specific pid with resource usage (rusage ignored).
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn wait4(pid: pid_t, stat_loc: *mut c_int, options: c_int, _rusage: *mut c_void) -> pid_t {
     waitpid(pid, stat_loc, options)
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn wait(stat_loc: *mut c_int) -> pid_t;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;

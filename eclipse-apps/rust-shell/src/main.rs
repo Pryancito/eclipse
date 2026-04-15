@@ -75,16 +75,13 @@ impl Shell {
     }
 
     pub fn update_terminal_size(&self) {
-        #[cfg(target_os = "eclipse")]
-        {
-            let mut winsz = [0u16; 4];
-            if eclipse_syscall::call::ioctl(0, 4, winsz.as_mut_ptr() as usize).is_ok() {
-                let rows = winsz[0];
-                let cols = winsz[1];
-                if rows > 0 && cols > 0 {
-                    std::env::set_var("LINES", ::alloc::format!("{}", rows));
-                    std::env::set_var("COLUMNS", ::alloc::format!("{}", cols));
-                }
+        let mut winsz = [0u16; 4];
+        if eclipse_syscall::call::ioctl(0, 4, winsz.as_mut_ptr() as usize).is_ok() {
+            let rows = winsz[0];
+            let cols = winsz[1];
+            if rows > 0 && cols > 0 {
+                std::env::set_var("LINES", ::alloc::format!("{}", rows));
+                std::env::set_var("COLUMNS", ::alloc::format!("{}", cols));
             }
         }
     }
@@ -106,7 +103,7 @@ impl Shell {
 
 fn main() {
     let mut shell = Shell::new();
-    let args = std::env::args(); 
+    let args: Vec<String> = std::env::args().collect();
     
     if args.len() > 1 {
         if args[1] == "-c" && args.len() > 2 {

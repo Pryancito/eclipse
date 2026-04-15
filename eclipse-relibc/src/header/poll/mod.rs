@@ -20,12 +20,12 @@ pub struct pollfd {
     pub revents: c_short,
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     use crate::read;

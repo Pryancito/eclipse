@@ -25,25 +25,11 @@ micromath = "2.1.0"
 bitflags = { version = "2.4", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["no-std-float"] }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-# Dependencias solo para target Eclipse (vendor eclipse).
-# wayland-server/wayland-protocols: detrás de feature "wayland"; sin ella el build Eclipse no los incluye
-# (evita errno/wayland_sys/downcast_rs que esperan std del sysroot; ver docs/WAYLAND_RS_ECLIPSE.md).
-[target.'cfg(target_os = "eclipse")'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
-eclipse-syscall = { path = "../../eclipse-syscall" }
 wayland-proto = { path = "../libs/wayland-proto" }
-# Usamos eclipse_std en modo compatibilidad con std para que NO registre su
-# propio panic_handler/alloc_error_handler; dejamos que eclipse-relibc lo haga.
-std = { package = "eclipse_std", path = "../eclipse_std" }
 # Misma versión que el [patch.crates-io] del workspace → eclipse-relibc.
 libc = { version = "0.2", default-features = false }
-
-# Dependencias solo para target Linux (host) — compositor Wayland con Smithay
-[target.'cfg(not(target_os = "eclipse"))'.dependencies]
-sidewind = { path = "../sidewind" }
-eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
-libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"], optional = true }
 

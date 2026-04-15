@@ -10,11 +10,10 @@ description = "Biblioteca IPC tipada no_std para Eclipse OS"
 testable = []
 # Habilita recv_async(), RecvFuture y block_on para uso con async/await o ejecutores.
 async = []
-host-testing = ["std/host-testing"]
+host-testing = ["libc/host-testing"]
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 libc = { path = "../../../eclipse-relibc", default-features = false }
-std = { package = "eclipse_std", path = "../../eclipse_std" }
 
 [dependencies]
 sidewind_core = { path = "../../sidewind_core" }

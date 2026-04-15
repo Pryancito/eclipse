@@ -14,7 +14,7 @@ pub struct ifaddrs {
     pub ifa_data: *mut c_void,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
     if ifap.is_null() { return -1; }
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn freeifaddrs(_ifa: *mut ifaddrs) {
     // Stub

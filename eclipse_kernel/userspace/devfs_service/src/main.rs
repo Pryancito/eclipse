@@ -1,6 +1,7 @@
 // devfs_service - Device Manager
 
 use std::prelude::v1::*;
+use eclipse_libc as libc;
 
 use eclipse_syscall::number::SYS_REGISTER_DEVICE;
 
@@ -45,9 +46,9 @@ fn main() {
     }
 
     println!("[DevFS] Initialization complete. Entering main loop.");
-    let ppid = unsafe { std::libc::getppid() };
+    let ppid = unsafe { libc::getppid() };
     if ppid > 0 {
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
+        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
     }
 
     loop {

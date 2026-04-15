@@ -10,11 +10,7 @@ use crate::types::*;
 // hosts) to avoid symbol collisions with the system libm during host builds.
 #[cfg(all(
     not(any(test, feature = "host-testing")),
-    any(
-        target_os = "eclipse",
-        eclipse_target,
-        not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))))
-    )
+    eclipse_target
 ))]
 mod imp {
     use crate::types::*;
@@ -630,11 +626,7 @@ mod imp {
 // dependency (e.g. `use libc::sin`) also need them in the public namespace.
 #[cfg(all(
     not(any(test, feature = "host-testing")),
-    any(
-        target_os = "eclipse",
-        eclipse_target,
-        not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target))))
-    )
+    eclipse_target
 ))]
 pub use imp::{
     fabs, fabsf, floor, floorf, ceil, ceilf, round, roundf, trunc, truncf,

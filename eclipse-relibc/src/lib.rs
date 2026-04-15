@@ -50,10 +50,13 @@ macro_rules! println {
 #[cfg(all(
     not(feature = "rustc-dep-of-std"),
     not(any(test, feature = "host-testing")),
-    any(target_os = "eclipse", eclipse_target,
-        not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))
+    eclipse_target
 ))]
+#[cfg(feature = "crt0")]
 core::arch::global_asm!(include_str!("posix_stubs.s"));
+
+#[cfg(not(feature = "crt0"))]
+core::arch::global_asm!(include_str!("posix_stubs_nostart.s"));
 
 // ── Prelude mínima para no_core (rustc-dep-of-std) ───────────────────────────
 // En modo no_core nada está en scope automáticamente. Importamos lo estrictamente
@@ -213,8 +216,7 @@ pub use header::sys_eclipse::*;
 #[cfg(all(
     not(feature = "rustc-dep-of-std"),
     not(any(test, feature = "host-testing")),
-    any(target_os = "eclipse", eclipse_target,
-        not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))
+    eclipse_target
 ))]
 #[no_mangle]
 pub unsafe extern "C" fn __libc_start_main(
@@ -242,6 +244,92 @@ pub unsafe extern "C" fn __libc_start_main(
 // ── Constantes de archivo (modo normal vía eclipse-syscall) ──────────────────
 #[cfg(not(feature = "rustc-dep-of-std"))]
 pub use types::*;
+
+// ── Minimal wide/multibyte stubs (ASCII) ─────────────────────────────────────
+#[cfg(all(
+    not(feature = "rustc-dep-of-std"),
+    not(any(test, feature = "host-testing")),
+    eclipse_target,
+))]
+mod wide_stubs {
+    use crate::types::*;
+
+    #[repr(C)]
+    pub struct mbstate_t {
+        _opaque: c_uint,
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn mbrtowc(pwc: *mut u32, s: *const c_char, n: size_t, _ps: *mut mbstate_t) -> size_t {
+        if s.is_null() {
+            return 0;
+        }
+        if n == 0 {
+            return usize::MAX;
+        }
+        let b = *(s as *const u8);
+        if !pwc.is_null() {
+            *pwc = b as u32;
+        }
+        if b == 0 { 0 } else { 1 }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn towlower(wc: c_uint) -> c_uint {
+        if wc >= b'A' as c_uint && wc <= b'Z' as c_uint {
+            wc + 32
+        } else {
+            wc
+        }
+    }
+}
+
+// ── Misc POSIX stubs needed by bash bring-up ─────────────────────────────────
+#[cfg(all(
+    not(feature = "rustc-dep-of-std"),
+    not(any(test, feature = "host-testing")),
+    eclipse_target,
+))]
+mod posix_stubs_for_bash {
+    use crate::types::*;
+
+    #[no_mangle]
+    pub unsafe extern "C" fn mktemp(_tmpl: *mut c_char) -> *mut c_char {
+        // Not secure; placeholder for bring-up. Indicate failure.
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ttyname(_fd: c_int) -> *mut c_char {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn mknod(_path: *const c_char, _mode: mode_t, _dev: dev_t) -> c_int {
+        *crate::header::errno::__errno_location() = 38; // ENOSYS
+        -1
+    }
+
+    // group database stubs
+    #[repr(C)]
+    pub struct group {
+        pub gr_name: *mut c_char,
+        pub gr_passwd: *mut c_char,
+        pub gr_gid: gid_t,
+        pub gr_mem: *mut *mut c_char,
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn setgrent() {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn endgrent() {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn getgrent() -> *mut group {
+        core::ptr::null_mut()
+    }
+}
 
 #[cfg(not(feature = "rustc-dep-of-std"))]
 pub const O_RDONLY:   c_int = eclipse_syscall::flag::O_RDONLY   as c_int;
@@ -459,27 +547,18 @@ pub const SOCK_DGRAM:  c_int = 2;
 // ── syscall (modo normal — implementación de stub) ────────────────────────────
 #[cfg(all(
     not(feature = "rustc-dep-of-std"),
-    not(any(test, feature = "host-testing")),
-    any(target_os = "eclipse", eclipse_target,
-        target_os = "none",
-        all(target_os = "linux", not(eclipse_target)))
+    not(any(test, feature = "host-testing"))
 ))]
 #[no_mangle]
 pub unsafe extern "C" fn syscall(_num: c_long, _args: ...) -> c_long { 0 }
 
-#[cfg(all(
-    not(feature = "rustc-dep-of-std"),
-    not(any(target_os = "eclipse", target_os = "none",
-            all(target_os = "linux", not(eclipse_target)), eclipse_target))
-))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" { pub fn syscall(num: c_long, _args: ...) -> c_long; }
 
 // ── Stubs de unwind (solo en builds de Eclipse, no en modo sysroot) ───────────
 #[cfg(all(
-    not(feature = "rustc-dep-of-std"),
-    not(any(test, feature = "host-testing")),
-    any(target_os = "eclipse", eclipse_target,
-        not(all(target_os = "linux", not(eclipse_target))))
+    not(feature = "use_std"),
+    not(any(test, feature = "host-testing"))
 ))]
 mod unwind_stubs {
     #[no_mangle] pub unsafe extern "C" fn _Unwind_GetRegionStart() -> usize { 0 }
@@ -493,16 +572,13 @@ mod unwind_stubs {
     #[no_mangle] pub unsafe extern "C" fn _Unwind_Resume() {}
 }
 
-// ── Panic handler propio de Eclipse OS (solo en builds normales) ──────────────
+// ── Panic handler propio de Eclipse OS (solo cuando NO hay std) ───────────────
 #[cfg(all(
-    not(feature = "rustc-dep-of-std"),
-    not(any(test, feature = "host-testing")),
     feature = "panic-handler",
-    any(target_os = "eclipse", eclipse_target),
+    not(feature = "use_std"),
+    not(any(test, feature = "host-testing"))
 ))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    use crate::header::unistd::_exit;
-    unsafe { _exit(1); }
     loop {}
 }

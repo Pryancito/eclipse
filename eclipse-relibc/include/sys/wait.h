@@ -5,6 +5,11 @@
 
 #include <sys/types.h>
 
+/* Ensure consumers take the POSIX `int` wait status path (e.g. bash). */
+#ifndef _POSIX_VERSION
+#define _POSIX_VERSION 200809L
+#endif
+
 #define WNOHANG   1
 #define WUNTRACED 2
 #define WCONTINUED 8

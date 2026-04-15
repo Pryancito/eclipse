@@ -4,8 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false, features = ["std"] }
-std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
+eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false, features = ["std", "use_std", "allocator", "eclipse-syscall"] }
 eclipse-syscall = { path = "../../../eclipse-syscall" }
 eclipse-program-codes = { path = "../../../eclipse-program-codes", default-features = false }
 

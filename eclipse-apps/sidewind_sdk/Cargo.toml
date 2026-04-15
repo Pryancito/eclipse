@@ -17,7 +17,6 @@ sidewind-opengl = { path = "../sidewind_opengl" }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 libc = { path = "../../eclipse-relibc", default-features = false }
-std = { package = "eclipse_std", path = "../../eclipse_std" }
 eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 
 [features]

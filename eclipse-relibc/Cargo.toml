@@ -20,10 +20,11 @@ rustc-std-workspace-core = { version = "1.0.1", optional = true }
 
 [features]
 eclipse-syscall = ["dep:eclipse-syscall"]
-default = ["std", "allocator", "eclipse-syscall"]
+default = ["allocator", "eclipse-syscall", "panic-handler"]
 allocator = []
 no-allocator = []
 panic-handler = []
+crt0 = []
 host-testing = []
 std = []
 extra_traits = []
@@ -42,7 +43,9 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [profile.release]
+panic = "abort"
 lto = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(eclipse_target)'] }
+[profile.dev]
+panic = "abort"
+

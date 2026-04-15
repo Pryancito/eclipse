@@ -26,7 +26,38 @@ pub const CLOCK_MONOTONIC: clockid_t = 1;
 
 static TIME_COUNTER: AtomicI64 = AtomicI64::new(0);
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[no_mangle]
+pub static mut timezone: c_long = 0;
+
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[no_mangle]
+pub unsafe extern "C" fn tzset() {
+    timezone = 0;
+}
+
+#[repr(C)]
+pub struct tms {
+    pub tms_utime: clock_t,
+    pub tms_stime: clock_t,
+    pub tms_cutime: clock_t,
+    pub tms_cstime: clock_t,
+}
+
+/// times — minimal stub for now.
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[no_mangle]
+pub unsafe extern "C" fn times(buf: *mut tms) -> clock_t {
+    if !buf.is_null() {
+        (*buf).tms_utime = 0;
+        (*buf).tms_stime = 0;
+        (*buf).tms_cutime = 0;
+        (*buf).tms_cstime = 0;
+    }
+    0
+}
+
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) -> c_int {
     if tp.is_null() {
@@ -46,7 +77,7 @@ pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) ->
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn gmtime_r(timer: *const time_t, result: *mut tm) -> *mut tm {
     if timer.is_null() || result.is_null() {
@@ -56,13 +87,13 @@ pub unsafe extern "C" fn gmtime_r(timer: *const time_t, result: *mut tm) -> *mut
     result
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn localtime_r(timer: *const time_t, result: *mut tm) -> *mut tm {
     gmtime_r(timer, result)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_int {
     if !_tv.is_null() {
@@ -80,13 +111,13 @@ pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn setitimer(_which: c_int, _new_value: *const itimerval, _old_value: *mut itimerval) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) -> c_int {
     if !curr_value.is_null() {
@@ -98,7 +129,7 @@ pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) ->
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
     let mut stats = eclipse_syscall::SystemStats::default();
@@ -113,19 +144,19 @@ pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
     t as time_t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn clock() -> clock_t {
     (TIME_COUNTER.load(Ordering::Relaxed) * 1000) as clock_t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn difftime(time1: time_t, time0: time_t) -> c_double {
     (time1 - time0) as c_double
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
     if timeptr.is_null() {
@@ -137,13 +168,13 @@ pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
     t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn timegm(timeptr: *mut tm) -> time_t {
     mktime(timeptr)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn gmtime(timer: *const time_t) -> *mut tm {
     if timer.is_null() {
@@ -152,20 +183,20 @@ pub unsafe extern "C" fn gmtime(timer: *const time_t) -> *mut tm {
     core::ptr::null_mut()
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "eclipse", eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn localtime(timer: *const time_t) -> *mut tm {
     gmtime(timer)
 }
 
-#[cfg(any(test, feature = "host-testing", all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn nanosleep(req: *const timespec, rem: *mut timespec) -> c_int;
     pub fn clock_gettime(clk_id: clockid_t, tp: *mut timespec) -> c_int;
     pub fn time(tloc: *mut time_t) -> time_t;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
 #[no_mangle]
 pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> c_int {
     if req.is_null() {
@@ -184,7 +215,7 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, not(all(target_os = "linux", not(any(target_os = "eclipse", eclipse_target)))))))]
+#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn ctime(_timep: *const time_t) -> *mut c_char {
     #[thread_local]
