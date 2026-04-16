@@ -1362,6 +1362,11 @@ const O_EXCL: usize = 0x0080;
 /// Virtual files under /tmp (in-memory overlay for O_CREAT)
 static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 
+/// Virtual files under /run (in-memory overlay for socket files, PID files, etc.)
+/// This allows programs like seatd to bind()/unlink() socket files under /run even though
+/// the real root filesystem is read-only.
+static VIRTUAL_RUN: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
+
 #[derive(Clone)]
 enum OpenFile {
     Real { 
@@ -1415,6 +1420,35 @@ impl Scheme for FileSystemScheme {
 
                 if vtmp.contains_key(&key) {
                     drop(vtmp);
+                    let mut open_files = OPEN_FILES_SCHEME.lock();
+                    for (i, slot) in open_files.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                            return Ok(i);
+                        }
+                    }
+                    let id = open_files.len();
+                    open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
+                    Ok(id)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            },
+            // Virtual /run overlay: supports socket files, PID files, and other runtime data.
+            // The real /run directory exists on the read-only root filesystem, so we maintain
+            // an in-memory overlay here just like /tmp.
+            p if p == "run" || p.starts_with("run/") => {
+                let key = String::from(clean_path);
+                let mut vrun = VIRTUAL_RUN.lock();
+                if (flags & O_CREAT) != 0 {
+                    if (flags & O_EXCL) != 0 && vrun.contains_key(&key) {
+                        return Err(scheme_error::EEXIST);
+                    }
+                    vrun.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
+                }
+
+                if vrun.contains_key(&key) {
+                    drop(vrun);
                     let mut open_files = OPEN_FILES_SCHEME.lock();
                     for (i, slot) in open_files.iter_mut().enumerate() {
                         if slot.is_none() {
@@ -1566,15 +1600,26 @@ impl Scheme for FileSystemScheme {
                 let path_clone = path.clone();
                 let off = *offset;
                 drop(open_files);
-                let vtmp = VIRTUAL_TMP.lock();
-                let content = vtmp.get(&path_clone).ok_or(scheme_error::EIO)?;
-                let start = off as usize;
-                if start >= content.len() {
-                    return Ok(0);
+                let len;
+                if path_clone.starts_with("run/") || path_clone == "run" {
+                    let vrun = VIRTUAL_RUN.lock();
+                    let content = vrun.get(&path_clone).ok_or(scheme_error::EIO)?;
+                    let start = off as usize;
+                    if start >= content.len() {
+                        return Ok(0);
+                    }
+                    len = core::cmp::min(buffer.len(), content.len() - start);
+                    buffer[..len].copy_from_slice(&content[start..start + len]);
+                } else {
+                    let vtmp = VIRTUAL_TMP.lock();
+                    let content = vtmp.get(&path_clone).ok_or(scheme_error::EIO)?;
+                    let start = off as usize;
+                    if start >= content.len() {
+                        return Ok(0);
+                    }
+                    len = core::cmp::min(buffer.len(), content.len() - start);
+                    buffer[..len].copy_from_slice(&content[start..start + len]);
                 }
-                let len = core::cmp::min(buffer.len(), content.len() - start);
-                buffer[..len].copy_from_slice(&content[start..start + len]);
-                
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 if let Some(Some(OpenFile::Virtual { offset: o, .. })) = open_files.get_mut(id) {
                     *o += len as u64;
@@ -1604,14 +1649,23 @@ impl Scheme for FileSystemScheme {
                 let off = *offset as usize;
                 let n = buffer.len();
                 drop(open_files);
-                let mut vtmp = VIRTUAL_TMP.lock();
-                let content = vtmp.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
-                let need_len = off + n;
-                if content.len() < need_len {
-                    content.resize(need_len, 0);
+                if path_clone.starts_with("run/") || path_clone == "run" {
+                    let mut vrun = VIRTUAL_RUN.lock();
+                    let content = vrun.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
+                    let need_len = off + n;
+                    if content.len() < need_len {
+                        content.resize(need_len, 0);
+                    }
+                    content[off..off + n].copy_from_slice(buffer);
+                } else {
+                    let mut vtmp = VIRTUAL_TMP.lock();
+                    let content = vtmp.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
+                    let need_len = off + n;
+                    if content.len() < need_len {
+                        content.resize(need_len, 0);
+                    }
+                    content[off..off + n].copy_from_slice(buffer);
                 }
-                content[off..off + n].copy_from_slice(buffer);
-                drop(vtmp);
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 if let Some(Some(OpenFile::Virtual { offset: o, .. })) = open_files.get_mut(id) {
                     *o += n as u64;
@@ -1643,9 +1697,13 @@ impl Scheme for FileSystemScheme {
                 let path_clone = path.clone();
                 let off = *offset;
                 drop(open_files);
-                let vtmp = VIRTUAL_TMP.lock();
-                let len = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
-                drop(vtmp);
+                let len = if path_clone.starts_with("run/") || path_clone == "run" {
+                    let vrun = VIRTUAL_RUN.lock();
+                    vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                } else {
+                    let vtmp = VIRTUAL_TMP.lock();
+                    vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                };
                 let no = match whence {
                     0 => seek_offset as u64,
                     1 => (off as isize + seek_offset) as u64,
@@ -1677,12 +1735,22 @@ impl Scheme for FileSystemScheme {
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 drop(open_files);
-                let mut vtmp = VIRTUAL_TMP.lock();
-                if let Some(content) = vtmp.get_mut(&path_clone) {
-                    content.resize(len, 0);
-                    Ok(0)
+                if path_clone.starts_with("run/") || path_clone == "run" {
+                    let mut vrun = VIRTUAL_RUN.lock();
+                    if let Some(content) = vrun.get_mut(&path_clone) {
+                        content.resize(len, 0);
+                        Ok(0)
+                    } else {
+                        Err(scheme_error::ENOENT)
+                    }
                 } else {
-                    Err(scheme_error::ENOENT)
+                    let mut vtmp = VIRTUAL_TMP.lock();
+                    if let Some(content) = vtmp.get_mut(&path_clone) {
+                        content.resize(len, 0);
+                        Ok(0)
+                    } else {
+                        Err(scheme_error::ENOENT)
+                    }
                 }
             }
             _ => Err(scheme_error::ENOSYS),
@@ -1735,8 +1803,13 @@ impl Scheme for FileSystemScheme {
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 drop(open_files);
-                let vtmp = VIRTUAL_TMP.lock();
-                stat.size = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
+                if path_clone.starts_with("run/") || path_clone == "run" {
+                    let vrun = VIRTUAL_RUN.lock();
+                    stat.size = vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
+                } else {
+                    let vtmp = VIRTUAL_TMP.lock();
+                    stat.size = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
+                }
                 Ok(0)
             }
             OpenFile::Framebuffer => {
@@ -1758,8 +1831,13 @@ impl Scheme for FileSystemScheme {
             vtmp.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
             return Ok(0);
         }
+        if clean_path.starts_with("run/") || clean_path == "run" {
+            let mut vrun = VIRTUAL_RUN.lock();
+            vrun.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
+            return Ok(0);
+        }
 
-        // Stub: fail for other directories if not in /tmp
+        // Stub: fail for other directories
         Err(scheme_error::EINVAL)
     }
 
@@ -1770,6 +1848,16 @@ impl Scheme for FileSystemScheme {
             if vtmp.remove(&String::from(clean_path)).is_some() {
                 return Ok(0);
             }
+            return Err(scheme_error::ENOENT);
+        }
+        if clean_path.starts_with("run/") || clean_path == "run" {
+            let mut vrun = VIRTUAL_RUN.lock();
+            if vrun.remove(&String::from(clean_path)).is_some() {
+                return Ok(0);
+            }
+            // File not present in the virtual overlay — return ENOENT so callers
+            // like seatd (which check `errno != ENOENT` after unlink) know the file
+            // simply doesn't exist rather than getting a spurious EPERM/ENOSYS.
             return Err(scheme_error::ENOENT);
         }
         Err(scheme_error::ENOSYS)
