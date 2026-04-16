@@ -3810,8 +3810,6 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
     const POLLIN:  i16 = 0x0001;
     const POLLPRI: i16 = 0x0002;
     const POLLOUT: i16 = 0x0004;
-    const POLLERR: i16 = 0x0008;
-    const POLLHUP: i16 = 0x0010;
     const POLLNVAL: i16 = 0x0020;
 
     let timeout = timeout_raw as i32;
@@ -3847,12 +3845,11 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
 
     // Maximum number of retry iterations before giving up:
     //   timeout < 0 → infinite (u64::MAX)
-    //   timeout = 0 → check once only (max_retries = 1, no sleep)
-    //   timeout > 0 → approximately timeout ms
+    //   timeout = 0 → single check, no sleep (handled by early return below)
+    //   timeout > 0 → approximately timeout ms; +2 accounts for rounding and
+    //                 ensures at least one retry even for very short timeouts
     let max_retries: u64 = if timeout < 0 {
         u64::MAX
-    } else if timeout == 0 {
-        1
     } else {
         (timeout as u64).saturating_div(POLL_SLEEP_MS).saturating_add(2)
     };
@@ -3896,7 +3893,7 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
                     r |= POLLOUT;
                 }
 
-                if r & (POLLIN | POLLPRI | POLLOUT | POLLERR | POLLHUP) != 0 {
+                if r & (POLLIN | POLLPRI | POLLOUT) != 0 {
                     ready = ready.saturating_add(1);
                 }
                 r
