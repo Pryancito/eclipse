@@ -2086,6 +2086,51 @@ impl Scheme for DevScheme {
                 }
             }
         }
+        if id == 104 { // tty / ttyN  (e.g. /dev/tty0, /dev/tty1)
+            // Provide the VT (virtual terminal) ioctls that seatd requires to
+            // determine and manage the active VT.  This is a single-VT system so
+            // we always report VT 1 as the only active terminal.
+            match request {
+                0x5603 => {
+                    // VT_GETSTATE – fill struct vt_stat { u16 v_active, v_signal, v_state }
+                    #[repr(C)]
+                    struct VtStat {
+                        v_active: u16,
+                        v_signal: u16,
+                        v_state:  u16,
+                    }
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    let stat = unsafe { &mut *(arg as *mut VtStat) };
+                    stat.v_active = 1; // VT 1 is the active terminal
+                    stat.v_signal = 0;
+                    stat.v_state  = 2; // bitmask: bit 1 = VT 1 open
+                    return Ok(0);
+                }
+                0x5602 => return Ok(0), // VT_SETMODE   – accept silently
+                0x5605 => return Ok(0), // VT_RELDISP   – release display, stub ok
+                0x5606 => return Ok(0), // VT_ACTIVATE  – activate a VT, stub ok
+                0x5607 => return Ok(0), // VT_WAITACTIVE – wait for VT, stub ok
+                0x4B3A => {
+                    // KDGETMODE – return KD_TEXT = 0
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    let mode = unsafe { &mut *(arg as *mut u32) };
+                    *mode = 0;
+                    return Ok(0);
+                }
+                0x4B3B => return Ok(0), // KDSETMODE   – set KD mode, stub ok
+                0x4B44 => {
+                    // KDGKBMODE – return K_UNICODE = 3
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    let mode = unsafe { &mut *(arg as *mut u32) };
+                    *mode = 3;
+                    return Ok(0);
+                }
+                0x4B45 => return Ok(0), // KDSKBMODE   – set keyboard mode, stub ok
+                0x540E => return Ok(0), // TIOCSCTTY   – set controlling tty, stub ok
+                _ => return Err(scheme_error::ENOSYS),
+            }
+        }
+
         Err(scheme_error::EBADF)
     }
 
