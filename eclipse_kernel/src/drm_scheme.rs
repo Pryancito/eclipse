@@ -128,14 +128,23 @@ impl Scheme for DrmScheme {
                     size: u64,
                 }
                 let info = unsafe { &mut *(arg as *mut DrmModeCreateDumb) };
-                let bytes_per_pixel = (info.bpp + 7) / 8;
-                let pitch = (info.width * bytes_per_pixel + 255) & !255;
-                let size = (pitch * info.height) as usize;
+                if info.width == 0 || info.height == 0 || info.bpp == 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+                let bytes_per_pixel = ((info.bpp as u64) + 7) / 8;
+                let pitch = ((info.width as u64) * bytes_per_pixel + 255) & !255u64;
+                // Cap at 64 MiB per buffer to prevent OOM on bogus user input.
+                const MAX_DUMB_BUFFER: u64 = 64 * 1024 * 1024;
+                let size_u64 = pitch.saturating_mul(info.height as u64);
+                if size_u64 > MAX_DUMB_BUFFER {
+                    return Err(scheme_error::EINVAL);
+                }
+                let size = size_u64 as usize;
                 
                 if let Some(handle) = drm::alloc_buffer(size) {
                     info.handle = handle.id;
-                    info.pitch = pitch;
-                    info.size = size as u64;
+                    info.pitch = pitch as u32;
+                    info.size = size_u64;
                     Ok(0)
                 } else {
                     Err(scheme_error::EIO)
