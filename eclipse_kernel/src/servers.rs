@@ -1100,6 +1100,7 @@ pub fn init() {
     
     let socket_scheme = Arc::new(SocketScheme::new());
     unsafe {
-        SOCKET_SCHEME = Some(socket_scheme);
+        SOCKET_SCHEME = Some(socket_scheme.clone());
     }
+    crate::scheme::register_scheme("socket", socket_scheme);
 }
