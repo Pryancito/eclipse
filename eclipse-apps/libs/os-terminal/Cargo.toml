@@ -1,0 +1,58 @@
+[package]
+name = "os-terminal"
+# Fork local para Eclipse OS: teclado español (España) en `keyboard.rs`.
+version = "0.7.3+eclipse"
+edition = "2021"
+authors = ["Xuanjun Wen <wenxuanjun@yahoo.com>", "Eclipse OS"]
+description = "Beautiful terminal emulator on no-std environment (Eclipse: layout ES)"
+keywords = ["terminal", "console", "os", "no-std"]
+categories = ["embedded", "gui", "no-std"]
+license = "MIT"
+homepage = "https://github.com/wenxuanjun/os-terminal"
+repository = "https://github.com/wenxuanjun/os-terminal"
+exclude = ["/examples", "screenshot.png"]
+rust-version = "1.81.0"
+
+[features]
+default = ["bitmap"]
+bitmap = ["dep:noto-sans-mono-bitmap"]
+truetype = ["dep:swash"]
+woff2 = ["dep:woff2"]
+
+[dependencies]
+bitflags = { version = "2.4", default-features = false }
+lru = "0.16.3"
+pc-keyboard = "0.8.0"
+unicode-width = "0.2.2"
+
+[dependencies.vte]
+version = "0.15.0"
+features = ["ansi"]
+default-features = false
+
+[dependencies.base64ct]
+version = "1.8.3"
+features = ["alloc"]
+
+[dependencies.swash]
+version = "0.2.6"
+default-features = false
+optional = true
+features = ["render", "libm"]
+
+[dependencies.woff2]
+package = "woff2-no-std"
+version = "0.3.4"
+optional = true
+
+[dependencies.noto-sans-mono-bitmap]
+version = "0.3.2"
+features = [
+    "regular",
+    "bold",
+    "size_20",
+    "unicode-basic-latin",
+    "unicode-specials",
+]
+optional = true
+default-features = false

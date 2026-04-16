@@ -1,0 +1,228 @@
+# OS Terminal
+
+A `no_std` terminal library for embedded systems and OS kernels.
+
+The environment should have initialized `global_allocator` since `alloc` crate is used for dynamic memory allocation.
+
+## Screenshot
+
+![](screenshot.png)
+
+This screenshot shows the result of running `fastfetch` in the example terminal. You can try it by running `cargo run --release --example terminal --features=truetype,woff2` (Unix only).
+
+## Features
+
+- Embedded smooth noto sans mono font rendering
+- Truetype font support
+- VT100 and part of XTerm escape sequence support
+- Wide character support
+- Integrated color schemes
+- Cursor display and shape control
+- Support sufficient complex applications (e.g. htop, nvim, etc.)
+
+## Usage
+
+### Basic
+
+Create a display wrapper to wrap your framebuffer and implement the `DrawTarget` trait for it.
+
+```rust,ignore
+use alloc::boxed::Box;
+use os_terminal::{DrawTarget, Rgb, Terminal};
+use os_terminal::font::BitmapFont;
+
+struct Display {
+    width: usize,
+    height: usize,
+    buffer: &'static mut [u32],
+}
+
+impl DrawTarget for Display {
+    fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    #[inline(always)]
+    fn draw_pixel(&mut self, x: usize, y: usize, color: Rgb) {
+        let value = (color.0 as u32) << 16 | (color.1 as u32) << 8 | color.2 as u32;
+        self.buffer[y * self.width + x] = value;
+    }
+}
+```
+
+Then you can create a terminal with a box-wrapped font manager and write some text to it.
+
+```rust,ignore
+use core::fmt::Write as _;
+
+let mut terminal = Terminal::new(display, Box::new(BitmapFont));
+
+terminal.process(b"\x1b[31mHello, world!\x1b[0m");
+terminal.write_fmt(format_args!("{} + {} = {}", 1, 2, 3));
+```
+
+The keyboard, mouse, and some ansi sequences (such as report device status ) generate new ansi sequences. So if you use the above features, you should use `terminal.set_pty_writer(writer)` to set the writer first.
+
+### Keyboard
+
+Now you can redirect the keyboard events to the terminal in scancode format (currently only Scan Code Set1 and North American standard English keyboard layout are supported) to let the terminal process shortcuts or pass escaped strings to your `PtyWriter`.
+
+`handle_keyboard` returns `Option<KeyboardEvent>` for events that need to be handled by the caller, such as font size changes:
+
+```rust,ignore
+use os_terminal::KeyboardEvent;
+
+// LCtrl pressed, C pressed, C released, LCtrl released
+let scancodes = [0x1d, 0x2e, 0xae, 0x9d];
+
+for scancode in scancodes.iter() {
+    let event = terminal.handle_keyboard(*scancode);
+    if let Some(KeyboardEvent::FontSize(delta)) = event {
+        // Resize font and call terminal.set_font_manager(...)
+    }
+}
+```
+
+### Mouse
+
+Unlike keyboard, you need to pass in the `MouseInput` enumeration specified by `os-terminal` instead of scancode.
+
+For example, you can pass in a mouse scroll event like this:
+
+```rust,ignore
+use os_terminal::MouseInput;
+
+terminal.handle_mouse(MouseInput::Scroll(lines));
+```
+
+You can use `terminal.set_scroll_speed(speed)` to set a positive mouse scroll speed multiplier.
+
+### Font
+
+The default enabled `BitmapFont` is based on the pre-rendered noto sans mono font, and does not support setting the font size, suitable for simple usage scenarios where you don't want to pass in a font file.
+
+To use truetype font, create a `TrueTypeFont` instance from a font file with size. WOFF2 input additionally requires the `woff2` feature.
+
+```rust,ignore
+let font_buffer = include_bytes!("SourceCodeVF.otf");
+let mut terminal = Terminal::new(display, Box::new(TrueTypeFont::new(10.0, font_buffer)));
+```
+
+If the font is a variable font, it uses the `wght` axis. If not, the library automatically synthesizes bold glyphs by thickening the outline. And you can optionally provide a separate italic font file. If not provided, the library automatically synthesizes italics by skewing the glyphs. You can enable subpixel rendering to improve text clarity on LCD screens.
+
+This means you can use a single standard `.ttf` file and still get Bold, Italic, and Bold-Italic styles, saving valuable flash storage.
+
+```rust,ignore
+let font_buffer = include_bytes!("FiraCode.ttf");
+// Optional: use a real italic font.
+let italic_buffer = include_bytes!("FiraCode-Italic.ttf");
+
+let font_manager = TrueTypeFont::new(10.0, font_buffer)
+    .with_italic_font(italic_buffer)
+    .with_subpixel(true);
+let mut terminal = Terminal::new(display, Box::new(font_manager));
+```
+
+### Logger
+
+If you want to get the logs from the terminal, you can set a logger that receives `fmt::Arguments`.
+
+```rust,ignore
+terminal.set_logger(|args| println!("Terminal: {:?}", args));
+```
+
+### Flush
+
+Default flush strategy is synchronous. If you need higher performance, you can disable the auto flush and flush manually when needed.
+
+```rust,ignore
+terminal.set_auto_flush(false);
+terminal.flush();
+```
+
+### Themes
+
+The terminal comes with 8 built-in themes. You can switch to other themes manually by calling `terminal.set_color_scheme(index)`.
+
+Custom theme is also supported:
+
+```rust,ignore
+let palette = Palette {
+    foreground: ...,
+    background: ...,
+    ansi_colors: [...],
+};
+
+terminal.set_custom_color_scheme(&palette);
+```
+
+Note that your setting is temporary because your palette will be overwritten if you switch to another theme.
+
+### Clipboard
+
+To enable clipboard support (Copy/Paste), you need to implement the `ClipboardHandler` trait and register it.
+
+```rust,ignore
+struct Clipboard;
+
+impl ClipboardHandler for Clipboard {
+    fn get_text(&mut self) -> Option<String> {
+        // Return text from system clipboard
+        Some("paste text".to_string())
+    }
+
+    fn set_text(&mut self, text: String) {
+        // Set text to system clipboard
+    }
+}
+
+terminal.set_clipboard(Box::new(Clipboard));
+```
+
+Once configured, the following shortcuts are enabled:
+- `Ctrl + Shift + C`: Copy selected text (or logic defined by you)
+- `Ctrl + Shift + V`: Paste text
+
+### Miscellaneous
+
+Default history size is `200` lines. You can change it by calling `terminal.set_history_size(size)`.
+
+And color cache size and `TrueTypeFont` rasterize cache size is also configurable.
+
+```rust,ignore
+// Set the size of the color cache (default: 128)
+terminal.set_color_cache_size(4096);
+
+// Set the size of the font raster cache (default: 512)
+// Only available when using TrueTypeFont
+let font = TrueTypeFont::new(10.0, font_buffer).with_cache_size(1024);
+```
+
+Moreover, you can use `terminal.set_bell_handler(handler)` to set the bell handler so that when you type `unicode(7)` such as `Ctrl + G`, the terminal will call the handler to play the bell.
+
+In a bare-metal environment (e.g. your toy OS), you may wish to have all input `\r` automatically converted to `\n` and output `\n` converted to `\r\n` (handled by the tty devices in linux, you can use `stty -a` to check the `icrnl` and `onlcr` flags). You can use `terminal.set_crnl_mapping(true)` to enable this feature.
+
+## Shortcuts
+
+With `handle_keyboard`, some shortcuts are supported:
+
+- `Ctrl + =/-`: Font size increase/decrease (returns `KeyboardEvent::FontSize`)
+- `Ctrl + Shift + F1-F8`: Switch to different built-in themes
+- `Ctrl + Shift + ArrowUp/ArrowDown`: Scroll up/down history
+- `Ctrl + Shift + PageUp/PageDown`: Scroll up/down history by page
+- `Ctrl + Shift + C`: Copy (requires `ClipboardHandler`)
+- `Ctrl + Shift + V`: Paste (requires `ClipboardHandler`)
+
+## Cargo Features
+
+- `bitmap`: Enable embedded noto sans mono bitmap font support. Enabled by default.
+- `truetype`: Enable truetype font support. Enabled by default.
+- `woff2`: Enable WOFF2 font decoding for `TrueTypeFont`. Enabled by default.
+
+## Acknowledgement
+
+- [embedded-term](https://github.com/rcore-os/embedded-term): This project is a fork of it with new features and improvements.
+- [alacritty](https://github.com/alacritty): General reference for the terminal implementation and `vte` crate.
+- [noto-sans-mono-bitmap-rs](https://github.com/phip1611/noto-sans-mono-bitmap-rs): Pre-rasterized smooth characters.
+
+Thanks to the original author and contributors for their great work.
