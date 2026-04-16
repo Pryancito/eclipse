@@ -216,10 +216,7 @@ pub fn init() {
     register_scheme("input", Arc::new(crate::servers::InputScheme::new()));
     register_scheme("snd", Arc::new(crate::servers::AudioScheme));
     register_scheme("net", Arc::new(crate::servers::NetworkScheme));
-    
-    if let Some(socket_scheme) = crate::servers::get_socket_scheme() {
-        register_scheme("socket", socket_scheme);
-    }
+    // "socket" scheme is registered by servers::init(), called after this function
 }
 
 /// Proxy sin estado que delega todas las operaciones en el singleton PIPE_SCHEME.

@@ -4877,7 +4877,7 @@ fn sys_unlink(path_ptr: u64) -> u64 {
     let scheme_path = user_path_to_scheme_path(path_str);
     match crate::scheme::unlink(&scheme_path) {
         Ok(_) => 0,
-        Err(_) => u64::MAX,
+        Err(e) => linux_abi_error(e as i32),
     }
 }
 
