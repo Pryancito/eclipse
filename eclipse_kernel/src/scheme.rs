@@ -210,6 +210,16 @@ pub fn init() {
     register_scheme("epoll", crate::epoll::get_epoll_scheme().clone());
     register_scheme("eventfd", crate::eventfd::get_eventfd_scheme().clone());
     register_scheme("signalfd", Arc::new(crate::signalfd::SignalfdScheme::new()));
+
+    // Schemes from servers module
+    register_scheme("display", Arc::new(crate::servers::DisplayScheme));
+    register_scheme("input", Arc::new(crate::servers::InputScheme::new()));
+    register_scheme("snd", Arc::new(crate::servers::AudioScheme));
+    register_scheme("net", Arc::new(crate::servers::NetworkScheme));
+    
+    if let Some(socket_scheme) = crate::servers::get_socket_scheme() {
+        register_scheme("socket", socket_scheme);
+    }
 }
 
 /// Proxy sin estado que delega todas las operaciones en el singleton PIPE_SCHEME.
@@ -286,9 +296,23 @@ pub fn read(scheme_idx: usize, id: usize, buffer: &mut [u8]) -> Result<usize, us
 pub fn poll(scheme_idx: usize, id: usize, events: usize) -> Result<usize, usize> {
     let scheme = {
         let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
+             Arc::clone(s)
+        } else {
+             return Err(error::EBADF);
+        }
     };
-    scheme.poll(id, events)
+    match scheme.poll(id, events) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            // DIAGNOSTIC: Log unexpected poll errors to identify which scheme is failing.
+            // Avoid logging EAGAIN as it's common.
+            if e != error::EAGAIN {
+                crate::serial::serial_printf(format_args!("[SCHEME] poll error {} for scheme_idx={}, resource_id={}\n", e, scheme_idx, id));
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Write to a resource in a specific scheme

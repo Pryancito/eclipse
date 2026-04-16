@@ -96,6 +96,10 @@ impl crate::storage::BlockDevice for NvmeDisk {
         if self.blk_sz == 0 {
             return Err("NVMe: zero block size");
         }
+        
+        // DIAGNOSTIC: Log writes to verify if seatd/labwc are triggering disk I/O
+        // crate::serial::serial_printf(format_args!("[NVMe] write block {}\n", block));
+
         if self.blk_sz >= ECLIPSE_BLOCK_SIZE {
             self.ns.write(block, buffer).map_err(|_| "NVMe write failed")
         } else {

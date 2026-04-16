@@ -296,11 +296,10 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     crate::scheme::init(); // Initialize Redox-style scheme system
     serial::serial_print("[INIT] Initializing file descriptors...\n");
     fd::init();
-    serial::serial_print("[INIT] Initializing services...\n");
+    //serial::serial_print("[INIT] Initializing services...\n");
     servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
     progress::bar(86);
     
-    // crate::video::init();
     serial::serial_print("[INIT] Initializing PCI...\n");
     pci::init();
     progress::bar(87);
