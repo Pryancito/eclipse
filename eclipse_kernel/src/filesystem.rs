@@ -1114,13 +1114,20 @@ pub fn list_dir_children(path: &str) -> Result<Vec<String>, &'static str> {
     list_dir_children_by_inode(inode)
 }
 
-/// Elimina un archivo.  Actualmente soportado solo para rutas /tmp/*.
+/// Elimina un archivo.  Actualmente soportado para rutas /tmp/* y /run/*.
 pub fn unlink_path(path: &str) -> Result<(), usize> {
     use crate::scheme::error;
     let clean = if path.starts_with('/') { &path[1..] } else { path };
-    if clean.starts_with("tmp/") || clean == "tmp" {
+    if is_virtual_tmp_path(clean) {
         let mut vtmp = VIRTUAL_TMP.lock();
         if vtmp.remove(&String::from(clean)).is_some() {
+            Ok(())
+        } else {
+            Err(error::ENOENT)
+        }
+    } else if is_virtual_run_path(clean) {
+        let mut vrun = VIRTUAL_RUN.lock();
+        if vrun.remove(&String::from(clean)).is_some() {
             Ok(())
         } else {
             Err(error::ENOENT)
@@ -1130,14 +1137,18 @@ pub fn unlink_path(path: &str) -> Result<(), usize> {
     }
 }
 
-/// Crea un directorio.  Actualmente soportado solo bajo /tmp/.
+/// Crea un directorio.  Actualmente soportado bajo /tmp/ y /run/.
 pub fn mkdir_path(path: &str, _mode: u32) -> Result<(), usize> {
     use crate::scheme::error;
     let clean = if path.starts_with('/') { &path[1..] } else { path };
-    if clean.starts_with("tmp/") || clean == "tmp" {
+    if is_virtual_tmp_path(clean) {
         // Guardamos el directorio como entrada vacía en VIRTUAL_TMP.
         let mut vtmp = VIRTUAL_TMP.lock();
         vtmp.entry(String::from(clean)).or_insert_with(alloc::vec::Vec::new);
+        Ok(())
+    } else if is_virtual_run_path(clean) {
+        let mut vrun = VIRTUAL_RUN.lock();
+        vrun.entry(String::from(clean)).or_insert_with(alloc::vec::Vec::new);
         Ok(())
     } else {
         Err(error::ENOSYS)
@@ -1367,6 +1378,18 @@ static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BT
 /// the real root filesystem is read-only.
 static VIRTUAL_RUN: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 
+/// Returns true when a clean (leading-slash-stripped) path belongs to the virtual /run overlay.
+#[inline(always)]
+fn is_virtual_run_path(clean_path: &str) -> bool {
+    clean_path == "run" || clean_path.starts_with("run/")
+}
+
+/// Returns true when a clean (leading-slash-stripped) path belongs to the virtual /tmp overlay.
+#[inline(always)]
+fn is_virtual_tmp_path(clean_path: &str) -> bool {
+    clean_path == "tmp" || clean_path.starts_with("tmp/")
+}
+
 #[derive(Clone)]
 enum OpenFile {
     Real { 
@@ -1407,7 +1430,7 @@ impl Scheme for FileSystemScheme {
                 open_files.push(Some(OpenFile::Framebuffer));
                 Ok(id)
             },
-            p if p == "tmp" || p.starts_with("tmp/") => {
+            p if is_virtual_tmp_path(p) => {
                 let key = String::from(clean_path);
                 let mut vtmp = VIRTUAL_TMP.lock();
                 // O_CREAT: create file if it doesn't exist
@@ -1437,7 +1460,7 @@ impl Scheme for FileSystemScheme {
             // Virtual /run overlay: supports socket files, PID files, and other runtime data.
             // The real /run directory exists on the read-only root filesystem, so we maintain
             // an in-memory overlay here just like /tmp.
-            p if p == "run" || p.starts_with("run/") => {
+            p if is_virtual_run_path(p) => {
                 let key = String::from(clean_path);
                 let mut vrun = VIRTUAL_RUN.lock();
                 if (flags & O_CREAT) != 0 {
@@ -1601,7 +1624,7 @@ impl Scheme for FileSystemScheme {
                 let off = *offset;
                 drop(open_files);
                 let len;
-                if path_clone.starts_with("run/") || path_clone == "run" {
+                if is_virtual_run_path(&path_clone) {
                     let vrun = VIRTUAL_RUN.lock();
                     let content = vrun.get(&path_clone).ok_or(scheme_error::EIO)?;
                     let start = off as usize;
@@ -1649,7 +1672,7 @@ impl Scheme for FileSystemScheme {
                 let off = *offset as usize;
                 let n = buffer.len();
                 drop(open_files);
-                if path_clone.starts_with("run/") || path_clone == "run" {
+                if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
                     let content = vrun.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
                     let need_len = off + n;
@@ -1697,7 +1720,7 @@ impl Scheme for FileSystemScheme {
                 let path_clone = path.clone();
                 let off = *offset;
                 drop(open_files);
-                let len = if path_clone.starts_with("run/") || path_clone == "run" {
+                let len = if is_virtual_run_path(&path_clone) {
                     let vrun = VIRTUAL_RUN.lock();
                     vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
                 } else {
@@ -1735,7 +1758,7 @@ impl Scheme for FileSystemScheme {
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 drop(open_files);
-                if path_clone.starts_with("run/") || path_clone == "run" {
+                if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
                     if let Some(content) = vrun.get_mut(&path_clone) {
                         content.resize(len, 0);
@@ -1803,7 +1826,7 @@ impl Scheme for FileSystemScheme {
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 drop(open_files);
-                if path_clone.starts_with("run/") || path_clone == "run" {
+                if is_virtual_run_path(&path_clone) {
                     let vrun = VIRTUAL_RUN.lock();
                     stat.size = vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
                 } else {
@@ -1826,12 +1849,12 @@ impl Scheme for FileSystemScheme {
         serial::serial_print(")\n");
         
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };
-        if clean_path.starts_with("tmp/") || clean_path == "tmp" {
+        if is_virtual_tmp_path(clean_path) {
             let mut vtmp = VIRTUAL_TMP.lock();
             vtmp.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
             return Ok(0);
         }
-        if clean_path.starts_with("run/") || clean_path == "run" {
+        if is_virtual_run_path(clean_path) {
             let mut vrun = VIRTUAL_RUN.lock();
             vrun.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
             return Ok(0);
@@ -1843,21 +1866,18 @@ impl Scheme for FileSystemScheme {
 
     fn unlink(&self, path: &str) -> Result<usize, usize> {
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };
-        if clean_path.starts_with("tmp/") || clean_path == "tmp" {
+        if is_virtual_tmp_path(clean_path) {
             let mut vtmp = VIRTUAL_TMP.lock();
             if vtmp.remove(&String::from(clean_path)).is_some() {
                 return Ok(0);
             }
             return Err(scheme_error::ENOENT);
         }
-        if clean_path.starts_with("run/") || clean_path == "run" {
+        if is_virtual_run_path(clean_path) {
             let mut vrun = VIRTUAL_RUN.lock();
             if vrun.remove(&String::from(clean_path)).is_some() {
                 return Ok(0);
             }
-            // File not present in the virtual overlay — return ENOENT so callers
-            // like seatd (which check `errno != ENOENT` after unlink) know the file
-            // simply doesn't exist rather than getting a spurious EPERM/ENOSYS.
             return Err(scheme_error::ENOENT);
         }
         Err(scheme_error::ENOSYS)
@@ -1874,10 +1894,10 @@ impl Scheme for FileSystemScheme {
         } else {
             new_path
         };
-        if !(old_key.starts_with("tmp/") || old_key == "tmp") {
+        if !(is_virtual_tmp_path(old_key)) {
             return Err(scheme_error::ENOSYS);
         }
-        if !(new_key.starts_with("tmp/") || new_key == "tmp") {
+        if !(is_virtual_tmp_path(new_key)) {
             return Err(scheme_error::ENOSYS);
         }
         let old_s = String::from(old_key);
