@@ -19,6 +19,8 @@ pub mod spawn_service {
     pub const NETWORK: u32 = 6;
     /// GUI / compositor launcher
     pub const GUI: u32 = 7;
+    /// Seat management server
+    pub const SEATD: u32 = 8;
 
     /// Filesystem paths where the kernel loads each service binary.
     pub const PATH_LOG: &str = "/sbin/log_service";
@@ -29,6 +31,7 @@ pub mod spawn_service {
     pub const PATH_AUDIO: &str = "/sbin/audio_service";
     pub const PATH_NETWORK: &str = "/sbin/network_service";
     pub const PATH_GUI: &str = "/sbin/gui_service";
+    pub const PATH_SEATD: &str = "/sbin/seatd";
 }
 
 /// Numeric service-ID type used by the spawn_service syscall.
@@ -45,6 +48,7 @@ pub fn spawn_service_short_name(service_id: u32) -> &'static str {
         spawn_service::AUDIO => "audio",
         spawn_service::NETWORK => "network",
         spawn_service::GUI => "gui",
+        spawn_service::SEATD => "seatd",
         _ => "unknown",
     }
 }
@@ -60,6 +64,7 @@ pub fn spawn_service_name(service_id: u32) -> &'static str {
         spawn_service::AUDIO => "Audio Server",
         spawn_service::NETWORK => "Network Server",
         spawn_service::GUI => "GUI Service",
+        spawn_service::SEATD => "Seat Management Server",
         _ => "Unknown Service",
     }
 }
@@ -72,7 +77,11 @@ pub fn spawn_service_name(service_id: u32) -> &'static str {
 /// Service IDs 0-7 map to indices 2-9 (offset of 2).
 #[inline]
 pub fn spawn_id_to_init_services_index(service_id: u32) -> usize {
-    service_id as usize + 2
+    match service_id {
+        8 => 9,  // seatd
+        7 => 10, // gui
+        _ => service_id as usize + 2,
+    }
 }
 
 /// Macro that resolves a service name token to its numeric service ID at compile time.
@@ -93,4 +102,5 @@ macro_rules! spawn_service_id {
     (audio)      => { $crate::spawn_service::AUDIO      };
     (network)    => { $crate::spawn_service::NETWORK    };
     (gui)        => { $crate::spawn_service::GUI        };
+    (seatd)      => { $crate::spawn_service::SEATD      };
 }

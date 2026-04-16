@@ -1024,6 +1024,47 @@ impl Scheme for SocketScheme {
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
         Err(scheme_error::ESPIPE)
     }
+
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+        let state = socket.state;
+
+        let mut ready = 0;
+
+        if domain == 1 {
+            if state == SocketState::Listening {
+                if let Some(q) = st.pending.get(&id) {
+                    if !q.is_empty() {
+                        ready |= crate::scheme::event::POLLIN;
+                    }
+                }
+            } else if let Some(conn_id) = socket.connection_id {
+                if let Some(conn) = st.connections.get(&conn_id) {
+                    let is_server = conn.server_socket_id == Some(id);
+                    let rx_buf: &alloc::collections::VecDeque<u8> = if is_server {
+                        &conn.buffer_to_server
+                    } else {
+                        &conn.buffer_to_client
+                    };
+
+                    if (events & crate::scheme::event::POLLIN) != 0 && !rx_buf.is_empty() {
+                        ready |= crate::scheme::event::POLLIN;
+                    }
+                    if (events & crate::scheme::event::POLLOUT) != 0 {
+                        // For now, UNIX sockets are always ready for write if connected
+                        ready |= crate::scheme::event::POLLOUT;
+                    }
+                }
+            }
+        } else if domain == 2 {
+            // AF_INET: return requested events for now (placeholder)
+            ready = events;
+        }
+
+        Ok(ready)
+    }
 }
 
 static mut SOCKET_SCHEME: Option<Arc<SocketScheme>> = None;

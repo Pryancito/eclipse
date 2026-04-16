@@ -33,6 +33,16 @@ pub mod error {
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
 }
 
+/// Polling event flags (Linux-compatible)
+pub mod event {
+    pub const POLLIN: usize = 0x001;
+    pub const POLLPRI: usize = 0x002;
+    pub const POLLOUT: usize = 0x004;
+    pub const POLLERR: usize = 0x008;
+    pub const POLLHUP: usize = 0x010;
+    pub const POLLNVAL: usize = 0x020;
+}
+
 /// Stat information for a resource
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,6 +139,13 @@ pub trait Scheme: Send + Sync {
     /// one does not affect the other.  Returns `Err(ENOSYS)` if not supported.
     fn dup_independent(&self, _id: usize) -> Result<usize, usize> {
         Err(error::ENOSYS)
+    }
+
+    /// Poll for events on a resource.
+    /// `events` is a bitmask of events to check for (POLLIN, POLLOUT, etc.).
+    /// Returns a bitmask of events that are currently active.
+    fn poll(&self, _id: usize, events: usize) -> Result<usize, usize> {
+        Ok(events) // Default: return requested events (always ready)
     }
 }
 
@@ -260,6 +277,15 @@ pub fn read(scheme_idx: usize, id: usize, buffer: &mut [u8]) -> Result<usize, us
         Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
     };
     scheme.read(id, buffer)
+}
+
+/// Poll a resource in a specific scheme for events.
+pub fn poll(scheme_idx: usize, id: usize, events: usize) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+    };
+    scheme.poll(id, events)
 }
 
 /// Write to a resource in a specific scheme

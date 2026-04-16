@@ -55,7 +55,7 @@ const HEARTBEAT_CHECK_INTERVAL: u64 = 5000; // Check every 5 seconds
 /// 5. Graphics Server (Display) (4)
 /// 6. Audio Server (5)
 /// 7. Network Server (6)
-static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
+static SERVICES: Spinlock<[Service; 11]> = Spinlock::new([
     Service::new("kernel", false),
     Service::new("init", false),
     Service::new("log", false),
@@ -65,6 +65,8 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("display", false),
     Service::new("audio", false),
     Service::new("network", false),
+    // seatd must start before the GUI/compositor to manage sessions.
+    Service::new("seatd", false),
     // gui_service es un lanzador one-shot: arranca el compositor (p. ej. labwc o lunas) y luego sale.
     // Don't enable heartbeat watchdog for it.
     Service::new("gui", false),
@@ -142,11 +144,15 @@ fn start_essential_service(service_id: u32) -> u32 {
 fn start_system_services() {
     // Start remaining services in order: filesystem, input, display, audio, network, gui
     // Índices 4..=9 en SERVICES ↔ IDs spawn_service 2..=7 (ver eclipse_program_codes).
-    for i in 4..=9 {
+    for i in 4..=10 {
         let (name, pid) = {
             let mut svc = SERVICES.lock();
             let name = svc[i].name;
-            let service_id = (i - 2) as u32; // Map index to sys_spawn_service ID
+            let service_id = match i {
+                9 => 8,  // seatd
+                10 => 7, // gui
+                _ => (i - 2) as u32,
+            };
             let pid = unsafe { eclipse_relibc::spawn_service(service_id, name.as_ptr(), name.len()) };
             
             if pid != u64::MAX {

@@ -531,6 +531,10 @@ pub extern "C" fn syscall_handler(
         232 => sys_epoll_wait(arg1, arg2, arg3, arg4),
         233 => sys_epoll_ctl(arg1, arg2, arg3, arg4),
         282 => sys_signalfd4(arg1, arg2, arg3, arg4),
+        283 => sys_timerfd_create(arg1, arg2),
+        286 => sys_timerfd_settime(arg1, arg2, arg3, arg4),
+        254 => sys_inotify_add_watch(arg1, arg2, arg3),
+        294 => sys_inotify_init1(arg1),
         289 => sys_pipe2(arg1, arg2),
         290 => sys_eventfd2(arg1, arg2),
         291 => sys_epoll_create1(arg1),
@@ -757,6 +761,7 @@ static mut SERVICE_DISPLAY_BIN: Option<Vec<u8>> = None;
 static mut SERVICE_AUDIO_BIN: Option<Vec<u8>> = None;
 static mut SERVICE_NET_BIN: Option<Vec<u8>> = None;
 static mut SERVICE_GUI_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_SEATD_BIN: Option<Vec<u8>> = None;
 
 static SERVICE_BIN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
@@ -776,6 +781,7 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
             x if x == svc::AUDIO as u64 => (&mut SERVICE_AUDIO_BIN, svc::PATH_AUDIO),
             x if x == svc::NETWORK as u64 => (&mut SERVICE_NET_BIN, svc::PATH_NETWORK),
             x if x == svc::GUI as u64 => (&mut SERVICE_GUI_BIN, svc::PATH_GUI),
+            x if x == svc::SEATD as u64 => (&mut SERVICE_SEATD_BIN, svc::PATH_SEATD),
             _ => return None,
         };
 
@@ -4189,7 +4195,8 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
             if let Ok((_scheme_id, _resource_id)) = crate::scheme::open(&file_path, 0x40 | 0x80, 0o777) {
                  // Successfully created file node. 
             } else {
-                serial::serial_print("[SYSCALL] bind failed to create file node for path\n");
+                // Warning only: UNIX sockets are managed in-memory, the node is for convenience only.
+                serial::serial_printf(format_args!("[SYSCALL] bind warning: could not create node for path {}\n", final_path_str));
             }
         }
 
@@ -5668,32 +5675,54 @@ fn sys_epoll_wait(epfd: u64, event_ptr: u64, maxevents: u64, timeout: u64) -> u6
         return linux_abi_error(14);
     }
 
-    // Placeholder: return all watched FDs as ready to unblock labwc immediate initialization.
-    // Real epoll_wait would block if nothing is ready.
-    let watched_res = crate::epoll::get_epoll_scheme().get_instance_watched_fds(epfd_entry.resource_id);
-    let watched: alloc::vec::Vec<(usize, crate::epoll::EpollEvent)> = match watched_res {
-        Some(w) => w,
-        None => return linux_abi_error(9),
-    };
+    let start_ticks = crate::interrupts::ticks();
     
-    if watched.is_empty() && timeout != 0 {
-        // If nothing watched and timeout > 0, we can actually sleep.
-        if timeout < 0xFFFFFFFF {
-             process_sleep_ms(timeout);
-        }
-        return 0;
-    }
+    loop {
+        let watched_res = crate::epoll::get_epoll_scheme().get_instance_watched_fds(epfd_entry.resource_id);
+        let watched = match watched_res {
+            Some(w) => w,
+            None => return linux_abi_error(9),
+        };
 
-    let mut count = 0;
-    for (_fd, ev) in watched {
-        if (count as u64) >= maxevents { break; }
-        unsafe {
-            *((event_ptr as *mut crate::epoll::EpollEvent).add(count)) = ev;
+        if watched.is_empty() {
+            if timeout == 0 { return 0; }
+            // If timeout > 0, sleep a bit and try again (real blocking would use a trigger)
+            crate::scheduler::yield_cpu();
+            if timeout < 0xFFFFFFFF && (crate::interrupts::ticks() - start_ticks) * 10 >= timeout {
+                return 0;
+            }
+            continue;
         }
-        count += 1;
+
+        let mut count = 0;
+        for (fd, ev) in watched {
+            if (count as u64) >= maxevents { break; }
+            
+            // Check readiness via scheme::poll wrapper
+            if let Some(fd_info) = crate::fd::fd_get(pid, fd) {
+                if let Ok(ready_bits) = crate::scheme::poll(fd_info.scheme_id, fd_info.resource_id, ev.events as usize) {
+                    if ready_bits != 0 {
+                        unsafe {
+                            let ev_out = (event_ptr as *mut crate::epoll::EpollEvent).add(count);
+                            (*ev_out).events = ready_bits as u32;
+                            (*ev_out).data = ev.data;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        if count > 0 || timeout == 0 {
+            return count as u64;
+        }
+
+        // Blocking: sleep a bit
+        crate::scheduler::yield_cpu();
+        if timeout < 0xFFFFFFFF && (crate::interrupts::ticks() - start_ticks) * 10 >= timeout {
+            return 0;
+        }
     }
-    
-    count as u64
 }
 
 /// sys_eventfd2 — Linux eventfd2(initval, flags).
@@ -5758,4 +5787,50 @@ fn sys_signalfd4(_fd: u64, _mask_ptr: u64, _mask_size: u64, _flags: u64) -> u64 
         Err(e) => return linux_abi_error(e as i32),
     }
     linux_abi_error(12) // ENOMEM
+}
+
+/// sys_timerfd_create — Linux timerfd_create(clockid, flags).
+fn sys_timerfd_create(clockid: u64, _flags: u64) -> u64 {
+    // Stub: create a signalfd-like object that never fires for now.
+    serial::serial_printf(format_args!("[SYSCALL] timerfd_create(clockid={})\n", clockid));
+    match crate::scheme::open("signalfd:", 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        _ => {}
+    }
+    linux_abi_error(12)
+}
+
+/// sys_timerfd_settime — Linux timerfd_settime(fd, flags, new_value, old_value).
+fn sys_timerfd_settime(fd: u64, _flags: u64, _new_value: u64, _old_value: u64) -> u64 {
+    serial::serial_printf(format_args!("[SYSCALL] timerfd_settime(fd={}) stub\n", fd));
+    0 // Success
+}
+
+/// sys_inotify_init1 — Linux inotify_init1(flags).
+fn sys_inotify_init1(flags: u64) -> u64 {
+    serial::serial_printf(format_args!("[SYSCALL] inotify_init1(flags={:#x})\n", flags));
+    // Another stub using signalfd: scheme
+    match crate::scheme::open("signalfd:", 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        _ => {}
+    }
+    linux_abi_error(12)
+}
+
+/// sys_inotify_add_watch — Linux inotify_add_watch(fd, pathname, mask).
+fn sys_inotify_add_watch(fd: u64, _path: u64, _mask: u64) -> u64 {
+    serial::serial_printf(format_args!("[SYSCALL] inotify_add_watch(fd={}) stub\n", fd));
+    1 // Dummy watch descriptor
 }

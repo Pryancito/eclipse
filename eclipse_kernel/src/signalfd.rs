@@ -41,4 +41,9 @@ impl Scheme for SignalfdScheme {
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
+
+    fn poll(&self, _id: usize, _events: usize) -> Result<usize, usize> {
+        // Signalfd is currently a placeholder that never has signals pending
+        Ok(0)
+    }
 }

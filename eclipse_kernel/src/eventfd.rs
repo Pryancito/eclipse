@@ -102,6 +102,22 @@ impl Scheme for EventFdScheme {
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
+
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        let instances = self.instances.lock();
+        let evfd = instances.get(&id).ok_or(error::EBADF)?;
+        
+        let mut ready = 0;
+        if (events & crate::scheme::event::POLLIN) != 0 && evfd.counter > 0 {
+            ready |= crate::scheme::event::POLLIN;
+        }
+        // eventfd is always ready for write (it only blocks if it reaches u64::MAX - 1)
+        if (events & crate::scheme::event::POLLOUT) != 0 {
+            ready |= crate::scheme::event::POLLOUT;
+        }
+        
+        Ok(ready)
+    }
 }
 
 pub static EVENTFD_SCHEME: spin::Once<Arc<EventFdScheme>> = spin::Once::new();
