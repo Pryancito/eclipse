@@ -1048,9 +1048,17 @@ impl Scheme for SocketScheme {
                     } else {
                         &conn.buffer_to_client
                     };
+                    let peer_closed = if is_server {
+                        conn.closed_by_client
+                    } else {
+                        conn.closed_by_server
+                    };
 
-                    if (events & crate::scheme::event::POLLIN) != 0 && !rx_buf.is_empty() {
-                        ready |= crate::scheme::event::POLLIN;
+                    if (events & crate::scheme::event::POLLIN) != 0 {
+                        // Ready for POLLIN when data is available OR peer has closed (EOF)
+                        if !rx_buf.is_empty() || peer_closed {
+                            ready |= crate::scheme::event::POLLIN;
+                        }
                     }
                     if (events & crate::scheme::event::POLLOUT) != 0 {
                         // For now, UNIX sockets are always ready for write if connected

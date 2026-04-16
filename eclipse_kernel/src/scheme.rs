@@ -234,6 +234,9 @@ impl Scheme for PipeSchemeProxy {
     fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
         crate::pipe::PIPE_SCHEME.fstat(id, stat)
     }
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.poll_pipe(id, events)
+    }
 }
 
 /// Devuelve el scheme_id (índice en el REGISTRY) para un scheme dado por nombre.

@@ -3807,7 +3807,7 @@ fn sys_tkill(tid: u64, sig: u64) -> u64 {
 
 /// Linux `poll(2)` — multiplexación mínima para musl/cargo (POLLIN/POLLOUT en fds válidos).
 fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
-    const POLLIN: i16 = 0x0001;
+    const POLLIN:  i16 = 0x0001;
     const POLLPRI: i16 = 0x0002;
     const POLLOUT: i16 = 0x0004;
     const POLLNVAL: i16 = 0x0020;
@@ -3840,47 +3840,81 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
         return linux_abi_error(14);
     }
 
-    let mut ready: u64 = 0;
-    for i in 0..nfds {
-        let base = fds_ptr + i * 8;
-        let fd = unsafe { (base as *const i32).read_unaligned() };
-        let events = unsafe { ((base + 4) as *const i16).read_unaligned() };
-        let revents_ptr = (base + 6) as *mut i16;
+    // Sleep duration per retry iteration (ms).
+    const POLL_SLEEP_MS: u64 = 1;
 
-        if fd < 0 {
-            unsafe { revents_ptr.write_unaligned(0) };
-            continue;
-        }
+    // Maximum number of retry iterations before giving up:
+    //   timeout < 0 → infinite (u64::MAX)
+    //   timeout = 0 → single check, no sleep (handled by early return below)
+    //   timeout > 0 → approximately timeout ms; +2 accounts for rounding and
+    //                 ensures at least one retry even for very short timeouts
+    let max_retries: u64 = if timeout < 0 {
+        u64::MAX
+    } else {
+        (timeout as u64).saturating_div(POLL_SLEEP_MS).saturating_add(2)
+    };
 
-        let fd_u = fd as usize;
-        let rev = if crate::fd::fd_get(pid, fd_u).is_none() {
-            ready = ready.saturating_add(1);
-            POLLNVAL
-        } else {
-            let mut r: i16 = 0;
-            if events & POLLIN != 0 || events & POLLPRI != 0 {
-                r |= POLLIN;
+    let mut retries: u64 = 0;
+    loop {
+        let mut ready: u64 = 0;
+
+        for i in 0..nfds {
+            let base = fds_ptr + i * 8;
+            let fd = unsafe { (base as *const i32).read_unaligned() };
+            let events = unsafe { ((base + 4) as *const i16).read_unaligned() };
+            let revents_ptr = (base + 6) as *mut i16;
+
+            if fd < 0 {
+                unsafe { revents_ptr.write_unaligned(0) };
+                continue;
             }
-            if events & POLLOUT != 0 {
-                r |= POLLOUT;
-            }
-            if r != 0 {
+
+            let fd_u = fd as usize;
+            let rev: i16 = if let Some(fd_entry) = crate::fd::fd_get(pid, fd_u) {
+                // Convert poll event bits to scheme event bits and query the scheme.
+                let scheme_ev =
+                    (if events & (POLLIN | POLLPRI) != 0 { crate::scheme::event::POLLIN }  else { 0 }) |
+                    (if events & POLLOUT             != 0 { crate::scheme::event::POLLOUT } else { 0 });
+
+                // Fall back to "always ready" when the scheme does not implement poll
+                // (default returns Ok(events)), so non-socket fds behave as before.
+                let ready_ev = crate::scheme::poll(
+                    fd_entry.scheme_id,
+                    fd_entry.resource_id,
+                    scheme_ev,
+                ).unwrap_or(scheme_ev);
+
+                let mut r: i16 = 0;
+                if (ready_ev & crate::scheme::event::POLLIN) != 0 {
+                    if events & POLLIN  != 0 { r |= POLLIN; }
+                    if events & POLLPRI != 0 { r |= POLLPRI; }
+                }
+                if (ready_ev & crate::scheme::event::POLLOUT) != 0 && events & POLLOUT != 0 {
+                    r |= POLLOUT;
+                }
+
+                if r & (POLLIN | POLLPRI | POLLOUT) != 0 {
+                    ready = ready.saturating_add(1);
+                }
+                r
+            } else {
+                // Invalid fd — always counts as ready (POLLNVAL)
                 ready = ready.saturating_add(1);
-            }
-            r
-        };
-        unsafe { revents_ptr.write_unaligned(rev) };
-    }
+                POLLNVAL
+            };
 
-    if ready == 0 && timeout != 0 {
-        if timeout < 0 {
-            process_sleep_ms(u64::saturating_sub(u64::MAX, 1) / 2);
-        } else {
-            process_sleep_ms(timeout as u32 as u64);
+            unsafe { revents_ptr.write_unaligned(rev) };
         }
-    }
 
-    ready
+        // Return as soon as at least one fd is ready, or when we've exhausted the timeout.
+        if ready > 0 || timeout == 0 || retries >= max_retries {
+            return ready;
+        }
+
+        // No fds ready yet — yield the CPU briefly and retry.
+        process_sleep_ms(POLL_SLEEP_MS);
+        retries += 1;
+    }
 }
 
 
@@ -5155,7 +5189,23 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
             2 // Default: O_RDWR
         }
-        4 => 0, // F_SETFL: success
+        4 => { // F_SETFL — update fd flags and propagate O_NONBLOCK to the underlying resource
+            const O_NONBLOCK: u32 = 0x800;
+            if let Some(pid) = current_process_id() {
+                if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+                    let new_flags = arg as u32;
+                    crate::fd::fd_set_flags(pid, fd as usize, new_flags);
+                    // Propagate O_NONBLOCK to pipe handles so PipeScheme::read respects it
+                    let nonblock = (new_flags & O_NONBLOCK) != 0;
+                    if let Some(pipe_scheme_id) = crate::scheme::get_scheme_id("pipe") {
+                        if fd_entry.scheme_id == pipe_scheme_id {
+                            crate::pipe::PIPE_SCHEME.set_nonblock(fd_entry.resource_id, nonblock);
+                        }
+                    }
+                }
+            }
+            0
+        }
         1 | 2 => 0, // F_GETFD / F_SETFD
         _ => 0, // Stub other cmds
     }
