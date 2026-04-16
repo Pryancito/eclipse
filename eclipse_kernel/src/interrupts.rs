@@ -2241,7 +2241,10 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         // perdiendo la referencia a CpuData para el próximo syscall en este core.
         "swapgs",
         
-        "mov fs, ax",
+        // NOTE: do NOT set FS here. The scheduler already restored FS_BASE (MSR 0xC0000100)
+        // from proc.fs_base before entering this trampoline. Setting `mov fs, 0x23` would
+        // load the GDT segment base (0) into FS.Base, wiping the TLS pointer and causing
+        // TLS accesses with negative offsets to compute kernel-space addresses → #GP.
         "mov gs, ax",
         "pop rax",
         
