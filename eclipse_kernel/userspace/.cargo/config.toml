@@ -1,0 +1,14 @@
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]
+
+#[target.x86_64-unknown-linux-musl]
+#rustflags = [
+#  "-Zunstable-options",
+#  "--cfg", "eclipse_target",
+#  "-C", "link-arg=-Tlinker.ld",
+#  "-C", "relocation-model=static",
+#]

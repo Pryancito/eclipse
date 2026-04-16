@@ -55,6 +55,7 @@ mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod sync;    // Synchronization primitives
 mod net;
+mod sys_scheme;
 pub mod drm_scheme; // DRM scheme for ioctl
 
 #[cfg(not(test))]
@@ -165,11 +166,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // Confirm kernel is running with serial output before any framebuffer access
     serial::serial_print("[KERNEL] Entered _start (Higher Half)\n");
 
-    unsafe {
-        serial::serial_print("[KERNEL] BOOT_STACK addr: ");
-        serial::serial_print_hex(&raw const BOOT_STACK as u64);
-        serial::serial_print("\n");
-    }
+    // Switch to Higher Half Boot Stack immediately to allow removing identity mapping later
 
     // Diagnostic framebuffer squares using identity-mapped (physical) address only.
     // NOTE: HHDM-based framebuffer access (phys_to_virt) is intentionally NOT done
@@ -296,8 +293,10 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     crate::scheme::init(); // Initialize Redox-style scheme system
     serial::serial_print("[INIT] Initializing file descriptors...\n");
     fd::init();
-    //serial::serial_print("[INIT] Initializing services...\n");
-    servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
+    // Register display:, input:, snd:, net:, sys: schemes so display_service can open display:
+    servers::init(); 
+    crate::scheme::register_scheme("sys", alloc::sync::Arc::new(sys_scheme::SysScheme::new()));
+    crate::scheme::register_scheme("drm", alloc::sync::Arc::new(drm_scheme::DrmScheme));
     progress::bar(86);
     
     serial::serial_print("[INIT] Initializing PCI...\n");

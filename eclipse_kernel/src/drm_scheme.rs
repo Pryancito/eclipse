@@ -2,6 +2,7 @@ use crate::scheme::{Scheme, Stat, error as scheme_error};
 use crate::drm;
 use crate::serial;
 use alloc::vec::Vec;
+use alloc::string::String;
 use spin::Mutex;
 
 /// DRM Scheme implementation
@@ -29,7 +30,7 @@ impl Scheme for DrmScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
         serial::serial_printf(format_args!("[DRM-SCHEME] open({})\n", path));
         
-        let kind = if path.is_empty() || path == "/" || path == "control" {
+        let kind = if path.is_empty() || path == "/" || path == "control" || path == "card0" {
             DrmResourceKind::Control
         } else {
             return Err(scheme_error::ENOENT);
@@ -410,5 +411,13 @@ impl Scheme for DrmScheme {
         // DRM devices usually don't support lseek on the control node.
         // We'll just return the offset or 0.
         Ok(offset as usize)
+    }
+
+    fn getdents(&self, _id: usize) -> Result<Vec<String>, usize> {
+        // Return the virtual device nodes for DRM
+        let mut list = Vec::new();
+        list.push(String::from("card0"));
+        list.push(String::from("control"));
+        Ok(list)
     }
 }

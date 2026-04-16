@@ -1064,10 +1064,17 @@ fn strlen_user_unique(path_ptr: u64, max_len: usize) -> u64 {
     max_len as u64
 }
 
-/// Rutas absolutas de usuario (`/…`) → `file:…`; `/dev/…` → `dev:…`.
+/// Rutas absolutas de usuario (`/…`) → `file:…`; `/dev/…` → `dev:…`; `/sys/…` → `sys:…`.
 fn user_path_to_scheme_path(path_str: &str) -> String {
-    if path_str.starts_with("/dev/") {
-        format!("dev:{}", path_str.trim_start_matches("/dev/"))
+    if path_str == "/dev/dri" || path_str.starts_with("/dev/dri/") {
+        let rel = path_str.trim_start_matches("/dev/dri").trim_start_matches('/');
+        format!("drm:{}", rel)
+    } else if path_str == "/dev" || path_str.starts_with("/dev/") {
+        let rel = path_str.trim_start_matches("/dev").trim_start_matches('/');
+        format!("dev:{}", rel)
+    } else if path_str == "/sys" || path_str.starts_with("/sys/") {
+        let rel = path_str.trim_start_matches("/sys").trim_start_matches('/');
+        format!("sys:{}", rel)
     } else if path_str.starts_with('/') {
         format!("file:{}", path_str)
     } else {
@@ -2324,40 +2331,18 @@ fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
     };
     
 
-    // Route through scheme system
-    // /dev/xxx -> dev:xxx (framebuffer, etc.); other /paths -> file:path
-    let (scheme_id, resource_id) = if path.starts_with("/dev/") {
-        let dev_path = alloc::format!("dev:{}", path.trim_start_matches("/dev/"));
-        match crate::scheme::open(&dev_path, flags as usize, 0) {
-            Ok(res) => res,
-            Err(e) => {
-                if e != crate::scheme::error::EAGAIN {
-                    serial::serial_printf(format_args!("[SYSCALL] open() dev failed: error {}\n", e));
-                }
-                return syscall_error_for_current_process(e as i32);
+    // Route through scheme system via centralized translation utility
+    let scheme_path = user_path_to_scheme_path(path);
+    
+    let (scheme_id, resource_id) = match crate::scheme::open(&scheme_path, flags as usize, mode as u32) {
+        Ok(res) => res,
+        Err(e) => {
+            if e != crate::scheme::error::EAGAIN 
+                && !(e == crate::scheme::error::ENOENT && path.starts_with("/tmp/"))
+            {
+                serial::serial_printf(format_args!("[SYSCALL] open('{}') -> '{}' failed: error {}\n", path, scheme_path, e));
             }
-        }
-    } else if path.starts_with('/') {
-        match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
-            Ok(res) => res,
-            Err(e) => {
-                if e != crate::scheme::error::EAGAIN
-                    && !(e == crate::scheme::error::ENOENT && path.starts_with("/tmp/"))
-                {
-                    serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
-                }
-                return syscall_error_for_current_process(e as i32);
-            }
-        }
-    } else {
-        match crate::scheme::open(path, flags as usize, 0) {
-            Ok(res) => res,
-            Err(e) => {
-                if e != crate::scheme::error::EAGAIN {
-                    serial::serial_printf(format_args!("[SYSCALL] open('{}') failed: error {}\n", path, e));
-                }
-                return syscall_error_for_current_process(e as i32);
-            }
+            return syscall_error_for_current_process(e as i32);
         }
     };
 
@@ -3470,7 +3455,9 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
     const CLONE_SETTLS: u64 = 0x00080000;
     const CLONE_PARENT_SETTID: u64 = 0x00100000;
     const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    const CLONE_DETACHED: u64 = 0x00400000;
     const CLONE_CHILD_SETTID: u64 = 0x01000000;
+    const CLONE_IO: u64 = 0x80000000;
 
     // Fork-style clone: CLONE_THREAD not set → treat as fork/vfork.
     // This handles relibc's vfork() (CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD)
@@ -3507,7 +3494,9 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
-        | CLONE_CHILD_SETTID;
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID
+        | CLONE_IO;
     if flags & !allowed != 0 {
         serial::serial_printf(format_args!(
             "sys_clone: unsupported flags {:#x}\n",
@@ -4953,7 +4942,29 @@ fn sys_readdir(path_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
         Err(_) => return u64::MAX,
     };
 
-    // Convertir /bin → bin (quitar la barra inicial)
+    let scheme_path = user_path_to_scheme_path(path);
+    
+    // Attempt to open and read from scheme
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
+        let mut bounce = [0u8; 4096];
+        let read_len = core::cmp::min(buf_size as usize, bounce.len());
+        let res = match crate::scheme::read(scheme_id, resource_id, &mut bounce[..read_len]) {
+            Ok(n) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf_ptr as *mut u8, n);
+                }
+                n as u64
+            }
+            Err(_) => u64::MAX,
+        };
+        let _ = crate::scheme::close(scheme_id, resource_id);
+        if res != u64::MAX {
+            return res;
+        }
+    }
+
+    // Fallback to legacy FS listing if scheme open failed or returned error
+    // (This handles the case where FS doesn't use the scheme system yet for readdir)
     let clean = if path.starts_with('/') { &path[1..] } else { path };
     let fs_path = if clean.is_empty() { "" } else { clean };
 
@@ -5608,10 +5619,10 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         None => return linux_abi_error(9), // EBADF
     };
 
-    // Get directory children via filesystem resource_id (for the FS scheme).
-    let children = match crate::filesystem::get_dir_children_by_resource(fd_entry.resource_id) {
+    // Get directory children via scheme system
+    let children = match crate::scheme::getdents(fd_entry.scheme_id, fd_entry.resource_id) {
         Ok(names) => names,
-        Err(_) => return linux_abi_error(20), // ENOTDIR
+        Err(e) => return linux_abi_error(e as i32),
     };
 
     // Use the FD's offset field as directory position.
@@ -5621,7 +5632,7 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         return 0; // No more entries.
     }
 
-    let mut kbuf = alloc::vec![0u8; count as usize];
+    let mut bounce = [0u8; 4096];
     let mut written: usize = 0;
     let mut idx = start_idx;
 
@@ -5630,13 +5641,15 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         let name_len = name.len();
         // struct linux_dirent64: d_ino(8)+d_off(8)+d_reclen(2)+d_type(1)+d_name(name+NUL), align 8
         let rec_size = (8 + 8 + 2 + 1 + name_len + 1 + 7) & !7usize;
-        if written + rec_size > count as usize {
+        
+        // Check if it fits in the user buffer OR the bounce buffer
+        if written + rec_size > count as usize || written + rec_size > bounce.len() {
             break;
         }
         
-        // Build the entry in the kernel buffer
+        // Build the entry in the bounce buffer
+        let p = unsafe { bounce.as_mut_ptr().add(written) };
         unsafe {
-            let p = kbuf.as_mut_ptr().add(written);
             (p as *mut u64).write_unaligned(idx as u64 + 1);                 // d_ino
             (p.add(8) as *mut u64).write_unaligned(idx as u64 + 2);          // d_off (next)
             (p.add(16) as *mut u16).write_unaligned(rec_size as u16);        // d_reclen
@@ -5653,10 +5666,10 @@ fn sys_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         idx += 1;
     }
 
-    // Copy the entire kernel buffer to user memory at once
+    // Copy the accumulated buffer to user memory
     if written > 0 {
         unsafe {
-            core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, written);
+            core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf_ptr as *mut u8, written);
         }
     }
 

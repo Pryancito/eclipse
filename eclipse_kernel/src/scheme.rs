@@ -31,6 +31,7 @@ pub mod error {
     pub const EBUSY: usize = 16;   // Device or resource busy
     pub const EPIPE: usize = 32;   // Broken pipe
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
+    pub const ENOTDIR: usize = 20; // Not a directory
 }
 
 /// Polling event flags (Linux-compatible)
@@ -73,6 +74,19 @@ pub fn fstat(scheme_idx: usize, id: usize, stat: &mut Stat) -> Result<usize, usi
         }
     };
     scheme.fstat(id, stat)
+}
+
+/// List directory entries in a specific scheme
+pub fn getdents(scheme_idx: usize, id: usize) -> Result<Vec<String>, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
+             Arc::clone(s)
+        } else {
+             return Err(error::EBADF);
+        }
+    };
+    scheme.getdents(id)
 }
 
 /// The Scheme trait defines the interface for all resource providers.
@@ -146,6 +160,11 @@ pub trait Scheme: Send + Sync {
     /// Returns a bitmask of events that are currently active.
     fn poll(&self, _id: usize, events: usize) -> Result<usize, usize> {
         Ok(events) // Default: return requested events (always ready)
+    }
+
+    /// List directory entries for a directory resource.
+    fn getdents(&self, _id: usize) -> Result<Vec<String>, usize> {
+        Err(error::ENOSYS)
     }
 }
 

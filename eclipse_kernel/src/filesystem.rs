@@ -1997,6 +1997,18 @@ impl Scheme for FileSystemScheme {
             _ => Err(scheme_error::ENOSYS),
         }
     }
+
+    fn getdents(&self, id: usize) -> Result<alloc::vec::Vec<alloc::string::String>, usize> {
+        let open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        match open_file {
+            OpenFile::Real { inode, .. } => {
+                crate::filesystem::get_dir_children_by_resource(*inode as usize)
+                    .map_err(|_| crate::scheme::error::ENOTDIR)
+            }
+            _ => Err(scheme_error::ENOTDIR),
+        }
+    }
 }
 
 // --- Dev Scheme ---
@@ -2148,10 +2160,19 @@ impl Scheme for DevScheme {
         Err(scheme_error::ENOSYS)
     }
 
+    fn getdents(&self, _id: usize) -> Result<alloc::vec::Vec<alloc::string::String>, usize> {
+        // We ignore the id (resource_id) here because /dev is a flat directory
+        // in our simple DevScheme implementation.
+        Ok(list_device_names())
+    }
+
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
         if id == 100 { // fb0
             match request {
                 0x4600 => { // FBIOGET_VSCREENINFO
+                    if !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<fb_var_screeninfo>() as u64) {
+                        return Err(scheme_error::EFAULT);
+                    }
                     let fb_info = &crate::boot::get_boot_info().framebuffer;
                     let var_info = unsafe { &mut *(arg as *mut fb_var_screeninfo) };
                     var_info.xres = fb_info.width as u32;
@@ -2170,6 +2191,9 @@ impl Scheme for DevScheme {
                     return Ok(0);
                 }
                 0x4602 => { // FBIOGET_FSCREENINFO
+                    if !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<fb_fix_screeninfo>() as u64) {
+                        return Err(scheme_error::EFAULT);
+                    }
                     let fb_info = &crate::boot::get_boot_info().framebuffer;
                     let fix_info = unsafe { &mut *(arg as *mut fb_fix_screeninfo) };
                     fix_info.smem_start = fb_info.base_address as u64;
@@ -2207,7 +2231,9 @@ impl Scheme for DevScheme {
                         v_signal: u16,
                         v_state:  u16,
                     }
-                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    if !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<VtStat>() as u64) {
+                        return Err(scheme_error::EFAULT);
+                    }
                     let stat = unsafe { &mut *(arg as *mut VtStat) };
                     stat.v_active = 1; // VT 1 is the active terminal
                     stat.v_signal = 0;
@@ -2220,7 +2246,16 @@ impl Scheme for DevScheme {
                 0x5607 => return Ok(0), // VT_WAITACTIVE – wait for VT, stub ok
                 0x4B3A => {
                     // KDGETMODE – return KD_TEXT = 0
-                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    // COMPATIBILITY HACK: Some broken Eclipse binaries were built with 
+                    // a header that defined KDSETMODE as 0x4B3A. If arg is 0 or 1,
+                    // assume they wanted to SET the mode and return success.
+                    if arg < 0x1000 {
+                         return Ok(0);
+                    }
+
+                    if !crate::syscalls::is_user_pointer(arg as u64, 4) {
+                        return Err(scheme_error::EFAULT);
+                    }
                     let mode = unsafe { &mut *(arg as *mut u32) };
                     *mode = 0;
                     return Ok(0);
@@ -2228,7 +2263,9 @@ impl Scheme for DevScheme {
                 0x4B3B => return Ok(0), // KDSETMODE   – set KD mode, stub ok
                 0x4B44 => {
                     // KDGKBMODE – return K_UNICODE = 3
-                    if arg == 0 { return Err(scheme_error::EFAULT); }
+                    if !crate::syscalls::is_user_pointer(arg as u64, 4) {
+                        return Err(scheme_error::EFAULT);
+                    }
                     let mode = unsafe { &mut *(arg as *mut u32) };
                     *mode = 3;
                     return Ok(0);
@@ -2238,6 +2275,7 @@ impl Scheme for DevScheme {
                 _ => return Err(scheme_error::ENOSYS),
             }
         }
+
 
         Err(scheme_error::EBADF)
     }
