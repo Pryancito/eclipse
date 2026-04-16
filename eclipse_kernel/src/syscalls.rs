@@ -2007,7 +2007,7 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
     // making it runnable before we replace its FDs.
 
     use alloc::vec::Vec;
-    if elf_ptr == 0 || elf_size == 0 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
         return u64::MAX;
     }
     if !is_user_pointer(elf_ptr, elf_size) {
