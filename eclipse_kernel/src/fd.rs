@@ -141,6 +141,20 @@ pub fn fd_get(pid: ProcessId, fd: usize) -> Option<FileDescriptor> {
     tables[pid_idx].get(fd).cloned()
 }
 
+/// Update file descriptor flags (e.g. O_NONBLOCK via fcntl F_SETFL)
+pub fn fd_set_flags(pid: ProcessId, fd: usize, flags: u32) -> bool {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut tables = FD_TABLES.lock();
+    if let Some(fd_entry) = tables[pid_idx].get_mut(fd) {
+        fd_entry.flags = flags;
+        return true;
+    }
+    false
+}
+
 /// Update file descriptor offset
 pub fn fd_update_offset(pid: ProcessId, fd: usize, new_offset: u64) -> bool {
     let pid_idx = match pid_to_fd_idx(pid) {

@@ -39,6 +39,8 @@ pub struct PipeHandle {
     /// Number of open references to this handle slot (incremented by dup, decremented by close).
     /// The channel side counter is only decremented when this reaches 0.
     pub ref_count:  usize,
+    /// When true, reads/writes return EAGAIN instead of blocking when the buffer is empty/full.
+    pub nonblock:   bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,12 +82,12 @@ impl PipeScheme {
         let mut handles = self.handles.lock();
         for (i, slot) in handles.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(PipeHandle { channel_id, is_write, ref_count: 1 });
+                *slot = Some(PipeHandle { channel_id, is_write, ref_count: 1, nonblock: false });
                 return i;
             }
         }
         let id = handles.len();
-        handles.push(Some(PipeHandle { channel_id, is_write, ref_count: 1 }));
+        handles.push(Some(PipeHandle { channel_id, is_write, ref_count: 1, nonblock: false }));
         id
     }
 
@@ -101,6 +103,43 @@ impl PipeScheme {
     fn get_channel(&self, channel_id: usize) -> Option<Arc<Mutex<PipeChannel>>> {
         let channels = self.channels.lock();
         channels.get(channel_id).and_then(|c| c.as_ref()).cloned()
+    }
+
+    /// Set or clear the O_NONBLOCK flag for a pipe handle.
+    pub fn set_nonblock(&self, id: usize, nonblock: bool) {
+        let mut handles = self.handles.lock();
+        if let Some(Some(h)) = handles.get_mut(id) {
+            h.nonblock = nonblock;
+        }
+    }
+
+    /// Query readiness of a pipe handle (for poll/select).
+    /// Returns a bitmask of `scheme::event::POLLIN` / `scheme::event::POLLOUT`.
+    pub fn poll_pipe(&self, id: usize, events: usize) -> Result<usize, usize> {
+        let (channel_id, is_write) = {
+            let handles = self.handles.lock();
+            let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
+            (h.channel_id, h.is_write)
+        };
+        let channel_arc = self.get_channel(channel_id).ok_or(error::EIO)?;
+        let ch = channel_arc.lock();
+        let mut ready = 0usize;
+        if !is_write {
+            // Read end: POLLIN when buffer has data or all writers have closed (EOF).
+            if (events & crate::scheme::event::POLLIN) != 0 {
+                if !ch.buffer.is_empty() || ch.write_ends == 0 {
+                    ready |= crate::scheme::event::POLLIN;
+                }
+            }
+        } else {
+            // Write end: POLLOUT when buffer has space and at least one reader is open.
+            if (events & crate::scheme::event::POLLOUT) != 0 {
+                if ch.buffer.len() < PIPE_BUF_CAP && ch.read_ends > 0 {
+                    ready |= crate::scheme::event::POLLOUT;
+                }
+            }
+        }
+        Ok(ready)
     }
 }
 
@@ -122,16 +161,16 @@ impl Scheme for PipeScheme {
             return Ok(0);
         }
 
-        let handle = {
+        let (channel_id, nonblock) = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
             if h.is_write {
                 return Err(error::EBADF);
             }
-            (h.channel_id, h.is_write)
+            (h.channel_id, h.nonblock)
         };
 
-        let channel_arc = self.get_channel(handle.0).ok_or(error::EIO)?;
+        let channel_arc = self.get_channel(channel_id).ok_or(error::EIO)?;
 
         loop {
             {
@@ -148,6 +187,10 @@ impl Scheme for PipeScheme {
                 }
                 if ch.write_ends == 0 {
                     return Ok(0); // EOF: todos los escritores cerraron
+                }
+                // If non-blocking, return EAGAIN immediately instead of blocking
+                if nonblock {
+                    return Err(error::EAGAIN);
                 }
             }
 
