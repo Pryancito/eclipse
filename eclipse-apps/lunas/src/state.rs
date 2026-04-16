@@ -1498,10 +1498,15 @@ impl LunasState {
     }
 
     /// Launch an application by its executable path.
-    fn launch_app(&mut self, _exec_path: &str) {
-        {
-            let _ = std::process::Command::new(_exec_path).spawn();
-        }
+    fn launch_app(&mut self, exec_path: &str) {
+        // Use Eclipse-native spawn instead of std::process::Command::spawn().
+        // Command::spawn() creates an error-reporting pipe and does a blocking read
+        // on it to detect exec failures.  Because Eclipse OS does not implement
+        // O_CLOEXEC, the exec'd child inherits the write end of that pipe; the
+        // parent's read never gets EOF and lunas hangs permanently after every
+        // successful app launch.  spawn_with_stdio_path loads the ELF directly
+        // (no fork, no pipe) and returns as soon as the child is enqueued.
+        let _ = eclipse_syscall::call::spawn_with_stdio_path(exec_path, None, 0, 1, 2);
         self.dirty = true;
     }
 
