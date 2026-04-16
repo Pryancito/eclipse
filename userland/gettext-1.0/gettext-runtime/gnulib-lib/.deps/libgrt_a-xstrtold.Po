@@ -1,0 +1,36 @@
+libgrt_a-xstrtold.o: xstrtold.c xstrtod.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h xstrtod.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h stdio.h \
+ /usr/include/x86_64-linux-musl/stdio.h \
+ /usr/include/x86_64-linux-musl/stdarg.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h sys/types.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h
+xstrtod.c:
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+xstrtod.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+stdio.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+sys/types.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:

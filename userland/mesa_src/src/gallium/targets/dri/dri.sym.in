@@ -1,0 +1,14 @@
+{
+	global:
+		__driDriverGetExtensions*;
+		dri_loader_get_extensions;
+		@nouveau_drm_screen_create@
+		@radeon_drm_winsys_create@
+		@amdgpu_winsys_create@
+		@fd_drm_screen_create_renderonly@
+		@ac_init_shared_llvm_once@
+		@va_driver_init@
+		@vdp_imp_device_create_x11@
+	local:
+		*;
+};

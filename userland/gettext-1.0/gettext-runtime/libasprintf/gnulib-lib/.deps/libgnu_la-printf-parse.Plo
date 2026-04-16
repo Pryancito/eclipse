@@ -1,0 +1,45 @@
+libgnu_la-printf-parse.lo: printf-parse.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h printf-parse.h printf-args.h \
+ stddef.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h wchar.h \
+ /usr/include/x86_64-linux-musl/wchar.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/stdarg.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h alloca.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h xsize.h attribute.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+printf-parse.h:
+printf-args.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+wchar.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+alloca.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+xsize.h:
+attribute.h:

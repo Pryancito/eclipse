@@ -1,0 +1,29 @@
+libgnu_la-wgetcwd-lgpl.lo: wgetcwd-lgpl.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h wchar.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/wchar.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h alloca.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+wchar.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+alloca.h:

@@ -1,0 +1,20 @@
+root = true
+
+[*.{c,h,scd}]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+indent_style = tab
+indent_size = 8
+max_line_length = 80
+
+[*.{xml,build,md}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+max_line_length = 80
+
+[COMMIT_EDITMSG]
+max_line_length = 74

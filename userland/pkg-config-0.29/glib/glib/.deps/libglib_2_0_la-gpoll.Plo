@@ -1,0 +1,73 @@
+libglib_2_0_la-gpoll.lo: gpoll.c ../config.h glibconfig.h \
+ ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h giochannel.h \
+ ../glib/gconvert.h ../glib/gerror.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gquark.h \
+ ../glib/gtypes.h glibconfig.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h ../glib/gmain.h ../glib/gpoll.h \
+ ../glib/gslist.h ../glib/gmem.h ../glib/gnode.h ../glib/gthread.h \
+ ../glib/gatomic.h ../glib/gstring.h ../glib/gunicode.h ../glib/gbytes.h \
+ ../glib/garray.h ../glib/gutils.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/sys/time.h \
+ /usr/include/x86_64-linux-musl/sys/poll.h \
+ /usr/include/x86_64-linux-musl/poll.h \
+ /usr/include/x86_64-linux-musl/bits/poll.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h gpoll.h
+../config.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+giochannel.h:
+../glib/gconvert.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+../glib/gmain.h:
+../glib/gpoll.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+../glib/gthread.h:
+../glib/gatomic.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/sys/time.h:
+/usr/include/x86_64-linux-musl/sys/poll.h:
+/usr/include/x86_64-linux-musl/poll.h:
+/usr/include/x86_64-linux-musl/bits/poll.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+gpoll.h:

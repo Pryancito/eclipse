@@ -1,0 +1,41 @@
+libfribidi_la-fribidi-brackets.lo: fribidi-brackets.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h common.h \
+ ../config.h fribidi-common.h fribidi-config.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h debug.h \
+ fribidi-types.h fribidi-common.h fribidi-begindecls.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
+ fribidi-enddecls.h fribidi-begindecls.h fribidi-enddecls.h \
+ fribidi-brackets.h fribidi-types.h fribidi-bidi-types.h \
+ fribidi-bidi-types-list.h brackets.tab.i brackets-type.tab.i \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+common.h:
+../config.h:
+fribidi-common.h:
+fribidi-config.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+debug.h:
+fribidi-types.h:
+fribidi-common.h:
+fribidi-begindecls.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
+fribidi-enddecls.h:
+fribidi-begindecls.h:
+fribidi-enddecls.h:
+fribidi-brackets.h:
+fribidi-types.h:
+fribidi-bidi-types.h:
+fribidi-bidi-types-list.h:
+brackets.tab.i:
+brackets-type.tab.i:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:

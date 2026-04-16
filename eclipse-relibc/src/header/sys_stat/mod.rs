@@ -1,7 +1,7 @@
 use crate::types::*;
 use crate::eclipse_syscall::call::mkdir as sys_mkdir;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut crate::types::stat) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -31,7 +31,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut crate::types::stat)
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut crate::types::stat) -> c_int {
     let mut st = eclipse_syscall::call::Stat::default();
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut crate::types::stat) -> c_int
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut crate::types::stat) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -91,19 +91,19 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut crate::types::stat
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn chmod(_path: *const c_char, _mode: mode_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn fchmod(_fd: c_int, _mode: mode_t) -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn umask(_mask: mode_t) -> mode_t {
     0

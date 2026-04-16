@@ -1,0 +1,20 @@
+libgrt_a-basename-lgpl.o: basename-lgpl.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h basename-lgpl.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h filename.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+basename-lgpl.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+filename.h:

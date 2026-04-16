@@ -2,7 +2,7 @@
 use crate::types::*;
 use crate::internal_alloc::{malloc, free};
 use crate::eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, fstat as sys_fstat, ftruncate as sys_ftruncate, Stat as sys_Stat};
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 use crate::header::time::nanosleep;
 
 #[cfg(all(not(any(test, feature = "host-testing"))))]
@@ -12,15 +12,7 @@ static mut FORCE_KEEP: i32 = 0;
 // Nota: había stubs/externs para host bajo un cfg imposible (`all(..., not())`).
 // Se eliminan para evitar referencias a `target_os` y porque nunca se compilaban.
 
-#[cfg(all(not(any(test, feature = "host-testing"))))]
-#[no_mangle]
-pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int {
-    let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
-    match sys_open(path_str, flags as usize) {
-        Ok(fd) => fd as c_int,
-        Err(_) => -1,
-    }
-}
+
 
 #[cfg(all(not(any(test, feature = "host-testing"))))]
 #[no_mangle]
@@ -66,7 +58,7 @@ pub unsafe extern "C" fn getpid() -> pid_t {
     sys_getpid() as pid_t
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(feature = "eclipse-syscall", eclipse_target)))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(feature = "eclipse-syscall", not(any(test, feature = "host-testing")))))]
 #[no_mangle]
 pub unsafe extern "C" fn fork() -> pid_t {
     use crate::eclipse_syscall::call::fork;
@@ -96,7 +88,7 @@ pub unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char, _args
 #[cfg(all(
     not(any(test, feature = "host-testing")),
     not(feature = "use_std"),
-    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+    not(all(target_os = "linux", target_env = "musl", any(test, feature = "host-testing"))),
 ))]
 #[no_mangle]
 pub unsafe extern "C" fn execv(path: *const c_char, argv: *const *const c_char) -> c_int {
@@ -107,7 +99,7 @@ pub unsafe extern "C" fn execv(path: *const c_char, argv: *const *const c_char) 
 #[cfg(all(
     not(any(test, feature = "host-testing")),
     not(feature = "use_std"),
-    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+    not(all(target_os = "linux", target_env = "musl", any(test, feature = "host-testing"))),
 ))]
 #[no_mangle]
 pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
@@ -119,7 +111,7 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
 #[cfg(all(
     not(any(test, feature = "host-testing")),
     not(feature = "use_std"),
-    not(all(target_os = "linux", target_env = "musl", not(eclipse_target))),
+    not(all(target_os = "linux", target_env = "musl", any(test, feature = "host-testing"))),
 ))]
 #[no_mangle]
 pub unsafe extern "C" fn execvpe(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int {
@@ -275,7 +267,7 @@ pub unsafe extern "C" fn getdtablesize() -> c_int {
     1024
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     let req = crate::types::timespec {
@@ -286,7 +278,7 @@ pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     let req = crate::types::timespec {
@@ -296,7 +288,7 @@ pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     nanosleep(&req, core::ptr::null_mut())
 }
 
-#[cfg(not(eclipse_target))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn sleep(seconds: c_uint) -> c_uint;
     pub fn usleep(usec: useconds_t) -> c_int;
@@ -549,7 +541,7 @@ pub unsafe extern "C" fn setpgrp() -> c_int {
 }
 
 /// tcgetpgrp — get foreground process group of terminal fd.
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcgetpgrp(fd: c_int) -> pid_t {
     let mut pgid: pid_t = 0;
@@ -564,7 +556,7 @@ pub unsafe extern "C" fn tcgetpgrp(fd: c_int) -> pid_t {
 }
 
 /// tcsetpgrp — set foreground process group of terminal fd.
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcsetpgrp(fd: c_int, pgrp: pid_t) -> c_int {
     // TIOCSPGRP = 0x5410

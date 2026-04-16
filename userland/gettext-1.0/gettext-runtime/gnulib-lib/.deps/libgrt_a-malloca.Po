@@ -1,0 +1,33 @@
+libgrt_a-malloca.o: malloca.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h malloca.h alloca.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h xalloc-oversized.h \
+ stdckdint.h intprops-internal.h idx.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+malloca.h:
+alloca.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+xalloc-oversized.h:
+stdckdint.h:
+intprops-internal.h:
+idx.h:

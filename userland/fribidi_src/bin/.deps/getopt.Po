@@ -1,0 +1,18 @@
+getopt.o: getopt.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h ../config.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h gettext.h \
+ getopt.h /home/moebius/eclipse/eclipse-os-build/include/ctype.h \
+ getopt_int.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+../config.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+gettext.h:
+getopt.h:
+/home/moebius/eclipse/eclipse-os-build/include/ctype.h:
+getopt_int.h:

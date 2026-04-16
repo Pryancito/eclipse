@@ -13,8 +13,8 @@ wayland-proto = { path = "../libs/wayland-proto" }
 # SideWind: crate `eclipse-apps/sidewind` (reexporta tipos IPC y `sidewind_core` internamente).
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
-eclipse_syscall = { package = "eclipse-syscall", path = "../../eclipse-syscall" }
-libc = { path = "../../eclipse-relibc" }
+libc = { workspace = true, features = ["allocator", "eclipse-syscall", "use_std"] }
+eclipse-syscall = { workspace = true }
 os-terminal = { path = "../libs/os-terminal" }
 
 [features]

@@ -2,7 +2,7 @@
  
 use std::prelude::v1::*;
 use std::vec;
-use eclipse_libc as libc;
+use eclipse_relibc as libc;
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags};
 
 const SEEK_SET: i32 = 0;

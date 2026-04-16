@@ -1,0 +1,242 @@
+# Void-musl images:
+# https://github.com/void-linux/void-containers/pkgs/container/void-musl
+#
+# Void dependencies based on:
+# https://github.com/void-linux/void-packages/blob/master/srcpkgs/labwc/template
+#
+# Recommended GH CI Void mirror based on
+# https://docs.voidlinux.org/xbps/repositories/mirrors/changing.html
+
+name: CI
+on: [pull_request]
+jobs:
+  codestyle:
+    name: CodeStyleCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - name: Code Style
+        run: |
+          ./scripts/check
+          make -C scripts/helper
+          ./scripts/find-banned.sh
+  build:
+    name: Build
+    needs: codestyle
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [
+          Arch,
+          Debian,
+          FreeBSD,
+          Void-musl
+        ]
+        include:
+          - name: Arch
+            os: ubuntu-latest
+            container: archlinux:base-devel
+            env:
+              TARGET: 'sh -xe'
+
+          - name: Debian
+            os: ubuntu-latest
+            container: debian:testing
+            env:
+              TARGET: 'sh -xe'
+
+          - name: FreeBSD
+            os: ubuntu-latest
+            env:
+              TARGET: 'ssh freebsd /bin/sh -xe'
+
+          - name: Void-musl
+            os: ubuntu-latest
+            container: ghcr.io/void-linux/void-musl:latest
+            env:
+              TARGET: 'sh -xe'
+
+    env: ${{ matrix.env }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Install Arch Linux dependencies
+        if: matrix.name == 'Arch'
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git meson clang wlroots libdrm libinput \
+            wayland-protocols cairo pango libxml2 xorg-xwayland librsvg \
+            libdisplay-info gdb ttf-dejavu foot
+
+      - name: Install Debian Testing dependencies
+        if: matrix.name == 'Debian'
+        run: |
+          sed -i '/^Types/ s/deb/& deb-src/' /etc/apt/sources.list.d/debian.sources
+          apt-get update
+          apt-get upgrade -y
+          apt-get install -y git gcc clang gdb xwayland
+          apt-get build-dep -y labwc
+          apt-get build-dep -y libwlroots-dev
+
+      - name: Install FreeBSD dependencies
+        if: matrix.name == 'FreeBSD'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            sed -i '' 's/quarterly/latest/' /etc/pkg/FreeBSD.conf
+            pkg set -yn pkg:mesa-dri # hack to skip llvm dependency
+            pkg install -y git meson gcc pkgconf cairo pango evdev-proto \
+              hwdata wayland-protocols wlroots libdisplay-info
+          run: echo "setup done"
+
+      - name: Install Void Linux dependencies
+        if: matrix.name == 'Void-musl'
+        run: |
+          mkdir -p /etc/xbps.d
+          cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/
+          sed -i "s:repo-default\.voidlinux\.org:repo-ci.voidlinux.org:g" \
+            /etc/xbps.d/*-repository-*.conf
+          xbps-install -Syu || xbps-install -yu xbps
+          xbps-install -Syu
+          xbps-install -y git meson gcc clang pkg-config scdoc \
+            cairo-devel glib-devel libpng-devel librsvg-devel libxml2-devel \
+            pango-devel wlroots0.18-devel gdb bash xorg-server-xwayland \
+            dejavu-fonts-ttf libsfdo-devel foot
+
+      # These builds are executed on all runners
+      - name: Build with gcc
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc -Dxwayland=enabled --werror
+            meson compile -C build-gcc
+          ' | $TARGET
+
+      - name: Build with clang
+        if: matrix.name != 'Debian'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=clang
+            meson setup build-clang -Dxwayland=enabled --werror
+            meson compile -C build-clang
+          ' | $TARGET
+
+      - name: Build with gcc - no-xwayland
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-no-xwayland -Dxwayland=disabled --werror
+            meson compile -C build-gcc-no-xwayland
+          ' | $TARGET
+
+      - name: Build with clang - no-xwayland
+        if: matrix.name != 'Debian'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=clang
+            meson setup build-clang-no-xwayland -Dxwayland=disabled --werror
+            meson compile -C build-clang-no-xwayland
+          ' | $TARGET
+
+      - name: Build with gcc - release
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-release -Dxwayland=enabled \
+              -Dbuildtype=release -Db_ndebug=true --werror
+            meson configure build-gcc-release -Dwlroots:b_ndebug=false || true
+            meson compile -C build-gcc-release
+          ' | $TARGET
+
+      - name: Build with gcc - static analyzer
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-static_analyzer -Dxwayland=enabled \
+              -Dstatic_analyzer=enabled --werror
+            meson compile -C build-gcc-static_analyzer
+          ' | $TARGET
+
+      - name: Build with clang - release
+        if: matrix.name != 'Debian'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=clang
+            meson setup build-clang-release -Dxwayland=enabled \
+              -Dbuildtype=release -Db_ndebug=true --werror
+            meson configure build-clang-release -Dwlroots:b_ndebug=false || true
+            meson compile -C build-clang-release
+          ' | $TARGET
+
+      # Runtime tests, these run on Arch and Void only (the later due to libmusl being used)
+
+      - name: Build with gcc - runtime test
+        if: matrix.name == 'Arch'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-gdb -Dxwayland=enabled -Db_sanitize=undefined --werror
+            meson compile -C build-gcc-gdb
+            scripts/ci/smoke-test.sh build-gcc-gdb
+          ' | $TARGET
+
+      - name: Build with clang - runtime test
+        if: matrix.name == 'Arch'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=clang
+            meson setup build-clang-gdb -Dxwayland=enabled -Db_sanitize=undefined --werror
+            meson compile -C build-clang-gdb
+            scripts/ci/smoke-test.sh build-clang-gdb
+          ' | $TARGET
+
+      - name: Build with gcc - runtime leak test
+        if: matrix.name == 'Arch'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-leak -Dxwayland=enabled -Db_sanitize=address,undefined \
+              --werror --force-fallback-for=wlroots
+            meson compile -C build-gcc-leak
+            LABWC_LEAK_TEST=1 scripts/ci/smoke-test.sh build-gcc-leak
+          ' | $TARGET
+
+      - name: Build with clang - runtime leak test
+        if: matrix.name == 'Arch'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=clang
+            meson setup build-clang-leak -Dxwayland=enabled -Db_sanitize=address,undefined \
+              --werror --force-fallback-for=wlroots
+            meson compile -C build-clang-leak
+            LABWC_LEAK_TEST=1 scripts/ci/smoke-test.sh build-clang-leak
+          ' | $TARGET
+
+      # Void-musl doesn't support sanitizer
+      - name: Build with gcc - runtime test w/o sanitizer
+        if: matrix.name == 'Void-musl'
+        run: |
+          echo '
+            cd "$GITHUB_WORKSPACE"
+            export CC=gcc
+            meson setup build-gcc-gdb -Dxwayland=enabled --werror
+            meson compile -C build-gcc-gdb
+            LABWC_RUNS=2 scripts/ci/smoke-test.sh build-gcc-gdb
+          ' | $TARGET

@@ -1,0 +1,22 @@
+libgrt_a-getprogname.o: getprogname.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h alloca.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h basename-lgpl.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+alloca.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+basename-lgpl.h:

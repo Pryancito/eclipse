@@ -1,0 +1,43 @@
+libglib_2_0_la-gcache.lo: deprecated/gcache.c ../config.h \
+ deprecated/gcache.h ../glib/glist.h ../glib/gmem.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h ../glib/gnode.h gslice.h ghash.h \
+ gtestutils.h ../glib/gmessages.h /usr/include/x86_64-linux-musl/stdarg.h \
+ ../glib/gstring.h ../glib/gunicode.h ../glib/gerror.h ../glib/gquark.h \
+ ../glib/gbytes.h ../glib/garray.h ../glib/gutils.h ../glib/gslist.h
+../config.h:
+deprecated/gcache.h:
+../glib/glist.h:
+../glib/gmem.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+../glib/gnode.h:
+gslice.h:
+ghash.h:
+gtestutils.h:
+../glib/gmessages.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gerror.h:
+../glib/gquark.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+../glib/gslist.h:

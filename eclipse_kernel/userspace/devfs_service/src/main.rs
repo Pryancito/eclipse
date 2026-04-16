@@ -1,7 +1,7 @@
 // devfs_service - Device Manager
 
 use std::prelude::v1::*;
-use eclipse_libc as libc;
+use eclipse_relibc as libc;
 
 use eclipse_syscall::number::SYS_REGISTER_DEVICE;
 

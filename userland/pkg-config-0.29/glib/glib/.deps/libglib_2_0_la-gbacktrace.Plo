@@ -1,0 +1,76 @@
+libglib_2_0_la-gbacktrace.lo: gbacktrace.c ../config.h glibconfig.h \
+ ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h \
+ /usr/include/x86_64-linux-musl/signal.h \
+ /usr/include/x86_64-linux-musl/bits/signal.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/stdio.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/sys/time.h \
+ /usr/include/x86_64-linux-musl/sys/select.h \
+ /usr/include/x86_64-linux-musl/sys/times.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/wait.h \
+ /usr/include/x86_64-linux-musl/sys/resource.h \
+ /usr/include/x86_64-linux-musl/bits/resource.h \
+ /usr/include/x86_64-linux-musl/time.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h gbacktrace.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gversionmacros.h gtypes.h gmain.h ../glib/gpoll.h \
+ ../glib/gslist.h ../glib/gmem.h ../glib/gnode.h ../glib/gthread.h \
+ ../glib/gatomic.h ../glib/gerror.h ../glib/gquark.h gprintfint.h \
+ gutils.h
+../config.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+/usr/include/x86_64-linux-musl/signal.h:
+/usr/include/x86_64-linux-musl/bits/signal.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/sys/time.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+/usr/include/x86_64-linux-musl/sys/times.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/wait.h:
+/usr/include/x86_64-linux-musl/sys/resource.h:
+/usr/include/x86_64-linux-musl/bits/resource.h:
+/usr/include/x86_64-linux-musl/time.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+gbacktrace.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gversionmacros.h:
+gtypes.h:
+gmain.h:
+../glib/gpoll.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+../glib/gthread.h:
+../glib/gatomic.h:
+../glib/gerror.h:
+../glib/gquark.h:
+gprintfint.h:
+gutils.h:

@@ -9,7 +9,7 @@ license.workspace = true
 # Use workspace dependencies for common crates (e.g. bitflags)
 bitflags = { workspace = true }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { workspace = true, features = ["eclipse-syscall", "use_std"] }
+eclipse-relibc = { workspace = true, features = ["eclipse-syscall", "use_std"] }
 
 [lints]
 workspace = true

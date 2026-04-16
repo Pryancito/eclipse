@@ -1,0 +1,68 @@
+libglib_2_0_la-gthread-posix.lo: gthread-posix.c ../config.h gthread.h \
+ ../glib/gatomic.h ../glib/gtypes.h glibconfig.h ../glib/gmacros.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h ../glib/gerror.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gquark.h \
+ gthreadprivate.h deprecated/gthread.h ../glib/gthread.h \
+ /usr/include/x86_64-linux-musl/pthread.h \
+ /usr/include/x86_64-linux-musl/sched.h gslice.h gmessages.h gstrfuncs.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/stdio.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h \
+ /usr/include/x86_64-linux-musl/sys/time.h \
+ /usr/include/x86_64-linux-musl/sys/select.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/sys/prctl.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h
+../config.h:
+gthread.h:
+../glib/gatomic.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+gthreadprivate.h:
+deprecated/gthread.h:
+../glib/gthread.h:
+/usr/include/x86_64-linux-musl/pthread.h:
+/usr/include/x86_64-linux-musl/sched.h:
+gslice.h:
+gmessages.h:
+gstrfuncs.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+/usr/include/x86_64-linux-musl/sys/time.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/sys/prctl.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:

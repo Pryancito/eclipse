@@ -1,0 +1,13 @@
+# Package Information for pkg-config
+
+prefix=/home/moebius/eclipse/eclipse-os-build
+exec_prefix=${prefix}
+libdir=/home/moebius/eclipse/eclipse-os-build/lib
+includedir=${prefix}/include
+
+Name: libpcre2-posix
+Description: Posix compatible interface to libpcre2-8
+Version: 10.44
+Libs: -L${libdir} -lpcre2-posix
+Cflags: -I${includedir} 
+Requires.private: libpcre2-8

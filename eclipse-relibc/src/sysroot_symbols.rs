@@ -149,8 +149,18 @@ pub const F_DUPFD_CLOEXEC:c_int = 1030;
 pub const F_GETFD:        c_int = 1;
 pub const F_GETFL:        c_int = 3;
 pub const F_SETFL:        c_int = 4;
+pub const F_SETFD:        c_int = 2;
+pub const FD_CLOEXEC:     c_int = 1;
+
 pub const FIOCLEX:        c_ulong = 0x5451;
 pub const FIONBIO:        c_ulong = 0x5421;
+
+pub const UIO_MAXIOV:     c_int = 1024;
+
+pub const LOCK_SH:        c_int = 1;
+pub const LOCK_EX:        c_int = 2;
+pub const LOCK_NB:        c_int = 4;
+pub const LOCK_UN:        c_int = 8;
 
 // exit
 pub const EXIT_SUCCESS: c_int = 0;
@@ -343,6 +353,7 @@ extern "C" {
     pub fn sigaddset(set: *mut sigset_t, signum: c_int) -> c_int;
     pub fn sched_yield() -> c_int;
     pub fn sysconf(name: c_int) -> c_long;
+    pub fn pause() -> c_int;
 
     // Descriptores de archivo
     pub fn dup(oldfd: c_int) -> c_int;
@@ -354,8 +365,12 @@ extern "C" {
     pub fn ftruncate(fd: c_int, length: off_t) -> c_int;
     pub fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t;
     pub fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t) -> ssize_t;
+    pub fn preadv(fd: c_int, iov: *const iovec, iovcnt: c_int, offset: off_t) -> ssize_t;
+    pub fn pwritev(fd: c_int, iov: *const iovec, iovcnt: c_int, offset: off_t) -> ssize_t;
     pub fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t;
     pub fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t;
+    pub fn fdatasync(fd: c_int) -> c_int;
+    pub fn flock(fd: c_int, operation: c_int) -> c_int;
 
     // Sistema de archivos
     pub fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
@@ -450,6 +465,7 @@ extern "C" {
     pub fn pthread_mutexattr_init(attr: *mut pthread_mutexattr_t) -> c_int;
     pub fn pthread_mutexattr_settype(attr: *mut pthread_mutexattr_t, kind: c_int) -> c_int;
     pub fn pthread_mutexattr_destroy(attr: *mut pthread_mutexattr_t) -> c_int;
+    pub fn pthread_attr_getstack(attr: *const pthread_attr_t, stackaddr: *mut *mut c_void, stacksize: *mut size_t) -> c_int;
 
     // rwlock (std lo usa internamente)
     pub fn pthread_rwlock_init(

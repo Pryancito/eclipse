@@ -1,0 +1,145 @@
+main.o: main.c config.h pkg.h glib/glib/glib.h glib/glib/galloca.h \
+ glib/glib/gtypes.h glib/glib/glibconfig.h glib/glib/gmacros.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h glib/glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h glib/glib/garray.h \
+ glib/glib/gasyncqueue.h glib/glib/gthread.h glib/glib/gatomic.h \
+ glib/glib/gerror.h /usr/include/x86_64-linux-musl/stdarg.h \
+ glib/glib/gquark.h glib/glib/gbacktrace.h \
+ /usr/include/x86_64-linux-musl/signal.h \
+ /usr/include/x86_64-linux-musl/bits/signal.h glib/glib/gbase64.h \
+ glib/glib/gbitlock.h glib/glib/gbookmarkfile.h glib/glib/gbytes.h \
+ glib/glib/gcharset.h glib/glib/gchecksum.h glib/glib/gconvert.h \
+ glib/glib/gdataset.h glib/glib/gdate.h glib/glib/gdatetime.h \
+ glib/glib/gtimezone.h glib/glib/gdir.h \
+ /usr/include/x86_64-linux-musl/dirent.h \
+ /usr/include/x86_64-linux-musl/bits/dirent.h glib/glib/genviron.h \
+ glib/glib/gfileutils.h glib/glib/ggettext.h glib/glib/ghash.h \
+ glib/glib/glist.h glib/glib/gmem.h glib/glib/gnode.h glib/glib/ghmac.h \
+ glib/glib/gchecksum.h glib/glib/ghook.h glib/glib/ghostutils.h \
+ glib/glib/giochannel.h glib/glib/gmain.h glib/glib/gpoll.h \
+ glib/glib/gslist.h glib/glib/gstring.h glib/glib/gunicode.h \
+ glib/glib/gutils.h glib/glib/gkeyfile.h glib/glib/gmappedfile.h \
+ glib/glib/gmarkup.h glib/glib/gmessages.h glib/glib/goption.h \
+ glib/glib/gpattern.h glib/glib/gprimes.h glib/glib/gqsort.h \
+ glib/glib/gqueue.h glib/glib/grand.h glib/glib/gscanner.h \
+ glib/glib/gsequence.h glib/glib/gshell.h glib/glib/gslice.h \
+ glib/glib/gspawn.h glib/glib/gstrfuncs.h glib/glib/gstringchunk.h \
+ glib/glib/gtestutils.h glib/glib/gthreadpool.h glib/glib/gtimer.h \
+ glib/glib/gtrashstack.h glib/glib/gtree.h glib/glib/gurifuncs.h \
+ glib/glib/gvarianttype.h glib/glib/gvariant.h glib/glib/gversion.h \
+ glib/glib/deprecated/gallocator.h glib/glib/deprecated/gcache.h \
+ glib/glib/deprecated/gcompletion.h glib/glib/deprecated/gmain.h \
+ glib/glib/deprecated/grel.h glib/glib/deprecated/gthread.h \
+ /usr/include/x86_64-linux-musl/pthread.h \
+ /usr/include/x86_64-linux-musl/sched.h parse.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/ctype.h \
+ /usr/include/x86_64-linux-musl/stdio.h
+config.h:
+pkg.h:
+glib/glib/glib.h:
+glib/glib/galloca.h:
+glib/glib/gtypes.h:
+glib/glib/glibconfig.h:
+glib/glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+glib/glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+glib/glib/garray.h:
+glib/glib/gasyncqueue.h:
+glib/glib/gthread.h:
+glib/glib/gatomic.h:
+glib/glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+glib/glib/gquark.h:
+glib/glib/gbacktrace.h:
+/usr/include/x86_64-linux-musl/signal.h:
+/usr/include/x86_64-linux-musl/bits/signal.h:
+glib/glib/gbase64.h:
+glib/glib/gbitlock.h:
+glib/glib/gbookmarkfile.h:
+glib/glib/gbytes.h:
+glib/glib/gcharset.h:
+glib/glib/gchecksum.h:
+glib/glib/gconvert.h:
+glib/glib/gdataset.h:
+glib/glib/gdate.h:
+glib/glib/gdatetime.h:
+glib/glib/gtimezone.h:
+glib/glib/gdir.h:
+/usr/include/x86_64-linux-musl/dirent.h:
+/usr/include/x86_64-linux-musl/bits/dirent.h:
+glib/glib/genviron.h:
+glib/glib/gfileutils.h:
+glib/glib/ggettext.h:
+glib/glib/ghash.h:
+glib/glib/glist.h:
+glib/glib/gmem.h:
+glib/glib/gnode.h:
+glib/glib/ghmac.h:
+glib/glib/gchecksum.h:
+glib/glib/ghook.h:
+glib/glib/ghostutils.h:
+glib/glib/giochannel.h:
+glib/glib/gmain.h:
+glib/glib/gpoll.h:
+glib/glib/gslist.h:
+glib/glib/gstring.h:
+glib/glib/gunicode.h:
+glib/glib/gutils.h:
+glib/glib/gkeyfile.h:
+glib/glib/gmappedfile.h:
+glib/glib/gmarkup.h:
+glib/glib/gmessages.h:
+glib/glib/goption.h:
+glib/glib/gpattern.h:
+glib/glib/gprimes.h:
+glib/glib/gqsort.h:
+glib/glib/gqueue.h:
+glib/glib/grand.h:
+glib/glib/gscanner.h:
+glib/glib/gsequence.h:
+glib/glib/gshell.h:
+glib/glib/gslice.h:
+glib/glib/gspawn.h:
+glib/glib/gstrfuncs.h:
+glib/glib/gstringchunk.h:
+glib/glib/gtestutils.h:
+glib/glib/gthreadpool.h:
+glib/glib/gtimer.h:
+glib/glib/gtrashstack.h:
+glib/glib/gtree.h:
+glib/glib/gurifuncs.h:
+glib/glib/gvarianttype.h:
+glib/glib/gvariant.h:
+glib/glib/gversion.h:
+glib/glib/deprecated/gallocator.h:
+glib/glib/deprecated/gcache.h:
+glib/glib/deprecated/gcompletion.h:
+glib/glib/deprecated/gmain.h:
+glib/glib/deprecated/grel.h:
+glib/glib/deprecated/gthread.h:
+/usr/include/x86_64-linux-musl/pthread.h:
+/usr/include/x86_64-linux-musl/sched.h:
+parse.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/ctype.h:
+/usr/include/x86_64-linux-musl/stdio.h:

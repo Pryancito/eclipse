@@ -1,0 +1,376 @@
+/* $XTermId: linedata.c,v 1.109 2026/01/22 00:53:17 tom Exp $ */
+
+/*
+ * Copyright 2009-2025,2026 by Thomas E. Dickey
+ *
+ *                         All Rights Reserved
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE ABOVE LISTED COPYRIGHT HOLDER(S) BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Except as contained in this notice, the name(s) of the above copyright
+ * holders shall not be used in advertising or otherwise to promote the
+ * sale, use or other dealings in this Software without prior written
+ * authorization.
+ */
+
+#include <xterm.h>
+#include <data.h>
+
+#include <assert.h>
+
+/*
+ * Given a row-number, find the corresponding data for the line in the VT100
+ * widget.  Row numbers can be positive or negative.
+ *
+ * If the data comes from the scrollback, defer that to getScrollback().
+ */
+LineData *
+getLineData(TScreen *screen, int row)
+{
+    LineData *result = NULL;
+    ScrnBuf buffer;
+    int max_row = LastRowNumber(screen);
+
+    if (row >= 0) {
+	buffer = screen->visbuf;
+    } else {
+	buffer = NULL;
+	result = getScrollback(screen, row);
+    }
+    if (row >= 0 && row <= max_row) {
+	result = (LineData *) scrnHeadAddr(screen, buffer, (unsigned) row);
+    }
+
+    return result;
+}
+
+/*
+ * Copy line's data, e.g., from one screen buffer to another, given the preset
+ * pointers for the destination.
+ *
+ * Experimental:
+ * Uses maxLineSize to determine actual storage capacity for preserving data
+ * beyond display width during resize operations.
+ *
+ * TODO: optionally prune unused combining character data from the result.
+ */
+void
+copyLineData(LineData *dst, CLineData *src)
+{
+#if OPT_RESIZE_ADJUST
+    Dimension srcDataSize;
+    Dimension dstStorage;
+    Dimension col;
+    Dimension limit;
+#if OPT_WIDE_CHARS
+    Char comb;
+#endif
+#endif /* OPT_RESIZE_ADJUST */
+
+    if (dst == NULL || src == NULL || dst == src)
+	return;
+
+    dst->bufHead = src->bufHead;
+
+#if OPT_WIDE_CHARS
+    dst->combSize = src->combSize;
+#endif
+
+#if OPT_RESIZE_ADJUST
+    /*
+     * Copy based on maxLineSize to preserve data during resize operations.
+     * When growing back after shrinking, source may have lineSize < maxLineSize
+     * but the data in columns up to maxLineSize should be recovered.
+     */
+    srcDataSize = src->lineSize;
+    if (src->maxLineSize > srcDataSize) {
+	srcDataSize = src->maxLineSize;
+    }
+    dstStorage = dst->lineSize;
+    if (dst->maxLineSize > dstStorage) {
+	dstStorage = dst->maxLineSize;
+    }
+    limit = (dstStorage < srcDataSize) ? dstStorage : srcDataSize;
+
+    for (col = 0; col < limit; ++col) {
+	dst->attribs[col] = src->attribs[col];
+#if OPT_ISO_COLORS
+	dst->color[col] = src->color[col];
+#endif
+	dst->charData[col] = src->charData[col];
+#if OPT_DEC_RECTOPS
+	dst->charSeen[col] = src->charSeen[col];
+	dst->charSets[col] = src->charSets[col];
+#endif
+#if OPT_WIDE_CHARS
+	for (comb = 0; comb < dst->combSize; ++comb) {
+	    dst->combData[comb][col] = src->combData[comb][col];
+	}
+#endif
+    }
+    for (col = limit; col < dstStorage; ++col) {
+	dst->attribs[col] = 0;
+#if OPT_ISO_COLORS
+	dst->color[col] = initCColor;
+#endif
+	dst->charData[col] = 0;
+#if OPT_DEC_RECTOPS
+	dst->charSeen[col] = 0;
+	dst->charSets[col] = 0;
+#endif
+#if OPT_WIDE_CHARS
+	for (comb = 0; comb < dst->combSize; ++comb) {
+	    dst->combData[comb][col] = 0;
+	}
+#endif
+#else
+    /*
+     * Usually we're copying the same-sized line; a memcpy is faster than
+     * several loops.
+     */
+    if (dst->lineSize == src->lineSize) {
+	size_t size = (sizeof(dst->attribs[0])
+#if OPT_ISO_COLORS
+		       + sizeof(dst->color[0])
+#endif
+		       + sizeof(dst->charData[0])
+#if OPT_WIDE_CHARS
+		       + sizeof(dst->combData[0][0]) * dst->combSize
+#endif
+#if OPT_DEC_RECTOPS
+		       + sizeof(dst->charSeen[0])
+		       + sizeof(dst->charSets[0])
+#endif
+	);
+
+	memcpy(dst->attribs, src->attribs, size * dst->lineSize);
+    } else {
+	Dimension col;
+	Dimension limit = ((dst->lineSize < src->lineSize)
+			   ? dst->lineSize
+			   : src->lineSize);
+#if OPT_WIDE_CHARS
+	Char comb;
+#endif
+
+	for (col = 0; col < limit; ++col) {
+	    dst->attribs[col] = src->attribs[col];
+#if OPT_ISO_COLORS
+	    dst->color[col] = src->color[col];
+#endif
+	    dst->charData[col] = src->charData[col];
+#if OPT_DEC_RECTOPS
+	    dst->charSeen[col] = src->charSeen[col];
+	    dst->charSets[col] = src->charSets[col];
+#endif
+#if OPT_WIDE_CHARS
+	    for (comb = 0; comb < dst->combSize; ++comb) {
+		dst->combData[comb][col] = src->combData[comb][col];
+	    }
+#endif
+	}
+	for (col = limit; col < dst->lineSize; ++col) {
+	    dst->attribs[col] = 0;
+#if OPT_ISO_COLORS
+	    dst->color[col] = initCColor;
+#endif
+	    dst->charData[col] = 0;
+#if OPT_DEC_RECTOPS
+	    dst->charSeen[col] = 0;
+	    dst->charSets[col] = 0;
+#endif
+#if OPT_WIDE_CHARS
+	    for (comb = 0; comb < dst->combSize; ++comb) {
+		dst->combData[comb][col] = 0;
+	    }
+#endif
+	}
+#endif /* OPT_RESIZE_ADJUST */
+    }
+}
+
+#if OPT_WIDE_CHARS
+#define initLineExtra(screen) \
+    screen->lineExtra = ((size_t) (screen->max_combining) * sizeof(IChar *)); \
+    screen->cellExtra = ((size_t) (screen->max_combining) * sizeof(IChar))
+#else
+#define initLineExtra(screen) \
+    screen->lineExtra = 0; \
+    screen->cellExtra = 0
+#endif
+
+#define CellDataAddr(screen, data, cell) \
+	( (CellData *)(void *) ((char *)data + (cell * CellDataSize(screen))) )
+#define ConstCellDataAddr(screen, data, cell) \
+	( (const CellData *)(const void *) ( \
+	      (const char *)data + (cell * CellDataSize(screen))) )
+
+void
+initLineData(XtermWidget xw)
+{
+    TScreen *screen = TScreenOf(xw);
+
+    initLineExtra(screen);
+
+#if OPT_WIDE_CHARS
+    TRACE(("initLineData %lu (%d combining chars)\n",
+	   (unsigned long) screen->lineExtra, screen->max_combining));
+#else
+    TRACE(("initLineData\n"));
+#endif
+
+    /*
+     * Per-line size/offsets.
+     */
+    TRACE(("** sizeof(LineData)  %lu\n", (unsigned long) sizeof(LineData)));
+    TRACE(("   offset(lineSize)  %lu\n", (unsigned long) offsetof(LineData, lineSize)));
+    TRACE(("   offset(bufHead)   %lu\n", (unsigned long) offsetof(LineData, bufHead)));
+#if OPT_WIDE_CHARS
+    TRACE(("   offset(combSize)  %lu\n", (unsigned long) offsetof(LineData, combSize)));
+#endif
+#if OPT_DEC_RECTOPS
+    TRACE(("   offset(*charSeen) %lu\n", (unsigned long) offsetof(LineData, charSeen)));
+    TRACE(("   offset(*charSets) %lu\n", (unsigned long) offsetof(LineData, charSets)));
+#endif
+    TRACE(("   offset(*attribs)  %lu\n", (unsigned long) offsetof(LineData, attribs)));
+#if OPT_ISO_COLORS
+    TRACE(("   offset(*color)    %lu\n", (unsigned long) offsetof(LineData, color)));
+#endif
+    TRACE(("   offset(*charData) %lu\n", (unsigned long) offsetof(LineData, charData)));
+    TRACE(("   offset(*combData) %lu\n", (unsigned long) offsetof(LineData, combData)));
+
+    /*
+     * Per-cell size/offsets.
+     */
+    TRACE(("** sizeof(CellData)  %lu\n", (unsigned long) CellDataSize(screen)));
+    TRACE(("   offset(attribs)   %lu\n", (unsigned long) offsetof(CellData, attribs)));
+#if OPT_WIDE_CHARS
+    TRACE(("   offset(combSize)  %lu\n", (unsigned long) offsetof(CellData, combSize)));
+#endif
+#if OPT_DEC_RECTOPS
+    TRACE(("   offset(charSeen)  %lu\n", (unsigned long) offsetof(CellData, charSeen)));
+    TRACE(("   offset(charSets)  %lu\n", (unsigned long) offsetof(CellData, charSets)));
+#endif
+#if OPT_ISO_COLORS
+    TRACE(("   offset(color)     %lu\n", (unsigned long) offsetof(CellData, color)));
+#endif
+    TRACE(("   offset(charData)  %lu\n", (unsigned long) offsetof(CellData, charData)));
+    TRACE(("   offset(combData)  %lu\n", (unsigned long) offsetof(CellData, combData)));
+
+    /*
+     * Data-type sizes.
+     */
+#if OPT_ISO_COLORS
+    TRACE(("** sizeof(CellColor) %lu\n", (unsigned long) sizeof(CellColor)));
+#endif
+    TRACE(("** sizeof(IAttr)     %lu\n", (unsigned long) sizeof(IAttr)));
+    TRACE(("** sizeof(IChar)     %lu\n", (unsigned long) sizeof(IChar)));
+    TRACE(("** sizeof(RowData)   %lu\n", (unsigned long) sizeof(RowData)));
+}
+
+CellData *
+newCellData(XtermWidget xw, Cardinal count)
+{
+    CellData *result;
+    TScreen *screen = TScreenOf(xw);
+
+    initLineExtra(screen);
+    result = (CellData *) calloc((size_t) count, (size_t) CellDataSize(screen));
+    return result;
+}
+
+void
+saveCellData(TScreen *screen,
+	     CellData *data,
+	     Cardinal cell,
+	     CLineData *ld,
+	     XTermRect *limits,
+	     int column)
+{
+    CellData *item = CellDataAddr(screen, data, cell);
+
+    (void) limits;
+    if (column < MaxCols(screen)) {
+	item->attribs = ld->attribs[column];
+	if_OPT_ISO_COLORS(screen, {
+	    item->color = ld->color[column];
+	});
+	if_OPT_DEC_RECTOPS({
+	    item->charSeen = ld->charSeen[column];
+	    item->charData = ld->charData[column];
+	});
+	if_OPT_WIDE_CHARS(screen, {
+	    size_t off;
+	    Bool blank = (((item->charData == HIDDEN_CHAR)
+			   && (limits == NULL
+			       || (column + 1) == limits->left))
+			  || (item->charData != HIDDEN_CHAR
+			      && WideCells(item->charData) > 1
+			      && (limits == NULL
+				  || (column + 1) >= limits->right)));
+	    if (blank) {
+		if_OPT_DEC_RECTOPS(item->charSeen = ' ');
+		item->charData = (CharData) ' ';
+	    }
+	    item->combSize = blank ? 0 : ld->combSize;
+	    if_OPT_DEC_RECTOPS(item->charSets = (blank
+						 ? 0
+						 : ld->charSets[column]));
+	    for_each_combData(off, item) {
+		item->combData[off] = ld->combData[off][column];
+	    }
+	});
+	TRACE2(("SAVED::%s\n", visibleIChars(&(item->charData), 1)));
+    }
+}
+
+void
+restoreCellData(TScreen *screen,
+		const CellData *data,
+		Cardinal cell,
+		LineData *ld,
+		XTermRect *limits,
+		int column)
+{
+    const CellData *item = ConstCellDataAddr(screen, data, cell);
+
+    (void) limits;
+    if (column < MaxCols(screen)) {
+	ld->attribs[column] = item->attribs;
+	TRACE2(("BEFORE:%2d:%s\n", column + 1, visibleIChars(ld->charData, ld->lineSize)));
+	if_OPT_ISO_COLORS(screen, {
+	    ld->color[column] = item->color;
+	});
+	if_OPT_DEC_RECTOPS({
+	    ld->charSeen[column] = item->charSeen;
+	    ld->charSets[column] = item->charSets;
+	});
+	ld->charData[column] = item->charData;
+	if_OPT_WIDE_CHARS(screen, {
+	    size_t off;
+	    ld->combSize = item->combSize;
+	    if_OPT_DEC_RECTOPS(ld->charSets[column] = item->charSets);
+	    for_each_combData(off, ld) {
+		ld->combData[off][column] = item->combData[off];
+	    }
+	});
+	TRACE2(("AFTER::%2d:%s\n", column + 1, visibleIChars(ld->charData, ld->lineSize)));
+    }
+}

@@ -24,9 +24,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use std::prelude::v1::*;
-use eclipse_libc::{getpid, getppid, sleep_ms, ioctl, O_RDWR};
-use eclipse_libc::{send_ipc, receive_ipc, eclipse_open, eclipse_read, eclipse_write};
-use eclipse_libc::{get_system_stats, SystemStats};
+use eclipse_relibc::{getpid, getppid, sleep_ms, ioctl, O_RDWR};
+use eclipse_relibc::{send_ipc, receive_ipc, eclipse_open, eclipse_read, eclipse_write};
+use eclipse_relibc::{get_system_stats, SystemStats};
 use smoltcp::phy::{self, DeviceCapabilities, Medium, Loopback};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address, DnsQueryType, Ipv4Cidr};

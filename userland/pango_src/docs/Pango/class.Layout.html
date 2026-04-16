@@ -1,0 +1,1217 @@
+<!--
+SPDX-FileCopyrightText: Owen Taylor, Behdad Esfahbod
+
+SPDX-License-Identifier: LGPL-2.1-or-later
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Pango.Layout</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta charset="utf-8" />
+
+  
+  <meta property="og:type" content="website"/>
+
+  
+  <meta property="og:image:width" content="256"/>
+  <meta property="og:image:height" content="256"/>
+  <meta property="og:image:secure_url" content="pango-name.png"/>
+  <meta property="og:image:alt" content="Pango-1.0"/>
+  
+
+  
+  <meta property="og:title" content="Pango.Layout"/>
+  <meta property="og:description" content="Reference for Pango.Layout"/>
+  <meta name="twitter:title" content="Pango.Layout"/>
+  <meta name="twitter:description" content="Reference for Pango.Layout"/>
+
+
+  
+  <meta name="twitter:card" content="summary"/>
+
+  
+  
+  
+  
+
+  <link rel="stylesheet" href="style.css" type="text/css" />
+
+  
+
+  
+  <script src="urlmap.js"></script>
+  
+  
+  <script src="fzy.js"></script>
+  <script src="search.js"></script>
+  
+  <script src="main.js"></script>
+
+  
+</head>
+
+<body>
+  <div id="body-wrapper" tabindex="-1">
+
+    <nav class="sidebar devhelp-hidden">
+      
+      <div class="section">
+        <a href="index.html"><img src="pango-name.png" class="logo"/></a>
+      </div>
+      
+      
+      <div class="search section">
+        <form id="search-form" autocomplete="off">
+          <input id="search-input" type="text" name="do-not-autocomplete" placeholder="Click, or press 's' to search" autocomplete="off"/>
+        </form>
+      </div>
+      
+      <div class="section namespace">
+        <h3><a href="index.html">Pango</a></h3>
+        <p>API Version: 1.0</p>
+        
+        <p>Library Version: 1.54.0</p>
+        
+      </div>
+      
+<div class="section">
+  <h5>Type</h5>
+  <div class="links">
+    <a class="current" href="class.Layout.html#description">Layout</a>
+  </div>
+</div>
+
+
+  
+<div class="section">
+  <h5>Constructors</h5>
+  <div class="links">
+  
+    <a class="ctor" href="ctor.Layout.new.html">new</a>
+  
+  </div>
+</div>
+
+
+
+  
+<div class="section">
+  <h5>Functions</h5>
+  <div class="links">
+  
+    <a class="func" href="type_func.Layout.deserialize.html">deserialize</a>
+  
+  </div>
+</div>
+
+
+
+  
+<div class="section">
+  <h5>Instance methods</h5>
+  <div class="links">
+  
+    <a class="method" href="method.Layout.context_changed.html">context_changed</a>
+  
+    <a class="method" href="method.Layout.copy.html">copy</a>
+  
+    <a class="method" href="method.Layout.get_alignment.html">get_alignment</a>
+  
+    <a class="method" href="method.Layout.get_attributes.html">get_attributes</a>
+  
+    <a class="method" href="method.Layout.get_auto_dir.html">get_auto_dir</a>
+  
+    <a class="method" href="method.Layout.get_baseline.html">get_baseline</a>
+  
+    <a class="method" href="method.Layout.get_caret_pos.html">get_caret_pos</a>
+  
+    <a class="method" href="method.Layout.get_character_count.html">get_character_count</a>
+  
+    <a class="method" href="method.Layout.get_context.html">get_context</a>
+  
+    <a class="method" href="method.Layout.get_cursor_pos.html">get_cursor_pos</a>
+  
+    <a class="method" href="method.Layout.get_direction.html">get_direction</a>
+  
+    <a class="method" href="method.Layout.get_ellipsize.html">get_ellipsize</a>
+  
+    <a class="method" href="method.Layout.get_extents.html">get_extents</a>
+  
+    <a class="method" href="method.Layout.get_font_description.html">get_font_description</a>
+  
+    <a class="method" href="method.Layout.get_height.html">get_height</a>
+  
+    <a class="method" href="method.Layout.get_indent.html">get_indent</a>
+  
+    <a class="method" href="method.Layout.get_iter.html">get_iter</a>
+  
+    <a class="method" href="method.Layout.get_justify.html">get_justify</a>
+  
+    <a class="method" href="method.Layout.get_justify_last_line.html">get_justify_last_line</a>
+  
+    <a class="method" href="method.Layout.get_line.html">get_line</a>
+  
+    <a class="method" href="method.Layout.get_line_count.html">get_line_count</a>
+  
+    <a class="method" href="method.Layout.get_line_readonly.html">get_line_readonly</a>
+  
+    <a class="method" href="method.Layout.get_line_spacing.html">get_line_spacing</a>
+  
+    <a class="method" href="method.Layout.get_lines.html">get_lines</a>
+  
+    <a class="method" href="method.Layout.get_lines_readonly.html">get_lines_readonly</a>
+  
+    <a class="method" href="method.Layout.get_log_attrs.html">get_log_attrs</a>
+  
+    <a class="method" href="method.Layout.get_log_attrs_readonly.html">get_log_attrs_readonly</a>
+  
+    <a class="method" href="method.Layout.get_pixel_extents.html">get_pixel_extents</a>
+  
+    <a class="method" href="method.Layout.get_pixel_size.html">get_pixel_size</a>
+  
+    <a class="method" href="method.Layout.get_serial.html">get_serial</a>
+  
+    <a class="method" href="method.Layout.get_single_paragraph_mode.html">get_single_paragraph_mode</a>
+  
+    <a class="method" href="method.Layout.get_size.html">get_size</a>
+  
+    <a class="method" href="method.Layout.get_spacing.html">get_spacing</a>
+  
+    <a class="method" href="method.Layout.get_tabs.html">get_tabs</a>
+  
+    <a class="method" href="method.Layout.get_text.html">get_text</a>
+  
+    <a class="method" href="method.Layout.get_unknown_glyphs_count.html">get_unknown_glyphs_count</a>
+  
+    <a class="method" href="method.Layout.get_width.html">get_width</a>
+  
+    <a class="method" href="method.Layout.get_wrap.html">get_wrap</a>
+  
+    <a class="method" href="method.Layout.index_to_line_x.html">index_to_line_x</a>
+  
+    <a class="method" href="method.Layout.index_to_pos.html">index_to_pos</a>
+  
+    <a class="method" href="method.Layout.is_ellipsized.html">is_ellipsized</a>
+  
+    <a class="method" href="method.Layout.is_wrapped.html">is_wrapped</a>
+  
+    <a class="method" href="method.Layout.move_cursor_visually.html">move_cursor_visually</a>
+  
+    <a class="method" href="method.Layout.serialize.html">serialize</a>
+  
+    <a class="method" href="method.Layout.set_alignment.html">set_alignment</a>
+  
+    <a class="method" href="method.Layout.set_attributes.html">set_attributes</a>
+  
+    <a class="method" href="method.Layout.set_auto_dir.html">set_auto_dir</a>
+  
+    <a class="method" href="method.Layout.set_ellipsize.html">set_ellipsize</a>
+  
+    <a class="method" href="method.Layout.set_font_description.html">set_font_description</a>
+  
+    <a class="method" href="method.Layout.set_height.html">set_height</a>
+  
+    <a class="method" href="method.Layout.set_indent.html">set_indent</a>
+  
+    <a class="method" href="method.Layout.set_justify.html">set_justify</a>
+  
+    <a class="method" href="method.Layout.set_justify_last_line.html">set_justify_last_line</a>
+  
+    <a class="method" href="method.Layout.set_line_spacing.html">set_line_spacing</a>
+  
+    <a class="method" href="method.Layout.set_markup.html">set_markup</a>
+  
+    <a class="method" href="method.Layout.set_markup_with_accel.html">set_markup_with_accel</a>
+  
+    <a class="method" href="method.Layout.set_single_paragraph_mode.html">set_single_paragraph_mode</a>
+  
+    <a class="method" href="method.Layout.set_spacing.html">set_spacing</a>
+  
+    <a class="method" href="method.Layout.set_tabs.html">set_tabs</a>
+  
+    <a class="method" href="method.Layout.set_text.html">set_text</a>
+  
+    <a class="method" href="method.Layout.set_width.html">set_width</a>
+  
+    <a class="method" href="method.Layout.set_wrap.html">set_wrap</a>
+  
+    <a class="method" href="method.Layout.write_to_file.html">write_to_file</a>
+  
+    <a class="method" href="method.Layout.xy_to_index.html">xy_to_index</a>
+  
+  </div>
+</div>
+
+
+
+  
+
+
+  
+
+
+  
+
+
+  
+
+
+
+      <div class="section generator">
+        <p>Generated by <a href="https://gitlab.gnome.org/GNOME/gi-docgen">gi-docgen</a> 2024.1</p>
+      </div>
+    </nav>
+
+    <button id="btn-to-top" class="hidden"><span class="up-arrow"></span></button>
+
+    
+<section id="main" class="content">
+  <header>
+    <h3>Class</h3>
+    <h1 aria-label="Name"><a href="index.html">Pango</a><span class="sep" role="presentation"></span>Layout</h1>
+  </header>
+
+  <section>
+    <summary>
+      <div class="docblock">
+        <p></p>
+      </div>
+
+      <div class="toggle-wrapper">
+        <h4 id="description" style="display:flex;">
+          Description
+          <a href="#description" class="anchor"></a>
+          
+          <a class="srclink" title="go to source location" href="https://gitlab.gnome.org/GNOME/pango/-/blob/main/pango/pango-layout.c#L22">[src]</a>
+          
+        </h4>
+
+        <pre><code>final class Pango.Layout : GObject.Object
+{
+  /* No available fields */
+}</pre></code>
+
+        <div class="docblock">
+          <p>A <code>PangoLayout</code> structure represents an entire paragraph of&nbsp;text.</p>
+<p>While complete access to the layout capabilities of Pango is provided
+using the detailed interfaces for itemization and shaping, using
+that functionality directly involves writing a fairly large amount
+of code. <code>PangoLayout</code> provides a high-level driver for formatting
+entire paragraphs of text at once. This includes paragraph-level
+functionality such as line breaking, justification, alignment and&nbsp;ellipsization.</p>
+<p>A <code>PangoLayout</code> is initialized with a <code>PangoContext</code>, <span class="caps">UTF</span>-8 string
+and set of attributes for that string. Once that is done, the set of
+formatted lines can be extracted from the object, the layout can be
+rendered, and conversion between logical character positions within
+the layout&#8217;s text, and the physical position of the resulting glyphs
+can be&nbsp;made.</p>
+<p>There are a number of parameters to adjust the formatting of a
+<code>PangoLayout</code>. The following image shows adjustable parameters
+(on the left) and font metrics (on the&nbsp;right):</p>
+<p><picture>
+  <source srcset="layout-dark.png" media="(prefers-color-scheme: dark)">
+  <img alt="Pango Layout Parameters" src="layout-light.png">
+</picture></p>
+<p>The following images demonstrate the effect of alignment and
+justification on the layout of&nbsp;text:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><img alt="align=left" src="align-left.png" /></td>
+<td><img alt="align=left, justify" src="align-left-justify.png" /></td>
+</tr>
+<tr>
+<td><img alt="align=center" src="align-center.png" /></td>
+<td><img alt="align=center, justify" src="align-center-justify.png" /></td>
+</tr>
+<tr>
+<td><img alt="align=right" src="align-right.png" /></td>
+<td><img alt="align=right, justify" src="align-right-justify.png" /></td>
+</tr>
+</tbody>
+</table>
+<p>It is possible, as well, to ignore the 2-D setup,
+and simply treat the results of a <code>PangoLayout</code> as a list of&nbsp;lines.</p>
+        </div>
+
+        <div class="docblock">
+          
+          
+          
+        </div>
+
+        
+      </div>
+    </summary>
+
+    
+
+    
+    <div class="toggle-wrapper ancestors">
+      <h4 id="ancestors">
+        Ancestors
+        <a href="#ancestors" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+        <ul>
+        
+          
+          <li class="class"><a class="external" href="javascript:void(0)" data-link="class.Object.html" data-namespace="GObject">GObject</a></li>
+          
+        
+        </ul>
+      </div>
+    </div>
+    
+
+    
+
+    
+
+    
+    <div class="toggle-wrapper constructors">
+      <h4 id="constructors">
+        Constructors
+        <a href="#constructors" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+        <div class="">
+          <h6><a href="ctor.Layout.new.html">pango_layout_new</a></h6>
+          <div class="docblock">
+            <p>Create a new <code>PangoLayout</code> object with attributes initialized to
+default values for a particular <code>PangoContext</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+      </div>
+    </div>
+    
+
+    
+    <div class="toggle-wrapper methods">
+      <h4 id="type-functions">
+        Functions
+        <a href="#type-functions" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+      <div class="">
+        <h6><a href="type_func.Layout.deserialize.html">pango_layout_deserialize</a></h6>
+        <div class="docblock">
+          <p>Loads data previously created via <code>pango_layout_serialize()</code>.</p>
+        </div>
+        <div class="docblock">
+          <p><span class="emblem available">since: 1.50</span></p>
+        </div>
+      </div>
+      
+      </div>
+    </div>
+    
+
+    
+    <div class="toggle-wrapper methods">
+      <h4 id="methods">
+        Instance methods
+        <a href="#methods" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+        <div class="">
+          <h6><a href="method.Layout.context_changed.html">pango_layout_context_changed</a></h6>
+          <div class="docblock">
+            <p>Forces recomputation of any state in the <code>PangoLayout</code> that
+might depend on the layout&#8217;s&nbsp;context.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.copy.html">pango_layout_copy</a></h6>
+          <div class="docblock">
+            <p>Creates a deep copy-by-value of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_alignment.html">pango_layout_get_alignment</a></h6>
+          <div class="docblock">
+            <p>Gets the alignment for the layout: how partial lines are
+positioned within the horizontal space&nbsp;available.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_attributes.html">pango_layout_get_attributes</a></h6>
+          <div class="docblock">
+            <p>Gets the attribute list for the layout, if&nbsp;any.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_auto_dir.html">pango_layout_get_auto_dir</a></h6>
+          <div class="docblock">
+            <p>Gets whether to calculate the base direction for the layout
+according to its&nbsp;contents.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.4</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_baseline.html">pango_layout_get_baseline</a></h6>
+          <div class="docblock">
+            <p>Gets the Y position of baseline of the first line in <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.22</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_caret_pos.html">pango_layout_get_caret_pos</a></h6>
+          <div class="docblock">
+            <p>Given an index within a layout, determines the positions that of the
+strong and weak cursors if the insertion point is at that&nbsp;index.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.50</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_character_count.html">pango_layout_get_character_count</a></h6>
+          <div class="docblock">
+            <p>Returns the number of Unicode characters in the
+the text of <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.30</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_context.html">pango_layout_get_context</a></h6>
+          <div class="docblock">
+            <p>Retrieves the <code>PangoContext</code> used for this&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_cursor_pos.html">pango_layout_get_cursor_pos</a></h6>
+          <div class="docblock">
+            <p>Given an index within a layout, determines the positions that of the
+strong and weak cursors if the insertion point is at that&nbsp;index.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_direction.html">pango_layout_get_direction</a></h6>
+          <div class="docblock">
+            <p>Gets the text direction at the given character position in <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.46</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_ellipsize.html">pango_layout_get_ellipsize</a></h6>
+          <div class="docblock">
+            <p>Gets the type of ellipsization being performed for <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.6</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_extents.html">pango_layout_get_extents</a></h6>
+          <div class="docblock">
+            <p>Computes the logical and ink extents of <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_font_description.html">pango_layout_get_font_description</a></h6>
+          <div class="docblock">
+            <p>Gets the font description for the layout, if&nbsp;any.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.8</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_height.html">pango_layout_get_height</a></h6>
+          <div class="docblock">
+            <p>Gets the height of layout used for&nbsp;ellipsization.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.20</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_indent.html">pango_layout_get_indent</a></h6>
+          <div class="docblock">
+            <p>Gets the paragraph indent width in Pango&nbsp;units.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_iter.html">pango_layout_get_iter</a></h6>
+          <div class="docblock">
+            <p>Returns an iterator to iterate over the visual extents of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_justify.html">pango_layout_get_justify</a></h6>
+          <div class="docblock">
+            <p>Gets whether each complete line should be stretched to fill the entire
+width of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_justify_last_line.html">pango_layout_get_justify_last_line</a></h6>
+          <div class="docblock">
+            <p>Gets whether the last line should be stretched
+to fill the entire width of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.50</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_line.html">pango_layout_get_line</a></h6>
+          <div class="docblock">
+            <p>Retrieves a particular line from a <code>PangoLayout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_line_count.html">pango_layout_get_line_count</a></h6>
+          <div class="docblock">
+            <p>Retrieves the count of lines for the <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_line_readonly.html">pango_layout_get_line_readonly</a></h6>
+          <div class="docblock">
+            <p>Retrieves a particular line from a <code>PangoLayout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_line_spacing.html">pango_layout_get_line_spacing</a></h6>
+          <div class="docblock">
+            <p>Gets the line spacing factor of <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.44</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_lines.html">pango_layout_get_lines</a></h6>
+          <div class="docblock">
+            <p>Returns the lines of the <code>layout</code> as a&nbsp;list.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_lines_readonly.html">pango_layout_get_lines_readonly</a></h6>
+          <div class="docblock">
+            <p>Returns the lines of the <code>layout</code> as a&nbsp;list.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_log_attrs.html">pango_layout_get_log_attrs</a></h6>
+          <div class="docblock">
+            <p>Retrieves an array of logical attributes for each character in
+the <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_log_attrs_readonly.html">pango_layout_get_log_attrs_readonly</a></h6>
+          <div class="docblock">
+            <p>Retrieves an array of logical attributes for each character in
+the <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.30</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_pixel_extents.html">pango_layout_get_pixel_extents</a></h6>
+          <div class="docblock">
+            <p>Computes the logical and ink extents of <code>layout</code> in device&nbsp;units.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_pixel_size.html">pango_layout_get_pixel_size</a></h6>
+          <div class="docblock">
+            <p>Determines the logical width and height of a <code>PangoLayout</code> in device&nbsp;units.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_serial.html">pango_layout_get_serial</a></h6>
+          <div class="docblock">
+            <p>Returns the current serial number of <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.32.4</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_single_paragraph_mode.html">pango_layout_get_single_paragraph_mode</a></h6>
+          <div class="docblock">
+            <p>Obtains whether <code>layout</code> is in single paragraph&nbsp;mode.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_size.html">pango_layout_get_size</a></h6>
+          <div class="docblock">
+            <p>Determines the logical width and height of a <code>PangoLayout</code> in Pango&nbsp;units.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_spacing.html">pango_layout_get_spacing</a></h6>
+          <div class="docblock">
+            <p>Gets the amount of spacing between the lines of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_tabs.html">pango_layout_get_tabs</a></h6>
+          <div class="docblock">
+            <p>Gets the current <code>PangoTabArray</code> used by this&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_text.html">pango_layout_get_text</a></h6>
+          <div class="docblock">
+            <p>Gets the text in the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_unknown_glyphs_count.html">pango_layout_get_unknown_glyphs_count</a></h6>
+          <div class="docblock">
+            <p>Counts the number of unknown glyphs in <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_width.html">pango_layout_get_width</a></h6>
+          <div class="docblock">
+            <p>Gets the width to which the lines of the <code>PangoLayout</code> should&nbsp;wrap.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.get_wrap.html">pango_layout_get_wrap</a></h6>
+          <div class="docblock">
+            <p>Gets the wrap mode for the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.index_to_line_x.html">pango_layout_index_to_line_x</a></h6>
+          <div class="docblock">
+            <p>Converts from byte <code>index_</code> within the <code>layout</code> to line and X&nbsp;position.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.index_to_pos.html">pango_layout_index_to_pos</a></h6>
+          <div class="docblock">
+            <p>Converts from an index within a <code>PangoLayout</code> to the onscreen position
+corresponding to the grapheme at that&nbsp;index.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.is_ellipsized.html">pango_layout_is_ellipsized</a></h6>
+          <div class="docblock">
+            <p>Queries whether the layout had to ellipsize any&nbsp;paragraphs.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.is_wrapped.html">pango_layout_is_wrapped</a></h6>
+          <div class="docblock">
+            <p>Queries whether the layout had to wrap any&nbsp;paragraphs.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.move_cursor_visually.html">pango_layout_move_cursor_visually</a></h6>
+          <div class="docblock">
+            <p>Computes a new cursor position from an old position and a&nbsp;direction.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.serialize.html">pango_layout_serialize</a></h6>
+          <div class="docblock">
+            <p>Serializes the <code>layout</code> for later deserialization via <code>pango_layout_deserialize()</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.50</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_alignment.html">pango_layout_set_alignment</a></h6>
+          <div class="docblock">
+            <p>Sets the alignment for the layout: how partial lines are
+positioned within the horizontal space&nbsp;available.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_attributes.html">pango_layout_set_attributes</a></h6>
+          <div class="docblock">
+            <p>Sets the text attributes for a layout&nbsp;object.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_auto_dir.html">pango_layout_set_auto_dir</a></h6>
+          <div class="docblock">
+            <p>Sets whether to calculate the base direction
+for the layout according to its&nbsp;contents.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.4</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_ellipsize.html">pango_layout_set_ellipsize</a></h6>
+          <div class="docblock">
+            <p>Sets the type of ellipsization being performed for <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.6</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_font_description.html">pango_layout_set_font_description</a></h6>
+          <div class="docblock">
+            <p>Sets the default font description for the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_height.html">pango_layout_set_height</a></h6>
+          <div class="docblock">
+            <p>Sets the height to which the <code>PangoLayout</code> should be ellipsized&nbsp;at.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.20</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_indent.html">pango_layout_set_indent</a></h6>
+          <div class="docblock">
+            <p>Sets the width in Pango units to indent each&nbsp;paragraph.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_justify.html">pango_layout_set_justify</a></h6>
+          <div class="docblock">
+            <p>Sets whether each complete line should be stretched to fill the
+entire width of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_justify_last_line.html">pango_layout_set_justify_last_line</a></h6>
+          <div class="docblock">
+            <p>Sets whether the last line should be stretched to fill the
+entire width of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.50</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_line_spacing.html">pango_layout_set_line_spacing</a></h6>
+          <div class="docblock">
+            <p>Sets a factor for line&nbsp;spacing.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.44</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_markup.html">pango_layout_set_markup</a></h6>
+          <div class="docblock">
+            <p>Sets the layout text and attribute list from marked-up&nbsp;text.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_markup_with_accel.html">pango_layout_set_markup_with_accel</a></h6>
+          <div class="docblock">
+            <p>Sets the layout text and attribute list from marked-up&nbsp;text.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_single_paragraph_mode.html">pango_layout_set_single_paragraph_mode</a></h6>
+          <div class="docblock">
+            <p>Sets the single paragraph mode of <code>layout</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_spacing.html">pango_layout_set_spacing</a></h6>
+          <div class="docblock">
+            <p>Sets the amount of spacing in Pango units between
+the lines of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_tabs.html">pango_layout_set_tabs</a></h6>
+          <div class="docblock">
+            <p>Sets the tabs to use for <code>layout</code>, overriding the default&nbsp;tabs.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_text.html">pango_layout_set_text</a></h6>
+          <div class="docblock">
+            <p>Sets the text of the&nbsp;layout.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_width.html">pango_layout_set_width</a></h6>
+          <div class="docblock">
+            <p>Sets the width to which the lines of the <code>PangoLayout</code> should wrap or&nbsp;ellipsized.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.set_wrap.html">pango_layout_set_wrap</a></h6>
+          <div class="docblock">
+            <p>Sets the wrap&nbsp;mode.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.write_to_file.html">pango_layout_write_to_file</a></h6>
+          <div class="docblock">
+            <p>A convenience method to serialize a layout to a&nbsp;file.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.50</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.Layout.xy_to_index.html">pango_layout_xy_to_index</a></h6>
+          <div class="docblock">
+            <p>Converts from X and Y position within a layout to the byte index to the
+character at that logical&nbsp;position.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+      </div>
+
+      
+        
+        <div class="toggle-wrapper default-hide ancestor-methods"><h5 style="display:block;">Methods inherited from <a class="external" href="javascript:void(0)" data-link="class.Object.html" data-namespace="GObject">GObject</a> (43)</h5>
+          <div class="docblock">
+          
+            <div class="docblock">
+              <p>Please see&nbsp;<a class="external" href="javascript:void(0)" data-link="class.Object.html#methods" data-namespace="GObject">GObject</a>&nbsp;for a full list of methods.</em></p>
+            </div>
+          
+          </div>
+        </div>
+        
+      
+
+      
+    </div>
+    
+
+    
+
+    
+    <div class="signals toggle-wrapper">
+      <h4 id="signals">
+        Signals
+        <a href="#signals" class="anchor"></a>
+      </h4>
+
+      
+
+      
+        
+        <div class="toggle-wrapper default-hide ancestor-signals"><h5 style="display:block;">Signals inherited from <a class="external" href="javascript:void(0)" data-link="class.Object.html" data-namespace="GObject">GObject</a> (1)</h5>
+          <div class="docblock">
+          <h6><a class="external" href="javascript:void(0)" data-namespace="GObject" data-link="signal.Object.notify.html">GObject::notify</a></h6>
+            <div class="docblock">
+              <p>The notify signal is emitted on an object when one of its properties has
+its value set through g_object_set_property(), g_object_set(), et&nbsp;al.</p>
+            </div>
+          </div>
+        </div>
+        
+      
+
+      
+
+    </div>
+    
+
+    
+    <div class="class toggle-wrapper default-hide">
+      <h4 id="class-struct">
+        Class structure
+        <a href="#class-struct" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+        <pre><code>struct PangoLayoutClass {
+  /* no available fields */
+}</code></pre>
+      </div>
+
+      <div class="docblock">
+        <p>No description available.</p>
+      </div>
+
+      
+    </div>
+    
+
+    
+
+    
+
+  </section>
+</section>
+
+
+    
+<div id="toc" class="toc">
+  <nav aria-labelledby="toc-title">
+    <p id="toc-title">Content</p>
+    <ul class="toc-list">
+      <li class="toc-list-item"><a href="#description"><span class="link-text">Description</span></a></li>
+      
+      
+      
+      <li class="toc-list-item"><a href="#ancestors"><span class="link-text">Ancestors</span></a></li>
+      
+      
+      
+<li class="toc-list-item"><a href="#constructors"><span class="link-text">Constructors</span></a></li>
+
+
+      
+<li class="toc-list-item"><a href="#type-functions"><span class="link-text">Functions</span></a></li>
+
+
+      
+<li class="toc-list-item"><a href="#methods"><span class="link-text">Methods</span></a></li>
+
+
+      
+
+      
+
+      
+
+      
+
+    </ul>
+  </nav>
+</div>
+
+
+    <section id="search" class="content hidden"></section>
+
+    <footer>
+    
+    </footer>
+  </div>
+</body>
+</html>

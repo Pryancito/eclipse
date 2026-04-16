@@ -1,0 +1,75 @@
+libglib_2_0_la-gslice.lo: gslice.c ../config.h glibconfig.h \
+ ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/stdio.h gslice.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h gmain.h ../glib/gpoll.h \
+ ../glib/gslist.h ../glib/gmem.h ../glib/gnode.h ../glib/gthread.h \
+ ../glib/gatomic.h ../glib/gerror.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gquark.h gmem.h \
+ gstrfuncs.h gutils.h gtrashstack.h ../glib/gutils.h gtestutils.h \
+ ../glib/gmessages.h ../glib/gstring.h ../glib/gunicode.h \
+ ../glib/gbytes.h ../glib/garray.h gthread.h glib_trace.h valgrind.h \
+ /usr/include/x86_64-linux-musl/malloc.h
+../config.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+gslice.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+gmain.h:
+../glib/gpoll.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+../glib/gthread.h:
+../glib/gatomic.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+gmem.h:
+gstrfuncs.h:
+gutils.h:
+gtrashstack.h:
+../glib/gutils.h:
+gtestutils.h:
+../glib/gmessages.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gbytes.h:
+../glib/garray.h:
+gthread.h:
+glib_trace.h:
+valgrind.h:
+/usr/include/x86_64-linux-musl/malloc.h:

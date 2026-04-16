@@ -1,0 +1,41 @@
+glthread/libgrt_a-lock.o: glthread/lock.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h glthread/lock.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h alloca.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h glthread/once.h \
+ /usr/include/x86_64-linux-musl/threads.h time.h \
+ /usr/include/x86_64-linux-musl/time.h pthread.h \
+ /usr/include/x86_64-linux-musl/pthread.h sched.h \
+ /usr/include/x86_64-linux-musl/sched.h sys/types.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+glthread/lock.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+alloca.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+glthread/once.h:
+/usr/include/x86_64-linux-musl/threads.h:
+time.h:
+/usr/include/x86_64-linux-musl/time.h:
+pthread.h:
+/usr/include/x86_64-linux-musl/pthread.h:
+sched.h:
+/usr/include/x86_64-linux-musl/sched.h:
+sys/types.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:

@@ -1,0 +1,77 @@
+src/tramp.lo: ../src/tramp.c \
+ /home/moebius/eclipse/host-toolchains/include/stdc-predef.h fficonfig.h \
+ include/ffi.h include/ffitarget.h \
+ /home/moebius/eclipse/host-toolchains/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/alltypes.h \
+ /home/moebius/eclipse/host-toolchains/include/limits.h \
+ /home/moebius/eclipse/host-toolchains/include/features.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/limits.h \
+ ../include/ffi_common.h \
+ /home/moebius/eclipse/host-toolchains/include/alloca.h \
+ /home/moebius/eclipse/host-toolchains/include/string.h \
+ /home/moebius/eclipse/host-toolchains/include/strings.h \
+ /home/moebius/eclipse/host-toolchains/include/stdio.h \
+ /home/moebius/eclipse/host-toolchains/include/unistd.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/posix.h \
+ /home/moebius/eclipse/host-toolchains/include/stdlib.h \
+ /home/moebius/eclipse/host-toolchains/include/stdint.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/stdint.h \
+ /home/moebius/eclipse/host-toolchains/include/fcntl.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/fcntl.h \
+ /home/moebius/eclipse/host-toolchains/include/pthread.h \
+ /home/moebius/eclipse/host-toolchains/include/sched.h \
+ /home/moebius/eclipse/host-toolchains/include/time.h \
+ /home/moebius/eclipse/host-toolchains/include/sys/mman.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/mman.h \
+ ../include/tramp.h \
+ /home/moebius/eclipse/host-toolchains/include/linux/limits.h \
+ /home/moebius/eclipse/host-toolchains/include/linux/types.h \
+ /home/moebius/eclipse/host-toolchains/include/asm/types.h \
+ /home/moebius/eclipse/host-toolchains/include/asm-generic/types.h \
+ /home/moebius/eclipse/host-toolchains/include/asm-generic/int-ll64.h \
+ /home/moebius/eclipse/host-toolchains/include/asm/bitsperlong.h \
+ /home/moebius/eclipse/host-toolchains/include/asm-generic/bitsperlong.h \
+ /home/moebius/eclipse/host-toolchains/include/linux/posix_types.h \
+ /home/moebius/eclipse/host-toolchains/include/linux/stddef.h \
+ /home/moebius/eclipse/host-toolchains/include/asm/posix_types.h \
+ /home/moebius/eclipse/host-toolchains/include/asm/posix_types_64.h \
+ /home/moebius/eclipse/host-toolchains/include/asm-generic/posix_types.h
+/home/moebius/eclipse/host-toolchains/include/stdc-predef.h:
+fficonfig.h:
+include/ffi.h:
+include/ffitarget.h:
+/home/moebius/eclipse/host-toolchains/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/include/bits/alltypes.h:
+/home/moebius/eclipse/host-toolchains/include/limits.h:
+/home/moebius/eclipse/host-toolchains/include/features.h:
+/home/moebius/eclipse/host-toolchains/include/bits/limits.h:
+../include/ffi_common.h:
+/home/moebius/eclipse/host-toolchains/include/alloca.h:
+/home/moebius/eclipse/host-toolchains/include/string.h:
+/home/moebius/eclipse/host-toolchains/include/strings.h:
+/home/moebius/eclipse/host-toolchains/include/stdio.h:
+/home/moebius/eclipse/host-toolchains/include/unistd.h:
+/home/moebius/eclipse/host-toolchains/include/bits/posix.h:
+/home/moebius/eclipse/host-toolchains/include/stdlib.h:
+/home/moebius/eclipse/host-toolchains/include/stdint.h:
+/home/moebius/eclipse/host-toolchains/include/bits/stdint.h:
+/home/moebius/eclipse/host-toolchains/include/fcntl.h:
+/home/moebius/eclipse/host-toolchains/include/bits/fcntl.h:
+/home/moebius/eclipse/host-toolchains/include/pthread.h:
+/home/moebius/eclipse/host-toolchains/include/sched.h:
+/home/moebius/eclipse/host-toolchains/include/time.h:
+/home/moebius/eclipse/host-toolchains/include/sys/mman.h:
+/home/moebius/eclipse/host-toolchains/include/bits/mman.h:
+../include/tramp.h:
+/home/moebius/eclipse/host-toolchains/include/linux/limits.h:
+/home/moebius/eclipse/host-toolchains/include/linux/types.h:
+/home/moebius/eclipse/host-toolchains/include/asm/types.h:
+/home/moebius/eclipse/host-toolchains/include/asm-generic/types.h:
+/home/moebius/eclipse/host-toolchains/include/asm-generic/int-ll64.h:
+/home/moebius/eclipse/host-toolchains/include/asm/bitsperlong.h:
+/home/moebius/eclipse/host-toolchains/include/asm-generic/bitsperlong.h:
+/home/moebius/eclipse/host-toolchains/include/linux/posix_types.h:
+/home/moebius/eclipse/host-toolchains/include/linux/stddef.h:
+/home/moebius/eclipse/host-toolchains/include/asm/posix_types.h:
+/home/moebius/eclipse/host-toolchains/include/asm/posix_types_64.h:
+/home/moebius/eclipse/host-toolchains/include/asm-generic/posix_types.h:

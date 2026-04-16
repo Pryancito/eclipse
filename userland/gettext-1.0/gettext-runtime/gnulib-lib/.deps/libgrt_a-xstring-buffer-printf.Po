@@ -1,0 +1,48 @@
+libgrt_a-xstring-buffer-printf.o: xstring-buffer-printf.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h string-buffer.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h alloca.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h attribute.h string-desc.h \
+ stdio.h /usr/include/x86_64-linux-musl/stdio.h sys/types.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h idx.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h xalloc.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+string-buffer.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+alloca.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+attribute.h:
+string-desc.h:
+stdio.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+sys/types.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+idx.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+xalloc.h:

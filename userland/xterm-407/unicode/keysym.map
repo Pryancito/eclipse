@@ -1,0 +1,67 @@
+# $XTermId: keysym.map,v 1.12 2025/03/26 08:00:13 tom Exp $
+#
+# This list can be used to convert X11 Keysyms to Unicode 2.1 character.
+# The list is not checked for correctness by Unicode officials.  Use it
+# at your own risk and the creator is not responsible for any damage that
+# occurred due to using this list.
+#
+# The list is created by looking at the Keysym names and the Unicode data
+# file.  Other mapping tables were used as a reference where needed.
+# Due to a lack of knowledge of the Hebrew, Thai and Hangul symbols,
+# expect errors in these sections.  The mapping of the keypad keys
+# might also require some adjustments.
+#
+# The following fields are used:
+# 1    The X11 keysym numbers from the include file keysymdef.h
+# 2    The Unicode (2.1) position (U0000 means unknown Unicode position)
+# #
+# 3    the name of the X11 keysym (without XK_)
+#
+# Authors:  Richard Verhoeven, TUE, <river@win.tue.nl>
+#           Markus Kuhn, University of Cambridge, <mkuhn@acm.org>
+#
+# You are free to use and modify this table.  If you introduce errors
+# in the table, please remove the copyright line. If you remove errors,
+# please let me know, so I can update my version.
+#
+# $XFree86: xc/programs/xterm/unicode/keysym.map,v 1.1 1999/06/12 15:37:24 dawes Exp $
+#
+0x09df     U2422  # blank
+0x13a4     U20ac  # Euro
+0x20a0     U20a0  # EcuSign
+0x20a1     U20a1  # ColonSign
+0x20a2     U20a2  # CruzeiroSign
+0x20a3     U20a3  # FFrancSign
+0x20a4     U20a4  # LiraSign
+0x20a5     U20a5  # MillSign
+0x20a6     U20a6  # NairaSign
+0x20a7     U20a7  # PesetaSign
+0x20a8     U20a8  # RupeeSign
+0x20a9     U20a9  # WonSign
+0x20aa     U20aa  # NewSheqelSign
+0x20ab     U20ab  # DongSign
+0xfe50     U0300  # dead_grave
+0xfe51     U0301  # dead_acute
+0xfe52     U0302  # dead_circumflex
+0xfe53     U0303  # dead_tilde
+0xfe54     U0304  # dead_macron
+0xfe55     U0306  # dead_breve
+0xfe56     U0307  # dead_abovedot
+0xfe57     U0308  # dead_diaeresis
+0xfe58     U030a  # dead_abovering
+0xfe59     U030b  # dead_doubleacute
+0xfe5a     U030c  # dead_caron
+0xfe5b     U0327  # dead_cedilla
+0xfe5c     U0328  # dead_ogonek
+0xfe5d     U0345  # dead_iota
+0xfe5e     U3099  # dead_voiced_sound
+0xfe5f     U309a  # dead_semivoiced_sound
+0xff08     U0008  # BackSpace	/* back space, back char */
+0xff09     U0009  # Tab
+0xff0a     U000a  # Linefeed	/* Linefeed, LF */
+0xff0b     U000b  # Clear
+0xff0d     U000d  # Return	/* Return, enter */
+0xff13     U0013  # Pause	/* Pause, hold */
+0xff14     U0014  # Scroll_Lock
+0xff15     U0015  # Sys_Req
+0xff1b     U001b  # Escape

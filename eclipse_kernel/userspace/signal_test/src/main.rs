@@ -9,14 +9,14 @@ extern "C" fn handle_sigusr1(_signum: u32) {
 
 fn main() {
     println!("=== SIGNAL TEST START ===");
-    let pid = unsafe { std::libc::getpid() };
+    let pid = unsafe { libc::getpid() };
     println!("My PID is: {}", pid);
 
-    println!("Registering handler for SIGUSR1 ({})", std::libc::SIGUSR1);
-    unsafe { std::libc::sigaction(std::libc::SIGUSR1, handle_sigusr1); }
+    println!("Registering handler for SIGUSR1 ({})", libc::SIGUSR1);
+    unsafe { libc::sigaction(libc::SIGUSR1, handle_sigusr1); }
 
     println!("Sending SIGUSR1 to myself...");
-    unsafe { std::libc::kill(pid, std::libc::SIGUSR1); }
+    unsafe { libc::kill(pid, libc::SIGUSR1); }
 
     println!("Waiting for signal...");
     // Give some time for the signal to be delivered.
@@ -30,9 +30,9 @@ fn main() {
 
     if SIGNAL_RECEIVED.load(Ordering::Acquire) {
         println!("SUCCESS: Signal handler was executed!");
-        unsafe { std::libc::exit(0); }
+        unsafe { libc::exit(0); }
     } else {
         println!("FAILURE: Signal handler was NOT executed.");
-        unsafe { std::libc::exit(1); }
+        unsafe { libc::exit(1); }
     }
 }

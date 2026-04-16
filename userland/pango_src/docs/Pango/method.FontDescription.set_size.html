@@ -1,0 +1,280 @@
+<!--
+SPDX-FileCopyrightText: Owen Taylor, Behdad Esfahbod
+
+SPDX-License-Identifier: LGPL-2.1-or-later
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Pango.FontDescription.set_size</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta charset="utf-8" />
+
+  
+  <meta property="og:type" content="website"/>
+
+  
+  <meta property="og:image:width" content="256"/>
+  <meta property="og:image:height" content="256"/>
+  <meta property="og:image:secure_url" content="pango-name.png"/>
+  <meta property="og:image:alt" content="Pango-1.0"/>
+  
+
+  
+  <meta priority="og:title" content="Pango.FontDescription.set_size"/>
+  <meta priority="og:description" content="Reference for Pango.FontDescription.set_size"/>
+  <meta name="twitter:title" content="Pango.FontDescription.set_size"/>
+  <meta name="twitter:description" content="Reference for Pango.FontDescription.set_size"/>
+
+
+  
+  <meta name="twitter:card" content="summary"/>
+
+  
+  
+  
+  
+
+  <link rel="stylesheet" href="style.css" type="text/css" />
+
+  
+
+  
+  <script src="urlmap.js"></script>
+  
+  
+  <script src="fzy.js"></script>
+  <script src="search.js"></script>
+  
+  <script src="main.js"></script>
+
+  
+</head>
+
+<body>
+  <div id="body-wrapper" tabindex="-1">
+
+    <nav class="sidebar devhelp-hidden">
+      
+      <div class="section">
+        <a href="index.html"><img src="pango-name.png" class="logo"/></a>
+      </div>
+      
+      
+      <div class="search section">
+        <form id="search-form" autocomplete="off">
+          <input id="search-input" type="text" name="do-not-autocomplete" placeholder="Click, or press 's' to search" autocomplete="off"/>
+        </form>
+      </div>
+      
+      <div class="section namespace">
+        <h3><a href="index.html">Pango</a></h3>
+        <p>API Version: 1.0</p>
+        
+        <p>Library Version: 1.54.0</p>
+        
+      </div>
+      
+<div class="section">
+  <h5>Type</h5>
+  <div class="links">
+    <a href="struct.FontDescription.html">FontDescription</a>
+  </div>
+</div>
+<div class="section">
+  <h5>Methods</h5>
+  <div class="links">
+  
+    <a class="method" href="method.FontDescription.better_match.html">better_match</a>
+  
+    <a class="method" href="method.FontDescription.copy.html">copy</a>
+  
+    <a class="method" href="method.FontDescription.copy_static.html">copy_static</a>
+  
+    <a class="method" href="method.FontDescription.equal.html">equal</a>
+  
+    <a class="method" href="method.FontDescription.free.html">free</a>
+  
+    <a class="method" href="method.FontDescription.get_family.html">get_family</a>
+  
+    <a class="method" href="method.FontDescription.get_gravity.html">get_gravity</a>
+  
+    <a class="method" href="method.FontDescription.get_set_fields.html">get_set_fields</a>
+  
+    <a class="method" href="method.FontDescription.get_size.html">get_size</a>
+  
+    <a class="method" href="method.FontDescription.get_size_is_absolute.html">get_size_is_absolute</a>
+  
+    <a class="method" href="method.FontDescription.get_stretch.html">get_stretch</a>
+  
+    <a class="method" href="method.FontDescription.get_style.html">get_style</a>
+  
+    <a class="method" href="method.FontDescription.get_variant.html">get_variant</a>
+  
+    <a class="method" href="method.FontDescription.get_variations.html">get_variations</a>
+  
+    <a class="method" href="method.FontDescription.get_weight.html">get_weight</a>
+  
+    <a class="method" href="method.FontDescription.hash.html">hash</a>
+  
+    <a class="method" href="method.FontDescription.merge.html">merge</a>
+  
+    <a class="method" href="method.FontDescription.merge_static.html">merge_static</a>
+  
+    <a class="method" href="method.FontDescription.set_absolute_size.html">set_absolute_size</a>
+  
+    <a class="method" href="method.FontDescription.set_family.html">set_family</a>
+  
+    <a class="method" href="method.FontDescription.set_family_static.html">set_family_static</a>
+  
+    <a class="method" href="method.FontDescription.set_gravity.html">set_gravity</a>
+  
+    <a class="method current" href="method.FontDescription.set_size.html">set_size</a>
+  
+    <a class="method" href="method.FontDescription.set_stretch.html">set_stretch</a>
+  
+    <a class="method" href="method.FontDescription.set_style.html">set_style</a>
+  
+    <a class="method" href="method.FontDescription.set_variant.html">set_variant</a>
+  
+    <a class="method" href="method.FontDescription.set_variations.html">set_variations</a>
+  
+    <a class="method" href="method.FontDescription.set_variations_static.html">set_variations_static</a>
+  
+    <a class="method" href="method.FontDescription.set_weight.html">set_weight</a>
+  
+    <a class="method" href="method.FontDescription.to_filename.html">to_filename</a>
+  
+    <a class="method" href="method.FontDescription.to_string.html">to_string</a>
+  
+    <a class="method" href="method.FontDescription.unset_fields.html">unset_fields</a>
+  
+  </div>
+</div>
+
+      <div class="section generator">
+        <p>Generated by <a href="https://gitlab.gnome.org/GNOME/gi-docgen">gi-docgen</a> 2024.1</p>
+      </div>
+    </nav>
+
+    <button id="btn-to-top" class="hidden"><span class="up-arrow"></span></button>
+
+    
+<section id="main" class="content">
+  <header>
+    <h3>Method</h3>
+    <h1><a href="index.html">Pango</a><span class="sep"></span><a href="struct.FontDescription.html">FontDescription</a><span class="sep"></span>set_size</h1>
+  </header>
+
+  <section>
+    <div class="docblock">
+      <p></p>
+    </div>
+
+    <div class="declaration toggle-wrapper">
+      <h4 style="display:flex;" id="declaration">
+        Declaration
+        <a class="anchor" href="#declaration"></a>
+        
+        <a class="srclink" title="go to source location" href="https://gitlab.gnome.org/GNOME/pango/-/blob/main/pango/pango-font.h#L295">[src]</a>
+        
+      </h4>
+
+      <div class="docblock c-decl">
+        <pre><code><div class="highlight"><pre><span></span><span class="kt">void</span>
+<span class="n">pango_font_description_set_size</span><span class="w"> </span><span class="p">(</span>
+<span class="w">  </span><span class="n">PangoFontDescription</span><span class="o">*</span><span class="w"> </span><span class="n">desc</span><span class="p">,</span>
+<span class="w">  </span><span class="n">gint</span><span class="w"> </span><span class="n">size</span>
+<span class="p">)</span>
+</pre></div>
+</code></pre>
+      </div>
+    </div>
+
+    <div class="description toggle-wrapper">
+      <h4 style="display:flex;" id="description">
+        Description
+        <a class="anchor" href="#description"></a>
+        
+        <a class="srclink" title="go to source location" href="https://gitlab.gnome.org/GNOME/pango/-/blob/main/pango/fonts.c#L346">[src]</a>
+        
+      </h4>
+
+      <div class="docblock">
+        <p>Sets the size field of a font description in fractional&nbsp;points.</p>
+<p>This is mutually exclusive with
+<a href="method.FontDescription.set_absolute_size.html"><code>pango_font_description_set_absolute_size()</code></a>.</p>
+      </div>
+
+      <div class="docblock">
+        
+        
+        
+        
+        
+        
+        
+      </div>
+
+      
+    </div>
+
+    
+    <div class="parameters toggle-wrapper">
+      <h4 id="parameters">
+        Parameters
+        <a href="#parameters" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+        <dl class="arguments">
+          
+          <dt class="arg-name"><code>size</code></dt>
+          <dd class="arg-description">
+            <p><em>Type:</em>&nbsp;<code>gint</code></p>
+            <p>The size of the font in points, scaled by <code>PANGO_SCALE</code>.
+  (That is, a <code>size</code> value of 10 * PANGO_SCALE is a 10 point font.
+  The conversion factor between points and device units depends on
+  system configuration and the output device. For screen display, a
+  logical <span class="caps">DPI</span> of 96 is common, in which case a 10 point font corresponds
+  to a 10 * (96 / 72) = 13.3 pixel font.
+  Use <a href="method.FontDescription.set_absolute_size.html"><code>pango_font_description_set_absolute_size()</code></a> if you need
+  a particular size in device&nbsp;units.</p>
+            <table>
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            </table>
+          </dd>
+          
+
+          
+        </dl>
+      </div>
+    </div>
+    
+
+    
+
+  </section>
+</section>
+
+
+    
+
+    <section id="search" class="content hidden"></section>
+
+    <footer>
+    
+    </footer>
+  </div>
+</body>
+</html>

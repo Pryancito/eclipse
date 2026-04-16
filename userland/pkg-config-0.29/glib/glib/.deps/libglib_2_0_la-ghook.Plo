@@ -1,0 +1,42 @@
+libglib_2_0_la-ghook.lo: ghook.c ../config.h ghook.h ../glib/gmem.h \
+ ../glib/gtypes.h glibconfig.h ../glib/gmacros.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h gtestutils.h ../glib/gmessages.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gstring.h \
+ ../glib/gunicode.h ../glib/gerror.h ../glib/gquark.h ../glib/gbytes.h \
+ ../glib/garray.h ../glib/gutils.h ../glib/gslist.h ../glib/gnode.h \
+ gslice.h
+../config.h:
+ghook.h:
+../glib/gmem.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+gtestutils.h:
+../glib/gmessages.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gerror.h:
+../glib/gquark.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+../glib/gslist.h:
+../glib/gnode.h:
+gslice.h:

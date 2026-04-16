@@ -1,0 +1,21 @@
+libgnu_la-printf-frexpl.lo: printf-frexpl.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h printf-frexp.c printf-frexpl.h \
+ float.h /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h math.h \
+ /usr/include/x86_64-linux-musl/math.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h fpucw.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+printf-frexp.c:
+printf-frexpl.h:
+float.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+math.h:
+/usr/include/x86_64-linux-musl/math.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+fpucw.h:

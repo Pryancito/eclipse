@@ -1,0 +1,11 @@
+testdso.lo: testdso.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ include/libxml/xmlexports.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+include/libxml/xmlexports.h:

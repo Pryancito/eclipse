@@ -1,0 +1,50 @@
+libglib_2_0_la-gcharset.lo: gcharset.c ../config.h gcharsetprivate.h \
+ gcharset.h ../glib/gtypes.h glibconfig.h ../glib/gmacros.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h garray.h genviron.h ghash.h \
+ ../glib/glist.h ../glib/gmem.h ../glib/gnode.h gmessages.h \
+ /usr/include/x86_64-linux-musl/stdarg.h gstrfuncs.h gthread.h \
+ ../glib/gatomic.h ../glib/gerror.h ../glib/gquark.h \
+ libcharset/libcharset.h libcharset/localcharset.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/stdio.h
+../config.h:
+gcharsetprivate.h:
+gcharset.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+garray.h:
+genviron.h:
+ghash.h:
+../glib/glist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gmessages.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+gstrfuncs.h:
+gthread.h:
+../glib/gatomic.h:
+../glib/gerror.h:
+../glib/gquark.h:
+libcharset/libcharset.h:
+libcharset/localcharset.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/stdio.h:

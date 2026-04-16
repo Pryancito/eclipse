@@ -75,20 +75,20 @@ pub const VWERASE:  usize = 14;
 pub const VLNEXT:   usize = 15;
 pub const VEOL2:    usize = 16;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcgetattr(fd: c_int, termios_p: *mut termios) -> c_int {
     crate::header::sys_ioctl::ioctl(fd, 0x5401, termios_p as *mut c_void)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcsetattr(fd: c_int, _optional_actions: c_int, termios_p: *const termios) -> c_int {
     // We ignore _optional_actions for now and just set it.
     crate::header::sys_ioctl::ioctl(fd, 0x5402, termios_p as *mut c_void)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) -> c_int {
     if !termios_p.is_null() {
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) ->
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) -> c_int {
     if !termios_p.is_null() {
@@ -127,32 +127,32 @@ pub const B9600:  speed_t = 13;
 pub const B19200: speed_t = 14;
 pub const B38400: speed_t = 15;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcdrain(fd: c_int) -> c_int {
     crate::header::sys_ioctl::ioctl(fd, 0x5409, core::ptr::null_mut())
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcflush(fd: c_int, queue_selector: c_int) -> c_int {
     crate::header::sys_ioctl::ioctl(fd, 0x540B, queue_selector as *mut c_void)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcflow(fd: c_int, action: c_int) -> c_int {
     crate::header::sys_ioctl::ioctl(fd, 0x540C, action as *mut c_void)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
     if termios_p.is_null() { return B9600; }
     (*termios_p).c_ispeed
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
     if termios_p.is_null() { return B9600; }

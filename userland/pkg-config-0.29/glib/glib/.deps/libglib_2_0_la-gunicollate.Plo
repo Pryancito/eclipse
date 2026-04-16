@@ -1,0 +1,54 @@
+libglib_2_0_la-gunicollate.lo: gunicollate.c ../config.h \
+ /usr/include/x86_64-linux-musl/locale.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h gmem.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h gunicode.h ../glib/gerror.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gquark.h \
+ gunicodeprivate.h gtypes.h gstring.h ../glib/gunicode.h ../glib/gbytes.h \
+ ../glib/garray.h ../glib/gutils.h gstrfuncs.h gtestutils.h \
+ ../glib/gmessages.h ../glib/gstring.h ../glib/gslist.h ../glib/gmem.h \
+ ../glib/gnode.h gcharset.h gconvert.h
+../config.h:
+/usr/include/x86_64-linux-musl/locale.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+gmem.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+gunicode.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+gunicodeprivate.h:
+gtypes.h:
+gstring.h:
+../glib/gunicode.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+gstrfuncs.h:
+gtestutils.h:
+../glib/gmessages.h:
+../glib/gstring.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gcharset.h:
+gconvert.h:

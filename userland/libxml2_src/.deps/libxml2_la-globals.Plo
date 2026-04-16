@@ -1,0 +1,76 @@
+libxml2_la-globals.lo: globals.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h libxml.h \
+ config.h include/libxml/xmlversion.h include/libxml/xmlexports.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ include/libxml/globals.h include/libxml/HTMLparser.h \
+ include/libxml/parser.h include/libxml/tree.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
+ include/libxml/xmlstring.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ include/libxml/xmlmemory.h include/libxml/xmlregexp.h \
+ include/libxml/dict.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ include/libxml/hash.h include/libxml/valid.h include/libxml/xmlerror.h \
+ include/libxml/list.h include/libxml/xmlautomata.h \
+ include/libxml/entities.h include/libxml/encoding.h \
+ /home/moebius/eclipse/eclipse-os-build/include/iconv.h \
+ include/libxml/xmlIO.h include/libxml/SAX2.h include/libxml/threads.h \
+ include/libxml/xmlsave.h include/libxml/SAX.h include/private/dict.h \
+ include/private/error.h include/private/globals.h \
+ include/private/threads.h \
+ /home/moebius/eclipse/eclipse-os-build/include/pthread.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sched.h \
+ /home/moebius/eclipse/eclipse-os-build/include/time.h \
+ include/private/tree.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+libxml.h:
+config.h:
+include/libxml/xmlversion.h:
+include/libxml/xmlexports.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+include/libxml/globals.h:
+include/libxml/HTMLparser.h:
+include/libxml/parser.h:
+include/libxml/tree.h:
+/home/moebius/eclipse/eclipse-os-build/include/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
+include/libxml/xmlstring.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+include/libxml/xmlmemory.h:
+include/libxml/xmlregexp.h:
+include/libxml/dict.h:
+/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+include/libxml/hash.h:
+include/libxml/valid.h:
+include/libxml/xmlerror.h:
+include/libxml/list.h:
+include/libxml/xmlautomata.h:
+include/libxml/entities.h:
+include/libxml/encoding.h:
+/home/moebius/eclipse/eclipse-os-build/include/iconv.h:
+include/libxml/xmlIO.h:
+include/libxml/SAX2.h:
+include/libxml/threads.h:
+include/libxml/xmlsave.h:
+include/libxml/SAX.h:
+include/private/dict.h:
+include/private/error.h:
+include/private/globals.h:
+include/private/threads.h:
+/home/moebius/eclipse/eclipse-os-build/include/pthread.h:
+/home/moebius/eclipse/eclipse-os-build/include/sched.h:
+/home/moebius/eclipse/eclipse-os-build/include/time.h:
+include/private/tree.h:

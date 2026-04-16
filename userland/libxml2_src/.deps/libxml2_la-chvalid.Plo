@@ -1,0 +1,17 @@
+libxml2_la-chvalid.lo: chvalid.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h libxml.h \
+ config.h include/libxml/xmlversion.h include/libxml/xmlexports.h \
+ include/libxml/chvalid.h include/libxml/xmlstring.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stddef.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+libxml.h:
+config.h:
+include/libxml/xmlversion.h:
+include/libxml/xmlexports.h:
+include/libxml/chvalid.h:
+include/libxml/xmlstring.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/stddef.h:

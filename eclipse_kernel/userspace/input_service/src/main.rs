@@ -13,7 +13,7 @@ use std::prelude::v1::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::prelude::*;
-use eclipse_libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info, get_system_stats, SystemStats};
+use eclipse_relibc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info, get_system_stats, SystemStats};
 use input_service::EventQueue;
 
 const SYS_REGISTER_DEVICE: usize = eclipse_syscall::number::SYS_REGISTER_DEVICE;
@@ -35,12 +35,12 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
 }
 
 fn sys_open(path: &str) -> Option<usize> {
-    let fd = eclipse_libc::eclipse_open(path, eclipse_libc::O_RDONLY, 0);
+    let fd = eclipse_relibc::eclipse_open(path, eclipse_relibc::O_RDONLY, 0);
     if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    eclipse_libc::eclipse_write(fd as u32, buf) as usize
+    eclipse_relibc::eclipse_write(fd as u32, buf) as usize
 }
 
 fn write_input_event_to_scheme(input_fd: Option<usize>, ev: &InputEvent) {
@@ -145,7 +145,7 @@ struct InputDevice {
     gaming_caps: GamingCapabilities,
 }
 
-/// Tamaño fijo (InputEvent viene de eclipse_libc)
+/// Tamaño fijo (InputEvent viene de eclipse_relibc)
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
 

@@ -1,0 +1,80 @@
+libglib_2_0_la-gmessages.lo: gmessages.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/stdio.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/signal.h \
+ /usr/include/x86_64-linux-musl/bits/signal.h \
+ /usr/include/x86_64-linux-musl/locale.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h gmessages-private.h \
+ ../glib/gmessages.h ../glib/gtypes.h glibconfig.h ../glib/gmacros.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h glib-init.h gmessages.h \
+ gbacktrace.h gcharset.h gconvert.h ../glib/gerror.h ../glib/gquark.h \
+ genviron.h gmem.h gprintfint.h gtestutils.h ../glib/gstring.h \
+ ../glib/gunicode.h ../glib/gbytes.h ../glib/garray.h ../glib/gutils.h \
+ ../glib/gslist.h ../glib/gmem.h ../glib/gnode.h gthread.h \
+ ../glib/gatomic.h gstrfuncs.h gstring.h gpattern.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/signal.h:
+/usr/include/x86_64-linux-musl/bits/signal.h:
+/usr/include/x86_64-linux-musl/locale.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+gmessages-private.h:
+../glib/gmessages.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+glib-init.h:
+gmessages.h:
+gbacktrace.h:
+gcharset.h:
+gconvert.h:
+../glib/gerror.h:
+../glib/gquark.h:
+genviron.h:
+gmem.h:
+gprintfint.h:
+gtestutils.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gthread.h:
+../glib/gatomic.h:
+gstrfuncs.h:
+gstring.h:
+gpattern.h:

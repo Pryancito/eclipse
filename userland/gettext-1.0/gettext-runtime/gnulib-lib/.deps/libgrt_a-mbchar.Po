@@ -1,0 +1,38 @@
+libgrt_a-mbchar.o: mbchar.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h mbchar.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h uchar.h \
+ /usr/include/x86_64-linux-musl/uchar.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h wchar.h \
+ /usr/include/x86_64-linux-musl/wchar.h wctype.h \
+ /usr/include/x86_64-linux-musl/wctype.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+mbchar.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+uchar.h:
+/usr/include/x86_64-linux-musl/uchar.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+wchar.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+wctype.h:
+/usr/include/x86_64-linux-musl/wctype.h:

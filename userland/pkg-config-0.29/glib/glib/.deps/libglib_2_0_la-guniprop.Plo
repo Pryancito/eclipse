@@ -1,0 +1,58 @@
+libglib_2_0_la-guniprop.lo: guniprop.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h \
+ /usr/include/x86_64-linux-musl/locale.h gmem.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gmacros.h /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h gstring.h ../glib/gunicode.h \
+ ../glib/gerror.h /usr/include/x86_64-linux-musl/stdarg.h \
+ ../glib/gquark.h ../glib/gbytes.h ../glib/garray.h ../glib/gutils.h \
+ gtestutils.h ../glib/gmessages.h ../glib/gstring.h ../glib/gslist.h \
+ ../glib/gmem.h ../glib/gnode.h gtypes.h gunicode.h gunichartables.h \
+ gmirroringtable.h gscripttable.h gunicodeprivate.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+/usr/include/x86_64-linux-musl/locale.h:
+gmem.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+gstring.h:
+../glib/gunicode.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+gtestutils.h:
+../glib/gmessages.h:
+../glib/gstring.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gtypes.h:
+gunicode.h:
+gunichartables.h:
+gmirroringtable.h:
+gscripttable.h:
+gunicodeprivate.h:

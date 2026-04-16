@@ -1,0 +1,39 @@
+libtestpat_la-xmltok.lo: xmltok.c \
+ /home/moebius/eclipse/host-toolchains/include/stdc-predef.h \
+ ../expat_config.h /home/moebius/eclipse/host-toolchains/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/alltypes.h \
+ /home/moebius/eclipse/host-toolchains/include/string.h \
+ /home/moebius/eclipse/host-toolchains/include/features.h \
+ /home/moebius/eclipse/host-toolchains/include/strings.h \
+ /home/moebius/eclipse/host-toolchains/include/stdbool.h expat_external.h \
+ internal.h /home/moebius/eclipse/host-toolchains/include/limits.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/limits.h expat.h \
+ /home/moebius/eclipse/host-toolchains/include/stdlib.h \
+ /home/moebius/eclipse/host-toolchains/include/alloca.h xmltok.h \
+ nametab.h xmltok_impl.h ascii.h xmltok_impl.c asciitab.h utf8tab.h \
+ iasciitab.h latin1tab.h xmltok_ns.c
+/home/moebius/eclipse/host-toolchains/include/stdc-predef.h:
+../expat_config.h:
+/home/moebius/eclipse/host-toolchains/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/include/bits/alltypes.h:
+/home/moebius/eclipse/host-toolchains/include/string.h:
+/home/moebius/eclipse/host-toolchains/include/features.h:
+/home/moebius/eclipse/host-toolchains/include/strings.h:
+/home/moebius/eclipse/host-toolchains/include/stdbool.h:
+expat_external.h:
+internal.h:
+/home/moebius/eclipse/host-toolchains/include/limits.h:
+/home/moebius/eclipse/host-toolchains/include/bits/limits.h:
+expat.h:
+/home/moebius/eclipse/host-toolchains/include/stdlib.h:
+/home/moebius/eclipse/host-toolchains/include/alloca.h:
+xmltok.h:
+nametab.h:
+xmltok_impl.h:
+ascii.h:
+xmltok_impl.c:
+asciitab.h:
+utf8tab.h:
+iasciitab.h:
+latin1tab.h:
+xmltok_ns.c:

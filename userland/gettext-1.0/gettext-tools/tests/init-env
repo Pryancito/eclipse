@@ -1,0 +1,77 @@
+# Note: LTLIBINTL uses the variable ${top_builddir}, whose value is set
+# as an environment variable by the 'test-framework-sh' module.
+
+OBJEXT="o"
+EXEEXT=""
+CC="musl-gcc"
+CFLAGS="-g -O2"
+CXX="g++"
+CXXFLAGS="-g -O2"
+OBJC="gcc"
+OBJCFLAGS=""
+CPPFLAGS=""
+LDFLAGS=""
+LTLIBINTL=""
+JAVA_CHOICE="yes"
+BUILDJAVA="no"
+TESTJAVA="no"
+CLASSPATH_SEPARATOR=":"
+CSHARP_CHOICE="any"
+BUILDCSHARP="no"
+TESTCSHARP="no"
+GO_CHOICE="any"
+GO=""
+D_CHOICE="yes"
+BUILDD="no"
+MODULA2_CHOICE="yes"
+BUILDMODULA2="no"
+M2C=""
+M2FLAGS=""
+TESTLIBASPRINTF="yes"
+GLIBC2="no"
+LOCALE_FR="none"
+LOCALE_FR_UTF8="fr_FR.UTF-8"
+LOCALE_JA="none"
+LOCALE_DE_UTF8="de_DE.UTF-8"
+host_os="linux-musl"
+ARCHIVE_VERSION="1.0"
+
+# For specific filename variables, define a variant that - in mingw builds
+# in a Cygwin environment - has the Windows filename syntax.
+wabs_srcdir="$abs_srcdir"
+wabs_top_srcdir="$abs_top_srcdir"
+case "$host_os" in
+  mingw* | windows*)
+    if (cygpath --version) >/dev/null 2>/dev/null; then
+      wabs_srcdir=`cygpath -w "$abs_srcdir"`
+      wabs_top_srcdir=`cygpath -w "$abs_top_srcdir"`
+    fi
+    ;;
+esac
+
+# Variable needed by xgettext.
+GETTEXTDATADIR="$wabs_top_srcdir"
+export GETTEXTDATADIR
+
+# Variable needed for checking output with --color.
+GETTEXTSTYLESDIR="$GETTEXTDATADIR/styles"
+export GETTEXTSTYLESDIR
+
+: ${GETTEXT=tstgettext}
+: ${NGETTEXT=tstngettext}
+: ${XGETTEXT=xgettext}
+: ${MSGATTRIB=msgattrib}
+: ${MSGCAT=msgcat}
+: ${MSGCMP=msgcmp}
+: ${MSGCOMM=msgcomm}
+: ${MSGCONV=msgconv}
+: ${MSGEN=msgen}
+: ${MSGEXEC=msgexec}
+: ${MSGFILTER=msgfilter}
+: ${MSGFMT=msgfmt}
+: ${MSGGREP=msggrep}
+: ${MSGINIT=msginit}
+: ${MSGMERGE=msgmerge}
+: ${MSGUNFMT=msgunfmt}
+: ${MSGUNIQ=msguniq}
+: ${RECODE=recode}

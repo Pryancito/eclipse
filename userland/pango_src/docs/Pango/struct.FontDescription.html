@@ -1,0 +1,661 @@
+<!--
+SPDX-FileCopyrightText: Owen Taylor, Behdad Esfahbod
+
+SPDX-License-Identifier: LGPL-2.1-or-later
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Pango.FontDescription</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta charset="utf-8" />
+
+  
+  <meta property="og:type" content="website"/>
+
+  
+  <meta property="og:image:width" content="256"/>
+  <meta property="og:image:height" content="256"/>
+  <meta property="og:image:secure_url" content="pango-name.png"/>
+  <meta property="og:image:alt" content="Pango-1.0"/>
+  
+
+  
+  <meta property="og:title" content="Pango.FontDescription"/>
+  <meta property="og:description" content="Reference for Pango.FontDescription"/>
+  <meta name="twitter:title" content="Pango.FontDescription"/>
+  <meta name="twitter:description" content="Reference for Pango.FontDescription"/>
+
+
+  
+  <meta name="twitter:card" content="summary"/>
+
+  
+  
+  
+  
+
+  <link rel="stylesheet" href="style.css" type="text/css" />
+
+  
+
+  
+  <script src="urlmap.js"></script>
+  
+  
+  <script src="fzy.js"></script>
+  <script src="search.js"></script>
+  
+  <script src="main.js"></script>
+
+  
+</head>
+
+<body>
+  <div id="body-wrapper" tabindex="-1">
+
+    <nav class="sidebar devhelp-hidden">
+      
+      <div class="section">
+        <a href="index.html"><img src="pango-name.png" class="logo"/></a>
+      </div>
+      
+      
+      <div class="search section">
+        <form id="search-form" autocomplete="off">
+          <input id="search-input" type="text" name="do-not-autocomplete" placeholder="Click, or press 's' to search" autocomplete="off"/>
+        </form>
+      </div>
+      
+      <div class="section namespace">
+        <h3><a href="index.html">Pango</a></h3>
+        <p>API Version: 1.0</p>
+        
+        <p>Library Version: 1.54.0</p>
+        
+      </div>
+      
+<div class="section">
+  <h5>Type</h5>
+  <div class="links">
+    <a class="current" href="struct.FontDescription.html#description">FontDescription</a>
+  </div>
+</div>
+
+
+  
+<div class="section">
+  <h5>Constructors</h5>
+  <div class="links">
+  
+    <a class="ctor" href="ctor.FontDescription.new.html">new</a>
+  
+  </div>
+</div>
+
+
+
+  
+<div class="section">
+  <h5>Functions</h5>
+  <div class="links">
+  
+    <a class="func" href="type_func.FontDescription.from_string.html">from_string</a>
+  
+  </div>
+</div>
+
+
+
+  
+<div class="section">
+  <h5>Instance methods</h5>
+  <div class="links">
+  
+    <a class="method" href="method.FontDescription.better_match.html">better_match</a>
+  
+    <a class="method" href="method.FontDescription.copy.html">copy</a>
+  
+    <a class="method" href="method.FontDescription.copy_static.html">copy_static</a>
+  
+    <a class="method" href="method.FontDescription.equal.html">equal</a>
+  
+    <a class="method" href="method.FontDescription.free.html">free</a>
+  
+    <a class="method" href="method.FontDescription.get_family.html">get_family</a>
+  
+    <a class="method" href="method.FontDescription.get_gravity.html">get_gravity</a>
+  
+    <a class="method" href="method.FontDescription.get_set_fields.html">get_set_fields</a>
+  
+    <a class="method" href="method.FontDescription.get_size.html">get_size</a>
+  
+    <a class="method" href="method.FontDescription.get_size_is_absolute.html">get_size_is_absolute</a>
+  
+    <a class="method" href="method.FontDescription.get_stretch.html">get_stretch</a>
+  
+    <a class="method" href="method.FontDescription.get_style.html">get_style</a>
+  
+    <a class="method" href="method.FontDescription.get_variant.html">get_variant</a>
+  
+    <a class="method" href="method.FontDescription.get_variations.html">get_variations</a>
+  
+    <a class="method" href="method.FontDescription.get_weight.html">get_weight</a>
+  
+    <a class="method" href="method.FontDescription.hash.html">hash</a>
+  
+    <a class="method" href="method.FontDescription.merge.html">merge</a>
+  
+    <a class="method" href="method.FontDescription.merge_static.html">merge_static</a>
+  
+    <a class="method" href="method.FontDescription.set_absolute_size.html">set_absolute_size</a>
+  
+    <a class="method" href="method.FontDescription.set_family.html">set_family</a>
+  
+    <a class="method" href="method.FontDescription.set_family_static.html">set_family_static</a>
+  
+    <a class="method" href="method.FontDescription.set_gravity.html">set_gravity</a>
+  
+    <a class="method" href="method.FontDescription.set_size.html">set_size</a>
+  
+    <a class="method" href="method.FontDescription.set_stretch.html">set_stretch</a>
+  
+    <a class="method" href="method.FontDescription.set_style.html">set_style</a>
+  
+    <a class="method" href="method.FontDescription.set_variant.html">set_variant</a>
+  
+    <a class="method" href="method.FontDescription.set_variations.html">set_variations</a>
+  
+    <a class="method" href="method.FontDescription.set_variations_static.html">set_variations_static</a>
+  
+    <a class="method" href="method.FontDescription.set_weight.html">set_weight</a>
+  
+    <a class="method" href="method.FontDescription.to_filename.html">to_filename</a>
+  
+    <a class="method" href="method.FontDescription.to_string.html">to_string</a>
+  
+    <a class="method" href="method.FontDescription.unset_fields.html">unset_fields</a>
+  
+  </div>
+</div>
+
+
+
+
+      <div class="section generator">
+        <p>Generated by <a href="https://gitlab.gnome.org/GNOME/gi-docgen">gi-docgen</a> 2024.1</p>
+      </div>
+    </nav>
+
+    <button id="btn-to-top" class="hidden"><span class="up-arrow"></span></button>
+
+    
+<section id="main" class="content">
+  <header>
+    <h3>Struct</h3>
+    <h1><a href="index.html">Pango</a><span class="sep"></span>FontDescription</h1>
+  </header>
+
+  <section>
+    <summary>
+      <div class="docblock">
+        <p></p>
+      </div>
+      <div class="toggle-wrapper">
+        <h4 style="display:flex;" id="description">
+          Description
+          <a href="#description" class="anchor"></a>
+          
+          <a class="srclink" title="go to source location" href="https://gitlab.gnome.org/GNOME/pango/-/blob/main/pango/pango-font.h#L33">[src]</a>
+          
+        </h4>
+
+        <pre><code><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">PangoFontDescription</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="cm">/* No available fields */</span>
+<span class="p">}</span>
+</pre></div>
+</code></pre>
+
+        <div class="docblock">
+          <p>A <code>PangoFontDescription</code> describes a font in an implementation-independent&nbsp;manner.</p>
+<p><code>PangoFontDescription</code> structures are used both to list what fonts are
+available on the system and also for specifying the characteristics of
+a font to&nbsp;load.</p>
+        </div>
+
+        
+
+        <div class="docblock">
+          
+          
+          
+        </div>
+
+        
+      </div>
+    </summary>
+
+    
+    <div class="toggle-wrapper constructors">
+      <h4 id="constructors">
+        Constructors
+        <a href="#constructors" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+        <div class="">
+          <h6><a href="ctor.FontDescription.new.html">pango_font_description_new</a></h6>
+          <div class="docblock">
+            <p>Creates a new font description structure with all fields&nbsp;unset.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+      </div>
+    </div>
+    
+
+    
+    <div class="toggle-wrapper methods">
+      <h4 id="type-functions">
+        Functions
+        <a href="#type-functions" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+      <div class="">
+        <h6><a href="type_func.FontDescription.from_string.html">pango_font_description_from_string</a></h6>
+        <div class="docblock">
+          <p>Creates a new font description from a string&nbsp;representation.</p>
+        </div>
+        <div class="docblock">
+          <p></p>
+        </div>
+      </div>
+      
+      </div>
+    </div>
+    
+
+    
+    <div class="toggle-wrapper methods">
+      <h4 id="methods">
+        Instance methods
+        <a href="#methods" class="anchor"></a>
+      </h4>
+
+      <div class="docblock">
+      
+        <div class="">
+          <h6><a href="method.FontDescription.better_match.html">pango_font_description_better_match</a></h6>
+          <div class="docblock">
+            <p>Determines if the style attributes of <code>new_match</code> are a closer match
+for <code>desc</code> than those of <code>old_match</code> are, or if <code>old_match</code> is <code>NULL</code>,
+determines if <code>new_match</code> is a match at&nbsp;all.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.copy.html">pango_font_description_copy</a></h6>
+          <div class="docblock">
+            <p>Make a copy of a <code>PangoFontDescription</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.copy_static.html">pango_font_description_copy_static</a></h6>
+          <div class="docblock">
+            <p>Make a copy of a <code>PangoFontDescription</code>, but don&#8217;t duplicate
+allocated&nbsp;fields.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.equal.html">pango_font_description_equal</a></h6>
+          <div class="docblock">
+            <p>Compares two font descriptions for&nbsp;equality.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.free.html">pango_font_description_free</a></h6>
+          <div class="docblock">
+            <p>Frees a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_family.html">pango_font_description_get_family</a></h6>
+          <div class="docblock">
+            <p>Gets the family name field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_gravity.html">pango_font_description_get_gravity</a></h6>
+          <div class="docblock">
+            <p>Gets the gravity field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_set_fields.html">pango_font_description_get_set_fields</a></h6>
+          <div class="docblock">
+            <p>Determines which fields in a font description have been&nbsp;set.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_size.html">pango_font_description_get_size</a></h6>
+          <div class="docblock">
+            <p>Gets the size field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_size_is_absolute.html">pango_font_description_get_size_is_absolute</a></h6>
+          <div class="docblock">
+            <p>Determines whether the size of the font is in points (not absolute)
+or device units&nbsp;(absolute).</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.8</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_stretch.html">pango_font_description_get_stretch</a></h6>
+          <div class="docblock">
+            <p>Gets the stretch field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_style.html">pango_font_description_get_style</a></h6>
+          <div class="docblock">
+            <p>Gets the style field of a <code>PangoFontDescription</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_variant.html">pango_font_description_get_variant</a></h6>
+          <div class="docblock">
+            <p>Gets the variant field of a <code>PangoFontDescription</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_variations.html">pango_font_description_get_variations</a></h6>
+          <div class="docblock">
+            <p>Gets the variations field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.42</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.get_weight.html">pango_font_description_get_weight</a></h6>
+          <div class="docblock">
+            <p>Gets the weight field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.hash.html">pango_font_description_hash</a></h6>
+          <div class="docblock">
+            <p>Computes a hash of a <code>PangoFontDescription</code> structure.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.merge.html">pango_font_description_merge</a></h6>
+          <div class="docblock">
+            <p>Merges the fields that are set in <code>desc_to_merge</code> into the fields in
+<code>desc</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.merge_static.html">pango_font_description_merge_static</a></h6>
+          <div class="docblock">
+            <p>Merges the fields that are set in <code>desc_to_merge</code> into the fields in
+<code>desc</code>, without copying allocated&nbsp;fields.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_absolute_size.html">pango_font_description_set_absolute_size</a></h6>
+          <div class="docblock">
+            <p>Sets the size field of a font description, in device&nbsp;units.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.8</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_family.html">pango_font_description_set_family</a></h6>
+          <div class="docblock">
+            <p>Sets the family name field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_family_static.html">pango_font_description_set_family_static</a></h6>
+          <div class="docblock">
+            <p>Sets the family name field of a font description, without copying the&nbsp;string.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_gravity.html">pango_font_description_set_gravity</a></h6>
+          <div class="docblock">
+            <p>Sets the gravity field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.16</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_size.html">pango_font_description_set_size</a></h6>
+          <div class="docblock">
+            <p>Sets the size field of a font description in fractional&nbsp;points.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_stretch.html">pango_font_description_set_stretch</a></h6>
+          <div class="docblock">
+            <p>Sets the stretch field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_style.html">pango_font_description_set_style</a></h6>
+          <div class="docblock">
+            <p>Sets the style field of a <code>PangoFontDescription</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_variant.html">pango_font_description_set_variant</a></h6>
+          <div class="docblock">
+            <p>Sets the variant field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_variations.html">pango_font_description_set_variations</a></h6>
+          <div class="docblock">
+            <p>Sets the variations field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.42</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_variations_static.html">pango_font_description_set_variations_static</a></h6>
+          <div class="docblock">
+            <p>Sets the variations field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p><span class="emblem available">since: 1.42</span></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.set_weight.html">pango_font_description_set_weight</a></h6>
+          <div class="docblock">
+            <p>Sets the weight field of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.to_filename.html">pango_font_description_to_filename</a></h6>
+          <div class="docblock">
+            <p>Creates a filename representation of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.to_string.html">pango_font_description_to_string</a></h6>
+          <div class="docblock">
+            <p>Creates a string representation of a font&nbsp;description.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+        <div class="">
+          <h6><a href="method.FontDescription.unset_fields.html">pango_font_description_unset_fields</a></h6>
+          <div class="docblock">
+            <p>Unsets some of the fields in a <code>PangoFontDescription</code>.</p>
+          </div>
+          <div class="docblock">
+            <p></p>
+          </div>
+        </div>
+      
+      </div>
+
+    </div>
+    
+
+  </section>
+</section>
+
+
+    
+<div id="toc" class="toc">
+  <nav aria-labelledby="toc-title">
+    <p id="toc-title">Content</p>
+    <ul class="toc-list">
+      <li class="toc-list-item"><a href="#description"><span class="link-text">Description</span></a></li>
+      
+      
+<li class="toc-list-item"><a href="#constructors"><span class="link-text">Constructors</span></a></li>
+
+
+      
+<li class="toc-list-item"><a href="#type-functions"><span class="link-text">Functions</span></a></li>
+
+
+      
+<li class="toc-list-item"><a href="#methods"><span class="link-text">Methods</span></a></li>
+
+
+    </ul>
+  </nav>
+</div>
+
+
+    <section id="search" class="content hidden"></section>
+
+    <footer>
+    
+    </footer>
+  </div>
+</body>
+</html>

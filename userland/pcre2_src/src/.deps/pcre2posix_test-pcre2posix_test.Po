@@ -1,0 +1,18 @@
+src/pcre2posix_test-pcre2posix_test.o: src/pcre2posix_test.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ src/pcre2posix.h /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+src/pcre2posix.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:

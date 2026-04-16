@@ -1,0 +1,65 @@
+libglib_2_0_la-gtimer.lo: gtimer.c ../config.h glibconfig.h \
+ ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/alloca.h \
+ /usr/include/x86_64-linux-musl/unistd.h \
+ /usr/include/x86_64-linux-musl/bits/posix.h \
+ /usr/include/x86_64-linux-musl/sys/time.h \
+ /usr/include/x86_64-linux-musl/sys/select.h \
+ /usr/include/x86_64-linux-musl/time.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h gtimer.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gversionmacros.h gmem.h gstrfuncs.h \
+ /usr/include/x86_64-linux-musl/stdarg.h gtestutils.h ../glib/gmessages.h \
+ ../glib/gstring.h ../glib/gunicode.h ../glib/gerror.h ../glib/gquark.h \
+ ../glib/gbytes.h ../glib/garray.h ../glib/gutils.h ../glib/gslist.h \
+ ../glib/gmem.h ../glib/gnode.h gmain.h ../glib/gpoll.h ../glib/gthread.h \
+ ../glib/gatomic.h
+../config.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/alloca.h:
+/usr/include/x86_64-linux-musl/unistd.h:
+/usr/include/x86_64-linux-musl/bits/posix.h:
+/usr/include/x86_64-linux-musl/sys/time.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+/usr/include/x86_64-linux-musl/time.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+gtimer.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gversionmacros.h:
+gmem.h:
+gstrfuncs.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+gtestutils.h:
+../glib/gmessages.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gerror.h:
+../glib/gquark.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gmain.h:
+../glib/gpoll.h:
+../glib/gthread.h:
+../glib/gatomic.h:

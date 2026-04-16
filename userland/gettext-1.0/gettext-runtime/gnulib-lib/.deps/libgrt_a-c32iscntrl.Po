@@ -1,0 +1,41 @@
+libgrt_a-c32iscntrl.o: c32iscntrl.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h uchar.h \
+ /usr/include/x86_64-linux-musl/uchar.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h wchar.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/wchar.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h wctype.h \
+ /usr/include/x86_64-linux-musl/wctype.h c32is-impl.h unictype.h \
+ unitypes.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+uchar.h:
+/usr/include/x86_64-linux-musl/uchar.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+wchar.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+wctype.h:
+/usr/include/x86_64-linux-musl/wctype.h:
+c32is-impl.h:
+unictype.h:
+unitypes.h:

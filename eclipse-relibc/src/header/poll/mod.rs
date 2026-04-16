@@ -25,7 +25,7 @@ extern "C" {
     pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     use crate::read;

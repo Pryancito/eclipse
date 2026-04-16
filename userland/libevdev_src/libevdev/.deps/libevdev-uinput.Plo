@@ -1,0 +1,99 @@
+libevdev-uinput.lo: libevdev-uinput.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h ../config.h \
+ /home/moebius/eclipse/eclipse-os-build/include/dirent.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/dirent.h \
+ /home/moebius/eclipse/eclipse-os-build/include/errno.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/errno.h \
+ /home/moebius/eclipse/eclipse-os-build/include/fcntl.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h \
+ ../include/linux/uinput.h ../include/linux/linux/uinput.h \
+ /home/moebius/eclipse/eclipse-os-build/include/linux/types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm/types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm-generic/types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm-generic/int-ll64.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm/bitsperlong.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm-generic/bitsperlong.h \
+ /home/moebius/eclipse/eclipse-os-build/include/linux/posix_types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/linux/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm/posix_types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm/posix_types_64.h \
+ /home/moebius/eclipse/eclipse-os-build/include/asm-generic/posix_types.h \
+ ../include/linux/input.h ../include/linux/linux/input.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/time.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/select.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/ioctl.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/ioctl.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/ioctl_fix.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/endian.h \
+ ../include/linux/linux/input-event-codes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/poll.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/poll.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/stat.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stat.h \
+ /home/moebius/eclipse/eclipse-os-build/include/time.h \
+ /home/moebius/eclipse/eclipse-os-build/include/unistd.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/posix.h \
+ libevdev-int.h /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdbool.h libevdev.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdarg.h libevdev-util.h \
+ libevdev-uinput-int.h libevdev-uinput.h ../libevdev/libevdev.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+../config.h:
+/home/moebius/eclipse/eclipse-os-build/include/dirent.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/dirent.h:
+/home/moebius/eclipse/eclipse-os-build/include/errno.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/errno.h:
+/home/moebius/eclipse/eclipse-os-build/include/fcntl.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h:
+../include/linux/uinput.h:
+../include/linux/linux/uinput.h:
+/home/moebius/eclipse/eclipse-os-build/include/linux/types.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm/types.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm-generic/types.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm-generic/int-ll64.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm/bitsperlong.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm-generic/bitsperlong.h:
+/home/moebius/eclipse/eclipse-os-build/include/linux/posix_types.h:
+/home/moebius/eclipse/eclipse-os-build/include/linux/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm/posix_types.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm/posix_types_64.h:
+/home/moebius/eclipse/eclipse-os-build/include/asm-generic/posix_types.h:
+../include/linux/input.h:
+../include/linux/linux/input.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/time.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/select.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/ioctl.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/ioctl.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/ioctl_fix.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/types.h:
+/home/moebius/eclipse/eclipse-os-build/include/endian.h:
+../include/linux/linux/input-event-codes.h:
+/home/moebius/eclipse/eclipse-os-build/include/poll.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/poll.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/stat.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stat.h:
+/home/moebius/eclipse/eclipse-os-build/include/time.h:
+/home/moebius/eclipse/eclipse-os-build/include/unistd.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/posix.h:
+libevdev-int.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdbool.h:
+libevdev.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+libevdev-util.h:
+libevdev-uinput-int.h:
+libevdev-uinput.h:
+../libevdev/libevdev.h:

@@ -1,0 +1,16 @@
+libgnu_la-asnwprintf.lo: asnwprintf.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h vasnwprintf.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+vasnwprintf.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:

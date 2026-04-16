@@ -5,22 +5,19 @@ edition = "2021"
 description = "Stack unificada de ventanas, IPC, OpenGL, Wayland y X11 para el compositor Eclipse OS"
 
 [dependencies]
-eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
+eclipse_ipc = { workspace = true, features = ["async"] }
 sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
 heapless = "0.8"
 micromath = "2.1.0"
 bitflags = { version = "2.4", default-features = false }
 
-eclipse-syscall = { path = "../../eclipse-syscall" }
-
-# Sin features por defecto: el default de eclipse-relibc incluye `panic-handler`, incompatible
-# con crates que enlazan `std` (p. ej. tests de lunas en host: E0152 duplicate panic_impl).
-libc = { path = "../../eclipse-relibc", default-features = false, features = ["allocator", "eclipse-syscall"] }
+eclipse-syscall = { workspace = true }
+eclipse-relibc = { workspace = true, features = ["allocator", "eclipse-syscall"] }
 
 [features]
 default = []
 host-testing = []
 
 [dev-dependencies]
-libc = { path = "../../eclipse-relibc", default-features = false }
+eclipse-relibc = { path = "../../eclipse-relibc", default-features = false }

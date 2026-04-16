@@ -1,0 +1,47 @@
+fribidi-caprtl2utf8.o: fribidi-caprtl2utf8.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h ../lib/fribidi.h \
+ ../lib/fribidi-common.h ../lib/fribidi-config.h ../lib/fribidi-unicode.h \
+ ../lib/fribidi-types.h ../lib/fribidi-begindecls.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
+ ../lib/fribidi-enddecls.h ../lib/fribidi-unicode-version.h \
+ ../lib/fribidi-flags.h ../lib/fribidi-bidi-types.h \
+ ../lib/fribidi-bidi-types-list.h ../lib/fribidi-bidi.h \
+ ../lib/fribidi-joining-types.h ../lib/fribidi-joining-types-list.h \
+ ../lib/fribidi-joining.h ../lib/fribidi-mirroring.h \
+ ../lib/fribidi-brackets.h ../lib/fribidi-arabic.h ../lib/fribidi-shape.h \
+ ../lib/fribidi-char-sets.h ../lib/fribidi-char-sets-list.h \
+ ../lib/fribidi-deprecated.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+../lib/fribidi.h:
+../lib/fribidi-common.h:
+../lib/fribidi-config.h:
+../lib/fribidi-unicode.h:
+../lib/fribidi-types.h:
+../lib/fribidi-begindecls.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
+../lib/fribidi-enddecls.h:
+../lib/fribidi-unicode-version.h:
+../lib/fribidi-flags.h:
+../lib/fribidi-bidi-types.h:
+../lib/fribidi-bidi-types-list.h:
+../lib/fribidi-bidi.h:
+../lib/fribidi-joining-types.h:
+../lib/fribidi-joining-types-list.h:
+../lib/fribidi-joining.h:
+../lib/fribidi-mirroring.h:
+../lib/fribidi-brackets.h:
+../lib/fribidi-arabic.h:
+../lib/fribidi-shape.h:
+../lib/fribidi-char-sets.h:
+../lib/fribidi-char-sets-list.h:
+../lib/fribidi-deprecated.h:

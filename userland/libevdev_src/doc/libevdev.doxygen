@@ -1,0 +1,22 @@
+PROJECT_NAME           = libevdev
+PROJECT_NUMBER         = 1.13.3
+PROJECT_BRIEF          = "A wrapper library for evdev devices"
+JAVADOC_AUTOBRIEF      = YES
+TAB_SIZE               = 8
+OPTIMIZE_OUTPUT_FOR_C  = YES
+EXTRACT_ALL            = YES
+MAX_INITIALIZER_LINES  = 0
+QUIET                  = YES
+INPUT                  = ../libevdev/libevdev.h \
+                         ../libevdev/libevdev-uinput.h
+EXAMPLE_PATH           = ../include
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = LIBEVDEV_ATTRIBUTE_PRINTF(f,a)=
+HTML_HEADER = "./style/header.html"
+HTML_FOOTER = "./style/footer.html"
+HTML_EXTRA_STYLESHEET = "./style/bootstrap.css" \
+                        "./style/customdoxygen.css" \
+                        "./style/libevdevdoxygen.css"

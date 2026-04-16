@@ -15,7 +15,7 @@
 //! It must start after the input service to handle display events.
 
 use std::prelude::v1::*;
-use eclipse_libc as libc;
+use eclipse_relibc as libc;
 
 use eclipse_syscall::flag::O_RDWR;
 use eclipse_syscall::number::{

@@ -190,6 +190,9 @@ pub fn init() {
     register_scheme("pty", Arc::new(crate::pty::PtyScheme::new()));
     // El PipeScheme usa el singleton global PIPE_SCHEME; el proxy delega en él.
     register_scheme("pipe", Arc::new(PipeSchemeProxy));
+    register_scheme("epoll", crate::epoll::get_epoll_scheme().clone());
+    register_scheme("eventfd", crate::eventfd::get_eventfd_scheme().clone());
+    register_scheme("signalfd", Arc::new(crate::signalfd::SignalfdScheme::new()));
 }
 
 /// Proxy sin estado que delega todas las operaciones en el singleton PIPE_SCHEME.

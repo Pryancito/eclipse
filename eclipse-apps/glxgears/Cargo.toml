@@ -10,4 +10,4 @@ wayland-proto = { path = "../libs/wayland-proto" }
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { path = "../../eclipse-relibc" }
+eclipse-relibc = { path = "../../eclipse-relibc" }

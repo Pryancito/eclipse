@@ -45,7 +45,10 @@ mod scheme; // Redox-style scheme system
 mod tty;    // Dedicated TTY Scheme
 mod pty;    // PTY Scheme
 mod pipe;   // Pipe anónimas (sys_pipe / POSIX pipe)
-mod bcache; // Buffer Cache
+pub mod bcache; // Buffer Cache
+pub mod epoll;
+mod eventfd;
+mod signalfd;
 mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery
 mod apic;    // Local APIC

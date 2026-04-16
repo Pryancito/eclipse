@@ -238,11 +238,11 @@ build_eclipse_libc() {
         mkdir -p "$SYSROOT_LIB"
         # Un `.rlib` es un archivo tipo `ar` y sirve como `.a` para el linker.
         # Lo instalamos como `libc.a` en el sysroot.
-        if [ -f "target/x86_64-unknown-linux-musl/release/liblibc.rlib" ]; then
-            cp "target/x86_64-unknown-linux-musl/release/liblibc.rlib" "$SYSROOT_LIB/libc.a"
-            print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a (desde .rlib)"
+        if [ -f "target/x86_64-unknown-linux-musl/release/libeclipse_relibc.rlib" ]; then
+            cp "target/x86_64-unknown-linux-musl/release/libeclipse_relibc.rlib" "$SYSROOT_LIB/libc.a"
+            print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a (desde libeclipse_relibc.rlib)"
         else
-            print_error "No se encontró liblibc.rlib en target/."
+            print_error "No se encontró libeclipse_relibc.rlib en target/."
             cd ..
             return 1
         fi
@@ -336,30 +336,7 @@ build_sidewind_project() {
     cd "$BASE_DIR"
 }
 
-# Función para compilar eclipse_std
-build_eclipse_std() {
-    print_step "Compilando eclipse_std..."
-    
-    if [ ! -d "eclipse-apps/eclipse_std" ]; then
-        print_status "Directorio eclipse-apps/eclipse_std no encontrado, saltando..."
-        return 0
-    fi
-    
-    cd eclipse-apps/eclipse_std
-    
-    print_status "Compilando eclipse_std (y deps: eclipse-syscall, eclipse-libc)..."
-    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo +nightly -Z unstable-options -Z json-target-spec build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
-    
-    if [ $? -eq 0 ]; then
-        print_success "eclipse_std compilado exitosamente"
-    else
-        print_error "Error al compilar eclipse_std"
-        cd ../..
-        return 1
-    fi
-    
-    cd ../..
-}
+
 
 # Función para compilar e instalar libXfont 1.5 (para TinyX con fuentes built-in)
 build_libxfont15() {
@@ -453,7 +430,7 @@ build_eclipse_init() {
     print_status "Compilando eclipse-init..."
     # IMPORTANTE: invocamos cargo desde la raíz para NO heredar el
     # `eclipse_kernel/.cargo/config.toml` (que fuerza build-std y puede duplicar `core`).
-    RUSTFLAGS="${RUSTFLAGS:-}" cargo +nightly build --release \
+    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--allow-multiple-definition" cargo +nightly build --release \
         --manifest-path eclipse_kernel/userspace/init/Cargo.toml \
         --target x86_64-unknown-linux-musl
     
@@ -511,7 +488,7 @@ build_userspace_services() {
             print_status "gui_service: compilando con compositor-lunas (file:/usr/bin/lunas)"
         fi
         # Igual que init: invocar desde la raíz para NO heredar eclipse_kernel/.cargo/config.toml.
-        RUSTFLAGS="${RUSTFLAGS:-}" cargo +nightly build --release --target x86_64-unknown-linux-musl $_gui_flags \
+        RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--allow-multiple-definition" cargo +nightly build --release --target x86_64-unknown-linux-musl $_gui_flags \
             --manifest-path "$manifest"
         local build_ok=$?
         local service_path="$BASE_DIR/eclipse_kernel/userspace/$service/target/x86_64-unknown-linux-musl/release/$service"
@@ -1013,7 +990,6 @@ build_userland() {
     build_eclipse_syscall
     prepare_sysroot
     build_eclipse_libc
-    build_eclipse_std
     build_sidewind_project
 
     # Aplicaciones

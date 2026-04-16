@@ -1,0 +1,74 @@
+libgrt_a-quotearg.o: quotearg.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h quotearg.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h alloca.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h quote.h attribute.h minmax.h \
+ /usr/include/x86_64-linux-musl/sys/param.h \
+ /usr/include/x86_64-linux-musl/sys/resource.h \
+ /usr/include/x86_64-linux-musl/sys/time.h \
+ /usr/include/x86_64-linux-musl/sys/select.h \
+ /usr/include/x86_64-linux-musl/bits/resource.h \
+ /usr/include/x86_64-linux-musl/endian.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h xalloc.h idx.h stdint.h \
+ /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h c-strcaseeq.h c-strcase.h \
+ c-ctype.h /usr/include/x86_64-linux-musl/ctype.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h uchar.h \
+ /usr/include/x86_64-linux-musl/uchar.h wchar.h \
+ /usr/include/x86_64-linux-musl/wchar.h wctype.h \
+ /usr/include/x86_64-linux-musl/wctype.h gettext.h locale.h \
+ /usr/include/x86_64-linux-musl/locale.h setlocale_null.h arg-nonnull.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+quotearg.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+alloca.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+quote.h:
+attribute.h:
+minmax.h:
+/usr/include/x86_64-linux-musl/sys/param.h:
+/usr/include/x86_64-linux-musl/sys/resource.h:
+/usr/include/x86_64-linux-musl/sys/time.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+/usr/include/x86_64-linux-musl/bits/resource.h:
+/usr/include/x86_64-linux-musl/endian.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+xalloc.h:
+idx.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+c-strcaseeq.h:
+c-strcase.h:
+c-ctype.h:
+/usr/include/x86_64-linux-musl/ctype.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+uchar.h:
+/usr/include/x86_64-linux-musl/uchar.h:
+wchar.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+wctype.h:
+/usr/include/x86_64-linux-musl/wctype.h:
+gettext.h:
+locale.h:
+/usr/include/x86_64-linux-musl/locale.h:
+setlocale_null.h:
+arg-nonnull.h:

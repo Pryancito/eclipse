@@ -1,0 +1,50 @@
+libglib_2_0_la-gthread-deprecated.lo: deprecated/gthread-deprecated.c \
+ ../config.h gmessages.h /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h ../glib/gtypes.h \
+ glibconfig.h ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h gslice.h deprecated/gmain.h \
+ ../glib/gmain.h ../glib/gpoll.h ../glib/gslist.h ../glib/gmem.h \
+ ../glib/gnode.h ../glib/gthread.h ../glib/gatomic.h ../glib/gerror.h \
+ ../glib/gquark.h deprecated/gthread.h \
+ /usr/include/x86_64-linux-musl/pthread.h \
+ /usr/include/x86_64-linux-musl/sched.h gthreadprivate.h \
+ deprecated/gthread.h deprecated/gthread.h garray.h gutils.h
+../config.h:
+gmessages.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+gslice.h:
+deprecated/gmain.h:
+../glib/gmain.h:
+../glib/gpoll.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+../glib/gthread.h:
+../glib/gatomic.h:
+../glib/gerror.h:
+../glib/gquark.h:
+deprecated/gthread.h:
+/usr/include/x86_64-linux-musl/pthread.h:
+/usr/include/x86_64-linux-musl/sched.h:
+gthreadprivate.h:
+deprecated/gthread.h:
+deprecated/gthread.h:
+garray.h:
+gutils.h:

@@ -1,0 +1,38 @@
+libfribidi_la-fribidi-char-sets-utf8.lo: fribidi-char-sets-utf8.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h common.h \
+ ../config.h fribidi-common.h fribidi-config.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h debug.h \
+ common.h fribidi-types.h fribidi-common.h fribidi-begindecls.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
+ fribidi-enddecls.h fribidi-begindecls.h fribidi-enddecls.h \
+ fribidi-char-sets-utf8.h fribidi-types.h fribidi-unicode.h \
+ fribidi-unicode-version.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+common.h:
+../config.h:
+fribidi-common.h:
+fribidi-config.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+debug.h:
+common.h:
+fribidi-types.h:
+fribidi-common.h:
+fribidi-begindecls.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
+fribidi-enddecls.h:
+fribidi-begindecls.h:
+fribidi-enddecls.h:
+fribidi-char-sets-utf8.h:
+fribidi-types.h:
+fribidi-unicode.h:
+fribidi-unicode-version.h:

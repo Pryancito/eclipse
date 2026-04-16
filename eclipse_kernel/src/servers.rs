@@ -712,6 +712,52 @@ impl SocketScheme {
         }
         Err(scheme_error::EAFNOSUPPORT)
     }
+
+    pub fn socketpair(&self, domain: u32, type_: u32, proto: u32) -> Result<(usize, usize), usize> {
+        if domain != 1 { return Err(scheme_error::EAFNOSUPPORT); }
+        let mut st = self.state.lock();
+        let conn_id = st.next_connection_id;
+        st.next_connection_id += 1;
+        
+        let s1_id = st.next_socket_id;
+        st.next_socket_id += 1;
+        let s2_id = st.next_socket_id;
+        st.next_socket_id += 1;
+        
+        st.connections.insert(conn_id, Connection {
+            id: conn_id,
+            buffer_to_client: VecDeque::new(),
+            buffer_to_server: VecDeque::new(),
+            client_socket_id: s1_id,
+            server_socket_id: Some(s2_id),
+            closed_by_client: false,
+            closed_by_server: false,
+            fd_queue_to_server: VecDeque::new(),
+            fd_queue_to_client: VecDeque::new(),
+        });
+        
+        st.sockets.insert(s1_id, Socket {
+            id: s1_id,
+            domain: 1,
+            type_,
+            protocol: proto,
+            state: SocketState::Connected,
+            path: None,
+            connection_id: Some(conn_id),
+        });
+        
+        st.sockets.insert(s2_id, Socket {
+            id: s2_id,
+            domain: 1,
+            type_,
+            protocol: proto,
+            state: SocketState::Connected,
+            path: None,
+            connection_id: Some(conn_id),
+        });
+        
+        Ok((s1_id, s2_id))
+    }
 }
 
 impl SocketScheme {

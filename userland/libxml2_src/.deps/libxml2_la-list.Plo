@@ -1,0 +1,27 @@
+libxml2_la-list.lo: list.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h libxml.h \
+ config.h include/libxml/xmlversion.h include/libxml/xmlexports.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ include/libxml/xmlmemory.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ include/libxml/xmlerror.h include/libxml/list.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+libxml.h:
+config.h:
+include/libxml/xmlversion.h:
+include/libxml/xmlexports.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+include/libxml/xmlmemory.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+include/libxml/xmlerror.h:
+include/libxml/list.h:

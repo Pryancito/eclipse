@@ -6,8 +6,9 @@
 extern crate std;
 use std::prelude::v1::*;
 use eclipse_program_codes::{spawn_id_to_init_services_index, spawn_service_id, spawn_service_short_name};
-use eclipse_libc::{getpid, yield_cpu, wait, Spinlock};
-use eclipse_libc::{fork, exec, get_service_binary, get_last_exec_error, exit};
+use eclipse_relibc::{getpid, yield_cpu, wait, Spinlock};
+use eclipse_relibc::{fork, exec, get_service_binary, get_last_exec_error, exit, get_system_stats, kill, receive_ipc, send_ipc, spawn_service};
+use eclipse_relibc::SystemStats;
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -123,7 +124,7 @@ fn start_essential_services() {
 
 fn start_essential_service(service_id: u32) -> u32 {
     let name = spawn_service_short_name(service_id);
-    let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
+    let pid = unsafe { eclipse_relibc::spawn_service(service_id, name.as_ptr(), name.len()) };
     if pid != u64::MAX {
         let mut svc = SERVICES.lock();
         let idx = spawn_id_to_init_services_index(service_id);
@@ -146,7 +147,7 @@ fn start_system_services() {
             let mut svc = SERVICES.lock();
             let name = svc[i].name;
             let service_id = (i - 2) as u32; // Map index to sys_spawn_service ID
-            let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
+            let pid = unsafe { eclipse_relibc::spawn_service(service_id, name.as_ptr(), name.len()) };
             
             if pid != u64::MAX {
                 svc[i].pid = pid as i32;
@@ -179,7 +180,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
     while attempts < max_attempts {
         // Poll mailbox a few times per ms to catch messages quickly
         for _ in 0..10 {
-            let (len, sender) = eclipse_libc::receive_ipc(&mut buffer);
+            let (len, sender) = eclipse_relibc::receive_ipc(&mut buffer);
             if len > 0 {
                 if len >= 5 && &buffer[..5] == b"READY" {
                     if sender == expected_pid {
@@ -228,7 +229,7 @@ fn main_loop() -> ! {
             
             // Active Watchdog: Check for heartbeat timeouts every CHECK_INTERVAL
             if counter % HEARTBEAT_CHECK_INTERVAL == 0 {
-                let mut stats = eclipse_libc::SystemStats {
+                let mut stats = eclipse_relibc::SystemStats {
             uptime_ticks: 0,
             idle_ticks: 0,
             total_mem_frames: 0,
@@ -243,7 +244,7 @@ fn main_loop() -> ! {
             heap_fragmentation: 0,
             wall_time_offset: 0,
         };
-                unsafe { eclipse_libc::get_system_stats(&mut stats); }
+                unsafe { eclipse_relibc::get_system_stats(&mut stats); }
                 let now = stats.uptime_ticks;
                 
                 let mut svc = SERVICES.lock();
@@ -254,7 +255,7 @@ fn main_loop() -> ! {
                         if service.last_heartbeat > 0 && now > service.last_heartbeat + HEARTBEAT_TIMEOUT_TICKS {
                             println!("[INIT] WATCHDOG: Service '{}' (PID {}) HUNG (no heartbeat for {}ms). Killing...", 
                                      service.name, service.pid, now - service.last_heartbeat);
-                            unsafe { eclipse_libc::kill(service.pid as i32, 9); }
+                            unsafe { eclipse_relibc::kill(service.pid as i32, 9); }
                             // Reap_zombies will handle the state transition to Failed in the next iteration
                         }
                     }
@@ -278,7 +279,7 @@ fn handle_ipc_requests(buffer: &mut [u8; 128]) {
     // Drain all pending IPC messages in one pass so that with SMP multiple
     // processes queuing messages simultaneously are all handled without delay.
     loop {
-        let (len, sender) = eclipse_libc::receive_ipc(buffer);
+        let (len, sender) = eclipse_relibc::receive_ipc(buffer);
         if len == 0 || sender == 0 {
             break;
         }
@@ -301,7 +302,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         let mut matched = false;
         for service in svc.iter_mut() {
             if service.pid == sender as i32 {
-                let mut stats = eclipse_libc::SystemStats {
+                let mut stats = eclipse_relibc::SystemStats {
             uptime_ticks: 0,
             idle_ticks: 0,
             total_mem_frames: 0,
@@ -316,7 +317,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
             heap_fragmentation: 0,
             wall_time_offset: 0,
         };
-                unsafe { eclipse_libc::get_system_stats(&mut stats); }
+                unsafe { eclipse_relibc::get_system_stats(&mut stats); }
                 service.last_heartbeat = stats.uptime_ticks;
                 matched = true;
                 break;
@@ -338,7 +339,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         response[4..8].copy_from_slice(&input_pid.to_le_bytes());
         // Use MSG_TYPE_INPUT (0x40 = P2P) so the response is delivered directly to
         // the requester's mailbox instead of being dropped in the global IPC queue.
-        let _ = eclipse_libc::send_ipc(sender, 0x40, &response);
+        let _ = eclipse_relibc::send_ipc(sender, 0x40, &response);
         return;
     }
 
@@ -349,7 +350,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"DSPL");
         response[4..8].copy_from_slice(&display_pid.to_le_bytes());
-        let _ = eclipse_libc::send_ipc(sender, 0x40, &response);
+        let _ = eclipse_relibc::send_ipc(sender, 0x40, &response);
         return;
     }
 
@@ -360,7 +361,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"NETW");
         response[4..8].copy_from_slice(&net_pid.to_le_bytes());
-        let _ = eclipse_libc::send_ipc(sender, 0x40, &response);
+        let _ = eclipse_relibc::send_ipc(sender, 0x40, &response);
         return;
     }
 
@@ -390,7 +391,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
                 offset += 4;
             }
         }
-        let _ = eclipse_libc::send_ipc(sender, 0x40, &reply[..offset]);
+        let _ = eclipse_relibc::send_ipc(sender, 0x40, &reply[..offset]);
         return;
     }
 
@@ -438,7 +439,7 @@ fn check_services() {
     let mut n_restart = 0;
     {
         let svc = SERVICES.lock();
-        let mut stats = eclipse_libc::SystemStats {
+        let mut stats = eclipse_relibc::SystemStats {
             uptime_ticks: 0,
             idle_ticks: 0,
             total_mem_frames: 0,
@@ -453,7 +454,7 @@ fn check_services() {
             heap_fragmentation: 0,
             wall_time_offset: 0,
         };
-        unsafe { eclipse_libc::get_system_stats(&mut stats); }
+        unsafe { eclipse_relibc::get_system_stats(&mut stats); }
         let now = stats.uptime_ticks;
 
         for (i, service) in svc.iter().enumerate() {
@@ -484,7 +485,7 @@ fn check_services() {
             let mut svc = SERVICES.lock();
             let service_id = (idx - 2) as u32;
             let name = svc[idx].name;
-            let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
+            let pid = unsafe { eclipse_relibc::spawn_service(service_id, name.as_ptr(), name.len()) };
             
             if pid != u64::MAX {
                 svc[idx].pid = pid as i32;

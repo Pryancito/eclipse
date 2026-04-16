@@ -124,6 +124,12 @@ pub enum SyscallNumber {
     ThreadCreate = 537,
     WaitPid = 538,
     ReceiveFast = 600,
+    EpollWait = 232,
+    EpollCtl = 233,
+    EpollCreate1 = 291,
+    Eventfd2 = 290,
+    Signalfd4 = 282,
+    Socketpair = 53,
 }
 
 
@@ -521,6 +527,13 @@ pub extern "C" fn syscall_handler(
         // Eclipse-native exec: replace current process with a raw ELF buffer.
         // Syscall 59 is the Linux-compatible execve(path, argv, envp); this slot
         // keeps the original Eclipse API (elf_ptr: u64, elf_size: u64) alive.
+        53  => sys_socketpair(arg1, arg2, arg3, arg4),
+        232 => sys_epoll_wait(arg1, arg2, arg3, arg4),
+        233 => sys_epoll_ctl(arg1, arg2, arg3, arg4),
+        282 => sys_signalfd4(arg1, arg2, arg3, arg4),
+        289 => sys_pipe2(arg1, arg2),
+        290 => sys_eventfd2(arg1, arg2),
+        291 => sys_epoll_create1(arg1),
         546 => sys_exec(arg1, arg2),
         600 => sys_receive_fast(context),
         _ => {
@@ -1142,11 +1155,11 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     
     // Validate parameters
     if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
-        return u64::MAX;
+        return linux_abi_error(22); // EINVAL
     }
 
     if !is_user_pointer(buf_ptr, len) {
-        return u64::MAX;
+        return linux_abi_error(14); // EFAULT
     }
     
     // File descriptor routing
@@ -1173,8 +1186,8 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                         total += n;
                         if n < chunk_len { break; } // Short write
                     }
-                    Err(_) => {
-                        return if total > 0 { total as u64 } else { u64::MAX };
+                    Err(e) => {
+                        return if total > 0 { total as u64 } else { linux_abi_error(e as i32) };
                     }
                 }
             }
@@ -1182,7 +1195,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         }
     }
     
-    u64::MAX
+    linux_abi_error(9) // EBADF
 }
 
 /// sys_read - Leer de un file descriptor (IMPLEMENTED)
@@ -1192,11 +1205,11 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     drop(stats);
     
     if buf_ptr == 0 || len == 0 || len > 32 * 1024 * 1024 {
-        return u64::MAX;
+        return linux_abi_error(22); // EINVAL
     }
     
     if !is_user_pointer(buf_ptr, len) {
-        return u64::MAX;
+        return linux_abi_error(14); // EFAULT
     }
     
     if let Some(pid) = current_process_id() {
@@ -4095,14 +4108,15 @@ fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
             serial::serial_printf(format_args!(
-                "[SYSCALL] socket(domain={}, type={}) -> failed\n",
-                domain, type_
+                "[SYSCALL] socket(domain={}, type={}) -> failed with error {}\n",
+                domain, type_, e
             ));
+            return linux_abi_error(e as i32);
         }
     }
-    u64::MAX
+    linux_abi_error(12) // ENOMEM or other internal error
 }
 
 /// sys_bind - Bind a name to a socket
@@ -4112,11 +4126,11 @@ fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
 fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
     // Validate arguments
     if addr == 0 || addrlen < 2 {
-        return u64::MAX; // EINVAL
+        return linux_abi_error(22); // EINVAL
     }
     
     if !is_user_pointer(addr, addrlen) {
-        return u64::MAX; // EFAULT
+        return linux_abi_error(14); // EFAULT
     }
     
     // Read address family (first 2 bytes)
@@ -4210,12 +4224,14 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
 fn sys_listen(fd: u64, backlog: u64) -> u64 {
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
-            if scheme.listen(fd_info.resource_id).is_ok() {
-                return 0;
+            match scheme.listen(fd_info.resource_id) {
+                Ok(_) => return 0,
+                Err(e) => return linux_abi_error(e as i32),
             }
         }
+        return linux_abi_error(9); // EBADF
     }
-    u64::MAX
+    linux_abi_error(38) // ENOSYS
 }
 
 /// sys_accept - Accept a connection on a socket
@@ -4228,43 +4244,47 @@ fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
                     if let Some(new_fd) = crate::fd::fd_open(pid, fd_info.scheme_id, new_res_id, fd_info.flags) {
                         return new_fd as u64;
                     }
+                    return linux_abi_error(12); // ENOMEM
                 },
-                Err(e) if e == crate::scheme::error::EAGAIN => {
-                    return u64::MAX; // Should return -EAGAIN if we have proper errno handling
-                },
-                Err(_) => return u64::MAX,
+                Err(e) => return linux_abi_error(e as i32),
             }
         }
+        return linux_abi_error(9); // EBADF
     }
-    u64::MAX
+    linux_abi_error(38) // ENOSYS
 }
 
 fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    if addr == 0 || addrlen < 2 { return u64::MAX; }
-    if !is_user_pointer(addr, addrlen) { return u64::MAX; }
+    if addr == 0 || addrlen < 2 { return linux_abi_error(22); } // EINVAL
+    if !is_user_pointer(addr, addrlen) { return linux_abi_error(14); } // EFAULT
     let family = unsafe { *(addr as *const u16) };
     
     if family == 1 { // AF_UNIX
         let path_start = addr + 2;
         let path_len = strlen_user_unique(path_start, (addrlen - 2) as usize);
         let mut path_buf = [0u8; 108];
-        if path_len > 107 { return u64::MAX; }
+        if path_len > 107 { return linux_abi_error(22); } // EINVAL
         unsafe {
             core::ptr::copy_nonoverlapping(path_start as *const u8, path_buf.as_mut_ptr(), path_len as usize);
         }
         path_buf[path_len as usize] = 0;
         let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
             Ok(s) => s,
-            Err(_) => return u64::MAX,
+            Err(_) => return linux_abi_error(22),
         };
+
+        serial::serial_printf(format_args!("[SYSCALL] connect(fd={}, path='{}')\n", fd, path_str));
 
         if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
             if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
-                if scheme.connect(fd_info.resource_id, path_str).is_ok() {
-                    return 0;
+                match scheme.connect(fd_info.resource_id, path_str) {
+                    Ok(_) => return 0,
+                    Err(e) => return linux_abi_error(e as i32),
                 }
             }
+            return linux_abi_error(9); // EBADF
         }
+        return linux_abi_error(38); // ENOSYS
     } else if family == 2 { // AF_INET
         let port_ptr = addr + 2;
         let ip_ptr = addr + 4;
@@ -4275,14 +4295,17 @@ fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
 
         if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
             if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
-                if scheme.connect(fd_info.resource_id, &path).is_ok() {
-                    return 0;
+                match scheme.connect(fd_info.resource_id, &path) {
+                    Ok(_) => return 0,
+                    Err(e) => return linux_abi_error(e as i32),
                 }
             }
+            return linux_abi_error(9); // EBADF
         }
+        return linux_abi_error(38); // ENOSYS
     }
 
-    u64::MAX
+    linux_abi_error(97) // EAFNOSUPPORT
 }
 
 /// sys_setsockopt - Set options on a socket
@@ -4323,7 +4346,7 @@ const MAX_PASS_FDS: usize = 8;
 /// handled; everything else is silently ignored.
 fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     if msg_ptr == 0 || !is_user_pointer(msg_ptr, 56) {
-        return u64::MAX;
+        return linux_abi_error(14); // EFAULT
     }
 
     // Read iov pointer + length (offsets 16, 24).
@@ -4373,7 +4396,7 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     }
 
     // ── Write payload to socket connection buffer ───────────────────────────
-    let total_written = if let Some(pid) = crate::process::current_process_id() {
+    if let Some(pid) = crate::process::current_process_id() {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             if let Some(scheme) = crate::servers::get_socket_scheme() {
                 // Enqueue FDs before writing data so the peer can retrieve them
@@ -4382,14 +4405,14 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
                     scheme.socket_enqueue_fds(fd_info.resource_id, fd_pairs);
                 }
                 match scheme.socket_write_raw(fd_info.resource_id, &all_data) {
-                    Ok(n) => n,
-                    Err(_) => return u64::MAX,
+                    Ok(n) => return n as u64,
+                    Err(e) => return linux_abi_error(e as i32),
                 }
-            } else { return u64::MAX; }
-        } else { return u64::MAX; }
-    } else { return u64::MAX; };
+            }
+        }
+    }
 
-    total_written as u64
+    linux_abi_error(9) // EBADF
 }
 
 /// sys_recvmsg - Receive a message from a socket (Linux syscall 47).
@@ -4399,7 +4422,7 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
 /// into the control buffer.
 fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     if msg_ptr == 0 || !is_user_pointer(msg_ptr, 56) {
-        return u64::MAX;
+        return linux_abi_error(14); // EFAULT
     }
 
     let msg_iov_ptr     = unsafe { *((msg_ptr + 16) as *const u64) };
@@ -4419,7 +4442,7 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     if total_cap == 0 { return 0; }
 
     // ── Read from socket connection buffer ──────────────────────────────────
-    let (n_read, fd_pairs_opt) = if let Some(pid) = crate::process::current_process_id() {
+    let (n_read, fd_pairs_opt) = if let Some(pid) = current_process_id() {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             if let Some(scheme) = crate::servers::get_socket_scheme() {
                 let mut tmp = alloc::vec![0u8; total_cap];
@@ -4445,22 +4468,13 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
                             }
                             written += chunk;
                         }
-                        let fds = scheme.socket_dequeue_fds(fd_info.resource_id);
-                        (written, fds)
+                        (written, scheme.socket_dequeue_fds(fd_info.resource_id))
                     }
-                    Err(e) => {
-                        // Return the Linux-ABI negative error code so libc sets errno
-                        // correctly.  For EAGAIN (e=11): kernel returns -11 (as u64),
-                        // relibc decodes that as errno=11 and returns -1 to the caller.
-                        // Previously u64::MAX (-1) was returned, which relibc decoded as
-                        // errno=1 (EPERM), causing the Wayland socket server to treat a
-                        // "no data yet" condition as a real disconnect.
-                        return (-(e as i64)) as u64;
-                    }
+                    Err(e) => return linux_abi_error(e as i32),
                 }
-            } else { return u64::MAX; }
-        } else { return u64::MAX; }
-    } else { return u64::MAX; };
+            } else { return linux_abi_error(38); }
+        } else { return linux_abi_error(9); }
+    } else { return linux_abi_error(1); };
 
     // ── Deliver queued file descriptors via control buffer (SCM_RIGHTS) ─────
     if let Some(fds) = fd_pairs_opt {
@@ -4614,12 +4628,12 @@ fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
 /// sys_writev - Vectorized write
 fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
     if iov_ptr == 0 || iov_cnt == 0 || iov_cnt > 1024 {
-        return u64::MAX;
+        return linux_abi_error(22); // EINVAL
     }
     
     // iovec struct size is 16 bytes on x86_64
     if !is_user_pointer(iov_ptr, iov_cnt * 16) {
-        return u64::MAX;
+        return linux_abi_error(14); // EFAULT
     }
     
     let mut total_written = 0;
@@ -4798,7 +4812,7 @@ fn sys_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let scheme_path = user_path_to_scheme_path(path_str);
     match crate::scheme::mkdir(&scheme_path, mode as u32) {
         Ok(_) => 0,
-        Err(_) => u64::MAX,
+        Err(e) => linux_abi_error(e as i32),
     }
 }
 
@@ -5598,4 +5612,150 @@ fn get_path_from_fd(pid: u32, fd: usize) -> Option<alloc::string::String> {
     use crate::fd::fd_get;
     let fd_entry = fd_get(pid, fd)?;
     crate::scheme::get_resource_path(fd_entry.scheme_id, fd_entry.resource_id)
+}
+
+/// sys_epoll_create1 — Linux epoll_create1(flags).
+fn sys_epoll_create1(_flags: u64) -> u64 {
+    // We ignore flags for now (e.g. EPOLL_CLOEXEC).
+    match crate::scheme::open("epoll:", 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        _ => {}
+    }
+    linux_abi_error(12) // ENOMEM
+}
+
+/// sys_epoll_ctl — Linux epoll_ctl(epfd, op, fd, event).
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+    let pid = match current_process_id() { Some(p) => p, None => return u64::MAX };
+    let epfd_entry = match crate::fd::fd_get(pid, epfd as usize) {
+        Some(e) => e,
+        None => return linux_abi_error(9), // EBADF
+    };
+    
+    // We should verify that epfd_entry.scheme_id corresponds to EpollScheme.
+    
+    let event = if event_ptr != 0 {
+        if !is_user_pointer(event_ptr, core::mem::size_of::<crate::epoll::EpollEvent>() as u64) {
+            return linux_abi_error(14); // EFAULT
+        }
+        Some(unsafe { *(event_ptr as *const crate::epoll::EpollEvent) })
+    } else {
+        None
+    };
+    
+    match crate::epoll::get_epoll_scheme().ctl(epfd_entry.resource_id, op as usize, fd as usize, event) {
+        Ok(_) => 0,
+        Err(e) => linux_abi_error(e as i32),
+    }
+}
+
+/// sys_epoll_wait — Linux epoll_wait(epfd, events, maxevents, timeout).
+fn sys_epoll_wait(epfd: u64, event_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let pid = match current_process_id() { Some(p) => p, None => return u64::MAX };
+    let epfd_entry = match crate::fd::fd_get(pid, epfd as usize) {
+        Some(e) => e,
+        None => return linux_abi_error(9), // EBADF
+    };
+    
+    if event_ptr == 0 || maxevents == 0 { return linux_abi_error(22); }
+    if !is_user_pointer(event_ptr, maxevents * core::mem::size_of::<crate::epoll::EpollEvent>() as u64) {
+        return linux_abi_error(14);
+    }
+
+    // Placeholder: return all watched FDs as ready to unblock labwc immediate initialization.
+    // Real epoll_wait would block if nothing is ready.
+    let watched_res = crate::epoll::get_epoll_scheme().get_instance_watched_fds(epfd_entry.resource_id);
+    let watched: alloc::vec::Vec<(usize, crate::epoll::EpollEvent)> = match watched_res {
+        Some(w) => w,
+        None => return linux_abi_error(9),
+    };
+    
+    if watched.is_empty() && timeout != 0 {
+        // If nothing watched and timeout > 0, we can actually sleep.
+        if timeout < 0xFFFFFFFF {
+             process_sleep_ms(timeout);
+        }
+        return 0;
+    }
+
+    let mut count = 0;
+    for (_fd, ev) in watched {
+        if (count as u64) >= maxevents { break; }
+        unsafe {
+            *((event_ptr as *mut crate::epoll::EpollEvent).add(count)) = ev;
+        }
+        count += 1;
+    }
+    
+    count as u64
+}
+
+/// sys_eventfd2 — Linux eventfd2(initval, flags).
+fn sys_eventfd2(initval: u64, flags: u64) -> u64 {
+    let path = alloc::format!("eventfd:{}/{}", initval, flags);
+    match crate::scheme::open(&path, 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        _ => {}
+    }
+    linux_abi_error(12) // ENOMEM
+}
+
+/// sys_socketpair — Linux socketpair(domain, type, protocol, sv[2]).
+fn sys_socketpair(domain: u64, type_: u64, protocol: u64, sv_ptr: u64) -> u64 {
+    if !is_user_pointer(sv_ptr, 8) { return linux_abi_error(14); } // EFAULT
+    
+    let scheme_id = match crate::scheme::get_scheme_id("socket") {
+        Some(id) => id,
+        None => return linux_abi_error(38),
+    };
+    
+    let scheme = match crate::servers::get_socket_scheme() {
+        Some(s) => s,
+        None => return linux_abi_error(38),
+    };
+    
+    match scheme.socketpair(domain as u32, type_ as u32, protocol as u32) {
+        Ok((r1, r2)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd1) = crate::fd::fd_open(pid, scheme_id, r1, 0) {
+                    if let Some(fd2) = crate::fd::fd_open(pid, scheme_id, r2, 0) {
+                        unsafe {
+                            *(sv_ptr as *mut i32) = fd1 as i32;
+                            *((sv_ptr as *mut i32).add(1)) = fd2 as i32;
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+        Err(e) => return linux_abi_error(e as i32),
+    }
+    linux_abi_error(12) // ENOMEM
+}
+
+/// sys_signalfd4 — Linux signalfd4(fd, mask, sizemask, flags).
+fn sys_signalfd4(_fd: u64, _mask_ptr: u64, _mask_size: u64, _flags: u64) -> u64 {
+    match crate::scheme::open("signalfd:", 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        Err(e) => return linux_abi_error(e as i32),
+    }
+    linux_abi_error(12) // ENOMEM
 }

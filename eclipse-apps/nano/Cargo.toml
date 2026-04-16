@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { workspace = true, features = ["eclipse-syscall", "use_std"] }
+eclipse-relibc = { workspace = true, features = ["eclipse-syscall", "use_std"] }
 
 [lints]
 workspace = true

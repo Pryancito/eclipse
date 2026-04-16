@@ -9,7 +9,7 @@
 //! 3. Salir si falla; si tiene éxito, la imagen del proceso es ya el compositor.
 
 use std::prelude::v1::*;
-use eclipse_libc as libc;
+use eclipse_relibc as libc;
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
 const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
@@ -17,9 +17,9 @@ const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 static LOAD_BUF: libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
 #[cfg(feature = "compositor-lunas")]
-const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
+const COMPOSITOR_PATH: &str = "file:/usr/bin/labwc";
 #[cfg(not(feature = "compositor-lunas"))]
-const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
+const COMPOSITOR_PATH: &str = "file:/usr/bin/labwc";
 
 fn main() {
     let pid = unsafe { libc::getpid() };
@@ -40,7 +40,7 @@ fn main() {
     // Transformar este proceso en el compositor (labwc o lunas).
     // Al usar exec(), el PID se mantiene pero la imagen del proceso cambia.
     unsafe {
-        use eclipse_libc::{eclipse_open, eclipse_close, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
+        use eclipse_relibc::{eclipse_open, eclipse_close, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
         const SEEK_SET: i32 = 0;
         const SEEK_END: i32 = 2;
 

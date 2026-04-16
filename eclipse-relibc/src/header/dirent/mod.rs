@@ -31,7 +31,7 @@ pub struct DIR {
     current: *mut dirent,
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut DIR {
     if name.is_null() {
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut DIR {
     dir
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn readdir(dirp: *mut DIR) -> *mut dirent {
     if dirp.is_null() { return core::ptr::null_mut(); }
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn readdir(dirp: *mut DIR) -> *mut dirent {
     dir.current
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn closedir(dirp: *mut DIR) -> c_int {
     if dirp.is_null() { return -1; }
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn closedir(dirp: *mut DIR) -> c_int {
 }
 
 /// rewinddir — reset directory stream to the beginning.
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn rewinddir(dirp: *mut DIR) {
     if !dirp.is_null() {
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn rewinddir(dirp: *mut DIR) {
 }
 
 /// dirfd — return fd associated with DIR (Eclipse has none; return -1).
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn dirfd(_dirp: *mut DIR) -> c_int {
     -1

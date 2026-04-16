@@ -1,0 +1,26 @@
+malloc/libgrt_a-scratch_buffer_grow.o: malloc/scratch_buffer_grow.c \
+ libc-config.h ../config.h /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h cdefs.h scratch_buffer.h \
+ malloc/scratch_buffer.gl.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h alloca.h
+libc-config.h:
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+cdefs.h:
+scratch_buffer.h:
+malloc/scratch_buffer.gl.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+alloca.h:

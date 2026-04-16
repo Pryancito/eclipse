@@ -1,0 +1,67 @@
+libgnu_la-vasnprintf.lo: vasnprintf.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h alloca.h vasnprintf.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h stdio.h \
+ /usr/include/x86_64-linux-musl/stdio.h sys/types.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h locale.h \
+ /usr/include/x86_64-linux-musl/locale.h setlocale_null.h arg-nonnull.h \
+ stdint.h /usr/include/x86_64-linux-musl/stdint.h \
+ /usr/include/x86_64-linux-musl/bits/stdint.h limits.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h stdlib.h \
+ /usr/include/x86_64-linux-musl/stdlib.h string.h \
+ /usr/include/x86_64-linux-musl/string.h \
+ /usr/include/x86_64-linux-musl/strings.h wchar.h \
+ /usr/include/x86_64-linux-musl/wchar.h \
+ /usr/include/x86_64-linux-musl/errno.h \
+ /usr/include/x86_64-linux-musl/bits/errno.h float.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h printf-parse.h printf-args.h \
+ xsize.h attribute.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+alloca.h:
+vasnprintf.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+stdio.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+sys/types.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:
+locale.h:
+/usr/include/x86_64-linux-musl/locale.h:
+setlocale_null.h:
+arg-nonnull.h:
+stdint.h:
+/usr/include/x86_64-linux-musl/stdint.h:
+/usr/include/x86_64-linux-musl/bits/stdint.h:
+limits.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+stdlib.h:
+/usr/include/x86_64-linux-musl/stdlib.h:
+string.h:
+/usr/include/x86_64-linux-musl/string.h:
+/usr/include/x86_64-linux-musl/strings.h:
+wchar.h:
+/usr/include/x86_64-linux-musl/wchar.h:
+/usr/include/x86_64-linux-musl/errno.h:
+/usr/include/x86_64-linux-musl/bits/errno.h:
+float.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+printf-parse.h:
+printf-args.h:
+xsize.h:
+attribute.h:

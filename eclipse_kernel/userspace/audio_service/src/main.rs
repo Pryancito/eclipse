@@ -9,8 +9,8 @@
 //! This is typically one of the last services to start.
 
 use std::prelude::v1::*;
-use eclipse_libc as libc;
-use eclipse_libc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
+use eclipse_relibc as libc;
+use eclipse_relibc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 fn sys_open(path: &str) -> Option<usize> {
     let fd = libc::eclipse_open(path, libc::O_RDONLY, 0);

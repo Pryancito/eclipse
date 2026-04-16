@@ -1,17 +1,24 @@
 //! errno.h - Error numbers
 use crate::types::*;
+use core::ptr;
 
 // Per-thread errno variable
 #[thread_local]
 static mut ERRNO: c_int = 0;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+/*
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe fn __errno_location() -> *mut c_int {
-    &raw mut ERRNO as *mut c_int
+    ptr::addr_of_mut!(ERRNO) as *mut c_int
+}
+*/
+
+extern "C" {
+    pub fn __errno_location() -> *mut c_int;
 }
 
-#[cfg(all(unix, not(eclipse_target)))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn __errno_location() -> *mut c_int;
 }
@@ -54,7 +61,8 @@ pub const ENOSYS: c_int = 35;
 
 pub const EWOULDBLOCK: c_int = EAGAIN;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+/*
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int {
     // Reuse the canonical `strerror` implementation from string.h.
@@ -66,13 +74,18 @@ pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: siz
     crate::header::string::strcpy(buf, msg);
     0
 }
+*/
 
-#[cfg(all(unix, not(eclipse_target)))]
 extern "C" {
     pub fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(any(test, feature = "host-testing"))]
+extern "C" {
+    pub fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int;
+}
+
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn perror(s: *const c_char) {
     use crate::header::stdio::stderr;
@@ -99,7 +112,7 @@ pub unsafe extern "C" fn perror(s: *const c_char) {
     fputs(b"\n\0".as_ptr() as *const c_char, stderr);
 }
 
-#[cfg(all(unix, not(eclipse_target)))]
+#[cfg(any(test, feature = "host-testing"))]
 extern "C" {
     pub fn perror(s: *const c_char);
 }

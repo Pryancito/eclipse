@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false }
+eclipse-relibc = { path = "../../../eclipse-relibc", default-features = false }
 eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 [profile.release]

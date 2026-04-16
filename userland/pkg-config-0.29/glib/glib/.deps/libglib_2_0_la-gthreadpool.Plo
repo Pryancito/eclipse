@@ -1,0 +1,49 @@
+libglib_2_0_la-gthreadpool.lo: gthreadpool.c ../config.h gthreadpool.h \
+ ../glib/gthread.h ../glib/gatomic.h ../glib/gtypes.h glibconfig.h \
+ ../glib/gmacros.h /usr/include/x86_64-linux-musl/stddef.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h \
+ /usr/include/x86_64-linux-musl/limits.h \
+ /usr/include/x86_64-linux-musl/features.h \
+ /usr/include/x86_64-linux-musl/bits/limits.h \
+ /usr/include/x86_64-linux-musl/float.h \
+ /usr/include/x86_64-linux-musl/bits/float.h ../glib/gversionmacros.h \
+ /usr/include/x86_64-linux-musl/time.h ../glib/gerror.h \
+ /usr/include/x86_64-linux-musl/stdarg.h ../glib/gquark.h gasyncqueue.h \
+ gasyncqueueprivate.h gmain.h ../glib/gpoll.h ../glib/gslist.h \
+ ../glib/gmem.h ../glib/gnode.h gtestutils.h ../glib/gmessages.h \
+ ../glib/gstring.h ../glib/gunicode.h ../glib/gbytes.h ../glib/garray.h \
+ ../glib/gutils.h gtimer.h
+../config.h:
+gthreadpool.h:
+../glib/gthread.h:
+../glib/gatomic.h:
+../glib/gtypes.h:
+glibconfig.h:
+../glib/gmacros.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+/usr/include/x86_64-linux-musl/limits.h:
+/usr/include/x86_64-linux-musl/features.h:
+/usr/include/x86_64-linux-musl/bits/limits.h:
+/usr/include/x86_64-linux-musl/float.h:
+/usr/include/x86_64-linux-musl/bits/float.h:
+../glib/gversionmacros.h:
+/usr/include/x86_64-linux-musl/time.h:
+../glib/gerror.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+../glib/gquark.h:
+gasyncqueue.h:
+gasyncqueueprivate.h:
+gmain.h:
+../glib/gpoll.h:
+../glib/gslist.h:
+../glib/gmem.h:
+../glib/gnode.h:
+gtestutils.h:
+../glib/gmessages.h:
+../glib/gstring.h:
+../glib/gunicode.h:
+../glib/gbytes.h:
+../glib/garray.h:
+../glib/gutils.h:
+gtimer.h:

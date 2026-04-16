@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "shape"] }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { version = "0.2", default-features = false }
+eclipse-relibc = { version = "0.2", default-features = false }

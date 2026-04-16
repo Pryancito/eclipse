@@ -2,7 +2,7 @@
 use crate::types::*;
 use crate::eclipse_syscall::call::exit as sys_exit;
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn abort() -> ! {
     use crate::header::unistd::_exit;
@@ -15,7 +15,7 @@ extern "C" {
     pub fn exit(status: c_int) -> !;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), any(eclipse_target, feature = "eclipse-syscall")))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn exit(status: c_int) -> ! {
     use crate::header::unistd::_exit;
@@ -28,25 +28,25 @@ pub use crate::internal_alloc::{malloc, free, calloc, realloc};
 
 // String to number conversions
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn atoi(s: *const c_char) -> c_int {
     strtol(s, core::ptr::null_mut(), 10) as c_int
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn atol(s: *const c_char) -> c_long {
     strtol(s, core::ptr::null_mut(), 10)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn atoll(s: *const c_char) -> c_longlong {
     strtoll(s, core::ptr::null_mut(), 10)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long {
     let mut result: c_long = 0;
@@ -121,19 +121,19 @@ pub unsafe extern "C" fn strtol(s: *const c_char, endptr: *mut *mut c_char, base
     result * sign
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __isoc23_strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long {
     strtol(s, endptr, base)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtoll(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_longlong {
     strtol(s, endptr, base) as c_longlong
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtoul(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong {
     let mut result: c_ulong = 0;
@@ -204,19 +204,19 @@ pub unsafe extern "C" fn strtoul(s: *const c_char, endptr: *mut *mut c_char, bas
     result
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __isoc23_strtoul(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong {
     strtoul(s, endptr, base)
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtoull(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulonglong {
     strtoul(s, endptr, base) as c_ulonglong
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtod(nptr: *const c_char, endptr: *mut *mut c_char) -> c_double {
     let mut result: f64 = 0.0;
@@ -257,19 +257,19 @@ pub unsafe extern "C" fn strtod(nptr: *const c_char, endptr: *mut *mut c_char) -
     result * sign
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strtof(nptr: *const c_char, endptr: *mut *mut c_char) -> c_float {
     strtod(nptr, endptr) as c_float
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn atof(nptr: *const c_char) -> c_double {
     strtod(nptr, core::ptr::null_mut())
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn qsort(
     base: *mut c_void,
@@ -303,19 +303,19 @@ pub unsafe extern "C" fn qsort(
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn abs(n: c_int) -> c_int {
     if n < 0 { -n } else { n }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn labs(n: c_long) -> c_long {
     if n < 0 { -n } else { n }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn llabs(n: c_longlong) -> c_longlong {
     if n < 0 { -n } else { n }
@@ -324,14 +324,14 @@ pub unsafe extern "C" fn llabs(n: c_longlong) -> c_longlong {
 #[thread_local]
 static mut RAND_SEED: u32 = 1;
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn rand() -> c_int {
     RAND_SEED = RAND_SEED.wrapping_mul(1103515245).wrapping_add(12345);
     ((RAND_SEED / 65536) % 32768) as c_int
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn srand(seed: c_uint) {
     RAND_SEED = seed;
@@ -466,7 +466,7 @@ pub fn getenv_str(name: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     if name.is_null() { return core::ptr::null_mut(); }
@@ -484,7 +484,7 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     }
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
     if name.is_null() || value.is_null() {
@@ -538,7 +538,7 @@ pub unsafe extern "C" fn setenv(name: *const c_char, value: *const c_char, overw
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
     if name.is_null() {
@@ -567,7 +567,7 @@ pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
 }
 
 /// putenv("NAME=VALUE") — add or change an environment variable.
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
     if string.is_null() {
@@ -623,7 +623,7 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
 }
 
 /// clearenv — clear the environment.
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn clearenv() -> c_int {
     if !ENVIRON_ARRAY.is_null() {
@@ -637,13 +637,13 @@ pub unsafe extern "C" fn clearenv() -> c_int {
     0
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn system(_command: *const c_char) -> c_int {
     -1
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn realpath(path: *const c_char, resolved_path: *mut c_char) -> *mut c_char {
     use crate::header::string::{strcpy, strdup};

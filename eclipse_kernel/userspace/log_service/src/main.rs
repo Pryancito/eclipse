@@ -1,5 +1,5 @@
 use std::prelude::v1::*;
-use eclipse_libc as libc;
+use eclipse_relibc as libc;
 
 /// Log buffer for storing messages before filesystem is ready
 const LOG_BUFFER_SIZE: usize = 4096;

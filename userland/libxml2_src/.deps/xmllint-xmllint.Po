@@ -1,0 +1,107 @@
+xmllint-xmllint.o: xmllint.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h libxml.h \
+ config.h include/libxml/xmlversion.h include/libxml/xmlexports.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/assert.h \
+ /home/moebius/eclipse/eclipse-os-build/include/time.h \
+ /home/moebius/eclipse/eclipse-os-build/include/errno.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/errno.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/time.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/select.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/timeb.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/stat.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stat.h \
+ /home/moebius/eclipse/eclipse-os-build/include/fcntl.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h \
+ /home/moebius/eclipse/eclipse-os-build/include/unistd.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/posix.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/mman.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/mman.h \
+ include/libxml/xmlmemory.h include/libxml/parser.h include/libxml/tree.h \
+ include/libxml/xmlstring.h include/libxml/xmlregexp.h \
+ include/libxml/dict.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ include/libxml/hash.h include/libxml/valid.h include/libxml/xmlerror.h \
+ include/libxml/list.h include/libxml/xmlautomata.h \
+ include/libxml/entities.h include/libxml/encoding.h \
+ /home/moebius/eclipse/eclipse-os-build/include/iconv.h \
+ include/libxml/xmlIO.h include/libxml/SAX2.h include/libxml/threads.h \
+ include/libxml/parserInternals.h include/libxml/HTMLparser.h \
+ include/libxml/chvalid.h include/libxml/HTMLtree.h \
+ include/libxml/xpath.h include/libxml/debugXML.h \
+ include/libxml/xinclude.h include/libxml/catalog.h \
+ include/libxml/xmlreader.h include/libxml/relaxng.h \
+ include/libxml/xmlschemas.h include/libxml/schematron.h \
+ include/libxml/pattern.h include/libxml/c14n.h include/libxml/xmlsave.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+libxml.h:
+config.h:
+include/libxml/xmlversion.h:
+include/libxml/xmlexports.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/assert.h:
+/home/moebius/eclipse/eclipse-os-build/include/time.h:
+/home/moebius/eclipse/eclipse-os-build/include/errno.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/errno.h:
+/home/moebius/eclipse/eclipse-os-build/include/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/time.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/select.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/timeb.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/stat.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stat.h:
+/home/moebius/eclipse/eclipse-os-build/include/fcntl.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h:
+/home/moebius/eclipse/eclipse-os-build/include/unistd.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/posix.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/mman.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/mman.h:
+include/libxml/xmlmemory.h:
+include/libxml/parser.h:
+include/libxml/tree.h:
+include/libxml/xmlstring.h:
+include/libxml/xmlregexp.h:
+include/libxml/dict.h:
+/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+include/libxml/hash.h:
+include/libxml/valid.h:
+include/libxml/xmlerror.h:
+include/libxml/list.h:
+include/libxml/xmlautomata.h:
+include/libxml/entities.h:
+include/libxml/encoding.h:
+/home/moebius/eclipse/eclipse-os-build/include/iconv.h:
+include/libxml/xmlIO.h:
+include/libxml/SAX2.h:
+include/libxml/threads.h:
+include/libxml/parserInternals.h:
+include/libxml/HTMLparser.h:
+include/libxml/chvalid.h:
+include/libxml/HTMLtree.h:
+include/libxml/xpath.h:
+include/libxml/debugXML.h:
+include/libxml/xinclude.h:
+include/libxml/catalog.h:
+include/libxml/xmlreader.h:
+include/libxml/relaxng.h:
+include/libxml/xmlschemas.h:
+include/libxml/schematron.h:
+include/libxml/pattern.h:
+include/libxml/c14n.h:
+include/libxml/xmlsave.h:

@@ -1,0 +1,23 @@
+libxml2_la-xmlunicode.lo: xmlunicode.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h libxml.h \
+ config.h include/libxml/xmlversion.h include/libxml/xmlexports.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h \
+ include/libxml/xmlunicode.h include/libxml/chvalid.h \
+ include/libxml/xmlstring.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdarg.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+libxml.h:
+config.h:
+include/libxml/xmlversion.h:
+include/libxml/xmlexports.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+include/libxml/xmlunicode.h:
+include/libxml/chvalid.h:
+include/libxml/xmlstring.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:

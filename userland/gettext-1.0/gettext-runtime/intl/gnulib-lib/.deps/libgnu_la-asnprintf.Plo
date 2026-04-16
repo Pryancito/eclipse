@@ -1,0 +1,26 @@
+libgnu_la-asnprintf.lo: asnprintf.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h vasnprintf.h \
+ /usr/include/x86_64-linux-musl/stdarg.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h stddef.h \
+ /usr/include/x86_64-linux-musl/stddef.h stdio.h \
+ /usr/include/x86_64-linux-musl/stdio.h sys/types.h \
+ /usr/include/x86_64-linux-musl/sys/types.h \
+ /usr/include/x86_64-linux-musl/endian.h \
+ /usr/include/x86_64-linux-musl/sys/select.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+vasnprintf.h:
+/usr/include/x86_64-linux-musl/stdarg.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
+stddef.h:
+/usr/include/x86_64-linux-musl/stddef.h:
+stdio.h:
+/usr/include/x86_64-linux-musl/stdio.h:
+sys/types.h:
+/usr/include/x86_64-linux-musl/sys/types.h:
+/usr/include/x86_64-linux-musl/endian.h:
+/usr/include/x86_64-linux-musl/sys/select.h:

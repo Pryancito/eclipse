@@ -1,0 +1,38 @@
+src/libpcre2_16_la-pcre2_chkdint.lo: src/pcre2_chkdint.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
+ src/config.h src/pcre2_internal.h \
+ /home/moebius/eclipse/eclipse-os-build/include/ctype.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h src/pcre2.h \
+ /home/moebius/eclipse/eclipse-os-build/include/inttypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
+ src/pcre2_ucp.h src/pcre2_intmodedep.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
+src/config.h:
+src/pcre2_internal.h:
+/home/moebius/eclipse/eclipse-os-build/include/ctype.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdio.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:
+src/pcre2.h:
+/home/moebius/eclipse/eclipse-os-build/include/inttypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
+src/pcre2_ucp.h:
+src/pcre2_intmodedep.h:

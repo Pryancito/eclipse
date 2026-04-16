@@ -16,7 +16,7 @@ micromath = "2.1.0"
 sidewind-opengl = { path = "../sidewind_opengl" }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-libc = { path = "../../eclipse-relibc", default-features = false }
+eclipse-relibc = { path = "../../eclipse-relibc", default-features = false }
 eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 
 [features]
@@ -25,4 +25,4 @@ host-testing = ["libc/host-testing"] # Changed from eclipse-libc/host-testing
 # Al ejecutar `cargo test`, Cargo une features: así eclipse-libc recibe host-testing,
 # no registra su global_allocator (mmap Eclipse) y se usa el allocator del sistema.
 [dev-dependencies]
-libc = { path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }
+eclipse-relibc = { path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }

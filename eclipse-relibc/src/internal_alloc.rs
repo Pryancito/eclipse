@@ -150,7 +150,7 @@ unsafe impl GlobalAlloc for Allocator {
 }
 
 // --- Implementación de funciones C (malloc, free, etc.) ---
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 mod imp {
     use super::*;
 
@@ -202,11 +202,11 @@ mod imp {
     }
 }
 
-// Eclipse: usar nuestro allocator; host (tests / Linux sin eclipse_target): usar libc del sistema
-#[cfg(all(not(any(test, feature = "host-testing")), eclipse_target))]
+// Eclipse: usar nuestro allocator; host (tests / Linux sin not(any(test, feature = "host-testing"))): usar libc del sistema
+#[cfg(not(any(test, feature = "host-testing")))]
 pub use imp::{malloc, free, calloc, realloc};
 
-#[cfg(any(test, feature = "host-testing", all(unix, not(eclipse_target))))]
+#[cfg(any(test, feature = "host-testing", any(test, feature = "host-testing")))]
 mod imp {
     use super::*;
 
@@ -239,5 +239,5 @@ mod imp {
     }
 }
 
-#[cfg(any(test, feature = "host-testing", all(unix, not(eclipse_target))))]
+#[cfg(any(test, feature = "host-testing", any(test, feature = "host-testing")))]
 pub use imp::{malloc, free, calloc, realloc};

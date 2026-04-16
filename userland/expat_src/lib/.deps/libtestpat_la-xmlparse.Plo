@@ -1,0 +1,66 @@
+libtestpat_la-xmlparse.lo: xmlparse.c \
+ /home/moebius/eclipse/host-toolchains/include/stdc-predef.h \
+ ../expat_config.h \
+ /home/moebius/eclipse/host-toolchains/include/stdbool.h \
+ /home/moebius/eclipse/host-toolchains/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/alltypes.h \
+ /home/moebius/eclipse/host-toolchains/include/string.h \
+ /home/moebius/eclipse/host-toolchains/include/features.h \
+ /home/moebius/eclipse/host-toolchains/include/strings.h \
+ /home/moebius/eclipse/host-toolchains/include/assert.h \
+ /home/moebius/eclipse/host-toolchains/include/limits.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/limits.h \
+ /home/moebius/eclipse/host-toolchains/include/stdio.h \
+ /home/moebius/eclipse/host-toolchains/include/stdlib.h \
+ /home/moebius/eclipse/host-toolchains/include/alloca.h \
+ /home/moebius/eclipse/host-toolchains/include/stdint.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/stdint.h \
+ /home/moebius/eclipse/host-toolchains/include/math.h \
+ /home/moebius/eclipse/host-toolchains/include/sys/time.h \
+ /home/moebius/eclipse/host-toolchains/include/sys/select.h \
+ /home/moebius/eclipse/host-toolchains/include/sys/types.h \
+ /home/moebius/eclipse/host-toolchains/include/endian.h \
+ /home/moebius/eclipse/host-toolchains/include/unistd.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/posix.h \
+ /home/moebius/eclipse/host-toolchains/include/fcntl.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/fcntl.h \
+ /home/moebius/eclipse/host-toolchains/include/errno.h \
+ /home/moebius/eclipse/host-toolchains/include/bits/errno.h ascii.h \
+ expat.h expat_external.h siphash.h \
+ /home/moebius/eclipse/host-toolchains/include/sys/random.h internal.h \
+ xmltok.h xmlrole.h
+/home/moebius/eclipse/host-toolchains/include/stdc-predef.h:
+../expat_config.h:
+/home/moebius/eclipse/host-toolchains/include/stdbool.h:
+/home/moebius/eclipse/host-toolchains/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/include/bits/alltypes.h:
+/home/moebius/eclipse/host-toolchains/include/string.h:
+/home/moebius/eclipse/host-toolchains/include/features.h:
+/home/moebius/eclipse/host-toolchains/include/strings.h:
+/home/moebius/eclipse/host-toolchains/include/assert.h:
+/home/moebius/eclipse/host-toolchains/include/limits.h:
+/home/moebius/eclipse/host-toolchains/include/bits/limits.h:
+/home/moebius/eclipse/host-toolchains/include/stdio.h:
+/home/moebius/eclipse/host-toolchains/include/stdlib.h:
+/home/moebius/eclipse/host-toolchains/include/alloca.h:
+/home/moebius/eclipse/host-toolchains/include/stdint.h:
+/home/moebius/eclipse/host-toolchains/include/bits/stdint.h:
+/home/moebius/eclipse/host-toolchains/include/math.h:
+/home/moebius/eclipse/host-toolchains/include/sys/time.h:
+/home/moebius/eclipse/host-toolchains/include/sys/select.h:
+/home/moebius/eclipse/host-toolchains/include/sys/types.h:
+/home/moebius/eclipse/host-toolchains/include/endian.h:
+/home/moebius/eclipse/host-toolchains/include/unistd.h:
+/home/moebius/eclipse/host-toolchains/include/bits/posix.h:
+/home/moebius/eclipse/host-toolchains/include/fcntl.h:
+/home/moebius/eclipse/host-toolchains/include/bits/fcntl.h:
+/home/moebius/eclipse/host-toolchains/include/errno.h:
+/home/moebius/eclipse/host-toolchains/include/bits/errno.h:
+ascii.h:
+expat.h:
+expat_external.h:
+siphash.h:
+/home/moebius/eclipse/host-toolchains/include/sys/random.h:
+internal.h:
+xmltok.h:
+xmlrole.h:

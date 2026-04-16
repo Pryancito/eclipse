@@ -1,0 +1,13 @@
+libgnu_la-math.lo: math.c ../config.h \
+ /usr/include/x86_64-linux-musl/stdbool.h \
+ /usr/include/x86_64-linux-musl/assert.h \
+ /usr/include/x86_64-linux-musl/features.h math.h \
+ /usr/include/x86_64-linux-musl/math.h \
+ /usr/include/x86_64-linux-musl/bits/alltypes.h
+../config.h:
+/usr/include/x86_64-linux-musl/stdbool.h:
+/usr/include/x86_64-linux-musl/assert.h:
+/usr/include/x86_64-linux-musl/features.h:
+math.h:
+/usr/include/x86_64-linux-musl/math.h:
+/usr/include/x86_64-linux-musl/bits/alltypes.h:
