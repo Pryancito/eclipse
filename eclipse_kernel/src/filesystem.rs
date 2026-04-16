@@ -2099,6 +2099,7 @@ impl Scheme for DevScheme {
                         v_signal: u16,
                         v_state:  u16,
                     }
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
                     let stat = unsafe { &mut *(arg as *mut VtStat) };
                     stat.v_active = 1; // VT 1 is the active terminal
                     stat.v_signal = 0;
@@ -2111,6 +2112,7 @@ impl Scheme for DevScheme {
                 0x5607 => return Ok(0), // VT_WAITACTIVE – wait for VT, stub ok
                 0x4B3A => {
                     // KDGETMODE – return KD_TEXT = 0
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
                     let mode = unsafe { &mut *(arg as *mut u32) };
                     *mode = 0;
                     return Ok(0);
@@ -2118,6 +2120,7 @@ impl Scheme for DevScheme {
                 0x4B3B => return Ok(0), // KDSETMODE   – set KD mode, stub ok
                 0x4B44 => {
                     // KDGKBMODE – return K_UNICODE = 3
+                    if arg == 0 { return Err(scheme_error::EFAULT); }
                     let mode = unsafe { &mut *(arg as *mut u32) };
                     *mode = 3;
                     return Ok(0);
