@@ -1906,6 +1906,7 @@ impl Scheme for DevScheme {
         }
         let is_dev = lookup_device(clean_path).is_some() || clean_path == "keyboard" 
             || clean_path == "null" || clean_path == "zero" || clean_path == "tty" 
+            || (clean_path.starts_with("tty") && clean_path.len() > 3 && clean_path[3..].chars().all(|c| c.is_ascii_digit()))
             || clean_path == "random" || clean_path == "urandom";
 
         if is_dev {
@@ -1921,7 +1922,7 @@ impl Scheme for DevScheme {
             if clean_path == "zero" {
                 return Ok(103);
             }
-            if clean_path == "tty" {
+            if clean_path == "tty" || (clean_path.starts_with("tty") && clean_path.len() > 3 && clean_path[3..].chars().all(|c| c.is_ascii_digit())) {
                 return Ok(104);
             }
             if clean_path == "random" || clean_path == "urandom" {

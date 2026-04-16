@@ -44,6 +44,12 @@ fn main() {
     if register_device("vda", DeviceType::Block) {
         println!("[DevFS] Registered /dev/vda");
     }
+    if register_device("tty", DeviceType::Char) {
+        println!("[DevFS] Registered /dev/tty");
+    }
+    if register_device("tty0", DeviceType::Char) {
+        println!("[DevFS] Registered /dev/tty0");
+    }
 
     println!("[DevFS] Initialization complete. Entering main loop.");
     let ppid = unsafe { libc::getppid() };

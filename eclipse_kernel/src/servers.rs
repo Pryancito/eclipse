@@ -939,6 +939,21 @@ impl Scheme for SocketScheme {
                 });
                 return Ok(id);
             }
+        } else if domain == 16 {
+            // AF_NETLINK: stub implementation for udev/netlink
+            let mut st = self.state.lock();
+            let id = st.next_socket_id;
+            st.next_socket_id += 1;
+            st.sockets.insert(id, Socket {
+                id,
+                domain: 16,
+                type_,
+                protocol: proto,
+                state: SocketState::Created,
+                path: None,
+                connection_id: None,
+            });
+            return Ok(id);
         }
 
         Err(scheme_error::EAFNOSUPPORT)
@@ -1066,9 +1081,8 @@ impl Scheme for SocketScheme {
                     }
                 }
             }
-        } else if domain == 2 {
-            // AF_INET: return requested events for now (placeholder)
-            ready = events;
+        } else if domain == 16 {
+            // AF_NETLINK: stub - never ready for read for now
         }
 
         Ok(ready)
