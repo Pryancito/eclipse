@@ -1168,6 +1168,76 @@ pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
     }
 }
 
+/// Demand-page fault handler.
+///
+/// Called from the `#PF` exception handler when a page-not-present fault occurs
+/// in userspace (error-code bit 0 == 0).  If the faulting address belongs to a
+/// lazy anonymous VMA (i.e. one whose frame was not allocated at `mmap()` time),
+/// this function allocates a fresh zeroed physical frame, maps it with the VMA's
+/// protection bits, and returns `true` so the CPU can retry the faulting instruction.
+///
+/// Returns `false` when the fault should be treated as an invalid access and the
+/// process killed:
+///   - the address is not covered by any VMA (true segfault),
+///   - the VMA has `PROT_NONE` (access to a reserved-but-inaccessible region), or
+///   - the VMA is file-backed (file-backed mappings are populated eagerly at mmap
+///     time, so a not-present fault there is unexpected).
+pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
+    use crate::process;
+
+    let page_addr = fault_addr & !0xFFF_u64;
+
+    let Some(proc) = process::get_process(pid) else {
+        return false;
+    };
+    let r = proc.resources.lock();
+
+    // Find the VMA containing the faulting page.
+    let vma = match r.vmas.iter().find(|v| page_addr >= v.start && page_addr < v.end) {
+        Some(v) => *v,
+        None => return false,
+    };
+    let page_table_phys = r.page_table_phys;
+    drop(r);
+    drop(proc);
+
+    // PROT_NONE (flags & 7 == 0): the region is reserved but not accessible.
+    const PROT_MASK: u64 = 7;
+    const PROT_EXEC: u64 = 4;
+    let linux_p = vma.flags & PROT_MASK;
+    if linux_p == 0 {
+        return false; // Access to PROT_NONE region → SIGSEGV
+    }
+
+    // File-backed mappings are populated eagerly in sys_mmap; a not-present fault
+    // for one of their pages is an unexpected condition — do not silently ignore it.
+    if vma.file_backed {
+        return false;
+    }
+
+    // Allocate and zero a fresh physical frame.
+    let Some(phys) = alloc_phys_frame_for_anon_mmap() else {
+        // Physical memory exhausted — let the process be killed.
+        crate::serial::serial_print("[MEM] demand-page: physical frame pool exhausted\n");
+        return false;
+    };
+    let fv = PHYS_MEM_OFFSET + phys;
+    unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
+
+    // Pages inside the kernel slack region (instruction-decode guard) carry PROT_EXEC
+    // regardless of the VMA's nominal protection.
+    let page_prot = if vma.anon_kernel_slack != 0 {
+        let slack_lo = vma.end.saturating_sub(vma.anon_kernel_slack);
+        if page_addr >= slack_lo { linux_p | PROT_EXEC } else { linux_p }
+    } else {
+        linux_p
+    };
+
+    let pte_leaf = linux_prot_to_leaf_pte_bits(page_prot);
+    map_user_page_4kb(page_table_phys, page_addr, phys, pte_leaf);
+    true
+}
+
 /// Notify AI-Core about current memory status
 fn notify_ai_memory_stats() {
     let next = ANON_MMAP_NEXT.load(Ordering::Relaxed);

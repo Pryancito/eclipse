@@ -776,6 +776,21 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     }
     // ---- End Fault Recovery ----
 
+    // ---- Demand Paging: satisfy a lazy anonymous page fault ----
+    // When a page-not-present fault (#PF, vector 14) arrives from userspace and the
+    // faulting address falls within a lazy anonymous VMA, allocate a fresh zeroed frame
+    // and map it.  The CPU will then retry the faulting instruction automatically after
+    // the handler returns (via iretq in common_exception_handler).
+    if num == 14 && cs & 3 == 3 && pid != 0 {
+        // error_code bit 0 == 0 means "not present" (as opposed to a protection violation).
+        if (err & 1) == 0 {
+            if crate::memory::handle_anon_page_fault(pid, cr2) {
+                return; // Frame allocated — retry the faulting instruction.
+            }
+        }
+    }
+    // ---- End Demand Paging ----
+
     // ---- Userspace fault: kill the process instead of BSOD ----
     // If CS[1:0] == 3, the fault originated from ring-3 (userspace) code.
     // In that case, terminate the faulting process and schedule the next one
