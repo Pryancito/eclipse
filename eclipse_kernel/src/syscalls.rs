@@ -4476,6 +4476,11 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
 
     // ── Determine total iov capacity ────────────────────────────────────────
+    // Cap to CONNECTION_BUFFER_CAP: the socket buffer itself is bounded to that
+    // size, so there is never more data to read.  Without this cap a process
+    // can pass arbitrarily large iov_len values (e.g. wlroots passes 128 MiB
+    // receive buffers) causing a kernel-heap OOM panic.
+    const RECVMSG_MAX_CAP: usize = crate::servers::CONNECTION_BUFFER_CAP;
     let max_iov = msg_iovlen.min(64);
     let mut total_cap: usize = 0;
     for i in 0..max_iov {
@@ -4484,6 +4489,7 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
         let iov_len = unsafe { *((iov_entry + 8) as *const u64) } as usize;
         total_cap = total_cap.saturating_add(iov_len);
     }
+    let total_cap = total_cap.min(RECVMSG_MAX_CAP);
     if total_cap == 0 { return 0; }
 
     // ── Read from socket connection buffer ──────────────────────────────────

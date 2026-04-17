@@ -452,7 +452,7 @@ pub struct Socket {
 }
 
 /// Maximum bytes buffered per direction per connection (avoid OOM).
-const CONNECTION_BUFFER_CAP: usize = 256 * 1024;
+pub const CONNECTION_BUFFER_CAP: usize = 256 * 1024;
 
 /// One bidirectional connection between a listener (server) and a client.
 struct Connection {
