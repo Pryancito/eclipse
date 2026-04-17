@@ -10,6 +10,50 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr::write_volatile;
 
+/// Trait to unify reading ELF data from both memory buffers and the filesystem.
+pub trait ElfDataProvider {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str>;
+    fn read_header(&self, buf: &mut [u8]) -> Result<(), &'static str> {
+        let n = self.read_at(0, buf)?;
+        if n < buf.len() {
+            return Err("ELF: failed to read header part");
+        }
+        Ok(())
+    }
+    fn len(&self) -> usize;
+}
+
+pub struct SliceDataProvider<'a>(pub &'a [u8]);
+
+impl<'a> ElfDataProvider for SliceDataProvider<'a> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let offset = offset as usize;
+        if offset >= self.0.len() {
+            return Ok(0);
+        }
+        let len = core::cmp::min(buf.len(), self.0.len() - offset);
+        buf[..len].copy_from_slice(&self.0[offset..offset + len]);
+        Ok(len)
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+pub struct InodeDataProvider {
+    pub inode: u32,
+    pub cached_len: usize,
+}
+
+impl ElfDataProvider for InodeDataProvider {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        crate::filesystem::Filesystem::read_file_by_inode_at(self.inode, buf, offset)
+    }
+    fn len(&self) -> usize {
+        self.cached_len
+    }
+}
+
 /// Minimal envp strings injected into all freshly-spawned processes so that
 /// bash/musl and other Linux-ABI programs can find binaries and terminals.
 pub const MINIMAL_ENVP: &[&[u8]] = &[
@@ -162,11 +206,11 @@ fn assert_ph_table_in_bounds(
 }
 
 fn program_header_at(
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     index: usize,
     ph_ent_size: usize,
-) -> Result<&Elf64ProgramHeader, &'static str> {
+) -> Result<Elf64ProgramHeader, &'static str> {
     if ph_ent_size < PHDR_MIN_SIZE {
         return Err("ELF: phentsize too small");
     }
@@ -176,13 +220,20 @@ fn program_header_at(
     let base = ph_offset
         .checked_add(idx_mul)
         .ok_or("ELF: ph table overflow")?;
-    let end = base
-        .checked_add(PHDR_MIN_SIZE)
-        .ok_or("ELF: ph table overflow")?;
-    if end > elf_data.len() {
-        return Err("ELF: program header out of bounds");
+    
+    let mut ph = Elf64ProgramHeader {
+        p_type: 0, p_flags: 0, p_offset: 0, p_vaddr: 0, p_paddr: 0, p_filesz: 0, p_memsz: 0, p_align: 0
+    };
+
+    let ph_slice = unsafe {
+        core::slice::from_raw_parts_mut(&mut ph as *mut _ as *mut u8, PHDR_MIN_SIZE)
+    };
+
+    let n = provider.read_at(base as u64, ph_slice)?;
+    if n < PHDR_MIN_SIZE {
+        return Err("ELF: failed to read program header");
     }
-    Ok(unsafe { &*(elf_data.as_ptr().add(base) as *const Elf64ProgramHeader) })
+    Ok(ph)
 }
 
 fn r_sym(info: u64) -> usize {
@@ -194,14 +245,14 @@ fn r_type(info: u64) -> u32 {
 }
 
 fn va_to_file_off(
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
     vaddr: u64,
 ) -> Option<usize> {
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size).ok()?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size).ok()?;
         if ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr.saturating_add(ph.p_filesz) {
             return Some((ph.p_offset + (vaddr - ph.p_vaddr)) as usize);
         }
@@ -226,14 +277,14 @@ fn write_user_u64(page_table_phys: u64, vaddr: u64, value: u64) -> Result<(), &'
 }
 
 fn min_load_vaddr(
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
     load_bias: u64,
 ) -> u64 {
     for i in 0..ph_count {
-        let Ok(ph) = program_header_at(elf_data, ph_offset, i, ph_size) else {
+        let Ok(ph) = program_header_at(provider, ph_offset, i, ph_size) else {
             break;
         };
         if ph.p_type == PT_LOAD {
@@ -243,48 +294,48 @@ fn min_load_vaddr(
     0
 }
 
-fn extract_interp_path<'a>(
-    elf_data: &'a [u8],
+fn extract_interp_path(
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
-) -> Result<Option<&'a str>, &'static str> {
+) -> Result<Option<alloc::string::String>, &'static str> {
+    use alloc::string::String;
+    use alloc::vec;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type != PT_INTERP {
             continue;
         }
         if ph.p_filesz > ph.p_memsz {
             return Err("ELF: PT_INTERP p_filesz > p_memsz");
         }
-        let Some(file_end) = ph.p_offset.checked_add(ph.p_filesz) else {
-            return Err("ELF: PT_INTERP file span overflow");
-        };
-        if file_end > elf_data.len() as u64 {
-            return Err("ELF: PT_INTERP out of bounds");
+        if ph.p_filesz > 4096 {
+            return Err("ELF: PT_INTERP path too long");
         }
-        let start = ph.p_offset as usize;
-        let end = start.saturating_add(ph.p_filesz as usize);
-        if end > elf_data.len() || start >= elf_data.len() {
-            return Err("ELF: PT_INTERP out of bounds");
+        
+        let mut bytes = vec![0u8; ph.p_filesz as usize];
+        let n = provider.read_at(ph.p_offset, &mut bytes)?;
+        if n < bytes.len() {
+            return Err("ELF: failed to read PT_INTERP path");
         }
-        let bytes = &elf_data[start..end];
+
         let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         let path = core::str::from_utf8(&bytes[..nul]).map_err(|_| "ELF: PT_INTERP not UTF-8")?;
-        return Ok(Some(path));
+        return Ok(Some(String::from(path)));
     }
     Ok(None)
 }
 
-fn has_pt_interp(elf_data: &[u8], ph_offset: usize, ph_count: usize, ph_size: usize) -> bool {
-    extract_interp_path(elf_data, ph_offset, ph_count, ph_size)
+fn has_pt_interp(provider: &dyn ElfDataProvider, ph_offset: usize, ph_count: usize, ph_size: usize) -> bool {
+    extract_interp_path(provider, ph_offset, ph_count, ph_size)
         .ok()
         .flatten()
         .is_some()
 }
 
 fn validate_entry_for_load(
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     header: &Elf64Header,
     ph_offset: usize,
     ph_count: usize,
@@ -305,7 +356,7 @@ fn validate_entry_for_load(
     }
     let mut ok = false;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD && (ph.p_flags & PF_X) != 0 {
             let base = if et_dyn {
                 ph.p_vaddr.wrapping_add(load_bias)
@@ -328,7 +379,7 @@ fn validate_entry_for_load(
 /// Map PT_LOAD; `et_dyn` adds `load_bias` to each segment vaddr. `load_bias` must be 0 for ET_EXEC.
 fn map_pt_load_segments(
     page_table_phys: u64,
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
@@ -338,19 +389,14 @@ fn map_pt_load_segments(
     let mut mapped_count: u32 = 0;
     let mut max_vaddr: u64 = 0;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type != PT_LOAD {
             continue;
         }
         if ph.p_filesz > ph.p_memsz {
             return Err("ELF: PT_LOAD p_filesz > p_memsz");
         }
-        let Some(file_span_end) = ph.p_offset.checked_add(ph.p_filesz) else {
-            return Err("ELF: PT_LOAD file span overflow");
-        };
-        if file_span_end > elf_data.len() as u64 {
-            return Err("ELF: PT_LOAD segment data out of file");
-        }
+        
         let vaddr_start = if et_dyn {
             ph.p_vaddr.wrapping_add(load_bias)
         } else {
@@ -400,17 +446,16 @@ fn map_pt_load_segments(
                 let intersect_end = core::cmp::min(vaddr_start + file_size, page_vaddr_end);
                 if intersect_start < intersect_end {
                     let copy_size = (intersect_end - intersect_start) as usize;
-                    let in_file_offset = (intersect_start - vaddr_start) as usize;
+                    let in_file_segment_offset = intersect_start - vaddr_start;
+                    let file_src_start = file_start_offset + in_file_segment_offset;
                     let in_page_offset = (intersect_start - page_vaddr_start) as usize;
-                    let file_src_start = file_start_offset as usize + in_file_offset;
-                    let file_src_end = file_src_start.saturating_add(copy_size);
-                    if file_src_end > elf_data.len() {
-                        return Err("ELF: segment data extends past end of file");
-                    }
-                    unsafe {
-                        let src = elf_data.as_ptr().add(file_src_start);
-                        let dst = kptr.add(in_page_offset);
-                        core::ptr::copy_nonoverlapping(src, dst, copy_size);
+                    
+                    let dst = unsafe { kptr.add(in_page_offset) };
+                    let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, copy_size) };
+                    
+                    let n = provider.read_at(file_src_start, dst_slice)?;
+                    if n < copy_size {
+                        return Err("ELF: failed to read segment data from provider");
                     }
                 }
             }
@@ -440,7 +485,7 @@ fn ph_flags_to_linux_prot(p_flags: u32) -> u64 {
 
 fn tls_setup_after_load(
     page_table_phys: u64,
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     max_vaddr_aligned: u64,
     tls_filesz: u64,
     tls_memsz: u64,
@@ -489,29 +534,27 @@ fn tls_setup_after_load(
         return 0;
     }
     if tls_filesz > 0 {
-        let src_end = (tls_file_offset as usize).saturating_add(tls_filesz as usize);
-        if src_end <= elf_data.len() {
-            let mut src_off = 0usize;
-            while src_off < tls_filesz as usize {
-                let dst_vaddr = tls_virt_start + src_off as u64;
-                let page_vaddr = dst_vaddr & !0xFFF;
-                let page_off = (dst_vaddr & 0xFFF) as usize;
-                if let Some(phys) = crate::memory::get_user_page_phys(page_table_phys, page_vaddr) {
-                    let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
-                    let space = 0x1000 - page_off;
-                    let remain = tls_filesz as usize - src_off;
-                    let chunk = space.min(remain);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf_data.as_ptr().add(tls_file_offset as usize + src_off),
-                            kptr.add(page_off),
-                            chunk,
-                        );
-                    }
-                    src_off += chunk;
-                } else {
+        let mut src_off = 0usize;
+        while src_off < tls_filesz as usize {
+            let dst_vaddr = tls_virt_start + src_off as u64;
+            let page_vaddr = dst_vaddr & !0xFFF;
+            let page_off = (dst_vaddr & 0xFFF) as usize;
+            if let Some(phys) = crate::memory::get_user_page_phys(page_table_phys, page_vaddr) {
+                let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
+                let space = 0x1000 - page_off;
+                let remain = tls_filesz as usize - src_off;
+                let chunk = space.min(remain);
+                
+                let dst = unsafe { kptr.add(page_off) };
+                let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, chunk) };
+                if let Err(e) = provider.read_at(tls_file_offset + src_off as u64, dst_slice) {
+                    serial::serial_printf(format_args!("[load_elf] TLS read error: {}\n", e));
                     break;
                 }
+                
+                src_off += chunk;
+            } else {
+                break;
             }
         }
     }
@@ -532,7 +575,7 @@ fn tls_setup_after_load(
 }
 
 fn collect_tls_phdr(
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
@@ -543,7 +586,7 @@ fn collect_tls_phdr(
     let mut tls_align = 8u64;
     let mut has_tls = false;
     for i in 0..ph_count {
-        let Ok(ph) = program_header_at(elf_data, ph_offset, i, ph_size) else {
+        let Ok(ph) = program_header_at(provider, ph_offset, i, ph_size) else {
             break;
         };
         if ph.p_type == PT_TLS {
@@ -560,7 +603,7 @@ fn collect_tls_phdr(
 
 fn apply_relocations_for_load_base(
     page_table_phys: u64,
-    elf_data: &[u8],
+    provider: &dyn ElfDataProvider,
     ph_offset: usize,
     ph_count: usize,
     ph_size: usize,
@@ -568,7 +611,7 @@ fn apply_relocations_for_load_base(
 ) -> Result<(), &'static str> {
     let mut dyn_file_off: Option<(u64, u64)> = None;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type == PT_DYNAMIC {
             dyn_file_off = Some((ph.p_offset, ph.p_filesz));
             break;
@@ -580,11 +623,8 @@ fn apply_relocations_for_load_base(
     if d_filesz < core::mem::size_of::<Elf64Dyn>() as u64 {
         return Ok(());
     }
-    let d_start = d_off as usize;
-    let d_end = d_start.saturating_add(d_filesz as usize);
-    if d_end > elf_data.len() {
-        return Err("ELF: PT_DYNAMIC out of bounds");
-    }
+    let d_start = d_off;
+
     let mut dt_rela: Option<u64> = None;
     let mut dt_relasz: u64 = 0;
     let mut dt_relaent: u64 = 0;
@@ -592,8 +632,13 @@ fn apply_relocations_for_load_base(
     let mut dt_strtab: Option<u64> = None;
     let mut dt_syment: u64 = core::mem::size_of::<Elf64Sym>() as u64;
     let mut idx = d_start;
-    while idx + core::mem::size_of::<Elf64Dyn>() <= d_end {
-        let d = unsafe { &*(elf_data[idx..].as_ptr() as *const Elf64Dyn) };
+    while idx + core::mem::size_of::<Elf64Dyn>() as u64 <= d_start + d_filesz {
+        let mut d = Elf64Dyn { d_tag: 0, d_val: 0 };
+        let d_slice = unsafe {
+            core::slice::from_raw_parts_mut(&mut d as *mut _ as *mut u8, core::mem::size_of::<Elf64Dyn>())
+        };
+        provider.read_at(idx, d_slice)?;
+
         match d.d_tag {
             DT_NULL => break,
             DT_RELA => dt_rela = Some(d.d_val),
@@ -608,7 +653,7 @@ fn apply_relocations_for_load_base(
             }
             _ => {}
         }
-        idx += core::mem::size_of::<Elf64Dyn>();
+        idx += core::mem::size_of::<Elf64Dyn>() as u64;
     }
     let Some(rela_vaddr) = dt_rela else {
         return Ok(());
@@ -619,17 +664,21 @@ fn apply_relocations_for_load_base(
     if dt_relaent == 0 {
         dt_relaent = core::mem::size_of::<Elf64Rela>() as u64;
     }
-    let rela_file_off = va_to_file_off(elf_data, ph_offset, ph_count, ph_size, rela_vaddr)
-        .ok_or("ELF: DT_RELA not in file")?;
+    let rela_file_off = va_to_file_off(provider, ph_offset, ph_count, ph_size, rela_vaddr)
+        .ok_or("ELF: DT_RELA not in file")? as u64;
     let symtab_vaddr = dt_symtab.ok_or("ELF: missing DT_SYMTAB for reloc")?;
-    let symtab_file_off = va_to_file_off(elf_data, ph_offset, ph_count, ph_size, symtab_vaddr)
-        .ok_or("ELF: DT_SYMTAB not in file")?;
-    dt_strtab.ok_or("ELF: missing DT_STRTAB for reloc")?;
+    let symtab_file_off = va_to_file_off(provider, ph_offset, ph_count, ph_size, symtab_vaddr)
+        .ok_or("ELF: DT_SYMTAB not in file")? as u64;
 
     let mut rel_off = rela_file_off;
-    let rel_end = rela_file_off.saturating_add(dt_relasz as usize);
-    while rel_off + core::mem::size_of::<Elf64Rela>() <= rel_end.min(elf_data.len()) {
-        let rela = unsafe { &*(elf_data[rel_off..].as_ptr() as *const Elf64Rela) };
+    let rel_end = rela_file_off + dt_relasz;
+    while rel_off + core::mem::size_of::<Elf64Rela>() as u64 <= rel_end {
+        let mut rela = Elf64Rela { r_offset: 0, r_info: 0, r_addend: 0 };
+        let rela_slice = unsafe {
+            core::slice::from_raw_parts_mut(&mut rela as *mut _ as *mut u8, core::mem::size_of::<Elf64Rela>())
+        };
+        provider.read_at(rel_off, rela_slice)?;
+
         let typ = r_type(rela.r_info);
         let sym_idx = r_sym(rela.r_info);
         let target = load_base.wrapping_add(rela.r_offset);
@@ -639,11 +688,15 @@ fn apply_relocations_for_load_base(
                 write_user_u64(page_table_phys, target, v)?;
             }
             R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_X86_64_64 => {
-                let sym_off = symtab_file_off.saturating_add(sym_idx.saturating_mul(dt_syment as usize));
-                if sym_off + core::mem::size_of::<Elf64Sym>() > elf_data.len() {
-                    return Err("ELF: symbol out of bounds");
-                }
-                let sym = unsafe { &*(elf_data[sym_off..].as_ptr() as *const Elf64Sym) };
+                let sym_off = symtab_file_off + (sym_idx as u64 * dt_syment);
+                let mut sym = Elf64Sym {
+                    st_name: 0, st_info: 0, st_other: 0, st_shndx: 0, st_value: 0, st_size: 0
+                };
+                let sym_slice = unsafe {
+                    core::slice::from_raw_parts_mut(&mut sym as *mut _ as *mut u8, core::mem::size_of::<Elf64Sym>())
+                };
+                provider.read_at(sym_off, sym_slice)?;
+
                 let s = if sym.st_shndx == SHN_UNDEF {
                     return Err("ELF: unresolved reloc (undef sym)");
                 } else {
@@ -660,23 +713,25 @@ fn apply_relocations_for_load_base(
                 ));
             }
         }
-        rel_off = rel_off.saturating_add(dt_relaent as usize);
+        rel_off += dt_relaent;
     }
     Ok(())
 }
 
-fn phdr_va_biased(elf_data: &[u8], load_bias: u64, et_dyn: bool) -> Result<(u64, u64, u64), &'static str> {
-    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("ELF: file too small");
-    }
-    let header = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
+fn phdr_va_biased(provider: &dyn ElfDataProvider, load_bias: u64, et_dyn: bool) -> Result<(u64, u64, u64), &'static str> {
+    let mut header = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
+    };
+    provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut header as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
+
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
+    assert_ph_table_in_bounds(provider.len(), ph_offset, ph_count, ph_size)?;
     let mut first_load_vaddr = None;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD {
             first_load_vaddr = Some(ph.p_vaddr);
             break;
@@ -691,17 +746,28 @@ fn phdr_va_biased(elf_data: &[u8], load_bias: u64, et_dyn: bool) -> Result<(u64,
     Ok((phdr_va, header.e_phnum as u64, header.e_phentsize as u64))
 }
 
-fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &str) -> Result<ExecLoadResult, &'static str> {
+fn load_elf_dynamic_pair(page_table_phys: u64, main_provider: &dyn ElfDataProvider, interp_path: &str) -> Result<ExecLoadResult, &'static str> {
     serial::serial_printf(format_args!(
         "[load_elf] dynamic: loading interpreter \"{}\"\n",
         interp_path
     ));
-    let interp_elf: Vec<u8> = filesystem::read_file_alloc(interp_path)?;
-    if interp_elf.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("ELF: interpreter too small");
-    }
-    let main_h = unsafe { &*(main_elf.as_ptr() as *const Elf64Header) };
-    let interp_h = unsafe { &*(interp_elf.as_ptr() as *const Elf64Header) };
+    
+    let interp_inode = filesystem::Filesystem::lookup_path(interp_path)?;
+    let interp_len = filesystem::Filesystem::content_len_by_inode(interp_inode)?;
+    let interp_provider = InodeDataProvider { inode: interp_inode, cached_len: interp_len };
+
+    let mut main_h = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
+    };
+    main_provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut main_h as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
+
+    let mut interp_h = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
+    };
+    interp_provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut interp_h as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
+
     if &interp_h.e_ident[0..4] != &ELF_MAGIC {
         return Err("ELF: interpreter bad magic");
     }
@@ -714,10 +780,10 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
     let interp_ph_off = interp_h.e_phoff as usize;
     let interp_ph_count = interp_h.e_phnum as usize;
     let interp_ph_size = interp_h.e_phentsize as usize;
-    assert_ph_table_in_bounds(main_elf.len(), main_ph_off, main_ph_count, main_ph_size)?;
-    assert_ph_table_in_bounds(interp_elf.len(), interp_ph_off, interp_ph_count, interp_ph_size)?;
+    assert_ph_table_in_bounds(main_provider.len(), main_ph_off, main_ph_count, main_ph_size)?;
+    assert_ph_table_in_bounds(interp_provider.len(), interp_ph_off, interp_ph_count, interp_ph_size)?;
 
-    if has_pt_interp(&interp_elf, interp_ph_off, interp_ph_count, interp_ph_size) {
+    if has_pt_interp(&interp_provider, interp_ph_off, interp_ph_count, interp_ph_size) {
         return Err("ELF: nested PT_INTERP in interpreter");
     }
 
@@ -727,12 +793,9 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
     } else {
         0u64
     };
-    if !main_et_dyn && main_h.e_type != ET_EXEC {
-        return Err("ELF: main not ET_EXEC/ET_DYN");
-    }
     validate_entry_for_load(
-        main_elf,
-        main_h,
+        main_provider,
+        &main_h,
         main_ph_off,
         main_ph_count,
         main_ph_size,
@@ -741,12 +804,9 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
     )?;
 
     let interp_et_dyn = interp_h.e_type == ET_DYN;
-    if !interp_et_dyn && interp_h.e_type != ET_EXEC {
-        return Err("ELF: interpreter not ET_EXEC/ET_DYN");
-    }
     validate_entry_for_load(
-        &interp_elf,
-        interp_h,
+        &interp_provider,
+        &interp_h,
         interp_ph_off,
         interp_ph_count,
         interp_ph_size,
@@ -756,7 +816,7 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
 
     let (max_v_main, mut mapped) = map_pt_load_segments(
         page_table_phys,
-        main_elf,
+        main_provider,
         main_ph_off,
         main_ph_count,
         main_ph_size,
@@ -764,24 +824,15 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
         main_et_dyn,
     )?;
     let max_v_main_al = (max_v_main + 0xFFF) & !0xFFF;
-    // No duplicar PT_TLS en un bloque aparte ni fijar %fs aquí: el primer código que corre es ld-musl,
-    // que debe ver %fs=0 (o su propio TLS) hasta montar el hilo inicial. Si cargamos el TLS del main
-    // y ponemos FS_BASE en el TCB del main, ld.so usa offsets propios de libc y acaba leyendo/escribiendo
-    // fuera del bloque (p. ej. CR2≈0x409d1ff8 con TCB en 0x409d3180).
-    let tls_base: u64 = 0;
     let main_end = max_v_main_al.saturating_add(0x1000);
 
     let base_above_main = main_end.saturating_add(DYNAMIC_INTERP_GAP);
     let step = 0x1_0000_0000u64;
     let interp_bias = (base_above_main.saturating_add(step - 1) / step).saturating_mul(step);
-    serial::serial_printf(format_args!(
-        "[load_elf] dynamic: main_bias=0x{:x} interp_bias=0x{:x} main_end=0x{:x}\n",
-        main_bias, interp_bias, main_end
-    ));
-
+    
     let (max_v_interp, mapped_i) = map_pt_load_segments(
         page_table_phys,
-        &interp_elf,
+        &interp_provider,
         interp_ph_off,
         interp_ph_count,
         interp_ph_size,
@@ -789,60 +840,43 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_elf: &[u8], interp_path: &st
         interp_et_dyn,
     )?;
     mapped = mapped.saturating_add(mapped_i);
-    // apply_relocations_for_load_base(
-    //     page_table_phys,
-    //     &interp_elf,
-    //     interp_ph_off,
-    //     interp_ph_count,
-    //     interp_ph_size,
-    //     interp_bias,
-    // )?;
 
-    let interp_entry = if interp_et_dyn {
-        interp_bias.wrapping_add(interp_h.e_entry)
-    } else {
-        interp_h.e_entry
-    };
-    let main_entry_va = if main_et_dyn {
-        main_bias.wrapping_add(main_h.e_entry)
-    } else {
-        main_h.e_entry
-    };
-    let max_v_interp_al = (max_v_interp + 0xFFF) & !0xFFF;
-    let max_maps = core::cmp::max(max_v_main_al, max_v_interp_al);
+    let (phdr_va, phnum, phent) = phdr_va_biased(main_provider, main_bias, main_et_dyn)?;
 
-    let (phdr_va, phnum, phentsize) = phdr_va_biased(main_elf, main_bias, main_et_dyn)?;
-
-    serial::serial_printf(format_args!(
-        "[load_elf] dynamic: interp_entry=0x{:x} main_entry=0x{:x} phdr=0x{:x}\n",
-        interp_entry, main_entry_va, phdr_va
-    ));
-
-    Ok(ExecLoadResult {
-        entry_point: interp_entry,
-        max_vaddr: max_maps,
+    let mut res = ExecLoadResult {
+        entry_point: if main_et_dyn { main_bias.wrapping_add(main_h.e_entry) } else { main_h.e_entry },
+        max_vaddr: max_v_interp,
         phdr_va,
         phnum,
-        phentsize,
+        phentsize: phent,
         segment_frames: mapped as u64,
-        tls_base,
-        dynamic_linker: Some((interp_bias, main_entry_va)),
-        loaded_vma_ranges: [(main_bias, max_v_main_al), (interp_bias, max_v_interp_al)],
-        loaded_vma_count: 2,
-    })
+        tls_base: 0,
+        dynamic_linker: Some((interp_bias, if interp_et_dyn { interp_bias.wrapping_add(interp_h.e_entry) } else { interp_h.e_entry })),
+        loaded_vma_ranges: [(0, 0), (0, 0)],
+        loaded_vma_count: 0,
+    };
+    res.loaded_vma_ranges[0] = (min_load_vaddr(main_provider, main_ph_off, main_ph_count, main_ph_size, main_bias), max_v_main);
+    res.loaded_vma_ranges[1] = (min_load_vaddr(&interp_provider, interp_ph_off, interp_ph_count, interp_ph_size, interp_bias), max_v_interp);
+    res.loaded_vma_count = 2;
+
+    Ok(res)
 }
 
+
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado.
-pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<ExecLoadResult, &'static str> {
+pub fn load_elf_into_space(page_table_phys: u64, provider: &dyn ElfDataProvider) -> Result<ExecLoadResult, &'static str> {
     serial::serial_printf(format_args!(
         "[load_elf] start len={} cr3=0x{:x}\n",
-        elf_data.len(),
+        provider.len(),
         page_table_phys
     ));
-    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("ELF: File too small");
-    }
-    let header = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
+    
+    let mut header = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
+    };
+    provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut header as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
+
     if &header.e_ident[0..4] != &ELF_MAGIC {
         return Err("ELF: Invalid magic number");
     }
@@ -852,10 +886,10 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
+    assert_ph_table_in_bounds(provider.len(), ph_offset, ph_count, ph_size)?;
 
-    if let Some(interp_path) = extract_interp_path(elf_data, ph_offset, ph_count, ph_size)? {
-        return load_elf_dynamic_pair(page_table_phys, elf_data, interp_path);
+    if let Some(interp_path) = extract_interp_path(provider, ph_offset, ph_count, ph_size)? {
+        return load_elf_dynamic_pair(page_table_phys, provider, interp_path.as_str());
     }
 
     let et_dyn = header.e_type == ET_DYN;
@@ -868,8 +902,8 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
         return Err("ELF: not ET_EXEC/ET_DYN");
     }
     validate_entry_for_load(
-        elf_data,
-        header,
+        provider,
+        &header,
         ph_offset,
         ph_count,
         ph_size,
@@ -877,10 +911,10 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
         et_dyn,
     )?;
 
-    let (has_tls, tf, tm, tfo, ta) = collect_tls_phdr(elf_data, ph_offset, ph_count, ph_size);
+    let (has_tls, tf, tm, tfo, ta) = collect_tls_phdr(provider, ph_offset, ph_count, ph_size);
     let (max_v, mut mapped) = map_pt_load_segments(
         page_table_phys,
-        elf_data,
+        provider,
         ph_offset,
         ph_count,
         ph_size,
@@ -896,7 +930,7 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
 
     let tls_base = tls_setup_after_load(
         page_table_phys,
-        elf_data,
+        provider,
         max_vaddr_aligned,
         tf,
         tm,
@@ -906,14 +940,14 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<Exec
         &mut mapped,
     );
 
-    let (phdr_va, phnum, phentsize) = phdr_va_biased(elf_data, load_bias, et_dyn)?;
+    let (phdr_va, phnum, phentsize) = phdr_va_biased(provider, load_bias, et_dyn)?;
 
     serial::serial_printf(format_args!(
         "[load_elf] successfully loaded: entry=0x{:x} max_v=0x{:x} mapped_pages={}\n",
         entry_point, max_vaddr_aligned, mapped
     ));
 
-    let min_vaddr = min_load_vaddr(elf_data, ph_offset, ph_count, ph_size, load_bias);
+    let min_vaddr = min_load_vaddr(provider, ph_offset, ph_count, ph_size, load_bias);
 
     Ok(ExecLoadResult {
         entry_point,
@@ -964,16 +998,30 @@ pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize
     Ok(stack_base + stack_size as u64)
 }
 
-/// Cargar binario ELF en memoria y crear proceso
+/// Cargar binario ELF en memoria y crear proceso (desde un slice en memoria)
 pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
+    load_elf_provider(&SliceDataProvider(elf_data))
+}
+
+/// Cargar binario ELF desde una ruta en el filesystem (streaming, eficiente en memoria)
+pub fn load_elf_path(path: &str) -> Option<ProcessId> {
+    let inode = match filesystem::Filesystem::lookup_path(path) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+    let len = match filesystem::Filesystem::content_len_by_inode(inode) {
+        Ok(l) => l,
+        Err(_) => return None,
+    };
+    let provider = InodeDataProvider { inode, cached_len: len };
+    load_elf_provider(&provider)
+}
+
+fn load_elf_provider(provider: &dyn ElfDataProvider) -> Option<ProcessId> {
     // Create the page table for this process ONCE and reuse it throughout.
-    // CRITICAL: We must pass this same cr3 to create_process_with_pid.
-    // Previously load_elf called create_process which allocated a *second* fresh
-    // cr3, causing the process to run in an empty address space while the ELF
-    // segments lived in the discarded first cr3 → execution of zero bytes → crash.
     let cr3 = crate::memory::create_process_paging();
 
-    let loaded = match load_elf_into_space(cr3, elf_data) {
+    let loaded = match load_elf_into_space(cr3, provider) {
         Ok(res) => res,
         Err(e) => {
             serial::serial_print("ELF: Load failed: ");
@@ -985,7 +1033,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
 
     // Default user stack at 512MB
     let stack_base = 0x20000000; // 512MB
-    let stack_size = 0x100000;  // 1MB (previously 256KB)
+    let stack_size = 0x100000;  // 1MB
 
     // Map the user stack into the SAME cr3 before creating the process entry.
     if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
@@ -1023,6 +1071,8 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
                 p.fs_base = loaded.tls_base;
             }
             p.dynamic_linker_aux = loaded.dynamic_linker;
+            // All user-space binaries use Linux ABI error convention.
+            p.is_linux = true;
         }
     });
 
@@ -1031,14 +1081,12 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     Some(pid)
 }
 
-fn load_info(elf_data: &[u8]) -> Result<(u64, usize, usize, usize), &'static str> {
-    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("ELF: File too small");
-    }
-    
-    let header = unsafe {
-        &*(elf_data.as_ptr() as *const Elf64Header)
+fn load_info(provider: &dyn ElfDataProvider) -> Result<(u64, usize, usize, usize), &'static str> {
+    let mut header = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
     };
+    provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut header as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
     
     if &header.e_ident[0..4] != &ELF_MAGIC {
         return Err("ELF: Invalid magic number");
@@ -1054,21 +1102,23 @@ pub fn init() {
 
 /// Return (phdr_va, phnum, phentsize) for an ELF so the kernel can put AT_PHDR/AT_PHNUM/AT_PHENT in auxv.
 /// phdr_va = first PT_LOAD.p_vaddr + e_phoff (program headers live at that VA in the loaded image).
-pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("ELF: file too small");
-    }
-    let header = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
+pub fn get_elf_phdr_info(provider: &dyn ElfDataProvider) -> Result<(u64, u64, u64), &'static str> {
+    let mut header = Elf64Header {
+        e_ident: [0; 16], e_type: 0, e_machine: 0, e_version: 0, e_entry: 0, e_phoff: 0, e_shoff: 0,
+        e_flags: 0, e_ehsize: 0, e_phentsize: 0, e_phnum: 0, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0
+    };
+    provider.read_header(unsafe { core::slice::from_raw_parts_mut(&mut header as *mut _ as *mut u8, core::mem::size_of::<Elf64Header>()) })?;
+
     if &header.e_ident[0..4] != &ELF_MAGIC {
         return Err("ELF: invalid magic");
     }
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
     let ph_size = header.e_phentsize as usize;
-    assert_ph_table_in_bounds(elf_data.len(), ph_offset, ph_count, ph_size)?;
+    assert_ph_table_in_bounds(provider.len(), ph_offset, ph_count, ph_size)?;
     let mut first_load_vaddr = None;
     for i in 0..ph_count {
-        let ph = program_header_at(elf_data, ph_offset, i, ph_size)?;
+        let ph = program_header_at(provider, ph_offset, i, ph_size)?;
         if ph.p_type == PT_LOAD {
             first_load_vaddr = Some(ph.p_vaddr);
             break;
@@ -1081,8 +1131,19 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static st
 
 /// Reemplazar la imagen del proceso actual con un nuevo ELF (backend de `exec`).
 pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<ExecLoadResult, &'static str> {
+    replace_process_image_provider(pid, &SliceDataProvider(elf_data))
+}
+
+pub fn replace_process_image_path(pid: ProcessId, path: &str) -> Result<ExecLoadResult, &'static str> {
+    let inode = filesystem::Filesystem::lookup_path(path)?;
+    let len = filesystem::Filesystem::content_len_by_inode(inode)?;
+    let provider = InodeDataProvider { inode, cached_len: len };
+    replace_process_image_provider(pid, &provider)
+}
+
+fn replace_process_image_provider(pid: ProcessId, provider: &dyn ElfDataProvider) -> Result<ExecLoadResult, &'static str> {
     serial::serial_printf(format_args!("[exec] replace_process_image for PID {}\n", pid));
-    load_elf_into_space(crate::memory::get_cr3(), elf_data)
+    load_elf_into_space(crate::memory::get_cr3(), provider)
 }
 
 /// Maximum bytes in a kernel process name (16 chars + NUL = 17, padded to 20 for alignment).

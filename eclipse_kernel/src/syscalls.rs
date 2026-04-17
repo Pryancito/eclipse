@@ -1917,9 +1917,9 @@ fn sys_spawn_with_stdio_path(
         }
     };
 
-    let elf_data: Vec<u8> = match crate::filesystem::read_file_alloc(path_str) {
-        Ok(v) => v,
-        Err(_) => return u64::MAX,
+    let pid = match crate::elf_loader::load_elf_path(path_str) {
+        Some(p) => p,
+        None => return u64::MAX,
     };
 
     let name_trimmed = if name_ptr != 0 {
@@ -1933,7 +1933,74 @@ fn sys_spawn_with_stdio_path(
         path_str.rsplit('/').next().unwrap_or(path_str)
     };
 
-    sys_spawn_with_stdio_from_elf(elf_data, name_trimmed, fd_in, fd_out, fd_err)
+    // Update process name if it was explicitly provided.
+    if name_ptr != 0 {
+        crate::process::modify_process(pid, |p| {
+            let n = name_trimmed.len().min(16);
+            p.name[..n].copy_from_slice(&name_trimmed.as_bytes()[..n]);
+            if n < 16 { p.name[n] = 0; }
+        }).unwrap();
+    }
+
+    setup_spawned_process_stdio(pid, fd_in, fd_out, fd_err)
+}
+
+fn setup_spawned_process_stdio(
+    pid: crate::process::ProcessId,
+    fd_in: u64,
+    fd_out: u64,
+    fd_err: u64,
+) -> u64 {
+    let parent_pid = crate::process::current_process_id().unwrap_or(1);
+    crate::process::modify_process(pid, |p| {
+        p.parent_pid = Some(parent_pid);
+    })
+    .unwrap();
+
+    {
+        let p_fd_in  = crate::fd::fd_get(parent_pid, fd_in  as usize);
+        let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
+        let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
+
+        let mut old_to_close: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
+
+        if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
+            let mut tables = crate::fd::FD_TABLES.lock();
+            if let Some(ref new_fd) = p_fd_in {
+                let old = &tables[child_fd_idx].fds[0];
+                if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                tables[child_fd_idx].fds[0] = *new_fd;
+            }
+            if let Some(ref new_fd) = p_fd_out {
+                let old = &tables[child_fd_idx].fds[1];
+                if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                tables[child_fd_idx].fds[1] = *new_fd;
+            }
+            if let Some(ref new_fd) = p_fd_err {
+                let old = &tables[child_fd_idx].fds[2];
+                if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
+                tables[child_fd_idx].fds[2] = *new_fd;
+            }
+        }
+
+        let mut closed: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
+        for pair in old_to_close {
+            if !closed.contains(&pair) {
+                let _ = crate::scheme::close(pair.0, pair.1);
+                closed.push(pair);
+            }
+        }
+
+        for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {
+            if let Some(fd) = fd_opt {
+                if fd.in_use {
+                    let _ = crate::scheme::dup(fd.scheme_id, fd.resource_id);
+                }
+            }
+        }
+    }
+
+    pid as u64
 }
 
 fn sys_spawn_with_stdio_from_elf(
@@ -1944,68 +2011,7 @@ fn sys_spawn_with_stdio_from_elf(
     fd_err: u64,
 ) -> u64 {
     match crate::process::spawn_process(&elf_data, name_trimmed) {
-        Ok(pid) => {
-            let parent_pid = crate::process::current_process_id().unwrap_or(1);
-            crate::process::modify_process(pid, |p| {
-                p.parent_pid = Some(parent_pid);
-            })
-            .unwrap();
-
-            {
-                let p_fd_in  = crate::fd::fd_get(parent_pid, fd_in  as usize);
-                let p_fd_out = crate::fd::fd_get(parent_pid, fd_out as usize);
-                let p_fd_err = crate::fd::fd_get(parent_pid, fd_err as usize);
-
-                // Collect the old (fd_init_stdio) entries that will be replaced so
-                // we can close their scheme resources afterward.  We must close them
-                // OUTSIDE the FD_TABLES lock and BEFORE calling dup on the new ones
-                // to keep ref-counts balanced.
-                // fd_init_stdio opens the TTY once and shares the same resource_id
-                // across FDs 0/1/2, so we deduplicate before closing.
-                let mut old_to_close: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
-
-                if let Some(child_fd_idx) = crate::fd::pid_to_fd_idx(pid as u32) {
-                    let mut tables = crate::fd::FD_TABLES.lock();
-                    if let Some(ref new_fd) = p_fd_in {
-                        let old = &tables[child_fd_idx].fds[0];
-                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
-                        tables[child_fd_idx].fds[0] = *new_fd;
-                    }
-                    if let Some(ref new_fd) = p_fd_out {
-                        let old = &tables[child_fd_idx].fds[1];
-                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
-                        tables[child_fd_idx].fds[1] = *new_fd;
-                    }
-                    if let Some(ref new_fd) = p_fd_err {
-                        let old = &tables[child_fd_idx].fds[2];
-                        if old.in_use { old_to_close.push((old.scheme_id, old.resource_id)); }
-                        tables[child_fd_idx].fds[2] = *new_fd;
-                    }
-                }
-
-                // Close old (init) handles outside the lock; skip duplicates so a
-                // resource shared across multiple FDs (e.g. the single TTY handle
-                // placed into all three FDs by fd_init_stdio) is closed only once.
-                let mut closed: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(3);
-                for pair in old_to_close {
-                    if !closed.contains(&pair) {
-                        let _ = crate::scheme::close(pair.0, pair.1);
-                        closed.push(pair);
-                    }
-                }
-
-                // Increment ref-counts for the newly inherited handles.
-                for fd_opt in [p_fd_in, p_fd_out, p_fd_err] {
-                    if let Some(fd) = fd_opt {
-                        if fd.in_use {
-                            let _ = crate::scheme::dup(fd.scheme_id, fd.resource_id);
-                        }
-                    }
-                }
-            }
-
-            pid as u64
-        }
+        Ok(pid) => setup_spawned_process_stdio(pid, fd_in, fd_out, fd_err),
         Err(_) => u64::MAX,
     }
 }
@@ -5452,25 +5458,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    // 4. Read ELF from filesystem.
-    let elf_data = match crate::filesystem::read_file_alloc(path) {
-        Ok(v) => v,
-        Err(_) => {
-            set_last_exec_error(b"execve: file not found");
-            return linux_abi_error(2); // ENOENT
-        }
-    };
-    if elf_data.len() < 4 || elf_data[0] != 0x7f || elf_data[1] != b'E' {
-        set_last_exec_error(b"execve: not an ELF");
-        return linux_abi_error(8); // ENOEXEC
-    }
-
-    // 5. Replace current process image.
+    // 4. Replace current process image.
     let current_pid = match current_process_id() {
         Some(p) => p,
         None => return linux_abi_error(3), // ESRCH
     };
-    let res = match crate::elf_loader::replace_process_image(current_pid, &elf_data) {
+    let res = match crate::elf_loader::replace_process_image_path(current_pid, path) {
         Ok(r) => r,
         Err(msg) => {
             set_last_exec_error(msg.as_bytes());
@@ -5499,11 +5492,6 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         crate::process::update_process(current_pid, proc);
     }
     crate::process::clear_pending_process_args(current_pid);
-
-    // Explicitly drop elf_data before the non-returning jump so heap memory is
-    // reclaimed.  jump_to_userspace_with_argv_envp is `-> !` and Rust will not
-    // run drop glue after a diverging call.
-    drop(elf_data);
 
     // 7. Allocate a fresh user stack.
     const USER_STACK_BASE: u64 = 0x2000_0000;

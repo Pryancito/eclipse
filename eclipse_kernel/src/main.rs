@@ -96,6 +96,10 @@ static mut BOOT_STACK: BootStack = BootStack { stack: [0; 65536] };
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial::serial_printf(format_args!("\n[KERNEL] PANIC on CPU {}: {}\n", crate::process::get_cpu_id(), info));
+    
+    // Intentar mostrar pantalla azul (BSOD) si el hardware está disponible
+    progress::panic_bsod(info);
+
     loop {
         unsafe { core::arch::asm!("hlt") };
     }

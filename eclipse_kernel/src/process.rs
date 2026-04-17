@@ -449,7 +449,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     crate::serial::serial_printf(format_args!("[spawn] create_process_paging returned cr3=0x{:x}\n", cr3));
 
     crate::serial::serial_print("[spawn] calling load_elf_into_space\n");
-    let loaded = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    let loaded = crate::elf_loader::load_elf_into_space(cr3, &crate::elf_loader::SliceDataProvider(elf_data))?;
     crate::serial::serial_printf(format_args!(
         "[spawn] load_elf_into_space done entry=0x{:x} TLS={:x}\n",
         loaded.entry_point, loaded.tls_base

@@ -7,6 +7,8 @@ use embedded_graphics::{
 };
 use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID, MAX_SMP_CPUS, get_cpu_id, get_cpu_id_gs, gs_base_ready};
 use core::sync::atomic::{AtomicU64, AtomicBool, AtomicU32, Ordering};
+use core::panic::PanicInfo;
+use core::fmt::Write;
 use spin::Mutex;
 
 // Buffer estático para acumular líneas de log hasta recibir '\n'
@@ -621,6 +623,148 @@ pub fn bsod(info: &BsodInfo) {
     draw_kv!("SS ",         info.ss);
 
     // 7. Flush si VirtIO
+    if source == FbSource::VirtIO {
+        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, width, height);
+    }
+}
+
+/// Helper para formatear core::fmt::Arguments en un buffer fijo en la pila (no_std)
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> core::fmt::Write for BufWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let remaining = self.buf.len() - self.pos;
+        if remaining == 0 { return Ok(()); }
+        let to_copy = core::cmp::min(s.len(), remaining);
+        self.buf[self.pos..self.pos+to_copy].copy_from_slice(&s.as_bytes()[..to_copy]);
+        self.pos += to_copy;
+        Ok(())
+    }
+}
+
+/// Pantalla azul específica para Kernel Panic. Muestra el mensaje de panic y la localización.
+pub fn panic_bsod(info: &PanicInfo) {
+    // Capturar registros básicos inmediatamente
+    let rip: u64;
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("lea {}, [rip]", out(reg) rip);
+        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+    }
+
+    // Intentar obtener el lock del hardware
+    let mut guard = None;
+    for _ in 0..1000 {
+        if let Some(g) = VIDEO_HARDWARE_LOCK.try_lock() {
+            guard = Some(g);
+            break;
+        }
+        crate::cpu::pause();
+    }
+    if guard.is_none() {
+        unsafe { VIDEO_HARDWARE_LOCK.force_unlock(); }
+        guard = Some(VIDEO_HARDWARE_LOCK.lock());
+    }
+    let _lock_guard = guard;
+
+    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
+    if phys == 0 || phys > 0x0000_0100_0000_0000 { return; }
+
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
+    let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
+
+    let bsod_blue = Rgb888::new(0x00, 0x78, 0xD7);
+    let _ = Rectangle::new(Point::new(0, 0), Size::new(width, height))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(bsod_blue).build())
+        .draw(&mut fb);
+
+    let style_big = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(Rgb888::WHITE)
+        .background_color(bsod_blue)
+        .build();
+    let style_small = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(Rgb888::WHITE)
+        .background_color(bsod_blue)
+        .build();
+
+    let margin_x = (width as i32) / 8;
+    let mut y = (height as i32) / 6;
+
+    let _ = Text::new(":(", Point::new(margin_x, y), style_big).draw(&mut fb);
+    y += 40;
+    let _ = Text::new("Your PC ran into a problem and needs to restart.", Point::new(margin_x, y), style_big).draw(&mut fb);
+    y += 30;
+    let _ = Text::new("Eclipse OS kernel panic.", Point::new(margin_x, y), style_big).draw(&mut fb);
+    y += 50;
+
+    let _ = Text::new("Stop code:", Point::new(margin_x, y), style_small).draw(&mut fb);
+    y += 14;
+    let _ = Text::new("KERNEL_PANIC", Point::new(margin_x, y), style_big).draw(&mut fb);
+    y += 40;
+
+    // Renderizar mensaje de panic
+    let mut msg_buf = [b' '; 512];
+    let pos = {
+        let mut writer = BufWriter { buf: &mut msg_buf, pos: 0 };
+        let _ = core::fmt::write(&mut writer, format_args!("{}", info.message()));
+        writer.pos
+    };
+    let msg_str = core::str::from_utf8(&msg_buf[..pos]).unwrap_or("Unknown panic message");
+    
+    // Si el mensaje es muy largo, lo dividimos en dos líneas (simplificado)
+    if msg_str.len() > 64 {
+        let _ = Text::new(&msg_str[..64.min(msg_str.len())], Point::new(margin_x, y), style_small).draw(&mut fb);
+        y += 13;
+        if msg_str.len() > 64 {
+            let _ = Text::new(&msg_str[64..128.min(msg_str.len())], Point::new(margin_x, y), style_small).draw(&mut fb);
+            y += 13;
+        }
+    } else {
+        let _ = Text::new(msg_str, Point::new(margin_x, y), style_small).draw(&mut fb);
+        y += 13;
+    }
+    y += 10;
+
+    // Renderizar localización
+    if let Some(loc) = info.location() {
+        let mut loc_buf = [b' '; 256];
+        let pos = {
+            let mut loc_writer = BufWriter { buf: &mut loc_buf, pos: 0 };
+            let _ = core::fmt::write(&mut loc_writer, format_args!("At {}:{}:{}", loc.file(), loc.line(), loc.column()));
+            loc_writer.pos
+        };
+        let loc_str = core::str::from_utf8(&loc_buf[..pos]).unwrap_or("Unknown location");
+        let _ = Text::new(loc_str, Point::new(margin_x, y), style_small).draw(&mut fb);
+        y += 20;
+    }
+
+    // Registros
+    let mut hex = [0u8; 18];
+    macro_rules! draw_kv {
+        ($label:literal, $val:expr) => {{
+            fmt_hex($val, &mut hex);
+            let mut line_buf = [b' '; 46];
+            let lbl = $label.as_bytes();
+            let ll = lbl.len().min(20);
+            line_buf[..ll].copy_from_slice(&lbl[..ll]);
+            line_buf[ll] = b':'; line_buf[ll+1] = b' ';
+            line_buf[ll+2..ll+2+18].copy_from_slice(&hex);
+            let s = core::str::from_utf8(&line_buf[..ll+2+18]).unwrap_or("");
+            let _ = Text::new(s, Point::new(margin_x, y), style_small).draw(&mut fb);
+            y += 13;
+        }};
+    }
+
+    draw_kv!("RIP", rip);
+    draw_kv!("RSP", rsp);
+    draw_kv!("CPU", crate::process::get_cpu_id() as u64);
+
     if source == FbSource::VirtIO {
         let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, width, height);
     }
