@@ -1655,7 +1655,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
+    // Reject buffers of exactly 128 MiB (>= instead of >) because Vec::with_capacity(N)
+    // produces Layout { size: N, align: 1 } which the linked_list_allocator rounds to
+    // Layout { size: (N+7)&!7, align: 8 }.  For N == 128 MiB the rounded size is still
+    // 128 MiB, but the heap is already partially used so the allocation panics.
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1739,6 +1743,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             // Misma PID, nueva imagen: no reutilizar argv del binario anterior (p. ej. sh → exec).
             crate::process::clear_pending_process_args(current_pid);
 
+            // Explicitly drop the ELF copy before the non-returning jump so that
+            // the heap memory is reclaimed.  jump_to_userspace* is declared `-> !`
+            // and Rust will not run drop glue after a diverging call.
+            drop(elf_data);
+
             // This doesn't return - we jump to the new process entry point.
             // Map a fresh 1 MB user stack for the exec'd binary.
             // A forked child only inherits the parent's 256 KB stack (up to 0x20040000),
@@ -1790,7 +1799,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
     }
@@ -2007,7 +2016,7 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
     // making it runnable before we replace its FDs.
 
     use alloc::vec::Vec;
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 128 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
         return u64::MAX;
     }
     if !is_user_pointer(elf_ptr, elf_size) {
@@ -5490,6 +5499,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         crate::process::update_process(current_pid, proc);
     }
     crate::process::clear_pending_process_args(current_pid);
+
+    // Explicitly drop elf_data before the non-returning jump so heap memory is
+    // reclaimed.  jump_to_userspace_with_argv_envp is `-> !` and Rust will not
+    // run drop glue after a diverging call.
+    drop(elf_data);
 
     // 7. Allocate a fresh user stack.
     const USER_STACK_BASE: u64 = 0x2000_0000;

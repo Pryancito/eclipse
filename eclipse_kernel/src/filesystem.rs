@@ -1183,12 +1183,14 @@ fn read_file_alloc_inode(inode: u32) -> Result<Vec<u8>, &'static str> {
         return Err("Empty file");
     }
     // Binarios grandes (p. ej. cargo ~50 MiB): límite propio del contenido, no del TLV de metadatos.
-    // Use >= so that a file of exactly MAX_WHOLE_FILE_READ bytes is also rejected; without this
-    // a 128 MiB file passes the `>` guard and the subsequent vec![0u8; len] triggers an OOM panic
-    // because the allocator internally rounds the Layout alignment up to 8, yielding
-    // Layout { size: 134217728, align: 8 } which exhausts the 256 MiB static kernel heap.
+    // The linked_list_allocator pads every allocation size up to the next multiple of
+    // size_of::<usize>() == 8, so a file whose length is in [MAX_WHOLE_FILE_READ - 7,
+    // MAX_WHOLE_FILE_READ - 1] would be rounded up to MAX_WHOLE_FILE_READ by the allocator,
+    // producing Layout { size: 134217728, align: 8 } which exhausts the 256 MiB static kernel
+    // heap.  Use saturating_add to avoid wrapping and compare against the limit.
     const MAX_WHOLE_FILE_READ: usize = 128 * 1024 * 1024;
-    if len >= MAX_WHOLE_FILE_READ {
+    const ALLOC_ALIGN: usize = core::mem::size_of::<usize>();
+    if len.saturating_add(ALLOC_ALIGN - 1) >= MAX_WHOLE_FILE_READ {
         return Err("File too large");
     }
     let mut buf = vec![0u8; len];
