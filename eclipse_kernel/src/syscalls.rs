@@ -2582,6 +2582,9 @@ fn sys_mount(path_ptr: u64, path_len: u64) -> u64 {
 
     match crate::filesystem::mount_root(device_path) {
         Ok(_) => 0,
+        // The kernel mounts the root filesystem at boot; a userspace service calling
+        // mount() after that should be treated as a no-op success rather than an error.
+        Err("Filesystem already mounted") => 0,
         Err(e) => {
             serial::serial_print("[SYSCALL] mount() failed: ");
             serial::serial_print(e);

@@ -697,6 +697,23 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     let cs  = context.cs;
     let ss  = context.ss;
 
+    // ---- Demand Paging: satisfy a lazy anonymous page fault ----
+    // When a page-not-present fault (#PF, vector 14) arrives from userspace and the
+    // faulting address falls within a lazy anonymous VMA, allocate a fresh zeroed frame
+    // and map it.  The CPU will then retry the faulting instruction automatically after
+    // the handler returns (via iretq in common_exception_handler).
+    // This check runs BEFORE any diagnostic printing so that normal demand-paging faults
+    // are handled silently without generating a noisy register dump.
+    if num == 14 && cs & 3 == 3 && pid != 0 {
+        // error_code bit 0 == 0 means "not present" (as opposed to a protection violation).
+        if (err & 1) == 0 {
+            if crate::memory::handle_anon_page_fault(pid, cr2) {
+                return; // Frame allocated — retry the faulting instruction.
+            }
+        }
+    }
+    // ---- End Demand Paging ----
+
     // CR2 is only defined for #PF (14); on other faults it is stale — do not imply a page fault.
     if num == 14 && cr2 < 4096 && pid != 0 {
         crate::serial::serial_printf(format_args!(
@@ -775,21 +792,6 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
         }
     }
     // ---- End Fault Recovery ----
-
-    // ---- Demand Paging: satisfy a lazy anonymous page fault ----
-    // When a page-not-present fault (#PF, vector 14) arrives from userspace and the
-    // faulting address falls within a lazy anonymous VMA, allocate a fresh zeroed frame
-    // and map it.  The CPU will then retry the faulting instruction automatically after
-    // the handler returns (via iretq in common_exception_handler).
-    if num == 14 && cs & 3 == 3 && pid != 0 {
-        // error_code bit 0 == 0 means "not present" (as opposed to a protection violation).
-        if (err & 1) == 0 {
-            if crate::memory::handle_anon_page_fault(pid, cr2) {
-                return; // Frame allocated — retry the faulting instruction.
-            }
-        }
-    }
-    // ---- End Demand Paging ----
 
     // ---- Userspace fault: kill the process instead of BSOD ----
     // If CS[1:0] == 3, the fault originated from ring-3 (userspace) code.
