@@ -843,15 +843,18 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_provider: &dyn ElfDataProvid
 
     let (phdr_va, phnum, phent) = phdr_va_biased(main_provider, main_bias, main_et_dyn)?;
 
+    let main_entry = if main_et_dyn { main_bias.wrapping_add(main_h.e_entry) } else { main_h.e_entry };
+    let interp_entry = if interp_et_dyn { interp_bias.wrapping_add(interp_h.e_entry) } else { interp_h.e_entry };
+
     let mut res = ExecLoadResult {
-        entry_point: if main_et_dyn { main_bias.wrapping_add(main_h.e_entry) } else { main_h.e_entry },
+        entry_point: interp_entry,
         max_vaddr: max_v_interp,
         phdr_va,
         phnum,
         phentsize: phent,
         segment_frames: mapped as u64,
         tls_base: 0,
-        dynamic_linker: Some((interp_bias, if interp_et_dyn { interp_bias.wrapping_add(interp_h.e_entry) } else { interp_h.e_entry })),
+        dynamic_linker: Some((interp_bias, main_entry)),
         loaded_vma_ranges: [(0, 0), (0, 0)],
         loaded_vma_count: 0,
     };
@@ -1401,6 +1404,8 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
+    const AT_BASE: u64 = 7;
+    const AT_ENTRY: u64 = 9;
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
 
@@ -1415,8 +1420,8 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     str_total += 16; // AT_RANDOM data
     let str_area_size = (str_total + 15) & !15usize;
 
-    // Number of 8-byte slots: 1(argc) + argc+1(argv+NULL) + MINIMAL_ENVP_COUNT+1(envp+NULL) + 2*(5 auxv + AT_NULL)
-    const AUXV_ENTRIES: usize = 5; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM
+    // Number of 8-byte slots: 1(argc) + argc+1(argv+NULL) + MINIMAL_ENVP_COUNT+1(envp+NULL) + 2*(7 auxv + AT_NULL)
+    const AUXV_ENTRIES: usize = 7; // AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_BASE,AT_ENTRY,AT_RANDOM
     let table_slots = 1 + (argc + 1) + (MINIMAL_ENVP_COUNT + 1) + (AUXV_ENTRIES + 1) * 2;
     let table_bytes = table_slots * 8;
 
@@ -1483,6 +1488,10 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         write_volatile(table.offset(i), phnum);     i += 1;
         write_volatile(table.offset(i), AT_PAGESZ); i += 1;
         write_volatile(table.offset(i), 4096u64);   i += 1;
+        write_volatile(table.offset(i), AT_BASE);   i += 1;
+        write_volatile(table.offset(i), 0u64);      i += 1;
+        write_volatile(table.offset(i), AT_ENTRY);  i += 1;
+        write_volatile(table.offset(i), entry_point); i += 1;
         write_volatile(table.offset(i), AT_RANDOM); i += 1;
         write_volatile(table.offset(i), random_ptr); i += 1;
         write_volatile(table.offset(i), AT_NULL);   i += 1;
@@ -1573,7 +1582,7 @@ pub unsafe fn jump_to_userspace_with_argv_envp(
     // Auxv entry count (type+val pairs): AT_PHDR,AT_PHENT,AT_PHNUM,AT_PAGESZ,AT_RANDOM,
     // optionally AT_BASE,AT_FLAGS,AT_ENTRY, then AT_NULL.
     let has_interp = res.dynamic_linker.is_some();
-    let auxv_count = if has_interp { 8 + 1 } else { 5 + 1 }; // +1 for AT_NULL
+    let auxv_count = if has_interp { 8 + 1 } else { 7 + 1 }; // +1 for AT_NULL
 
     // Table slots: 1(argc) + argc+1(argv) + envc+1(envp) + auxv_count*2
     let table_slots = 1 + (argc + 1) + (envc + 1) + auxv_count * 2;
@@ -1637,6 +1646,11 @@ pub unsafe fn jump_to_userspace_with_argv_envp(
         write_volatile(table.offset(idx), at_entry);  idx += 1;
         write_volatile(table.offset(idx), AT_FLAGS);  idx += 1;
         write_volatile(table.offset(idx), 0u64);      idx += 1;
+    } else {
+        write_volatile(table.offset(idx), AT_BASE);   idx += 1;
+        write_volatile(table.offset(idx), 0u64);      idx += 1;
+        write_volatile(table.offset(idx), AT_ENTRY);  idx += 1;
+        write_volatile(table.offset(idx), res.entry_point); idx += 1;
     }
     write_volatile(table.offset(idx), AT_RANDOM);     idx += 1;
     write_volatile(table.offset(idx), random_ptr);    idx += 1;
