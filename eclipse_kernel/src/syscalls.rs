@@ -149,6 +149,10 @@ mod linux_mmap_abi {
     pub const MAP_FIXED: u64 = 0x10;
     pub const MAP_SHARED: u64 = 0x01;
     pub const MAP_ANONYMOUS: u64 = 0x20;
+    /// Pre-populate page table entries. When set, physical frames are allocated
+    /// eagerly (like Linux `MAP_POPULATE`). Without it, anonymous private mappings
+    /// are lazy: frames are allocated on first access via the demand-page handler.
+    pub const MAP_POPULATE: u64 = 0x08000;
     /// Donde `mmap_find_free` coloca `mmap(NULL, …)` anónimo.
     pub const USER_ARENA_LO: u64 = 0x6000_0000;
     pub const USER_ARENA_HI: u64 = 0x7000_0000;
@@ -3126,7 +3130,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     // A file-backed mapping populates each page with content from the open file.
     // MAP_ANONYMOUS: mapping is not backed by a file.
     use linux_mmap_abi::{
-        ANON_SLACK_BYTES, MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, USER_ARENA_HI, USER_ARENA_LO,
+        ANON_SLACK_BYTES, MAP_ANONYMOUS, MAP_FIXED, MAP_POPULATE, MAP_SHARED, USER_ARENA_HI,
+        USER_ARENA_LO,
     };
     const MMAP_MAX_FD: u64 = crate::fd::MAX_FDS_PER_PROCESS as u64;
     let fd_entry = if (flags & MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
@@ -3268,6 +3273,22 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         use linux_mmap_abi::PROT_MASK;
         let linux_p = prot & PROT_MASK;
 
+        // Lazy (demand-paging) path: anonymous private mappings without MAP_POPULATE
+        // are NOT backed by physical frames at mmap() time.  Frames are allocated on
+        // first access by the page-fault demand-page handler in memory.rs.
+        // This matches Linux behaviour and prevents the kernel heap from being exhausted
+        // by large PROT_NONE reservations (e.g. musl malloc's 1 GiB initial mmap).
+        //
+        // Mappings that require eager allocation:
+        //   • file-backed (fd_entry.is_some())
+        //   • shared device mappings (fmap_phys_base.is_some())
+        //   • MAP_POPULATE flag explicitly requested
+        let is_lazy = (flags & MAP_ANONYMOUS) != 0
+            && fd_entry.is_none()
+            && fmap_phys_base.is_none()
+            && (flags & MAP_POPULATE) == 0;
+
+        if !is_lazy {
         while current < end {
             let frame_phys = if let Some(base) = fmap_phys_base {
                 // Use physical frame directly from fmap
@@ -3318,6 +3339,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             memory::map_user_page_4kb(page_table_phys, current, frame_phys, pte_leaf);
             current += 4096;
         }
+        } // end !is_lazy
 
         // MAP_FIXED + PROT_EXEC with no kernel slack yet (`anon_slack == 0`): add zeroed
         // executable slack pages after the mapping so multi-byte instructions at the last
@@ -3329,13 +3351,11 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         //
         // Two bugs fixed here vs the original approach:
         //
-        // 1. The old code skipped pages that were already present (e.g. a PROT_NONE
-        //    page left by musl's initial `mmap(NULL, total, PROT_NONE)` reservation).
-        //    Our kernel eagerly allocates physical frames for PROT_NONE pages (unlike
-        //    Linux which defers them), so `get_user_page_phys` returns Some for those
-        //    frames.  Skipping them leaves the page mapped with NX set — an instruction
-        //    fetch through the boundary gives error 0x15 (present, NX violation), and
-        //    if the page is later stolen and freed the error becomes 0x14 (not present).
+        // 1. The old code skipped pages that were already present (e.g. an eagerly
+        //    populated page at this address from MAP_POPULATE or a file-backed mapping).
+        //    Skipping them leaves the page mapped with NX set — an instruction fetch
+        //    through the boundary gives error 0x15 (present, NX violation), and if the
+        //    page is later freed the error becomes 0x14 (not present).
         //    Fix: always remap any existing page with exec permission.
         //
         // 2. The old code did NOT add the slack region to the VMA list, so
@@ -3356,9 +3376,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             let mut sv = map_end;
             while sv < slack_end {
                 if let Some(existing_phys) = memory::get_user_page_phys(page_table_phys, sv) {
-                    // Page already present (e.g. PROT_NONE from the initial musl
-                    // reservation).  Remap it with exec permission so that instruction
-                    // decoding across the page boundary succeeds.
+                    // Page already present (e.g. eagerly allocated by a previous MAP_POPULATE
+                    // or file-backed mapping at this address).  Remap it with exec permission
+                    // so that instruction decoding across the page boundary succeeds.
                     memory::map_user_page_4kb(page_table_phys, sv, existing_phys, slack_prot);
                 } else if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
                     let fv = memory::PHYS_MEM_OFFSET + phys;
@@ -3389,7 +3409,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             anon_kernel_slack: anon_slack,
         });
 
-        proc.mem_frames += num_pages_mapped;
+        proc.mem_frames += if is_lazy { 0 } else { num_pages_mapped };
         drop(r);
         process::update_process(current_pid, proc);
         return map_start;
