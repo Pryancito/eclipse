@@ -1694,6 +1694,15 @@ fn release_service_binary_containing_ptr(ptr: u64) {
 /// so service binaries embedded in .rodata live at addresses starting there.
 const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 
+/// Maximum ELF buffer size accepted by sys_exec, sys_spawn, and sys_spawn_with_stdio.
+///
+/// Vec::with_capacity(N) produces Layout { size: N, align: 1 } which the
+/// linked_list_allocator rounds to Layout { size: (N+7)&!7, align: 8 }.
+/// Any N in [128 MiB − 7, 128 MiB] yields a rounded size of exactly 128 MiB;
+/// with the heap already partially used that allocation panics.  Subtracting 7
+/// from the threshold catches those edge-case sizes as well.
+const MAX_ELF_SIZE: u64 = 128 * 1024 * 1024 - 7;
+
 /// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
 const LAST_EXEC_ERR_LEN: usize = 80;
 static LAST_EXEC_ERR: spin::Mutex<[u8; LAST_EXEC_ERR_LEN]> = spin::Mutex::new([0u8; LAST_EXEC_ERR_LEN]);
@@ -1716,14 +1725,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes.
-    // Vec::with_capacity(N) produces Layout { size: N, align: 1 } which the
-    // linked_list_allocator rounds to Layout { size: (N+7)&!7, align: 8 }.
-    // Any N in [128 MiB − 7, 128 MiB] yields a rounded size of exactly 128 MiB;
-    // with the heap already partially used that allocation panics.  Subtracting 7
-    // from the threshold catches those edge-case sizes as well.
-    const EXEC_MAX_ELF_SIZE: u64 = 128 * 1024 * 1024 - 7;
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= EXEC_MAX_ELF_SIZE {
+    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes
+    // (see MAX_ELF_SIZE for the rationale).
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1866,7 +1870,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
+    // Use the same edge-case-safe limit as sys_exec and sys_spawn_with_stdio
+    // (see MAX_ELF_SIZE for the rationale).
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
     }
@@ -2089,7 +2095,9 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
     // making it runnable before we replace its FDs.
 
     use alloc::vec::Vec;
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
+    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes
+    // (see MAX_ELF_SIZE for the rationale).
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
         return u64::MAX;
     }
     if !is_user_pointer(elf_ptr, elf_size) {
@@ -4468,17 +4476,36 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
 
     // ── Gather payload from iovec array ────────────────────────────────────
-    let mut all_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Cap total payload to CONNECTION_BUFFER_CAP: the socket buffer is bounded
+    // to that size, so copying more is wasteful and — more importantly — a
+    // process can pass arbitrarily large iov_len values (e.g. a 128 MiB SHM
+    // buffer used as a scatter-gather entry) which would cause a kernel-heap
+    // OOM panic identical to the one fixed in sys_recvmsg.
+    const SENDMSG_MAX_CAP: usize = crate::servers::CONNECTION_BUFFER_CAP;
     let max_iov = msg_iovlen.min(64);
+    let mut total_send: usize = 0;
     for i in 0..max_iov {
+        let iov_entry = msg_iov_ptr + (i as u64) * 16;
+        if !is_user_pointer(iov_entry, 16) { break; }
+        let iov_len = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+        total_send = total_send.saturating_add(iov_len);
+    }
+    let total_send = total_send.min(SENDMSG_MAX_CAP);
+
+    let mut all_data: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(total_send);
+    let mut remaining = total_send;
+    for i in 0..max_iov {
+        if remaining == 0 { break; }
         let iov_entry = msg_iov_ptr + (i as u64) * 16;
         if !is_user_pointer(iov_entry, 16) { break; }
         let iov_base = unsafe { *(iov_entry as *const u64) };
         let iov_len  = unsafe { *((iov_entry + 8) as *const u64) } as usize;
         if iov_base == 0 || iov_len == 0 { continue; }
-        if !is_user_pointer(iov_base, iov_len as u64) { continue; }
-        let slice = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+        let chunk = iov_len.min(remaining);
+        if !is_user_pointer(iov_base, chunk as u64) { continue; }
+        let slice = unsafe { core::slice::from_raw_parts(iov_base as *const u8, chunk) };
         all_data.extend_from_slice(slice);
+        remaining -= chunk;
     }
 
     // ── Extract file descriptors from SCM_RIGHTS control message ───────────
