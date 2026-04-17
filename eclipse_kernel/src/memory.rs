@@ -25,16 +25,16 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Size of the kernel region with offset-based mapping.
 /// Must be large enough to cover the entire kernel virtual extent from KERNEL_OFFSET,
-/// including the .bss section that contains the 512 MiB static HEAP.  The total kernel
-/// virtual footprint is approximately kernel-code (~30 MiB) + 512 MiB heap ≈ 540 MiB,
-/// so 1 GiB gives a safe margin.
-const KERNEL_REGION_SIZE: u64 = 0x40000000; // 1 GiB
+/// including the .bss section that contains the 1 GiB static HEAP.  The total kernel
+/// virtual footprint is approximately kernel-code (~30 MiB) + 1 GiB heap ≈ 1054 MiB,
+/// so 2 GiB gives a safe margin.
+const KERNEL_REGION_SIZE: u64 = 0x80000000; // 2 GiB
 
-/// Kernel heap size (512 MB)
-/// Increased from 256 MB to accommodate 128 MB compositor buffer allocations
+/// Kernel heap size (1 GiB)
+/// Increased from 512 MB to accommodate the 256 MB compositor buffer allocations
 /// (used by wlroots/labwc and Eclipse compositor apps such as MAX_SURFACE_BYTES)
-/// alongside the rest of the kernel state (~150 MB for processes, FDs, DMA buffers, etc.).
-const HEAP_SIZE: usize = 512 * 1024 * 1024;
+/// alongside the rest of the kernel state (~200 MB for processes, FDs, DMA buffers, etc.).
+const HEAP_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Static kernel heap
 #[repr(align(4096))]

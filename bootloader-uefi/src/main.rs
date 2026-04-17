@@ -76,14 +76,14 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
 const KERNEL_VIRT_BASE: u64 = 0xFFFF800000000000; // Dirección base del kernel (Higher Half)
-// The kernel's static BSS section includes a 256 MiB heap array (HEAP_SIZE in memory.rs).
+// The kernel's static BSS section includes a 1 GiB heap array (HEAP_SIZE in memory.rs).
 // Together with code, data, and other BSS variables, the kernel's total virtual extent
-// from KERNEL_VIRT_BASE can exceed 280 MiB.  The bootloader must map *at least* this
+// from KERNEL_VIRT_BASE can exceed 1054 MiB.  The bootloader must map *at least* this
 // many bytes of kernel virtual space so that BSS zeroing in _start does not write through
 // the "baseline" page-table entries (which point to unrelated physical pages, potentially
 // overwriting the UEFI-allocated page tables themselves and causing a triple-fault).
-// 512 MiB gives a comfortable margin for future kernel growth.
-const MAX_KERNEL_ALLOCATION: u64 = 512 * 1024 * 1024; // 512 MiB
+// 2 GiB gives a comfortable margin for future kernel growth.
+const MAX_KERNEL_ALLOCATION: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 // Higher Half Kernel constants (Redox-style)
 /// Physical memory is mapped to this virtual address range
