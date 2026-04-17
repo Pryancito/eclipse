@@ -39,6 +39,10 @@ pub struct BootInfo {
     /// Total bytes of UEFI "conventional" RAM (MemoryType::CONVENTIONAL_MEMORY).
     /// Used by the kernel to report RAM total in system statistics.
     pub conventional_mem_total_bytes: u64,
+    /// Physical address of the kernel heap region allocated by the bootloader.
+    pub heap_phys_base: u64,
+    /// Size in bytes of the heap region.
+    pub heap_phys_size: u64,
 }
 
 static mut GLOBAL_FB_INFO: Option<FramebufferInfo> = None;
@@ -76,12 +80,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
 const KERNEL_VIRT_BASE: u64 = 0xFFFF800000000000; // Dirección base del kernel (Higher Half)
-// The kernel's static BSS section includes a 1 GiB heap array (HEAP_SIZE in memory.rs).
-// Together with code, data, and other BSS variables, the kernel's total virtual extent
-// from KERNEL_VIRT_BASE can exceed 1054 MiB.  The bootloader must map *at least* this
-// many bytes of kernel virtual space so that BSS zeroing in _start does not write through
-// the "baseline" page-table entries (which point to unrelated physical pages, potentially
-// overwriting the UEFI-allocated page tables themselves and causing a triple-fault).
+// The kernel's static BSS no longer contains a large heap array (the heap is
+// allocated dynamically from UEFI conventional RAM and passed via BootInfo).
+// The kernel binary (code+data+small BSS) fits well within 256 MiB.
 // 2 GiB gives a comfortable margin for future kernel growth.
 const MAX_KERNEL_ALLOCATION: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
@@ -1459,6 +1460,43 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         unsafe {
             let dst = boot_info_ptr as *mut BootInfo;
             (*dst).conventional_mem_total_bytes = conventional_mem_total_bytes;
+        }
+    }
+    // Allocate a large heap region for the kernel from UEFI conventional RAM.
+    // We request up to 75 % of available conventional RAM, capped at 2 GiB.
+    // If the first attempt fails we halve the request until it succeeds.
+    {
+        let bs = system_table.boot_services();
+        let max_heap: u64 = 2 * 1024 * 1024 * 1024;
+        let min_heap: u64 = 64 * 1024 * 1024; // 64 MiB floor
+        let desired: u64 = (conventional_mem_total_bytes.saturating_mul(3) / 4)
+            .max(min_heap)
+            .min(max_heap);
+        let mut try_bytes = desired;
+        let mut heap_phys_base: u64 = 0;
+        let mut heap_phys_size: u64 = 0;
+        while try_bytes >= min_heap {
+            let pages = ((try_bytes + 0xFFF) / 0x1000) as usize;
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+                heap_phys_base = phys;
+                heap_phys_size = pages as u64 * 0x1000;
+                break;
+            }
+            try_bytes /= 2;
+        }
+        unsafe {
+            serial_write_str("BL: heap_phys_base=0x");
+            serial_write_hex64(heap_phys_base);
+            serial_write_str(" heap_phys_size=0x");
+            serial_write_hex64(heap_phys_size);
+            serial_write_str("\r\n");
+        }
+        if boot_info_ptr != 0 {
+            unsafe {
+                let dst = boot_info_ptr as *mut BootInfo;
+                (*dst).heap_phys_base = heap_phys_base;
+                (*dst).heap_phys_size = heap_phys_size;
+            }
         }
     }
     // DEBUG: confirmar RAM convencional calculada

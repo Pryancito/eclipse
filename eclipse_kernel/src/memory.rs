@@ -6,7 +6,7 @@
 //! - Physical memory management
 
 use linked_list_allocator::LockedHeap;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF900000000000;
 
@@ -24,23 +24,12 @@ pub const FB_VADDR_BASE: u64 = 0xFFFFFB0000000000;
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Size of the kernel region with offset-based mapping.
-/// Must be large enough to cover the entire kernel virtual extent from KERNEL_OFFSET,
-/// including the .bss section that contains the 1 GiB static HEAP.  The total kernel
-/// virtual footprint is approximately kernel-code (~30 MiB) + 1 GiB heap ≈ 1054 MiB,
-/// so 2 GiB gives a safe margin.
+/// The kernel binary (code+data+BSS, no static heap) is well under 256 MiB.
+/// 2 GiB gives a generous margin for future growth.
 const KERNEL_REGION_SIZE: u64 = 0x80000000; // 2 GiB
 
-/// Kernel heap size (1 GiB)
-/// Increased from 512 MB to accommodate the 256 MB compositor buffer allocations
-/// (used by wlroots/labwc and Eclipse compositor apps such as MAX_SURFACE_BYTES)
-/// alongside the rest of the kernel state (~200 MB for processes, FDs, DMA buffers, etc.).
-const HEAP_SIZE: usize = 1024 * 1024 * 1024;
-
-/// Static kernel heap
-#[repr(align(4096))]
-struct KernelHeap {
-    memory: [u8; HEAP_SIZE],
-}
+/// Actual size of the kernel heap, set during memory::init() from bootloader data.
+pub static HEAP_TOTAL_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Tablas de páginas estáticas para el kernel
 /// Definidas ANTES del heap para asegurar que estén en memoria física más baja
@@ -55,10 +44,6 @@ static mut PML4: PageTable = PageTable::new();
 static mut PDPT: PageTable = PageTable::new();
 #[link_section = ".page_tables"]
 static mut PD: [PageTable; 4] = [PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new()];
-
-static mut HEAP: KernelHeap = KernelHeap {
-    memory: [0; HEAP_SIZE],
-};
 
 use core::alloc::{GlobalAlloc, Layout};
 use spin::Mutex;
@@ -102,44 +87,44 @@ pub static ALLOCATOR: InterruptSafeAllocator = InterruptSafeAllocator(LockedHeap
 /// Must always be used with interrupts disabled to avoid deadlocks.
 pub static PAGING_LOCK: Mutex<()> = Mutex::new(());
 
-/// Inicializar el sistema de memoria
-pub fn init() {
-    unsafe {
-        // Inicializar el heap con un bloque libre grande
-        // IMPORTANTE: Obtenemos la dirección del array estático en memoria baja
-        let heap_ptr_low = HEAP.memory.as_mut_ptr();
-        crate::serial::serial_print("[MEM] HEAP static addr: ");
-        crate::serial::serial_print_hex(heap_ptr_low as u64);
-        crate::serial::serial_print("\n");
-        
-        // Convertimos a dirección física
-        let heap_phys = virt_to_phys(heap_ptr_low as u64);
-        crate::serial::serial_print("[MEM] HEAP physical addr: ");
-        crate::serial::serial_print_hex(heap_phys);
-        crate::serial::serial_print("\n");
-        
-        // Convertimos a dirección Higher Half (0xFFFF8000...) de forma EXPLICITA
-        let heap_start_high = PHYS_MEM_OFFSET + heap_phys;
-        crate::serial::serial_print("[MEM] HEAP higher-half base: ");
-        crate::serial::serial_print_hex(heap_start_high);
-        crate::serial::serial_print("\n");
-        
-        #[cfg(not(test))]
-        {
-            // Get raw pointer to the inner LockedHeap and initialize it
-            let allocator_ptr = &raw const ALLOCATOR;
-            let allocator_ref = unsafe { &*allocator_ptr };
-            let mut inner = allocator_ref.0.lock();
-            
-            // Initialize allocator with Higher Half address
-            inner.init(heap_start_high as *mut u8, HEAP_SIZE);
-            
-            crate::serial::serial_print("[MEM] Allocator initialized (Interrupt-safe)\n");
+/// Inicializar el sistema de memoria.
+/// `heap_phys_base` and `heap_phys_size` are the physical address and byte length
+/// of the heap region allocated by the bootloader from UEFI conventional RAM.
+/// The region is already mapped at PHYS_MEM_OFFSET + heap_phys_base by the bootloader.
+pub fn init(heap_phys_base: u64, heap_phys_size: u64) {
+    if heap_phys_base == 0 || heap_phys_size == 0 {
+        crate::serial::serial_print("[MEM] ERROR: bootloader did not provide a heap region!\n");
+        return;
+    }
+
+    // The bootloader's HHDM maps all physical RAM at PHYS_MEM_OFFSET + phys.
+    let heap_virt = PHYS_MEM_OFFSET + heap_phys_base;
+
+    crate::serial::serial_print("[MEM] HEAP phys base: ");
+    crate::serial::serial_print_hex(heap_phys_base);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("[MEM] HEAP virt base: ");
+    crate::serial::serial_print_hex(heap_virt);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("[MEM] HEAP size: ");
+    crate::serial::serial_print_hex(heap_phys_size);
+    crate::serial::serial_print("\n");
+
+    HEAP_TOTAL_SIZE.store(heap_phys_size as usize, Ordering::Relaxed);
+
+    #[cfg(not(test))]
+    {
+        let allocator_ptr = &raw const ALLOCATOR;
+        let allocator_ref = unsafe { &*allocator_ptr };
+        let mut inner = allocator_ref.0.lock();
+        unsafe {
+            inner.init(heap_virt as *mut u8, heap_phys_size as usize);
         }
-        #[cfg(test)]
-        {
-            crate::serial::serial_print("[MEM] Using std allocator for tests\n");
-        }
+        crate::serial::serial_print("[MEM] Allocator initialized (dynamic heap)\n");
+    }
+    #[cfg(test)]
+    {
+        crate::serial::serial_print("[MEM] Using std allocator for tests\n");
     }
 }
 

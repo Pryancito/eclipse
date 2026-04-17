@@ -31,6 +31,11 @@ pub struct BootInfo {
     /// Total bytes of UEFI "conventional" RAM (MemoryType::CONVENTIONAL_MEMORY).
     /// Used to report RAM total in system statistics.
     pub conventional_mem_total_bytes: u64,
+    /// Physical address of the kernel heap region allocated by the bootloader.
+    /// The region is accessible at PHYS_MEM_OFFSET + heap_phys_base in the kernel.
+    pub heap_phys_base: u64,
+    /// Size in bytes of the heap region allocated by the bootloader.
+    pub heap_phys_size: u64,
 }
 
 /// Framebuffer source for gpu_present
@@ -64,6 +69,8 @@ static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
     kernel_phys_base: 0,
     rsdp_addr: 0,
     conventional_mem_total_bytes: 0,
+    heap_phys_base: 0,
+    heap_phys_size: 0,
 });
 
 /// True once `load_gdt()` has initialized GS base to point at valid per-CPU data.
