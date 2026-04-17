@@ -812,10 +812,33 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
 }
 
 fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
-    let elf_slice: &[u8] = match get_service_slice(service_id) {
-        Some(s) => s,
-        None => {
-            serial::serial_print("[SYSCALL] spawn_service: invalid service_id or failed to load from disk\n");
+    // Derive the on-disk path for this service ID.
+    let path = match service_id {
+        x if x == svc::LOG as u64       => svc::PATH_LOG,
+        x if x == svc::DEVFS as u64     => svc::PATH_DEVFS,
+        x if x == svc::FILESYSTEM as u64 => svc::PATH_FILESYSTEM,
+        x if x == svc::INPUT as u64     => svc::PATH_INPUT,
+        x if x == svc::DISPLAY as u64   => svc::PATH_DISPLAY,
+        x if x == svc::AUDIO as u64     => svc::PATH_AUDIO,
+        x if x == svc::NETWORK as u64   => svc::PATH_NETWORK,
+        x if x == svc::GUI as u64       => svc::PATH_GUI,
+        x if x == svc::SEATD as u64     => svc::PATH_SEATD,
+        _ => {
+            serial::serial_print("[SYSCALL] spawn_service: invalid service_id\n");
+            return u64::MAX;
+        }
+    };
+
+    // Load the binary transiently – no persistent kernel-heap cache.
+    // The Vec is dropped at the end of this function, reclaiming the memory
+    // immediately after the new process has been created.
+    let elf_data: Vec<u8> = match crate::filesystem::read_file_alloc(path) {
+        Ok(buf) => buf,
+        Err(e) => {
+            serial::serial_printf(format_args!(
+                "[SYSCALL] spawn_service: failed to load {}: {}\n",
+                path, e
+            ));
             return u64::MAX;
         }
     };
@@ -837,7 +860,7 @@ fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
         name_str.trim_matches('\0')
     };
 
-    match crate::process::spawn_process(elf_slice, name_trimmed) {
+    let result = match crate::process::spawn_process(&elf_data, name_trimmed) {
         Ok(pid) => {
             // Set parent_pid so init can wait() for the child
             if let Some(caller_pid) = current_process_id() {
@@ -855,7 +878,10 @@ fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
             serial::serial_printf(format_args!("[SYSCALL] spawn_service failed: {}\n", e));
             u64::MAX
         }
-    }
+    };
+    // elf_data is dropped here when the function returns, freeing the kernel-heap
+    // allocation immediately rather than keeping it cached indefinitely.
+    result
 }
 
 /// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
@@ -1628,7 +1654,42 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     }
 }
 
-/// Kernel half: get_service_binary returns pointers in this range.
+/// Release the service-binary cache entry whose data buffer contains `ptr`.
+///
+/// Called from `sys_exec` after copying out of a kernel-half pointer that was
+/// previously handed to userspace by `sys_get_service_binary`.  Once the copy
+/// is complete the cache is no longer needed and can be freed to reclaim heap.
+fn release_service_binary_containing_ptr(ptr: u64) {
+    let _guard = SERVICE_BIN_LOCK.lock();
+    unsafe {
+        // List every service-binary cache slot.  The compiler infers the array
+        // length, so adding a new service only requires adding it here.
+        let slots = [
+            &raw mut SERVICE_LOG_BIN,
+            &raw mut SERVICE_DEVFS_BIN,
+            &raw mut SERVICE_FS_BIN,
+            &raw mut SERVICE_INPUT_BIN,
+            &raw mut SERVICE_DISPLAY_BIN,
+            &raw mut SERVICE_AUDIO_BIN,
+            &raw mut SERVICE_NET_BIN,
+            &raw mut SERVICE_GUI_BIN,
+            &raw mut SERVICE_SEATD_BIN,
+        ];
+        for slot_ptr in slots.iter() {
+            let slot = &mut **slot_ptr;
+            if let Some(ref v) = *slot {
+                let start = v.as_ptr() as u64;
+                let end   = start + v.len() as u64;
+                if ptr >= start && ptr < end {
+                    *slot = None; // drops the Vec<u8>, reclaiming heap
+                    return;
+                }
+            }
+        }
+    }
+}
+
+
 /// The kernel image itself is linked at KERNEL_OFFSET (0xFFFF_8000_0000_0000),
 /// so service binaries embedded in .rodata live at addresses starting there.
 const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
@@ -1655,11 +1716,14 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    // Reject buffers of exactly 128 MiB (>= instead of >) because Vec::with_capacity(N)
-    // produces Layout { size: N, align: 1 } which the linked_list_allocator rounds to
-    // Layout { size: (N+7)&!7, align: 8 }.  For N == 128 MiB the rounded size is still
-    // 128 MiB, but the heap is already partially used so the allocation panics.
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= 128 * 1024 * 1024 {
+    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes.
+    // Vec::with_capacity(N) produces Layout { size: N, align: 1 } which the
+    // linked_list_allocator rounds to Layout { size: (N+7)&!7, align: 8 }.
+    // Any N in [128 MiB − 7, 128 MiB] yields a rounded size of exactly 128 MiB;
+    // with the heap already partially used that allocation panics.  Subtracting 7
+    // from the threshold catches those edge-case sizes as well.
+    const EXEC_MAX_ELF_SIZE: u64 = 128 * 1024 * 1024 - 7;
+    if elf_ptr == 0 || elf_size == 0 || elf_size >= EXEC_MAX_ELF_SIZE {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1684,6 +1748,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         unsafe {
             crate::memory::set_cr3(current_cr3);
         }
+        // The service-binary cache entry that contained elf_ptr is no longer
+        // needed once the data has been copied.  Release it to reclaim heap.
+        release_service_binary_containing_ptr(elf_ptr);
         copy
     } else {
         // Validate the user-supplied pointer before touching it.  Without this check
