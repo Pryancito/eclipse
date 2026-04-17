@@ -13,6 +13,13 @@ pub const BLOCK_SIZE: usize = 4096;
 /// Maximum record size to prevent OOM (32 MiB)
 pub const MAX_RECORD_SIZE: usize = 32 * 1024 * 1024;
 
+/// Maximum size for an in-kernel virtual file (/tmp, /run).
+/// These files are backed by a Vec<u8> on the kernel heap (256 MiB total).
+/// Capping at 64 MiB prevents a single ftruncate/write from exhausting the
+/// heap and triggering an allocation panic (e.g. a Wayland compositor
+/// requesting a 128 MiB shared-memory pool for an 8 K display).
+pub const MAX_VIRTUAL_FILE_SIZE: usize = 64 * 1024 * 1024;
+
 const INODE_CACHE_SIZE: usize = 128;
 
 #[derive(Clone, Copy)]
@@ -1678,10 +1685,15 @@ impl Scheme for FileSystemScheme {
                 let off = *offset as usize;
                 let n = buffer.len();
                 drop(open_files);
+                // Guard against writes that would grow the in-kernel Vec<u8>
+                // beyond the per-file cap, preventing kernel heap exhaustion.
+                let need_len = off.saturating_add(n);
+                if need_len > MAX_VIRTUAL_FILE_SIZE {
+                    return Err(scheme_error::EINVAL);
+                }
                 if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
                     let content = vrun.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
-                    let need_len = off + n;
                     if content.len() < need_len {
                         content.resize(need_len, 0);
                     }
@@ -1689,7 +1701,6 @@ impl Scheme for FileSystemScheme {
                 } else {
                     let mut vtmp = VIRTUAL_TMP.lock();
                     let content = vtmp.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
-                    let need_len = off + n;
                     if content.len() < need_len {
                         content.resize(need_len, 0);
                     }
@@ -1758,6 +1769,14 @@ impl Scheme for FileSystemScheme {
         // protocol. Without this, the terminal's framebuffer remains 0 bytes
         // and fmap() returns EINVAL, causing every mmap(MAP_SHARED) to fall back
         // to private anonymous frames that are invisible to other processes.
+        //
+        // Guard against oversized requests: these files are backed by a Vec<u8>
+        // on the 256 MiB kernel heap.  Without a cap a single ftruncate from a
+        // Wayland compositor (e.g. 128 MiB SHM pool for an 8 K display) exhausts
+        // the heap and triggers an allocation panic.
+        if len > MAX_VIRTUAL_FILE_SIZE {
+            return Err(scheme_error::EINVAL);
+        }
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         match open_file {
