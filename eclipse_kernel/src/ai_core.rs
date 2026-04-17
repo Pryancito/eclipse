@@ -535,7 +535,8 @@ pub fn update_heap_metrics(allocated: usize, largest_free: usize) {
     stats.largest_free_block = largest_free;
     
     // Fragmentación simple: ratio de (total - mayor) / total
-    let total_capacity: usize = 64 * 1024 * 1024;
+    let total_capacity = crate::memory::HEAP_TOTAL_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    let total_capacity = if total_capacity == 0 { 64 * 1024 * 1024 } else { total_capacity };
     let free_space = total_capacity.saturating_sub(allocated);
     if free_space > 0 {
         stats.fragmentation_p = ((free_space.saturating_sub(largest_free)) * 100 / free_space) as u32;
