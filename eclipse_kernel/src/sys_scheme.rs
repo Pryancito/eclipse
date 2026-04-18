@@ -33,8 +33,8 @@ impl Scheme for SysScheme {
                 Ok(0x2000 | (hash_path(normalized) as usize & 0xFFF))
             }
             "dev/char/226:0" | "dev/char/29:0" => {
-                // Symlink (represented as file or dir for udev)
-                Ok(0x2000 | (hash_path(normalized) as usize & 0xFFF))
+                // Symlink — use resource type 0x3000
+                Ok(0x3000 | (hash_path(normalized) as usize & 0xFFF))
             }
             _ => Err(ENOENT),
         }
@@ -74,10 +74,10 @@ impl Scheme for SysScheme {
             "29:0\n"
         } else if id == 0x2000 | (hash_path("class/graphics/fb0/uevent") as usize & 0xFFF) {
             "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n"
-        } else if id == 0x2000 | (hash_path("dev/char/226:0") as usize & 0xFFF) {
-            "../../class/drm/card0\n" // Pointer to actual device
-        } else if id == 0x2000 | (hash_path("dev/char/29:0") as usize & 0xFFF) {
-            "../../class/graphics/fb0\n"
+        } else if id == 0x3000 | (hash_path("dev/char/226:0") as usize & 0xFFF) {
+            "../../class/drm/card0"
+        } else if id == 0x3000 | (hash_path("dev/char/29:0") as usize & 0xFFF) {
+            "../../class/graphics/fb0"
         } else {
             return Err(EBADF);
         };
@@ -102,7 +102,11 @@ impl Scheme for SysScheme {
 
     fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
         let res_type = id >> 12;
-        stat.mode = if res_type == 1 { 0o40755 } else { 0o100444 };
+        stat.mode = match res_type {
+            1 => 0o40755,   // directory
+            3 => 0o120644,  // symlink (S_IFLNK)
+            _ => 0o100444,  // regular file
+        };
         stat.size = if res_type == 1 { 0 } else { 6 };
         Ok(0)
     }
