@@ -381,22 +381,22 @@ AMTAR = $${TAR-tar}
 AM_DEFAULT_VERBOSITY = 1
 AM_LTLDFLAGS = 
 AM_RUNTESTFLAGS = 
-AR = ar
+AR = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ar
 AUTOCONF = ${SHELL} '/home/moebius/eclipse/userland/libffi_src/missing' autoconf
 AUTOHEADER = ${SHELL} '/home/moebius/eclipse/userland/libffi_src/missing' autoheader
 AUTOMAKE = ${SHELL} '/home/moebius/eclipse/userland/libffi_src/missing' automake-1.16
 AWK = mawk
-CC = x86_64-linux-musl-gcc
-CCAS = x86_64-linux-musl-gcc
+CC = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
+CCAS = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 CCASDEPMODE = depmode=gcc3
-CCASFLAGS = -fPIC -O3 -isystem /home/moebius/eclipse/host-toolchains/include
+CCASFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include 
 CCDEPMODE = depmode=gcc3
-CFLAGS = -Wall -fPIC -O3 -isystem /home/moebius/eclipse/host-toolchains/include -fexceptions
-CPPFLAGS = 
+CFLAGS = -Wall -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include  -fexceptions
+CPPFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include 
 CSCOPE = cscope
 CTAGS = ctags
-CXX = x86_64-linux-musl-g++
-CXXCPP = /lib/cpp
+CXX = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-g++
+CXXCPP = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-g++ -E
 CXXDEPMODE = depmode=gcc3
 CXXFLAGS = -g -O2
 CYGPATH_W = echo
@@ -404,7 +404,7 @@ DEFS = -DHAVE_CONFIG_H
 DEPDIR = .deps
 DLLTOOL = false
 DSYMUTIL = 
-DUMPBIN = :
+DUMPBIN = 
 ECHO_C = 
 ECHO_N = -n
 ECHO_T = 
@@ -423,7 +423,7 @@ INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LD = /home/moebius/eclipse/host-toolchains/x86_64-linux-musl/bin/ld -m elf_x86_64
-LDFLAGS = 
+LDFLAGS = -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
 LIBOBJS = 
 LIBS = 
 LIBTOOL = $(SHELL) $(top_builddir)/libtool
@@ -435,7 +435,7 @@ MAINT = #
 MAKEINFO = ${SHELL} '/home/moebius/eclipse/userland/libffi_src/missing' makeinfo
 MANIFEST_TOOL = :
 MKDIR_P = /usr/bin/mkdir -p
-NM = nm
+NM = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-nm
 NMEDIT = 
 OBJDUMP = objdump
 OBJEXT = o
@@ -451,7 +451,7 @@ PACKAGE_URL =
 PACKAGE_VERSION = 3.4.6
 PATH_SEPARATOR = :
 PRTDIAG = 
-RANLIB = ranlib
+RANLIB = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ranlib
 READELF = readelf
 SECTION_LDFLAGS = 
 SED = /usr/bin/sed
@@ -466,10 +466,10 @@ abs_builddir = /home/moebius/eclipse/userland/libffi_src/x86_64-pc-linux-musl
 abs_srcdir = /home/moebius/eclipse/userland/libffi_src/x86_64-pc-linux-musl/..
 abs_top_builddir = /home/moebius/eclipse/userland/libffi_src/x86_64-pc-linux-musl
 abs_top_srcdir = /home/moebius/eclipse/userland/libffi_src/x86_64-pc-linux-musl/..
-ac_ct_AR = ar
+ac_ct_AR = 
 ac_ct_CC = 
 ac_ct_CXX = 
-ac_ct_DUMPBIN = link -dump
+ac_ct_DUMPBIN = 
 am__include = include
 am__leading_dot = .
 am__quote = 
@@ -505,7 +505,7 @@ mandir = ${datarootdir}/man
 mkdir_p = $(MKDIR_P)
 oldincludedir = /usr/include
 pdfdir = ${docdir}
-prefix = /home/moebius/eclipse/eclipse-os-build
+prefix = /home/moebius/eclipse/eclipse-os-build/usr
 program_transform_name = s,x,x,
 psdir = ${docdir}
 runstatedir = ${localstatedir}/run
@@ -612,12 +612,12 @@ libffi_convenience_la_DEPENDENCIES = $(libffi_la_DEPENDENCIES)
 nodist_libffi_convenience_la_SOURCES = $(nodist_libffi_la_SOURCES)
 LTLDFLAGS = $(shell $(SHELL) $(top_srcdir)/libtool-ldflags $(LDFLAGS))
 AM_CFLAGS = $(am__append_3)
-libffi_version_script = 
-##libffi_version_script = -Wl,--version-script,libffi.map
-##libffi_version_script = -Wl,-M,libffi.map-sun
-libffi_version_dep = 
-##libffi_version_dep = libffi.map
-##libffi_version_dep = libffi.map-sun
+#libffi_version_script = 
+libffi_version_script = -Wl,--version-script,libffi.map
+#libffi_version_script = -Wl,-M,libffi.map-sun
+#libffi_version_dep = 
+libffi_version_dep = libffi.map
+#libffi_version_dep = libffi.map-sun
 libffi_version_info = -version-info `grep -v '^\#' $(srcdir)/libtool-version`
 libffi_la_LDFLAGS = -no-undefined $(libffi_version_info) $(libffi_version_script) $(LTLDFLAGS) $(AM_LTLDFLAGS)
 libffi_la_DEPENDENCIES = $(libffi_la_LIBADD) $(libffi_version_dep)
@@ -2103,12 +2103,12 @@ uninstall-am: uninstall-pkgconfigDATA uninstall-toolexeclibLTLIBRARIES
 
 .PRECIOUS: Makefile
 
-##libffi.map-sun : libffi.map $(top_srcdir)/make_sunver.pl \
-##		 $(libffi_la_OBJECTS) $(libffi_la_LIBADD)
-##	perl $(top_srcdir)/make_sunver.pl libffi.map \
-##	 `echo $(libffi_la_OBJECTS) $(libffi_la_LIBADD) | \
-##	    sed 's,\([^/        ]*\)\.l\([ao]\),.libs/\1.\2,g'` \
-##	 > $@ || (rm -f $@ ; exit 1)
+#libffi.map-sun : libffi.map $(top_srcdir)/make_sunver.pl \
+#		 $(libffi_la_OBJECTS) $(libffi_la_LIBADD)
+#	perl $(top_srcdir)/make_sunver.pl libffi.map \
+#	 `echo $(libffi_la_OBJECTS) $(libffi_la_LIBADD) | \
+#	    sed 's,\([^/        ]*\)\.l\([ao]\),.libs/\1.\2,g'` \
+#	 > $@ || (rm -f $@ ; exit 1)
 
 libffi.map: $(top_srcdir)/libffi.map.in
 	$(COMPILE) -D$(TARGET) -DGENERATE_LIBFFI_MAP \

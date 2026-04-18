@@ -921,6 +921,37 @@ impl Filesystem {
         
         Ok(current_inode)
     }
+
+    /// Igual que [`lookup_path`], pero si el último componente es un symlink lo sigue hasta un
+    /// inode de **fichero** regular. Necesario para `open(2)` y para cargar `.so`/`PT_INTERP`:
+    /// sin esto, `open` devolvía el TLV del symlink (~20 bytes) y musl fallaba con «Exec format error».
+    pub fn lookup_path_resolve_file_inode(path: &str) -> Result<u32, &'static str> {
+        use alloc::string::String;
+        let mut cur = String::from(path.trim_start_matches('/'));
+        if cur.is_empty() {
+            return Err("Empty path");
+        }
+        const MAX: usize = 32;
+        for _ in 0..MAX {
+            let inode = Self::lookup_path(&cur)?;
+            match Self::inode_kind(inode)? {
+                NodeKind::Symlink => {
+                    let target = Self::read_symlink_target(inode)?;
+                    let slash_path = alloc::format!("/{}", cur.trim_start_matches('/'));
+                    let link_for_resolve = slash_path.trim_end_matches('/');
+                    let resolved = resolve_symlink_path(link_for_resolve, target.as_str());
+                    cur.clear();
+                    cur.push_str(resolved.trim_start_matches('/'));
+                    if cur.is_empty() {
+                        return Err("Symlink resolved to empty path");
+                    }
+                }
+                NodeKind::Directory => return Err("Path resolves to a directory"),
+                NodeKind::File => return Ok(inode),
+            }
+        }
+        Err("Too many symlink levels")
+    }
 }
 
 
@@ -1507,7 +1538,7 @@ impl Scheme for FileSystemScheme {
                     return Err(scheme_error::EIO);
                 }
                 
-                let res = Filesystem::lookup_path(clean_path);
+                let res = Filesystem::lookup_path_resolve_file_inode(clean_path);
                 let (ino, size, id) = match res {
                     Ok(ino) => {
                         let (data_start, size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;

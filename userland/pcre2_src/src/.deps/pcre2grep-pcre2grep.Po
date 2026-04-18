@@ -27,6 +27,7 @@ src/pcre2grep-pcre2grep.o: src/pcre2grep.c \
  /home/moebius/eclipse/eclipse-os-build/include/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/inttypes.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/dirent.h \
@@ -61,6 +62,7 @@ src/pcre2.h:
 /home/moebius/eclipse/eclipse-os-build/include/limits.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
 /home/moebius/eclipse/eclipse-os-build/include/inttypes.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/dirent.h:

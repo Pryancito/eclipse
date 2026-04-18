@@ -49,6 +49,17 @@
 #define WL_CLOSURE_MAX_ARGS 20
 #define WL_BUFFER_DEFAULT_SIZE_POT 12
 #define WL_BUFFER_DEFAULT_MAX_SIZE (1 << WL_BUFFER_DEFAULT_SIZE_POT)
+#if WL_BUFFER_DEFAULT_MAX_SIZE < WL_MAX_MESSAGE_SIZE
+# error default buffer cannot hold maximum-sized message
+#endif
+
+#define WL_DEBUG_COLOR_RESET "\e[0m"
+#define WL_DEBUG_COLOR_RED "\e[31m"
+#define WL_DEBUG_COLOR_GREEN "\e[32m"
+#define WL_DEBUG_COLOR_YELLOW "\e[33m"
+#define WL_DEBUG_COLOR_BLUE "\e[34m"
+#define WL_DEBUG_COLOR_MAGENTA "\e[35m"
+#define WL_DEBUG_COLOR_CYAN "\e[36m"
 
 /**
  * Argument types used in signatures.
@@ -226,11 +237,14 @@ wl_closure_send(struct wl_closure *closure, struct wl_connection *connection);
 int
 wl_closure_queue(struct wl_closure *closure, struct wl_connection *connection);
 
+bool
+wl_check_env_token(const char *env, const char *token);
+
 void
 wl_closure_print(struct wl_closure *closure,
 		 struct wl_object *target, int send, int discarded,
 		 uint32_t (*n_parse)(union wl_argument *arg),
-		 const char *queue_name);
+		 const char *queue_name, int color);
 
 void
 wl_closure_destroy(struct wl_closure *closure);

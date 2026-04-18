@@ -1,0 +1,23 @@
+CMakeFiles/xmlwf.dir/xmlwf/xmlwf.c.o: \
+ /home/moebius/eclipse/userland/expat_src/xmlwf/xmlwf.c \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
+ /home/moebius/eclipse/userland/expat_src/bld-eclipse/expat_config.h \
+ /home/moebius/eclipse/eclipse-os-build/include/assert.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/math.h \
+ /home/moebius/eclipse/eclipse-os-build/include/errno.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/errno.h \
+ /home/moebius/eclipse/userland/expat_src/lib/expat.h \
+ /home/moebius/eclipse/userland/expat_src/lib/expat_external.h \
+ /home/moebius/eclipse/userland/expat_src/xmlwf/codepage.h \
+ /home/moebius/eclipse/userland/expat_src/lib/internal.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/userland/expat_src/lib/expat.h \
+ /home/moebius/eclipse/userland/expat_src/xmlwf/xmlfile.h \
+ /home/moebius/eclipse/userland/expat_src/xmlwf/xmltchar.h \
+ /home/moebius/eclipse/userland/expat_src/lib/expat_external.h

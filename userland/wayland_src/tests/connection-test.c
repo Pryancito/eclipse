@@ -686,7 +686,7 @@ TEST(connection_marshal_big_enough)
 
 TEST(connection_marshal_unbounded_boundary_size)
 {
-	/* A string of lenth 8178 requires a buffer size of exactly 2^13. */
+	/* A string of length 8178 requires a buffer size of exactly 2^13. */
 	struct marshal_data data;
 	char *big_string = malloc(8178);
 	assert(big_string);

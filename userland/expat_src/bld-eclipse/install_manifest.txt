@@ -1,0 +1,15 @@
+/home/moebius/eclipse/eclipse-os-build/usr/include/expat_config.h
+/home/moebius/eclipse/eclipse-os-build/usr/lib/libexpat.so.1.9.2
+/home/moebius/eclipse/eclipse-os-build/usr/lib/libexpat.so.1
+/home/moebius/eclipse/eclipse-os-build/usr/lib/libexpat.so
+/home/moebius/eclipse/eclipse-os-build/usr/include/expat.h
+/home/moebius/eclipse/eclipse-os-build/usr/include/expat_external.h
+/home/moebius/eclipse/eclipse-os-build/usr/lib/pkgconfig/expat.pc
+/home/moebius/eclipse/eclipse-os-build/usr/bin/xmlwf
+/home/moebius/eclipse/eclipse-os-build/usr/share/man/man1/xmlwf.1
+/home/moebius/eclipse/eclipse-os-build/usr/share/doc/expat/AUTHORS
+/home/moebius/eclipse/eclipse-os-build/usr/share/doc/expat/changelog
+/home/moebius/eclipse/eclipse-os-build/usr/lib/cmake/expat-2.6.2/expat-config.cmake
+/home/moebius/eclipse/eclipse-os-build/usr/lib/cmake/expat-2.6.2/expat-config-version.cmake
+/home/moebius/eclipse/eclipse-os-build/usr/lib/cmake/expat-2.6.2/expat.cmake
+/home/moebius/eclipse/eclipse-os-build/usr/lib/cmake/expat-2.6.2/expat-noconfig.cmake

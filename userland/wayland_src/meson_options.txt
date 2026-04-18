@@ -14,6 +14,10 @@ option('documentation',
   description: 'Build the documentation (requires Doxygen, dot, xmlto, xsltproc)',
   type: 'boolean',
   value: true)
+option('docbook_validation',
+  type: 'boolean',
+  value: false,
+  description: 'Validate the intermediate DocBook XML during the documentation build')
 option('dtd_validation',
   description: 'Validate the protocol DTD (requires libxml2)',
   type: 'boolean',

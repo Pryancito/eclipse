@@ -1,25 +1,25 @@
 src/raw_api.lo: ../src/raw_api.c \
- /home/moebius/eclipse/host-toolchains/include/stdc-predef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
  include/ffi.h include/ffitarget.h \
- /home/moebius/eclipse/host-toolchains/include/stddef.h \
- /home/moebius/eclipse/host-toolchains/include/bits/alltypes.h \
- /home/moebius/eclipse/host-toolchains/include/limits.h \
- /home/moebius/eclipse/host-toolchains/include/features.h \
- /home/moebius/eclipse/host-toolchains/include/bits/limits.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/features.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
  ../include/ffi_common.h fficonfig.h \
- /home/moebius/eclipse/host-toolchains/include/alloca.h \
- /home/moebius/eclipse/host-toolchains/include/string.h \
- /home/moebius/eclipse/host-toolchains/include/strings.h
-/home/moebius/eclipse/host-toolchains/include/stdc-predef.h:
+ /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
+ /home/moebius/eclipse/eclipse-os-build/include/string.h \
+ /home/moebius/eclipse/eclipse-os-build/include/strings.h
+/home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
 include/ffi.h:
 include/ffitarget.h:
-/home/moebius/eclipse/host-toolchains/include/stddef.h:
-/home/moebius/eclipse/host-toolchains/include/bits/alltypes.h:
-/home/moebius/eclipse/host-toolchains/include/limits.h:
-/home/moebius/eclipse/host-toolchains/include/features.h:
-/home/moebius/eclipse/host-toolchains/include/bits/limits.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/include/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/features.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
 ../include/ffi_common.h:
 fficonfig.h:
-/home/moebius/eclipse/host-toolchains/include/alloca.h:
-/home/moebius/eclipse/host-toolchains/include/string.h:
-/home/moebius/eclipse/host-toolchains/include/strings.h:
+/home/moebius/eclipse/eclipse-os-build/include/alloca.h:
+/home/moebius/eclipse/eclipse-os-build/include/string.h:
+/home/moebius/eclipse/eclipse-os-build/include/strings.h:

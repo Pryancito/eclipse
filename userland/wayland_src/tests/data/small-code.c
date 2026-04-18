@@ -35,6 +35,8 @@ extern const struct wl_interface intf_not_here_interface;
 
 static const struct wl_interface *small_test_types[] = {
 	NULL,
+	NULL,
+	NULL,
 	&intf_not_here_interface,
 	NULL,
 	NULL,
@@ -46,7 +48,7 @@ static const struct wl_interface *small_test_types[] = {
 
 static const struct wl_message intf_A_requests[] = {
 	{ "rq1", "sun", small_test_types + 0 },
-	{ "rq2", "nsiufho", small_test_types + 1 },
+	{ "rq2", "nsiufho", small_test_types + 3 },
 	{ "destroy", "", small_test_types + 0 },
 };
 

@@ -54,7 +54,7 @@ tests_protocol_c = custom_target(
 	output: 'tests-protocol.c'
 )
 
-executable(
+exec_fd_leak_checker = executable(
 	'exec-fd-leak-checker',
 	'exec-fd-leak-checker.c',
 	dependencies: test_runner_dep
@@ -96,78 +96,116 @@ if get_option('scanner')
 endif
 
 tests = {
-	'array-test': [],
-	'client-test': [ wayland_server_protocol_h ],
-	'display-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-		tests_server_protocol_h,
-		tests_client_protocol_c,
-		tests_protocol_c,
-	],
-	'connection-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'event-loop-test': [ wayland_server_protocol_h ],
-	'fixed-test': [],
-	'interface-test': [ wayland_client_protocol_h ],
-	'list-test': [],
-	'map-test': [],
-	'sanity-test' : [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'socket-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'queue-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'signal-test': [ wayland_server_protocol_h ],
-	'newsignal-test': [
-		# wayland-server.c is needed here to access wl_priv_* functions
-		files('../src/wayland-server.c'),
-		wayland_server_protocol_h,
-	],
-	'resources-test': [ wayland_server_protocol_h ],
-	'message-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'compositor-introspection-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'protocol-logger-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'headers-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-		'headers-protocol-test.c',
-		wayland_client_protocol_core_h,
-		wayland_server_protocol_core_h,
-		'headers-protocol-core-test.c',
-	],
-	'os-wrappers-test': [],
-	'proxy-test': [
-		wayland_client_protocol_h,
-		wayland_server_protocol_h,
-	],
-	'enum-validator-test': [],
+	'array-test': {},
+	'client-test': {
+		'extra_sources': [ wayland_server_protocol_h ],
+	},
+	'display-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+			tests_server_protocol_h,
+			tests_client_protocol_c,
+			tests_protocol_c,
+		],
+	},
+	'connection-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'event-loop-test': {
+		'extra_sources': [ wayland_server_protocol_h ],
+	},
+	'fixed-test': {},
+	'interface-test': {
+		'extra_sources': [ wayland_client_protocol_h ],
+	},
+	'list-test': {},
+	'map-test': {},
+	'sanity-test' : {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+		'runtime_deps': [ exec_fd_leak_checker ],
+	},
+	'socket-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'queue-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'signal-test': {
+		'extra_sources': [ wayland_server_protocol_h ],
+	},
+	'newsignal-test': {
+		'extra_sources': [
+			# wayland-server.c is needed here to access wl_priv_* functions
+			files('../src/wayland-server.c'),
+			wayland_server_protocol_h,
+		],
+	},
+	'resources-test': {
+		'extra_sources': [ wayland_server_protocol_h ],
+	},
+	'message-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'compositor-introspection-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'protocol-logger-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'headers-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+			'headers-protocol-test.c',
+			wayland_client_protocol_core_h,
+			wayland_server_protocol_core_h,
+			'headers-protocol-core-test.c',
+		],
+	},
+	'os-wrappers-test': {
+		'runtime_deps': [ exec_fd_leak_checker ],
+	},
+	'proxy-test': {
+		'extra_sources': [
+			wayland_client_protocol_h,
+			wayland_server_protocol_h,
+		],
+	},
+	'enum-validator-test': {},
 }
 
-foreach test_name, test_extra_sources: tests
+foreach test_name, test_extras : tests
+	test_extra_sources = test_extras.get('extra_sources', [])
+	test_runtime_deps = test_extras.get('runtime_deps', [])
 	test_sources = [ test_name + '.c' ] + test_extra_sources
 	test_deps = [test_runner_dep, epoll_dep]
 	bin = executable(test_name, test_sources, dependencies: test_deps)
 	test(
 		test_name,
 		bin,
+		depends: test_runtime_deps,
 		env: [
 			'TEST_SRC_DIR=@0@'.format(meson.current_source_dir()),
 			'TEST_BUILD_DIR=@0@'.format(meson.current_build_dir()),

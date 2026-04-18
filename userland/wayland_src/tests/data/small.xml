@@ -58,5 +58,12 @@
 	<entry name="negative" value="-1" since="2" summary="this is a negative value"/>
 	<entry name="deprecated" value="3" since="2" deprecated-since="3" summary="this is a deprecated value"/>
     </enum>
+
+    <enum name="bar" bitfield="true">
+      <entry name="first" value="0x01" summary="this is the first"/>
+      <entry name="second" value="0x02" summary="this is the second"/>
+      <entry name="third" value="0x04" since="2" summary="this is the third"/>
+    </enum>
+
   </interface>
 </protocol>

@@ -106,7 +106,7 @@
 #define HAVE_UNISTD_H 1
 
 /* Define to 1 if GNU symbol versioning is used for libatomic. */
-/* #undef LIBFFI_GNU_SYMBOL_VERSIONING */
+#define LIBFFI_GNU_SYMBOL_VERSIONING 1
 
 /* Define to the sub-directory where libtool stores uninstalled libraries. */
 #define LT_OBJDIR ".libs/"

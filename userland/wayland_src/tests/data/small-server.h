@@ -107,6 +107,10 @@ enum intf_A_foo {
  * @ingroup iface_intf_A
  */
 #define INTF_A_FOO_DEPRECATED_SINCE_VERSION 2
+#endif /* INTF_A_FOO_ENUM */
+
+#ifndef INTF_A_FOO_ENUM_IS_VALID
+#define INTF_A_FOO_ENUM_IS_VALID
 /**
  * @ingroup iface_intf_A
  * Validate a intf_A foo value.
@@ -131,7 +135,52 @@ intf_A_foo_is_valid(uint32_t value, uint32_t version) {
 		return false;
 	}
 }
-#endif /* INTF_A_FOO_ENUM */
+#endif /* INTF_A_FOO_ENUM_IS_VALID */
+
+#ifndef INTF_A_BAR_ENUM
+#define INTF_A_BAR_ENUM
+enum intf_A_bar {
+	/**
+	 * this is the first
+	 */
+	INTF_A_BAR_FIRST = 0x01,
+	/**
+	 * this is the second
+	 */
+	INTF_A_BAR_SECOND = 0x02,
+	/**
+	 * this is the third
+	 * @since 2
+	 */
+	INTF_A_BAR_THIRD = 0x04,
+};
+/**
+ * @ingroup iface_intf_A
+ */
+#define INTF_A_BAR_THIRD_SINCE_VERSION 2
+#endif /* INTF_A_BAR_ENUM */
+
+#ifndef INTF_A_BAR_ENUM_IS_VALID
+#define INTF_A_BAR_ENUM_IS_VALID
+/**
+ * @ingroup iface_intf_A
+ * Validate a intf_A bar value.
+ *
+ * @return true on success, false on error.
+ * @ref intf_A_bar
+ */
+static inline bool
+intf_A_bar_is_valid(uint32_t value, uint32_t version) {
+	uint32_t valid = 0;
+	if (version >= 1)
+		valid |= INTF_A_BAR_FIRST;
+	if (version >= 1)
+		valid |= INTF_A_BAR_SECOND;
+	if (version >= 2)
+		valid |= INTF_A_BAR_THIRD;
+	return (value & ~valid) == 0;
+}
+#endif /* INTF_A_BAR_ENUM_IS_VALID */
 
 /**
  * @ingroup iface_intf_A

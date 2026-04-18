@@ -51,6 +51,63 @@
 #include "tests-server-protocol.h"
 #include "tests-client-protocol.h"
 
+static void
+registry_handle_global_noop(void *data,
+			    struct wl_registry *registry,
+			    uint32_t id, const char *interface,
+			    uint32_t ver)
+{
+}
+
+static void
+registry_handle_global_remove_noop(void *data,
+				   struct wl_registry *registry,
+				   uint32_t id)
+{
+}
+
+static void
+fixes_destroy(struct wl_client *client,
+	      struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+static void
+fixes_destroy_registry(struct wl_client *client,
+		       struct wl_resource *resource,
+		       struct wl_resource *registry)
+{
+	wl_resource_destroy(registry);
+}
+
+static void
+fixes_ack_global_remove(struct wl_client *client,
+			struct wl_resource *resource,
+			struct wl_resource *registry,
+			uint32_t global_id)
+{
+	wl_fixes_handle_ack_global_remove(resource, registry, global_id);
+}
+
+static const struct wl_fixes_interface fixes_implementation = {
+	.destroy = fixes_destroy,
+	.destroy_registry = fixes_destroy_registry,
+	.ack_global_remove = fixes_ack_global_remove,
+};
+
+static void
+bind_fixes(struct wl_client *client,
+	   void *data,
+	   uint32_t version,
+	   uint32_t id)
+{
+	struct wl_resource *resource;
+
+	resource = wl_resource_create(client, &wl_fixes_interface, version, id);
+	wl_resource_set_implementation(resource, &fixes_implementation, NULL, NULL);
+}
+
 struct display_destroy_listener {
 	struct wl_listener listener;
 	int done;
@@ -924,7 +981,7 @@ TEST(versions)
 }
 
 static void
-check_error_on_destroyed_object(void *data)
+check_error_on_destroyed_object(void)
 {
 	struct client *c;
 	struct wl_seat *seat;
@@ -1043,7 +1100,7 @@ TEST(filtered_global_is_hidden)
 		      1, d, bind_data_offer);
 	wl_display_set_global_filter(d->wl_display, global_filter, NULL);
 
-	client_create_noarg(d, get_globals);
+	client_create(d, get_globals, NULL);
 	display_run(d);
 
 	wl_global_destroy(g);
@@ -1052,13 +1109,13 @@ TEST(filtered_global_is_hidden)
 }
 
 static void
-get_dynamic_globals(void *data)
+get_dynamic_globals(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
 
 	registry = wl_display_get_registry(c->wl_display);
-	wl_registry_add_listener(registry, &registry_listener_filtered, data);
+	wl_registry_add_listener(registry, &registry_listener_filtered, NULL);
 	wl_display_roundtrip(c->wl_display);
 
 	/* Wait for the server to create a new global */
@@ -1206,7 +1263,7 @@ static const struct wl_registry_listener zombie_fd_registry_listener = {
 };
 
 static void
-zombie_client(void *data)
+zombie_client(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
@@ -1376,7 +1433,7 @@ static const struct wl_registry_listener double_zombie_fd_registry_listener = {
 };
 
 static void
-double_zombie_client(void *data)
+double_zombie_client(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
@@ -1436,7 +1493,7 @@ static const struct wl_registry_listener bind_interface_mismatch_registry_listen
 };
 
 static void
-registry_bind_interface_mismatch_client(void *data)
+registry_bind_interface_mismatch_client(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
@@ -1598,7 +1655,7 @@ static const struct wl_registry_listener global_remove_before_registry_listener 
 };
 
 static void
-global_remove_before_client(void *data)
+global_remove_before_client(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
@@ -1648,7 +1705,7 @@ static const struct wl_registry_listener global_remove_after_registry_listener =
 };
 
 static void
-global_remove_after_client(void *data)
+global_remove_after_client(void)
 {
 	struct client *c = client_connect();
 	struct wl_registry *registry;
@@ -1689,6 +1746,241 @@ TEST(global_remove)
 	client_create_noarg(d, global_remove_after_client);
 
 	display_resume(d);
+
+	wl_global_destroy(global);
+
+	display_destroy(d);
+}
+
+static void
+registry_ack_global_remove_handle_global_remove(void *data,
+						struct wl_registry *registry,
+						uint32_t id)
+{
+	struct client *client = data;
+
+	wl_fixes_ack_global_remove(client->wl_fixes, registry, id);
+}
+
+static struct wl_registry_listener registry_ack_global_remove_listener = {
+	.global = registry_handle_global_noop,
+	.global_remove = registry_ack_global_remove_handle_global_remove,
+};
+
+static void
+ack_global_remove_client(void *data)
+{
+	struct client *c = client_connect();
+	struct wl_registry *registry;
+	struct wl_registry_listener *registry_listener = data;
+	int ret;
+
+	registry = wl_display_get_registry(c->wl_display);
+	wl_registry_add_listener(registry,
+				 registry_listener,
+				 c);
+
+	ret = wl_display_roundtrip(c->wl_display);
+	assert(ret >= 0);
+
+	/* yield the control back to the compositor so it can remove
+	 * the global */
+	assert(stop_display(c, 1) >= 0);
+
+	/* check if there are any global_remove events */
+	ret = wl_display_roundtrip(c->wl_display);
+	assert(ret >= 0);
+
+	/* yield the control back to the compositor so it can check
+	 * whether the global is withdrawn */
+	assert(stop_display(c, 1) >= 0);
+
+	wl_registry_destroy(registry);
+
+	client_disconnect(c);
+}
+
+static void
+mark_global_withdrawn(struct wl_global *global)
+{
+	bool *withdrawn = wl_global_get_user_data(global);
+
+	*withdrawn = true;
+}
+
+TEST(ack_global_remove)
+{
+	struct display *d;
+	struct wl_global *seat;
+	struct wl_global *fixes;
+	bool withdrawn = false;
+
+	d = display_create();
+
+	fixes = wl_global_create(d->wl_display, &wl_fixes_interface,
+				 2, NULL, bind_fixes);
+
+	seat = wl_global_create(d->wl_display, &wl_seat_interface,
+				1, &withdrawn, NULL);
+
+	wl_global_set_withdrawn_listener(seat, mark_global_withdrawn);
+
+	client_create(d, ack_global_remove_client,
+		      &registry_ack_global_remove_listener);
+
+	display_run(d);
+	assert(!withdrawn);
+
+	wl_global_remove(seat);
+
+	/* the global will be marked as withdrawn after the client
+	 * acknowledges the wl_registry.global_remove event */
+	display_resume(d);
+	assert(withdrawn);
+
+	/* the global will be still marked as withdrawn even after
+	 * the client disconnects */
+	display_resume(d);
+	assert(withdrawn);
+
+	wl_global_destroy(seat);
+	wl_global_destroy(fixes);
+
+	display_destroy(d);
+}
+
+static struct wl_registry_listener registry_no_ack_global_remove_listener = {
+	.global = registry_handle_global_noop,
+	.global_remove = registry_handle_global_remove_noop,
+};
+
+TEST(no_ack_global_remove)
+{
+	struct display *d;
+	struct wl_global *seat;
+	struct wl_global *fixes;
+	bool withdrawn = false;
+
+	d = display_create();
+
+	fixes = wl_global_create(d->wl_display, &wl_fixes_interface,
+				 2, NULL, bind_fixes);
+
+	seat = wl_global_create(d->wl_display, &wl_seat_interface,
+				1, &withdrawn, NULL);
+
+	wl_global_set_withdrawn_listener(seat, mark_global_withdrawn);
+
+	client_create(d, ack_global_remove_client,
+		      &registry_no_ack_global_remove_listener);
+
+	display_run(d);
+	assert(!withdrawn);
+
+	wl_global_remove(seat);
+
+	/* if the client does not ack the wl_registry.global_remove event,
+	 * the global will not be marked as withdrawn */
+	display_resume(d);
+	assert(!withdrawn);
+
+	/* when the client disconnects, the wl_registry.global_remove will
+	 * be implicitly acknowledged and the global can be destroyed then */
+	display_resume(d);
+	assert(withdrawn);
+
+	wl_global_destroy(seat);
+	wl_global_destroy(fixes);
+
+	display_destroy(d);
+}
+
+TEST(global_remove_without_clients)
+{
+	struct display *d;
+	struct wl_global *global;
+	bool withdrawn = false;
+
+	d = display_create();
+
+	global = wl_global_create(d->wl_display, &wl_seat_interface,
+				  1, &withdrawn, NULL);
+
+	wl_global_set_withdrawn_listener(global, mark_global_withdrawn);
+
+	/* if there are no clients at all, the global can be destroyed
+	 * immediately */
+	wl_global_remove(global);
+	assert(withdrawn);
+
+	wl_global_destroy(global);
+
+	display_destroy(d);
+}
+
+static void
+dispatch_single_read_events(struct wl_display *d)
+{
+	if (wl_display_prepare_read(d) < 0) {
+		return;
+	}
+
+	int ret = 0;
+	do {
+		ret = wl_display_flush(d);
+	} while (ret < 0 && (errno == EINTR || errno == EAGAIN));
+	assert(ret >= 0);
+
+	struct pollfd pfd[1];
+	pfd[0].fd = wl_display_get_fd(d);
+	pfd[0].events = POLLIN;
+
+	do {
+		ret = poll(pfd, 1, -1);
+	} while (ret < 0 && errno == EINTR);
+	assert(ret > 0);
+
+	wl_display_read_events(d);
+}
+
+static void
+dispatch_single_client(void)
+{
+	struct client *c = client_connect();
+
+	assert(wl_display_dispatch_pending_single(c->wl_display) == 0);
+
+	struct wl_registry *registry = wl_display_get_registry(c->wl_display);
+
+	dispatch_single_read_events(c->wl_display);
+
+	// [1815110.061] {Default Queue} wl_registry#3.global(1, "test", 1)
+	assert(wl_display_dispatch_pending_single(c->wl_display) == 1);
+
+	dispatch_single_read_events(c->wl_display);
+
+	// [1815110.067] {Default Queue} wl_registry#3.global(2, "wl_seat", 1)
+	assert(wl_display_dispatch_pending_single(c->wl_display) == 1);
+
+	// No more events
+	assert(wl_display_dispatch_pending_single(c->wl_display) == 0);
+
+	wl_registry_destroy(registry);
+
+	client_disconnect(c);
+}
+
+TEST(dispatch_single)
+{
+	struct display *d = display_create();
+
+	struct wl_global *global = wl_global_create(d->wl_display,
+						    &wl_seat_interface,
+						    1, d, bind_seat);
+
+	client_create_noarg(d, dispatch_single_client);
+
+	display_run(d);
 
 	wl_global_destroy(global);
 

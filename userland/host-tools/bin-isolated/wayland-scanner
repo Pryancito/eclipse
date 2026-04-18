@@ -1,0 +1,3 @@
+#!/bin/bash
+# wayland-scanner is a native C binary, we just need a clean env
+env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu" /home/moebius/eclipse/userland/host-tools/bin/wayland-scanner "$@"

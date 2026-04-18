@@ -1,14 +1,18 @@
 project(
 	'wayland', 'c',
-	version: '1.23.0',
+	version: '1.25.90',
 	license: 'MIT',
-	meson_version: '>= 0.57.0',
+	meson_version: '>= 0.64.0',
 	default_options: [
 		'warning_level=2',
 		'buildtype=debugoptimized',
 		'c_std=c99',
 	]
 )
+
+fs = import('fs')
+pkgconfig = import('pkgconfig')
+
 wayland_version = meson.project_version().split('.')
 
 config_h = configuration_data()
@@ -46,6 +50,7 @@ have_funcs = [
 	'memfd_create',
 	'mremap',
 	'strndup',
+	'gettid',
 ]
 foreach f: have_funcs
 	config_h.set('HAVE_' + f.underscorify().to_upper(), cc.has_function(f))
@@ -105,8 +110,6 @@ configure_file(
 	configuration: config_h,
 )
 
-pkgconfig = import('pkgconfig')
-
 wayland_protocol_xml = files('protocol/wayland.xml')
 
 root_inc = include_directories('.')
@@ -131,7 +134,9 @@ if get_option('scanner')
 		'wayland-scanner.mk',
 		'protocol/wayland.xml',
 		'protocol/wayland.dtd',
-	])
+	],
+		install_dir: join_paths(get_option('prefix'), get_option('datadir'), 'wayland'),
+	)
 
 	install_data(
 		[ 'wayland-scanner.m4' ],

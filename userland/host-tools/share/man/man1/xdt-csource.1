@@ -1,0 +1,125 @@
+'\" t
+.\"     Title: xdt-csource
+.\"    Author: [see the "Author" section]
+.\" Generator: DocBook XSL Stylesheets vsnapshot <http://docbook.sf.net/>
+.\"      Date: 04/18/2026
+.\"    Manual: Xfce User\*(Aqs Manual
+.\"    Source: Xfce
+.\"  Language: English
+.\"
+.TH "XDT\-CSOURCE" "1" "04/18/2026" "Xfce" "Xfce User\*(Aqs Manual"
+.\" -----------------------------------------------------------------
+.\" * Define some portability stuff
+.\" -----------------------------------------------------------------
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.\" http://bugs.debian.org/507673
+.\" http://lists.gnu.org/archive/html/groff/2009-02/msg00013.html
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.ie \n(.g .ds Aq \(aq
+.el       .ds Aq '
+.\" -----------------------------------------------------------------
+.\" * set default formatting
+.\" -----------------------------------------------------------------
+.\" disable hyphenation
+.nh
+.\" disable justification (adjust text to left margin only)
+.ad l
+.\" -----------------------------------------------------------------
+.\" * MAIN CONTENT STARTS HERE *
+.\" -----------------------------------------------------------------
+.SH "NAME"
+xdt-csource \- C code generation utility for arbitrary data
+.SH "SYNOPSIS"
+.HP \w'\fBxdt\-csource\fR\ 'u
+\fBxdt\-csource\fR [options] [file]
+.HP \w'\fBxdt\-csource\fR\ 'u
+\fBxdt\-csource\fR [options] \-\-build\-list [[name]\ [file]...]
+.SH "DESCRIPTION"
+.PP
+\fBxdt\-csource\fR
+is a small utility that generates C code containing arbitrary data, useful for compiling texts or other data directly into programs\&. It supersedes exo\-csource\&.
+.SH "INVOCATION"
+.PP
+\fBxdt\-csource\fR
+either takes as input one file name to generate code for, or, using the
+\fB\-\-build\-list\fR
+option, a list of (\fIname\fR,
+\fIfile\fR) pairs to generate code for a list of images into named variables\&.
+.SS "Options"
+.PP
+\fB\-h\fR, \fB\-\-help\fR
+.RS 4
+Print brief help and exit\&.
+.RE
+.PP
+\fB\-V\fR, \fB\-\-version\fR
+.RS 4
+Print version information and exit\&.
+.RE
+.PP
+\fB\-\-extern\fR
+.RS 4
+Generate extern symbols\&.
+.RE
+.PP
+\fB\-\-static\fR
+.RS 4
+Generate static symbols (default)\&.
+.RE
+.PP
+\fB\-\-name=identifier\fR
+.RS 4
+Specifies the
+\fIidentifier\fR
+name (prefix) for the generated variables (only used if
+\fB\-\-build\-list\fR
+was not specified as well)\&.
+.RE
+.PP
+\fB\-\-build\-list\fR
+.RS 4
+Enables (\fIname\fR,
+\fIfile\fR) pair parsing mode\&.
+.RE
+.PP
+\fB\-\-strip\-comments\fR
+.RS 4
+Remove comments from XML files
+.RE
+.PP
+\fB\-\-strip\-content\fR
+.RS 4
+Remove node contents from XML files
+.RE
+.PP
+\fB\-\-output=identifier\fR
+.RS 4
+Prints the output to
+\fIidentifier\fR
+instead of stdout (only used if
+\fB\-\-build\-list\fR
+was not specified as well)\&.
+.RE
+.SH "SEE ALSO"
+.PP
+The
+\fBgdk\-pixbuf\-csource\fR
+utility which ships with the Gtk+ distribution, available from
+\m[blue]\fBwww\&.gtk\&.org\fR\m[]\&\s-2\u[1]\d\s+2\&.
+.SH "AUTHOR"
+.PP
+Original program
+\fBexo\-csource\fR
+was written by Benedikt Meurer
+<benny@xfce\&.org>\&.
+\fBxdt\-csource\fR
+supersedes it\&.
+.PP
+This manual page was provided by the Xfce Development Team
+<xfce4\-dev@xfce\&.org>\&.
+.SH "NOTES"
+.IP " 1." 4
+www.gtk.org
+.RS 4
+\%https://www.gtk.org
+.RE

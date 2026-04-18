@@ -22,6 +22,7 @@ if get_option('tests')
 		test(
 			'wayland-egl symbols check',
 			find_program('wayland-egl-symbols-check'),
+			depends: wayland_egl,
 			env: [
 				'WAYLAND_EGL_LIB=@0@'.format(wayland_egl_shared.full_path()),
 				'NM=@0@'.format(nm_path)

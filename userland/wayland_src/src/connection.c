@@ -26,7 +26,8 @@
 
 #define _GNU_SOURCE
 
-#include <assert.h>
+#include "../config.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -75,7 +76,8 @@ struct wl_connection {
 static inline size_t
 size_pot(uint32_t size_bits)
 {
-	assert(size_bits < 8 * sizeof(size_t));
+	if (!(size_bits < 8 * sizeof(size_t)))
+		wl_abort("Too many bits for size_t\n");
 
 	return ((size_t)1) << size_bits;
 }
@@ -260,7 +262,7 @@ ring_buffer_ensure_space(struct wl_ring_buffer *b, size_t count)
 	 * allowed).
 	 */
 	if (net_size > size_pot(size_bits)) {
-		wl_log("Data too big for buffer (%d + %zd > %zd).\n",
+		wl_log("Data too big for buffer (%zu + %zu > %zu).\n",
 		       ring_buffer_size(b), count, size_pot(size_bits));
 		errno = E2BIG;
 		return -1;
@@ -928,7 +930,7 @@ wl_connection_demarshal(struct wl_connection *connection,
 	for (i = 0; i < count; i++) {
 		signature = get_next_argument(signature, &arg);
 
-		if (arg.type != WL_ARG_FD && p + 1 > end) {
+		if (arg.type != WL_ARG_FD && p >= end) {
 			wl_log("message too short, "
 			       "object (%d), message %s(%s)\n",
 			       closure->sender_id, message->name,
@@ -975,9 +977,17 @@ wl_connection_demarshal(struct wl_connection *connection,
 
 			s = (char *) p;
 
-			if (length > 0 && s[length - 1] != '\0') {
+			if (s[length - 1] != '\0') {
 				wl_log("string not nul-terminated, "
 				       "message %s(%s)\n",
+				       message->name, message->signature);
+				errno = EINVAL;
+				goto err;
+			}
+
+			if (strlen(s) != length - 1) {
+				wl_log("string has embedded nul at offset %zu, "
+				       "message %s(%s)\n", strlen(s),
 				       message->name, message->signature);
 				errno = EINVAL;
 				goto err;
@@ -1221,6 +1231,11 @@ wl_closure_invoke(struct wl_closure *closure, uint32_t flags,
 		     count + 2, &ffi_type_void, ffi_types);
 
 	implementation = target->implementation;
+	if (!implementation) {
+		wl_abort("Implementation of resource %d of %s is NULL\n",
+			  target->id, target->interface->name);
+	}
+
 	if (!implementation[opcode]) {
 		wl_abort("listener function for opcode %u of %s is NULL\n",
 			 opcode, target->interface->name);
@@ -1343,7 +1358,7 @@ serialize_closure(struct wl_closure *closure, uint32_t *buffer,
 		if (arg.type == WL_ARG_FD)
 			continue;
 
-		if (p + 1 > end)
+		if (p >= end)
 			goto overflow;
 
 		switch (arg.type) {
@@ -1371,7 +1386,7 @@ serialize_closure(struct wl_closure *closure, uint32_t *buffer,
 			size = strlen(closure->args[i].s) + 1;
 			*p++ = size;
 
-			if (p + div_roundup(size, sizeof *p) > end)
+			if (div_roundup(size, sizeof *p) > (uint32_t)(end - p))
 				goto overflow;
 
 			memcpy(p, closure->args[i].s, size);
@@ -1386,7 +1401,7 @@ serialize_closure(struct wl_closure *closure, uint32_t *buffer,
 			size = closure->args[i].a->size;
 			*p++ = size;
 
-			if (p + div_roundup(size, sizeof *p) > end)
+			if (div_roundup(size, sizeof *p) > (uint32_t)(end - p))
 				goto overflow;
 
 			if (size != 0)
@@ -1478,11 +1493,56 @@ wl_closure_queue(struct wl_closure *closure, struct wl_connection *connection)
 	return result;
 }
 
+bool
+wl_check_env_token(const char *env, const char *token)
+{
+	const char *ptr = env;
+	size_t token_len;
+
+	if (env == NULL)
+		return false;
+
+	token_len = strlen(token);
+
+	// Scan the string for comma-separated tokens and look for a match.
+	while (true) {
+		const char *end;
+		size_t len;
+
+		// Skip over any leading separators.
+		while (*ptr == ',')
+			ptr++;
+
+		if (*ptr == '\x00')
+			return false;
+
+		end = strchr(ptr + 1, ',');
+
+		// If there isn't another separarator, then the rest of the string
+		// is one token.
+		if (end == NULL)
+			return (strcmp(ptr, token) == 0);
+
+		len = end - ptr;
+		if (len == token_len && memcmp(ptr, token, len) == 0) {
+			return true;
+		}
+
+		// Skip to the next token.
+		ptr += len;
+	}
+
+	return false;
+}
+
 void
 wl_closure_print(struct wl_closure *closure, struct wl_object *target,
 		 int send, int discarded, uint32_t (*n_parse)(union wl_argument *arg),
-		 const char *queue_name)
+		 const char *queue_name, int color)
 {
+#if defined(HAVE_GETTID)
+	static int include_tid = -1;
+#endif // defined(HAVE_GETTID)
 	int i;
 	struct argument_details arg;
 	const char *signature = closure->message->signature;
@@ -1499,17 +1559,40 @@ wl_closure_print(struct wl_closure *closure, struct wl_object *target,
 
 	clock_gettime(CLOCK_REALTIME, &tp);
 	time = (tp.tv_sec * 1000000L) + (tp.tv_nsec / 1000);
+	fprintf(f, "%s[%7u.%03u] ",
+		color ? WL_DEBUG_COLOR_GREEN : "",
+		time / 1000, time % 1000);
 
-	fprintf(f, "[%7u.%03u] ", time / 1000, time % 1000);
+#if defined(HAVE_GETTID)
+	if (include_tid < 0) {
+		include_tid = wl_check_env_token(getenv("WAYLAND_DEBUG"), "thread_id");
+	}
 
-	if (queue_name)
-		fprintf(f, "{%s} ", queue_name);
+	if (include_tid) {
+		fprintf(f, "%sTID#%d ",
+			color ? WL_DEBUG_COLOR_CYAN : "",
+			(int) gettid());
+	}
+#endif
 
-	fprintf(f, "%s%s%s#%u.%s(",
+	if (queue_name) {
+		fprintf(f, "%s{%s} ",
+			color ? WL_DEBUG_COLOR_YELLOW : "",
+			queue_name);
+	}
+
+	fprintf(f, "%s%s%s%s%s%s%s#%u%s.%s%s(",
+		color ? WL_DEBUG_COLOR_RED : "",
 		discarded ? "discarded " : "",
+		color ? WL_DEBUG_COLOR_RESET : "",
 		send ? " -> " : "",
-		target->interface->name, target->id,
-		closure->message->name);
+		color ? WL_DEBUG_COLOR_BLUE : "",
+		target->interface->name,
+		color ? WL_DEBUG_COLOR_MAGENTA : "",
+		target->id,
+		color ? WL_DEBUG_COLOR_CYAN : "",
+		closure->message->name,
+		color ? WL_DEBUG_COLOR_RESET : "");
 
 	for (i = 0; i < closure->count; i++) {
 		signature = get_next_argument(signature, &arg);
@@ -1574,7 +1657,7 @@ wl_closure_print(struct wl_closure *closure, struct wl_object *target,
 		}
 	}
 
-	fprintf(f, ")\n");
+	fprintf(f, ")%s\n", color ? WL_DEBUG_COLOR_RESET : "");
 
 	if (fclose(f) == 0) {
 		fprintf(stderr, "%s", buffer);

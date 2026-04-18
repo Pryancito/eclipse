@@ -43,7 +43,7 @@ include:
     # API changes. If you need new features from ci-templates you must bump
     # this to the current SHA you require from the ci-templates repo, however
     # be aware that you may need to account for API changes when doing so.
-    ref: b791bd48996e3ced9ca13f1c5ee82be8540b8adb
+    ref: 48c2c583a865bd59be21e8938df247faf460099c
     file:
       - '/templates/debian.yml'
       - '/templates/freebsd.yml'
@@ -62,6 +62,13 @@ stages:
   - "Build and test"
   - "Other build configurations"
 
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 .ci-rules:
   rules:
     - when: on_success
@@ -70,12 +77,11 @@ stages:
 .os-debian:
   variables:
     BUILD_OS: debian
-    FDO_DISTRIBUTION_VERSION: bookworm
-    FDO_DISTRIBUTION_PACKAGES: 'build-essential pkg-config libexpat1-dev libffi-dev libxml2-dev doxygen graphviz xmlto xsltproc docbook-xsl python3-pip python3-setuptools ninja-build'
-    FDO_DISTRIBUTION_EXEC: 'pip3 install --break-system-packages meson~=0.57.2'
+    FDO_DISTRIBUTION_VERSION: trixie
+    FDO_DISTRIBUTION_PACKAGES: 'build-essential pkg-config libexpat1-dev libffi-dev libxml2-dev doxygen graphviz xmlto xsltproc docbook-xsl mdbook meson ninja-build'
     # bump this tag every time you change something which requires rebuilding the
     # base image
-    FDO_DISTRIBUTION_TAG: "2024-03-28.2"
+    FDO_DISTRIBUTION_TAG: "2026-01-31.0"
 
 .debian-x86_64:
   extends:
@@ -94,6 +100,7 @@ stages:
     - .os-debian
   variables:
     BUILD_ARCH: "armv7"
+    FDO_DISTRIBUTION_PLATFORM: "linux/arm/v7"
 
 
 # Does not inherit .ci-rules as we only want it to run in MR context.
@@ -147,13 +154,12 @@ armv7-debian-container_prep:
   stage: "Base container"
   variables:
     GIT_STRATEGY: none
-    FDO_BASE_IMAGE: "arm32v7/debian:$FDO_DISTRIBUTION_VERSION"
 
 
 # Core build environment.
 .build-env:
   variables:
-    MESON_BUILD_TYPE: "-Dbuildtype=debug -Doptimization=0 -Db_sanitize=address,undefined"
+    MESON_BUILD_TYPE: "-Dbuildtype=debug -Doptimization=0 -Db_sanitize=address,undefined -Ddocbook_validation=true"
     # See https://gitlab.freedesktop.org/wayland/wayland/-/merge_requests/154
     ASAN_OPTIONS: "detect_odr_violation=0"
   before_script:
@@ -216,11 +222,11 @@ armv7-debian-container_prep:
     - .ci-rules
   stage: "Build and test"
   script:
-    - cd "$BUILDDIR"
-    - meson --prefix="$PREFIX" -Dicon_directory=/usr/share/X11/icons --fatal-meson-warnings -Dwerror=true ${MESON_BUILD_TYPE} ..
-    - ninja -k0 -j${FDO_CI_CONCURRENT:-4}
-    - meson test --num-processes ${FDO_CI_CONCURRENT:-4}
-    - ninja clean
+    - meson setup $BUILDDIR --prefix="$PREFIX" -Dicon_directory=/usr/share/X11/icons --fatal-meson-warnings -Dwerror=true ${MESON_BUILD_TYPE}
+    - ninja -C $BUILDDIR -k0 -j${FDO_CI_CONCURRENT:-4}
+    - meson test -C $BUILDDIR --num-processes ${FDO_CI_CONCURRENT:-4}
+    - ninja -C $BUILDDIR install
+    - ninja -C $BUILDDIR clean
   artifacts:
     name: wayland-$CI_JOB_NAME
     when: always
@@ -243,7 +249,7 @@ armv7-debian-container_prep:
     # the workspace to see details about the failed tests.
     - |
       set +e
-      /app/vmctl exec "pkg info; cd $CI_PROJECT_NAME ; meson $BUILDDIR --prefix=$PREFIX $MESON_BUILD_TYPE $MESON_ARGS && ninja -C $BUILDDIR -j${FDO_CI_CONCURRENT:-4}"
+      /app/vmctl exec "pkg info; cd $CI_PROJECT_NAME ; meson setup $BUILDDIR --prefix=$PREFIX $MESON_BUILD_TYPE $MESON_ARGS && ninja -C $BUILDDIR -j${FDO_CI_CONCURRENT:-4}"
       /app/vmctl exec "meson test --print-errorlogs -C $BUILDDIR --num-processes ${FDO_CI_CONCURRENT:-4}" && touch .tests-successful
       set -ex
       scp -r vm:$BUILDDIR/meson-logs .
@@ -299,11 +305,11 @@ armv7-release-debian-build:
 .os-freebsd:
   variables:
     BUILD_OS: freebsd
-    FDO_DISTRIBUTION_VERSION: "13.2"
+    FDO_DISTRIBUTION_VERSION: "14.4"
     FDO_DISTRIBUTION_PACKAGES: 'libxslt meson ninja pkgconf expat libffi libepoll-shim libxml2'
     # bump this tag every time you change something which requires rebuilding the
     # base image
-    FDO_DISTRIBUTION_TAG: "2023-08-02.0"
+    FDO_DISTRIBUTION_TAG: "2026-03-10.0"
     # Don't build documentation since installing the required tools massively
     # increases the VM image (and therefore container) size.
     MESON_ARGS: "--fatal-meson-warnings -Dwerror=true -Ddocumentation=false"

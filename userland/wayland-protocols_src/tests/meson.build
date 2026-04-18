@@ -22,9 +22,12 @@ endforeach
 add_languages('c', 'cpp', native: false)
 replace = find_program('replace.py')
 
-extra_linker_flags = meson.get_compiler('c').get_supported_link_arguments([
-	'-Wl,--unresolved-symbols=ignore-all',
-])
+# First pass: generate scanner outputs for each protocol and record the
+# generated custom_targets for use when building test executables.
+protocol_code = {}
+protocol_client_header = {}
+protocol_server_header = {}
+protocol_replace_command = {}
 
 foreach protocol_file : protocol_files
 	xml_file = fs.name(protocol_file)
@@ -75,7 +78,10 @@ foreach protocol_file : protocol_files
 		install: false,
 	)
 
-	replace_command = [
+	protocol_code += {protocol_file: code}
+	protocol_client_header += {protocol_file: client_header}
+	protocol_server_header += {protocol_file: server_header}
+	protocol_replace_command += {protocol_file: [
 		replace,
 		'@INPUT@',
 		'@OUTPUT@',
@@ -83,7 +89,22 @@ foreach protocol_file : protocol_files
 		client_header.full_path(),
 		'PROTOCOL_SERVER_INCLUDE_FILE',
 		server_header.full_path(),
-	]
+	]}
+endforeach
+
+# Second pass: build test executables, linking in dependency code.
+foreach protocol_file : protocol_files
+	client_header = protocol_client_header[protocol_file]
+	server_header = protocol_server_header[protocol_file]
+	code = protocol_code[protocol_file]
+	replace_command = protocol_replace_command[protocol_file]
+
+	dep_code = []
+	if protocol_file in protocol_deps
+		foreach dep : protocol_deps[protocol_file]
+			dep_code += [protocol_code[dep]]
+		endforeach
+	endif
 
 	# Check that header can be included by a pedantic C99 compiler
 	test_name = 'test-build-pedantic-@0@'.format(protocol_file.underscorify())
@@ -100,9 +121,8 @@ foreach protocol_file : protocol_files
 			test_source,
 			client_header,
 			server_header,
-			code
-		],
-		link_args: extra_linker_flags,
+			code,
+		] + dep_code,
 		dependencies: libwayland,
 		c_args: [
 			'-std=c99',
@@ -129,9 +149,8 @@ foreach protocol_file : protocol_files
 				test_source,
 				client_header,
 				server_header,
-			],
-			link_args: extra_linker_flags,
-			dependencies: libwayland,
+			] + dep_code,
+					dependencies: libwayland,
 			cpp_args: [
 				'-Wall',
 				'-Werror',

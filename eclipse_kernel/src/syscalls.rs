@@ -184,6 +184,7 @@ fn vma_remove_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo: u
             }
         }
     }
+    vma_merge_adjacent(vmas);
 }
 
 fn vma_mprotect_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo: u64, hi: u64, prot: u64) {
@@ -211,6 +212,33 @@ fn vma_mprotect_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo:
                 vmas.push(crate::process::VMARegion { start: hi, ..vma });
             }
         }
+    }
+    vma_merge_adjacent(vmas);
+}
+
+/// Combina VMAs adyacentes con flags e identidad idénticos para evitar fragmentación.
+fn vma_merge_adjacent(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>) {
+    if vmas.len() < 2 { return; }
+
+    // 1. Ordenar por dirección de inicio para facilitar el merge lineal.
+    vmas.sort_by_key(|v| v.start);
+
+    // 2. Merge lineal en un nuevo vector.
+    let old = core::mem::take(vmas);
+    let mut iter = old.into_iter();
+    
+    if let Some(mut current) = iter.next() {
+        for next in iter {
+            if current.can_merge(&next) {
+                // Son adyacentes e idénticas: extender el final de la actual.
+                current.end = next.end;
+            } else {
+                // No son combinables: guardar la actual e iniciar nueva candidata.
+                vmas.push(current);
+                current = next;
+            }
+        }
+        vmas.push(current);
     }
 }
 
@@ -506,6 +534,7 @@ pub extern "C" fn syscall_handler(
         293 => sys_pipe2(arg1, arg2),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
+        324 => sys_membarrier(arg1, arg2, arg3),
         439 => sys_faccessat(arg1, arg2, arg3, arg4),
 
         // --- Eclipse Native Syscalls (500+) ---
@@ -1726,14 +1755,24 @@ fn release_service_binary_containing_ptr(ptr: u64) {
 /// so service binaries embedded in .rodata live at addresses starting there.
 const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 
-/// Maximum ELF buffer size accepted by sys_exec, sys_spawn, and sys_spawn_with_stdio.
+/// Byte length of an ELF buffer after the kernel heap rounds the allocation up to a
+/// multiple of `usize` (8 on x86_64), matching `linked_list_allocator` / `Layout` padding.
 ///
-/// Vec::with_capacity(N) produces Layout { size: N, align: 1 } which the
-/// linked_list_allocator rounds to Layout { size: (N+7)&!7, align: 8 }.
-/// Any N in [128 MiB − 7, 128 MiB] yields a rounded size of exactly 128 MiB;
-/// with the heap already partially used that allocation panics.  Subtracting 7
-/// from the threshold catches those edge-case sizes as well.
-const MAX_ELF_SIZE: u64 = 128 * 1024 * 1024 - 7;
+/// `sys_exec` uses `Vec::with_capacity(elf_size)`; sizes in `(128 MiB − 8, 128 MiB − 1]`
+/// still pass an `elf_size < 128 MiB − 7` check but round up to **exactly** 128 MiB,
+/// producing `Layout { size: 134217728, align: 8 }` and exhausting a 256 MiB heap mid-boot.
+#[inline]
+fn elf_byte_len_heap_padded(byte_len: u64) -> usize {
+    let n = byte_len as usize;
+    n.saturating_add(core::mem::size_of::<usize>() - 1) & !(core::mem::size_of::<usize>() - 1)
+}
+
+/// `true` iff a `Vec<u8>` holding `byte_len` bytes will not ask the global allocator for a
+/// block of 128 MiB or more (after alignment padding).
+#[inline]
+fn elf_size_allowed_for_kernel_heap_copy(byte_len: u64) -> bool {
+    byte_len > 0 && elf_byte_len_heap_padded(byte_len) < 128 * 1024 * 1024
+}
 
 /// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
 const LAST_EXEC_ERR_LEN: usize = 80;
@@ -1757,9 +1796,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes
-    // (see MAX_ELF_SIZE for the rationale).
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
+    if elf_ptr == 0 || !elf_size_allowed_for_kernel_heap_copy(elf_size) {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1902,9 +1939,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    // Use the same edge-case-safe limit as sys_exec and sys_spawn_with_stdio
-    // (see MAX_ELF_SIZE for the rationale).
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
+    if elf_ptr == 0 || !elf_size_allowed_for_kernel_heap_copy(elf_size) {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
     }
@@ -2127,9 +2162,7 @@ fn sys_spawn_with_stdio(elf_ptr: u64, elf_size: u64, name_ptr: u64, fd_in: u64, 
     // making it runnable before we replace its FDs.
 
     use alloc::vec::Vec;
-    // Reject buffers whose size rounds up to >= 128 MiB when aligned to 8 bytes
-    // (see MAX_ELF_SIZE for the rationale).
-    if elf_ptr == 0 || elf_size == 0 || elf_size >= MAX_ELF_SIZE {
+    if elf_ptr == 0 || !elf_size_allowed_for_kernel_heap_copy(elf_size) {
         return u64::MAX;
     }
     if !is_user_pointer(elf_ptr, elf_size) {
@@ -3730,9 +3763,10 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
 
                 // 3. CLONE_CHILD_CLEARTID: store ctid address in thread struct (r10).
                 if (flags & CLONE_CHILD_CLEARTID) != 0 {
-                    let mut t = process::get_process(tid).unwrap();
-                    t.clear_child_tid = context.r10;
-                    process::update_process(tid, t);
+                    if let Some(mut t) = process::get_process(tid) {
+                        t.clear_child_tid = context.r10;
+                        process::update_process(tid, t);
+                    }
                 }
 
                 crate::scheduler::enqueue_process(tid);
@@ -4196,6 +4230,18 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             u64::MAX
         }
     }
+}
+
+/// Linux `membarrier(2)` (NR 324). musl/glibc consultan capacidades y emiten barreras explícitas.
+/// Eclipse no implementa el modelo NUMA/global de Linux; `QUERY` anuncia solo `GLOBAL` y el resto es no-op con éxito.
+fn sys_membarrier(cmd: u64, _flags: u64, _cpu_id: u64) -> u64 {
+    const MEMBARRIER_CMD_QUERY: u64 = 0;
+    const MEMBARRIER_CMD_GLOBAL: u64 = 1 << 0;
+
+    if cmd == MEMBARRIER_CMD_QUERY {
+        return MEMBARRIER_CMD_GLOBAL;
+    }
+    0
 }
 
 /// sys_getrandom - Fill buffer with random bytes

@@ -59,6 +59,16 @@ pub struct VMARegion {
     pub anon_kernel_slack: u64,
 }
 
+impl VMARegion {
+    /// Returns true if other is immediately adjacent to this VMA and has identical properties.
+    pub fn can_merge(&self, other: &Self) -> bool {
+        self.end == other.start 
+            && self.flags == other.flags 
+            && self.file_backed == other.file_backed 
+            && self.anon_kernel_slack == other.anon_kernel_slack
+    }
+}
+
 /// Estructura de contexto salvado de un proceso
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

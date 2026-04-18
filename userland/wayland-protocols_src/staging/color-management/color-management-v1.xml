@@ -1702,7 +1702,7 @@
     </event>
   </interface>
 
-  <interface name="wp_image_description_reference_v1" version="1">
+  <interface name="wp_image_description_reference_v1" version="1" frozen="true">
     <description summary="Reference to an image description">
       This object is a reference to an image description. This interface is
       frozen at version 1 to allow other protocols to create

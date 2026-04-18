@@ -6,7 +6,7 @@ xmlcatalog-xmlcatalog.o: xmlcatalog.c \
  /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
- /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
  /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
  include/libxml/xmlmemory.h include/libxml/uri.h \
@@ -15,7 +15,7 @@ xmlcatalog-xmlcatalog.o: xmlcatalog.c \
  /home/moebius/eclipse/eclipse-os-build/include/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
  include/libxml/xmlregexp.h include/libxml/dict.h \
- /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  include/libxml/hash.h include/libxml/valid.h include/libxml/xmlerror.h \
  include/libxml/list.h include/libxml/xmlautomata.h \
  include/libxml/entities.h include/libxml/encoding.h \
@@ -31,7 +31,7 @@ include/libxml/xmlexports.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
-/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
 /home/moebius/eclipse/eclipse-os-build/include/alloca.h:
 include/libxml/xmlmemory.h:
@@ -44,7 +44,7 @@ include/libxml/parser.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
 include/libxml/xmlregexp.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 include/libxml/hash.h:
 include/libxml/valid.h:
 include/libxml/xmlerror.h:

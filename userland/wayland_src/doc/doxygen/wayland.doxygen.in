@@ -5,7 +5,6 @@ OUTPUT_DIRECTORY       = @top_builddir@/doc/doxygen
 JAVADOC_AUTOBRIEF      = YES
 TAB_SIZE               = 8
 QUIET                  = YES
-HTML_TIMESTAMP         = YES
 GENERATE_LATEX         = NO
 MAN_LINKS              = NO
 PREDEFINED             = WL_EXPORT=              \

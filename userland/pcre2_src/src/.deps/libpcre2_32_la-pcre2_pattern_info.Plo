@@ -6,13 +6,14 @@ src/libpcre2_32_la-pcre2_pattern_info.lo: src/pcre2_pattern_info.c \
  /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
  /home/moebius/eclipse/eclipse-os-build/include/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
- /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
  /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
  /home/moebius/eclipse/eclipse-os-build/include/string.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h src/pcre2.h \
  /home/moebius/eclipse/eclipse-os-build/include/inttypes.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
  src/pcre2_ucp.h src/pcre2_intmodedep.h
@@ -24,7 +25,7 @@ src/pcre2_internal.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
 /home/moebius/eclipse/eclipse-os-build/include/limits.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
-/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
 /home/moebius/eclipse/eclipse-os-build/include/alloca.h:
@@ -32,6 +33,7 @@ src/pcre2_internal.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
 src/pcre2.h:
 /home/moebius/eclipse/eclipse-os-build/include/inttypes.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
 src/pcre2_ucp.h:

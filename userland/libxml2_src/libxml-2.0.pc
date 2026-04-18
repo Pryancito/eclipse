@@ -1,12 +1,13 @@
-prefix=/home/moebius/eclipse/eclipse-os-build
+prefix=/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix=${prefix}
-libdir=/home/moebius/eclipse/eclipse-os-build/lib
+libdir=${exec_prefix}/lib
 includedir=${prefix}/include
 modules=1
 
 Name: libXML
 Version: 2.13.4
 Description: libXML library version2.
-Requires: 
-Libs: -L${libdir} -lxml2     -lm   
+Requires.private: 
+Libs: -L${libdir} -lxml2 
+Libs.private:  -L/home/moebius/eclipse/eclipse-os-build/usr/lib -lz   -lm   
 Cflags: -I${includedir}/libxml2 

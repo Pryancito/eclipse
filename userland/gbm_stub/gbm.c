@@ -36,6 +36,12 @@ uint32_t gbm_bo_get_format(struct gbm_bo *bo) { return 0; }
 struct gbm_device *gbm_bo_get_device(struct gbm_bo *bo) { return NULL; }
 union gbm_bo_handle gbm_bo_get_handle(struct gbm_bo *bo) { union gbm_bo_handle h; h.u32 = 0; return h; }
 int gbm_bo_get_fd(struct gbm_bo *bo) { return -1; }
+int gbm_bo_get_fd_for_plane(struct gbm_bo *bo, int plane)
+{
+	if (plane != 0)
+		return -1;
+	return gbm_bo_get_fd(bo);
+}
 uint32_t gbm_bo_get_offset(struct gbm_bo *bo, int plane) { return 0; }
 uint32_t gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane) { return 0; }
 uint64_t gbm_bo_get_modifier(struct gbm_bo *bo) { return 0; }

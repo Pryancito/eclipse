@@ -106,6 +106,29 @@ enum intf_A_foo {
 #define INTF_A_FOO_DEPRECATED_SINCE_VERSION 2
 #endif /* INTF_A_FOO_ENUM */
 
+#ifndef INTF_A_BAR_ENUM
+#define INTF_A_BAR_ENUM
+enum intf_A_bar {
+	/**
+	 * this is the first
+	 */
+	INTF_A_BAR_FIRST = 0x01,
+	/**
+	 * this is the second
+	 */
+	INTF_A_BAR_SECOND = 0x02,
+	/**
+	 * this is the third
+	 * @since 2
+	 */
+	INTF_A_BAR_THIRD = 0x04,
+};
+/**
+ * @ingroup iface_intf_A
+ */
+#define INTF_A_BAR_THIRD_SINCE_VERSION 2
+#endif /* INTF_A_BAR_ENUM */
+
 /**
  * @ingroup iface_intf_A
  * @struct intf_A_listener

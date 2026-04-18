@@ -3,6 +3,6 @@
   <interface name="required_interface" version="13">
     <description summary="required summary">
     </description>
-    <event name="requied_event"/>
+    <event name="required_event"/>
   </interface>
 </protocol>

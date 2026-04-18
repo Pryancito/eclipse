@@ -27,6 +27,7 @@
 #include "xcursor.h"
 #include "wayland-cursor.h"
 #include "wayland-client.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -68,11 +69,16 @@ shm_pool_create(struct wl_shm *shm, int size)
 		goto err_close;
 
 	pool->pool = wl_shm_create_pool(shm, pool->fd, size);
+	if (!pool->pool)
+		goto err_unmap;
+
 	pool->size = size;
 	pool->used = 0;
 
 	return pool;
 
+err_unmap:
+	munmap(pool->data, size);
 err_close:
 	close(pool->fd);
 err_free:
@@ -279,7 +285,8 @@ wl_cursor_create_from_xcursor_images(struct xcursor_images *images,
 {
 	struct cursor *cursor;
 	struct cursor_image *image;
-	int i, size;
+	size_t size;
+	int i;
 
 	cursor = malloc(sizeof *cursor);
 	if (!cursor)
@@ -309,7 +316,12 @@ wl_cursor_create_from_xcursor_images(struct xcursor_images *images,
 		image->image.hotspot_y = images->images[i]->yhot;
 		image->image.delay = images->images[i]->delay;
 
-		size = image->image.width * image->image.height * 4;
+		size = (size_t) image->image.width * image->image.height * 4;
+		if (size > INT_MAX) {
+			free(image);
+			break;
+		}
+
 		image->offset = shm_pool_allocate(theme->pool, size);
 		if (image->offset < 0) {
 			free(image);
@@ -339,6 +351,8 @@ load_callback(struct xcursor_images *images, void *data)
 {
 	struct wl_cursor_theme *theme = data;
 	struct wl_cursor *cursor;
+	struct wl_cursor **p;
+	size_t s;
 
 	if (wl_cursor_theme_get_cursor(theme, images->name)) {
 		xcursor_images_destroy(images);
@@ -348,15 +362,14 @@ load_callback(struct xcursor_images *images, void *data)
 	cursor = wl_cursor_create_from_xcursor_images(images, theme);
 
 	if (cursor) {
-		theme->cursor_count++;
-		theme->cursors =
-			realloc(theme->cursors,
-				theme->cursor_count * sizeof theme->cursors[0]);
+		s = theme->cursor_count + 1;
+		p = realloc(theme->cursors, s * sizeof theme->cursors[0]);
 
-		if (theme->cursors == NULL) {
-			theme->cursor_count--;
+		if (p == NULL) {
 			free(cursor);
 		} else {
+			theme->cursor_count = s;
+			theme->cursors = p;
 			theme->cursors[theme->cursor_count - 1] = cursor;
 		}
 	}
@@ -384,6 +397,9 @@ wl_cursor_theme_load(const char *name, int size, struct wl_shm *shm)
 	if (!theme)
 		return NULL;
 
+	if (size < 0 || (size > 0 && INT_MAX / size / 4 < size))
+		goto err;
+
 	if (!name)
 		name = "default";
 
@@ -393,7 +409,7 @@ wl_cursor_theme_load(const char *name, int size, struct wl_shm *shm)
 
 	theme->pool = shm_pool_create(shm, size * size * 4);
 	if (!theme->pool)
-		goto out_error_pool;
+		goto err;
 
 	xcursor_load_theme(name, size, load_callback, theme);
 
@@ -405,7 +421,7 @@ wl_cursor_theme_load(const char *name, int size, struct wl_shm *shm)
 
 	return theme;
 
-out_error_pool:
+err:
 	free(theme);
 	return NULL;
 }

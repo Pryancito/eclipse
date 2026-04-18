@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+
+component=$1
+version=$2
+steps=0
+steps_complete=0
+version_scheme=1
+warning='\e[1;33mWarning:\e[0m'
+nproc=$( \
+	nproc 2>/dev/null \
+	|| getconf _NPROCESSORS_ONLN 2>/dev/null \
+	|| getconf NPROCESSORS_ONLN 2>/dev/null \
+) || nproc=1
+
+SED=${SED:-sed}
+MAKE=${MAKE:-make}
+MESON=${MESON:-meson}
+OPEN_CMD='xfce-open'
+type "$OPEN_CMD" &>/dev/null || OPEN_CMD='exo-open'
+
+# Check if the working directory is in the state we expect it to be in
+sanity_checks () {
+	is_git=$(git rev-parse --is-inside-work-tree)
+	if [ "$is_git" != "true" ]; then
+		exit 1
+	fi
+
+	current_branch=$(git rev-parse --abbrev-ref HEAD)
+	if [[ "$current_branch" != @(master|main) ]]; then
+		if [[ "$current_branch" == *"xfce-4"* ]]; then
+			echo "You are on a maintenance branch."
+		else
+			printf "$warning You are not on the master branch.\n"
+			read -n 1 -p "Do you really want to continue? ([y]es, [N]o) " response
+			printf "\n"
+			if [ "$response" != "y" ]; then
+				exit 1
+			fi
+		fi
+	fi
+
+	echo "Updating $current_branch to avoid conflicts..."
+	if [ -n "$(git status --untracked-files=no --porcelain)" ]; then
+		printf "$warning The working directory is not clean.\nYou have the following unstaged or uncommitted changes:\n"
+		git status --untracked-files=no -s
+		read -n 1 -p "Do you really want to continue? ([y]es, [N]o) " response
+		printf "\n"
+		if [ "$response" != "y" ]; then
+			exit 1
+		fi
+	else
+		git pull
+	fi
+
+	if ! which docker &>/dev/null; then
+		echo "INFO: please install docker to support building in a clean environment."
+	elif which xfce-build &>/dev/null; then
+		export TAG="xfce-build"
+		echo "Working with the 'xfce-build' script and container."
+	elif ! which xfce-test &>/dev/null; then
+		echo "INFO: please install xfce-test to support building in a clean environment. See https://github.com/schuellerf/xfce-test"
+	else
+		images=$(docker images|grep -Po "(?<=^schuellerf/xfce-test) +[^ ]+"|tr -d ' ')
+		echo "Select xfce-test docker-tag to work with:"
+		select image in $images; do
+			break
+		done
+
+		if [ -z "$image" ]; then
+			echo "No xfce-test images found or selected. Use 'xfce-test pull' to get one."
+		else
+			export TAG=$image
+			echo "Working with $image"
+		fi
+
+	fi
+}
+
+# Check if the input parameters (component version) were provided
+test_parameters () {
+	# Get the component
+	if [ -n "$1" ]; then
+		echo "Component: $component"
+	else
+		currentdir=${PWD##*/}
+		read -p "Specify a component (Default: '$currentdir') " new_component
+		if [ "$new_component" = "" ]; then
+			component="$(echo "$currentdir")"
+			echo "Component: $component"
+		else
+			component="$(echo "$new_component")"
+			echo "Component: $component"
+		fi
+	fi
+
+	# Get the latest tag and increment the patch version by 1
+	latest_tag=$(git describe --abbrev=0 --match "$component*" 2>/dev/null)
+	if [ "$latest_tag" = "" ]; then
+		echo "Note: This repository does not follow the <component>-<version> schema."
+		latest_tag=$(git describe --abbrev=0)
+		version_scheme=0
+	fi
+
+	if [ $version_scheme = 0 ]; then
+		latest_major=$(echo $latest_tag | $SED 's/\(.*\)\.\(.*\)\.\(.*\)/\1/')
+		latest_minor=$(echo $latest_tag | $SED 's/\(.*\)\.\(.*\)\.\(.*\)/\2/')
+		latest_patch=$(echo $latest_tag | $SED 's/\(.*\)\.\(.*\)\.\(.*\)/\3/')
+	else
+		latest_major=$(echo $latest_tag | $SED 's/\(.*\)-\(.*\)\.\(.*\)\.\(.*\)/\2/')
+		latest_minor=$(echo $latest_tag | $SED 's/\(.*\)-\(.*\)\.\(.*\)\.\(.*\)/\3/')
+		latest_patch=$(echo $latest_tag | $SED 's/\(.*\)-\(.*\)\.\(.*\)/\3/')
+	fi
+	new_patch=$(echo "$(($latest_patch + 1))")
+
+	# Get the version
+	if [ -z "$2" ]; then
+		read -p "Specify a version (Default: $latest_major.$latest_minor.$new_patch): " version
+		if [ -z "$version" ]; then
+			version="$(echo "$latest_major.$latest_minor.$new_patch")"
+		fi
+	else
+		version=$2
+	fi
+
+	if [ "$(git tag | grep -c $version\$)" = "1" ]; then
+		printf "$warning The version you specified ('$version') exists as a git tag. "
+		read -n 1 -p "Do you really want to release again? ([y]es, [N]o) " response
+		printf "\n"
+		if [ "$response" != "y" ]; then
+			exit 1
+		fi
+	fi
+
+	echo "Version: $version"
+
+	# Split up the actual version number so we can re-use it later
+	semantic_version=( ${version//./ } )
+	version_major="${semantic_version[0]}"
+	version_minor="${semantic_version[1]}"
+	version_patch="${semantic_version[2]}"
+}
+
+# Print the step info
+step () {
+	printf "\n\n \e[1mStep $steps: $1\e[0m\n ==================\n"
+}
+
+# Ask whether the step should be executed
+run_command () {
+	let steps++
+	read -n 1 -p " → Do it? ([y]es, [N]o, [s]kip) " response
+	printf "\n"
+	if [ "$response" = "y" ]; then
+		if eval $1 && eval $2 && eval $3; then
+			printf "\n ✓ Done."
+			let steps_complete++
+			return 0
+		else
+			printf "\n × Failed!"
+			return 1
+		fi
+	elif [ "$response" = "s" ]; then
+		printf "\n Step $(( $steps - 1 )) skipped."
+		return 0
+	else
+		read -n 1 -p " Step $(( $steps - 1 )) aborted. Do you really want to quit? ([y]es, [N]o) " abort
+		if [ "$abort" = "y" ]; then
+			printf "\n Aborted. (Steps complete: $steps_complete)\n"
+			exit 0
+		else
+			printf "\n Step $(( $steps - 1 )) aborted. Continuing...\n"
+			return 0
+		fi
+	fi
+}
+
+build_system_type () {
+	if [[ $BUILD_SYSTEM != "autotools" && ($BUILD_SYSTEM == "meson" || $version == 4.21.*) ]]; then
+		if [ -f "meson.build" ]; then
+			echo "meson"
+		elif [ -f "configure.ac" -o -f "configure.ac.in" ]; then
+			echo "autotools"
+		fi
+	else
+		if [ -f "configure.ac" -o -f "configure.ac.in" ]; then
+			echo "autotools"
+		elif [ -f "meson.build" ]; then
+			echo "meson"
+		fi
+	fi
+}
+
+update_appdata_file () {
+	$SED -Ei "s%(\s*)<releases>%&\n\1\1<release date=\"$(date '+%Y-%m-%d')\" version=\"$version\"/>%" "$1"
+	git diff "$1"
+}
+
+get_appdata_file () {
+	local -a files
+	local set_nullglob=$(shopt -p nullglob) set_nocaseglob=$(shopt -p nocaseglob)
+
+	shopt -s nullglob nocaseglob
+	files=(*"$component.appdata.xml.in" data/*"$component.appdata.xml.in")
+	$set_nullglob
+	$set_nocaseglob
+
+	if ((${#files[@]} > 0)) && grep -q '^\s*<releases>' "${files[0]}"; then
+		echo "${files[0]}"
+		return 0
+	else
+		return 1
+	fi
+}
+
+get_extra_source_files () {
+	local build_file
+	local -a files
+	local -i n_files=0
+
+	[ -f 'configure.ac' ] && build_file='configure.ac' || build_file='meson.build'
+
+	if grep -q 'xdt-gen-visibility' "$build_file"; then
+		files+=("$(which 'xdt-gen-visibility')")
+		((n_files++))
+	fi
+
+	# One file not found implies failure
+	((${#files[@]} == n_files)) || files=()
+
+	# These are system files, so separating them with spaces shouldn't be a problem
+	echo "${files[*]}"
+	((n_files > 0))
+}
+
+edit () {
+	read -n 1 -p " → Accept? ([Y]es, [e]dit) " response
+	if [ "$response" = "e" ]; then
+		$(git config --default "${EDITOR:-vi}" --global core.editor) $1
+	else
+		printf "\n ✓ Accepted.\n"
+	fi
+}
+
+update_project_version () {
+	local configure_file
+	local meson_build_file
+	local year=$(date +%Y)
+
+	if [ -f "configure.ac.in" ]; then
+		configure_file="configure.ac.in"
+	elif [ -f "configure.ac" ]; then
+		configure_file="configure.ac"
+	fi
+
+	if [ -f "meson.build" ]; then
+		meson_build_file="meson.build"
+	fi
+
+	if [ -z "$configure_file" -a -z "$meson_build_file" ]; then
+		printf "$warning There is no 'configure.ac.in', 'configure.ac', or 'meson.build' file.\n"
+		return 1
+	fi
+
+	if [ "$configure_file" ]; then
+		if ! grep -Ezq "AC_COPYRIGHT\(\[[^]]*($year|copyright_year\(\))[^]]*\]\)" "$configure_file"; then
+			printf '%b\n' \
+				"\n$warning The copyright year of the project does not seem to be up to date." \
+				"This is just a check of '$configure_file' though, you should check this in the" \
+				"whole source code, especially the about dialog and/or its command line counterpart.\n"
+		fi
+		$SED -E -i "s/^m4_define\(\[copyright_year\], *\[[0-9]+\]\)/m4_define([copyright_year], [$year])/" "$configure_file"
+
+		if grep -q 'XDT_VERSION_INIT' "$configure_file"; then
+			if [ "$1" = "pre" ]; then
+				$SED -i "s/^\(XDT_VERSION_INIT\s*\)(.*/\1([$version])/" "$configure_file"
+			elif [ "$1" = "post" ]; then
+				$SED -i "s/^\(XDT_VERSION_INIT\s*\)(.*/\1([$version], [git])/" "$configure_file"
+			fi
+		else
+			if [ "$1" = "pre" ]; then
+				$SED -i \
+					-e "s/^\(m4_define(\[.*_version_major\], *\[\)\(.*\)\(\])\)/\1$version_major\3/g" \
+					-e "s/^\(m4_define(\[.*_version_minor\], *\[\)\(.*\)\(\])\)/\1$version_minor\3/g" \
+					-e "s/^\(m4_define(\[.*_version_micro\], *\[\)\(.*\)\(\])\)/\1$version_patch\3/g" \
+					-e 's/^\(m4_define(\[.*_version_tag\], *\[\)\(git\)\(\])\)/\1\3/g' \
+					"$configure_file"
+			elif [ "$1" = "post" ]; then
+				$SED -i 's/\(m4_define(\[.*_version_tag\], *\[\)\(.*\)\(\])\)/\1git\3/g' "$configure_file"
+			fi
+		fi
+	fi
+
+	if [ "$meson_build_file" ]; then
+		local meson_version_string
+
+		$SED -E -i "s/^copyright_year *= *'?[0-9]+'?/copyright_year = '$year'/" "$meson_build_file"
+
+		meson_version_string="$version_major.$version_minor.$version_patch"
+		if [ "$1" = "pre" ]; then
+			$SED -E -i 's/#define VERSION_FULL VERSION "-" REVISION/#define VERSION_FULL VERSION/' xfce-revision.h.in
+		elif [ "$1" = "post" ]; then
+			$SED -E -i 's/#define VERSION_FULL VERSION/#define VERSION_FULL VERSION "-" REVISION/' xfce-revision.h.in
+			meson_version_string+="-dev"
+		fi
+
+		if git diff --quiet xfce-revision.h.in; then
+			printf "$warning No change made to xfce-revision.h.in, probably a file format issue.\n"
+		fi
+
+		$MESON rewrite kwargs set project / version "$meson_version_string"
+	fi
+
+	if git diff --exit-code $configure_file $meson_build_file; then
+		printf "$warning No project version change, probably a file format issue.\n"
+	fi
+}
+
+get_sha1_hash () {
+	local dirname suffix
+
+	if [ "$1" = "autotools" ]; then
+		suffix=bz2
+	elif [ "$1" = "meson" ]; then
+		dirname="build/meson-dist/"
+		suffix=xz
+	fi
+
+	sha1sum "$dirname$component-$version.tar.$suffix" | cut -d ' ' -f 1
+}
+
+join_by () {
+	local delim="${1-}" first="${2-}"
+	if shift 2; then
+		printf '%s' "$first" "${@/#/$delim}"
+	fi
+}
+
+# Playbook for all release steps
+run_steps () {
+	local build_type
+	local dist_commands
+	local build_tarball_prompt
+	local -a extra_source_files
+	local -i has_extra_source_files=0
+
+	build_type=$(build_system_type)
+	if [ -z "$build_type" ]; then
+		printf "$warning Unknown build system.\n"
+		return 1
+	fi
+
+	step "Update project version \e[0m(add new version and remove git tag)"
+	run_command "update_project_version pre"
+
+	step "Update NEWS file with changelog? \e[0m(xfce-update-news)"
+	run_command "xfce-update-news $component $version"
+	edit NEWS
+
+	if appdata_file=$(get_appdata_file); then
+		step "Update Appdata file \e[0m(add new release)"
+		run_command "update_appdata_file $appdata_file"
+	fi
+
+	if extra_source_files=($(get_extra_source_files)); then
+		if [ -z "${extra_source_files[*]}" ]; then
+			printf "\nExtra source files should be added but could not be found.\n"
+			return 1
+		fi
+
+		step "Add extra source files \e[0m(cp ${extra_source_files[*]} ./ && git add ${extra_source_files[*]##*/})"
+		run_command "cp ${extra_source_files[*]} ./" "git add ${extra_source_files[*]##*/}"
+		has_extra_source_files=1
+	fi
+
+	step "Commit the changes \e[0m(git add -u; git commit -m 'Updates for release')"
+	run_command "git add -u" "git commit -m 'Updates for release'"
+
+	step "Tag the version \e[0m(git tag -a $component-$version)"
+	run_command 'git tag -a $component-$version -e -m "$(xfce-update-news $component $version WRITETAG)"'
+
+	if [ "$build_type" = "autotools" ]; then
+		build_tarball_prompt="Build the tarball \e[0m(./autogen.sh && $MAKE -j$nproc distcheck)"
+		dist_commands=("./autogen.sh" "$MAKE -j$nproc distcheck")
+	elif [ "$build_type" = "meson" ]; then
+		build_tarball_prompt="Build the tarball \e[0m(meson setup && meson dist)"
+		dist_commands=("rm -rf build" "meson setup build" "meson dist -C build --include-subprojects")
+	fi
+
+	# either in the xfce-build or xfce-test container or on the local machine
+	if [[ "$TAG" == "xfce-build" ]]; then
+		# turn the array into a single argument to pass to 'xfce-build',
+		# stripping any '-j' arguments
+		dist_commands=("xfce-build \"$(join_by ' \&\& ' "${dist_commands[@]}" | sed -e 's/-j[0-9]*//')\"")
+	elif [ -n "$TAG" ]; then
+		# prefix each element with 'xfce-test call '
+		dist_commands=("${dist_commands[@]/#/xfce-test call }")
+	fi
+
+	step "$build_tarball_prompt"
+	if ! run_command "${dist_commands[@]}"; then
+		printf "\n\nDeleting tag and rolling back release commit.\n"
+		git tag -d $component-$version
+		git reset --hard HEAD^
+		return 1
+	fi
+
+	step "Push your changes \e[0m(git push && git push --tags)"
+	run_command "git push" "git push --tags"
+
+	step "Log in to the release manager \e[0m(https://releases.xfce.org/)"
+	run_command "$OPEN_CMD 'https://releases.xfce.org/'"
+
+	step "Click on 'Release New Version' \e[0m(https://releases.xfce.org/project/$component/new-release/tarball)"
+	run_command "$OPEN_CMD 'https://releases.xfce.org/project/$component/new-release/tarball?checksum=$(get_sha1_hash $build_type)'"
+
+	step "Post-update project version \e[0m(add back git tag)"
+	run_command "update_project_version post"
+
+	if ((has_extra_source_files)); then
+		step "Remove extra source files \e[0m(git rm ${extra_source_files[*]##*/})"
+		run_command "git rm ${extra_source_files[*]##*/}"
+	fi
+
+	step "Commit and push the change \e[0m(git add -u; git commit -m 'Back to development'; git push)"
+	run_command "git add -u" "git commit -m 'Back to development'" "git push"
+}
+
+### Main loop
+
+main () {
+	sanity_checks
+	test_parameters $component $version
+	run_steps || exit 1
+
+	printf "\nCongrats, you completed $steps_complete of $steps steps of doing a release for Xfce!\n"
+}
+
+main

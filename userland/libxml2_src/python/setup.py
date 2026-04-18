@@ -18,14 +18,14 @@ except ImportError:
 # Below ROOT, we expect to find include, include/libxml2, lib and bin.
 # On *nix, it is not needed (but should not harm),
 # on Windows, it is set by configure.js.
-ROOT = r'/home/moebius/eclipse/eclipse-os-build'
+ROOT = r'/home/moebius/eclipse/eclipse-os-build/usr'
 
 # Thread-enabled libxml2
 with_threads = 1
 
 # Features of libxml2 requiring external DLLs
 with_iconv = 1
-with_zlib = 0
+with_zlib = 1
 with_lzma = 0
 with_icu = 0
 

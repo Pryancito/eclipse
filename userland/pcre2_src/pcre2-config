@@ -1,6 +1,6 @@
 #!/bin/sh
 
-prefix=/home/moebius/eclipse/eclipse-os-build
+prefix=/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix=${prefix}
 exec_prefix_set=no
 
@@ -30,16 +30,16 @@ fi
 libR=
 case `uname -s` in
   *SunOS*)
-  libR=" -R/home/moebius/eclipse/eclipse-os-build/lib"
+  libR=" -R${exec_prefix}/lib"
   ;;
   *BSD*)
-  libR=" -Wl,-R/home/moebius/eclipse/eclipse-os-build/lib"
+  libR=" -Wl,-R${exec_prefix}/lib"
   ;;
 esac
 
 libS=
-if test /home/moebius/eclipse/eclipse-os-build/lib != /usr/lib ; then
-  libS=-L/home/moebius/eclipse/eclipse-os-build/lib
+if test ${exec_prefix}/lib != /usr/lib ; then
+  libS=-L${exec_prefix}/lib
 fi
 
 while test $# -gt 0; do
@@ -72,14 +72,14 @@ while test $# -gt 0; do
       if test ${prefix}/include != /usr/include ; then
         includes=-I${prefix}/include
       fi
-      echo $includes -DPCRE2_STATIC
+      echo $includes 
       ;;
     --cflags-posix)
       if test yes = yes ; then
         if test ${prefix}/include != /usr/include ; then
           includes=-I${prefix}/include
         fi
-        echo $includes 
+        echo $includes -DPCRE2POSIX_SHARED
       else
         echo "${usage}" 1>&2
       fi

@@ -9,8 +9,8 @@
  * - <a href="../Cursor/index.html">Cursor helper library API</a>
  *
  * Further documentation about the architecture and principles of Wayland is
- * available in the
- * <a href="https://wayland.freedesktop.org/docs/html">Wayland Book</a>
+ * available on the
+ * <a href="https://wayland.freedesktop.org">website</a>.
  *
  * @section ifaces Interfaces
  * For the list of available interfaces, please see the

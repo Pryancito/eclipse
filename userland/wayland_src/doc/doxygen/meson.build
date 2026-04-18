@@ -1,16 +1,5 @@
 # Here be dragons
 
-dot_gv = {
-	'wayland-architecture': files('dot/wayland-architecture.gv'),
-	'x-architecture': files('dot/x-architecture.gv'),
-}
-
-# This is a workaround for Meson's custom_target() directive, which
-# currently does not support outputs pointing to a sub-directory
-# XXX: try turning these into maps, so they can be indexed with picture name
-dot_png = []
-dot_map = []
-
 doxygen_conf = configuration_data()
 doxygen_conf.set('VERSION', meson.project_version())
 doxygen_conf.set('top_builddir', meson.project_build_root())
@@ -91,7 +80,6 @@ foreach f_name, sections: formats
 			],
 			input: s_files,
 			output: '@0@.stamp'.format(t_name),
-			depends: [dot_png, dot_map],
 			build_by_default: true,
 		)
 	endforeach

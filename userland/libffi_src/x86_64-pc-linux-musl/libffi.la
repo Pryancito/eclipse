@@ -5,19 +5,19 @@
 # It is necessary for linking the library.
 
 # The name that we can dlopen(3).
-dlname=''
+dlname='libffi.so.8'
 
 # Names of this library.
-library_names=''
+library_names='libffi.so.8.1.4 libffi.so.8 libffi.so'
 
 # The name of the static archive.
-old_library='libffi.a'
+old_library=''
 
 # Linker flags that cannot go in dependency_libs.
 inherited_linker_flags=''
 
 # Libraries that this one depends upon.
-dependency_libs=''
+dependency_libs=' -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib'
 
 # Names of additional weak libraries provided by this library
 weak_library_names=''
@@ -38,4 +38,4 @@ dlopen=''
 dlpreopen=''
 
 # Directory that this library needs to be installed in:
-libdir='/home/moebius/eclipse/eclipse-os-build/lib'
+libdir='/home/moebius/eclipse/eclipse-os-build/usr/lib'

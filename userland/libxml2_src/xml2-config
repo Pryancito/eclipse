@@ -1,9 +1,9 @@
 #! /bin/sh
 
-prefix=/home/moebius/eclipse/eclipse-os-build
+prefix=/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix=${prefix}
 includedir=${prefix}/include
-libdir=/home/moebius/eclipse/eclipse-os-build/lib
+libdir=${exec_prefix}/lib
 cflags=
 libs=
 
@@ -84,9 +84,9 @@ while test $# -gt 0; do
     --libs)
         if [ "$2" = "--dynamic" ]; then
             shift
-            libs="-lxml2    -lm  "
+            libs="-lxml2 "
         else
-            libs="-lxml2    -lm    "
+            libs="-lxml2  -L/home/moebius/eclipse/eclipse-os-build/usr/lib -lz   -lm    "
         fi
 
         if [ "-L${libdir}" != "-L/usr/lib" -a "-L${libdir}" != "-L/usr/lib64" ]; then

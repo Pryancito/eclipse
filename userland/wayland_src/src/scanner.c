@@ -189,7 +189,6 @@ struct message {
 	char *uppercase_name;
 	struct wl_list arg_list;
 	struct wl_list link;
-	int arg_count;
 	int new_id_count;
 	int type_index;
 	int all_null;
@@ -736,6 +735,7 @@ start_element(void *data, const char *element_name, const char **atts)
 	const char *allow_null = NULL;
 	const char *enumeration_name = NULL;
 	const char *bitfield = NULL;
+	const char *frozen = NULL;
 	int i, version = 0;
 
 	ctx->loc.line_number = XML_GetCurrentLineNumber(ctx->parser);
@@ -765,6 +765,8 @@ start_element(void *data, const char *element_name, const char **atts)
 			enumeration_name = atts[i + 1];
 		if (strcmp(atts[i], "bitfield") == 0)
 			bitfield = atts[i + 1];
+		if (strcmp(atts[i], "frozen") == 0)
+			frozen = atts[i + 1];
 	}
 
 	ctx->character_data_length = 0;
@@ -783,6 +785,20 @@ start_element(void *data, const char *element_name, const char **atts)
 
 		if (version == 0)
 			fail(&ctx->loc, "no interface version given");
+
+		if (frozen) {
+			if (strcmp(frozen, "true") == 0) {
+				if (version != 1) {
+					fail(&ctx->loc,
+					     "frozen interface must have version 1");
+				}
+			} else if (strcmp(frozen, "false") != 0) {
+				fail(&ctx->loc,
+				     "invalid value (%s) frozen attribute "
+				     "(only true/false are accepted)",
+				     frozen);
+			}
+		}
 
 		validate_identifier(&ctx->loc, name, STANDALONE_IDENT);
 		interface = create_interface(ctx->loc, name, version);
@@ -873,7 +889,6 @@ start_element(void *data, const char *element_name, const char **atts)
 			arg->summary = xstrdup(summary);
 
 		wl_list_insert(ctx->message->arg_list.prev, &arg->link);
-		ctx->message->arg_count++;
 	} else if (strcmp(element_name, "enum") == 0) {
 		if (name == NULL)
 			fail(&ctx->loc, "no enum name given");
@@ -1207,7 +1222,6 @@ emit_stubs(struct wl_list *message_list, struct interface *interface)
 		     "interface '%s' has method named destroy "
 		     "but no destructor",
 		     interface->name);
-		exit(EXIT_FAILURE);
 	}
 
 	if (!has_destroy && strcmp(interface->name, "wl_display") != 0) {
@@ -1379,6 +1393,58 @@ emit_event_wrappers(struct wl_list *message_list, struct interface *interface)
 }
 
 static void
+emit_validator(struct interface *interface, struct enumeration *e)
+{
+	struct entry *entry;
+
+	printf("#ifndef %s_%s_ENUM_IS_VALID\n",
+	       interface->uppercase_name, e->uppercase_name);
+	printf("#define %s_%s_ENUM_IS_VALID\n",
+	       interface->uppercase_name, e->uppercase_name);
+
+	printf("/**\n"
+	       " * @ingroup iface_%s\n"
+	       " * Validate a %s %s value.\n"
+	       " *\n"
+	       " * @return true on success, false on error.\n"
+	       " * @ref %s_%s\n"
+	       " */\n"
+	       "static inline bool\n"
+	       "%s_%s_is_valid(uint32_t value, uint32_t version) {\n",
+	       interface->name, interface->name, e->name,
+	       interface->name, e->name,
+	       interface->name, e->name);
+
+	if (e->bitfield) {
+		printf("	uint32_t valid = 0;\n");
+		wl_list_for_each(entry, &e->entry_list, link) {
+			printf("	if (version >= %d)\n"
+			       "		valid |= %s_%s_%s;\n",
+			       entry->since,
+			       interface->uppercase_name, e->uppercase_name,
+			       entry->uppercase_name);
+		}
+		printf("	return (value & ~valid) == 0;\n");
+	} else {
+		printf("	switch (value) {\n");
+		wl_list_for_each(entry, &e->entry_list, link) {
+			printf("	case %s%s_%s_%s:\n"
+			       "		return version >= %d;\n",
+			       entry->value[0] == '-' ? "(uint32_t)" : "",
+			       interface->uppercase_name, e->uppercase_name,
+			       entry->uppercase_name, entry->since);
+		}
+		printf("	default:\n"
+		       "		return false;\n"
+		       "	}\n");
+	}
+	printf("}\n");
+
+	printf("#endif /* %s_%s_ENUM_IS_VALID */\n\n",
+	       interface->uppercase_name, e->uppercase_name);
+}
+
+static void
 emit_enumerations(struct interface *interface, bool with_validators)
 {
 	struct enumeration *e;
@@ -1439,35 +1505,11 @@ emit_enumerations(struct interface *interface, bool with_validators)
 
 		}
 
-		if (with_validators) {
-			printf("/**\n"
-			       " * @ingroup iface_%s\n"
-			       " * Validate a %s %s value.\n"
-			       " *\n"
-			       " * @return true on success, false on error.\n"
-			       " * @ref %s_%s\n"
-			       " */\n"
-			       "static inline bool\n"
-			       "%s_%s_is_valid(uint32_t value, uint32_t version) {\n"
-			       "	switch (value) {\n",
-			       interface->name, interface->name, e->name,
-			       interface->name, e->name,
-			       interface->name, e->name);
-			wl_list_for_each(entry, &e->entry_list, link) {
-				printf("	case %s%s_%s_%s:\n"
-				       "		return version >= %d;\n",
-				       entry->value[0] == '-' ? "(uint32_t)" : "",
-				       interface->uppercase_name, e->uppercase_name,
-				       entry->uppercase_name, entry->since);
-			}
-			printf("	default:\n"
-			       "		return false;\n"
-			       "	}\n"
-			       "}\n");
-		}
-
 		printf("#endif /* %s_%s_ENUM */\n\n",
 		       interface->uppercase_name, e->uppercase_name);
+
+		if (with_validators)
+			emit_validator(interface, e);
 	}
 }
 
@@ -1585,6 +1627,10 @@ emit_types_forward_declarations(struct protocol *protocol,
 		m->all_null = 1;
 		wl_list_for_each(a, &m->arg_list, link) {
 			length++;
+			if (a->type == NEW_ID && !a->interface_name)
+				// adds implicit string and uint arguments
+				length += 2;
+
 			switch (a->type) {
 			case NEW_ID:
 			case OBJECT:
@@ -1822,9 +1868,15 @@ emit_types(struct protocol *protocol, struct wl_list *message_list)
 
 		m->type_index =
 			protocol->null_run_length + protocol->type_index;
-		protocol->type_index += m->arg_count;
 
 		wl_list_for_each(a, &m->arg_list, link) {
+			protocol->type_index++;
+			if (a->type == NEW_ID && !a->interface_name) {
+				// adds implicit string and uint arguments
+				printf("\tNULL,\n\tNULL,\n");
+				protocol->type_index += 2;
+			}
+
 			switch (a->type) {
 			case NEW_ID:
 			case OBJECT:

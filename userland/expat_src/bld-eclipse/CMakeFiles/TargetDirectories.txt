@@ -1,0 +1,16 @@
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/expat.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmlwf.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmlts-zip-downloaded.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmlts-zip-extracted.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmltest-sh-been-run.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmltest-log-fixed.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/xmltest-log-verified.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/run-xmltest.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/package.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/package_source.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/edit_cache.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/rebuild_cache.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/list_install_components.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/install.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/install/local.dir
+/home/moebius/eclipse/userland/expat_src/bld-eclipse/CMakeFiles/install/strip.dir

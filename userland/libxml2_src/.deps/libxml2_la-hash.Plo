@@ -10,10 +10,10 @@ libxml2_la-hash.lo: hash.c \
  include/libxml/parser.h include/libxml/tree.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
  include/libxml/xmlstring.h \
- /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/libxml/xmlmemory.h include/libxml/xmlregexp.h \
  include/libxml/dict.h \
- /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  include/libxml/hash.h include/libxml/valid.h include/libxml/xmlerror.h \
  include/libxml/list.h include/libxml/xmlautomata.h \
  include/libxml/entities.h include/libxml/encoding.h \
@@ -35,11 +35,11 @@ include/libxml/parser.h:
 include/libxml/tree.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
 include/libxml/xmlstring.h:
-/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/libxml/xmlmemory.h:
 include/libxml/xmlregexp.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 include/libxml/hash.h:
 include/libxml/valid.h:
 include/libxml/xmlerror.h:

@@ -1,0 +1,10 @@
+prefix=/home/moebius/eclipse/userland/host-tools
+includedir=${prefix}/include
+libdir=${prefix}/lib/x86_64-linux-gnu
+
+Name: Wayland Cursor
+Description: Wayland cursor helper library
+Version: 1.25.90
+Requires.private: wayland-client
+Libs: -L${libdir} -lwayland-cursor
+Cflags: -I${includedir}

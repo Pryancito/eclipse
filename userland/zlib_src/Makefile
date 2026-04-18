@@ -12,18 +12,18 @@
 # To install in $HOME instead of /usr/local, use:
 #    make install prefix=$HOME
 
-CC=x86_64-linux-musl-gcc
+CC=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 
-CFLAGS=-fPIC -O3 -isystem /home/moebius/eclipse/host-toolchains/include -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
+CFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include  -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
 #CFLAGS=-O -DMAX_WBITS=14 -DMAX_MEM_LEVEL=7
 #CFLAGS=-g -DZLIB_DEBUG
 #CFLAGS=-O3 -Wall -Wwrite-strings -Wpointer-arith -Wconversion \
 #           -Wstrict-prototypes -Wmissing-prototypes
 
-SFLAGS=-fPIC -O3 -isystem /home/moebius/eclipse/host-toolchains/include -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
-LDFLAGS=
+SFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include  -fPIC -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
+LDFLAGS=-L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
 TEST_LIBS=-L. libz.a
-LDSHARED=x86_64-linux-musl-gcc
+LDSHARED=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 CPP=
 
 STATICLIB=libz.a
@@ -32,16 +32,16 @@ SHAREDLIBV=
 SHAREDLIBM=
 LIBS=$(STATICLIB) $(SHAREDLIBV)
 
-AR=ar
+AR=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ar
 ARFLAGS=rc
-RANLIB=ranlib
+RANLIB=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ranlib
 LDCONFIG=ldconfig
 LDSHAREDLIBC=-lc
 TAR=tar
 SHELL=/bin/sh
 EXE=
 
-prefix =/home/moebius/eclipse/eclipse-os-build
+prefix =/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix =${prefix}
 libdir =${exec_prefix}/lib
 sharedlibdir =${libdir}

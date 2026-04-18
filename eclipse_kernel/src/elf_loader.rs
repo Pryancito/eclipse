@@ -636,7 +636,8 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_provider: &dyn ElfDataProvid
         interp_path
     ));
     
-    let interp_inode = filesystem::Filesystem::lookup_path(interp_path)?;
+    let interp_inode =
+        filesystem::Filesystem::lookup_path_resolve_file_inode(interp_path.trim_start_matches('/'))?;
     let interp_len = filesystem::Filesystem::content_len_by_inode(interp_inode)?;
     let interp_provider = InodeDataProvider { inode: interp_inode, cached_len: interp_len };
 
@@ -892,7 +893,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
 
 /// Cargar binario ELF desde una ruta en el filesystem (streaming, eficiente en memoria)
 pub fn load_elf_path(path: &str) -> Option<ProcessId> {
-    let inode = match filesystem::Filesystem::lookup_path(path) {
+    let inode = match filesystem::Filesystem::lookup_path_resolve_file_inode(path.trim_start_matches('/')) {
         Ok(i) => i,
         Err(_) => return None,
     };
@@ -1022,7 +1023,7 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<ExecLoad
 }
 
 pub fn replace_process_image_path(pid: ProcessId, path: &str) -> Result<ExecLoadResult, &'static str> {
-    let inode = filesystem::Filesystem::lookup_path(path)?;
+    let inode = filesystem::Filesystem::lookup_path_resolve_file_inode(path.trim_start_matches('/'))?;
     let len = filesystem::Filesystem::content_len_by_inode(inode)?;
     let provider = InodeDataProvider { inode, cached_len: len };
     replace_process_image_provider(pid, &provider)

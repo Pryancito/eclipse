@@ -23,7 +23,6 @@
  * SOFTWARE.
  */
 
-#include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <errno.h>
@@ -39,6 +38,7 @@
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include "timespec-util.h"
 #include "wayland-util.h"
 #include "wayland-private.h"
 #include "wayland-server-core.h"
@@ -447,7 +447,8 @@ wl_timer_heap_disarm(struct wl_timer_heap *timers,
 	struct wl_event_source_timer *last_end_evt;
 	int old_source_idx;
 
-	assert(source->heap_idx >= 0);
+	if (!(source->heap_idx >= 0))
+		wl_abort("Timer has already been disarmed\n");
 
 	old_source_idx = source->heap_idx;
 	source->heap_idx = -1;
@@ -476,7 +477,8 @@ wl_timer_heap_arm(struct wl_timer_heap *timers,
 		  struct wl_event_source_timer *source,
 		  struct timespec deadline)
 {
-	assert(source->heap_idx == -1);
+	if (!(source->heap_idx == -1))
+		wl_abort("Timer is already armed\n");
 
 	source->deadline = deadline;
 	timers->data[timers->active] = source;
@@ -972,57 +974,6 @@ wl_event_loop_dispatch_idle(struct wl_event_loop *loop)
 	}
 }
 
-static int
-timespec_to_ms(struct timespec value)
-{
-	return (value.tv_sec * 1000) + (value.tv_nsec / 1000000);
-}
-
-static struct timespec
-ms_to_timespec(int ms)
-{
-	struct timespec val;
-	val.tv_sec = ms / 1000;
-	val.tv_nsec = (ms % 1000) * 1000000;
-	return val;
-}
-
-static struct timespec
-timespec_normalize(struct timespec value)
-{
-	struct timespec result = value;
-
-	while (result.tv_nsec >= 1000000000) {
-		result.tv_nsec -= 1000000000;
-		result.tv_sec++;
-	}
-
-	while (result.tv_nsec < 0) {
-		result.tv_nsec += 1000000000;
-		result.tv_sec--;
-	}
-
-	return result;
-}
-
-static struct timespec
-timespec_add(struct timespec a, struct timespec b)
-{
-	struct timespec result;
-	result.tv_sec = a.tv_sec + b.tv_sec;
-	result.tv_nsec = a.tv_nsec + b.tv_nsec;
-	return timespec_normalize(result);
-}
-
-static struct timespec
-timespec_sub(struct timespec a, struct timespec b)
-{
-	struct timespec result;
-	result.tv_sec = a.tv_sec - b.tv_sec;
-	result.tv_nsec = a.tv_nsec - b.tv_nsec;
-	return timespec_normalize(result);
-}
-
 /** Wait for events and dispatch them
  *
  * \param loop The event loop whose sources to wait for.
@@ -1051,13 +1002,15 @@ wl_event_loop_dispatch(struct wl_event_loop *loop, int timeout)
 	int i, count;
 	bool has_timers = false;
 	bool use_timeout = timeout > 0;
-	struct timespec now, end;
+	struct timespec now;
+	struct timespec deadline = {0};
+	struct timespec result;
 
 	wl_event_loop_dispatch_idle(loop);
 
 	if (use_timeout) {
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		end = timespec_add(now, ms_to_timespec(timeout));
+		timespec_add_msec(&deadline, &now, timeout);
 	}
 
 	while (true) {
@@ -1069,7 +1022,8 @@ wl_event_loop_dispatch(struct wl_event_loop *loop, int timeout)
 
 		if (use_timeout) {
 			clock_gettime(CLOCK_MONOTONIC, &now);
-			timeout = timespec_to_ms(timespec_sub(end, now));
+			timespec_sub(&result, &deadline, &now);
+			timeout = timespec_to_msec(&result);
 			if (timeout <= 0) {
 				/* too late */
 				count = 0;

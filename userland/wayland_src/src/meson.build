@@ -66,7 +66,6 @@ if get_option('scanner')
 		variables: [
 			'datarootdir=' + join_paths('${prefix}', get_option('datadir')),
 			'pkgdatadir=' + join_paths('${pc_sysrootdir}${datarootdir}', meson.project_name()),
-			'bindir=' + join_paths('${prefix}', get_option('bindir')),
 			'wayland_scanner=${bindir}/wayland-scanner'
 		],
 		filebase: 'wayland-scanner'
@@ -81,8 +80,7 @@ if get_option('scanner')
 endif
 
 if meson.is_cross_build() or not get_option('scanner')
-	scanner_dep = dependency('wayland-scanner', native: true)
-	wayland_scanner_for_build = find_program(scanner_dep.get_variable(pkgconfig: 'wayland_scanner'))
+	wayland_scanner_for_build = find_program('wayland-scanner', native: true)
 else
 	wayland_scanner_for_build = wayland_scanner
 endif
@@ -212,6 +210,7 @@ if get_option('libraries')
 		description: 'Server side implementation of the Wayland protocol',
 		version: meson.project_version(),
 		filebase: 'wayland-server',
+		libraries: mathlib_dep,
 		variables: [
 			'datarootdir=' + join_paths('${prefix}', get_option('datadir')),
 			'pkgdatadir=' + join_paths('${pc_sysrootdir}${datarootdir}', meson.project_name())
@@ -251,6 +250,7 @@ if get_option('libraries')
 		description: 'Wayland client side library',
 		version: meson.project_version(),
 		filebase: 'wayland-client',
+		libraries: mathlib_dep,
 		variables: [
 			'datarootdir=' + join_paths('${prefix}', get_option('datadir')),
 			'pkgdatadir=' + join_paths('${pc_sysrootdir}${datarootdir}', meson.project_name())

@@ -259,6 +259,8 @@ xcursor_read_file_header(FILE *file)
 		return NULL;
 	if (!xcursor_read_uint(file, &head.ntoc))
 		return NULL;
+	if (head.header < XCURSOR_FILE_HEADER_LEN)
+		return NULL;
 	skip = head.header - XCURSOR_FILE_HEADER_LEN;
 	if (skip)
 		if (fseek(file, skip, SEEK_CUR) == EOF)
@@ -571,7 +573,7 @@ xcursor_build_theme_dir(const char *dir, const char *theme)
 	 * add space for any needed directory separators, one per component,
 	 * and one for the trailing null
 	 */
-	full_size = 1 + homelen + 1 + dirlen + 1 + themelen + 1;
+	full_size = (size_t) 1 + homelen + 1 + dirlen + 1 + themelen + 1;
 	full = malloc(full_size);
 	if (!full)
 		return NULL;
@@ -605,7 +607,7 @@ xcursor_build_fullname(const char *dir, const char *subdir, const char *file)
 static const char *
 xcursor_next_path(const char *path)
 {
-	char *colon = strchr(path, ':');
+	const char *colon = strchr(path, ':');
 
 	if (!colon)
 		return NULL;
@@ -686,11 +688,15 @@ load_all_cursors_from_dir(const char *path, int size,
 			  void *user_data)
 {
 	FILE *f;
-	DIR *dir = opendir(path);
+	DIR *dir;
 	struct dirent *ent;
 	char *full;
 	struct xcursor_images *images;
 
+	if (!path)
+		return;
+
+	dir = opendir(path);
 	if (!dir)
 		return;
 
@@ -798,14 +804,14 @@ xcursor_load_theme_protected(const char *theme, int size,
 	free(xcursor_path);
 }
 
-/** Load all the cursor of a theme
+/** Load all the cursors of a theme
  *
  * This function loads all the cursor images of a given theme and its
- * inherited themes. Each cursor is loaded into an struct xcursor_images object
+ * inherited themes. Each cursor is loaded into a struct xcursor_images object
  * which is passed to the caller's load callback. If a cursor appears
  * more than once across all the inherited themes, the load callback
  * will be called multiple times, with possibly different struct xcursor_images
- * object which have the same name. The user is expected to destroy the
+ * objects which have the same name. The user is expected to destroy the
  * struct xcursor_images objects passed to the callback with
  * xcursor_images_destroy().
  *

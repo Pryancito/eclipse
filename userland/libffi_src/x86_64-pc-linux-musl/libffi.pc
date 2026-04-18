@@ -1,4 +1,4 @@
-prefix=/home/moebius/eclipse/eclipse-os-build
+prefix=/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix=${prefix}
 libdir=${exec_prefix}/lib
 toolexeclibdir=${libdir}

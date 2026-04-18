@@ -15,21 +15,25 @@ libxml2_la-xmlIO.lo: xmlIO.c \
  /home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h \
  /home/moebius/eclipse/eclipse-os-build/include/unistd.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/posix.h \
+ /home/moebius/eclipse/eclipse-os-build/usr/include/zlib.h \
+ /home/moebius/eclipse/eclipse-os-build/usr/include/zconf.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/include/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/types.h \
+ /home/moebius/eclipse/eclipse-os-build/include/endian.h \
+ /home/moebius/eclipse/eclipse-os-build/include/sys/select.h \
+ /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/libxml/xmlIO.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
  include/libxml/encoding.h \
  /home/moebius/eclipse/eclipse-os-build/include/iconv.h \
- include/libxml/tree.h \
- /home/moebius/eclipse/eclipse-os-build/include/limits.h \
- /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
- include/libxml/xmlstring.h \
- /home/moebius/eclipse/eclipse-os-build/include/stdarg.h \
+ include/libxml/tree.h include/libxml/xmlstring.h \
  include/libxml/xmlmemory.h include/libxml/xmlregexp.h \
  include/libxml/uri.h include/libxml/nanohttp.h include/libxml/nanoftp.h \
  include/libxml/xmlerror.h include/libxml/catalog.h \
- include/libxml/parser.h include/libxml/dict.h \
- /home/moebius/eclipse/eclipse-os-build/include/stddef.h \
- include/libxml/hash.h include/libxml/valid.h include/libxml/list.h \
+ include/libxml/parser.h include/libxml/dict.h include/libxml/hash.h \
+ include/libxml/valid.h include/libxml/list.h \
  include/libxml/xmlautomata.h include/libxml/entities.h \
  include/libxml/SAX2.h include/libxml/threads.h include/private/buf.h \
  include/private/enc.h include/private/error.h include/private/io.h \
@@ -53,15 +57,21 @@ include/libxml/xmlexports.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h:
 /home/moebius/eclipse/eclipse-os-build/include/unistd.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/posix.h:
+/home/moebius/eclipse/eclipse-os-build/usr/include/zlib.h:
+/home/moebius/eclipse/eclipse-os-build/usr/include/zconf.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/include/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/types.h:
+/home/moebius/eclipse/eclipse-os-build/include/endian.h:
+/home/moebius/eclipse/eclipse-os-build/include/sys/select.h:
+/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/libxml/xmlIO.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
 include/libxml/encoding.h:
 /home/moebius/eclipse/eclipse-os-build/include/iconv.h:
 include/libxml/tree.h:
-/home/moebius/eclipse/eclipse-os-build/include/limits.h:
-/home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
 include/libxml/xmlstring.h:
-/home/moebius/eclipse/eclipse-os-build/include/stdarg.h:
 include/libxml/xmlmemory.h:
 include/libxml/xmlregexp.h:
 include/libxml/uri.h:
@@ -71,7 +81,6 @@ include/libxml/xmlerror.h:
 include/libxml/catalog.h:
 include/libxml/parser.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/eclipse-os-build/include/stddef.h:
 include/libxml/hash.h:
 include/libxml/valid.h:
 include/libxml/list.h:

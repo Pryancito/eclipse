@@ -1,8 +1,8 @@
 # Package Information for pkg-config
 
-prefix=/home/moebius/eclipse/eclipse-os-build
+prefix=/home/moebius/eclipse/eclipse-os-build/usr
 exec_prefix=${prefix}
-libdir=/home/moebius/eclipse/eclipse-os-build/lib
+libdir=${exec_prefix}/lib
 includedir=${prefix}/include
 
 Name: libpcre2-32
@@ -10,4 +10,4 @@ Description: PCRE2 - Perl compatible regular expressions C library (2nd API) wit
 Version: 10.44
 Libs: -L${libdir} -lpcre2-32
 Libs.private:  
-Cflags: -I${includedir} -DPCRE2_STATIC
+Cflags: -I${includedir} 

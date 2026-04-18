@@ -1,0 +1,14 @@
+prefix=/home/moebius/eclipse/userland/host-tools
+includedir=${prefix}/include
+libdir=${prefix}/lib/x86_64-linux-gnu
+
+datarootdir=${prefix}/share
+pkgdatadir=${pc_sysrootdir}${datarootdir}/wayland
+
+Name: Wayland Client
+Description: Wayland client side library
+Version: 1.25.90
+Requires.private: libffi
+Libs: -L${libdir} -lwayland-client -lm
+Libs.private: -pthread -lrt
+Cflags: -I${includedir}

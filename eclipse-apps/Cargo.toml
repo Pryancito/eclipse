@@ -40,7 +40,7 @@ sidewind_core = { path = "sidewind_core" }
 # Sin `std` por defecto: el target Eclipse usa build-std=core,alloc y eclipse_std como `std`
 # solo para binarios que la enlazan; las libs no_std no deben forzar `bitflags/std`.
 bitflags = { version = "2.4", default-features = false }
-eclipse-reeclipse-relibc = { path = "../eclipse-relibc", features = ["eclipse-syscall", "allocator", "panic-handler"] }
+eclipse-relibc = { path = "../eclipse-relibc", features = ["eclipse-syscall", "allocator", "panic-handler"] }
 
 eclipse-syscall = { path = "../eclipse-syscall" }
 
@@ -61,8 +61,8 @@ opt-level = "s"
 codegen-units = 1
 # debug = false
 # strip = "symbols"
-debug = true
-strip = "none"
+debug = false
+strip = "symbols"
 
 [profile.dev]
 opt-level = "s"
