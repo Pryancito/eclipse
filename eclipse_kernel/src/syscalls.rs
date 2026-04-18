@@ -3633,7 +3633,14 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
             thread.priority = parent.priority;
             thread.time_slice = parent.time_slice;
             thread.parent_pid = Some(parent_pid);
-            thread.fs_base = parent.fs_base; 
+            // CLONE_SETTLS: use r8 (newtls syscall arg) as the child's FS base.
+            // Without this, all threads share the parent's TLS, causing __pthread_exit
+            // to corrupt the parent's pthread descriptor and call exit(0).
+            if (flags & CLONE_SETTLS) != 0 {
+                thread.fs_base = context.r8;
+            } else {
+                thread.fs_base = parent.fs_base;
+            }
             thread.is_linux = parent.is_linux;
             
             // Copy registers from parent current context
@@ -3667,6 +3674,15 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
             });
 
             if success {
+                // CLONE_PARENT_SETTID: write the new TID into *ptid (rdx).
+                // musl's pthread_create passes &new->tid here so it can find
+                // the kernel-assigned TID for the child thread.
+                if (flags & CLONE_PARENT_SETTID) != 0 {
+                    let ptid_addr = context.rdx;
+                    if ptid_addr != 0 && is_user_pointer(ptid_addr, 4) {
+                        unsafe { (ptid_addr as *mut u32).write_unaligned(tid) };
+                    }
+                }
                 crate::scheduler::enqueue_process(tid);
                 return tid as u64;
             }
@@ -5362,8 +5378,46 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 
 /// sys_readlink - Read value of a symbolic link
 fn sys_readlink(path_ptr: u64, buf_ptr: u64, size: u64) -> u64 {
-    // Basic stub: return EINVAL (not a symlink) or ENOENT
-    u64::MAX
+    if path_ptr == 0 || buf_ptr == 0 || size == 0 {
+        return linux_abi_error(22); // EINVAL
+    }
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 {
+        return linux_abi_error(2); // ENOENT
+    }
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 {
+        return linux_abi_error(36); // ENAMETOOLONG
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return linux_abi_error(22),
+    };
+
+    // Strip scheme prefix and leading slashes to get the path under /sys.
+    let stripped = path_str
+        .trim_start_matches("sys:")
+        .trim_start_matches('/')
+        .trim_start_matches("sys/");
+
+    // The SysScheme exposes these as symlinks.
+    let target: &[u8] = match stripped {
+        "dev/char/226:0" => b"../../class/drm/card0",
+        "dev/char/29:0"  => b"../../class/graphics/fb0",
+        _ => return linux_abi_error(22), // EINVAL — not a symlink
+    };
+
+    if !is_user_pointer(buf_ptr, size) {
+        return linux_abi_error(14); // EFAULT
+    }
+    let copy_len = core::cmp::min(target.len(), size as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(target.as_ptr(), buf_ptr as *mut u8, copy_len);
+    }
+    copy_len as u64
 }
 
 /// sys_setpgid - Establishes a process group ID.
