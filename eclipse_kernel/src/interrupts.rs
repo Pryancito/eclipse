@@ -799,8 +799,8 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     // so the kernel keeps running and the watchdog can restart the process.
     if cs & 3 == 3 && pid != 0 {
         crate::serial::serial_printf(format_args!(
-            "[FAULT] Userspace exception #{} in PID {} at RIP={:#018x} CR2={:#018x} — killing process\n",
-            num, pid, rip, cr2
+            "[FAULT] Userspace exception #{} in PID {} at RIP={:#018x} CR2={:#018x} RBX={:#018x} R11={:#018x} — killing process\n",
+            num, pid, rip, cr2, rbx, r11
         ));
         crate::process::exit_process();
         crate::scheduler::schedule();

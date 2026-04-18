@@ -45,7 +45,7 @@ impl Scheme for TtyScheme {
         Ok(0) // Single resource for the console TTY
     }
 
-    fn read(&self, _id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if buffer.is_empty() { return Ok(0); }
 
         loop {
@@ -75,7 +75,7 @@ impl Scheme for TtyScheme {
         }
     }
 
-    fn write(&self, _id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         if let Ok(s) = core::str::from_utf8(buffer) {
             serial::serial_print(s);
             Ok(buffer.len())
@@ -87,7 +87,7 @@ impl Scheme for TtyScheme {
         }
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE) // TTY is not seekable
     }
 
@@ -101,12 +101,32 @@ impl Scheme for TtyScheme {
         Ok(0)
     }
 
-    fn ioctl(&self, _id: usize, request: usize, _arg: usize) -> Result<usize, usize> {
+    fn ioctl(&self, _id: usize, request: usize, arg: usize) -> Result<usize, usize> {
         // Basic ioctl support could be added here (e.g. TCGETS, TCSETS)
-        // For now, return ENOSYS to indicate we haven't implemented specific TTY controls yet
         match request {
-             0x5401 => Err(error::ENOSYS), // TCGETS
-             0x5402 => Err(error::ENOSYS), // TCSETS
+             0x5401 => { // TCGETS
+                #[repr(C)]
+                struct Termios {
+                    c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
+                    c_line: u8, c_cc: [u8; 32], c_ispeed: u32, c_ospeed: u32,
+                }
+                let t = unsafe { &mut *(arg as *mut Termios) };
+                t.c_iflag = 0;
+                t.c_oflag = 0x5; // ONLCR | OPOST
+                t.c_cflag = 0xBF; // B38400 | CS8 | CREAD
+                t.c_lflag = 0x8A03; // ISIG | ICANON | ECHO | IEXTEN
+                Ok(0)
+             },
+             0x5413 => { // TIOCGWINSZ
+                #[repr(C)]
+                struct WinSize {
+                    row: u16, col: u16, xpixel: u16, ypixel: u16,
+                }
+                let w = unsafe { &mut *(arg as *mut WinSize) };
+                w.row = 25;
+                w.col = 80;
+                Ok(0)
+             },
              _ => Err(error::ENOSYS),
         }
     }

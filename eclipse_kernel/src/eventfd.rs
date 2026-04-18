@@ -42,7 +42,7 @@ impl Scheme for EventFdScheme {
         Ok(id)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if buffer.len() < 8 { return Err(error::EINVAL); }
         
         let mut instances = self.instances.lock();
@@ -67,7 +67,7 @@ impl Scheme for EventFdScheme {
         Ok(8)
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         if buffer.len() < 8 { return Err(error::EINVAL); }
         let mut val_bytes = [0u8; 8];
         val_bytes.copy_from_slice(&buffer[..8]);
@@ -99,7 +99,7 @@ impl Scheme for EventFdScheme {
         Ok(0)
     }
     
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
 

@@ -95,9 +95,9 @@ impl Scheme for EpollScheme {
         }
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> { Err(error::EINVAL) }
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> { Err(error::EINVAL) }
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> { Err(error::ESPIPE) }
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> { Err(error::EINVAL) }
+    fn write(&self, _id: usize, _buffer: &[u8], _offset: u64) -> Result<usize, usize> { Err(error::EINVAL) }
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> { Err(error::ESPIPE) }
     
     fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
         stat.mode = 0o666; // Placeholder

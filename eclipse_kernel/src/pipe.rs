@@ -156,7 +156,7 @@ impl Scheme for PipeScheme {
         Err(error::ENOSYS)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -205,7 +205,7 @@ impl Scheme for PipeScheme {
         }
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -293,7 +293,7 @@ impl Scheme for PipeScheme {
         Ok(0)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
 }

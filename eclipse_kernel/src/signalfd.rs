@@ -19,13 +19,13 @@ impl Scheme for SignalfdScheme {
         Ok(res)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         // For now, return EAGAIN to indicate no signals are pending.
         // This satisfies the event loop's non-blocking check.
         Err(error::EAGAIN)
     }
 
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, _buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         Err(error::EBADF)
     }
 
@@ -38,7 +38,7 @@ impl Scheme for SignalfdScheme {
         Ok(0)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
 

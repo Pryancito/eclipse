@@ -57,6 +57,7 @@ mod sync;    // Synchronization primitives
 mod net;
 mod sys_scheme;
 pub mod drm_scheme; // DRM scheme for ioctl
+mod input_scheme;
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -301,6 +302,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     servers::init(); 
     crate::scheme::register_scheme("sys", alloc::sync::Arc::new(sys_scheme::SysScheme::new()));
     crate::scheme::register_scheme("drm", alloc::sync::Arc::new(drm_scheme::DrmScheme));
+    crate::scheme::register_scheme("input", alloc::sync::Arc::new(input_scheme::InputScheme::new()));
     progress::bar(86);
     
     serial::serial_print("[INIT] Initializing PCI...\n");

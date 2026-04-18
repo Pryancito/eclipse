@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::process::{self, ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
 use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_24};
-use crate::scheme::{Scheme, error, Stat};
+use crate::scheme::{Scheme, error as scheme_error, Stat};
 use crate::serial;
 use spin::Mutex;
 use alloc::sync::Arc;
@@ -179,6 +179,34 @@ fn vma_remove_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo: u
             if vma.start < lo {
                 vmas.push(crate::process::VMARegion { end: lo, ..vma });
             }
+            if vma.end > hi {
+                vmas.push(crate::process::VMARegion { start: hi, ..vma });
+            }
+        }
+    }
+}
+
+fn vma_mprotect_range(vmas: &mut alloc::vec::Vec<crate::process::VMARegion>, lo: u64, hi: u64, prot: u64) {
+    if hi <= lo {
+        return;
+    }
+    let old: alloc::vec::Vec<crate::process::VMARegion> = core::mem::take(vmas);
+    for vma in old {
+        if vma.end <= lo || vma.start >= hi {
+            vmas.push(vma);
+        } else {
+            if vma.start < lo {
+                vmas.push(crate::process::VMARegion { end: lo, ..vma });
+            }
+
+            let mid_start = vma.start.max(lo);
+            let mid_end = vma.end.min(hi);
+            let mut new_vma = vma.clone();
+            new_vma.start = mid_start;
+            new_vma.end = mid_end;
+            new_vma.flags = prot;
+            vmas.push(new_vma);
+
             if vma.end > hi {
                 vmas.push(crate::process::VMARegion { start: hi, ..vma });
             }
@@ -1224,9 +1252,11 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                     );
                 }
                 
-                match crate::scheme::write(fd_entry.scheme_id, fd_entry.resource_id, &bounce[..chunk_len]) {
+                let offset = fd_entry.offset;
+                match crate::scheme::write(fd_entry.scheme_id, fd_entry.resource_id, &bounce[..chunk_len], offset + total as u64) {
                     Ok(n) => {
                         total += n;
+                        crate::fd::fd_update_offset(pid, fd as usize, offset + total as u64);
                         if n < chunk_len { break; } // Short write
                     }
                     Err(e) => {
@@ -1257,21 +1287,21 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            // SAFETY: Use a kernel-space bounce buffer. Drivers and schemes must not
-            // access user-space memory directly via slices, as it may cause #PF 
-            // if the page is not present or SMAP is enabled.
+            let offset = fd_entry.offset;
             let mut bounce = [0u8; 4096]; // 4 KB bounce buffer on stack (safer)
             let read_len = core::cmp::min(len as usize, bounce.len());
 
-            match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, &mut bounce[..read_len]) {
+            match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, &mut bounce[..read_len], offset) {
                 Ok(bytes_read) => {
                     if bytes_read > 0 {
                         unsafe {
                             core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf_ptr as *mut u8, bytes_read);
                         }
                     }
-                    if bytes_read == 0 && pid >= 10 && pid <= 20 {
-                         serial::serial_printf(format_args!("[SYSCALL] read(fd={}) returned EOF (0 bytes) for pid={}\n", fd, pid));
+                    crate::fd::fd_update_offset(pid, fd as usize, offset + bytes_read as u64);
+                    
+                    if pid == 10 || (bytes_read == 0 && pid >= 10 && pid <= 20) {
+                         serial::serial_printf(format_args!("[SYSCALL] read(fd={}) returned {} bytes at offset {} (pid={}, scheme={}, resource={})\n", fd, bytes_read, offset, pid, fd_entry.scheme_id, fd_entry.resource_id));
                     }
                     return bytes_read as u64;
                 },
@@ -1307,22 +1337,12 @@ fn sys_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
     let scheme_id = fd_entry.scheme_id;
     let resource_id = fd_entry.resource_id;
 
-    let saved = match crate::scheme::lseek(scheme_id, resource_id, 0, 1) {
-        Ok(p) => p,
-        Err(_) => return syscall_error_for_current_process(crate::scheme::error::ESPIPE as i32),
-    };
-
-    if crate::scheme::lseek(scheme_id, resource_id, offset as isize, 0).is_err() {
-        let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
-        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
-    }
-
     let mut total = 0usize;
     while total < count as usize {
         let chunk_len = core::cmp::min((count as usize) - total, 4096);
         let mut bounce = [0u8; 4096];
         
-        match crate::scheme::read(scheme_id, resource_id, &mut bounce[..chunk_len]) {
+        match crate::scheme::read(scheme_id, resource_id, &mut bounce[..chunk_len], offset + total as u64) {
             Ok(0) => break,
             Ok(n) => {
                 unsafe {
@@ -1336,7 +1356,6 @@ fn sys_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
                 if n < chunk_len { break; } // Short read
             }
             Err(e) => {
-                let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
                 if e != crate::scheme::error::EAGAIN {
                     crate::serial::serial_printf(format_args!(
                         "[SYSCALL] pread64() scheme error: {}\n",
@@ -1348,7 +1367,6 @@ fn sys_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
         }
     }
 
-    let _ = crate::scheme::lseek(scheme_id, resource_id, saved as isize, 0);
     total as u64
 }
 
@@ -1608,6 +1626,16 @@ fn sys_pause() -> u64 {
 
 /// sys_getpid - Obtener PID del proceso actual
 fn sys_getpid() -> u64 {
+    if let Some(pid) = current_process_id() {
+        if let Some(p) = crate::process::get_process(pid) {
+            return p.tgid as u64;
+        }
+    }
+    0
+}
+
+/// sys_gettid - Get unique thread identifier
+fn sys_gettid() -> u64 {
     if let Some(pid) = current_process_id() {
         pid as u64
     } else {
@@ -2504,8 +2532,11 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
                 fd, offset, whence
             ));
 
-            match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, offset as isize, whence) {
-                Ok(new_offset) => return new_offset as u64,
+            match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, offset as isize, whence, fd_entry.offset) {
+                Ok(new_offset) => {
+                    crate::fd::fd_update_offset(pid, fd as usize, new_offset as u64);
+                    return new_offset as u64;
+                }
                 Err(_) => return u64::MAX,
             }
         }
@@ -2582,13 +2613,10 @@ fn sys_mount(path_ptr: u64, path_len: u64) -> u64 {
 
     match crate::filesystem::mount_root(device_path) {
         Ok(_) => 0,
-        // The kernel mounts the root filesystem at boot; a userspace service calling
-        // mount() after that should be treated as a no-op success rather than an error.
-        Err("Filesystem already mounted") => 0,
+        // Robust check for already mounted: if it contains the phrase, treat as success.
+        Err(e) if e.contains("already mounted") => 0,
         Err(e) => {
-            serial::serial_print("[SYSCALL] mount() failed: ");
-            serial::serial_print(e);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] mount({}) failed: {}\n", device_path, e));
             u64::MAX
         }
     }
@@ -3306,17 +3334,14 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 let bytes_mapped = (current - map_start) as usize;
                 let current_offset = offset as usize + bytes_mapped;
                 
-                // Set file position to the correct offset before reading
-                let _ = crate::scheme::lseek(fde.scheme_id, fde.resource_id, current_offset as isize, 0); // SEEK_SET=0
-
                 let remaining = file_len.saturating_sub(bytes_mapped);
                 if remaining > 0 {
                     let to_read = remaining.min(4096);
                     let frame_slice = unsafe {
                         core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
                     };
-                    match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice) {
-                        Ok(n) => { /* file_offset ignored since we explicitly lseek every page */ }
+                    match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice, current_offset as u64) {
+                        Ok(n) => { /* OK */ }
                         Err(e) => {
                             serial::serial_printf(format_args!(
                                 "[SYSCALL] mmap: file read error at offset {}: {}\n",
@@ -3431,15 +3456,18 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
     };
     let (page_table_phys, eff_addr, eff_len) = {
-        let r = proc.resources.lock();
+        let mut r = proc.resources.lock();
         let pt = r.page_table_phys;
         if len == 0 {
             (pt, addr, 0u64)
         } else {
             let Some(req_end) = addr.checked_add(len) else {
-                drop(r);
                 return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
             };
+
+            // Update VMA flags (splitting if needed)
+            vma_mprotect_range(&mut r.vmas, addr, req_end, prot);
+
             let (eff_addr, eff_end) =
                 mprotect_expand_anon_slack(&r.vmas, addr, req_end, prot);
             let el = eff_end.saturating_sub(eff_addr);
@@ -3618,6 +3646,8 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
         return u64::MAX;
     }
 
+    serial::serial_printf(format_args!("sys_clone: flags={:#x} stack={:#x}\n", flags, stack));
+
     if let Some(parent_pid) = process::current_process_id() {
         if let Some(parent) = process::get_process(parent_pid) {
             // Share the resources Arc
@@ -3629,6 +3659,14 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
             // New PID
             let tid = process::next_pid();
             thread.id = tid;
+
+            // TGID Propagation: CLONE_THREAD means child shares the same PID as parent.
+            if (flags & CLONE_THREAD) != 0 {
+                thread.tgid = parent.tgid;
+            } else {
+                thread.tgid = tid;
+            }
+
             thread.state = process::ProcessState::Ready;
             thread.priority = parent.priority;
             thread.time_slice = parent.time_slice;
@@ -3674,15 +3712,29 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
             });
 
             if success {
-                // CLONE_PARENT_SETTID: write the new TID into *ptid (rdx).
-                // musl's pthread_create passes &new->tid here so it can find
-                // the kernel-assigned TID for the child thread.
+                // 1. CLONE_PARENT_SETTID: write the new TID into *ptid (rdx).
                 if (flags & CLONE_PARENT_SETTID) != 0 {
                     let ptid_addr = context.rdx;
                     if ptid_addr != 0 && is_user_pointer(ptid_addr, 4) {
                         unsafe { (ptid_addr as *mut u32).write_unaligned(tid) };
                     }
                 }
+                
+                // 2. CLONE_CHILD_SETTID: write the new TID into *ctid (r10).
+                if (flags & CLONE_CHILD_SETTID) != 0 {
+                    let ctid_addr = context.r10;
+                    if ctid_addr != 0 && is_user_pointer(ctid_addr, 4) {
+                        unsafe { (ctid_addr as *mut u32).write_unaligned(tid) };
+                    }
+                }
+
+                // 3. CLONE_CHILD_CLEARTID: store ctid address in thread struct (r10).
+                if (flags & CLONE_CHILD_CLEARTID) != 0 {
+                    let mut t = process::get_process(tid).unwrap();
+                    t.clear_child_tid = context.r10;
+                    process::update_process(tid, t);
+                }
+
                 crate::scheduler::enqueue_process(tid);
                 return tid as u64;
             }
@@ -3770,14 +3822,6 @@ fn sys_thread_create(stack_top: u64, entry: u64, arg: u64) -> u64 {
     u64::MAX
 }
 
-/// sys_gettid - Get thread ID
-/// 
-/// Returns: Current thread ID (for now, same as PID)
-fn sys_gettid() -> u64 {
-    // For now, threads not implemented, return PID
-    current_process_id().unwrap_or(0) as u64
-}
-
 /// sys_futex - Fast userspace mutex
 /// 
 /// Arguments:
@@ -3845,6 +3889,26 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, _timeout: u64) -> u64 {
         }
         _ => {
             u64::MAX
+        }
+    }
+}
+
+/// Wake all processes waiting on the specified futex address.
+/// This is used internally by the kernel (e.g., during thread exit).
+pub fn futex_wake_all_atomic(uaddr: u64) {
+    let mut waiters = FUTEX_WAITERS.lock();
+    let mut i = 0;
+    while i < waiters.len() {
+        if waiters[i].addr == uaddr {
+            let waiter_pid = waiters[i].pid;
+            if let Some(mut p) = crate::process::get_process(waiter_pid) {
+                p.state = crate::process::ProcessState::Ready;
+                crate::process::update_process(waiter_pid, p);
+                crate::scheduler::enqueue_process(waiter_pid);
+            }
+            waiters.remove(i);
+        } else {
+            i += 1;
         }
     }
 }
@@ -4394,7 +4458,9 @@ fn sys_listen(fd: u64, backlog: u64) -> u64 {
 }
 
 /// sys_accept - Accept a connection on a socket
-fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
+fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    serial::serial_printf(format_args!("[SYSCALL] accept(fd={}, addr={:#x}, addrlen={})\n", fd, addr, addrlen));
+    
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             match scheme.accept(fd_info.resource_id) {
@@ -4474,8 +4540,41 @@ fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u
 }
 
 /// sys_getsockopt - Get options on a socket
-fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u64) -> u64 {
-    // Stub: Always return success
+fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen_ptr: u64) -> u64 {
+    const SOL_SOCKET: u64 = 1;
+    const SO_PEERCRED: u64 = 17;
+
+    serial::serial_printf(format_args!("[SYSCALL] getsockopt(fd={}, level={}, optname={}, optval={:#x}, optlen_ptr={:#x})\n", 
+        fd, level, optname, optval, optlen_ptr));
+
+    if level == SOL_SOCKET && optname == SO_PEERCRED {
+        if optval == 0 || optlen_ptr == 0 || !is_user_pointer(optlen_ptr, 4) {
+            return -(scheme_error::EINVAL as i64) as u64;
+        }
+
+        let provided_len = unsafe { *(optlen_ptr as *const u32) };
+        if provided_len < 12 {
+            return -(scheme_error::EINVAL as i64) as u64;
+        }
+
+        let pid = process::current_process_id().unwrap_or(0);
+        let uid = 0;
+        let gid = 0;
+
+        if is_user_pointer(optval, 12) {
+            unsafe {
+                let ucred_ptr = optval as *mut u32;
+                ucred_ptr.write_volatile(pid);
+                ucred_ptr.add(1).write_volatile(uid);
+                ucred_ptr.add(2).write_volatile(gid);
+                
+                *(optlen_ptr as *mut u32) = 12;
+            }
+            return 0;
+        }
+    }
+
+    // Stub for other options: Always return success for now
     0
 }
 
@@ -4513,6 +4612,17 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
     let msg_iovlen      = unsafe { *((msg_ptr + 24) as *const u64) } as usize;
     let msg_control     = unsafe { *((msg_ptr + 32) as *const u64) };
     let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
+
+    if msg_iovlen > 0 {
+        if !is_user_pointer(msg_iov_ptr, msg_iovlen as u64 * 16) { return linux_abi_error(1); }
+    }
+    
+    let mut total_len = 0usize;
+    for i in 0..msg_iovlen {
+        let iov_entry = msg_iov_ptr + (i as u64) * 16;
+        let iov_len = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+        total_len += iov_len;
+    }
 
     // ── Gather payload from iovec array ────────────────────────────────────
     // Cap total payload to CONNECTION_BUFFER_CAP: the socket buffer is bounded
@@ -4598,15 +4708,19 @@ fn sys_sendmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
 /// Mirrors the layout described in sys_sendmsg.  Scatters incoming bytes
 /// across the iovec array and delivers any pending SCM_RIGHTS fd batches
 /// into the control buffer.
-fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
+fn sys_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
     if msg_ptr == 0 || !is_user_pointer(msg_ptr, 56) {
         return linux_abi_error(14); // EFAULT
     }
 
+    let msg_iovlen      = unsafe { *((msg_ptr + 24) as *const u64) } as usize;
     let msg_iov_ptr     = unsafe { *((msg_ptr + 16) as *const u64) };
     let msg_iovlen      = unsafe { *((msg_ptr + 24) as *const u64) } as usize;
     let msg_control     = unsafe { *((msg_ptr + 32) as *const u64) };
     let msg_controllen  = unsafe { *((msg_ptr + 40) as *const u64) } as usize;
+    
+    serial::serial_printf(format_args!("[SYSCALL] recvmsg(fd={}, iovlen={}, controllen={}, flags={})\n", 
+        fd, msg_iovlen, msg_controllen, flags));
 
     // ── Determine total iov capacity ────────────────────────────────────────
     // Cap to CONNECTION_BUFFER_CAP: the socket buffer itself is bounded to that
@@ -4660,59 +4774,66 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, _flags: u64) -> u64 {
         } else { return linux_abi_error(9); }
     } else { return linux_abi_error(1); };
 
-    // ── Deliver queued file descriptors via control buffer (SCM_RIGHTS) ─────
-    if let Some(fds) = fd_pairs_opt {
-        if !fds.is_empty()
-            && msg_control != 0
-            && is_user_pointer(msg_control, msg_controllen as u64)
-        {
-            let needed = CMSG_HDR_SIZE as usize + fds.len() * core::mem::size_of::<i32>();
-            if msg_controllen >= needed {
-                if let Some(receiver_pid) = crate::process::current_process_id() {
-                    // Allocate new fds in the receiving process for each (scheme_id, resource_id).
-                    let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-                    for (s_id, r_id) in &fds {
-                        // Create an independent resource copy so closing the
-                        // receiver's fd doesn't destroy the sender's resource.
-                        let recv_r_id = crate::scheme::dup_independent(*s_id, *r_id)
-                            .unwrap_or(*r_id);
-                        if let Some(new_fd) = crate::fd::fd_open(receiver_pid, *s_id, recv_r_id, 0) {
-                            new_fds.push(new_fd as i32);
-                        }
-                    }
+    // ── Deliver queued file descriptors (SCM_RIGHTS) and credentials (SCM_CREDENTIALS) ──
+    if msg_control != 0 && is_user_pointer(msg_control, msg_controllen as u64) {
+        let mut cmsg_offset = 0;
+        let mut total_written = 0usize;
 
-                    if !new_fds.is_empty() {
-                        // Write CmsgHdr.
-                        let data_size = new_fds.len() * core::mem::size_of::<i32>();
-                        let cmsg_len = CMSG_HDR_SIZE as usize + data_size;
-                        unsafe {
-                            *(msg_control as *mut u64) = cmsg_len as u64;
-                            *((msg_control + 8) as *mut i32) = SOL_SOCKET_LEVEL;
-                            *((msg_control + 12) as *mut i32) = SCM_RIGHTS_TYPE;
-                            // Write fd values after the header.
-                            let fds_ptr = (msg_control + CMSG_HDR_SIZE) as *mut i32;
-                            for (i, &fd_val) in new_fds.iter().enumerate() {
-                                core::ptr::write_unaligned(fds_ptr.add(i), fd_val);
+        // 1. Deliver FDs (SCM_RIGHTS)
+        if let Some(fds) = fd_pairs_opt {
+            if !fds.is_empty() {
+                let needed = CMSG_HDR_SIZE as usize + fds.len() * 4;
+                if msg_controllen >= cmsg_offset + needed {
+                    if let Some(receiver_pid) = crate::process::current_process_id() {
+                        let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+                        for (s_id, r_id) in &fds {
+                            let recv_r_id = crate::scheme::dup_independent(*s_id, *r_id).unwrap_or(*r_id);
+                            if let Some(new_fd) = crate::fd::fd_open(receiver_pid, *s_id, recv_r_id, 0) {
+                                new_fds.push(new_fd as i32);
                             }
                         }
-                        // Update msg_controllen in the MsgHdr to reflect actual data written.
-                        unsafe { *((msg_ptr + 40) as *mut u64) = cmsg_len as u64; }
-                    } else {
-                        // No fds were dup'd; clear controllen.
-                        unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
+                        
+                        unsafe {
+                            let h_ptr = (msg_control + cmsg_offset as u64) as *mut u64;
+                            h_ptr.write_volatile(needed as u64); // cmsg_len
+                            *((msg_control + cmsg_offset as u64 + 8) as *mut i32) = 1; // SOL_SOCKET
+                            *((msg_control + cmsg_offset as u64 + 12) as *mut i32) = 1; // SCM_RIGHTS
+                            let data_ptr = (msg_control + cmsg_offset as u64 + 16) as *mut i32;
+                            for (i, &fd_val) in new_fds.iter().enumerate() {
+                                data_ptr.add(i).write_volatile(fd_val);
+                            }
+                        }
+                        cmsg_offset += needed;
+                        total_written += needed;
                     }
                 }
-            } else {
-                // Control buffer too small; discard fds.
-                unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
             }
-        } else {
-            // No control buffer; discard fds.
         }
-    } else {
-        // No pending fds; report controllen = 0.
-        if msg_control != 0 {
-            unsafe { *((msg_ptr + 40) as *mut u64) = 0; }
+
+        // 2. Deliver Peer Credentials (SCM_CREDENTIALS)
+        // Musl seatd (and wlr_backend) often sets SO_PASSCRED or expects these.
+        const SCM_CREDENTIALS: i32 = 2;
+        let cred_needed = CMSG_HDR_SIZE as usize + 12; // sizeof(struct ucred)
+        if msg_controllen >= cmsg_offset + cred_needed {
+            let pid = current_process_id().unwrap_or(0);
+            unsafe {
+                let cmsg_ptr = msg_control + cmsg_offset as u64;
+                *(cmsg_ptr as *mut u64) = cred_needed as u64; // cmsg_len
+                *((cmsg_ptr + 8) as *mut i32) = 1; // SOL_SOCKET
+                *((cmsg_ptr + 12) as *mut i32) = SCM_CREDENTIALS;
+                let ucred_ptr = (cmsg_ptr + 16) as *mut u32;
+                ucred_ptr.write_volatile(pid);
+                ucred_ptr.add(1).write_volatile(0); // UID
+                ucred_ptr.add(2).write_volatile(0); // GID
+            }
+            cmsg_offset += cred_needed;
+            total_written += cred_needed;
+            serial::serial_printf(format_args!("[SYSCALL] recvmsg injected SCM_CREDENTIALS (pid={})\n", pid));
+        }
+
+        // Update msg_controllen back to userspace via the pointer
+        unsafe {
+            *((msg_ptr + 40) as *mut u64) = total_written as u64;
         }
     }
 
@@ -4944,8 +5065,13 @@ fn sys_getlogin(buf: u64, len: u64) -> u64 {
 
 /// sys_set_tid_address - Stub for thread-local storage setup
 fn sys_set_tid_address(tid_ptr: u64) -> u64 {
-    // Return current TID (stubbed to PID)
-    sys_getpid()
+    if let Some(pid) = current_process_id() {
+        if let Some(mut p) = crate::process::get_process(pid) {
+            p.clear_child_tid = tid_ptr;
+            crate::process::update_process(pid, p);
+        }
+    }
+    sys_gettid() // Return current TID
 }
 
 /// sys_clock_gettime - Get real or monotonic time
@@ -5102,7 +5228,7 @@ fn sys_readdir(path_ptr: u64, buf_ptr: u64, buf_size: u64) -> u64 {
     if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
         let mut bounce = [0u8; 4096];
         let read_len = core::cmp::min(buf_size as usize, bounce.len());
-        let res = match crate::scheme::read(scheme_id, resource_id, &mut bounce[..read_len]) {
+        let res = match crate::scheme::read(scheme_id, resource_id, &mut bounce[..read_len], 0) {
             Ok(n) => {
                 unsafe {
                     core::ptr::copy_nonoverlapping(bounce.as_ptr(), buf_ptr as *mut u8, n);

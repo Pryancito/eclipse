@@ -160,6 +160,12 @@ pub struct Process {
     pub cwd_len: usize,
     /// Si es true, cada syscall de este proceso se registra en serial (syscall `strace`, 545).
     pub syscall_trace: bool,
+    /// Address to write 0 and wake on futex on exit (CLONE_CHILD_CLEARTID).
+    pub clear_child_tid: u64,
+    /// Address to write TID on clone (CLONE_CHILD_SETTID).
+    pub set_child_tid: u64,
+    /// Thread Group ID (the "PID" seen by userspace).
+    pub tgid: ProcessId,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -205,6 +211,9 @@ impl Process {
             },
             cwd_len: 1,
             syscall_trace: false,
+            clear_child_tid: 0,
+            set_child_tid: 0,
+            tgid: 0,
         }
     }
 }
@@ -396,6 +405,7 @@ pub fn create_process_with_pid(
 
                 let mut process = Process::new(resources);
                 process.id = pid;
+                process.tgid = pid;
                 process.stack_base = stack_base;
                 process.stack_size = stack_size;
                 process.priority = 5; 
@@ -867,6 +877,19 @@ pub fn exit_process() {
             for (slot_idx, slot) in table.iter_mut().enumerate() {
                 if let Some(p) = slot {
                     if p.id == pid {
+                        // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex-wake it.
+                        // Musl's pthread_join waits on this.
+                        if p.clear_child_tid != 0 {
+                            let addr = p.clear_child_tid;
+                            if crate::syscalls::is_user_pointer(addr, 4) {
+                                unsafe {
+                                    (addr as *mut u32).write_unaligned(0);
+                                }
+                                // Futex wake all waiters on this address
+                                crate::syscalls::futex_wake_all_atomic(addr);
+                            }
+                        }
+
                         p.state = ProcessState::Terminated;
                         // NO llamamos a unregister_pid_slot aquí: el proceso queda
                         // como zombie (slot registrado, estado=Terminated) hasta que
@@ -1007,6 +1030,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
 
                 let mut child = Process::new(child_resources);
                 child.id = child_pid;
+                child.tgid = child_pid;
                 child.state = ProcessState::Blocked;
                 child.current_cpu = NO_CPU;
                 child.last_cpu = NO_CPU;

@@ -69,7 +69,6 @@ use crate::scheme::{Scheme, Stat, error as scheme_error};
 
 struct OpenDisk {
     disk_idx: usize,
-    offset: u64,            // byte offset *within this view* (0 = start of partition or disk)
     partition_offset: u64,  // byte offset of the partition start on the raw disk (0 = whole disk)
     partition_size: u64,    // byte length of the partition (u64::MAX = whole disk, no bound)
 }
@@ -111,7 +110,7 @@ impl Scheme for DiskScheme {
 
         let (partition_offset, partition_size) = part_info.unwrap_or((0, u64::MAX));
 
-        let od = OpenDisk { disk_idx, offset: 0, partition_offset, partition_size };
+        let od = OpenDisk { disk_idx, partition_offset, partition_size };
         let mut open_disks = OPEN_DISKS.lock();
         for (i, slot) in open_disks.iter_mut().enumerate() {
             if slot.is_none() {
@@ -124,7 +123,7 @@ impl Scheme for DiskScheme {
         Ok(id)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
         let mut open_disks = OPEN_DISKS.lock();
         let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
 
@@ -132,14 +131,15 @@ impl Scheme for DiskScheme {
         let avail_in_partition = if disk.partition_size == u64::MAX {
             buffer.len() as u64
         } else {
-            disk.partition_size.saturating_sub(disk.offset)
+            disk.partition_size.saturating_sub(offset)
         };
         if avail_in_partition == 0 { return Ok(0); }
         let read_len = core::cmp::min(buffer.len() as u64, avail_in_partition) as usize;
 
         let mut total = 0usize;
         while total < read_len {
-            let abs_offset = disk.partition_offset + disk.offset;
+            let current_off = offset + total as u64;
+            let abs_offset = disk.partition_offset + current_off;
             let block_num = abs_offset / 4096;
             let offset_in_block = (abs_offset % 4096) as usize;
 
@@ -149,7 +149,6 @@ impl Scheme for DiskScheme {
                 crate::serial::serial_print_dec(disk.disk_idx as u64);
                 crate::serial::serial_print(" block=");
                 crate::serial::serial_print_dec(block_num);
-                crate::serial::serial_print("\n");
                 return if total > 0 {
                     Ok(total)
                 } else {
@@ -162,13 +161,12 @@ impl Scheme for DiskScheme {
             let to_copy = core::cmp::min(chunk_remaining, available);
             buffer[total..total + to_copy]
                 .copy_from_slice(&temp[offset_in_block..offset_in_block + to_copy]);
-            disk.offset += to_copy as u64;
             total += to_copy;
         }
         Ok(total)
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -179,7 +177,7 @@ impl Scheme for DiskScheme {
         let avail_in_partition = if disk.partition_size == u64::MAX {
             buffer.len() as u64
         } else {
-            disk.partition_size.saturating_sub(disk.offset)
+            disk.partition_size.saturating_sub(offset)
         };
         if avail_in_partition == 0 {
             return Ok(0);
@@ -188,7 +186,8 @@ impl Scheme for DiskScheme {
 
         let mut total = 0usize;
         while total < write_len {
-            let abs_offset = disk.partition_offset + disk.offset;
+            let current_off = offset + total as u64;
+            let abs_offset = disk.partition_offset + current_off;
             let block_num = abs_offset / 4096;
             let offset_in_block = (abs_offset % 4096) as usize;
             let chunk_remaining = write_len - total;
@@ -227,15 +226,14 @@ impl Scheme for DiskScheme {
                 };
             }
 
-            disk.offset += to_copy as u64;
             total += to_copy;
         }
         Ok(total)
     }
 
-    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
-        let mut open_disks = OPEN_DISKS.lock();
-        let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+    fn lseek(&self, id: usize, offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize> {
+        let open_disks = OPEN_DISKS.lock();
+        let disk = open_disks.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
 
         let view_size = if disk.partition_size == u64::MAX {
             get_device(disk.disk_idx).map(|d| d.capacity() * 4096).unwrap_or(0)
@@ -245,11 +243,10 @@ impl Scheme for DiskScheme {
 
         let new_offset: u64 = match whence {
             0 => offset as u64,                                    // SEEK_SET
-            1 => (disk.offset as isize + offset) as u64,          // SEEK_CUR
-            2 => (view_size as isize + offset) as u64,            // SEEK_END
+            1 => (current_offset as i128 + offset as i128).max(0) as u64,    // SEEK_CUR
+            2 => (view_size as i128 + offset as i128).max(0) as u64,            // SEEK_END
             _ => return Err(scheme_error::EINVAL),
         };
-        disk.offset = new_offset;
         Ok(new_offset as usize)
     }
 

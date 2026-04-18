@@ -40,7 +40,7 @@ impl Scheme for SysScheme {
         }
     }
 
-    fn read(&self, id: usize, buf: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buf: &mut [u8], _offset: u64) -> Result<usize, usize> {
         // Identify the resource by its fake ID
         let res_type = id >> 12;
         
@@ -88,11 +88,11 @@ impl Scheme for SysScheme {
         Ok(len)
     }
 
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, _buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         Err(ENOSYS)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 

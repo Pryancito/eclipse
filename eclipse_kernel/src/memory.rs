@@ -881,22 +881,22 @@ pub fn mprotect_user_range(pml4_phys: u64, addr: u64, len: u64, prot: u64) -> bo
 
                 let pml4_entry = &pml4.entries[pml4_idx];
                 if !pml4_entry.present() {
-                    false
+                    true // Not present is OK (demand paging)
                 } else {
                     let pdpt = &mut *(phys_to_virt(pml4_entry.get_addr()) as *mut PageTable);
                     let pdpt_entry = &mut pdpt.entries[pdpt_idx];
                     if !pdpt_entry.present() || pdpt_entry.is_huge() {
-                        false
+                        true // Not present or huge (ignore huge range for 4kb update)
                     } else {
                         let pd = &mut *(phys_to_virt(pdpt_entry.get_addr()) as *mut PageTable);
                         let pd_entry = &mut pd.entries[pd_idx];
                         if !pd_entry.present() || pd_entry.is_huge() {
-                            false
+                            true // Not present or huge
                         } else {
                             let pt = &mut *(phys_to_virt(pd_entry.get_addr()) as *mut PageTable);
                             let pt_entry = &mut pt.entries[pt_idx];
                             if !pt_entry.present() {
-                                false
+                                true // Not present (demand paging)
                             } else {
                                 let paddr = pt_entry.get_addr();
                                 pt_entry.set_addr(paddr, leaf_bits);

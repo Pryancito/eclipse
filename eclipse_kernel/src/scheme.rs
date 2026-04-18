@@ -32,6 +32,7 @@ pub mod error {
     pub const EPIPE: usize = 32;   // Broken pipe
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
     pub const ENOTDIR: usize = 20; // Not a directory
+    pub const EROFS: usize = 30;   // Read-only file system
 }
 
 /// Polling event flags (Linux-compatible)
@@ -63,30 +64,135 @@ pub struct Stat {
 }
 
 
-/// Get file status in a specific scheme
-pub fn fstat(scheme_idx: usize, id: usize, stat: &mut Stat) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
-             Arc::clone(s)
-        } else {
-             return Err(error::EBADF);
-        }
-    };
-    scheme.fstat(id, stat)
+/// Dispatch routing functions for the global scheme registry
+fn get_scheme(idx: usize) -> Result<Arc<dyn Scheme>, usize> {
+    let reg = REGISTRY.lock();
+    reg.schemes.get(idx).map(|(_, s)| Arc::clone(s)).ok_or(error::EBADF)
 }
 
-/// List directory entries in a specific scheme
+pub fn read(scheme_idx: usize, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.read(id, buffer, offset)
+}
+
+pub fn write(scheme_idx: usize, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.write(id, buffer, offset)
+}
+
+pub fn open(path: &str, flags: usize, mode: u32) -> Result<(usize, usize), usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let relative_path = parts.next().unwrap_or("");
+
+    let (i, scheme) = {
+        let reg = REGISTRY.lock();
+        let (i, (_, scheme)) = reg.schemes.iter().enumerate()
+            .find(|(_, (name, _))| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        (i, Arc::clone(scheme))
+    };
+
+    scheme.open(relative_path, flags, mode).map(|id| (i, id))
+}
+
+pub fn close(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.close(id)
+}
+
+pub fn lseek(scheme_idx: usize, id: usize, offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.lseek(id, offset, whence, current_offset)
+}
+
+pub fn fstat(scheme_idx: usize, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.fstat(id, stat)
+}
+
 pub fn getdents(scheme_idx: usize, id: usize) -> Result<Vec<String>, usize> {
+    get_scheme(scheme_idx)?.getdents(id)
+}
+
+pub fn poll(scheme_idx: usize, id: usize, events: usize) -> Result<usize, usize> {
+    let scheme = get_scheme(scheme_idx)?;
+    match scheme.poll(id, events) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if e != error::EAGAIN {
+                crate::serial::serial_printf(format_args!("[SCHEME] poll error {} for scheme_idx={}, resource_id={}\n", e, scheme_idx, id));
+            }
+            Err(e)
+        }
+    }
+}
+
+pub fn fmap(scheme_idx: usize, id: usize, offset: usize, len: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.fmap(id, offset, len)
+}
+
+pub fn ftruncate(scheme_idx: usize, id: usize, len: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.ftruncate(id, len)
+}
+
+pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.ioctl(id, request, arg)
+}
+
+pub fn dup(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.dup(id)
+}
+
+pub fn dup_independent(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.dup_independent(id)
+}
+
+pub fn mkdir(path: &str, mode: u32) -> Result<usize, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let relative_path = parts.next().unwrap_or("");
     let scheme = {
         let reg = REGISTRY.lock();
-        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
-             Arc::clone(s)
-        } else {
-             return Err(error::EBADF);
-        }
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
     };
-    scheme.getdents(id)
+    scheme.mkdir(relative_path, mode)
+}
+
+pub fn unlink(path: &str) -> Result<usize, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let relative_path = parts.next().unwrap_or("");
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+    scheme.unlink(relative_path)
+}
+
+pub fn rename(old_path: &str, new_path: &str) -> Result<usize, usize> {
+    let mut old_parts = old_path.splitn(2, ':');
+    let old_scheme = old_parts.next().ok_or(error::EINVAL)?;
+    let old_rel = old_parts.next().unwrap_or("");
+
+    let mut new_parts = new_path.splitn(2, ':');
+    let new_scheme = new_parts.next().ok_or(error::EINVAL)?;
+    let new_rel = new_parts.next().unwrap_or("");
+
+    if old_scheme != new_scheme {
+        return Err(error::EINVAL);
+    }
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == old_scheme)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.rename(old_rel, new_rel)
 }
 
 /// The Scheme trait defines the interface for all resource providers.
@@ -94,14 +200,14 @@ pub trait Scheme: Send + Sync {
     /// Open a resource at the given path
     fn open(&self, path: &str, flags: usize, mode: u32) -> Result<usize, usize>;
 
-    /// Read data from a resource
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize>;
+    /// Read data from a resource at a given offset
+    fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize>;
 
-    /// Write data to a resource
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize>;
+    /// Write data to a resource at a given offset
+    fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize>;
 
     /// Seek within a resource
-    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize>;
+    fn lseek(&self, id: usize, offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize>;
 
     /// Close a resource
     fn close(&self, id: usize) -> Result<usize, usize>;
@@ -186,12 +292,12 @@ impl Scheme for LogScheme {
         Ok(0) // Single resource for logging
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         // Log is write-only; read returns 0 (EOF) so stdin read(0) doesn't fail with EIO
         Ok(0)
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         if let Ok(s) = core::str::from_utf8(buf) {
             crate::serial::serial_print(s);
             Ok(buf.len())
@@ -204,7 +310,7 @@ impl Scheme for LogScheme {
         }
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::EIO) // Not seekable
     }
 
@@ -245,14 +351,14 @@ impl Scheme for PipeSchemeProxy {
     fn open(&self, path: &str, flags: usize, mode: u32) -> Result<usize, usize> {
         crate::pipe::PIPE_SCHEME.open(path, flags, mode)
     }
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
-        crate::pipe::PIPE_SCHEME.read(id, buffer)
+    fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.read(id, buffer, offset)
     }
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
-        crate::pipe::PIPE_SCHEME.write(id, buffer)
+    fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.write(id, buffer, offset)
     }
-    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
-        crate::pipe::PIPE_SCHEME.lseek(id, offset, whence)
+    fn lseek(&self, id: usize, offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize> {
+        crate::pipe::PIPE_SCHEME.lseek(id, offset, whence, current_offset)
     }
     fn close(&self, id: usize) -> Result<usize, usize> {
         crate::pipe::PIPE_SCHEME.close(id)
@@ -279,195 +385,7 @@ pub fn register_scheme(name: &str, scheme: Arc<dyn Scheme>) {
     reg.schemes.push((String::from(name), scheme));
 }
 
-/// Open a path by routing to the appropriate scheme
-pub fn open(path: &str, flags: usize, mode: u32) -> Result<(usize, usize), usize> {
-    let mut parts = path.splitn(2, ':');
-    let scheme_name = parts.next().ok_or(error::EINVAL)?;
-    let relative_path = parts.next().unwrap_or("");
 
-    let (i, scheme) = {
-        let reg = REGISTRY.lock();
-        let (i, (_, scheme)) = reg.schemes.iter().enumerate()
-            .find(|(_, (name, _))| name == scheme_name)
-            .ok_or(error::ENOENT)?;
-        (i, Arc::clone(scheme))
-    };
-
-    match scheme.open(relative_path, flags, mode) {
-        Ok(id) => Ok((i, id)),
-        Err(e) => Err(e),
-    }
-}
-
-/// Read from a resource in a specific scheme
-pub fn read(scheme_idx: usize, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.read(id, buffer)
-}
-
-/// Poll a resource in a specific scheme for events.
-pub fn poll(scheme_idx: usize, id: usize, events: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
-             Arc::clone(s)
-        } else {
-             return Err(error::EBADF);
-        }
-    };
-    match scheme.poll(id, events) {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            // DIAGNOSTIC: Log unexpected poll errors to identify which scheme is failing.
-            // Avoid logging EAGAIN as it's common.
-            if e != error::EAGAIN {
-                crate::serial::serial_printf(format_args!("[SCHEME] poll error {} for scheme_idx={}, resource_id={}\n", e, scheme_idx, id));
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Write to a resource in a specific scheme
-pub fn write(scheme_idx: usize, id: usize, buffer: &[u8]) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.write(id, buffer)
-}
-
-/// Seek in a resource in a specific scheme
-pub fn lseek(scheme_idx: usize, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.lseek(id, offset, whence)
-}
-
-/// Close a resource in a specific scheme
-pub fn close(scheme_idx: usize, id: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.close(id)
-}
-
-/// Map a resource in a specific scheme
-pub fn fmap(scheme_idx: usize, id: usize, offset: usize, len: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.fmap(id, offset, len)
-}
-
-/// Truncate or extend a resource in a specific scheme
-pub fn ftruncate(scheme_idx: usize, id: usize, len: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.ftruncate(id, len)
-}
-
-/// Perform an ioctl on a resource in a specific scheme
-pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.ioctl(id, request, arg)
-}
-
-/// Notify the scheme that a handle has been inherited by a new process (fd dup/fork).
-/// Schemes with reference counting (e.g. PtyScheme) use this to track open references
-/// so that close() only destroys the resource when the last holder releases it.
-pub fn dup(scheme_idx: usize, id: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.dup(id)
-}
-
-/// Create an independent copy of a resource for SCM_RIGHTS delivery.
-/// Returns a new resource id that is independent of the original (closing one
-/// does not affect the other).  Falls back to the original id for schemes that
-/// do not support independent duplication.
-pub fn dup_independent(scheme_idx: usize, id: usize) -> Result<usize, usize> {
-    let scheme = {
-        let reg = REGISTRY.lock();
-        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
-    };
-    scheme.dup_independent(id)
-}
-
-/// Create a directory by routing to the appropriate scheme
-pub fn mkdir(path: &str, mode: u32) -> Result<usize, usize> {
-    let mut parts = path.splitn(2, ':');
-    let scheme_name = parts.next().ok_or(error::EINVAL)?;
-    let relative_path = parts.next().unwrap_or("");
-
-    let scheme = {
-        let reg = REGISTRY.lock();
-        let (_, scheme) = reg.schemes.iter()
-            .find(|(name, _)| name == scheme_name)
-            .ok_or(error::ENOENT)?;
-        Arc::clone(scheme)
-    };
-
-    scheme.mkdir(relative_path, mode)
-}
-
-/// Remove a file by routing to the appropriate scheme
-pub fn unlink(path: &str) -> Result<usize, usize> {
-    let mut parts = path.splitn(2, ':');
-    let scheme_name = parts.next().ok_or(error::EINVAL)?;
-    let relative_path = parts.next().unwrap_or("");
-
-    let scheme = {
-        let reg = REGISTRY.lock();
-        let (_, scheme) = reg.schemes.iter()
-            .find(|(name, _)| name == scheme_name)
-            .ok_or(error::ENOENT)?;
-        Arc::clone(scheme)
-    };
-
-    scheme.unlink(relative_path)
-}
-
-/// Renombra dentro del mismo esquema (`file:/a` → `file:` + `/a`).
-pub fn rename(old_path: &str, new_path: &str) -> Result<usize, usize> {
-    let mut old_parts = old_path.splitn(2, ':');
-    let old_scheme = old_parts.next().ok_or(error::EINVAL)?;
-    let old_rel = old_parts.next().unwrap_or("");
-
-    let mut new_parts = new_path.splitn(2, ':');
-    let new_scheme = new_parts.next().ok_or(error::EINVAL)?;
-    let new_rel = new_parts.next().unwrap_or("");
-
-    if old_scheme != new_scheme {
-        return Err(error::EINVAL);
-    }
-
-    let scheme = {
-        let reg = REGISTRY.lock();
-        let (_, scheme) = reg
-            .schemes
-            .iter()
-            .find(|(name, _)| name == old_scheme)
-            .ok_or(error::ENOENT)?;
-        Arc::clone(scheme)
-    };
-
-    scheme.rename(old_rel, new_rel)
-}
 
 /// Get the path/name of a resource for directory listing purposes.
 /// Returns the path if available (filesystem scheme stores inode info).
@@ -588,37 +506,44 @@ impl Scheme for ShmScheme {
         Ok(id)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
         let handles = self.handles.lock();
         let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
         let regions = self.regions.lock();
         let region = regions.get(name).ok_or(error::EIO)?;
 
-        // For SHM, read/write might be used, but mmap is preferred.
-        // We'll implement a simple read at offset 0 (since we don't track offset per handle yet)
-        let to_copy = core::cmp::min(buffer.len(), region.size);
-        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr;
+        if offset as usize >= region.size {
+            return Ok(0);
+        }
+
+        // For SHM, read/write at the given offset.
+        let to_copy = core::cmp::min(buffer.len(), region.size - offset as usize);
+        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr + offset;
         unsafe {
             core::ptr::copy_nonoverlapping(virt as *const u8, buffer.as_mut_ptr(), to_copy);
         }
         Ok(to_copy)
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
         let handles = self.handles.lock();
         let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
         let regions = self.regions.lock();
         let region = regions.get(name).ok_or(error::EIO)?;
 
-        let to_copy = core::cmp::min(buffer.len(), region.size);
-        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr;
+        if offset as usize >= region.size {
+            return Err(error::EINVAL);
+        }
+
+        let to_copy = core::cmp::min(buffer.len(), region.size - offset as usize);
+        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr + offset;
         unsafe {
             core::ptr::copy_nonoverlapping(buffer.as_ptr(), virt as *mut u8, to_copy);
         }
         Ok(to_copy)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         // Shared memory objects are treated as non-seekable via this interface for now.
         // Callers should use mmap and explicit offsets instead of lseek on shm handles.
         Err(error::ESPIPE)

@@ -66,11 +66,11 @@ impl Scheme for DrmScheme {
         Ok(0)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, _buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         Ok(_buffer.len())
     }
 
@@ -96,8 +96,52 @@ impl Scheme for DrmScheme {
         const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
         const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC04464B7;
         const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+        const DRM_IOCTL_VERSION: u32 = 0xC0406400;
+        const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
 
+        serial::serial_printf(format_args!("[DRM-SCHEME] ioctl: id={} request=0x{:x}\n", id, request));
         match request as u32 {
+            DRM_IOCTL_VERSION => {
+                #[repr(C)]
+                struct DrmVersion {
+                    version_major: i32,
+                    version_minor: i32,
+                    version_patchlevel: i32,
+                    name_len: usize,
+                    name: *mut u8,
+                    date_len: usize,
+                    date: *mut u8,
+                    desc_len: usize,
+                    desc: *mut u8,
+                }
+                let v = unsafe { &mut *(arg as *mut DrmVersion) };
+                v.version_major = 1;
+                v.version_minor = 0;
+                v.version_patchlevel = 0;
+                
+                let name = b"eclipse\0";
+                let date = b"20260418\0";
+                let desc = b"Eclipse DRM Driver\0";
+                
+                unsafe {
+                    if v.name_len > 0 && !v.name.is_null() {
+                        let len = core::cmp::min(v.name_len, name.len());
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), v.name, len);
+                    }
+                    if v.date_len > 0 && !v.date.is_null() {
+                        let len = core::cmp::min(v.date_len, date.len());
+                        core::ptr::copy_nonoverlapping(date.as_ptr(), v.date, len);
+                    }
+                    if v.desc_len > 0 && !v.desc.is_null() {
+                        let len = core::cmp::min(v.desc_len, desc.len());
+                        core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc, len);
+                    }
+                }
+                v.name_len = name.len();
+                v.date_len = date.len();
+                v.desc_len = desc.len();
+                Ok(0)
+            }
             DRM_IOCTL_GET_CAP => {
                 #[repr(C)]
                 struct DrmGetCap {
@@ -273,6 +317,27 @@ impl Scheme for DrmScheme {
                     Err(scheme_error::ENOENT)
                 }
             }
+            DRM_IOCTL_MODE_GETENCODER => {
+                #[repr(C)]
+                struct DrmModeGetEncoder {
+                    encoder_id: u32,
+                    encoder_type: u32,
+                    crtc_id: u32,
+                    possible_crtcs: u32,
+                    possible_clones: u32,
+                }
+                let enc = unsafe { &mut *(arg as *mut DrmModeGetEncoder) };
+                // Virtual encoder 101, linked to CRTC 200 (from simplefb resources)
+                if enc.encoder_id == 101 {
+                    enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
+                    enc.crtc_id = 200;
+                    enc.possible_crtcs = 1;
+                    enc.possible_clones = 0;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            }
             DRM_IOCTL_MODE_GETCRTC => {
                 #[repr(C)]
                 struct DrmModeCrtc {
@@ -376,9 +441,32 @@ impl Scheme for DrmScheme {
                 }
             }
             DRM_IOCTL_MODE_GETPROPERTY => {
-                // Stub for property discovery: return ENODEV or similar if not found
-                // For now, just return OK with 0 properties to avoid client crashes
-                Ok(0)
+                #[repr(C)]
+                struct DrmModeGetProperty {
+                    values_ptr: u64,
+                    enum_blob_ptr: u64,
+                    prop_id: u32,
+                    flags: u32,
+                    name: [u8; 32],
+                    count_values: u32,
+                    count_enum_blobs: u32,
+                }
+                let p = unsafe { &mut *(arg as *mut DrmModeGetProperty) };
+                // Stub for property discovery: return generic "type" for prop_id 1
+                if p.prop_id == 1 {
+                    p.flags = 0x8; // DRM_MODE_PROP_ENUM
+                    let name = b"type\0";
+                    let len = core::cmp::min(name.len(), 32);
+                    p.name[..len].copy_from_slice(&name[..len]);
+                    p.count_values = 3; // Overlay, Primary, Cursor
+                    p.count_enum_blobs = 0;
+                    Ok(0)
+                } else {
+                    // For any other property, just return OK with no data to avoid crashes
+                    p.count_values = 0;
+                    p.count_enum_blobs = 0;
+                    Ok(0)
+                }
             }
             _ => {
                 Err(scheme_error::ENOSYS)
@@ -416,7 +504,7 @@ impl Scheme for DrmScheme {
         Ok(0)
     }
 
-    fn lseek(&self, _id: usize, offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         // DRM devices usually don't support lseek on the control node.
         // We'll just return the offset or 0.
         Ok(offset as usize)

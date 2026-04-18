@@ -178,7 +178,7 @@ impl Scheme for PtyScheme {
         Err(error::ENOENT)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if buffer.is_empty() { return Ok(0); }
         let handle = {
             let handles = self.handles.lock();
@@ -247,7 +247,7 @@ impl Scheme for PtyScheme {
         }
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         let handle = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
@@ -541,7 +541,7 @@ impl Scheme for PtyScheme {
         Ok(0)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }
 

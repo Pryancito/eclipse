@@ -41,7 +41,7 @@ impl SocketScheme {
         None
     }
 
-    fn send_request_and_wait(&self, net_pid: u32, op: NetOp, data: &[u8]) -> Result<i64, usize> {
+    fn send_request_and_wait(&self, net_pid: u32, op: NetOp, data: &[u8]) -> Result<(i64, ipc::Message), usize> {
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
         let client_pid = process::current_process_id().unwrap_or(0);
         
@@ -75,11 +75,9 @@ impl SocketScheme {
                 if msg.msg_type == MessageType::Network && msg.data_size >= core::mem::size_of::<NetResponseHeader>() as u32 {
                     let resp = unsafe { &*(msg.data.as_ptr() as *const NetResponseHeader) };
                     if resp.magic == *NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id {
-                        return Ok(resp.status);
+                        return Ok((resp.status, msg));
                     }
                 }
-                // If it's another message, we should probably stick it back or handle it.
-                // For now, if we are in a syscall, we just loop and try again.
             }
             
             if crate::interrupts::ticks() > start_ticks + 5000 { // 5 second timeout
@@ -95,40 +93,38 @@ impl Scheme for SocketScheme {
     fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
         let net_pid = self.get_network_pid().ok_or(scheme_error::ENOENT)?;
         
-        // Path might contain "unix" or other info
-        let res = self.send_request_and_wait(net_pid, NetOp::Socket, path.as_bytes())?;
+        let (res, _) = self.send_request_and_wait(net_pid, NetOp::Socket, path.as_bytes())?;
         if res < 0 {
             return Err((-res) as usize);
         }
         Ok(res as usize)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         let net_pid = self.get_network_pid().ok_or(scheme_error::ENOENT)?;
         
-        let mut data = [0u8; 8];
+        let mut data = [0u8; 16];
         data[..8].copy_from_slice(&(id as u64).to_le_bytes());
+        data[8..16].copy_from_slice(&(buffer.len() as u64).to_le_bytes());
         
-        // Wait, recv has multiple args. 
-        // For simple read(fd, buf, len), we just pass the id.
-        
-        let res = self.send_request_and_wait(net_pid, NetOp::Recv, &data)?;
+        let (res, msg) = self.send_request_and_wait(net_pid, NetOp::Recv, &data)?;
         if res < 0 {
             return Err((-res) as usize);
         }
         
-        // The data should be in a second message or we need a way to get it.
-        // For now, let's assume the response message contains the data if successful.
-        // But NetResponseHeader is already ~13 bytes.
-        // MAX_MESSAGE_DATA is 512.
+        let n = res as usize;
+        let payload_offset = core::mem::size_of::<NetResponseHeader>();
+        let to_copy = core::cmp::min(n, buffer.len());
+        let to_copy = core::cmp::min(to_copy, 512 - payload_offset);
         
-        // We need to fetch the data from the message that contained the successful response.
-        // I'll modify send_request_and_wait to return the message too.
+        if to_copy > 0 {
+             buffer[..to_copy].copy_from_slice(&msg.data[payload_offset..payload_offset + to_copy]);
+        }
         
-        Err(scheme_error::ENOSYS) // Still refining the protocol
+        Ok(to_copy)
     }
 
-    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buffer: &[u8], _offset: u64) -> Result<usize, usize> {
         let net_pid = self.get_network_pid().ok_or(scheme_error::ENOENT)?;
         
         // For now, limited to 512 - header size
@@ -140,7 +136,7 @@ impl Scheme for SocketScheme {
         payload.extend_from_slice(&(id as u64).to_le_bytes());
         payload.extend_from_slice(&buffer[..to_send]);
         
-        let res = self.send_request_and_wait(net_pid, NetOp::Send, &payload)?;
+        let (res, _) = self.send_request_and_wait(net_pid, NetOp::Send, &payload)?;
         if res < 0 {
             return Err((-res) as usize);
         }
@@ -150,11 +146,15 @@ impl Scheme for SocketScheme {
     fn close(&self, id: usize) -> Result<usize, usize> {
         let net_pid = self.get_network_pid().ok_or(scheme_error::ENOENT)?;
         let data = (id as u64).to_le_bytes();
-        let res = self.send_request_and_wait(net_pid, NetOp::Close, &data)?;
+        let (res, _) = self.send_request_and_wait(net_pid, NetOp::Close, &data)?;
         if res < 0 {
             return Err((-res) as usize);
         }
         Ok(0)
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
+        Err(scheme_error::ENOSYS)
     }
 
     fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
@@ -169,7 +169,7 @@ impl Scheme for SocketScheme {
         payload.extend_from_slice(&(request as u64).to_le_bytes());
         payload.extend_from_slice(&(arg as u64).to_le_bytes());
         
-        let res = self.send_request_and_wait(net_pid, NetOp::Bind, &payload)?; // Reuse Op for PoC or add Ioctl Op
+        let (res, _) = self.send_request_and_wait(net_pid, NetOp::Bind, &payload)?; // Reuse Op for PoC or add Ioctl Op
         if res < 0 {
             return Err((-res) as usize);
         }

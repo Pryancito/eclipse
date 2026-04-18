@@ -196,7 +196,7 @@ impl Scheme for DisplayScheme {
         Ok(0) // Single display resource
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         let (fb_phys, fb_size) = if crate::boot::get_boot_info().framebuffer.base_address != 0
             && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
         {
@@ -220,11 +220,11 @@ impl Scheme for DisplayScheme {
         Ok(to_copy)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         Err(scheme_error::EIO)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
@@ -311,7 +311,7 @@ impl Scheme for InputScheme {
         Ok(0)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if _buffer.len() < Self::INPUT_EVENT_SIZE {
             return Ok(0);
         }
@@ -334,7 +334,7 @@ impl Scheme for InputScheme {
         Ok(to_copy)
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -351,7 +351,7 @@ impl Scheme for InputScheme {
         Ok(aligned_len)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
@@ -373,15 +373,15 @@ impl Scheme for AudioScheme {
         Ok(0)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         Ok(buf.len())
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
@@ -403,15 +403,15 @@ impl Scheme for NetworkScheme {
         Ok(0)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, _id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         Ok(buf.len())
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
@@ -959,7 +959,7 @@ impl Scheme for SocketScheme {
         Err(scheme_error::EAFNOSUPPORT)
     }
 
-    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+    fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         let mut st = self.state.lock();
         let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
         let domain = socket.domain;
@@ -989,7 +989,7 @@ impl Scheme for SocketScheme {
         Err(scheme_error::ENOSYS)
     }
 
-    fn write(&self, id: usize, buf: &[u8]) -> Result<usize, usize> {
+    fn write(&self, id: usize, buf: &[u8], _offset: u64) -> Result<usize, usize> {
         let mut st = self.state.lock();
         let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
         let domain = socket.domain;
@@ -1036,7 +1036,7 @@ impl Scheme for SocketScheme {
         Ok(0)
     }
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(scheme_error::ESPIPE)
     }
 
