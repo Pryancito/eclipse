@@ -11,7 +11,7 @@ use spin::Mutex;
 use crate::scheme::{Scheme, error, Stat};
 
 /// Capacidad máxima del buffer interno de una pipe (64 KiB).
-const PIPE_BUF_CAP: usize = 65536;
+pub const PIPE_BUF_CAP: usize = 65536;
 
 // ---------------------------------------------------------------------------
 // Estructuras internas

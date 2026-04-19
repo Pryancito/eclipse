@@ -176,6 +176,12 @@ pub struct Process {
     pub set_child_tid: u64,
     /// Thread Group ID (the "PID" seen by userspace).
     pub tgid: ProcessId,
+    /// Linux `CLONE_VFORK`: el padre permanece dentro de `clone` hasta que este hijo
+    /// ejecuta `execve` con éxito o termina (`exit`). `Some(child_pid)` mientras espera.
+    pub vfork_waiting_for_child: Option<ProcessId>,
+    /// Linux `CLONE_VM` + vfork: este proceso comparte `ProcessResources` (y CR3) con el padre
+    /// hasta el primer `exec` exitoso; entonces se hace copia de VM + FD propia.
+    pub vfork_shared_mm_with_parent: Option<ProcessId>,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -224,8 +230,71 @@ impl Process {
             clear_child_tid: 0,
             set_child_tid: 0,
             tgid: 0,
+            vfork_waiting_for_child: None,
+            vfork_shared_mm_with_parent: None,
         }
     }
+}
+
+/// Despertar al padre que hizo `vfork`/`clone(CLONE_VFORK|CLONE_VM)` esperando a este hijo.
+/// Linux: el padre sale de `clone` cuando el hijo hace `execve` exitoso o `_exit`.
+/// Antes de cargar un ELF en `exec*`, si el proceso es hijo vfork con `CLONE_VM`,
+/// duplicar la tabla de páginas y la tabla de FDs del padre para no pisar la imagen del padre.
+pub fn vfork_detach_mm_for_exec_if_needed(pid: ProcessId) -> Result<(), &'static str> {
+    let needs_detach = get_process(pid)
+        .map(|p| p.vfork_shared_mm_with_parent.is_some())
+        .unwrap_or(false);
+    if !needs_detach {
+        return Ok(());
+    }
+
+    let child_slot = crate::ipc::pid_to_slot_fast(pid).ok_or("vfork detach: no slot")?;
+
+    let (shared_pt, src_fd_slot, vmas, brk) = {
+        let p = get_process(pid).ok_or("vfork detach: process")?;
+        let r = p.resources.lock();
+        (r.page_table_phys, r.fd_table_idx, r.vmas.clone(), r.brk_current)
+    };
+
+    if src_fd_slot != child_slot {
+        crate::fd::fd_duplicate_table_slots(src_fd_slot, child_slot);
+    }
+
+    let new_cr3 = crate::memory::clone_process_paging(shared_pt);
+
+    let new_resources = Arc::new(Mutex::new(ProcessResources {
+        page_table_phys: new_cr3,
+        vmas,
+        brk_current: brk,
+        fd_table_idx: child_slot,
+    }));
+
+    modify_process(pid, |p| {
+        p.resources = new_resources;
+        p.vfork_shared_mm_with_parent = None;
+    })
+    .map_err(|_| "vfork detach: process vanished")?;
+
+    unsafe {
+        crate::memory::set_cr3(new_cr3);
+    }
+    x86_64::instructions::tlb::flush_all();
+
+    Ok(())
+}
+
+pub fn vfork_wake_parent_waiting_for_child(child_pid: ProcessId) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.vfork_waiting_for_child == Some(child_pid) {
+                    p.vfork_waiting_for_child = None;
+                    return;
+                }
+            }
+        }
+    });
 }
 
 
@@ -457,6 +526,45 @@ pub fn create_process_with_pid(
     })
 }
 
+/// Registra en `vmas` los segmentos ELF cargados y la pila fija `[stack_base, stack_base+stack_size)`.
+///
+/// Tras `exec` / `execve` el kernel vacía `vmas`; si no se vuelven a registrar, un `mmap` con
+/// pista o `MAP_FIXED` puede solapar `unmap_user_range` con la pila en 0x20000000..0x20100000
+/// y provocar #PF en RSP; además el fallo bajo demanda no puede reponer hojas sin VMA.
+pub fn register_post_exec_vm_as(
+    pid: ProcessId,
+    loaded: &crate::elf_loader::ExecLoadResult,
+    stack_base: u64,
+    stack_size: u64,
+) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(mut proc) = get_process(pid) {
+            let mut r = proc.resources.lock();
+            for i in 0..loaded.loaded_vma_count {
+                let (start, end) = loaded.loaded_vma_ranges[i];
+                if start < end {
+                    r.vmas.push(VMARegion {
+                        start,
+                        end,
+                        flags:             0x5, // PROT_READ | PROT_EXEC
+                        file_backed:       true,
+                        anon_kernel_slack: 0,
+                    });
+                }
+            }
+            r.vmas.push(VMARegion {
+                start:             stack_base,
+                end:               stack_base.saturating_add(stack_size),
+                flags:             0x3, // PROT_READ | PROT_WRITE
+                file_backed:       false,
+                anon_kernel_slack: 0,
+            });
+            drop(r);
+            update_process(pid, proc);
+        }
+    });
+}
+
 /// Ejecutar un binario ELF como un nuevo proceso.
 ///
 /// Responsabilidades kernel vs ld.so: `ELF_LOADING.md` en este crate.
@@ -529,36 +637,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
              }
         }
         crate::fd::fd_init_stdio(pid);
-        // Registrar VMAs para las regiones ocupadas por los segmentos ELF y el stack.
-        // Esto evita que sys_mmap devuelva direcciones que colisionan con el binario cargado.
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            if let Some(mut proc) = get_process(pid) {
-                let mut r = proc.resources.lock();
-                // Registrar cada rango de segmentos ELF cargados
-                for i in 0..loaded.loaded_vma_count {
-                    let (start, end) = loaded.loaded_vma_ranges[i];
-                    if start < end {
-                        r.vmas.push(crate::process::VMARegion {
-                            start,
-                            end,
-                            flags: 0x5, // PROT_READ | PROT_EXEC
-                            file_backed: true,
-                            anon_kernel_slack: 0,
-                        });
-                    }
-                }
-                // Registrar el stack como VMA
-                r.vmas.push(crate::process::VMARegion {
-                    start: stack_base,
-                    end: stack_base + stack_size as u64,
-                    flags: 0x3, // PROT_READ | PROT_WRITE
-                    file_backed: false,
-                    anon_kernel_slack: 0,
-                });
-                drop(r);
-                crate::process::update_process(pid, proc);
-            }
-        });
+        register_post_exec_vm_as(pid, &loaded, stack_base, stack_size as u64);
         crate::serial::serial_printf(format_args!("[spawn] SUCCESS for process: {}\n", name));
         Ok(pid)
     } else {
@@ -843,6 +922,8 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
 pub fn exit_process() {
     if let Some(pid) = current_process_id() {
         clear_pending_process_args(pid);
+        // Linux vfork: el padre bloqueado en `clone` debe continuar si el hijo sale sin exec.
+        vfork_wake_parent_waiting_for_child(pid);
 
         // Collect open file descriptors so we can close them outside the lock
         let mut to_close: [(usize, usize); crate::fd::MAX_FDS_PER_PROCESS] =
@@ -1102,6 +1183,106 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     crate::fd::fd_clone_for_fork(current_pid, child_pid);
 
     Some(child_pid)
+}
+
+/// `clone(CLONE_VM|CLONE_VFORK|…)` sin `CLONE_THREAD`: hijo comparte el mismo `ProcessResources`
+/// (tabla de páginas y `fd_table_idx`) que el padre hasta `execve` / `exit` (comportamiento Linux).
+pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
+    let current_pid = current_process_id()?;
+    let parent = get_process(current_pid)?;
+
+    let child_resources = Arc::clone(&parent.resources);
+
+    let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
+    let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+    core::mem::forget(kernel_stack);
+
+    let kstack_ptr = unsafe {
+        let mut p = kernel_stack_top_aligned as *mut u64;
+        p = p.offset(-1);
+        *p = 0x23;
+        p = p.offset(-1);
+        *p = parent_context.rsp;
+        p = p.offset(-1);
+        *p = parent_context.rflags;
+        p = p.offset(-1);
+        *p = 0x1b;
+        p = p.offset(-1);
+        *p = parent_context.rip;
+        p
+    };
+
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        let mut next_pid = NEXT_PID.lock();
+
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    && p.current_cpu == NO_CPU);
+            if slot_available {
+                *slot = None;
+                let child_pid = *next_pid;
+                *next_pid += 1;
+
+                let mut child = Process::new(child_resources);
+                child.id = child_pid;
+                child.tgid = child_pid;
+                child.state = ProcessState::Blocked;
+                child.current_cpu = NO_CPU;
+                child.last_cpu = NO_CPU;
+                child.parent_pid = Some(current_pid);
+                child.kernel_stack_top = kernel_stack_top_aligned;
+                child.vfork_shared_mm_with_parent = Some(current_pid);
+
+                child.fs_base = parent.fs_base;
+                child.dynamic_linker_aux = parent.dynamic_linker_aux;
+                child.gs_base = parent.gs_base;
+                child.is_linux = parent.is_linux;
+                child.priority = parent.priority;
+                child.time_slice = parent.time_slice;
+                child.stack_base = parent.stack_base;
+                child.stack_size = parent.stack_size;
+                child.mem_frames = parent.mem_frames;
+                child.cpu_affinity = parent.cpu_affinity;
+                child.exit_signal = 0;
+                child.syscall_trace = parent.syscall_trace;
+
+                let mut name = [0u8; 16];
+                let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
+                let copy_len = core::cmp::min(parent_name_len, 16);
+                name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
+                child.name = name;
+
+                child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
+                child.context.rsp = kstack_ptr as u64;
+                child.context.rax = 0;
+                child.context.rbx = parent_context.rbx;
+                child.context.rcx = parent_context.rcx;
+                child.context.rdx = parent_context.rdx;
+                child.context.rsi = parent_context.rsi;
+                child.context.rdi = parent_context.rdi;
+                child.context.rbp = parent_context.rbp;
+                child.context.r8 = parent_context.r8;
+                child.context.r9 = parent_context.r9;
+                child.context.r10 = parent_context.r10;
+                child.context.r11 = parent_context.r11;
+                child.context.r12 = parent_context.r12;
+                child.context.r13 = parent_context.r13;
+                child.context.r14 = parent_context.r14;
+                child.context.r15 = parent_context.r15;
+
+                *slot = Some(child);
+                crate::ipc::register_pid_slot(child_pid, slot_idx);
+                return Some(child_pid);
+            }
+        }
+        None
+    });
+
+    result
 }
 
 // ---------------------------------------------------------------------------

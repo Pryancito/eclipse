@@ -716,8 +716,21 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
 
     // CR2 is only defined for #PF (14); on other faults it is stale — do not imply a page fault.
     if num == 14 && cr2 < 4096 && pid != 0 {
-        crate::serial::serial_printf(format_args!(
-            "\n[PF] CR2={:#x} in first page: likely NULL+offset in userspace (e.g. /dev/fb0 failed?)\n", cr2));
+        // error bit 4 = instruction fetch; RIP≈CR2 suele ser call/jmp a NULL, no un simple *NULL.
+        let ifetch = (err & 0x10) != 0;
+        if rip < 4096 {
+            crate::serial::serial_printf(format_args!(
+                "\n[PF] CR2={:#x} RIP={:#x} err={:#x}: ejecución en página cero ({}). \
+Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras recurso no inicializado.\n",
+                cr2, rip, err,
+                if ifetch { "fetch de instrucción" } else { "acceso" },
+            ));
+        } else {
+            crate::serial::serial_printf(format_args!(
+                "\n[PF] CR2={:#x} RIP={:#x}: acceso a datos en primera página (NULL+desp); comprobar retorno de open/mmap.\n",
+                cr2, rip,
+            ));
+        }
     }
     crate::serial::serial_printf(format_args!(
         "\n!!! EXCEPTION: {} Error: {:#018x} RIP: {:#018x} !!!\n\
@@ -735,6 +748,226 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
         r12, r13, r14, r15,
         rfl, cs, ss
     ));
+
+    // Salto a código NULL: volcar palabras en la pila de **usuario** vía tablas de páginas
+    // (no leer RSP como puntero lineal del kernel: CR3 activo es del proceso).
+    if num == 14 && rip == 0 && (cs & 3) == 3 && pid != 0 {
+        crate::serial::serial_printf(format_args!(
+            "[PF] pistas código: RBX={:#x} RCX={:#x} R13={:#x} (RCX=musl a veces RIP post-syscall)\n",
+            rbx, rcx, r13
+        ));
+        if let Some(p) = crate::process::get_process(pid) {
+            let pt = p.resources.lock().page_table_phys;
+            drop(p);
+            crate::serial::serial_printf(format_args!(
+                "[PF] CR3_en_fault={:#x} PCB_page_table_phys={:#x}{}\n",
+                cr3,
+                pt,
+                if cr3 != pt { " **DISCREPANCIA**" } else { "" }
+            ));
+            let rsp_pg = rsp & !0xFFF;
+            match crate::memory::get_user_page_phys(pt, rsp_pg) {
+                Some(pa) => {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] página RSP paddr={:#x} (va página {:#x})\n",
+                        pa, rsp_pg
+                    ));
+                }
+                None => {
+                    crate::serial::serial_print("[PF] RSP: sin hoja 4K / huge en walk PTE\n");
+                }
+            }
+            const USER_VA_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+            let dump_user_qwords = |label: &'static str, base: u64| {
+                if base == 0 {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] volcado {}=0 omitido (NULL)\n",
+                        label
+                    ));
+                    return;
+                }
+                if base > USER_VA_MAX {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] volcado {}={:#x} omitido (fuera VA usuario canónico)\n",
+                        label, base
+                    ));
+                    return;
+                }
+                if (base & 7) != 0 {
+                    if base < 0x1000 {
+                        crate::serial::serial_printf(format_args!(
+                            "[PF] volcado {}={:#x} omitido (valor pequeño; suele ser argc/retval syscall, no puntero)\n",
+                            label, base
+                        ));
+                    } else {
+                        crate::serial::serial_printf(format_args!(
+                            "[PF] volcado {}={:#x} omitido (VA desalineada a 8)\n",
+                            label, base
+                        ));
+                    }
+                    return;
+                }
+                crate::serial::serial_printf(format_args!(
+                    "[PF] 8 qwords desde {} (va {:#x}); 1ª=0 encaja con call/jmp *({}) tras mmap/calloc:\n",
+                    label, base, label
+                ));
+                for i in 0..8u64 {
+                    let va = base.wrapping_add(i * 8);
+                    match crate::memory::try_read_user_u64(pt, va) {
+                        Some(w) => {
+                            crate::serial::serial_printf(format_args!(
+                                "  {}+{:3}: {:#018x}\n",
+                                label,
+                                i * 8,
+                                w
+                            ));
+                        }
+                        None => {
+                            crate::serial::serial_printf(format_args!(
+                                "  {}+{:3}: <no legible>\n",
+                                label,
+                                i * 8
+                            ));
+                            break;
+                        }
+                    }
+                }
+            };
+            if rbx == 0 {
+                crate::serial::serial_print(
+                    "[PF] RBX=0: típico call/jmp *RBX; mirar RDI/RAX si son «this» o destino de call *(%reg)\n",
+                );
+            } else {
+                let rbx_pg = (rbx >> 12) << 12;
+                match crate::memory::try_read_user_u64(pt, rbx_pg) {
+                    Some(w) => {
+                        crate::serial::serial_printf(format_args!(
+                            "[PF] 1ª qword página RBX (va={:#x}): {:#018x}\n",
+                            rbx_pg, w
+                        ));
+                    }
+                    None => {
+                        crate::serial::serial_print(
+                            "[PF] página RBX no legible vía try_read_user_u64\n",
+                        );
+                    }
+                }
+                // RBX suele ser RIP previo, base de vtable o puntero a struct; el inicio de página puede ser .bss.
+                if (rbx & 7) == 0 {
+                    if let Some(slot) = crate::memory::try_read_user_u64(pt, rbx) {
+                        crate::serial::serial_printf(format_args!(
+                            "[PF] qword en dirección RBX (dato @va={:#x}): {:#018x}\n",
+                            rbx, slot
+                        ));
+                    } else {
+                        crate::serial::serial_print(
+                            "[PF] qword @RBX: no legible (sin PTE hoja / phys=0 / cruce de página)\n",
+                        );
+                    }
+                } else {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] RBX desalineado ({:#x}); omito lectura @RBX\n",
+                        rbx
+                    ));
+                }
+                let rbx_lo = rbx.saturating_sub(32) & !7u64;
+                crate::serial::serial_print(
+                    "[PF] qwords usuario alrededor RBX (RBX-32..RBX+32, alineado):\n",
+                );
+                for j in 0..9u64 {
+                    let va = rbx_lo.wrapping_add(j * 8);
+                    let rel = va as i64 - rbx as i64;
+                    match crate::memory::try_read_user_u64(pt, va) {
+                        Some(w) => {
+                            crate::serial::serial_printf(format_args!(
+                                "  RBX{:+}: va={:#x} -> {:#018x}\n",
+                                rel, va, w
+                            ));
+                        }
+                        None => {
+                            crate::serial::serial_printf(format_args!(
+                                "  RBX{:+}: va={:#x} -> <no legible>\n",
+                                rel, va
+                            ));
+                        }
+                    }
+                }
+            }
+            dump_user_qwords("RDI", rdi);
+            if rax != rdi {
+                dump_user_qwords("RAX", rax);
+            }
+            if rsi != 0 && (rsi & 7) == 0 && rsi <= USER_VA_MAX && rsi != rdi {
+                dump_user_qwords("RSI", rsi);
+            }
+            let rcx_pg = (rcx >> 12) << 12;
+            match crate::memory::try_read_user_u64(pt, rcx_pg) {
+                Some(w) => {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] 1ª qword página RCX (va={:#x}): {:#018x}\n",
+                        rcx_pg, w
+                    ));
+                }
+                None => {
+                    crate::serial::serial_print("[PF] página RCX no legible vía try_read_user_u64\n");
+                }
+            }
+            crate::serial::serial_printf(format_args!(
+                "[PF] volcado pila usuario @RSP={:#x} (tabla {:#x}):\n",
+                rsp, pt
+            ));
+            for i in 0..16u64 {
+                let va = rsp.wrapping_add(i * 8);
+                match crate::memory::try_read_user_u64(pt, va) {
+                    Some(w) => {
+                        crate::serial::serial_printf(format_args!(
+                            "  RSP+{:3}: {:#018x}\n",
+                            i * 8,
+                            w
+                        ));
+                    }
+                    None => {
+                        crate::serial::serial_printf(format_args!(
+                            "  RSP+{:3}: <no mapeado>\n",
+                            i * 8
+                        ));
+                        break;
+                    }
+                }
+            }
+            // Con jmp *reg no hay retorno recién empujado; el marco suele tener saved RIP cerca de RBP.
+            const USER_STACK_LO: u64 = 0x2000_0000;
+            const USER_STACK_HI: u64 = 0x2010_0000;
+            if rbp >= USER_STACK_LO && rbp < USER_STACK_HI {
+                let lo = rbp.saturating_sub(72) & !7u64;
+                let hi = rbp.saturating_add(24) & !7u64;
+                crate::serial::serial_printf(format_args!(
+                    "[PF] volcado pila usuario alrededor RBP={:#x} (RBP-72 … RBP+24):\n",
+                    rbp
+                ));
+                let mut va = lo;
+                while va <= hi {
+                    match crate::memory::try_read_user_u64(pt, va) {
+                        Some(w) => {
+                            let rel = va as i64 - rbp as i64;
+                            crate::serial::serial_printf(format_args!(
+                                "  RBP{:+}: {:#018x}\n",
+                                rel,
+                                w
+                            ));
+                        }
+                        None => {
+                            crate::serial::serial_printf(format_args!(
+                                "  {:#x}: <no mapeado>\n",
+                                va
+                            ));
+                        }
+                    }
+                    va = va.wrapping_add(8);
+                }
+            }
+        }
+    }
     
     // Stack dump (first 64 bytes) — kernel RSP only.
     // Dumping a *user* RSP here is unsafe: if the RSP points to an unmapped page (e.g.

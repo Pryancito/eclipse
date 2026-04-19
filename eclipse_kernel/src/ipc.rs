@@ -4,6 +4,7 @@
 
 use spin::Mutex;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::process::MAX_PROCESSES;
 
 /// Mensajes Input/Signal descartados por mailbox lleno (debug: si >0 al congelarse input, aumentar MAILBOX_DEPTH o drenar más).
 pub(crate) static DROPPED_P2P_MSGS: AtomicU64 = AtomicU64::new(0);
@@ -20,7 +21,7 @@ pub type ServerId = u32;
 pub type ClientId = u32;
 
 /// Tamaño máximo de datos en un mensaje
-const MAX_MESSAGE_DATA: usize = 512;
+pub const MAX_MESSAGE_DATA: usize = 512;
 
 /// Tipos de mensaje
 #[repr(u32)]
@@ -244,7 +245,7 @@ pub fn pid_to_slot_fast(pid: crate::process::ProcessId) -> Option<usize> {
 /// Capacidad por proceso: picos de input (ratón/teclado) cuando el compositor está ocupado.
 /// Si se llena, se descartan eventos → ratón/teclado "bloqueados". 256 da margen amplio.
 /// 256 × ~256 bytes ≈ 64 KB por slot.
-const MAILBOX_DEPTH: usize = 256;
+pub const MAILBOX_DEPTH: usize = 256;
 struct ProcessMailbox {
     msgs: [Message; MAILBOX_DEPTH],
     head: usize,
@@ -281,7 +282,8 @@ impl ProcessMailbox {
 /// Buzones de mensajes por proceso — ring buffers estáticos, sin heap.
 /// Indexados por SLOT INDEX en PROCESS_TABLE (0-255).
 const EMPTY_MAILBOX: ProcessMailbox = ProcessMailbox::new();
-static PROCESS_MAILBOXES: Mutex<[ProcessMailbox; 256]> = Mutex::new([EMPTY_MAILBOX; 256]);
+static PROCESS_MAILBOXES: Mutex<[ProcessMailbox; MAX_PROCESSES]> =
+    Mutex::new([EMPTY_MAILBOX; MAX_PROCESSES]);
 
 /// Helper to run a closure with interrupts disabled.
 /// In tests, it just runs the closure to avoid x86_64 instruction dependency.
@@ -372,7 +374,7 @@ pub fn register_client(name: &[u8], server_id: ServerId, permissions: u32) -> Op
         let client_id = ipc.client_id_counter.fetch_add(1, Ordering::SeqCst);
         
         // Buscar slot libre
-        for i in 0..256 {
+        for i in 0..MAX_PROCESSES {
             if ipc.clients[i].is_none() {
                 let mut client = Client::new();
                 client.id = client_id;
@@ -663,7 +665,7 @@ pub fn receive_message(pid: ClientId) -> Option<Message> {
 
 /// Limpiar el buzón de un slot al terminar el proceso.
 pub fn clear_mailbox_slot(slot_idx: usize) {
-    if slot_idx < 256 {
+    if slot_idx < MAX_PROCESSES {
         run_critical(|| {
             PROCESS_MAILBOXES.lock()[slot_idx].clear();
         });

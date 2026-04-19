@@ -52,6 +52,7 @@ pub mod sw_cursor;   // Software cursor for real-hardware (non-VirtIO) EFI GOP f
 pub mod sync;        // Synchronization primitives
 mod memory_builtins;
 mod drm_scheme;
+mod invariants;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};

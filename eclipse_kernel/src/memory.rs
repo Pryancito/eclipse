@@ -663,15 +663,14 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                         
                         if p_pd_is_user {
                             if pd_flags.contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
-                                // 2MB Huge Page Deep Copy
-                                if let Some((new_frame_ptr, new_frame_phys)) = alloc_dma_buffer(2 * 1024 * 1024, 2 * 1024 * 1024) {
-                                    let p_frame_phys = p_pd.entries[j].get_addr();
-                                    let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
-                                    core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 2 * 1024 * 1024);
-                                    new_pd.entries[j].set_addr(new_frame_phys, pd_flags.bits());
-                                } else {
-                                    new_pd.entries[j] = p_pd.entries[j].clone();
-                                }
+                                // 2MB Huge Page Deep Copy (no compartir PTE con el padre: exec del hijo
+                                // modificaría la misma hoja y rompe la pila del padre tras vfork+detach).
+                                let (new_frame_ptr, new_frame_phys) = alloc_dma_buffer(2 * 1024 * 1024, 2 * 1024 * 1024)
+                                    .expect("clone_process_paging: OOM 2MiB user huge");
+                                let p_frame_phys = p_pd.entries[j].get_addr();
+                                let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
+                                core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 2 * 1024 * 1024);
+                                new_pd.entries[j].set_addr(new_frame_phys, pd_flags.bits());
                             } else {
                                 // Standard 4KB Page Table Deep Copy
                                 let (new_pt_ptr, new_pt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PT");
@@ -682,24 +681,81 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                 let p_pt = &*(phys_to_virt(p_pt_phys) as *const PageTable);
                                 
                                 for k in 0..512 {
-                                    if !p_pt.entries[k].present() { continue; }
-                                    let pt_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(p_pt.entries[k].get_flags());
-                                    
-                                    // Deep copy 4KB frame
-                                    if let Some((new_frame_ptr, new_frame_phys)) = alloc_dma_buffer(4096, 4096) {
-                                        let p_frame_phys = p_pt.entries[k].get_addr();
-                                        let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
-                                        core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 4096);
-                                        new_pt.entries[k].set_addr(new_frame_phys, (pt_flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-                                    } else {
-                                        new_pt.entries[k] = p_pt.entries[k].clone();
+                                    if !p_pt.entries[k].present() {
+                                        continue;
                                     }
+                                    let pt_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(
+                                        p_pt.entries[k].get_flags(),
+                                    );
+                                    if !pt_flags.contains(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+                                    {
+                                        // Tabla compartida kernel / huecos: copiar PTE tal cual (misma física).
+                                        new_pt.entries[k] = p_pt.entries[k].clone();
+                                        continue;
+                                    }
+                                    // Hoja de usuario: copia física privada (vfork/exec no deben aliasar con el padre).
+                                    let (new_frame_ptr, new_frame_phys) = alloc_dma_buffer(4096, 4096)
+                                        .expect("clone_process_paging: OOM 4KiB user leaf");
+                                    let p_frame_phys = p_pt.entries[k].get_addr();
+                                    let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
+                                    core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 4096);
+                                    new_pt.entries[k].set_addr(
+                                        new_frame_phys,
+                                        (pt_flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+                                            .bits(),
+                                    );
                                 }
                                 
                                 new_pd.entries[j].set_addr(new_pt_phys, pd_flags.bits());
                             }
                         } else {
-                            new_pd.entries[j] = p_pd.entries[j].clone();
+                            // Entrada de PD sin USER_ACCESSIBLE: puede apuntar a una PT que contiene
+                            // páginas de usuario (pila/heap). Clonar solo la PTE aliasaría la PT
+                            // completa con el padre — exec del hijo borraría mapeos del padre.
+                            if pd_flags.contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) {
+                                new_pd.entries[j] = p_pd.entries[j].clone();
+                            } else if p_pd.entries[j].present() {
+                                let p_pt_phys = p_pd.entries[j].get_addr();
+                                let p_pt = &*(phys_to_virt(p_pt_phys) as *const PageTable);
+                                let (new_pt_ptr, new_pt_phys) = alloc_dma_buffer(4096, 4096)
+                                    .expect("clone_process_paging: OOM PT (non-user PD path)");
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        (p_pt as *const PageTable).cast::<u8>(),
+                                        new_pt_ptr as *mut u8,
+                                        4096,
+                                    );
+                                }
+                                let new_pt = &mut *(new_pt_ptr as *mut PageTable);
+                                for k in 0..512 {
+                                    if !new_pt.entries[k].present() || new_pt.entries[k].is_huge() {
+                                        continue;
+                                    }
+                                    let leaf_bits = new_pt.entries[k].get_flags();
+                                    let leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(
+                                        leaf_bits,
+                                    );
+                                    if !leaf_flags.contains(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+                                    {
+                                        continue;
+                                    }
+                                    let (new_frame_ptr, new_frame_phys) = alloc_dma_buffer(4096, 4096)
+                                        .expect("clone_process_paging: OOM 4KiB leaf (non-user PD path)");
+                                    let p_frame_phys = new_pt.entries[k].get_addr();
+                                    let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 4096);
+                                    }
+                                    new_pt.entries[k].set_addr(
+                                        new_frame_phys,
+                                        (leaf_flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+                                            .bits(),
+                                    );
+                                }
+                                new_pd.entries[j].set_addr(new_pt_phys, pd_flags.bits());
+                            } else {
+                                new_pd.entries[j] = PageTableEntry::new();
+                            }
                         }
                     }
                     
@@ -825,6 +881,24 @@ pub fn get_user_page_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
 
         Some(pt_entry.get_addr())
     }
+}
+
+/// Lee 8 bytes alineados en el espacio de direcciones del proceso (para depuración en #PF).
+/// Devuelve `None` si la página no está presente o la dirección no está alineada a 8 bytes.
+pub fn try_read_user_u64(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    if (vaddr & 7) != 0 {
+        return None;
+    }
+    if (vaddr & 0xFFF) > 4096 - 8 {
+        return None;
+    }
+    let phys = get_user_page_phys(pml4_phys, vaddr)?;
+    if phys == 0 {
+        return None;
+    }
+    let off = (vaddr & 0xFFF) as usize;
+    let kva = phys_to_virt(phys) as *const u64;
+    unsafe { Some(core::ptr::read_volatile(kva.byte_add(off))) }
 }
 
 /// Linux `PROT_READ|WRITE|EXEC` (bits 0–2) → bits de PTE de hoja para usuario.
@@ -1077,10 +1151,22 @@ pub fn phys_to_virt(phys_addr: u64) -> u64 {
     PHYS_MEM_OFFSET + phys_addr
 }
 
+/// Tope duro para **una** petición a [`alloc_dma_buffer`]: va al heap global del kernel (`alloc`).
+/// Tests e invariantes: `eclipse_kernel/src/invariants.rs` (comprobaciones `const` en compilación);
+/// espejo en host: `cargo test` en `kernel_host_tests/` (`policy`, `extended`, `tests/kernel_invariants_mirror.rs`, etc.).
+/// Sin esto, cualquier driver o syscall que calcule mal `size` desde userspace / dispositivo / GPT
+/// puede pedir p. ej. 1 GiB y disparar `allocation error: Layout { size: 1073741824, … }`.
+/// DRM GEM y framebuffer VirtIO usan el mismo orden de magnitud vía [`crate::drm::MAX_GEM_BUFFER_SIZE`].
+pub const MAX_KERNEL_DMA_HEAP_ALLOC: usize = 64 * 1024 * 1024;
+
 /// Allocate DMA-safe buffer
 /// Returns (virtual address, physical address)
 pub fn alloc_dma_buffer(size: usize, align: usize) -> Option<(*mut u8, u64)> {
     use alloc::alloc::{alloc, Layout};
+
+    if size == 0 || size > MAX_KERNEL_DMA_HEAP_ALLOC {
+        return None;
+    }
     
     unsafe {
         // Allocate aligned buffer

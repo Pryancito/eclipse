@@ -177,10 +177,8 @@ impl Scheme for DrmScheme {
                 }
                 let bytes_per_pixel = ((info.bpp as u64) + 7) / 8;
                 let pitch = ((info.width as u64) * bytes_per_pixel + 255) & !255u64;
-                // Cap at 64 MiB per buffer to prevent OOM on bogus user input.
-                const MAX_DUMB_BUFFER: u64 = 64 * 1024 * 1024;
                 let size_u64 = pitch.saturating_mul(info.height as u64);
-                if size_u64 > MAX_DUMB_BUFFER {
+                if size_u64 > crate::drm::MAX_GEM_BUFFER_SIZE as u64 {
                     return Err(scheme_error::EINVAL);
                 }
                 let size = size_u64 as usize;

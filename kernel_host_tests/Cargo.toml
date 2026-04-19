@@ -1,0 +1,9 @@
+[package]
+name = "kernel_host_tests"
+version = "0.1.0"
+edition = "2021"
+description = "Tests de políticas numéricas alineadas con eclipse_kernel (host std, sin build-std)"
+publish = false
+
+[lib]
+path = "src/lib.rs"

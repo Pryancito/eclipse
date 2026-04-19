@@ -53,6 +53,10 @@ void wlr_backend_finish(struct wlr_backend *backend) {
 }
 
 bool wlr_backend_start(struct wlr_backend *backend) {
+	if (!backend || !backend->impl) {
+		wlr_log(WLR_ERROR, "wlr_backend_start: backend or impl is NULL");
+		return false;
+	}
 	if (backend->impl->start) {
 		return backend->impl->start(backend);
 	}

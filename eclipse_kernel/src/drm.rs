@@ -38,6 +38,9 @@ pub struct GemHandle {
     pub phys_addr: u64,
 }
 
+/// Límite por buffer GEM: alineado con [`crate::memory::MAX_KERNEL_DMA_HEAP_ALLOC`] (`alloc_dma_buffer`).
+pub const MAX_GEM_BUFFER_SIZE: usize = crate::memory::MAX_KERNEL_DMA_HEAP_ALLOC;
+
 /// DRM Connector (output)
 #[derive(Debug, Clone, Copy)]
 pub struct DrmConnector {
@@ -262,6 +265,9 @@ pub fn get_primary_driver() -> Option<Arc<dyn DrmDriver>> {
 
 /// Allocate a buffer (GEM object) via the primary driver
 pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
+    if size == 0 || size > MAX_GEM_BUFFER_SIZE {
+        return None;
+    }
     let mut state = DRM_STATE.lock();
     let driver = state.drivers.first()?.clone();
     let id = state.next_handle_id;

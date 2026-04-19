@@ -156,6 +156,9 @@ mod linux_mmap_abi {
     /// Donde `mmap_find_free` coloca `mmap(NULL, …)` anónimo.
     pub const USER_ARENA_LO: u64 = 0x6000_0000;
     pub const USER_ARENA_HI: u64 = 0x7000_0000;
+    /// Pila fija tras `exec`/`execve` / `spawn` (1 MiB en 512 MiB virtuales).
+    pub const USER_EXEC_STACK_LO: u64 = 0x2000_0000;
+    pub const USER_EXEC_STACK_HI: u64 = USER_EXEC_STACK_LO + 0x10_0000;
     /// Páginas extra más allá del tamaño redondeado (trampolines / desbordes de musl).
     /// Incluye margen para fetch de instrucción de hasta 15 B en el último byte de página
     /// (p. ej. RIP=0x…3fff y CR2=0x…4000: hacía falta >4 páginas de colchón).
@@ -1006,6 +1009,9 @@ fn sys_drm_get_caps(caps_ptr: u64) -> u64 {
 
 /// sys_drm_alloc_buffer - Allocate a GEM buffer
 fn sys_drm_alloc_buffer(size: u64) -> u64 {
+    if size == 0 || size > crate::drm::MAX_GEM_BUFFER_SIZE as u64 {
+        return u64::MAX;
+    }
     if let Some(handle) = crate::drm::alloc_buffer(size as usize) {
         handle.id as u64
     } else {
@@ -1690,27 +1696,33 @@ fn sys_getppid() -> u64 {
 /// Returns: Child PID in parent, 0 in child, -1 on error
 fn sys_fork(context: &crate::process::Context) -> u64 {
     use crate::process;
-    
+
     let mut stats = SYSCALL_STATS.lock();
     stats.fork_calls += 1;
     drop(stats);
+
+    let linux_abi = process::current_process_id()
+        .and_then(process::get_process)
+        .map(|p| p.is_linux)
+        .unwrap_or(false);
 
     // Create child process with modified context
     // The child needs to see RAX=0 (return value of fork)
     let mut child_context = *context;
     child_context.rax = 0;
-    
-    // Create child process
+
     match process::fork_process(&child_context) {
         Some(child_pid) => {
-            // Add child to scheduler
             crate::scheduler::enqueue_process(child_pid);
-            
             child_pid as u64
         }
         None => {
             serial::serial_print("[SYSCALL] fork() failed - could not create child\n");
-            u64::MAX // -1 indicates error
+            if linux_abi {
+                linux_abi_error(11)
+            } else {
+                u64::MAX
+            }
         }
     }
 }
@@ -1758,9 +1770,10 @@ const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 /// Byte length of an ELF buffer after the kernel heap rounds the allocation up to a
 /// multiple of `usize` (8 on x86_64), matching `linked_list_allocator` / `Layout` padding.
 ///
-/// `sys_exec` uses `Vec::with_capacity(elf_size)`; sizes in `(128 MiB − 8, 128 MiB − 1]`
-/// still pass an `elf_size < 128 MiB − 7` check but round up to **exactly** 128 MiB,
-/// producing `Layout { size: 134217728, align: 8 }` and exhausting a 256 MiB heap mid-boot.
+/// `sys_exec` uses `Vec::with_capacity(elf_size)`; the guard below uses the byte length
+/// rounded **up** to `align_of::<usize>()` (8 on x86_64). Sizes from **128 MiB − 7** through
+/// **128 MiB − 1** round up to **exactly** 128 MiB and are rejected, avoiding
+/// `Layout { size: 134217728, align: 8 }` on a tight heap.
 #[inline]
 fn elf_byte_len_heap_padded(byte_len: u64) -> usize {
     let n = byte_len as usize;
@@ -1850,6 +1863,10 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 
     // Replace current process with ELF binary
     let current_pid = current_process_id().expect("exec called without current process");
+    if let Err(msg) = crate::process::vfork_detach_mm_for_exec_if_needed(current_pid) {
+        set_last_exec_error(msg.as_bytes());
+        return u64::MAX;
+    }
     match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
         Ok(res) => {
             serial::serial_printf(format_args!(
@@ -1902,6 +1919,21 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                 serial::serial_print("\n");
                 return u64::MAX;
             }
+            crate::process::register_post_exec_vm_as(
+                current_pid,
+                &res,
+                USER_STACK_BASE,
+                USER_STACK_SIZE as u64,
+            );
+            crate::fd::fd_ensure_stdio(current_pid);
+            crate::serial::serial_printf(format_args!(
+                "[EXEC] pid={} salto userspace entry={:#x} stack_top={:#x} phdr={:#x} dyn={}\n",
+                current_pid,
+                res.entry_point,
+                USER_STACK_BASE + USER_STACK_SIZE as u64,
+                res.phdr_va,
+                res.dynamic_linker.is_some()
+            ));
             unsafe {
                 let stack_top: u64 = USER_STACK_BASE + USER_STACK_SIZE as u64;
                 if res.dynamic_linker.is_some() {
@@ -3254,6 +3286,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
             }
             let unmap_span = aligned_length.saturating_add(anon_slack);
+            if addr < linux_mmap_abi::USER_EXEC_STACK_HI
+                && addr.saturating_add(unmap_span) > linux_mmap_abi::USER_EXEC_STACK_LO
+            {
+                drop(r);
+                drop(proc);
+                return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+            }
             memory::unmap_user_range(page_table_phys, addr, unmap_span);
             let t0 = addr;
             let t1 = addr.saturating_add(aligned_length);
@@ -3276,10 +3315,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             }
             let span = me - ms;
             let need = span.saturating_add(anon_slack);
-            let hint_ok = !r
-                .vmas
-                .iter()
-                .any(|vma| ms < vma.end && me.saturating_add(anon_slack) > vma.start);
+            let overlaps_exec_stack = ms < linux_mmap_abi::USER_EXEC_STACK_HI
+                && me.saturating_add(anon_slack) > linux_mmap_abi::USER_EXEC_STACK_LO;
+            let hint_ok = !overlaps_exec_stack
+                && !r
+                    .vmas
+                    .iter()
+                    .any(|vma| ms < vma.end && me.saturating_add(anon_slack) > vma.start);
             if hint_ok {
                 (ms, me)
             } else if let Some(c) = mmap_find_free(&r, need) {
@@ -3609,9 +3651,21 @@ fn sys_brk(addr: u64) -> u64 {
 ///   context: Current process register context (needed for fork-style clone)
 /// 
 /// Returns: TID of new thread/process, or u64::MAX on error
-fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process::Context) -> u64 {
+fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::process::Context) -> u64 {
     use crate::process;
-    
+
+    let raw_flags = flags;
+    let ppid = current_process_id().unwrap_or(0);
+    serial::serial_printf(format_args!(
+        "[CLONE] enter pid={} raw_flags={:#x} stack={:#x} rdx/ptid={:#x} r8_tls={:#x} r10_ctid={:#x}\n",
+        ppid,
+        raw_flags,
+        stack,
+        parent_tid_arg,
+        context.r8,
+        context.r10
+    ));
+
     // Linux encodes exit signal in the low byte of flags.
     let exit_signal = flags & 0xFF;
     let flags = flags & !0xFF;
@@ -3633,28 +3687,122 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
     const CLONE_CHILD_SETTID: u64 = 0x01000000;
     const CLONE_IO: u64 = 0x80000000;
 
-    // Fork-style clone: CLONE_THREAD not set → treat as fork/vfork.
-    // This handles relibc's vfork() (CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD)
-    // and plain fork() (exit_signal=SIGCHLD only).  We implement vfork as a
-    // regular fork (without the "parent suspended" semantics) because the child
-    // will exec immediately.
+    /// Flags permitidos en `clone` sin `CLONE_THREAD` (fork / vfork vía `clone`).
+    /// Alineado con la máscara del camino thread, sin `CLONE_THREAD`.
+    const FORK_STYLE_CLONE_ALLOWED: u64 = CLONE_VM
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_VFORK
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID
+        | CLONE_IO;
+
+    let linux_clone_caller = process::get_process(ppid)
+        .map(|p| p.is_linux)
+        .unwrap_or(false);
+
+    // Fork-style clone: CLONE_THREAD not set → fork(2) / vfork vía clone.
+    // - Linux exige `CLONE_VM` con `CLONE_VFORK` (EINVAL si no).
+    // - `CLONE_VFORK|CLONE_VM`: padre bloqueado en `clone` hasta `execve` exitoso o `exit`
+    //   del hijo; el hijo comparte `ProcessResources` (misma tabla de páginas y FD slot)
+    //   hasta que `execve` duplica VM+FD (`vfork_detach_mm_for_exec_if_needed`).
     if (flags & CLONE_THREAD) == 0 {
+        if (flags & CLONE_VFORK) != 0 && (flags & CLONE_VM) == 0 {
+            serial::serial_printf(format_args!(
+                "[CLONE] fork-style EINVAL: CLONE_VFORK without CLONE_VM pid={}\n",
+                ppid
+            ));
+            return if linux_clone_caller {
+                linux_abi_error(22)
+            } else {
+                u64::MAX
+            };
+        }
+        if flags & !FORK_STYLE_CLONE_ALLOWED != 0 {
+            serial::serial_printf(format_args!(
+                "[CLONE] fork-style EINVAL pid={} bad_flags={:#x}\n",
+                ppid,
+                flags & !FORK_STYLE_CLONE_ALLOWED
+            ));
+            return if linux_clone_caller {
+                linux_abi_error(22)
+            } else {
+                u64::MAX
+            };
+        }
+
+        let vfork_block_parent =
+            (flags & CLONE_VFORK) != 0 && (flags & CLONE_VM) != 0;
+
+        serial::serial_printf(format_args!(
+            "[CLONE] fork-style pid={} flags={:#x} exit_sig={} vfork_shared_vm={}\n",
+            ppid, flags, exit_signal, vfork_block_parent
+        ));
         let mut child_context = *context;
         child_context.rax = 0; // child sees 0 as fork() return value
-        match process::fork_process(&child_context) {
-            Some(child_pid) => {
-                crate::scheduler::enqueue_process(child_pid);
-                return child_pid as u64;
+        let child_pid = if vfork_block_parent {
+            match process::vfork_process_shared_vm(&child_context) {
+                Some(c) => c,
+                None => {
+                    serial::serial_printf(format_args!(
+                        "[CLONE] vfork shared-vm FAIL pid={}\n",
+                        ppid
+                    ));
+                    return if linux_clone_caller {
+                        linux_abi_error(11)
+                    } else {
+                        u64::MAX
+                    };
+                }
             }
-            None => {
-                serial::serial_printf(format_args!(
-                    "sys_clone: fork-style clone failed; flags={:#x} exit_signal={}\n",
-                    flags,
-                    exit_signal
-                ));
-                return u64::MAX;
+        } else {
+            match process::fork_process(&child_context) {
+                Some(c) => c,
+                None => {
+                    serial::serial_printf(format_args!(
+                        "[CLONE] fork FAIL pid={} flags={:#x} exit_signal={}\n",
+                        ppid, flags, exit_signal
+                    ));
+                    return if linux_clone_caller {
+                        linux_abi_error(11)
+                    } else {
+                        u64::MAX
+                    };
+                }
+            }
+        };
+
+        if vfork_block_parent {
+            if let Some(mut p) = process::get_process(ppid) {
+                p.vfork_waiting_for_child = Some(child_pid);
+                process::update_process(ppid, p);
             }
         }
+
+        serial::serial_printf(format_args!(
+            "[CLONE] fork ok parent={} child={}\n",
+            ppid, child_pid
+        ));
+        crate::scheduler::enqueue_process(child_pid);
+
+        if vfork_block_parent {
+            loop {
+                let released = process::get_process(ppid)
+                    .map(|p| p.vfork_waiting_for_child != Some(child_pid))
+                    .unwrap_or(true);
+                if released {
+                    break;
+                }
+                yield_cpu();
+            }
+        }
+
+        return child_pid as u64;
     }
 
     // Reject any other unknown flags to surface unexpected ABI changes early.
@@ -3673,13 +3821,25 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
         | CLONE_IO;
     if flags & !allowed != 0 {
         serial::serial_printf(format_args!(
-            "sys_clone: unsupported flags {:#x}\n",
+            "[CLONE] unsupported extra flags pid={} bad={:#x} (allowed mask ok)\n",
+            ppid,
             flags & !allowed
         ));
         return u64::MAX;
     }
 
-    serial::serial_printf(format_args!("sys_clone: flags={:#x} stack={:#x}\n", flags, stack));
+    serial::serial_printf(format_args!(
+        "[CLONE] thread-style pid={} flags={:#x} stack={:#x} set_tls={} fs_base_child={:#x}\n",
+        ppid,
+        flags,
+        stack,
+        (flags & CLONE_SETTLS) != 0,
+        if (flags & CLONE_SETTLS) != 0 {
+            context.r8
+        } else {
+            0u64
+        }
+    ));
 
     if let Some(parent_pid) = process::current_process_id() {
         if let Some(parent) = process::get_process(parent_pid) {
@@ -3769,12 +3929,39 @@ fn sys_clone(flags: u64, stack: u64, _parent_tid: u64, context: &crate::process:
                     }
                 }
 
+                let child_tgid = if (flags & CLONE_THREAD) != 0 {
+                    parent.tgid
+                } else {
+                    tid
+                };
+                serial::serial_printf(format_args!(
+                    "[CLONE] thread OK parent={} new_tid={} tgid={}\n",
+                    parent_pid, tid, child_tgid
+                ));
                 crate::scheduler::enqueue_process(tid);
                 return tid as u64;
             }
+            serial::serial_printf(format_args!(
+                "[CLONE] thread FAIL pid={} no PROCESS_TABLE slot (tid={})\n",
+                parent_pid, tid
+            ));
+        } else {
+            serial::serial_printf(format_args!(
+                "[CLONE] thread FAIL pid={} get_process(None)\n",
+                ppid
+            ));
         }
+    } else {
+        serial::serial_printf(format_args!(
+            "[CLONE] thread FAIL current_process_id None (entry logged ppid={})\n",
+            ppid
+        ));
     }
 
+    serial::serial_printf(format_args!(
+        "[CLONE] exit ERR ppid={} raw_flags={:#x}\n",
+        ppid, raw_flags
+    ));
     u64::MAX
 }
 
@@ -5753,6 +5940,10 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     // 2. Read argv[] from userspace (null-terminated array of char* pointers).
+    /// Tope acumulado de bytes copiados para argv+env en el heap del kernel (evita E2BIG-style OOM).
+    const MAX_EXECVE_ARG_ENV_BYTES: usize = 4 * 1024 * 1024;
+    let mut argv_env_byte_total: usize = 0;
+
     let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     if argv_ptr != 0 {
         let mut ptr_off: u64 = argv_ptr;
@@ -5761,15 +5952,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             let arg_ptr = unsafe { *(ptr_off as *const u64) };
             if arg_ptr == 0 { break; }
             let arg_len = strlen_user_unique(arg_ptr, 4096);
-            if arg_len == 0 || !is_user_pointer(arg_ptr, arg_len + 1) {
-                argv_strings.push(b"\0".to_vec());
+            let s = if arg_len == 0 || !is_user_pointer(arg_ptr, arg_len + 1) {
+                b"\0".to_vec()
             } else {
                 let mut s = unsafe {
                     core::slice::from_raw_parts(arg_ptr as *const u8, arg_len as usize).to_vec()
                 };
                 s.push(0); // null-terminate
-                argv_strings.push(s);
+                s
+            };
+            argv_env_byte_total = argv_env_byte_total.saturating_add(s.len());
+            if argv_env_byte_total > MAX_EXECVE_ARG_ENV_BYTES {
+                set_last_exec_error(b"execve: argv/env too large");
+                return linux_abi_error(7); // E2BIG
             }
+            argv_strings.push(s);
             ptr_off += 8;
         }
     }
@@ -5778,6 +5975,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         let base = path.rsplit('/').next().unwrap_or(path);
         let mut s = base.as_bytes().to_vec();
         s.push(0);
+        argv_env_byte_total = argv_env_byte_total.saturating_add(s.len());
+        if argv_env_byte_total > MAX_EXECVE_ARG_ENV_BYTES {
+            set_last_exec_error(b"execve: argv/env too large");
+            return linux_abi_error(7);
+        }
         argv_strings.push(s);
     }
 
@@ -5796,15 +5998,26 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 core::slice::from_raw_parts(env_ptr as *const u8, env_len as usize).to_vec()
             };
             s.push(0);
+            argv_env_byte_total = argv_env_byte_total.saturating_add(s.len());
+            if argv_env_byte_total > MAX_EXECVE_ARG_ENV_BYTES {
+                set_last_exec_error(b"execve: argv/env too large");
+                return linux_abi_error(7);
+            }
             envp_strings.push(s);
             ptr_off += 8;
         }
     }
     // Ensure minimal envp for bash if none provided.
     if envp_strings.is_empty() {
+        let minimal_bytes: usize = crate::elf_loader::MINIMAL_ENVP.iter().map(|e| e.len()).sum();
+        if argv_env_byte_total.saturating_add(minimal_bytes) > MAX_EXECVE_ARG_ENV_BYTES {
+            set_last_exec_error(b"execve: argv/env too large");
+            return linux_abi_error(7);
+        }
         for e in crate::elf_loader::MINIMAL_ENVP {
             envp_strings.push(e.to_vec());
         }
+        argv_env_byte_total = argv_env_byte_total.saturating_add(minimal_bytes);
     }
 
     // 4. Replace current process image.
@@ -5812,6 +6025,10 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Some(p) => p,
         None => return linux_abi_error(3), // ESRCH
     };
+    if let Err(msg) = crate::process::vfork_detach_mm_for_exec_if_needed(current_pid) {
+        set_last_exec_error(msg.as_bytes());
+        return linux_abi_error(12); // ENOMEM / recurso
+    }
     let res = match crate::elf_loader::replace_process_image_path(current_pid, path) {
         Ok(r) => r,
         Err(msg) => {
@@ -5853,10 +6070,36 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         serial::serial_print("\n");
         return linux_abi_error(12); // ENOMEM
     }
+    crate::process::register_post_exec_vm_as(
+        current_pid,
+        &res,
+        USER_STACK_BASE,
+        USER_STACK_SIZE as u64,
+    );
+    crate::fd::fd_ensure_stdio(current_pid);
     let stack_top = USER_STACK_BASE + USER_STACK_SIZE as u64;
+
+    // Linux vfork: el padre puede salir de `clone` solo cuando el exec está listo
+    // para saltar a userspace (no despertar si falla el stack tras `replace`).
+    crate::process::vfork_wake_parent_waiting_for_child(current_pid);
 
     // 8. Set up user stack with argv/envp/auxv and jump.
     let tls_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
+    crate::serial::serial_printf(format_args!(
+        "[EXECVE] pid={} salto userspace entry={:#x} stack_top={:#x} phdr={:#x} phnum={} tls={:#x}\n",
+        current_pid,
+        res.entry_point,
+        stack_top,
+        res.phdr_va,
+        res.phnum,
+        tls_base
+    ));
+    if let Some((at_base, at_entry)) = res.dynamic_linker {
+        crate::serial::serial_printf(format_args!(
+            "[EXECVE] pid={} intérprete AT_BASE={:#x} AT_ENTRY(main)={:#x}\n",
+            current_pid, at_base, at_entry
+        ));
+    }
     unsafe {
         crate::elf_loader::jump_to_userspace_with_argv_envp(
             &res, stack_top, &argv_strings, &envp_strings, tls_base,

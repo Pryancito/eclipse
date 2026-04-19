@@ -222,6 +222,35 @@ pub fn init() {
     crate::serial::serial_print("File descriptor system initialized\n");
 }
 
+/// Copia la tabla de FDs de `src_slot` a `dst_slot` en `FD_TABLES` y hace `dup` en cada recurso.
+/// Usado al separar un hijo vfork (`CLONE_VM`) en `exec` cuando antes compartía `fd_table_idx`
+/// con el padre.
+pub fn fd_duplicate_table_slots(src_slot: usize, dst_slot: usize) {
+    if src_slot >= MAX_FD_PROCESSES || dst_slot >= MAX_FD_PROCESSES || src_slot == dst_slot {
+        return;
+    }
+
+    let mut to_dup: [(usize, usize); MAX_FDS_PER_PROCESS] = [(0, 0); MAX_FDS_PER_PROCESS];
+    let mut dup_count = 0;
+    {
+        let mut tables = FD_TABLES.lock();
+        tables[dst_slot] = tables[src_slot];
+        for fd in 0..MAX_FDS_PER_PROCESS {
+            if tables[dst_slot].fds[fd].in_use {
+                to_dup[dup_count] = (
+                    tables[dst_slot].fds[fd].scheme_id,
+                    tables[dst_slot].fds[fd].resource_id,
+                );
+                dup_count += 1;
+            }
+        }
+    }
+
+    for i in 0..dup_count {
+        let _ = crate::scheme::dup(to_dup[i].0, to_dup[i].1);
+    }
+}
+
 /// Clone parent's fd table to child (call from fork). Child gets same open fds as parent.
 pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
     // Resolve slots before acquiring FD_TABLES to avoid lock-order issues.
@@ -290,6 +319,26 @@ pub fn fd_init_stdio(pid: ProcessId) {
             offset: 0,
             flags: 0,
         };
+    }
+}
+
+/// Si alguno de stdin/stdout/stderr no está en uso, inicializar los tres con `tty:`.
+///
+/// Tras `execve`/`exec` los FD se heredan; si el padre nunca abrió `tty:` (p. ej. fallo al
+/// spawn), `write(1)` / `write(2)` devuelven EBADF y las trazas de arranque no llegan al serial.
+pub fn fd_ensure_stdio(pid: ProcessId) {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return,
+    };
+    let need = {
+        let tables = FD_TABLES.lock();
+        !tables[pid_idx].fds[0].in_use
+            || !tables[pid_idx].fds[1].in_use
+            || !tables[pid_idx].fds[2].in_use
+    };
+    if need {
+        fd_init_stdio(pid);
     }
 }
 

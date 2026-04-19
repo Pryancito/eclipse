@@ -45,6 +45,10 @@ pub mod event {
     pub const POLLNVAL: usize = 0x020;
 }
 
+/// Tamaño máximo de región SHM (creación por defecto y `ftruncate`).
+/// Debe ser ≤ [`crate::memory::MAX_KERNEL_DMA_HEAP_ALLOC`]; ver `invariants`.
+pub const SHM_REGION_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Stat information for a resource
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -460,7 +464,7 @@ impl Scheme for ShmScheme {
                 
                 // For now, let's default to a reasonably large size (e.g. 16MB) to keep it simple
                 // until we have ftruncate.
-                let size: usize = 16 * 1024 * 1024; 
+                let size: usize = SHM_REGION_MAX_BYTES;
                 
                 #[cfg(not(test))]
                 let phys_addr_opt = crate::memory::alloc_phys_frames_contig((size / 4096) as u64);
@@ -612,7 +616,7 @@ impl Scheme for ShmScheme {
 
         // For now, our prototype allocator fixes the region to 16MB. 
         // We only allow logical truncation within this physical allocation.
-        if len > 16 * 1024 * 1024 {
+        if len > SHM_REGION_MAX_BYTES {
              return Err(error::EINVAL);
         }
         region.size = len;

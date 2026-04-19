@@ -13,6 +13,22 @@ use crate::storage::BlockDevice;
 use crate::boot::VIRTIO_DISPLAY_RESOURCE_ID;
 use alloc::vec::Vec;
 
+/// Tamaño en bytes de un framebuffer BGRA8 (`pitch = 4*width`) con tope igual a [`crate::drm::MAX_GEM_BUFFER_SIZE`].
+/// Sin esto, el syscall 517 (`gpu_alloc_display_buffer`) o EDID/host corrupto pueden pedir p. ej. 16384²×4 = **1 GiB**
+/// y el `alloc_dma_buffer` del kernel dispara el pánico `Layout { size: 1073741824, … }`.
+fn virtio_display_pitch_and_size(width: u32, height: u32) -> Option<(usize, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pitch = usize::try_from(width.checked_mul(4)?).ok()?;
+    let size_u64 = (pitch as u64).checked_mul(u64::from(height))?;
+    if size_u64 > crate::drm::MAX_GEM_BUFFER_SIZE as u64 {
+        return None;
+    }
+    let size = usize::try_from(size_u64).ok()?;
+    Some((pitch, size))
+}
+
 /// Read time stamp counter
 #[inline]
 fn rdtsc() -> u64 {
@@ -1140,6 +1156,9 @@ impl VirtIONetDevice {
     }
 }
 
+/// Tamaño máximo de payload TX (jumbo + margen). Evita `alloc_dma_buffer(data.len())` con slices enormes.
+const VIRTIO_NET_MAX_TX_BYTES: usize = 16 * 1024;
+
 impl crate::net::NetworkDevice for VirtIONetDevice {
     fn get_mac_address(&self) -> [u8; 6] {
         self.inner.lock().mac_address
@@ -1162,6 +1181,9 @@ impl crate::net::NetworkDevice for VirtIONetDevice {
 
 impl VirtIONetDeviceInner {
     unsafe fn send_packet(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() > VIRTIO_NET_MAX_TX_BYTES {
+            return Err("TX packet too large");
+        }
         let queue = self.queue_tx.as_mut().ok_or("TX queue not initialized")?;
 
         // Reclaim completed TX descriptors from the used ring to prevent the
@@ -3693,11 +3715,7 @@ pub fn set_cursor_position(x: u32, y: u32) -> bool {
 /// Internal: allocate VirtIO display buffer (used by init for primary, and by gpu_alloc)
 fn alloc_primary_display_buffer_internal() -> Option<(u64, u32, u32, usize)> {
     let (width, height) = get_gpu_display_info()?;
-    let pitch = width.wrapping_mul(4);
-    let size = (pitch as usize).wrapping_mul(height as usize);
-    if size == 0 || width == 0 || height == 0 {
-        return None;
-    }
+    let (pitch, size) = virtio_display_pitch_and_size(width, height)?;
     let (buf_ptr, buf_phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
     unsafe { core::ptr::write_bytes(buf_ptr, 0, size); }
 
@@ -3718,8 +3736,8 @@ fn alloc_primary_display_buffer_internal() -> Option<(u64, u32, u32, usize)> {
     }
     *DISPLAY_FB_PHYS.lock() = buf_phys;
     *DISPLAY_FB_SIZE.lock() = size;
-    *DISPLAY_FB_PITCH.lock() = pitch as usize;
-    Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch, size))
+    *DISPLAY_FB_PITCH.lock() = pitch;
+    Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch as u32, size))
 }
 
 /// Get primary VirtIO display info (when no GOP, kernel owns the buffer).
@@ -3737,11 +3755,7 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
         }
     }
 
-    let pitch = width.wrapping_mul(4);
-    let size = (pitch as usize).wrapping_mul(height as usize);
-    if size == 0 || width == 0 || height == 0 {
-        return None;
-    }
+    let (pitch, size) = virtio_display_pitch_and_size(width, height)?;
     let (buf_ptr, buf_phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
     unsafe { core::ptr::write_bytes(buf_ptr, 0, size); }
 
@@ -3762,8 +3776,8 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
     }
     *DISPLAY_FB_PHYS.lock() = buf_phys;
     *DISPLAY_FB_SIZE.lock() = size;
-    *DISPLAY_FB_PITCH.lock() = pitch as usize;
-    Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch, size))
+    *DISPLAY_FB_PITCH.lock() = pitch;
+    Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch as u32, size))
 }
 
 /// Present display buffer to screen: transfer guest memory to GPU and flush.

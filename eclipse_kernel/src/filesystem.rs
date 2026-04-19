@@ -20,6 +20,10 @@ pub const MAX_RECORD_SIZE: usize = 32 * 1024 * 1024;
 /// requesting a 128 MiB shared-memory pool for an 8 K display).
 pub const MAX_VIRTUAL_FILE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Tope de bytes de contenido para `read_file_alloc_inode` (comparación con padding del allocator).
+/// Debe ser ≤ [`MAX_RECORD_SIZE`]. Publicado para `invariants` y tests host.
+pub const READ_FILE_ALLOC_MAX_CONTENT: usize = 32 * 1024 * 1024;
+
 const INODE_CACHE_SIZE: usize = 128;
 
 #[derive(Clone, Copy)]
@@ -401,6 +405,9 @@ impl Filesystem {
             }
             
             if tag == tlv_tags::CONTENT {
+                if length > MAX_RECORD_SIZE {
+                    return Err("CONTENT TLV exceeds MAX_RECORD_SIZE");
+                }
                 let mut content = vec![0u8; length];
                 content.copy_from_slice(&data[offset..offset+length]);
                 return Ok(content);
@@ -1202,13 +1209,12 @@ fn read_file_alloc_inode(inode: u32) -> Result<Vec<u8>, &'static str> {
     }
     // Binarios grandes (p. ej. cargo ~50 MiB): límite propio del contenido, no del TLV de metadatos.
     // The linked_list_allocator pads every allocation size up to the next multiple of
-    // size_of::<usize>() == 8, so a file whose length is in [MAX_WHOLE_FILE_READ - 7,
-    // MAX_WHOLE_FILE_READ - 1] would be rounded up to MAX_WHOLE_FILE_READ by the allocator,
+    // size_of::<usize>() == 8, so a file whose length is in [READ_FILE_ALLOC_MAX_CONTENT - 7,
+    // READ_FILE_ALLOC_MAX_CONTENT - 1] would be rounded up to READ_FILE_ALLOC_MAX_CONTENT by the allocator,
     // producing Layout { size: 134217728, align: 8 } which exhausts the static kernel
     // heap.  Use saturating_add to avoid wrapping and compare against the limit.
-    const MAX_WHOLE_FILE_READ: usize = 32 * 1024 * 1024;
     const ALLOC_ALIGN: usize = core::mem::size_of::<usize>();
-    if len.saturating_add(ALLOC_ALIGN - 1) >= MAX_WHOLE_FILE_READ {
+    if len.saturating_add(ALLOC_ALIGN - 1) >= READ_FILE_ALLOC_MAX_CONTENT {
         return Err("File too large");
     }
     let mut buf = vec![0u8; len];
@@ -1657,10 +1663,15 @@ impl Scheme for FileSystemScheme {
             OpenFile::Virtual { path } => {
                 let path_clone = path.clone();
                 let off = offset;
+                let end = (off as usize)
+                    .checked_add(buffer.len())
+                    .ok_or(scheme_error::EINVAL)?;
+                if end > MAX_VIRTUAL_FILE_SIZE {
+                    return Err(scheme_error::EINVAL);
+                }
                 if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
                     let content = vrun.entry(path_clone).or_insert_with(alloc::vec::Vec::new);
-                    let end = off as usize + buffer.len();
                     if end > content.len() {
                         content.resize(end, 0);
                     }
@@ -1668,7 +1679,6 @@ impl Scheme for FileSystemScheme {
                 } else if is_virtual_tmp_path(&path_clone) {
                     let mut vtmp = VIRTUAL_TMP.lock();
                     let content = vtmp.entry(path_clone).or_insert_with(alloc::vec::Vec::new);
-                    let end = off as usize + buffer.len();
                     if end > content.len() {
                         content.resize(end, 0);
                     }

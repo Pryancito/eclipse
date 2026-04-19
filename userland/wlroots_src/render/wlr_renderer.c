@@ -60,12 +60,15 @@ void wlr_renderer_destroy(struct wlr_renderer *r) {
 
 const struct wlr_drm_format_set *wlr_renderer_get_texture_formats(
 		struct wlr_renderer *r, uint32_t buffer_caps) {
+	if (!r || !r->impl || !r->impl->get_texture_formats) {
+		return NULL;
+	}
 	return r->impl->get_texture_formats(r, buffer_caps);
 }
 
 const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
 		struct wlr_renderer *r) {
-	if (!r->impl->get_render_formats) {
+	if (!r || !r->impl || !r->impl->get_render_formats) {
 		return NULL;
 	}
 	return r->impl->get_render_formats(r);
