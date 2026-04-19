@@ -807,11 +807,37 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
                     }
                     return;
                 }
-                crate::serial::serial_printf(format_args!(
-                    "[PF] 8 qwords desde {} (va {:#x}); 1ª=0 encaja con call/jmp *({}) tras mmap/calloc:\n",
-                    label, base, label
-                ));
-                for i in 0..8u64 {
+                // Read the first qword first to decide the header; reuse the
+                // cached value in the loop so it is fetched only once.
+                let first_qword = crate::memory::try_read_user_u64(pt, base);
+                if matches!(first_qword, Some(0)) {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] 8 qwords desde {} (va {:#x}); 1ª=0 encaja con call/jmp *({}) tras mmap/calloc:\n",
+                        label, base, label
+                    ));
+                } else {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF] 8 qwords desde {} (va {:#x}):\n",
+                        label, base
+                    ));
+                }
+                // Print qword 0 from the cached read, then fetch the remaining 7.
+                match first_qword {
+                    Some(w) => {
+                        crate::serial::serial_printf(format_args!(
+                            "  {}+{:3}: {:#018x}\n",
+                            label, 0u64, w
+                        ));
+                    }
+                    None => {
+                        crate::serial::serial_printf(format_args!(
+                            "  {}+{:3}: <no legible>\n",
+                            label, 0u64
+                        ));
+                        return;
+                    }
+                }
+                for i in 1..8u64 {
                     let va = base.wrapping_add(i * 8);
                     match crate::memory::try_read_user_u64(pt, va) {
                         Some(w) => {
