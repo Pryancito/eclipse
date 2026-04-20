@@ -332,7 +332,7 @@ pub fn mkdir(path: &str, mode: usize) -> Result<()> {
 
 /// Wait for a child process to exit (cualquier hijo).
 pub fn waitpid(status: *mut u32) -> Result<usize> {
-    unsafe { cvt(syscall1(SYS_WAIT, status as usize)) }
+    unsafe { cvt(syscall1(SYS_WAIT4, status as usize)) }
 }
 
 /// Esperar a que termine el hijo `pid` (0 = cualquier hijo, igual que [`waitpid`]).

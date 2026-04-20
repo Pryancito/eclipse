@@ -30,12 +30,15 @@ pub(crate) static WALL_TIME_OFFSET: AtomicU64 = AtomicU64::new(0);
 #[repr(u64)]
 #[derive(Debug, Clone, Copy)]
 pub enum SyscallNumber {
+    // --- Linux x86-64 standard syscalls ---
     Read = 0,
     Write = 1,
     Open = 2,
     Close = 3,
     Stat = 4,
     Fstat = 5,
+    Lstat = 6,
+    Poll = 7,
     Lseek = 8,
     Mmap = 9,
     Mprotect = 10,
@@ -43,44 +46,118 @@ pub enum SyscallNumber {
     Brk = 12,
     SigAction = 13,
     Sigprocmask = 14,
+    RtSigreturn = 15,
     Ioctl = 16,
+    Pread64 = 17,
+    Writev = 20,
+    Access = 21,
+    Pipe = 22,
     Yield = 24,
+    Madvise = 28,
+    Dup = 32,
+    Dup2 = 33,
     Pause = 34,
     Nanosleep = 35,
     GetPid = 39,
     Socket = 41,
     Connect = 42,
     Accept = 43,
+    Sendto = 44,
+    Recvfrom = 45,
+    Sendmsg = 46,
+    Recvmsg = 47,
+    Shutdown = 48,
     Bind = 49,
     Listen = 50,
+    Getsockname = 51,
+    Getpeername = 52,
+    Socketpair = 53,
     Setsockopt = 54,
     Getsockopt = 55,
     Clone = 56,
     Fork = 57,
-    Exec = 59,
+    Vfork = 58,
+    Execve = 59,
     Exit = 60,
-    Wait = 61,
+    Wait4 = 61,
     Kill = 62,
+    Uname = 63,
+    Fcntl = 72,
+    Flock = 73,
+    Fsync = 74,
+    Fdatasync = 75,
+    Truncate = 76,
     Ftruncate = 77,
+    Getdents = 78,
+    Getcwd = 79,
+    Chdir = 80,
+    Fchdir = 81,
     Rename = 82,
     Mkdir = 83,
+    Rmdir = 84,
+    Creat = 85,
+    Link = 86,
     Unlink = 87,
-    Getppid = 110,
-    Setpgid = 109,
-    Setsid = 112,
-    SetHostName = 170,
-    ArchPrctl = 158,
-    Gettid = 186,
-    Futex = 202,
-    Getpgid = 121,
+    Symlink = 88,
+    Readlink = 89,
+    Chmod = 90,
+    Fchmod = 91,
+    Chown = 92,
+    Fchown = 93,
+    Lchown = 94,
+    Umask = 95,
+    Gettimeofday = 96,
+    Getrlimit = 97,
+    Getrusage = 98,
+    Sysinfo = 99,
     Getuid = 102,
+    Syslog = 103,
     Getgid = 104,
+    Setuid = 105,
+    Setgid = 106,
     Geteuid = 107,
     Getegid = 108,
+    Setpgid = 109,
+    Getppid = 110,
+    Getpgrp = 111,
+    Setsid = 112,
+    Setreuid = 113,
+    Setregid = 114,
+    Getresuid = 118,
+    Getresgid = 120,
+    Getpgid = 121,
+    Sigaltstack = 131,
+    ArchPrctl = 158,
+    SetHostName = 170,
+    Gettid = 186,
+    Tkill = 200,
+    Futex = 202,
+    Getdents64 = 217,
+    SetTidAddress = 218,
+    ClockGettime = 228,
+    ClockNanosleep = 230,
+    ExitGroup = 231,
+    EpollWait = 232,
+    EpollCtl = 233,
     GetLogin = 247,
+    InotifyAddWatch = 254,
+    Openat = 257,
+    Fstatat = 262,
+    Faccessat = 269,
+    Pselect6 = 270,
+    Signalfd4 = 282,
+    TimerfdCreate = 283,
+    TimerfdSettime = 286,
+    Eventfd2 = 290,
+    EpollCreate1 = 291,
+    Dup3 = 292,
+    Pipe2 = 293,
+    InotifyInit1 = 294,
+    Prlimit64 = 302,
     GetRandom = 318,
+    Membarrier = 324,
 
-    // Eclipse-specific (500+)
+    // --- Eclipse-specific (500+) ---
     Send = 500,
     Receive = 501,
     GetServiceBinary = 502,
@@ -118,18 +195,13 @@ pub enum SyscallNumber {
     RegisterLogHud = 534,
     SetTime = 535,
     SpawnWithStdio = 536,
+    ThreadCreate = 537,
+    WaitPid = 538,
     /// ELF cargado desde ruta VFS en el kernel (ver `sys_spawn_with_stdio_path`).
     SpawnWithStdioPath = 544,
     Strace = 545,
-    ThreadCreate = 537,
-    WaitPid = 538,
+    Exec = 546,
     ReceiveFast = 600,
-    EpollWait = 232,
-    EpollCtl = 233,
-    EpollCreate1 = 291,
-    Eventfd2 = 290,
-    Signalfd4 = 282,
-    Socketpair = 53,
 }
 
 
@@ -446,11 +518,6 @@ pub extern "C" fn syscall_handler(
     }
 
     // Stage 5: Dispatch
-    if syscall_num == 202 {
-         serial::serial_printf(format_args!("[SYSCALL] Dispatching futex for pid={}\n", pid));
-    }
-
-
     let ret = match syscall_num {
         // --- Linux Compatibility Syscalls (x86_64) ---
         0   => sys_read(arg1, arg2, arg3),
@@ -487,33 +554,67 @@ pub extern "C" fn syscall_handler(
         43  => sys_accept(arg1, arg2, arg3),
         46  => sys_sendmsg(arg1, arg2, arg3),
         47  => sys_recvmsg(arg1, arg2, arg3),
+        44  => sys_sendto(arg1, arg2, arg3, arg4, arg5, arg6),
+        45  => sys_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6),
+        48  => sys_shutdown(arg1, arg2),
         49  => sys_bind(arg1, arg2, arg3),
         50  => sys_listen(arg1, arg2),
+        51  => sys_getsockname(arg1, arg2, arg3),
+        52  => sys_getpeername(arg1, arg2, arg3),
         54  => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         55  => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
         56  => sys_clone(arg1, arg2, arg3, &process_context),
         57  => sys_fork(&process_context),
+        58  => sys_fork(&process_context), // vfork: behave as fork
         59  => sys_execve(arg1, arg2, arg3),
         60  => sys_exit(arg1),
         61  => sys_wait4_linux(arg1, arg2, arg3),
         62  => sys_kill(arg1, arg2),
         63  => sys_uname(arg1),
         72  => sys_fcntl(arg1, arg2, arg3),
+        73  => sys_flock(arg1, arg2),
+        74  => sys_fsync(arg1),
+        75  => sys_fdatasync(arg1),
+        76  => sys_truncate(arg1, arg2),
         77  => sys_ftruncate(arg1, arg2),
+        78  => sys_getdents64(arg1, arg2, arg3), // getdents (same format as getdents64 in Eclipse)
         79  => sys_getcwd(arg1, arg2),
         80  => sys_chdir(arg1),
         81  => sys_fchdir(arg1),
         82  => sys_rename(arg1, arg2),
         83  => sys_mkdir(arg1, arg2),
+        84  => sys_rmdir(arg1),
+        85  => sys_creat(arg1, arg2),
+        86  => sys_link(arg1, arg2),
         87  => sys_unlink(arg1),
+        88  => sys_symlink(arg1, arg2),
         89  => sys_readlink(arg1, arg2, arg3),
+        90  => sys_chmod(arg1, arg2),
+        91  => sys_fchmod(arg1, arg2),
+        92  => sys_chown(arg1, arg2, arg3),
+        93  => sys_fchown(arg1, arg2, arg3),
+        94  => sys_lchown(arg1, arg2, arg3),
+        95  => sys_umask(arg1),
+        96  => sys_gettimeofday(arg1, arg2),
+        97  => sys_getrlimit(arg1, arg2),
+        98  => sys_getrusage(arg1, arg2),
+        99  => sys_sysinfo(arg1),
+        100 => linux_abi_error(38), // times — ENOSYS stub
         102 => sys_getuid(),
+        103 => linux_abi_error(38), // syslog — ENOSYS stub
         104 => sys_getgid(),
+        105 => sys_setuid(arg1),
+        106 => sys_setgid(arg1),
         107 => sys_geteuid(),
         108 => sys_getegid(),
         109 => sys_setpgid(arg1, arg2),
         110 => sys_getppid(),
+        111 => sys_getpgrp(),
         112 => sys_setsid(),
+        113 => sys_setreuid(arg1, arg2),
+        114 => sys_setregid(arg1, arg2),
+        115 => sys_setresuid(arg1, arg2, arg3),
+        117 => sys_setresgid(arg1, arg2, arg3),
         118 => sys_getresuid(arg1, arg2, arg3),
         120 => sys_getresgid(arg1, arg2, arg3),
         121 => sys_getpgid(arg1),
@@ -525,11 +626,7 @@ pub extern "C" fn syscall_handler(
         170 => sys_sethostname(arg1, arg2),
         186 => sys_gettid(),
         200 => sys_tkill(arg1, arg2),
-        202 => {
-            crate::serial::serial_printf(format_args!("[FUTEX-RAW] num={} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}\n",
-                syscall_num, arg1, arg2, arg3, arg4, arg5, arg6));
-            sys_futex(arg1, arg2, arg3, arg4, arg5, arg6 as u32)
-        },
+        202 => sys_futex(arg1, arg2, arg3, arg4, arg5, arg6 as u32),
         218 => sys_set_tid_address(arg1),
         217 => sys_getdents64(arg1, arg2, arg3),
         228 => sys_clock_gettime(arg1, arg2),
@@ -4114,57 +4211,82 @@ struct FutexWaiter {
 
 static FUTEX_WAITERS: Mutex<alloc::vec::Vec<FutexWaiter>> = Mutex::new(alloc::vec::Vec::new());
 
-/// sys_futex - Advanced Linux-compatible Fast Userspace Mutex
+/// sys_futex — Linux-compatible fast userspace mutex (x86-64 ABI).
+///
+/// op bits:
+///   [6:0]  = command  (FUTEX_CMD_MASK = 0x7f)
+///   [7]    = FUTEX_PRIVATE_FLAG (128)
+///   [8]    = FUTEX_CLOCK_REALTIME (256)
 fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u32) -> u64 {
     use crate::process;
-    
-    let pid = process::current_process_id().unwrap_or(0);
-    let is_linux = true;
-    let cmd = op & 0x7F; // Mask out PRIVATE and CLOCKREALTIME flags
 
-    crate::serial::serial_printf(format_args!("[FUTEX] pid={} uaddr={:#x} op={:#x} val={:#x} tmo_ptr={:#x} u2={:#x} v3={:#x}\n",
-        pid, uaddr, op, val, timeout_ptr, uaddr2, val3));
+    let pid = process::current_process_id().unwrap_or(0);
+    let cmd = op & 0x7F; // strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
 
     match cmd {
-        0 | 9 => { // FUTEX_WAIT or FUTEX_WAIT_BITSET
-            let bitset = if cmd == 9 { val3 } else { 0xFFFFFFFF };
-            
-            // 1. Check value at uaddr
-            if !is_user_pointer(uaddr, 4) { return if is_linux { linux_abi_error(14) } else { u64::MAX }; }
-            let current_val = unsafe { *(uaddr as *const u32) };
-            if current_val != val as u32 {
-                return if is_linux { linux_abi_error(11) } else { 11 }; // EAGAIN
+        0 | 9 => {
+            // FUTEX_WAIT (0) / FUTEX_WAIT_BITSET (9)
+            // Block until *uaddr != val or woken by FUTEX_WAKE.
+            let bitset: u32 = if cmd == 9 { val3 } else { 0xFFFF_FFFF };
+
+            if !is_user_pointer(uaddr, 4) {
+                return linux_abi_error(14); // EFAULT
             }
 
-            // 2. Add to waiters
+            // Add ourselves to the waiter list first, then re-check the value.
+            // This ordering is important: a concurrent FUTEX_WAKE that fires between
+            // the value check and the push would be lost if we pushed after.
             {
                 let mut waiters = FUTEX_WAITERS.lock();
                 waiters.push(FutexWaiter { addr: uaddr, pid, bitset });
             }
-            
-            // 3. Block and yield
-            match process::compare_and_set_process_state(pid, process::ProcessState::Running, process::ProcessState::Blocked) {
+
+            // Re-read the futex word under our own (already-added) entry.
+            let current_val = unsafe { *(uaddr as *const u32) };
+            if current_val != val as u32 {
+                // Value already changed — remove our entry and return EAGAIN.
+                let mut waiters = FUTEX_WAITERS.lock();
+                if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
+                    waiters.remove(pos);
+                }
+                return linux_abi_error(11); // EAGAIN
+            }
+
+            // Block the current process and yield.
+            match process::compare_and_set_process_state(
+                pid,
+                process::ProcessState::Running,
+                process::ProcessState::Blocked,
+            ) {
                 Ok(true) => {
-                    // TODO: Implement timeout logic using timeout_ptr (Timespec)
+                    // TODO: honour timeout_ptr (Timespec) for timed waits.
                     crate::scheduler::yield_cpu();
-                    
-                    // After waking up, we might still be in the waiters list if we timed out 
-                    // or were woken by something else. Clean up.
+
+                    // After waking, clean up any stale waiter entry (timeout / spurious wake).
                     let mut waiters = FUTEX_WAITERS.lock();
                     if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
                         waiters.remove(pos);
                     }
                     0
                 }
-                _ => 0, // Already woken
+                _ => {
+                    // Was already woken (or state wasn't Running); remove stale entry.
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
+                        waiters.remove(pos);
+                    }
+                    0
+                }
             }
         }
-        1 | 10 => { // FUTEX_WAKE or FUTEX_WAKE_BITSET
-            let bitset = if cmd == 10 { val3 } else { 0xFFFFFFFF };
-            let mut woken = 0;
+        1 | 10 => {
+            // FUTEX_WAKE (1) / FUTEX_WAKE_BITSET (10)
+            // Wake up to `val` threads waiting on uaddr whose bitset overlaps.
+            let bitset: u32 = if cmd == 10 { val3 } else { 0xFFFF_FFFF };
+            let mut woken: u64 = 0;
             let mut waiters = FUTEX_WAITERS.lock();
             let mut i = 0;
-            while i < waiters.len() && (woken as u64) < val {
+            while i < waiters.len() && woken < val {
                 if waiters[i].addr == uaddr && (waiters[i].bitset & bitset) != 0 {
                     let waiter_pid = waiters[i].pid;
                     crate::scheduler::enqueue_process(waiter_pid);
@@ -4174,32 +4296,35 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
                     i += 1;
                 }
             }
-            woken as u64
+            woken
         }
-        3 | 4 => { // FUTEX_REQUEUE or FUTEX_CMP_REQUEUE
-            // REQUEUE: despierta 'val', mueve 'timeout_ptr' a uaddr2.
-            // CMP_REQUEUE: igual, pero solo si *uaddr == val3.
+        3 | 4 => {
+            // FUTEX_REQUEUE (3) / FUTEX_CMP_REQUEUE (4)
+            // Wake `val` threads on uaddr; requeue up to `timeout_ptr` threads to uaddr2.
+            // CMP_REQUEUE also checks that *uaddr == val3 first.
             if cmd == 4 {
-                if !is_user_pointer(uaddr, 4) { return if is_linux { linux_abi_error(14) } else { u64::MAX }; }
+                if !is_user_pointer(uaddr, 4) {
+                    return linux_abi_error(14); // EFAULT
+                }
                 let current_val = unsafe { *(uaddr as *const u32) };
                 if current_val != val3 {
-                    return if is_linux { linux_abi_error(11) } else { 11 }; // EAGAIN
+                    return linux_abi_error(11); // EAGAIN
                 }
             }
 
-            let mut woken = 0;
-            let mut requeued = 0;
-            let max_requeue = timeout_ptr as u64;
-
+            let max_requeue = timeout_ptr; // Linux ABI: timeout field carries val2 here
+            let mut woken: u64 = 0;
+            let mut requeued: u64 = 0;
             let mut waiters = FUTEX_WAITERS.lock();
             let mut i = 0;
             while i < waiters.len() {
                 if waiters[i].addr == uaddr {
-                    if (woken as u64) < val {
-                        crate::scheduler::enqueue_process(waiters[i].pid);
+                    if woken < val {
+                        let waiter_pid = waiters[i].pid;
+                        crate::scheduler::enqueue_process(waiter_pid);
                         waiters.remove(i);
                         woken += 1;
-                    } else if (requeued as u64) < max_requeue {
+                    } else if requeued < max_requeue {
                         waiters[i].addr = uaddr2;
                         requeued += 1;
                         i += 1;
@@ -4210,32 +4335,80 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
                     i += 1;
                 }
             }
-            (woken + requeued) as u64
+            woken + requeued
         }
-        5 => { // FUTEX_WAKE_OP
-            // Wake 'val' threads on uaddr1, and potentially wake 'timeout_ptr' threads on uaddr2
-            // based on an operation encoded in val3.
-            // For now, we perform a simplified wake on both to avoid blocking.
-            let mut woken = 0;
-            {
-                let mut waiters = FUTEX_WAITERS.lock();
-                let mut i = 0;
-                while i < waiters.len() && (woken as u64) < val {
-                    if waiters[i].addr == uaddr {
-                        crate::scheduler::enqueue_process(waiters[i].pid);
-                        waiters.remove(i);
-                        woken += 1;
-                    } else {
-                        i += 1;
-                    }
+        5 => {
+            // FUTEX_WAKE_OP
+            // val3 encodes: op[31:28] | cmp[27:24] | oparg[23:12] | cmparg[11:0]
+            // 1. Apply atomic operation to *uaddr2; save the old value.
+            // 2. Wake `val` waiters on uaddr.
+            // 3. If comparison(old_val, cmparg) is true, also wake `val2` waiters on uaddr2.
+            //    val2 is carried in timeout_ptr per the Linux ABI.
+            let val2 = timeout_ptr; // number of waiters to maybe wake on uaddr2
+
+            let old_val2: u32 = if is_user_pointer(uaddr2, 4) {
+                let ptr = uaddr2 as *mut u32;
+                let op_num  = (val3 >> 28) & 0xF;
+                let cmp     = (val3 >> 24) & 0xF;
+                let oparg   = ((val3 >> 12) & 0xFFF) as u32;
+                let cmparg  = (val3 & 0xFFF) as u32;
+
+                // Determine the actual oparg (may be a shift amount).
+                let effective_oparg = if op_num & 8 != 0 { 1u32 << (oparg & 31) } else { oparg };
+
+                let old = unsafe { core::ptr::read_volatile(ptr) };
+                let new_val = match op_num & 7 {
+                    0 => effective_oparg,                  // FUTEX_OP_SET
+                    1 => old.wrapping_add(effective_oparg),// FUTEX_OP_ADD
+                    2 => old | effective_oparg,            // FUTEX_OP_OR
+                    3 => old & !effective_oparg,           // FUTEX_OP_ANDN
+                    4 => old ^ effective_oparg,            // FUTEX_OP_XOR
+                    _ => old,
+                };
+                unsafe { core::ptr::write_volatile(ptr, new_val) };
+
+                // Evaluate comparison against the OLD value.
+                let cmp_ok = match cmp {
+                    0 => old == cmparg,  // FUTEX_OP_CMP_EQ
+                    1 => old != cmparg,  // FUTEX_OP_CMP_NE
+                    2 => old <  cmparg,  // FUTEX_OP_CMP_LT
+                    3 => old <= cmparg,  // FUTEX_OP_CMP_LE
+                    4 => old >  cmparg,  // FUTEX_OP_CMP_GT
+                    5 => old >= cmparg,  // FUTEX_OP_CMP_GE
+                    _ => false,
+                };
+
+                if cmp_ok { old } else { u32::MAX } // sentinel: MAX means "don't wake uaddr2"
+            } else {
+                u32::MAX
+            };
+
+            let do_wake_uaddr2 = old_val2 != u32::MAX;
+
+            let mut woken: u64 = 0;
+            let mut waiters = FUTEX_WAITERS.lock();
+
+            // Wake up to `val` threads on uaddr.
+            let mut i = 0;
+            while i < waiters.len() && woken < val {
+                if waiters[i].addr == uaddr {
+                    let waiter_pid = waiters[i].pid;
+                    crate::scheduler::enqueue_process(waiter_pid);
+                    waiters.remove(i);
+                    woken += 1;
+                } else {
+                    i += 1;
                 }
-                
-                let mut woken2 = 0;
-                let val2 = timeout_ptr as u64;
+            }
+
+            // Conditionally wake up to `val2` threads on uaddr2.
+            if do_wake_uaddr2 {
+                let mut woken2: u64 = 0;
                 let mut i = 0;
-                while i < waiters.len() && (woken2 as u64) < val2 {
+                while i < waiters.len() && woken2 < val2 {
                     if waiters[i].addr == uaddr2 {
-                        crate::scheduler::enqueue_process(waiters[i].pid);
+                        let waiter_pid = waiters[i].pid;
+                        crate::scheduler::enqueue_process(waiter_pid);
                         waiters.remove(i);
                         woken2 += 1;
                     } else {
@@ -4244,11 +4417,26 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
                 }
                 woken += woken2;
             }
-            woken as u64
+            woken
         }
-        _ => {
-            if is_linux { linux_abi_error(38) } else { u64::MAX } // ENOSYS
+        6 => {
+            // FUTEX_LOCK_PI — priority-inheritance locking (best-effort stub).
+            // Return ENOSYS so the caller falls back to a non-PI path.
+            linux_abi_error(38) // ENOSYS
         }
+        7 => {
+            // FUTEX_UNLOCK_PI — priority-inheritance unlock (best-effort stub).
+            linux_abi_error(38) // ENOSYS
+        }
+        8 => {
+            // FUTEX_TRYLOCK_PI (best-effort stub).
+            linux_abi_error(38) // ENOSYS
+        }
+        11 | 12 => {
+            // FUTEX_WAIT_REQUEUE_PI / FUTEX_CMP_REQUEUE_PI (best-effort stubs).
+            linux_abi_error(38) // ENOSYS
+        }
+        _ => linux_abi_error(38), // ENOSYS
     }
 }
 
@@ -6649,3 +6837,268 @@ fn sys_inotify_add_watch(fd: u64, _path: u64, _mask: u64) -> u64 {
     serial::serial_printf(format_args!("[SYSCALL] inotify_add_watch(fd={}) stub\n", fd));
     1 // Dummy watch descriptor
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux-compatible stubs added for full x86-64 ABI coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// sys_sendto — send a message to a specific destination address.
+/// Falls back to sys_write when dest_addr is NULL (connected socket).
+fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, dest_addr: u64, _addrlen: u64) -> u64 {
+    if dest_addr == 0 {
+        // Connected socket: behave like write.
+        sys_write(fd, buf_ptr, len)
+    } else {
+        // Unconnected socket with destination — not yet implemented; treat as write.
+        sys_write(fd, buf_ptr, len)
+    }
+}
+
+/// sys_recvfrom — receive a message and optionally record the sender address.
+/// Falls back to sys_read; source address output is left zero-filled.
+fn sys_recvfrom(fd: u64, buf_ptr: u64, len: u64, _flags: u64, src_addr: u64, addrlen_ptr: u64) -> u64 {
+    let ret = sys_read(fd, buf_ptr, len);
+    // Zero-fill the source address if provided.
+    if src_addr != 0 && addrlen_ptr != 0 && is_user_pointer(addrlen_ptr, 4) {
+        let addrlen = unsafe { *(addrlen_ptr as *const u32) } as u64;
+        if addrlen > 0 && is_user_pointer(src_addr, addrlen) {
+            unsafe { core::ptr::write_bytes(src_addr as *mut u8, 0, addrlen as usize) };
+        }
+    }
+    ret
+}
+
+/// sys_shutdown — shut down part or all of a full-duplex connection.
+fn sys_shutdown(_sockfd: u64, _how: u64) -> u64 {
+    0 // Stub: pretend success
+}
+
+/// sys_getsockname — get the current address of a socket.
+fn sys_getsockname(fd: u64, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
+    if addr_ptr == 0 || addrlen_ptr == 0 { return linux_abi_error(14); } // EFAULT
+    if !is_user_pointer(addrlen_ptr, 4) { return linux_abi_error(14); }
+    let addrlen = unsafe { *(addrlen_ptr as *const u32) } as u64;
+    if addrlen > 0 && is_user_pointer(addr_ptr, addrlen) {
+        unsafe { core::ptr::write_bytes(addr_ptr as *mut u8, 0, addrlen as usize) };
+    }
+    0
+}
+
+/// sys_getpeername — get the address of the peer connected to a socket.
+fn sys_getpeername(fd: u64, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
+    sys_getsockname(fd, addr_ptr, addrlen_ptr)
+}
+
+/// sys_flock — apply or remove an advisory lock on an open file.
+/// Stub: always succeeds (Eclipse uses advisory locking at VFS level).
+fn sys_flock(_fd: u64, _operation: u64) -> u64 { 0 }
+
+/// sys_fsync — flush in-core state of a file to storage.
+fn sys_fsync(_fd: u64) -> u64 { 0 }
+
+/// sys_fdatasync — flush file data (but not metadata) to storage.
+fn sys_fdatasync(_fd: u64) -> u64 { 0 }
+
+/// sys_truncate — truncate a file to a specified length by path.
+fn sys_truncate(path_ptr: u64, length: u64) -> u64 {
+    // Open the file, ftruncate it, then close.
+    let fd = sys_open(path_ptr, 1 | (1 << 9), 0); // O_WRONLY | O_CREAT-ish; just need write
+    if fd >= 0xFFFF_FFFF_FFFF_F000 { return fd; } // propagate error
+    let ret = sys_ftruncate(fd, length);
+    sys_close(fd);
+    ret
+}
+
+/// sys_rmdir — delete a directory.
+fn sys_rmdir(path_ptr: u64) -> u64 {
+    // Reuse unlink — the VFS scheme handles empty-directory removal.
+    sys_unlink(path_ptr)
+}
+
+/// sys_creat — open (or create + truncate) a file, return fd.
+/// Equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
+fn sys_creat(path_ptr: u64, mode: u64) -> u64 {
+    // O_CREAT=0x40, O_WRONLY=0x1, O_TRUNC=0x200
+    sys_open(path_ptr, 0x241, mode)
+}
+
+/// sys_link — create a hard link (not fully supported; stub returns EPERM).
+fn sys_link(_oldpath: u64, _newpath: u64) -> u64 {
+    linux_abi_error(1) // EPERM — hard links not implemented
+}
+
+/// sys_symlink — create a symbolic link (stub; returns EPERM).
+fn sys_symlink(_target: u64, _linkpath: u64) -> u64 {
+    linux_abi_error(1) // EPERM — symlinks not implemented
+}
+
+/// sys_chmod — change permissions of a file by path (stub; always succeeds).
+fn sys_chmod(_path_ptr: u64, _mode: u64) -> u64 { 0 }
+
+/// sys_fchmod — change permissions of an open file (stub; always succeeds).
+fn sys_fchmod(_fd: u64, _mode: u64) -> u64 { 0 }
+
+/// sys_chown — change ownership of a file by path (stub; always succeeds).
+fn sys_chown(_path_ptr: u64, _uid: u64, _gid: u64) -> u64 { 0 }
+
+/// sys_fchown — change ownership of an open file (stub; always succeeds).
+fn sys_fchown(_fd: u64, _uid: u64, _gid: u64) -> u64 { 0 }
+
+/// sys_lchown — change ownership of a symlink (stub; always succeeds).
+fn sys_lchown(_path_ptr: u64, _uid: u64, _gid: u64) -> u64 { 0 }
+
+/// sys_umask — set file creation mask. Returns the previous mask (022).
+fn sys_umask(_mask: u64) -> u64 { 0o022 }
+
+#[repr(C)]
+struct Timeval {
+    tv_sec:  i64,
+    tv_usec: i64,
+}
+
+/// sys_gettimeofday — get current time as struct timeval.
+fn sys_gettimeofday(tv_ptr: u64, _tz_ptr: u64) -> u64 {
+    if tv_ptr != 0 && is_user_pointer(tv_ptr, core::mem::size_of::<Timeval>() as u64) {
+        let ticks = crate::interrupts::ticks();
+        let wall_offset = WALL_TIME_OFFSET.load(Ordering::Relaxed);
+        let sec  = wall_offset + ticks / 1000;
+        let usec = (ticks % 1000) * 1000;
+        unsafe {
+            let tv = tv_ptr as *mut Timeval;
+            (*tv).tv_sec  = sec as i64;
+            (*tv).tv_usec = usec as i64;
+        }
+    }
+    0
+}
+
+#[repr(C)]
+struct RLimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// sys_getrlimit — get resource limits.
+fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> u64 {
+    if rlim_ptr == 0 || !is_user_pointer(rlim_ptr, core::mem::size_of::<RLimit>() as u64) {
+        return linux_abi_error(14); // EFAULT
+    }
+    let (soft, hard): (u64, u64) = match resource {
+        0  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_CPU
+        1  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_FSIZE
+        2  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_DATA
+        3  => (8 * 1024 * 1024, RLIM_INFINITY), // RLIMIT_STACK (8 MiB default)
+        4  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_CORE
+        5  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_RSS
+        6  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_NPROC
+        7  => (1024, 1024),                   // RLIMIT_NOFILE
+        8  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_MEMLOCK
+        9  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_AS
+        10 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_LOCKS
+        11 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_SIGPENDING
+        12 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_MSGQUEUE
+        13 => (0, 0),                         // RLIMIT_NICE
+        14 => (0, 0),                         // RLIMIT_RTPRIO
+        15 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_RTTIME
+        _  => (RLIM_INFINITY, RLIM_INFINITY),
+    };
+    unsafe {
+        let rl = rlim_ptr as *mut RLimit;
+        (*rl).rlim_cur = soft;
+        (*rl).rlim_max = hard;
+    }
+    0
+}
+
+#[repr(C)]
+struct Rusage {
+    ru_utime:    Timeval,
+    ru_stime:    Timeval,
+    ru_maxrss:   i64,
+    ru_ixrss:    i64,
+    ru_idrss:    i64,
+    ru_isrss:    i64,
+    ru_minflt:   i64,
+    ru_majflt:   i64,
+    ru_nswap:    i64,
+    ru_inblock:  i64,
+    ru_oublock:  i64,
+    ru_msgsnd:   i64,
+    ru_msgrcv:   i64,
+    ru_nsignals: i64,
+    ru_nvcsw:    i64,
+    ru_nivcsw:   i64,
+}
+
+/// sys_getrusage — get resource usage. Returns zeroed struct (stub).
+fn sys_getrusage(_who: u64, rusage_ptr: u64) -> u64 {
+    if rusage_ptr == 0 || !is_user_pointer(rusage_ptr, core::mem::size_of::<Rusage>() as u64) {
+        return linux_abi_error(14); // EFAULT
+    }
+    unsafe { core::ptr::write_bytes(rusage_ptr as *mut u8, 0, core::mem::size_of::<Rusage>()) };
+    0
+}
+
+#[repr(C)]
+struct SysinfoStruct {
+    uptime:    i64,
+    loads:     [u64; 3],
+    totalram:  u64,
+    freeram:   u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap:  u64,
+    procs:     u16,
+    _pad:      [u8; 6],
+    totalhigh: u64,
+    freehigh:  u64,
+    mem_unit:  u32,
+    _pad2:     [u8; 20],
+}
+
+/// sys_sysinfo — return system information.
+fn sys_sysinfo(info_ptr: u64) -> u64 {
+    if info_ptr == 0 || !is_user_pointer(info_ptr, core::mem::size_of::<SysinfoStruct>() as u64) {
+        return linux_abi_error(14); // EFAULT
+    }
+    let ticks = crate::interrupts::ticks();
+    let (pool_total, pool_used) = crate::memory::get_memory_stats();
+    let boot_bi = crate::boot::get_boot_info();
+    let total_ram = if boot_bi.conventional_mem_total_bytes > 0 {
+        boot_bi.conventional_mem_total_bytes
+    } else {
+        pool_total * 4096
+    };
+    let free_ram = total_ram.saturating_sub(pool_used * 4096);
+
+    unsafe {
+        let si = info_ptr as *mut SysinfoStruct;
+        core::ptr::write_bytes(si as *mut u8, 0, core::mem::size_of::<SysinfoStruct>());
+        (*si).uptime   = (ticks / 1000) as i64;
+        (*si).totalram = total_ram;
+        (*si).freeram  = free_ram;
+        (*si).mem_unit = 1;
+    }
+    0
+}
+
+/// sys_setuid — set user ID (stub; Eclipse runs as root, always succeeds).
+fn sys_setuid(_uid: u64) -> u64 { 0 }
+
+/// sys_setgid — set group ID (stub; Eclipse runs as root, always succeeds).
+fn sys_setgid(_gid: u64) -> u64 { 0 }
+
+/// sys_setreuid — set real and effective user IDs (stub).
+fn sys_setreuid(_ruid: u64, _euid: u64) -> u64 { 0 }
+
+/// sys_setregid — set real and effective group IDs (stub).
+fn sys_setregid(_rgid: u64, _egid: u64) -> u64 { 0 }
+
+/// sys_setresuid — set real, effective, and saved user IDs (stub).
+fn sys_setresuid(_ruid: u64, _euid: u64, _suid: u64) -> u64 { 0 }
+
+/// sys_setresgid — set real, effective, and saved group IDs (stub).
+fn sys_setresgid(_rgid: u64, _egid: u64, _sgid: u64) -> u64 { 0 }
