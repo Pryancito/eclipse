@@ -5286,34 +5286,53 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
     if total_cap == 0 { return 0; }
 
     // ── Read from socket connection buffer ──────────────────────────────────
+    const MSG_DONTWAIT: u64 = 0x40;
+    let nonblock = (flags & MSG_DONTWAIT) != 0;
+
     let (n_read, fd_pairs_opt) = if let Some(pid) = current_process_id() {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             if let Some(scheme) = crate::servers::get_socket_scheme() {
                 let mut tmp = alloc::vec![0u8; total_cap];
-                match scheme.socket_read_raw(fd_info.resource_id, &mut tmp) {
-                    Ok(n) => {
-                        // Scatter bytes into iovec entries.
-                        let mut written = 0usize;
-                        for i in 0..max_iov {
-                            if written >= n { break; }
-                            let iov_entry = msg_iov_ptr + (i as u64) * 16;
-                            if !is_user_pointer(iov_entry, 16) { break; }
-                            let iov_base = unsafe { *(iov_entry as *const u64) };
-                            let iov_len  = unsafe { *((iov_entry + 8) as *const u64) } as usize;
-                            if iov_base == 0 || iov_len == 0 { continue; }
-                            if !is_user_pointer(iov_base, iov_len as u64) { continue; }
-                            let chunk = (n - written).min(iov_len);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    tmp[written..].as_ptr(),
-                                    iov_base as *mut u8,
-                                    chunk,
-                                );
+                // Blocking loop: retry with a yield until data arrives or an error occurs.
+                let result = loop {
+                    match scheme.socket_read_raw(fd_info.resource_id, &mut tmp) {
+                        Ok(n) => {
+                            // Scatter bytes into iovec entries.
+                            let mut written = 0usize;
+                            for i in 0..max_iov {
+                                if written >= n { break; }
+                                let iov_entry = msg_iov_ptr + (i as u64) * 16;
+                                if !is_user_pointer(iov_entry, 16) { break; }
+                                let iov_base = unsafe { *(iov_entry as *const u64) };
+                                let iov_len  = unsafe { *((iov_entry + 8) as *const u64) } as usize;
+                                if iov_base == 0 || iov_len == 0 { continue; }
+                                if !is_user_pointer(iov_base, iov_len as u64) { continue; }
+                                let chunk = (n - written).min(iov_len);
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        tmp[written..].as_ptr(),
+                                        iov_base as *mut u8,
+                                        chunk,
+                                    );
+                                }
+                                written += chunk;
                             }
-                            written += chunk;
+                            break Ok((written, scheme.socket_dequeue_fds(fd_info.resource_id)));
                         }
-                        (written, scheme.socket_dequeue_fds(fd_info.resource_id))
+                        Err(e) if e == crate::scheme::error::EAGAIN && !nonblock => {
+                            // No data yet on a blocking socket — yield and retry.
+                            // Safety: `scheme` is an Arc (reference count), not a lock guard.
+                            // The fd table holding the Arc persists across yields, so the
+                            // SocketScheme object remains alive for the lifetime of this call.
+                            crate::scheduler::yield_cpu();
+                            // socket_read_raw re-acquires its internal mutex on each call,
+                            // allowing other threads/processes to write to the socket.
+                        }
+                        Err(e) => break Err(e),
                     }
+                };
+                match result {
+                    Ok(pair) => pair,
                     Err(e) => return linux_abi_error(e as i32),
                 }
             } else { return linux_abi_error(38); }

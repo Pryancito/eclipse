@@ -5,6 +5,9 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 
+/// Virtual encoder ID used for the single simulated display path (encoder → CRTC 200).
+const VIRTUAL_ENCODER_ID: u32 = 101;
+
 /// DRM Scheme implementation
 pub struct DrmScheme;
 
@@ -81,21 +84,26 @@ impl Scheme for DrmScheme {
         // DRM IOCTL ranges usually start with 0x64 ('d')
         // Standard codes:
         const DRM_IOCTL_GET_CAP: u32 = 0xC0106405;
+        const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010641D;
         const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC02064B2;
         const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
         const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
+        const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC08064B8;
         const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
         const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086444;
         const DRM_IOCTL_MODE_DESTROYFB: u32 = 0xC00464AF;
         const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
         const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
         const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+        const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
         const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
         const DRM_IOCTL_MODE_CURSOR: u32 = 0xC01C64A3;
         const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
         const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
         const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC04464B7;
         const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+        const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC01064AC;
+        const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC01C64B9;
         const DRM_IOCTL_VERSION: u32 = 0xC0406400;
         const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
 
@@ -151,13 +159,31 @@ impl Scheme for DrmScheme {
                 let cap = unsafe { &mut *(arg as *mut DrmGetCap) };
                 if let Some(drm_caps) = drm::get_caps() {
                     match cap.capability {
-                        1 => cap.value = if drm_caps.has_cursor { 1 } else { 0 }, // DRM_CAP_CURSOR_WIDTH (oversimplified)
-                        3 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
+                        1 => cap.value = if drm_caps.has_cursor { 1 } else { 0 }, // DRM_CAP_CURSOR_BITMAP
+                        3 => cap.value = 1, // DRM_CAP_DUMB_BUFFER: dumb (CPU-mapped) buffers supported
+                        5 => cap.value = 0, // DRM_CAP_PRIME: buffer sharing not supported (software renderer)
+                        6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
+                        8 => cap.value = drm_caps.max_width as u64,  // DRM_CAP_CURSOR_WIDTH
+                        9 => cap.value = drm_caps.max_height as u64, // DRM_CAP_CURSOR_HEIGHT
+                        0xB => cap.value = 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
+                        0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS: no format modifier support
                         _ => cap.value = 0,
                     }
                     Ok(0)
                 } else {
                     Err(scheme_error::EIO)
+                }
+            }
+            DRM_IOCTL_SET_CLIENT_CAP => {
+                // struct drm_set_client_cap { uint64_t capability; uint64_t value; }
+                let cap_ptr = arg as *const u64;
+                let capability = unsafe { *cap_ptr };
+                match capability {
+                    // DRM_CLIENT_CAP_STEREO_3D (1), DRM_CLIENT_CAP_UNIVERSAL_PLANES (2),
+                    // DRM_CLIENT_CAP_ATOMIC (3), DRM_CLIENT_CAP_ASPECT_RATIO (4),
+                    // DRM_CLIENT_CAP_WRITEBACK_CONNECTORS (5)
+                    1..=5 => Ok(0),
+                    _ => Err(scheme_error::EINVAL),
                 }
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
@@ -270,7 +296,8 @@ impl Scheme for DrmScheme {
                 }
                 let res = unsafe { &mut *(arg as *mut DrmModeCardRes) };
                 let (fbs, crtcs, connectors) = drm::get_resources();
-                
+                let encoders: [u32; 1] = [VIRTUAL_ENCODER_ID];
+
                 // Copy IDs if pointers are non-null and counts match
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
                     unsafe { core::ptr::copy_nonoverlapping(fbs.as_ptr(), res.fb_id_ptr as *mut u32, fbs.len()); }
@@ -281,16 +308,21 @@ impl Scheme for DrmScheme {
                 if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
                     unsafe { core::ptr::copy_nonoverlapping(connectors.as_ptr(), res.connector_id_ptr as *mut u32, connectors.len()); }
                 }
+                if res.encoder_id_ptr != 0 && res.count_encoders >= encoders.len() as u32 {
+                    unsafe { core::ptr::copy_nonoverlapping(encoders.as_ptr(), res.encoder_id_ptr as *mut u32, encoders.len()); }
+                }
 
                 res.count_fbs = fbs.len() as u32;
                 res.count_crtcs = crtcs.len() as u32;
                 res.count_connectors = connectors.len() as u32;
-                res.count_encoders = 0;
-                
+                res.count_encoders = encoders.len() as u32;
+
                 if let Some(caps) = drm::get_caps() {
                     res.max_width = caps.max_width;
                     res.max_height = caps.max_height;
                 }
+                res.min_width = 0;
+                res.min_height = 0;
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETCONNECTOR => {
@@ -307,9 +339,83 @@ impl Scheme for DrmScheme {
                     conn.mm_width = d_conn.mm_width;
                     conn.mm_height = d_conn.mm_height;
                     conn.connector_type = 11; // DRM_MODE_CONNECTOR_eDP
-                    conn.count_modes = 0;
+                    conn.connector_type_id = 1;
+                    conn.encoder_id = VIRTUAL_ENCODER_ID; // Virtual encoder linked to CRTC 200
+
+                    // Populate one preferred mode using the framebuffer dimensions
+                    let (fb_width, fb_height) = crate::boot::get_fb_info()
+                        .map(|(_, w, h, _, _, _)| (w, h))
+                        .unwrap_or((1920, 1080));
+
+                    // Build a drm_mode_modeinfo (68 bytes) for the preferred mode.
+                    // Layout: clock(u32), h*(u16 x5), v*(u16 x5), vrefresh(u32), flags(u32),
+                    //         type(u32), name([u8;32])
+                    // Approximate clock = htotal * vtotal * 60 / 1000 kHz
+                    // Approximate horizontal total = hdisplay + ~12% blanking (typical CVT/GTF value).
+                    // Approximate vertical total = vdisplay + ~5% blanking.
+                    let htotal = fb_width + fb_width / 8;  // ~12.5% horizontal blanking
+                    let vtotal = fb_height + fb_height / 20; // ~5% vertical blanking
+                    let clock_khz = (htotal as u64 * vtotal as u64 * 60 / 1000) as u32;
+                    let hsync_start = (fb_width + 8) as u16;
+                    let hsync_end   = (fb_width + 40) as u16;
+                    let vsync_start = (fb_height + 3) as u16;
+                    let vsync_end   = (fb_height + 8) as u16;
+
+                    #[repr(C, packed)]
+                    struct ModeInfo {
+                        clock:       u32,
+                        hdisplay:    u16, hsync_start: u16, hsync_end: u16,
+                        htotal:      u16, hskew: u16,
+                        vdisplay:    u16, vsync_start: u16, vsync_end: u16,
+                        vtotal:      u16, vscan: u16,
+                        vrefresh:    u32,
+                        flags:       u32,
+                        mode_type:   u32,
+                        name:        [u8; 32],
+                    }
+
+                    let mut mode_name = [0u8; 32];
+                    let name_str = alloc::format!("{}x{}", fb_width, fb_height);
+                    let name_bytes = name_str.as_bytes();
+                    let copy_len = core::cmp::min(name_bytes.len(), 31);
+                    mode_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+                    let mode = ModeInfo {
+                        clock:       clock_khz,
+                        hdisplay:    fb_width as u16,
+                        hsync_start,
+                        hsync_end,
+                        htotal:      htotal as u16,
+                        hskew:       0,
+                        vdisplay:    fb_height as u16,
+                        vsync_start,
+                        vsync_end,
+                        vtotal:      vtotal as u16,
+                        vscan:       0,
+                        vrefresh:    60,
+                        flags:       0x5, // DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC
+                        mode_type:   0x48, // DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED
+                        name:        mode_name,
+                    };
+
+                    if conn.modes_ptr != 0 && conn.count_modes >= 1 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                &mode as *const ModeInfo as *const u8,
+                                conn.modes_ptr as *mut u8,
+                                core::mem::size_of::<ModeInfo>(),
+                            );
+                        }
+                    }
+                    conn.count_modes = 1;
+
+                    // Populate encoder list
+                    let enc_id: u32 = VIRTUAL_ENCODER_ID;
+                    if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
+                        unsafe { (conn.encoders_ptr as *mut u32).write_unaligned(enc_id); }
+                    }
+                    conn.count_encoders = 1;
                     conn.count_props = 0;
-                    conn.count_encoders = 0;
                     Ok(0)
                 } else {
                     Err(scheme_error::ENOENT)
@@ -325,8 +431,8 @@ impl Scheme for DrmScheme {
                     possible_clones: u32,
                 }
                 let enc = unsafe { &mut *(arg as *mut DrmModeGetEncoder) };
-                // Virtual encoder 101, linked to CRTC 200 (from simplefb resources)
-                if enc.encoder_id == 101 {
+                // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 200 (from simplefb resources)
+                if enc.encoder_id == VIRTUAL_ENCODER_ID {
                     enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
                     enc.crtc_id = 200;
                     enc.possible_crtcs = 1;
@@ -354,6 +460,21 @@ impl Scheme for DrmScheme {
                 } else {
                     Err(scheme_error::ENOENT)
                 }
+            }
+            DRM_IOCTL_MODE_SETCRTC => {
+                #[repr(C)]
+                struct DrmModeCrtc {
+                    set_connectors_ptr: u64, count_connectors: u32,
+                    crtc_id: u32, fb_id: u32, x: u32, y: u32,
+                    gamma_size: u32, mode_valid: u32,
+                    mode: [u8; 68], // drm_mode_modeinfo
+                }
+                let crtc = unsafe { &*(arg as *const DrmModeCrtc) };
+                // If a framebuffer is specified, perform the page flip to display it
+                if crtc.fb_id != 0 {
+                    drm::page_flip(crtc.fb_id);
+                }
+                Ok(0)
             }
             DRM_IOCTL_WAIT_VBLANK => {
                 #[repr(C)]
@@ -465,6 +586,53 @@ impl Scheme for DrmScheme {
                     p.count_enum_blobs = 0;
                     Ok(0)
                 }
+            }
+            DRM_IOCTL_MODE_ADDFB2 => {
+                // struct drm_mode_fb_cmd2: fb_id(u32), width(u32), height(u32),
+                // pixel_format(u32), flags(u32), handles[4](u32), pitches[4](u32),
+                // offsets[4](u32), modifier[4](u64)
+                #[repr(C)]
+                struct DrmModeFbCmd2 {
+                    fb_id: u32,
+                    width: u32,
+                    height: u32,
+                    pixel_format: u32,
+                    flags: u32,
+                    handles: [u32; 4],
+                    pitches: [u32; 4],
+                    offsets: [u32; 4],
+                    modifier: [u64; 4],
+                }
+                let cmd = unsafe { &mut *(arg as *mut DrmModeFbCmd2) };
+                // Use the first handle/pitch (primary plane)
+                let handle = cmd.handles[0];
+                let pitch = cmd.pitches[0];
+                if let Some(fb_id) = drm::create_fb(handle, cmd.width, cmd.height, pitch) {
+                    cmd.fb_id = fb_id;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::EIO)
+                }
+            }
+            DRM_IOCTL_MODE_GETPROPBLOB => {
+                // struct drm_mode_get_blob { uint32_t blob_id; uint32_t length; uint64_t data; }
+                // Return blob not found for any unknown blob id
+                #[repr(C)]
+                struct DrmModeGetBlob { blob_id: u32, length: u32, data: u64 }
+                let blob = unsafe { &mut *(arg as *mut DrmModeGetBlob) };
+                blob.length = 0;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                // struct drm_mode_obj_get_properties { props_ptr(u64), values_ptr(u64), count_props(u32), obj_id(u32), obj_type(u32) }
+                #[repr(C)]
+                struct DrmModeObjGetProperties {
+                    props_ptr: u64, values_ptr: u64,
+                    count_props: u32, obj_id: u32, obj_type: u32,
+                }
+                let props = unsafe { &mut *(arg as *mut DrmModeObjGetProperties) };
+                props.count_props = 0;
+                Ok(0)
             }
             _ => {
                 Err(scheme_error::ENOSYS)
