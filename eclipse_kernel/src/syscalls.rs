@@ -4346,7 +4346,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
             //    val2 is carried in timeout_ptr per the Linux ABI.
             let val2 = timeout_ptr; // number of waiters to maybe wake on uaddr2
 
-            let old_val2: u32 = if is_user_pointer(uaddr2, 4) {
+            let old_val2: Option<(u32, bool)> = if is_user_pointer(uaddr2, 4) {
                 let ptr = uaddr2 as *mut u32;
                 let op_num  = (val3 >> 28) & 0xF;
                 let cmp     = (val3 >> 24) & 0xF;
@@ -4378,12 +4378,12 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
                     _ => false,
                 };
 
-                if cmp_ok { old } else { u32::MAX } // sentinel: MAX means "don't wake uaddr2"
+                Some((old, cmp_ok))
             } else {
-                u32::MAX
+                None
             };
 
-            let do_wake_uaddr2 = old_val2 != u32::MAX;
+            let do_wake_uaddr2 = old_val2.map_or(false, |(_, cmp_ok)| cmp_ok);
 
             let mut woken: u64 = 0;
             let mut waiters = FUTEX_WAITERS.lock();
@@ -6901,8 +6901,9 @@ fn sys_fdatasync(_fd: u64) -> u64 { 0 }
 
 /// sys_truncate — truncate a file to a specified length by path.
 fn sys_truncate(path_ptr: u64, length: u64) -> u64 {
-    // Open the file, ftruncate it, then close.
-    let fd = sys_open(path_ptr, 1 | (1 << 9), 0); // O_WRONLY | O_CREAT-ish; just need write
+    const O_WRONLY: u64 = 0x1;
+    // Open for write, ftruncate, then close.
+    let fd = sys_open(path_ptr, O_WRONLY, 0);
     if fd >= 0xFFFF_FFFF_FFFF_F000 { return fd; } // propagate error
     let ret = sys_ftruncate(fd, length);
     sys_close(fd);
@@ -6918,8 +6919,10 @@ fn sys_rmdir(path_ptr: u64) -> u64 {
 /// sys_creat — open (or create + truncate) a file, return fd.
 /// Equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
 fn sys_creat(path_ptr: u64, mode: u64) -> u64 {
-    // O_CREAT=0x40, O_WRONLY=0x1, O_TRUNC=0x200
-    sys_open(path_ptr, 0x241, mode)
+    const O_CREAT:  u64 = 0x40;
+    const O_WRONLY: u64 = 0x1;
+    const O_TRUNC:  u64 = 0x200;
+    sys_open(path_ptr, O_CREAT | O_WRONLY | O_TRUNC, mode)
 }
 
 /// sys_link — create a hard link (not fully supported; stub returns EPERM).
@@ -6979,6 +6982,10 @@ struct RLimit {
 }
 
 const RLIM_INFINITY: u64 = u64::MAX;
+/// Default soft stack limit (8 MiB, matching Linux default).
+const DEFAULT_STACK_LIMIT: u64 = 8 * 1024 * 1024;
+/// Maximum number of open file descriptors per process.
+const MAX_OPEN_FILES: u64 = 1024;
 
 /// sys_getrlimit — get resource limits.
 fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> u64 {
@@ -6986,22 +6993,22 @@ fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> u64 {
         return linux_abi_error(14); // EFAULT
     }
     let (soft, hard): (u64, u64) = match resource {
-        0  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_CPU
-        1  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_FSIZE
-        2  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_DATA
-        3  => (8 * 1024 * 1024, RLIM_INFINITY), // RLIMIT_STACK (8 MiB default)
-        4  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_CORE
-        5  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_RSS
-        6  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_NPROC
-        7  => (1024, 1024),                   // RLIMIT_NOFILE
-        8  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_MEMLOCK
-        9  => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_AS
-        10 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_LOCKS
-        11 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_SIGPENDING
-        12 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_MSGQUEUE
-        13 => (0, 0),                         // RLIMIT_NICE
-        14 => (0, 0),                         // RLIMIT_RTPRIO
-        15 => (RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_RTTIME
+        0  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_CPU
+        1  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_FSIZE
+        2  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_DATA
+        3  => (DEFAULT_STACK_LIMIT, RLIM_INFINITY),    // RLIMIT_STACK
+        4  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_CORE
+        5  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_RSS
+        6  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_NPROC
+        7  => (MAX_OPEN_FILES, MAX_OPEN_FILES),        // RLIMIT_NOFILE
+        8  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_MEMLOCK
+        9  => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_AS
+        10 => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_LOCKS
+        11 => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_SIGPENDING
+        12 => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_MSGQUEUE
+        13 => (0, 0),                                  // RLIMIT_NICE
+        14 => (0, 0),                                  // RLIMIT_RTPRIO
+        15 => (RLIM_INFINITY, RLIM_INFINITY),          // RLIMIT_RTTIME
         _  => (RLIM_INFINITY, RLIM_INFINITY),
     };
     unsafe {

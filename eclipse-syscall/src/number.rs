@@ -284,7 +284,6 @@ pub const SYS_FALLOCATE:        usize = 285;
 pub const SYS_TIMERFD_SETTIME:  usize = 286;
 pub const SYS_TIMERFD_GETTIME:  usize = 287;
 pub const SYS_ACCEPT4:          usize = 288;
-pub const SYS_SIGNALFD4_2:      usize = 289; // pipe2 in Linux is 293; 289 = signalfd4 on some
 pub const SYS_EVENTFD2:         usize = 290;
 pub const SYS_EPOLL_CREATE1:    usize = 291;
 pub const SYS_DUP3:             usize = 292;
