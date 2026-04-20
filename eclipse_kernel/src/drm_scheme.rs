@@ -5,6 +5,9 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 
+/// Virtual encoder ID used for the single simulated display path (encoder → CRTC 200).
+const VIRTUAL_ENCODER_ID: u32 = 101;
+
 /// DRM Scheme implementation
 pub struct DrmScheme;
 
@@ -156,14 +159,14 @@ impl Scheme for DrmScheme {
                 let cap = unsafe { &mut *(arg as *mut DrmGetCap) };
                 if let Some(drm_caps) = drm::get_caps() {
                     match cap.capability {
-                        1 => cap.value = if drm_caps.has_cursor { 1 } else { 0 }, // DRM_CAP_DUMB_BUFFER (overridden below)
-                        3 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
-                        5 => cap.value = 0, // DRM_CAP_PRIME: not supported for software renderer
+                        1 => cap.value = if drm_caps.has_cursor { 1 } else { 0 }, // DRM_CAP_CURSOR_BITMAP
+                        3 => cap.value = 1, // DRM_CAP_DUMB_BUFFER: dumb (CPU-mapped) buffers supported
+                        5 => cap.value = 0, // DRM_CAP_PRIME: buffer sharing not supported (software renderer)
                         6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
                         8 => cap.value = drm_caps.max_width as u64,  // DRM_CAP_CURSOR_WIDTH
                         9 => cap.value = drm_caps.max_height as u64, // DRM_CAP_CURSOR_HEIGHT
                         0xB => cap.value = 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
-                        0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS: no modifier support
+                        0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS: no format modifier support
                         _ => cap.value = 0,
                     }
                     Ok(0)
@@ -293,7 +296,7 @@ impl Scheme for DrmScheme {
                 }
                 let res = unsafe { &mut *(arg as *mut DrmModeCardRes) };
                 let (fbs, crtcs, connectors) = drm::get_resources();
-                let encoders: [u32; 1] = [101];
+                let encoders: [u32; 1] = [VIRTUAL_ENCODER_ID];
 
                 // Copy IDs if pointers are non-null and counts match
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
@@ -337,7 +340,7 @@ impl Scheme for DrmScheme {
                     conn.mm_height = d_conn.mm_height;
                     conn.connector_type = 11; // DRM_MODE_CONNECTOR_eDP
                     conn.connector_type_id = 1;
-                    conn.encoder_id = 101; // Virtual encoder linked to CRTC 200
+                    conn.encoder_id = VIRTUAL_ENCODER_ID; // Virtual encoder linked to CRTC 200
 
                     // Populate one preferred mode using the framebuffer dimensions
                     let (fb_width, fb_height) = crate::boot::get_fb_info()
@@ -348,8 +351,10 @@ impl Scheme for DrmScheme {
                     // Layout: clock(u32), h*(u16 x5), v*(u16 x5), vrefresh(u32), flags(u32),
                     //         type(u32), name([u8;32])
                     // Approximate clock = htotal * vtotal * 60 / 1000 kHz
-                    let htotal = fb_width + fb_width / 8;
-                    let vtotal = fb_height + fb_height / 20;
+                    // Approximate horizontal total = hdisplay + ~12% blanking (typical CVT/GTF value).
+                    // Approximate vertical total = vdisplay + ~5% blanking.
+                    let htotal = fb_width + fb_width / 8;  // ~12.5% horizontal blanking
+                    let vtotal = fb_height + fb_height / 20; // ~5% vertical blanking
                     let clock_khz = (htotal as u64 * vtotal as u64 * 60 / 1000) as u32;
                     let hsync_start = (fb_width + 8) as u16;
                     let hsync_end   = (fb_width + 40) as u16;
@@ -405,7 +410,7 @@ impl Scheme for DrmScheme {
                     conn.count_modes = 1;
 
                     // Populate encoder list
-                    let enc_id: u32 = 101;
+                    let enc_id: u32 = VIRTUAL_ENCODER_ID;
                     if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
                         unsafe { (conn.encoders_ptr as *mut u32).write_unaligned(enc_id); }
                     }
@@ -426,8 +431,8 @@ impl Scheme for DrmScheme {
                     possible_clones: u32,
                 }
                 let enc = unsafe { &mut *(arg as *mut DrmModeGetEncoder) };
-                // Virtual encoder 101, linked to CRTC 200 (from simplefb resources)
-                if enc.encoder_id == 101 {
+                // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 200 (from simplefb resources)
+                if enc.encoder_id == VIRTUAL_ENCODER_ID {
                     enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
                     enc.crtc_id = 200;
                     enc.possible_crtcs = 1;

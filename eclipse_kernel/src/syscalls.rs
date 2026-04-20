@@ -5321,8 +5321,12 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
                         }
                         Err(e) if e == crate::scheme::error::EAGAIN && !nonblock => {
                             // No data yet on a blocking socket — yield and retry.
+                            // Safety: `scheme` is an Arc (reference count), not a lock guard.
+                            // The fd table holding the Arc persists across yields, so the
+                            // SocketScheme object remains alive for the lifetime of this call.
                             crate::scheduler::yield_cpu();
-                            // Continue looping; scheme Arc is still valid across yield.
+                            // socket_read_raw re-acquires its internal mutex on each call,
+                            // allowing other threads/processes to write to the socket.
                         }
                         Err(e) => break Err(e),
                     }
