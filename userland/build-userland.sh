@@ -30,6 +30,11 @@ BASE_DIR="$(cd "${USERLAND_DIR}/.." && pwd)"
 ECLIPSE_SYSROOT="${ECLIPSE_SYSROOT:-$BASE_DIR/eclipse-os-build}"
 ECLIPSE_TOOLCHAIN_DIR="${ECLIPSE_TOOLCHAIN_DIR:-$BASE_DIR/host-toolchains}"
 ECLIPSE_MESON_BUILDTYPE="${ECLIPSE_MESON_BUILDTYPE:-release}"
+ECLIPSE_MESON_STATIC_LINK="${ECLIPSE_MESON_STATIC_LINK:-1}"
+default_lib="shared"
+if [[ "$ECLIPSE_MESON_STATIC_LINK" == "1" ]]; then
+    default_lib="static"
+fi
 
 MUSL_PREFIX="${MUSL_PREFIX:-x86_64-linux-musl}"
 MUSL_GCC="$ECLIPSE_TOOLCHAIN_DIR/bin/${MUSL_PREFIX}-gcc"
@@ -109,7 +114,7 @@ eclipse_fix_labwc_rpath() {
 		patchelf --remove-rpath "$bin" 2>/dev/null || true
 		ok "labwc: sin RPATH/RUNPATH (host: LD_LIBRARY_PATH hacia el sysroot musl; en imagen Eclipse suele bastar /usr/lib sin RUNPATH si ld-musl.path está bien)"
 	else
-		patchelf --set-rpath "$rp" "$bin"
+		patchelf --set-rpath "$rp" "$bin" || true
 		ok "labwc: RPATH de ejecución → $rp ($bin)"
 	fi
 }
@@ -381,7 +386,7 @@ write_meson_cross() {
 	# en los wraps, o enlaza solo el binario final con LDFLAGS=-static.
 	local _link="['-L$ECLIPSE_SYSROOT/usr/lib', '-L$ECLIPSE_SYSROOT/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/usr/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/lib']"
 	if [[ "${ECLIPSE_MESON_STATIC_LINK:-0}" == "1" ]]; then
-		_link="['-static', '-L$ECLIPSE_SYSROOT/usr/lib', '-L$ECLIPSE_SYSROOT/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/usr/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/lib']"
+		_link="['-static', '-Wl,--allow-multiple-definition', '-L$ECLIPSE_SYSROOT/usr/lib', '-L$ECLIPSE_SYSROOT/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/usr/lib', '-Wl,-rpath-link,$ECLIPSE_SYSROOT/lib']"
 	fi
 	# shellcheck disable=SC2016
 	cat >"$out" <<EOF
@@ -449,7 +454,8 @@ export_musl_cross_env() {
 	export PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:-$ECLIPSE_SYSROOT/usr/lib/pkgconfig:$ECLIPSE_SYSROOT/lib/pkgconfig}"
 	export PKG_CONFIG_SYSROOT_DIR="$ECLIPSE_SYSROOT"
 	local sys_inc="-idirafter $ECLIPSE_SYSROOT/usr/include -idirafter $ECLIPSE_SYSROOT/include"
-	export CFLAGS="$sys_inc ${CFLAGS:-}"
+	export CFLAGS="$sys_inc -fPIC ${CFLAGS:-}"
+	export CXXFLAGS="$sys_inc -fPIC ${CXXFLAGS:-}"
 	export CPPFLAGS="$sys_inc ${CPPFLAGS:-}"
 	export LDFLAGS="-L$ECLIPSE_SYSROOT/usr/lib -L$ECLIPSE_SYSROOT/lib -Wl,-rpath-link,$ECLIPSE_SYSROOT/usr/lib -Wl,-rpath-link,$ECLIPSE_SYSROOT/lib ${LDFLAGS:-}"
 }
@@ -556,10 +562,7 @@ build_labwc() {
 
 	# labwc enlaza wayland-server, Mesa (EGL/gbm), udev, cairo/pango, etc. desde el
 	# sysroot como .so; -static en el cross file hace que ld rechace esas bibliotecas.
-	local _save_meson_static="${ECLIPSE_MESON_STATIC_LINK:-0}"
-	ECLIPSE_MESON_STATIC_LINK=0
 	write_meson_cross "$cross"
-	ECLIPSE_MESON_STATIC_LINK="$_save_meson_static"
 
 	if [[ "${ECLIPSE_LABWC_CLEAN:-0}" == "1" ]]; then
 		rm -rf "$bld"
@@ -573,7 +576,8 @@ build_labwc() {
 	meson setup "$bld" "$root" --cross-file="$cross" \
 		--prefix="$ECLIPSE_SYSROOT/usr" \
 		"--buildtype=$ECLIPSE_MESON_BUILDTYPE" \
-		-Ddefault_library=${default_lib:-shared} \
+		--default-library=static \
+		--force-fallback-for=wlroots,pixman,libxkbcommon,wayland,libdisplay-info,libliftoff,libffi \
 		-Dxwayland=disabled \
 		-Dnls=disabled \
 		-Dman-pages=disabled \
@@ -643,14 +647,19 @@ build_expat() {
 			-Ddefault_library=${default_lib:-shared} -Dtests=false
 		ninja -C "$bld" install
 	else
-		info "expat no tiene meson.build, usando cmake..."
+		local shared="ON"
+		if [[ "$default_lib" == "static" ]]; then
+			shared="OFF"
+		fi
+		info "expat no tiene meson.build, usando cmake (shared=$shared)..."
 		mkdir -p "$bld"
 		(
 			cd "$bld"
 			cmake "$root" -DCMAKE_INSTALL_PREFIX="$ECLIPSE_SYSROOT/usr" \
 				-DCMAKE_C_COMPILER="$MUSL_GCC" -DCMAKE_CXX_COMPILER="$MUSL_GXX" \
 				-DEXPAT_BUILD_TESTS=OFF -DEXPAT_BUILD_EXAMPLES=OFF \
-				-DBUILD_shared_libs=ON
+				-DEXPAT_BUILD_TOOLS=OFF \
+				-DBUILD_SHARED_LIBS="$shared"
 			make -j$(nproc) install
 		)
 	fi
@@ -665,7 +674,7 @@ build_libffi() {
 	(
 		cd "$root"
 		[[ -f configure ]] || ./autogen.sh
-		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" --enable-shared --disable-static
+		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" --enable-static --disable-shared
 		make -j$(nproc)
 		make install
 	)
@@ -698,8 +707,12 @@ build_libudev_zero() {
 		cd "$root"
 		# libudev-zero suele tener un Makefile simple
 		local p="$ECLIPSE_SYSROOT/usr"
-		make CC="$MUSL_GCC" PREFIX="$p" LIBDIR="$p/lib" INCLUDEDIR="$p/include" PKGCONFIGDIR="$p/lib/pkgconfig" -j$(nproc)
-		make CC="$MUSL_GCC" PREFIX="$p" LIBDIR="$p/lib" INCLUDEDIR="$p/include" PKGCONFIGDIR="$p/lib/pkgconfig" install
+		local target="install"
+		if [[ "$default_lib" == "static" ]]; then
+			target="install-static"
+		fi
+		make CC="$MUSL_GCC" AR="$MUSL_AR" PREFIX="$p" LIBDIR="$p/lib" INCLUDEDIR="$p/include" PKGCONFIGDIR="$p/lib/pkgconfig" -j$(nproc)
+		make CC="$MUSL_GCC" AR="$MUSL_AR" PREFIX="$p" LIBDIR="$p/lib" INCLUDEDIR="$p/include" PKGCONFIGDIR="$p/lib/pkgconfig" "$target"
 	)
 }
 
@@ -729,7 +742,7 @@ build_mtdev() {
 	(
 		cd "$root"
 		[[ -f configure ]] || ./autogen.sh
-		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" --enable-shared --disable-static
+		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" --enable-static --disable-shared
 		make -j$(nproc)
 		make install
 	)
@@ -782,8 +795,12 @@ build_pcre2() {
 		cd "$root"
 		[[ -f configure ]] || ./autogen.sh
 		make clean || true
+		local shared="--enable-shared"
+		if [[ "$default_lib" == "static" ]]; then
+			shared="--disable-shared"
+		fi
 		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" \
-			--enable-shared --disable-static --enable-pcre2-8 \
+			"$shared" --enable-static --disable-shared --enable-pcre2-8 \
 			--enable-pcre2-16 --enable-pcre2-32 --disable-stack-for-recursion
 		make -j$(nproc)
 		make install
@@ -800,11 +817,17 @@ build_libjpeg_turbo() {
 	info "Construyendo libjpeg-turbo..."
 	(
 		cd "$bld"
+		local shared="ON"
+		local static="OFF"
+		if [[ "$default_lib" == "static" ]]; then
+			shared="OFF"
+			static="ON"
+		fi
 		cmake "$root" \
 			-DCMAKE_TOOLCHAIN_FILE="$USERLAND_DIR/eclipse-toolchain.cmake" \
 			-DCMAKE_INSTALL_PREFIX="/usr" \
 			-DCMAKE_INSTALL_LIBDIR="/usr/lib" \
-			-DENABLE_SHARED=ON -DENABLE_STATIC=OFF \
+			-DENABLE_SHARED="$shared" -DENABLE_STATIC="$static" \
 			-DCMAKE_BUILD_TYPE=Release
 		make -j$(nproc)
 		make DESTDIR="$ECLIPSE_SYSROOT" install
@@ -821,10 +844,16 @@ build_libpng() {
 	info "Construyendo libpng..."
 	(
 		cd "$bld"
+		local shared="ON"
+		local static="OFF"
+		if [[ "$default_lib" == "static" ]]; then
+			shared="OFF"
+			static="ON"
+		fi
 		cmake "$root" \
 			-DCMAKE_TOOLCHAIN_FILE="$USERLAND_DIR/eclipse-toolchain.cmake" \
 			-DCMAKE_INSTALL_PREFIX="/usr" \
-			-DENABLE_SHARED=ON -DENABLE_STATIC=OFF \
+			-DENABLE_SHARED="$shared" -DENABLE_STATIC="$static" \
 			-DPNG_TESTS=OFF \
 			-DCMAKE_BUILD_TYPE=Release
 		make -j$(nproc)
@@ -949,7 +978,7 @@ build_pango() {
 	write_meson_cross "$cross"
 	info "Construyendo pango..."
 	meson setup "$bld" "$root" --cross-file="$cross" --prefix="$ECLIPSE_SYSROOT/usr" \
-		-Ddefault_library=${default_lib:-shared} -Dintrospection=disabled -Dgtk_doc=false
+		-Ddefault_library=${default_lib:-shared} -Dintrospection=disabled -Ddocumentation=false -Dbuild-testsuite=false -Dbuild-examples=false
 	ninja -C "$bld" install
 }
 
@@ -985,8 +1014,12 @@ build_libxml2() {
 		# Forzar desactivación de símbolos versionados (causan caos en musl)
 		sed -i 's/USE_VERSION_SCRIPT_TRUE=/USE_VERSION_SCRIPT_TRUE="# "/g' configure
 		sed -i 's/USE_VERSION_SCRIPT_FALSE="# "/USE_VERSION_SCRIPT_FALSE=/g' configure
+		local shared="--enable-shared"
+		if [[ "$default_lib" == "static" ]]; then
+			shared="--disable-shared"
+		fi
 		./configure --host="$MUSL_PREFIX" --prefix="$ECLIPSE_SYSROOT/usr" \
-			--enable-shared --disable-static --with-python=no --with-icu=no \
+			"$shared" --enable-static --disable-shared --with-python=no --with-icu=no \
 			--with-zlib="$ECLIPSE_SYSROOT/usr" --with-lzma=no
 		make -j$(nproc)
 		make install
@@ -1096,7 +1129,7 @@ build_mesa() {
 		-Ddefault_library=${default_lib:-shared} -Dplatforms=wayland -Dgallium-drivers=softpipe,nouveau \
 		-Dvulkan-drivers='' -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Degl=enabled \
 		-Dgbm=enabled -Dshared-glapi=enabled -Dllvm=disabled -Dtools='' -Dbuild-tests=false \
-		-Dglx=disabled -Ddri-drivers-path=lib/dri
+		-Dglx=disabled -Ddri-drivers-path=lib/dri -Dgallium-xa=disabled
 	ninja -C "$bld" install
 }
 
@@ -1396,6 +1429,69 @@ main() {
 		;;
 	xkb-data)
 		build_xkeyboard_config
+		;;
+	libffi)
+		build_libffi
+		;;
+	mtdev)
+		build_mtdev
+		;;
+	pcre2)
+		build_pcre2
+		;;
+	libxml2)
+		build_libxml2
+		;;
+	zlib)
+		build_zlib
+		;;
+	expat)
+		build_expat
+		;;
+	udev)
+		build_libudev_zero
+		;;
+	evdev)
+		build_libevdev
+		;;
+	wayland)
+		build_wayland
+		;;
+	input)
+		build_libinput
+		;;
+	pixman)
+		build_pixman
+		;;
+	libffi)
+		build_libffi
+		;;
+	harfbuzz)
+		build_harfbuzz
+		;;
+	glib)
+		build_glib
+		;;
+	fribidi)
+		build_fribidi
+		;;
+	freetype)
+		build_freetype
+		;;
+	fontconfig)
+		build_fontconfig
+		;;
+	harfbuzz)
+		build_harfbuzz
+		;;
+	cairo)
+		build_cairo
+		;;
+	pango)
+		build_pango
+		;;
+	libepoxy)
+		build_libepoxy
 		;;
 	xfwl4)
 		build_xfwl4

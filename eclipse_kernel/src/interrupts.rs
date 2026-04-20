@@ -704,9 +704,10 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     // the handler returns (via iretq in common_exception_handler).
     // This check runs BEFORE any diagnostic printing so that normal demand-paging faults
     // are handled silently without generating a noisy register dump.
-    if num == 14 && cs & 3 == 3 && pid != 0 {
-        // error_code bit 0 == 0 means "not present" (as opposed to a protection violation).
-        if (err & 1) == 0 {
+    if num == 14 && pid != 0 {
+        // error_code bit 0 == 0 means "not present".
+        // Allow handling faults for user-space addresses (< 0xFFFF...) even if triggered by the kernel.
+        if (err & 1) == 0 && cr2 < 0xFFFF_8000_0000_0000 {
             if crate::memory::handle_anon_page_fault(pid, cr2) {
                 return; // Frame allocated — retry the faulting instruction.
             }

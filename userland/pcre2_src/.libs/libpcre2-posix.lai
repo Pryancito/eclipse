@@ -5,13 +5,13 @@
 # It is necessary for linking the library.
 
 # The name that we can dlopen(3).
-dlname='libpcre2-posix.so.3'
+dlname=''
 
 # Names of this library.
-library_names='libpcre2-posix.so.3.0.5 libpcre2-posix.so.3 libpcre2-posix.so'
+library_names=''
 
 # The name of the static archive.
-old_library=''
+old_library='libpcre2-posix.a'
 
 # Linker flags that cannot go in dependency_libs.
 inherited_linker_flags=''

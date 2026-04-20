@@ -42,7 +42,7 @@ else
   libgallium_name = 'gallium-@0@'.format(meson.project_version())
 endif
 
-libgallium_dri = shared_library(
+libgallium_dri = static_library(
   libgallium_name,
   files('dri_target.c'),
   include_directories : [
@@ -67,7 +67,6 @@ libgallium_dri = shared_library(
     driver_asahi, driver_crocus
   ],
   install : true,
-  name_suffix : 'so',
 )
 
 if with_gallium_va or with_gallium_vdpau

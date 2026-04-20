@@ -26,7 +26,7 @@ if with_platform_windows
   _glapi_c_args += ['-D_GLAPI_DLL_EXPORTS']
 endif
 
-libglapi = shared_library(
+libglapi = static_library(
   'glapi',
   [files_shared_glapi, shared_glapi_mapi_tmp_h],
   c_args : [
@@ -40,8 +40,6 @@ libglapi = shared_library(
   link_args : [ld_args_gc_sections],
   include_directories : [inc_src, inc_include, inc_mapi],
   dependencies : [dep_thread, dep_selinux, idep_mesautil],
-  soversion : host_machine.system() == 'windows' ? '' : '0',
-  version : '0.0.0',
   name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
   install : true,
 )

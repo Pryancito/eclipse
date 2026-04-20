@@ -10,4 +10,4 @@ Description: PCRE2 - Perl compatible regular expressions C library (2nd API) wit
 Version: 10.44
 Libs: -L${libdir} -lpcre2-8
 Libs.private:  
-Cflags: -I${includedir} 
+Cflags: -I${includedir} -DPCRE2_STATIC

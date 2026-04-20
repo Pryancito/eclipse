@@ -1450,7 +1450,15 @@ impl Scheme for FileSystemScheme {
         // one slash left `/foo` and lookup treated `foo` as a child of root. Also, musl may
         // open `//libfoo.so` (bad search-dir join); trimming yields `libfoo.so` so we can retry
         // under `lib/` / `usr/lib/` below.
-        let clean_path = path.trim_start_matches('/');
+        let mut clean_path = path.trim_start_matches('/');
+
+        // Handle hardcoded build-time paths from relocated libraries (e.g. Fontconfig)
+        let hardcoded_prefix = "home/moebius/eclipse/eclipse-os-build/";
+        if clean_path.starts_with(hardcoded_prefix) {
+            let old_path = clean_path;
+            clean_path = &clean_path[hardcoded_prefix.len()..];
+            serial::serial_printf(format_args!("[FS-SCHEME] fontconfig: redirected {} to: {}\n", old_path, clean_path));
+        }
 
         match clean_path {
             p if p == "dev/fb0" || p == "fb0" => {
@@ -1486,8 +1494,8 @@ impl Scheme for FileSystemScheme {
                 Ok(id)
             },
             p if p == "dev/tty" || p == "tty" 
-                || (p.starts_with("dev/tty") && p.len() > 7 && p[7..].chars().all(|c| c.is_ascii_digit()))
-                || (p.starts_with("tty") && p.len() > 3 && p[3..].chars().all(|c| c.is_ascii_digit())) => {
+                || (p.starts_with("dev/tty") && p.len() > 7)
+                || (p.starts_with("tty") && p.len() > 3) => {
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 let id = open_files.len();
                 open_files.push(Some(OpenFile::Tty));

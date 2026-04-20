@@ -84,7 +84,7 @@ while test $# -gt 0; do
     --libs)
         if [ "$2" = "--dynamic" ]; then
             shift
-            libs="-lxml2 "
+            libs="-lxml2  -L/home/moebius/eclipse/eclipse-os-build/usr/lib -lz   -lm  "
         else
             libs="-lxml2  -L/home/moebius/eclipse/eclipse-os-build/usr/lib -lz   -lm    "
         fi

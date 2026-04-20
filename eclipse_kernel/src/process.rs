@@ -814,6 +814,65 @@ where
     })
 }
 
+/// Modify process state (bypasses metadata-only protection in update_process)
+pub fn modify_process_state(pid: ProcessId, new_state: ProcessState) -> Result<(), &'static str> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        // O(1) lookup
+        if let Some(slot_idx) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot_idx].as_mut() {
+                if p.id == pid {
+                    p.state = new_state;
+                    return Ok(());
+                }
+            }
+        }
+        // O(N) lookup fallback
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    p.state = new_state;
+                    return Ok(());
+                }
+            }
+        }
+        Err("Process not found")
+    })
+}
+
+/// Atomic compare-and-set process state
+pub fn compare_and_set_process_state(pid: ProcessId, expected: ProcessState, new_state: ProcessState) -> Result<bool, &'static str> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(slot_idx) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot_idx].as_mut() {
+                if p.id == pid {
+                    if p.state == expected {
+                        p.state = new_state;
+                        return Ok(true);
+                    } else {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        // O(N) lookup fallback
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    if p.state == expected {
+                        p.state = new_state;
+                        return Ok(true);
+                    } else {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Err("Process not found")
+    })
+}
+
 /// Cambiar de contexto entre procesos
 /// 
 /// Esta función guarda el contexto del proceso actual y carga el contexto del siguiente proceso
@@ -1300,37 +1359,44 @@ pub fn get_pending_signals(pid: ProcessId) -> u64 {
 /// si está en espera (para que la señal sea entregada en la próxima iteración).
 pub fn set_pending_signal(pid: ProcessId, signum: u8) {
     if signum >= 64 { return; }
-    let mut table = PROCESS_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(p) = slot {
-            if p.id == pid {
-                p.pending_signals |= 1u64 << signum;
-                
-                // Job Control: handle stop/cont signals
-                if signum == 19 || signum == 20 { // SIGSTOP or SIGTSTP
-                    p.state = ProcessState::Stopped;
-                    p.exit_signal = signum;
-                    let parent_pid = p.parent_pid;
-                    if let Some(ppid) = parent_pid {
-                        wake_parent_from_wait(ppid);
-                    }
-                } else if signum == 18 { // SIGCONT
-                    if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
-                        p.state = ProcessState::Ready;
+    let mut to_wake = None;
+    {
+        let mut table = PROCESS_TABLE.lock();
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    p.pending_signals |= 1u64 << signum;
+                    
+                    // Job Control: handle stop/cont signals
+                    if signum == 19 || signum == 20 { // SIGSTOP or SIGTSTP
+                        p.state = ProcessState::Stopped;
+                        p.exit_signal = signum;
                         let parent_pid = p.parent_pid;
                         if let Some(ppid) = parent_pid {
                             wake_parent_from_wait(ppid);
                         }
+                    } else if signum == 18 { // SIGCONT
+                        if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
+                            // Don't set state here; enqueue_process will do it.
+                            to_wake = Some(pid);
+                            let parent_pid = p.parent_pid;
+                            if let Some(ppid) = parent_pid {
+                                wake_parent_from_wait(ppid);
+                            }
+                        }
+                    } else {
+                        // Despertar al proceso si está bloqueado por otras señales
+                        if p.state == ProcessState::Blocked {
+                            to_wake = Some(pid);
+                        }
                     }
-                } else {
-                    // Despertar al proceso si está bloqueado por otras señales
-                    if p.state == ProcessState::Blocked {
-                        p.state = ProcessState::Ready;
-                    }
+                    break;
                 }
-                return;
             }
         }
+    }
+    if let Some(pid_to_wake) = to_wake {
+        crate::scheduler::enqueue_process(pid_to_wake);
     }
 }
 

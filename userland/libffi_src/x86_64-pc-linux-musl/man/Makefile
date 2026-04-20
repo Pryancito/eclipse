@@ -178,16 +178,16 @@ AWK = mawk
 CC = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 CCAS = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 CCASDEPMODE = depmode=gcc3
-CCASFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include 
+CCASFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC 
 CCDEPMODE = depmode=gcc3
-CFLAGS = -Wall -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include  -fexceptions
-CPPFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include 
+CFLAGS = -Wall -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fexceptions
+CPPFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include 
 CSCOPE = cscope
 CTAGS = ctags
 CXX = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-g++
 CXXCPP = /home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-g++ -E
 CXXDEPMODE = depmode=gcc3
-CXXFLAGS = -g -O2
+CXXFLAGS = -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC 
 CYGPATH_W = echo
 DEFS = -DHAVE_CONFIG_H
 DEPDIR = .deps
@@ -212,7 +212,7 @@ INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LD = /home/moebius/eclipse/host-toolchains/x86_64-linux-musl/bin/ld -m elf_x86_64
-LDFLAGS = -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
+LDFLAGS = -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
 LIBOBJS = 
 LIBS = 
 LIBTOOL = $(SHELL) $(top_builddir)/libtool

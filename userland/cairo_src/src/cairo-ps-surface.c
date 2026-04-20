@@ -102,13 +102,13 @@
 #define DEBUG_FALLBACK(s)
 #endif
 
-#ifndef HAVE_CTIME_R
+/* #ifndef HAVE_CTIME_R
 static char *ctime_r(const time_t *timep, char *buf)
 {
     (void)buf;
     return ctime(timep);
 }
-#endif
+#endif */
 
 /**
  * SECTION:cairo-ps

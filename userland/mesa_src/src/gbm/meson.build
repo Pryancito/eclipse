@@ -33,7 +33,7 @@ if with_platform_android and get_option('platform-sdk-version') >= 30
   libgbm_name = 'gbm_mesa'
 endif
 
-libgbm = shared_library(
+libgbm = static_library(
   libgbm_name,
   files_gbm,
   include_directories : incs_gbm,
@@ -42,7 +42,6 @@ libgbm = shared_library(
   link_with : [libloader, libgallium_dri],
   dependencies : [deps_gbm, dep_dl, dep_thread, dep_libdrm, idep_mesautil, idep_xmlconfig],
   gnu_symbol_visibility : 'hidden',
-  version : '1.0.0',
   install : true,
 )
 
@@ -57,7 +56,6 @@ pkg.generate(
   name : 'gbm',
   filebase : 'gbm',
   description : 'Mesa gbm library',
-  version : meson.project_version(),
   libraries : libgbm,
   libraries_private : gbm_priv_libs,
   variables : ['gbmbackendspath=' + gbm_backends_path],

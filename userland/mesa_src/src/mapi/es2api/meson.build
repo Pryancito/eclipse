@@ -22,10 +22,9 @@ gles2_def = custom_target(
   command : gen_vs_module_defs_normal_command,
 )
 
-libgles2 = shared_library(
+libgles2 = static_library(
   'GLESv2' + get_option('gles-lib-suffix'),
   ['../entry.c', es2_glapi_mapi_tmp_h],
-  vs_module_defs : gles2_def,
   c_args : [
     c_msvc_compat_args,
     _es2_c_args,
@@ -38,9 +37,6 @@ libgles2 = shared_library(
   include_directories : [inc_src, inc_include, inc_mapi],
   link_with : libglapi,
   dependencies : [dep_thread, dep_libdrm, dep_m, dep_dl, idep_mesautilc11],
-  soversion : host_machine.system() == 'windows' ? '' : '2',
-  version : '2.0.0',
-  darwin_versions : '3.0.0',
   name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
   install : true,
 )
@@ -49,7 +45,6 @@ pkg.generate(
   name : 'glesv2',
   filebase : 'glesv2',
   description : 'Mesa OpenGL ES 2.0 library',
-  version : meson.project_version(),
   libraries : libgles2,
   libraries_private : gl_priv_libs,
 )

@@ -541,8 +541,8 @@ root_inc = include_directories('.')
 pango_inc = include_directories('pango')
 
 subdir('pango')
-subdir('utils')
-subdir('tools')
+# subdir('utils')
+# subdir('tools')
 if get_option('documentation')
   subdir('docs')
 endif

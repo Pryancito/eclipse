@@ -5,8 +5,8 @@
 # It is necessary for linking the library.
 
 # Name of the PIC object.
-pic_object='.libs/libpcre2_32_la-pcre2_auto_possess.o'
+pic_object=none
 
 # Name of the non-PIC object
-non_pic_object=none
+non_pic_object='libpcre2_32_la-pcre2_auto_possess.o'
 

@@ -109,7 +109,9 @@ fn panic(info: &PanicInfo) -> ! {
 #[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    panic!("allocation error: {:?}", layout)
+    let pid = crate::syscalls::LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let num = crate::syscalls::LAST_SYSCALL_NUM.load(core::sync::atomic::Ordering::Relaxed);
+    panic!("allocation error: {:?} (Last Syscall: {} from PID {})", layout, num, pid)
 }
 
 /// Punto de entrada del kernel, llamado desde el bootloader UEFI
