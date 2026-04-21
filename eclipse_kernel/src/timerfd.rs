@@ -155,14 +155,15 @@ impl TimerFdScheme {
 
         // Optionally write the old value back to userspace.
         if old_ptr != 0 {
+            if !crate::syscalls::is_user_pointer(old_ptr, core::mem::size_of::<Itimerspec>() as u64) {
+                return Err(error::EFAULT);
+            }
             let old = Itimerspec {
                 it_interval: Timespec::from_ms(state.interval_ms),
                 it_value: Timespec::from_ms(state.value_ms),
             };
-            if crate::syscalls::is_user_pointer(old_ptr, core::mem::size_of::<Itimerspec>() as u64) {
-                unsafe {
-                    core::ptr::write_unaligned(old_ptr as *mut Itimerspec, old);
-                }
+            unsafe {
+                core::ptr::write_unaligned(old_ptr as *mut Itimerspec, old);
             }
         }
 
@@ -236,7 +237,7 @@ impl Scheme for TimerFdScheme {
 
         let count = state.expirations;
         state.expirations = 0;
-        buffer[..8].copy_from_slice(&count.to_ne_bytes());
+        buffer[..8].copy_from_slice(&count.to_le_bytes());
         Ok(8)
     }
 

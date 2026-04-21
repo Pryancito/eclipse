@@ -567,10 +567,12 @@ impl Scheme for DrmScheme {
                     possible_clones: u32,
                 }
                 let enc = unsafe { &mut *(arg as *mut DrmModeGetEncoder) };
-                // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 2000 (from simplefb/virtio resources)
+                // VIRTUAL_ENCODER_ID is a virtual DAC encoder. We report crtc_id=0 (unset)
+                // because this is the initial state before wlroots issues DRM_IOCTL_MODE_SETCRTC.
+                // The old value of 2000 was incorrect (CRTC 200 is the only CRTC we expose).
                 if enc.encoder_id == VIRTUAL_ENCODER_ID {
                     enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
-                    enc.crtc_id = 0; // No CRTC currently active; wlroots will assign one via SETCRTC
+                    enc.crtc_id = 0; // No CRTC currently active; wlroots assigns one via SETCRTC
                     enc.possible_crtcs = 1;
                     enc.possible_clones = 0;
                     Ok(0)

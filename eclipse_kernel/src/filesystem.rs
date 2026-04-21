@@ -1898,21 +1898,24 @@ impl Scheme for FileSystemScheme {
                         Ok(0)
                     }
                     0x5600 => { // VT_OPENQRY — find first available VT
-                        if arg != 0 && crate::syscalls::is_user_pointer(arg as u64, 4) {
-                            unsafe { *(arg as *mut u32) = 1; }
+                        if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 4) {
+                            return Err(scheme_error::EFAULT);
                         }
+                        unsafe { *(arg as *mut u32) = 1; }
                         Ok(0)
                     }
                     0x5601 => { // VT_GETMODE
-                        // struct vt_mode { mode, waitv, relsig, acqsig, frsig } — 8 bytes
+                        // struct vt_mode: { char mode; char waitv; short relsig; short acqsig; short frsig; }
+                        // Packed on x86: 1+1+2+2+2 = 8 bytes with standard C layout.
                         if arg != 0 && crate::syscalls::is_user_pointer(arg as u64, 8) {
                             unsafe {
                                 let ptr = arg as *mut u8;
-                                ptr.write(0); // VT_AUTO
-                                ptr.add(1).write(0); // waitv
-                                ptr.add(2).write(0); // relsig
-                                ptr.add(3).write(0); // acqsig
-                                ptr.add(4).write(0); // frsig
+                                ptr.write(0);       // mode = VT_AUTO
+                                ptr.add(1).write(0);// waitv
+                                // relsig, acqsig, frsig as i16 = 0
+                                core::ptr::write_unaligned(ptr.add(2) as *mut i16, 0);
+                                core::ptr::write_unaligned(ptr.add(4) as *mut i16, 0);
+                                core::ptr::write_unaligned(ptr.add(6) as *mut i16, 0);
                             }
                         }
                         Ok(0)
