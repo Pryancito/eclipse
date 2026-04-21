@@ -1,262 +1,280 @@
-//! timerfd support for Eclipse OS.
+//! timerfd — temporizadores vía descriptor (compatible con Linux en lo esencial).
 //!
-//! Provides Linux-compatible `timerfd_create` / `timerfd_settime` / `timerfd_gettime`
-//! functionality as a kernel Scheme.  Timers are polled via the global tick counter so
-//! no dedicated hardware timer is required beyond the existing PIT/APIC interrupt.
+//! Semántica: `timerfd_create` + `timerfd_settime` / `timerfd_gettime`, lectura de 8 bytes
+//! (u64 nativo-endian, número de expiraciones desde la última lectura) y `poll(POLLIN)`
+//! cuando hay expiraciones pendientes.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use spin::Mutex;
-use crate::scheme::{Scheme, Stat, error};
 
-// ── Timespec / itimerspec ABI structs (matches Linux x86_64) ──────────────────
+use crate::scheme::error;
+use crate::scheme::{Scheme, Stat};
+use crate::scheme::event;
 
-/// Linux `struct timespec` (64-bit version — tv_sec and tv_nsec are both 64-bit).
+/// Linux `TFD_TIMER_ABSTIME`
+pub const TFD_TIMER_ABSTIME: i32 = 1;
+/// Linux `TFD_NONBLOCK`
+pub const TFD_NONBLOCK: u32 = 0x800;
+
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default)]
 pub struct Timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
 }
 
-impl Timespec {
-    /// Convert to milliseconds (saturating).
-    #[inline]
-    fn to_ms(&self) -> u64 {
-        if self.tv_sec < 0 {
-            return 0;
-        }
-        (self.tv_sec as u64)
-            .saturating_mul(1000)
-            .saturating_add((self.tv_nsec.max(0) as u64) / 1_000_000)
-    }
-
-    /// Build a Timespec from milliseconds.
-    #[inline]
-    fn from_ms(ms: u64) -> Self {
-        Self {
-            tv_sec: (ms / 1000) as i64,
-            tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-        }
-    }
-
-    /// True if both fields are zero (disarmed / zero interval).
-    #[inline]
-    fn is_zero(&self) -> bool {
-        self.tv_sec == 0 && self.tv_nsec == 0
-    }
-}
-
-/// Linux `struct itimerspec`.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default)]
 pub struct Itimerspec {
-    /// Interval for periodic timer (0 = one-shot).
     pub it_interval: Timespec,
-    /// Initial expiry time (0 = disarmed).
     pub it_value: Timespec,
 }
 
-// ── Internal timer state ───────────────────────────────────────────────────────
-
-struct TimerFdState {
-    /// Clock ID passed to `timerfd_create`.
-    _clockid: u32,
-    /// Tick count at which the current armed window started.
-    armed_at_ticks: u64,
-    /// Duration until first expiry in milliseconds (0 = disarmed).
-    value_ms: u64,
-    /// Periodic interval in milliseconds (0 = one-shot).
+struct TimerState {
+    clockid: u32,
+    nonblock: bool,
+    refcnt: u32,
+    armed: bool,
+    /// Periodo entre expiraciones (0 = one-shot).
     interval_ms: u64,
-    /// Number of expirations that have not yet been consumed by `read`.
-    expirations: u64,
+    /// Próxima expiración en la misma escala que `now_ms()` para este `clockid`.
+    deadline_ms: u64,
+    pending: u64,
 }
 
-impl TimerFdState {
-    fn new(clockid: u32) -> Self {
-        Self {
-            _clockid: clockid,
-            armed_at_ticks: 0,
-            value_ms: 0,
-            interval_ms: 0,
-            expirations: 0,
+impl TimerState {
+    fn now_pair(&self) -> (u64, u64) {
+        let uptime = crate::scheduler::get_stats().total_ticks;
+        let wall = crate::syscalls::WALL_TIME_OFFSET
+            .load(Ordering::Relaxed)
+            .saturating_mul(1000)
+            .saturating_add(uptime);
+        (uptime, wall)
+    }
+
+    fn now_for_clock(&self) -> u64 {
+        let (uptime, wall) = self.now_pair();
+        match self.clockid {
+            0 => wall,
+            _ => uptime,
         }
     }
 
-    /// Return current kernel tick count (10 ms per tick by default).
-    fn now_ms() -> u64 {
-        // ticks() returns the raw PIT/APIC counter; each tick ≈ 1 ms (or 10 ms —
-        // depends on the configured IRQ0 rate).  We use it as a monotonic counter.
-        crate::interrupts::ticks()
+    /// Avanza expiraciones hasta el instante actual.
+    fn advance(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let now = self.now_for_clock();
+        while self.armed && now >= self.deadline_ms {
+            self.pending = self.pending.saturating_add(1);
+            if self.interval_ms == 0 {
+                self.armed = false;
+                break;
+            }
+            self.deadline_ms = self.deadline_ms.saturating_add(self.interval_ms);
+        }
     }
 
-    /// Refresh internal expiration count based on current time.  Called before
-    /// `read` or `poll` to account for elapsed wall-clock time.
-    fn refresh(&mut self) {
-        if self.value_ms == 0 {
-            return; // disarmed
+    fn itimerspec_remaining(&self) -> Itimerspec {
+        let mut cur = Itimerspec::default();
+        cur.it_interval = timespec_from_ms(self.interval_ms);
+        if !self.armed {
+            return cur;
         }
-        let now = Self::now_ms();
-        let elapsed = now.saturating_sub(self.armed_at_ticks);
-
-        if elapsed < self.value_ms {
-            return; // not yet expired
-        }
-
-        // Compute how many expirations have occurred since last refresh.
-        // First expiry at armed_at_ticks + value_ms, then every interval_ms.
-        let after_first = elapsed - self.value_ms;
-        let new_count: u64 = if self.interval_ms == 0 {
-            // One-shot: disarm after the first expiry.
-            self.value_ms = 0;
-            1
-        } else {
-            let extra = after_first / self.interval_ms;
-            // Advance arm point so next poll computes correctly.
-            self.armed_at_ticks += self.value_ms + extra * self.interval_ms;
-            self.value_ms = self.interval_ms; // ongoing periodic
-            1 + extra
-        };
-
-        self.expirations = self.expirations.saturating_add(new_count);
+        let now = self.now_for_clock();
+        let rem_ms = self.deadline_ms.saturating_sub(now);
+        cur.it_value = timespec_from_ms(rem_ms);
+        cur
     }
 }
 
-// ── TimerFdScheme ──────────────────────────────────────────────────────────────
+fn timespec_from_ms(ms: u64) -> Timespec {
+    Timespec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    }
+}
+
+fn timespec_to_ms(ts: Timespec) -> Result<u64, usize> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return Err(error::EINVAL);
+    }
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Err(error::EINVAL);
+    }
+    let s = ts.tv_sec as u64;
+    let ns = ts.tv_nsec as u64;
+    Ok(s.saturating_mul(1000).saturating_add(ns / 1_000_000))
+}
+
+fn is_monotonic_like(clockid: u32) -> bool {
+    matches!(clockid, 1 | 4 | 7)
+}
 
 pub struct TimerFdScheme {
-    timers: Mutex<BTreeMap<usize, TimerFdState>>,
+    instances: Mutex<BTreeMap<usize, TimerState>>,
     next_id: Mutex<usize>,
 }
 
 impl TimerFdScheme {
     pub fn new() -> Self {
         Self {
-            timers: Mutex::new(BTreeMap::new()),
+            instances: Mutex::new(BTreeMap::new()),
             next_id: Mutex::new(1),
         }
     }
 
-    // ── Extra methods called directly from syscalls.rs ─────────────────────
-
-    /// `timerfd_settime(fd, flags, new, old_ptr)`.
-    ///
-    /// `flags` 0 = relative, 1 = `TFD_TIMER_ABSTIME`.
-    /// `old_ptr` if non-zero receives the previous `itimerspec`.
     pub fn settime(
         &self,
         id: usize,
-        _flags: i32,
+        flags: i32,
         new: &Itimerspec,
-        old_ptr: u64,
+        old_user_ptr: u64,
     ) -> Result<(), usize> {
-        let mut timers = self.timers.lock();
-        let state = timers.get_mut(&id).ok_or(error::EBADF)?;
+        let interval_ms = timespec_to_ms(new.it_interval)?;
+        let value_ms = timespec_to_ms(new.it_value)?;
 
-        // Optionally write the old value back to userspace.
-        if old_ptr != 0 {
-            if !crate::syscalls::is_user_pointer(old_ptr, core::mem::size_of::<Itimerspec>() as u64) {
+        let mut map = self.instances.lock();
+        let t = map.get_mut(&id).ok_or(error::EBADF)?;
+
+        t.advance();
+
+        if old_user_ptr != 0 {
+            if !crate::syscalls::is_user_pointer(old_user_ptr, core::mem::size_of::<Itimerspec>() as u64) {
                 return Err(error::EFAULT);
             }
-            let old = Itimerspec {
-                it_interval: Timespec::from_ms(state.interval_ms),
-                it_value: Timespec::from_ms(state.value_ms),
-            };
+            let old = t.itimerspec_remaining();
             unsafe {
-                core::ptr::write_unaligned(old_ptr as *mut Itimerspec, old);
+                core::ptr::write_unaligned(old_user_ptr as *mut Itimerspec, old);
             }
         }
 
-        let value_ms = new.it_value.to_ms();
-        let interval_ms = new.it_interval.to_ms();
+        t.interval_ms = interval_ms;
 
-        state.expirations = 0;
-        state.value_ms = value_ms;
-        state.interval_ms = interval_ms;
-        state.armed_at_ticks = if value_ms > 0 { TimerFdState::now_ms() } else { 0 };
+        // Ambos ceros → desarmar (conservamos interval_ms como en Linux para gettime).
+        if value_ms == 0 && new.it_value.tv_sec == 0 && new.it_value.tv_nsec == 0 {
+            t.armed = false;
+            return Ok(());
+        }
 
+        let (uptime, wall) = t.now_pair();
+        let now = match t.clockid {
+            0 => wall,
+            _ => uptime,
+        };
+
+        let deadline_ms = if (flags & TFD_TIMER_ABSTIME) != 0 {
+            if t.clockid == 0 {
+                value_ms
+            } else if is_monotonic_like(t.clockid) {
+                value_ms
+            } else {
+                return Err(error::EINVAL);
+            }
+        } else {
+            now.saturating_add(value_ms)
+        };
+
+        t.deadline_ms = deadline_ms;
+        t.armed = true;
+        t.advance();
         Ok(())
     }
 
-    /// `timerfd_gettime(fd, curr_ptr)` — writes current `itimerspec` into userspace.
-    pub fn gettime(&self, id: usize, curr_ptr: u64) -> Result<(), usize> {
-        let mut timers = self.timers.lock();
-        let state = timers.get_mut(&id).ok_or(error::EBADF)?;
-        state.refresh();
-
-        if !crate::syscalls::is_user_pointer(curr_ptr, core::mem::size_of::<Itimerspec>() as u64) {
+    pub fn gettime(&self, id: usize, out_user_ptr: u64) -> Result<(), usize> {
+        if !crate::syscalls::is_user_pointer(out_user_ptr, core::mem::size_of::<Itimerspec>() as u64) {
             return Err(error::EFAULT);
         }
-
-        // it_value: remaining time until next expiry.
-        let remaining_ms = if state.value_ms > 0 {
-            let elapsed = TimerFdState::now_ms().saturating_sub(state.armed_at_ticks);
-            state.value_ms.saturating_sub(elapsed)
-        } else {
-            0
-        };
-
-        let curr = Itimerspec {
-            it_interval: Timespec::from_ms(state.interval_ms),
-            it_value: Timespec::from_ms(remaining_ms),
-        };
+        let mut map = self.instances.lock();
+        let t = map.get_mut(&id).ok_or(error::EBADF)?;
+        t.advance();
+        let cur = t.itimerspec_remaining();
         unsafe {
-            core::ptr::write_unaligned(curr_ptr as *mut Itimerspec, curr);
+            core::ptr::write_unaligned(out_user_ptr as *mut Itimerspec, cur);
         }
         Ok(())
     }
 }
 
 impl Scheme for TimerFdScheme {
-    /// Path format (after stripping "timerfd:"): `<clockid>/<flags>`
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
-        let parts: alloc::vec::Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let clockid: u32 = parts.first().and_then(|&s| s.parse().ok()).unwrap_or(1);
+        // Ruta relativa tras `timerfd:`: `<clockid>/<flags>` (flags decimales, p. ej. TFD_NONBLOCK=0x800).
+        let parts: Vec<&str> = path.split('/').collect();
+        let clockid: u32 = parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .ok_or(error::EINVAL)?;
+        let create_flags: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        if clockid != 0 && !is_monotonic_like(clockid) {
+            return Err(error::EINVAL);
+        }
 
         let mut id_gen = self.next_id.lock();
         let id = *id_gen;
         *id_gen += 1;
 
-        self.timers.lock().insert(id, TimerFdState::new(clockid));
+        self.instances.lock().insert(
+            id,
+            TimerState {
+                clockid,
+                nonblock: (create_flags & TFD_NONBLOCK) != 0,
+                refcnt: 1,
+                armed: false,
+                interval_ms: 0,
+                deadline_ms: 0,
+                pending: 0,
+            },
+        );
         Ok(id)
     }
 
-    /// `read(2)` on a timerfd returns an 8-byte little-endian expiry count.
-    /// Returns `EAGAIN` if the timer has not yet expired.
     fn read(&self, id: usize, buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
         if buffer.len() < 8 {
             return Err(error::EINVAL);
         }
-        let mut timers = self.timers.lock();
-        let state = timers.get_mut(&id).ok_or(error::EBADF)?;
-        state.refresh();
-
-        if state.expirations == 0 {
-            return Err(error::EAGAIN);
+        loop {
+            let mut map = self.instances.lock();
+            let t = map.get_mut(&id).ok_or(error::EBADF)?;
+            t.advance();
+            if t.pending > 0 {
+                let v = t.pending;
+                t.pending = 0;
+                buffer[..8].copy_from_slice(&v.to_ne_bytes());
+                return Ok(8);
+            }
+            if t.nonblock {
+                return Err(error::EAGAIN);
+            }
+            drop(map);
+            crate::scheduler::yield_cpu();
         }
-
-        let count = state.expirations;
-        state.expirations = 0;
-        buffer[..8].copy_from_slice(&count.to_le_bytes());
-        Ok(8)
     }
 
-    /// Writes are not allowed on timerfd.
     fn write(&self, _id: usize, _buffer: &[u8], _offset: u64) -> Result<usize, usize> {
-        Err(error::EBADF)
+        Err(error::EINVAL)
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
-        if self.timers.lock().remove(&id).is_some() {
-            Ok(0)
-        } else {
-            Err(error::EBADF)
+        let mut map = self.instances.lock();
+        let remove = {
+            let t = map.get_mut(&id).ok_or(error::EBADF)?;
+            t.refcnt = t.refcnt.saturating_sub(1);
+            t.refcnt == 0
+        };
+        if remove {
+            map.remove(&id);
         }
+        Ok(0)
     }
 
     fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
-        // Report as a regular file; no special device type needed here.
-        stat.mode = 0o100600;
+        stat.mode = 0o100644;
+        stat.size = 0;
         Ok(0)
     }
 
@@ -264,24 +282,26 @@ impl Scheme for TimerFdScheme {
         Err(error::ESPIPE)
     }
 
-    /// `poll` / `epoll` readiness: POLLIN when at least one expiry is pending.
     fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
-        let mut timers = self.timers.lock();
-        let state = timers.get_mut(&id).ok_or(error::EBADF)?;
-        state.refresh();
-
+        let mut map = self.instances.lock();
+        let t = map.get_mut(&id).ok_or(error::EBADF)?;
+        t.advance();
         let mut ready = 0;
-        if (events & crate::scheme::event::POLLIN) != 0 && state.expirations > 0 {
-            ready |= crate::scheme::event::POLLIN;
+        if (events & event::POLLIN) != 0 && t.pending > 0 {
+            ready |= event::POLLIN;
         }
         Ok(ready)
     }
+
+    fn dup(&self, id: usize) -> Result<usize, usize> {
+        let mut map = self.instances.lock();
+        let t = map.get_mut(&id).ok_or(error::EBADF)?;
+        t.refcnt = t.refcnt.saturating_add(1);
+        Ok(0)
+    }
 }
 
-// ── Singleton ──────────────────────────────────────────────────────────────────
-
-pub static TIMERFD_SCHEME: spin::Once<Arc<TimerFdScheme>> =
-    spin::Once::new();
+static TIMERFD_SCHEME: spin::Once<Arc<TimerFdScheme>> = spin::Once::new();
 
 pub fn get_timerfd_scheme() -> &'static Arc<TimerFdScheme> {
     TIMERFD_SCHEME.call_once(|| Arc::new(TimerFdScheme::new()))
