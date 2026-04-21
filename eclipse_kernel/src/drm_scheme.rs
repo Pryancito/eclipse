@@ -230,8 +230,8 @@ impl Scheme for DrmScheme {
                         0x5 => cap.value = 3, // DRM_CAP_PRIME: IMPORT|EXPORT
                         0x6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
                         0x7 => cap.value = 0, // DRM_CAP_ASYNC_PAGE_FLIP
-                        0x8 => cap.value = drm_caps.max_width as u64, // DRM_CAP_CURSOR_WIDTH
-                        0x9 => cap.value = drm_caps.max_height as u64, // DRM_CAP_CURSOR_HEIGHT
+                        0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
+                        0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
                         0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS
                         0x11 => cap.value = 0, // DRM_CAP_PAGE_FLIP_TARGET
                         0x12 => cap.value = 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
@@ -570,7 +570,7 @@ impl Scheme for DrmScheme {
                 // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 2000 (from simplefb/virtio resources)
                 if enc.encoder_id == VIRTUAL_ENCODER_ID {
                     enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
-                    enc.crtc_id = 2000;
+                    enc.crtc_id = 0; // No CRTC currently active; wlroots will assign one via SETCRTC
                     enc.possible_crtcs = 1;
                     enc.possible_clones = 0;
                     Ok(0)
@@ -696,9 +696,19 @@ impl Scheme for DrmScheme {
                     p.fb_id = info.fb_id;
                     p.possible_crtcs = info.possible_crtcs;
                     p.gamma_size = 0;
-                    // Linux expects the 2-step pattern: first call with count=0 to get count,
-                    // then with pointer+count to fill. We currently expose no format list.
-                    p.count_format_types = 0;
+                    // Supported pixel formats: XRGB8888 and ARGB8888.
+                    // Follow the Linux 2-step pattern: first call returns count (ptr=NULL or
+                    // count=0), second call fills the array.
+                    const FORMATS: [u32; 2] = [
+                        0x34325258, // DRM_FORMAT_XRGB8888
+                        0x34325241, // DRM_FORMAT_ARGB8888
+                    ];
+                    if p.format_type_ptr != 0 && p.count_format_types >= FORMATS.len() as u32 {
+                        for (i, &fmt) in FORMATS.iter().enumerate() {
+                            unsafe { (p.format_type_ptr as *mut u32).add(i).write_unaligned(fmt) };
+                        }
+                    }
+                    p.count_format_types = FORMATS.len() as u32;
                     Ok(0)
                 } else {
                     Err(scheme_error::ENOENT)

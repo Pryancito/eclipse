@@ -6177,6 +6177,7 @@ fn sys_readlink(path_ptr: u64, buf_ptr: u64, size: u64) -> u64 {
         "class/drm/card0/device" | "class/drm/renderD128/device" => b"../../../devices/pci0000:00/0000:00:02.0",
         "class/graphics/fb0/device" => b"../../../devices/pci0000:00/0000:00:02.0",
         "dev/char/29:0"  => b"../../class/graphics/fb0",
+        "devices/pci0000:00/0000:00:02.0/subsystem" => b"../../../../bus/pci",
         _ => return linux_abi_error(22), // EINVAL — not a symlink
     };
 
