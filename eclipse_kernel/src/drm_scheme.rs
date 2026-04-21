@@ -703,9 +703,16 @@ impl Scheme for DrmScheme {
                         0x34325258, // DRM_FORMAT_XRGB8888
                         0x34325241, // DRM_FORMAT_ARGB8888
                     ];
-                    if p.format_type_ptr != 0 && p.count_format_types >= FORMATS.len() as u32 {
-                        for (i, &fmt) in FORMATS.iter().enumerate() {
-                            unsafe { (p.format_type_ptr as *mut u32).add(i).write_unaligned(fmt) };
+                    if p.format_type_ptr != 0 && p.count_format_types > 0 {
+                        // Write only as many formats as the caller allocated (capped to our list).
+                        let write_count = core::cmp::min(p.count_format_types as usize, FORMATS.len());
+                        let byte_len = (write_count * core::mem::size_of::<u32>()) as u64;
+                        if crate::syscalls::is_user_pointer(p.format_type_ptr, byte_len) {
+                            for (i, &fmt) in FORMATS[..write_count].iter().enumerate() {
+                                unsafe { (p.format_type_ptr as *mut u32).add(i).write_unaligned(fmt) };
+                            }
+                        } else {
+                            return Err(scheme_error::EFAULT);
                         }
                     }
                     p.count_format_types = FORMATS.len() as u32;
