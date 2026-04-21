@@ -1897,8 +1897,38 @@ impl Scheme for FileSystemScheme {
                         stat.v_state = 2;
                         Ok(0)
                     }
-                    0x5602 | 0x5605 | 0x5606 | 0x5607 => Ok(0), // VT stubs
-                    0x4B3A => { // KDGETMODE / legacy SET
+                    0x5600 => { // VT_OPENQRY — find first available VT
+                        if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 4) {
+                            return Err(scheme_error::EFAULT);
+                        }
+                        unsafe { *(arg as *mut u32) = 1; }
+                        Ok(0)
+                    }
+                    0x5601 => { // VT_GETMODE
+                        // struct vt_mode: { char mode; char waitv; short relsig; short acqsig; short frsig; }
+                        // Packed on x86: 1+1+2+2+2 = 8 bytes with standard C layout.
+                        if arg != 0 && crate::syscalls::is_user_pointer(arg as u64, 8) {
+                            unsafe {
+                                let ptr = arg as *mut u8;
+                                ptr.write(0);       // mode = VT_AUTO
+                                ptr.add(1).write(0);// waitv
+                                // relsig, acqsig, frsig as i16 = 0
+                                core::ptr::write_unaligned(ptr.add(2) as *mut i16, 0);
+                                core::ptr::write_unaligned(ptr.add(4) as *mut i16, 0);
+                                core::ptr::write_unaligned(ptr.add(6) as *mut i16, 0);
+                            }
+                        }
+                        Ok(0)
+                    }
+                    0x5602 => { // VT_SETMODE — accept and ignore
+                        Ok(0)
+                    }
+                    0x5604 => { // VT_RELDISP — release/acquire display
+                        Ok(0)
+                    }
+                    0x5605 | 0x5606 | 0x5607 => Ok(0), // VT_ACTIVATE, VT_WAITACTIVE, VT_DISALLOCATE stubs
+                    0x5608 | 0x5609 => Ok(0), // VT_RESIZE, VT_RESIZEX stubs
+                    0x4B3A => { // KDGETMODE
                         if arg < 0x1000 { return Ok(0); }
                         let mode = unsafe { &mut *(arg as *mut u32) };
                         *mode = 0; // KD_TEXT
@@ -1911,6 +1941,7 @@ impl Scheme for FileSystemScheme {
                         Ok(0)
                     }
                     0x4B45 | 0x540E => Ok(0), // KDSKBMODE, TIOCSCTTY stubs
+                    0x4B46 | 0x4B47 | 0x4B4D | 0x4B33 => Ok(0), // KDSKBMUTE, KDSKBENT, KDGKBENT, KDGKBLED
                     _ => Err(scheme_error::ENOSYS)
                 }
             }

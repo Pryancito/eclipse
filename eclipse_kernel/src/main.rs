@@ -339,6 +339,12 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
 
     serial::serial_print("[INIT] Initializing Filesystem...\n");
     filesystem::init();
+
+    // Pre-create the virtual /run directories needed by labwc and seatd.
+    // This must happen after filesystem::init() so the virtual overlay is ready.
+    let _ = filesystem::mkdir_path("/run", 0o755);
+    let _ = filesystem::mkdir_path("/run/user", 0o755);
+    let _ = filesystem::mkdir_path("/run/user/0", 0o700);
     // Notify APs that system boot is complete, so they can start their scheduler loops.
     // We do this BEFORE loading the init process to ensure all cores are ready.
     serial::serial_print("[BOOT] Releasing APs for scheduler...\n");
