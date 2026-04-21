@@ -6,7 +6,7 @@
 extern crate std;
 use std::prelude::v1::*;
 use eclipse_program_codes::{spawn_id_to_init_services_index, spawn_service_id, spawn_service_short_name};
-use eclipse_relibc::{getpid, yield_cpu, wait, Spinlock};
+use eclipse_relibc::{getpid, wait, Spinlock};
 use eclipse_relibc::{fork, exec, get_service_binary, get_last_exec_error, exit, get_system_stats, kill, receive_ipc, send_ipc, spawn_service};
 use eclipse_relibc::SystemStats;
 
@@ -55,7 +55,7 @@ const HEARTBEAT_CHECK_INTERVAL: u64 = 5000; // Check every 5 seconds
 /// 5. Graphics Server (Display) (4)
 /// 6. Audio Server (5)
 /// 7. Network Server (6)
-static SERVICES: Spinlock<[Service; 11]> = Spinlock::new([
+static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("kernel", false),
     Service::new("init", false),
     Service::new("log", false),
@@ -65,8 +65,6 @@ static SERVICES: Spinlock<[Service; 11]> = Spinlock::new([
     Service::new("display", false),
     Service::new("audio", false),
     Service::new("network", false),
-    // seatd must start before the GUI/compositor to manage sessions.
-    Service::new("seatd", false),
     // gui_service es un lanzador one-shot: arranca el compositor (p. ej. labwc o lunas) y luego sale.
     // Don't enable heartbeat watchdog for it.
     Service::new("gui", false),
@@ -144,13 +142,12 @@ fn start_essential_service(service_id: u32) -> u32 {
 fn start_system_services() {
     // Start remaining services in order: filesystem, input, display, audio, network, gui
     // Índices 4..=9 en SERVICES ↔ IDs spawn_service 2..=7 (ver eclipse_program_codes).
-    for i in 4..=10 {
+    for i in 4..=9 {
         let (name, pid) = {
             let mut svc = SERVICES.lock();
             let name = svc[i].name;
             let service_id = match i {
-                9 => 8,  // seatd
-                10 => 7, // gui
+                9 => 7, // gui
                 _ => (i - 2) as u32,
             };
             let pid = unsafe { eclipse_relibc::spawn_service(service_id, name.as_ptr(), name.len()) };
@@ -176,8 +173,6 @@ fn start_system_services() {
 }
 
 /// Wait for a service to signal READY via IPC.
-/// Uses a tight poll with yield_cpu + periodic short sleep to balance
-/// responsiveness with CPU efficiency on SMP.
 fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
     let mut buffer = [0u8; 128];
     let mut attempts = 0u32;
@@ -207,7 +202,6 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
                     process_single_ipc_request(&buffer, len, sender);
                 }
             }
-            unsafe { yield_cpu(); }
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
         attempts += 1;

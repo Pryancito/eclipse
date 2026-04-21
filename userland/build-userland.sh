@@ -21,6 +21,8 @@ set -u
 #   ECLIPSE_MESON_BUILDTYPE release o debug (defecto: release)
 #   ECLIPSE_LABWC_CLEAN   si está a 1, borra userland/labwc/bld antes de configurar
 #   ECLIPSE_WLROOTS_CLEAN idem para wlroots_src/bld-eclipse
+#   ECLIPSE_LIBINPUT_CLEAN idem para libinput_src/bld-eclipse (p. ej. tras cambiar --prefix)
+#   ECLIPSE_XKBCOMMON_CLEAN idem para xkbcommon_src/bld-eclipse (--prefix=/usr incrustado en la .so)
 
 set -euo pipefail
 
@@ -527,14 +529,14 @@ build_xkeyboard_config() {
 	fi
 
 	info "Configurando xkeyboard-config → $bld"
-	# xkeyboard-config es mayormente datos, pero necesita configuración rápida.
+	# prefix=/usr + DESTDIR: mismos datos bajo el sysroot sin rutas absolutas del host en metadatos.
 	meson setup "$bld" "$root" --cross-file="$cross" \
-		--prefix="$ECLIPSE_SYSROOT/usr" \
+		--prefix=/usr \
 		-Ddatadir=share \
 		"-Dbuildtype=$ECLIPSE_MESON_BUILDTYPE"
 
 	info "Instalando xkeyboard-config…"
-	ninja -C "$bld" install
+	DESTDIR="$ECLIPSE_SYSROOT" ninja -C "$bld" install
 
 	ok "xkeyboard-config instalado en $ECLIPSE_SYSROOT/usr/share/X11/xkb"
 }
@@ -759,12 +761,17 @@ build_libinput() {
  
 	ensure_xfwl4_xfce_wayland_protocols
 	write_meson_cross "$cross"
+	if [[ "${ECLIPSE_LIBINPUT_CLEAN:-0}" == "1" ]]; then
+		rm -rf "$bld"
+	fi
 	info "Construyendo libinput..."
 	# libinput necesita libevdev, mtdev y libudev (usamos libudev-zero)
-	meson setup "$bld" "$root" --cross-file="$cross" --prefix="$ECLIPSE_SYSROOT/usr" \
+	# --prefix=/usr (no $ECLIPSE_SYSROOT/usr): los quirks/datadir se compilan como /usr/share/…;
+	# la instalación al sysroot va con DESTDIR (mismo patrón que libjpeg-turbo con CMAKE_INSTALL_PREFIX=/usr).
+	meson setup "$bld" "$root" --cross-file="$cross" --prefix=/usr \
 		-Ddefault_library=${default_lib:-shared} -Ddebug-gui=false -Dtests=false -Ddocumentation=false \
 		-Dlibwacom=false
-	ninja -C "$bld" install
+	DESTDIR="$ECLIPSE_SYSROOT" ninja -C "$bld" install
 }
 
 build_xkbcommon() {
@@ -779,10 +786,19 @@ build_xkbcommon() {
  
 	ensure_xfwl4_xfce_wayland_protocols
 	write_meson_cross "$cross"
+	if [[ "${ECLIPSE_XKBCOMMON_CLEAN:-0}" == "1" ]]; then
+		rm -rf "$bld"
+	fi
 	info "Construyendo xkbcommon..."
-	meson setup "$bld" "$root" --cross-file="$cross" --prefix="$ECLIPSE_SYSROOT/usr" \
-		-Ddefault_library=${default_lib:-shared} -Denable-x11=false -Denable-docs=false -Denable-wayland=true
-	ninja -C "$bld" install
+	# --prefix=/usr + DESTDIR: instala bajo el sysroot con rutas lógicas /usr/…
+	# -Dxkb-config-root=…: si no se fija, Meson usa pkg-config `xkb_base` de xkeyboard-config,
+	#   que suele ser la ruta absoluta del host (…/eclipse-os-build/usr/…) → [XKB-632] en la imagen.
+	meson setup "$bld" "$root" --cross-file="$cross" --prefix=/usr \
+		-Ddefault_library=${default_lib:-shared} -Denable-x11=false -Denable-docs=false -Denable-wayland=true \
+		-Dxkb-config-root=/usr/share/X11/xkb \
+		-Dxkb-config-extra-path=/etc/xkb \
+		-Dx-locale-root=/usr/share/X11/locale
+	DESTDIR="$ECLIPSE_SYSROOT" ninja -C "$bld" install
 }
 
 build_pcre2() {
@@ -1374,7 +1390,7 @@ Construcción userland (Eclipse OS / musl).
 Variables:
   ECLIPSE_SYSROOT=$ECLIPSE_SYSROOT
   ECLIPSE_TOOLCHAIN_DIR=$ECLIPSE_TOOLCHAIN_DIR
-  ECLIPSE_LABWC_CLEAN=1 / ECLIPSE_WLROOTS_CLEAN=1  — borrar bld antes de meson setup
+  ECLIPSE_LABWC_CLEAN=1 / ECLIPSE_WLROOTS_CLEAN=1 / ECLIPSE_LIBINPUT_CLEAN=1 / ECLIPSE_XKBCOMMON_CLEAN=1  — borrar bld antes de meson setup
   ECLIPSE_LABWC_RUNTIME_RPATH=/usr/lib:/lib  — RUNPATH en la imagen Eclipse (musl en /usr/lib).
     Valores remove|none — quita RUNPATH (host glibc: no ejecutes con /usr/lib del sistema; usa QEMU/chroot o LD_LIBRARY_PATH solo al sysroot musl).
   ECLIPSE_LABWC_SKIP_RPATH_PATCH=1  — no modificar RPATH (solo depuración en el host)
@@ -1429,6 +1445,7 @@ main() {
 		;;
 	xkb-data)
 		build_xkeyboard_config
+		build_xkbcommon
 		;;
 	libffi)
 		build_libffi

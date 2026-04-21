@@ -701,6 +701,7 @@ pub extern "C" fn syscall_handler(
         282 => sys_signalfd4(arg1, arg2, arg3, arg4),
         283 => sys_timerfd_create(arg1, arg2),
         286 => sys_timerfd_settime(arg1, arg2, arg3, arg4),
+        287 => sys_timerfd_gettime(arg1, arg2),
         254 => sys_inotify_add_watch(arg1, arg2, arg3),
         294 => sys_inotify_init1(arg1),
         289 => sys_pipe2(arg1, arg2),
@@ -1266,6 +1267,9 @@ fn user_path_to_scheme_path(path_str: &str) -> String {
     if path_str == "/dev/dri" || path_str.starts_with("/dev/dri/") {
         let rel = path_str.trim_start_matches("/dev/dri").trim_start_matches('/');
         format!("drm:{}", rel)
+    } else if path_str == "/dev/input" || path_str.starts_with("/dev/input/") {
+        let rel = path_str.trim_start_matches("/dev/input").trim_start_matches('/');
+        format!("input:{}", rel)
     } else if path_str == "/dev" || path_str.starts_with("/dev/") {
         let rel = path_str.trim_start_matches("/dev").trim_start_matches('/');
         format!("dev:{}", rel)
@@ -4238,6 +4242,9 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
             // the value check and the push would be lost if we pushed after.
             {
                 let mut waiters = FUTEX_WAITERS.lock();
+                // Ensure we don't have a stale entry for this process before adding a new one.
+                // A process can only wait on one address at a time.
+                waiters.retain(|w| w.pid != pid);
                 waiters.push(FutexWaiter { addr: uaddr, pid, bitset });
             }
 
@@ -4246,11 +4253,21 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
             if current_val != val as u32 {
                 // Value already changed — remove our entry and return EAGAIN.
                 let mut waiters = FUTEX_WAITERS.lock();
-                if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
-                    waiters.remove(pos);
-                }
+                waiters.retain(|w| w.pid != pid);
                 return linux_abi_error(11); // EAGAIN
             }
+
+            // Calculate timeout if provided
+            let timeout_ms = if timeout_ptr != 0 && is_user_pointer(timeout_ptr, 16) {
+                let ts = unsafe { &*(timeout_ptr as *const Timespec) };
+                if ts.tv_sec < 0 || ts.tv_nsec < 0 {
+                    return linux_abi_error(22); // EINVAL
+                }
+                Some((ts.tv_sec as u64 * 1000) + (ts.tv_nsec as u64 / 1_000_000))
+            } else {
+                None
+            };
+            let start_ticks = crate::interrupts::ticks();
 
             // Block the current process and yield.
             match process::compare_and_set_process_state(
@@ -4259,22 +4276,45 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3:
                 process::ProcessState::Blocked,
             ) {
                 Ok(true) => {
-                    // TODO: honour timeout_ptr (Timespec) for timed waits.
-                    crate::scheduler::yield_cpu();
-
-                    // After waking, clean up any stale waiter entry (timeout / spurious wake).
-                    let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
-                        waiters.remove(pos);
+                    if let Some(ms) = timeout_ms {
+                        crate::scheduler::add_sleep(pid, start_ticks.saturating_add(ms));
                     }
+
+                    loop {
+                        // Check if we were woken up (state changed back to Running/Runnable)
+                        if let Some(p) = process::get_process(pid) {
+                            if p.state != process::ProcessState::Blocked {
+                                break;
+                            }
+                        }
+
+                        // Check for timeout (even if we are Blocked, if we are in the sleep queue, 
+                        // wake_sleeping_processes will set us to Ready and we will run again)
+                        if let Some(ms) = timeout_ms {
+                            if crate::interrupts::ticks() - start_ticks >= ms {
+                                let mut waiters = FUTEX_WAITERS.lock();
+                                waiters.retain(|w| w.pid != pid);
+                                let _ = process::compare_and_set_process_state(
+                                    pid,
+                                    process::ProcessState::Blocked,
+                                    process::ProcessState::Running,
+                                );
+                                return linux_abi_error(110); // ETIMEDOUT
+                            }
+                        }
+
+                        crate::scheduler::yield_cpu();
+                    }
+
+                    // Final cleanup of waiter entry
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    waiters.retain(|w| w.pid != pid);
                     0
                 }
                 _ => {
-                    // Was already woken (or state wasn't Running); remove stale entry.
+                    // Was already woken (or state wasn't Running); remove entry.
                     let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(pos) = waiters.iter().position(|w| w.pid == pid && w.addr == uaddr) {
-                        waiters.remove(pos);
-                    }
+                    waiters.retain(|w| w.pid != pid);
                     0
                 }
             }
@@ -4459,7 +4499,7 @@ pub fn futex_wake_all_atomic(uaddr: u64) {
 
 /// Block the current process for `ms` timer ticks (1 ms per tick at 1000 Hz PIT).
 /// Used by `nanosleep` and Linux `poll`.
-fn process_sleep_ms(ms: u64) -> u64 {
+pub(crate) fn process_sleep_ms(ms: u64) -> u64 {
     if ms == 0 {
         yield_cpu();
         return 0;
@@ -4636,7 +4676,7 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
 
 fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if stat_ptr == 0 { return u64::MAX; }
-    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<LinuxStat>() as u64) {
         return u64::MAX;
     }
     
@@ -4647,14 +4687,29 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
             // Call scheme fstat
             match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat) {
                 Ok(_) => {
-                    // SAFETY: Copy to user memory via safe raw pointer copy.
-                    // stat_ptr has been validated by is_user_pointer above.
+                    // Return Linux ABI stat struct, not the internal scheme::Stat layout.
+                    let lstat = LinuxStat {
+                        st_dev: stat.dev,
+                        st_ino: stat.ino,
+                        st_nlink: stat.nlink as u64,
+                        st_mode: stat.mode,
+                        st_uid: stat.uid,
+                        st_gid: stat.gid,
+                        __pad0: 0,
+                        st_rdev: stat.rdev,
+                        st_size: stat.size as i64,
+                        st_blksize: stat.blksize as i64,
+                        st_blocks: stat.blocks as i64,
+                        st_atime: stat.atime as u64,
+                        st_atime_nsec: 0,
+                        st_mtime: stat.mtime as u64,
+                        st_mtime_nsec: 0,
+                        st_ctime: stat.ctime as u64,
+                        st_ctime_nsec: 0,
+                        __unused: [0; 3],
+                    };
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            &stat as *const crate::scheme::Stat,
-                            stat_ptr as *mut crate::scheme::Stat,
-                            1
-                        );
+                        core::ptr::write_unaligned(stat_ptr as *mut LinuxStat, lstat);
                     }
                     return 0;
                 }
@@ -5368,7 +5423,7 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
                                 data_ptr.add(i).write_volatile(fd_val);
                             }
                         }
-                        cmsg_offset += needed;
+                        cmsg_offset += (needed + 7) & !7; // Align to 8 bytes
                         total_written += needed;
                     }
                 }
@@ -5391,7 +5446,7 @@ fn sys_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
                 ucred_ptr.add(1).write_volatile(0); // UID
                 ucred_ptr.add(2).write_volatile(0); // GID
             }
-            cmsg_offset += cred_needed;
+            cmsg_offset += (cred_needed + 7) & !7; // Align to 8 bytes
             total_written += cred_needed;
             serial::serial_printf(format_args!("[SYSCALL] recvmsg injected SCM_CREDENTIALS (pid={})\n", pid));
         }
@@ -5428,32 +5483,57 @@ struct LinuxStat {
     __unused: [i64; 3],
 }
 
+#[inline(always)]
+pub(crate) fn linux_makedev(major: u32, minor: u32) -> u64 {
+    // Linux dev_t encoding (glibc/musl).
+    // Equivalent to gnu_dev_makedev().
+    let major = major as u64;
+    let minor = minor as u64;
+    ((major & 0xFFFF_F000) << 32)
+        | ((major & 0x0000_0FFF) << 8)
+        | ((minor & 0xFFFF_FF00) << 12)
+        | (minor & 0x0000_00FF)
+}
+
 fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
-    if path_ptr == 0 || stat_ptr == 0 { return u64::MAX; }
-    if !is_user_pointer(stat_ptr, core::mem::size_of::<LinuxStat>() as u64) {
-        return u64::MAX;
+    let _ = (dirfd, flags); // AT_FDCWD / AT_SYMLINK_NOFOLLOW: best-effort for now
+
+    if path_ptr == 0 || stat_ptr == 0 {
+        return linux_abi_error(22); // EINVAL
     }
-    
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<LinuxStat>() as u64) {
+        return linux_abi_error(14); // EFAULT
+    }
+
     let path_len = strlen_user_unique(path_ptr, 4096);
-    if path_len == 0 { return u64::MAX; }
-    
+    if path_len == 0 {
+        return linux_abi_error(22); // EINVAL
+    }
+
     let mut path_buf = [0u8; MAX_PATH_LENGTH];
-    if path_len >= MAX_PATH_LENGTH as u64 { return u64::MAX; }
-    
+    if path_len >= MAX_PATH_LENGTH as u64 {
+        return linux_abi_error(36); // ENAMETOOLONG
+    }
+
     unsafe {
         core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
     }
     path_buf[path_len as usize] = 0;
-    
+
     let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
         Ok(s) => s,
-        Err(_) => return u64::MAX,
+        Err(_) => return linux_abi_error(22),
     };
 
     let scheme_path = user_path_to_scheme_path(path_str);
-    if let Ok((scheme_id, resource_id)) = crate::scheme::open(&scheme_path, 0, 0) {
-        let mut stat = crate::scheme::Stat::default();
-        let res = if crate::scheme::fstat(scheme_id, resource_id, &mut stat).is_ok() {
+    match crate::scheme::open(&scheme_path, 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            let mut stat = crate::scheme::Stat::default();
+            let fstat_ok = crate::scheme::fstat(scheme_id, resource_id, &mut stat).is_ok();
+            let _ = crate::scheme::close(scheme_id, resource_id);
+            if !fstat_ok {
+                return linux_abi_error(5); // EIO
+            }
             let lstat = LinuxStat {
                 st_dev: stat.dev,
                 st_ino: stat.ino,
@@ -5462,7 +5542,7 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
                 st_uid: stat.uid,
                 st_gid: stat.gid,
                 __pad0: 0,
-                st_rdev: 0,
+                st_rdev: stat.dev,
                 st_size: stat.size as i64,
                 st_blksize: stat.blksize as i64,
                 st_blocks: stat.blocks as i64,
@@ -5478,14 +5558,9 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
                 core::ptr::write_unaligned(stat_ptr as *mut LinuxStat, lstat);
             }
             0
-        } else {
-            u64::MAX
-        };
-        crate::scheme::close(scheme_id, resource_id).ok();
-        return res;
+        }
+        Err(e) => linux_abi_error(e as i32),
     }
-    
-    u64::MAX
 }
 
 /// sys_stat - Get file status by path
@@ -6097,6 +6172,10 @@ fn sys_readlink(path_ptr: u64, buf_ptr: u64, size: u64) -> u64 {
     // The SysScheme exposes these as symlinks.
     let target: &[u8] = match stripped {
         "dev/char/226:0" => b"../../class/drm/card0",
+        "dev/char/226:128" => b"../../class/drm/renderD128",
+        "dev/char/226:0/device/subsystem" | "dev/char/226:128/device/subsystem" => b"../../../../bus/pci",
+        "class/drm/card0/device" | "class/drm/renderD128/device" => b"../../../devices/pci0000:00/0000:00:02.0",
+        "class/graphics/fb0/device" => b"../../../devices/pci0000:00/0000:00:02.0",
         "dev/char/29:0"  => b"../../class/graphics/fb0",
         _ => return linux_abi_error(22), // EINVAL — not a symlink
     };
@@ -6812,31 +6891,84 @@ fn sys_signalfd4(_fd: u64, _mask_ptr: u64, _mask_size: u64, _flags: u64) -> u64 
 }
 
 /// sys_timerfd_create — Linux timerfd_create(clockid, flags).
-fn sys_timerfd_create(clockid: u64, _flags: u64) -> u64 {
-    // Stub: create a signalfd-like object that never fires for now.
-    serial::serial_printf(format_args!("[SYSCALL] timerfd_create(clockid={})\n", clockid));
-    match crate::scheme::open("signalfd:", 0, 0) {
+fn sys_timerfd_create(clockid: u64, flags: u64) -> u64 {
+    if clockid != 0 && !matches!(clockid, 1 | 4 | 7) {
+        return linux_abi_error(22); // EINVAL
+    }
+    let path = alloc::format!("timerfd:{}/{}", clockid, flags as u32);
+    match crate::scheme::open(&path, 0, 0) {
         Ok((scheme_id, resource_id)) => {
             if let Some(pid) = current_process_id() {
                 if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
                     return fd as u64;
                 }
             }
+            let _ = crate::scheme::close(scheme_id, resource_id);
         }
-        _ => {}
+        Err(e) => return linux_abi_error(e as i32),
     }
-    linux_abi_error(12)
+    linux_abi_error(12) // ENOMEM
 }
 
 /// sys_timerfd_settime — Linux timerfd_settime(fd, flags, new_value, old_value).
-fn sys_timerfd_settime(fd: u64, _flags: u64, _new_value: u64, _old_value: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] timerfd_settime(fd={}) stub\n", fd));
-    0 // Success
+fn sys_timerfd_settime(fd: u64, flags: u64, new_value: u64, old_value: u64) -> u64 {
+    let sz = core::mem::size_of::<crate::timerfd::Itimerspec>();
+    if !is_user_pointer(new_value, sz as u64) {
+        return linux_abi_error(14); // EFAULT
+    }
+    if old_value != 0 && !is_user_pointer(old_value, sz as u64) {
+        return linux_abi_error(14);
+    }
+    let Some(scheme_id) = crate::scheme::get_scheme_id("timerfd") else {
+        return linux_abi_error(38); // ENOSYS
+    };
+    let Some(pid) = current_process_id() else {
+        return linux_abi_error(3);
+    };
+    let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) else {
+        return linux_abi_error(9); // EBADF
+    };
+    if fd_entry.scheme_id != scheme_id {
+        return linux_abi_error(22); // EINVAL — no es un timerfd
+    }
+    let new = unsafe { core::ptr::read_unaligned(new_value as *const crate::timerfd::Itimerspec) };
+    match crate::timerfd::get_timerfd_scheme().settime(
+        fd_entry.resource_id,
+        flags as i32,
+        &new,
+        old_value,
+    ) {
+        Ok(()) => 0,
+        Err(e) => linux_abi_error(e as i32),
+    }
+}
+
+/// sys_timerfd_gettime — Linux timerfd_gettime(fd, curr_value).
+fn sys_timerfd_gettime(fd: u64, curr_ptr: u64) -> u64 {
+    let sz = core::mem::size_of::<crate::timerfd::Itimerspec>();
+    if !is_user_pointer(curr_ptr, sz as u64) {
+        return linux_abi_error(14);
+    }
+    let Some(scheme_id) = crate::scheme::get_scheme_id("timerfd") else {
+        return linux_abi_error(38);
+    };
+    let Some(pid) = current_process_id() else {
+        return linux_abi_error(3);
+    };
+    let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) else {
+        return linux_abi_error(9);
+    };
+    if fd_entry.scheme_id != scheme_id {
+        return linux_abi_error(22);
+    }
+    match crate::timerfd::get_timerfd_scheme().gettime(fd_entry.resource_id, curr_ptr) {
+        Ok(()) => 0,
+        Err(e) => linux_abi_error(e as i32),
+    }
 }
 
 /// sys_inotify_init1 — Linux inotify_init1(flags).
-fn sys_inotify_init1(flags: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] inotify_init1(flags={:#x})\n", flags));
+fn sys_inotify_init1(_flags: u64) -> u64 {
     // Another stub using signalfd: scheme
     match crate::scheme::open("signalfd:", 0, 0) {
         Ok((scheme_id, resource_id)) => {
@@ -6852,8 +6984,7 @@ fn sys_inotify_init1(flags: u64) -> u64 {
 }
 
 /// sys_inotify_add_watch — Linux inotify_add_watch(fd, pathname, mask).
-fn sys_inotify_add_watch(fd: u64, _path: u64, _mask: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] inotify_add_watch(fd={}) stub\n", fd));
+fn sys_inotify_add_watch(_fd: u64, _path: u64, _mask: u64) -> u64 {
     1 // Dummy watch descriptor
 }
 

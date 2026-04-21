@@ -370,7 +370,7 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
         true
     }
     fn wait_vblank(&self, _crtc_id: u32) -> bool {
-        crate::scheduler::yield_cpu();
+        crate::syscalls::process_sleep_ms(16);
         true
     }
     fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
@@ -450,7 +450,7 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
         }
         planes
     }
-    fn set_plane(&self, plane_id: u32, _crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
+    fn set_plane(&self, plane_id: u32, crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, src_x: u32, src_y: u32, src_w: u32, src_h: u32) -> bool {
         let fb = if let Some(fb) = crate::drm::get_fb(fb_id) { fb } else { return false; };
         let resource_id = fb.gem_handle_id;
         
@@ -482,6 +482,127 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
             }
         }
         false
+    }
+
+    fn ioctl(&self, request: u32, arg: usize) -> Result<usize, usize> {
+        use crate::scheme::error as scheme_error;
+
+        const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106441;
+        const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xC0406442;
+        const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106443;
+        const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = 0xC0386444;
+        const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = 0xC0106445;
+        const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0xC0286446;
+        const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = 0xC0286447;
+        const DRM_IOCTL_VIRTGPU_WAIT: u32 = 0xC0086448;
+        const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = 0xC0186449;
+
+        match request {
+            DRM_IOCTL_VIRTGPU_GETPARAM => {
+                #[repr(C)]
+                struct DrmVirtgpuGetparam { param: u64, value: u64 }
+                let p = unsafe { &mut *(arg as *mut DrmVirtgpuGetparam) };
+                match p.param {
+                    1 => { // VIRTGPU_PARAM_3D_FEATURES
+                        let devices = GPU_DEVICES.lock();
+                        p.value = if devices.first().map_or(false, |g| g.virgl_supported) { 1 } else { 0 };
+                    }
+                    2 => p.value = 1, // VIRTGPU_PARAM_CAPSET_QUERY_FIX
+                    _ => p.value = 0,
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_VIRTGPU_MAP => {
+                #[repr(C)]
+                struct DrmVirtgpuMap { offset: u64, handle: u32, pad: u32 }
+                let m = unsafe { &mut *(arg as *mut DrmVirtgpuMap) };
+                // On Eclipse OS, we use the GEM handle ID as the mmap offset.
+                m.offset = m.handle as u64;
+                Ok(0)
+            }
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => {
+                #[repr(C)]
+                struct DrmVirtgpuResourceCreate {
+                    target: u32, format: u32, bind: u32, width: u32, height: u32, depth: u32,
+                    array_size: u32, last_level: u32, nr_samples: u32, flags: u32,
+                    bo_handle: u32, res_handle: u32, size: u32, stride: u32,
+                }
+                let c = unsafe { &mut *(arg as *mut DrmVirtgpuResourceCreate) };
+                let mut devices = GPU_DEVICES.lock();
+                let gpu = devices.first_mut().ok_or(scheme_error::ENODEV)?;
+                
+                // If bo_handle is 0, we need to allocate a GEM object first.
+                let handle_id = if c.bo_handle == 0 {
+                    let size = if c.size > 0 { c.size as usize } else { (c.width * c.height * 4) as usize };
+                    let handle = crate::drm::alloc_buffer(size).ok_or(scheme_error::ENOMEM)?;
+                    handle.id
+                } else {
+                    c.bo_handle
+                };
+
+                // Use handle_id as res_handle (resource_id in VirtIO)
+                if gpu.virgl_resource_create_3d(1, handle_id, c.target, c.format, c.bind, c.width, c.height, c.depth, c.array_size, c.last_level, c.nr_samples, c.flags).is_ok() {
+                    let handle = crate::drm::get_handle(handle_id).ok_or(scheme_error::EINVAL)?;
+                    let _ = gpu.resource_attach_backing(handle_id, &[(handle.phys_addr, handle.size as u32)]);
+                    c.bo_handle = handle_id;
+                    c.res_handle = handle_id;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::EIO)
+                }
+            }
+            DRM_IOCTL_VIRTGPU_EXECBUFFER => {
+                #[repr(C)]
+                struct DrmVirtgpuExecbuffer {
+                    flags: u32, size: u32, command: u64, bo_handles: u64, num_bo_handles: u32,
+                    fence_fd: i32, ring_idx: u32, syncobj_stride: u32, num_in_syncobjs: u32,
+                    num_out_syncobjs: u32, in_syncobjs: u64, out_syncobjs: u64,
+                }
+                let e = unsafe { &*(arg as *const DrmVirtgpuExecbuffer) };
+                if e.size > 4096 { return Err(scheme_error::EINVAL); }
+                
+                let mut cmd = [0u8; 4096];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(e.command as *const u8, cmd.as_mut_ptr(), e.size as usize);
+                }
+                
+                let mut devices = GPU_DEVICES.lock();
+                let gpu = devices.first_mut().ok_or(scheme_error::ENODEV)?;
+                if gpu.virgl_submit_3d(1, &cmd[..e.size as usize]).is_ok() {
+                    Ok(0)
+                } else {
+                    Err(scheme_error::EIO)
+                }
+            }
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
+                #[repr(C)]
+                struct DrmVirtgpuResourceInfo { bo_handle: u32, res_handle: u32, size: u32, blob_mem: u32 }
+                let i = unsafe { &mut *(arg as *mut DrmVirtgpuResourceInfo) };
+                if let Some(handle) = crate::drm::get_handle(i.bo_handle) {
+                    i.res_handle = i.bo_handle;
+                    i.size = handle.size as u32;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::EINVAL)
+                }
+            }
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => {
+                #[repr(C)]
+                struct DrmVirtgpu3dTransferToHost {
+                    bo_handle: u32, x: u32, y: u32, z: u32, w: u32, h: u32, d: u32,
+                    level: u32, offset: u32, stride: u32, layer_stride: u32,
+                }
+                let t = unsafe { &*(arg as *const DrmVirtgpu3dTransferToHost) };
+                let mut devices = GPU_DEVICES.lock();
+                let gpu = devices.first_mut().ok_or(scheme_error::ENODEV)?;
+                if gpu.virgl_transfer_to_host_3d(1, t.bo_handle, t.x, t.y, t.z, t.w, t.h, t.d, t.offset as u64, t.level, t.stride, t.layer_stride).is_ok() {
+                    Ok(0)
+                } else {
+                    Err(scheme_error::EIO)
+                }
+            }
+            _ => Err(scheme_error::ENOSYS),
+        }
     }
 }
 

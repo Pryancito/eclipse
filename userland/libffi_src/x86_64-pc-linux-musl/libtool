@@ -171,7 +171,7 @@ lock_old_archive_extraction=no
 LTCC="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc"
 
 # LTCC compiler flags.
-LTCFLAGS="-Wall -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fexceptions"
+LTCFLAGS="-Wall -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fexceptions"
 
 # Take the output of nm and produce a listing of raw symbols and C names.
 global_symbol_pipe="/usr/bin/sed -n -e 's/^.*[	 ]\\([ABCDGIRSTW][ABCDGIRSTW]*\\)[	 ][	 ]*\\([_A-Za-z][_A-Za-z0-9]*\\)\$/\\1 \\2 \\2/p' | /usr/bin/sed '/ __gnu_lto/d'"

@@ -13,14 +13,16 @@ pub struct DrmScheme;
 
 #[derive(Clone, Copy)]
 enum DrmResourceKind {
-    Control,
+    Directory,
+    Control { minor: u32 },
+    PrimeBuf { handle: u32 },
 }
 
 /// A DRM resource handle with a reference count.
 /// The resource is kept alive until `ref_count` reaches zero.
 #[derive(Clone, Copy)]
 struct DrmResource {
-    _kind: DrmResourceKind,
+    kind: DrmResourceKind,
     /// Number of processes (or duplicated fds) that currently hold this resource.
     /// Starts at 1 on open, incremented on dup, decremented on close.
     /// The slot is freed when it reaches 0.
@@ -29,27 +31,36 @@ struct DrmResource {
 
 static OPEN_RESOURCES: Mutex<Vec<Option<DrmResource>>> = Mutex::new(Vec::new());
 
+fn alloc_resource(kind: DrmResourceKind) -> usize {
+    let resource = DrmResource { kind, ref_count: 1 };
+    let mut resources = OPEN_RESOURCES.lock();
+    for (i, slot) in resources.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(resource);
+            return i;
+        }
+    }
+    let id = resources.len();
+    resources.push(Some(resource));
+    id
+}
+
 impl Scheme for DrmScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
         serial::serial_printf(format_args!("[DRM-SCHEME] open({})\n", path));
         
-        let kind = if path.is_empty() || path == "/" || path == "control" || path == "card0" {
-            DrmResourceKind::Control
+        let kind = if path.is_empty() || path == "/" {
+            DrmResourceKind::Directory
+        } else if path == "card0" {
+            DrmResourceKind::Control { minor: 0 }
+        } else if path == "control" {
+            DrmResourceKind::Control { minor: 64 }
+        } else if path == "renderD128" {
+            DrmResourceKind::Control { minor: 128 }
         } else {
             return Err(scheme_error::ENOENT);
         };
-
-        let resource = DrmResource { _kind: kind, ref_count: 1 };
-        let mut resources = OPEN_RESOURCES.lock();
-        for (i, slot) in resources.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(resource);
-                return Ok(i);
-            }
-        }
-        let id = resources.len();
-        resources.push(Some(resource));
-        Ok(id)
+        Ok(alloc_resource(kind))
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
@@ -78,34 +89,65 @@ impl Scheme for DrmScheme {
     }
 
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
-        let resources = OPEN_RESOURCES.lock();
-        let _resource = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        // IMPORTANT: don't hold OPEN_RESOURCES lock across the whole ioctl handler.
+        // Some ioctls (e.g. CREATE_LEASE) allocate new resources and would deadlock
+        // if we tried to re-lock OPEN_RESOURCES while already holding it.
+        {
+            let resources = OPEN_RESOURCES.lock();
+            let _resource = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+            let _ = _resource; // validate fd resource exists
+        }
         
-        // DRM IOCTL ranges usually start with 0x64 ('d')
-        // Standard codes:
-        const DRM_IOCTL_GET_CAP: u32 = 0xC0106405;
-        const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010641D;
+        // Linux DRM UAPI ioctl numbers (x86_64), as in <drm/drm.h> + <drm/drm_mode.h>.
+        // Keep these aligned with Linux so libdrm/wlroots work unmodified.
+        const DRM_IOCTL_VERSION: u32 = 0xC0406400;
+        const DRM_IOCTL_GET_UNIQUE: u32 = 0xC0106401;
+        const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
+        const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
+        const DRM_IOCTL_SET_VERSION: u32 = 0xC0106407;
+        const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+
+        const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
+        const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+        const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
+        const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
+        const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
+
         const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC02064B2;
         const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
         const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
-        const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC08064B8;
+        const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06864B8;
+        const DRM_IOCTL_MODE_DESTROYFB: u32 = 0xC00464AF; // RMFB
         const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
-        const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086444;
-        const DRM_IOCTL_MODE_DESTROYFB: u32 = 0xC00464AF;
-        const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
-        const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
-        const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
-        const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
+
         const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
         const DRM_IOCTL_MODE_CURSOR: u32 = 0xC01C64A3;
+
         const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
         const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
-        const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC04464B7;
+        const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC03064B7;
+
         const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
         const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC01064AC;
-        const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC01C64B9;
-        const DRM_IOCTL_VERSION: u32 = 0xC0406400;
-        const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
+        const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+
+        // Atomic KMS commit ioctl. Even if we don't fully support it yet,
+        // the number must match Linux for correct feature probing.
+        const DRM_IOCTL_MODE_ATOMIC: u32 = 0xC03864BC;
+
+        // DRM leases (used by wlroots allocator path)
+        const DRM_IOCTL_MODE_CREATE_LEASE: u32 = 0xC01864C6;
+        const DRM_IOCTL_MODE_REVOKE_LEASE: u32 = 0xC00464C9;
+
+        // Legacy DRM auth/master ioctls (not strictly needed for our bring-up, but keep Linux values).
+        const DRM_IOCTL_GET_MAGIC: u32 = 0x80046402;
+        const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
+        const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
+        const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
+
+        // PRIME dmabuf interop (Linux values).
+        const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C642D;
+        const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C642E;
 
         serial::serial_printf(format_args!("[DRM-SCHEME] ioctl: id={} request=0x{:x}\n", id, request));
         match request as u32 {
@@ -150,6 +192,27 @@ impl Scheme for DrmScheme {
                 v.desc_len = desc.len();
                 Ok(0)
             }
+            DRM_IOCTL_GET_UNIQUE => {
+                #[repr(C)]
+                struct DrmUnique {
+                    unique_len: usize,
+                    unique: *mut u8,
+                }
+                let u = unsafe { &mut *(arg as *mut DrmUnique) };
+                let name = b"eclipse-gpu\0";
+                unsafe {
+                    if u.unique_len > 0 && !u.unique.is_null() {
+                        let len = core::cmp::min(u.unique_len, name.len());
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), u.unique, len);
+                    }
+                }
+                u.unique_len = name.len();
+                Ok(0)
+            }
+            DRM_IOCTL_SET_VERSION => {
+                // No-op for now, just accept whatever version userspace wants.
+                Ok(0)
+            }
             DRM_IOCTL_GET_CAP => {
                 #[repr(C)]
                 struct DrmGetCap {
@@ -158,15 +221,21 @@ impl Scheme for DrmScheme {
                 }
                 let cap = unsafe { &mut *(arg as *mut DrmGetCap) };
                 if let Some(drm_caps) = drm::get_caps() {
+                    // Values must match <drm/drm.h> DRM_CAP_* (libdrm drmGetCap).
                     match cap.capability {
-                        1 => cap.value = if drm_caps.has_cursor { 1 } else { 0 }, // DRM_CAP_CURSOR_BITMAP
-                        3 => cap.value = 1, // DRM_CAP_DUMB_BUFFER: dumb (CPU-mapped) buffers supported
-                        5 => cap.value = 0, // DRM_CAP_PRIME: buffer sharing not supported (software renderer)
-                        6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
-                        8 => cap.value = drm_caps.max_width as u64,  // DRM_CAP_CURSOR_WIDTH
-                        9 => cap.value = drm_caps.max_height as u64, // DRM_CAP_CURSOR_HEIGHT
-                        0xB => cap.value = 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
-                        0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS: no format modifier support
+                        0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
+                        0x2 => cap.value = 0, // DRM_CAP_VBLANK_HIGH_CRTC
+                        0x3 => cap.value = 0, // DRM_CAP_DUMB_PREFERRED_DEPTH (optional)
+                        0x4 => cap.value = 0, // DRM_CAP_DUMB_PREFER_SHADOW
+                        0x5 => cap.value = 3, // DRM_CAP_PRIME: IMPORT|EXPORT
+                        0x6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
+                        0x7 => cap.value = 0, // DRM_CAP_ASYNC_PAGE_FLIP
+                        0x8 => cap.value = drm_caps.max_width as u64, // DRM_CAP_CURSOR_WIDTH
+                        0x9 => cap.value = drm_caps.max_height as u64, // DRM_CAP_CURSOR_HEIGHT
+                        0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS
+                        0x11 => cap.value = 0, // DRM_CAP_PAGE_FLIP_TARGET
+                        0x12 => cap.value = 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
+                        0x13 | 0x14 | 0x15 => cap.value = 0, // SYNCOBJ / TIMELINE / ATOMIC_ASYNC_PAGE_FLIP
                         _ => cap.value = 0,
                     }
                     Ok(0)
@@ -174,16 +243,83 @@ impl Scheme for DrmScheme {
                     Err(scheme_error::EIO)
                 }
             }
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                #[repr(C)]
+                struct DrmPrimeHandle {
+                    handle: u32,
+                    flags: u32,
+                    fd: i32,
+                }
+                let ph = unsafe { &mut *(arg as *mut DrmPrimeHandle) };
+                let _ = ph.flags;
+
+                let pid = crate::process::current_process_id().ok_or(scheme_error::ESRCH)?;
+                let drm_scheme_id = crate::scheme::get_scheme_id("drm").ok_or(scheme_error::EINVAL)?;
+
+                // Create a new DRM scheme resource representing a dmabuf view of this GEM handle.
+                let res_id = alloc_resource(DrmResourceKind::PrimeBuf { handle: ph.handle });
+                // EMFILE isn't part of scheme_error; use EINVAL for "no fd slots".
+                let new_fd = crate::fd::fd_open(pid, drm_scheme_id, res_id, 0).ok_or(scheme_error::EINVAL)?;
+                ph.fd = new_fd as i32;
+                Ok(0)
+            }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                #[repr(C)]
+                struct DrmPrimeHandle {
+                    handle: u32,
+                    flags: u32,
+                    fd: i32,
+                }
+                let ph = unsafe { &mut *(arg as *mut DrmPrimeHandle) };
+                let _ = ph.flags;
+
+                let pid = crate::process::current_process_id().ok_or(scheme_error::ESRCH)?;
+                if ph.fd < 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+                let fd_entry = crate::fd::fd_get(pid, ph.fd as usize).ok_or(scheme_error::EBADF)?;
+                let drm_scheme_id = crate::scheme::get_scheme_id("drm").ok_or(scheme_error::EINVAL)?;
+                if fd_entry.scheme_id != drm_scheme_id {
+                    return Err(scheme_error::EINVAL);
+                }
+                let resources = OPEN_RESOURCES.lock();
+                let res = resources
+                    .get(fd_entry.resource_id)
+                    .and_then(|slot| slot.as_ref())
+                    .ok_or(scheme_error::EBADF)?;
+                match res.kind {
+                    DrmResourceKind::PrimeBuf { handle } => {
+                        ph.handle = handle;
+                        Ok(0)
+                    }
+                    DrmResourceKind::Control { .. } | DrmResourceKind::Directory => Err(scheme_error::EINVAL),
+                }
+            }
             DRM_IOCTL_SET_CLIENT_CAP => {
-                // struct drm_set_client_cap { uint64_t capability; uint64_t value; }
-                let cap_ptr = arg as *const u64;
-                let capability = unsafe { *cap_ptr };
-                match capability {
-                    // DRM_CLIENT_CAP_STEREO_3D (1), DRM_CLIENT_CAP_UNIVERSAL_PLANES (2),
-                    // DRM_CLIENT_CAP_ATOMIC (3), DRM_CLIENT_CAP_ASPECT_RATIO (4),
+                #[repr(C)]
+                struct DrmSetClientCap {
+                    capability: u64,
+                    value: u64,
+                }
+
+                let ptr = arg as u64;
+                if !crate::syscalls::is_user_pointer(ptr, core::mem::size_of::<DrmSetClientCap>() as u64) {
+                    return Err(scheme_error::EFAULT);
+                }
+
+                // SAFETY: userspace pointer validated above. Still use unaligned reads.
+                let cap = unsafe { (ptr as *const DrmSetClientCap).read_unaligned() };
+
+                // Accept the common caps wlroots requests. Value is usually 1 (enable).
+                // If we don't recognize it, be permissive to keep userspace moving.
+                match cap.capability {
+                    // DRM_CLIENT_CAP_STEREO_3D (1)
+                    // DRM_CLIENT_CAP_UNIVERSAL_PLANES (2)
+                    // DRM_CLIENT_CAP_ATOMIC (3)
+                    // DRM_CLIENT_CAP_ASPECT_RATIO (4)
                     // DRM_CLIENT_CAP_WRITEBACK_CONNECTORS (5)
                     1..=5 => Ok(0),
-                    _ => Err(scheme_error::EINVAL),
+                    _ => Ok(0),
                 }
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
@@ -340,7 +476,7 @@ impl Scheme for DrmScheme {
                     conn.mm_height = d_conn.mm_height;
                     conn.connector_type = 11; // DRM_MODE_CONNECTOR_eDP
                     conn.connector_type_id = 1;
-                    conn.encoder_id = VIRTUAL_ENCODER_ID; // Virtual encoder linked to CRTC 200
+                    conn.encoder_id = VIRTUAL_ENCODER_ID; // Virtual encoder linked to CRTC 2000
 
                     // Populate one preferred mode using the framebuffer dimensions
                     let (fb_width, fb_height) = crate::boot::get_fb_info()
@@ -431,10 +567,10 @@ impl Scheme for DrmScheme {
                     possible_clones: u32,
                 }
                 let enc = unsafe { &mut *(arg as *mut DrmModeGetEncoder) };
-                // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 200 (from simplefb resources)
+                // Virtual encoder VIRTUAL_ENCODER_ID, linked to CRTC 2000 (from simplefb/virtio resources)
                 if enc.encoder_id == VIRTUAL_ENCODER_ID {
                     enc.encoder_type = 1; // DRM_MODE_ENCODER_DAC
-                    enc.crtc_id = 200;
+                    enc.crtc_id = 2000;
                     enc.possible_crtcs = 1;
                     enc.possible_clones = 0;
                     Ok(0)
@@ -483,12 +619,28 @@ impl Scheme for DrmScheme {
                     crtc_id: u32,
                     reply: u64,
                 }
-                let vbl = unsafe { &mut *(arg as *mut DrmWaitVblank) };
-                if drm::wait_vblank(vbl.crtc_id) {
-                    Ok(0)
-                } else {
-                    Err(scheme_error::EINVAL)
+                #[repr(C)]
+                struct DrmWaitVblankReply {
+                    sequence: u32,
+                    tv_sec: i32,
+                    tv_usec: i32,
                 }
+                
+                let _vbl = unsafe { &mut *(arg as *mut DrmWaitVblank) };
+                
+                // Simulate 60Hz: wait ~16ms to prevent busy loops and allow other threads to run
+                crate::syscalls::process_sleep_ms(16);
+                
+                // Fill reply with fake but incrementing data (crucial for wlroots)
+                let reply = unsafe { &mut *(arg as *mut DrmWaitVblankReply) };
+                static VBLANK_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+                reply.sequence = VBLANK_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                
+                let ticks = crate::interrupts::ticks();
+                reply.tv_sec = (ticks / 1000) as i32;
+                reply.tv_usec = ((ticks % 1000) * 1000) as i32;
+
+                Ok(0)
             }
             DRM_IOCTL_MODE_CURSOR => {
                 #[repr(C)]
@@ -514,6 +666,7 @@ impl Scheme for DrmScheme {
                 struct DrmModeGetPlaneRes {
                     plane_id_ptr: u64,
                     count_planes: u32,
+                    pad: u32,
                 }
                 let res = unsafe { &mut *(arg as *mut DrmModeGetPlaneRes) };
                 let planes = drm::get_planes();
@@ -529,16 +682,23 @@ impl Scheme for DrmScheme {
                 #[repr(C)]
                 #[derive(Clone, Copy)]
                 struct DrmModeGetPlane {
-                    plane_id: u32, crtc_id: u32, fb_id: u32,
-                    possible_crtcs: u32, gamma_size: u32,
-                    count_formats: u32, format_type_ptr: u64,
+                    plane_id: u32,
+                    crtc_id: u32,
+                    fb_id: u32,
+                    possible_crtcs: u32,
+                    gamma_size: u32,
+                    count_format_types: u32,
+                    format_type_ptr: u64,
                 }
                 let p = unsafe { &mut *(arg as *mut DrmModeGetPlane) };
                 if let Some(info) = drm::get_plane(p.plane_id) {
                     p.crtc_id = info.crtc_id;
                     p.fb_id = info.fb_id;
                     p.possible_crtcs = info.possible_crtcs;
-                    p.count_formats = 0;
+                    p.gamma_size = 0;
+                    // Linux expects the 2-step pattern: first call with count=0 to get count,
+                    // then with pointer+count to fill. We currently expose no format list.
+                    p.count_format_types = 0;
                     Ok(0)
                 } else {
                     Err(scheme_error::ENOENT)
@@ -548,9 +708,18 @@ impl Scheme for DrmScheme {
                 #[repr(C)]
                 #[derive(Clone, Copy)]
                 struct DrmModeSetPlane {
-                    plane_id: u32, crtc_id: u32, fb_id: u32, flags: u32,
-                    crtc_x: i32, crtc_y: i32, crtc_w: u32, crtc_h: u32,
-                    src_x: u32, src_y: u32, src_w: u32, src_h: u32,
+                    plane_id: u32,
+                    crtc_id: u32,
+                    fb_id: u32,
+                    flags: u32,
+                    crtc_x: i32,
+                    crtc_y: i32,
+                    crtc_w: u32,
+                    crtc_h: u32,
+                    src_x: u32,
+                    src_y: u32,
+                    src_w: u32,
+                    src_h: u32,
                 }
                 let p = unsafe { &*(arg as *const DrmModeSetPlane) };
                 if drm::set_plane(p.plane_id, p.crtc_id, p.fb_id, p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h, p.src_x, p.src_y, p.src_w, p.src_h) {
@@ -559,33 +728,73 @@ impl Scheme for DrmScheme {
                     Err(scheme_error::EIO)
                 }
             }
-            DRM_IOCTL_MODE_GETPROPERTY => {
+            DRM_IOCTL_MODE_ATOMIC => {
+                // Linux: struct drm_mode_atomic { flags(u32), count_objs(u32), objs_ptr(u64), count_props_ptr(u64),
+                //                                props_ptr(u64), prop_values_ptr(u64), reserved(u64), user_data(u64) }
+                // For now we don't implement atomic KMS; return ENOSYS so userspace can fall back when configured.
+                Err(scheme_error::ENOSYS)
+            }
+            DRM_IOCTL_MODE_CREATE_LEASE => {
+                // Linux UAPI (include/uapi/drm/drm_mode.h): struct drm_mode_create_lease
+                // On success the kernel ioctl returns 0 and fills lessee_id + fd in the struct.
                 #[repr(C)]
-                struct DrmModeGetProperty {
-                    values_ptr: u64,
-                    enum_blob_ptr: u64,
-                    prop_id: u32,
+                #[derive(Clone, Copy)]
+                struct DrmModeCreateLease {
+                    object_ids: u64,
+                    object_count: u32,
                     flags: u32,
-                    name: [u8; 32],
-                    count_values: u32,
-                    count_enum_blobs: u32,
+                    lessee_id: u32,
+                    fd: u32,
                 }
-                let p = unsafe { &mut *(arg as *mut DrmModeGetProperty) };
-                // Stub for property discovery: return generic "type" for prop_id 1
-                if p.prop_id == 1 {
-                    p.flags = 0x8; // DRM_MODE_PROP_ENUM
-                    let name = b"type\0";
-                    let len = core::cmp::min(name.len(), 32);
-                    p.name[..len].copy_from_slice(&name[..len]);
-                    p.count_values = 3; // Overlay, Primary, Cursor
-                    p.count_enum_blobs = 0;
-                    Ok(0)
-                } else {
-                    // For any other property, just return OK with no data to avoid crashes
-                    p.count_values = 0;
-                    p.count_enum_blobs = 0;
-                    Ok(0)
+
+                let pid = crate::process::current_process_id().ok_or(scheme_error::ESRCH)?;
+                let drm_scheme_id = crate::scheme::get_scheme_id("drm").ok_or(scheme_error::EINVAL)?;
+
+                // Validate user pointer (best-effort).
+                let ptr = arg as u64;
+                if !crate::syscalls::is_user_pointer(ptr, core::mem::size_of::<DrmModeCreateLease>() as u64) {
+                    return Err(scheme_error::EFAULT);
                 }
+
+                // SAFETY: userspace pointer validated above.
+                let mut lease = unsafe { (ptr as *const DrmModeCreateLease).read_unaligned() };
+                serial::serial_printf(format_args!(
+                    "[DRM-SCHEME] CREATE_LEASE: pid={} object_count={} flags=0x{:x}\n",
+                    pid,
+                    lease.object_count,
+                    lease.flags
+                ));
+
+                // Create a new DRM control resource and hand it out as a fresh fd.
+                let res_id = alloc_resource(DrmResourceKind::Control { minor: 0 });
+                let Some(new_fd) = crate::fd::fd_open(pid, drm_scheme_id, res_id, 0) else {
+                    serial::serial_printf(format_args!(
+                        "[DRM-SCHEME] CREATE_LEASE: fd_open failed (pid={})\n",
+                        pid
+                    ));
+                    return Err(scheme_error::EINVAL);
+                };
+
+                // Non-zero lessee IDs (same style as Linux idr_alloc starting at 1).
+                static NEXT_LESSEE_ID: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let prev = NEXT_LESSEE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                lease.lessee_id = prev.wrapping_add(1);
+                lease.fd = new_fd as u32;
+                unsafe { (ptr as *mut DrmModeCreateLease).write_unaligned(lease) };
+
+                serial::serial_printf(format_args!(
+                    "[DRM-SCHEME] CREATE_LEASE: ok lessee_id={} fd={} (ioctl ret 0)\n",
+                    lease.lessee_id,
+                    lease.fd
+                ));
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_REVOKE_LEASE => {
+                // Linux UAPI: struct drm_mode_revoke_lease { __u32 lease_id; __u32 _reserved; }
+                // We accept and no-op for now.
+                serial::serial_printf(format_args!("[DRM-SCHEME] REVOKE_LEASE\n"));
+                Ok(0)
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 // struct drm_mode_fb_cmd2: fb_id(u32), width(u32), height(u32),
@@ -604,6 +813,8 @@ impl Scheme for DrmScheme {
                     modifier: [u64; 4],
                 }
                 let cmd = unsafe { &mut *(arg as *mut DrmModeFbCmd2) };
+                serial::serial_printf(format_args!("[DRM-SCHEME] ADDFB2: {}x{} format=0x{:x} handle={}\n", 
+                    cmd.width, cmd.height, cmd.pixel_format, cmd.handles[0]));
                 // Use the first handle/pitch (primary plane)
                 let handle = cmd.handles[0];
                 let pitch = cmd.pitches[0];
@@ -624,28 +835,278 @@ impl Scheme for DrmScheme {
                 Ok(0)
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
-                // struct drm_mode_obj_get_properties { props_ptr(u64), values_ptr(u64), count_props(u32), obj_id(u32), obj_type(u32) }
                 #[repr(C)]
                 struct DrmModeObjGetProperties {
-                    props_ptr: u64, values_ptr: u64,
-                    count_props: u32, obj_id: u32, obj_type: u32,
+                    props_ptr: u64,
+                    prop_values_ptr: u64,
+                    count_props: u32,
+                    obj_id: u32,
+                    obj_type: u32,
                 }
-                let props = unsafe { &mut *(arg as *mut DrmModeObjGetProperties) };
-                props.count_props = 0;
+
+                // Minimal stable property IDs (names must match wlroots tables)
+                const PROP_CRTC_ACTIVE: u32 = 0x100;
+                const PROP_CRTC_MODE_ID: u32 = 0x101;
+                const PROP_CRTC_GAMMA_LUT: u32 = 0x102;
+                const PROP_CRTC_GAMMA_LUT_SIZE: u32 = 0x103;
+                const PROP_CRTC_VRR_ENABLED: u32 = 0x104;
+
+                const PROP_CONN_CRTC_ID: u32 = 0x200;
+                const PROP_CONN_EDID: u32 = 0x201;
+
+                const PROP_PLANE_TYPE: u32 = 0x300;
+                const PROP_PLANE_FB_ID: u32 = 0x301;
+                const PROP_PLANE_CRTC_ID: u32 = 0x302;
+                const PROP_PLANE_SRC_X: u32 = 0x303;
+                const PROP_PLANE_SRC_Y: u32 = 0x304;
+                const PROP_PLANE_SRC_W: u32 = 0x305;
+                const PROP_PLANE_SRC_H: u32 = 0x306;
+                const PROP_PLANE_CRTC_X: u32 = 0x307;
+                const PROP_PLANE_CRTC_Y: u32 = 0x308;
+                const PROP_PLANE_CRTC_W: u32 = 0x309;
+                const PROP_PLANE_CRTC_H: u32 = 0x30A;
+
+                // Object type values from drm_mode.h
+                const DRM_MODE_OBJECT_ANY: u32 = 0;
+                const DRM_MODE_OBJECT_CRTC: u32 = 0xcccccccc;
+                const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0c0c0;
+                const DRM_MODE_OBJECT_PLANE: u32 = 0xeeeeeeee;
+
+                let req = unsafe { &mut *(arg as *mut DrmModeObjGetProperties) };
+                let obj_id = req.obj_id;
+
+                // wlroots/libdrm frequently call with DRM_MODE_OBJECT_ANY.
+                // In that case, infer the object type from the ID.
+                let obj_type = if req.obj_type == DRM_MODE_OBJECT_ANY {
+                    if drm::get_plane(obj_id).is_some() {
+                        DRM_MODE_OBJECT_PLANE
+                    } else if drm::get_crtc(obj_id).is_some() {
+                        DRM_MODE_OBJECT_CRTC
+                    } else if drm::get_connector(obj_id).is_some() {
+                        DRM_MODE_OBJECT_CONNECTOR
+                    } else {
+                        0xFFFF_FFFF
+                    }
+                } else {
+                    req.obj_type
+                };
+
+                // IDs are stable; values are dynamic per-object.
+                let mut prop_ids: &[u32] = &[];
+                let mut prop_vals: &[u64] = &[];
+                let mut vals_small: [u64; 11] = [0; 11];
+
+                match obj_type {
+                    DRM_MODE_OBJECT_CRTC => {
+                        const IDS: [u32; 5] = [
+                            PROP_CRTC_ACTIVE,
+                            PROP_CRTC_MODE_ID,
+                            PROP_CRTC_GAMMA_LUT,
+                            PROP_CRTC_GAMMA_LUT_SIZE,
+                            PROP_CRTC_VRR_ENABLED,
+                        ];
+                        // Minimal defaults: inactive until modeset; others 0.
+                        let _ = obj_id;
+                        vals_small[0] = 0; // ACTIVE
+                        vals_small[1] = 0; // MODE_ID
+                        vals_small[2] = 0; // GAMMA_LUT
+                        vals_small[3] = 0; // GAMMA_LUT_SIZE
+                        vals_small[4] = 0; // VRR_ENABLED
+                        prop_ids = &IDS;
+                        prop_vals = &vals_small[..IDS.len()];
+                    }
+                    DRM_MODE_OBJECT_CONNECTOR => {
+                        const IDS: [u32; 2] = [PROP_CONN_CRTC_ID, PROP_CONN_EDID];
+                        vals_small[0] = 0; // CRTC_ID
+                        vals_small[1] = 0; // EDID blob id (not implemented)
+                        prop_ids = &IDS;
+                        prop_vals = &vals_small[..IDS.len()];
+                    }
+                    DRM_MODE_OBJECT_PLANE => {
+                        const IDS: [u32; 11] = [
+                            PROP_PLANE_TYPE,
+                            PROP_PLANE_FB_ID,
+                            PROP_PLANE_CRTC_ID,
+                            PROP_PLANE_SRC_X,
+                            PROP_PLANE_SRC_Y,
+                            PROP_PLANE_SRC_W,
+                            PROP_PLANE_SRC_H,
+                            PROP_PLANE_CRTC_X,
+                            PROP_PLANE_CRTC_Y,
+                            PROP_PLANE_CRTC_W,
+                            PROP_PLANE_CRTC_H,
+                        ];
+                        if let Some(p) = drm::get_plane(obj_id) {
+                            vals_small[0] = p.plane_type as u64; // type: 1=PRIMARY, 2=CURSOR, 0=OVERLAY
+                            vals_small[1] = p.fb_id as u64;
+                            vals_small[2] = p.crtc_id as u64;
+                        } else {
+                            vals_small[0] = 0;
+                        }
+                        prop_ids = &IDS;
+                        prop_vals = &vals_small[..IDS.len()];
+                    }
+                    _ => {
+                        prop_ids = &[];
+                        prop_vals = &[];
+                    }
+                }
+
+                // Always report the required count.
+                req.count_props = prop_ids.len() as u32;
+
+                // Fill arrays if provided (2-step ioctl pattern).
+                if req.props_ptr != 0 && (req.count_props as usize) <= prop_ids.len() {
+                    let out = req.props_ptr as *mut u32;
+                    for (i, pid) in prop_ids.iter().enumerate() {
+                        unsafe { out.add(i).write_unaligned(*pid) };
+                    }
+                }
+                if req.prop_values_ptr != 0 && (req.count_props as usize) <= prop_vals.len() {
+                    let out = req.prop_values_ptr as *mut u64;
+                    for (i, v) in prop_vals.iter().enumerate() {
+                        unsafe { out.add(i).write_unaligned(*v) };
+                    }
+                }
+
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPROPERTY => {
+                #[repr(C)]
+                struct DrmModeGetProperty {
+                    values_ptr: u64,
+                    enum_blob_ptr: u64,
+                    prop_id: u32,
+                    flags: u32,
+                    name: [u8; 32],
+                    count_values: u32,
+                    count_enum_blobs: u32,
+                }
+
+                fn write_name(dst: &mut [u8; 32], s: &[u8]) {
+                    dst.fill(0);
+                    let n = core::cmp::min(dst.len() - 1, s.len());
+                    dst[..n].copy_from_slice(&s[..n]);
+                }
+
+                let p = unsafe { &mut *(arg as *mut DrmModeGetProperty) };
+
+                // Linux UAPI flags (from drm_mode.h)
+                const DRM_MODE_PROP_RANGE: u32 = 0x2;
+                const DRM_MODE_PROP_ENUM: u32 = 0x8;
+                const DRM_MODE_PROP_BLOB: u32 = 0x10;
+                const DRM_MODE_PROP_OBJECT: u32 = 0x40;
+
+                #[repr(C)]
+                struct DrmModePropertyEnum {
+                    value: u64,
+                    name: [u8; 32],
+                }
+
+                fn write_enum(dst: &mut DrmModePropertyEnum, value: u64, name: &[u8]) {
+                    dst.value = value;
+                    dst.name.fill(0);
+                    let n = core::cmp::min(dst.name.len() - 1, name.len());
+                    dst.name[..n].copy_from_slice(&name[..n]);
+                }
+
+                // Property naming + minimal type metadata so wlroots/libdrm can interpret them.
+                match p.prop_id {
+                    // CRTC
+                    0x100 => { write_name(&mut p.name, b"ACTIVE"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x101 => { write_name(&mut p.name, b"MODE_ID"); p.flags = DRM_MODE_PROP_BLOB; p.count_values = 0; }
+                    0x102 => { write_name(&mut p.name, b"GAMMA_LUT"); p.flags = DRM_MODE_PROP_BLOB; p.count_values = 0; }
+                    0x103 => { write_name(&mut p.name, b"GAMMA_LUT_SIZE"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x104 => { write_name(&mut p.name, b"VRR_ENABLED"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+
+                    // Connector
+                    0x200 => { write_name(&mut p.name, b"CRTC_ID"); p.flags = DRM_MODE_PROP_OBJECT; p.count_values = 0; }
+                    0x201 => { write_name(&mut p.name, b"EDID"); p.flags = DRM_MODE_PROP_BLOB; p.count_values = 0; }
+
+                    // Plane
+                    0x300 => { write_name(&mut p.name, b"type"); p.flags = DRM_MODE_PROP_ENUM; p.count_enum_blobs = 3; }
+                    0x301 => { write_name(&mut p.name, b"FB_ID"); p.flags = DRM_MODE_PROP_OBJECT; }
+                    0x302 => { write_name(&mut p.name, b"CRTC_ID"); p.flags = DRM_MODE_PROP_OBJECT; }
+                    0x303 => { write_name(&mut p.name, b"SRC_X"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x304 => { write_name(&mut p.name, b"SRC_Y"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x305 => { write_name(&mut p.name, b"SRC_W"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x306 => { write_name(&mut p.name, b"SRC_H"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x307 => { write_name(&mut p.name, b"CRTC_X"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x308 => { write_name(&mut p.name, b"CRTC_Y"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x309 => { write_name(&mut p.name, b"CRTC_W"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    0x30A => { write_name(&mut p.name, b"CRTC_H"); p.flags = DRM_MODE_PROP_RANGE; p.count_values = 2; }
+                    _ => {
+                        // Unknown property ID.
+                        return Err(scheme_error::EINVAL);
+                    }
+                }
+
+                // Fill range values if requested.
+                if (p.flags & DRM_MODE_PROP_RANGE) != 0 {
+                    // Defaults: [0, 1] for bool-ish, otherwise [0, 0].
+                    let (min, max) = match p.prop_id {
+                        0x100 => (0, 1), // ACTIVE
+                        0x103 => (0, 4096), // GAMMA_LUT_SIZE
+                        0x104 => (0, 1), // VRR_ENABLED
+                        _ => (0, 0),
+                    };
+                    if p.values_ptr != 0 && p.count_values >= 2 {
+                        let out = p.values_ptr as *mut u64;
+                        unsafe {
+                            out.add(0).write_unaligned(min);
+                            out.add(1).write_unaligned(max);
+                        }
+                    }
+                }
+
+                // Fill enum list for plane "type" if requested.
+                if p.prop_id == 0x300 && p.enum_blob_ptr != 0 && p.count_enum_blobs >= 3 {
+                    let out = p.enum_blob_ptr as *mut DrmModePropertyEnum;
+                    unsafe {
+                        write_enum(&mut *out.add(0), 0, b"Overlay");
+                        write_enum(&mut *out.add(1), 1, b"Primary");
+                        write_enum(&mut *out.add(2), 2, b"Cursor");
+                    }
+                }
+
+                Ok(0)
+            }
+            DRM_IOCTL_GET_MAGIC => {
+                let magic_ptr = arg as *mut u32;
+                unsafe { *magic_ptr = 0x1234; }
+                Ok(0)
+            }
+            DRM_IOCTL_AUTH_MAGIC => {
+                Ok(0)
+            }
+            DRM_IOCTL_SET_MASTER => {
+                Ok(0)
+            }
+            DRM_IOCTL_DROP_MASTER => {
                 Ok(0)
             }
             _ => {
-                Err(scheme_error::ENOSYS)
+                if let Some(driver) = drm::get_primary_driver() {
+                    driver.ioctl(request as u32, arg)
+                } else {
+                    serial::serial_printf(format_args!("[DRM-SCHEME] UNKNOWN ioctl (no driver): 0x{:x}\n", request));
+                    Err(scheme_error::ENOSYS)
+                }
             }
         }
     }
 
     fn fmap(&self, id: usize, offset: usize, _len: usize) -> Result<usize, usize> {
         let resources = OPEN_RESOURCES.lock();
-        let _resource = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        let resource = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         
         // Offset here is what was returned in DRM_IOCTL_MODE_MAP_DUMB
-        let handle_id = offset as u32;
+        // For PRIME dmabuf fds, we ignore offset and map the stored handle.
+        let handle_id = match resource.kind {
+            DrmResourceKind::Directory => return Err(scheme_error::EINVAL),
+            DrmResourceKind::Control { .. } => offset as u32,
+            DrmResourceKind::PrimeBuf { handle } => handle,
+        };
         if let Some(handle) = drm::get_handle(handle_id) {
             let mut phys = handle.phys_addr as usize;
             
@@ -665,8 +1126,28 @@ impl Scheme for DrmScheme {
         }
     }
 
-    fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
-        stat.mode = 0o20666; // Character device
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        let resources = OPEN_RESOURCES.lock();
+        let resource = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        
+        match resource.kind {
+            DrmResourceKind::Directory => {
+                stat.mode = 0o40755; // Directory
+                stat.dev = 0;
+                stat.rdev = 0;
+            }
+            DrmResourceKind::Control { minor } => {
+                stat.mode = 0o20666; // Character device
+                // DRM primary node major is 226, card0 minor is 0, renderD128 is 128.
+                stat.rdev = crate::syscalls::linux_makedev(226, minor);
+                stat.dev = 0;
+            }
+            DrmResourceKind::PrimeBuf { .. } => {
+                stat.mode = 0o20666;
+                stat.rdev = crate::syscalls::linux_makedev(226, 0);
+                stat.dev = 0;
+            }
+        }
         Ok(0)
     }
 
@@ -681,6 +1162,7 @@ impl Scheme for DrmScheme {
         let mut list = Vec::new();
         list.push(String::from("card0"));
         list.push(String::from("control"));
+        list.push(String::from("renderD128"));
         Ok(list)
     }
 }

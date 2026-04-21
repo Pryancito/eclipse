@@ -14,14 +14,14 @@
 
 CC=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 
-CFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
+CFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
 #CFLAGS=-O -DMAX_WBITS=14 -DMAX_MEM_LEVEL=7
 #CFLAGS=-g -DZLIB_DEBUG
 #CFLAGS=-O3 -Wall -Wwrite-strings -Wpointer-arith -Wconversion \
 #           -Wstrict-prototypes -Wmissing-prototypes
 
-SFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fPIC -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
-LDFLAGS=-L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
+SFLAGS=-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC  -fPIC -fPIC -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN
+LDFLAGS=-L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib -L/home/moebius/eclipse/eclipse-os-build/usr/lib -L/home/moebius/eclipse/eclipse-os-build/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib -Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib 
 TEST_LIBS=-L. libz.a
 LDSHARED=/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc
 CPP=

@@ -6,6 +6,7 @@
 use spin::Mutex;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
+use crate::scheme::error as scheme_error;
 
 /// DRM Device capabilities
 #[repr(C)]
@@ -109,6 +110,11 @@ pub trait DrmDriver: Send + Sync {
 
     /// Set plane properties (mapping a FB to a CRTC at specific coordinates)
     fn set_plane(&self, plane_id: u32, crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, src_x: u32, src_y: u32, src_w: u32, src_h: u32) -> bool;
+
+    /// Driver-specific IOCTLs
+    fn ioctl(&self, _request: u32, _arg: usize) -> Result<usize, usize> {
+        Err(scheme_error::ENOSYS)
+    }
 }
 
 struct DrmState {

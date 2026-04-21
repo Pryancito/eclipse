@@ -49,6 +49,7 @@ pub mod bcache; // Buffer Cache
 pub mod epoll;
 mod eventfd;
 mod signalfd;
+mod timerfd;
 mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery
 mod apic;    // Local APIC

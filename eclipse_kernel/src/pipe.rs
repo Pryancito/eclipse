@@ -293,6 +293,10 @@ impl Scheme for PipeScheme {
         Ok(0)
     }
 
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        self.poll_pipe(id, events)
+    }
+
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Err(error::ESPIPE)
     }

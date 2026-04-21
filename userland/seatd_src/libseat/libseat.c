@@ -13,9 +13,13 @@
 extern const struct seat_impl seatd_impl;
 extern const struct seat_impl logind_impl;
 extern const struct seat_impl builtin_impl;
+extern const struct seat_impl eclipse_impl;
 extern const struct seat_impl noop_impl;
 
 static const struct named_backend impls[] = {
+#ifdef ECLIPSE_ENABLED
+	{"eclipse", &eclipse_impl},
+#endif
 #ifdef SEATD_ENABLED
 	{"seatd", &seatd_impl},
 #endif

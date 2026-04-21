@@ -46,7 +46,7 @@
 /* #undef HAVE_AS_SPARC_UA_PCREL */
 
 /* Define if your assembler supports unwind section type. */
-/* #undef HAVE_AS_X86_64_UNWIND_SECTION_TYPE */
+#define HAVE_AS_X86_64_UNWIND_SECTION_TYPE 1
 
 /* Define if your assembler supports PC relative relocs. */
 #define HAVE_AS_X86_PCREL 1

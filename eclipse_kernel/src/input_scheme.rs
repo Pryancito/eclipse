@@ -11,6 +11,17 @@ pub struct InputScheme;
 enum InputType {
     Keyboard,
     Mouse,
+    EvdevKeyboard,
+    EvdevMouse,
+}
+
+#[repr(C)]
+struct InputEvent {
+    time_sec: u64,
+    time_usec: u64,
+    kind: u16,
+    code: u16,
+    value: i32,
 }
 
 struct InputResource {
@@ -31,6 +42,10 @@ impl Scheme for InputScheme {
             InputType::Keyboard
         } else if path == "mouse" || path == "/mouse" {
             InputType::Mouse
+        } else if path == "event0" || path == "/event0" {
+            InputType::EvdevKeyboard
+        } else if path == "event1" || path == "/event1" {
+            InputType::EvdevMouse
         } else {
             return Err(scheme_error::ENOENT);
         };
@@ -63,7 +78,6 @@ impl Scheme for InputScheme {
                     let key = interrupts::read_key();
                     if key == 0 {
                         if count > 0 { break; }
-                        // Non-blocking for now, or we could yield
                         return Err(scheme_error::EAGAIN);
                     }
                     buffer[count] = key;
@@ -72,7 +86,6 @@ impl Scheme for InputScheme {
                 Ok(count)
             }
             InputType::Mouse => {
-                // Return 4-byte packed packets: buttons | dx<<8 | dy<<16 | 0<<24
                 let mut count = 0;
                 while count + 4 <= buffer.len() {
                     let packet = interrupts::read_mouse_packet();
@@ -90,6 +103,91 @@ impl Scheme for InputScheme {
                     count += 4;
                 }
                 Ok(count)
+            }
+            InputType::EvdevKeyboard => {
+                let mut count = 0;
+                let event_size = core::mem::size_of::<InputEvent>();
+                while count + event_size <= buffer.len() {
+                    let key = interrupts::read_key();
+                    if key == 0 {
+                        if count > 0 { break; }
+                        return Err(scheme_error::EAGAIN);
+                    }
+                    
+                    let ticks = interrupts::ticks();
+                    let event = InputEvent {
+                        time_sec: ticks / 1000,
+                        time_usec: (ticks % 1000) * 1000,
+                        kind: 1, // EV_KEY
+                        code: key as u16,
+                        value: 1, // Press (simplified, we don't have release yet in kernel buffer)
+                    };
+                    
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &event as *const _ as *const u8,
+                            buffer.as_mut_ptr().add(count),
+                            event_size
+                        );
+                    }
+                    count += event_size;
+                }
+                Ok(count)
+            }
+            InputType::EvdevMouse => {
+                let mut count = 0;
+                let event_size = core::mem::size_of::<InputEvent>();
+                // A single mouse packet can generate multiple evdev events (X, Y, Buttons, SYN)
+                while count + event_size * 4 <= buffer.len() {
+                    let packet = interrupts::read_mouse_packet();
+                    if packet == 0xFFFFFFFF {
+                        if count > 0 { break; }
+                        return Err(scheme_error::EAGAIN);
+                    }
+                    
+                    let buttons = (packet & 0xFF) as u8;
+                    let dx = ((packet >> 8) & 0xFF) as i8;
+                    let dy = ((packet >> 16) & 0xFF) as i8;
+                    
+                    let ticks = interrupts::ticks();
+                    let mut events = [
+                        InputEvent { time_sec: ticks/1000, time_usec: (ticks%1000)*1000, kind: 2 /* EV_REL */, code: 0 /* REL_X */, value: dx as i32 },
+                        InputEvent { time_sec: ticks/1000, time_usec: (ticks%1000)*1000, kind: 2 /* EV_REL */, code: 1 /* REL_Y */, value: -dy as i32 },
+                        InputEvent { time_sec: ticks/1000, time_usec: (ticks%1000)*1000, kind: 1 /* EV_KEY */, code: 0x110 /* BTN_LEFT */, value: (buttons & 1) as i32 },
+                        InputEvent { time_sec: ticks/1000, time_usec: (ticks%1000)*1000, kind: 0 /* EV_SYN */, code: 0, value: 0 },
+                    ];
+                    
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            events.as_ptr() as *const u8,
+                            buffer.as_mut_ptr().add(count),
+                            event_size * 4
+                        );
+                    }
+                    count += event_size * 4;
+                }
+                Ok(count)
+            }
+        }
+    }
+
+    fn ioctl(&self, _id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+        // Minimal evdev ioctls to satisfy libinput
+        match request {
+            0x80044501 => { // EVIOCGVERSION
+                unsafe { *(arg as *mut u32) = 0x010001; }
+                Ok(0)
+            }
+            0x80084502 => { // EVIOCGID
+                unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 8); }
+                Ok(0)
+            }
+            _ => {
+                // Return success for most BIT queries to let libinput proceed
+                if (request >> 8) & 0xFF == 0x45 { // 'E'
+                    return Ok(0);
+                }
+                Err(scheme_error::ENOSYS)
             }
         }
     }

@@ -1444,7 +1444,7 @@ pub struct FileSystemScheme;
 impl Scheme for FileSystemScheme {
     fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
         
-        serial::serial_printf(format_args!("[FS-SCHEME] open({})\n", path));
+        // serial::serial_printf(format_args!("[FS-SCHEME] open({})\n", path));
 
         // Strip *all* leading slashes. `file://foo` yields relative_path `//foo`; removing only
         // one slash left `/foo` and lookup treated `foo` as a child of root. Also, musl may
@@ -1457,7 +1457,7 @@ impl Scheme for FileSystemScheme {
         if clean_path.starts_with(hardcoded_prefix) {
             let old_path = clean_path;
             clean_path = &clean_path[hardcoded_prefix.len()..];
-            serial::serial_printf(format_args!("[FS-SCHEME] fontconfig: redirected {} to: {}\n", old_path, clean_path));
+            // serial::serial_printf(format_args!("[FS-SCHEME] fontconfig: redirected {} to: {}\n", old_path, clean_path));
         }
 
         match clean_path {

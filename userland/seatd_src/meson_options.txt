@@ -5,3 +5,4 @@ option('server', type: 'combo', choices: ['enabled', 'disabled'], value: 'enable
 option('examples', type: 'combo', choices: ['enabled', 'disabled'], value: 'disabled', description: 'libseat example programs')
 option('man-pages', type: 'feature', value: 'auto', description: 'Generate and install man pages')
 option('defaultpath', type: 'string', value: '', description: 'Default location for seatd socket (empty for default)')
+option('eclipse', type: 'boolean', value: true, description: 'Eclipse OS backend support')

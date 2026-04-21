@@ -14408,10 +14408,10 @@ else
 fi
 
  if test -n "$VERSION_SCRIPT_FLAGS"; then
-  USE_VERSION_SCRIPT_TRUE="# ""# "
+  USE_VERSION_SCRIPT_TRUE="# ""# ""# "
   USE_VERSION_SCRIPT_FALSE='#'
 else
-  USE_VERSION_SCRIPT_TRUE="# ""# "'#'
+  USE_VERSION_SCRIPT_TRUE="# ""# ""# "'#'
   USE_VERSION_SCRIPT_FALSE=
 fi
 

@@ -55,8 +55,19 @@ fn main() {
 /// labwc: `execve` con `-d` (argv real; `SYS_EXEC` no soporta argumentos).
 #[cfg(not(feature = "compositor-lunas"))]
 fn exec_labwc_debug() {
-    // wlroots: sin dispositivos de entrada reales, libinput falla al arrancar el backend.
-    let _ = std::env::set_var("WLR_LIBINPUT_NO_DEVICES", "1");
+    // libinput usa udev + ficheros de quirks bajo /usr/share/libinput; en Eclipse
+    // `libinput_udev_assign_seat` falla al *start* (antes de que WLR_LIBINPUT_NO_DEVICES
+    // evite solo el caso "creado pero sin dispositivos"). Cargar solo DRM aquí; labwc
+    // añade el backend headless después en server.c.
+    //let _ = std::env::set_var("WLR_BACKENDS", "drm");
+    //let _ = std::env::set_var("WLR_LIBINPUT_NO_DEVICES", "1");
+    // Usar el nuevo backend nativo de Eclipse para libseat.
+    let _ = std::env::set_var("LIBSEAT_BACKEND", "eclipse");
+    // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
+    let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
+
+    //let _ = std::env::set_var("WLR_DRM_NO_ATOMIC", "1");
+    //let _ = std::env::set_var("WLR_RENDERER", "pixman");
 
     let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
     let arg0 = CString::new(LABWC_EXEC_PATH).expect("argv0");

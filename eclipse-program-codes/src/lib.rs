@@ -78,8 +78,7 @@ pub fn spawn_service_name(service_id: u32) -> &'static str {
 #[inline]
 pub fn spawn_id_to_init_services_index(service_id: u32) -> usize {
     match service_id {
-        8 => 9,  // seatd
-        7 => 10, // gui
+        7 => 9, // gui
         _ => service_id as usize + 2,
     }
 }

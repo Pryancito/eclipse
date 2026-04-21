@@ -3329,7 +3329,15 @@ static bool drmNodeIsDRM(int maj, int min)
 
     snprintf(path, sizeof(path), "/sys/dev/char/%d:%d/device/drm",
              maj, min);
-    return stat(path, &sbuf) == 0;
+    if (stat(path, &sbuf) == 0) {
+        return true;
+    }
+
+    /* If sysfs isn't available or is access-restricted, fall back. */
+    if (errno == ENOENT || errno == EPERM || errno == EACCES) {
+        return maj == DRM_MAJOR;
+    }
+    return false;
 #elif defined(__FreeBSD__)
     char name[SPECNAMELEN];
 
@@ -4932,8 +4940,14 @@ drm_public char *drmGetDeviceNameFromFd2(int fd)
     snprintf(path, sizeof(path), "/sys/dev/char/%d:%d", maj, min);
 
     value = sysfs_uevent_get(path, "DEVNAME");
-    if (!value)
-        return NULL;
+    if (!value) {
+        /*
+         * Some environments don't expose sysfs uevent information for DRM
+         * nodes (missing or access-restricted /sys). Fall back to the
+         * legacy implementation rather than failing backend init.
+         */
+        return drmGetDeviceNameFromFd(fd);
+    }
 
     snprintf(path, sizeof(path), "/dev/%s", value);
     free(value);

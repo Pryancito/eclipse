@@ -1218,17 +1218,25 @@ pub const GPU_FW_MAX_SIZE: u64 = 32 * 1024 * 1024; // 32MB
 pub const GPU_RPC_PHYS_BASE: u64 = 0x2200_0000; // 544MB
 pub const GPU_RPC_MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB for queues
 
+static FREE_FRAMES_LOCK: Mutex<()> = Mutex::new(());
 static mut FREE_FRAMES_STACK: [u64; 1024] = [0; 1024];
 static mut FREE_FRAMES_COUNT: usize = 0;
 
 pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
-    unsafe {
-        if FREE_FRAMES_COUNT > 0 {
-            FREE_FRAMES_COUNT -= 1;
-            let frame = FREE_FRAMES_STACK[FREE_FRAMES_COUNT];
-            notify_ai_memory_stats();
-            return Some(frame);
+    let mut frame = None;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = FREE_FRAMES_LOCK.lock();
+        unsafe {
+            if FREE_FRAMES_COUNT > 0 {
+                FREE_FRAMES_COUNT -= 1;
+                frame = Some(FREE_FRAMES_STACK[FREE_FRAMES_COUNT]);
+            }
         }
+    });
+
+    if let Some(f) = frame {
+        notify_ai_memory_stats();
+        return Some(f);
     }
     let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
     let frame_phys = ANON_MMAP_PHYS_START + next;
@@ -1243,15 +1251,18 @@ pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
     if phys_addr < ANON_MMAP_PHYS_START || phys_addr >= ANON_MMAP_PHYS_END {
         return;
     }
-    unsafe {
-        if FREE_FRAMES_COUNT < 1024 {
-            FREE_FRAMES_STACK[FREE_FRAMES_COUNT] = phys_addr;
-            FREE_FRAMES_COUNT += 1;
-            notify_ai_memory_stats();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = FREE_FRAMES_LOCK.lock();
+        unsafe {
+            if FREE_FRAMES_COUNT < 1024 {
+                FREE_FRAMES_STACK[FREE_FRAMES_COUNT] = phys_addr;
+                FREE_FRAMES_COUNT += 1;
+            }
+            // If stack is full, we just leak the frame (better than crashing).
+            // In a real OS we'd use a bitmap or a larger list.
         }
-        // If stack is full, we just leak the frame (better than crashing).
-        // In a real OS we'd use a bitmap or a larger list.
-    }
+    });
+    notify_ai_memory_stats();
 }
 
 /// Demand-page fault handler.
@@ -1308,6 +1319,14 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
         return false;
     };
     let fv = PHYS_MEM_OFFSET + phys;
+    // Cada fallo #PF en VMA anónima rellena una página: labwc/libinput generan miles de líneas.
+    const LOG_ANON_DEMAND_PAGE: bool = false;
+    if LOG_ANON_DEMAND_PAGE {
+        crate::serial::serial_printf(format_args!(
+            "[PF] PID {} mapping 0x{:x} -> phys 0x{:x}\n",
+            pid, page_addr, phys
+        ));
+    }
     unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
 
     // Pages inside the kernel slack region (instruction-decode guard) carry PROT_EXEC
@@ -1328,7 +1347,10 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
 fn notify_ai_memory_stats() {
     let next = ANON_MMAP_NEXT.load(Ordering::Relaxed);
     let remaining_bump = (ANON_MMAP_PHYS_END.saturating_sub(ANON_MMAP_PHYS_START).saturating_sub(next)) / 4096;
-    let free_count = unsafe { FREE_FRAMES_COUNT };
+    let free_count = x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = FREE_FRAMES_LOCK.lock();
+        unsafe { FREE_FRAMES_COUNT }
+    });
     crate::ai_core::update_memory_stats(remaining_bump + free_count as u64);
 }
 

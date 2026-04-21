@@ -130,7 +130,7 @@ if with_seatd or with_builtin
 	private_files += 'libseat/backend/seatd.c'
 endif
 
-libseat_c_args = ['-DLIBSEAT=1']
+libseat_c_args = ['-DLIBSEAT=1', '-DECLIPSE_ENABLED=1']
 
 if with_seatd
 	libseat_c_args += '-DSEATD_ENABLED=1'
@@ -179,7 +179,7 @@ symbols_file = 'libseat/libseat.syms'
 symbols_flag = '-Wl,--version-script,@0@/@1@'.format(meson.current_source_dir(), symbols_file)
 lib = library(
 	'seat', # This results in the library being called 'libseat'
-	[ 'libseat/libseat.c', 'libseat/backend/noop.c' ],
+	[ 'libseat/libseat.c', 'libseat/backend/noop.c', 'libseat/backend/eclipse.c' ],
 	soversion: '@0@'.format(libseat_soversion),
 	link_with: private_lib,
 	include_directories: [include_directories('.', 'include')],

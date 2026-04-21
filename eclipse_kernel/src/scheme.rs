@@ -33,6 +33,7 @@ pub mod error {
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
     pub const ENOTDIR: usize = 20; // Not a directory
     pub const EROFS: usize = 30;   // Read-only file system
+    pub const ENODEV: usize = 19;  // No such device
 }
 
 /// Polling event flags (Linux-compatible)
@@ -59,6 +60,7 @@ pub struct Stat {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    pub rdev: u64,
     pub size: u64,
     pub blksize: u32,
     pub blocks: u64,
@@ -339,6 +341,7 @@ pub fn init() {
     register_scheme("epoll", crate::epoll::get_epoll_scheme().clone());
     register_scheme("eventfd", crate::eventfd::get_eventfd_scheme().clone());
     register_scheme("signalfd", Arc::new(crate::signalfd::SignalfdScheme::new()));
+    register_scheme("timerfd", crate::timerfd::get_timerfd_scheme().clone());
 
     // Schemes from servers module
     register_scheme("display", Arc::new(crate::servers::DisplayScheme));
