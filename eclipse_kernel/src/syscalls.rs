@@ -641,6 +641,7 @@ pub extern "C" fn syscall_handler(
         293 => sys_pipe2(arg1, arg2),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
+        319 => sys_memfd_create(arg1, arg2),
         324 => sys_membarrier(arg1, arg2, arg3),
         439 => sys_faccessat(arg1, arg2, arg3, arg4),
 
@@ -1150,29 +1151,23 @@ fn sys_drm_map_handle(handle_id: u64) -> u64 {
         
         let aligned_length = (handle.size + 0xFFF) & !0xFFF;
         
-        // Find a free VMA spot (0x60000000 to 0x70000000)
-        let mut target_addr: u64 = 0;
-        let mut candidate = 0x60000000;
-        let mut found = false;
-        while !found && candidate < 0x70000000 {
-            let mut overlap = false;
-            for vma in r.vmas.iter() {
-                if candidate < vma.end && (candidate + aligned_length as u64) > vma.start {
-                    overlap = true;
-                    break;
-                }
+        // Find a free VMA spot (0x60000000 to 0x70000000).
+        // Jump to the end of any overlapping VMA instead of scanning page-by-page.
+        let span = aligned_length as u64;
+        let mut candidate: u64 = 0x60000000;
+        let target_addr = loop {
+            if candidate >= 0x70000000 {
+                return u64::MAX;
             }
-            if !overlap {
-                found = true;
-                target_addr = candidate;
-            } else {
-                candidate += 0x1000;
+            let next = r.vmas.iter()
+                .filter(|vma| candidate < vma.end && candidate.saturating_add(span) > vma.start)
+                .map(|vma| vma.end)
+                .max();
+            match next {
+                None => break candidate,
+                Some(end) => candidate = end,
             }
-        }
-        
-        if !found {
-            return u64::MAX;
-        }
+        };
         
         // Map the physical frames of the GEM handle directly to the found userspace address.
         // Use Write-Combining (WC) caching: PWT=1, PCD=0 selects PAT index 1 which is
@@ -1368,7 +1363,11 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     drop(stats);
     
     // Validate parameters
-    if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
+    // A zero-length write/read is valid: return 0 (Linux behaviour).
+    if len == 0 {
+        return 0;
+    }
+    if buf_ptr == 0 || len > 1024 * 1024 {
         return linux_abi_error(22); // EINVAL
     }
 
@@ -1420,7 +1419,11 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     stats.read_calls += 1;
     drop(stats);
     
-    if buf_ptr == 0 || len == 0 || len > 32 * 1024 * 1024 {
+    // A zero-length read is valid: return 0 (Linux behaviour).
+    if len == 0 {
+        return 0;
+    }
+    if buf_ptr == 0 || len > 32 * 1024 * 1024 {
         return linux_abi_error(22); // EINVAL
     }
     
@@ -3375,13 +3378,17 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
         fn mmap_find_free(r: &crate::process::ProcessResources, span: u64) -> Option<u64> {
             let mut candidate = linux_mmap_abi::USER_ARENA_LO;
             while candidate < linux_mmap_abi::USER_ARENA_HI {
-                let overlap = r.vmas.iter().any(|vma| {
-                    candidate < vma.end && candidate.saturating_add(span) > vma.start
-                });
-                if !overlap {
-                    return Some(candidate);
+                // Find the highest end of any VMA that overlaps [candidate, candidate+span).
+                // Jumping directly to that end skips all pages inside large mappings in O(n)
+                // instead of O(vma_size/page_size * n).
+                let next = r.vmas.iter()
+                    .filter(|vma| candidate < vma.end && candidate.saturating_add(span) > vma.start)
+                    .map(|vma| vma.end)
+                    .max();
+                match next {
+                    None => return Some(candidate),
+                    Some(end) => candidate = end,
                 }
-                candidate += 0x1000;
             }
             None
         }
@@ -3733,7 +3740,13 @@ fn sys_brk(addr: u64) -> u64 {
                         }
                         None => {
                             serial::serial_print("[SYSCALL] brk: physical frame pool exhausted\n");
-                            return u64::MAX;
+                            // Per Linux brk(2): on failure return the current (unchanged) break.
+                            // Update brk_current to reflect the pages we did successfully map.
+                            let mapped_brk = curr;
+                            r.brk_current = mapped_brk;
+                            drop(r);
+                            process::update_process(pid, proc);
+                            return mapped_brk;
                         }
                     }
                     curr += 4096;
@@ -4832,6 +4845,38 @@ fn sys_getrandom(buf_ptr: u64, len: u64, _flags: u64) -> u64 {
 
     len
 }
+
+/// sys_memfd_create - Create an anonymous RAM-backed file (Linux syscall 319).
+///
+/// `name_ptr` is an optional debugging label (ignored).
+/// `flags` may include MFD_CLOEXEC (0x0001) and MFD_ALLOW_SEALING (0x0002).
+///
+/// Returns an fd referencing the new anonymous file, or -errno on error.
+fn sys_memfd_create(_name_ptr: u64, flags: u64) -> u64 {
+    const MFD_CLOEXEC: u64 = 0x0001;
+    // MFD_ALLOW_SEALING (0x0002) is accepted but sealing is not enforced.
+
+    let pid = match crate::process::current_process_id() {
+        Some(p) => p,
+        None => return linux_abi_error(crate::scheme::error::ESRCH as i32),
+    };
+
+    // Open a new slot in the memfd scheme.
+    let (scheme_id, resource_id) = match crate::scheme::open("memfd:/", 0, 0) {
+        Ok(pair) => pair,
+        Err(e) => return linux_abi_error(e as i32),
+    };
+
+    let fd_flags: u32 = if (flags & MFD_CLOEXEC) != 0 { 0x80000 } else { 0 }; // O_CLOEXEC=0x80000
+    match crate::fd::fd_open(pid, scheme_id, resource_id, fd_flags) {
+        Some(fd) => fd as u64,
+        None => {
+            let _ = crate::scheme::close(scheme_id, resource_id);
+            linux_abi_error(crate::scheme::error::ENOMEM as i32)
+        }
+    }
+}
+
 
 /// Check if RDRAND instruction is available via CPUID
 fn has_rdrand() -> bool {
