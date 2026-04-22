@@ -521,19 +521,22 @@ pub fn enable_sse() {
         // Habilitar OSXSAVE + inicializar XCR0 si el CPU soporta XSAVE.
         // CPUID.1: ECX[26] = XSAVE, ECX[28] = AVX.
         let ecx_features: u32;
+        // cpuid clobbers rbx, which LLVM reserves internally; save/restore it manually.
         asm!(
-            "push rbx",       // cpuid destruye rbx; preservar
+            "push rbx",
             "mov eax, 1",
             "cpuid",
             "pop rbx",
             out("ecx") ecx_features,
-            // eax/edx son descartados
             out("eax") _,
             out("edx") _,
             options(nomem, nostack, preserves_flags),
         );
-        const CPUID_XSAVE: u32 = 1 << 26;
-        const CPUID_AVX:   u32 = 1 << 28;
+        const CPUID_XSAVE:    u32 = 1 << 26;
+        const CPUID_AVX:      u32 = 1 << 28;
+        // XCR0 masks for XSETBV
+        const XCR0_X87_SSE:     u64 = 0x3; // x87 (bit 0) | SSE/XMM (bit 1)
+        const XCR0_X87_SSE_AVX: u64 = 0x7; // x87 (bit 0) | SSE/XMM (bit 1) | YMM/AVX (bit 2)
         if (ecx_features & CPUID_XSAVE) != 0 {
             // Activar CR4.OSXSAVE (bit 18): permite XGETBV/XSETBV en Ring 3.
             let mut cr4_new: u64;
@@ -544,9 +547,9 @@ pub fn enable_sse() {
             // XCR0: habilitar estado x87 (bit 0) + SSE/XMM (bit 1) obligatorios,
             // más estado YMM/AVX (bit 2) si el CPU lo soporta.
             let xcr0: u64 = if (ecx_features & CPUID_AVX) != 0 {
-                0x7 // x87 | SSE | AVX
+                XCR0_X87_SSE_AVX
             } else {
-                0x3 // x87 | SSE
+                XCR0_X87_SSE
             };
             asm!(
                 "xsetbv",
