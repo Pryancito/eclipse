@@ -627,6 +627,7 @@ pub extern "C" fn syscall_handler(
         // En Eclipse tratamos esto como nanosleep(req) e ignoramos clockid/flags/rem.
         230 => sys_nanosleep(arg3),
         170 => sys_sethostname(arg1, arg2),
+        172 => sys_iopl(arg1, context),
         186 => sys_gettid(),
         200 => sys_tkill(arg1, arg2),
         202 => sys_futex(arg1, arg2, arg3, arg4, arg5, arg6 as u32),
@@ -5080,7 +5081,40 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     }
 }
 
-/// Linux `membarrier(2)` (NR 324). musl/glibc consultan capacidades y emiten barreras explícitas.
+/// sys_iopl - Change I/O privilege level (Linux syscall 172)
+///
+/// On Linux, `iopl(level)` sets bits 12–13 (IOPL) of EFLAGS for the calling process.
+/// Ring-3 code can execute IN/OUT instructions for any I/O port only when IOPL == 3.
+/// This is needed by some Wayland compositors (e.g. labwc / wlroots) that probe GPU
+/// hardware registers directly during early initialisation.
+///
+/// We store the requested IOPL in the syscall return frame (context.rflags) so that
+/// `iretq` restores it immediately when the syscall returns.  We also persist it in
+/// the process context so it survives context switches.
+fn sys_iopl(level: u64, context: &mut crate::interrupts::SyscallContext) -> u64 {
+    if level > 3 {
+        return u64::MAX; // EINVAL
+    }
+    // Bits 12–13 of RFLAGS are the IOPL field.
+    const IOPL_MASK: u64 = 0x3000;
+    let new_iopl_bits = (level & 3) << 12;
+
+    // Update the RFLAGS that will be restored by iretq on syscall return.
+    context.rflags = (context.rflags & !IOPL_MASK) | new_iopl_bits;
+
+    // Persist in the process context so a context switch restores the right IOPL.
+    let pid = crate::process::current_process_id().unwrap_or(0);
+    if pid != 0 {
+        if let Some(mut proc) = crate::process::get_process(pid) {
+            proc.context.rflags = (proc.context.rflags & !IOPL_MASK) | new_iopl_bits;
+            crate::process::update_process(pid, proc);
+        }
+    }
+    serial::serial_printf(format_args!("[SYSCALL] sys_iopl: PID {} IOPL set to {}\n", pid, level));
+    0
+}
+
+
 /// Eclipse no implementa el modelo NUMA/global de Linux; `QUERY` anuncia solo `GLOBAL` y el resto es no-op con éxito.
 fn sys_membarrier(cmd: u64, _flags: u64, _cpu_id: u64) -> u64 {
     const MEMBARRIER_CMD_QUERY: u64 = 0;

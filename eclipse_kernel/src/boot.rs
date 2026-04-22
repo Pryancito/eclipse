@@ -503,11 +503,12 @@ pub fn enable_sse() {
         cr0 |= (1 << 1);  // SET MP (bit 1)
         asm!("mov cr0, {}", in(reg) cr0);
 
-        // Habilitar SSE en CR4 (OSFXSR y OSXMMEXCPT)
+        // Habilitar SSE en CR4 (OSFXSR y OSXMMEXCPT) y FSGSBASE para wrfsbase/rdfsbase
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4);
         cr4 |= (1 << 9);  // OSFXSR
         cr4 |= (1 << 10); // OSXMMEXCPT
+        cr4 |= (1 << 16); // FSGSBASE — permite wrfsbase/rdfsbase desde ring 3
         asm!("mov cr4, {}", in(reg) cr4);
     }
 }

@@ -75,9 +75,9 @@ fn exec_labwc_debug() {
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
     let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
     // El kernel Eclipse no implementa DRM_IOCTL_MODE_ATOMIC; forzar interfaz legacy.
-    //let _ = std::env::set_var("WLR_DRM_NO_ATOMIC", "1");
+    let _ = std::env::set_var("WLR_DRM_NO_ATOMIC", "1");
     // Forzar el renderizador software Pixman para evitar problemas con EGL/GPU.
-    //let _ = std::env::set_var("WLR_RENDERER", "pixman");
+    let _ = std::env::set_var("WLR_RENDERER", "pixman");
 
     let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
     let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
