@@ -493,7 +493,15 @@ pub const USER_CODE_SELECTOR: u16 = 0x18 | 3; // Ring 3
 pub const USER_DATA_SELECTOR: u16 = 0x20 | 3; // Ring 3
 pub const TSS_SELECTOR: u16 = 0x40;
 
-/// Habilitar instrucciones SSE
+/// Habilitar instrucciones SSE (y AVX/XSAVE si el CPU lo soporta).
+///
+/// Además de los bits clásicos OSFXSR/OSXMMEXCPT se habilita CR4.OSXSAVE
+/// (bit 18) cuando el CPU lo indica en CPUID.1:ECX[26].  Sin OSXSAVE, la
+/// instrucción `XGETBV` ejecutada en Ring 3 (p.ej. por Mesa/wlroots al
+/// detectar soporte AVX) genera una #GP con código de error 0, abortando
+/// el compositor antes de llegar a su bucle principal.
+/// Una vez activo OSXSAVE se inicializa XCR0 para x87 + SSE y, si el CPU
+/// anuncia AVX (CPUID.1:ECX[28]), también el estado YMM.
 pub fn enable_sse() {
     unsafe {
         // Habilitar SSE bit en CR0 (Monitor Coprocessor) y limpiar Emulation
@@ -509,5 +517,44 @@ pub fn enable_sse() {
         cr4 |= (1 << 9);  // OSFXSR
         cr4 |= (1 << 10); // OSXMMEXCPT
         asm!("mov cr4, {}", in(reg) cr4);
+
+        // Habilitar OSXSAVE + inicializar XCR0 si el CPU soporta XSAVE.
+        // CPUID.1: ECX[26] = XSAVE, ECX[28] = AVX.
+        let ecx_features: u32;
+        asm!(
+            "push rbx",       // cpuid destruye rbx; preservar
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx_features,
+            // eax/edx son descartados
+            out("eax") _,
+            out("edx") _,
+            options(nomem, nostack, preserves_flags),
+        );
+        const CPUID_XSAVE: u32 = 1 << 26;
+        const CPUID_AVX:   u32 = 1 << 28;
+        if (ecx_features & CPUID_XSAVE) != 0 {
+            // Activar CR4.OSXSAVE (bit 18): permite XGETBV/XSETBV en Ring 3.
+            let mut cr4_new: u64;
+            asm!("mov {}, cr4", out(reg) cr4_new);
+            cr4_new |= 1 << 18; // OSXSAVE
+            asm!("mov cr4, {}", in(reg) cr4_new);
+
+            // XCR0: habilitar estado x87 (bit 0) + SSE/XMM (bit 1) obligatorios,
+            // más estado YMM/AVX (bit 2) si el CPU lo soporta.
+            let xcr0: u64 = if (ecx_features & CPUID_AVX) != 0 {
+                0x7 // x87 | SSE | AVX
+            } else {
+                0x3 // x87 | SSE
+            };
+            asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") xcr0 as u32,
+                in("edx") (xcr0 >> 32) as u32,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
     }
 }
