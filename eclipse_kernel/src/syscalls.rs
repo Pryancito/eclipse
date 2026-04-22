@@ -3393,6 +3393,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 drop(proc);
                 return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
             }
+            // Reject kernel-space MAP_FIXED addresses: the subsequent
+            // unmap_user_range call would corrupt shared HHDM page tables.
+            if addr >= memory::USER_SPACE_END {
+                drop(r);
+                drop(proc);
+                return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+            }
             let unmap_span = aligned_length.saturating_add(anon_slack);
             if addr < linux_mmap_abi::USER_EXEC_STACK_HI
                 && addr.saturating_add(unmap_span) > linux_mmap_abi::USER_EXEC_STACK_LO
@@ -3668,6 +3675,11 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
     use crate::process;
     use crate::memory;
     if length == 0 { return u64::MAX; }
+    // Reject kernel-space addresses: unmapping through a kernel virtual address
+    // would walk the shared bootloader HHDM page tables and corrupt them.
+    if addr >= memory::USER_SPACE_END {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
     if let Some(pid) = process::current_process_id() {
         if let Some(mut proc) = process::get_process(pid) {
             let mut r = proc.resources.lock();

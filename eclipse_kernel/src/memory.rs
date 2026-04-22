@@ -1518,10 +1518,27 @@ pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: 
 /// Physical frames are NOT freed here (the bump allocator has no free-list);
 /// they are reclaimed only when the whole process exits and its page tables are
 /// torn down.  This is acceptable because sys_brk only ever grows the heap.
+
+/// Exclusive upper bound of the user virtual-address space.
+///
+/// Any virtual address `>= USER_SPACE_END` is kernel space (HHDM, kernel image,
+/// MMIO mappings, …).  Walking into those regions via `unmap_user_range` would
+/// follow the bootloader's shared HHDM PDPTs/PDs and, if a 2 MB huge-page
+/// entry is encountered, zero it — permanently corrupting the PHYS_MEM_OFFSET
+/// direct mapping for every process (exception #14, error 0x2).
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
 pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
     if length == 0 { return; }
     let aligned_start = vaddr & !0xFFF;
-    let aligned_end   = (vaddr + length + 0xFFF) & !0xFFF;
+    // Clamp the range to user space.  If the caller (sys_munmap / sys_mmap
+    // MAP_FIXED) passes a kernel-space address we must not touch the shared
+    // kernel HHDM page tables.
+    if aligned_start >= USER_SPACE_END {
+        return;
+    }
+    let unclamped_aligned_end = vaddr.saturating_add(length).saturating_add(0xFFF) & !0xFFF;
+    let aligned_end = unclamped_aligned_end.min(USER_SPACE_END);
 
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = PAGING_LOCK.lock();
