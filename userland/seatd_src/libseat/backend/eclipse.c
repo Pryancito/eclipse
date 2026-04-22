@@ -44,7 +44,7 @@ static struct backend_eclipse *backend_eclipse_from_libseat(struct libseat *base
 	return (struct backend_eclipse *)base;
 }
 
-static void destroy(struct backend_eclipse *backend) {
+static void backend_eclipse_destroy(struct backend_eclipse *backend) {
 	close(backend->sockets[0]);
 	close(backend->sockets[1]);
 	free(backend);
@@ -52,7 +52,7 @@ static void destroy(struct backend_eclipse *backend) {
 
 static int close_seat(struct libseat *base) {
 	struct backend_eclipse *backend = backend_eclipse_from_libseat(base);
-	destroy(backend);
+	backend_eclipse_destroy(backend);
 	return 0;
 }
 
@@ -91,7 +91,7 @@ static int close_device(struct libseat *base, int device_id) {
 static int switch_session(struct libseat *base, int s) {
 	(void)base;
 	(void)s;
-	log_errorf("Eclipse backend cannot switch to session %d", s);
+	log_errorf("Eclipse backend does not support session switching (session %d)", s);
 	return -1;
 }
 
