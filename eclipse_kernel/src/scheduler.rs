@@ -393,6 +393,26 @@ fn wake_sleeping_processes(current_tick: u64) {
     }
 }
 
+/// Read the current value of the IA32_FS_BASE MSR (0xC0000100).
+///
+/// This captures any FS_BASE change made by userspace via the `wrfsbase` instruction
+/// (available when CR4.FSGSBASE is set), which bypasses the kernel's `arch_prctl` path
+/// and thus would not automatically update the process struct.  Call this before a
+/// context switch to save the up-to-date value.
+#[inline]
+unsafe fn read_fs_base_msr() -> u64 {
+    let low: u32;
+    let high: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") 0xC0000100u32,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
+    ((high as u64) << 32) | (low as u64)
+}
+
 /// Función principal de scheduling con soporte SMP completo.
 ///
 /// Invariantes SMP:
@@ -603,18 +623,7 @@ pub fn schedule() -> u64 {
                                         match table[slot].as_mut() {
                                             Some(p) if p.id == pid => {
                                                 // Save current FS_BASE before switching to idle
-                                                let current_fs_base = unsafe {
-                                                    let low: u32;
-                                                    let high: u32;
-                                                    core::arch::asm!("rdmsr",
-                                                        in("ecx") 0xC0000100u32,
-                                                        out("eax") low,
-                                                        out("edx") high,
-                                                        options(nomem, nostack, preserves_flags)
-                                                    );
-                                                    ((high as u64) << 32) | (low as u64)
-                                                };
-                                                p.fs_base = current_fs_base;
+                                                p.fs_base = unsafe { read_fs_base_msr() };
                                                 let ctx_ptr = &mut p.context as *mut crate::process::Context;
                                                 let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
                                                 (ctx_ptr, cpu_ptr)
@@ -680,18 +689,7 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
                     Some(p) if p.id == from_pid => {
                         // Save current FS_BASE (may have been changed by userspace via wrfsbase)
                         // so that it is correctly restored when this process is next scheduled.
-                        let current_fs_base = unsafe {
-                            let low: u32;
-                            let high: u32;
-                            core::arch::asm!("rdmsr",
-                                in("ecx") 0xC0000100u32,
-                                out("eax") low,
-                                out("edx") high,
-                                options(nomem, nostack, preserves_flags)
-                            );
-                            ((high as u64) << 32) | (low as u64)
-                        };
-                        p.fs_base = current_fs_base;
+                        p.fs_base = unsafe { read_fs_base_msr() };
                         &mut p.context as *mut crate::process::Context
                     }
                     _ => {
