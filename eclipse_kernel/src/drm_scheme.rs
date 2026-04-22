@@ -311,14 +311,19 @@ impl Scheme for DrmScheme {
                 let cap = unsafe { (ptr as *const DrmSetClientCap).read_unaligned() };
 
                 // Accept the common caps wlroots requests. Value is usually 1 (enable).
-                // If we don't recognize it, be permissive to keep userspace moving.
                 match cap.capability {
                     // DRM_CLIENT_CAP_STEREO_3D (1)
+                    1 => Ok(0),
                     // DRM_CLIENT_CAP_UNIVERSAL_PLANES (2)
-                    // DRM_CLIENT_CAP_ATOMIC (3)
+                    2 => Ok(0),
+                    // DRM_CLIENT_CAP_ATOMIC (3): reject — DRM_IOCTL_MODE_ATOMIC is not
+                    // implemented; returning EINVAL here forces wlroots to fall back to
+                    // the legacy modesetting interface which IS supported.
+                    3 => Err(scheme_error::EINVAL),
                     // DRM_CLIENT_CAP_ASPECT_RATIO (4)
+                    4 => Ok(0),
                     // DRM_CLIENT_CAP_WRITEBACK_CONNECTORS (5)
-                    1..=5 => Ok(0),
+                    5 => Ok(0),
                     _ => Ok(0),
                 }
             }
