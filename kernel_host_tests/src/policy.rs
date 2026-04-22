@@ -38,7 +38,7 @@ pub const MMAP_MAP_SHARED: u64 = 0x01;
 pub const MMAP_MAP_ANONYMOUS: u64 = 0x20;
 pub const MMAP_MAP_POPULATE: u64 = 0x08000;
 pub const MMAP_USER_ARENA_LO: u64 = 0x6000_0000;
-pub const MMAP_USER_ARENA_HI: u64 = 0x7000_0000;
+pub const MMAP_USER_ARENA_HI: u64 = 0x8000_0000;
 pub const MMAP_ANON_SLACK_BYTES: u64 = 0x8000;
 
 /// `eclipse_kernel/src/virtio.rs` — `VIRTIO_NET_MAX_TX_BYTES`

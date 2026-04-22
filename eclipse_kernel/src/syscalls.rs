@@ -226,8 +226,10 @@ mod linux_mmap_abi {
     /// are lazy: frames are allocated on first access via the demand-page handler.
     pub const MAP_POPULATE: u64 = 0x08000;
     /// Donde `mmap_find_free` coloca `mmap(NULL, …)` anónimo.
+    /// 512 MiB de espacio virtual: suficiente para aplicaciones pesadas (Mesa/GLES2)
+    /// incluso sin el colchón de 32 KiB por mmap que se aplica solo a PROT_EXEC.
     pub const USER_ARENA_LO: u64 = 0x6000_0000;
-    pub const USER_ARENA_HI: u64 = 0x7000_0000;
+    pub const USER_ARENA_HI: u64 = 0x8000_0000;
     /// Pila fija tras `exec`/`execve` / `spawn` (1 MiB en 512 MiB virtuales).
     pub const USER_EXEC_STACK_LO: u64 = 0x2000_0000;
     pub const USER_EXEC_STACK_HI: u64 = USER_EXEC_STACK_LO + 0x10_0000;
@@ -3399,8 +3401,14 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 .map_or(false, |end| end <= USER_ARENA_HI);
         use linux_mmap_abi::PROT_EXEC;
         let anon_slack: u64 = if (flags & MAP_ANONYMOUS) != 0 && fd_entry.is_none() {
-            // Anonymous mappings always get slack (unless MAP_FIXED outside the arena).
-            if (flags & MAP_FIXED) == 0 || map_fixed_in_mmap_arena {
+            // Only PROT_EXEC anonymous mappings need instruction-decoder slack pages
+            // (so the CPU can safely decode multi-byte instructions that span a page
+            // boundary at the very end of the mapping).  Data-only mappings (e.g. musl
+            // malloc arenas, IPC buffers) never execute instructions from their pages, so
+            // adding 32 KB slack to every such mmap wastes virtual address space and
+            // quickly exhausts the 512 MB arena when a complex application like Mesa/GLES2
+            // makes thousands of small group mmaps during initialisation.
+            if (prot & PROT_EXEC) != 0 && ((flags & MAP_FIXED) == 0 || map_fixed_in_mmap_arena) {
                 ANON_SLACK_BYTES
             } else {
                 0
