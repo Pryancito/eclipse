@@ -1620,7 +1620,7 @@ EOF
     truncate -s ${ROOT_SIZE}M "$ROOT_IMG"
     
     if [ -f "mkfs-eclipsefs/target/release/mkfs-eclipsefs" ]; then
-        ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "EclipseOS" -N 10000 "$ROOT_IMG" > /dev/null
+        ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "EclipseOS" -N 20000 "$ROOT_IMG" > /dev/null
         
         if [ -f "populate-eclipsefs/target/release/populate-eclipsefs" ] && [ -d "$BUILD_DIR" ]; then
             print_status "Poblando filesystem EclipseFS con populate-eclipsefs..."
