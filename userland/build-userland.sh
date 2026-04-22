@@ -11,7 +11,7 @@ set -u
 # Uso:
 #   ./build-userland.sh help
 #   ./build-userland.sh wlroots    # instala en $ECLIPSE_SYSROOT/usr (recomendado antes de labwc)
-#   ./build-userland.sh labwc      # genera userland/labwc/bld/labwc
+#   ./build-userland.sh labwc      # genera userland/labwc_v08/bld/labwc
 #   ./build-userland.sh labwc-install
 #   ./build-userland.sh all
 #
@@ -19,7 +19,7 @@ set -u
 #   ECLIPSE_SYSROOT       destino de includes/libs/pkg-config (defecto: ../eclipse-os-build)
 #   ECLIPSE_TOOLCHAIN_DIR defecto: ../host-toolchains
 #   ECLIPSE_MESON_BUILDTYPE release o debug (defecto: release)
-#   ECLIPSE_LABWC_CLEAN   si está a 1, borra userland/labwc/bld antes de configurar
+#   ECLIPSE_LABWC_CLEAN   si está a 1, borra userland/labwc_v08/bld antes de configurar
 #   ECLIPSE_WLROOTS_CLEAN idem para wlroots_src/bld-eclipse
 #   ECLIPSE_LIBINPUT_CLEAN idem para libinput_src/bld-eclipse (p. ej. tras cambiar --prefix)
 #   ECLIPSE_XKBCOMMON_CLEAN idem para xkbcommon_src/bld-eclipse (--prefix=/usr incrustado en la .so)
@@ -193,20 +193,20 @@ patch_sysroot_extras() {
 	fi
 }
 
-# wlroots 0.20 + wayland 1.25.x requieren scanner >= 1.25; Ubuntu 24.04 suele traer 1.24.
+# wlroots 0.18 es el subproyecto declarado en labwc_v08/subprojects/wlroots.wrap.
 # Compilamos wayland nativo (solo host) una vez bajo userland/.eclipse-builddeps/.
 # Varios .wrap de labwc redirigen a wlroots/subprojects/*.wrap; hace falta el árbol wlroots
 # antes de que Meson resuelva pixman, libdrm, etc.
 ensure_wlroots_subproject() {
-	local root="$USERLAND_DIR/labwc"
+	local root="$USERLAND_DIR/labwc_v08"
 	local wr="$root/subprojects/wlroots"
 	if [[ -f "$wr/meson.build" ]]; then
 		return 0
 	fi
 	require_cmd git
-	info "Clonando wlroots 0.20 (subproyecto labwc, requerido por wrap-redirect)…"
+	info "Clonando wlroots 0.18 (subproyecto labwc_v08, requerido por wrap-redirect)…"
 	rm -rf "$wr"
-	git clone --depth 1 --branch 0.20 https://gitlab.freedesktop.org/wlroots/wlroots.git "$wr"
+	git clone --depth 1 --branch 0.18 https://gitlab.freedesktop.org/wlroots/wlroots.git "$wr"
 }
 
 # libgbm.a del sysroot a veces es un stub mínimo; wlroots 0.20 enlaza gbm_bo_get_fd_for_plane.
@@ -284,7 +284,7 @@ build_libliftoff() {
 	check_toolchain
 	check_sysroot
 	export_musl_cross_env
-	local root="$USERLAND_DIR/labwc/subprojects/libliftoff"
+	local root="$USERLAND_DIR/labwc_v08/subprojects/libliftoff"
 	local cross="$root/meson.cross-eclipse"
 	local bld="$root/bld-eclipse"
 	require_file "$root/meson.build"
@@ -553,7 +553,7 @@ build_labwc() {
 	require_cmd ninja
 	require_file "$WAYLAND_SCANNER" "falló la construcción nativa de wayland-scanner"
 
-	local root="$USERLAND_DIR/labwc"
+	local root="$USERLAND_DIR/labwc_v08"
 	local cross="$root/meson.cross"
 	local bld="$root/bld"
 
@@ -579,7 +579,7 @@ build_labwc() {
 		--prefix="$ECLIPSE_SYSROOT/usr" \
 		"--buildtype=$ECLIPSE_MESON_BUILDTYPE" \
 		--default-library=static \
-		--force-fallback-for=wlroots,pixman,libxkbcommon,wayland,libdisplay-info,libliftoff,libffi \
+		--force-fallback-for=wlroots,pixman,libxkbcommon,wayland,libdisplay-info,libsfdo,libffi \
 		-Dxwayland=disabled \
 		-Dnls=disabled \
 		-Dman-pages=disabled \
@@ -596,16 +596,16 @@ build_labwc() {
 }
 
 install_labwc_bin() {
-	local bld="$USERLAND_DIR/labwc/bld"
+	local bld="$USERLAND_DIR/labwc_v08/bld"
 	require_file "$bld/labwc"
 	eclipse_fix_labwc_rpath "$bld/labwc"
 	cp -f "$bld/labwc" "$ECLIPSE_SYSROOT/usr/bin/labwc"
 
 	# Instalar configuración y temas por defecto
 	mkdir -p "$ECLIPSE_SYSROOT/usr/share/labwc" "$ECLIPSE_SYSROOT/usr/share/themes/labwc/openbox-3"
-	cp -f "$USERLAND_DIR/labwc/docs/rc.xml" "$ECLIPSE_SYSROOT/usr/share/labwc/rc.xml"
-	cp -f "$USERLAND_DIR/labwc/docs/menu.xml" "$ECLIPSE_SYSROOT/usr/share/labwc/menu.xml"
-	cp -f "$USERLAND_DIR/labwc/docs/themerc" "$ECLIPSE_SYSROOT/usr/share/themes/labwc/openbox-3/themerc"
+	cp -f "$USERLAND_DIR/labwc_v08/docs/rc.xml" "$ECLIPSE_SYSROOT/usr/share/labwc/rc.xml"
+	cp -f "$USERLAND_DIR/labwc_v08/docs/menu.xml" "$ECLIPSE_SYSROOT/usr/share/labwc/menu.xml"
+	cp -f "$USERLAND_DIR/labwc_v08/docs/themerc" "$ECLIPSE_SYSROOT/usr/share/themes/labwc/openbox-3/themerc"
 
 	ok "Instalado: $ECLIPSE_SYSROOT/usr/bin/labwc (y assets en usr/share/labwc)"
 }
@@ -1382,7 +1382,7 @@ Construcción userland (Eclipse OS / musl).
 
   $0 wlroots         — compila e instala wlroots_src en ECLIPSE_SYSROOT/usr
   $0 xkb-data        — compila e instala xkeyboard-config en el sysroot
-  $0 labwc           — compila labwc (salida: userland/labwc/bld/labwc)
+  $0 labwc           — compila labwc (salida: userland/labwc_v08/bld/labwc)
   $0 labwc-install   — copia labwc a ECLIPSE_SYSROOT/usr/bin/
   $0 xfwl4           — compila e instala xfwl4 y TODAS sus dependencias (GTK3, Xfce, etc.)
   $0 all             — wlroots, xkb-data, labwc y xfwl4
@@ -1396,7 +1396,7 @@ Variables:
   ECLIPSE_LABWC_SKIP_RPATH_PATCH=1  — no modificar RPATH (solo depuración en el host)
   ECLIPSE_WLROOTS_BACKENDS / _RENDERERS / _SESSION — opciones Meson (-D…) para wlroots
   ECLIPSE_MESON_STATIC_LINK=1 — añade -static al cross Meson (labwc lo omite: sysroot con .so wayland/Mesa/GLib).
-  ECLIPSE_WAYLAND_TAG=1.25.0 — tag Git de wayland para scanner + subproyecto (coincide con labwc/subprojects/wayland.wrap)
+  ECLIPSE_WAYLAND_TAG=1.25.0 — tag Git de wayland para scanner + subproyecto (coincide con labwc_v08/subprojects/wayland.wrap)
 
 Notas (labwc): si libseat.a se construyó con libseat-builtin=enabled, el script lo
 recompila con builtin=disabled para evitar símbolos duplicados con src/server.c.
