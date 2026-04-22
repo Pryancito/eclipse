@@ -105,8 +105,11 @@ static int dispatch(struct libseat *base, int timeout) {
 
 	if (backend->initial_setup) {
 		backend->initial_setup = false;
-		backend->seat_listener->enable_seat(&backend->base,
-						    backend->seat_listener_data);
+		if (backend->seat_listener != NULL &&
+		    backend->seat_listener->enable_seat != NULL) {
+			backend->seat_listener->enable_seat(&backend->base,
+							    backend->seat_listener_data);
+		}
 	}
 
 	struct pollfd pfd = {
