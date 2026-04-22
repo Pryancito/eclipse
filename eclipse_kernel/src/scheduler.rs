@@ -602,6 +602,19 @@ pub fn schedule() -> u64 {
                                     Some(slot) => {
                                         match table[slot].as_mut() {
                                             Some(p) if p.id == pid => {
+                                                // Save current FS_BASE before switching to idle
+                                                let current_fs_base = unsafe {
+                                                    let low: u32;
+                                                    let high: u32;
+                                                    core::arch::asm!("rdmsr",
+                                                        in("ecx") 0xC0000100u32,
+                                                        out("eax") low,
+                                                        out("edx") high,
+                                                        options(nomem, nostack, preserves_flags)
+                                                    );
+                                                    ((high as u64) << 32) | (low as u64)
+                                                };
+                                                p.fs_base = current_fs_base;
                                                 let ctx_ptr = &mut p.context as *mut crate::process::Context;
                                                 let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
                                                 (ctx_ptr, cpu_ptr)
@@ -664,7 +677,23 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
         let from_ptr: *mut crate::process::Context = match crate::ipc::pid_to_slot_fast(from_pid) {
             Some(slot) => {
                 match table[slot].as_mut() {
-                    Some(p) if p.id == from_pid => &mut p.context as *mut crate::process::Context,
+                    Some(p) if p.id == from_pid => {
+                        // Save current FS_BASE (may have been changed by userspace via wrfsbase)
+                        // so that it is correctly restored when this process is next scheduled.
+                        let current_fs_base = unsafe {
+                            let low: u32;
+                            let high: u32;
+                            core::arch::asm!("rdmsr",
+                                in("ecx") 0xC0000100u32,
+                                out("eax") low,
+                                out("edx") high,
+                                options(nomem, nostack, preserves_flags)
+                            );
+                            ((high as u64) << 32) | (low as u64)
+                        };
+                        p.fs_base = current_fs_base;
+                        &mut p.context as *mut crate::process::Context
+                    }
                     _ => {
                         if cpu_id < MAX_CPUS {
                             unsafe { &mut SCRATCH_CONTEXTS[cpu_id] as *mut crate::process::Context }
@@ -730,9 +759,9 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     // Update TSS RSP0
     crate::boot::set_tss_stack(to_kernel_stack);
     
-    // Save current FS_BASE to from_ctx (optional, if we want to support user-mode changes being persisted)
-    // Actually, we should probably save it back to the Process struct, but switch_context takes from_ctx.
-    // Let's just restore the new one.
+    // FS_BASE of the from-process was already saved (via RDMSR) into its Process struct
+    // by perform_context_switch() before calling us. Here we only need to restore the
+    // to-process's FS_BASE.
     unsafe {
         use core::arch::asm;
         let msr_fs_base = 0xC0000100u32;
