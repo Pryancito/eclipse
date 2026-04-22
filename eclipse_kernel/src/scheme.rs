@@ -329,10 +329,162 @@ impl Scheme for LogScheme {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MemfdScheme — anonymous in-memory files created by memfd_create(2)
+// ---------------------------------------------------------------------------
+
+struct MemfdEntry {
+    phys_addr: u64,
+    allocated_bytes: usize,
+    logical_size: usize,
+}
+
+/// Scheme backing `memfd_create(2)`.  Each `open` call creates a new anonymous
+/// file backed by contiguous physical pages.  The file starts with size 0 and
+/// grows via `ftruncate`.  It supports `read`, `write`, `fmap` (for `mmap`),
+/// and `fstat`.  Entries are private to the opener (not accessible by name).
+pub struct MemfdScheme {
+    entries: Mutex<Vec<Option<MemfdEntry>>>,
+}
+
+unsafe impl Send for MemfdScheme {}
+unsafe impl Sync for MemfdScheme {}
+
+impl MemfdScheme {
+    pub fn new() -> Self {
+        Self { entries: Mutex::new(Vec::new()) }
+    }
+}
+
+impl Scheme for MemfdScheme {
+    /// Create a new anonymous file.  `path` and `flags` are ignored; the caller
+    /// (sys_memfd_create) is responsible for O_CLOEXEC handling.
+    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        let mut entries = self.entries.lock();
+        for (i, slot) in entries.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0 });
+                return Ok(i);
+            }
+        }
+        let id = entries.len();
+        entries.push(Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0 }));
+        Ok(id)
+    }
+
+    fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
+        let entries = self.entries.lock();
+        let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        let off = offset as usize;
+        if off >= e.logical_size || e.allocated_bytes == 0 {
+            return Ok(0);
+        }
+        let avail = e.logical_size - off;
+        let to_copy = buffer.len().min(avail);
+        let virt = crate::memory::PHYS_MEM_OFFSET + e.phys_addr + off as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(virt as *const u8, buffer.as_mut_ptr(), to_copy);
+        }
+        Ok(to_copy)
+    }
+
+    fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
+        let entries = self.entries.lock();
+        let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        let off = offset as usize;
+        if e.allocated_bytes == 0 || off >= e.logical_size {
+            return Err(error::EINVAL);
+        }
+        let avail = e.logical_size - off;
+        let to_copy = buffer.len().min(avail);
+        let virt = crate::memory::PHYS_MEM_OFFSET + e.phys_addr + off as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr(), virt as *mut u8, to_copy);
+        }
+        Ok(to_copy)
+    }
+
+    fn lseek(&self, _id: usize, offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize> {
+        // SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+        let new_off: i64 = match whence {
+            0 => offset as i64,
+            1 => current_offset as i64 + offset as i64,
+            _ => return Err(error::EINVAL),
+        };
+        if new_off < 0 { return Err(error::EINVAL); }
+        Ok(new_off as usize)
+    }
+
+    /// `ftruncate` sets the logical file size, allocating physical pages on
+    /// the first call.  Shrinking (logical_size only) is supported; growing
+    /// beyond the initially allocated region is not (returns EINVAL).
+    fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
+        let mut entries = self.entries.lock();
+        let e = entries.get_mut(id).and_then(|s| s.as_mut()).ok_or(error::EBADF)?;
+        if len > SHM_REGION_MAX_BYTES {
+            return Err(error::EINVAL);
+        }
+        let needed_pages = (len + 0xFFF) / 0x1000;
+        if needed_pages > e.allocated_bytes / 0x1000 {
+            if e.allocated_bytes != 0 {
+                // Growing beyond initial allocation is not supported.
+                return Err(error::EINVAL);
+            }
+            // First allocation.
+            match crate::memory::alloc_phys_frames_contig(needed_pages as u64) {
+                Some(phys) => {
+                    let virt = crate::memory::PHYS_MEM_OFFSET + phys;
+                    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, needed_pages * 0x1000); }
+                    e.phys_addr = phys;
+                    e.allocated_bytes = needed_pages * 0x1000;
+                }
+                None => return Err(error::ENOMEM),
+            }
+        }
+        e.logical_size = len;
+        Ok(0)
+    }
+
+    fn fmap(&self, id: usize, offset: usize, len: usize) -> Result<usize, usize> {
+        let entries = self.entries.lock();
+        let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        if e.allocated_bytes == 0 {
+            return Err(error::EINVAL);
+        }
+        if offset + len > e.allocated_bytes {
+            return Err(error::EINVAL);
+        }
+        Ok(e.phys_addr as usize + offset)
+    }
+
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        let entries = self.entries.lock();
+        let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        stat.size = e.logical_size as u64;
+        stat.mode = 0o600 | 0x8000; // S_IFREG | rw-------
+        Ok(0)
+    }
+
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut entries = self.entries.lock();
+        if id < entries.len() {
+            if entries[id].is_some() {
+                // Physical pages are not freed (no free_phys_frames_contig yet);
+                // same limitation as ShmScheme.
+                entries[id] = None;
+                return Ok(0);
+            }
+        }
+        Err(error::EBADF)
+    }
+}
+
+
 pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
     register_scheme("tty", Arc::new(crate::tty::TtyScheme::new()));
     register_scheme("shm", Arc::new(ShmScheme::new()));
+    register_scheme("memfd", Arc::new(MemfdScheme::new()));
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     register_scheme("eth", Arc::new(crate::eth::EthScheme));
     register_scheme("pty", Arc::new(crate::pty::PtyScheme::new()));
