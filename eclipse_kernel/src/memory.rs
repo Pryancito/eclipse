@@ -901,6 +901,36 @@ pub fn try_read_user_u64(pml4_phys: u64, vaddr: u64) -> Option<u64> {
     unsafe { Some(core::ptr::read_volatile(kva.byte_add(off))) }
 }
 
+/// Lee hasta `n` bytes desde una dirección de usuario arbitraria (sin restricción de alineación)
+/// recorriendo la tabla de páginas del proceso. Devuelve el número de bytes leídos (puede ser
+/// menor que `n` si la página no está presente o el extremo no cabe en la misma página).
+/// Diseñada para depuración en manejadores de excepción.
+pub fn try_read_user_bytes(pml4_phys: u64, vaddr: u64, buf: &mut [u8]) -> usize {
+    let n = buf.len();
+    if n == 0 {
+        return 0;
+    }
+    let page_va = vaddr & !0xFFF;
+    let page_off = (vaddr & 0xFFF) as usize;
+    let Some(phys) = get_user_page_phys(pml4_phys, page_va) else {
+        return 0;
+    };
+    if phys == 0 {
+        return 0;
+    }
+    // Only read bytes that fit within this single page (no cross-page reads to avoid
+    // a second page-table walk that could fault inside the exception handler).
+    let available = 4096 - page_off;
+    let to_copy = n.min(available);
+    let kva = phys_to_virt(phys) as *const u8;
+    unsafe {
+        for i in 0..to_copy {
+            buf[i] = core::ptr::read_volatile(kva.add(page_off + i));
+        }
+    }
+    to_copy
+}
+
 /// Linux `PROT_READ|WRITE|EXEC` (bits 0–2) → bits de PTE de hoja para usuario.
 /// Sin `PROT_EXEC` se marca `NO_EXECUTE` (coherente con [`mprotect_user_range`] y Linux).
 pub fn linux_prot_to_leaf_pte_bits(prot: u64) -> u64 {

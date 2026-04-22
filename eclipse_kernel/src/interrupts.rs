@@ -1058,6 +1058,25 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
     // In that case, terminate the faulting process and schedule the next one
     // so the kernel keeps running and the watchdog can restart the process.
     if cs & 3 == 3 && pid != 0 {
+        // Dump up to 16 instruction bytes at RIP so we can identify the faulting
+        // opcode without needing a userspace disassembler.
+        {
+            let mut ibuf = [0u8; 16];
+            let n = crate::memory::try_read_user_bytes(cr3, rip, &mut ibuf);
+            if n > 0 {
+                crate::serial::serial_print("[FAULT] Instruction bytes at RIP:");
+                for i in 0..n {
+                    crate::serial::serial_printf(format_args!(" {:02x}", ibuf[i]));
+                }
+                crate::serial::serial_print("\n");
+            } else {
+                crate::serial::serial_printf(format_args!(
+                    "[FAULT] Could not read instruction bytes at RIP={:#018x} (page not mapped)\n",
+                    rip
+                ));
+            }
+        }
+
         crate::serial::serial_printf(format_args!(
             "[FAULT] Userspace exception #{} in PID {} at RIP={:#018x} CR2={:#018x} RBX={:#018x} R11={:#018x} — killing process\n",
             num, pid, rip, cr2, rbx, r11
