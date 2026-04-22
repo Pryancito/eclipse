@@ -544,6 +544,7 @@ pub extern "C" fn syscall_handler(
         21  => sys_faccessat(0, arg1, arg2, 0),
         22  => sys_pipe(arg1),
         24  => sys_yield(),
+        25  => sys_mremap(arg1, arg2, arg3, arg4, arg5),
         32  => sys_dup(arg1),
         33  => sys_dup2(arg1, arg2),
         34  => sys_pause(),
@@ -627,6 +628,7 @@ pub extern "C" fn syscall_handler(
         186 => sys_gettid(),
         200 => sys_tkill(arg1, arg2),
         202 => sys_futex(arg1, arg2, arg3, arg4, arg5, arg6 as u32),
+        204 => sys_sched_getaffinity(arg1, arg2, arg3),
         218 => sys_set_tid_address(arg1),
         217 => sys_getdents64(arg1, arg2, arg3),
         228 => sys_clock_gettime(arg1, arg2),
@@ -1238,6 +1240,45 @@ fn sys_sched_setaffinity(pid: u64, cpu_id: u64) -> u64 {
         }
         u64::MAX
     })
+}
+
+/// Linux `sched_getaffinity` (syscall 204 on x86_64).
+///
+/// Signature: sched_getaffinity(pid, cpusetsize, mask_ptr)
+/// Returns 0 on success (Linux ABI: -errno on failure).
+///
+/// We report all online CPUs as available. This is enough for libdrm/wlroots and
+/// most thread pools that probe affinity to size worker counts.
+fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> u64 {
+    use crate::scheduler::MAX_CPUS;
+
+    if mask_ptr == 0 || cpusetsize == 0 {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+    // Linux writes up to cpusetsize bytes. We only implement up to 64 CPUs (8 bytes).
+    if cpusetsize < 8 {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+    if !is_user_pointer(mask_ptr, 8) {
+        return syscall_error_for_current_process(crate::scheme::error::EFAULT as i32);
+    }
+
+    // pid==0 means current process; other pids are accepted (we don't currently
+    // track per-process affinity masks in Linux ABI form).
+    let _ = pid;
+
+    let online: u64 = (crate::cpu::get_active_cpu_count() as u64).min(MAX_CPUS as u64);
+    let mut mask: u64 = 0;
+    for i in 0..online {
+        if i < 64 {
+            mask |= 1u64 << i;
+        }
+    }
+
+    unsafe {
+        (mask_ptr as *mut u64).write_unaligned(mask);
+    }
+    0
 }
 
 /// Length of null-terminated string in user space (max max_len bytes).
@@ -3706,6 +3747,225 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
         }
     }
     u64::MAX
+}
+
+/// Linux `mremap` (syscall 25 on x86_64).
+///
+/// Suficiente para musl/labwc:
+/// - soporta shrink/grow
+/// - soporta `MREMAP_MAYMOVE` (y `MREMAP_FIXED` cuando MAYMOVE está presente)
+/// - mueve páginas *presentes* (PTE hoja) remapeando el mismo frame físico
+/// - páginas no presentes (demand paging) simplemente quedan como "no mapeadas" y se
+///   asignarán en el primer acceso mediante `handle_anon_page_fault`.
+///
+/// Flags Linux:
+/// - MREMAP_MAYMOVE = 1
+/// - MREMAP_FIXED   = 2  (requiere MAYMOVE)
+fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr: u64) -> u64 {
+    use crate::memory;
+    use crate::process::{self, VMARegion};
+
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+
+    if old_addr == 0 || old_size == 0 || new_size == 0 {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+    if (old_addr & 0xFFF) != 0 {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+    // Reject kernel-space addresses early.
+    if old_addr >= memory::USER_SPACE_END {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+
+    // Linux rounds sizes up to page size for mapping operations.
+    let old_len = (old_size + 0xFFF) & !0xFFF;
+    let new_len = (new_size + 0xFFF) & !0xFFF;
+    let old_end = old_addr.saturating_add(old_len);
+    if old_end <= old_addr {
+        return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+    }
+
+    let Some(pid) = process::current_process_id() else {
+        return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
+    };
+    let Some(mut proc) = process::get_process(pid) else {
+        return syscall_error_for_current_process(crate::scheme::error::ESRCH as i32);
+    };
+
+    // Locate VMA and grab page table phys.
+    let (pt, vma_flags) = {
+        let r = proc.resources.lock();
+        let pt = r.page_table_phys;
+        // Find a VMA that fully covers the old range.
+        let vma = r.vmas.iter().find(|v| old_addr >= v.start && old_end <= v.end);
+        let Some(vma) = vma else {
+            return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+        };
+        (pt, vma.flags)
+    };
+
+    // Fast path: shrink in-place.
+    if new_len <= old_len {
+        let shrink_start = old_addr.saturating_add(new_len);
+        let shrink_len = old_len - new_len;
+        if shrink_len != 0 {
+            // Unmap tail and update VMA tracking.
+            memory::unmap_user_range(pt, shrink_start, shrink_len);
+            {
+                let mut r = proc.resources.lock();
+                vma_remove_range(&mut r.vmas, shrink_start, old_end);
+                // Ensure there is still a VMA for the remaining prefix.
+                r.vmas.push(VMARegion {
+                    start: old_addr,
+                    end: shrink_start,
+                    flags: vma_flags,
+                    file_backed: false,
+                    anon_kernel_slack: 0,
+                });
+            }
+        }
+        process::update_process(pid, proc);
+        return old_addr;
+    }
+
+    // Grow: try in-place if the next range is free and caller didn't force FIXED.
+    // We only do this if MAYMOVE is not required and the gap is free.
+    let wants_fixed = (flags & MREMAP_FIXED) != 0;
+    let may_move = (flags & MREMAP_MAYMOVE) != 0;
+
+    if !wants_fixed {
+        let grow_end = old_addr.saturating_add(new_len);
+        let grow_start = old_end;
+        let need_len = new_len - old_len;
+        let can_grow = if need_len == 0 {
+            true
+        } else {
+            let r = proc.resources.lock();
+            !r.vmas
+                .iter()
+                .any(|v| grow_start < v.end && grow_end > v.start)
+        };
+        if can_grow {
+            // Just extend the VMA; pages will be allocated lazily on fault.
+            {
+                let mut r = proc.resources.lock();
+                vma_remove_range(&mut r.vmas, old_addr, old_end);
+                r.vmas.push(VMARegion {
+                    start: old_addr,
+                    end: grow_end,
+                    flags: vma_flags,
+                    file_backed: false,
+                    anon_kernel_slack: 0,
+                });
+            }
+            process::update_process(pid, proc);
+            return old_addr;
+        }
+    }
+
+    // If we cannot grow in place and MAYMOVE not allowed: ENOMEM.
+    if !may_move {
+        return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
+    }
+
+    // Choose destination.
+    use linux_mmap_abi::{USER_ARENA_HI, USER_ARENA_LO};
+    let dst = if wants_fixed {
+        if (flags & MREMAP_MAYMOVE) == 0 {
+            return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+        }
+        if (new_addr & 0xFFF) != 0 || new_addr < USER_ARENA_LO {
+            return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+        }
+        let end = new_addr.saturating_add(new_len);
+        if end <= new_addr || end > USER_ARENA_HI {
+            return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
+        }
+        new_addr
+    } else {
+        // Find any free range in the mmap arena.
+        let r = proc.resources.lock();
+        let mut candidate = USER_ARENA_LO;
+        let mut found = None;
+        while candidate < USER_ARENA_HI {
+            let end = candidate.saturating_add(new_len);
+            if end <= candidate || end > USER_ARENA_HI {
+                break;
+            }
+            let next = r
+                .vmas
+                .iter()
+                .filter(|v| candidate < v.end && end > v.start)
+                .map(|v| v.end)
+                .max();
+            match next {
+                None => {
+                    found = Some(candidate);
+                    break;
+                }
+                Some(n) => candidate = n,
+            }
+        }
+        drop(r);
+        match found {
+            Some(a) => a,
+            None => return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32),
+        }
+    };
+
+    // If FIXED, clear destination range first.
+    if wants_fixed {
+        let mut r = proc.resources.lock();
+        memory::unmap_user_range(pt, dst, new_len);
+        vma_remove_range(&mut r.vmas, dst, dst.saturating_add(new_len));
+        drop(r);
+    }
+
+    // Move present pages by COPYING into fresh frames.
+    // This is less efficient than Linux's PTE-move approach, but it avoids
+    // aliasing the same physical frames at two virtual addresses (which can
+    // confuse some allocators if they briefly observe both mappings) and makes
+    // the semantics robust even if later code assumes the old range is gone.
+    let move_len = old_len.min(new_len);
+    let mut off = 0u64;
+    while off < move_len {
+        let src_va = old_addr.saturating_add(off);
+        let dst_va = dst.saturating_add(off);
+        if let Some(phys) = memory::get_user_page_phys(pt, src_va) {
+            // Allocate a fresh frame and copy the 4 KB page contents via HHDM.
+            let Some(new_phys) = memory::alloc_phys_frame_for_anon_mmap() else {
+                // Best-effort: do not destroy the old mapping if we can't complete the move.
+                return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
+            };
+            let src_kva = memory::PHYS_MEM_OFFSET + phys;
+            let dst_kva = memory::PHYS_MEM_OFFSET + new_phys;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_kva as *const u8, dst_kva as *mut u8, 4096);
+            }
+            let pte = memory::linux_prot_to_leaf_pte_bits(vma_flags);
+            memory::map_user_page_4kb(pt, dst_va, new_phys, pte);
+        }
+        off = off.saturating_add(4096);
+    }
+
+    // Unmap the old region and update VMA list.
+    memory::unmap_user_range(pt, old_addr, old_len);
+    {
+        let mut r = proc.resources.lock();
+        vma_remove_range(&mut r.vmas, old_addr, old_end);
+        r.vmas.push(VMARegion {
+            start: dst,
+            end: dst.saturating_add(new_len),
+            flags: vma_flags,
+            file_backed: false,
+            anon_kernel_slack: 0,
+        });
+    }
+
+    process::update_process(pid, proc);
+    dst
 }
 
 fn sys_brk(addr: u64) -> u64 {

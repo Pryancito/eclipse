@@ -30,7 +30,15 @@ USERLAND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${USERLAND_DIR}/.." && pwd)"
 
 ECLIPSE_SYSROOT="${ECLIPSE_SYSROOT:-$BASE_DIR/eclipse-os-build}"
-ECLIPSE_TOOLCHAIN_DIR="${ECLIPSE_TOOLCHAIN_DIR:-$BASE_DIR/host-toolchains}"
+# En este repo, `./build.sh` instala el toolchain musl bajo `eclipse-os-build/`.
+# Mantener compatibilidad con árboles antiguos que lo ponían en `host-toolchains/`.
+if [[ -z "${ECLIPSE_TOOLCHAIN_DIR:-}" ]]; then
+	if [[ -x "$BASE_DIR/eclipse-os-build/bin/x86_64-linux-musl-gcc" ]]; then
+		ECLIPSE_TOOLCHAIN_DIR="$BASE_DIR/eclipse-os-build"
+	else
+		ECLIPSE_TOOLCHAIN_DIR="$BASE_DIR/host-toolchains"
+	fi
+fi
 ECLIPSE_MESON_BUILDTYPE="${ECLIPSE_MESON_BUILDTYPE:-release}"
 ECLIPSE_MESON_STATIC_LINK="${ECLIPSE_MESON_STATIC_LINK:-1}"
 default_lib="shared"
@@ -59,7 +67,10 @@ CROSS_MUSL_AR="$USERLAND_DIR/host-tools/bin-toolchain-isolated/${MUSL_PREFIX}-ar
 CROSS_MUSL_NM="$USERLAND_DIR/host-tools/bin-toolchain-isolated/${MUSL_PREFIX}-nm"
 CROSS_MUSL_RANLIB="$USERLAND_DIR/host-tools/bin-toolchain-isolated/${MUSL_PREFIX}-ranlib"
 CROSS_MUSL_STRIP="$USERLAND_DIR/host-tools/bin-toolchain-isolated/${MUSL_PREFIX}-strip"
-if [[ ! -x "$CROSS_MUSL_CC" ]]; then
+# Los wrappers aislados de `host-tools/bin-toolchain-isolated` están pensados para un toolchain
+# instalado bajo `$BASE_DIR/host-toolchains`. Si el toolchain está en otro prefijo (p. ej.
+# `$BASE_DIR/eclipse-os-build` que es donde `./build.sh` lo instala), usar directamente MUSL_*.
+if [[ ! -x "$CROSS_MUSL_CC" || "$ECLIPSE_TOOLCHAIN_DIR" != "$BASE_DIR/host-toolchains" ]]; then
 	CROSS_MUSL_CC="$MUSL_GCC"
 	CROSS_MUSL_CPP="$MUSL_GXX"
 	CROSS_MUSL_AR="$MUSL_AR"

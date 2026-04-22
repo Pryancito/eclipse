@@ -15,6 +15,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::prelude::v1::*;
 use eclipse_relibc as libc;
+use eclipse_relibc::syscall_wrappers::syscall;
 
 #[cfg(feature = "compositor-lunas")]
 const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
@@ -45,6 +46,14 @@ fn main() {
         let _ = libc::send_ipc(ppid as u32, 255, b"READY");
     }
 
+    // Activar strace para este proceso (se conserva tras execve).
+    // pid=0 => proceso actual.
+    unsafe {
+        // syscall Linux 545 en nuestro kernel: sys_strace(pid, enable)
+        // A través de la libc: eclipse_relibc expone syscall() genérica.
+        let _ = syscall(545, 0usize, 1usize);
+    }
+
     #[cfg(not(feature = "compositor-lunas"))]
     exec_labwc_debug();
 
@@ -62,14 +71,15 @@ fn exec_labwc_debug() {
     // Usar el backend noop de libseat: abre dispositivos directamente con open()
     // y activa el seat en el primer dispatch. El backend "eclipse" del binario
     // pre-compilado causaba un #GP; noop es equivalente en Eclipse OS.
-    let _ = std::env::set_var("LIBSEAT_BACKEND", "noop");
+    //let _ = std::env::set_var("LIBSEAT_BACKEND", "noop");
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
     let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
     // El kernel Eclipse no implementa DRM_IOCTL_MODE_ATOMIC; forzar interfaz legacy.
-    let _ = std::env::set_var("WLR_DRM_NO_ATOMIC", "1");
+    //let _ = std::env::set_var("WLR_DRM_NO_ATOMIC", "1");
     // Forzar el renderizador software Pixman para evitar problemas con EGL/GPU.
-    let _ = std::env::set_var("WLR_RENDERER", "pixman");
+    //let _ = std::env::set_var("WLR_RENDERER", "pixman");
 
+    let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
     let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
     let arg0 = CString::new(LABWC_EXEC_PATH).expect("argv0");
     let arg_d = CString::new("-d").expect("-d");
