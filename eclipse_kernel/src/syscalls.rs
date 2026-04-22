@@ -5093,7 +5093,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 /// the process context so it survives context switches.
 fn sys_iopl(level: u64, context: &mut crate::interrupts::SyscallContext) -> u64 {
     if level > 3 {
-        return u64::MAX; // EINVAL
+        return (-22i64) as u64; // EINVAL
     }
     // Bits 12–13 of RFLAGS are the IOPL field.
     const IOPL_MASK: u64 = 0x3000;
@@ -5110,6 +5110,7 @@ fn sys_iopl(level: u64, context: &mut crate::interrupts::SyscallContext) -> u64 
             crate::process::update_process(pid, proc);
         }
     }
+    #[cfg(debug_assertions)]
     serial::serial_printf(format_args!("[SYSCALL] sys_iopl: PID {} IOPL set to {}\n", pid, level));
     0
 }
