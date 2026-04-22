@@ -63,8 +63,7 @@ pub const MINIMAL_ENVP: &[&[u8]] = &[
     b"USER=root\0",
     b"SHELL=/bin/bash\0",
     b"LANG=C\0",
-    // Wayland compositor environment — required by labwc and wlroots-based clients.
-    b"WAYLAND_DISPLAY=wayland-0\0",
+    // Runtime environment for processes (XDG_RUNTIME_DIR is required by most Wayland libs).
     b"XDG_RUNTIME_DIR=/run/user/0\0",
     b"XDG_SESSION_TYPE=wayland\0",
 ];
