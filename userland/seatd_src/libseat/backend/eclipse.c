@@ -146,7 +146,11 @@ dispatch(struct libseat *base, int timeout)
 	}
 	if (ret > 0 && (pfd.revents & POLLIN)) {
 		char buf[64];
-		(void)read(backend->pipe_fds[0], buf, sizeof(buf));
+		ssize_t n = read(backend->pipe_fds[0], buf, sizeof(buf));
+		if (n < 0 && errno != EAGAIN && errno != EINTR) {
+			log_errorf("Eclipse: pipe read error: %s", strerror(errno));
+			return -1;
+		}
 	}
 	return 0;
 }
