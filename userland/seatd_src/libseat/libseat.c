@@ -34,7 +34,7 @@ static const struct named_backend impls[] = {
 	{NULL, NULL},
 };
 
-#if !defined(SEATD_ENABLED) && !defined(LOGIND_ENABLED) && !defined(BUILTIN_ENABLED)
+#if !defined(SEATD_ENABLED) && !defined(LOGIND_ENABLED) && !defined(BUILTIN_ENABLED) && !defined(ECLIPSE_ENABLED)
 #error At least one backend must be enabled
 #endif
 
