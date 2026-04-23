@@ -2,15 +2,12 @@
 //!
 //! Por defecto (**labwc**): `execve("/usr/bin/labwc", [..., "-d"], environ)` para activar
 //! el nivel de log de wlroots (`WLR_DEBUG`) sin depender de argv en `SYS_EXEC`.
-//! **Wayfire** si el entorno tiene `ECLIPSE_COMPOSITOR=wayfire` (comparación sin distinguir
-//! mayúsculas). Cualquier otro valor o ausente → labwc.
 //! Con feature **`compositor-lunas`**: abre **`file:/usr/bin/lunas`**, `mmap` + `exec` (ET_EXEC estático).
 //!
 //! Responsabilidades:
 //! 1. labwc: ruta VFS absoluta + `execve` con `-d` (defecto).
-//! 2. wayfire: `execve` a `/usr/bin/wayfire` (vía `ECLIPSE_COMPOSITOR=wayfire`).
-//! 3. lunas: abrir vía `file:`, `mmap` + `exec` en el mismo flujo de arranque.
-//! 4. Salir si falla; si tiene éxito, la imagen del proceso es ya el compositor.
+//! 2. lunas: abrir vía `file:`, `mmap` + `exec` en el mismo flujo de arranque.
+//! 3. Salir si falla; si tiene éxito, la imagen del proceso es ya el compositor.
 
 #[cfg(not(feature = "compositor-lunas"))]
 use std::ffi::CString;
@@ -27,22 +24,7 @@ const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 #[cfg(not(feature = "compositor-lunas"))]
 const LABWC_EXEC_PATH: &str = "/usr/bin/labwc";
 
-/// Ruta para wayfire.
-#[cfg(not(feature = "compositor-lunas"))]
-const WAYFIRE_EXEC_PATH: &str = "/usr/bin/wayfire";
-
-/// Nombre de la variable que elige el compositor wlroots-based (`wayfire` → Wayfire, resto → labwc).
-#[cfg(not(feature = "compositor-lunas"))]
-const ENV_COMPOSITOR: &str = "ECLIPSE_COMPOSITOR";
-
-/// Si se debe arrancar Wayfire según el valor (p. ej. `std::env::var(ENV_COMPOSITOR).ok().as_deref()`).
-#[cfg(not(feature = "compositor-lunas"))]
-fn use_wayfire_from_value(val: Option<&str>) -> bool {
-    val.map(|s| s.eq_ignore_ascii_case("wayfire"))
-        .unwrap_or(false)
-}
-
-/// Variables de entorno comunes (wlroots + Eclipse) para labwc y wayfire.
+/// Variables de entorno comunes (wlroots + Eclipse) para labwc.
 #[cfg(not(feature = "compositor-lunas"))]
 fn apply_wlroots_eclipse_env() {
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
@@ -51,35 +33,19 @@ fn apply_wlroots_eclipse_env() {
     let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
 }
 
-/// labwc o wayfire: `execve` según `ECLIPSE_COMPOSITOR`. lunas se maneja en otra rama.
+/// labwc: `execve` directo. lunas se maneja en otra rama.
 #[cfg(not(feature = "compositor-lunas"))]
 fn exec_wlroots_compositor() {
-    let wayfire = true;//use_wayfire_from_value(std::env::var(ENV_COMPOSITOR).ok().as_deref());
     apply_wlroots_eclipse_env();
-    if wayfire {
-        let path = CString::new(WAYFIRE_EXEC_PATH).expect("wayfire path");
-        let arg0 = CString::new(WAYFIRE_EXEC_PATH).expect("argv0");
-        let argv: [*const c_char; 2] = [arg0.as_ptr(), core::ptr::null()];
-        let envp = libc::environ_ptr();
-        unsafe {
-            let r = libc::execve(path.as_ptr(), argv.as_ptr(), envp);
-            println!(
-                "[GUI-SERVICE] FATAL: execve({}) failed: {}",
-                WAYFIRE_EXEC_PATH, r
-            );
-            libc::exit(1);
-        }
-    } else {
-        let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
-        let arg0 = CString::new(LABWC_EXEC_PATH).expect("argv0");
-        let arg_d = CString::new("-d").expect("-d");
-        let argv: [*const c_char; 3] = [arg0.as_ptr(), arg_d.as_ptr(), core::ptr::null()];
-        let envp = libc::environ_ptr();
-        unsafe {
-            let r = libc::execve(path.as_ptr(), argv.as_ptr(), envp);
-            println!("[GUI-SERVICE] FATAL: execve({}) failed: {}", LABWC_EXEC_PATH, r);
-            libc::exit(1);
-        }
+    let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
+    let arg0 = CString::new(LABWC_EXEC_PATH).expect("argv0");
+    let arg_d = CString::new("-d").expect("-d");
+    let argv: [*const c_char; 3] = [arg0.as_ptr(), arg_d.as_ptr(), core::ptr::null()];
+    let envp = libc::environ_ptr();
+    unsafe {
+        let r = libc::execve(path.as_ptr(), argv.as_ptr(), envp);
+        println!("[GUI-SERVICE] FATAL: execve({}) failed: {}", LABWC_EXEC_PATH, r);
+        libc::exit(1);
     }
 }
 
@@ -94,15 +60,10 @@ fn main() {
     println!("[GUI-SERVICE] exec compositor: {}", COMPOSITOR_PATH);
     #[cfg(not(feature = "compositor-lunas"))]
     {
-        let wayfire = true;//use_wayfire_from_value(std::env::var(ENV_COMPOSITOR).ok().as_deref());
-        if wayfire {
-            println!("[GUI-SERVICE] {}=wayfire → {} (execve)", ENV_COMPOSITOR, WAYFIRE_EXEC_PATH);
-        } else {
-            println!(
-                "[GUI-SERVICE] exec compositor: {} -d (execve) [{} distinto de wayfire o ausente]",
-                LABWC_EXEC_PATH, ENV_COMPOSITOR
-            );
-        }
+        println!(
+            "[GUI-SERVICE] exec compositor: {} -d (execve)",
+            LABWC_EXEC_PATH
+        );
     }
 
     // IMPORTANT: este proceso hace exec() y se transforma en el compositor.
@@ -185,9 +146,6 @@ fn exec_lunas_via_mmap() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "compositor-lunas"))]
-    use super::use_wayfire_from_value;
-
     #[cfg(feature = "compositor-lunas")]
     #[test]
     fn compositor_path_is_file_uri_lunas() {
@@ -199,21 +157,5 @@ mod tests {
     #[test]
     fn labwc_uses_vfs_exec_path() {
         assert_eq!(super::LABWC_EXEC_PATH, "/usr/bin/labwc");
-    }
-
-    #[cfg(not(feature = "compositor-lunas"))]
-    #[test]
-    fn wayfire_uses_vfs_exec_path() {
-        assert_eq!(super::WAYFIRE_EXEC_PATH, "/usr/bin/wayfire");
-    }
-
-    #[cfg(not(feature = "compositor-lunas"))]
-    #[test]
-    fn wayfire_from_env_parsing() {
-        assert!(!use_wayfire_from_value(None));
-        assert!(!use_wayfire_from_value(Some("")));
-        assert!(!use_wayfire_from_value(Some("labwc")));
-        assert!(use_wayfire_from_value(Some("wayfire")));
-        assert!(use_wayfire_from_value(Some("Wayfire")));
     }
 }

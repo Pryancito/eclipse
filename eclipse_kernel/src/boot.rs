@@ -493,21 +493,51 @@ pub const USER_CODE_SELECTOR: u16 = 0x18 | 3; // Ring 3
 pub const USER_DATA_SELECTOR: u16 = 0x20 | 3; // Ring 3
 pub const TSS_SELECTOR: u16 = 0x40;
 
-/// Habilitar instrucciones SSE
-pub fn enable_sse() {
+/// Habilitar instrucciones SSE, AVX, XSAVE y FSGSBASE según disponibilidad de la CPU.
+pub fn enable_cpu_features() {
     unsafe {
-        // Habilitar SSE bit en CR0 (Monitor Coprocessor) y limpiar Emulation
+        // 1. Habilitar SSE bit en CR0 (Monitor Coprocessor) y limpiar Emulation
         let mut cr0: u64;
         asm!("mov {}, cr0", out(reg) cr0);
         cr0 &= !(1 << 2); // LIMPIAR EM (bit 2)
         cr0 |= (1 << 1);  // SET MP (bit 1)
         asm!("mov cr0, {}", in(reg) cr0);
 
-        // Habilitar SSE en CR4 (OSFXSR y OSXMMEXCPT)
+        // 2. Habilitar características en CR4
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= (1 << 9);  // OSFXSR
-        cr4 |= (1 << 10); // OSXMMEXCPT
+        cr4 |= (1 << 9);  // OSFXSR: Soporte para FXSAVE/FXRSTOR
+        cr4 |= (1 << 10); // OSXMMEXCPT: Soporte para excepciones SIMD (#XM)
+
+        let cpuid_1 = core::arch::x86_64::__cpuid(1);
+
+        // Habilitar XSAVE y AVX si están soportados
+        if (cpuid_1.ecx & (1 << 26)) != 0 {
+            // OSXSAVE (bit 18): Requerido para usar XGETBV/XSETBV y AVX
+            cr4 |= (1 << 18);
+
+            // Una vez activado OSXSAVE, configuramos XCR0
+            // Queremos habilitar: x87 (bit 0), SSE (bit 1)
+            let mut xcr0: u64 = 0x01 | 0x02;
+
+            // AVX (bit 28 de ECX en leaf 1)
+            if (cpuid_1.ecx & (1 << 28)) != 0 {
+                xcr0 |= 0x04; // Habilitar AVX en XCR0
+            }
+
+            let low = xcr0 as u32;
+            let high = (xcr0 >> 32) as u32;
+            // XSETBV: ECX indica el registro (0 para XCR0)
+            asm!("xsetbv", in("ecx") 0, in("eax") low, in("edx") high);
+        }
+
+        // Habilitar FSGSBASE (bit 0 de EBX en CPUID leaf 7)
+        // Permite RDFSBASE/WRFSBASE en userspace para gestionar TLS
+        let cpuid_7 = core::arch::x86_64::__cpuid_count(7, 0);
+        if (cpuid_7.ebx & (1 << 0)) != 0 {
+            cr4 |= (1 << 16);
+        }
+
         asm!("mov cr4, {}", in(reg) cr4);
     }
 }

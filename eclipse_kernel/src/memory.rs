@@ -1017,6 +1017,15 @@ pub fn get_user_page_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
 
 /// Lee 8 bytes alineados en el espacio de direcciones del proceso (para depuración en #PF).
 /// Devuelve `None` si la página no está presente o la dirección no está alineada a 8 bytes.
+pub fn try_read_user_u8(page_table_phys: u64, vaddr: u64) -> Option<u8> {
+    if vaddr > 0x0000_7FFF_FFFF_FFFF { return None; }
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    let phys = crate::memory::get_user_page_phys(page_table_phys, page)?;
+    let kptr = crate::memory::phys_to_virt(phys) as *const u8;
+    unsafe { Some(*kptr.add(offset)) }
+}
+
 pub fn try_read_user_u64(pml4_phys: u64, vaddr: u64) -> Option<u64> {
     if (vaddr & 7) != 0 {
         return None;

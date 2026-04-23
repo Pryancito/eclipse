@@ -539,8 +539,8 @@ pub extern "C" fn ap_entry() -> ! {
     // 3. Enable the Local APIC for this AP
     crate::apic::init();
 
-    // 4. Enable SSE (per-CPU CR0/CR4 bits; must mirror boot::enable_sse() on BSP)
-    crate::boot::enable_sse();
+    // 4. Enable SSE, AVX, XSAVE, etc. (must mirror boot::enable_cpu_features() on BSP)
+    crate::boot::enable_cpu_features();
 
     // 5. Program the Page Attribute Table MSR (IA32_PAT) – this is a per-CPU MSR
     crate::memory::init_pat();

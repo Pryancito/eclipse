@@ -6,7 +6,7 @@ resolver = "2"
 
 [features]
 default = []
-# Alternativa estática (ET_EXEC) si no usás labwc/wayfire: cargo build --features compositor-lunas
+# Alternativa estática (ET_EXEC) si no usás labwc: cargo build --features compositor-lunas
 compositor-lunas = []
 
 [dependencies]

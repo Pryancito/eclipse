@@ -757,6 +757,21 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
         rfl, cs, ss
     ));
 
+    // For #GP (13) and #UD (6), dump instruction bytes at RIP to help identify the faulting instruction
+    if (num == 13 || num == 6) && pid != 0 && (cs & 3) == 3 {
+        if let Some(p) = crate::process::get_process(pid) {
+            let pt = p.resources.lock().page_table_phys;
+            crate::serial::serial_printf(format_args!("[FAULT] bytes at RIP({:#x}): ", rip));
+            for i in 0..15 {
+                match crate::memory::try_read_user_u8(pt, rip + i) {
+                    Some(b) => crate::serial::serial_printf(format_args!("{:02x} ", b)),
+                    None => crate::serial::serial_printf(format_args!("?? ")),
+                }
+            }
+            crate::serial::serial_print("\n");
+        }
+    }
+
     // Salto a código NULL: volcar palabras en la pila de **usuario** vía tablas de páginas
     // (no leer RSP como puntero lineal del kernel: CR3 activo es del proceso).
     if num == 14 && rip == 0 && (cs & 3) == 3 && pid != 0 {
