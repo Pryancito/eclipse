@@ -55,6 +55,7 @@ pub mod sync;        // Synchronization primitives
 mod memory_builtins;
 mod drm_scheme;
 mod invariants;
+pub mod random_scheme;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};

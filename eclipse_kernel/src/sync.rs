@@ -1,6 +1,6 @@
 //! Synchronization primitives for the Eclipse kernel.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 
 /// A spinlock-based reentrant mutex that allows the same CPU to re-acquire it.
 /// Uses the per-CPU `cpu_id` stored in GS:[16] to identify the owning CPU.
@@ -153,5 +153,57 @@ impl<T> Drop for ReentrantMutexGuard<'_, T> {
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+/// Mutex con soporte para Herencia de Prioridad (Real-Time).
+/// Rastrea el PID del propietario para permitir que el planificador eleve su prioridad
+/// si un proceso de tiempo real se bloquea esperando este recurso.
+pub struct RtMutex<T> {
+    owner: AtomicU32,
+    inner: spin::Mutex<T>,
+}
+
+pub struct RtMutexGuard<'a, T> {
+    lock: &'a RtMutex<T>,
+    guard: spin::MutexGuard<'a, T>,
+}
+
+impl<T> RtMutex<T> {
+    pub const fn new(val: T) -> Self {
+        Self {
+            owner: AtomicU32::new(0),
+            inner: spin::Mutex::new(val),
+        }
+    }
+
+    pub fn lock(&self) -> RtMutexGuard<'_, T> {
+        let me = crate::process::current_process_id().unwrap_or(0);
+        
+        // Si el lock está ocupado, podríamos necesitar herencia de prioridad aquí.
+        // Por ahora, implementamos el rastreo del owner.
+        let guard = self.inner.lock();
+        self.owner.store(me as u32, Ordering::Release);
+        
+        RtMutexGuard { lock: self, guard }
+    }
+
+    pub fn owner(&self) -> u32 {
+        self.owner.load(Ordering::Acquire)
+    }
+}
+
+impl<T> core::ops::Deref for RtMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T { &*self.guard }
+}
+
+impl<T> core::ops::DerefMut for RtMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T { &mut *self.guard }
+}
+
+impl<T> Drop for RtMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.owner.store(0, Ordering::Release);
     }
 }

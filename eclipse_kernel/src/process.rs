@@ -13,6 +13,21 @@ pub type ProcessId = u32;
 // encolar al hijo. No se consume al leer (varios lectores / crt + libc); se libera
 // en `exit_process` para el PID que termina.
 static PENDING_PROCESS_ARGS: Mutex<BTreeMap<ProcessId, Vec<u8>>> = Mutex::new(BTreeMap::new());
+/// Registro global de "cumpleaños" por usuario (UID -> ticks de su primera aparición).
+pub static USER_BIRTHDAYS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
+/// Obtiene el cumpleaños de un usuario. Si es la primera vez que se ve, se registra ahora.
+pub fn get_user_birthday(uid: u32) -> u64 {
+    let mut map = USER_BIRTHDAYS.lock();
+    if let Some(&ticks) = map.get(&uid) {
+        ticks
+    } else {
+        let ticks = crate::interrupts::ticks();
+        map.insert(uid, ticks);
+        ticks
+    }
+}
+
 
 /// syscall 542: guardar argv del hijo (reemplaza entrada previa si existía).
 pub fn set_pending_process_args(pid: ProcessId, data: Vec<u8>) {
@@ -45,6 +60,20 @@ pub enum ProcessState {
     Blocked,
     Terminated,
     Stopped, // For Job Control (SIGSTOP/SIGTSTP)
+    WaitingForChild,
+}
+
+/// Parámetros para el planificador de Tiempo Real (EDF)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RTParams {
+    /// Tiempo de ejecución reservado por periodo (en ticks/ms)
+    pub runtime: u64,
+    /// Plazo relativo desde el inicio del periodo (en ticks/ms)
+    pub deadline: u64,
+    /// Duración del periodo (en ticks/ms)
+    pub period: u64,
+    /// Deadline absoluto actual (timestamp en ticks)
+    pub next_deadline: u64,
 }
 
 /// Virtual Memory Area (VMA) region
@@ -57,6 +86,10 @@ pub struct VMARegion {
     /// Bytes mapeados de más en `mmap` anónimo (colchón del kernel). `mprotect` de musl solo
     /// cubre la longitud pedida; hay que extender el rango para quitar NX en esas páginas.
     pub anon_kernel_slack: u64,
+    /// Identificador de región anónima compartida (MAP_SHARED | MAP_ANONYMOUS).
+    pub shared_anon_id: Option<u64>,
+    /// Indica si la región usa Huge Pages (2MB).
+    pub is_huge: bool,
 }
 
 impl VMARegion {
@@ -66,6 +99,8 @@ impl VMARegion {
             && self.flags == other.flags 
             && self.file_backed == other.file_backed 
             && self.anon_kernel_slack == other.anon_kernel_slack
+            && self.shared_anon_id == other.shared_anon_id
+            && self.is_huge == other.is_huge
     }
 }
 
@@ -241,6 +276,17 @@ pub struct Process {
     pub set_child_tid: u64,
     /// Thread Group ID (the "PID" seen by userspace).
     pub tgid: ProcessId,
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub supplementary_groups: [u32; 32],
+    pub supplementary_groups_len: usize,
+    pub start_time: u64,
+    /// Parámetros de tiempo real (EDF).
+    pub rt_params: Option<RTParams>,
     /// Linux `CLONE_VFORK`: el padre permanece dentro de `clone` hasta que este hijo
     /// ejecuta `execve` con éxito o termina (`exit`). `Some(child_pid)` mientras espera.
     pub vfork_waiting_for_child: Option<ProcessId>,
@@ -292,6 +338,15 @@ impl Process {
             sigaltstack: Sigaltstack::new(),
             pgid: 0,
             sid: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            suid: 0,
+            sgid: 0,
+            supplementary_groups: [0; 32],
+            supplementary_groups_len: 0,
+            start_time: get_user_birthday(0),
             dynamic_linker_aux: None,
             cwd: {
                 let mut buf = [0u8; 512];
@@ -308,6 +363,7 @@ impl Process {
             notified_stopped: false,
             notified_continued: false,
             kernel_stack: None,
+            rt_params: None,
         }
     }
 }
@@ -627,6 +683,8 @@ pub fn register_post_exec_vm_as(
                         flags:             0x5, // PROT_READ | PROT_EXEC
                         file_backed:       true,
                         anon_kernel_slack: 0,
+                        shared_anon_id:    None,
+                        is_huge:           false,
                     });
                 }
             }
@@ -636,6 +694,8 @@ pub fn register_post_exec_vm_as(
                 flags:             0x3, // PROT_READ | PROT_WRITE
                 file_backed:       false,
                 anon_kernel_slack: 0,
+                shared_anon_id:    None,
+                is_huge:           false,
             });
             drop(r);
             update_process(pid, proc);
@@ -1306,6 +1366,15 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 // Inherit process group, session, and working directory.
                 child.pgid    = parent.pgid;
                 child.sid     = parent.sid;
+                child.uid = parent.uid;
+                child.gid = parent.gid;
+                child.euid = parent.euid;
+                child.egid = parent.egid;
+                child.suid = parent.suid;
+                child.sgid = parent.sgid;
+                child.supplementary_groups = parent.supplementary_groups;
+                child.supplementary_groups_len = parent.supplementary_groups_len;
+                child.start_time = parent.start_time;
                 child.cwd     = parent.cwd;
                 child.cwd_len = parent.cwd_len;
 
@@ -1422,6 +1491,15 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
                 child.sigaltstack    = parent.sigaltstack;
                 child.pgid    = parent.pgid;
                 child.sid     = parent.sid;
+                child.uid = parent.uid;
+                child.gid = parent.gid;
+                child.euid = parent.euid;
+                child.egid = parent.egid;
+                child.suid = parent.suid;
+                child.sgid = parent.sgid;
+                child.supplementary_groups = parent.supplementary_groups;
+                child.supplementary_groups_len = parent.supplementary_groups_len;
+                child.start_time = parent.start_time;
                 child.cwd     = parent.cwd;
                 child.cwd_len = parent.cwd_len;
 
@@ -1468,6 +1546,8 @@ pub fn get_pending_signals(pid: ProcessId) -> u64 {
 pub fn set_pending_signal(pid: ProcessId, signum: u8) {
     if signum >= 64 { return; }
     let mut to_wake = None;
+    let mut parent_to_notify = None;
+
     {
         let mut table = PROCESS_TABLE.lock();
         for slot in table.iter_mut() {
@@ -1480,20 +1560,14 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
                         p.state = ProcessState::Stopped;
                         p.exit_signal = signum;
                         p.notified_stopped = false; // Reset for next wait4
-                        let parent_pid = p.parent_pid;
-                        if let Some(ppid) = parent_pid {
-                            wake_parent_from_wait(ppid);
-                        }
+                        parent_to_notify = p.parent_pid;
                     } else if signum == 18 { // SIGCONT
                         if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
                             p.exit_signal = 18;
                             p.notified_continued = false; // Reset for next wait4
                             // Don't set state here; enqueue_process will do it.
                             to_wake = Some(pid);
-                            let parent_pid = p.parent_pid;
-                            if let Some(ppid) = parent_pid {
-                                wake_parent_from_wait(ppid);
-                            }
+                            parent_to_notify = p.parent_pid;
                         }
                     } else {
                         // Despertar al proceso si está bloqueado por otras señales
@@ -1506,8 +1580,17 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
             }
         }
     }
+
+    // Process wakeup outside the lock to avoid deadlock
     if let Some(pid_to_wake) = to_wake {
         crate::scheduler::enqueue_process(pid_to_wake);
+    }
+
+    // Notify parent outside the lock
+    if let Some(ppid) = parent_to_notify {
+        // Send SIGCHLD (17) to parent
+        set_pending_signal(ppid, 17);
+        wake_parent_from_wait(ppid);
     }
 }
 

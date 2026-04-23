@@ -76,9 +76,54 @@ impl FairRunQueue {
     }
 }
 
+/// Estructura de cola de Tiempo Real (EDF) para una CPU
+struct RtRunQueue {
+    tasks: Option<BTreeMap<u64, VecDeque<ProcessId>>>,
+}
+
+impl RtRunQueue {
+    const fn new() -> Self {
+        Self {
+            tasks: None,
+        }
+    }
+
+    fn push(&mut self, pid: ProcessId, deadline: u64) {
+        if self.tasks.is_none() {
+            self.tasks = Some(BTreeMap::new());
+        }
+        let tasks = self.tasks.as_mut().unwrap();
+        tasks.entry(deadline).or_insert_with(VecDeque::new).push_back(pid);
+    }
+
+    fn pop(&mut self) -> Option<ProcessId> {
+        let tasks = self.tasks.as_mut()?;
+        
+        let mut first_key = None;
+        let mut pid = None;
+
+        if let Some((&deadline, queue)) = tasks.iter_mut().next() {
+            pid = queue.pop_front();
+            if queue.is_empty() {
+                first_key = Some(deadline);
+            }
+        }
+
+        if let Some(k) = first_key {
+            tasks.remove(&k);
+        }
+
+        pid
+    }
+}
+
 /// Colas de procesos ready (CFS), una por cada CPU.
 static READY_QUEUES: [Mutex<FairRunQueue>; MAX_CPUS] =
     [const { Mutex::new(FairRunQueue::new()) }; MAX_CPUS];
+
+/// Colas de procesos de Tiempo Real (EDF), una por cada CPU.
+static RT_QUEUES: [Mutex<RtRunQueue>; MAX_CPUS] =
+    [const { Mutex::new(RtRunQueue::new()) }; MAX_CPUS];
 
 /// Contador round-robin para distribuir procesos nuevos entre CPUs.
 static NEW_PROC_RR_CPU: AtomicU32 = AtomicU32::new(0);
@@ -172,7 +217,7 @@ pub fn enqueue_process(pid: ProcessId) {
     };
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let (target_cpu, vruntime) = {
+        let (target_cpu, vruntime, rt_deadline) = {
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(p) = table[slot].as_mut() {
                 if p.id != pid { return; }
@@ -200,24 +245,21 @@ pub fn enqueue_process(pid: ProcessId) {
                     next % active_cpus.max(1)
                 };
 
-                // CFS New Task / Wakeup Logic:
-                // If the process was sleeping (Blocked), its vruntime might be very old.
-                // We bump it to be at least min_vruntime of the target queue to avoid
-                // it hogging the CPU for too long, but give it a small bonus for interactivity.
-                let mut queue = READY_QUEUES[target].lock();
-                if p.vruntime < queue.min_vruntime {
-                    // Bonus of 20ms (20 ticks) for waking up
-                    p.vruntime = queue.min_vruntime.saturating_sub(20);
-                }
-                
-                (target, p.vruntime)
+                let rt_deadline = p.rt_params.as_ref().map(|rp| rp.next_deadline);
+                (target, p.vruntime, rt_deadline)
             } else {
                 return;
             }
         };
 
-        let mut queue = READY_QUEUES[target_cpu].lock();
-        queue.push(pid, vruntime);
+        if let Some(deadline) = rt_deadline {
+            let mut queue = RT_QUEUES[target_cpu].lock();
+            queue.push(pid, deadline);
+        } else {
+            let mut queue = READY_QUEUES[target_cpu].lock();
+            queue.push(pid, vruntime);
+        }
+
         RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
         QUEUE_VERSIONS[target_cpu].fetch_add(1, Ordering::SeqCst);
 
@@ -233,6 +275,15 @@ pub fn enqueue_process(pid: ProcessId) {
 
 fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // 0. RT queue
+        {
+            let mut rt_q = RT_QUEUES[cpu_id].lock();
+            if let Some(pid) = rt_q.pop() {
+                RUNNABLE_COUNT.fetch_sub(1, Ordering::SeqCst);
+                return Some(pid);
+            }
+        }
+
         // 1. Local queue
         {
             let mut local_q = READY_QUEUES[cpu_id].lock();
@@ -457,21 +508,26 @@ pub fn schedule() -> u64 {
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(process) = table[slot].as_mut() {
                             if process.id == pid && process.current_cpu == cpu_id as u32 {
-                                // CFS vruntime update
+                                // Calculate time consumed by the process
                                 let consumed = unsafe { CPU_INITIAL_QUANTUM[cpu_id].saturating_sub(CPU_QUANTUM[cpu_id]) };
                                 process.cpu_ticks += consumed as u64;
 
-                                // vruntime += consumed * (NICE_0_LOAD / weight)
-                                let delta_vruntime = (consumed as u64 * NICE_0_LOAD) / process.weight.max(1);
-                                process.vruntime += delta_vruntime;
+                                if let Some(rt) = process.rt_params.as_mut() {
+                                    // RT: Deduct from runtime budget
+                                    let _consumed_rt = consumed as u64;
+                                } else {
+                                    // CFS vruntime update
+                                    let delta_vruntime = (consumed as u64 * NICE_0_LOAD) / process.weight.max(1);
+                                    process.vruntime += delta_vruntime;
+                                }
                                 
                                 // Update AI profile burst duration
                                 process.ai_profile.update_burst(consumed as u64);
 
                                 // Reset quantum based on AI and priority
-                                let base_q = process.ai_profile.predict_burst().max(10).min(50) as u32;
+                                let base_q = if process.rt_params.is_some() { 100 } else { process.ai_profile.predict_burst().max(10).min(50) as u32 };
                                 // Give more quantum to high priority tasks
-                                let next_q = (base_q as u64 * process.weight / NICE_0_LOAD).max(5).min(100) as u32;
+                                let next_q = if process.rt_params.is_some() { 100 } else { (base_q as u64 * process.weight / NICE_0_LOAD).max(5).min(100) as u32 };
 
                                 unsafe { 
                                     CPU_QUANTUM[cpu_id] = next_q;

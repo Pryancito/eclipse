@@ -1078,21 +1078,24 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
     // ---- Userspace fault: try signal delivery, then kill if no handler ----
     // If CS[1:0] == 3, the fault originated from ring-3 (userspace) code.
     if cs & 3 == 3 && pid != 0 {
-        // Map hardware exception to POSIX signal.
-        let signal_for_exc: Option<u8> = match num {
-            0        => Some(8),   // #DE  → SIGFPE
-            4 | 5    => Some(11),  // #OF/#BR → SIGSEGV
-            6        => Some(4),   // #UD  → SIGILL
-            11 | 12  => Some(11),  // #NP/#SS → SIGSEGV
-            13       => Some(11),  // #GP  → SIGSEGV
-            14       => Some(11),  // #PF  → SIGSEGV
+        // Map hardware exception to POSIX signal and si_code.
+        let mapping: Option<(u8, i32)> = match num {
+            0        => Some((8, 1)),   // #DE  → SIGFPE, FPE_INTDIV
+            4 | 5    => Some((11, 1)),  // #OF/#BR → SIGSEGV, SEGV_MAPERR
+            6        => Some((4, 1)),   // #UD  → SIGILL, ILL_ILLOPC
+            11 | 12  => Some((11, 1)),  // #NP/#SS → SIGSEGV, SEGV_MAPERR
+            13       => Some((11, 1)),  // #GP  → SIGSEGV, SEGV_MAPERR
+            14       => {
+                let code = if (err & 1) == 0 { 1 } else { 2 }; // 1=MAPERR (not present), 2=ACCERR (protection)
+                Some((11, code))  // #PF  → SIGSEGV
+            },
             _        => None,
         };
 
-        if let Some(signum) = signal_for_exc {
+        if let Some((signum, si_code)) = mapping {
             // Try to deliver via signal frame; if the process has a handler we redirect
             // the iretq to the signal handler instead of killing the process.
-            if crate::syscalls::deliver_signal_from_exception(context, pid, signum, cr2) {
+            if crate::syscalls::deliver_signal_from_exception(context, pid, signum, si_code, cr2) {
                 return;
             }
         }

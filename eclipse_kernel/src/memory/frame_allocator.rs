@@ -119,6 +119,42 @@ impl BitMapFrameAllocator {
         None
     }
 
+    /// Allocate multiple contiguous frames with specified alignment (in frames).
+    pub fn allocate_contiguous_frames(&mut self, count: usize, alignment: usize) -> Option<PhysFrame> {
+        let mut start = (self.last_allocated_index + alignment - 1) & !(alignment - 1);
+        
+        // Ensure start is within bounds
+        if start >= self.total_frames { start = 0; }
+
+        for _ in 0..self.total_frames / alignment + 1 {
+            if start + count > self.total_frames {
+                start = 0;
+            }
+
+            let mut all_free = true;
+            for j in 0..count {
+                if !self.is_free(start + j) {
+                    all_free = false;
+                    break;
+                }
+            }
+
+            if all_free {
+                for j in 0..count {
+                    self.mark_used(start + j);
+                }
+                self.last_allocated_index = start + count;
+                USED_FRAMES.fetch_add(count, Ordering::SeqCst);
+                let phys = start as u64 * 4096;
+                return Some(PhysFrame::from_start_address(PhysAddr::new(phys)).unwrap());
+            }
+
+            start = (start + alignment) % self.total_frames;
+            if start == 0 && count > 0 { break; } // Avoid infinite loop if no match after full wrap
+        }
+        None
+    }
+
     pub fn deallocate_frame(&mut self, frame: PhysFrame) {
         let phys = frame.start_address().as_u64();
         let idx = (phys / 4096) as usize;
@@ -177,6 +213,17 @@ pub fn dealloc_frame(frame: PhysFrame) {
     unsafe {
         if let Some(ref mut allocator) = FRAME_ALLOCATOR {
             allocator.deallocate_frame(frame);
+        }
+    }
+}
+
+pub fn alloc_contiguous_frames(count: usize, alignment: usize) -> Option<PhysFrame> {
+    let _lock = FRAME_ALLOC_LOCK.lock();
+    unsafe {
+        if let Some(ref mut allocator) = FRAME_ALLOCATOR {
+            allocator.allocate_contiguous_frames(count, alignment)
+        } else {
+            None
         }
     }
 }

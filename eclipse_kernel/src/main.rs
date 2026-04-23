@@ -41,6 +41,7 @@ mod nvme;
 mod storage;
 mod progress;
 mod fd;  // File descriptor management
+mod random_scheme;
 mod scheme; // Redox-style scheme system
 mod tty;    // Dedicated TTY Scheme
 mod pty;    // PTY Scheme

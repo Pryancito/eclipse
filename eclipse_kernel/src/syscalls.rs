@@ -154,6 +154,7 @@ pub enum SyscallNumber {
     Pipe2 = 293,
     InotifyInit1 = 294,
     Prlimit64 = 302,
+    SchedSetDeadline = 314,
     GetRandom = 318,
     Membarrier = 324,
 
@@ -361,10 +362,12 @@ fn push_rt_signal_frame(
         return false;
     }
     // Determine the user stack to use.
+    let mut using_altstack = false;
     let user_rsp = if (action.flags & SA_ONSTACK) != 0 {
         let (alt_sp, alt_sz, alt_flags) = crate::process::get_process_altstack(pid);
         if (alt_flags & crate::process::SS_DISABLE) == 0 {
             if (alt_flags & crate::process::SS_ONSTACK) == 0 {
+                using_altstack = true;
                 alt_sp + alt_sz
             } else {
                 ctx.rsp
@@ -422,7 +425,7 @@ fn push_rt_signal_frame(
         info: SigInfo {
             si_signo: sig as i32,
             si_errno: 0,
-            si_code:  0,
+            si_code:  0, // Set later if needed
             _rest:    [0u8; 116],
         },
         _pad: 0,
@@ -472,7 +475,7 @@ fn push_rt_signal_frame(
     ctx.rip = action.handler;
     ctx.rsp = frame_addr;
     ctx.rdi = sig as u64;
-    ctx.rsi = frame_addr + 432; // Offset of 'info'
+    ctx.rsi = frame_addr + 312; // Offset of 'info'
     ctx.rdx = frame_addr + 8;   // Offset of 'uc'
     ctx.rax = 0;
     
@@ -553,6 +556,7 @@ pub fn deliver_signal_from_exception(
     exc:        &mut crate::interrupts::ExceptionContext,
     pid:        crate::process::ProcessId,
     signum:     u8,
+    si_code:    i32,
     fault_addr: u64,
 ) -> bool {
     use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SS_DISABLE};
@@ -569,12 +573,18 @@ pub fn deliver_signal_from_exception(
         let old_mask = p.signal_mask;
         let ss = p.sigaltstack;
         let rsp = exc.rsp;
+        let mut using_altstack = false;
         let rsp = if (action.flags & SA_ONSTACK) != 0
             && (ss.ss_flags & SS_DISABLE) == 0
             && ss.ss_sp != 0
         {
             let ss_top = ss.ss_sp.wrapping_add(ss.ss_size);
-            if !(rsp >= ss.ss_sp && rsp < ss_top) { ss_top } else { rsp }
+            if !(rsp >= ss.ss_sp && rsp < ss_top) { 
+                using_altstack = true;
+                ss_top 
+            } else { 
+                rsp 
+            }
         } else {
             rsp
         };
@@ -625,8 +635,18 @@ pub fn deliver_signal_from_exception(
         info: SigInfo {
             si_signo: signum as i32,
             si_errno: 0,
-            si_code:  128, // SI_KERNEL
-            _rest:    [0u8; 116],
+            si_code:  si_code,
+            _rest:    {
+                let mut r = [0u8; 116];
+                // si_addr is at offset 16 of siginfo_t.
+                // Our struct has 3 i32 (12 bytes) before _rest.
+                // So si_addr starts at _rest[4..12].
+                let addr_bytes = fault_addr.to_ne_bytes();
+                for i in 0..8 {
+                    r[4 + i] = addr_bytes[i];
+                }
+                r
+            },
         },
         _pad: 0,
         fpstate: [0; 512],
@@ -669,7 +689,7 @@ pub fn deliver_signal_from_exception(
     exc.rsp = frame_addr;
     exc.rip = action.handler;
     exc.rdi = signum as u64;
-    exc.rsi = frame_addr + 432; // Offset of 'info'
+    exc.rsi = frame_addr + 312; // Offset of 'info'
     exc.rdx = frame_addr + 8;   // Offset of 'uc'
     exc.rax = 0;
     
@@ -699,6 +719,10 @@ mod linux_mmap_abi {
     /// eagerly (like Linux `MAP_POPULATE`). Without it, anonymous private mappings
     /// are lazy: frames are allocated on first access via the demand-page handler.
     pub const MAP_POPULATE: u64 = 0x08000;
+    /// Use huge pages (2MB or 1GB).
+    pub const MAP_HUGETLB: u64 = 0x40000;
+    /// 2MB huge page size (part of MAP_HUGE_MASK).
+    pub const MAP_HUGE_2MB: u64 = 21 << 26;
     /// Donde `mmap_find_free` coloca `mmap(NULL, …)` anónimo.
     /// 512 MiB de espacio virtual: suficiente para aplicaciones pesadas (Mesa/GLES2)
     /// incluso sin el colchón de 32 KiB por mmap que se aplica solo a PROT_EXEC.
@@ -1009,7 +1033,7 @@ pub extern "C" fn syscall_handler(
         11  => sys_munmap(arg1, arg2),
         12  => sys_brk(arg1),
         13  => sys_rt_sigaction(arg1, arg2, arg3, arg4),
-        14  => sys_sigprocmask(arg1, arg2, arg3),
+        14  => sys_rt_sigprocmask(arg1, arg2, arg3, arg4),
         15  => sys_rt_sigreturn(context),
         28  => sys_madvise(arg1, arg2, arg3),
         16  => sys_ioctl(arg1, arg2, arg3),
@@ -1042,7 +1066,7 @@ pub extern "C" fn syscall_handler(
         58  => sys_fork(&process_context), // vfork: behave as fork
         59  => sys_execve(arg1, arg2, arg3),
         60  => sys_exit(arg1),
-        61  => sys_wait4_linux(arg1, arg2, arg3),
+        61  => sys_wait4_linux(arg1, arg2, arg3, arg4),
         62  => sys_kill(arg1, arg2),
         63  => sys_uname(arg1),
         72  => sys_fcntl(arg1, arg2, arg3),
@@ -1074,6 +1098,7 @@ pub extern "C" fn syscall_handler(
         98  => sys_getrusage(arg1, arg2),
         99  => sys_sysinfo(arg1),
         100 => linux_abi_error(38), // times — ENOSYS stub
+        101 => sys_ptrace(arg1, arg2, arg3, arg4),
         102 => sys_getuid(),
         103 => linux_abi_error(38), // syslog — ENOSYS stub
         104 => sys_getgid(),
@@ -1092,8 +1117,10 @@ pub extern "C" fn syscall_handler(
         118 => sys_getresuid(arg1, arg2, arg3),
         120 => sys_getresgid(arg1, arg2, arg3),
         121 => sys_getpgid(arg1),
+        127 => sys_rt_sigpending(arg1, arg2),
         131 => sys_sigaltstack(arg1, arg2),
         158 => sys_arch_prctl(arg1, arg2),
+        157 => sys_prctl(arg1, arg2, arg3, arg4, arg5),
         // clock_nanosleep(clockid, flags, req, rem) — usado por std/musl para sleep.
         // En Eclipse tratamos esto como nanosleep(req) e ignoramos clockid/flags/rem.
         230 => sys_nanosleep(arg3),
@@ -1107,7 +1134,7 @@ pub extern "C" fn syscall_handler(
         217 => sys_getdents64(arg1, arg2, arg3),
         228 => sys_clock_gettime(arg1, arg2),
         231 => sys_exit(arg1), // Linux exit_group
-        247 => sys_getlogin(arg1, arg2),
+        247 => sys_waitid(arg1, arg2, arg3, arg4, arg5),
         // openat(dirfd, path, flags, mode): mode en r10 — imprescindible para musl (cargar .so)
         257 => sys_openat(arg1, arg2, arg3, arg4),
         262 => sys_fstatat(arg1, arg2, arg3, arg4),
@@ -1116,6 +1143,7 @@ pub extern "C" fn syscall_handler(
         292 => sys_dup3(arg1, arg2, arg3),
         293 => sys_pipe2(arg1, arg2),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
+        314 => sys_sched_set_deadline(arg1 as u32, arg2, arg3, arg4),
         318 => sys_getrandom(arg1, arg2, arg3),
         319 => sys_memfd_create(arg1, arg2),
         324 => sys_membarrier(arg1, arg2, arg3),
@@ -1670,6 +1698,8 @@ fn sys_drm_map_handle(handle_id: u64) -> u64 {
             flags: flags, 
             file_backed: false,
             anon_kernel_slack: 0,
+            shared_anon_id: None,
+            is_huge: false,
         });
         
         proc.mem_frames += (aligned_length as u64 + 4095) / 4096;
@@ -2859,209 +2889,103 @@ fn sys_wait_pid(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
     sys_wait_impl(status_ptr, wait_pid, flags)
 }
 
+
+/// sys_waitid - Wait for child process event
+fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64, rusage: u64) -> u64 {
+    // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID
+    let wait_pid = if idtype == 1 { id } else { 0 };
+    // For now, map to wait_impl but we don't fully populate siginfo_t yet
+    let res = sys_wait_impl(0, wait_pid, options);
+    if (res as i64) < 0 { return res; }
+    
+    if infop != 0 && is_user_pointer(infop, 128) {
+        // Basic siginfo_t population
+        unsafe {
+            let ptr = infop as *mut i32;
+            ptr.write_unaligned(17); // si_signo = SIGCHLD
+            ptr.add(1).write_unaligned(0); // si_errno
+            ptr.add(2).write_unaligned(1); // si_code = CLD_EXITED
+            // si_pid and si_uid would go here...
+            ((infop + 16) as *mut i32).write_unaligned(res as i32); // si_pid
+        }
+    }
+    0
+}
+
 fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
     use crate::process;
     let wnohang = (flags & 1) != 0;
     let wuntraced = (flags & 2) != 0;
     let wcontinued = (flags & 8) != 0;
 
-    let mut stats = SYSCALL_STATS.lock();
-    stats.wait_calls += 1;
-    drop(stats);
-
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
-        None => {
-            serial::serial_print("[SYSCALL] wait() failed - no current process\n");
-            return u64::MAX;
-        }
+        None => return u64::MAX,
     };
 
     loop {
-        if wait_pid != 0 {
-            let wp = wait_pid as process::ProcessId;
-            
-            if let Some(mut proc) = process::get_process(wp) {
-                if proc.parent_pid == Some(current_pid) {
-                    if proc.state == process::ProcessState::Terminated {
-                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                            let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                            }
+        let mut found_eligible_child = false;
+        let mut terminated_child = None;
+
+        {
+            let mut table = process::PROCESS_TABLE.lock();
+            for slot in table.iter_mut() {
+                if let Some(p) = slot {
+                    if p.parent_pid == Some(current_pid) {
+                        if wait_pid != 0 && p.id != wait_pid as u32 {
+                            continue;
                         }
-                        process::unregister_child_waiter(current_pid);
-                        // Reap zombie: free PROCESS_TABLE slot and PID map entry.
-                        process::remove_process(wp);
-                        return wp as u64;
-                    }
+                        found_eligible_child = true;
 
-                    if wuntraced && proc.state == process::ProcessState::Stopped && !proc.notified_stopped {
-                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                            let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                            }
+                        if p.state == process::ProcessState::Terminated {
+                            terminated_child = Some((p.id, p.exit_code));
+                            break;
                         }
-                        process::unregister_child_waiter(current_pid);
-                        process::modify_process(wp, |p| p.notified_stopped = true).ok();
-                        return wp as u64;
-                    }
-
-                    if wcontinued && !proc.notified_continued && proc.exit_signal == 18 {
-                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                            let wait_status = 0xFFFF; // WIFCONTINUED status in some ABIs, Linux uses 0x007F but we'll use a clear marker
-                            // Actually, Linux WIFCONTINUED(status) is (status == 0xffff)
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                            }
+                        if wuntraced && p.state == process::ProcessState::Stopped && !p.notified_stopped {
+                            terminated_child = Some((p.id, 0x7F | ((p.exit_signal as u64) << 8)));
+                            p.notified_stopped = true;
+                            break;
                         }
-                        process::unregister_child_waiter(current_pid);
-                        process::modify_process(wp, |p| p.notified_continued = true).ok();
-                        return wp as u64;
-                    }
-                } else {
-                    process::unregister_child_waiter(current_pid);
-                    return u64::MAX; // Not a child
-                }
-            } else {
-                process::unregister_child_waiter(current_pid);
-                return u64::MAX; // No such process
-            }
-        } else {
-            let mut has_children = false;
-            let processes = process::list_processes();
-
-            for (pid, state) in processes.iter() {
-                if *pid == 0 {
-                    continue;
-                }
-
-                if let Some(mut proc) = process::get_process(*pid) {
-                    if proc.parent_pid == Some(current_pid) {
-                        has_children = true;
-                        
-                        if state == &process::ProcessState::Terminated {
-                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                }
-                            }
-
-                            process::unregister_child_waiter(current_pid);
-                            // Reap zombie: free PROCESS_TABLE slot and PID map entry.
-                            process::remove_process(*pid);
-                            return *pid as u64;
-                        }
-
-                        if wuntraced && state == &process::ProcessState::Stopped && !proc.notified_stopped {
-                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                }
-                            }
-                            process::unregister_child_waiter(current_pid);
-                            process::modify_process(*pid, |p| p.notified_stopped = true).ok();
-                            return *pid as u64;
-                        }
-
-                        if wcontinued && !proc.notified_continued && proc.exit_signal == 18 {
-                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                let wait_status = 0xFFFF;
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                }
-                            }
-                            process::unregister_child_waiter(current_pid);
-                            process::modify_process(*pid, |p| p.notified_continued = true).ok();
-                            return *pid as u64;
+                        if wcontinued && p.state != process::ProcessState::Stopped && !p.notified_continued && p.exit_signal == 18 {
+                             terminated_child = Some((p.id, 0xFFFF));
+                             p.notified_continued = true;
+                             break;
                         }
                     }
                 }
-            }
-
-            if !has_children {
-                process::unregister_child_waiter(current_pid);
-                return u64::MAX;
             }
         }
 
-        // WNOHANG: si ningún hijo ha terminado aún, devolver 0 sin bloquear.
+        if let Some((child_pid, status)) = terminated_child {
+            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                let s = if status == 0xFFFF { 0xFFFFu32 } else { status as u32 };
+                unsafe { *(status_ptr as *mut u32) = s; }
+            }
+            if status != 0xFFFF && (status & 0x7F) == 0 { // Real termination
+                process::remove_process(child_pid);
+            }
+            process::unregister_child_waiter(current_pid);
+            return child_pid as u64;
+        }
+
+        if !found_eligible_child {
+            return linux_abi_error(10); // ECHILD
+        }
+
         if wnohang {
             return 0;
         }
 
-        // Sin status_ptr no hay a dónde escribir el estado → salir.
-        if status_ptr == 0 {
-            return u64::MAX;
+        // Block and wait for SIGCHLD or any child termination
+        {
+            let mut proc = process::get_process(current_pid).unwrap();
+            proc.state = process::ProcessState::WaitingForChild;
+            process::update_process(current_pid, proc);
+            process::register_child_waiter(current_pid);
         }
-
-        // Registrar ANTES de marcar como Blocked para evitar la race condition
-        // "lost wakeup": si el hijo termina entre la comprobación inicial y el
-        // registro, wake_parent_from_wait() nos encontrará en la lista de
-        // espera y no perderemos la notificación.
-        process::register_child_waiter(current_pid);
-
-        // DOUBLE-CHECK: el hijo puede haber terminado entre la comprobación
-        // inicial (arriba) y register_child_waiter.  Si ya está Terminated,
-        // cancelamos el sueño y volvemos al inicio del loop (que lo recogerá).
-        //
-        // Nota: sólo hacemos el double-check para wait_pid != 0 (hijo concreto).
-        // Para wait_pid == 0 (cualquier hijo) omitimos el double-check con
-        // list_processes() para evitar una gran asignación en el stack del kernel.
-        // En ese caso, la race es tolerable: el bucle se despertará igualmente
-        // por el siguiente tick del temporizador.
-        let child_done = if wait_pid != 0 {
-            let wp = wait_pid as process::ProcessId;
-            process::get_process(wp).map_or(false, |p| {
-                p.state == process::ProcessState::Terminated
-                    && p.parent_pid == Some(current_pid)
-            })
-        } else {
-            false
-        };
-
-        if child_done {
-            // El hijo terminó mientras nos registrábamos: cancelar el sueño
-            // y dejar que el siguiente ciclo del loop recoja el resultado.
-            process::unregister_child_waiter(current_pid);
-            continue;
-        }
-
-        // TRIPLE-CHECK (SMP): entre el double-check y marcar Blocked el hijo puede
-        // terminar y wake_parent_from_wait ejecutarse mientras el padre sigue Running.
-        // Si además consumiéramos el waiter en wake, el padre quedaría Blocked sin wake.
-        // Con wake que ya no borra el waiter, esto acorta la ventana residual.
-        if wait_pid != 0 {
-            let wp = wait_pid as process::ProcessId;
-            if let Some(p) = process::get_process(wp) {
-                if p.state == process::ProcessState::Terminated
-                    && p.parent_pid == Some(current_pid)
-                {
-                    process::unregister_child_waiter(current_pid);
-                    continue;
-                }
-            }
-        }
-
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let slot = crate::ipc::pid_to_slot_fast(current_pid);
-            let mut table = process::PROCESS_TABLE.lock();
-            if let Some(slot_idx) = slot {
-                if let Some(p) = table[slot_idx].as_mut() {
-                    if p.id == current_pid {
-                        p.state = process::ProcessState::Blocked;
-                    }
-                }
-            }
-        });
-
-        crate::scheduler::yield_cpu();
+        yield_cpu();
     }
 }
-
 /// sys_get_service_binary - Get pointer and size of embedded service binary
 /// Args: service_id (0-7, ver `eclipse_program_codes::spawn_service`), out_ptr, out_size
 /// Returns: 0 on success, -1 on error
@@ -3865,8 +3789,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     // A file-backed mapping populates each page with content from the open file.
     // MAP_ANONYMOUS: mapping is not backed by a file.
     use linux_mmap_abi::{
-        ANON_SLACK_BYTES, MAP_ANONYMOUS, MAP_FIXED, MAP_POPULATE, MAP_SHARED, USER_ARENA_HI,
-        USER_ARENA_LO,
+        ANON_SLACK_BYTES, MAP_ANONYMOUS, MAP_FIXED, MAP_POPULATE, MAP_SHARED, MAP_HUGETLB,
+        USER_ARENA_HI, USER_ARENA_LO,
     };
     const MMAP_MAX_FD: u64 = crate::fd::MAX_FDS_PER_PROCESS as u64;
     let fd_entry = if (flags & MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
@@ -3878,6 +3802,14 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     if let Some(mut proc) = process::get_process(current_pid) {
         let mut r = proc.resources.lock();
         let page_table_phys = r.page_table_phys;
+
+        let shared_anon_id = if (flags & MAP_ANONYMOUS) != 0 && (flags & MAP_SHARED) != 0 {
+            Some(memory::allocate_shared_anon_id())
+        } else {
+            None
+        };
+
+        let is_huge = (flags & MAP_HUGETLB) != 0;
 
         let map_fixed_in_mmap_arena = (flags & MAP_FIXED) != 0
             && addr >= USER_ARENA_LO
@@ -3910,7 +3842,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
 
         /// Rango [candidate, candidate+span) libre respecto a `vmas`.
         fn mmap_find_free(r: &crate::process::ProcessResources, span: u64) -> Option<u64> {
-            let mut candidate = linux_mmap_abi::USER_ARENA_LO;
+            // ASLR: Randomize starting candidate in the arena (up to 256MB offset, page aligned)
+            let rnd_offset = (crate::cpu::get_random_u64() % 0x1000_0000u64) & !0xFFFu64;
+            let mut candidate = linux_mmap_abi::USER_ARENA_LO + rnd_offset;
             while candidate < linux_mmap_abi::USER_ARENA_HI {
                 // Find the highest end of any VMA that overlaps [candidate, candidate+span).
                 // Jumping directly to that end skips all pages inside large mappings in O(n)
@@ -4132,6 +4066,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                 flags:             prot,
                 file_backed:       false,
                 anon_kernel_slack: ANON_SLACK_BYTES,
+                shared_anon_id:    None, // Slack is never shared
+                is_huge:           false,
             });
         }
 
@@ -4141,6 +4077,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
             flags: prot,
             file_backed: fd_entry.is_some(),
             anon_kernel_slack: anon_slack,
+            shared_anon_id: shared_anon_id,
+            is_huge: is_huge,
         });
 
         proc.mem_frames += if is_lazy { 0 } else { num_pages_mapped };
@@ -4263,7 +4201,7 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
     };
 
     // Locate VMA and grab page table phys.
-    let (pt, vma_flags) = {
+    let (pt, vma_flags, vma_shared_id, vma_is_huge) = {
         let r = proc.resources.lock();
         let pt = r.page_table_phys;
         // Find a VMA that fully covers the old range.
@@ -4271,7 +4209,7 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
         let Some(vma) = vma else {
             return syscall_error_for_current_process(crate::scheme::error::EINVAL as i32);
         };
-        (pt, vma.flags)
+        (pt, vma.flags, vma.shared_anon_id, vma.is_huge)
     };
 
     // Fast path: shrink in-place.
@@ -4291,6 +4229,8 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
                     flags: vma_flags,
                     file_backed: false,
                     anon_kernel_slack: 0,
+                    shared_anon_id: vma_shared_id,
+                    is_huge: vma_is_huge,
                 });
             }
         }
@@ -4326,6 +4266,8 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
                     flags: vma_flags,
                     file_backed: false,
                     anon_kernel_slack: 0,
+                    shared_anon_id: vma_shared_id,
+                    is_huge: vma_is_huge,
                 });
             }
             process::update_process(pid, proc);
@@ -4429,6 +4371,8 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
             flags: vma_flags,
             file_backed: false,
             anon_kernel_slack: 0,
+            shared_anon_id: vma_shared_id,
+            is_huge: vma_is_huge,
         });
     }
 
@@ -5931,14 +5875,15 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen_ptr: u6
             return -(scheme_error::EINVAL as i64) as u64;
         }
 
+        let pid = process::current_process_id().unwrap_or(0);
+        let (uid, gid) = process::get_process(pid).map(|p| (p.uid, p.gid)).unwrap_or((0, 0));
+
+
         let provided_len = unsafe { *(optlen_ptr as *const u32) };
         if provided_len < 12 {
             return -(scheme_error::EINVAL as i64) as u64;
         }
 
-        let pid = process::current_process_id().unwrap_or(0);
-        let uid = 0;
-        let gid = 0;
 
         if is_user_pointer(optval, 12) {
             unsafe {
@@ -6342,6 +6287,53 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
 }
 
 /// sys_stat - Get file status by path
+
+/// sys_access - Check user's permissions for a file
+fn sys_access(path_ptr: u64, mode: u64) -> u64 {
+    if path_ptr == 0 {
+        return linux_abi_error(22); // EINVAL
+    }
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 {
+        return linux_abi_error(22); // EINVAL
+    }
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 {
+        return linux_abi_error(36); // ENAMETOOLONG
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    path_buf[path_len as usize] = 0;
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return linux_abi_error(22),
+    };
+
+    let scheme_path = user_path_to_scheme_path(path_str);
+    if scheme_path.starts_with("file:") {
+        let rel_path = &scheme_path[5..];
+        match crate::filesystem::Filesystem::lookup_path(rel_path) {
+            Ok(inode) => {
+                match crate::filesystem::Filesystem::check_access(inode, mode as u8) {
+                    Ok(_) => 0,
+                    Err(_) => linux_abi_error(13), // EACCES
+                }
+            }
+            Err(_) => linux_abi_error(2), // ENOENT
+        }
+    } else {
+        // For other schemes, just return success if it exists
+        match crate::scheme::open(&scheme_path, 0, 0) {
+            Ok((s, r)) => {
+                let _ = crate::scheme::close(s, r);
+                0
+            }
+            Err(_) => linux_abi_error(2),
+        }
+    }
+}
+
 fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
     // Linux stat(path, stat_ptr) is fstatat(AT_FDCWD, path, stat_ptr, 0)
     // We treat all paths as relative to root or absolute for now.
@@ -6450,28 +6442,123 @@ fn sys_getcwd(buf_ptr: u64, size: u64) -> u64 {
 }
 
 /// sys_getresuid / sys_getresgid - Get identity (stubbed to 0)
-fn sys_getuid() -> u64 { 0 }
-fn sys_geteuid() -> u64 { 0 }
-fn sys_getgid() -> u64 { 0 }
-fn sys_getegid() -> u64 { 0 }
+fn sys_getuid() -> u64 {
+    process::current_process_id().and_then(|pid| {
+        process::get_process(pid).map(|p| p.uid as u64)
+    }).unwrap_or(0)
+}
+
+fn sys_geteuid() -> u64 {
+    process::current_process_id().and_then(|pid| {
+        process::get_process(pid).map(|p| p.euid as u64)
+    }).unwrap_or(0)
+}
+
+fn sys_getgid() -> u64 {
+    process::current_process_id().and_then(|pid| {
+        process::get_process(pid).map(|p| p.gid as u64)
+    }).unwrap_or(0)
+}
+
+fn sys_getegid() -> u64 {
+    process::current_process_id().and_then(|pid| {
+        process::get_process(pid).map(|p| p.egid as u64)
+    }).unwrap_or(0)
+}
+
+
+fn sys_setresuid(ruid: u64, euid: u64, suid: u64) -> u64 {
+    let ruid = ruid as u32;
+    let euid = euid as u32;
+    let suid = suid as u32;
+    
+    if let Some(pid) = process::current_process_id() {
+        let mut p = match process::get_process(pid) {
+            Some(p) => p,
+            None => return linux_abi_error(3),
+        };
+
+        let is_root = p.euid == 0;
+        
+        let check = |val: u32| {
+            val == 0xFFFFFFFF || is_root || val == p.uid || val == p.euid || val == p.suid
+        };
+
+        if !check(ruid) || !check(euid) || !check(suid) {
+            return linux_abi_error(1); // EPERM
+        }
+
+        if ruid != 0xFFFFFFFF { p.uid = ruid; }
+        if ruid != 0xFFFFFFFF { p.start_time = process::get_user_birthday(ruid); }
+        if euid != 0xFFFFFFFF { p.euid = euid; }
+        if suid != 0xFFFFFFFF { p.suid = suid; }
+        
+        process::update_process(pid, p);
+        return 0;
+    }
+    linux_abi_error(3)
+}
+
+fn sys_setresgid(rgid: u64, egid: u64, sgid: u64) -> u64 {
+    let rgid = rgid as u32;
+    let egid = egid as u32;
+    let sgid = sgid as u32;
+    
+    if let Some(pid) = process::current_process_id() {
+        let mut p = match process::get_process(pid) {
+            Some(p) => p,
+            None => return linux_abi_error(3),
+        };
+
+        let is_root = p.euid == 0;
+        
+        let check = |val: u32| {
+            val == 0xFFFFFFFF || is_root || val == p.gid || val == p.egid || val == p.sgid
+        };
+
+        if !check(rgid) || !check(egid) || !check(sgid) {
+            return linux_abi_error(1); // EPERM
+        }
+
+        if rgid != 0xFFFFFFFF { p.gid = rgid; }
+        if egid != 0xFFFFFFFF { p.egid = egid; }
+        if sgid != 0xFFFFFFFF { p.sgid = sgid; }
+        
+        process::update_process(pid, p);
+        return 0;
+    }
+    linux_abi_error(3)
+}
+
 
 fn sys_getresuid(ruid_ptr: u64, euid_ptr: u64, suid_ptr: u64) -> u64 {
-    for ptr in &[ruid_ptr, euid_ptr, suid_ptr] {
-        if *ptr != 0 && is_user_pointer(*ptr, 4) {
-            let zero: u32 = 0;
-            unsafe { core::ptr::copy_nonoverlapping(&zero, *ptr as *mut u32, 1); }
+    if let Some(pid) = process::current_process_id() {
+        if let Some(p) = process::get_process(pid) {
+            let res = [(ruid_ptr, p.uid), (euid_ptr, p.euid), (suid_ptr, p.suid)];
+            for (ptr, val) in res {
+                if ptr != 0 && is_user_pointer(ptr, 4) {
+                    unsafe { *(ptr as *mut u32) = val; }
+                }
+            }
+            return 0;
         }
     }
-    0
+    linux_abi_error(3) // ESRCH
 }
 
 fn sys_getresgid(rgid_ptr: u64, egid_ptr: u64, sgid_ptr: u64) -> u64 {
-    for ptr in &[rgid_ptr, egid_ptr, sgid_ptr] {
-        if *ptr != 0 && is_user_pointer(*ptr, 4) {
-            unsafe { *(*ptr as *mut u32) = 0; }
+    if let Some(pid) = process::current_process_id() {
+        if let Some(p) = process::get_process(pid) {
+            let res = [(rgid_ptr, p.gid), (egid_ptr, p.egid), (sgid_ptr, p.sgid)];
+            for (ptr, val) in res {
+                if ptr != 0 && is_user_pointer(ptr, 4) {
+                    unsafe { *(ptr as *mut u32) = val; }
+                }
+            }
+            return 0;
         }
     }
-    0
+    linux_abi_error(3) // ESRCH
 }
 
 /// sys_getlogin - Get user name
@@ -6812,6 +6899,57 @@ fn sys_sigaltstack(ss: u64, oss: u64) -> u64 {
 
 /// sys_sigprocmask - change signal mask
 /// how: 0=SIG_BLOCK, 1=SIG_UNBLOCK, 2=SIG_SETMASK
+
+/// sys_rt_sigprocmask - Change the list of currently blocked signals
+fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) -> u64 {
+    if sigsetsize != 8 { return linux_abi_error(22); }
+    let pid = current_process_id().unwrap();
+    
+    let mut old_mask = 0u64;
+    let mut new_set = 0u64;
+    if set_ptr != 0 {
+        if !copy_from_user(set_ptr, unsafe { core::slice::from_raw_parts_mut(&mut new_set as *mut u64 as *mut u8, 8) }) {
+            return linux_abi_error(14);
+        }
+    }
+
+    let _ = crate::process::modify_process(pid, |p| {
+        old_mask = p.signal_mask;
+        if set_ptr != 0 {
+            match how {
+                0 => p.signal_mask |= new_set, // SIG_BLOCK
+                1 => p.signal_mask &= !new_set, // SIG_UNBLOCK
+                2 => p.signal_mask = new_set,  // SIG_SETMASK
+                _ => {}
+            }
+            p.signal_mask &= !((1 << 9) | (1 << 19));
+        }
+    });
+
+    if oldset_ptr != 0 {
+        if !copy_to_user(oldset_ptr, &old_mask.to_le_bytes()) {
+            return linux_abi_error(14);
+        }
+    }
+    0
+}
+
+/// sys_rt_sigpending - Examine pending signals
+fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> u64 {
+    if sigsetsize != 8 { return linux_abi_error(22); }
+    let pid = current_process_id().unwrap();
+    let pending = crate::process::get_pending_signals(pid);
+    if !copy_to_user(set_ptr, &pending.to_le_bytes()) {
+        return linux_abi_error(14);
+    }
+    0
+}
+
+/// sys_ptrace - Process trace (stub)
+fn sys_ptrace(_request: u64, _pid: u64, _addr: u64, _data: u64) -> u64 {
+    linux_abi_error(38) // ENOSYS
+}
+
 fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     let Some(pid) = current_process_id() else { return -(crate::scheme::error::ESRCH as isize) as u64 };
     
@@ -7210,6 +7348,7 @@ fn sys_rt_sigreturn(ctx: &mut crate::interrupts::SyscallContext) -> u64 {
     if let Some(pid) = crate::process::current_process_id() {
         let _ = crate::process::modify_process(pid, |p| {
             p.signal_mask = frame.uc.uc_sigmask & !((1u64 << 8) | (1u64 << 18));
+            p.sigaltstack.ss_flags = frame.uc.uc_stack.ss_flags;
         });
     }
 
@@ -7221,7 +7360,7 @@ fn sys_rt_sigreturn(ctx: &mut crate::interrupts::SyscallContext) -> u64 {
 /// arg1 = pid  (-1 = any child, 0 = any in group, >0 = specific)
 /// arg2 = *wstatus pointer (may be 0)
 /// arg3 = options (WNOHANG=1, WUNTRACED=2, WCONTINUED=8)
-fn sys_wait4_linux(pid: u64, status_ptr: u64, options: u64) -> u64 {
+fn sys_wait4_linux(pid: u64, status_ptr: u64, options: u64, _rusage: u64) -> u64 {
     // Map pid to wait_pid: negative/zero means "any child" (0 in our impl).
     let wait_pid: u64 = if (pid as i64) <= 0 {
         0 // wait for any child
@@ -8017,13 +8156,86 @@ fn sys_symlink(_target: u64, _linkpath: u64) -> u64 {
 }
 
 /// sys_chmod — change permissions of a file by path (stub; always succeeds).
-fn sys_chmod(_path_ptr: u64, _mode: u64) -> u64 { 0 }
+
+/// sys_chmod - Change file permissions
+fn sys_chmod(path_ptr: u64, mode: u64) -> u64 {
+    if path_ptr == 0 { return linux_abi_error(22); }
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return linux_abi_error(22); }
+    let mut path_buf = [0u8; 4096];
+    let n = path_len.min(4095) as usize;
+    unsafe { core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), n); }
+    path_buf[n] = 0;
+    let path_str = core::str::from_utf8(&path_buf[..n]).unwrap_or("");
+    
+    let scheme_path = user_path_to_scheme_path(path_str);
+    if !scheme_path.starts_with("file:") { return linux_abi_error(38); } // ENOSYS
+    
+    match crate::filesystem::Filesystem::lookup_path(&scheme_path[5..]) {
+        Ok(inode) => {
+            // Permission check: only owner or root can chmod
+            if let Ok(meta) = crate::filesystem::Filesystem::get_node_metadata(inode) {
+                let pid = crate::process::current_process_id().unwrap();
+                let p = crate::process::get_process(pid).unwrap();
+                if p.euid != 0 && p.euid != meta.uid {
+                    return linux_abi_error(1); // EPERM
+                }
+            }
+
+            let m = (mode as u16) & 0o777;
+            match crate::filesystem::Filesystem::update_metadata(inode, 0x0002, &m.to_le_bytes()) {
+                Ok(_) => 0,
+                Err(_) => linux_abi_error(5),
+            }
+        }
+        Err(_) => linux_abi_error(2),
+    }
+}
+
+/// sys_chown - Change file ownership
+fn sys_chown(path_ptr: u64, uid: u64, gid: u64) -> u64 {
+    if path_ptr == 0 { return linux_abi_error(22); }
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return linux_abi_error(22); }
+    let mut path_buf = [0u8; 4096];
+    let n = path_len.min(4095) as usize;
+    unsafe { core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), n); }
+    path_buf[n] = 0;
+    let path_str = core::str::from_utf8(&path_buf[..n]).unwrap_or("");
+    
+    let scheme_path = user_path_to_scheme_path(path_str);
+    if !scheme_path.starts_with("file:") { return linux_abi_error(38); }
+    
+    match crate::filesystem::Filesystem::lookup_path(&scheme_path[5..]) {
+        Ok(inode) => {
+            // Only root can chown
+            let pid = crate::process::current_process_id().unwrap();
+            let p = crate::process::get_process(pid).unwrap();
+            if p.euid != 0 {
+                return linux_abi_error(1); // EPERM
+            }
+
+            if uid != 0xFFFFFFFF {
+                let u = uid as u32;
+                let _ = crate::filesystem::Filesystem::update_metadata(inode, 0x0003, &u.to_le_bytes());
+            }
+            if gid != 0xFFFFFFFF {
+                let g = gid as u32;
+                let _ = crate::filesystem::Filesystem::update_metadata(inode, 0x0004, &g.to_le_bytes());
+            }
+            0
+        }
+        Err(_) => linux_abi_error(2),
+    }
+}
+
+
 
 /// sys_fchmod — change permissions of an open file (stub; always succeeds).
 fn sys_fchmod(_fd: u64, _mode: u64) -> u64 { 0 }
 
 /// sys_chown — change ownership of a file by path (stub; always succeeds).
-fn sys_chown(_path_ptr: u64, _uid: u64, _gid: u64) -> u64 { 0 }
+
 
 /// sys_fchown — change ownership of an open file (stub; always succeeds).
 fn sys_fchown(_fd: u64, _uid: u64, _gid: u64) -> u64 { 0 }
@@ -8174,10 +8386,117 @@ fn sys_sysinfo(info_ptr: u64) -> u64 {
 }
 
 /// sys_setuid — set user ID (stub; Eclipse runs as root, always succeeds).
-fn sys_setuid(_uid: u64) -> u64 { 0 }
+
+fn sys_getgroups(size: u64, list_ptr: u64) -> u64 {
+    if let Some(pid) = process::current_process_id() {
+        if let Some(p) = process::get_process(pid) {
+            if size == 0 {
+                return p.supplementary_groups_len as u64;
+            }
+            if size < p.supplementary_groups_len as u64 {
+                return linux_abi_error(22); // EINVAL
+            }
+            if list_ptr != 0 && is_user_pointer(list_ptr, p.supplementary_groups_len as u64 * 4) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        p.supplementary_groups.as_ptr(),
+                        list_ptr as *mut u32,
+                        p.supplementary_groups_len
+                    );
+                }
+                return p.supplementary_groups_len as u64;
+            }
+            return linux_abi_error(14); // EFAULT
+        }
+    }
+    linux_abi_error(3)
+}
+
+fn sys_setgroups(size: u64, list_ptr: u64) -> u64 {
+    if size > 32 { return linux_abi_error(22); } // EINVAL (our limit is 32)
+    if let Some(pid) = process::current_process_id() {
+        let mut p = match process::get_process(pid) {
+            Some(p) => p,
+            None => return linux_abi_error(3),
+        };
+
+        if p.euid != 0 {
+            return linux_abi_error(1); // EPERM
+        }
+
+        if size > 0 {
+            if list_ptr == 0 || !is_user_pointer(list_ptr, size * 4) {
+                return linux_abi_error(14); // EFAULT
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    list_ptr as *const u32,
+                    p.supplementary_groups.as_mut_ptr(),
+                    size as usize
+                );
+            }
+        }
+        p.supplementary_groups_len = size as usize;
+        process::update_process(pid, p);
+        return 0;
+    }
+    linux_abi_error(3)
+}
+
+
+fn sys_setuid(uid: u64) -> u64 {
+    let uid = uid as u32;
+    if let Some(pid) = process::current_process_id() {
+        let mut p = match process::get_process(pid) {
+            Some(p) => p,
+            None => return linux_abi_error(3), // ESRCH
+        };
+
+        if p.euid == 0 {
+            // Root can set everything
+            p.uid = uid;
+            p.start_time = process::get_user_birthday(uid);
+            p.euid = uid;
+            p.suid = uid;
+        } else {
+            // Non-root can only set euid to ruid or suid
+            if uid == p.uid || uid == p.suid {
+                p.euid = uid;
+            } else {
+                return linux_abi_error(1); // EPERM
+            }
+        }
+        process::update_process(pid, p);
+        return 0;
+    }
+    linux_abi_error(3)
+}
 
 /// sys_setgid — set group ID (stub; Eclipse runs as root, always succeeds).
-fn sys_setgid(_gid: u64) -> u64 { 0 }
+fn sys_setgid(gid: u64) -> u64 {
+    let gid = gid as u32;
+    if let Some(pid) = process::current_process_id() {
+        let mut p = match process::get_process(pid) {
+            Some(p) => p,
+            None => return linux_abi_error(3), // ESRCH
+        };
+
+        if p.euid == 0 {
+            p.gid = gid;
+            p.egid = gid;
+            p.sgid = gid;
+        } else {
+            if gid == p.gid || gid == p.sgid {
+                p.egid = gid;
+            } else {
+                return linux_abi_error(1); // EPERM
+            }
+        }
+        process::update_process(pid, p);
+        return 0;
+    }
+    linux_abi_error(3)
+}
 
 /// sys_setreuid — set real and effective user IDs (stub).
 fn sys_setreuid(_ruid: u64, _euid: u64) -> u64 { 0 }
@@ -8185,8 +8504,63 @@ fn sys_setreuid(_ruid: u64, _euid: u64) -> u64 { 0 }
 /// sys_setregid — set real and effective group IDs (stub).
 fn sys_setregid(_rgid: u64, _egid: u64) -> u64 { 0 }
 
-/// sys_setresuid — set real, effective, and saved user IDs (stub).
-fn sys_setresuid(_ruid: u64, _euid: u64, _suid: u64) -> u64 { 0 }
 
-/// sys_setresgid — set real, effective, and saved group IDs (stub).
-fn sys_setresgid(_rgid: u64, _egid: u64, _sgid: u64) -> u64 { 0 }
+/// sys_prctl - Process control (Syscall 157)
+fn sys_prctl(option: u64, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
+    const PR_SET_NAME: u64 = 15;
+    if option == PR_SET_NAME {
+        let current_pid = match process::current_process_id() {
+            Some(pid) => pid,
+            None => return 0,
+        };
+        if let Some(mut proc) = process::get_process(current_pid) {
+            let pt = proc.resources.lock().page_table_phys;
+            // Read name from user space (arg2)
+            let mut name = [0u8; 16];
+            for i in 0..15 {
+                if let Some(b) = crate::memory::try_read_user_u8(pt, arg2 + i as u64) {
+                    if b == 0 { break; }
+                    name[i] = b;
+                } else {
+                    break;
+                }
+            }
+            proc.name = name;
+            process::update_process(current_pid, proc);
+            return 0;
+        }
+    }
+    0 // Unknown option or failed
+}
+
+/// sys_sched_set_deadline - Set EDF real-time parameters (Syscall 314)
+fn sys_sched_set_deadline(pid: u32, runtime: u64, deadline: u64, period: u64) -> u64 {
+    let current_pid = process::current_process_id().unwrap_or(0);
+    let target_pid = if pid == 0 { current_pid } else { pid };
+    
+    if let Some(mut p) = process::get_process(target_pid) {
+        if runtime > deadline || deadline > period || period == 0 {
+            return 0xFFFF_FFFF_FFFF_FFFF; // EINVAL (-1)
+        }
+        
+        let now = crate::interrupts::ticks();
+        p.rt_params = Some(process::RTParams {
+            runtime,
+            deadline,
+            period,
+            next_deadline: now + deadline,
+        });
+        
+        let is_ready = p.state == process::ProcessState::Ready;
+        process::update_process(target_pid, p);
+        
+        // If the process is currently Ready, we need to move it to the RT queue.
+        if is_ready {
+             crate::scheduler::enqueue_process(target_pid);
+        }
+        
+        0
+    } else {
+        0xFFFF_FFFF_FFFF_FFFE // ESRCH (-2)
+    }
+}

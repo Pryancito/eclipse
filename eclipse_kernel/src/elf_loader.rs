@@ -786,7 +786,9 @@ pub fn load_elf_into_space(page_table_phys: u64, provider: &dyn ElfDataProvider)
 
     let et_dyn = header.e_type == ET_DYN;
     let load_bias = if et_dyn {
-        DYNAMIC_MAIN_LOAD_BIAS
+        let rnd = crate::cpu::get_random_u64();
+        // Randomize bias in [1GB, 3GB) range, 2MB aligned.
+        0x4000_0000u64 + (rnd % 0x8000_0000u64 & !0x1F_FFFFu64)
     } else {
         0u64
     };
@@ -1479,7 +1481,10 @@ pub unsafe fn jump_to_userspace_with_argv_envp(
     // Strings sit above the table.
     let strings_base = (stack_top as usize).wrapping_sub(str_area);
     let rsp_raw = strings_base.wrapping_sub(table_bytes);
-    let rsp = (rsp_raw & !0xF) as u64;
+    
+    // ASLR: Randomize stack offset by up to 4KB (16-byte aligned)
+    let stack_jitter = (crate::cpu::get_random_u64() % 4096) & !0xF;
+    let rsp = ((rsp_raw as u64 - stack_jitter) & !0xF) as u64;
     let strings_base = rsp + table_bytes as u64;
 
     // Switch CR3 to the (already-replaced) user page table.

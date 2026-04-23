@@ -290,6 +290,7 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 });
 
 // --- Log Scheme ---
+pub use crate::random_scheme::RandomScheme;
 
 pub struct LogScheme;
 
@@ -482,6 +483,7 @@ impl Scheme for MemfdScheme {
 
 pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
+    register_scheme("random", Arc::new(RandomScheme::new()));
     register_scheme("tty", Arc::new(crate::tty::TtyScheme::new()));
     register_scheme("shm", Arc::new(ShmScheme::new()));
     register_scheme("memfd", Arc::new(MemfdScheme::new()));

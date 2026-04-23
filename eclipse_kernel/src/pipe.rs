@@ -175,6 +175,13 @@ impl Scheme for PipeScheme {
         loop {
             {
                 let mut ch = channel_arc.lock();
+
+                if ch.read_ends == 0 {
+                    if let Some(pid) = crate::process::current_process_id() {
+                        crate::process::set_pending_signal(pid, 13); // SIGPIPE
+                    }
+                    return Err(error::EPIPE);
+                }
                 if !ch.buffer.is_empty() {
                     let mut n = 0;
                     while n < buffer.len() {
@@ -226,8 +233,12 @@ impl Scheme for PipeScheme {
                 let mut ch = channel_arc.lock();
 
                 if ch.read_ends == 0 {
+                    if let Some(pid) = crate::process::current_process_id() {
+                        crate::process::set_pending_signal(pid, 13); // SIGPIPE
+                    }
                     return Err(error::EPIPE);
                 }
+
 
                 let available = PIPE_BUF_CAP.saturating_sub(ch.buffer.len());
                 if available > 0 {

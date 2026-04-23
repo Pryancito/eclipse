@@ -100,7 +100,7 @@ t_entry: .quad 0
 trampoline_end:
 "#);
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 extern "C" {
     /// Linker-defined start of trampoline section
@@ -119,6 +119,7 @@ static AP_READY: AtomicUsize = AtomicUsize::new(0);
 pub static SYSTEM_BOOT_COMPLETE: AtomicBool = AtomicBool::new(false);
 static TSC_COUNTS_PER_US: AtomicU64 = AtomicU64::new(10000); // Default to 10GHz (safe upper bound)
 static TSC_DEADLINE_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn update_tsc_frequency(counts_per_us: u64) {
     TSC_COUNTS_PER_US.store(counts_per_us, Ordering::SeqCst);
@@ -402,12 +403,11 @@ pub fn has_thermal_msrs() -> bool {
     (leaf6.eax & 0x1) != 0
 }
 
-static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static RDRAND_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Detectar características avanzadas de la CPU (MONITOR/MWAIT)
+/// Detectar características avanzadas de la CPU (MONITOR/MWAIT, RDRAND)
 pub fn detect_features() {
     serial_printf(format_args!("[CPU] detect_features entry\n"));
-    // Usamos el intrínseco directamente. Rust se encarga de RBX y la seguridad.
     let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
 
     // Bit 3 de ECX: MONITOR/MWAIT
@@ -422,14 +422,42 @@ pub fn detect_features() {
         serial_printf(format_args!("[CPU] TSC-Deadline support detected\n"));
     }
 
-    // Ya que estás aquí, deberías detectar RDRAND para entropía en SMP
+    // RDRAND para entropía (bit 30 de ECX en leaf 1)
     if (leaf1.ecx & (1 << 30)) != 0 {
-        // RDRAND_SUPPORTED.store(true, Ordering::SeqCst);
+        RDRAND_SUPPORTED.store(true, Ordering::SeqCst);
+        serial_printf(format_args!("[CPU] RDRAND entropy support detected\n"));
     }
     serial_printf(format_args!("[CPU] Features detected\n"));
 }
 
-use core::sync::atomic::AtomicBool;
+/// Obtiene un valor aleatorio de 64 bits.
+/// Utiliza RDRAND si está disponible, de lo contrario cae a una mezcla de TSC y jitter.
+pub fn get_random_u64() -> u64 {
+    if RDRAND_SUPPORTED.load(Ordering::Relaxed) {
+        let mut val: u64 = 0;
+        for _ in 0..10 {
+            let success: u8;
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {0}",
+                    "setc {1}",
+                    out(reg) val,
+                    out(reg_byte) success,
+                );
+            }
+            if success != 0 {
+                return val;
+            }
+        }
+    }
+
+    // Fallback: Mezcla de TSC y dirección de pila (pobre pero mejor que nada)
+    let stack_var = 0usize;
+    let tsc = rdtsc();
+    tsc ^ (stack_var as u64) ^ 0xDEADBEEF_CAFEF00D
+}
+
+
 
 /// Dormir el núcleo de forma eficiente.
 /// Intenta usar MONITOR/MWAIT (Nivel 4) si está disponible, 

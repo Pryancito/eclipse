@@ -26,7 +26,16 @@ pub const READ_FILE_ALLOC_MAX_CONTENT: usize = 32 * 1024 * 1024;
 
 const INODE_CACHE_SIZE: usize = 128;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone)]
+pub struct NodeMetadata {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct InodeCacheEntry {
     inode_id: u32,
     offset: u64,
@@ -475,6 +484,161 @@ impl Filesystem {
             Ok(InodeTableEntry::new(inode_num, absolute_offset))
         }
     }
+
+    pub fn get_node_metadata(inode: u32) -> Result<NodeMetadata, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        let (data_start, _) = Self::get_file_metadata(inode)?;
+        
+        // Read Record header (8 bytes: u32 inode, u32 size)
+        let mut header = [0u8; 8];
+        read_bytes_at(data_start, &mut header)?;
+        
+        let record_inode = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let record_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        
+        if record_inode != inode { return Err("Record inode mismatch"); }
+        
+        let mut data = vec![0u8; record_size as usize];
+        read_bytes_at(data_start + 8, &mut data)?;
+        
+        let mut meta = NodeMetadata {
+            mode: 0, uid: 0, gid: 0, size: 0, kind: NodeKind::File,
+        };
+        
+        // Parse metadata TLVs
+        let mut pos = 0;
+        while pos + 6 <= data.len() {
+            let t = u16::from_le_bytes([data[pos], data[pos+1]]);
+            let l = u32::from_le_bytes([data[pos+2], data[pos+3], data[pos+4], data[pos+5]]) as usize;
+            if pos + 6 + l > data.len() { break; }
+            let v = &data[pos+6 .. pos+6 + l];
+            match t {
+                tlv_tags::NODE_TYPE => meta.kind = match v[0] { 1 => NodeKind::File, 2 => NodeKind::Directory, 3 => NodeKind::Symlink, _ => NodeKind::File },
+                tlv_tags::MODE => meta.mode = u16::from_le_bytes([v[0], v[1]]),
+                tlv_tags::UID => meta.uid = u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
+                tlv_tags::GID => meta.gid = u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
+                tlv_tags::SIZE => meta.size = u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
+                _ => {}
+            }
+            pos += 6 + l;
+        }
+        // Default modes if missing
+        if meta.mode == 0 {
+            meta.mode = match meta.kind {
+                NodeKind::Directory => 0o755,
+                NodeKind::Symlink => 0o777,
+                _ => 0o644,
+            };
+        }
+        Ok(meta)
+    }
+
+    /// Update a specific metadata tag for an inode (LFS only)
+    pub fn update_metadata(inode: u32, target_tag: u32, new_value: &[u8]) -> Result<(), &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        unsafe {
+            if !FS.use_lfs { return Err("Metadata update only supported in LFS mode"); }
+        }
+        
+        let (old_data_start, _) = Self::get_file_metadata(inode)?;
+        
+        // Read existing record
+        let mut header = [0u8; 8];
+        read_bytes_at(old_data_start, &mut header)?;
+        let record_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let mut data = vec![0u8; record_size as usize];
+        read_bytes_at(old_data_start + 8, &mut data)?;
+        
+        // Build new metadata buffer
+        let mut new_data = Vec::new();
+        let mut pos = 0;
+        let mut updated = false;
+        let target_tag_u16 = target_tag as u16;
+        
+        while pos + 6 <= data.len() {
+            let t = u16::from_le_bytes([data[pos], data[pos+1]]);
+            let l = u32::from_le_bytes([data[pos+2], data[pos+3], data[pos+4], data[pos+5]]) as usize;
+            if pos + 6 + l > data.len() { break; }
+            let v = &data[pos+6 .. pos+6 + l];
+            
+            new_data.extend_from_slice(&t.to_le_bytes());
+            if t == target_tag_u16 {
+                new_data.extend_from_slice(&(new_value.len() as u32).to_le_bytes());
+                new_data.extend_from_slice(new_value);
+                updated = true;
+            } else {
+                new_data.extend_from_slice(&(l as u32).to_le_bytes());
+                new_data.extend_from_slice(v);
+            }
+            pos += 6 + l;
+        }
+        
+        if !updated {
+            new_data.extend_from_slice(&target_tag_u16.to_le_bytes());
+            new_data.extend_from_slice(&(new_value.len() as u32).to_le_bytes());
+            new_data.extend_from_slice(new_value);
+        }
+        
+        // Write new record to log
+        let total_len = new_data.len() as u32;
+        let mut record = Vec::new();
+        record.extend_from_slice(&inode.to_le_bytes());
+        record.extend_from_slice(&total_len.to_le_bytes());
+        record.extend_from_slice(&new_data);
+        
+        unsafe {
+            let new_off = FS.log_tail;
+            write_bytes_at(new_off, &record)?;
+            FS.log_tail += record.len() as u64;
+            INODE_MAP.lock().insert(inode, new_off);
+        }
+        
+        Ok(())
+    }
+
+    /// Comprobar permisos de acceso para el proceso actual.
+    /// mask: 4=R, 2=W, 1=X
+    pub fn check_access(inode: u32, mask: u8) -> Result<(), &'static str> {
+        let pid = crate::process::current_process_id().ok_or("No current process")?;
+        let p = crate::process::get_process(pid).ok_or("Process not found")?;
+        
+        // Root bypasses everything
+        if p.euid == 0 {
+            return Ok(());
+        }
+
+        let meta = Self::get_node_metadata(inode)?;
+        
+        let mut mode = meta.mode;
+        
+        let mut granted = 0;
+        if p.euid == meta.uid {
+            granted = (mode >> 6) & 0x7;
+        } else if p.egid == meta.gid {
+            granted = (mode >> 3) & 0x7;
+        } else {
+            // Check supplementary groups
+            let mut in_group = false;
+            for i in 0..p.supplementary_groups_len {
+                if p.supplementary_groups[i] == meta.gid {
+                    in_group = true;
+                    break;
+                }
+            }
+            if in_group {
+                granted = (mode >> 3) & 0x7;
+            } else {
+                granted = mode & 0x7;
+            }
+        }
+
+        if (granted as u8 & mask) == mask {
+            Ok(())
+        } else {
+            Err("Permission denied")
+        }
+    }
+
     
     /// Parse TLV data from a node record
     fn parse_tlv_content(data: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -960,7 +1124,122 @@ impl Filesystem {
     }
 
     /// Lookup functionality
+    
     pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
+        Self::lookup_path_recursive(path, 0)
+    }
+
+    fn lookup_path_recursive(path: &str, depth: usize) -> Result<u32, &'static str> {
+        if depth > 32 { return Err("Too many symlink levels"); }
+        let _lock = FILESYSTEM_LOCK.lock();
+        
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current_inode = 1;
+        
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i == parts.len() - 1;
+            
+            // Standard lookup in current_inode (directory)
+            let next_inode = {
+                // Reusing the B-Tree search logic...
+                // (I'll extract it to a helper find_in_dir_btree)
+                Self::find_child_in_dir_btree(current_inode, part)?
+            };
+
+            // Check if next_inode is a symlink
+            match Self::inode_kind(next_inode)? {
+                NodeKind::Symlink => {
+                    let target = Self::read_symlink_target(next_inode)?;
+                    // Resolve relative/absolute
+                    let link_parent_path = if i == 0 { "/" } else {
+                        // Reconstruct path up to here
+                        // This is a bit inefficient but safe
+                        "" // TODO: implement proper parent path reconstruction if needed
+                    };
+                    // Actually, resolve_symlink_path handles it
+                    let mut full_path_so_far = String::from("/");
+                    for j in 0..i { full_path_so_far.push_str(parts[j]); full_path_so_far.push('/'); }
+                    full_path_so_far.push_str(part);
+                    
+                    let resolved = resolve_symlink_path(&full_path_so_far, &target);
+                    
+                    if is_last {
+                        // Restart lookup for the resolved path
+                        return Self::lookup_path_recursive(&resolved, depth + 1);
+                    } else {
+                        // Resolve the symlink and continue traversal
+                        current_inode = Self::lookup_path_recursive(&resolved, depth + 1)?;
+                    }
+                }
+                NodeKind::Directory => {
+                    current_inode = next_inode;
+                }
+                NodeKind::File => {
+                    if !is_last { return Err("Not a directory"); }
+                    current_inode = next_inode;
+                }
+            }
+        }
+        Ok(current_inode)
+    }
+
+    fn find_child_in_dir_btree(dir_inode: u32, name: &str) -> Result<u32, &'static str> {
+        // (Copied from existing lookup_path logic)
+        let cached = {
+            let mut dc = DIR_CACHE.lock();
+            if let Some(idx) = dc.entries.iter().position(|e| e.0 == dir_inode) {
+                dc.access_counter = dc.access_counter.wrapping_add(1);
+                dc.entries[idx].1 = dc.access_counter;
+                Some(dc.entries[idx].2.clone())
+            } else { None }
+        };
+        let record_data = if let Some(data) = cached { data } else {
+            let entry = Self::read_inode_entry(dir_inode)?;
+            let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+            let mut header_buf = [0u8; 8];
+            read_bytes_at(abs_disk_offset, &mut header_buf)?;
+            let record_size = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]) as usize;
+            if record_size < 8 || record_size > MAX_RECORD_SIZE { return Err("Invalid directory record"); }
+            let mut data = vec![0u8; record_size];
+            read_bytes_at(abs_disk_offset, &mut data)?;
+            DIR_CACHE.lock().insert(dir_inode, data.clone());
+            data
+        };
+        let mut cache = BTREE_CACHE.lock();
+        let btree = if let Some(bt) = cache.get(&dir_inode) {
+            alloc::sync::Arc::clone(bt)
+        } else {
+            let mut bt = eclipsefs_lib::btree::BTree::new();
+            let data = &record_data[8..];
+            let mut tlv_pos = 0usize;
+            while tlv_pos + 6 <= data.len() {
+                let tag = u16::from_le_bytes([data[tlv_pos], data[tlv_pos + 1]]);
+                let length = u32::from_le_bytes([data[tlv_pos+2], data[tlv_pos+3], data[tlv_pos+4], data[tlv_pos+5]]) as usize;
+                if tag == tlv_tags::DIRECTORY_ENTRIES && tlv_pos + 6 + length <= data.len() {
+                    let dir_data = &data[tlv_pos + 6..tlv_pos + 6 + length];
+                    let mut dir_off = 0usize;
+                    while dir_off + 8 <= dir_data.len() {
+                        let name_len = u32::from_le_bytes([dir_data[dir_off], dir_data[dir_off+1], dir_data[dir_off+2], dir_data[dir_off+3]]) as usize;
+                        let child_inode = u32::from_le_bytes([dir_data[dir_off+4], dir_data[dir_off+5], dir_data[dir_off+6], dir_data[dir_off+7]]);
+                        if name_len > 0 && dir_off + 8 + name_len <= dir_data.len() {
+                            let name_bytes = &dir_data[dir_off + 8..dir_off + 8 + name_len];
+                            if let Ok(name) = core::str::from_utf8(name_bytes) {
+                                let _ = bt.insert(alloc::string::String::from(name), child_inode);
+                            }
+                        }
+                        dir_off += 8 + name_len;
+                    }
+                }
+                tlv_pos += 6 + length;
+            }
+            let arc_bt = alloc::sync::Arc::new(bt);
+            cache.insert(dir_inode, alloc::sync::Arc::clone(&arc_bt));
+            arc_bt
+        };
+        btree.search(name).ok_or("File not found")
+    }
+
+    pub fn lookup_path_no_follow(path: &str) -> Result<u32, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             if !FS.mounted {
@@ -1378,6 +1657,25 @@ pub fn unlink_path(path: &str) -> Result<(), usize> {
 }
 
 /// Crea un directorio.  Actualmente soportado bajo /tmp/ y /run/.
+
+pub fn create_virtual_symlink(path: &str, target: &str) -> Result<(), &'static str> {
+    let mut vtmp = VIRTUAL_TMP.lock();
+    let mut vrun = VIRTUAL_RUN.lock();
+    let mut vkinds = VIRTUAL_KINDS.lock();
+    
+    let (map, key) = if path.starts_with("tmp/") {
+        (&mut *vtmp, path)
+    } else if path.starts_with("run/") {
+        (&mut *vrun, path)
+    } else {
+        return Err("Not a virtual path");
+    };
+    
+    map.insert(String::from(key), target.as_bytes().to_vec());
+    vkinds.insert(String::from(key), NodeKind::Symlink);
+    Ok(())
+}
+
 pub fn mkdir_path(path: &str, _mode: u32) -> Result<(), usize> {
     use crate::scheme::error;
     let clean = if path.starts_with('/') { &path[1..] } else { path };
@@ -1621,6 +1919,7 @@ static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BT
 /// Virtual files under /run (in-memory overlay for socket files, PID files, etc.)
 /// This allows programs like seatd to bind()/unlink() socket files under /run even though
 /// the real root filesystem is read-only.
+static VIRTUAL_KINDS: Mutex<BTreeMap<String, NodeKind>> = Mutex::new(BTreeMap::new());
 static VIRTUAL_RUN: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 
 /// Returns true when a clean (leading-slash-stripped) path belongs to the virtual /run overlay.
@@ -1774,9 +2073,20 @@ impl Scheme for FileSystemScheme {
                     return Err(scheme_error::EIO);
                 }
                 
+                                let mut access_mask = 0u8;
+                if (flags & 3) == 0 { access_mask |= 4; } // O_RDONLY
+                if (flags & 3) == 1 { access_mask |= 2; } // O_WRONLY
+                if (flags & 3) == 2 { access_mask |= 6; } // O_RDWR
+                
                 let res = Filesystem::lookup_path_resolve_file_inode(clean_path);
                 let (ino, size, id) = match res {
                     Ok(ino) => {
+                        // Check access
+                        if let Err(e) = Filesystem::check_access(ino, access_mask) {
+                            return Err(scheme_error::EACCES);
+                        }
+                        
+                        let (data_start, size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
                         let (data_start, size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
                         let mut open_files = OPEN_FILES_SCHEME.lock();
                         let id = open_files.len();
@@ -1795,16 +2105,17 @@ impl Scheme for FileSystemScheme {
         }
     }
 
+    
     fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode, data_start_abs: _, size } => {
+            OpenFile::Real { inode, size, .. } => {
                 let current_off = offset;
                 let file_size = *size;
                 let inode_id = *inode;
-                let device_id = unsafe { FS.disk_scheme_id }; // Using scheme_id as device proxy for now
+                let device_id = unsafe { FS.disk_scheme_id };
 
                 if current_off >= file_size {
                     return Ok(0);
@@ -1819,15 +2130,11 @@ impl Scheme for FileSystemScheme {
                     let off_in_page = (file_off % 4096) as usize;
                     let take = core::cmp::min(max_read - total_read, 4096 - off_in_page);
 
-                    // Use Page Cache
                     let page_arc = crate::page_cache::PAGE_CACHE.lock().get_or_create(device_id, inode_id, page_idx * 4096);
                     let mut page = page_arc.lock();
 
-                    // If page is fresh, fill it from disk
                     if !page.valid {
                          let mut temp = [0u8; 4096];
-                         // We still need to know WHERE the page is on disk.
-                         // For now, LFS logic is not fully here, so we use the old contiguous mapping.
                          let (data_start, _) = Filesystem::get_file_metadata(inode_id).map_err(|_| scheme_error::EIO)?;
                          let abs_disk_off = data_start + (page_idx * 4096);
                          if read_bytes_at(abs_disk_off, &mut temp).is_ok() {
@@ -1840,10 +2147,8 @@ impl Scheme for FileSystemScheme {
                     buffer[total_read..total_read + take].copy_from_slice(&page.as_slice()[off_in_page..off_in_page + take]);
                     total_read += take;
                 }
-
                 Ok(total_read)
             }
-
             OpenFile::Virtual { path } => {
                 let path_clone = path.clone();
                 let off = offset;
@@ -1852,9 +2157,7 @@ impl Scheme for FileSystemScheme {
                     let vrun = VIRTUAL_RUN.lock();
                     let content = vrun.get(&path_clone).ok_or(scheme_error::EIO)?;
                     let start = off as usize;
-                    if start >= content.len() {
-                        return Ok(0);
-                    }
+                    if start >= content.len() { return Ok(0); }
                     let len = core::cmp::min(buffer.len(), content.len() - start);
                     buffer[..len].copy_from_slice(&content[start..start + len]);
                     Ok(len)
@@ -1862,9 +2165,7 @@ impl Scheme for FileSystemScheme {
                     let vtmp = VIRTUAL_TMP.lock();
                     let content = vtmp.get(&path_clone).ok_or(scheme_error::EIO)?;
                     let start = off as usize;
-                    if start >= content.len() {
-                        return Ok(0);
-                    }
+                    if start >= content.len() { return Ok(0); }
                     let len = core::cmp::min(buffer.len(), content.len() - start);
                     buffer[..len].copy_from_slice(&content[start..start + len]);
                     Ok(len)
@@ -1873,14 +2174,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::DeviceList => {
                 let names = list_device_names();
                 let mut data = alloc::string::String::new();
-                for name in names {
-                    data.push_str(&name);
-                    data.push('\n');
-                }
+                for name in names { data.push_str(&name); data.push('\n'); }
                 let data_bytes = data.as_bytes();
-                if offset >= data_bytes.len() as u64 {
-                    return Ok(0);
-                }
+                if offset >= data_bytes.len() as u64 { return Ok(0); }
                 let count = core::cmp::min(buffer.len(), data_bytes.len() - offset as usize);
                 buffer[..count].copy_from_slice(&data_bytes[offset as usize .. offset as usize + count]);
                 Ok(count)
@@ -1889,31 +2185,20 @@ impl Scheme for FileSystemScheme {
             OpenFile::Drm { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                let drm = crate::drm_scheme::DrmScheme;
-                drm.read(res_id, buffer, offset)
+                crate::drm_scheme::DrmScheme.read(res_id, buffer, offset)
             }
             OpenFile::Keyboard => {
                 if buffer.is_empty() { return Ok(0); }
                 let key = crate::interrupts::read_key();
-                if key != 0 {
-                    buffer[0] = key;
-                    Ok(1)
-                } else {
-                    Ok(0) // Non-blocking
-                }
+                if key != 0 { buffer[0] = key; Ok(1) } else { Ok(0) }
             }
             OpenFile::Null => Ok(0),
-            OpenFile::Zero => {
-                for b in buffer.iter_mut() { *b = 0; }
-                Ok(buffer.len())
-            }
+            OpenFile::Zero => { for b in buffer.iter_mut() { *b = 0; } Ok(buffer.len()) }
             OpenFile::Tty => Ok(0),
             OpenFile::Random => {
                 let mut tsc: u64;
                 for b in buffer.iter_mut() {
-                    unsafe {
-                        core::arch::asm!("rdtsc", out("rax") tsc, out("rdx") _, options(nomem, nostack));
-                    }
+                    unsafe { core::arch::asm!("rdtsc", out("rax") tsc, out("rdx") _, options(nomem, nostack)); }
                     *b = (tsc & 0xFF) as u8 ^ ((tsc >> 8) & 0xFF) as u8;
                 }
                 Ok(buffer.len())
@@ -1924,86 +2209,58 @@ impl Scheme for FileSystemScheme {
     fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
-        
         match open_file {
             OpenFile::Real { inode, .. } => {
-                match Filesystem::write_file_by_inode(*inode, buffer, offset) {
-                    Ok(bytes_written) => Ok(bytes_written),
-                    Err(_) => Err(scheme_error::EIO),
-                }
+                Filesystem::write_file_by_inode(*inode, buffer, offset).map_err(|_| scheme_error::EIO)
             }
             OpenFile::Virtual { path } => {
                 let path_clone = path.clone();
-                let off = offset;
-                let end = (off as usize)
-                    .checked_add(buffer.len())
-                    .ok_or(scheme_error::EINVAL)?;
-                if end > MAX_VIRTUAL_FILE_SIZE {
-                    return Err(scheme_error::EINVAL);
-                }
+                let end = (offset as usize).checked_add(buffer.len()).ok_or(scheme_error::EINVAL)?;
+                if end > MAX_VIRTUAL_FILE_SIZE { return Err(scheme_error::EINVAL); }
                 if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
                     let content = vrun.entry(path_clone).or_insert_with(alloc::vec::Vec::new);
-                    if end > content.len() {
-                        content.resize(end, 0);
-                    }
-                    content[off as usize..end].copy_from_slice(buffer);
+                    if end > content.len() { content.resize(end, 0); }
+                    content[offset as usize..end].copy_from_slice(buffer);
                 } else if is_virtual_tmp_path(&path_clone) {
                     let mut vtmp = VIRTUAL_TMP.lock();
                     let content = vtmp.entry(path_clone).or_insert_with(alloc::vec::Vec::new);
-                    if end > content.len() {
-                        content.resize(end, 0);
-                    }
-                    content[off as usize..end].copy_from_slice(buffer);
-                } else {
-                    return Err(scheme_error::EROFS);
-                }
+                    if end > content.len() { content.resize(end, 0); }
+                    content[offset as usize..end].copy_from_slice(buffer);
+                } else { return Err(scheme_error::EROFS); }
                 Ok(buffer.len())
             }
-            OpenFile::DeviceList => Err(scheme_error::EINVAL),
-            OpenFile::Framebuffer => Ok(buffer.len()),
             OpenFile::Drm { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                let drm = crate::drm_scheme::DrmScheme;
-                drm.write(res_id, buffer, offset)
+                crate::drm_scheme::DrmScheme.write(res_id, buffer, offset)
             }
-            OpenFile::Keyboard => Err(scheme_error::EROFS),
-            OpenFile::Null | OpenFile::Zero | OpenFile::Random => Ok(buffer.len()),
             OpenFile::Tty => {
-                if let Ok(s) = core::str::from_utf8(buffer) {
-                    crate::serial::serial_print(s);
-                    Ok(buffer.len())
-                } else {
-                    Err(scheme_error::EINVAL)
-                }
+                if let Ok(s) = core::str::from_utf8(buffer) { crate::serial::serial_print(s); Ok(buffer.len()) }
+                else { Err(scheme_error::EINVAL) }
             }
+            _ => Ok(buffer.len()),
         }
     }
 
     fn lseek(&self, id: usize, seek_offset: isize, whence: usize, current_offset: u64) -> Result<usize, usize> {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
-        
         let new_offset = match open_file {
             OpenFile::Real { size, .. } => {
-                let file_size = *size;
                 match whence {
                     0 => seek_offset as u64,
                     1 => (current_offset as i128 + seek_offset as i128).max(0) as u64,
-                    2 => (file_size as i128 + seek_offset as i128).max(0) as u64,
+                    2 => (*size as i128 + seek_offset as i128).max(0) as u64,
                     _ => return Err(scheme_error::EINVAL),
                 }
             }
             OpenFile::Virtual { path } => {
                 let path_clone = path.clone();
-                drop(open_files);
                 let len = if is_virtual_run_path(&path_clone) {
-                    let vrun = VIRTUAL_RUN.lock();
-                    vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                    VIRTUAL_RUN.lock().get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
                 } else {
-                    let vtmp = VIRTUAL_TMP.lock();
-                    vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                    VIRTUAL_TMP.lock().get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
                 };
                 match whence {
                     0 => seek_offset as u64,
@@ -2012,215 +2269,115 @@ impl Scheme for FileSystemScheme {
                     _ => return Err(scheme_error::EINVAL),
                 }
             }
-            OpenFile::DeviceList => {
-                let names = list_device_names();
-                let mut len = 0;
-                for name in names {
-                    len += name.len() + 1;
-                }
-                match whence {
-                    0 => seek_offset as u64,
-                    1 => (current_offset as i128 + seek_offset as i128).max(0) as u64,
-                    2 => (len as i128 + seek_offset as i128).max(0) as u64,
-                    _ => return Err(scheme_error::EINVAL),
-                }
-            }
-            OpenFile::Framebuffer | OpenFile::Drm { .. } | OpenFile::Keyboard | OpenFile::Null | OpenFile::Zero | OpenFile::Tty | OpenFile::Random => 0,
+            _ => current_offset,
         };
         Ok(new_offset as usize)
     }
 
-    fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
-        // Resize the in-memory content vector for virtual /tmp files so that
-        // subsequent fmap() calls return a non-empty physical address, enabling
-        // true MAP_SHARED cross-process shared memory for the SideWind compositor
-        // protocol. Without this, the terminal's framebuffer remains 0 bytes
-        // and fmap() returns EINVAL, causing every mmap(MAP_SHARED) to fall back
-        // to private anonymous frames that are invisible to other processes.
-        //
-        // Guard against oversized requests: these files are backed by a Vec<u8>
-        // on the 256 MiB kernel heap.  Without a cap a single ftruncate from a
-        // Wayland compositor (e.g. 128 MiB SHM pool for an 8 K display) exhausts
-        // the heap and triggers an allocation panic.
-        if len > MAX_VIRTUAL_FILE_SIZE {
-            return Err(scheme_error::EINVAL);
-        }
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         match open_file {
+            OpenFile::Real { inode, size, .. } => {
+                stat.size = *size;
+                stat.mode = 0o100644;
+                Ok(0)
+            }
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
-                drop(open_files);
+                let kind = VIRTUAL_KINDS.lock().get(&path_clone).cloned().unwrap_or(NodeKind::File);
+                stat.mode = match kind {
+                    NodeKind::File => 0o100644,
+                    NodeKind::Directory => 0o040755,
+                    NodeKind::Symlink => 0o120777,
+                };
+                stat.size = if is_virtual_run_path(&path_clone) {
+                    VIRTUAL_RUN.lock().get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                } else {
+                    VIRTUAL_TMP.lock().get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
+                };
+                Ok(0)
+            }
+            OpenFile::Framebuffer => {
+                let fb_info = &crate::boot::get_boot_info().framebuffer;
+                stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
+                stat.mode = 0o020666;
+                Ok(0)
+            }
+            OpenFile::DeviceList => {
+                stat.mode = 0o444 | 0x4000;
+                stat.size = list_device_names().iter().map(|n| n.len() + 1).sum::<usize>() as u64;
+                Ok(0)
+            }
+            _ => { stat.mode = 0o020666; Ok(0) }
+        }
+    }
+
+    fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
+        if len > MAX_VIRTUAL_FILE_SIZE { return Err(scheme_error::EINVAL); }
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        match open_file {
+            OpenFile::Virtual { path, .. } => {
+                let path_clone = path.clone();
                 if is_virtual_run_path(&path_clone) {
                     let mut vrun = VIRTUAL_RUN.lock();
-                    if let Some(content) = vrun.get_mut(&path_clone) {
-                        content.resize(len, 0);
-                        Ok(0)
-                    } else {
-                        Err(scheme_error::ENOENT)
-                    }
+                    if let Some(content) = vrun.get_mut(&path_clone) { content.resize(len, 0); Ok(0) }
+                    else { Err(scheme_error::ENOENT) }
                 } else {
                     let mut vtmp = VIRTUAL_TMP.lock();
-                    if let Some(content) = vtmp.get_mut(&path_clone) {
-                        content.resize(len, 0);
-                        Ok(0)
-                    } else {
-                        Err(scheme_error::ENOENT)
-                    }
+                    if let Some(content) = vtmp.get_mut(&path_clone) { content.resize(len, 0); Ok(0) }
+                    else { Err(scheme_error::ENOENT) }
                 }
             }
             _ => Err(scheme_error::ENOSYS),
         }
     }
 
-    fn dup_independent(&self, id: usize) -> Result<usize, usize> {
-        let mut open_files = OPEN_FILES_SCHEME.lock();
-        let existing = open_files
-            .get(id)
-            .and_then(|s| s.as_ref())
-            .ok_or(scheme_error::EBADF)?
-            .clone();
-        // Reuse the first free slot (but not the same slot as id).
-        for (i, slot) in open_files.iter_mut().enumerate() {
-            if i != id && slot.is_none() {
-                *slot = Some(existing);
-                return Ok(i);
-            }
-        }
-        let new_id = open_files.len();
-        open_files.push(Some(existing));
-        Ok(new_id)
-    }
-
-    fn close(&self, id: usize) -> Result<usize, usize> {
-        let mut open_files = OPEN_FILES_SCHEME.lock();
-        if let Some(Some(open_file)) = open_files.get(id) {
-            match open_file {
-                OpenFile::Drm { resource_id } => {
-                    let res_id = *resource_id;
-                    drop(open_files);
-                    let drm = crate::drm_scheme::DrmScheme;
-                    let _ = drm.close(res_id);
-                    let mut open_files = OPEN_FILES_SCHEME.lock();
-                    if let Some(slot) = open_files.get_mut(id) {
-                        *slot = None;
-                    }
-                    return Ok(0);
-                }
-                _ => {}
-            }
-        }
-        if let Some(slot) = open_files.get_mut(id) {
-            if slot.is_some() {
-                *slot = None;
-                return Ok(0);
-            }
-        }
-        Err(scheme_error::EBADF)
-    }
-
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
-        
         match open_file {
             OpenFile::Drm { resource_id } => {
-                let res_id = *resource_id;
-                drop(open_files);
-                let drm = crate::drm_scheme::DrmScheme;
-                drm.ioctl(res_id, request, arg)
+                let res_id = *resource_id; drop(open_files);
+                crate::drm_scheme::DrmScheme.ioctl(res_id, request, arg)
             }
             OpenFile::Framebuffer => {
                 match request as u32 {
                     0x4600 => { // FBIOGET_VSCREENINFO
                         let fb_info = &crate::boot::get_boot_info().framebuffer;
                         let var_info = unsafe { &mut *(arg as *mut fb_var_screeninfo) };
-                        var_info.xres = fb_info.width as u32;
-                        var_info.yres = fb_info.height as u32;
-                        var_info.xres_virtual = fb_info.width as u32;
-                        var_info.yres_virtual = fb_info.height as u32;
+                        var_info.xres = fb_info.width as u32; var_info.yres = fb_info.height as u32;
+                        var_info.xres_virtual = fb_info.width as u32; var_info.yres_virtual = fb_info.height as u32;
                         var_info.bits_per_pixel = 32;
-                        var_info.red.offset = 16;
-                        var_info.red.length = 8;
-                        var_info.green.offset = 8;
-                        var_info.green.length = 8;
-                        var_info.blue.offset = 0;
-                        var_info.blue.length = 8;
-                        var_info.transp.offset = 24;
-                        var_info.transp.length = 8;
+                        var_info.red.offset = 16; var_info.red.length = 8;
+                        var_info.green.offset = 8; var_info.green.length = 8;
+                        var_info.blue.offset = 0; var_info.blue.length = 8;
+                        var_info.transp.offset = 24; var_info.transp.length = 8;
                         Ok(0)
                     }
-                    0x4601 => Ok(0), // FBIOPUT_VSCREENINFO
                     0x4602 => { // FBIOGET_FSCREENINFO
                         let fb_info = &crate::boot::get_boot_info().framebuffer;
                         let fix_info = unsafe { &mut *(arg as *mut fb_fix_screeninfo) };
                         fix_info.smem_start = fb_info.base_address as u64;
                         fix_info.smem_len = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u32;
                         fix_info.line_length = (fb_info.pixels_per_scan_line * 4) as u32;
-                        fix_info.visual = 2; // FB_VISUAL_TRUECOLOR
-                        Ok(0)
+                        fix_info.visual = 2; Ok(0)
                     }
-                    0x4611 => Ok(0), // FBIOPAN_DISPLAY
-                    _ => Err(scheme_error::EINVAL)
+                    _ => Ok(0)
                 }
             }
             OpenFile::Tty => {
-                // TTY/VT ioctls for seatd/labwc
                 match request {
                     0x5603 => { // VT_GETSTATE
                         #[repr(C)] struct VtStat { v_active: u16, v_signal: u16, v_state: u16 }
                         let stat = unsafe { &mut *(arg as *mut VtStat) };
-                        stat.v_active = 1;
-                        stat.v_signal = 0;
-                        stat.v_state = 2;
-                        Ok(0)
+                        stat.v_active = 1; stat.v_state = 2; Ok(0)
                     }
-                    0x5600 => { // VT_OPENQRY — find first available VT
-                        if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 4) {
-                            return Err(scheme_error::EFAULT);
-                        }
-                        unsafe { *(arg as *mut u32) = 1; }
-                        Ok(0)
+                    0x5600 => { // VT_OPENQRY
+                        unsafe { *(arg as *mut u32) = 1; } Ok(0)
                     }
-                    0x5601 => { // VT_GETMODE
-                        // struct vt_mode: { char mode; char waitv; short relsig; short acqsig; short frsig; }
-                        // Packed on x86: 1+1+2+2+2 = 8 bytes with standard C layout.
-                        if arg != 0 && crate::syscalls::is_user_pointer(arg as u64, 8) {
-                            unsafe {
-                                let ptr = arg as *mut u8;
-                                ptr.write(0);       // mode = VT_AUTO
-                                ptr.add(1).write(0);// waitv
-                                // relsig, acqsig, frsig as i16 = 0
-                                core::ptr::write_unaligned(ptr.add(2) as *mut i16, 0);
-                                core::ptr::write_unaligned(ptr.add(4) as *mut i16, 0);
-                                core::ptr::write_unaligned(ptr.add(6) as *mut i16, 0);
-                            }
-                        }
-                        Ok(0)
-                    }
-                    0x5602 => { // VT_SETMODE — accept and ignore
-                        Ok(0)
-                    }
-                    0x5604 => { // VT_RELDISP — release/acquire display
-                        Ok(0)
-                    }
-                    0x5605 | 0x5606 | 0x5607 => Ok(0), // VT_ACTIVATE, VT_WAITACTIVE, VT_DISALLOCATE stubs
-                    0x5608 | 0x5609 => Ok(0), // VT_RESIZE, VT_RESIZEX stubs
-                    0x4B3A => { // KDGETMODE
-                        if arg < 0x1000 { return Ok(0); }
-                        let mode = unsafe { &mut *(arg as *mut u32) };
-                        *mode = 0; // KD_TEXT
-                        Ok(0)
-                    }
-                    0x4B3B => Ok(0), // KDSETMODE
-                    0x4B44 => { // KDGKBMODE
-                        let mode = unsafe { &mut *(arg as *mut u32) };
-                        *mode = 3; // K_UNICODE
-                        Ok(0)
-                    }
-                    0x4B45 | 0x540E => Ok(0), // KDSKBMODE, TIOCSCTTY stubs
-                    0x4B46 | 0x4B47 | 0x4B4D | 0x4B33 => Ok(0), // KDSKBMUTE, KDSKBENT, KDGKBENT, KDGKBLED
-                    _ => Err(scheme_error::ENOSYS)
+                    _ => Ok(0)
                 }
             }
             _ => Err(scheme_error::ENOSYS),
@@ -2230,175 +2387,69 @@ impl Scheme for FileSystemScheme {
     fn fmap(&self, id: usize, offset: usize, len: usize) -> Result<usize, usize> {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
-        
         match open_file {
             OpenFile::Framebuffer => {
                 let fb_info = &crate::boot::get_boot_info().framebuffer;
-                if fb_info.base_address == 0 {
-                    return Err(scheme_error::EIO);
-                }
+                if fb_info.base_address == 0 { return Err(scheme_error::EIO); }
                 Ok(fb_info.base_address as usize)
             }
             OpenFile::Drm { resource_id } => {
-                let res_id = *resource_id;
-                drop(open_files);
-                let drm = crate::drm_scheme::DrmScheme;
-                drm.fmap(res_id, offset, len)
-            }
-            OpenFile::Virtual { path, .. } => {
-                let vtmp = VIRTUAL_TMP.lock();
-                if let Some(content) = vtmp.get(path) {
-                    let ptr = content.as_ptr() as u64;
-                    if content.is_empty() {
-                         return Err(scheme_error::EINVAL);
-                    }
-                    let phys = crate::memory::virt_to_phys(ptr);
-                    Ok(phys as usize)
-                } else {
-                    Err(scheme_error::ENOENT)
-                }
-            }
-            OpenFile::Real { inode, size, .. } => {
-                let inode_id = *inode;
-                let device_id = unsafe { FS.disk_scheme_id };
-                let page_idx = offset as u64 / 4096;
-
-                if offset as u64 >= *size {
-                    return Err(scheme_error::EINVAL);
-                }
-                
-                drop(open_files);
-
-                // Ensure page is in cache and valid
-                let page_arc = crate::page_cache::PAGE_CACHE.lock().get_or_create(device_id, inode_id, page_idx * 4096);
-                let mut page = page_arc.lock();
-                if !page.valid {
-                     let mut temp = [0u8; 4096];
-                     let (data_start, _) = Filesystem::get_file_metadata(inode_id).map_err(|_| scheme_error::EIO)?;
-                     let abs_disk_off = data_start + (page_idx * 4096);
-                     if read_bytes_at(abs_disk_off, &mut temp).is_ok() {
-                         page.as_slice_mut().copy_from_slice(&temp);
-                         page.valid = true;
-                         page.dirty = false;
-                     } else {
-                         return Err(scheme_error::EIO);
-                     }
-                }
-                
-                Ok(page.phys_addr as usize)
+                let res_id = *resource_id; drop(open_files);
+                crate::drm_scheme::DrmScheme.fmap(res_id, offset, len)
             }
             _ => Err(scheme_error::ENOSYS),
         }
     }
 
-    fn getdents(&self, id: usize) -> Result<alloc::vec::Vec<alloc::string::String>, usize> {
-        let open_files = OPEN_FILES_SCHEME.lock();
-        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
-        match open_file {
-            OpenFile::Real { inode, .. } => {
-                crate::filesystem::list_dir_children_by_inode(*inode)
-                    .map_err(|_| 1) // 1 = General error
-            }
-            _ => Err(1),
+    fn dup_independent(&self, id: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let existing = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?.clone();
+        for (i, slot) in open_files.iter_mut().enumerate() {
+            if i != id && slot.is_none() { *slot = Some(existing); return Ok(i); }
         }
+        let new_id = open_files.len(); open_files.push(Some(existing)); Ok(new_id)
     }
 
-    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
-        let open_files = OPEN_FILES_SCHEME.lock();
-        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
-        
-        match open_file {
-            OpenFile::Real { inode, size, .. } => {
-                stat.ino = *inode as u64;
-                stat.size = *size;
-                stat.mode = 0o100644;
-                stat.blksize = BLOCK_SIZE as u32;
-                stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-                Ok(0)
-            }
-            OpenFile::Virtual { path, .. } => {
-                let path_clone = path.clone();
-                drop(open_files);
-                if is_virtual_run_path(&path_clone) {
-                    let vrun = VIRTUAL_RUN.lock();
-                    stat.size = vrun.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
-                } else {
-                    let vtmp = VIRTUAL_TMP.lock();
-                    stat.size = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
-                }
-                Ok(0)
-            }
-            OpenFile::Framebuffer => {
-                let fb_info = &crate::boot::get_boot_info().framebuffer;
-                stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
-                stat.mode = 0o020666;
-                Ok(0)
-            }
-            OpenFile::Drm { .. } => {
-                stat.mode = 0o020666;
-                Ok(0)
-            }
-            OpenFile::Keyboard | OpenFile::Null | OpenFile::Zero | OpenFile::Tty | OpenFile::Random => {
-                stat.mode = 0o020666;
-                Ok(0)
-            }
-            OpenFile::DeviceList => {
-                let names = list_device_names();
-                let mut len = 0;
-                for name in names {
-                    len += name.len() + 1;
-                }
-                stat.mode = 0o444 | 0x4000; // S_IFDIR
-                stat.size = len as u64;
-                Ok(0)
-            }
-        }
+        fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        if let Some(slot) = open_files.get_mut(id) { *slot = None; return Ok(0); }
+        Err(scheme_error::EBADF)
     }
 
     fn mkdir(&self, path: &str, _mode: u32) -> Result<usize, usize> {
         let clean_path = path.trim_start_matches('/');
         if is_virtual_tmp_path(clean_path) {
-            let mut vtmp = VIRTUAL_TMP.lock();
-            vtmp.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
-            return Ok(0);
-        }
-        if is_virtual_run_path(clean_path) {
-            let mut vrun = VIRTUAL_RUN.lock();
-            vrun.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
-            return Ok(0);
-        }
-        Err(scheme_error::ENOSYS)
+            VIRTUAL_TMP.lock().entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
+            Ok(0)
+        } else if is_virtual_run_path(clean_path) {
+            VIRTUAL_RUN.lock().entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
+            Ok(0)
+        } else { Err(scheme_error::ENOSYS) }
     }
 
     fn unlink(&self, path: &str) -> Result<usize, usize> {
         let clean_path = path.trim_start_matches('/');
         if is_virtual_tmp_path(clean_path) {
-            let mut vtmp = VIRTUAL_TMP.lock();
-            if vtmp.remove(&String::from(clean_path)).is_some() { return Ok(0); }
-            return Err(scheme_error::ENOENT);
-        }
-        if is_virtual_run_path(clean_path) {
-            let mut vrun = VIRTUAL_RUN.lock();
-            if vrun.remove(&String::from(clean_path)).is_some() { return Ok(0); }
-            return Err(scheme_error::ENOENT);
-        }
-        Err(scheme_error::ENOSYS)
+            if VIRTUAL_TMP.lock().remove(&String::from(clean_path)).is_some() { Ok(0) }
+            else { Err(scheme_error::ENOENT) }
+        } else if is_virtual_run_path(clean_path) {
+            if VIRTUAL_RUN.lock().remove(&String::from(clean_path)).is_some() { Ok(0) }
+            else { Err(scheme_error::ENOENT) }
+        } else { Err(scheme_error::ENOSYS) }
     }
 
     fn rename(&self, old_path: &str, new_path: &str) -> Result<usize, usize> {
         let old_key = old_path.trim_start_matches('/');
         let new_key = new_path.trim_start_matches('/');
-        
         if is_virtual_tmp_path(old_key) && is_virtual_tmp_path(new_key) {
             let mut vtmp = VIRTUAL_TMP.lock();
             if let Some(data) = vtmp.remove(&String::from(old_key)) {
-                vtmp.insert(String::from(new_key), data);
-                return Ok(0);
-            }
-        }
-        Err(scheme_error::ENOSYS)
+                vtmp.insert(String::from(new_key), data); Ok(0)
+            } else { Err(scheme_error::ENOENT) }
+        } else { Err(scheme_error::ENOSYS) }
     }
 }
+
 
 
 
