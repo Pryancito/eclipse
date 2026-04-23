@@ -203,7 +203,7 @@ impl Process {
             resources,
             fs_base: 0,
             gs_base: 0,
-            is_linux: false,
+            is_linux: true,
             wake_tick: 0,
             name: [0; 16],
             cpu_ticks: 0,
@@ -614,11 +614,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                         proc.fs_base = loaded.tls_base;
                     }
                     proc.dynamic_linker_aux = loaded.dynamic_linker;
-                    // All user-space binaries (both Eclipse-native and Linux/musl cross-compiled)
-                    // use the Linux ABI error convention (-errno in RAX).  Setting is_linux=true
-                    // makes the kernel return proper Linux errno values (e.g. ENOENT = -2) instead
-                    // of the generic u64::MAX (= EPERM) that was returned before.
-                    proc.is_linux = true;
+                    // is_linux is always true (all processes use Linux/musl ABI)
                 }
             }
         });
@@ -1191,7 +1187,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.fs_base = parent.fs_base;
                 child.dynamic_linker_aux = parent.dynamic_linker_aux;
                 child.gs_base = parent.gs_base;
-                child.is_linux = parent.is_linux;
+                // is_linux always true (all processes use Linux/musl ABI)
                 child.priority = parent.priority;
                 child.time_slice = parent.time_slice;
                 child.stack_base = parent.stack_base;
@@ -1299,7 +1295,7 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
                 child.fs_base = parent.fs_base;
                 child.dynamic_linker_aux = parent.dynamic_linker_aux;
                 child.gs_base = parent.gs_base;
-                child.is_linux = parent.is_linux;
+                // is_linux always true (all processes use Linux/musl ABI)
                 child.priority = parent.priority;
                 child.time_slice = parent.time_slice;
                 child.stack_base = parent.stack_base;

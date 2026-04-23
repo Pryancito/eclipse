@@ -963,8 +963,7 @@ fn load_elf_provider(provider: &dyn ElfDataProvider) -> Option<ProcessId> {
                 p.fs_base = loaded.tls_base;
             }
             p.dynamic_linker_aux = loaded.dynamic_linker;
-            // All user-space binaries use Linux ABI error convention.
-            p.is_linux = true;
+            // is_linux always true (all processes use Linux/musl ABI)
         }
     });
 

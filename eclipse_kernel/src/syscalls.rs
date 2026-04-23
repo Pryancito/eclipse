@@ -446,10 +446,7 @@ fn linux_abi_error(errno: i32) -> u64 {
 
 #[inline]
 fn syscall_error_for_current_process(errno: i32) -> u64 {
-    match crate::process::current_process_id().and_then(|pid| crate::process::get_process(pid)) {
-        Some(p) if p.is_linux => linux_abi_error(errno),
-        _ => u64::MAX,
-    }
+    linux_abi_error(errno)
 }
 
 /// Handler principal de syscalls
@@ -1861,11 +1858,6 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     stats.fork_calls += 1;
     drop(stats);
 
-    let linux_abi = process::current_process_id()
-        .and_then(process::get_process)
-        .map(|p| p.is_linux)
-        .unwrap_or(false);
-
     // Create child process with modified context
     // The child needs to see RAX=0 (return value of fork)
     let mut child_context = *context;
@@ -1878,11 +1870,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
         }
         None => {
             serial::serial_print("[SYSCALL] fork() failed - could not create child\n");
-            if linux_abi {
-                linux_abi_error(11)
-            } else {
-                u64::MAX
-            }
+            linux_abi_error(11) // EAGAIN
         }
     }
 }
@@ -4101,9 +4089,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
         | CLONE_CHILD_SETTID
         | CLONE_IO;
 
-    let linux_clone_caller = process::get_process(ppid)
-        .map(|p| p.is_linux)
-        .unwrap_or(false);
+    // All processes use the Linux/musl ABI — always return Linux errno values.
 
     // Fork-style clone: CLONE_THREAD not set → fork(2) / vfork vía clone.
     // - Linux exige `CLONE_VM` con `CLONE_VFORK` (EINVAL si no).
@@ -4116,11 +4102,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                 "[CLONE] fork-style EINVAL: CLONE_VFORK without CLONE_VM pid={}\n",
                 ppid
             ));
-            return if linux_clone_caller {
-                linux_abi_error(22)
-            } else {
-                u64::MAX
-            };
+            return linux_abi_error(22); // EINVAL
         }
         if flags & !FORK_STYLE_CLONE_ALLOWED != 0 {
             serial::serial_printf(format_args!(
@@ -4128,11 +4110,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                 ppid,
                 flags & !FORK_STYLE_CLONE_ALLOWED
             ));
-            return if linux_clone_caller {
-                linux_abi_error(22)
-            } else {
-                u64::MAX
-            };
+            return linux_abi_error(22); // EINVAL
         }
 
         let vfork_block_parent =
@@ -4152,11 +4130,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                         "[CLONE] vfork shared-vm FAIL pid={}\n",
                         ppid
                     ));
-                    return if linux_clone_caller {
-                        linux_abi_error(11)
-                    } else {
-                        u64::MAX
-                    };
+                    return linux_abi_error(11); // EAGAIN
                 }
             }
         } else {
@@ -4167,11 +4141,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                         "[CLONE] fork FAIL pid={} flags={:#x} exit_signal={}\n",
                         ppid, flags, exit_signal
                     ));
-                    return if linux_clone_caller {
-                        linux_abi_error(11)
-                    } else {
-                        u64::MAX
-                    };
+                    return linux_abi_error(11); // EAGAIN
                 }
             }
         };
@@ -4224,7 +4194,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
             ppid,
             flags & !allowed
         ));
-        return u64::MAX;
+        return linux_abi_error(22); // EINVAL
     }
 
     serial::serial_printf(format_args!(
@@ -4271,7 +4241,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
             } else {
                 thread.fs_base = parent.fs_base;
             }
-            thread.is_linux = parent.is_linux;
+            // is_linux always true (all processes use Linux/musl ABI)
             
             // Copy registers from the current syscall context
             thread.context = *context;
@@ -4425,7 +4395,7 @@ fn sys_thread_create(stack_top: u64, entry: u64, arg: u64, context: &process::Co
             thread.time_slice = parent.time_slice;
             thread.parent_pid = Some(parent_pid);
             thread.fs_base = parent.fs_base;
-            thread.is_linux = parent.is_linux;
+            // is_linux always true (all processes use Linux/musl ABI)
 
             // Initialize thread context from syscall context
             thread.context = *context;
