@@ -59,6 +59,7 @@ mod net;
 mod sys_scheme;
 pub mod drm_scheme; // DRM scheme for ioctl
 mod input_scheme;
+mod page_cache;
 
 #[cfg(not(test))]
 #[global_allocator]

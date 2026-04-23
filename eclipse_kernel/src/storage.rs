@@ -143,24 +143,27 @@ impl Scheme for DiskScheme {
             let block_num = abs_offset / 4096;
             let offset_in_block = (abs_offset % 4096) as usize;
 
-            let mut temp = [0u8; 4096];
-            if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
-                crate::serial::serial_print("[DISK-SCHEME] read failed: disk:");
-                crate::serial::serial_print_dec(disk.disk_idx as u64);
-                crate::serial::serial_print(" block=");
-                crate::serial::serial_print_dec(block_num);
-                return if total > 0 {
-                    Ok(total)
-                } else {
-                    Err(scheme_error::EIO)
-                };
+            // Use Page Cache instead of old bcache
+            let page_arc = crate::page_cache::PAGE_CACHE.lock()
+                .get_or_create(disk.disk_idx, 0, block_num * 4096);
+            let mut page = page_arc.lock();
+
+            // If we are reading and the page is not in the cache (or just allocated),
+            // we should fill it.
+            if !page.valid {
+                 let mut temp = [0u8; 4096];
+                 if get_device(disk.disk_idx).unwrap().read(block_num, &mut temp).is_ok() {
+                     page.as_slice_mut().copy_from_slice(&temp);
+                     page.valid = true;
+                     page.dirty = false;
+                 }
             }
 
             let chunk_remaining = read_len - total;
             let available = 4096 - offset_in_block;
             let to_copy = core::cmp::min(chunk_remaining, available);
             buffer[total..total + to_copy]
-                .copy_from_slice(&temp[offset_in_block..offset_in_block + to_copy]);
+                .copy_from_slice(&page.as_slice()[offset_in_block..offset_in_block + to_copy]);
             total += to_copy;
         }
         Ok(total)
@@ -194,37 +197,22 @@ impl Scheme for DiskScheme {
             let available = 4096 - offset_in_block;
             let to_copy = core::cmp::min(chunk_remaining, available);
 
-            let full_aligned_block = offset_in_block == 0 && to_copy == 4096;
-            let write_failed = if full_aligned_block {
-                crate::bcache::write_block(
-                    disk.disk_idx,
-                    block_num,
-                    &buffer[total..total + 4096],
-                )
-                .is_err()
-            } else {
-                let mut temp = [0u8; 4096];
-                if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
-                    true
-                } else {
-                    temp[offset_in_block..offset_in_block + to_copy]
-                        .copy_from_slice(&buffer[total..total + to_copy]);
-                    crate::bcache::write_block(disk.disk_idx, block_num, &temp).is_err()
-                }
-            };
-
-            if write_failed {
-                return if total > 0 {
-                    Ok(total)
-                } else {
-                    crate::serial::serial_print("[DISK-SCHEME] write failed: disk:");
-                    crate::serial::serial_print_dec(disk.disk_idx as u64);
-                    crate::serial::serial_print(" block=");
-                    crate::serial::serial_print_dec(block_num);
-                    crate::serial::serial_print("\n");
-                    Err(scheme_error::EIO)
-                };
+            // Write through Page Cache
+            let page_arc = crate::page_cache::PAGE_CACHE.lock()
+                .get_or_create(disk.disk_idx, 0, block_num * 4096);
+            let mut page = page_arc.lock();
+            
+            // If partial write, we need to read first
+            if to_copy < 4096 && !page.valid {
+                 let mut temp = [0u8; 4096];
+                 let _ = get_device(disk.disk_idx).unwrap().read(block_num, &mut temp);
+                 page.as_slice_mut().copy_from_slice(&temp);
+                 page.valid = true;
             }
+
+            page.as_slice_mut()[offset_in_block..offset_in_block + to_copy]
+                .copy_from_slice(&buffer[total..total + to_copy]);
+            page.dirty = true;
 
             total += to_copy;
         }

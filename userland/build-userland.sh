@@ -1650,7 +1650,8 @@ build_xfwl4() {
 		--prefix="$ECLIPSE_SYSROOT/usr" \
 		"-Dbuildtype=$ECLIPSE_MESON_BUILDTYPE" \
 		"-Declipse_sysroot=$ECLIPSE_SYSROOT" \
-		-Dbackends=udev,winit -Dxwayland=false
+		-Dbackends=udev,winit,x11 -Dxwayland=true \
+		"-Dwayland-session-prefix=$ECLIPSE_SYSROOT/usr"
 
 	info "Compilando xfwl4..."
 	ninja -C "$bld"

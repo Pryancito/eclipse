@@ -3869,4 +3869,17 @@ dist-hook dist-hook-all:
 #### ...... x86_64-pc-linux-musl
 #### ...... x86_64-pc-linux-musl
 #### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
+#### ...... x86_64-pc-linux-musl
 ####  |x86_64-pc-linux-musl

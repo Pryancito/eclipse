@@ -46,6 +46,7 @@ pub mod eventfd;
 pub mod signalfd;
 pub mod timerfd;
 pub mod usb_hid;
+pub mod page_cache;
 mod elf_loader;
 pub mod acpi;
 pub mod apic;

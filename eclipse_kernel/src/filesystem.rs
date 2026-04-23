@@ -92,9 +92,15 @@ impl DirCacheState {
 
 static DIR_CACHE: spin::Mutex<DirCacheState> = spin::Mutex::new(DirCacheState::new());
 
+/// In-memory map for LFS: inode_id -> disk_offset (bytes)
+static INODE_MAP: spin::Mutex<alloc::collections::BTreeMap<u32, u64>> = spin::Mutex::new(alloc::collections::BTreeMap::new());
+
 /// Global lock for filesystem operations to prevent SMP race conditions.
 /// This protects the static `FS` state and ensures atomicity of `lseek` + `read/write` sequences.
 static FILESYSTEM_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
+
+/// B-Tree Cache for directory indexing: inode_id -> BTree
+static BTREE_CACHE: spin::Mutex<alloc::collections::BTreeMap<u32, alloc::sync::Arc<eclipsefs_lib::btree::BTree>>> = spin::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// Filesystem state
 pub struct Filesystem {
@@ -105,6 +111,8 @@ pub struct Filesystem {
     disk_resource_id: usize,
     partition_offset: u64,
     inode_cache: InodeCache,
+    log_tail: u64,  // Next available block for append in LFS
+    use_lfs: bool,   // Whether LFS mode is enabled
 }
 
 static mut FS: Filesystem = Filesystem {
@@ -115,6 +123,8 @@ static mut FS: Filesystem = Filesystem {
     disk_resource_id: 0,
     partition_offset: 0,
     inode_cache: InodeCache::new(),
+    log_tail: 0,
+    use_lfs: false,
 };
 
 /// Read a range of bytes directly from disk, potentially spanning block boundaries.
@@ -293,9 +303,16 @@ impl Filesystem {
                     return Err("Filesystem too large (inodes overlap with DevFS)");
                 }
                 
-                FS.header = Some(header);
+                FS.header = Some(header.clone());
                 FS.mounted = true;
                 
+                // Initialize LFS: log starts after the initial inode table
+                FS.use_lfs = true;
+                FS.log_tail = (header.inode_table_offset + header.inode_table_size + 4095) / 4096;
+                serial::serial_print("[FS] LFS Mode Enabled. Log Tail initialized at block ");
+                serial::serial_print_dec(FS.log_tail);
+                serial::serial_print("\n");
+
                 serial::serial_print("[FS] Filesystem mounted successfully.\n");
 
                 Ok(())
@@ -323,6 +340,13 @@ impl Filesystem {
             
             if inode < 1 || inode > header.total_inodes {
                 return Err("Inode out of range");
+            }
+
+            // 0. Check LFS Inode Map
+            if FS.use_lfs {
+                if let Some(&offset) = INODE_MAP.lock().get(&inode) {
+                    return Ok(InodeTableEntry::new(inode as u64, offset));
+                }
             }
             
             // 1. Check Inode Cache
@@ -473,8 +497,13 @@ impl Filesystem {
     /// - offset: Offset within the file content (not block offset)
     /// 
     /// Returns: Number of bytes written
+    /// Write file by inode (handles LFS redirection)
     pub fn write_file_by_inode(inode: u32, data: &[u8], offset: u64) -> Result<usize, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
+        if unsafe { FS.use_lfs } {
+            return Self::write_file_lfs(inode, data, offset);
+        }
+        
         let entry = Self::read_inode_entry(inode)?;
         
         let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
@@ -917,9 +946,47 @@ impl Filesystem {
                 data
             };
          
-            if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
-                serial::serial_printf(format_args!("[FS] Found '{}' -> inode {}\n", part, inode));
-                current_inode = inode;
+            // Use B-Tree for lookup
+            let next_inode = {
+                let mut cache = BTREE_CACHE.lock();
+                let btree = if let Some(bt) = cache.get(&current_inode) {
+                    alloc::sync::Arc::clone(bt)
+                } else {
+                    // Build BTree from record_data
+                    let mut bt = eclipsefs_lib::btree::BTree::new();
+                    // Simple parse to fill BTree (reusing logic from find_child_in_dir)
+                    let data = &record_data[8..];
+                    let mut tlv_pos = 0usize;
+                    while tlv_pos + 6 <= data.len() {
+                        let tag = u16::from_le_bytes([data[tlv_pos], data[tlv_pos + 1]]);
+                        let length = u32::from_le_bytes([data[tlv_pos+2], data[tlv_pos+3], data[tlv_pos+4], data[tlv_pos+5]]) as usize;
+                        if tag == tlv_tags::DIRECTORY_ENTRIES && tlv_pos + 6 + length <= data.len() {
+                            let dir_data = &data[tlv_pos + 6..tlv_pos + 6 + length];
+                            let mut dir_off = 0usize;
+                            while dir_off + 8 <= dir_data.len() {
+                                let name_len = u32::from_le_bytes([dir_data[dir_off], dir_data[dir_off+1], dir_data[dir_off+2], dir_data[dir_off+3]]) as usize;
+                                let child_inode = u32::from_le_bytes([dir_data[dir_off+4], dir_data[dir_off+5], dir_data[dir_off+6], dir_data[dir_off+7]]);
+                                if name_len > 0 && dir_off + 8 + name_len <= dir_data.len() {
+                                    let name_bytes = &dir_data[dir_off + 8..dir_off + 8 + name_len];
+                                    if let Ok(name) = core::str::from_utf8(name_bytes) {
+                                        let _ = bt.insert(alloc::string::String::from(name), child_inode);
+                                    }
+                                }
+                                dir_off += 8 + name_len;
+                            }
+                        }
+                        tlv_pos += 6 + length;
+                    }
+                    let arc_bt = alloc::sync::Arc::new(bt);
+                    cache.insert(current_inode, alloc::sync::Arc::clone(&arc_bt));
+                    arc_bt
+                };
+                btree.search(part)
+            };
+
+            if let Some(ino) = next_inode {
+                serial::serial_printf(format_args!("[FS] Found '{}' -> inode {} (via B-Tree)\n", part, ino));
+                current_inode = ino;
             } else {
                 serial::serial_printf(format_args!("[FS] Child '{}' not found in directory\n", part));
                 return Err("File not found");
@@ -959,6 +1026,56 @@ impl Filesystem {
         }
         Err("Too many symlink levels")
     }
+
+    /// LFS Write: Append new version of the record to the log
+    fn write_file_lfs(inode: u32, data: &[u8], offset: u64) -> Result<usize, &'static str> {
+        let entry = Self::read_inode_entry(inode)?;
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+        
+        // Read old record
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
+        let record_size = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]) as usize;
+        
+        if record_size > MAX_RECORD_SIZE { return Err("Record too large"); }
+        let mut record_data = vec![0u8; record_size];
+        read_bytes_at(abs_disk_offset, &mut record_data)?;
+        
+        // Find CONTENT TLV
+        let mut tlv_offset = 8; // skip 8-byte record header
+        let mut found = false;
+        while tlv_offset + 6 <= record_size {
+            let tag = u16::from_le_bytes([record_data[tlv_offset], record_data[tlv_offset+1]]);
+            let length = u32::from_le_bytes([record_data[tlv_offset+2], record_data[tlv_offset+3], record_data[tlv_offset+4], record_data[tlv_offset+5]]) as usize;
+            
+            if tag == tlv_tags::CONTENT {
+                if offset as usize + data.len() > length {
+                    return Err("LFS Write: Expansion not yet supported");
+                }
+                record_data[tlv_offset + 6 + offset as usize .. tlv_offset + 6 + offset as usize + data.len()].copy_from_slice(data);
+                found = true;
+                break;
+            }
+            tlv_offset += 6 + length;
+        }
+        
+        if !found { return Err("No CONTENT TLV found"); }
+        
+        // Write new version to log tail
+        let new_abs_offset = unsafe { (FS.log_tail + FS.partition_offset) * BLOCK_SIZE as u64 };
+        write_bytes_at(new_abs_offset, &record_data)?;
+        
+        // Update state
+        unsafe {
+            let blocks_used = (record_size as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+            FS.log_tail += blocks_used;
+        }
+        INODE_MAP.lock().insert(inode, new_abs_offset / BLOCK_SIZE as u64 * BLOCK_SIZE as u64 - (unsafe { FS.partition_offset } * BLOCK_SIZE as u64));
+        
+        serial::serial_printf(format_args!("[LFS] Inode {} updated at log_tail={}, new_offset={}\n", inode, unsafe { FS.log_tail }, new_abs_offset));
+        
+        Ok(data.len())
+    }
 }
 
 
@@ -971,7 +1088,6 @@ impl Filesystem {
 /// without any hard-coded index.
 pub fn init() {
     serial::serial_print("[FS] Initializing filesystem subsystem...\n");
-    crate::bcache::init();
     let fs_scheme = alloc::sync::Arc::new(FileSystemScheme);
     crate::scheme::register_scheme("file", fs_scheme.clone());
     crate::scheme::register_scheme("dev", fs_scheme);
@@ -1578,21 +1694,48 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode: _, data_start_abs, size } => {
+            OpenFile::Real { inode, data_start_abs: _, size } => {
                 let current_off = offset;
                 let file_size = *size;
-                
+                let inode_id = *inode;
+                let device_id = unsafe { FS.disk_scheme_id }; // Using scheme_id as device proxy for now
+
                 if current_off >= file_size {
                     return Ok(0);
                 }
-                
-                let read_len = core::cmp::min(buffer.len(), (file_size - current_off) as usize);
-                let abs_disk_read_offset = *data_start_abs + current_off;
-                
-                match read_bytes_at(abs_disk_read_offset, &mut buffer[..read_len]) {
-                    Ok(_) => Ok(read_len),
-                    Err(_) => Err(scheme_error::EIO),
+
+                let max_read = core::cmp::min(buffer.len(), (file_size - current_off) as usize);
+                let mut total_read = 0usize;
+
+                while total_read < max_read {
+                    let file_off = current_off + total_read as u64;
+                    let page_idx = file_off / 4096;
+                    let off_in_page = (file_off % 4096) as usize;
+                    let take = core::cmp::min(max_read - total_read, 4096 - off_in_page);
+
+                    // Use Page Cache
+                    let page_arc = crate::page_cache::PAGE_CACHE.lock().get_or_create(device_id, inode_id, page_idx * 4096);
+                    let mut page = page_arc.lock();
+
+                    // If page is fresh, fill it from disk
+                    if !page.valid {
+                         let mut temp = [0u8; 4096];
+                         // We still need to know WHERE the page is on disk.
+                         // For now, LFS logic is not fully here, so we use the old contiguous mapping.
+                         let (data_start, _) = Filesystem::get_file_metadata(inode_id).map_err(|_| scheme_error::EIO)?;
+                         let abs_disk_off = data_start + (page_idx * 4096);
+                         if read_bytes_at(abs_disk_off, &mut temp).is_ok() {
+                             page.as_slice_mut().copy_from_slice(&temp);
+                             page.valid = true;
+                             page.dirty = false;
+                         }
+                    }
+
+                    buffer[total_read..total_read + take].copy_from_slice(&page.as_slice()[off_in_page..off_in_page + take]);
+                    total_read += take;
                 }
+
+                Ok(total_read)
             }
 
             OpenFile::Virtual { path } => {
@@ -1979,6 +2122,35 @@ impl Scheme for FileSystemScheme {
                 } else {
                     Err(scheme_error::ENOENT)
                 }
+            }
+            OpenFile::Real { inode, size, .. } => {
+                let inode_id = *inode;
+                let device_id = unsafe { FS.disk_scheme_id };
+                let page_idx = offset as u64 / 4096;
+
+                if offset as u64 >= *size {
+                    return Err(scheme_error::EINVAL);
+                }
+                
+                drop(open_files);
+
+                // Ensure page is in cache and valid
+                let page_arc = crate::page_cache::PAGE_CACHE.lock().get_or_create(device_id, inode_id, page_idx * 4096);
+                let mut page = page_arc.lock();
+                if !page.valid {
+                     let mut temp = [0u8; 4096];
+                     let (data_start, _) = Filesystem::get_file_metadata(inode_id).map_err(|_| scheme_error::EIO)?;
+                     let abs_disk_off = data_start + (page_idx * 4096);
+                     if read_bytes_at(abs_disk_off, &mut temp).is_ok() {
+                         page.as_slice_mut().copy_from_slice(&temp);
+                         page.valid = true;
+                         page.dirty = false;
+                     } else {
+                         return Err(scheme_error::EIO);
+                     }
+                }
+                
+                Ok(page.phys_addr as usize)
             }
             _ => Err(scheme_error::ENOSYS),
         }

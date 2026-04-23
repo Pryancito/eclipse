@@ -179,7 +179,6 @@ pub mod compression;
 pub mod cow;
 #[cfg(feature = "std")]
 pub mod merkle;
-#[cfg(feature = "std")]
 pub mod btree;
 #[cfg(feature = "std")]
 pub mod dedup;

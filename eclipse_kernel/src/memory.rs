@@ -1255,7 +1255,7 @@ pub const GPU_RPC_PHYS_BASE: u64 = 0x2200_0000; // 544MB
 pub const GPU_RPC_MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB for queues
 
 static FREE_FRAMES_LOCK: Mutex<()> = Mutex::new(());
-static mut FREE_FRAMES_STACK: [u64; 1024] = [0; 1024];
+static mut FREE_FRAMES_HEAD: u64 = 0;
 static mut FREE_FRAMES_COUNT: usize = 0;
 
 pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
@@ -1263,19 +1263,19 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = FREE_FRAMES_LOCK.lock();
         unsafe {
-            if FREE_FRAMES_COUNT > 0 {
+            if FREE_FRAMES_HEAD != 0 {
+                let phys = FREE_FRAMES_HEAD;
+                frame = Some(phys);
+                
+                // Read the 'next' pointer from the frame using HHDM
+                let virt = phys_to_virt(phys) as *const u64;
+                FREE_FRAMES_HEAD = core::ptr::read_volatile(virt);
                 FREE_FRAMES_COUNT -= 1;
-                frame = Some(FREE_FRAMES_STACK[FREE_FRAMES_COUNT]);
             }
         }
     });
 
     if let Some(f) = frame {
-        // Reutilización: el contenido viejo se pisa al mapear a user (`handle_anon` /
-        // `sys_mmap` ansioso/`brk`/ELF… suelen poner a cero; no tocar aquí con HHDM: el
-        // mapa lineal 0xFFFF9000+phys **no** garantiza un PTE para cada 4K de RAM
-        // reportada como "convencional", y `write_bytes` vía `PHYS_MEM_OFFSET+phys`
-        // en marcos aún no mapeados en el HHDM dispara #14 en **ring 0** (RIP en kernel).
         notify_ai_memory_stats();
         return Some(f);
     }
@@ -1286,28 +1286,34 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     if frame_phys >= pool_end {
         return None;
     }
-    // El cero inicial lo hacen `handle_anon_page_fault` y el camino no-perezoso de
-    // `mmap` al instalar el PTE, sin leer/escribir en HHDM hacia memoria no cubierta.
     notify_ai_memory_stats();
     Some(frame_phys)
 }
 
 pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
-    if phys_addr < anon_mmap_pool_start() || phys_addr >= anon_mmap_pool_end() {
+    if !is_frame_managed(phys_addr) {
         return;
     }
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = FREE_FRAMES_LOCK.lock();
         unsafe {
-            if FREE_FRAMES_COUNT < 1024 {
-                FREE_FRAMES_STACK[FREE_FRAMES_COUNT] = phys_addr;
-                FREE_FRAMES_COUNT += 1;
-            }
-            // If stack is full, we just leak the frame (better than crashing).
-            // In a real OS we'd use a bitmap or a larger list.
+            // Write the current head into the new free frame
+            let virt = phys_to_virt(phys_addr) as *mut u64;
+            core::ptr::write_volatile(virt, FREE_FRAMES_HEAD);
+            
+            // Update head
+            FREE_FRAMES_HEAD = phys_addr;
+            FREE_FRAMES_COUNT += 1;
         }
     });
     notify_ai_memory_stats();
+}
+
+/// Check if a physical frame belongs to the managed anonymous pool
+pub fn is_frame_managed(phys_addr: u64) -> bool {
+    let start = anon_mmap_pool_start();
+    let end = anon_mmap_pool_end();
+    phys_addr >= start && phys_addr < end && (phys_addr & 0xFFF) == 0
 }
 
 /// Demand-page fault handler.
@@ -1579,9 +1585,6 @@ pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
     if length == 0 { return; }
     let aligned_start = vaddr & !0xFFF;
-    // Clamp the range to user space.  If the caller (sys_munmap / sys_mmap
-    // MAP_FIXED) passes a kernel-space address we must not touch the shared
-    // kernel HHDM page tables.
     if aligned_start >= USER_SPACE_END {
         return;
     }
@@ -1608,7 +1611,10 @@ pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
                 if !pd.entries[pd_idx].present() { page += 4096; continue; }
 
                 if pd.entries[pd_idx].is_huge() {
-                    // 2MB huge page: zero the PD entry and skip the whole 2MB region.
+                    let pa = pd.entries[pd_idx].get_addr();
+                    if is_frame_managed(pa) {
+                        // For now we don't handle huge page freeing (anon pool is 4KB based)
+                    }
                     pd.entries[pd_idx].set_entry(0, 0);
                     x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page));
                     page += 2 * 1024 * 1024;
@@ -1617,7 +1623,7 @@ pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
 
                 let pt = &mut *(phys_to_virt(pd.entries[pd_idx].get_addr()) as *mut PageTable);
                 let phys_addr = pt.entries[pt_idx].get_addr();
-                if phys_addr != 0 {
+                if phys_addr != 0 && is_frame_managed(phys_addr) {
                     free_phys_frame_for_anon_mmap(phys_addr);
                 }
                 pt.entries[pt_idx].set_entry(0, 0);
@@ -1627,6 +1633,86 @@ pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
             page += 4096;
         }
     });
+}
+
+/// Recursively tear down a process's page table and free all managed physical frames.
+pub fn teardown_process_paging(pml4_phys: u64) {
+    if pml4_phys == 0 || pml4_phys == get_kernel_cr3() {
+        return;
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        unsafe {
+            let pml4_virt = phys_to_virt(pml4_phys);
+            let pml4 = &mut *(pml4_virt as *mut PageTable);
+
+            // We only need to tear down PML4[0] (user space)
+            let user_pml4_idx = 0;
+            if pml4.entries[user_pml4_idx].present() {
+                let pdpt_phys = pml4.entries[user_pml4_idx].get_addr();
+                teardown_pdpt(pdpt_phys);
+                pml4.entries[user_pml4_idx].set_entry(0, 0);
+                
+                // Free the PDPT table frame itself (it was allocated via alloc_dma_buffer)
+                // Wait, pdpt_phys was allocated via alloc_dma_buffer which uses the kernel heap.
+                // We should free it back to the kernel heap.
+                free_dma_buffer(phys_to_virt(pdpt_phys) as *mut u8, 4096, 4096);
+            }
+            
+            // PML4 itself was also allocated via alloc_dma_buffer
+            free_dma_buffer(pml4_virt as *mut u8, 4096, 4096);
+        }
+    });
+}
+
+unsafe fn teardown_pdpt(pdpt_phys: u64) {
+    let pdpt = &mut *(phys_to_virt(pdpt_phys) as *mut PageTable);
+    for entry in pdpt.entries.iter_mut() {
+        if entry.present() {
+            let pa = entry.get_addr();
+            if entry.is_huge() {
+                if is_frame_managed(pa) {
+                    // Huge page reclamation (not implemented for anon pool)
+                }
+            } else {
+                teardown_pd(pa);
+                free_dma_buffer(phys_to_virt(pa) as *mut u8, 4096, 4096);
+            }
+            entry.set_entry(0, 0);
+        }
+    }
+}
+
+unsafe fn teardown_pd(pd_phys: u64) {
+    let pd = &mut *(phys_to_virt(pd_phys) as *mut PageTable);
+    for entry in pd.entries.iter_mut() {
+        if entry.present() {
+            let pa = entry.get_addr();
+            if entry.is_huge() {
+                if is_frame_managed(pa) {
+                    // Huge page reclamation (not implemented for anon pool)
+                }
+            } else {
+                teardown_pt(pa);
+                free_dma_buffer(phys_to_virt(pa) as *mut u8, 4096, 4096);
+            }
+            entry.set_entry(0, 0);
+        }
+    }
+}
+
+unsafe fn teardown_pt(pt_phys: u64) {
+    let pt = &mut *(phys_to_virt(pt_phys) as *mut PageTable);
+    for entry in pt.entries.iter_mut() {
+        if entry.present() {
+            let pa = entry.get_addr();
+            if is_frame_managed(pa) {
+                free_phys_frame_for_anon_mmap(pa);
+            }
+            entry.set_entry(0, 0);
+        }
+    }
 }
 
 /// Map a physical MMIO range into the kernel's virtual address space.

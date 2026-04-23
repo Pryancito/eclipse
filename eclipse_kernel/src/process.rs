@@ -115,6 +115,14 @@ impl ProcessResources {
     }
 }
 
+impl Drop for ProcessResources {
+    fn drop(&mut self) {
+        // Free the page table and all mapped physical frames.
+        // teardown_process_paging safely ignores the kernel page table.
+        crate::memory::teardown_process_paging(self.page_table_phys);
+    }
+}
+
 impl Context {
     pub const fn new() -> Self {
         Self {
@@ -136,6 +144,8 @@ pub struct Process {
     pub stack_base: u64,
     pub stack_size: usize,
     pub priority: u8,
+    pub vruntime: u64,
+    pub weight: u64,
     pub time_slice: u32,
     pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
     pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
@@ -197,6 +207,8 @@ impl Process {
             stack_base: 0,
             stack_size: 0,
             priority: 0,
+            vruntime: 0,
+            weight: 1024, // NICE_0_LOAD
             time_slice: 0,
             parent_pid: None,
             kernel_stack_top: 0,
@@ -488,6 +500,8 @@ pub fn create_process_with_pid(
                 process.stack_base = stack_base;
                 process.stack_size = stack_size;
                 process.priority = 5; 
+                process.vruntime = 0;
+                process.weight = 1024;
                 process.time_slice = 10; 
                 
                 let kernel_stack_top_aligned = kernel_stack_top & !0xF;
@@ -1193,6 +1207,8 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.gs_base = parent.gs_base;
                 child.is_linux = parent.is_linux;
                 child.priority = parent.priority;
+                child.vruntime = parent.vruntime;
+                child.weight = parent.weight;
                 child.time_slice = parent.time_slice;
                 child.stack_base = parent.stack_base;
                 child.stack_size = parent.stack_size;

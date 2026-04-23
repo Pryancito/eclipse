@@ -1,57 +1,98 @@
 //! Scheduler básico round-robin con soporte SMP completo
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process, modify_process};
 use spin::Mutex;
+use alloc::collections::{BTreeMap, VecDeque};
 
 /// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
 pub const MAX_CPUS: usize = 32;
 
 /// Estructura de cola para una CPU
-struct RunQueue {
-    buffer: [Option<ProcessId>; 64],
-    head: usize,
-    tail: usize,
+/// Peso de cada nivel de prioridad (0-9). Basado en la tabla de nice de Linux.
+const PRIO_TO_WEIGHT: [u64; 10] = [
+    88761, 71755, 56483, 46273, 36291, // 0-4 (Alta prioridad)
+    29154, 23254, 18705, 14949, 11916, // 5-9 (Baja prioridad)
+];
+const NICE_0_LOAD: u64 = 29154; // Peso para prioridad 5 (default)
+
+/// Estructura de cola CFS para una CPU
+struct FairRunQueue {
+    tasks: Option<BTreeMap<u64, VecDeque<ProcessId>>>,
+    min_vruntime: u64,
 }
 
-impl RunQueue {
+impl FairRunQueue {
     const fn new() -> Self {
         Self {
-            buffer: [None; 64],
-            head: 0,
-            tail: 0,
+            tasks: None,
+            min_vruntime: 0,
         }
     }
 
-    fn push(&mut self, pid: ProcessId) -> bool {
-        let next_tail = (self.tail + 1) % 64;
-        if next_tail == self.head {
-            return false;
+    fn push(&mut self, pid: ProcessId, vruntime: u64) {
+        if self.tasks.is_none() {
+            self.tasks = Some(BTreeMap::new());
         }
-        self.buffer[self.tail] = Some(pid);
-        self.tail = next_tail;
-        true
+        let tasks = self.tasks.as_mut().unwrap();
+        tasks.entry(vruntime).or_insert_with(VecDeque::new).push_back(pid);
+        
+        // Actualizar min_vruntime si es necesario (el más pequeño de la cola)
+        if vruntime < self.min_vruntime || tasks.len() == 1 {
+            self.min_vruntime = vruntime;
+        }
     }
 
     fn pop(&mut self) -> Option<ProcessId> {
-        if self.head == self.tail {
+        let tasks = if let Some(ref mut t) = self.tasks {
+            t
+        } else {
             return None;
+        };
+
+        let mut first_key = None;
+        let mut pid = None;
+        let mut vruntime_to_set = None;
+
+        if let Some((&vruntime, queue)) = tasks.iter_mut().next() {
+            pid = queue.pop_front();
+            if queue.is_empty() {
+                first_key = Some(vruntime);
+            }
+            if pid.is_some() {
+                vruntime_to_set = Some(vruntime);
+            }
         }
-        let pid = self.buffer[self.head].take();
-        self.head = (self.head + 1) % 64;
+
+        if let Some(v) = vruntime_to_set {
+            self.min_vruntime = v;
+        }
+
+        if let Some(k) = first_key {
+            tasks.remove(&k);
+        }
+
         pid
     }
 }
 
-/// Colas de procesos ready, una por cada CPU para evitar contención de locks.
-static READY_QUEUES: [Mutex<RunQueue>; MAX_CPUS] =
-    [const { Mutex::new(RunQueue::new()) }; MAX_CPUS];
+/// Colas de procesos ready (CFS), una por cada CPU.
+static READY_QUEUES: [Mutex<FairRunQueue>; MAX_CPUS] =
+    [const { Mutex::new(FairRunQueue::new()) }; MAX_CPUS];
 
 /// Contador round-robin para distribuir procesos nuevos entre CPUs.
 static NEW_PROC_RR_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// Contador global de procesos en colas de Ready (para optimizar bucles idle).
 static RUNNABLE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Versiones de las colas para MWAIT/MONITOR (indican si la cola ha cambiado)
+static QUEUE_VERSIONS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+pub fn ready_queue_tail_addr() -> u64 {
+    let cpu_id = crate::process::get_cpu_id();
+    &QUEUE_VERSIONS[cpu_id] as *const _ as u64
+}
 
 /// Contextos idle por CPU para APs.
 /// CPU 0 (BSP) utiliza el contexto del proceso kernel (PID 0) como idle.
@@ -131,7 +172,7 @@ pub fn enqueue_process(pid: ProcessId) {
     };
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let (target_cpu, already_ready) = {
+        let (target_cpu, vruntime) = {
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(p) = table[slot].as_mut() {
                 if p.id != pid { return; }
@@ -153,77 +194,74 @@ pub fn enqueue_process(pid: ProcessId) {
                 let target = if let Some(aff) = p.cpu_affinity {
                     aff as usize % MAX_CPUS
                 } else if p.last_cpu != crate::process::NO_CPU {
-                    // Cache affinity
                     p.last_cpu as usize % MAX_CPUS
                 } else {
-                    // New process or first time enqueuing:
-                    // Use Round-Robin but bias AWAY from current CPU if more than 1 CPU exists.
                     let next = NEW_PROC_RR_CPU.fetch_add(1, Ordering::Relaxed) as usize;
-                    if active_cpus > 1 {
-                        let rr_target = next % active_cpus;
-                        if rr_target == current_cpu {
-                            (rr_target + 1) % active_cpus
-                        } else {
-                            rr_target
-                        }
-                    } else {
-                        0
-                    }
+                    next % active_cpus.max(1)
                 };
-                (target, false)
+
+                // CFS New Task / Wakeup Logic:
+                // If the process was sleeping (Blocked), its vruntime might be very old.
+                // We bump it to be at least min_vruntime of the target queue to avoid
+                // it hogging the CPU for too long, but give it a small bonus for interactivity.
+                let mut queue = READY_QUEUES[target].lock();
+                if p.vruntime < queue.min_vruntime {
+                    // Bonus of 20ms (20 ticks) for waking up
+                    p.vruntime = queue.min_vruntime.saturating_sub(20);
+                }
+                
+                (target, p.vruntime)
             } else {
                 return;
             }
         };
 
         let mut queue = READY_QUEUES[target_cpu].lock();
-        if queue.push(pid) {
-            RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
-        } else {
-            // crate::serial::serial_print("[SCHED] WARNING: RunQueue full\n");
-        }
+        queue.push(pid, vruntime);
+        RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
+        QUEUE_VERSIONS[target_cpu].fetch_add(1, Ordering::SeqCst);
 
-        // Notify only the target CPU if it's not the current one.
         if target_cpu != crate::process::get_cpu_id() {
             let apic_ids = crate::acpi::get_info().apic_ids;
-            let target_apic_id = apic_ids[target_cpu];
-            crate::apic::send_reschedule_ipi(target_apic_id);
+            if target_cpu < apic_ids.len() {
+                let target_apic_id = apic_ids[target_cpu];
+                crate::apic::send_reschedule_ipi(target_apic_id);
+            }
         }
     });
 }
 
-/// Sacar siguiente proceso de la cola ready que cumpla afinidad para esta CPU.
-/// Si un proceso tiene cpu_affinity = Some(n), solo la CPU n puede ejecutarlo.
-/// Si cpu_affinity = None, cualquier CPU puede ejecutarlo.
 fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // 1. Intentar sacar de la cola local (Cache Affinity)
+        // 1. Local queue
         {
             let mut local_q = READY_QUEUES[cpu_id].lock();
             if let Some(pid) = local_q.pop() {
                 RUNNABLE_COUNT.fetch_sub(1, Ordering::SeqCst);
-                // crate::serial::serial_printf(format_args!("[SCHED] C{} dequeued PID {} (LOCAL)\n", cpu_id, pid));
                 return Some(pid);
             }
         }
 
-        // 2. Work Stealing: si mi cola está vacía, buscar en otras.
+        // 2. Work Stealing
         let active_cpus = crate::cpu::get_active_cpu_count();
         if active_cpus <= 1 {
             return None;
         }
 
-        // Límite de robos para evitar O(N) excesivo en sistemas muy grandes
         let steal_limit = core::cmp::min(active_cpus, 8); 
 
         for offset in 1..steal_limit {
             let victim_cpu = (cpu_id + offset) % active_cpus;
             let mut victim_q = READY_QUEUES[victim_cpu].lock();
             
-            if victim_q.head != victim_q.tail {
-                let pid = victim_q.buffer[victim_q.head].unwrap();
-                
-                // DEADLOCK PREVENTION: Use try_lock when holding another lock.
+            // Peek at the first task in the victim's BTreeMap
+            let victim_pid = if let Some(tasks) = victim_q.tasks.as_ref() {
+                tasks.values().next().and_then(|q| q.front().cloned())
+            } else {
+                None
+            };
+
+            if let Some(pid) = victim_pid {
                 let can_steal = if let Some(table) = crate::process::PROCESS_TABLE.try_lock() {
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(p) = table[slot].as_ref() {
@@ -231,7 +269,7 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
                         } else { false }
                     } else { false }
                 } else {
-                    false // Avoid deadlock, skip this victim for now
+                    false 
                 };
 
                 if can_steal {
@@ -239,7 +277,6 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
                     if pid.is_some() {
                         RUNNABLE_COUNT.fetch_sub(1, Ordering::SeqCst);
                     }
-                    // crate::serial::serial_printf(format_args!("[SCHED] C{} STOLE PID {:?} from C{}\n", cpu_id, pid, victim_cpu));
                     return pid;
                 }
             }
@@ -254,7 +291,7 @@ pub fn has_runnable_threads_local() -> bool {
     if cpu_id >= MAX_CPUS { return false; }
     
     let queue = READY_QUEUES[cpu_id].lock();
-    queue.head != queue.tail
+    queue.tasks.as_ref().map_or(false, |t| !t.is_empty())
 }
 
 /// Indica si hay ALGÚN proceso listo en alguna cola del sistema.
@@ -263,11 +300,11 @@ pub fn has_runnable_threads() -> bool {
 }
 
 
-pub fn ready_queue_tail_addr() -> usize {
+pub fn ready_queue_min_vruntime() -> u64 {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let cpu_id = crate::process::get_cpu_id();
         let q = READY_QUEUES[cpu_id].lock();
-        &q.tail as *const usize as usize
+        q.min_vruntime
     })
 }
 
@@ -410,33 +447,40 @@ pub fn schedule() -> u64 {
         let cpu_id = crate::process::get_cpu_id();
         let current_pid = current_process_id();
         let mut should_requeue = false;
+        
         // Paso 1: Si hay un proceso usuario en ejecución (Running), preemptarlo
-        // y meterlo en la cola ready. PID 0 NUNCA se encola globalmente.
+        // y actualizar su vruntime antes de meterlo en la cola ready.
         if let Some(pid) = current_pid {
             if pid != 0 {
                 {
                     let mut table = crate::process::PROCESS_TABLE.lock();
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(process) = table[slot].as_mut() {
-                            if process.id == pid && process.current_cpu == cpu_id as u32 {                                 // Update ticks for any process that was running on this CPU,
-                                 // even if it just blocked or terminated.
-                                 let consumed = unsafe { CPU_INITIAL_QUANTUM[cpu_id].saturating_sub(CPU_QUANTUM[cpu_id]) };
-                                 process.cpu_ticks += consumed as u64;
-                                 
-                                 // Update AI profile burst duration
-                                 process.ai_profile.update_burst(consumed as u64);
+                            if process.id == pid && process.current_cpu == cpu_id as u32 {
+                                // CFS vruntime update
+                                let consumed = unsafe { CPU_INITIAL_QUANTUM[cpu_id].saturating_sub(CPU_QUANTUM[cpu_id]) };
+                                process.cpu_ticks += consumed as u64;
 
-                                 // Reset quantum here so we don't count the same ticks twice.
-                                 // Default is 10, but AI can suggest a different one.
-                                 let next_q = process.ai_profile.predict_burst().max(10).min(50) as u32;
-                                 unsafe { 
-                                     CPU_QUANTUM[cpu_id] = next_q;
-                                     CPU_INITIAL_QUANTUM[cpu_id] = next_q;
-                                 }
-                                 
-                                 if process.state == ProcessState::Running {
-                                     should_requeue = true;
-                                 }
+                                // vruntime += consumed * (NICE_0_LOAD / weight)
+                                let delta_vruntime = (consumed as u64 * NICE_0_LOAD) / process.weight.max(1);
+                                process.vruntime += delta_vruntime;
+                                
+                                // Update AI profile burst duration
+                                process.ai_profile.update_burst(consumed as u64);
+
+                                // Reset quantum based on AI and priority
+                                let base_q = process.ai_profile.predict_burst().max(10).min(50) as u32;
+                                // Give more quantum to high priority tasks
+                                let next_q = (base_q as u64 * process.weight / NICE_0_LOAD).max(5).min(100) as u32;
+
+                                unsafe { 
+                                    CPU_QUANTUM[cpu_id] = next_q;
+                                    CPU_INITIAL_QUANTUM[cpu_id] = next_q;
+                                }
+                                
+                                if process.state == ProcessState::Running {
+                                    should_requeue = true;
+                                }
                             }
                         }
                     }
@@ -448,36 +492,28 @@ pub fn schedule() -> u64 {
             }
         }
 
-        // Paso 2: Obtener el siguiente proceso de la cola (respetando afinidad).
+        // Paso 2: Obtener el siguiente proceso de la cola CFS.
         if let Some(next_pid) = dequeue_for_cpu(cpu_id) {
             if (next_pid as usize) < MAX_PIDS {
                 RUN_COUNTS[next_pid as usize].fetch_add(1, Ordering::Relaxed);
             }
             
-            // ATOMIC OWNERSHIP: Marcar como Running y asignar CPU_ID bajo el lock de la tabla.
-            let mut should_requeue = false;
+            let mut should_requeue_pid = None;
             let next_process_exists = {
                 let mut table = crate::process::PROCESS_TABLE.lock();
-                // Use pid_to_slot_fast: next_pid from the queue is a real PID value that may
-                // can exceed 255 after slot reuse, making table[next_pid as usize] out-of-bounds.
                 if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
                     if let Some(next_process) = table[slot].as_mut() {
                         if next_process.id != next_pid {
-                            // Slot was reused for a different process — discard stale queue entry.
                             false
                         } else if next_process.current_cpu != crate::process::NO_CPU && next_process.current_cpu != cpu_id as u32 {
-                            // Si por algún motivo aún tiene dueño (el core anterior todavía no terminó el switch_context),
-                            // lo devolvemos a la cola y buscamos otro. Esto previene el "Double Run".
-                            should_requeue = true;
+                            should_requeue_pid = Some(next_pid);
                             false
                         } else if next_process.state == ProcessState::Terminated {
-                            // Process was killed (via sys_kill) while still in the ready queue.
-                            // Promoting it to Running would resume a dead process — drop it instead.
                             false
                         } else {
                             next_process.state = ProcessState::Running;
                             next_process.current_cpu = cpu_id as u32;
-                            next_process.last_cpu = cpu_id as u32; // Update cache affinity
+                            next_process.last_cpu = cpu_id as u32; 
                             true
                         }
                     } else {
@@ -488,29 +524,14 @@ pub fn schedule() -> u64 {
                 }
             };
 
-            if should_requeue {
-                // The process has state=Ready (set by enqueue_process when it was first
-                // queued) but was dequeued by this CPU and cannot be run because
-                // current_cpu belongs to another CPU.  Re-insert it directly into the
-                // ring buffer without going through enqueue_process(): that function's
-                // dedup guard (`if p.state == Ready { return; }`) would fire and silently
-                // drop the process, causing permanent starvation.
-                // We hold READY_QUEUE+QUEUE_TAIL+QUEUE_HEAD in a single critical section,
-                // consistent with enqueue_process's lock order, so there is no TOCTOU
-                // window between the state check and the insertion.
-                x86_64::instructions::interrupts::without_interrupts(|| {
-                    let mut queue = READY_QUEUES[cpu_id].lock();
-                    if queue.push(next_pid) {
-                        RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
-                    }
-                });
+            if let Some(requeue_pid) = should_requeue_pid {
+                enqueue_process(requeue_pid);
             }
 
             if next_process_exists {
                 match current_pid {
                     Some(cur) if cur == next_pid => {
-                        // Mismo proceso (único en cola), continúa sin cambio de contexto.
-                        // Reset quantum based on AI prediction
+                        // Mismo proceso
                         let next_q = {
                             let table = crate::process::PROCESS_TABLE.lock();
                             if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
@@ -524,6 +545,7 @@ pub fn schedule() -> u64 {
                         }
                     }
                     Some(cur) => {
+                        // Cambio de contexto
                         let next_q = {
                             let table = crate::process::PROCESS_TABLE.lock();
                             if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
@@ -538,7 +560,7 @@ pub fn schedule() -> u64 {
                         perform_context_switch(cur, next_pid);
                     }
                     None => {
-                        // AP transitioning from idle to first user process.
+                        // Transición desde idle
                         let next_q = {
                             let table = crate::process::PROCESS_TABLE.lock();
                             if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
@@ -550,17 +572,14 @@ pub fn schedule() -> u64 {
                             crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
                             crate::scheduler::CPU_INITIAL_QUANTUM[cpu_id] = next_q;
                         }
-                        // Don't set current_process here; perform_context_switch_to will do it.
+                        
                         if cpu_id < MAX_CPUS {
-                            // Guardar el contexto idle de este AP para poder volver más tarde.
-                            // Safety: cada CPU escribe únicamente su propia ranura [cpu_id].
                             x86_64::instructions::interrupts::without_interrupts(|| {
                                 let idle_ctx = unsafe { &mut AP_IDLE_CONTEXTS[cpu_id] };
                                 AP_IDLE_CONTEXT_VALID[cpu_id].store(true, Ordering::SeqCst);
                                 perform_context_switch_to(idle_ctx, next_pid);
                             });
                         } else {
-                            // cpu_id fuera de rango: fallback al dummy original.
                             x86_64::instructions::interrupts::without_interrupts(|| {
                                 let mut dummy = crate::process::Context::new();
                                 perform_context_switch_to(&mut dummy, next_pid);
@@ -573,11 +592,8 @@ pub fn schedule() -> u64 {
             // Paso 3: No hay procesos listos.
             if let Some(pid) = current_pid {
                 if pid != 0 {
-                    // Estamos ejecutando un proceso de usuario, pero no hay nada más que hacer.
-                    // Debemos sacarlo de la CPU para que el núcleo pueda entrar en modo idle (HLT/MWAIT).
-                    
                     if cpu_id == 0 {
-                        // BSP: volver al proceso kernel (PID 0) que actúa como idle.
+                        // BSP: volver al proceso kernel (PID 0)
                         x86_64::instructions::interrupts::without_interrupts(|| {
                             {
                                 let mut table = crate::process::PROCESS_TABLE.lock();
@@ -589,13 +605,9 @@ pub fn schedule() -> u64 {
                             perform_context_switch(pid, 0);
                         });
                     } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
-                        // AP: restaurar el contexto idle guardado.
+                        // AP: restaurar el contexto idle
                         x86_64::instructions::interrupts::without_interrupts(|| {
                             set_current_process(None);
-                            // Si el slot del proceso saliente fue desregistrado (exit/kill antes
-                            // del context switch), usamos el scratch buffer de esta CPU y
-                            // clear_ptr = 0 (sin atomic release de current_cpu, inocuo porque
-                            // el proceso ya está muerto y su slot fue limpiado).
                             let (from_ptr, clear_ptr): (*mut crate::process::Context, u64) = {
                                 let mut table = crate::process::PROCESS_TABLE.lock();
                                 match crate::ipc::pid_to_slot_fast(pid) {
@@ -621,7 +633,6 @@ pub fn schedule() -> u64 {
                 }
             }
             
-            // Calcular el tiempo hasta el próximo despertar si no hay nada que ejecutar.
             let current_tick = crate::interrupts::ticks();
             let mut min_wake = None;
             {
@@ -637,16 +648,16 @@ pub fn schedule() -> u64 {
 
             sleep_duration = match min_wake {
                 Some(tick) if tick > current_tick => {
-                    // Limitar a un máximo de 50ms para mantener el sistema reactivo
                     (tick - current_tick).min(50).max(1)
                 },
-                Some(_) => 0, // Debería haber despertado ya
-                None => 10,   // Valor por defecto (10ms) si no hay nada pendiente
+                Some(_) => 0,
+                None => 10,
             };
         }
-    });
-    sleep_duration
+        sleep_duration
+    })
 }
+
 
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {

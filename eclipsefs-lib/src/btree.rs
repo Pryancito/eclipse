@@ -3,7 +3,10 @@
 //! Inspired by Btrfs and XFS directory structures
 
 use crate::EclipseFSResult;
-use std::cmp::Ordering;
+use core::cmp::Ordering;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::vec;
 
 /// B-Tree node order (max children = 2 * ORDER)
 const ORDER: usize = 128;

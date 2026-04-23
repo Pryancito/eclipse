@@ -33,8 +33,8 @@ xdt-gen-visibility = '/home/moebius/eclipse/userland/host-tools/bin/xdt-gen-visi
 [built-in options]
 c_args = ['-idirafter', '/home/moebius/eclipse/eclipse-os-build/usr/include', '-idirafter', '/home/moebius/eclipse/eclipse-os-build/include', '-D_REDIR_TIME64=0', '-Wno-error=undef']
 cpp_args = ['-idirafter', '/home/moebius/eclipse/eclipse-os-build/usr/include', '-idirafter', '/home/moebius/eclipse/eclipse-os-build/include', '-D_REDIR_TIME64=0', '-Wno-error=undef']
-c_link_args = ['-static', '-Wl,--allow-multiple-definition', '-L/home/moebius/eclipse/eclipse-os-build/usr/lib', '-L/home/moebius/eclipse/eclipse-os-build/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib']
-cpp_link_args = ['-static', '-Wl,--allow-multiple-definition', '-L/home/moebius/eclipse/eclipse-os-build/usr/lib', '-L/home/moebius/eclipse/eclipse-os-build/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib']
+c_link_args = ['-L/home/moebius/eclipse/eclipse-os-build/usr/lib', '-L/home/moebius/eclipse/eclipse-os-build/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib']
+cpp_link_args = ['-L/home/moebius/eclipse/eclipse-os-build/usr/lib', '-L/home/moebius/eclipse/eclipse-os-build/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/usr/lib', '-Wl,-rpath-link,/home/moebius/eclipse/eclipse-os-build/lib']
 
 [host_machine]
 system = 'linux'

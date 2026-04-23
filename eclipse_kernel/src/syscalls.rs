@@ -3532,84 +3532,59 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
 
         let is_shared = (flags & MAP_SHARED) != 0;
 
-        // Try to use fmap for shared mappings
-        let mut fmap_phys_base = None;
-        let mut wc_write_through = false;
-
-        if is_shared {
-            if let Some(ref fde) = fd_entry {
-                if let Ok(phys) = crate::scheme::fmap(
-                    fde.scheme_id,
-                    fde.resource_id,
-                    offset as usize,
-                    map_total as usize,
-                ) {
-                    // Detect Write-Combining (WC) signal in bit 63
-                    if (phys >> 63) != 0 {
-                        wc_write_through = true;
-                    }
-                    fmap_phys_base = Some((phys & !(1 << 63)) as u64);
-                }
-            }
-        }
-
         use linux_mmap_abi::PROT_MASK;
         let linux_p = prot & PROT_MASK;
-
-        // Lazy (demand-paging) path: anonymous private mappings without MAP_POPULATE
-        // are NOT backed by physical frames at mmap() time.  Frames are allocated on
-        // first access by the page-fault demand-page handler in memory.rs.
-        // This matches Linux behaviour and prevents the kernel heap from being exhausted
-        // by large PROT_NONE reservations (e.g. musl malloc's 1 GiB initial mmap).
-        //
-        // Mappings that require eager allocation:
-        //   • file-backed (fd_entry.is_some())
-        //   • shared device mappings (fmap_phys_base.is_some())
-        //   • MAP_POPULATE flag explicitly requested
+        
         let is_lazy = (flags & MAP_ANONYMOUS) != 0
             && fd_entry.is_none()
-            && fmap_phys_base.is_none()
             && (flags & MAP_POPULATE) == 0;
 
         if !is_lazy {
-        while current < end {
-            let frame_phys = if let Some(base) = fmap_phys_base {
-                // Use physical frame directly from fmap
-                base + (current - map_start)
-            } else if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
-                // Zero the frame via the higher-half direct mapping.
-                let frame_virt = memory::PHYS_MEM_OFFSET + phys;
-                unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
+            while current < end {
+                let mut frame_phys = 0u64;
+                let mut wc_write_through = false;
 
-            // For private file-backed mappings, read the next 4 KB of file data into the private frame.
-            if let Some(ref fde) = fd_entry {
-                let bytes_mapped = (current - map_start) as usize;
-                let current_offset = offset as usize + bytes_mapped;
-                
-                let remaining = file_len.saturating_sub(bytes_mapped);
-                if remaining > 0 {
-                    let to_read = remaining.min(4096);
-                    let frame_slice = unsafe {
-                        core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
-                    };
-                    match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice, current_offset as u64) {
-                        Ok(n) => { /* OK */ }
-                        Err(e) => {
-                            serial::serial_printf(format_args!(
-                                "[SYSCALL] mmap: file read error at offset {}: {}\n",
-                                current_offset, e
-                            ));
+                // Try to use fmap for each page
+                let mut mapped_from_scheme = false;
+                if is_shared {
+                    if let Some(ref fde) = fd_entry {
+                        let bytes_mapped = (current - map_start) as usize;
+                        if let Ok(phys) = crate::scheme::fmap(
+                            fde.scheme_id,
+                            fde.resource_id,
+                            offset as usize + bytes_mapped,
+                            4096,
+                        ) {
+                            if (phys >> 63) != 0 {
+                                wc_write_through = true;
+                            }
+                            frame_phys = (phys & !(1 << 63)) as u64;
+                            mapped_from_scheme = true;
                         }
                     }
                 }
-            }
-                phys
-            } else {
-                serial::serial_print("[SYSCALL] mmap: physical frame pool exhausted\n");
-                // Never map to physical address 0 as a fallback: that turns allocation
-                // failures into NULL dereferences in userspace (hard to debug).
-                return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
-            };
+
+                if !mapped_from_scheme {
+                    if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                        let frame_virt = memory::PHYS_MEM_OFFSET + phys;
+                        unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
+                        
+                        // For private file-backed mappings, read data
+                        if let Some(ref fde) = fd_entry {
+                             let bytes_mapped = (current - map_start) as usize;
+                             let current_offset = offset as usize + bytes_mapped;
+                             let remaining = file_len.saturating_sub(bytes_mapped);
+                             if remaining > 0 {
+                                 let to_read = remaining.min(4096);
+                                 let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read) };
+                                 let _ = crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice, current_offset as u64);
+                             }
+                        }
+                        frame_phys = phys;
+                    } else {
+                        return syscall_error_for_current_process(crate::scheme::error::ENOMEM as i32);
+                    }
+                }
 
             let page_prot = mmap_pte_linux_prot(linux_p, anon_slack, map_end, current);
             let mut pte_leaf = memory::linux_prot_to_leaf_pte_bits(page_prot);
