@@ -361,10 +361,9 @@ fn push_rt_signal_frame(
     if action.restorer == 0 {
         return false;
     }
-    // Determine the user stack to use.
+    let (alt_sp, alt_sz, alt_flags) = crate::process::get_process_altstack(pid);
     let mut using_altstack = false;
     let user_rsp = if (action.flags & SA_ONSTACK) != 0 {
-        let (alt_sp, alt_sz, alt_flags) = crate::process::get_process_altstack(pid);
         if (alt_flags & crate::process::SS_DISABLE) == 0 {
             if (alt_flags & crate::process::SS_ONSTACK) == 0 {
                 using_altstack = true;
@@ -389,7 +388,12 @@ fn push_rt_signal_frame(
         uc: UContext {
             uc_flags:    0,
             uc_link:     0,
-            uc_stack:    StackT { ss_sp: 0, ss_flags: crate::process::SS_DISABLE, _pad: 0, ss_size: 0 },
+            uc_stack:    StackT { 
+                ss_sp:    alt_sp, 
+                ss_flags: alt_flags, 
+                _pad:     0, 
+                ss_size:  alt_sz 
+            },
             uc_mcontext: SigContext {
                 r8:      ctx.r8,
                 r9:      ctx.r9,
@@ -460,6 +464,11 @@ fn push_rt_signal_frame(
         
         // SIGKILL and SIGSTOP are unblockable.
         p.signal_mask &= !((1u64 << 8) | (1u64 << 18));
+
+        // Set SS_ONSTACK if we moved to the altstack.
+        if using_altstack {
+            p.sigaltstack.ss_flags |= crate::process::SS_ONSTACK;
+        }
     });
 
     // SA_RESETHAND: reset handler to SIG_DFL after first delivery.
@@ -561,7 +570,7 @@ pub fn deliver_signal_from_exception(
 ) -> bool {
     use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SS_DISABLE};
 
-    let (action, old_mask, user_rsp) = {
+    let (action, old_mask, user_rsp, alt_sp, alt_sz, alt_flags, using_altstack) = {
         let p = match crate::process::get_process(pid) {
             Some(p) => p,
             None    => return false,
@@ -576,19 +585,17 @@ pub fn deliver_signal_from_exception(
         let mut using_altstack = false;
         let rsp = if (action.flags & SA_ONSTACK) != 0
             && (ss.ss_flags & SS_DISABLE) == 0
-            && ss.ss_sp != 0
         {
-            let ss_top = ss.ss_sp.wrapping_add(ss.ss_size);
-            if !(rsp >= ss.ss_sp && rsp < ss_top) { 
+            if (ss.ss_flags & crate::process::SS_ONSTACK) == 0 {
                 using_altstack = true;
-                ss_top 
-            } else { 
-                rsp 
+                ss.ss_sp.wrapping_add(ss.ss_size)
+            } else {
+                rsp
             }
         } else {
             rsp
         };
-        (action, old_mask, rsp)
+        (action, old_mask, rsp, ss.ss_sp, ss.ss_size, ss.ss_flags, using_altstack)
     };
 
     const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
@@ -599,7 +606,12 @@ pub fn deliver_signal_from_exception(
         uc: UContext {
             uc_flags:    0,
             uc_link:     0,
-            uc_stack:    StackT { ss_sp: 0, ss_flags: crate::process::SS_DISABLE, _pad: 0, ss_size: 0 },
+            uc_stack:    StackT { 
+                ss_sp:    alt_sp, 
+                ss_flags: alt_flags, 
+                _pad:     0, 
+                ss_size:  alt_sz 
+            },
             uc_mcontext: SigContext {
                 r8:      exc.r8,
                 r9:      exc.r9,
@@ -676,6 +688,11 @@ pub fn deliver_signal_from_exception(
             p.signal_mask |= 1u64 << signum;
         }
         p.signal_mask |= action.mask;
+        
+        // Set SS_ONSTACK if we moved to the altstack.
+        if using_altstack {
+            p.sigaltstack.ss_flags |= crate::process::SS_ONSTACK;
+        }
     });
 
     // SA_RESETHAND: reset handler to SIG_DFL after first delivery.
@@ -1040,6 +1057,7 @@ pub extern "C" fn syscall_handler(
         20  => sys_writev(arg1, arg2, arg3),
         21  => sys_faccessat(0, arg1, arg2, 0),
         22  => sys_pipe(arg1),
+        23  => sys_select(arg1, arg2, arg3, arg4, arg5),
         24  => sys_yield(),
         25  => sys_mremap(arg1, arg2, arg3, arg4, arg5),
         32  => sys_dup(arg1),
@@ -1140,6 +1158,7 @@ pub extern "C" fn syscall_handler(
         262 => sys_fstatat(arg1, arg2, arg3, arg4),
         269 => sys_faccessat(arg1, arg2, arg3, arg4),
         270 => sys_pselect6(arg1, arg2, arg3, arg4, arg5, arg6),
+        271 => sys_ppoll(arg1, arg2, arg3, arg4, arg5),
         292 => sys_dup3(arg1, arg2, arg3),
         293 => sys_pipe2(arg1, arg2),
         302 => sys_prlimit64(arg1, arg2, arg3, arg4),
@@ -5252,115 +5271,137 @@ fn sys_tkill(tid: u64, sig: u64) -> u64 {
 }
 
 /// Linux `poll(2)` — multiplexación mínima para musl/cargo (POLLIN/POLLOUT en fds válidos).
-fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
+/// Core polling logic used by poll, ppoll, and pselect6.
+fn poll_internal(fds_ptr: u64, nfds: u64, timeout_ms: i32, sigmask_ptr: u64) -> u64 {
     const POLLIN:  i16 = 0x0001;
     const POLLPRI: i16 = 0x0002;
     const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
     const POLLNVAL: i16 = 0x0020;
 
-    let timeout = timeout_raw as i32;
-    let Some(pid) = current_process_id() else {
-        return linux_abi_error(9);
-    };
+    let Some(pid) = current_process_id() else { return linux_abi_error(9); };
 
-    // `poll(NULL, 0, timeout)` se usa como temporizador.
-    if nfds == 0 {
-        if timeout == 0 {
+    // Handle temporary sigmask for ppoll/pselect6
+    let mut old_mask = 0u64;
+    let mut mask_changed = false;
+    if sigmask_ptr != 0 && is_user_pointer(sigmask_ptr, 8) {
+        if let Some(mut p) = crate::process::get_process(pid) {
+            old_mask = p.signal_mask;
+            p.signal_mask = unsafe { *(sigmask_ptr as *const u64) };
+            crate::process::update_process(pid, p);
+            mask_changed = true;
+        }
+    }
+
+    let ret = (|| {
+        if nfds == 0 {
+            if timeout_ms == 0 { return 0; }
+            if timeout_ms < 0 { process_sleep_ms(u64::MAX / 2); return 0; }
+            process_sleep_ms(timeout_ms as u32 as u64);
             return 0;
         }
-        if timeout < 0 {
-            process_sleep_ms(u64::saturating_sub(u64::MAX, 1) / 2);
-            return 0;
+
+        let total = nfds.saturating_mul(8);
+        if total > 1024 * 1024 || fds_ptr == 0 || !is_user_pointer(fds_ptr, total) {
+            return linux_abi_error(22);
         }
-        process_sleep_ms(timeout as u32 as u64);
-        return 0;
-    }
 
-    let Some(total) = nfds.checked_mul(8) else {
-        return linux_abi_error(22);
-    };
-    if total > 1024 * 1024 {
-        return linux_abi_error(22);
-    }
-    if fds_ptr == 0 || !is_user_pointer(fds_ptr, total) {
-        return linux_abi_error(14);
-    }
+        const POLL_SLEEP_MS: u64 = 1;
+        let max_retries: u64 = if timeout_ms < 0 { u64::MAX } 
+                               else { (timeout_ms as u64).saturating_div(POLL_SLEEP_MS).saturating_add(2) };
 
-    // Sleep duration per retry iteration (ms).
-    const POLL_SLEEP_MS: u64 = 1;
+        let mut retries: u64 = 0;
+        loop {
+            let mut ready: u64 = 0;
+            for i in 0..nfds {
+                let base = fds_ptr + i * 8;
+                let fd = unsafe { (base as *const i32).read_unaligned() };
+                let events = unsafe { ((base + 4) as *const i16).read_unaligned() };
+                let revents_ptr = (base + 6) as *mut i16;
 
-    // Maximum number of retry iterations before giving up:
-    //   timeout < 0 → infinite (u64::MAX)
-    //   timeout = 0 → single check, no sleep (handled by early return below)
-    //   timeout > 0 → approximately timeout ms; +2 accounts for rounding and
-    //                 ensures at least one retry even for very short timeouts
-    let max_retries: u64 = if timeout < 0 {
-        u64::MAX
-    } else {
-        (timeout as u64).saturating_div(POLL_SLEEP_MS).saturating_add(2)
-    };
+                if fd < 0 { unsafe { revents_ptr.write_unaligned(0) }; continue; }
 
-    let mut retries: u64 = 0;
-    loop {
-        let mut ready: u64 = 0;
+                let fd_u = fd as usize;
+                let rev: i16 = if let Some(fd_entry) = crate::fd::fd_get(pid, fd_u) {
+                    let scheme_ev = (if events & (POLLIN | POLLPRI) != 0 { crate::scheme::event::POLLIN } else { 0 }) |
+                                    (if events & POLLOUT != 0 { crate::scheme::event::POLLOUT } else { 0 });
 
-        for i in 0..nfds {
-            let base = fds_ptr + i * 8;
-            let fd = unsafe { (base as *const i32).read_unaligned() };
-            let events = unsafe { ((base + 4) as *const i16).read_unaligned() };
-            let revents_ptr = (base + 6) as *mut i16;
-
-            if fd < 0 {
-                unsafe { revents_ptr.write_unaligned(0) };
-                continue;
+                    let ready_ev = crate::scheme::poll(fd_entry.scheme_id, fd_entry.resource_id, scheme_ev).unwrap_or(scheme_ev);
+                    let mut r: i16 = 0;
+                    if (ready_ev & crate::scheme::event::POLLIN) != 0 {
+                        if events & POLLIN  != 0 { r |= POLLIN; }
+                        if events & POLLPRI != 0 { r |= POLLPRI; }
+                    }
+                    if (ready_ev & crate::scheme::event::POLLOUT) != 0 && events & POLLOUT != 0 { r |= POLLOUT; }
+                    
+                    if r != 0 { ready = ready.saturating_add(1); }
+                    r
+                } else {
+                    ready = ready.saturating_add(1);
+                    POLLNVAL
+                };
+                unsafe { revents_ptr.write_unaligned(rev) };
             }
 
-            let fd_u = fd as usize;
-            let rev: i16 = if let Some(fd_entry) = crate::fd::fd_get(pid, fd_u) {
-                // Convert poll event bits to scheme event bits and query the scheme.
-                let scheme_ev =
-                    (if events & (POLLIN | POLLPRI) != 0 { crate::scheme::event::POLLIN }  else { 0 }) |
-                    (if events & POLLOUT             != 0 { crate::scheme::event::POLLOUT } else { 0 });
-
-                // Fall back to "always ready" when the scheme does not implement poll
-                // (default returns Ok(events)), so non-socket fds behave as before.
-                let ready_ev = crate::scheme::poll(
-                    fd_entry.scheme_id,
-                    fd_entry.resource_id,
-                    scheme_ev,
-                ).unwrap_or(scheme_ev);
-
-                let mut r: i16 = 0;
-                if (ready_ev & crate::scheme::event::POLLIN) != 0 {
-                    if events & POLLIN  != 0 { r |= POLLIN; }
-                    if events & POLLPRI != 0 { r |= POLLPRI; }
+            if ready > 0 || timeout_ms == 0 { return ready; }
+            if retries >= max_retries { return 0; }
+            
+            // Check for pending signals that should interrupt the poll
+            if let Some(p) = crate::process::get_process(pid) {
+                if (p.pending_signals & !p.signal_mask) != 0 {
+                    return linux_abi_error(4); // EINTR
                 }
-                if (ready_ev & crate::scheme::event::POLLOUT) != 0 && events & POLLOUT != 0 {
-                    r |= POLLOUT;
-                }
+            }
 
-                if r & (POLLIN | POLLPRI | POLLOUT) != 0 {
-                    ready = ready.saturating_add(1);
-                }
-                r
-            } else {
-                // Invalid fd — always counts as ready (POLLNVAL)
-                ready = ready.saturating_add(1);
-                POLLNVAL
-            };
-
-            unsafe { revents_ptr.write_unaligned(rev) };
+            process_sleep_ms(POLL_SLEEP_MS);
+            retries += 1;
         }
+    })();
 
-        // Return as soon as at least one fd is ready, or when we've exhausted the timeout.
-        if ready > 0 || timeout == 0 || retries >= max_retries {
-            return ready;
+    if mask_changed {
+        if let Some(mut p) = crate::process::get_process(pid) {
+            p.signal_mask = old_mask;
+            crate::process::update_process(pid, p);
         }
-
-        // No fds ready yet — yield the CPU briefly and retry.
-        process_sleep_ms(POLL_SLEEP_MS);
-        retries += 1;
     }
+    ret
+}
+
+fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
+    poll_internal(fds_ptr, nfds, timeout_raw as i32, 0)
+}
+
+/// sys_select — Linux select(nfds, readfds, writefds, exceptfds, timeout).
+fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ptr: u64) -> u64 {
+    // Basic stub: if no fds are provided, it's used as a high-resolution sleep.
+    // Full fd_set support would require converting bitmaps to pollfds.
+    if readfds == 0 && writefds == 0 && exceptfds == 0 {
+        let timeout_ms = if timeout_ptr != 0 && is_user_pointer(timeout_ptr, 16) {
+            let sec = unsafe { *(timeout_ptr as *const i64) };
+            let usec = unsafe { *((timeout_ptr + 8) as *const i64) };
+            if sec < 0 || usec < 0 { return linux_abi_error(22); }
+            (sec.saturating_mul(1000).saturating_add(usec / 1000)) as i32
+        } else {
+            -1 // Infinite
+        };
+        return poll_internal(0, 0, timeout_ms, 0);
+    }
+    
+    linux_abi_error(38) // ENOSYS for full bitmask support for now
+}
+
+/// sys_ppoll — Linux ppoll(fds, nfds, timespec, sigmask, sigsetsize).
+fn sys_ppoll(fds_ptr: u64, nfds: u64, tmo_ptr: u64, sigmask_ptr: u64, _sigsetsize: u64) -> u64 {
+    let timeout_ms = if tmo_ptr != 0 && is_user_pointer(tmo_ptr, 16) {
+        let sec = unsafe { *(tmo_ptr as *const i64) };
+        let nsec = unsafe { *((tmo_ptr + 8) as *const i64) };
+        if sec < 0 || nsec < 0 { return linux_abi_error(22); }
+        (sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)) as i32
+    } else {
+        -1 // Infinite
+    };
+    poll_internal(fds_ptr, nfds, timeout_ms, sigmask_ptr)
 }
 
 
@@ -7254,12 +7295,29 @@ fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64
 }
 
 /// sys_pselect6 - Synchronous I/O multiplexing
-fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64, sigmask: u64) -> u64 {
-    // Very basic stub: if it's used for sleeping (no FDs), use sys_nanosleep or just yield
-    if nfds == 0 && timeout != 0 {
-        return sys_nanosleep(timeout);
+fn sys_pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, tmo_ptr: u64, sigmask_info_ptr: u64) -> u64 {
+    // pselect6(nfds, readfds, writefds, exceptfds, timespec, sigmask_info)
+    // If no fds are provided, it's used as a high-resolution sleep with signal masking.
+    if readfds == 0 && writefds == 0 && exceptfds == 0 {
+        let timeout_ms = if tmo_ptr != 0 && is_user_pointer(tmo_ptr, 16) {
+            let sec = unsafe { *(tmo_ptr as *const i64) };
+            let nsec = unsafe { *((tmo_ptr + 8) as *const i64) };
+            (sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)) as i32
+        } else {
+            -1 // Infinite
+        };
+        
+        let sigmask_ptr = if sigmask_info_ptr != 0 && is_user_pointer(sigmask_info_ptr, 8) {
+            // Linux x86-64: arg6 is a pointer to {sigset_t*, size_t}
+            unsafe { *(sigmask_info_ptr as *const u64) }
+        } else {
+            0
+        };
+
+        return poll_internal(0, 0, timeout_ms, sigmask_ptr);
     }
-    0 // Return 0 (no FDs ready)
+    
+    linux_abi_error(38) // ENOSYS for full fd_set bitmask support
 }
 /// sys_faccessat - Check file permissions
 fn sys_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
