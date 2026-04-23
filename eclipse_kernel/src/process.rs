@@ -247,6 +247,11 @@ pub struct Process {
     /// Linux `CLONE_VM` + vfork: este proceso comparte `ProcessResources` (y CR3) con el padre
     /// hasta el primer `exec` exitoso; entonces se hace copia de VM + FD propia.
     pub vfork_shared_mm_with_parent: Option<ProcessId>,
+    /// Flags para sys_wait4 (WUNTRACED / WCONTINUED)
+    pub notified_stopped: bool,
+    pub notified_continued: bool,
+    /// El buffer de la pila de kernel, para que se libere al destruir el proceso.
+    pub kernel_stack: Option<alloc::vec::Vec<u8>>,
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -300,6 +305,9 @@ impl Process {
             tgid: 0,
             vfork_waiting_for_child: None,
             vfork_shared_mm_with_parent: None,
+            notified_stopped: false,
+            notified_continued: false,
+            kernel_stack: None,
         }
     }
 }
@@ -726,6 +734,18 @@ pub fn current_process_id() -> Option<ProcessId> {
     } else {
         Some(pid)
     }
+}
+
+pub fn get_process_altstack(pid: ProcessId) -> (u64, u64, u32) {
+    let table = PROCESS_TABLE.lock();
+    for slot in table.iter() {
+        if let Some(p) = slot {
+            if p.id == pid {
+                return (p.sigaltstack.ss_sp, p.sigaltstack.ss_size, p.sigaltstack.ss_flags);
+            }
+        }
+    }
+    (0, 0, SS_DISABLE)
 }
 
 /// Establecer proceso actual (O(1) vía GS segment, sin lock)
@@ -1201,7 +1221,6 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let kernel_stack_top_aligned = kernel_stack_top & !0xF;
-    core::mem::forget(kernel_stack); // Leak intentionally (no proper dealloc yet)
 
     // Build the IRETQ frame on the child's kernel stack.
     // layout (low→high in memory): RIP, CS, RFLAGS, RSP, SS
@@ -1214,6 +1233,20 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
         p = p.offset(-1); *p = parent_context.rip;    // RIP
         p
     };
+
+    // Clone of resources for fork()
+    let child_resources = {
+        let p = parent.resources.lock();
+        Arc::new(Mutex::new(ProcessResources {
+            page_table_phys: child_cr3,
+            vmas: p.vmas.clone(),
+            brk_current: p.brk_current,
+            fd_table_idx: p.fd_table_idx,
+        }))
+    };
+
+    let mut child_proc = Process::new(child_resources);
+    child_proc.kernel_stack = Some(kernel_stack);
 
     // ── Phase 2: Brief critical section — insert child into PROCESS_TABLE ───
 
@@ -1235,18 +1268,9 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 let child_pid = *next_pid;
                 *next_pid += 1;
 
-                // Clone of resources for fork()
-                let child_resources = {
-                    let p = parent.resources.lock();
-                    Arc::new(Mutex::new(ProcessResources {
-                        page_table_phys: child_cr3,
-                        vmas: p.vmas.clone(),
-                        brk_current: p.brk_current,
-                        fd_table_idx: slot_idx, // Use the new slot index for isolated FD table copy
-                    }))
-                };
-
-                let mut child = Process::new(child_resources);
+                child_proc.id = child_pid;
+                child_proc.resources.lock().fd_table_idx = slot_idx; // Use the new slot index for isolated FD table copy
+                let mut child = child_proc;
                 child.id = child_pid;
                 child.tgid = child_pid;
                 child.state = ProcessState::Blocked;
@@ -1339,7 +1363,6 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let kernel_stack_top_aligned = kernel_stack_top & !0xF;
-    core::mem::forget(kernel_stack);
 
     let kstack_ptr = unsafe {
         let mut p = kernel_stack_top_aligned as *mut u64;
@@ -1417,6 +1440,7 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
                 child.context.r14 = parent_context.r14;
                 child.context.r15 = parent_context.r15;
 
+                child.kernel_stack = Some(kernel_stack);
                 *slot = Some(child);
                 crate::ipc::register_pid_slot(child_pid, slot_idx);
                 return Some(child_pid);
@@ -1455,12 +1479,15 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
                     if signum == 19 || signum == 20 { // SIGSTOP or SIGTSTP
                         p.state = ProcessState::Stopped;
                         p.exit_signal = signum;
+                        p.notified_stopped = false; // Reset for next wait4
                         let parent_pid = p.parent_pid;
                         if let Some(ppid) = parent_pid {
                             wake_parent_from_wait(ppid);
                         }
                     } else if signum == 18 { // SIGCONT
                         if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
+                            p.exit_signal = 18;
+                            p.notified_continued = false; // Reset for next wait4
                             // Don't set state here; enqueue_process will do it.
                             to_wake = Some(pid);
                             let parent_pid = p.parent_pid;

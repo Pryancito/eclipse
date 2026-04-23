@@ -712,6 +712,13 @@ extern "C" fn exception_handler(context: &mut ExceptionContext) {
                 return; // Frame allocated — retry the faulting instruction.
             }
         }
+
+        // error_code bit 0 == 1 (Present) and bit 1 == 1 (Write) -> Possible CoW fault
+        if (err & 3) == 3 && cr2 < 0xFFFF_8000_0000_0000 {
+            if crate::memory::handle_cow_fault(pid, cr2) {
+                return; // Page copied/unlocked — retry the faulting instruction.
+            }
+        }
     }
     // ---- End Demand Paging ----
 

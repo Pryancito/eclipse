@@ -7,6 +7,11 @@
 
 use linked_list_allocator::LockedHeap;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use x86_64::PhysAddr;
+use x86_64::structures::paging::{PhysFrame, PageTable as X86PageTable};
+
+pub mod frame_allocator;
+pub mod frame_info;
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF900000000000;
 
@@ -123,6 +128,8 @@ pub fn init(heap_phys_base: u64, heap_phys_size: u64, conventional_mem_total_byt
         unsafe {
             inner.init(heap_virt as *mut u8, heap_phys_size as usize);
         }
+        // Reserve the heap region in the physical frame allocator
+        crate::memory::frame_allocator::reserve_region(heap_phys_base, heap_phys_size);
         crate::serial::serial_print("[MEM] Allocator initialized (dynamic heap)\n");
     }
     #[cfg(test)]
@@ -151,6 +158,11 @@ pub fn init(heap_phys_base: u64, heap_phys_size: u64, conventional_mem_total_byt
         crate::serial::serial_print(
             "[MEM] WARN: using default anon-mmap pool at 4 GiB+ (check conventional_mem / heap)\n",
         );
+    }
+
+    // Initialize frame reference counts
+    unsafe {
+        frame_info::init(conventional_mem_total_bytes);
     }
 }
 
@@ -496,7 +508,6 @@ pub fn get_kernel_cr3() -> u64 {
 
 use x86_64::registers::control::Cr3;
 // use x86_64::structures::paging::PageTable; // Import removed to avoid conflict with local definition
-use x86_64::PhysAddr;
 
 /// Remove the identity mapping (PML4[0]) from the current page table.
 /// This enforces strict Higher Half only execution for the kernel.
@@ -620,25 +631,26 @@ pub fn create_process_paging() -> u64 {
         
         let current_pml4 = &*(current_pml4_virt as *const PageTable);
 
-        // 1. Copy ALL mappings from the current PML4 (boot/kernel)
+        // 1. Copy ONLY kernel-space mappings (256..511)
+        // Entries 0..256 are user-space; entry 511 is recursive (handled below).
         // This ensures the higher half (physical map, kernel image, etc.) is identical.
-        for i in 0..512 {
-            pml4.entries[i] = current_pml4.entries[i].clone();
+        for i in 256..511 {
+            pml4.entries[i] = current_pml4.entries[i];
         }
-        crate::serial::serial_print("[create_paging] kernel mappings copied\n");
+        crate::serial::serial_print("[create_paging] kernel mappings copied (256-510)\n");
         
-        // 2. Clear PML4[0] to remove identity map/user space from the template
-        // User space will be mapped explicitly via ELF loader.
-        pml4.entries[0] = PageTableEntry::new();
+        // 2. Ensure user-space range is clean (0..256)
+        for i in 0..256 {
+            pml4.entries[i] = PageTableEntry::new();
+        }
+        crate::serial::serial_print("[create_paging] user mappings cleared (0-255)\n");
         
         // 3. Setup Recursive Mapping
         // Map the LAST entry (511) to point to the NEW PML4 itself
-        // This allows the kernel to access this page table structure at a known virtual address
-        // when this page table is active.
         pml4.entries[511].set_addr(
              pml4_phys, 
              (x86_64::structures::paging::PageTableFlags::PRESENT | 
-             x86_64::structures::paging::PageTableFlags::WRITABLE).bits()
+              x86_64::structures::paging::PageTableFlags::WRITABLE).bits()
         );
 
         crate::serial::serial_print("[create_paging] done\n");
@@ -653,7 +665,7 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
     let child_pml4_phys = create_process_paging();
     
     unsafe {
-        let p_pml4 = &*(phys_to_virt(parent_pml4_phys) as *const PageTable);
+        let p_pml4 = &mut *(phys_to_virt(parent_pml4_phys) as *mut PageTable);
         let c_pml4 = &mut *(phys_to_virt(child_pml4_phys) as *mut PageTable);
         
         // We focus on PML4[0] (Identity/User Map)
@@ -664,7 +676,7 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
             let new_pdpt = &mut *(new_pdpt_ptr as *mut PageTable);
             
             let p_pdpt_phys = p_pml4.entries[0].get_addr();
-            let p_pdpt = &*(phys_to_virt(p_pdpt_phys) as *const PageTable);
+            let p_pdpt = &mut *(phys_to_virt(p_pdpt_phys) as *mut PageTable);
             
             for i in 0..512 {
                 if !p_pdpt.entries[i].present() { continue; }
@@ -679,7 +691,7 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                     let new_pd = &mut *(new_pd_ptr as *mut PageTable);
                     
                     let p_pd_phys = p_pdpt.entries[i].get_addr();
-                    let p_pd = &*(phys_to_virt(p_pd_phys) as *const PageTable);
+                    let p_pd = &mut *(phys_to_virt(p_pd_phys) as *mut PageTable);
                     
                     for j in 0..512 {
                         if !p_pd.entries[j].present() { continue; }
@@ -704,7 +716,7 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                 let new_pt = &mut *(new_pt_ptr as *mut PageTable);
                                 
                                 let p_pt_phys = p_pd.entries[j].get_addr();
-                                let p_pt = &*(phys_to_virt(p_pt_phys) as *const PageTable);
+                                let p_pt = &mut *(phys_to_virt(p_pt_phys) as *mut PageTable);
                                 
                                 for k in 0..512 {
                                     if !p_pt.entries[k].present() {
@@ -719,17 +731,22 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                         new_pt.entries[k] = p_pt.entries[k].clone();
                                         continue;
                                     }
-                                    // Hoja de usuario: copia física privada (vfork/exec no deben aliasar con el padre).
-                                    let (new_frame_ptr, new_frame_phys) = alloc_dma_buffer(4096, 4096)
-                                        .expect("clone_process_paging: OOM 4KiB user leaf");
-                                    let p_frame_phys = p_pt.entries[k].get_addr();
-                                    let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
-                                    core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 4096);
-                                    new_pt.entries[k].set_addr(
-                                        new_frame_phys,
-                                        (pt_flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
-                                            .bits(),
-                                    );
+                                    // Hoja de usuario: Copy-on-Write (CoW)
+                                    let p_pte = &mut p_pt.entries[k];
+                                    let phys_addr = p_pte.get_addr();
+                                    let mut leaf_flags = pt_flags;
+
+                                    if leaf_flags.contains(x86_64::structures::paging::PageTableFlags::WRITABLE) {
+                                        // Mark as Read-Only to trigger CoW on write
+                                        leaf_flags.remove(x86_64::structures::paging::PageTableFlags::WRITABLE);
+                                        p_pte.set_addr(phys_addr, leaf_flags.bits());
+                                    }
+
+                                    // Increment reference count to protect shared frame
+                                    frame_info::increment_refcount(phys_addr);
+
+                                    // Map same physical frame in child with same (Read-Only) flags
+                                    new_pt.entries[k].set_addr(phys_addr, leaf_flags.bits());
                                 }
                                 
                                 new_pd.entries[j].set_addr(new_pt_phys, pd_flags.bits());
@@ -742,7 +759,7 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                 new_pd.entries[j] = p_pd.entries[j].clone();
                             } else if p_pd.entries[j].present() {
                                 let p_pt_phys = p_pd.entries[j].get_addr();
-                                let p_pt = &*(phys_to_virt(p_pt_phys) as *const PageTable);
+                                let p_pt = &mut *(phys_to_virt(p_pt_phys) as *mut PageTable);
                                 let (new_pt_ptr, new_pt_phys) = alloc_dma_buffer(4096, 4096)
                                     .expect("clone_process_paging: OOM PT (non-user PD path)");
                                 unsafe {
@@ -795,7 +812,96 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
         }
     }
 
+    // Flush TLB on parent to enforce Read-Only CoW protections
+    x86_64::instructions::tlb::flush_all();
     child_pml4_phys
+}
+
+/// Handle a write fault on a Read-Only page that was shared via CoW.
+/// Returns true if the fault was handled (page copied), false otherwise.
+pub fn handle_cow_fault(pid: u32, fault_addr: u64) -> bool {
+    use crate::process;
+    let page_addr = fault_addr & !0xFFF_u64;
+
+    let Some(proc) = process::get_process(pid) else {
+        return false;
+    };
+    let r = proc.resources.lock();
+    let page_table_phys = r.page_table_phys;
+    
+    // Find the VMA to verify write permission
+    let vma = match r.vmas.iter().find(|v| page_addr >= v.start && page_addr < v.end) {
+        Some(v) => *v,
+        None => {
+            drop(r);
+            drop(proc);
+            return false;
+        }
+    };
+    
+    // Check if the VMA is supposed to be writable (PROT_WRITE = 2)
+    if (vma.flags & 2) == 0 {
+        drop(r);
+        drop(proc);
+        return false;
+    }
+    
+    drop(r);
+    drop(proc);
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        
+        let pml4 = unsafe { &mut *(phys_to_virt(page_table_phys) as *mut PageTable) };
+        let pml4_idx = ((page_addr >> 39) & 0x1FF) as usize;
+        if !pml4.entries[pml4_idx].present() { return false; }
+        
+        let pdpt = unsafe { &mut *(phys_to_virt(pml4.entries[pml4_idx].get_addr()) as *mut PageTable) };
+        let pdpt_idx = ((page_addr >> 30) & 0x1FF) as usize;
+        if !pdpt.entries[pdpt_idx].present() || pdpt.entries[pdpt_idx].is_huge() { return false; }
+        
+        let pd = unsafe { &mut *(phys_to_virt(pdpt.entries[pdpt_idx].get_addr()) as *mut PageTable) };
+        let pd_idx = ((page_addr >> 21) & 0x1FF) as usize;
+        if !pd.entries[pd_idx].present() || pd.entries[pd_idx].is_huge() { return false; }
+        
+        let pt = unsafe { &mut *(phys_to_virt(pd.entries[pd_idx].get_addr()) as *mut PageTable) };
+        let pt_idx = ((page_addr >> 12) & 0x1FF) as usize;
+        let pte = &mut pt.entries[pt_idx];
+        
+        if !pte.present() { return false; }
+        
+        let phys_addr = pte.get_addr();
+        let refcount = frame_info::get_refcount(phys_addr);
+        
+        if refcount > 1 {
+            // Shared CoW page: Allocate private copy
+            let Some(new_phys) = alloc_phys_frame_for_anon_mmap() else {
+                return false;
+            };
+            
+            let old_virt = phys_to_virt(phys_addr) as *const u8;
+            let new_virt = phys_to_virt(new_phys) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(old_virt, new_virt, 4096); }
+            
+            // Map new frame as WRITABLE
+            let flags = pte.get_flags() | x86_64::structures::paging::PageTableFlags::WRITABLE.bits();
+            pte.set_addr(new_phys, flags);
+            
+            // Release shared frame
+            frame_info::decrement_refcount(phys_addr);
+            
+            x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
+            true
+        } else if refcount == 1 {
+            // Last owner: just mark writable
+            let flags = pte.get_flags() | x86_64::structures::paging::PageTableFlags::WRITABLE.bits();
+            pte.set_addr(phys_addr, flags);
+            x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Map a 4KB page in a process's page table
@@ -1259,53 +1365,21 @@ static mut FREE_FRAMES_HEAD: u64 = 0;
 static mut FREE_FRAMES_COUNT: usize = 0;
 
 pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
-    let mut frame = None;
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let _lock = FREE_FRAMES_LOCK.lock();
-        unsafe {
-            if FREE_FRAMES_HEAD != 0 {
-                let phys = FREE_FRAMES_HEAD;
-                frame = Some(phys);
-                
-                // Read the 'next' pointer from the frame using HHDM
-                let virt = phys_to_virt(phys) as *const u64;
-                FREE_FRAMES_HEAD = core::ptr::read_volatile(virt);
-                FREE_FRAMES_COUNT -= 1;
-            }
-        }
-    });
-
+    let frame = crate::memory::frame_allocator::alloc_frame();
     if let Some(f) = frame {
+        let phys = f.start_address().as_u64();
+        frame_info::set_refcount(phys, 1);
         notify_ai_memory_stats();
-        return Some(f);
+        return Some(phys);
     }
-    let pool_start = anon_mmap_pool_start();
-    let pool_end = anon_mmap_pool_end();
-    let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
-    let frame_phys = pool_start.saturating_add(next);
-    if frame_phys >= pool_end {
-        return None;
-    }
-    notify_ai_memory_stats();
-    Some(frame_phys)
+    None
 }
 
 pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
-    if !is_frame_managed(phys_addr) {
-        return;
+    if frame_info::decrement_refcount(phys_addr) == 0 {
+        let frame = unsafe { PhysFrame::from_start_address_unchecked(PhysAddr::new(phys_addr)) };
+        crate::memory::frame_allocator::dealloc_frame(frame);
     }
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let _lock = FREE_FRAMES_LOCK.lock();
-        unsafe {
-            // Write the current head into the new free frame
-            let virt = phys_to_virt(phys_addr) as *mut u64;
-            core::ptr::write_volatile(virt, FREE_FRAMES_HEAD);
-            
-            // Update head
-            FREE_FRAMES_HEAD = phys_addr;
-            FREE_FRAMES_COUNT += 1;
-        }
-    });
     notify_ai_memory_stats();
 }
 
@@ -1438,10 +1512,7 @@ pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
 
 /// Returns (total_frames, used_frames) for the userspace physical pool.
 pub fn get_memory_stats() -> (u64, u64) {
-    let total = (anon_mmap_pool_end().saturating_sub(anon_mmap_pool_start())) / 4096;
-    // Cap at total so the counter never reports used > total after the pool is exhausted.
-    let used = (ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096).min(total);
-    (total, used)
+    crate::memory::frame_allocator::get_memory_usage_stats()
 }
 
 /// Fixed virtual address for GPU framebuffer (avoids identity-mapping page faults)

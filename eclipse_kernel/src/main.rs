@@ -57,6 +57,7 @@ mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebu
 mod sync;    // Synchronization primitives
 mod net;
 mod sys_scheme;
+mod proc_scheme;
 pub mod drm_scheme; // DRM scheme for ioctl
 mod input_scheme;
 mod page_cache;
@@ -254,6 +255,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
+    memory::frame_allocator::init(boot_info);
     memory::init(
         boot_info.heap_phys_base,
         boot_info.heap_phys_size,
@@ -309,6 +311,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Register display:, input:, snd:, net:, sys: schemes so display_service can open display:
     servers::init(); 
     crate::scheme::register_scheme("sys", alloc::sync::Arc::new(sys_scheme::SysScheme::new()));
+    crate::scheme::register_scheme("proc", alloc::sync::Arc::new(proc_scheme::ProcScheme::new()));
     crate::scheme::register_scheme("drm", alloc::sync::Arc::new(drm_scheme::DrmScheme));
     crate::scheme::register_scheme("input", alloc::sync::Arc::new(input_scheme::InputScheme::new()));
     progress::bar(86);

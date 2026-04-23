@@ -291,10 +291,13 @@ struct SigInfo {
 
 /// Complete `rt_sigframe` as pushed onto the user stack — 440 bytes.
 #[repr(C)]
+#[repr(C, align(16))]
 struct RtSigframe {
     pretcode: u64,      // 0  — sa_restorer address
     uc:       UContext,  // 8  (304 bytes) → end 312
     info:     SigInfo,   // 312 (128 bytes) → end 440
+    _pad:     u64,       // 440 (8 bytes) → 448 (FXSAVE alignment)
+    fpstate:  [u8; 512], // 448 (512 bytes) → end 960
 }
 
 // Compile-time layout assertions.
@@ -303,65 +306,82 @@ const _: () = {
     assert!(core::mem::size_of::<StackT>()      == 24);
     assert!(core::mem::size_of::<UContext>()    == 304);
     assert!(core::mem::size_of::<SigInfo>()     == 128);
-    assert!(core::mem::size_of::<RtSigframe>()  == 440);
+    assert!(core::mem::size_of::<RtSigframe>()  == 960);
 };
+
+/// Safe copy to user memory using kernel recovery mechanism.
+fn copy_to_user(user_ptr: u64, src: &[u8]) -> bool {
+    if !is_user_pointer(user_ptr, src.len() as u64) {
+        return false;
+    }
+    
+    if unsafe { !crate::interrupts::set_recovery_point() } {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), user_ptr as *mut u8, src.len());
+        }
+        unsafe { crate::interrupts::clear_recovery_point() };
+        true
+    } else {
+        false
+    }
+}
+
+/// Safe copy from user memory using kernel recovery mechanism.
+fn copy_from_user(user_ptr: u64, dest: &mut [u8]) -> bool {
+    if !is_user_pointer(user_ptr, dest.len() as u64) {
+        return false;
+    }
+    
+    if unsafe { !crate::interrupts::set_recovery_point() } {
+        unsafe {
+            core::ptr::copy_nonoverlapping(user_ptr as *const u8, dest.as_mut_ptr(), dest.len());
+        }
+        unsafe { crate::interrupts::clear_recovery_point() };
+        true
+    } else {
+        false
+    }
+}
 
 /// Build and push an `rt_sigframe` onto the user stack, then redirect `ctx`
 /// (the syscall return context) to the signal handler.
-///
-/// Returns `true` on success (caller should not call the old exit_process path).
-/// Returns `false` if the stack is invalid or the action has no usable restorer.
 fn push_rt_signal_frame(
-    ctx:        &mut crate::interrupts::SyscallContext,
-    pid:        process::ProcessId,
-    sig:        u8,
-    action:     &crate::process::SignalAction,
-    trap_num:   u64,
+    ctx: &mut crate::interrupts::SyscallContext,
+    pid: crate::process::ProcessId,
+    sig: u8,
+    action: &crate::process::SignalAction,
+    old_mask: u64,
     fault_addr: u64,
+    trap_num: u64,
 ) -> bool {
-    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SA_SIGINFO, SS_DISABLE};
-
+    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SS_DISABLE};
+    
     // Require a valid restorer (musl always sets SA_RESTORER + __restore_rt).
     if action.restorer == 0 {
         return false;
     }
-
-    // Determine which stack to use.
-    let old_mask;
-    let user_rsp = {
-        let p = match crate::process::get_process(pid) {
-            Some(p) => p,
-            None    => return false,
-        };
-        old_mask = p.signal_mask;
-        let ss = p.sigaltstack;
-        if (action.flags & SA_ONSTACK) != 0
-            && (ss.ss_flags & SS_DISABLE) == 0
-            && ss.ss_sp != 0
-        {
-            let ss_top = ss.ss_sp.wrapping_add(ss.ss_size);
-            // Use alt-stack only if we are not already on it.
-            if !(ctx.rsp >= ss.ss_sp && ctx.rsp < ss_top) {
-                ss_top
+    // Determine the user stack to use.
+    let user_rsp = if (action.flags & SA_ONSTACK) != 0 {
+        let (alt_sp, alt_sz, alt_flags) = crate::process::get_process_altstack(pid);
+        if (alt_flags & crate::process::SS_DISABLE) == 0 {
+            if (alt_flags & crate::process::SS_ONSTACK) == 0 {
+                alt_sp + alt_sz
             } else {
                 ctx.rsp
             }
         } else {
             ctx.rsp
         }
+    } else {
+        ctx.rsp
     };
 
-    // Allocate frame: skip the red-zone (128 B), reserve frame, align to 16 B.
+    // Allocate frame: reserve frame, align to 16 B.
     const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
-    const RED_ZONE: u64 = 128;
-    let frame_addr = (user_rsp.wrapping_sub(RED_ZONE).wrapping_sub(FRAME_SZ)) & !15u64;
-
-    if !is_user_pointer(frame_addr, FRAME_SZ) {
-        return false;
-    }
+    let frame_addr = (user_rsp.wrapping_sub(FRAME_SZ)) & !15u64;
 
     // Build the frame.
-    let frame = RtSigframe {
+    let mut frame = RtSigframe {
         pretcode: action.restorer,
         uc: UContext {
             uc_flags:    0,
@@ -405,10 +425,27 @@ fn push_rt_signal_frame(
             si_code:  0,
             _rest:    [0u8; 116],
         },
+        _pad: 0,
+        fpstate: [0; 512],
     };
 
-    // Write the frame to user memory (user page table is active).
-    unsafe { core::ptr::write_unaligned(frame_addr as *mut RtSigframe, frame); }
+    // Save FPU state to the frame.
+    unsafe {
+        core::arch::asm!("fxsave [{}]", in(reg) &mut frame.fpstate[0]);
+    }
+
+    // Point uc_mcontext.fpstate to the fpstate buffer ON THE USER STACK.
+    frame.uc.uc_mcontext.fpstate = frame_addr + 448;
+
+    // Write the frame to user memory safely.
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts(&frame as *const RtSigframe as *const u8, FRAME_SZ as usize)
+    };
+    
+    if !copy_to_user(frame_addr, frame_bytes) {
+        crate::serial::serial_printf(format_args!("[SIG] Failed to push frame to {:#018x}\n", frame_addr));
+        return false;
+    }
 
     // Block this signal during the handler (and any additional signals from sa_mask),
     // unless SA_NODEFER is set.
@@ -417,33 +454,34 @@ fn push_rt_signal_frame(
             p.signal_mask |= 1u64 << sig;
         }
         p.signal_mask |= action.mask;
-        // SIGKILL (9) and SIGSTOP (19) are always unblockable.
-        p.signal_mask &= !((1u64 << 9) | (1u64 << 19));
+        
+        // SIGKILL and SIGSTOP are unblockable.
+        p.signal_mask &= !((1u64 << 8) | (1u64 << 18));
     });
 
     // SA_RESETHAND: reset handler to SIG_DFL after first delivery.
     if (action.flags & SA_RESETHAND) != 0 {
         let _ = crate::process::modify_process(pid, |p| {
-            p.signal_actions[sig as usize].handler = 0;
+            if (sig as usize) < p.signal_actions.len() {
+                p.signal_actions[sig as usize].handler = 0;
+            }
         });
     }
 
-    // Redirect execution to the signal handler.
-    ctx.rsp = frame_addr;
+    // Set up context for handler.
     ctx.rip = action.handler;
+    ctx.rsp = frame_addr;
     ctx.rdi = sig as u64;
-    if (action.flags & SA_SIGINFO) != 0 {
-        ctx.rsi = frame_addr + 312; // &frame->info
-        ctx.rdx = frame_addr + 8;   // &frame->uc
-    } else {
-        ctx.rsi = 0;
-        ctx.rdx = 0;
-    }
-    // Clear RAX so the handler does not see the syscall return value.
+    ctx.rsi = frame_addr + 432; // Offset of 'info'
+    ctx.rdx = frame_addr + 8;   // Offset of 'uc'
     ctx.rax = 0;
-
+    
+    // Clear RFLAGS.TF to prevent single-stepping into handler.
+    ctx.rflags &= !0x100;
+    
     true
 }
+
 
 /// Deliver pending signals that have userspace handlers by pushing signal frames.
 ///
@@ -458,8 +496,16 @@ pub fn deliver_pending_signals_for_current(ctx: &mut crate::interrupts::SyscallC
     }
 
     loop {
-        let Some((sig, action)) = crate::process::pop_lowest_pending_signal(pid) else {
-            break;
+        let (sig, action, old_mask) = {
+            let p = match crate::process::get_process(pid) {
+                Some(p) => p,
+                None => break,
+            };
+            let old_mask = p.signal_mask;
+            let Some((sig, action)) = crate::process::pop_lowest_pending_signal(pid) else {
+                break;
+            };
+            (sig, action, old_mask)
         };
 
         if action.handler == 1 {
@@ -469,7 +515,7 @@ pub fn deliver_pending_signals_for_current(ctx: &mut crate::interrupts::SyscallC
 
         if action.handler != 0 {
             // Userspace handler: try to push a signal frame.
-            if push_rt_signal_frame(ctx, pid, sig, &action, 0, 0) {
+            if push_rt_signal_frame(ctx, pid, sig, &action, old_mask, 0, 0) {
                 // Successfully set up; handler will run on iretq.
                 // Deliver one signal at a time per syscall return.
                 break;
@@ -505,11 +551,11 @@ pub fn deliver_pending_signals_for_current(ctx: &mut crate::interrupts::SyscallC
 /// handler is registered, in which case the caller should terminate the process.
 pub fn deliver_signal_from_exception(
     exc:        &mut crate::interrupts::ExceptionContext,
-    pid:        process::ProcessId,
+    pid:        crate::process::ProcessId,
     signum:     u8,
     fault_addr: u64,
 ) -> bool {
-    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SA_SIGINFO, SS_DISABLE};
+    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SS_DISABLE};
 
     let (action, old_mask, user_rsp) = {
         let p = match crate::process::get_process(pid) {
@@ -517,7 +563,6 @@ pub fn deliver_signal_from_exception(
             None    => return false,
         };
         let action = p.signal_actions[signum as usize];
-        // Require a real handler with a restorer.
         if action.handler == 0 || action.handler == 1 || action.restorer == 0 {
             return false;
         }
@@ -537,14 +582,9 @@ pub fn deliver_signal_from_exception(
     };
 
     const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
-    const RED_ZONE: u64 = 128;
-    let frame_addr = (user_rsp.wrapping_sub(RED_ZONE).wrapping_sub(FRAME_SZ)) & !15u64;
+    let frame_addr = (user_rsp.wrapping_sub(FRAME_SZ)) & !15u64;
 
-    if !is_user_pointer(frame_addr, FRAME_SZ) {
-        return false;
-    }
-
-    let frame = RtSigframe {
+    let mut frame = RtSigframe {
         pretcode: action.restorer,
         uc: UContext {
             uc_flags:    0,
@@ -588,19 +628,37 @@ pub fn deliver_signal_from_exception(
             si_code:  128, // SI_KERNEL
             _rest:    [0u8; 116],
         },
+        _pad: 0,
+        fpstate: [0; 512],
     };
 
-    unsafe { core::ptr::write_unaligned(frame_addr as *mut RtSigframe, frame); }
+    // Save FPU state to the frame.
+    unsafe {
+        core::arch::asm!("fxsave [{}]", in(reg) &mut frame.fpstate[0]);
+    }
 
-    // Update signal mask.
+    // Point uc_mcontext.fpstate to the fpstate buffer ON THE USER STACK.
+    frame.uc.uc_mcontext.fpstate = frame_addr + 448;
+
+    // Write the frame to user memory safely.
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts(&frame as *const RtSigframe as *const u8, FRAME_SZ as usize)
+    };
+    
+    if !copy_to_user(frame_addr, frame_bytes) {
+        return false;
+    }
+
+    // Block this signal during the handler (and any additional signals from sa_mask),
+    // unless SA_NODEFER is set.
     let _ = crate::process::modify_process(pid, |p| {
         if (action.flags & SA_NODEFER) == 0 {
             p.signal_mask |= 1u64 << signum;
         }
         p.signal_mask |= action.mask;
-        p.signal_mask &= !((1u64 << 9) | (1u64 << 19));
     });
 
+    // SA_RESETHAND: reset handler to SIG_DFL after first delivery.
     if (action.flags & SA_RESETHAND) != 0 {
         let _ = crate::process::modify_process(pid, |p| {
             p.signal_actions[signum as usize].handler = 0;
@@ -608,16 +666,15 @@ pub fn deliver_signal_from_exception(
     }
 
     // Redirect the iretq to the signal handler.
-    exc.rsp    = frame_addr;
-    exc.rip    = action.handler;
-    exc.rdi    = signum as u64;
-    if (action.flags & SA_SIGINFO) != 0 {
-        exc.rsi = frame_addr + 312; // &frame->info
-        exc.rdx = frame_addr + 8;   // &frame->uc
-    } else {
-        exc.rsi = 0;
-        exc.rdx = 0;
-    }
+    exc.rsp = frame_addr;
+    exc.rip = action.handler;
+    exc.rdi = signum as u64;
+    exc.rsi = frame_addr + 432; // Offset of 'info'
+    exc.rdx = frame_addr + 8;   // Offset of 'uc'
+    exc.rax = 0;
+    
+    // Clear RFLAGS.TF to prevent single-stepping into handler.
+    exc.rflags &= !0x100;
     exc.rflags |= 0x200; // Ensure IF=1 on return
 
     true
@@ -1040,6 +1097,7 @@ pub extern "C" fn syscall_handler(
         // clock_nanosleep(clockid, flags, req, rem) — usado por std/musl para sleep.
         // En Eclipse tratamos esto como nanosleep(req) e ignoramos clockid/flags/rem.
         230 => sys_nanosleep(arg3),
+        161 => sys_sync(),
         170 => sys_sethostname(arg1, arg2),
         186 => sys_gettid(),
         200 => sys_tkill(arg1, arg2),
@@ -1283,23 +1341,24 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
         };
     }
 
-    // Señales no fatales: entregarlas como pendientes (se aplican al volver de syscall).
-    if sig != 9 && sig != 15 {
-        crate::process::set_pending_signal(target_pid, sig as u8);
+    // SIGKILL (9) es inmediato y fatal; no se puede capturar ni ignorar.
+    if sig == 9 {
+        serial::serial_printf(format_args!("[KILL] pid={} fatal SIGKILL\n", target_pid));
+        let parent_pid = match crate::process::terminate_other_process_by_signal(target_pid, 9) {
+            None => return u64::MAX,
+            Some(pp) => pp,
+        };
+
+        if let Some(ppid) = parent_pid {
+            crate::process::wake_parent_from_wait(ppid);
+        }
         return 0;
     }
 
-    serial::serial_printf(format_args!("[KILL] pid={} sig={}\n", target_pid, sig));
-
-    let parent_pid = match crate::process::terminate_other_process_by_signal(target_pid, sig as u8) {
-        None => return u64::MAX,
-        Some(pp) => pp,
-    };
-
-    if let Some(ppid) = parent_pid {
-        crate::process::wake_parent_from_wait(ppid);
-    }
-
+    // Otras señales: entregarlas como pendientes.
+    // Esto incluye SIGTERM (15), SIGINT (2), SIGSTOP (19), etc.
+    // set_pending_signal manejará la transición a Stopped para SIGSTOP.
+    crate::process::set_pending_signal(target_pid, sig as u8);
     0
 }
 
@@ -2804,6 +2863,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
     use crate::process;
     let wnohang = (flags & 1) != 0;
     let wuntraced = (flags & 2) != 0;
+    let wcontinued = (flags & 8) != 0;
 
     let mut stats = SYSCALL_STATS.lock();
     stats.wait_calls += 1;
@@ -2820,37 +2880,53 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
     loop {
         if wait_pid != 0 {
             let wp = wait_pid as process::ProcessId;
-            match process::get_process(wp) {
-                Some(mut proc) if proc.parent_pid == Some(current_pid) => {
-                        if proc.state == process::ProcessState::Terminated {
-                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                }
+            
+            if let Some(mut proc) = process::get_process(wp) {
+                if proc.parent_pid == Some(current_pid) {
+                    if proc.state == process::ProcessState::Terminated {
+                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                            let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                             }
-                            process::unregister_child_waiter(current_pid);
-                            // Reap zombie: free PROCESS_TABLE slot and PID map entry.
-                            process::remove_process(wp);
-                            return wp as u64;
                         }
+                        process::unregister_child_waiter(current_pid);
+                        // Reap zombie: free PROCESS_TABLE slot and PID map entry.
+                        process::remove_process(wp);
+                        return wp as u64;
+                    }
 
-                        if wuntraced && proc.state == process::ProcessState::Stopped {
-                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                }
+                    if wuntraced && proc.state == process::ProcessState::Stopped && !proc.notified_stopped {
+                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                            let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                             }
-                            process::unregister_child_waiter(current_pid);
-                            // NO cosechamos: el proceso sigue vivo aunque detenido
-                            return wp as u64;
                         }
-                }
-                _ => {
+                        process::unregister_child_waiter(current_pid);
+                        process::modify_process(wp, |p| p.notified_stopped = true).ok();
+                        return wp as u64;
+                    }
+
+                    if wcontinued && !proc.notified_continued && proc.exit_signal == 18 {
+                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                            let wait_status = 0xFFFF; // WIFCONTINUED status in some ABIs, Linux uses 0x007F but we'll use a clear marker
+                            // Actually, Linux WIFCONTINUED(status) is (status == 0xffff)
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                            }
+                        }
+                        process::unregister_child_waiter(current_pid);
+                        process::modify_process(wp, |p| p.notified_continued = true).ok();
+                        return wp as u64;
+                    }
+                } else {
                     process::unregister_child_waiter(current_pid);
-                    return u64::MAX;
+                    return u64::MAX; // Not a child
                 }
+            } else {
+                process::unregister_child_waiter(current_pid);
+                return u64::MAX; // No such process
             }
         } else {
             let mut has_children = false;
@@ -2864,6 +2940,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                 if let Some(mut proc) = process::get_process(*pid) {
                     if proc.parent_pid == Some(current_pid) {
                         has_children = true;
+                        
                         if state == &process::ProcessState::Terminated {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
@@ -2878,7 +2955,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             return *pid as u64;
                         }
 
-                        if wuntraced && state == &process::ProcessState::Stopped {
+                        if wuntraced && state == &process::ProcessState::Stopped && !proc.notified_stopped {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
@@ -2886,7 +2963,19 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
-                            // NO cosechamos
+                            process::modify_process(*pid, |p| p.notified_stopped = true).ok();
+                            return *pid as u64;
+                        }
+
+                        if wcontinued && !proc.notified_continued && proc.exit_signal == 18 {
+                            if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                                let wait_status = 0xFFFF;
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
+                                }
+                            }
+                            process::unregister_child_waiter(current_pid);
+                            process::modify_process(*pid, |p| p.notified_continued = true).ok();
                             return *pid as u64;
                         }
                     }
@@ -6967,14 +7056,17 @@ fn sys_setpgid(pid_arg: u64, pgid_arg: u64) -> u64 {
     let pgid = if pgid_arg == 0 { pid } else { pgid_arg as u32 };
     
     if let Some(mut proc) = crate::process::get_process(pid) {
-        // En una implementación real, deberíamos verificar que 'pid' es el proceso actual
-        // o un hijo en la misma sesión. Para Eclipse single-user, permitimos el cambio.
+        // POSIX: A session leader cannot change its pgid.
+        if proc.sid == proc.id && proc.id != pgid {
+             return linux_abi_error(1); // EPERM
+        }
+        
         proc.pgid = pgid;
         crate::process::update_process(pid, proc);
         serial::serial_printf(format_args!("[SYSCALL] setpgid(pid={}, pgid={}) OK\n", pid, pgid));
         return 0;
     }
-    u64::MAX
+    linux_abi_error(3) // ESRCH
 }
 
 /// sys_setsid - Creates a new session.
@@ -7064,27 +7156,22 @@ fn sys_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
 // Bash / musl compatibility syscalls
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `rt_sigreturn` — restore process context after a signal handler returns.
-///
-/// The signal handler's restorer (`__restore_rt`) calls this syscall.  At that
-/// point the user RSP points 8 bytes past the start of the `RtSigframe` that
-/// was pushed during signal delivery (because `ret` inside the restorer has
-/// already popped `pretcode`).
-///
-/// We read the saved `uc_mcontext` back and restore all GPRs plus RIP/RSP/RFLAGS.
+/// Restores the process state from a signal frame after a signal handler returns.
 fn sys_rt_sigreturn(ctx: &mut crate::interrupts::SyscallContext) -> u64 {
-    // frame_start = RSP - 8 (restorer's `ret` consumed `pretcode`)
-    let frame_addr = ctx.rsp.wrapping_sub(8);
+    // The frame is at the current user RSP.
+    let frame_addr = ctx.rsp;
 
     const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
-    if !is_user_pointer(frame_addr, FRAME_SZ) {
+    let mut frame = unsafe { core::mem::MaybeUninit::<RtSigframe>::uninit().assume_init() };
+    
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut frame as *mut RtSigframe as *mut u8, FRAME_SZ as usize)
+    };
+    
+    if !copy_from_user(frame_addr, frame_bytes) {
+        crate::serial::serial_printf(format_args!("[SIG] Failed to read sigreturn frame at {:#018x}\n", frame_addr));
         return linux_abi_error(14); // EFAULT
     }
-
-    // Read the saved frame from user memory.
-    let frame: RtSigframe = unsafe {
-        core::ptr::read_unaligned(frame_addr as *const RtSigframe)
-    };
 
     let mc = &frame.uc.uc_mcontext;
 
@@ -7106,20 +7193,28 @@ fn sys_rt_sigreturn(ctx: &mut crate::interrupts::SyscallContext) -> u64 {
     ctx.rcx    = mc.rcx;
     ctx.rsp    = mc.rsp;
     ctx.rip    = mc.rip;
+    
     // Only restore user-visible RFLAGS bits; force IF=1 so userspace runs with interrupts.
     ctx.rflags = (mc.eflags & !0x3000u64) | 0x200u64;
 
-    // Restore the signal mask that was in effect when the signal was delivered.
-    let new_mask = frame.uc.uc_sigmask & !((1u64 << 9) | (1u64 << 19)); // SIGKILL/SIGSTOP unblockable
-    if let Some(pid) = current_process_id() {
+    // Ensure CS and SS are correct (don't trust userspace to change them to kernel values).
+    ctx.cs     = 0x1B; // User CS
+    ctx.ss     = 0x23; // User SS
+
+    // Restore FPU state.
+    unsafe {
+        core::arch::asm!("fxrstor [{}]", in(reg) &frame.fpstate[0]);
+    }
+
+    // Restore the signal mask.
+    if let Some(pid) = crate::process::current_process_id() {
         let _ = crate::process::modify_process(pid, |p| {
-            p.signal_mask = new_mask;
+            p.signal_mask = frame.uc.uc_sigmask & !((1u64 << 8) | (1u64 << 18));
         });
     }
 
-    // The return value is taken from the restored RAX above; syscall_handler will
-    // overwrite ctx.rax with our return value, so we return the saved RAX directly.
-    mc.rax
+    // Return RAX value (the one from the context).
+    ctx.rax
 }
 
 /// sys_wait4 — Linux wait4(pid, *wstatus, options, *rusage).
@@ -7867,7 +7962,20 @@ fn sys_getpeername(fd: u64, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
 fn sys_flock(_fd: u64, _operation: u64) -> u64 { 0 }
 
 /// sys_fsync — flush in-core state of a file to storage.
-fn sys_fsync(_fd: u64) -> u64 { 0 }
+fn sys_fsync(_fd: u64) -> u64 {
+    match crate::filesystem::Filesystem::sync() {
+        Ok(_) => 0,
+        Err(_) => 5, // EIO
+    }
+}
+
+/// sys_sync — commit filesystem caches to disk.
+fn sys_sync() -> u64 {
+    match crate::filesystem::Filesystem::sync() {
+        Ok(_) => 0,
+        Err(_) => 5, // EIO
+    }
+}
 
 /// sys_fdatasync — flush file data (but not metadata) to storage.
 fn sys_fdatasync(_fd: u64) -> u64 { 0 }

@@ -286,7 +286,7 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
         );
         result
     };
-    if dev_fd != u64::MAX && dev_fd != 0 {
+    if (dev_fd as i64) > 0 {
         println!("[DISPLAY-SERVICE]   Listing /dev/:");
         let mut buf = [0u8; 256];
         loop {
@@ -303,11 +303,12 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
                 );
                 result
             };
-            if n == 0 || n == u64::MAX {
+            // Correctly check for EOF (0) or error (negative)
+            if n == 0 || (n as i64) < 0 {
                 break;
             }
             let n = n as usize;
-            let slice = &buf[..n];
+            let slice = &buf[..n.min(buf.len())];
             let mut start = 0;
             for (i, &b) in slice.iter().enumerate() {
                 if b == b'\n' {

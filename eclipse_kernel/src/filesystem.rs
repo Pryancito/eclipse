@@ -211,6 +211,17 @@ fn write_bytes_at(abs_offset: u64, src: &[u8]) -> Result<(), &'static str> {
     }
 }
 
+/// Escribe una página (4KB) de un archivo al disco.
+/// Usado por el PageCache para el write-back.
+pub fn write_page_to_disk(inode: u32, data: &[u8], page_index: u64) -> Result<(), &'static str> {
+    // 1. Obtener el offset del archivo
+    // NOTA: En este LFS simplificado, buscamos el offset base del inodo y sumamos el indice de página.
+    let inode_info = Filesystem::read_inode_entry(inode)?;
+    let abs_offset = inode_info.offset + page_index;
+    
+    write_bytes_at(abs_offset, data)
+}
+
 impl Filesystem {
     /// Partition offset in 4096-byte blocks.
     /// - When mounted as disk:NpM the DiskScheme already applies the partition
@@ -306,10 +317,56 @@ impl Filesystem {
                 FS.header = Some(header.clone());
                 FS.mounted = true;
                 
-                // Initialize LFS: log starts after the initial inode table
+                // Initialize LFS: find the highest offset to set log_tail correctly
                 FS.use_lfs = true;
-                FS.log_tail = (header.inode_table_offset + header.inode_table_size + 4095) / 4096;
-                serial::serial_print("[FS] LFS Mode Enabled. Log Tail initialized at block ");
+                let mut highest_offset = header.inode_table_offset + header.inode_table_size;
+                
+                serial::serial_print("[FS] Scanning inode table for log_tail (optimized)...\n");
+                let chunk_size = 64 * 1024; // 64KB per read (4096 inodes)
+                let entries_per_chunk = chunk_size / constants::INODE_TABLE_ENTRY_SIZE;
+                let mut chunk_buf = vec![0u8; chunk_size];
+
+                for chunk_start in (0..header.total_inodes).step_by(entries_per_chunk) {
+                    let entries_in_chunk = core::cmp::min(entries_per_chunk as u32, header.total_inodes - chunk_start);
+                    let bytes_to_read = entries_in_chunk as usize * constants::INODE_TABLE_ENTRY_SIZE;
+                    
+                    let table_offset = header.inode_table_offset + (chunk_start as u64 * constants::INODE_TABLE_ENTRY_SIZE as u64);
+                    let abs_disk_offset = table_offset + (part_offset * BLOCK_SIZE as u64);
+                    
+                    if read_bytes_at(abs_disk_offset, &mut chunk_buf[..bytes_to_read]).is_ok() {
+                        for i in 0..entries_in_chunk {
+                            let entry_ptr = i as usize * constants::INODE_TABLE_ENTRY_SIZE;
+                            let offset = u64::from_le_bytes([
+                                chunk_buf[entry_ptr + 8], chunk_buf[entry_ptr + 9],
+                                chunk_buf[entry_ptr + 10], chunk_buf[entry_ptr + 11],
+                                chunk_buf[entry_ptr + 12], chunk_buf[entry_ptr + 13],
+                                chunk_buf[entry_ptr + 14], chunk_buf[entry_ptr + 15]
+                            ]);
+                            
+                            if offset != 0 {
+                                let abs_record_offset = header.inode_table_offset + header.inode_table_size + offset;
+                                // Need to know the record size to correctly set the tail.
+                                // We read the record header (first 8 bytes).
+                                let mut rec_header = [0u8; 8];
+                                let rec_abs_disk_offset = abs_record_offset + (part_offset * BLOCK_SIZE as u64);
+                                if read_bytes_at(rec_abs_disk_offset, &mut rec_header).is_ok() {
+                                    let record_size = u32::from_le_bytes([
+                                        rec_header[4], rec_header[5],
+                                        rec_header[6], rec_header[7]
+                                    ]) as u64;
+                                    
+                                    let end_offset = abs_record_offset + record_size;
+                                    if end_offset > highest_offset {
+                                        highest_offset = end_offset;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                FS.log_tail = (highest_offset + 4095) / 4096;
+                serial::serial_print("[FS] LFS Mode Enabled. Log Tail found at block ");
                 serial::serial_print_dec(FS.log_tail);
                 serial::serial_print("\n");
 
@@ -584,6 +641,42 @@ impl Filesystem {
         Ok(max_write)
     }
 
+    /// Flush all in-memory LFS redirections to the on-disk inode table.
+    /// This makes the current state persistent across reboots.
+    pub fn sync() -> Result<(), &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        unsafe {
+            if !FS.mounted { return Ok(()); }
+        }
+        
+        serial::serial_print("[FS] Flushing Page Cache...\n");
+        crate::page_cache::PAGE_CACHE.lock().flush_all();
+        
+        serial::serial_print("[FS] Syncing LFS inode map to disk...\n");
+        
+        let map = INODE_MAP.lock();
+        for (&inode, &new_offset) in map.iter() {
+            // Update the entry in the original inode table
+            let index = (inode - 1) as u64;
+            let entry_offset = unsafe { FS.inode_table_offset } + (index * constants::INODE_TABLE_ENTRY_SIZE as u64);
+            let abs_disk_offset = entry_offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+            
+            let mut entry_buffer = [0u8; 16];
+            entry_buffer[0..8].copy_from_slice(&(inode as u64).to_le_bytes());
+            
+            let header = unsafe { FS.header.as_ref().unwrap() };
+            let log_base = header.inode_table_offset + header.inode_table_size;
+            let rel_offset = new_offset.saturating_sub(log_base);
+            
+            entry_buffer[8..16].copy_from_slice(&rel_offset.to_le_bytes());
+            
+            write_bytes_at(abs_disk_offset, &entry_buffer)?;
+        }
+        
+        serial::serial_print("[FS] Sync complete\n");
+        Ok(())
+    }
+
     /// Helper to find child inode in directory data
     fn find_child_in_dir(data: &[u8], target_name: &str) -> Option<u32> {
         let mut offset = 0;
@@ -671,7 +764,7 @@ impl Filesystem {
         // en los 8 KiB del scan).
         if (8..=MAX_RECORD_SIZE).contains(&raw_record_size) {
             if let Ok(Some(found)) = Self::scan_content_tlv_disk(abs_disk_offset, raw_record_size) {
-                serial::serial_printf(format_args!("[FS] get_file_metadata(ino={}): found size={} at offset={:#x}\n", inode, found.1, found.0));
+                // serial::serial_printf(format_args!("[FS] get_file_metadata(ino={}): found size={} at offset={:#x}\n", inode, found.1, found.0));
                 return Ok(found);
             }
         }
@@ -1557,6 +1650,7 @@ enum OpenFile {
     Zero,
     Tty,
     Random,
+    DeviceList,
 }
 
 static OPEN_FILES_SCHEME: Mutex<alloc::vec::Vec<Option<OpenFile>>> = Mutex::new(alloc::vec::Vec::new());
@@ -1583,6 +1677,12 @@ impl Scheme for FileSystemScheme {
         }
 
         match clean_path {
+            p if p == "" || p == "dev" || p == "dev/" => {
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                let id = open_files.len();
+                open_files.push(Some(OpenFile::DeviceList));
+                Ok(id)
+            },
             p if p == "dev/fb0" || p == "fb0" => {
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 let id = open_files.len();
@@ -1770,6 +1870,21 @@ impl Scheme for FileSystemScheme {
                     Ok(len)
                 }
             }
+            OpenFile::DeviceList => {
+                let names = list_device_names();
+                let mut data = alloc::string::String::new();
+                for name in names {
+                    data.push_str(&name);
+                    data.push('\n');
+                }
+                let data_bytes = data.as_bytes();
+                if offset >= data_bytes.len() as u64 {
+                    return Ok(0);
+                }
+                let count = core::cmp::min(buffer.len(), data_bytes.len() - offset as usize);
+                buffer[..count].copy_from_slice(&data_bytes[offset as usize .. offset as usize + count]);
+                Ok(count)
+            }
             OpenFile::Framebuffer => Ok(0),
             OpenFile::Drm { resource_id } => {
                 let res_id = *resource_id;
@@ -1845,6 +1960,7 @@ impl Scheme for FileSystemScheme {
                 }
                 Ok(buffer.len())
             }
+            OpenFile::DeviceList => Err(scheme_error::EINVAL),
             OpenFile::Framebuffer => Ok(buffer.len()),
             OpenFile::Drm { resource_id } => {
                 let res_id = *resource_id;
@@ -1889,6 +2005,19 @@ impl Scheme for FileSystemScheme {
                     let vtmp = VIRTUAL_TMP.lock();
                     vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0)
                 };
+                match whence {
+                    0 => seek_offset as u64,
+                    1 => (current_offset as i128 + seek_offset as i128).max(0) as u64,
+                    2 => (len as i128 + seek_offset as i128).max(0) as u64,
+                    _ => return Err(scheme_error::EINVAL),
+                }
+            }
+            OpenFile::DeviceList => {
+                let names = list_device_names();
+                let mut len = 0;
+                for name in names {
+                    len += name.len() + 1;
+                }
                 match whence {
                     0 => seek_offset as u64,
                     1 => (current_offset as i128 + seek_offset as i128).max(0) as u64,
@@ -2211,6 +2340,16 @@ impl Scheme for FileSystemScheme {
             }
             OpenFile::Keyboard | OpenFile::Null | OpenFile::Zero | OpenFile::Tty | OpenFile::Random => {
                 stat.mode = 0o020666;
+                Ok(0)
+            }
+            OpenFile::DeviceList => {
+                let names = list_device_names();
+                let mut len = 0;
+                for name in names {
+                    len += name.len() + 1;
+                }
+                stat.mode = 0o444 | 0x4000; // S_IFDIR
+                stat.size = len as u64;
                 Ok(0)
             }
         }
