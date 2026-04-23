@@ -1512,7 +1512,7 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         }
     }
     
-    u64::MAX
+    linux_abi_error(9) // EBADF
 }
 
 /// pread64(fd, buf, count, offset) — lectura sin avanzar el offset del descriptor (ld-musl / libc).
