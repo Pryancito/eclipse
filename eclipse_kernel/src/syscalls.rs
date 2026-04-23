@@ -5912,7 +5912,7 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
         let (base, len): (u64, u64) = unsafe {
             if crate::interrupts::set_recovery_point() {
                 crate::interrupts::clear_recovery_point();
-                return if total_written > 0 { total_written } else { u64::MAX };
+                return if total_written > 0 { total_written } else { linux_abi_error(14) }; // EFAULT
             }
             let ptr = (iov_ptr + i * 16) as *const u64;
             let base = ptr.read_unaligned();
@@ -5923,8 +5923,12 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
         
         if len == 0 { continue; }
         let ret = sys_write(fd, base, len);
-        if ret == u64::MAX {
-            return if total_written > 0 { total_written } else { u64::MAX };
+        // For Linux-ABI processes, errors are returned as (-(errno as i64)) as u64 — a
+        // large unsigned value whose signed interpretation is negative.  For non-Linux
+        // processes, errors are returned as u64::MAX (= -1i64).  Either way the signed
+        // interpretation is negative, so casting to i64 and checking < 0 catches both.
+        if (ret as i64) < 0 {
+            return if total_written > 0 { total_written } else { ret };
         }
         total_written += ret;
     }
