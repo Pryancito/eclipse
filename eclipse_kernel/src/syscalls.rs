@@ -1308,6 +1308,12 @@ fn user_path_to_scheme_path(path_str: &str) -> String {
     } else if path_str == "/dev/input" || path_str.starts_with("/dev/input/") {
         let rel = path_str.trim_start_matches("/dev/input").trim_start_matches('/');
         format!("input:{}", rel)
+    } else if path_str.starts_with("/dev/shm/") {
+        // Linux: `/dev/shm` es tmpfs compartido; wlroots abre ficheros tipo
+        // `/dev/shm/wlroots-XXXX` con O_CREAT|O_RDWR. Sin este caso la ruta
+        // caía en `dev:shm/...` y el esquema `dev` devolvía ENOENT.
+        let rel = path_str.trim_start_matches("/dev/shm/");
+        format!("shm:{}", rel)
     } else if path_str == "/dev" || path_str.starts_with("/dev/") {
         let rel = path_str.trim_start_matches("/dev").trim_start_matches('/');
         format!("dev:{}", rel)

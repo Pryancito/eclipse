@@ -203,10 +203,10 @@ QEMU_CMD="$QEMU_CMD -no-reboot"
 # virtio-vga: compatible GOP, OVMF lo encuentra. virtio-gpu: PCI-only, GOP puede fallar
 if [ "$VIRTIO_GPU" = "1" ]; then
     if [ "$VIRTIO_GPU_TYPE" = "gpu" ]; then
-        QEMU_CMD="$QEMU_CMD -device virtio-gpu,xres=$RES_X,yres=$RES_Y"
+        QEMU_CMD="$QEMU_CMD -device virtio-gpu"
         print_info "VirtIO GPU: ${RES_X}x${RES_Y}"
     else
-        QEMU_CMD="$QEMU_CMD -device virtio-vga,xres=$RES_X,yres=$RES_Y"
+        QEMU_CMD="$QEMU_CMD -device virtio-vga"
         print_info "VirtIO VGA: ${RES_X}x${RES_Y}"
     fi
 else

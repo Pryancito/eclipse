@@ -12,9 +12,9 @@ libxml2_la-dict.lo: dict.c \
  /home/moebius/eclipse/eclipse-os-build/include/string.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h \
  include/private/dict.h include/libxml/dict.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  include/libxml/xmlstring.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/private/globals.h include/private/threads.h \
  include/libxml/threads.h \
  /home/moebius/eclipse/eclipse-os-build/include/pthread.h \
@@ -45,9 +45,9 @@ include/libxml/xmlexports.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
 include/private/dict.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 include/libxml/xmlstring.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/private/globals.h:
 include/private/threads.h:
 include/libxml/threads.h:

@@ -15,9 +15,9 @@ libxml2_la-catalog.lo: catalog.c \
  /home/moebius/eclipse/eclipse-os-build/include/fcntl.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/fcntl.h \
  include/libxml/xmlmemory.h include/libxml/hash.h include/libxml/dict.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  include/libxml/xmlstring.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/libxml/uri.h include/libxml/parserInternals.h \
  include/libxml/parser.h include/libxml/tree.h \
  /home/moebius/eclipse/eclipse-os-build/include/limits.h \
@@ -51,9 +51,9 @@ include/libxml/xmlexports.h:
 include/libxml/xmlmemory.h:
 include/libxml/hash.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 include/libxml/xmlstring.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/libxml/uri.h:
 include/libxml/parserInternals.h:
 include/libxml/parser.h:

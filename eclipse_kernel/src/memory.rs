@@ -91,7 +91,10 @@ pub static PAGING_LOCK: Mutex<()> = Mutex::new(());
 /// `heap_phys_base` and `heap_phys_size` are the physical address and byte length
 /// of the heap region allocated by the bootloader from UEFI conventional RAM.
 /// The region is already mapped at PHYS_MEM_OFFSET + heap_phys_base by the bootloader.
-pub fn init(heap_phys_base: u64, heap_phys_size: u64) {
+/// `conventional_mem_total_bytes` is the total conventional RAM from the firmware; we use
+/// it to bound the anonymous user page pool so we never "allocate" physical addresses
+/// past real RAM (e.g. VMs with less than 4 GiB would otherwise get frames at 0x1_0000_0000+).
+pub fn init(heap_phys_base: u64, heap_phys_size: u64, conventional_mem_total_bytes: u64) {
     if heap_phys_base == 0 || heap_phys_size == 0 {
         crate::serial::serial_print("[MEM] ERROR: bootloader did not provide a heap region!\n");
         return;
@@ -125,6 +128,29 @@ pub fn init(heap_phys_base: u64, heap_phys_size: u64) {
     #[cfg(test)]
     {
         crate::serial::serial_print("[MEM] Using std allocator for tests\n");
+    }
+
+    // Rango físico para marcos de usuario (mmap anónimo, pila, demand paging).
+    // Debe quedar *dentro* de la RAM convencional real; el valor por defecto 4 GiB
+    // rompía invitados con poca memoria: el bump devolvía direcciones no respaldadas.
+    let heap_end = heap_phys_base.saturating_add(heap_phys_size);
+    let heap_end_aligned = (heap_end + 0xFFF) & !0xFFF;
+    if conventional_mem_total_bytes > 0
+        && heap_end_aligned > 0
+        && heap_end_aligned < conventional_mem_total_bytes
+    {
+        ANON_MMAP_NEXT.store(0, Ordering::Relaxed);
+        ANON_MMAP_PHYS_START.store(heap_end_aligned, Ordering::Relaxed);
+        ANON_MMAP_PHYS_END
+            .store(conventional_mem_total_bytes, Ordering::Relaxed);
+        crate::serial::serial_printf(format_args!(
+            "[MEM] anon-mmap phys pool: start={:#x} end={:#x}\n",
+            heap_end_aligned, conventional_mem_total_bytes
+        ));
+    } else {
+        crate::serial::serial_print(
+            "[MEM] WARN: using default anon-mmap pool at 4 GiB+ (check conventional_mem / heap)\n",
+        );
     }
 }
 
@@ -1204,11 +1230,21 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
 /// Physical address is accessible at phys_to_virt(phys_addr).
 static ANON_MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
 
-// Start at 4GiB to reduce collision with the typical PCI/MMIO hole (3-4GiB)
-// on real x86_64 systems. Bootloader HHDM pages cover a much larger physical range.
-const ANON_MMAP_PHYS_START: u64 = 0x1_0000_0000; // 4GiB
-// Allow up to 256GiB of anon mmap frames.
-const ANON_MMAP_PHYS_END: u64 = ANON_MMAP_PHYS_START + (256u64 * 1024u64 * 1024u64 * 1024u64);
+// Rango [start,end) ajustado en `memory::init` desde el heap y la RAM convencional.
+// Valores iniciales: misma base 4 GiB y +256 GiB (si `init` no puede fijar un rango válido).
+static ANON_MMAP_PHYS_START: AtomicU64 = AtomicU64::new(0x1_0000_0000);
+static ANON_MMAP_PHYS_END: AtomicU64 =
+    AtomicU64::new(0x1_0000_0000 + (256u64 * 1024u64 * 1024u64 * 1024u64));
+
+#[inline]
+fn anon_mmap_pool_start() -> u64 {
+    ANON_MMAP_PHYS_START.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn anon_mmap_pool_end() -> u64 {
+    ANON_MMAP_PHYS_END.load(Ordering::Relaxed)
+}
 
 /// Dedicated physical memory region for GPU Firmware (Phase 3)
 pub const GPU_FW_PHYS_BASE: u64 = 0x2000_0000;  // 512MB
@@ -1235,20 +1271,29 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     });
 
     if let Some(f) = frame {
+        // Reutilización: el contenido viejo se pisa al mapear a user (`handle_anon` /
+        // `sys_mmap` ansioso/`brk`/ELF… suelen poner a cero; no tocar aquí con HHDM: el
+        // mapa lineal 0xFFFF9000+phys **no** garantiza un PTE para cada 4K de RAM
+        // reportada como "convencional", y `write_bytes` vía `PHYS_MEM_OFFSET+phys`
+        // en marcos aún no mapeados en el HHDM dispara #14 en **ring 0** (RIP en kernel).
         notify_ai_memory_stats();
         return Some(f);
     }
+    let pool_start = anon_mmap_pool_start();
+    let pool_end = anon_mmap_pool_end();
     let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
-    let frame_phys = ANON_MMAP_PHYS_START + next;
-    if frame_phys >= ANON_MMAP_PHYS_END {
+    let frame_phys = pool_start.saturating_add(next);
+    if frame_phys >= pool_end {
         return None;
     }
+    // El cero inicial lo hacen `handle_anon_page_fault` y el camino no-perezoso de
+    // `mmap` al instalar el PTE, sin leer/escribir en HHDM hacia memoria no cubierta.
     notify_ai_memory_stats();
     Some(frame_phys)
 }
 
 pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
-    if phys_addr < ANON_MMAP_PHYS_START || phys_addr >= ANON_MMAP_PHYS_END {
+    if phys_addr < anon_mmap_pool_start() || phys_addr >= anon_mmap_pool_end() {
         return;
     }
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -1346,7 +1391,8 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
 /// Notify AI-Core about current memory status
 fn notify_ai_memory_stats() {
     let next = ANON_MMAP_NEXT.load(Ordering::Relaxed);
-    let remaining_bump = (ANON_MMAP_PHYS_END.saturating_sub(ANON_MMAP_PHYS_START).saturating_sub(next)) / 4096;
+    let pool = anon_mmap_pool_end().saturating_sub(anon_mmap_pool_start());
+    let remaining_bump = pool.saturating_sub(next) / 4096;
     let free_count = x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = FREE_FRAMES_LOCK.lock();
         unsafe { FREE_FRAMES_COUNT }
@@ -1362,12 +1408,14 @@ pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
     }
     let bytes = num_pages * 4096;
 
+    let pool_start = anon_mmap_pool_start();
+    let pool_end = anon_mmap_pool_end();
     loop {
         let current = ANON_MMAP_NEXT.load(Ordering::SeqCst);
-        let start_phys = ANON_MMAP_PHYS_START + current;
+        let start_phys = pool_start + current;
         let end_phys = start_phys + bytes;
 
-        if end_phys > ANON_MMAP_PHYS_END {
+        if end_phys > pool_end {
             return None;
         }
 
@@ -1384,7 +1432,7 @@ pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
 
 /// Returns (total_frames, used_frames) for the userspace physical pool.
 pub fn get_memory_stats() -> (u64, u64) {
-    let total = (ANON_MMAP_PHYS_END - ANON_MMAP_PHYS_START) / 4096;
+    let total = (anon_mmap_pool_end().saturating_sub(anon_mmap_pool_start())) / 4096;
     // Cap at total so the counter never reports used > total after the pool is exhausted.
     let used = (ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096).min(total);
     (total, used)

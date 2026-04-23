@@ -90,7 +90,7 @@ EGREP="/usr/bin/grep -E"
 FGREP="/usr/bin/grep -F"
 
 # A BSD- or MS-compatible name lister.
-NM="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-nm"
+NM="/home/moebius/eclipse/eclipse-os-build/bin/x86_64-linux-musl-gcc-nm"
 
 # Whether we need soft or hard links.
 LN_S="ln -s"
@@ -141,7 +141,7 @@ DLLTOOL="false"
 sharedlib_from_linklib_cmd="printf %s\\n"
 
 # The archiver.
-AR="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ar"
+AR="/home/moebius/eclipse/eclipse-os-build/bin/x86_64-linux-musl-gcc-ar"
 
 # Flags to create an archive.
 AR_FLAGS="cr"
@@ -153,7 +153,7 @@ archiver_list_spec="@"
 STRIP="strip"
 
 # Commands used to install an old-style archive.
-RANLIB="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ranlib"
+RANLIB="/home/moebius/eclipse/eclipse-os-build/bin/x86_64-linux-musl-gcc-ranlib"
 old_postinstall_cmds="chmod 644 \$oldlib~\$RANLIB \$tool_oldlib"
 old_postuninstall_cmds=""
 
@@ -161,10 +161,10 @@ old_postuninstall_cmds=""
 lock_old_archive_extraction=no
 
 # A C compiler.
-LTCC="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc"
+LTCC="/home/moebius/eclipse/eclipse-os-build/bin/x86_64-linux-musl-gcc"
 
 # LTCC compiler flags.
-LTCFLAGS="-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC "
+LTCFLAGS="-idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC -idirafter /home/moebius/eclipse/eclipse-os-build/usr/include -idirafter /home/moebius/eclipse/eclipse-os-build/include -fPIC "
 
 # Take the output of nm and produce a listing of raw symbols and C names.
 global_symbol_pipe="sed -n -e 's/^.*[	 ]\\([ABCDGIRSTW][ABCDGIRSTW]*\\)[	 ][	 ]*\\([_A-Za-z][_A-Za-z0-9]*\\)\$/\\1 \\2 \\2/p' | sed '/ __gnu_lto/d'"
@@ -281,7 +281,7 @@ finish_eval=""
 hardcode_into_libs=yes
 
 # Compile-time system search path for libraries.
-sys_lib_search_path_spec="/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1 /home/moebius/eclipse/host-toolchains/lib/gcc /home/moebius/eclipse/host-toolchains/x86_64-linux-musl/lib /home/moebius/eclipse/host-toolchains/lib "
+sys_lib_search_path_spec="/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1 /home/moebius/eclipse/eclipse-os-build/lib/gcc /home/moebius/eclipse/eclipse-os-build/x86_64-linux-musl/lib /home/moebius/eclipse/eclipse-os-build/lib /home/moebius/eclipse/eclipse-os-build/usr/lib "
 
 # Detected run-time system search path for libraries.
 sys_lib_dlsearch_path_spec="/lib /usr/lib /usr/lib/x86_64-linux-gnu/libfakeroot /usr/local/lib/i386-linux-gnu /lib/i386-linux-gnu /usr/lib/i386-linux-gnu /usr/local/lib/i686-linux-gnu /lib/i686-linux-gnu /usr/lib/i686-linux-gnu /usr/local/lib /usr/local/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu "
@@ -304,7 +304,7 @@ striplib="strip --strip-unneeded"
 
 
 # The linker used to build libraries.
-LD="/home/moebius/eclipse/host-toolchains/x86_64-linux-musl/bin/ld -m elf_x86_64"
+LD="/home/moebius/eclipse/eclipse-os-build/x86_64-linux-musl/bin/ld -m elf_x86_64"
 
 # How to create reloadable object files.
 reload_flag=" -r"
@@ -314,7 +314,7 @@ reload_cmds="\$LD\$reload_flag -o \$output\$reload_objs"
 old_archive_cmds="\$AR \$AR_FLAGS \$oldlib\$oldobjs~\$RANLIB \$tool_oldlib"
 
 # A language specific compiler.
-CC="/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc"
+CC="/home/moebius/eclipse/eclipse-os-build/bin/x86_64-linux-musl-gcc"
 
 # Is the compiler the GNU compiler?
 with_gcc=yes

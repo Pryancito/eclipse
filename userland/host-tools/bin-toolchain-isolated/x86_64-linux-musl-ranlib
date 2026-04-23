@@ -1,3 +1,11 @@
-#!/bin/bash
-export LD_LIBRARY_PATH="/home/moebius/eclipse/host-toolchains/lib"
-exec "/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc-ranlib" "$@"
+#!/usr/bin/env bash
+set -e
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$d/../../.." && pwd)"
+for TC in "$ROOT/eclipse-os-build" "$ROOT/host-toolchains"; do
+	BIN="$TC/bin/x86_64-linux-musl-gcc-ranlib"
+	if [[ -x "$BIN" ]]; then
+		exec "$BIN" "$@"
+	fi
+done
+exit 127

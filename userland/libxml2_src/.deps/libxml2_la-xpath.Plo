@@ -7,14 +7,14 @@ libxml2_la-xpath.lo: xpath.c \
  /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/string.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  /home/moebius/eclipse/eclipse-os-build/include/math.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/float.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/float.h \
  /home/moebius/eclipse/eclipse-os-build/include/ctype.h \
  include/libxml/xmlmemory.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
  include/libxml/tree.h include/libxml/parser.h include/libxml/xmlstring.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/libxml/xmlregexp.h include/libxml/dict.h include/libxml/hash.h \
  include/libxml/valid.h include/libxml/xmlerror.h include/libxml/list.h \
  include/libxml/xmlautomata.h include/libxml/entities.h \
@@ -28,7 +28,7 @@ libxml2_la-xpath.lo: xpath.c \
  include/private/xpath.h timsort.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
  /home/moebius/eclipse/eclipse-os-build/include/alloca.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h
 /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
@@ -42,16 +42,16 @@ include/libxml/xmlexports.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h:
 /home/moebius/eclipse/eclipse-os-build/include/string.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 /home/moebius/eclipse/eclipse-os-build/include/math.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/float.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/float.h:
 /home/moebius/eclipse/eclipse-os-build/include/ctype.h:
 include/libxml/xmlmemory.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
 include/libxml/tree.h:
 include/libxml/parser.h:
 include/libxml/xmlstring.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/libxml/xmlregexp.h:
 include/libxml/dict.h:
 include/libxml/hash.h:
@@ -78,6 +78,6 @@ include/private/xpath.h:
 timsort.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
 /home/moebius/eclipse/eclipse-os-build/include/alloca.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:

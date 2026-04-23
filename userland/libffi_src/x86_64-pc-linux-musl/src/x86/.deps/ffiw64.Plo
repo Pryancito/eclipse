@@ -1,7 +1,7 @@
 src/x86/ffiw64.lo: ../src/x86/ffiw64.c \
  /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h \
  include/ffi.h include/ffitarget.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  /home/moebius/eclipse/eclipse-os-build/include/limits.h \
  /home/moebius/eclipse/eclipse-os-build/include/features.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
@@ -11,14 +11,14 @@ src/x86/ffiw64.lo: ../src/x86/ffiw64.c \
  /home/moebius/eclipse/eclipse-os-build/include/string.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdlib.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdint.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h \
  ../include/tramp.h
 /home/moebius/eclipse/eclipse-os-build/include/stdc-predef.h:
 include/ffi.h:
 include/ffitarget.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 /home/moebius/eclipse/eclipse-os-build/include/limits.h:
 /home/moebius/eclipse/eclipse-os-build/include/features.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
@@ -29,7 +29,7 @@ fficonfig.h:
 /home/moebius/eclipse/eclipse-os-build/include/string.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdlib.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdint.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/stdint.h:
 ../include/tramp.h:

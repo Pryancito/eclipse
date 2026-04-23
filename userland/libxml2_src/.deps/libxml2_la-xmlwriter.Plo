@@ -5,7 +5,7 @@ libxml2_la-xmlwriter.lo: xmlwriter.c \
  /home/moebius/eclipse/eclipse-os-build/include/features.h \
  /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h \
  /home/moebius/eclipse/eclipse-os-build/include/strings.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h \
  include/libxml/xmlmemory.h \
  /home/moebius/eclipse/eclipse-os-build/include/stdio.h \
  include/libxml/parser.h include/libxml/tree.h \
@@ -13,7 +13,7 @@ libxml2_la-xmlwriter.lo: xmlwriter.c \
  /home/moebius/eclipse/eclipse-os-build/include/bits/limits.h \
  include/libxml/xmlstring.h include/libxml/xmlregexp.h \
  include/libxml/dict.h \
- /home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
+ /home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h \
  include/libxml/hash.h include/libxml/valid.h include/libxml/xmlerror.h \
  include/libxml/list.h include/libxml/xmlautomata.h \
  include/libxml/entities.h include/libxml/encoding.h \
@@ -32,7 +32,7 @@ include/libxml/xmlexports.h:
 /home/moebius/eclipse/eclipse-os-build/include/features.h:
 /home/moebius/eclipse/eclipse-os-build/include/bits/alltypes.h:
 /home/moebius/eclipse/eclipse-os-build/include/strings.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stdarg.h:
 include/libxml/xmlmemory.h:
 /home/moebius/eclipse/eclipse-os-build/include/stdio.h:
 include/libxml/parser.h:
@@ -42,7 +42,7 @@ include/libxml/tree.h:
 include/libxml/xmlstring.h:
 include/libxml/xmlregexp.h:
 include/libxml/dict.h:
-/home/moebius/eclipse/host-toolchains/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
+/home/moebius/eclipse/eclipse-os-build/lib/gcc/x86_64-linux-musl/11.2.1/include/stddef.h:
 include/libxml/hash.h:
 include/libxml/valid.h:
 include/libxml/xmlerror.h:

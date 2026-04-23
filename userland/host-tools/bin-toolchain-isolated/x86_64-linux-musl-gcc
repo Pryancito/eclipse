@@ -1,3 +1,14 @@
-#!/bin/bash
-export LD_LIBRARY_PATH="/home/moebius/eclipse/host-toolchains/lib"
-exec "/home/moebius/eclipse/host-toolchains/bin/x86_64-linux-musl-gcc" "$@"
+#!/usr/bin/env bash
+# Resuelve el prefijo del toolchain: eclipse-os-build o host-toolchains bajo el repo.
+set -e
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$d/../../.." && pwd)"
+for TC in "$ROOT/eclipse-os-build" "$ROOT/host-toolchains"; do
+	BIN="$TC/bin/x86_64-linux-musl-gcc"
+	if [[ -x "$BIN" ]]; then
+		export LD_LIBRARY_PATH="$TC/lib"
+		exec "$BIN" "$@"
+	fi
+done
+echo "bin-toolchain-isolated: no se encontró x86_64-linux-musl-gcc en $ROOT/eclipse-os-build ni $ROOT/host-toolchains" >&2
+exit 127

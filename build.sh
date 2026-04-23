@@ -1519,6 +1519,24 @@ EOF
         print_warning "No hay libgcc_s.so.1 en $_musl_native_lib — ejecuta el paso de descarga musl o copia manual para cargo dinámico"
     fi
 
+    # Intérprete dinámico musl: PT_INTERP de binarios enlazados con -dynamic-linker /lib/ld-musl-x86_64.so.1
+    # (wayfire, labwc, …). En musl el loader es el mismo binario que libc.so; en el .stage, ld-musl suele
+    # apuntar a /lib/libc.so — copiamos el .so real y hardlinkeamos el nombre del loader (el kernel
+    # no resolvía el intérprete si faltaba en /lib en EclipseFS).
+    if [ -f "$_musl_native_lib/libc.so" ]; then
+        if [ ! -f "$BUILD_DIR/lib/libc.so" ]; then
+            cp -a "$_musl_native_lib/libc.so" "$BUILD_DIR/lib/libc.so"
+            print_status "Instalado lib/libc.so (musl dinámico) desde musl native staging"
+        fi
+        if [ ! -e "$BUILD_DIR/lib/ld-musl-x86_64.so.1" ]; then
+            ln "$BUILD_DIR/lib/libc.so" "$BUILD_DIR/lib/ld-musl-x86_64.so.1" 2>/dev/null \
+                || cp -a "$BUILD_DIR/lib/libc.so" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
+            print_status "lib/ld-musl-x86_64.so.1 → mismo inodo que libc.so (cargador para execve/PT_INTERP)"
+        fi
+    else
+        print_warning "No hay $_musl_native_lib/libc.so — no se instala ld-musl; los binarios PIE/dinámicos fallarán al arrancar"
+    fi
+
     # Árbol lib/gcc (specs, crt, includes): gcc en la imagen lo necesita; musl.cc no siempre trae `specs` en el .tgz.
     local _musl_stage="$HOST_TOOLCHAINS_DIR/.stage/x86_64-linux-musl-native"
     if [ -d "$_musl_stage/lib/gcc" ]; then

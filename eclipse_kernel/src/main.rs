@@ -253,7 +253,11 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
-    memory::init(boot_info.heap_phys_base, boot_info.heap_phys_size);
+    memory::init(
+        boot_info.heap_phys_base,
+        boot_info.heap_phys_size,
+        boot_info.conventional_mem_total_bytes,
+    );
     progress::init();
     progress::bar(65);
 
