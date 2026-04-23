@@ -127,6 +127,59 @@ impl Context {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signal infrastructure — POSIX/Linux ABI
+// ---------------------------------------------------------------------------
+
+/// SA_* flags (Linux x86-64 compatible).
+pub const SA_NOCLDSTOP:  u64 = 1;
+pub const SA_NOCLDWAIT:  u64 = 2;
+pub const SA_SIGINFO:    u64 = 4;
+pub const SA_RESTORER:   u64 = 0x0400_0000;
+pub const SA_ONSTACK:    u64 = 0x0800_0000;
+pub const SA_RESTART:    u64 = 0x1000_0000;
+pub const SA_NODEFER:    u64 = 0x4000_0000;
+pub const SA_RESETHAND:  u64 = 0x8000_0000;
+
+/// SS_* flags for `sigaltstack`.
+pub const SS_ONSTACK: u32 = 1;
+pub const SS_DISABLE: u32 = 2;
+
+/// Complete signal action — mirrors Linux `struct sigaction` for x86-64.
+///
+/// Layout (matches `struct sigaction` passed by musl/glibc via `rt_sigaction`):
+///   [0..8]   handler  — `SIG_DFL` = 0, `SIG_IGN` = 1, or userspace fn ptr
+///   [8..16]  flags    — `SA_*` flags
+///   [16..24] restorer — `sa_restorer` pointer (required when `SA_RESTORER` is set)
+///   [24..32] mask     — signals to block during this handler (64-bit bitmask)
+#[derive(Clone, Copy)]
+pub struct SignalAction {
+    pub handler:  u64,
+    pub flags:    u64,
+    pub restorer: u64,
+    pub mask:     u64,
+}
+
+impl SignalAction {
+    pub const fn new() -> Self {
+        Self { handler: 0, flags: 0, restorer: 0, mask: 0 }
+    }
+}
+
+/// Alternate signal stack — mirrors Linux `stack_t`.
+#[derive(Clone, Copy)]
+pub struct Sigaltstack {
+    pub ss_sp:    u64,
+    pub ss_flags: u32,
+    pub ss_size:  u64,
+}
+
+impl Sigaltstack {
+    pub const fn new() -> Self {
+        Self { ss_sp: 0, ss_flags: SS_DISABLE, ss_size: 0 }
+    }
+}
+
 /// Process Control Block
 #[derive(Clone)]
 pub struct Process {
@@ -157,8 +210,10 @@ pub struct Process {
     pub pending_signals: u64,
     /// Máscara de señales bloqueadas (bit N = señal N bloqueada).
     pub signal_mask: u64,
-    /// Manejadores de señal registrados por el proceso vía sys_sigaction.
-    pub signal_handlers: [u64; 64],
+    /// Acciones de señal registradas por el proceso vía rt_sigaction.
+    pub signal_actions: [SignalAction; 64],
+    /// Pila alternativa para manejadores de señal (sigaltstack).
+    pub sigaltstack: Sigaltstack,
     /// Process Group ID
     pub pgid: ProcessId,
     /// Session ID
@@ -216,7 +271,8 @@ impl Process {
             ai_profile: crate::ai_core::ProcessProfile::new(),
             pending_signals: 0,
             signal_mask: 0,
-            signal_handlers: [0u64; 64],
+            signal_actions: [const { SignalAction::new() }; 64],
+            sigaltstack: Sigaltstack::new(),
             pgid: 0,
             sid: 0,
             dynamic_linker_aux: None,
@@ -1064,6 +1120,8 @@ pub fn exit_process() {
             })
         };
         if let Some(ppid) = parent_pid {
+            // Send SIGCHLD to parent (SIG 17) so it wakes from wait() / handler.
+            set_pending_signal(ppid, 17);
             wake_parent_from_wait(ppid);
         }
     }
@@ -1197,6 +1255,20 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.exit_signal = 0;
                 child.syscall_trace = parent.syscall_trace;
 
+                // Signal inheritance (POSIX fork semantics):
+                // - child inherits signal dispositions and mask
+                // - child's pending signals are cleared (done by Process::new())
+                // - child inherits alternate signal stack
+                child.signal_actions = parent.signal_actions;
+                child.signal_mask    = parent.signal_mask;
+                child.sigaltstack    = parent.sigaltstack;
+
+                // Inherit process group, session, and working directory.
+                child.pgid    = parent.pgid;
+                child.sid     = parent.sid;
+                child.cwd     = parent.cwd;
+                child.cwd_len = parent.cwd_len;
+
                 // Keep parent name (child will overwrite it with set_process_name if needed)
                 let mut name = [0u8; 16];
                 let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
@@ -1305,16 +1377,16 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
                 child.exit_signal = 0;
                 child.syscall_trace = parent.syscall_trace;
 
-                let mut name = [0u8; 16];
-                let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
-                let copy_len = core::cmp::min(parent_name_len, 16);
-                name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
-                child.name = name;
+                // Signal inheritance (POSIX fork semantics).
+                child.signal_actions = parent.signal_actions;
+                child.signal_mask    = parent.signal_mask;
+                child.sigaltstack    = parent.sigaltstack;
+                child.pgid    = parent.pgid;
+                child.sid     = parent.sid;
+                child.cwd     = parent.cwd;
+                child.cwd_len = parent.cwd_len;
 
-                child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
-                child.context.rsp = kstack_ptr as u64;
-                child.context.rax = 0;
-                child.context.rbx = parent_context.rbx;
+                let mut name = [0u8; 16];
                 child.context.rcx = parent_context.rcx;
                 child.context.rdx = parent_context.rdx;
                 child.context.rsi = parent_context.rsi;
@@ -1396,9 +1468,9 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
     }
 }
 
-/// Consume (limpia) un bit de señal del proceso actual y devuelve el handler registrado.
+/// Consume (limpia) un bit de señal del proceso actual y devuelve la acción registrada.
 /// Devuelve None si no hay señal pendiente o no hay proceso actual.
-pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<u64> {
+pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<SignalAction> {
     if signum >= 64 { return None; }
     let mask = 1u64 << signum;
     let mut table = PROCESS_TABLE.lock();
@@ -1406,7 +1478,7 @@ pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<u64> {
         if let Some(p) = slot {
             if p.id == pid && (p.pending_signals & mask) != 0 {
                 p.pending_signals &= !mask;
-                return Some(p.signal_handlers[signum as usize]);
+                return Some(p.signal_actions[signum as usize]);
             }
         }
     }
@@ -1422,9 +1494,9 @@ pub fn signal_default_is_ignore(signum: u8) -> bool {
     }
 }
 
-/// Extrae la señal pendiente de menor número, la borra del bitmask y devuelve (número, handler).
+/// Extrae la señal pendiente de menor número, la borra del bitmask y devuelve (número, acción).
 /// **Respeta la máscara de señales (p.signal_mask)**, excepto para SIGKILL (9) y SIGSTOP (19).
-pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
+pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, SignalAction)> {
     let mut table = PROCESS_TABLE.lock();
     for slot in table.iter_mut() {
         if let Some(p) = slot {
@@ -1447,8 +1519,8 @@ pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
             let sig = bit as u8;
             let mask = 1u64 << sig;
             p.pending_signals &= !mask;
-            let handler = p.signal_handlers[sig as usize];
-            return Some((sig, handler));
+            let action = p.signal_actions[sig as usize];
+            return Some((sig, action));
         }
     }
     None
@@ -1457,7 +1529,7 @@ pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, u64)> {
 /// Termina `target_pid` con `exit_code = 128 + sig` (como `sys_kill` fatal).
 /// Devuelve `None` si no existe, `Some(None)` si ya era zombie, `Some(Some(ppid))` si se mató.
 pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Option<Option<ProcessId>> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
         for (slot_idx, slot) in table.iter_mut().enumerate() {
             if let Some(p) = slot {
@@ -1474,13 +1546,19 @@ pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Opti
             }
         }
         None
-    })
+    });
+    // Send SIGCHLD to parent outside the lock to avoid deadlock.
+    if let Some(Some(ppid)) = result {
+        set_pending_signal(ppid, 17); // SIGCHLD
+        wake_parent_from_wait(ppid);
+    }
+    result
 }
 
-/// Tras cada syscall desde userspace: aplica señales en cola (SIG_IGN, SIG_DFL, SIGKILL).
-/// Los manejadores de usuario (puntero != 0 y != 1) aún **no** se invocan: se tratan como fatal
-/// hasta implementar trampa/sigreturn.
-pub fn deliver_pending_signals_for_current() {
+/// Tras cada tick de timer/interrupción: entrega solo SIGKILL y señales fatales SIG_DFL.
+/// Los manejadores de usuario con restorer se dejan pendientes para que
+/// `deliver_pending_signals_for_current` los entregue correctamente al retorno de syscall.
+pub fn deliver_pending_signals_noctx() {
     let Some(pid) = current_process_id() else { return };
     if let Some(p) = get_process(pid) {
         if p.state == ProcessState::Terminated {
@@ -1491,18 +1569,23 @@ pub fn deliver_pending_signals_for_current() {
     }
 
     loop {
-        let Some((sig, handler)) = pop_lowest_pending_signal(pid) else {
+        let Some((sig, action)) = pop_lowest_pending_signal(pid) else {
             break;
         };
 
-        if handler == 1 {
+        if action.handler == 1 {
             // SIG_IGN
             continue;
         }
 
-        // SIGKILL (9) no se puede ignorar ni capturar.
-        let terminate = sig == 9
-            || handler != 0 // capturado: sin sigreturn → fatal por ahora
+        if action.handler != 0 {
+            // Userspace handler with restorer: re-queue and defer to syscall return path.
+            set_pending_signal(pid, sig);
+            break;
+        }
+
+        // SIG_DFL: check if fatal
+        let terminate = sig == 9  // SIGKILL: always fatal
             || !signal_default_is_ignore(sig);
 
         if !terminate {
