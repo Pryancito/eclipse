@@ -175,10 +175,22 @@ pub fn fd_close(pid: ProcessId, fd: usize) -> bool {
         Some(i) => i,
         None => return false,
     };
-    let mut tables = FD_TABLES.lock();
-    if tables[pid_idx].close(fd) {
-        // Also notify scheme
-        let (scheme_id, resource_id) = (tables[pid_idx].fds[fd].scheme_id, tables[pid_idx].fds[fd].resource_id);
+    // Save scheme/resource IDs and mark the slot as free *before* releasing the
+    // lock, then notify the scheme *after* the lock is dropped.  Calling
+    // scheme::close() while FD_TABLES is held risks a deadlock if the scheme
+    // implementation ever needs to re-acquire that lock.
+    let ids = {
+        let mut tables = FD_TABLES.lock();
+        if fd < MAX_FDS_PER_PROCESS && tables[pid_idx].fds[fd].in_use {
+            let scheme_id = tables[pid_idx].fds[fd].scheme_id;
+            let resource_id = tables[pid_idx].fds[fd].resource_id;
+            tables[pid_idx].fds[fd].in_use = false;
+            Some((scheme_id, resource_id))
+        } else {
+            None
+        }
+    };
+    if let Some((scheme_id, resource_id)) = ids {
         let _ = crate::scheme::close(scheme_id, resource_id);
         true
     } else {

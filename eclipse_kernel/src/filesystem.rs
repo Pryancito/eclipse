@@ -359,7 +359,13 @@ impl Filesystem {
                 entry_buffer[14], entry_buffer[15]
             ]);
              
-            let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
+            // Use checked arithmetic: these three values come from an on-disk header and
+            // could be crafted to overflow when added together, producing an incorrect
+            // disk seek that corrupts arbitrary memory via the HHDM mapping.
+            let absolute_offset = header.inode_table_offset
+                .checked_add(header.inode_table_size)
+                .and_then(|s| s.checked_add(rel_offset))
+                .ok_or("Inode offset arithmetic overflow (corrupt filesystem header)")?;
             
             // 2. Update Inode Cache (LRU)
             let mut victim_idx = 0;

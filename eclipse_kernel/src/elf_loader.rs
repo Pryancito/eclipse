@@ -257,7 +257,8 @@ fn va_to_file_off(
     for i in 0..ph_count {
         let ph = program_header_at(provider, ph_offset, i, ph_size).ok()?;
         if ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr.saturating_add(ph.p_filesz) {
-            return Some((ph.p_offset + (vaddr - ph.p_vaddr)) as usize);
+            let offset_in_seg = vaddr - ph.p_vaddr;
+            return ph.p_offset.checked_add(offset_in_seg).map(|o| o as usize);
         }
     }
     None
@@ -962,8 +963,7 @@ fn load_elf_provider(provider: &dyn ElfDataProvider) -> Option<ProcessId> {
                 p.fs_base = loaded.tls_base;
             }
             p.dynamic_linker_aux = loaded.dynamic_linker;
-            // All user-space binaries use Linux ABI error convention.
-            p.is_linux = true;
+            // is_linux always true (all processes use Linux/musl ABI)
         }
     });
 

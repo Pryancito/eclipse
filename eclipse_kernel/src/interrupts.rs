@@ -658,7 +658,7 @@ pub struct ExceptionContext {
     pub ss: u64,
 }
 
-extern "C" fn exception_handler(context: &ExceptionContext) {
+extern "C" fn exception_handler(context: &mut ExceptionContext) {
     // CR2 MUST be read before ANY operation that could trigger a nested fault
     let cr2: u64;
     let cr3: u64;
@@ -1053,11 +1053,28 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
     }
     // ---- End Fault Recovery ----
 
-    // ---- Userspace fault: kill the process instead of BSOD ----
+    // ---- Userspace fault: try signal delivery, then kill if no handler ----
     // If CS[1:0] == 3, the fault originated from ring-3 (userspace) code.
-    // In that case, terminate the faulting process and schedule the next one
-    // so the kernel keeps running and the watchdog can restart the process.
     if cs & 3 == 3 && pid != 0 {
+        // Map hardware exception to POSIX signal.
+        let signal_for_exc: Option<u8> = match num {
+            0        => Some(8),   // #DE  → SIGFPE
+            4 | 5    => Some(11),  // #OF/#BR → SIGSEGV
+            6        => Some(4),   // #UD  → SIGILL
+            11 | 12  => Some(11),  // #NP/#SS → SIGSEGV
+            13       => Some(11),  // #GP  → SIGSEGV
+            14       => Some(11),  // #PF  → SIGSEGV
+            _        => None,
+        };
+
+        if let Some(signum) = signal_for_exc {
+            // Try to deliver via signal frame; if the process has a handler we redirect
+            // the iretq to the signal handler instead of killing the process.
+            if crate::syscalls::deliver_signal_from_exception(context, pid, signum, cr2) {
+                return;
+            }
+        }
+
         crate::serial::serial_printf(format_args!(
             "[FAULT] Userspace exception #{} in PID {} at RIP={:#018x} CR2={:#018x} RBX={:#018x} R11={:#018x} — killing process\n",
             num, pid, rip, cr2, rbx, r11
@@ -1876,7 +1893,7 @@ extern "C" fn apic_timer_handler(cs: u64) {
     // Signals MUST NOT be delivered when returning to Ring 0 (kernel) as it
     // could interrupt a kernel critical section or lock acquisition.
     if (cs & 3) == 3 {
-        crate::process::deliver_pending_signals_for_current();
+        crate::process::deliver_pending_signals_noctx();
     }
 }
 
