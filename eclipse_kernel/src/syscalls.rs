@@ -2417,11 +2417,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2434,11 +2430,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2467,11 +2459,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
 
@@ -2485,11 +2473,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2729,16 +2713,13 @@ fn sys_close(fd: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.close_calls += 1;
     drop(stats);
-    
+
     if let Some(pid) = current_process_id() {
-        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            // Close in scheme
-            let _ = crate::scheme::close(fd_entry.scheme_id, fd_entry.resource_id);
-            
-            // Close in FD table
-            if crate::fd::fd_close(pid, fd as usize) {
-                return 0;
-            }
+        // fd_close marks the slot as free and notifies the scheme in one step.
+        // Do NOT call scheme::close here; fd_close already does so, and calling
+        // it a second time would double-free the scheme resource.
+        if crate::fd::fd_close(pid, fd as usize) {
+            return 0;
         }
     }
     u64::MAX
@@ -3992,9 +3973,20 @@ fn sys_brk(addr: u64) -> u64 {
             let current_brk = r.brk_current;
             if addr == 0 { return current_brk; }
             if current_brk == 0 { return u64::MAX; }
-            
-            let old_page_end = (current_brk + 4095) & !4095;
-            let new_page_end = (addr + 4095) & !4095;
+
+            // Reject kernel-space or obviously invalid addresses: mapping into
+            // kernel half would corrupt the HHDM page tables.
+            if addr >= memory::USER_SPACE_END {
+                return current_brk; // Linux: return old brk unchanged on error
+            }
+
+            // Use checked arithmetic to avoid page-end overflow when addr is
+            // close to u64::MAX.
+            let old_page_end = current_brk.saturating_add(4095) & !4095;
+            let new_page_end = match addr.checked_add(4095) {
+                Some(v) => v & !4095,
+                None => return current_brk,
+            };
             
             if new_page_end > old_page_end {
                 let mut curr = old_page_end;
