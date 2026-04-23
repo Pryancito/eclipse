@@ -210,31 +210,50 @@ impl Scheme for PipeScheme {
             return Ok(0);
         }
 
-        let handle = {
+        let (channel_id, nonblock) = {
             let handles = self.handles.lock();
             let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
             if !h.is_write {
                 return Err(error::EBADF);
             }
-            (h.channel_id, h.is_write)
+            (h.channel_id, h.nonblock)
         };
 
-        let channel_arc = self.get_channel(handle.0).ok_or(error::EIO)?;
-        let mut ch = channel_arc.lock();
+        let channel_arc = self.get_channel(channel_id).ok_or(error::EIO)?;
 
-        if ch.read_ends == 0 {
-            return Err(error::EPIPE);
+        loop {
+            {
+                let mut ch = channel_arc.lock();
+
+                if ch.read_ends == 0 {
+                    return Err(error::EPIPE);
+                }
+
+                let available = PIPE_BUF_CAP.saturating_sub(ch.buffer.len());
+                if available > 0 {
+                    let to_write = buffer.len().min(available);
+                    for &b in &buffer[..to_write] {
+                        ch.buffer.push_back(b);
+                    }
+                    return Ok(to_write);
+                }
+
+                // Buffer full: non-blocking returns EAGAIN immediately.
+                if nonblock {
+                    return Err(error::EAGAIN);
+                }
+                // Blocking: release the lock and yield below.
+            }
+
+            // Check for pending signals before blocking.
+            if let Some(pid) = crate::process::current_process_id() {
+                if crate::process::get_pending_signals(pid) != 0 {
+                    return Err(4); // EINTR
+                }
+            }
+
+            crate::scheduler::yield_cpu();
         }
-
-        // Si el buffer está lleno, descartar bytes más antiguos para no bloquear
-        // (comportamiento de desbordamiento; en un sistema real bloquearía)
-        let available = PIPE_BUF_CAP.saturating_sub(ch.buffer.len());
-        let to_write = buffer.len().min(available);
-        for &b in &buffer[..to_write] {
-            ch.buffer.push_back(b);
-        }
-
-        Ok(to_write)
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {

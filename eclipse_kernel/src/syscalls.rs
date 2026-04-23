@@ -206,6 +206,423 @@ pub enum SyscallNumber {
 
 
 
+// =============================================================================
+// Signal frame types — Linux x86-64 rt_sigframe ABI
+// =============================================================================
+//
+// When delivering a signal to userspace, the kernel pushes an `RtSigframe`
+// onto the user stack and redirects RIP to the signal handler.  When the
+// handler finishes and the restorer (`__restore_rt`) calls `rt_sigreturn`
+// (syscall 15), the kernel reads this frame back to restore the saved context.
+//
+// Frame layout (total 440 bytes, 8-byte aligned):
+//   [0]    pretcode  (8)  — points to sa_restorer (`__restore_rt`)
+//   [8]    uc        (304) — struct ucontext (flags + link + stack + mcontext + sigmask)
+//   [312]  info      (128) — siginfo_t
+//
+// uc.uc_mcontext (struct sigcontext) starts at frame+48 and contains all GPRs + RIP/RSP.
+// =============================================================================
+
+/// x86-64 `struct sigcontext` — 256 bytes.
+#[repr(C)]
+struct SigContext {
+    r8:        u64,   // 0
+    r9:        u64,   // 8
+    r10:       u64,   // 16
+    r11:       u64,   // 24
+    r12:       u64,   // 32
+    r13:       u64,   // 40
+    r14:       u64,   // 48
+    r15:       u64,   // 56
+    rdi:       u64,   // 64
+    rsi:       u64,   // 72
+    rbp:       u64,   // 80
+    rbx:       u64,   // 88
+    rdx:       u64,   // 96
+    rax:       u64,   // 104
+    rcx:       u64,   // 112
+    rsp:       u64,   // 120
+    rip:       u64,   // 128
+    eflags:    u64,   // 136
+    cs:        u16,   // 144
+    gs:        u16,   // 146
+    fs:        u16,   // 148
+    ss:        u16,   // 150 → next u64 at 152 ✓
+    err:       u64,   // 152
+    trapno:    u64,   // 160
+    oldmask:   u64,   // 168
+    cr2:       u64,   // 176
+    fpstate:   u64,   // 184 (NULL = no FPU state saved)
+    _reserved1: [u64; 8], // 192 → size 64 → end 256
+}
+// Compile-time size check via const assertion below.
+
+/// x86-64 `stack_t` — 24 bytes.
+#[repr(C)]
+struct StackT {
+    ss_sp:    u64,   // 0
+    ss_flags: u32,   // 8
+    _pad:     u32,   // 12
+    ss_size:  u64,   // 16
+}
+
+/// Minimal `ucontext_t` (without `__fpregs_mem`) — 304 bytes.
+///
+/// We omit the 512-byte `__fpregs_mem` FPU state block; `fpstate` in
+/// `uc_mcontext` is set to NULL so the kernel and restorer know there is no
+/// saved FPU state to restore.
+#[repr(C)]
+struct UContext {
+    uc_flags:    u64,      // 0
+    uc_link:     u64,      // 8
+    uc_stack:    StackT,   // 16 (24 bytes) → end 40
+    uc_mcontext: SigContext, // 40 (256 bytes) → end 296
+    uc_sigmask:  u64,      // 296
+}
+
+/// `siginfo_t` — 128 bytes.
+#[repr(C)]
+struct SigInfo {
+    si_signo: i32,      // 0
+    si_errno: i32,      // 4
+    si_code:  i32,      // 8
+    _rest:    [u8; 116], // 12 → 128
+}
+
+/// Complete `rt_sigframe` as pushed onto the user stack — 440 bytes.
+#[repr(C)]
+struct RtSigframe {
+    pretcode: u64,      // 0  — sa_restorer address
+    uc:       UContext,  // 8  (304 bytes) → end 312
+    info:     SigInfo,   // 312 (128 bytes) → end 440
+}
+
+// Compile-time layout assertions.
+const _: () = {
+    assert!(core::mem::size_of::<SigContext>()  == 256);
+    assert!(core::mem::size_of::<StackT>()      == 24);
+    assert!(core::mem::size_of::<UContext>()    == 304);
+    assert!(core::mem::size_of::<SigInfo>()     == 128);
+    assert!(core::mem::size_of::<RtSigframe>()  == 440);
+};
+
+/// Build and push an `rt_sigframe` onto the user stack, then redirect `ctx`
+/// (the syscall return context) to the signal handler.
+///
+/// Returns `true` on success (caller should not call the old exit_process path).
+/// Returns `false` if the stack is invalid or the action has no usable restorer.
+fn push_rt_signal_frame(
+    ctx:        &mut crate::interrupts::SyscallContext,
+    pid:        process::ProcessId,
+    sig:        u8,
+    action:     &crate::process::SignalAction,
+    trap_num:   u64,
+    fault_addr: u64,
+) -> bool {
+    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SA_SIGINFO, SS_DISABLE};
+
+    // Require a valid restorer (musl always sets SA_RESTORER + __restore_rt).
+    if action.restorer == 0 {
+        return false;
+    }
+
+    // Determine which stack to use.
+    let old_mask;
+    let user_rsp = {
+        let p = match crate::process::get_process(pid) {
+            Some(p) => p,
+            None    => return false,
+        };
+        old_mask = p.signal_mask;
+        let ss = p.sigaltstack;
+        if (action.flags & SA_ONSTACK) != 0
+            && (ss.ss_flags & SS_DISABLE) == 0
+            && ss.ss_sp != 0
+        {
+            let ss_top = ss.ss_sp.wrapping_add(ss.ss_size);
+            // Use alt-stack only if we are not already on it.
+            if !(ctx.rsp >= ss.ss_sp && ctx.rsp < ss_top) {
+                ss_top
+            } else {
+                ctx.rsp
+            }
+        } else {
+            ctx.rsp
+        }
+    };
+
+    // Allocate frame: skip the red-zone (128 B), reserve frame, align to 16 B.
+    const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
+    const RED_ZONE: u64 = 128;
+    let frame_addr = (user_rsp.wrapping_sub(RED_ZONE).wrapping_sub(FRAME_SZ)) & !15u64;
+
+    if !is_user_pointer(frame_addr, FRAME_SZ) {
+        return false;
+    }
+
+    // Build the frame.
+    let frame = RtSigframe {
+        pretcode: action.restorer,
+        uc: UContext {
+            uc_flags:    0,
+            uc_link:     0,
+            uc_stack:    StackT { ss_sp: 0, ss_flags: crate::process::SS_DISABLE, _pad: 0, ss_size: 0 },
+            uc_mcontext: SigContext {
+                r8:      ctx.r8,
+                r9:      ctx.r9,
+                r10:     ctx.r10,
+                r11:     ctx.r11,
+                r12:     ctx.r12,
+                r13:     ctx.r13,
+                r14:     ctx.r14,
+                r15:     ctx.r15,
+                rdi:     ctx.rdi,
+                rsi:     ctx.rsi,
+                rbp:     ctx.rbp,
+                rbx:     ctx.rbx,
+                rdx:     ctx.rdx,
+                rax:     ctx.rax,
+                rcx:     ctx.rcx,
+                rsp:     ctx.rsp,
+                rip:     ctx.rip,
+                eflags:  ctx.rflags,
+                cs:      ctx.cs as u16,
+                gs:      0,
+                fs:      0,
+                ss:      ctx.ss as u16,
+                err:     0,
+                trapno:  trap_num,
+                oldmask: old_mask,
+                cr2:     fault_addr,
+                fpstate: 0,
+                _reserved1: [0u64; 8],
+            },
+            uc_sigmask: old_mask,
+        },
+        info: SigInfo {
+            si_signo: sig as i32,
+            si_errno: 0,
+            si_code:  0,
+            _rest:    [0u8; 116],
+        },
+    };
+
+    // Write the frame to user memory (user page table is active).
+    unsafe { core::ptr::write_unaligned(frame_addr as *mut RtSigframe, frame); }
+
+    // Block this signal during the handler (and any additional signals from sa_mask),
+    // unless SA_NODEFER is set.
+    let _ = crate::process::modify_process(pid, |p| {
+        if (action.flags & SA_NODEFER) == 0 {
+            p.signal_mask |= 1u64 << sig;
+        }
+        p.signal_mask |= action.mask;
+        // SIGKILL (9) and SIGSTOP (19) are always unblockable.
+        p.signal_mask &= !((1u64 << 9) | (1u64 << 19));
+    });
+
+    // SA_RESETHAND: reset handler to SIG_DFL after first delivery.
+    if (action.flags & SA_RESETHAND) != 0 {
+        let _ = crate::process::modify_process(pid, |p| {
+            p.signal_actions[sig as usize].handler = 0;
+        });
+    }
+
+    // Redirect execution to the signal handler.
+    ctx.rsp = frame_addr;
+    ctx.rip = action.handler;
+    ctx.rdi = sig as u64;
+    if (action.flags & SA_SIGINFO) != 0 {
+        ctx.rsi = frame_addr + 312; // &frame->info
+        ctx.rdx = frame_addr + 8;   // &frame->uc
+    } else {
+        ctx.rsi = 0;
+        ctx.rdx = 0;
+    }
+    // Clear RAX so the handler does not see the syscall return value.
+    ctx.rax = 0;
+
+    true
+}
+
+/// Deliver pending signals that have userspace handlers by pushing signal frames.
+///
+/// Called at every syscall return (except `exit`/`exit_group`) while `ctx` is
+/// still live so we can redirect the `iretq` to the handler.
+pub fn deliver_pending_signals_for_current(ctx: &mut crate::interrupts::SyscallContext) {
+    let Some(pid) = current_process_id() else { return };
+    if crate::process::get_process(pid)
+        .map_or(true, |p| p.state == crate::process::ProcessState::Terminated)
+    {
+        return;
+    }
+
+    loop {
+        let Some((sig, action)) = crate::process::pop_lowest_pending_signal(pid) else {
+            break;
+        };
+
+        if action.handler == 1 {
+            // SIG_IGN — discard.
+            continue;
+        }
+
+        if action.handler != 0 {
+            // Userspace handler: try to push a signal frame.
+            if push_rt_signal_frame(ctx, pid, sig, &action, 0, 0) {
+                // Successfully set up; handler will run on iretq.
+                // Deliver one signal at a time per syscall return.
+                break;
+            }
+            // Frame build failed (bad stack): fall through to fatal handling.
+        }
+
+        // SIG_DFL or frame-build failure.
+        let is_fatal = sig == 9 // SIGKILL is always fatal
+            || !crate::process::signal_default_is_ignore(sig);
+
+        if !is_fatal {
+            continue;
+        }
+
+        if let Some(mut proc) = crate::process::get_process(pid) {
+            proc.exit_code = 128 + sig as u64;
+            crate::process::update_process(pid, proc);
+        }
+        exit_process();
+        yield_cpu();
+        return;
+    }
+}
+
+/// Deliver a signal to a userspace process directly from the exception handler.
+///
+/// `exc` is the mutable `ExceptionContext` that will be `iretq`'d back;
+/// modifying its `rip`/`rsp` fields redirects execution to the signal handler.
+///
+/// Returns `true` if a signal frame was successfully pushed (caller should
+/// return from the exception handler normally).  Returns `false` if no valid
+/// handler is registered, in which case the caller should terminate the process.
+pub fn deliver_signal_from_exception(
+    exc:        &mut crate::interrupts::ExceptionContext,
+    pid:        process::ProcessId,
+    signum:     u8,
+    fault_addr: u64,
+) -> bool {
+    use crate::process::{SA_ONSTACK, SA_NODEFER, SA_RESETHAND, SA_SIGINFO, SS_DISABLE};
+
+    let (action, old_mask, user_rsp) = {
+        let p = match crate::process::get_process(pid) {
+            Some(p) => p,
+            None    => return false,
+        };
+        let action = p.signal_actions[signum as usize];
+        // Require a real handler with a restorer.
+        if action.handler == 0 || action.handler == 1 || action.restorer == 0 {
+            return false;
+        }
+        let old_mask = p.signal_mask;
+        let ss = p.sigaltstack;
+        let rsp = exc.rsp;
+        let rsp = if (action.flags & SA_ONSTACK) != 0
+            && (ss.ss_flags & SS_DISABLE) == 0
+            && ss.ss_sp != 0
+        {
+            let ss_top = ss.ss_sp.wrapping_add(ss.ss_size);
+            if !(rsp >= ss.ss_sp && rsp < ss_top) { ss_top } else { rsp }
+        } else {
+            rsp
+        };
+        (action, old_mask, rsp)
+    };
+
+    const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
+    const RED_ZONE: u64 = 128;
+    let frame_addr = (user_rsp.wrapping_sub(RED_ZONE).wrapping_sub(FRAME_SZ)) & !15u64;
+
+    if !is_user_pointer(frame_addr, FRAME_SZ) {
+        return false;
+    }
+
+    let frame = RtSigframe {
+        pretcode: action.restorer,
+        uc: UContext {
+            uc_flags:    0,
+            uc_link:     0,
+            uc_stack:    StackT { ss_sp: 0, ss_flags: crate::process::SS_DISABLE, _pad: 0, ss_size: 0 },
+            uc_mcontext: SigContext {
+                r8:      exc.r8,
+                r9:      exc.r9,
+                r10:     exc.r10,
+                r11:     exc.r11,
+                r12:     exc.r12,
+                r13:     exc.r13,
+                r14:     exc.r14,
+                r15:     exc.r15,
+                rdi:     exc.rdi,
+                rsi:     exc.rsi,
+                rbp:     exc.rbp,
+                rbx:     exc.rbx,
+                rdx:     exc.rdx,
+                rax:     exc.rax,
+                rcx:     exc.rcx,
+                rsp:     exc.rsp,
+                rip:     exc.rip,
+                eflags:  exc.rflags,
+                cs:      exc.cs as u16,
+                gs:      0,
+                fs:      0,
+                ss:      exc.ss as u16,
+                err:     exc.error_code,
+                trapno:  exc.num,
+                oldmask: old_mask,
+                cr2:     fault_addr,
+                fpstate: 0,
+                _reserved1: [0u64; 8],
+            },
+            uc_sigmask: old_mask,
+        },
+        info: SigInfo {
+            si_signo: signum as i32,
+            si_errno: 0,
+            si_code:  128, // SI_KERNEL
+            _rest:    [0u8; 116],
+        },
+    };
+
+    unsafe { core::ptr::write_unaligned(frame_addr as *mut RtSigframe, frame); }
+
+    // Update signal mask.
+    let _ = crate::process::modify_process(pid, |p| {
+        if (action.flags & SA_NODEFER) == 0 {
+            p.signal_mask |= 1u64 << signum;
+        }
+        p.signal_mask |= action.mask;
+        p.signal_mask &= !((1u64 << 9) | (1u64 << 19));
+    });
+
+    if (action.flags & SA_RESETHAND) != 0 {
+        let _ = crate::process::modify_process(pid, |p| {
+            p.signal_actions[signum as usize].handler = 0;
+        });
+    }
+
+    // Redirect the iretq to the signal handler.
+    exc.rsp    = frame_addr;
+    exc.rip    = action.handler;
+    exc.rdi    = signum as u64;
+    if (action.flags & SA_SIGINFO) != 0 {
+        exc.rsi = frame_addr + 312; // &frame->info
+        exc.rdx = frame_addr + 8;   // &frame->uc
+    } else {
+        exc.rsi = 0;
+        exc.rdx = 0;
+    }
+    exc.rflags |= 0x200; // Ensure IF=1 on return
+
+    true
+}
+
 /// lseek whence values (POSIX standard)
 pub const SEEK_SET: u64 = 0; // Absolute position
 pub const SEEK_CUR: u64 = 1; // Relative to current position  
@@ -446,10 +863,7 @@ fn linux_abi_error(errno: i32) -> u64 {
 
 #[inline]
 fn syscall_error_for_current_process(errno: i32) -> u64 {
-    match crate::process::current_process_id().and_then(|pid| crate::process::get_process(pid)) {
-        Some(p) if p.is_linux => linux_abi_error(errno),
-        _ => u64::MAX,
-    }
+    linux_abi_error(errno)
 }
 
 /// Handler principal de syscalls
@@ -537,9 +951,9 @@ pub extern "C" fn syscall_handler(
         10  => sys_mprotect(arg1, arg2, arg3),
         11  => sys_munmap(arg1, arg2),
         12  => sys_brk(arg1),
-        13  => sys_sigaction(arg1, arg2, arg3),
+        13  => sys_rt_sigaction(arg1, arg2, arg3, arg4),
         14  => sys_sigprocmask(arg1, arg2, arg3),
-        15  => sys_rt_sigreturn(),
+        15  => sys_rt_sigreturn(context),
         28  => sys_madvise(arg1, arg2, arg3),
         16  => sys_ioctl(arg1, arg2, arg3),
         20  => sys_writev(arg1, arg2, arg3),
@@ -738,7 +1152,7 @@ pub extern "C" fn syscall_handler(
 
     // Entregar señales pendientes antes de volver a userspace (no reentrar tras exit).
     if syscall_num != 60 && syscall_num != 231 {
-        crate::process::deliver_pending_signals_for_current();
+        deliver_pending_signals_for_current(context);
     }
 
     ret
@@ -1451,6 +1865,10 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                         if n < chunk_len { break; } // Short write
                     }
                     Err(e) => {
+                        if total == 0 && e == crate::scheme::error::EPIPE {
+                            // Broken pipe: send SIGPIPE to this process (unless masked/ignored).
+                            crate::process::set_pending_signal(pid, 13); // SIGPIPE = 13
+                        }
                         return if total > 0 { total as u64 } else { linux_abi_error(e as i32) };
                     }
                 }
@@ -1512,7 +1930,7 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         }
     }
     
-    u64::MAX
+    linux_abi_error(9) // EBADF
 }
 
 /// pread64(fd, buf, count, offset) — lectura sin avanzar el offset del descriptor (ld-musl / libc).
@@ -1861,11 +2279,6 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     stats.fork_calls += 1;
     drop(stats);
 
-    let linux_abi = process::current_process_id()
-        .and_then(process::get_process)
-        .map(|p| p.is_linux)
-        .unwrap_or(false);
-
     // Create child process with modified context
     // The child needs to see RAX=0 (return value of fork)
     let mut child_context = *context;
@@ -1878,11 +2291,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
         }
         None => {
             serial::serial_print("[SYSCALL] fork() failed - could not create child\n");
-            if linux_abi {
-                linux_abi_error(11)
-            } else {
-                u64::MAX
-            }
+            linux_abi_error(11) // EAGAIN
         }
     }
 }
@@ -2417,11 +2826,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2434,11 +2839,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2467,11 +2868,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
 
@@ -2485,11 +2882,7 @@ fn sys_wait_impl(status_ptr: u64, wait_pid: u64, flags: u64) -> u64 {
                             if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
                                 let wait_status = 0x7F | ((proc.exit_signal as u32) << 8);
                                 unsafe {
-                                    if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
-                                        }
-                                    }
+                                    core::ptr::copy_nonoverlapping(&wait_status, status_ptr as *mut u32, 1);
                                 }
                             }
                             process::unregister_child_waiter(current_pid);
@@ -2729,16 +3122,13 @@ fn sys_close(fd: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.close_calls += 1;
     drop(stats);
-    
+
     if let Some(pid) = current_process_id() {
-        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            // Close in scheme
-            let _ = crate::scheme::close(fd_entry.scheme_id, fd_entry.resource_id);
-            
-            // Close in FD table
-            if crate::fd::fd_close(pid, fd as usize) {
-                return 0;
-            }
+        // fd_close marks the slot as free and notifies the scheme in one step.
+        // Do NOT call scheme::close here; fd_close already does so, and calling
+        // it a second time would double-free the scheme resource.
+        if crate::fd::fd_close(pid, fd as usize) {
+            return 0;
         }
     }
     u64::MAX
@@ -3967,9 +4357,20 @@ fn sys_brk(addr: u64) -> u64 {
             let current_brk = r.brk_current;
             if addr == 0 { return current_brk; }
             if current_brk == 0 { return u64::MAX; }
-            
-            let old_page_end = (current_brk + 4095) & !4095;
-            let new_page_end = (addr + 4095) & !4095;
+
+            // Reject kernel-space or obviously invalid addresses: mapping into
+            // kernel half would corrupt the HHDM page tables.
+            if addr >= memory::USER_SPACE_END {
+                return current_brk; // Linux: return old brk unchanged on error
+            }
+
+            // Use checked arithmetic to avoid page-end overflow when addr is
+            // close to u64::MAX.
+            let old_page_end = current_brk.saturating_add(4095) & !4095;
+            let new_page_end = match addr.checked_add(4095) {
+                Some(v) => v & !4095,
+                None => return current_brk,
+            };
             
             if new_page_end > old_page_end {
                 let mut curr = old_page_end;
@@ -4084,9 +4485,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
         | CLONE_CHILD_SETTID
         | CLONE_IO;
 
-    let linux_clone_caller = process::get_process(ppid)
-        .map(|p| p.is_linux)
-        .unwrap_or(false);
+    // All processes use the Linux/musl ABI — always return Linux errno values.
 
     // Fork-style clone: CLONE_THREAD not set → fork(2) / vfork vía clone.
     // - Linux exige `CLONE_VM` con `CLONE_VFORK` (EINVAL si no).
@@ -4099,11 +4498,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                 "[CLONE] fork-style EINVAL: CLONE_VFORK without CLONE_VM pid={}\n",
                 ppid
             ));
-            return if linux_clone_caller {
-                linux_abi_error(22)
-            } else {
-                u64::MAX
-            };
+            return linux_abi_error(22); // EINVAL
         }
         if flags & !FORK_STYLE_CLONE_ALLOWED != 0 {
             serial::serial_printf(format_args!(
@@ -4111,11 +4506,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                 ppid,
                 flags & !FORK_STYLE_CLONE_ALLOWED
             ));
-            return if linux_clone_caller {
-                linux_abi_error(22)
-            } else {
-                u64::MAX
-            };
+            return linux_abi_error(22); // EINVAL
         }
 
         let vfork_block_parent =
@@ -4135,11 +4526,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                         "[CLONE] vfork shared-vm FAIL pid={}\n",
                         ppid
                     ));
-                    return if linux_clone_caller {
-                        linux_abi_error(11)
-                    } else {
-                        u64::MAX
-                    };
+                    return linux_abi_error(11); // EAGAIN
                 }
             }
         } else {
@@ -4150,11 +4537,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
                         "[CLONE] fork FAIL pid={} flags={:#x} exit_signal={}\n",
                         ppid, flags, exit_signal
                     ));
-                    return if linux_clone_caller {
-                        linux_abi_error(11)
-                    } else {
-                        u64::MAX
-                    };
+                    return linux_abi_error(11); // EAGAIN
                 }
             }
         };
@@ -4207,7 +4590,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
             ppid,
             flags & !allowed
         ));
-        return u64::MAX;
+        return linux_abi_error(22); // EINVAL
     }
 
     serial::serial_printf(format_args!(
@@ -4254,7 +4637,7 @@ fn sys_clone(flags: u64, stack: u64, parent_tid_arg: u64, context: &crate::proce
             } else {
                 thread.fs_base = parent.fs_base;
             }
-            thread.is_linux = parent.is_linux;
+            // is_linux always true (all processes use Linux/musl ABI)
             
             // Copy registers from the current syscall context
             thread.context = *context;
@@ -4408,7 +4791,7 @@ fn sys_thread_create(stack_top: u64, entry: u64, arg: u64, context: &process::Co
             thread.time_slice = parent.time_slice;
             thread.parent_pid = Some(parent_pid);
             thread.fs_base = parent.fs_base;
-            thread.is_linux = parent.is_linux;
+            // is_linux always true (all processes use Linux/musl ABI)
 
             // Initialize thread context from syscall context
             thread.context = *context;
@@ -5895,7 +6278,7 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
         let (base, len): (u64, u64) = unsafe {
             if crate::interrupts::set_recovery_point() {
                 crate::interrupts::clear_recovery_point();
-                return if total_written > 0 { total_written } else { u64::MAX };
+                return if total_written > 0 { total_written } else { linux_abi_error(14) }; // EFAULT
             }
             let ptr = (iov_ptr + i * 16) as *const u64;
             let base = ptr.read_unaligned();
@@ -5906,8 +6289,12 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> u64 {
         
         if len == 0 { continue; }
         let ret = sys_write(fd, base, len);
-        if ret == u64::MAX {
-            return if total_written > 0 { total_written } else { u64::MAX };
+        // For Linux-ABI processes, errors are returned as (-(errno as i64)) as u64 — a
+        // large unsigned value whose signed interpretation is negative.  For non-Linux
+        // processes, errors are returned as u64::MAX (= -1i64).  Either way the signed
+        // interpretation is negative, so casting to i64 and checking < 0 catches both.
+        if (ret as i64) < 0 {
+            return if total_written > 0 { total_written } else { ret };
         }
         total_written += ret;
     }
@@ -6279,24 +6666,58 @@ fn sys_madvise(_addr: u64, _len: u64, _advice: u64) -> u64 {
     0
 }
 
-/// Linux `sigaltstack(2)` — pila alternativa para manejadores; stub para musl.
+/// Linux `sigaltstack(2)` — alternate signal stack per process.
 fn sys_sigaltstack(ss: u64, oss: u64) -> u64 {
-    // stack_t: ss_sp (8), ss_flags (4), padding (4), ss_size (8)
+    // stack_t layout: ss_sp(8) + ss_flags(4) + _pad(4) + ss_size(8) = 24 bytes
     const STACK_T_BYTES: u64 = 24;
-    const SS_DISABLE: u32 = 2;
 
     if ss != 0 && !is_user_pointer(ss, STACK_T_BYTES) {
-        return linux_abi_error(14);
+        return linux_abi_error(14); // EFAULT
     }
+    if oss != 0 && !is_user_pointer(oss, STACK_T_BYTES) {
+        return linux_abi_error(14); // EFAULT
+    }
+
+    let Some(pid) = current_process_id() else {
+        return linux_abi_error(3); // ESRCH
+    };
+
+    let Some(mut proc) = crate::process::get_process(pid) else {
+        return linux_abi_error(3);
+    };
+
+    // Return old stack_t if requested.
     if oss != 0 {
-        if !is_user_pointer(oss, STACK_T_BYTES) {
-            return linux_abi_error(14);
-        }
+        let s = proc.sigaltstack;
         unsafe {
-            core::ptr::write_bytes(oss as *mut u8, 0, STACK_T_BYTES as usize);
-            ((oss + 8) as *mut u32).write_unaligned(SS_DISABLE);
+            (oss as *mut u64).write_unaligned(s.ss_sp);
+            ((oss + 8) as *mut u32).write_unaligned(s.ss_flags);
+            // _pad at offset 12 — leave as zero (already zeroed by write_unaligned above).
+            ((oss + 16) as *mut u64).write_unaligned(s.ss_size);
         }
     }
+
+    // Install new stack if provided.
+    if ss != 0 {
+        let new_sp    = unsafe { (ss as *const u64).read_unaligned() };
+        let new_flags = unsafe { ((ss + 8) as *const u32).read_unaligned() };
+        let new_size  = unsafe { ((ss + 16) as *const u64).read_unaligned() };
+
+        if new_flags & crate::process::SS_DISABLE != 0 {
+            proc.sigaltstack = crate::process::Sigaltstack::new(); // disable
+        } else {
+            if new_sp == 0 || new_size < 2048 {
+                return linux_abi_error(22); // EINVAL
+            }
+            proc.sigaltstack = crate::process::Sigaltstack {
+                ss_sp:    new_sp,
+                ss_flags: new_flags & !(crate::process::SS_ONSTACK), // clear ONSTACK
+                ss_size:  new_size,
+            };
+        }
+    }
+
+    crate::process::update_process(pid, proc);
     0
 }
 
@@ -6342,33 +6763,75 @@ fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     0
 }
 
-fn sys_sigaction(signum: u64, new_action_ptr: u64, old_action_ptr: u64) -> u64 {
-    if signum >= 64 {
-        return u64::MAX;
+/// Linux `rt_sigaction(2)` — install/query a signal handler.
+///
+/// `struct sigaction` layout (x86-64, 32 bytes):
+///   [0]   sa_handler / sa_sigaction  (8 bytes)
+///   [8]   sa_flags                   (8 bytes)
+///   [16]  sa_restorer                (8 bytes)  — requires SA_RESTORER
+///   [24]  sa_mask                    (8 bytes)  — first 64 signals
+///
+/// The 4th argument `sigsetsize` must equal 8; we validate but do not use it.
+fn sys_rt_sigaction(signum: u64, new_action_ptr: u64, old_action_ptr: u64, sigsetsize: u64) -> u64 {
+    // Validate sigsetsize (must be sizeof(sigset_t) = 8 on x86-64).
+    if sigsetsize != 0 && sigsetsize != 8 {
+        return linux_abi_error(22); // EINVAL
     }
 
-    let pid = match current_process_id() {
-        Some(p) => p,
-        None    => return u64::MAX,
+    if signum == 0 || signum >= 64 {
+        return linux_abi_error(22); // EINVAL
+    }
+
+    // SIGKILL (9) and SIGSTOP (19) cannot be caught or ignored.
+    if signum == 9 || signum == 19 {
+        return linux_abi_error(22); // EINVAL
+    }
+
+    let Some(pid) = current_process_id() else {
+        return linux_abi_error(3); // ESRCH
     };
 
-    if let Some(mut proc) = crate::process::get_process(pid) {
-        // Devolver el manejador anterior si se pidió
-        if old_action_ptr != 0 && is_user_pointer(old_action_ptr, 8) {
-            unsafe {
-                *(old_action_ptr as *mut u64) = proc.signal_handlers[signum as usize];
-            }
+    let Some(mut proc) = crate::process::get_process(pid) else {
+        return linux_abi_error(3);
+    };
+
+    // Return old action if requested.
+    if old_action_ptr != 0 {
+        if !is_user_pointer(old_action_ptr, 32) {
+            return linux_abi_error(14); // EFAULT
         }
-        // Instalar el nuevo manejador
-        if new_action_ptr != 0 && is_user_pointer(new_action_ptr, 8) {
-            let new_handler = unsafe { *(new_action_ptr as *const u64) };
-            proc.signal_handlers[signum as usize] = new_handler;
+        let old = proc.signal_actions[signum as usize];
+        unsafe {
+            (old_action_ptr as *mut u64).write_unaligned(old.handler);
+            ((old_action_ptr + 8) as *mut u64).write_unaligned(old.flags);
+            ((old_action_ptr + 16) as *mut u64).write_unaligned(old.restorer);
+            ((old_action_ptr + 24) as *mut u64).write_unaligned(old.mask);
         }
-        crate::process::update_process(pid, proc);
-        0
-    } else {
-        u64::MAX
     }
+
+    // Install new action if provided.
+    if new_action_ptr != 0 {
+        if !is_user_pointer(new_action_ptr, 32) {
+            return linux_abi_error(14); // EFAULT
+        }
+        let (handler, flags, restorer, mask) = unsafe {
+            (
+                (new_action_ptr as *const u64).read_unaligned(),
+                ((new_action_ptr + 8) as *const u64).read_unaligned(),
+                ((new_action_ptr + 16) as *const u64).read_unaligned(),
+                ((new_action_ptr + 24) as *const u64).read_unaligned(),
+            )
+        };
+        proc.signal_actions[signum as usize] = crate::process::SignalAction {
+            handler,
+            flags,
+            restorer,
+            mask: mask & !((1u64 << 9) | (1u64 << 19)), // SIGKILL/SIGSTOP always unblockable
+        };
+    }
+
+    crate::process::update_process(pid, proc);
+    0
 }
 
 /// sys_dup - Duplicate a file descriptor
@@ -6601,9 +7064,62 @@ fn sys_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
 // Bash / musl compatibility syscalls
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// sys_rt_sigreturn — stub; proper implementation would restore signal context.
-fn sys_rt_sigreturn() -> u64 {
-    0
+/// `rt_sigreturn` — restore process context after a signal handler returns.
+///
+/// The signal handler's restorer (`__restore_rt`) calls this syscall.  At that
+/// point the user RSP points 8 bytes past the start of the `RtSigframe` that
+/// was pushed during signal delivery (because `ret` inside the restorer has
+/// already popped `pretcode`).
+///
+/// We read the saved `uc_mcontext` back and restore all GPRs plus RIP/RSP/RFLAGS.
+fn sys_rt_sigreturn(ctx: &mut crate::interrupts::SyscallContext) -> u64 {
+    // frame_start = RSP - 8 (restorer's `ret` consumed `pretcode`)
+    let frame_addr = ctx.rsp.wrapping_sub(8);
+
+    const FRAME_SZ: u64 = core::mem::size_of::<RtSigframe>() as u64;
+    if !is_user_pointer(frame_addr, FRAME_SZ) {
+        return linux_abi_error(14); // EFAULT
+    }
+
+    // Read the saved frame from user memory.
+    let frame: RtSigframe = unsafe {
+        core::ptr::read_unaligned(frame_addr as *const RtSigframe)
+    };
+
+    let mc = &frame.uc.uc_mcontext;
+
+    // Restore all general-purpose registers and the iretq frame.
+    ctx.r8     = mc.r8;
+    ctx.r9     = mc.r9;
+    ctx.r10    = mc.r10;
+    ctx.r11    = mc.r11;
+    ctx.r12    = mc.r12;
+    ctx.r13    = mc.r13;
+    ctx.r14    = mc.r14;
+    ctx.r15    = mc.r15;
+    ctx.rdi    = mc.rdi;
+    ctx.rsi    = mc.rsi;
+    ctx.rbp    = mc.rbp;
+    ctx.rbx    = mc.rbx;
+    ctx.rdx    = mc.rdx;
+    ctx.rax    = mc.rax;
+    ctx.rcx    = mc.rcx;
+    ctx.rsp    = mc.rsp;
+    ctx.rip    = mc.rip;
+    // Only restore user-visible RFLAGS bits; force IF=1 so userspace runs with interrupts.
+    ctx.rflags = (mc.eflags & !0x3000u64) | 0x200u64;
+
+    // Restore the signal mask that was in effect when the signal was delivered.
+    let new_mask = frame.uc.uc_sigmask & !((1u64 << 9) | (1u64 << 19)); // SIGKILL/SIGSTOP unblockable
+    if let Some(pid) = current_process_id() {
+        let _ = crate::process::modify_process(pid, |p| {
+            p.signal_mask = new_mask;
+        });
+    }
+
+    // The return value is taken from the restored RAX above; syscall_handler will
+    // overwrite ctx.rax with our return value, so we return the saved RAX directly.
+    mc.rax
 }
 
 /// sys_wait4 — Linux wait4(pid, *wstatus, options, *rusage).

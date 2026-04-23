@@ -161,9 +161,11 @@ pub fn read_block(device_idx: usize, block_num: u64, buffer: &mut [u8]) -> Resul
             // Copy to user buffer
             buffer.copy_from_slice(&cache.data[victim_idx]);
 
-            // Trigger AI pre-fetching for subsequent likely blocks
-            drop(cache);
-            prefetch_ai(device_idx);
+            // NOTE: AI pre-fetching was removed from here to prevent a mutual
+            // recursion that could exhaust the kernel stack:
+            //   read_block → prefetch_ai → read_block → prefetch_ai → …
+            // The prefetch path must be driven from a higher-level call site
+            // where it is safe to call read_block again.
 
             Ok(())
         },

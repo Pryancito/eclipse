@@ -394,11 +394,11 @@ impl Scheme for PtyScheme {
 
         // Request 1: TIOCGPTN (Get PTY Number)
         if request == 1 {
-            if arg != 0 {
-                // Warning! The arg needs to be validated properly in a real kernel memory map check
-                unsafe {
-                    *(arg as *mut usize) = handle.pair_id;
-                }
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<usize>() as u64) {
+                return Err(error::EINVAL);
+            }
+            unsafe {
+                *(arg as *mut usize) = handle.pair_id;
             }
             Ok(0)
         } else if request == 2 {
@@ -409,17 +409,21 @@ impl Scheme for PtyScheme {
             };
             let channel = channel_arc.lock();
             let queue = if handle.is_master { &channel.master_in } else { &channel.slave_in };
-            
+            let len = queue.len();
+
             if arg != 0 {
+                if !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<usize>() as u64) {
+                    return Err(error::EFAULT);
+                }
                 unsafe {
-                    *(arg as *mut usize) = queue.len();
+                    *(arg as *mut usize) = len;
                 }
             }
-            Ok(queue.len())
+            Ok(len)
         } else if request == 3 {
             // TIOCSWINSZ: establecer tamaño de ventana del terminal.
             // arg = puntero a [u16; 4] = [ws_rows, ws_cols, ws_xpixel, ws_ypixel]
-            if arg == 0 {
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 8) {
                 return Err(error::EINVAL);
             }
             let channel_arc = {
@@ -428,13 +432,11 @@ impl Scheme for PtyScheme {
             };
             let mut channel = channel_arc.lock();
             let ptr = arg as *const u16;
-            // SAFETY: el puntero viene de userspace; en un kernel real usaríamos
-            // copy_from_user. Por ahora asumimos que el caller lo mapea correctamente.
             let slave_pid = unsafe {
-                channel.ws_rows   = *ptr;
-                channel.ws_cols   = *ptr.add(1);
-                channel.ws_xpixel = *ptr.add(2);
-                channel.ws_ypixel = *ptr.add(3);
+                channel.ws_rows   = ptr.read_unaligned();
+                channel.ws_cols   = ptr.add(1).read_unaligned();
+                channel.ws_xpixel = ptr.add(2).read_unaligned();
+                channel.ws_ypixel = ptr.add(3).read_unaligned();
                 channel.slave_pid
             };
             // Enviar SIGWINCH (28) al proceso esclavo para que sepa que cambió el tamaño
@@ -445,7 +447,7 @@ impl Scheme for PtyScheme {
         } else if request == 4 {
             // TIOCGWINSZ: leer tamaño de ventana del terminal.
             // arg = puntero a [u16; 4] = [ws_rows, ws_cols, ws_xpixel, ws_ypixel]
-            if arg == 0 {
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, 8) {
                 return Err(error::EINVAL);
             }
             let channel_arc = {
@@ -455,10 +457,10 @@ impl Scheme for PtyScheme {
             let channel = channel_arc.lock();
             let ptr = arg as *mut u16;
             unsafe {
-                *ptr          = channel.ws_rows;
-                *ptr.add(1)   = channel.ws_cols;
-                *ptr.add(2)   = channel.ws_xpixel;
-                *ptr.add(3)   = channel.ws_ypixel;
+                ptr.write_unaligned(channel.ws_rows);
+                ptr.add(1).write_unaligned(channel.ws_cols);
+                ptr.add(2).write_unaligned(channel.ws_xpixel);
+                ptr.add(3).write_unaligned(channel.ws_ypixel);
             }
             Ok(0)
         } else if request == 5 || request == 0x5410 { // TIOCSPGRP
@@ -490,7 +492,9 @@ impl Scheme for PtyScheme {
             Ok(0)
         } else if request == 0x5401 {
             // TCGETS: Read termios structure.
-            if arg == 0 { return Err(error::EINVAL); }
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<Termios>() as u64) {
+                return Err(error::EINVAL);
+            }
             let channel_arc = {
                 let channels = self.channels.lock();
                 channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
@@ -498,12 +502,14 @@ impl Scheme for PtyScheme {
             let channel = channel_arc.lock();
             let ptr = arg as *mut Termios;
             unsafe {
-                *ptr = channel.termios;
+                ptr.write_unaligned(channel.termios);
             }
             Ok(0)
         } else if request == 0x5402 {
             // TCSETS: Write termios structure.
-            if arg == 0 { return Err(error::EINVAL); }
+            if arg == 0 || !crate::syscalls::is_user_pointer(arg as u64, core::mem::size_of::<Termios>() as u64) {
+                return Err(error::EINVAL);
+            }
             let channel_arc = {
                 let channels = self.channels.lock();
                 channels.get(handle.pair_id).and_then(|c| c.as_ref()).cloned().ok_or(error::EIO)?
@@ -511,7 +517,7 @@ impl Scheme for PtyScheme {
             let mut channel = channel_arc.lock();
             let ptr = arg as *const Termios;
             unsafe {
-                channel.termios = *ptr;
+                channel.termios = ptr.read_unaligned();
             }
             Ok(0)
         } else if request == 7 { // TIOCSCTTY

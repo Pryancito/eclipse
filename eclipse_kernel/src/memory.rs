@@ -1412,14 +1412,14 @@ pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
     if num_pages == 0 {
         return None;
     }
-    let bytes = num_pages * 4096;
+    let bytes = num_pages.checked_mul(4096)?;
 
     let pool_start = anon_mmap_pool_start();
     let pool_end = anon_mmap_pool_end();
     loop {
         let current = ANON_MMAP_NEXT.load(Ordering::SeqCst);
-        let start_phys = pool_start + current;
-        let end_phys = start_phys + bytes;
+        let start_phys = pool_start.checked_add(current)?;
+        let end_phys = start_phys.checked_add(bytes)?;
 
         if end_phys > pool_end {
             return None;
