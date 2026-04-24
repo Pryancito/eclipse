@@ -55,7 +55,6 @@ pub mod sync;        // Synchronization primitives
 mod memory_builtins;
 mod invariants;
 pub mod random_scheme;
-pub mod input_scheme;
 pub mod drm_scheme;
 
 // Re-exportar tipos importantes

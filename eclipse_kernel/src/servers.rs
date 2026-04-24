@@ -351,15 +351,55 @@ impl Scheme for InputScheme {
         Ok(aligned_len)
     }
 
+    fn poll(&self, _id: usize, events: usize) -> Result<usize, usize> {
+        let mut ready = 0;
+        if (events & crate::scheme::event::POLLIN) != 0 {
+            if !self.queue.lock().is_empty() {
+                ready |= crate::scheme::event::POLLIN;
+            }
+        }
+        if (events & crate::scheme::event::POLLOUT) != 0 {
+            ready |= crate::scheme::event::POLLOUT;
+        }
+        Ok(ready)
+    }
+
+    fn ioctl(&self, _id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+        // Minimal evdev ioctls to satisfy libinput discovery
+        match request {
+            0x80044501 => { // EVIOCGVERSION
+                if crate::syscalls::is_user_pointer(arg as u64, 4) {
+                    unsafe { *(arg as *mut u32) = 0x010001; }
+                    Ok(0)
+                } else { Err(scheme_error::EFAULT) }
+            }
+            0x80084502 => { // EVIOCGID
+                if crate::syscalls::is_user_pointer(arg as u64, 8) {
+                    unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 8); }
+                    Ok(0)
+                } else { Err(scheme_error::EFAULT) }
+            }
+            _ => {
+                // Return success for BIT queries (0x45 == 'E') to allow libinput probe
+                if (request >> 8) & 0xFF == 0x45 {
+                    return Ok(0);
+                }
+                Err(scheme_error::ENOSYS)
+            }
+        }
+    }
+
+    fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        stat.mode = 0o444 | 0x2000; // Character device, read-only (for userspace readers)
+        stat.size = self.queue.lock().len() as u64;
+        Ok(0)
+    }
+
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize, _current_offset: u64) -> Result<usize, usize> {
         Ok(0)
     }
 
     fn close(&self, _id: usize) -> Result<usize, usize> {
-        Ok(0)
-    }
-
-    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
         Ok(0)
     }
 }
@@ -552,14 +592,19 @@ impl SocketScheme {
         
         let start_ticks = crate::interrupts::ticks();
         loop {
-            if let Some(msg) = crate::ipc::receive_message(client_pid) {
+            let msg_opt = crate::ipc::receive_message_filtered(client_pid, |msg| {
                 if msg.msg_type == MessageType::Network && msg.data_size >= core::mem::size_of::<NetResponseHeader>() as u32 {
                     let resp = unsafe { &*(msg.data.as_ptr() as *const NetResponseHeader) };
-                    if resp.magic == NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id {
-                        return Ok((resp.status, Some(msg)));
-                    }
+                    return resp.magic == NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id;
                 }
+                false
+            });
+
+            if let Some(msg) = msg_opt {
+                let resp = unsafe { &*(msg.data.as_ptr() as *const NetResponseHeader) };
+                return Ok((resp.status, Some(msg)));
             }
+
             if crate::interrupts::ticks() > start_ticks + 5000 {
                 return Err(scheme_error::EAGAIN);
             }

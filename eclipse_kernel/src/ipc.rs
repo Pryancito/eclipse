@@ -271,6 +271,32 @@ impl ProcessMailbox {
         self.len -= 1;
         Some(msg)
     }
+    /// Extrae el primer mensaje que cumpla el predicado, sin perder el resto.
+    /// Útil para syscalls síncronos que esperan un ID específico.
+    fn pop_filtered<F>(&mut self, filter: F) -> Option<Message>
+    where F: Fn(&Message) -> bool {
+        if self.len == 0 { return None; }
+        let mut current = self.head;
+        for i in 0..self.len {
+            if filter(&self.msgs[current]) {
+                let msg = self.msgs[current];
+                // Desplazar el resto de mensajes "hacia atrás" para cerrar el hueco.
+                // i es la distancia desde head.
+                let mut move_idx = current;
+                let steps = (self.len - 1) - i;
+                for _ in 0..steps {
+                    let next = (move_idx + 1) % MAILBOX_DEPTH;
+                    self.msgs[move_idx] = self.msgs[next];
+                    move_idx = next;
+                }
+                self.tail = (self.tail + MAILBOX_DEPTH - 1) % MAILBOX_DEPTH;
+                self.len -= 1;
+                return Some(msg);
+            }
+            current = (current + 1) % MAILBOX_DEPTH;
+        }
+        None
+    }
     fn peek(&self) -> Option<&Message> {
         if self.len == 0 { None } else { Some(&self.msgs[self.head]) }
     }
@@ -641,7 +667,9 @@ pub fn receive_message(pid: ClientId) -> Option<Message> {
     run_critical(|| {
         // 1. Intentar slot de proceso (P2P / Mailbox)
         if let Some(slot) = pid_to_slot_fast(pid) {
-            return PROCESS_MAILBOXES.lock()[slot].pop();
+            if let Some(msg) = PROCESS_MAILBOXES.lock()[slot].pop() {
+                return Some(msg);
+            }
         }
 
         // 2. Intentar como Kernel Server (Cola interna de IPC_SYSTEM)
@@ -658,6 +686,18 @@ pub fn receive_message(pid: ClientId) -> Option<Message> {
                     return None;
                 }
             }
+        }
+        None
+    })
+}
+
+/// Recibir el primer mensaje que cumpla el predicado para un proceso (O(N) en mailbox_size).
+/// NOTA: Solo busca en el Mailbox P2P, no en colas de Kernel Servers (que son FIFOs estrictos).
+pub fn receive_message_filtered<F>(pid: ClientId, filter: F) -> Option<Message> 
+where F: Fn(&Message) -> bool {
+    run_critical(|| {
+        if let Some(slot) = pid_to_slot_fast(pid) {
+            return PROCESS_MAILBOXES.lock()[slot].pop_filtered(filter);
         }
         None
     })

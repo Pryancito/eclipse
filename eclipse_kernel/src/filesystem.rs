@@ -1944,7 +1944,6 @@ enum OpenFile {
     Virtual { path: String },
     Framebuffer,
     Drm { resource_id: usize },
-    Keyboard,
     Input { resource_id: usize },
     Null,
     Zero,
@@ -1997,14 +1996,12 @@ impl Scheme for FileSystemScheme {
                 open_files.push(Some(OpenFile::Drm { resource_id: res_id }));
                 Ok(id)
             },
-            p if p == "dev/keyboard" || p == "keyboard" => {
-                let mut open_files = OPEN_FILES_SCHEME.lock();
-                let id = open_files.len();
-                open_files.push(Some(OpenFile::Keyboard));
-                Ok(id)
-            },
-            p if p == "dev/input/event0" || p == "dev/input/event1" || p == "input/event0" || p == "input/event1" => {
-                let input_path = if p.contains("event0") { "event0" } else { "event1" };
+            p if p == "dev/keyboard" || p == "keyboard" 
+              || p == "dev/input/event0" || p == "dev/input/event1" 
+              || p == "input/event0" || p == "input/event1" => {
+                let input_path = if p.contains("keyboard") { "keyboard" }
+                                else if p.contains("event0") { "event0" } 
+                                else { "event1" };
                 let (_, res_id) = crate::scheme::open(&alloc::format!("input:{}", input_path), flags, _mode)?;
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 let id = open_files.len();
@@ -2199,12 +2196,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::Input { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                crate::input_scheme::InputScheme::new().read(res_id, buffer, offset)
-            }
-            OpenFile::Keyboard => {
-                if buffer.is_empty() { return Ok(0); }
-                let key = crate::interrupts::read_key();
-                if key != 0 { buffer[0] = key; Ok(1) } else { Ok(0) }
+                if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                    crate::scheme::read(scheme_id, res_id, buffer, offset)
+                } else { Err(scheme_error::ENODEV) }
             }
             OpenFile::Null => Ok(0),
             OpenFile::Zero => { for b in buffer.iter_mut() { *b = 0; } Ok(buffer.len()) }
@@ -2252,7 +2246,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::Input { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                crate::input_scheme::InputScheme::new().write(res_id, buffer, offset)
+                if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                    crate::scheme::write(scheme_id, res_id, buffer, offset)
+                } else { Err(scheme_error::ENODEV) }
             }
             OpenFile::Tty => {
                 if let Ok(s) = core::str::from_utf8(buffer) { crate::serial::serial_print(s); Ok(buffer.len()) }
@@ -2331,7 +2327,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::Input { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                crate::input_scheme::InputScheme::new().fstat(res_id, stat)
+                if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                    crate::scheme::fstat(scheme_id, res_id, stat)
+                } else { Err(scheme_error::ENODEV) }
             }
             _ => { stat.mode = 0o020666; Ok(0) }
         }
@@ -2407,7 +2405,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::Input { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                crate::input_scheme::InputScheme::new().ioctl(res_id, request, arg)
+                if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                    crate::scheme::ioctl(scheme_id, res_id, request, arg)
+                } else { Err(scheme_error::ENODEV) }
             }
             _ => Err(scheme_error::ENOSYS),
         }
@@ -2442,14 +2442,9 @@ impl Scheme for FileSystemScheme {
             OpenFile::Input { resource_id } => {
                 let res_id = *resource_id;
                 drop(open_files);
-                crate::input_scheme::InputScheme::new().poll(res_id, events)
-            }
-            OpenFile::Keyboard => {
-                let has = crate::interrupts::has_key();
-                let mut ready = 0;
-                if (events & crate::scheme::event::POLLIN) != 0 && has { ready |= crate::scheme::event::POLLIN; }
-                if (events & crate::scheme::event::POLLOUT) != 0 { ready |= crate::scheme::event::POLLOUT; }
-                Ok(ready)
+                if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                    crate::scheme::poll(scheme_id, res_id, events)
+                } else { Err(scheme_error::ENODEV) }
             }
             _ => Ok(events),
         }
@@ -2474,8 +2469,12 @@ impl Scheme for FileSystemScheme {
                         return crate::drm_scheme::DrmScheme.close(resource_id);
                     }
                     OpenFile::Input { resource_id } => {
+                        let res_id = resource_id;
                         drop(open_files);
-                        return crate::input_scheme::InputScheme::new().close(resource_id);
+                        if let Some(scheme_id) = crate::scheme::get_scheme_id("input") {
+                            return crate::scheme::close(scheme_id, res_id);
+                        }
+                        return Err(scheme_error::ENODEV);
                     }
                     _ => {}
                 }

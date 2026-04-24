@@ -690,7 +690,7 @@ fn main() {
                 processed = true;
                 let mut status: i64 = -1; // Default error
                 let mut resp_data_size: u32 = 0;
-                if sender_pid == 0x01 {
+                if sender_pid == 0x01 || sender_pid == 0 {
                     match header.op {
                         NetOp::Socket => {
                             let path_ptr = unsafe { ipc_buf.as_ptr().add(core::mem::size_of::<NetRequestHeader>()) };
