@@ -116,10 +116,10 @@ fn start_essential_services() {
     // Start log server first - critical for debugging
     let log_pid = start_essential_service(spawn_service_id!(log));
     wait_for_ready(log_pid, "log", 5000);
-    std::thread::sleep(std::time::Duration::from_millis(5000));
+    std::thread::sleep(std::time::Duration::from_millis(1000));
     let devfs_pid = start_essential_service(spawn_service_id!(devfs));
     wait_for_ready(devfs_pid, "devfs", 5000);
-    std::thread::sleep(std::time::Duration::from_millis(5000));
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 }
 
 fn start_essential_service(service_id: u32) -> u32 {
@@ -163,12 +163,12 @@ fn start_system_services() {
             (svc[i].name, pid as u32)
         };
         if pid > 0 {
-            let timeout = if name == "filesystem" { 15000 } else { 5000 };
+            let timeout = if name == "filesystem" { 5000 } else { 5000 };
             wait_for_ready(pid, name, timeout);
             // gui_service is a one-shot launcher, but we keep its PID to track heartbeats
             // until it exits naturally.
         }
-        std::thread::sleep(std::time::Duration::from_millis(5000));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
     }
 }
 
@@ -188,8 +188,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
                         println!("[INIT] Service '{}' is READY (PID {})", name, sender);
                         return;
                     } else {
-                        // READY from someone else - might be a service that we aren't waiting for yet,
-                        // or the compositor (labwc, lunas, etc.). Mark it as READY if it matches any service.
+                        println!("[INIT] Received READY from unexpected PID {} while waiting for {} ({})", sender, expected_pid, name);
                         let mut svc = SERVICES.lock();
                         for s in svc.iter_mut() {
                             if s.pid == sender as i32 {
@@ -199,6 +198,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
                         }
                     }
                 } else {
+                    println!("[INIT] Received non-READY message from PID {} (len={}) while waiting for {}", sender, len, name);
                     process_single_ipc_request(&buffer, len, sender);
                 }
             }

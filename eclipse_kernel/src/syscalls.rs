@@ -2217,6 +2217,11 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> u64 
             }
         }
         
+        crate::serial::serial_printf(format_args!(
+            "[IPC-SEND] from={} to={} type={:?} data_len={}\n",
+            client_id, server_id, message_type, len
+        ));
+
         if send_message(client_id, server_id as u32, message_type, &data[..len]) {
             return 0; // Success
         }
@@ -2248,13 +2253,10 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     if let Some(client_id) = current_process_id() {
         if let Some(msg) = receive_message(client_id) {
             RECV_OK.fetch_add(1, Ordering::Relaxed);
-            // Diagnóstico: loguear mensajes recibidos por PID 11 (glxgears).
-            if client_id == 11 {
-                crate::serial::serial_printf(format_args!(
-                    "[RECV-SLOW] glxgears pid=11 got msg data_size={} from={}\n",
-                    msg.data_size, msg.from
-                ));
-            }
+            crate::serial::serial_printf(format_args!(
+                "[IPC-RECV] pid={} got msg data_size={} from={} type={:?}\n",
+                client_id, msg.data_size, msg.from, msg.msg_type
+            ));
             // Calcular cuántos bytes copiar al buffer del usuario
             let data_len = (msg.data_size as usize).min(msg.data.len());
             let copy_len = core::cmp::min(size as usize, data_len);

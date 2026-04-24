@@ -74,6 +74,7 @@ mod mock_interrupts {
 #[cfg(test)]
 mod mock_serial {
     pub fn serial_print(s: &str) { print!("{}", s); }
+    pub fn serial_print_hex(num: u64) { print!("{:016X}", num); }
 }
 
 #[cfg(test)]
@@ -1807,7 +1808,7 @@ pub fn usb_irq_handler() {
     if let Some(ref mut xhci) = *guard {
         if let Some(ref mmio) = xhci.mmio {
             // Check EINT in USBSTS (offset 0x04)
-            let usbsts = mmio.read_operational(0x04);
+            let usbsts: u32 = mmio.read_operational(0x04);
             if (usbsts & 0x08) == 0 { return; } // not our interrupt
             // Clear EINT (write-1-to-clear)
             mmio.write_operational(0x04, 0x08);
@@ -1838,7 +1839,7 @@ pub fn poll() {
     if let Some(ref mut xhci) = *guard {
         // Check if controller halted (USBSTS bit 0)
         if let Some(ref mmio) = xhci.mmio {
-            let sts = mmio.read_operational(0x04);
+            let sts: u32 = mmio.read_operational(0x04);
             if (sts & 1) != 0 {
                 serial::serial_print("[XHCI] Controller HALTED! Status: ");
                 serial::serial_print_hex(sts as u64);
