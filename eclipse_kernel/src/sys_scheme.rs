@@ -73,6 +73,11 @@ fn dir_index(path: &str) -> Option<u16> {
         "firmware" => 24,
         "firmware/devicetree" => 25,
         "firmware/devicetree/base" => 26,
+        "class/input" => 50,
+        "class/input/event0" => 51,
+        "class/input/event1" => 52,
+        "dev/char/13:64" => 53,
+        "dev/char/13:65" => 54,
         _ => return None,
     })
 }
@@ -95,6 +100,12 @@ fn file_index(path: &str) -> Option<u16> {
         "dev/char/29:0/uevent" => 5,
         "devices/virtual/dmi/id/uevent" => 6,
         "firmware/devicetree/base/compatible" => 7,
+        "class/input/event0/dev" => 27,
+        "class/input/event0/uevent" => 28,
+        "class/input/event1/dev" => 29,
+        "class/input/event1/uevent" => 30,
+        "dev/char/13:64/uevent" => 31,
+        "dev/char/13:65/uevent" => 32,
         // PCI device uevent (shared between card0/renderD128/pci device paths)
         "dev/char/226:0/device/uevent"
         | "dev/char/226:128/device/uevent"
@@ -170,7 +181,8 @@ fn dir_listing(idx: u16) -> &'static str {
         // devices/pci0000:00/0000:00:02.0/drm — list DRM nodes for this device
         34 => "card0\nrenderD128\n",
         // dev/char/226:0/device/drm/card0, renderD128 — leaf dirs
-        35 | 36 | 37 | 38 | 39 | 40 => "",
+        35 | 36 | 37 | 38 | 39 | 40 | 51 | 52 | 53 | 54 => "dev\nuevent\n",
+        50 => "event0\nevent1\n",
         _ => "",
     }
 }
@@ -205,7 +217,13 @@ fn file_content(idx: u16) -> &'static str {
         // PCI subsystem device
         26 => "0x1050\n",
         // devices/pci0000:00/0000:00:02.0/subsystem — symlink, content via readlink
-        27 => "",
+        // devices/pci0000:00/0000:00:02.0/subsystem — symlink, content via readlink
+        27 => "13:64\n",
+        28 => "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\n",
+        29 => "13:65\n",
+        30 => "MAJOR=13\nMINOR=65\nDEVNAME=input/event1\n",
+        31 => "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\n",
+        32 => "MAJOR=13\nMINOR=65\nDEVNAME=input/event1\n",
         _ => "",
     }
 }

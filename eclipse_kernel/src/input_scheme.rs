@@ -170,6 +170,29 @@ impl Scheme for InputScheme {
             }
         }
     }
+    
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        let mut ready = 0;
+        let resources = OPEN_RESOURCES.lock();
+        let res = resources.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        let kind = res.kind;
+        drop(resources);
+
+        if (events & crate::scheme::event::POLLIN) != 0 {
+            match kind {
+                InputType::Keyboard | InputType::EvdevKeyboard => {
+                    if interrupts::has_key() { ready |= crate::scheme::event::POLLIN; }
+                }
+                InputType::Mouse | InputType::EvdevMouse => {
+                    if interrupts::has_mouse_packet() { ready |= crate::scheme::event::POLLIN; }
+                }
+            }
+        }
+        if (events & crate::scheme::event::POLLOUT) != 0 {
+            ready |= crate::scheme::event::POLLOUT;
+        }
+        Ok(ready)
+    }
 
     fn ioctl(&self, _id: usize, request: usize, arg: usize) -> Result<usize, usize> {
         // Minimal evdev ioctls to satisfy libinput

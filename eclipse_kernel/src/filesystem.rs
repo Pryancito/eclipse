@@ -1945,6 +1945,7 @@ enum OpenFile {
     Framebuffer,
     Drm { resource_id: usize },
     Keyboard,
+    Input { resource_id: usize },
     Null,
     Zero,
     Tty,
@@ -2000,6 +2001,14 @@ impl Scheme for FileSystemScheme {
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 let id = open_files.len();
                 open_files.push(Some(OpenFile::Keyboard));
+                Ok(id)
+            },
+            p if p == "dev/input/event0" || p == "dev/input/event1" || p == "input/event0" || p == "input/event1" => {
+                let input_path = if p.contains("event0") { "event0" } else { "event1" };
+                let (_, res_id) = crate::scheme::open(&alloc::format!("input:{}", input_path), flags, _mode)?;
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                let id = open_files.len();
+                open_files.push(Some(OpenFile::Input { resource_id: res_id }));
                 Ok(id)
             },
             p if p == "dev/null" || p == "null" => {
@@ -2187,6 +2196,11 @@ impl Scheme for FileSystemScheme {
                 drop(open_files);
                 crate::drm_scheme::DrmScheme.read(res_id, buffer, offset)
             }
+            OpenFile::Input { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::input_scheme::InputScheme::new().read(res_id, buffer, offset)
+            }
             OpenFile::Keyboard => {
                 if buffer.is_empty() { return Ok(0); }
                 let key = crate::interrupts::read_key();
@@ -2234,6 +2248,11 @@ impl Scheme for FileSystemScheme {
                 let res_id = *resource_id;
                 drop(open_files);
                 crate::drm_scheme::DrmScheme.write(res_id, buffer, offset)
+            }
+            OpenFile::Input { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::input_scheme::InputScheme::new().write(res_id, buffer, offset)
             }
             OpenFile::Tty => {
                 if let Ok(s) = core::str::from_utf8(buffer) { crate::serial::serial_print(s); Ok(buffer.len()) }
@@ -2309,6 +2328,11 @@ impl Scheme for FileSystemScheme {
                 stat.size = list_device_names().iter().map(|n| n.len() + 1).sum::<usize>() as u64;
                 Ok(0)
             }
+            OpenFile::Input { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::input_scheme::InputScheme::new().fstat(res_id, stat)
+            }
             _ => { stat.mode = 0o020666; Ok(0) }
         }
     }
@@ -2380,6 +2404,11 @@ impl Scheme for FileSystemScheme {
                     _ => Ok(0)
                 }
             }
+            OpenFile::Input { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::input_scheme::InputScheme::new().ioctl(res_id, request, arg)
+            }
             _ => Err(scheme_error::ENOSYS),
         }
     }
@@ -2401,6 +2430,31 @@ impl Scheme for FileSystemScheme {
         }
     }
 
+    fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        match open_file {
+            OpenFile::Drm { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::drm_scheme::DrmScheme.poll(res_id, events)
+            }
+            OpenFile::Input { resource_id } => {
+                let res_id = *resource_id;
+                drop(open_files);
+                crate::input_scheme::InputScheme::new().poll(res_id, events)
+            }
+            OpenFile::Keyboard => {
+                let has = crate::interrupts::has_key();
+                let mut ready = 0;
+                if (events & crate::scheme::event::POLLIN) != 0 && has { ready |= crate::scheme::event::POLLIN; }
+                if (events & crate::scheme::event::POLLOUT) != 0 { ready |= crate::scheme::event::POLLOUT; }
+                Ok(ready)
+            }
+            _ => Ok(events),
+        }
+    }
+
     fn dup_independent(&self, id: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let existing = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?.clone();
@@ -2410,9 +2464,24 @@ impl Scheme for FileSystemScheme {
         let new_id = open_files.len(); open_files.push(Some(existing)); Ok(new_id)
     }
 
-        fn close(&self, id: usize) -> Result<usize, usize> {
+    fn close(&self, id: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
-        if let Some(slot) = open_files.get_mut(id) { *slot = None; return Ok(0); }
+        if let Some(slot) = open_files.get_mut(id) {
+            if let Some(file) = slot.take() {
+                match file {
+                    OpenFile::Drm { resource_id } => {
+                        drop(open_files);
+                        return crate::drm_scheme::DrmScheme.close(resource_id);
+                    }
+                    OpenFile::Input { resource_id } => {
+                        drop(open_files);
+                        return crate::input_scheme::InputScheme::new().close(resource_id);
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(0);
+        }
         Err(scheme_error::EBADF)
     }
 

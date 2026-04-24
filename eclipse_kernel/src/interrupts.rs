@@ -1729,6 +1729,22 @@ pub fn read_mouse_packet() -> u32 {
     })
 }
 
+pub fn has_key() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let head = KEY_HEAD.lock();
+        let tail = KEY_TAIL.lock();
+        *head != *tail
+    })
+}
+
+pub fn has_mouse_packet() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let head = MOUSE_HEAD.lock();
+        let tail = MOUSE_TAIL.lock();
+        *head != *tail
+    })
+}
+
 /// Inject a scancode into the keyboard buffer (used by USB HID driver).
 pub fn push_key(scancode: u8) {
     x86_64::instructions::interrupts::without_interrupts(|| {
