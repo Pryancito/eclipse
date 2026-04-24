@@ -1043,19 +1043,77 @@ pub fn try_read_user_u8(page_table_phys: u64, vaddr: u64) -> Option<u8> {
 }
 
 pub fn try_read_user_u64(pml4_phys: u64, vaddr: u64) -> Option<u64> {
-    if (vaddr & 7) != 0 {
-        return None;
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    if let Some(phys) = get_user_page_phys(pml4_phys, page) {
+        let virt = PHYS_MEM_OFFSET + phys + offset as u64;
+        if offset <= 4096 - 8 {
+            Some(unsafe { (virt as *const u64).read_unaligned() })
+        } else {
+            None
+        }
+    } else {
+        None
     }
-    if (vaddr & 0xFFF) > 4096 - 8 {
-        return None;
+}
+
+pub fn try_read_user_u32(pml4_phys: u64, vaddr: u64) -> Option<u32> {
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    if let Some(phys) = get_user_page_phys(pml4_phys, page) {
+        let virt = PHYS_MEM_OFFSET + phys + offset as u64;
+        if offset <= 4096 - 4 {
+            Some(unsafe { (virt as *const u32).read_unaligned() })
+        } else {
+            None
+        }
+    } else {
+        None
     }
-    let phys = get_user_page_phys(pml4_phys, vaddr)?;
-    if phys == 0 {
-        return None;
+}
+
+pub fn try_write_user_u8(pml4_phys: u64, vaddr: u64, val: u8) -> bool {
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    if let Some(phys) = get_user_page_phys(pml4_phys, page) {
+        let virt = PHYS_MEM_OFFSET + phys + offset as u64;
+        unsafe { (virt as *mut u8).write_volatile(val); }
+        true
+    } else {
+        false
     }
-    let off = (vaddr & 0xFFF) as usize;
-    let kva = phys_to_virt(phys) as *const u64;
-    unsafe { Some(core::ptr::read_volatile(kva.byte_add(off))) }
+}
+
+pub fn try_write_user_u32(pml4_phys: u64, vaddr: u64, val: u32) -> bool {
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    if let Some(phys) = get_user_page_phys(pml4_phys, page) {
+        let virt = PHYS_MEM_OFFSET + phys + offset as u64;
+        if offset <= 4096 - 4 {
+            unsafe { (virt as *mut u32).write_unaligned(val); }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+pub fn try_write_user_u64(pml4_phys: u64, vaddr: u64, val: u64) -> bool {
+    let page = vaddr & !0xFFF;
+    let offset = (vaddr & 0xFFF) as usize;
+    if let Some(phys) = get_user_page_phys(pml4_phys, page) {
+        let virt = PHYS_MEM_OFFSET + phys + offset as u64;
+        if offset <= 4096 - 8 {
+            unsafe { (virt as *mut u64).write_unaligned(val); }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
 }
 
 /// Linux `PROT_READ|WRITE|EXEC` (bits 0–2) → bits de PTE de hoja para usuario.
@@ -1606,7 +1664,7 @@ pub fn map_shared_memory_for_process(page_table_phys: u64, phys_addr: u64, size:
     serial::serial_print_hex(virt_addr);
     serial::serial_print("\n");
     
-    map_physical_range(page_table_phys, phys_addr, aligned_size, virt_addr, pt_flags);
+    map_phys_bulk(page_table_phys, phys_addr, aligned_size, virt_addr, pt_flags);
     
     virt_addr
 }
@@ -1636,7 +1694,7 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     serial::serial_print_hex(virt_addr);
     serial::serial_print(" (same path as mmap)\n");
     
-    map_physical_range(page_table_phys, fb_phys_addr, aligned_size, virt_addr, pt_flags);
+    map_phys_bulk(page_table_phys, fb_phys_addr, aligned_size, virt_addr, pt_flags);
     
     serial::serial_print("MAP_FB: Done v=");
     serial::serial_print_hex(virt_addr);
@@ -1689,7 +1747,7 @@ pub fn map_framebuffer_kernel(paddr: u64, size: usize) -> u64 {
     virt_addr
 }
 /// Map a physical memory range into a process's page table using 4KB pages
-pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: u64, flags: u64) {
+pub fn map_phys_bulk(page_table_phys: u64, paddr: u64, length: u64, vaddr: u64, flags: u64) {
     let num_pages = (length + 0xFFF) / 0x1000;
     for i in 0..num_pages {
         let page_offset = i * 0x1000;

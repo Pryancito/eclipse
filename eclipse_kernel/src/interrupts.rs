@@ -2318,6 +2318,8 @@ pub struct SyscallContext {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 extern "C" fn syscall_handler_rust(

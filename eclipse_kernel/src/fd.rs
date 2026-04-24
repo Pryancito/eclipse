@@ -214,18 +214,54 @@ pub fn fd_push(pid: ProcessId, fd_entry: FileDescriptor) -> Option<usize> {
     None
 }
 
-/// Push an existing file descriptor entry into a specific slot
-pub fn fd_push_at(pid: ProcessId, target_fd: usize, fd_entry: FileDescriptor) -> bool {
-    if target_fd >= MAX_FDS_PER_PROCESS { return false; }
+/// Duplicate a file descriptor
+pub fn fd_dup(pid: ProcessId, fd: usize) -> Option<usize> {
+    let pid_idx = pid_to_fd_idx(pid)?;
+    let mut tables = FD_TABLES.lock();
+    let entry = tables[pid_idx].get(fd)?.clone();
+    
+    for i in 3..MAX_FDS_PER_PROCESS {
+        if !tables[pid_idx].fds[i].in_use {
+            tables[pid_idx].fds[i] = entry;
+            tables[pid_idx].fds[i].in_use = true;
+            let _ = crate::scheme::dup(entry.scheme_id, entry.resource_id);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Duplicate a file descriptor to a specific slot
+pub fn fd_dup2(pid: ProcessId, old_fd: usize, new_fd: usize) -> bool {
+    if new_fd >= MAX_FDS_PER_PROCESS { return false; }
     let pid_idx = match pid_to_fd_idx(pid) {
         Some(i) => i,
         None => return false,
     };
+    
+    let entry = {
+        let mut tables = FD_TABLES.lock();
+        let e = match tables[pid_idx].get(old_fd) {
+            Some(e) => e.clone(),
+            None => return false,
+        };
+        // If new_fd is already open, close it first
+        if tables[pid_idx].fds[new_fd].in_use {
+            let s_id = tables[pid_idx].fds[new_fd].scheme_id;
+            let r_id = tables[pid_idx].fds[new_fd].resource_id;
+            tables[pid_idx].fds[new_fd].in_use = false;
+            drop(tables);
+            let _ = crate::scheme::close(s_id, r_id);
+        } else {
+            drop(tables);
+        }
+        e
+    };
+    
     let mut tables = FD_TABLES.lock();
-    tables[pid_idx].fds[target_fd] = fd_entry;
-    tables[pid_idx].fds[target_fd].in_use = true;
-    // Increment ref count
-    let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+    tables[pid_idx].fds[new_fd] = entry;
+    tables[pid_idx].fds[new_fd].in_use = true;
+    let _ = crate::scheme::dup(entry.scheme_id, entry.resource_id);
     true
 }
 

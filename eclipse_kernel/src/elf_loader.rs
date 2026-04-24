@@ -63,9 +63,6 @@ pub const MINIMAL_ENVP: &[&[u8]] = &[
     b"USER=root\0",
     b"SHELL=/bin/bash\0",
     b"LANG=C\0",
-    // Runtime environment for processes (XDG_RUNTIME_DIR is required by most Wayland libs).
-    b"XDG_RUNTIME_DIR=/run/user/0\0",
-    b"XDG_SESSION_TYPE=wayland\0",
 ];
 
 /// Number of entries in MINIMAL_ENVP.
@@ -400,6 +397,12 @@ fn map_pt_load_segments(
         if ph.p_filesz > ph.p_memsz {
             return Err("ELF: PT_LOAD p_filesz > p_memsz");
         }
+        if ph.p_align > 0 && !ph.p_align.is_power_of_two() {
+            return Err("ELF: invalid segment alignment (not power of two)");
+        }
+        if ph.p_align > 1 && (ph.p_vaddr % ph.p_align != ph.p_offset % ph.p_align) {
+            return Err("ELF: vaddr and offset alignment mismatch");
+        }
         
         let vaddr_start = if et_dyn {
             ph.p_vaddr.wrapping_add(load_bias)
@@ -411,8 +414,8 @@ fn map_pt_load_segments(
             return Err("ELF: segment in kernel space");
         }
         serial::serial_printf(format_args!(
-            "[load_elf] segment {}: vaddr=0x{:x} filesz=0x{:x} memsz=0x{:x}\n",
-            i, vaddr_start, ph.p_filesz, ph.p_memsz
+            "[load_elf] segment {}: vaddr=0x{:x} filesz=0x{:x} memsz=0x{:x} flags=0x{:x}\n",
+            i, vaddr_start, ph.p_filesz, ph.p_memsz, ph.p_flags
         ));
         let file_size = ph.p_filesz;
         let file_start_offset = ph.p_offset;
@@ -436,8 +439,8 @@ fn map_pt_load_segments(
                     return Err("Failed to allocate 4KB anonymous frame for segment");
                 };
             let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
+            unsafe { core::ptr::write_bytes(kptr, 0, 0x1000) };
             if allocated_new {
-                unsafe { core::ptr::write_bytes(kptr, 0, 0x1000) };
                 mapped_count = mapped_count.saturating_add(1);
             }
             // Permisos alineados con p_flags (NX en segmentos sin PF_X); coherente con mprotect/mmap.

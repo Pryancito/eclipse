@@ -752,6 +752,84 @@ impl Scheme for DrmScheme {
                     Err(scheme_error::EIO)
                 }
             }
+            DRM_IOCTL_MODE_GETPROPERTY => {
+                #[repr(C)]
+                struct DrmModeGetProperty {
+                    values_ptr: u64, enum_blob_ptr: u64,
+                    prop_id: u32, flags: u32,
+                    name: [u8; 32],
+                    count_values: u32, count_enum_blobs: u32,
+                }
+                let prop = unsafe { &mut *(arg as *mut DrmModeGetProperty) };
+                match prop.prop_id {
+                    1 => { // EDID
+                        let name = b"EDID\0";
+                        prop.name[..name.len()].copy_from_slice(name);
+                        prop.flags = 0x10; // DRM_MODE_PROP_BLOB
+                        prop.count_values = 0;
+                        prop.count_enum_blobs = 0;
+                        Ok(0)
+                    }
+                    2 => { // DPMS
+                        let name = b"DPMS\0";
+                        prop.name[..name.len()].copy_from_slice(name);
+                        prop.flags = 0x8; // DRM_MODE_PROP_ENUM
+                        prop.count_values = 4;
+                        Ok(0)
+                    }
+                    3 => { // type (for planes)
+                        let name = b"type\0";
+                        prop.name[..name.len()].copy_from_slice(name);
+                        prop.flags = 0x48; // DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE
+                        prop.count_values = 3;
+                        Ok(0)
+                    }
+                    _ => Err(scheme_error::ENOENT),
+                }
+            }
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                #[repr(C)]
+                struct DrmModeObjGetProps {
+                    props_ptr: u64, prop_values_ptr: u64,
+                    count_props: u32, obj_id: u32, obj_type: u32,
+                }
+                let o = unsafe { &mut *(arg as *mut DrmModeObjGetProps) };
+                let (props, values) = match o.obj_type {
+                    0xc0000000 => { // Connector
+                        (alloc::vec![1, 2], alloc::vec![10, 0]) // EDID=blob 10, DPMS=0
+                    }
+                    0xeeeeeeee => { // Plane
+                        (alloc::vec![3], alloc::vec![1]) // type=Primary
+                    }
+                    _ => (alloc::vec![], alloc::vec![]),
+                };
+
+                if o.props_ptr != 0 && o.prop_values_ptr != 0 && o.count_props >= props.len() as u32 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(props.as_ptr(), o.props_ptr as *mut u32, props.len());
+                        core::ptr::copy_nonoverlapping(values.as_ptr(), o.prop_values_ptr as *mut u64, values.len());
+                    }
+                }
+                o.count_props = props.len() as u32;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPROPBLOB => {
+                #[repr(C)]
+                struct DrmModeGetBlob {
+                    blob_id: u32, length: u32, data: u64,
+                }
+                let b = unsafe { &mut *(arg as *mut DrmModeGetBlob) };
+                if b.blob_id == 10 { // Our fake EDID blob
+                    let edid = [0u8; 128]; // Minimal empty EDID
+                    if b.data != 0 && b.length >= 128 {
+                        unsafe { core::ptr::copy_nonoverlapping(edid.as_ptr(), b.data as *mut u8, 128); }
+                    }
+                    b.length = 128;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            }
             DRM_IOCTL_MODE_ATOMIC => {
                 // Linux: struct drm_mode_atomic { flags(u32), count_objs(u32), objs_ptr(u64), count_props_ptr(u64),
                 //                                props_ptr(u64), prop_values_ptr(u64), reserved(u64), user_data(u64) }

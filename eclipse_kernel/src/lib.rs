@@ -45,6 +45,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod signalfd;
 pub mod timerfd;
+pub mod kqueue;
 pub mod usb_hid;
 pub mod page_cache;
 mod elf_loader;

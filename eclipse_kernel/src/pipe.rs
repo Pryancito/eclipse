@@ -21,6 +21,8 @@ struct PipeChannel {
     buffer:     VecDeque<u8>,
     write_ends: usize,   // cuántos extremos de escritura siguen abiertos
     read_ends:  usize,   // cuántos extremos de lectura siguen abiertos
+    pub creator_uid: u32,
+    pub creator_gid: u32,
 }
 
 impl PipeChannel {
@@ -29,6 +31,8 @@ impl PipeChannel {
             buffer:     VecDeque::with_capacity(4096),
             write_ends: 1,
             read_ends:  1,
+            creator_uid: 0,
+            creator_gid: 0,
         }
     }
 }
@@ -69,12 +73,26 @@ impl PipeScheme {
         // Reutilizar slot vacío si lo hay
         for (i, slot) in channels.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(Arc::new(Mutex::new(PipeChannel::new())));
+                let mut ch = PipeChannel::new();
+                if let Some(pid) = crate::process::current_process_id() {
+                    if let Some(p) = crate::process::get_process(pid) {
+                        ch.creator_uid = p.uid;
+                        ch.creator_gid = p.gid;
+                    }
+                }
+                *slot = Some(Arc::new(Mutex::new(ch)));
                 return i;
             }
         }
         let id = channels.len();
-        channels.push(Some(Arc::new(Mutex::new(PipeChannel::new()))));
+        let mut ch = PipeChannel::new();
+        if let Some(pid) = crate::process::current_process_id() {
+            if let Some(p) = crate::process::get_process(pid) {
+                ch.creator_uid = p.uid;
+                ch.creator_gid = p.gid;
+            }
+        }
+        channels.push(Some(Arc::new(Mutex::new(ch))));
         id
     }
 
@@ -140,6 +158,17 @@ impl PipeScheme {
             }
         }
         Ok(ready)
+    }
+
+    pub fn get_credentials(&self, id: usize) -> Result<(u32, u32), usize> {
+        let channel_id = {
+            let handles = self.handles.lock();
+            let h = handles.get(id).and_then(|x| x.as_ref()).ok_or(error::EBADF)?;
+            h.channel_id
+        };
+        let channel_arc = self.get_channel(channel_id).ok_or(error::EIO)?;
+        let ch = channel_arc.lock();
+        Ok((ch.creator_uid, ch.creator_gid))
     }
 }
 

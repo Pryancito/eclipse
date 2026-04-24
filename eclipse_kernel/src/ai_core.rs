@@ -101,7 +101,7 @@ impl ProcessProfile {
     }
 
     /// Registra el fin de una ráfaga de CPU y actualiza EWMA
-    pub fn update_burst(&mut self, duration: u64) {
+    pub fn update_burst(&mut self, duration: u64, slot: usize) {
         // Actualizar EWMA: alpha = 1/2
         // P = (P + B) / 2
         let duration_scaled = duration << 10;
@@ -112,6 +112,11 @@ impl ProcessProfile {
             self.cpu_history[i] = self.cpu_history[i+1];
         }
         self.cpu_history[3] = duration;
+
+        // Sync and reset the fast syscall counter
+        let fast_count = SYSCALL_COUNTERS[slot].swap(0, core::sync::atomic::Ordering::Relaxed);
+        self.last_tick_syscalls = fast_count;
+        self.syscall_count += fast_count;
 
         // Desplazar historial de syscalls
         for i in 0..7 {
@@ -283,6 +288,10 @@ pub static CPU_TEMP: Mutex<[u32; 16]> = Mutex::new([400; 16]); // Inicia a 40°C
 
 /// Per-CPU Profile storage (Sync via Mutex)
 pub static CPU_PROFILES: Mutex<[CpuProfile; 16]> = Mutex::new([CpuProfile::new(); 16]);
+
+/// Fast syscall counters (Lock-free) to avoid PROCESS_TABLE contention on every syscall.
+/// Indexed by process slot (0-255).
+pub static SYSCALL_COUNTERS: [core::sync::atomic::AtomicU64; 256] = [const { core::sync::atomic::AtomicU64::new(0) }; 256];
 
 /// Historial de ticks para calcular carga delta
 static LAST_CPU_TICKS: Mutex<[(u64, u64); 16]> = Mutex::new([(0, 0); 16]);
@@ -564,56 +573,65 @@ pub fn init() {
 
 /// Analiza una syscall para detectar anomalías (DoS, ráfagas sospechosas)
 pub fn audit_syscall(pid: u32, _syscall_num: u64) -> bool {
-    let mut blocked = false;
-    let _ = crate::process::modify_process(pid, |proc| {
-        proc.ai_profile.last_tick_syscalls += 1;
-        proc.ai_profile.syscall_count += 1;
+    let slot = match crate::ipc::pid_to_slot_fast(pid) {
+        Some(s) => s,
+        None => return true,
+    };
 
-        // Umbral estadístico: promediar syscalls históricas
-        let history_sum: u64 = proc.ai_profile.syscall_history.iter().sum();
-        let avg_syscalls = history_sum / 8;
-        
-        // Aumentamos el límite base y permitimos más ráfaga para PIDs del sistema (< 16)
-        let mut limit = (avg_syscalls * 20).max(500);
-        if pid < 16 {
-            limit *= 4; // Los procesos del sistema pueden ser muy ruidosos legítimamente (E/S, Render)
-        }
-        
-        if proc.ai_profile.last_tick_syscalls > limit {
+    // Incremento atómico ultra-rápido sin bloquear PROCESS_TABLE
+    let current_burst = SYSCALL_COUNTERS[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+
+    // Solo entramos en el lock pesado si sospechamos de una anomalía o para auditoría periódica
+    // Umbral de pánico: 500 syscalls en un solo tick (aprox 1ms)
+    if current_burst > 500 {
+        let mut blocked = false;
+        let _ = crate::process::modify_process(pid, |proc| {
+            // Sincronizar el contador atómico con el perfil para el cálculo del límite
+            proc.ai_profile.last_tick_syscalls = current_burst;
+            
+            // Umbral estadístico: promediar syscalls históricas
+            let history_sum: u64 = proc.ai_profile.syscall_history.iter().sum();
+            let avg_syscalls = history_sum / 8;
+            
+            let mut limit = (avg_syscalls * 20).max(500);
             if pid < 16 {
-                // For system processes, we only log but DO NOT block
-                serial::serial_print("[AI-CORE] SYSTEM ANOMALY WARNING: PID ");
-                serial::serial_print_dec(pid as u64);
-                serial::serial_print(" exceeded limit (");
-                serial::serial_print_dec(proc.ai_profile.last_tick_syscalls);
-                serial::serial_print("/");
-                serial::serial_print_dec(limit);
-                serial::serial_print(")\n");
-            } else {
-                blocked = true;
+                limit *= 4;
             }
-        }
-    });
+            
+            if current_burst > limit {
+                if pid < 16 {
+                    serial::serial_print("[AI-CORE] SYSTEM ANOMALY WARNING: PID ");
+                    serial::serial_print_dec(pid as u64);
+                    serial::serial_print(" exceeded limit (");
+                    serial::serial_print_dec(current_burst);
+                    serial::serial_print("/");
+                    serial::serial_print_dec(limit);
+                    serial::serial_print(")\n");
+                } else {
+                    blocked = true;
+                }
+            }
+        });
 
-    if blocked {
-        {
-            let mut count = ANOMALY_COUNT.lock();
-            *count += 1;
+        if blocked {
+            {
+                let mut count = ANOMALY_COUNT.lock();
+                *count += 1;
+            }
+            serial::serial_print("[AI-CORE] ANOMALY DETECTED: PID ");
+            serial::serial_print_dec(pid as u64);
+            serial::serial_print(" blocked.\n");
+            return false;
         }
-        serial::serial_print("[AI-CORE] ANOMALY DETECTED: PID ");
-        serial::serial_print_dec(pid as u64);
-        serial::serial_print(" blocked.\n");
-        return false;
     }
     true
 }
 
-/// Incrementa el contador de syscalls de forma eficiente (sin clonar todo el proceso)
+/// Incrementa el contador de syscalls de forma eficiente (sin bloqueo global)
 pub fn increment_syscall_count(pid: u32) {
-    let _ = crate::process::modify_process(pid, |proc| {
-        proc.ai_profile.last_tick_syscalls += 1;
-        proc.ai_profile.syscall_count += 1;
-    });
+    if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+        SYSCALL_COUNTERS[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Establece el hint de foreground para un proceso

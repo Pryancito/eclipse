@@ -521,8 +521,9 @@ pub fn schedule() -> u64 {
                                     process.vruntime += delta_vruntime;
                                 }
                                 
-                                // Update AI profile burst duration
-                                process.ai_profile.update_burst(consumed as u64);
+                                // Update AI profile burst duration (passing slot index for fast syscall counter sync)
+                                let slot = crate::ipc::pid_to_slot_fast(process.id).unwrap_or(0);
+                                process.ai_profile.update_burst(consumed as u64, slot);
 
                                 // Reset quantum based on AI and priority
                                 let base_q = if process.rt_params.is_some() { 100 } else { process.ai_profile.predict_burst().max(10).min(50) as u32 };

@@ -129,6 +129,9 @@ pub struct Context {
     pub rsp: u64,    // 0x78
     pub rip: u64,    // 0x80
     pub rflags: u64, // 0x88
+
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 /// Contexto de recursos compartidos entre hilos (proceso lógico)
@@ -166,6 +169,8 @@ impl Context {
             rsp: 0,
             rip: 0,
             rflags: 0x002, // IF disabled by default
+            fs_base: 0,
+            gs_base: 0,
         }
     }
 }
@@ -296,6 +301,8 @@ pub struct Process {
     /// Flags para sys_wait4 (WUNTRACED / WCONTINUED)
     pub notified_stopped: bool,
     pub notified_continued: bool,
+    /// Signal to send when parent dies (PR_SET_PDEATHSIG).
+    pub pdeathsig: u8,
     /// El buffer de la pila de kernel, para que se libere al destruir el proceso.
     pub kernel_stack: Option<alloc::vec::Vec<u8>>,
 }
@@ -364,6 +371,7 @@ impl Process {
             notified_continued: false,
             kernel_stack: None,
             rt_params: None,
+            pdeathsig: 0,
         }
     }
 }
@@ -653,6 +661,8 @@ pub fn create_process_with_pid(
                 *slot = Some(process);
                 // Registrar en tabla inversa PID → slot O(1) para IPC
                 crate::ipc::register_pid_slot(pid, slot_idx);
+                // Reset the fast syscall counter for the new process slot
+                crate::ai_core::SYSCALL_COUNTERS[slot_idx].store(0, core::sync::atomic::Ordering::Relaxed);
                 return true;
             }
         }
@@ -665,6 +675,23 @@ pub fn create_process_with_pid(
 /// Tras `exec` / `execve` el kernel vacía `vmas`; si no se vuelven a registrar, un `mmap` con
 /// pista o `MAP_FIXED` puede solapar `unmap_user_range` con la pila en 0x20000000..0x20100000
 /// y provocar #PF en RSP; además el fallo bajo demanda no puede reponer hojas sin VMA.
+pub fn register_mmap_vma(pid: ProcessId, start: u64, len: u64, prot: u64, flags: u32) {
+    if let Some(mut proc) = get_process(pid) {
+        let mut r = proc.resources.lock();
+        r.vmas.push(VMARegion {
+            start,
+            end: start + len as u64,
+            flags: prot,
+            file_backed: (flags & 0x01) == 0, // Simplified
+            anon_kernel_slack: 0,
+            shared_anon_id: None,
+            is_huge: false,
+        });
+        drop(r);
+        update_process(pid, proc);
+    }
+}
+
 pub fn register_post_exec_vm_as(
     pid: ProcessId,
     loaded: &crate::elf_loader::ExecLoadResult,
@@ -824,6 +851,15 @@ pub fn set_current_process(pid: Option<ProcessId>) {
 pub fn get_process(pid: ProcessId) -> Option<Process> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let table = PROCESS_TABLE.lock();
+        // O(1) lookup via fast PID-to-slot map
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot].as_ref() {
+                if p.id == pid {
+                    return Some(p.clone());
+                }
+            }
+        }
+        // Fallback: linear scan
         for process in table.iter() {
             if let Some(p) = process {
                 if p.id == pid {
@@ -859,6 +895,10 @@ pub fn get_process_by_name(name: &str) -> Option<ProcessId> {
 /// y siempre cabe en el array de mailboxes IPC (también de 64 entradas).
 /// Devuelve None si el proceso no existe o está terminado.
 pub fn pid_to_slot(pid: ProcessId) -> Option<usize> {
+    // Try fast lookup first (O(1))
+    if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+        return Some(slot);
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         let table = PROCESS_TABLE.lock();
         for (i, slot) in table.iter().enumerate() {
@@ -886,23 +926,13 @@ pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
 pub fn update_process(pid: ProcessId, mut new_process: Process) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
-        if (pid as usize) < table.len() {
-            if let Some(p) = table[pid as usize].as_mut() {
-                // After slot reuse, table[pid] may hold a *different* process whose PID
-                // happens to equal the slot index (e.g. slot 5 now holds PID 70).
-                // Overwriting it without checking p.id == pid would corrupt the new
-                // process's PCB with stale data from the old one.  Fall through to the
-                // linear scan when the slot is occupied by a different process.
+        // O(1) lookup
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot].as_mut() {
                 if p.id == pid {
-                    // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
-                    // Solo permitimos que update_process cambie metadatos.
-                    // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
-                    // mantenemos los valores de la tabla real.
                     let real_cpu = p.current_cpu;
                     let real_state = p.state;
-                    
                     *p = new_process;
-                    
                     p.current_cpu = real_cpu;
                     p.state = real_state;
                     return;
@@ -932,8 +962,9 @@ where
 {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
-        if (pid as usize) < table.len() {
-            if let Some(p) = table[pid as usize].as_mut() {
+        // O(1) lookup
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot].as_mut() {
                 if p.id == pid {
                     let real_cpu = p.current_cpu;
                     let real_state = p.state;
@@ -1126,9 +1157,26 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
 /// Terminar proceso actual
 pub fn exit_process() {
     if let Some(pid) = current_process_id() {
+        crate::kqueue::get_kqueue_scheme().trigger_global(crate::kqueue::EVFILT_PROC, pid as u64, crate::kqueue::NOTE_EXIT as i64);
         clear_pending_process_args(pid);
         // Linux vfork: el padre bloqueado en `clone` debe continuar si el hijo sale sin exec.
         vfork_wake_parent_waiting_for_child(pid);
+
+        // Re-parent children to PID 1 (init) and send pdeathsig if requested.
+        let target_pid = pid;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = PROCESS_TABLE.lock();
+            for slot in table.iter_mut() {
+                if let Some(p) = slot {
+                    if p.parent_pid == Some(target_pid) {
+                        p.parent_pid = Some(1); // Reparent to init
+                        if p.pdeathsig != 0 && p.pdeathsig <= 64 {
+                            p.pending_signals |= 1u64 << (p.pdeathsig as u64 - 1);
+                        }
+                    }
+                }
+            }
+        });
 
         // Collect open file descriptors so we can close them outside the lock
         let mut to_close: [(usize, usize); crate::fd::MAX_FDS_PER_PROCESS] =
@@ -1140,7 +1188,7 @@ pub fn exit_process() {
             // Use the slot index (not the raw PID) to index FD_TABLES.
             // pid_to_slot_fast is safe to call here: the process is still in PROCESS_TABLE
             // (we haven't marked it Terminated yet) so the slot lookup will succeed.
-            let pid_idx = match crate::ipc::pid_to_slot_fast(pid) {
+            let pid_idx = match crate::ipc::pid_to_slot_fast(target_pid) {
                 Some(i) => i,
                 None => return,
             };
@@ -1172,7 +1220,7 @@ pub fn exit_process() {
             let mut table = PROCESS_TABLE.lock();
             for (slot_idx, slot) in table.iter_mut().enumerate() {
                 if let Some(p) = slot {
-                    if p.id == pid {
+                    if p.id == target_pid {
                         // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex-wake it.
                         // Musl's pthread_join waits on this.
                         if p.clear_child_tid != 0 {
@@ -1592,10 +1640,27 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
         set_pending_signal(ppid, 17);
         wake_parent_from_wait(ppid);
     }
+    
+    // Trigger kqueue SIGNAL filter for the target process
+    crate::kqueue::get_kqueue_scheme().trigger_for_process(pid, crate::kqueue::EVFILT_SIGNAL, signum as u64, 0);
 }
 
 /// Consume (limpia) un bit de señal del proceso actual y devuelve la acción registrada.
 /// Devuelve None si no hay señal pendiente o no hay proceso actual.
+pub fn get_signal_handler(pid: ProcessId, signum: u8) -> Option<SignalAction> {
+    if signum >= 64 { return None; }
+    let table = PROCESS_TABLE.lock();
+    table.iter().flatten().find(|p| p.id == pid).map(|p| p.signal_actions[signum as usize])
+}
+
+pub fn set_signal_handler(pid: ProcessId, signum: u8, action: SignalAction) {
+    if signum >= 64 { return; }
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.iter_mut().flatten().find(|p| p.id == pid) {
+        p.signal_actions[signum as usize] = action;
+    }
+}
+
 pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<SignalAction> {
     if signum >= 64 { return None; }
     let mask = 1u64 << signum;

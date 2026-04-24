@@ -22,14 +22,14 @@ const COMPOSITOR_PATH: &str = "file:/usr/bin/lunas";
 
 /// Ruta VFS para labwc (execve del kernel; no esquema `file:`).
 #[cfg(not(feature = "compositor-lunas"))]
-const LABWC_EXEC_PATH: &str = "/usr/bin/xfwl4";
+const LABWC_EXEC_PATH: &str = "/usr/bin/labwc";
 
 /// Variables de entorno comunes (wlroots + Eclipse) para labwc.
 #[cfg(not(feature = "compositor-lunas"))]
 fn apply_wlroots_eclipse_env() {
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
-    //let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
-    //let _ = std::env::set_var("LIBINPUT_QUIRKS_DIR", "/usr/share/libinput");
+    let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
+    let _ = std::env::set_var("LIBINPUT_QUIRKS_DIR", "/usr/share/libinput");
     //let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
 }
 

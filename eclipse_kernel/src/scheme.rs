@@ -28,6 +28,7 @@ pub mod error {
     pub const ENOTCONN: usize = 107; // Transport endpoint is not connected
     pub const ENOMEM: usize = 12;  // Out of memory
     pub const EACCES: usize = 13;  // Permission denied
+    pub const EPERM:  usize = 1;   // Operation not permitted
     pub const EBUSY: usize = 16;   // Device or resource busy
     pub const EPIPE: usize = 32;   // Broken pipe
     pub const EAFNOSUPPORT: usize = 97; // Address family not supported
@@ -338,6 +339,7 @@ struct MemfdEntry {
     phys_addr: u64,
     allocated_bytes: usize,
     logical_size: usize,
+    seals: u32,
 }
 
 /// Scheme backing `memfd_create(2)`.  Each `open` call creates a new anonymous
@@ -355,6 +357,24 @@ impl MemfdScheme {
     pub fn new() -> Self {
         Self { entries: Mutex::new(Vec::new()) }
     }
+
+    pub fn get_seals(&self, id: usize) -> Result<u32, usize> {
+        let entries = self.entries.lock();
+        let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        Ok(e.seals)
+    }
+
+    pub fn add_seals(&self, id: usize, seals: u32) -> Result<(), usize> {
+        let mut entries = self.entries.lock();
+        let e = entries.get_mut(id).and_then(|s| s.as_mut()).ok_or(error::EBADF)?;
+        
+        if (e.seals & 0x0001) != 0 { // F_SEAL_SEAL
+            return Err(error::EPERM);
+        }
+        
+        e.seals |= seals;
+        Ok(())
+    }
 }
 
 impl Scheme for MemfdScheme {
@@ -364,12 +384,12 @@ impl Scheme for MemfdScheme {
         let mut entries = self.entries.lock();
         for (i, slot) in entries.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0 });
+                *slot = Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0, seals: 0 });
                 return Ok(i);
             }
         }
         let id = entries.len();
-        entries.push(Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0 }));
+        entries.push(Some(MemfdEntry { phys_addr: 0, allocated_bytes: 0, logical_size: 0, seals: 0 }));
         Ok(id)
     }
 
@@ -392,6 +412,11 @@ impl Scheme for MemfdScheme {
     fn write(&self, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
         let entries = self.entries.lock();
         let e = entries.get(id).and_then(|s| s.as_ref()).ok_or(error::EBADF)?;
+        
+        if (e.seals & 0x0008) != 0 { // F_SEAL_WRITE
+            return Err(error::EPERM);
+        }
+
         let off = offset as usize;
         if e.allocated_bytes == 0 || off >= e.logical_size {
             return Err(error::EINVAL);
@@ -422,6 +447,14 @@ impl Scheme for MemfdScheme {
     fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
         let mut entries = self.entries.lock();
         let e = entries.get_mut(id).and_then(|s| s.as_mut()).ok_or(error::EBADF)?;
+        
+        if len < e.logical_size && (e.seals & 0x0002) != 0 { // F_SEAL_SHRINK
+            return Err(error::EPERM);
+        }
+        if len > e.logical_size && (e.seals & 0x0004) != 0 { // F_SEAL_GROW
+            return Err(error::EPERM);
+        }
+
         if len > SHM_REGION_MAX_BYTES {
             return Err(error::EINVAL);
         }
@@ -486,7 +519,7 @@ pub fn init() {
     register_scheme("random", Arc::new(RandomScheme::new()));
     register_scheme("tty", Arc::new(crate::tty::TtyScheme::new()));
     register_scheme("shm", Arc::new(ShmScheme::new()));
-    register_scheme("memfd", Arc::new(MemfdScheme::new()));
+    register_scheme("memfd", get_memfd_scheme().clone());
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     register_scheme("eth", Arc::new(crate::eth::EthScheme));
     register_scheme("pty", Arc::new(crate::pty::PtyScheme::new()));
@@ -496,6 +529,7 @@ pub fn init() {
     register_scheme("eventfd", crate::eventfd::get_eventfd_scheme().clone());
     register_scheme("signalfd", Arc::new(crate::signalfd::SignalfdScheme::new()));
     register_scheme("timerfd", crate::timerfd::get_timerfd_scheme().clone());
+    register_scheme("kqueue", crate::kqueue::get_kqueue_scheme().clone());
 
     // Schemes from servers module
     register_scheme("display", Arc::new(crate::servers::DisplayScheme));
@@ -503,6 +537,12 @@ pub fn init() {
     register_scheme("snd", Arc::new(crate::servers::AudioScheme));
     register_scheme("net", Arc::new(crate::servers::NetworkScheme));
     // "socket" scheme is registered by servers::init(), called after this function
+}
+
+static MEMFD_SCHEME: spin::Once<Arc<MemfdScheme>> = spin::Once::new();
+
+pub fn get_memfd_scheme() -> &'static Arc<MemfdScheme> {
+    MEMFD_SCHEME.call_once(|| Arc::new(MemfdScheme::new()))
 }
 
 /// Proxy sin estado que delega todas las operaciones en el singleton PIPE_SCHEME.

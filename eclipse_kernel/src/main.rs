@@ -59,6 +59,7 @@ mod sync;    // Synchronization primitives
 mod net;
 mod sys_scheme;
 mod proc_scheme;
+mod kqueue;
 pub mod drm_scheme; // DRM scheme for ioctl
 mod page_cache;
 

@@ -136,6 +136,7 @@ fn file_index(path: &str) -> Option<u16> {
         | "devices/pci0000:00/0000:00:02.0/subsystem_device" => 26,
         // devices/pci0000:00/0000:00:02.0/subsystem is a symlink (content via readlink)
         "devices/pci0000:00/0000:00:02.0/subsystem" => 27,
+        "devices/pci0000:00/0000:00:02.0/config" => 40,
         _ => return None,
     })
 }
@@ -177,7 +178,7 @@ fn dir_listing(idx: u16) -> &'static str {
         31 => "",
         32 => "0000:00:02.0\n",
         // devices/pci0000:00/0000:00:02.0 — includes PCI attribute files and drm subdir
-        33 => "drm\nsubsystem\nuevent\nvendor\ndevice\nclass\nrevision\nsubsystem_vendor\nsubsystem_device\n",
+        33 => "drm\nsubsystem\nuevent\nvendor\ndevice\nclass\nrevision\nsubsystem_vendor\nsubsystem_device\nconfig\n",
         // devices/pci0000:00/0000:00:02.0/drm — list DRM nodes for this device
         34 => "card0\nrenderD128\n",
         // dev/char/226:0/device/drm/card0, renderD128 — leaf dirs
@@ -187,44 +188,47 @@ fn dir_listing(idx: u16) -> &'static str {
     }
 }
 
-fn file_content(idx: u16) -> &'static str {
+fn file_content(idx: u16) -> &'static [u8] {
     match idx {
-        0 => "226:0\n",
-        1 => "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
-        8 => "226:128\n",
-        9 => "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n",
-        2 => "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
-        10 => "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n",
-        3 => "29:0\n",
-        4 => "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n",
-        5 => "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n",
-        // libinput → udev_device_new_from_syspath + set_properties_from_uevent lee MODALIAS
-        6 => "MODALIAS=dmi:bvnEclipse:bvr1.0:bd01010101:svnEclipse:pnGeneric:pvr1:rvnEclipse:rnVirtual:rvr1:cvnEclipse:ct1:cvr1:\n",
-        // init_dt (libinput): primera cadena compatible; sin DT real en Eclipse
-        7 => "eclipse,generic\n",
-        // PCI device uevent — libdrm drmParsePciBusInfo reads DRIVER, PCI_ID, PCI_SLOT_NAME
-        20 => "DRIVER=eclipse\nPCI_ID=1af4:1050\nPCI_SLOT_NAME=0000:00:02.0\n",
-        // PCI vendor: VirtIO/Red Hat (0x1af4)
-        21 => "0x1af4\n",
-        // PCI device: VirtIO GPU (0x1050)
-        22 => "0x1050\n",
-        // PCI class: Display controller / VGA compatible (0x030000)
-        23 => "0x030000\n",
-        // PCI revision
-        24 => "0x00\n",
-        // PCI subsystem vendor
-        25 => "0x1af4\n",
-        // PCI subsystem device
-        26 => "0x1050\n",
-        // devices/pci0000:00/0000:00:02.0/subsystem — symlink, content via readlink
-        // devices/pci0000:00/0000:00:02.0/subsystem — symlink, content via readlink
-        27 => "13:64\n",
-        28 => "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\n",
-        29 => "13:65\n",
-        30 => "MAJOR=13\nMINOR=65\nDEVNAME=input/event1\n",
-        31 => "MAJOR=13\nMINOR=64\nDEVNAME=input/event0\n",
-        32 => "MAJOR=13\nMINOR=65\nDEVNAME=input/event1\n",
-        _ => "",
+        0 => b"226:0\n",
+        1 => b"MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
+        8 => b"226:128\n",
+        9 => b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n",
+        2 => b"MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
+        10 => b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n",
+        3 => b"29:0\n",
+        4 => b"MAJOR=29\nMINOR=0\nDEVNAME=fb0\n",
+        5 => b"MAJOR=29\nMINOR=0\nDEVNAME=fb0\n",
+        6 => b"MODALIAS=dmi:bvnEclipse:bvr1.0:bd01010101:svnEclipse:pnGeneric:pvr1:rvnEclipse:rnVirtual:rvr1:cvnEclipse:ct1:cvr1:\n",
+        7 => b"eclipse,generic\n",
+        20 => b"DRIVER=eclipse\nPCI_ID=1af4:1050\nPCI_SLOT_NAME=0000:00:02.0\n",
+        21 => b"0x1af4\n",
+        22 => b"0x1050\n",
+        23 => b"0x030000\n",
+        24 => b"0x00\n",
+        25 => b"0x1af4\n",
+        26 => b"0x1050\n",
+        27 => b"13:64\n",
+        28 => b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nID_INPUT_KEYBOARD=1\n",
+        29 => b"13:65\n",
+        30 => b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\nID_INPUT_MOUSE=1\n",
+        31 => b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nID_INPUT_KEYBOARD=1\n",
+        32 => b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\nID_INPUT_MOUSE=1\n",
+        40 => &[
+            0xf4, 0x1a, 0x50, 0x10, // Vendor: 0x1af4, Device: 0x1050
+            0x07, 0x00, 0x10, 0x00, // Command: 0x0007, Status: 0x0010
+            0x00, 0x00, 0x00, 0x03, // Revision: 0, Class: 0x030000
+            0x00, 0x00, 0x00, 0x00, // Cache Line, Latency, Header Type, BIST
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xf4, 0x1a, 0x50, 0x10, // Subsystem Vendor/Device
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ],
+        _ => b"",
     }
 }
 
@@ -252,8 +256,7 @@ impl Scheme for SysScheme {
         }
         if res_type == 2 {
             let idx = (id & 0xFFF) as u16;
-            let content = file_content(idx);
-            let bytes = content.as_bytes();
+            let bytes = file_content(idx);
             let len = core::cmp::min(buf.len(), bytes.len());
             buf[..len].copy_from_slice(&bytes[..len]);
             return Ok(len);
