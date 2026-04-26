@@ -1,9 +1,8 @@
 use crate::serial;
 use core::cmp::min;
 use alloc::vec::Vec;
-use alloc::{vec, format};
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::string::String;
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags, constants};
 use eclipsefs_lib::NodeKind;
 
@@ -601,26 +600,27 @@ impl Filesystem {
     pub fn check_access(inode: u32, mask: u8) -> Result<(), &'static str> {
         let pid = crate::process::current_process_id().ok_or("No current process")?;
         let p = crate::process::get_process(pid).ok_or("Process not found")?;
+        let proc = p.proc.lock();
         
         // Root bypasses everything
-        if p.euid == 0 {
+        if proc.euid == 0 {
             return Ok(());
         }
 
         let meta = Self::get_node_metadata(inode)?;
         
-        let mut mode = meta.mode;
+        let mode = meta.mode;
         
         let mut granted = 0;
-        if p.euid == meta.uid {
+        if proc.euid == meta.uid {
             granted = (mode >> 6) & 0x7;
-        } else if p.egid == meta.gid {
+        } else if proc.egid == meta.gid {
             granted = (mode >> 3) & 0x7;
         } else {
             // Check supplementary groups
             let mut in_group = false;
-            for i in 0..p.supplementary_groups_len {
-                if p.supplementary_groups[i] == meta.gid {
+            for i in 0..proc.supplementary_groups_len {
+                if proc.supplementary_groups[i] == meta.gid {
                     in_group = true;
                     break;
                 }
@@ -1126,7 +1126,8 @@ impl Filesystem {
     /// Lookup functionality
     
     pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
-        Self::lookup_path_recursive(path, 0)
+        let clean_path = path.trim_start_matches("file:");
+        Self::lookup_path_recursive(clean_path, 0)
     }
 
     fn lookup_path_recursive(path: &str, depth: usize) -> Result<u32, &'static str> {
@@ -1151,7 +1152,7 @@ impl Filesystem {
                 NodeKind::Symlink => {
                     let target = Self::read_symlink_target(next_inode)?;
                     // Resolve relative/absolute
-                    let link_parent_path = if i == 0 { "/" } else {
+                    let _link_parent_path = if i == 0 { "/" } else {
                         // Reconstruct path up to here
                         // This is a bit inefficient but safe
                         "" // TODO: implement proper parent path reconstruction if needed
@@ -1240,6 +1241,7 @@ impl Filesystem {
     }
 
     pub fn lookup_path_no_follow(path: &str) -> Result<u32, &'static str> {
+        let clean_path = path.trim_start_matches("file:");
         let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             if !FS.mounted {
@@ -1247,9 +1249,9 @@ impl Filesystem {
             }
         }
         
-        serial::serial_printf(format_args!("[FS] lookup_path('{}')\n", path));
+        serial::serial_printf(format_args!("[FS] lookup_path('{}')\n", clean_path));
 
-        if path == "/" {
+        if clean_path == "/" || clean_path == "" {
             return Ok(1); // Root
         }
         
@@ -1970,7 +1972,7 @@ impl Scheme for FileSystemScheme {
         // Handle hardcoded build-time paths from relocated libraries (e.g. Fontconfig)
         let hardcoded_prefix = "home/moebius/eclipse/eclipse-os-build/";
         if clean_path.starts_with(hardcoded_prefix) {
-            let old_path = clean_path;
+            let _old_path = clean_path;
             clean_path = &clean_path[hardcoded_prefix.len()..];
             // serial::serial_printf(format_args!("[FS-SCHEME] fontconfig: redirected {} to: {}\n", old_path, clean_path));
         }
@@ -2088,11 +2090,11 @@ impl Scheme for FileSystemScheme {
                 let (ino, size, id) = match res {
                     Ok(ino) => {
                         // Check access
-                        if let Err(e) = Filesystem::check_access(ino, access_mask) {
+                        if let Err(_e) = Filesystem::check_access(ino, access_mask) {
                             return Err(scheme_error::EACCES);
                         }
                         
-                        let (data_start, size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
+                        let (_data_start, _size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
                         let (data_start, size) = Filesystem::get_file_metadata(ino).map_err(|_| scheme_error::EIO)?;
                         let mut open_files = OPEN_FILES_SCHEME.lock();
                         let id = open_files.len();
@@ -2293,7 +2295,7 @@ impl Scheme for FileSystemScheme {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         match open_file {
-            OpenFile::Real { inode, size, .. } => {
+            OpenFile::Real { inode: _, size, .. } => {
                 stat.size = *size;
                 stat.mode = 0o100644;
                 Ok(0)
@@ -2515,6 +2517,19 @@ impl Scheme for FileSystemScheme {
                 vtmp.insert(String::from(new_key), data); Ok(0)
             } else { Err(scheme_error::ENOENT) }
         } else { Err(scheme_error::ENOSYS) }
+    }
+
+    fn check_access(&self, id: usize, mask: u8) -> Result<(), usize> {
+        let open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        match open_file {
+            OpenFile::Real { inode, .. } => {
+                let ino = *inode;
+                drop(open_files);
+                Filesystem::check_access(ino, mask).map_err(|_| scheme_error::EACCES)
+            },
+            _ => Ok(()),
+        }
     }
 }
 

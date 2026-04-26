@@ -149,7 +149,7 @@ pub fn start_aps() {
         crate::memory::map_physical_low_memory();
 
         // 1. Copy trampoline to physical 0x1000
-        let trampoline_phys = 0x1000;
+        let _trampoline_phys = 0x1000;
         // With map_physical_low_memory, virtual 0x1000 is now TRUE physical 0x1000
         let trampoline_virt = 0x1000;
         

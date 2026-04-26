@@ -1,7 +1,7 @@
 //! Scheduler básico round-robin con soporte SMP completo
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process, modify_process};
+use crate::process::{ProcessId, ProcessState, current_process_id, set_current_process};
 use spin::Mutex;
 use alloc::collections::{BTreeMap, VecDeque};
 
@@ -234,7 +234,7 @@ pub fn enqueue_process(pid: ProcessId) {
                 p.state = ProcessState::Ready;
                 
                 let active_cpus = crate::cpu::get_active_cpu_count();
-                let current_cpu = crate::process::get_cpu_id();
+                let _current_cpu = crate::process::get_cpu_id();
 
                 let target = if let Some(aff) = p.cpu_affinity {
                     aff as usize % MAX_CPUS
@@ -512,7 +512,7 @@ pub fn schedule() -> u64 {
                                 let consumed = unsafe { CPU_INITIAL_QUANTUM[cpu_id].saturating_sub(CPU_QUANTUM[cpu_id]) };
                                 process.cpu_ticks += consumed as u64;
 
-                                if let Some(rt) = process.rt_params.as_mut() {
+                                if let Some(_rt) = process.rt_params.as_mut() {
                                     // RT: Deduct from runtime budget
                                     let _consumed_rt = consumed as u64;
                                 } else {
@@ -781,15 +781,12 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
             Some(p) if p.id == to_pid => p,
             _ => return,
         };
-        // If to_pid was killed (via sys_kill) between when it was dequeued and now,
-        // switching to it would resume a terminated process.  Bail out — the scheduler
-        // will be called again on the next timer tick and will skip the terminated PID.
         if to_process.state == ProcessState::Terminated {
             return;
         }
         let to_ctx_ptr = &to_process.context as *const crate::process::Context;
         let to_kernel_stack = to_process.kernel_stack_top;
-        let to_page_table = to_process.resources.lock().page_table_phys;
+        let to_page_table = to_process.proc.lock().resources.lock().page_table_phys;
         let to_fs_base = to_process.fs_base;
         
         (to_ctx_ptr, to_kernel_stack, to_page_table, to_fs_base)
@@ -869,10 +866,45 @@ pub fn yield_cpu() {
     crate::cpu::pause();
 }
 
-/// Dormir el proceso actual (stub - no implementado completamente)
-pub fn sleep(_ticks: u64) {
-    // TODO: Implementar lista de procesos bloqueados con timer
-    yield_cpu();
+/// Duerme el proceso actual `ms` milisegundos (reloj global `interrupts::ticks`, 1 tick ≈ 1 ms en BSP).
+/// Usa la cola `add_sleep` + `wake_sleeping_processes` del timer.
+pub fn sleep(ms: u64) {
+    if ms == 0 {
+        yield_cpu();
+        return;
+    }
+    let Some(pid) = current_process_id() else {
+        yield_cpu();
+        return;
+    };
+    let start = crate::interrupts::ticks();
+    let wake_tick = start.saturating_add(ms);
+
+    let cas_ok = crate::process::compare_and_set_process_state(
+        pid,
+        ProcessState::Running,
+        ProcessState::Blocked,
+    )
+    .ok()
+    .unwrap_or(false);
+
+    if !cas_ok {
+        yield_cpu();
+        return;
+    }
+
+    add_sleep(pid, wake_tick);
+
+    loop {
+        if let Some(p) = crate::process::get_process(pid) {
+            if p.state != ProcessState::Blocked {
+                return;
+            }
+        } else {
+            return;
+        }
+        yield_cpu();
+    }
 }
 
 /// Obtener estadísticas del scheduler

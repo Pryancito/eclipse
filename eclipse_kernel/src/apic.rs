@@ -4,7 +4,7 @@
 //! Supports both xAPIC (MMIO) and x2APIC (MSR) modes.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // LAPIC Register Offsets
 const LAPIC_REG_ID: u32 = 0x20;
@@ -128,7 +128,7 @@ pub fn init_timer(vector: u8) {
             // For now let's stick to One-shot if we want robustness, or Periodic if we want simplicity.
             // Redox recommends One-shot.
             TIMER_MODE.store(1, Ordering::SeqCst);
-            write_reg(LAPIC_REG_LVT_TIMER, (vector as u32)); // One-shot
+            write_reg(LAPIC_REG_LVT_TIMER, vector as u32); // One-shot
             write_reg(LAPIC_REG_TMRINIT, count);
         }
     }

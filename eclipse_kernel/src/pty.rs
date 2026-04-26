@@ -2,7 +2,6 @@
 //! Permite a un emulador de terminal y un shell comunicarse vía Maestro/Esclavo
 
 use alloc::vec::Vec;
-use alloc::string::String;
 use alloc::collections::VecDeque;
 use spin::Mutex;
 use crate::scheme::{Scheme, error, Stat};
@@ -266,7 +265,7 @@ impl Scheme for PtyScheme {
             return Err(error::EPIPE);
         }
 
-        let slave_pid = channel.slave_pid;
+        let _slave_pid = channel.slave_pid;
         let is_master = handle.is_master;
         let lflag = channel.termios.c_lflag;
         let oflag = channel.termios.c_oflag;

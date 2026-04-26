@@ -76,8 +76,9 @@ impl PipeScheme {
                 let mut ch = PipeChannel::new();
                 if let Some(pid) = crate::process::current_process_id() {
                     if let Some(p) = crate::process::get_process(pid) {
-                        ch.creator_uid = p.uid;
-                        ch.creator_gid = p.gid;
+                        let proc = p.proc.lock();
+                        ch.creator_uid = proc.uid;
+                        ch.creator_gid = proc.gid;
                     }
                 }
                 *slot = Some(Arc::new(Mutex::new(ch)));
@@ -88,8 +89,9 @@ impl PipeScheme {
         let mut ch = PipeChannel::new();
         if let Some(pid) = crate::process::current_process_id() {
             if let Some(p) = crate::process::get_process(pid) {
-                ch.creator_uid = p.uid;
-                ch.creator_gid = p.gid;
+                let proc = p.proc.lock();
+                ch.creator_uid = proc.uid;
+                ch.creator_gid = proc.gid;
             }
         }
         channels.push(Some(Arc::new(Mutex::new(ch))));

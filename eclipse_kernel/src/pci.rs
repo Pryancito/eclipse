@@ -22,7 +22,6 @@
 //! - Device hot-plug detection
 //! - Power management (D0-D3 states)
 
-use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 use alloc::vec::Vec;
 
@@ -287,6 +286,17 @@ pub unsafe fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8)
     inl(PCI_CONFIG_DATA)
 }
 
+/// Write to PCI configuration space (8-bit)
+pub unsafe fn pci_config_write_u8(bus: u8, device: u8, function: u8, offset: u8, value: u8) {
+    let _lock = PCI_CONFIG_LOCK.lock();
+    let address = pci_config_address(bus, device, function, offset);
+    outl(PCI_CONFIG_ADDRESS, address);
+    let shift = (offset & 3) * 8;
+    let data = inl(PCI_CONFIG_DATA);
+    let new_data = (data & !(0xFF << shift)) | ((value as u32) << shift);
+    outl(PCI_CONFIG_DATA, new_data);
+}
+
 /// Write to PCI configuration space (16-bit)
 pub unsafe fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     let _lock = PCI_CONFIG_LOCK.lock();
@@ -299,7 +309,7 @@ pub unsafe fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8
 }
 
 /// Write to PCI configuration space (32-bit)
-unsafe fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+pub unsafe fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
@@ -589,6 +599,10 @@ pub fn find_nvidia_gpu() -> Option<PciDevice> {
         .copied()
 }
 
+pub fn get_device_count() -> usize {
+    PCI_DEVICES.lock().len()
+}
+
 /// Find all display-class devices (GPUs, including VirtIO, Intel, etc.)
 pub fn find_all_gpus() -> alloc::vec::Vec<PciDevice> {
     let devices = PCI_DEVICES.lock();
@@ -798,6 +812,20 @@ pub fn find_ac97() -> Option<PciDevice> {
     devices.iter()
         .find(|dev| dev.is_ac97())
         .copied()
+}
+
+/// Enumerate all discovered PCI devices to a userspace buffer
+pub fn enum_devices_to_user(buf_ptr: u64, max_count: usize) -> usize {
+    let devices = PCI_DEVICES.lock();
+    let count = core::cmp::min(devices.len(), max_count);
+    
+    for i in 0..count {
+        let dev = &devices[i];
+        unsafe {
+            core::ptr::write_unaligned((buf_ptr as *mut PciDevice).add(i), *dev);
+        }
+    }
+    count
 }
 
 /// Find all USB controllers

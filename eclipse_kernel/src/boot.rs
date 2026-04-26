@@ -3,7 +3,7 @@
 use crate::memory::PHYS_MEM_OFFSET;
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -500,21 +500,21 @@ pub fn enable_cpu_features() {
         let mut cr0: u64;
         asm!("mov {}, cr0", out(reg) cr0);
         cr0 &= !(1 << 2); // LIMPIAR EM (bit 2)
-        cr0 |= (1 << 1);  // SET MP (bit 1)
+        cr0 |= 1 << 1;  // SET MP (bit 1)
         asm!("mov cr0, {}", in(reg) cr0);
 
         // 2. Habilitar características en CR4
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= (1 << 9);  // OSFXSR: Soporte para FXSAVE/FXRSTOR
-        cr4 |= (1 << 10); // OSXMMEXCPT: Soporte para excepciones SIMD (#XM)
+        cr4 |= 1 << 9;  // OSFXSR: Soporte para FXSAVE/FXRSTOR
+        cr4 |= 1 << 10; // OSXMMEXCPT: Soporte para excepciones SIMD (#XM)
 
         let cpuid_1 = core::arch::x86_64::__cpuid(1);
 
         // Habilitar XSAVE y AVX si están soportados
         if (cpuid_1.ecx & (1 << 26)) != 0 {
             // OSXSAVE (bit 18): Requerido para usar XGETBV/XSETBV y AVX
-            cr4 |= (1 << 18);
+            cr4 |= 1 << 18;
 
             // Una vez activado OSXSAVE, configuramos XCR0
             // Queremos habilitar: x87 (bit 0), SSE (bit 1)
@@ -535,7 +535,7 @@ pub fn enable_cpu_features() {
         // Permite RDFSBASE/WRFSBASE en userspace para gestionar TLS
         let cpuid_7 = core::arch::x86_64::__cpuid_count(7, 0);
         if (cpuid_7.ebx & (1 << 0)) != 0 {
-            cr4 |= (1 << 16);
+            cr4 |= 1 << 16;
         }
 
         asm!("mov cr4, {}", in(reg) cr4);

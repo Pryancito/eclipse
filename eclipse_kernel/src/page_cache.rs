@@ -140,7 +140,7 @@ pub fn read_page(device_id: usize, inode_id: u32, page_index: u64, buffer: &mut 
     }
 
     let page_arc = PAGE_CACHE.lock().get_or_create(device_id, inode_id, page_index);
-    let mut page = page_arc.lock();
+    let page = page_arc.lock();
 
     // If it's a new page (e.g. just allocated), we should ideally fill it from disk.
     // However, get_or_create doesn't know if it was just created.

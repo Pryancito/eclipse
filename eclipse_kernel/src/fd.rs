@@ -2,8 +2,6 @@
 //! 
 //! Implements per-process file descriptor tables for syscall operations.
 
-use alloc::vec::Vec;
-use alloc::string::String;
 use spin::Mutex;
 use crate::process::ProcessId;
 
@@ -53,8 +51,11 @@ impl FdTable {
     /// Returns the FD number (3+) or None if table is full
     /// FDs 0-2 are reserved for stdio
     pub fn allocate(&mut self, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
-        // Start from FD 3 (0=stdin, 1=stdout, 2=stderr)
-        for fd in 3..MAX_FDS_PER_PROCESS {
+        self.allocate_min(scheme_id, resource_id, flags, 3)
+    }
+
+    pub fn allocate_min(&mut self, scheme_id: usize, resource_id: usize, flags: u32, min_fd: usize) -> Option<usize> {
+        for fd in min_fd..MAX_FDS_PER_PROCESS {
             if !self.fds[fd].in_use {
                 self.fds[fd] = FileDescriptor {
                     in_use: true,
@@ -113,7 +114,7 @@ pub static FD_TABLES: Mutex<[FdTable; MAX_FD_PROCESSES]> = Mutex::new([FdTable::
 /// array index — we must resolve it to the reusable slot index via the IPC PID→slot map.
 pub fn pid_to_fd_idx(pid: ProcessId) -> Option<usize> {
     if let Some(p) = crate::process::get_process(pid) {
-        return Some(p.resources.lock().fd_table_idx);
+        return Some(p.proc.lock().resources.lock().fd_table_idx);
     }
     None
 }
@@ -129,9 +130,13 @@ pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable
 
 /// Open a file for a process using a scheme and resource
 pub fn fd_open(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
+    fd_open_min(pid, scheme_id, resource_id, flags, 3)
+}
+
+pub fn fd_open_min(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32, min_fd: usize) -> Option<usize> {
     let pid_idx = pid_to_fd_idx(pid)?;
-    let mut tables = FD_TABLES.lock();
-    tables[pid_idx].allocate(scheme_id, resource_id, flags)
+    let mut tables = get_fd_table(pid)?;
+    tables[pid_idx].allocate_min(scheme_id, resource_id, flags, min_fd)
 }
 
 /// Get file descriptor for a process
@@ -212,6 +217,40 @@ pub fn fd_push(pid: ProcessId, fd_entry: FileDescriptor) -> Option<usize> {
         }
     }
     None
+}
+
+/// Inserta un `FileDescriptor` existente en un slot concreto.
+///
+/// Semántica tipo `dup2`/`dup3`: si el slot destino está ocupado se cierra primero,
+/// luego se instala `fd_entry` y se hace `dup` del recurso subyacente.
+pub fn fd_push_at(pid: ProcessId, dest_fd: usize, fd_entry: FileDescriptor) -> bool {
+    if dest_fd >= MAX_FDS_PER_PROCESS {
+        return false;
+    }
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Cerrar el destino si está ocupado (sin deadlocks).
+    {
+        let mut tables = FD_TABLES.lock();
+        if tables[pid_idx].fds[dest_fd].in_use {
+            let s_id = tables[pid_idx].fds[dest_fd].scheme_id;
+            let r_id = tables[pid_idx].fds[dest_fd].resource_id;
+            tables[pid_idx].fds[dest_fd].in_use = false;
+            drop(tables);
+            let _ = crate::scheme::close(s_id, r_id);
+        }
+    }
+
+    let mut tables = FD_TABLES.lock();
+    tables[pid_idx].fds[dest_fd] = fd_entry;
+    tables[pid_idx].fds[dest_fd].in_use = true;
+    drop(tables);
+
+    let _ = crate::scheme::dup(fd_entry.scheme_id, fd_entry.resource_id);
+    true
 }
 
 /// Duplicate a file descriptor
@@ -336,12 +375,18 @@ pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
 
 /// Initialize standard I/O for a process
 pub fn fd_init_stdio(pid: ProcessId) {
+    crate::serial::serial_printf(format_args!("[debug] fd_init_stdio pid={}\n", pid));
     // Resolve the slot before touching FD_TABLES so high-PID processes get proper stdio.
     let pid_idx = match pid_to_fd_idx(pid) {
         Some(i) => i,
-        None => return,
+        None => {
+            crate::serial::serial_print("[debug] fd_init_stdio: pid_to_fd_idx failed\n");
+            return;
+        }
     };
+    crate::serial::serial_print("[debug] fd_init_stdio: opening tty:\n");
     if let Ok((scheme_id, resource_id)) = crate::scheme::open("tty:", 0, 0) {
+        crate::serial::serial_print("[debug] fd_init_stdio: tty: opened, locking FD_TABLES\n");
         let mut tables = FD_TABLES.lock();
         // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
         tables[pid_idx].fds[0] = FileDescriptor {
@@ -410,4 +455,38 @@ pub fn fd_set_offset(pid: ProcessId, fd: usize, offset: u64) {
     if fd < MAX_FDS_PER_PROCESS && tables[pid_idx].fds[fd].in_use {
         tables[pid_idx].fds[fd].offset = offset;
     }
+}
+/// Alias for fd_open to support older code
+pub fn fd_create(pid: ProcessId, scheme_id: usize, resource_id: usize) -> Option<usize> {
+    fd_open(pid, scheme_id, resource_id, 0)
+}
+
+/// Replace an existing FD with a new resource
+pub fn fd_replace(pid: ProcessId, fd: usize, scheme_id: usize, resource_id: usize, flags: u32) -> bool {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
+    if fd >= MAX_FDS_PER_PROCESS { return false; }
+    
+    let mut tables = FD_TABLES.lock();
+    if tables[pid_idx].fds[fd].in_use {
+        let s_id = tables[pid_idx].fds[fd].scheme_id;
+        let r_id = tables[pid_idx].fds[fd].resource_id;
+        tables[pid_idx].fds[fd].in_use = false;
+        drop(tables);
+        let _ = crate::scheme::close(s_id, r_id);
+    } else {
+        drop(tables);
+    }
+    
+    let mut tables = FD_TABLES.lock();
+    tables[pid_idx].fds[fd] = FileDescriptor {
+        in_use: true,
+        scheme_id,
+        resource_id,
+        offset: 0,
+        flags,
+    };
+    true
 }

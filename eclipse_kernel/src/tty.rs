@@ -3,7 +3,6 @@
 //! Provides a character-based interface for standard I/O,
 //! multiplexing keyboard input and serial console output.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::scheme::{Scheme, error, Stat};

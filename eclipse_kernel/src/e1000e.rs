@@ -771,7 +771,7 @@ impl E1000EInner {
         //     UEFI session are terminated before we global-reset the card.
         //     Failing to do this can cause PCIe bus hangs or corrupted init.
         serial::serial_print("[e1000e] Disabling GIO Master...\n");
-        let mut ctrl_ext = self.read32(REG_CTRL_EXT);
+        let ctrl_ext = self.read32(REG_CTRL_EXT);
         self.write32(REG_CTRL_EXT, ctrl_ext | CTRL_EXT_GIO_MASTER_DISABLE);
         let mut master_disabled = false;
         for _ in 0..20_000 {

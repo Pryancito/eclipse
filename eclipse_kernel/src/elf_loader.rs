@@ -963,12 +963,12 @@ fn load_elf_provider(provider: &dyn ElfDataProvider) -> Option<ProcessId> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(p) = table[pid as usize].as_mut() {
-            p.mem_frames += loaded.segment_frames;
+            let mut proc = p.proc.lock();
+            proc.mem_frames += loaded.segment_frames;
             if loaded.tls_base != 0 {
                 p.fs_base = loaded.tls_base;
             }
-            p.dynamic_linker_aux = loaded.dynamic_linker;
-            // is_linux always true (all processes use Linux/musl ABI)
+            proc.dynamic_linker_aux = loaded.dynamic_linker;
         }
     });
 
@@ -1076,8 +1076,9 @@ fn build_argv_from_pending(pid: crate::process::ProcessId) -> Vec<Vec<u8>> {
     // Fallback: use process name as argv[0].
     let mut argv0 = [0u8; ARGV0_BUF_LEN];
     let argv0_len = if let Some(p) = get_process(pid) {
-        let n = p.name.iter().position(|&b| b == 0).unwrap_or(MAX_PROCESS_NAME_LEN).min(MAX_PROCESS_NAME_LEN);
-        argv0[..n].copy_from_slice(&p.name[..n]);
+        let proc = p.proc.lock();
+        let n = proc.name.iter().position(|&b| b == 0).unwrap_or(MAX_PROCESS_NAME_LEN).min(MAX_PROCESS_NAME_LEN);
+        argv0[..n].copy_from_slice(&proc.name[..n]);
         argv0[n] = 0;
         n + 1
     } else {
@@ -1151,12 +1152,13 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     let strings_base = adjusted_stack + table_bytes as u64;
 
     let (tls_base, at_base, at_entry) = if let Some(pid) = current_process_id() {
-        if let Some(proc) = get_process(pid) {
+        if let Some(p) = get_process(pid) {
             unsafe {
-                memory::set_cr3(proc.resources.lock().page_table_phys);
+                memory::set_cr3(p.proc.lock().resources.lock().page_table_phys);
             }
-            match proc.dynamic_linker_aux {
-                Some((b, e)) => (proc.fs_base, b, e),
+            let aux = p.proc.lock().dynamic_linker_aux;
+            match aux {
+                Some((b, e)) => (p.fs_base, b, e),
                 None => {
                     crate::serial::serial_print("ERROR: jump_to_userspace_dynamic_linker without dynamic_linker_aux\n");
                     loop {
@@ -1329,7 +1331,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     // Always reload CR3 to flush the TLB.
     let tls_base: u64 = if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
-            let cr3 = proc.resources.lock().page_table_phys;
+            let cr3 = proc.proc.lock().resources.lock().page_table_phys;
             unsafe { memory::set_cr3(cr3); }
             proc.fs_base
         } else { 0 }
@@ -1493,7 +1495,7 @@ pub unsafe fn jump_to_userspace_with_argv_envp(
     // Switch CR3 to the (already-replaced) user page table.
     if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
-            let cr3 = proc.resources.lock().page_table_phys;
+            let cr3 = proc.proc.lock().resources.lock().page_table_phys;
             memory::set_cr3(cr3);
         }
     }

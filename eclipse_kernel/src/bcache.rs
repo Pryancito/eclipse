@@ -7,7 +7,6 @@
 
 use spin::Mutex;
 use alloc::vec::Vec;
-use alloc::vec;
 
 /// Entradas de 4 KiB; más entradas = menos misses en lecturas repetidas (coste RAM: × 4096).
 const CACHE_SIZE: usize = 1024;

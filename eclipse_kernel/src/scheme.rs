@@ -5,9 +5,7 @@
 
 use alloc::vec::Vec;
 use alloc::string::String;
-use alloc::boxed::Box;
 use spin::Mutex;
-use crate::process::ProcessId;
 
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
@@ -113,6 +111,21 @@ pub fn fstat(scheme_idx: usize, id: usize, stat: &mut Stat) -> Result<usize, usi
     get_scheme(scheme_idx)?.fstat(id, stat)
 }
 
+pub fn stat(path: &str, stat: &mut Stat) -> Result<usize, usize> {
+    let (sid, rid) = open(path, 0, 0)?;
+    let res = fstat(sid, rid, stat);
+    let _ = close(sid, rid);
+    res
+}
+
+pub fn pread(scheme_idx: usize, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
+    read(scheme_idx, id, buffer, offset)
+}
+
+pub fn pwrite(scheme_idx: usize, id: usize, buffer: &[u8], offset: u64) -> Result<usize, usize> {
+    write(scheme_idx, id, buffer, offset)
+}
+
 pub fn getdents(scheme_idx: usize, id: usize) -> Result<Vec<String>, usize> {
     get_scheme(scheme_idx)?.getdents(id)
 }
@@ -138,8 +151,24 @@ pub fn ftruncate(scheme_idx: usize, id: usize, len: usize) -> Result<usize, usiz
     get_scheme(scheme_idx)?.ftruncate(id, len)
 }
 
+pub fn fsync(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.fsync(id)
+}
+
+pub fn fdatasync(scheme_idx: usize, id: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.fdatasync(id)
+}
+
+pub fn flock(scheme_idx: usize, id: usize, operation: usize) -> Result<usize, usize> {
+    get_scheme(scheme_idx)?.flock(id, operation)
+}
+
 pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
     get_scheme(scheme_idx)?.ioctl(id, request, arg)
+}
+
+pub fn check_access(scheme_idx: usize, id: usize, mask: u8) -> Result<(), usize> {
+    get_scheme(scheme_idx)?.check_access(id, mask)
 }
 
 pub fn dup(scheme_idx: usize, id: usize) -> Result<usize, usize> {
@@ -202,6 +231,38 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<usize, usize> {
     scheme.rename(old_rel, new_rel)
 }
 
+pub fn readlink(path: &str, bufsiz: usize) -> Result<String, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let rel_path = parts.next().unwrap_or("");
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.readlink(rel_path, bufsiz)
+}
+
+pub fn rmdir(path: &str) -> Result<usize, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let rel_path = parts.next().unwrap_or("");
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.rmdir(rel_path)
+}
+
 /// The Scheme trait defines the interface for all resource providers.
 pub trait Scheme: Send + Sync {
     /// Open a resource at the given path
@@ -232,6 +293,21 @@ pub trait Scheme: Send + Sync {
         Err(error::ENOSYS)
     }
 
+    /// Synchronize resource state to storage
+    fn fsync(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    /// Synchronize data to storage (metadata may not be synced)
+    fn fdatasync(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    /// Apply or remove an advisory lock on the open file
+    fn flock(&self, _id: usize, _operation: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
     /// Create a directory
     fn mkdir(&self, _path: &str, _mode: u32) -> Result<usize, usize> {
         Err(error::ENOSYS)
@@ -239,6 +315,11 @@ pub trait Scheme: Send + Sync {
 
     /// Remove a file
     fn unlink(&self, _path: &str) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
+
+    /// Remove a directory
+    fn rmdir(&self, _path: &str) -> Result<usize, usize> {
         Err(error::ENOSYS)
     }
 
@@ -275,9 +356,20 @@ pub trait Scheme: Send + Sync {
         Ok(events) // Default: return requested events (always ready)
     }
 
+    /// Check if the current process has access to the resource.
+    /// `mask` is 4=R, 2=W, 1=X.
+    fn check_access(&self, _id: usize, _mask: u8) -> Result<(), usize> {
+        Ok(())
+    }
+
     /// List directory entries for a directory resource.
     fn getdents(&self, _id: usize) -> Result<Vec<String>, usize> {
         Err(error::ENOSYS)
+    }
+
+    /// Read the target of a symbolic link.
+    fn readlink(&self, _path: &str, _bufsiz: usize) -> Result<String, usize> {
+        Err(error::EINVAL)
     }
 }
 

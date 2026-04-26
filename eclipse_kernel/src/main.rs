@@ -11,12 +11,12 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
-use x86_64;
 
 // Módulos del microkernel
 mod ai_core;
 mod boot;
 mod memory;
+mod vm_object;
 mod memory_builtins;
 mod interrupts;
 mod ipc;
@@ -218,7 +218,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             "mov rbp, 0",
             "jmp {1}",
             in(reg) stack_top_aligned,
-            in(reg) kernel_bootstrap as u64,
+            in(reg) kernel_bootstrap as *const () as u64,
             in("rdi") boot_info_ptr, // Pass the original boot_info_ptr to kernel_bootstrap
             options(noreturn)
         );
@@ -226,7 +226,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 }
 
 /// Entry point in Higher Half with clean stack
-extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
+extern "C" fn kernel_bootstrap(_boot_info_ptr: u64) -> ! {
     // Redundant but safe: ensure interrupts stay disabled after stack switch.
     unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
     serial::serial_print("[KERNEL] kernel_bootstrap entry\n");
@@ -237,7 +237,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // (Accessed after load_gdt() so that gs:[16] reads are safe.)
     let boot_info = boot::get_boot_info();
     
-    let pml4_phys = boot_info.pml4_addr;
+    let _pml4_phys = boot_info.pml4_addr;
     let kernel_phys_base = boot_info.kernel_phys_base;
 
     // progress::bar(60) will be called after paging init
@@ -305,6 +305,8 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     crate::scheme::register_scheme("sys", alloc::sync::Arc::new(sys_scheme::SysScheme::new()));
     crate::scheme::register_scheme("proc", alloc::sync::Arc::new(proc_scheme::ProcScheme::new()));
     crate::scheme::register_scheme("drm", alloc::sync::Arc::new(drm_scheme::DrmScheme));
+    crate::scheme::register_scheme("eventfd", crate::eventfd::get_eventfd_scheme().clone());
+    crate::scheme::register_scheme("timerfd", crate::timerfd::get_timerfd_scheme().clone());
     progress::bar(86);
     
     serial::serial_print("[INIT] Initializing PCI...\n");

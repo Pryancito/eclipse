@@ -12,11 +12,13 @@ extern crate alloc;
 pub mod boot;
 pub mod ai_core;
 pub mod memory;
+pub mod vm_object;
 pub mod interrupts;
 pub mod drm;
 pub mod serial;
 pub mod ipc;
 pub mod process;
+pub mod thread;
 pub mod cpu;
 pub mod scheduler;
 pub mod syscalls;
@@ -60,8 +62,8 @@ pub mod drm_scheme;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};
-pub use memory::{PageTable, PageTableEntry};
-pub use process::{Process, ProcessId, ProcessState, Context};
+pub use process::{ProcessId, ProcessState, Context, Proc};
+pub use thread::{Thread, ThreadId};
 // pub use scheduler::SchedulerStats;
 // pub use syscalls::SyscallStats;
 

@@ -42,6 +42,29 @@ pub enum MessageType {
     Log = 0x00000800,
 }
 
+impl MessageType {
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            0x00000001 => MessageType::System,
+            0x00000002 => MessageType::Memory,
+            0x00000004 => MessageType::FileSystem,
+            0x00000008 => MessageType::Network,
+            0x00000010 => MessageType::Graphics,
+            0x00000020 => MessageType::Audio,
+            0x00000040 => MessageType::Input,
+            0x00000080 => MessageType::AI,
+            0x00000100 => MessageType::Security,
+            0x00000200 => MessageType::User,
+            0x00000400 => MessageType::Signal,
+            0x00000800 => MessageType::Log,
+            _          => MessageType::User,
+        }
+    }
+    pub fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Mensaje del microkernel
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -205,9 +228,13 @@ static PID_SLOT_MAP: Mutex<[PidSlotEntry; PID_MAP_SIZE]> = Mutex::new([EMPTY_PSE
 /// Llamar desde `create_process_with_pid` al insertar en PROCESS_TABLE.
 pub fn register_pid_slot(pid: crate::process::ProcessId, slot: usize) {
     let idx = pid as usize % PID_MAP_SIZE;
+    crate::serial::serial_printf(format_args!("[debug] register_pid_slot pid={} slot={} idx={}\n", pid, slot, idx));
     run_critical(|| {
-        PID_SLOT_MAP.lock()[idx] = PidSlotEntry { pid, slot: slot as u8 };
+        let mut map = PID_SLOT_MAP.lock();
+        crate::serial::serial_print("[debug] register_pid_slot: lock acquired\n");
+        map[idx] = PidSlotEntry { pid, slot: slot as u8 };
     });
+    crate::serial::serial_print("[debug] register_pid_slot: done\n");
 }
 
 /// Eliminar un PID de la tabla inversa al terminar un proceso.
@@ -257,7 +284,19 @@ impl ProcessMailbox {
         const EMPTY: Message = Message::new();
         Self { msgs: [EMPTY; MAILBOX_DEPTH], head: 0, tail: 0, len: 0 }
     }
+    #[inline(always)]
+    fn check_invariants(&self) {
+        if self.len > MAILBOX_DEPTH || self.head >= MAILBOX_DEPTH || self.tail >= MAILBOX_DEPTH {
+            crate::serial::serial_printf(format_args!(
+                "[IPC-MB] CRITICAL: Invariant violation! len={} head={} tail={} depth={}\n",
+                self.len, self.head, self.tail, MAILBOX_DEPTH
+            ));
+            // In a production kernel we might panic, but here we'll try to survive by resetting.
+            // panic!("IPC Mailbox corruption detected");
+        }
+    }
     fn push(&mut self, msg: Message) -> bool {
+        self.check_invariants();
         if self.len >= MAILBOX_DEPTH { return false; }
         self.msgs[self.tail] = msg;
         self.tail = (self.tail + 1) % MAILBOX_DEPTH;
@@ -265,6 +304,7 @@ impl ProcessMailbox {
         true
     }
     fn pop(&mut self) -> Option<Message> {
+        self.check_invariants();
         if self.len == 0 { return None; }
         let msg = self.msgs[self.head];
         self.head = (self.head + 1) % MAILBOX_DEPTH;
@@ -275,20 +315,29 @@ impl ProcessMailbox {
     /// Útil para syscalls síncronos que esperan un ID específico.
     fn pop_filtered<F>(&mut self, filter: F) -> Option<Message>
     where F: Fn(&Message) -> bool {
+        self.check_invariants();
         if self.len == 0 { return None; }
+        
         let mut current = self.head;
-        for i in 0..self.len {
+        let original_len = self.len;
+        
+        for i in 0..original_len {
+            // Safety: current is always wrapped by MAILBOX_DEPTH.
             if filter(&self.msgs[current]) {
                 let msg = self.msgs[current];
-                // Desplazar el resto de mensajes "hacia atrás" para cerrar el hueco.
-                // i es la distancia desde head.
-                let mut move_idx = current;
+                
+                // Shift subsequent messages back to fill the gap.
+                // Number of elements to shift is (len - 1) - i.
                 let steps = (self.len - 1) - i;
+                let mut move_idx = current;
+                
                 for _ in 0..steps {
                     let next = (move_idx + 1) % MAILBOX_DEPTH;
                     self.msgs[move_idx] = self.msgs[next];
                     move_idx = next;
                 }
+                
+                // Update tail and len
                 self.tail = (self.tail + MAILBOX_DEPTH - 1) % MAILBOX_DEPTH;
                 self.len -= 1;
                 return Some(msg);
@@ -658,8 +707,26 @@ pub fn p2p_heartbeat() {
                 "[IPC] Heartbeat: Delivered P2P: {}, Dropped P2P: {}, Total Msgs: {}, Sv: {}, Cl: {}\n",
                 delivered, dropped, total, sv, cl
             ));
+            audit_mailboxes();
         }
     }
+}
+
+/// Escanea todos los buzones en busca de inconsistencias (debug).
+pub fn audit_mailboxes() {
+    run_critical(|| {
+        let mut mailboxes = PROCESS_MAILBOXES.lock();
+        for i in 0..MAX_PROCESSES {
+            let mb = &mut mailboxes[i];
+            if mb.len > MAILBOX_DEPTH || mb.head >= MAILBOX_DEPTH || mb.tail >= MAILBOX_DEPTH {
+                crate::serial::serial_printf(format_args!(
+                    "[IPC-AUDIT] WARNING: Slot {} corrupted! len={} head={} tail={}. Resetting.\n",
+                    i, mb.len, mb.head, mb.tail
+                ));
+                mb.clear();
+            }
+        }
+    });
 }
 
 /// Recibir mensaje para un proceso (O(1)).

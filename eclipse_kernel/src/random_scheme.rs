@@ -1,7 +1,4 @@
 use crate::scheme::{Scheme, Stat};
-use crate::scheme::error::*;
-use alloc::string::String;
-use alloc::vec::Vec;
 
 /// Scheme providing random numbers (similar to /dev/urandom).
 /// Uses the hardware random number generator (RDRAND) via crate::cpu::get_random_u64.

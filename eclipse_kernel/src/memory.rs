@@ -9,8 +9,9 @@ use linked_list_allocator::LockedHeap;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use x86_64::PhysAddr;
-use x86_64::structures::paging::{PhysFrame, PageTable as X86PageTable};
+use x86_64::structures::paging::PhysFrame;
 
+use crate::vm_object;
 pub mod frame_allocator;
 pub mod frame_info;
 
@@ -37,20 +38,6 @@ const KERNEL_REGION_SIZE: u64 = 0x80000000; // 2 GiB
 /// Actual size of the kernel heap, set during memory::init() from bootloader data.
 pub static HEAP_TOTAL_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-pub struct SharedAnonRegion {
-    pub frames: alloc::collections::BTreeMap<u64, u64>, // page_index -> phys_frame
-}
-
-/// Registro global para MAP_SHARED | MAP_ANONYMOUS.
-pub static SHARED_ANON_REGISTRY: Mutex<alloc::collections::BTreeMap<u64, Arc<Mutex<SharedAnonRegion>>>> = Mutex::new(alloc::collections::BTreeMap::new());
-static NEXT_SHARED_ANON_ID: AtomicU64 = AtomicU64::new(1);
-
-pub fn allocate_shared_anon_id() -> u64 {
-    let id = NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::SeqCst);
-    let mut reg = SHARED_ANON_REGISTRY.lock();
-    reg.insert(id, Arc::new(Mutex::new(SharedAnonRegion { frames: alloc::collections::BTreeMap::new() })));
-    id
-}
 
 /// Tablas de páginas estáticas para el kernel
 /// Definidas ANTES del heap para asegurar que estén en memoria física más baja
@@ -842,12 +829,13 @@ pub fn handle_cow_fault(pid: u32, fault_addr: u64) -> bool {
     let Some(proc) = process::get_process(pid) else {
         return false;
     };
-    let r = proc.resources.lock();
+    let r_arc = proc.proc.lock().resources.clone();
+    let mut r = r_arc.lock();
     let page_table_phys = r.page_table_phys;
     
     // Find the VMA to verify write permission
     let vma = match r.vmas.iter().find(|v| page_addr >= v.start && page_addr < v.end) {
-        Some(v) => *v,
+        Some(v) => v.clone(),
         None => {
             drop(r);
             drop(proc);
@@ -906,6 +894,10 @@ pub fn handle_cow_fault(pid: u32, fault_addr: u64) -> bool {
             // Release shared frame
             frame_info::decrement_refcount(phys_addr);
             
+            // Update VMObject so future faults/lookups see the new private page
+            let page_index = (page_addr - vma.start + vma.offset) / 4096;
+            vma.object.lock().pages.insert(page_index, new_phys);
+
             x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
             true
         } else if refcount == 1 {
@@ -1501,19 +1493,20 @@ pub fn is_frame_managed(phys_addr: u64) -> bool {
 ///   - the VMA is file-backed (file-backed mappings are populated eagerly at mmap
 ///     time).
 pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
-    let mut proc = if let Some(p) = crate::process::get_process(pid) {
+    let proc = if let Some(p) = crate::process::get_process(pid) {
         p
     } else {
         return false;
     };
 
-    let (page_table_phys, linux_p, is_huge, vma_start, vma_shared_id, vma_slack) = {
-        let r = proc.resources.lock();
+    let (page_table_phys, linux_p, is_huge, vma_start, obj_arc, offset) = {
+        let r_arc = proc.proc.lock().resources.clone();
+        let r = r_arc.lock();
         let pt = r.page_table_phys;
         // Find the VMA containing the faulting address.
         let vma = r.vmas.iter().find(|v| fault_addr >= v.start && fault_addr < v.end);
         if let Some(v) = vma {
-            (pt, v.flags, v.is_huge, v.start, v.shared_anon_id, v.anon_kernel_slack)
+            (pt, v.flags, v.is_huge, v.start, v.object.clone(), v.offset)
         } else {
             return false;
         }
@@ -1522,19 +1515,24 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
     // Huge Page (2MB) Handling
     if is_huge {
         let page_addr = fault_addr & !0x1FFFFF_u64;
-        // Shared huge pages are not supported yet in the registry (TODO: Phase 2)
-        if vma_shared_id.is_some() {
-            return false;
-        }
-        
-        let Some(phys) = alloc_phys_frames_2mb() else {
-            return false;
-        };
-        
-        let fv = PHYS_MEM_OFFSET + phys;
-        unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 0x200000); }
-        
         let pte_leaf = linux_prot_to_leaf_pte_bits(linux_p);
+        
+        let mut obj = obj_arc.lock();
+        let page_index = (page_addr - vma_start + offset) / 0x200000;
+        
+        let phys = if let Some(&p) = obj.pages.get(&page_index) {
+            p
+        } else {
+            let Some(p) = alloc_phys_frames_2mb() else {
+                return false;
+            };
+            let fv = PHYS_MEM_OFFSET + p;
+            unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 0x200000); }
+            obj.pages.insert(page_index, p);
+            p
+        };
+        drop(obj);
+
         map_user_page_2mb(page_table_phys, page_addr, phys, pte_leaf);
         return true;
     }
@@ -1542,44 +1540,32 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
     // Standard 4KB Page Handling
     let page_addr = fault_addr & !0xFFF_u64;
 
-    // Allocate a physical frame.
-    // If it's a shared anonymous mapping, check the global registry.
-    let phys = if let Some(shared_id) = vma_shared_id {
-        let registry = SHARED_ANON_REGISTRY.lock();
-        if let Some(region_arc) = registry.get(&shared_id) {
-            let mut region = region_arc.lock();
-            let page_index = (page_addr - vma_start) / 4096;
-            if let Some(&p) = region.frames.get(&page_index) {
-                p
-            } else {
+    let mut obj = obj_arc.lock();
+    let page_index = (page_addr - vma_start + offset) / 4096;
+    
+    let phys = if let Some(&p) = obj.pages.get(&page_index) {
+        p
+    } else {
+        match obj.obj_type {
+            crate::vm_object::VMObjectType::Anonymous => {
                 let Some(p) = alloc_phys_frame_for_anon_mmap() else {
                     return false;
                 };
-                region.frames.insert(page_index, p);
+                let fv = PHYS_MEM_OFFSET + p;
+                unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
+                obj.pages.insert(page_index, p);
                 p
+            },
+            crate::vm_object::VMObjectType::Physical { phys_base } => {
+                phys_base + (page_index * 4096)
+            },
+            crate::vm_object::VMObjectType::File { .. } => {
+                // TODO: Implement file loading
+                return false;
             }
-        } else {
-            return false;
         }
-    } else {
-        let Some(p) = alloc_phys_frame_for_anon_mmap() else {
-            return false;
-        };
-        p
     };
-
-    let fv = PHYS_MEM_OFFSET + phys;
-    unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
-
-    // Pages inside the kernel slack region (instruction-decode guard) carry PROT_EXEC
-    // regardless of the VMA's nominal protection.
-    let page_prot = if vma_slack != 0 {
-        let slack_lo = (vma_start + 0x1000).saturating_add(0); // Simplified check for now
-        // This slack logic needs adjustment for various VMA types, but for now we maintain compatibility.
-        linux_p
-    } else {
-        linux_p
-    };
+    drop(obj);
     
     // Use the original linux_p for now to avoid breaking complex slack logic
     let pte_leaf = linux_prot_to_leaf_pte_bits(linux_p);
@@ -1667,6 +1653,28 @@ pub fn map_shared_memory_for_process(page_table_phys: u64, phys_addr: u64, size:
     map_phys_bulk(page_table_phys, phys_addr, aligned_size, virt_addr, pt_flags);
     
     virt_addr
+}
+
+/// Mapea un rango físico arbitrario en un vaddr concreto del proceso.
+///
+/// Esta API existe por compatibilidad con el estilo “antiguo” de syscalls:
+/// el kernel devuelve al usuario un puntero virtual usable, no un físico.
+///
+/// Caching por defecto: Write-Back (WB). Para WC/MMIO usa helpers dedicados.
+pub fn map_physical_range(page_table_phys: u64, phys_addr: u64, size: u64, virt_addr: u64) -> u64 {
+    use x86_64::structures::paging::PageTableFlags as Flags;
+
+    if phys_addr == 0 || phys_addr >= PHYS_MEM_OFFSET {
+        return 0;
+    }
+    if virt_addr == 0 || virt_addr >= USER_SPACE_END {
+        return 0;
+    }
+
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+    let pt_flags = (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits();
+    map_phys_bulk(page_table_phys, phys_addr, aligned_size, virt_addr & !0xFFF, pt_flags);
+    virt_addr & !0xFFF
 }
 
 /// Map framebuffer physical memory into process page tables
@@ -2055,4 +2063,17 @@ pub fn update_working_set(pml4_phys: u64) -> u64 {
         }
     });
     count
+}
+
+pub fn map_user_range(pml4_phys: u64, vaddr: u64, paddr: u64, length: u64, flags: u64) {
+    let mut offset = 0;
+    while offset < length {
+        map_user_page_4kb(pml4_phys, vaddr + offset, paddr + offset, flags);
+        offset += 4096;
+    }
+}
+
+pub fn reprotect_user_range(pml4_phys: u64, vaddr: u64, length: u64, _flags: u64) {
+    // Stub
+    let _ = (pml4_phys, vaddr, length);
 }

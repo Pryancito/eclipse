@@ -6,7 +6,7 @@
 //! - **Extensiones Eclipse**: reservado el rango **≥ 500** (IPC, framebuffer, spawn de
 //!   servicios, DRM, etc.). No coinciden con Linux: ahí siempre usar estas constantes.
 //!
-//! Única fuente de verdad: este módulo + tabla `match` en `eclipse_kernel/src/syscalls.rs`.
+//! Única fuente de verdad: este módulo + tabla `match` en `eclipse_kernel/src/syscalls/mod.rs`.
 
 // --- Linux x86-64 standard syscall numbers ---
 pub const SYS_READ:             usize = 0;

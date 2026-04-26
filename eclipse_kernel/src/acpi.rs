@@ -104,7 +104,7 @@ pub fn init(rsdp_phys: u64) {
         }
 
         let rsdp = &*rsdp_ptr;
-        let signature = rsdp.signature;
+        let _signature = rsdp.signature;
         let revision = rsdp.revision;
         let rsdt_addr = rsdp.rsdt_addr;
         let xsdt_addr = rsdp.xsdt_addr;

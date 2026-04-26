@@ -36,8 +36,8 @@
 //! - Nova: https://docs.kernel.org/next/gpu/nova/index.html
 //! - open-gpu-kernel-modules: https://github.com/NVIDIA/open-gpu-kernel-modules
 
-use crate::pci::{PciDevice, find_nvidia_gpus, get_bar, get_bar_size};
-use crate::memory::{map_mmio_range, map_framebuffer_kernel, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
+use crate::pci::{PciDevice, find_nvidia_gpus, get_bar};
+use crate::memory::{map_mmio_range, map_framebuffer_kernel, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE};
 use crate::serial;
 use crate::filesystem;
 use alloc::vec::Vec;
@@ -342,7 +342,7 @@ pub fn fill_rect(payload: &[u8]) -> bool {
     if payload.len() < 20 {
         return false;
     }
-    let (fb_phys, bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (_fb_phys, _bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -1420,7 +1420,7 @@ pub fn update_all_gpu_vitals() {
         .sum();
 
     let used_vram_bytes_primary = {
-        let mut allocator = VRAM_ALLOCATOR.lock();
+        let allocator = VRAM_ALLOCATOR.lock();
         allocator
             .as_ref()
             .map(|a| a.used_bytes())

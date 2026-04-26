@@ -23,7 +23,13 @@
 //! - Hardware flow control (RTS/CTS)
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use spin::Mutex;
+
+const LOG_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+static mut LOG_BUFFER: [u8; LOG_BUFFER_SIZE] = [0u8; LOG_BUFFER_SIZE];
+static LOG_BUFFER_HEAD: AtomicUsize = AtomicUsize::new(0);
+static LOG_BUFFER_WRAPPED: AtomicBool = AtomicBool::new(false);
 
 const SERIAL_PORT: u16 = 0x3F8; // COM1
 
@@ -169,6 +175,18 @@ pub fn serial_print(s: &str) {
         if crate::boot::gs_base_ready() {
             crate::progress::log(s);
         }
+
+        // Add to circular log buffer for sys_get_logs
+        for byte in s.bytes() {
+            let pos = LOG_BUFFER_HEAD.fetch_add(1, Ordering::Relaxed);
+            let actual_pos = pos % LOG_BUFFER_SIZE;
+            if pos >= LOG_BUFFER_SIZE {
+                LOG_BUFFER_WRAPPED.store(true, Ordering::Relaxed);
+            }
+            unsafe {
+                LOG_BUFFER[actual_pos] = byte;
+            }
+        }
     });
 }
 
@@ -204,6 +222,18 @@ impl core::fmt::Write for RawSerialWriter {
         // Also log to screen once GS base is ready (early boot may not have it yet).
         if crate::boot::gs_base_ready() {
             crate::progress::log(s);
+        }
+
+        // Add to circular log buffer
+        for byte in s.bytes() {
+            let pos = LOG_BUFFER_HEAD.fetch_add(1, Ordering::Relaxed);
+            let actual_pos = pos % LOG_BUFFER_SIZE;
+            if pos >= LOG_BUFFER_SIZE {
+                LOG_BUFFER_WRAPPED.store(true, Ordering::Relaxed);
+            }
+            unsafe {
+                LOG_BUFFER[actual_pos] = byte;
+            }
         }
         Ok(())
     }
@@ -279,4 +309,38 @@ unsafe fn inb(port: u16) -> u8 {
         options(nomem, nostack, preserves_flags)
     );
     value
+}
+
+/// Copiar los logs del kernel al espacio de usuario
+pub fn copy_logs_to_user(buf_ptr: u64, len: u64) -> usize {
+    let head_val = LOG_BUFFER_HEAD.load(Ordering::Relaxed);
+    let wrapped = LOG_BUFFER_WRAPPED.load(Ordering::Relaxed);
+    
+    let head = head_val % LOG_BUFFER_SIZE;
+    let total_available = if wrapped { LOG_BUFFER_SIZE } else { head };
+    let to_copy = core::cmp::min(len as usize, total_available);
+    
+    if to_copy == 0 { return 0; }
+    
+    unsafe {
+        let user_buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, to_copy);
+        if !wrapped {
+            user_buf.copy_from_slice(&LOG_BUFFER[head - to_copy..head]);
+        } else {
+            // If wrapped, we might need two copies from the circular buffer
+            if to_copy <= head {
+                user_buf.copy_from_slice(&LOG_BUFFER[head - to_copy..head]);
+            } else {
+                let second_part_len = head;
+                let first_part_len = to_copy - head;
+                // First part: from the end of the buffer
+                user_buf[..first_part_len].copy_from_slice(
+                    &LOG_BUFFER[LOG_BUFFER_SIZE - first_part_len..]
+                );
+                // Second part: from the beginning up to head
+                user_buf[first_part_len..].copy_from_slice(&LOG_BUFFER[..second_part_len]);
+            }
+        }
+    }
+    to_copy
 }

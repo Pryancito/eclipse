@@ -760,7 +760,7 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
     // For #GP (13) and #UD (6), dump instruction bytes at RIP to help identify the faulting instruction
     if (num == 13 || num == 6) && pid != 0 && (cs & 3) == 3 {
         if let Some(p) = crate::process::get_process(pid) {
-            let pt = p.resources.lock().page_table_phys;
+            let pt = p.proc.lock().resources.lock().page_table_phys;
             crate::serial::serial_printf(format_args!("[FAULT] bytes at RIP({:#x}): ", rip));
             for i in 0..15 {
                 match crate::memory::try_read_user_u8(pt, rip + i) {
@@ -780,7 +780,7 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
             rbx, rcx, r13
         ));
         if let Some(p) = crate::process::get_process(pid) {
-            let pt = p.resources.lock().page_table_phys;
+            let pt = p.proc.lock().resources.lock().page_table_phys;
             drop(p);
             crate::serial::serial_printf(format_args!(
                 "[PF] CR3_en_fault={:#x} PCB_page_table_phys={:#x}{}\n",
@@ -1703,7 +1703,7 @@ extern "C" fn mouse_handler() {
         }
     }
 
-    let mut stats = INTERRUPT_STATS.try_lock();
+    let stats = INTERRUPT_STATS.try_lock();
     if let Some(mut s) = stats {
         s.irqs += 1;
     }
@@ -2332,7 +2332,16 @@ extern "C" fn syscall_handler_rust(
     arg6: u64,
     context: &mut SyscallContext,
 ) -> u64 {
-    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6, context)
+    crate::syscalls::syscall_handler(
+        syscall_num,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5,
+        arg6,
+        context,
+    )
 }
 
 #[unsafe(naked)]

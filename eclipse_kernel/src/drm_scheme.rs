@@ -220,7 +220,7 @@ impl Scheme for DrmScheme {
                     value: u64,
                 }
                 let cap = unsafe { &mut *(arg as *mut DrmGetCap) };
-                if let Some(drm_caps) = drm::get_caps() {
+                if let Some(_drm_caps) = drm::get_caps() {
                     // Values must match <drm/drm.h> DRM_CAP_* (libdrm drmGetCap).
                     match cap.capability {
                         0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
@@ -994,8 +994,8 @@ impl Scheme for DrmScheme {
                 };
 
                 // IDs are stable; values are dynamic per-object.
-                let mut prop_ids: &[u32] = &[];
-                let mut prop_vals: &[u64] = &[];
+                let prop_ids: &[u32];
+                let prop_vals: &[u64];
                 let mut vals_small: [u64; 11] = [0; 11];
 
                 match obj_type {
@@ -1241,7 +1241,7 @@ impl Scheme for DrmScheme {
             DrmResourceKind::Control { minor } => {
                 stat.mode = 0o20666; // Character device
                 // DRM primary node major is 226, card0 minor is 0, renderD128 is 128.
-                stat.rdev = crate::syscalls::linux_makedev(226, minor);
+                stat.rdev = crate::syscalls::linux_makedev(226, minor as u32);
                 stat.dev = 0;
             }
             DrmResourceKind::PrimeBuf { .. } => {

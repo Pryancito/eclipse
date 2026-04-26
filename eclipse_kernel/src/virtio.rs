@@ -450,7 +450,7 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
         }
         planes
     }
-    fn set_plane(&self, plane_id: u32, crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, src_x: u32, src_y: u32, src_w: u32, src_h: u32) -> bool {
+    fn set_plane(&self, plane_id: u32, _crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
         let fb = if let Some(fb) = crate::drm::get_fb(fb_id) { fb } else { return false; };
         let resource_id = fb.gem_handle_id;
         
@@ -1248,7 +1248,7 @@ impl VirtIONetDevice {
         let (queue_rx, notify_rx_addr) = q_rx.map(|(q, a)| (Some(q), a)).unwrap_or((None, 0));
         let (queue_tx, notify_tx_addr) = q_tx.map(|(q, a)| (Some(q), a)).unwrap_or((None, 0));
 
-        let mut dev = VirtIONetDevice {
+        let dev = VirtIONetDevice {
             inner: Mutex::new(VirtIONetDeviceInner {
                 mmio_base: common_virt,
                 io_base: 0,
@@ -1473,7 +1473,7 @@ impl VirtIONetDeviceInner {
         outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
         let rx_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
         if rx_size > 0 {
-            if let Some(mut q) = Virtqueue::new(rx_size) {
+            if let Some(q) = Virtqueue::new(rx_size) {
                 outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q.phys_addr() >> 12) as u32);
                 self.queue_rx = Some(q);
             }
@@ -1483,7 +1483,7 @@ impl VirtIONetDeviceInner {
         outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 1);
         let tx_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
         if tx_size > 0 {
-            if let Some(mut q) = Virtqueue::new(tx_size) {
+            if let Some(q) = Virtqueue::new(tx_size) {
                 outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q.phys_addr() >> 12) as u32);
                 self.queue_tx = Some(q);
             }
@@ -1595,7 +1595,7 @@ impl VirtIOBlockDeviceInner {
         outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER as u8));
         
         // Read device features
-        let features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
+        let _features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
         // serial::serial_print("[VirtIO] Device features: ");
         // serial::serial_print_hex(features as u64);
         // serial::serial_print("\n");
@@ -1848,7 +1848,7 @@ impl VirtIOBlockDeviceInner {
             sfence();
             
             let result: Result<(), &'static str> = (|| {
-                let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+                let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
                 
                 // FORCE MEMORY BARRIER before notification
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -1891,7 +1891,7 @@ impl VirtIOBlockDeviceInner {
                 }
                 
                 // Get used buffer
-                if let Some((used_idx, len)) = queue.get_used() {
+                if let Some((used_idx, _len)) = queue.get_used() {
                     // Memory fence to ensure device writes are visible
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                     
@@ -2831,7 +2831,7 @@ impl VirtIOGpuDevice {
             (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
         ];
 
-        let head = unsafe { queue.add_buf(&buffers).ok_or("add_buf failed")? };
+        let _head = unsafe { queue.add_buf(&buffers).ok_or("add_buf failed")? };
         unsafe { Self::gpu_notify_queue(self.io_base, self.mmio_base, self.modern_notify_addr, 0); }
 
         let mut timeout = 1_000_000;
@@ -3784,6 +3784,11 @@ pub fn virgl_submit_3d(ctx_id: u32, cmd_data: &[u8]) -> bool {
         None => return false,
     };
     dev.virgl_submit_3d(ctx_id, cmd_data).is_ok()
+}
+
+/// Get the number of registered block devices
+pub fn get_block_device_count() -> usize {
+    BLOCK_DEVICES.lock().len()
 }
 
 /// Allocate backing memory for Virgl 3D resource. Returns (phys_addr, size) for kernel to map.

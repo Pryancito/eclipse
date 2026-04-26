@@ -1,11 +1,8 @@
 //! Servidores del sistema ejecutándose en el microkernel
 
 use crate::ipc::{MessageType, register_server, ServerId, receive_message};
-use crate::process::{create_process, ProcessId};
 use crate::serial;
-use crate::scheduler::yield_cpu;
 use crate::scheme::{Scheme, Stat, error as scheme_error};
-use alloc::boxed::Box;
 use crate::net::*;
 
 /// Framebuffer information from bootloader
@@ -202,7 +199,7 @@ impl Scheme for DisplayScheme {
         {
             let fi = &crate::boot::get_boot_info().framebuffer;
             (fi.base_address, (fi.pixels_per_scan_line * fi.height * 4) as usize)
-        } else if let Some((phys, _w, _h, pitch, size)) = crate::virtio::get_primary_virtio_display() {
+        } else if let Some((phys, _w, _h, _pitch, size)) = crate::virtio::get_primary_virtio_display() {
             (phys, size)
         } else if let Some((phys, _bar_phys, _w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             (phys, (pitch * h) as usize)
@@ -548,8 +545,9 @@ impl SocketScheme {
         let mut pid_opt = self.network_pid.lock();
         if let Some(pid) = *pid_opt {
              if let Some(p) = crate::process::get_process(pid) {
-                 let name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
-                 if &p.name[..name_len] == b"network" {
+                 let proc = p.proc.lock();
+                 let name_len = proc.name.iter().position(|&b| b == 0).unwrap_or(16);
+                 if &proc.name[..name_len] == b"network" {
                      return Some(pid);
                  }
              }
@@ -802,6 +800,55 @@ impl SocketScheme {
         });
         
         Ok((s1_id, s2_id))
+    }
+
+    pub fn shutdown(&self, id: usize, _how: i32) -> Result<(), usize> {
+        let mut st = self.state.lock();
+        let _socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        // For now, we just mark as closed.
+        Self::close_connection(&mut st, id);
+        Ok(())
+    }
+
+    pub fn getsockname(&self, id: usize, buf: &mut [u8]) -> Result<usize, usize> {
+        let st = self.state.lock();
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        if let Some(ref path) = socket.path {
+            let bytes = path.as_bytes();
+            let len = bytes.len().min(buf.len());
+            buf[..len].copy_from_slice(&bytes[..len]);
+            return Ok(len);
+        }
+        Ok(0)
+    }
+
+    pub fn getpeername(&self, id: usize, buf: &mut [u8]) -> Result<usize, usize> {
+        let st = self.state.lock();
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        if let Some(conn_id) = socket.connection_id {
+            if let Some(conn) = st.connections.get(&conn_id) {
+                let peer_id = if id == conn.client_socket_id { conn.server_socket_id } else { Some(conn.client_socket_id) };
+                if let Some(pid) = peer_id {
+                    if let Some(peer) = st.sockets.get(&pid) {
+                        if let Some(ref path) = peer.path {
+                            let bytes = path.as_bytes();
+                            let len = bytes.len().min(buf.len());
+                            buf[..len].copy_from_slice(&bytes[..len]);
+                            return Ok(len);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn setsockopt(&self, _id: usize, _level: i32, _opt: i32, _val: &[u8]) -> Result<(), usize> {
+        Ok(()) // Placeholder
+    }
+
+    pub fn getsockopt(&self, _id: usize, _level: i32, _opt: i32, _buf: &mut [u8]) -> Result<usize, usize> {
+        Ok(0) // Placeholder
     }
 }
 
@@ -1086,7 +1133,7 @@ impl Scheme for SocketScheme {
     }
 
     fn poll(&self, id: usize, events: usize) -> Result<usize, usize> {
-        let mut st = self.state.lock();
+        let st = self.state.lock();
         let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
         let domain = socket.domain;
         let state = socket.state;

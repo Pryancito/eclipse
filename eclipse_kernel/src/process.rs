@@ -5,6 +5,7 @@ use spin::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use crate::vm_object::{VMObject, VMObjectType};
 
 /// ID de proceso
 pub type ProcessId = u32;
@@ -77,19 +78,15 @@ pub struct RTParams {
 }
 
 /// Virtual Memory Area (VMA) region
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct VMARegion {
     pub start: u64,
     pub end: u64,
     pub flags: u64,
-    pub file_backed: bool,
-    /// Bytes mapeados de más en `mmap` anónimo (colchón del kernel). `mprotect` de musl solo
-    /// cubre la longitud pedida; hay que extender el rango para quitar NX en esas páginas.
-    pub anon_kernel_slack: u64,
-    /// Identificador de región anónima compartida (MAP_SHARED | MAP_ANONYMOUS).
-    pub shared_anon_id: Option<u64>,
-    /// Indica si la región usa Huge Pages (2MB).
+    pub object: Arc<Mutex<VMObject>>,
+    pub offset: u64,
     pub is_huge: bool,
+    pub is_shared: bool,
 }
 
 impl VMARegion {
@@ -97,49 +94,32 @@ impl VMARegion {
     pub fn can_merge(&self, other: &Self) -> bool {
         self.end == other.start 
             && self.flags == other.flags 
-            && self.file_backed == other.file_backed 
-            && self.anon_kernel_slack == other.anon_kernel_slack
-            && self.shared_anon_id == other.shared_anon_id
             && self.is_huge == other.is_huge
+            && self.is_shared == other.is_shared
+            && self.offset + (self.end - self.start) == other.offset
+            && Arc::ptr_eq(&self.object, &other.object)
     }
 }
 
-/// Estructura de contexto salvado de un proceso
-#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
-    // Registros de propósito general
-    pub rax: u64, // 0x00
-    pub rbx: u64, // 0x08
-    pub rcx: u64, // 0x10
-    pub rdx: u64, // 0x18
-    pub rsi: u64, // 0x20
-    pub rdi: u64, // 0x28
-    pub rbp: u64, // 0x30
-    pub r8: u64,  // 0x38
-    pub r9: u64,  // 0x40
-    pub r10: u64, // 0x48
-    pub r11: u64, // 0x50
-    pub r12: u64, // 0x58
-    pub r13: u64, // 0x60
-    pub r14: u64, // 0x68
-    pub r15: u64, // 0x70
-    
-    // Punteros y estado
-    pub rsp: u64,    // 0x78
-    pub rip: u64,    // 0x80
-    pub rflags: u64, // 0x88
-
+    pub rax: u64, pub rbx: u64, pub rcx: u64, pub rdx: u64,
+    pub rsi: u64, pub rdi: u64, pub rbp: u64,
+    pub r8: u64,  pub r9: u64,  pub r10: u64, pub r11: u64,
+    pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub rflags: u64,
     pub fs_base: u64,
     pub gs_base: u64,
 }
 
-/// Contexto de recursos compartidos entre hilos (proceso lógico)
+/// Recursos compartidos por todos los hilos de un proceso (Address Space, FDs)
 pub struct ProcessResources {
-    pub page_table_phys: u64,          // Physical address of the PML4
-    pub vmas: Vec<VMARegion>,          // Memory mappings
-    pub brk_current: u64,              // Current program break (heap end)
-    pub fd_table_idx: usize,           // Index into FD_TABLES
+    pub page_table_phys: u64,
+    pub vmas: Vec<VMARegion>,
+    pub brk_current: u64,
+    pub fd_table_idx: usize,
 }
 
 impl ProcessResources {
@@ -155,9 +135,120 @@ impl ProcessResources {
 
 impl Drop for ProcessResources {
     fn drop(&mut self) {
-        // Free the page table and all mapped physical frames.
-        // teardown_process_paging safely ignores the kernel page table.
         crate::memory::teardown_process_paging(self.page_table_phys);
+    }
+}
+
+/// Contenedor de proceso (estilo FreeBSD `struct proc`)
+pub struct Proc {
+    pub id: ProcessId,
+    pub parent_pid: Option<ProcessId>,
+    pub resources: Arc<Mutex<ProcessResources>>,
+    pub name: [u8; 16],
+    pub signal_actions: [SignalAction; 64],
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub exit_code: i32,
+    pub exit_signal: i32,
+    pub notified_stopped: bool,
+    pub notified_continued: bool,
+    pub is_linux: bool,
+    pub syscall_trace: bool,
+    pub mem_frames: u64,
+    pub vfork_waiting_for_child: Option<ProcessId>,
+    pub vfork_shared_mm_with_parent: Option<ProcessId>,
+    pub cwd: [u8; 128],
+    pub cwd_len: usize,
+    pub pgid: ProcessId,
+    pub sid: ProcessId,
+    pub dynamic_linker_aux: Option<(u64, u64)>,
+    pub umask: u32,
+    pub supplementary_groups: [u32; 32],
+    pub supplementary_groups_len: usize,
+}
+
+/// Hilo de ejecución (estilo FreeBSD `struct thread`)
+#[derive(Clone)]
+pub struct Process {
+    pub id: ProcessId,           // TID
+    pub tgid: ProcessId,         // PID del proceso (Thread Group ID)
+    pub state: ProcessState,
+    pub context: Context,
+    pub stack_base: u64,
+    pub stack_size: usize,
+    pub kernel_stack_top: u64,
+    pub current_cpu: u32,
+    pub last_cpu: u32,
+    pub time_slice: u32,
+    pub priority: u8,
+    pub rt_params: Option<RTParams>,
+    pub ai_profile: crate::ai_core::ProcessProfile,
+    pub kernel_stack: Option<Vec<u8>>,
+    pub signal_mask: u64,
+    pub pending_signals: u64,
+    pub sigaltstack: Sigaltstack,
+    pub cpu_affinity: Option<u32>,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub proc: Arc<Mutex<Proc>>, // Referencia al contenedor de proceso
+    pub vruntime: u64,
+    pub weight: u64,
+    pub wake_tick: u64,
+    pub cpu_ticks: u64,
+    pub clear_child_tid: u64,
+    pub set_child_tid: u64,
+    pub start_time: u64,
+}
+
+impl Process {
+    pub fn new(id: ProcessId, proc: Arc<Mutex<Proc>>) -> Self {
+        Process {
+            id,
+            tgid: id,
+            state: ProcessState::Ready,
+            context: Context::new(),
+            stack_base: 0,
+            stack_size: 0,
+            kernel_stack_top: 0,
+            current_cpu: NO_CPU,
+            last_cpu: NO_CPU,
+            time_slice: 10,
+            priority: 10,
+            rt_params: None,
+            ai_profile: crate::ai_core::ProcessProfile::new(),
+            kernel_stack: None,
+            signal_mask: 0,
+            pending_signals: 0,
+            sigaltstack: Sigaltstack { ss_sp: 0, ss_flags: SS_DISABLE as i32, ss_size: 0 },
+            cpu_affinity: None,
+            fs_base: 0,
+            gs_base: 0,
+            proc,
+            vruntime: 0,
+            weight: 1024,
+            wake_tick: 0,
+            cpu_ticks: 0,
+            clear_child_tid: 0,
+            set_child_tid: 0,
+            start_time: crate::interrupts::ticks(),
+        }
+    }
+
+    pub fn get_uid(&self) -> u32 { self.proc.lock().uid }
+    pub fn get_gid(&self) -> u32 { self.proc.lock().gid }
+    pub fn get_euid(&self) -> u32 { self.proc.lock().euid }
+    pub fn get_egid(&self) -> u32 { self.proc.lock().egid }
+    pub fn get_pgid(&self) -> ProcessId { self.proc.lock().pgid }
+    pub fn get_sid(&self) -> ProcessId { self.proc.lock().sid }
+
+    pub fn set_pending_signal(&mut self, sig: u32) {
+        if sig > 0 && sig <= 64 {
+            self.pending_signals |= 1 << (sig - 1);
+        }
     }
 }
 
@@ -190,16 +281,10 @@ pub const SA_NODEFER:    u64 = 0x4000_0000;
 pub const SA_RESETHAND:  u64 = 0x8000_0000;
 
 /// SS_* flags for `sigaltstack`.
-pub const SS_ONSTACK: u32 = 1;
-pub const SS_DISABLE: u32 = 2;
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
 
 /// Complete signal action — mirrors Linux `struct sigaction` for x86-64.
-///
-/// Layout (matches `struct sigaction` passed by musl/glibc via `rt_sigaction`):
-///   [0..8]   handler  — `SIG_DFL` = 0, `SIG_IGN` = 1, or userspace fn ptr
-///   [8..16]  flags    — `SA_*` flags
-///   [16..24] restorer — `sa_restorer` pointer (required when `SA_RESTORER` is set)
-///   [24..32] mask     — signals to block during this handler (64-bit bitmask)
 #[derive(Clone, Copy)]
 pub struct SignalAction {
     pub handler:  u64,
@@ -214,165 +299,21 @@ impl SignalAction {
     }
 }
 
+impl Default for SignalAction {
+    fn default() -> Self { Self::new() }
+}
+
 /// Alternate signal stack — mirrors Linux `stack_t`.
 #[derive(Clone, Copy)]
 pub struct Sigaltstack {
     pub ss_sp:    u64,
-    pub ss_flags: u32,
+    pub ss_flags: i32,
     pub ss_size:  u64,
 }
 
 impl Sigaltstack {
     pub const fn new() -> Self {
-        Self { ss_sp: 0, ss_flags: SS_DISABLE, ss_size: 0 }
-    }
-}
-
-/// Process Control Block
-#[derive(Clone)]
-pub struct Process {
-    pub id: ProcessId,
-    pub state: ProcessState,
-    pub context: Context,
-    pub stack_base: u64,
-    pub stack_size: usize,
-    pub priority: u8,
-    pub vruntime: u64,
-    pub weight: u64,
-    pub time_slice: u32,
-    pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
-    pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
-    pub resources: Arc<Mutex<ProcessResources>>, // Shared resources (VM, FDs, etc)
-    pub fs_base: u64,                     // TLS base (FS_BASE)
-    pub gs_base: u64,                     // Kernel/User swap GS base
-    pub is_linux: bool,                   // Use Linux ABI translation
-    pub wake_tick: u64,                   // Timer tick at which to wake from Blocked sleep (0 = not sleeping)
-    pub name: [u8; 16],                   // Process name (truncated to 16 bytes)
-    pub cpu_ticks: u64,                   // Total CPU ticks consumed
-    pub mem_frames: u64,                  // Approximate physical memory usage in frames
-    pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
-    pub last_cpu: u32,                    // Last CPU that executed this process (for cache affinity)
-    pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
-    pub exit_signal: u8,                  // Signal that caused termination or stopping
-    pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
-    pub ai_profile: crate::ai_core::ProcessProfile, // AI Behavior statistics
-    /// Máscara de señales pendientes (bit N = señal N pendiente).
-    pub pending_signals: u64,
-    /// Máscara de señales bloqueadas (bit N = señal N bloqueada).
-    pub signal_mask: u64,
-    /// Acciones de señal registradas por el proceso vía rt_sigaction.
-    pub signal_actions: [SignalAction; 64],
-    /// Pila alternativa para manejadores de señal (sigaltstack).
-    pub sigaltstack: Sigaltstack,
-    /// Process Group ID
-    pub pgid: ProcessId,
-    /// Session ID
-    pub sid: ProcessId,
-    /// `Some((AT_BASE, AT_ENTRY))` si el arranque es vía intérprete dinámico (ld-musl).
-    pub dynamic_linker_aux: Option<(u64, u64)>,
-    /// Current working directory (null-terminated, max 511 chars + NUL).
-    pub cwd: [u8; 512],
-    pub cwd_len: usize,
-    /// Si es true, cada syscall de este proceso se registra en serial (syscall `strace`, 545).
-    pub syscall_trace: bool,
-    /// Address to write 0 and wake on futex on exit (CLONE_CHILD_CLEARTID).
-    pub clear_child_tid: u64,
-    /// Address to write TID on clone (CLONE_CHILD_SETTID).
-    pub set_child_tid: u64,
-    /// Thread Group ID (the "PID" seen by userspace).
-    pub tgid: ProcessId,
-    pub uid: u32,
-    pub gid: u32,
-    pub euid: u32,
-    pub egid: u32,
-    pub suid: u32,
-    pub sgid: u32,
-    pub supplementary_groups: [u32; 32],
-    pub supplementary_groups_len: usize,
-    pub start_time: u64,
-    /// Parámetros de tiempo real (EDF).
-    pub rt_params: Option<RTParams>,
-    /// Linux `CLONE_VFORK`: el padre permanece dentro de `clone` hasta que este hijo
-    /// ejecuta `execve` con éxito o termina (`exit`). `Some(child_pid)` mientras espera.
-    pub vfork_waiting_for_child: Option<ProcessId>,
-    /// Linux `CLONE_VM` + vfork: este proceso comparte `ProcessResources` (y CR3) con el padre
-    /// hasta el primer `exec` exitoso; entonces se hace copia de VM + FD propia.
-    pub vfork_shared_mm_with_parent: Option<ProcessId>,
-    /// Flags para sys_wait4 (WUNTRACED / WCONTINUED)
-    pub notified_stopped: bool,
-    pub notified_continued: bool,
-    /// Signal to send when parent dies (PR_SET_PDEATHSIG).
-    pub pdeathsig: u8,
-    /// El buffer de la pila de kernel, para que se libere al destruir el proceso.
-    pub kernel_stack: Option<alloc::vec::Vec<u8>>,
-}
-
-/// Sentinel value for current_cpu meaning "not owned by any CPU"
-pub const NO_CPU: u32 = u32::MAX;
-
-
-impl Process {
-    pub fn new(resources: Arc<Mutex<ProcessResources>>) -> Self {
-        Self {
-            id: 0,
-            state: ProcessState::Blocked,
-            context: Context::new(),
-            stack_base: 0,
-            stack_size: 0,
-            priority: 0,
-            vruntime: 0,
-            weight: 1024, // NICE_0_LOAD
-            time_slice: 0,
-            parent_pid: None,
-            kernel_stack_top: 0,
-            resources,
-            fs_base: 0,
-            gs_base: 0,
-            is_linux: true,
-            wake_tick: 0,
-            name: [0; 16],
-            cpu_ticks: 0,
-            mem_frames: 0,
-            current_cpu: NO_CPU,
-            last_cpu: NO_CPU,
-            exit_code: 0,
-            exit_signal: 0,
-            cpu_affinity: None,
-            ai_profile: crate::ai_core::ProcessProfile::new(),
-            pending_signals: 0,
-            signal_mask: 0,
-            signal_actions: [const { SignalAction::new() }; 64],
-            sigaltstack: Sigaltstack::new(),
-            pgid: 0,
-            sid: 0,
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            suid: 0,
-            sgid: 0,
-            supplementary_groups: [0; 32],
-            supplementary_groups_len: 0,
-            start_time: get_user_birthday(0),
-            dynamic_linker_aux: None,
-            cwd: {
-                let mut buf = [0u8; 512];
-                buf[0] = b'/';
-                buf
-            },
-            cwd_len: 1,
-            syscall_trace: false,
-            clear_child_tid: 0,
-            set_child_tid: 0,
-            tgid: 0,
-            vfork_waiting_for_child: None,
-            vfork_shared_mm_with_parent: None,
-            notified_stopped: false,
-            notified_continued: false,
-            kernel_stack: None,
-            rt_params: None,
-            pdeathsig: 0,
-        }
+        Self { ss_sp: 0, ss_flags: SS_DISABLE as i32, ss_size: 0 }
     }
 }
 
@@ -381,39 +322,31 @@ impl Process {
 /// Antes de cargar un ELF en `exec*`, si el proceso es hijo vfork con `CLONE_VM`,
 /// duplicar la tabla de páginas y la tabla de FDs del padre para no pisar la imagen del padre.
 pub fn vfork_detach_mm_for_exec_if_needed(pid: ProcessId) -> Result<(), &'static str> {
-    let needs_detach = get_process(pid)
-        .map(|p| p.vfork_shared_mm_with_parent.is_some())
-        .unwrap_or(false);
-    if !needs_detach {
-        return Ok(());
-    }
-
-    let child_slot = crate::ipc::pid_to_slot_fast(pid).ok_or("vfork detach: no slot")?;
-
-    let (shared_pt, src_fd_slot, vmas, brk) = {
-        let p = get_process(pid).ok_or("vfork detach: process")?;
-        let r = p.resources.lock();
-        (r.page_table_phys, r.fd_table_idx, r.vmas.clone(), r.brk_current)
+    let p = get_process(pid).ok_or("vfork detach: no process")?;
+    let parent_pid = {
+        let mut proc = p.proc.lock();
+        let parent_pid = proc.vfork_shared_mm_with_parent.take();
+        if parent_pid.is_none() {
+            return Ok(());
+        }
+        parent_pid.unwrap()
     };
 
-    if src_fd_slot != child_slot {
-        crate::fd::fd_duplicate_table_slots(src_fd_slot, child_slot);
+    let child_slot = crate::ipc::pid_to_slot_fast(pid).ok_or("vfork detach: no slot")?;
+    
+    // Create NEW address space for child (detaching from parent)
+    let new_cr3 = crate::memory::create_process_paging();
+    
+    // Copy parent's FDs into a new table (detaching from parent's shared table)
+    crate::fd::fd_clone_for_fork(parent_pid, pid);
+
+    {
+        let process = get_process(pid).ok_or("vfork detach: child lost")?;
+        let proc = process.proc.lock();
+        let mut r = proc.resources.lock();
+        r.page_table_phys = new_cr3;
+        r.fd_table_idx = child_slot;
     }
-
-    let new_cr3 = crate::memory::clone_process_paging(shared_pt);
-
-    let new_resources = Arc::new(Mutex::new(ProcessResources {
-        page_table_phys: new_cr3,
-        vmas,
-        brk_current: brk,
-        fd_table_idx: child_slot,
-    }));
-
-    modify_process(pid, |p| {
-        p.resources = new_resources;
-        p.vfork_shared_mm_with_parent = None;
-    })
-    .map_err(|_| "vfork detach: process vanished")?;
 
     unsafe {
         crate::memory::set_cr3(new_cr3);
@@ -428,8 +361,9 @@ pub fn vfork_wake_parent_waiting_for_child(child_pid: ProcessId) {
         let mut table = PROCESS_TABLE.lock();
         for slot in table.iter_mut() {
             if let Some(p) = slot {
-                if p.vfork_waiting_for_child == Some(child_pid) {
-                    p.vfork_waiting_for_child = None;
+                let mut proc = p.proc.lock();
+                if proc.vfork_waiting_for_child == Some(child_pid) {
+                    proc.vfork_waiting_for_child = None;
                     return;
                 }
             }
@@ -437,6 +371,9 @@ pub fn vfork_wake_parent_waiting_for_child(child_pid: ProcessId) {
     });
 }
 
+
+/// Sentinel value for current_cpu meaning "not owned by any CPU"
+pub const NO_CPU: u32 = u32::MAX;
 
 /// Tabla de procesos
 pub const MAX_PROCESSES: usize = 256;
@@ -535,17 +472,41 @@ pub fn init_kernel_process() {
 
         let cr3 = crate::memory::get_cr3();
         let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, 0)));
-        let mut process = Process::new(resources);
-        process.id = 0;
+        let proc_obj = Arc::new(Mutex::new(Proc {
+            id: 0,
+            parent_pid: None,
+            resources,
+            name: *b"kernel\0\0\0\0\0\0\0\0\0\0",
+            signal_actions: [SignalAction::default(); 64],
+            uid: 0, gid: 0, euid: 0, egid: 0, suid: 0, sgid: 0,
+            exit_code: 0, exit_signal: 0,
+            notified_stopped: false, notified_continued: false,
+            is_linux: true,
+            syscall_trace: false,
+            mem_frames: 0,
+            vfork_waiting_for_child: None,
+            vfork_shared_mm_with_parent: None,
+            cwd: {
+                let mut buf = [0u8; 128];
+                buf[0] = b'/';
+                buf
+            },
+            cwd_len: 1,
+            pgid: 0,
+            sid: 0,
+            dynamic_linker_aux: None,
+            umask: 0o022,
+            supplementary_groups: [0; 32],
+            supplementary_groups_len: 0,
+        }));
+
+        let mut process = Process::new(0, proc_obj);
         process.state = ProcessState::Running;
         process.current_cpu = 0;
         process.last_cpu = 0;
         process.priority = 0;
         process.time_slice = 10;
         process.kernel_stack_top = kernel_stack_top_aligned;
-        let name = b"kernel";
-        let len = core::cmp::min(name.len(), 16);
-        process.name[..len].copy_from_slice(&name[..len]);
         
         table[0] = Some(process);
         drop(table);
@@ -612,8 +573,6 @@ pub fn create_process_with_pid(
                     // overwritten by the old CPU's register save.
                     && p.current_cpu == crate::process::NO_CPU);
             if slot_available {
-                *slot = None; 
-                
                 // Allocate a unique FD table index for the new process resources
                 // For simplicity, we use same slot_idx as the fd_table_idx initially.
                 let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, slot_idx)));
@@ -622,9 +581,32 @@ pub fn create_process_with_pid(
                     r.brk_current = initial_brk;
                 }
 
-                let mut process = Process::new(resources);
-                process.id = pid;
-                process.tgid = pid;
+                let proc_obj = Arc::new(Mutex::new(Proc {
+                    id: pid,
+                    parent_pid: current_process_id(),
+                    resources,
+                    name: [0; 16],
+                    signal_actions: [SignalAction::default(); 64],
+                    uid: 0, gid: 0, euid: 0, egid: 0, suid: 0, sgid: 0,
+                    exit_code: 0, exit_signal: 0,
+                    notified_stopped: false,
+                    notified_continued: false,
+                    is_linux: true,
+                    syscall_trace: false,
+                    mem_frames: (stack_size / 4096) as u64,
+                    vfork_waiting_for_child: None,
+                    vfork_shared_mm_with_parent: None,
+                    cwd: [0u8; 128],
+                    cwd_len: 0,
+                    pgid: pid,
+                    sid: pid,
+                    dynamic_linker_aux,
+                    umask: 0o022,
+                    supplementary_groups: [0; 32],
+                    supplementary_groups_len: 0,
+                }));
+
+                let mut process = Process::new(pid, proc_obj);
                 process.stack_base = stack_base;
                 process.stack_size = stack_size;
                 process.priority = 5; 
@@ -634,7 +616,6 @@ pub fn create_process_with_pid(
                 
                 let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-                process.dynamic_linker_aux = dynamic_linker_aux;
                 let trampoline: u64 = if dynamic_linker_aux.is_some() {
                     crate::elf_loader::jump_to_userspace_dynamic_linker as *const () as u64
                 } else {
@@ -650,7 +631,6 @@ pub fn create_process_with_pid(
                 process.context.rsp = kernel_stack_top_aligned;               
                 process.context.rflags = 0x002; 
                 process.kernel_stack_top = kernel_stack_top_aligned; 
-                process.mem_frames = (stack_size / 4096) as u64; 
                 process.fs_base = tls_base;
                 
                 crate::serial::serial_printf(format_args!(
@@ -658,14 +638,19 @@ pub fn create_process_with_pid(
                     pid, slot_idx, cr3
                 ));
 
+                crate::serial::serial_print("[debug] create_process_with_pid: assigning slot\n");
                 *slot = Some(process);
+                crate::serial::serial_print("[debug] create_process_with_pid: registering pid slot\n");
                 // Registrar en tabla inversa PID → slot O(1) para IPC
                 crate::ipc::register_pid_slot(pid, slot_idx);
+                crate::serial::serial_print("[debug] create_process_with_pid: resetting syscall counters\n");
                 // Reset the fast syscall counter for the new process slot
                 crate::ai_core::SYSCALL_COUNTERS[slot_idx].store(0, core::sync::atomic::Ordering::Relaxed);
+                crate::serial::serial_print("[debug] create_process_with_pid: returning true\n");
                 return true;
             }
         }
+        crate::serial::serial_print("[debug] create_process_with_pid: no slot available\n");
         false
     })
 }
@@ -677,15 +662,17 @@ pub fn create_process_with_pid(
 /// y provocar #PF en RSP; además el fallo bajo demanda no puede reponer hojas sin VMA.
 pub fn register_mmap_vma(pid: ProcessId, start: u64, len: u64, prot: u64, flags: u32) {
     if let Some(mut proc) = get_process(pid) {
-        let mut r = proc.resources.lock();
+        let r_arc = proc.proc.lock().resources.clone();
+        let mut r = r_arc.lock();
+        let obj = crate::vm_object::VMObject::new_anonymous(len as u64);
         r.vmas.push(VMARegion {
             start,
             end: start + len as u64,
             flags: prot,
-            file_backed: (flags & 0x01) == 0, // Simplified
-            anon_kernel_slack: 0,
-            shared_anon_id: None,
+            object: obj,
+            offset: 0,
             is_huge: false,
+            is_shared: (flags & 0x01) != 0, // MAP_SHARED is 0x01
         });
         drop(r);
         update_process(pid, proc);
@@ -698,9 +685,12 @@ pub fn register_post_exec_vm_as(
     stack_base: u64,
     stack_size: u64,
 ) {
+    crate::serial::serial_printf(format_args!("[debug] register_post_exec_vm_as pid={}\n", pid));
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(mut proc) = get_process(pid) {
-            let mut r = proc.resources.lock();
+            crate::serial::serial_print("[debug] register_post_exec_vm_as: got process\n");
+            let r_arc = proc.proc.lock().resources.clone();
+            let mut r = r_arc.lock();
             for i in 0..loaded.loaded_vma_count {
                 let (start, end) = loaded.loaded_vma_ranges[i];
                 if start < end {
@@ -708,10 +698,10 @@ pub fn register_post_exec_vm_as(
                         start,
                         end,
                         flags:             0x5, // PROT_READ | PROT_EXEC
-                        file_backed:       true,
-                        anon_kernel_slack: 0,
-                        shared_anon_id:    None,
+                        object:            crate::vm_object::VMObject::new_anonymous((end - start) as u64),
+                        offset:            0,
                         is_huge:           false,
+                        is_shared:         false,
                     });
                 }
             }
@@ -719,15 +709,17 @@ pub fn register_post_exec_vm_as(
                 start:             stack_base,
                 end:               stack_base.saturating_add(stack_size),
                 flags:             0x3, // PROT_READ | PROT_WRITE
-                file_backed:       false,
-                anon_kernel_slack: 0,
-                shared_anon_id:    None,
+                object:            crate::vm_object::VMObject::new_anonymous(stack_size),
+                offset:            0,
                 is_huge:           false,
+                is_shared:         false,
             });
             drop(r);
             update_process(pid, proc);
+            crate::serial::serial_print("[debug] register_post_exec_vm_as: updated process\n");
         }
     });
+    crate::serial::serial_print("[debug] register_post_exec_vm_as: done\n");
 }
 
 /// Ejecutar un binario ELF como un nuevo proceso.
@@ -770,34 +762,28 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     ) {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = PROCESS_TABLE.lock();
-            if let Some(p) = table.iter_mut().find(|s| s.as_ref().map_or(false, |p| p.id == pid)) {
-                if let Some(proc) = p {
+            if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+                if let Some(p) = table[slot].as_mut() {
+                    let mut proc = p.proc.lock();
                     let n = core::cmp::min(name.len(), 16);
                     proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
                     proc.mem_frames += loaded.segment_frames;
-                    if loaded.tls_base != 0 {
-                        proc.fs_base = loaded.tls_base;
+                    
+                    if let Some(parent_pid) = current_process_id() {
+                        if let Some(parent) = get_process(parent_pid) {
+                            let p_proc = parent.proc.lock();
+                            proc.pgid = p_proc.pgid;
+                            proc.sid = p_proc.sid;
+                            proc.cwd = p_proc.cwd;
+                            proc.cwd_len = p_proc.cwd_len;
+                        }
                     }
-                    proc.dynamic_linker_aux = loaded.dynamic_linker;
-                    // is_linux is always true (all processes use Linux/musl ABI)
                 }
             }
         });
-        if let Some(parent_pid) = current_process_id() {
-             if let Some(parent) = get_process(parent_pid) {
-                 if let Some(mut proc) = get_process(pid) {
-                     proc.pgid = parent.pgid;
-                     proc.sid = parent.sid;
-                     proc.mem_frames = (0x100000 / 4096) + loaded.segment_frames; // stack + segments
-                    if loaded.tls_base != 0 {
-                        proc.fs_base = loaded.tls_base;
-                    }
-                    proc.dynamic_linker_aux = loaded.dynamic_linker;
-                    crate::process::update_process(pid, proc);
-                 }
-             }
-        }
+        crate::serial::serial_print("[spawn] calling fd_init_stdio\n");
         crate::fd::fd_init_stdio(pid);
+        crate::serial::serial_print("[spawn] calling register_post_exec_vm_as\n");
         register_post_exec_vm_as(pid, &loaded, stack_base, stack_size as u64);
         crate::serial::serial_printf(format_args!("[spawn] SUCCESS for process: {}\n", name));
         Ok(pid)
@@ -823,7 +809,7 @@ pub fn current_process_id() -> Option<ProcessId> {
     }
 }
 
-pub fn get_process_altstack(pid: ProcessId) -> (u64, u64, u32) {
+pub fn get_process_altstack(pid: ProcessId) -> (u64, u64, i32) {
     let table = PROCESS_TABLE.lock();
     for slot in table.iter() {
         if let Some(p) = slot {
@@ -880,8 +866,9 @@ pub fn get_process_by_name(name: &str) -> Option<ProcessId> {
         
         for slot in table.iter() {
             if let Some(p) = slot {
-                let p_name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
-                if p_name_len == name_len && &p.name[..name_len] == &name_bytes[..name_len] {
+                let proc = p.proc.lock();
+                let p_name_len = proc.name.iter().position(|&b| b == 0).unwrap_or(16);
+                if p_name_len == name_len && &proc.name[..name_len] == &name_bytes[..name_len] {
                     return Some(p.id);
                 }
             }
@@ -916,7 +903,7 @@ pub fn pid_to_slot(pid: ProcessId) -> Option<usize> {
 pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
     if let Some(pid) = pid {
         if let Some(process) = get_process(pid) {
-            return process.resources.lock().page_table_phys;
+            return process.proc.lock().resources.lock().page_table_phys;
         }
     }
     0
@@ -989,6 +976,17 @@ where
         }
         Err("Process not found")
     })
+}
+
+pub fn get_uid(pid: ProcessId) -> u32 { get_process(pid).map(|p| p.get_uid()).unwrap_or(0) }
+pub fn get_gid(pid: ProcessId) -> u32 { get_process(pid).map(|p| p.get_gid()).unwrap_or(0) }
+pub fn get_euid(pid: ProcessId) -> u32 { get_process(pid).map(|p| p.get_euid()).unwrap_or(0) }
+pub fn get_egid(pid: ProcessId) -> u32 { get_process(pid).map(|p| p.get_egid()).unwrap_or(0) }
+pub fn get_pgid(pid: ProcessId) -> ProcessId { get_process(pid).map(|p| p.get_pgid()).unwrap_or(0) }
+pub fn get_sid(pid: ProcessId) -> ProcessId { get_process(pid).map(|p| p.get_sid()).unwrap_or(0) }
+
+pub fn process_count() -> usize {
+    PROCESS_TABLE.lock().iter().flatten().count()
 }
 
 /// Modify process state (bypasses metadata-only protection in update_process)
@@ -1159,20 +1157,17 @@ pub fn exit_process() {
     if let Some(pid) = current_process_id() {
         crate::kqueue::get_kqueue_scheme().trigger_global(crate::kqueue::EVFILT_PROC, pid as u64, crate::kqueue::NOTE_EXIT as i64);
         clear_pending_process_args(pid);
-        // Linux vfork: el padre bloqueado en `clone` debe continuar si el hijo sale sin exec.
         vfork_wake_parent_waiting_for_child(pid);
 
-        // Re-parent children to PID 1 (init) and send pdeathsig if requested.
+        // Re-parent children to PID 1 (init)
         let target_pid = pid;
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = PROCESS_TABLE.lock();
             for slot in table.iter_mut() {
                 if let Some(p) = slot {
-                    if p.parent_pid == Some(target_pid) {
-                        p.parent_pid = Some(1); // Reparent to init
-                        if p.pdeathsig != 0 && p.pdeathsig <= 64 {
-                            p.pending_signals |= 1u64 << (p.pdeathsig as u64 - 1);
-                        }
+                    let mut proc = p.proc.lock();
+                    if proc.parent_pid == Some(target_pid) {
+                        proc.parent_pid = Some(1);
                     }
                 }
             }
@@ -1257,7 +1252,7 @@ pub fn exit_process() {
             let table = PROCESS_TABLE.lock();
             table.iter().find_map(|slot| {
                 slot.as_ref().and_then(|p| {
-                    if p.id == pid { p.parent_pid } else { None }
+                    if p.id == pid { p.proc.lock().parent_pid } else { None }
                 })
             })
         };
@@ -1317,155 +1312,121 @@ pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
 /// CPUs that need PROCESS_TABLE during a fork.
 pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     let current_pid = current_process_id()?;
-    // Clone of parent released immediately — no lock held for the expensive work below.
     let parent = get_process(current_pid)?;
+    let p_proc = parent.proc.lock();
 
     // ── Phase 1: Expensive work BEFORE acquiring any kernel-global lock ──────
+    let child_cr3 = crate::memory::clone_process_paging(p_proc.resources.lock().page_table_phys);
 
-    // Deep copy of the parent's user address space.
-    let child_cr3 = crate::memory::clone_process_paging(parent.resources.lock().page_table_phys);
-
-    // Allocate a fresh kernel stack for the child.
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-    // Build the IRETQ frame on the child's kernel stack.
-    // layout (low→high in memory): RIP, CS, RFLAGS, RSP, SS
     let kstack_ptr = unsafe {
         let mut p = kernel_stack_top_aligned as *mut u64;
-        p = p.offset(-1); *p = 0x23;                  // SS  (user data)
-        p = p.offset(-1); *p = parent_context.rsp;    // RSP (user stack)
+        p = p.offset(-1); *p = 0x23;                  // SS
+        p = p.offset(-1); *p = parent_context.rsp;    // RSP
         p = p.offset(-1); *p = parent_context.rflags; // RFLAGS
-        p = p.offset(-1); *p = 0x1b;                  // CS  (user code)
+        p = p.offset(-1); *p = 0x1b;                  // CS
         p = p.offset(-1); *p = parent_context.rip;    // RIP
         p
     };
 
-    // Clone of resources for fork()
     let child_resources = {
-        let p = parent.resources.lock();
+        let r = p_proc.resources.lock();
+        let mut child_vmas = Vec::new();
+        for vma in r.vmas.iter() {
+            let mut new_vma = vma.clone();
+            if !vma.is_shared {
+                // For private mappings, we need a new VMObject that initially points to the same frames (COW)
+                new_vma.object = vma.object.lock().clone_for_fork();
+            }
+            // For shared mappings, new_vma.object already points to the same Arc<Mutex<VMObject>> via vma.clone()
+            child_vmas.push(new_vma);
+        }
+
         Arc::new(Mutex::new(ProcessResources {
             page_table_phys: child_cr3,
-            vmas: p.vmas.clone(),
-            brk_current: p.brk_current,
-            fd_table_idx: p.fd_table_idx,
+            vmas: child_vmas,
+            brk_current: r.brk_current,
+            fd_table_idx: r.fd_table_idx,
         }))
     };
 
-    let mut child_proc = Process::new(child_resources);
-    child_proc.kernel_stack = Some(kernel_stack);
-
-    // ── Phase 2: Brief critical section — insert child into PROCESS_TABLE ───
-
+    // ── Phase 2: Critical section — insert child into PROCESS_TABLE ───
     let result = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
         let mut next_pid = NEXT_PID.lock();
 
         for (slot_idx, slot) in table.iter_mut().enumerate() {
-            // Accept both empty slots and slots whose previous occupant has Terminated
-            // (and has been fully released by the owning CPU).  Without this, fork()
-            // fails permanently once the table fills with a mix of live and Terminated
-            // processes — the same condition already handled by create_process_with_pid.
             let slot_available = slot.is_none()
                 || matches!(slot, Some(ref p) if
                     p.state == ProcessState::Terminated
                     && p.current_cpu == NO_CPU);
+
             if slot_available {
-                *slot = None; // evict Terminated entry before writing the child
                 let child_pid = *next_pid;
                 *next_pid += 1;
 
-                child_proc.id = child_pid;
-                child_proc.resources.lock().fd_table_idx = slot_idx; // Use the new slot index for isolated FD table copy
-                let mut child = child_proc;
-                child.id = child_pid;
+                // Create new Proc for child (POSIX fork creates a new process)
+                let child_proc_obj = Arc::new(Mutex::new(Proc {
+                    id: child_pid,
+                    parent_pid: Some(current_pid),
+                    resources: child_resources,
+                    name: p_proc.name,
+                    signal_actions: p_proc.signal_actions,
+                    uid: p_proc.uid, gid: p_proc.gid,
+                    euid: p_proc.euid, egid: p_proc.egid,
+                    suid: p_proc.suid, sgid: p_proc.sgid,
+                    exit_code: 0, exit_signal: 0,
+                    notified_stopped: false, notified_continued: false,
+                    is_linux: p_proc.is_linux,
+                    syscall_trace: p_proc.syscall_trace,
+                    mem_frames: p_proc.mem_frames,
+                    vfork_waiting_for_child: None,
+                    vfork_shared_mm_with_parent: None,
+                    cwd: p_proc.cwd,
+                    cwd_len: p_proc.cwd_len,
+                    pgid: p_proc.pgid,
+                    sid: p_proc.sid,
+                    dynamic_linker_aux: p_proc.dynamic_linker_aux,
+                    umask: p_proc.umask,
+                    supplementary_groups: p_proc.supplementary_groups,
+                    supplementary_groups_len: p_proc.supplementary_groups_len,
+                }));
+
+                let mut child = Process::new(child_pid, child_proc_obj);
+                child.kernel_stack = Some(kernel_stack);
                 child.tgid = child_pid;
                 child.state = ProcessState::Blocked;
-                child.current_cpu = NO_CPU;
-                child.last_cpu = NO_CPU;
-                child.parent_pid = Some(current_pid);
                 child.kernel_stack_top = kernel_stack_top_aligned;
-                
-                // Inherit missing fields (CRITICAL for TLS/Libc stability)
                 child.fs_base = parent.fs_base;
-                child.dynamic_linker_aux = parent.dynamic_linker_aux;
                 child.gs_base = parent.gs_base;
-                // is_linux always true (all processes use Linux/musl ABI)
                 child.priority = parent.priority;
                 child.vruntime = parent.vruntime;
                 child.weight = parent.weight;
                 child.time_slice = parent.time_slice;
                 child.stack_base = parent.stack_base;
                 child.stack_size = parent.stack_size;
-                child.mem_frames = parent.mem_frames;
                 child.cpu_affinity = parent.cpu_affinity;
-                child.exit_signal = 0;
-                child.syscall_trace = parent.syscall_trace;
+                child.signal_mask = parent.signal_mask;
+                child.sigaltstack = parent.sigaltstack;
 
-                // Signal inheritance (POSIX fork semantics):
-                // - child inherits signal dispositions and mask
-                // - child's pending signals are cleared (done by Process::new())
-                // - child inherits alternate signal stack
-                child.signal_actions = parent.signal_actions;
-                child.signal_mask    = parent.signal_mask;
-                child.sigaltstack    = parent.sigaltstack;
-
-                // Inherit process group, session, and working directory.
-                child.pgid    = parent.pgid;
-                child.sid     = parent.sid;
-                child.uid = parent.uid;
-                child.gid = parent.gid;
-                child.euid = parent.euid;
-                child.egid = parent.egid;
-                child.suid = parent.suid;
-                child.sgid = parent.sgid;
-                child.supplementary_groups = parent.supplementary_groups;
-                child.supplementary_groups_len = parent.supplementary_groups_len;
-                child.start_time = parent.start_time;
-                child.cwd     = parent.cwd;
-                child.cwd_len = parent.cwd_len;
-
-                // Keep parent name (child will overwrite it with set_process_name if needed)
-                let mut name = [0u8; 16];
-                let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
-                let copy_len = core::cmp::min(parent_name_len, 16);
-                name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
-                child.name = name;
-
-                // Set up context so the child resumes via fork_child_setup (which clears locks).
+                // Set up context so the child resumes via fork_child_setup
                 child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
                 child.context.rsp = kstack_ptr as u64;
-                child.context.rax = 0; // fork() returns 0 in the child
-                child.context.rbx = parent_context.rbx;
-                child.context.rcx = parent_context.rcx;
-                child.context.rdx = parent_context.rdx;
-                child.context.rsi = parent_context.rsi;
-                child.context.rdi = parent_context.rdi;
-                child.context.rbp = parent_context.rbp;
-                child.context.r8  = parent_context.r8;
-                child.context.r9  = parent_context.r9;
-                child.context.r10 = parent_context.r10;
-                child.context.r11 = parent_context.r11;
-                child.context.r12 = parent_context.r12;
-                child.context.r13 = parent_context.r13;
-                child.context.r14 = parent_context.r14;
-                child.context.r15 = parent_context.r15;
-
+                child.context.rax = 0; // fork() returns 0 in child
+                
                 *slot = Some(child);
-                // Register in O(1) IPC lookup table before releasing the lock.
                 crate::ipc::register_pid_slot(child_pid, slot_idx);
-                return Some((child_pid, slot_idx));
+                return Some(child_pid);
             }
         }
         None
     });
 
-    let (child_pid, _slot_idx) = result?;
-
-    // ── Phase 3: Clone FDs under FD_TABLES lock only (no PROCESS_TABLE) ────
+    let child_pid = result?;
     crate::fd::fd_clone_for_fork(current_pid, child_pid);
-
     Some(child_pid)
 }
 
@@ -1474,8 +1435,9 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
 pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
     let current_pid = current_process_id()?;
     let parent = get_process(current_pid)?;
+    let p_proc = parent.proc.lock();
 
-    let child_resources = Arc::clone(&parent.resources);
+    let child_resources = Arc::clone(&p_proc.resources);
 
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
@@ -1483,16 +1445,11 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
 
     let kstack_ptr = unsafe {
         let mut p = kernel_stack_top_aligned as *mut u64;
-        p = p.offset(-1);
-        *p = 0x23;
-        p = p.offset(-1);
-        *p = parent_context.rsp;
-        p = p.offset(-1);
-        *p = parent_context.rflags;
-        p = p.offset(-1);
-        *p = 0x1b;
-        p = p.offset(-1);
-        *p = parent_context.rip;
+        p = p.offset(-1); *p = 0x23;                  // SS
+        p = p.offset(-1); *p = parent_context.rsp;    // RSP
+        p = p.offset(-1); *p = parent_context.rflags; // RFLAGS
+        p = p.offset(-1); *p = 0x1b;                  // CS
+        p = p.offset(-1); *p = parent_context.rip;    // RIP
         p
     };
 
@@ -1506,67 +1463,58 @@ pub fn vfork_process_shared_vm(parent_context: &Context) -> Option<ProcessId> {
                     p.state == ProcessState::Terminated
                     && p.current_cpu == NO_CPU);
             if slot_available {
-                *slot = None;
                 let child_pid = *next_pid;
                 *next_pid += 1;
 
-                let mut child = Process::new(child_resources);
-                child.id = child_pid;
+                // Create new Proc but SHARING the same ProcessResources
+                let child_proc_obj = Arc::new(Mutex::new(Proc {
+                    id: child_pid,
+                    parent_pid: Some(current_pid),
+                    resources: child_resources,
+                    name: p_proc.name,
+                    signal_actions: p_proc.signal_actions,
+                    uid: p_proc.uid, gid: p_proc.gid,
+                    euid: p_proc.euid, egid: p_proc.egid,
+                    suid: p_proc.suid, sgid: p_proc.sgid,
+                    exit_code: 0, exit_signal: 0,
+                    notified_stopped: false, notified_continued: false,
+                    is_linux: p_proc.is_linux,
+                    syscall_trace: p_proc.syscall_trace,
+                    mem_frames: p_proc.mem_frames,
+                    vfork_waiting_for_child: None,
+                    vfork_shared_mm_with_parent: Some(current_pid),
+                    cwd: p_proc.cwd,
+                    cwd_len: p_proc.cwd_len,
+                    pgid: p_proc.pgid,
+                    sid: p_proc.sid,
+                    dynamic_linker_aux: p_proc.dynamic_linker_aux,
+                    umask: p_proc.umask,
+                    supplementary_groups: p_proc.supplementary_groups,
+                    supplementary_groups_len: p_proc.supplementary_groups_len,
+                }));
+
+                let mut child = Process::new(child_pid, child_proc_obj);
+                child.kernel_stack = Some(kernel_stack);
                 child.tgid = child_pid;
                 child.state = ProcessState::Blocked;
-                child.current_cpu = NO_CPU;
-                child.last_cpu = NO_CPU;
-                child.parent_pid = Some(current_pid);
                 child.kernel_stack_top = kernel_stack_top_aligned;
-                child.vfork_shared_mm_with_parent = Some(current_pid);
-
                 child.fs_base = parent.fs_base;
-                child.dynamic_linker_aux = parent.dynamic_linker_aux;
                 child.gs_base = parent.gs_base;
-                // is_linux always true (all processes use Linux/musl ABI)
                 child.priority = parent.priority;
+                child.vruntime = parent.vruntime;
+                child.weight = parent.weight;
                 child.time_slice = parent.time_slice;
                 child.stack_base = parent.stack_base;
                 child.stack_size = parent.stack_size;
-                child.mem_frames = parent.mem_frames;
                 child.cpu_affinity = parent.cpu_affinity;
-                child.exit_signal = 0;
-                child.syscall_trace = parent.syscall_trace;
+                child.signal_mask = parent.signal_mask;
+                child.sigaltstack = parent.sigaltstack;
 
-                // Signal inheritance (POSIX fork semantics).
-                child.signal_actions = parent.signal_actions;
-                child.signal_mask    = parent.signal_mask;
-                child.sigaltstack    = parent.sigaltstack;
-                child.pgid    = parent.pgid;
-                child.sid     = parent.sid;
-                child.uid = parent.uid;
-                child.gid = parent.gid;
-                child.euid = parent.euid;
-                child.egid = parent.egid;
-                child.suid = parent.suid;
-                child.sgid = parent.sgid;
-                child.supplementary_groups = parent.supplementary_groups;
-                child.supplementary_groups_len = parent.supplementary_groups_len;
-                child.start_time = parent.start_time;
-                child.cwd     = parent.cwd;
-                child.cwd_len = parent.cwd_len;
-
-                let mut name = [0u8; 16];
-                child.context.rcx = parent_context.rcx;
-                child.context.rdx = parent_context.rdx;
-                child.context.rsi = parent_context.rsi;
-                child.context.rdi = parent_context.rdi;
-                child.context.rbp = parent_context.rbp;
-                child.context.r8 = parent_context.r8;
-                child.context.r9 = parent_context.r9;
-                child.context.r10 = parent_context.r10;
-                child.context.r11 = parent_context.r11;
-                child.context.r12 = parent_context.r12;
-                child.context.r13 = parent_context.r13;
-                child.context.r14 = parent_context.r14;
-                child.context.r15 = parent_context.r15;
-
-                child.kernel_stack = Some(kernel_stack);
+                // Set up context so the child resumes via fork_child_setup
+                child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
+                child.context.rsp = kstack_ptr as u64;
+                child.context.rax = 0; // vfork() returns 0 in child
+                
                 *slot = Some(child);
                 crate::ipc::register_pid_slot(child_pid, slot_idx);
                 return Some(child_pid);
@@ -1603,22 +1551,21 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
                 if p.id == pid {
                     p.pending_signals |= 1u64 << signum;
                     
+                    let mut proc = p.proc.lock();
                     // Job Control: handle stop/cont signals
                     if signum == 19 || signum == 20 { // SIGSTOP or SIGTSTP
                         p.state = ProcessState::Stopped;
-                        p.exit_signal = signum;
-                        p.notified_stopped = false; // Reset for next wait4
-                        parent_to_notify = p.parent_pid;
+                        proc.exit_signal = signum as i32;
+                        proc.notified_stopped = false;
+                        parent_to_notify = proc.parent_pid;
                     } else if signum == 18 { // SIGCONT
                         if p.state == ProcessState::Stopped || p.state == ProcessState::Blocked {
-                            p.exit_signal = 18;
-                            p.notified_continued = false; // Reset for next wait4
-                            // Don't set state here; enqueue_process will do it.
+                            proc.exit_signal = 18;
+                            proc.notified_continued = false;
                             to_wake = Some(pid);
-                            parent_to_notify = p.parent_pid;
+                            parent_to_notify = proc.parent_pid;
                         }
                     } else {
-                        // Despertar al proceso si está bloqueado por otras señales
                         if p.state == ProcessState::Blocked {
                             to_wake = Some(pid);
                         }
@@ -1645,19 +1592,16 @@ pub fn set_pending_signal(pid: ProcessId, signum: u8) {
     crate::kqueue::get_kqueue_scheme().trigger_for_process(pid, crate::kqueue::EVFILT_SIGNAL, signum as u64, 0);
 }
 
-/// Consume (limpia) un bit de señal del proceso actual y devuelve la acción registrada.
-/// Devuelve None si no hay señal pendiente o no hay proceso actual.
-pub fn get_signal_handler(pid: ProcessId, signum: u8) -> Option<SignalAction> {
+pub fn get_signal_action(pid: ProcessId, signum: u8) -> Option<SignalAction> {
     if signum >= 64 { return None; }
     let table = PROCESS_TABLE.lock();
-    table.iter().flatten().find(|p| p.id == pid).map(|p| p.signal_actions[signum as usize])
+    table.iter().flatten().find(|p| p.id == pid).map(|p| p.proc.lock().signal_actions[signum as usize])
 }
 
-pub fn set_signal_handler(pid: ProcessId, signum: u8, action: SignalAction) {
+pub fn set_signal_action(pid: ProcessId, signum: u8, action: SignalAction) {
     if signum >= 64 { return; }
-    let mut table = PROCESS_TABLE.lock();
-    if let Some(p) = table.iter_mut().flatten().find(|p| p.id == pid) {
-        p.signal_actions[signum as usize] = action;
+    if let Some(p) = get_process(pid) {
+        p.proc.lock().signal_actions[signum as usize] = action;
     }
 }
 
@@ -1669,7 +1613,7 @@ pub fn consume_pending_signal(pid: ProcessId, signum: u8) -> Option<SignalAction
         if let Some(p) = slot {
             if p.id == pid && (p.pending_signals & mask) != 0 {
                 p.pending_signals &= !mask;
-                return Some(p.signal_actions[signum as usize]);
+                return Some(p.proc.lock().signal_actions[signum as usize]);
             }
         }
     }
@@ -1685,8 +1629,6 @@ pub fn signal_default_is_ignore(signum: u8) -> bool {
     }
 }
 
-/// Extrae la señal pendiente de menor número, la borra del bitmask y devuelve (número, acción).
-/// **Respeta la máscara de señales (p.signal_mask)**, excepto para SIGKILL (9) y SIGSTOP (19).
 pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, SignalAction)> {
     let mut table = PROCESS_TABLE.lock();
     for slot in table.iter_mut() {
@@ -1694,9 +1636,7 @@ pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, SignalAction)> {
             if p.id != pid || p.pending_signals == 0 {
                 continue;
             }
-            // Filtramos las señales que NO están bloqueadas.
-            // SIGKILL (9) y SIGSTOP (19) no se pueden bloquear (máscara 1 << 9 y 1 << 19).
-            let unblockable = (1 << 9) | (1 << 19);
+            let unblockable = (1 << 9) | (1 << 18); // SIGKILL and SIGSTOP
             let deliverable = p.pending_signals & (!p.signal_mask | unblockable);
             
             if deliverable == 0 {
@@ -1710,15 +1650,13 @@ pub fn pop_lowest_pending_signal(pid: ProcessId) -> Option<(u8, SignalAction)> {
             let sig = bit as u8;
             let mask = 1u64 << sig;
             p.pending_signals &= !mask;
-            let action = p.signal_actions[sig as usize];
+            let action = p.proc.lock().signal_actions[sig as usize];
             return Some((sig, action));
         }
     }
     None
 }
 
-/// Termina `target_pid` con `exit_code = 128 + sig` (como `sys_kill` fatal).
-/// Devuelve `None` si no existe, `Some(None)` si ya era zombie, `Some(Some(ppid))` si se mató.
 pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Option<Option<ProcessId>> {
     let result = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
@@ -1728,11 +1666,14 @@ pub fn terminate_other_process_by_signal(target_pid: ProcessId, sig: u8) -> Opti
                     if p.state == ProcessState::Terminated {
                         return Some(None);
                     }
-                    p.exit_code = 128 + sig as u64;
-                    p.exit_signal = sig;
+                    {
+                        let mut proc = p.proc.lock();
+                        proc.exit_code = (128 + sig as u64) as i32;
+                        proc.exit_signal = sig as i32;
+                    }
                     p.state = ProcessState::Terminated;
                     crate::ipc::clear_mailbox_slot(slot_idx);
-                    return Some(p.parent_pid);
+                    return Some(p.proc.lock().parent_pid);
                 }
             }
         }
@@ -1784,7 +1725,7 @@ pub fn deliver_pending_signals_noctx() {
         }
 
         if let Some(mut proc) = get_process(pid) {
-            proc.exit_code = 128 + sig as u64;
+            proc.proc.lock().exit_code = (128 + sig as u64) as i32;
             update_process(pid, proc);
         }
         exit_process();
@@ -1796,8 +1737,9 @@ pub fn deliver_pending_signals_noctx() {
 /// Get the current working directory of a process as a &str (from its cwd buffer).
 pub fn get_process_cwd(pid: ProcessId) -> alloc::string::String {
     if let Some(p) = get_process(pid) {
-        let len = p.cwd_len.min(511);
-        alloc::string::String::from_utf8_lossy(&p.cwd[..len]).into_owned()
+        let proc = p.proc.lock();
+        let len = proc.cwd_len.min(127);
+        alloc::string::String::from_utf8_lossy(&proc.cwd[..len]).into_owned()
     } else {
         alloc::string::String::from("/")
     }
@@ -1807,13 +1749,14 @@ pub fn get_process_cwd(pid: ProcessId) -> alloc::string::String {
 /// Returns true on success, false if path is too long.
 pub fn set_process_cwd(pid: ProcessId, new_cwd: &str) -> bool {
     let bytes = new_cwd.as_bytes();
-    if bytes.len() > 511 {
+    if bytes.len() > 127 {
         return false;
     }
     modify_process(pid, |p| {
-        p.cwd_len = bytes.len();
-        p.cwd[..bytes.len()].copy_from_slice(bytes);
-        p.cwd[bytes.len()] = 0;
+        let mut proc = p.proc.lock();
+        proc.cwd_len = bytes.len();
+        proc.cwd[..bytes.len()].copy_from_slice(bytes);
+        proc.cwd[bytes.len()] = 0;
     }).is_ok()
 }
 

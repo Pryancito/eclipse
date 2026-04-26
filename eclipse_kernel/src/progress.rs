@@ -3,13 +3,11 @@ use embedded_graphics::{
     prelude::*,
     primitives::{Rectangle, PrimitiveStyleBuilder},
     text::Text,
-    mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyle, MonoTextStyleBuilder},
+    mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyleBuilder},
 };
 use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID, MAX_SMP_CPUS, get_cpu_id, get_cpu_id_gs, gs_base_ready};
 use core::sync::atomic::{AtomicU64, AtomicBool, AtomicU32, Ordering};
 use core::panic::PanicInfo;
-use core::fmt::Write;
-use spin::Mutex;
 
 // Buffer estático para acumular líneas de log hasta recibir '\n'
 const LOG_BUF_SIZE: usize = 128;
@@ -214,7 +212,7 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
-    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
+    let Some((phys, width, height, pitch, _size, source)) = get_fb_info() else { return };
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
     let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
@@ -372,7 +370,7 @@ pub fn log(msg: &str) {
                 let logging_enabled = LOGGING_ENABLED.load(Ordering::SeqCst);
                 let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
                 if logging_enabled && mapped != 0 {
-                    if let Some((phys, width, height, pitch, size, source)) = get_fb_info() {
+                    if let Some((phys, width, height, pitch, _size, source)) = get_fb_info() {
                         if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
                             render_log_line(line, source, width, height, pitch, phys);
                         }
@@ -494,7 +492,7 @@ pub fn bsod(info: &BsodInfo) {
     }
     let _lock_guard = guard; // Hold for the remainder of bsod() to serialise FB access.
 
-    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
+    let Some((phys, width, height, pitch, _size, source)) = get_fb_info() else { return };
     
     // Safety check: Verificar que la dirección física del FB no sea nula y esté
     // dentro de un rango razonable para evitar un Triple Fault si phys_to_virt falla.
@@ -670,7 +668,7 @@ pub fn panic_bsod(info: &PanicInfo) {
     }
     let _lock_guard = guard;
 
-    let Some((phys, width, height, pitch, size, source)) = get_fb_info() else { return };
+    let Some((phys, width, height, pitch, _size, source)) = get_fb_info() else { return };
     if phys == 0 || phys > 0x0000_0100_0000_0000 { return; }
 
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
