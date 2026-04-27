@@ -697,7 +697,11 @@ pub fn register_post_exec_vm_as(
                     r.vmas.push(VMARegion {
                         start,
                         end,
-                        flags:             0x5, // PROT_READ | PROT_EXEC
+                        // NOTE: wlroots/labwc forks early and triggers CoW write faults.
+                        // Until we track per-segment protections here, mark the whole loaded
+                        // image as RWX so CoW can validate writes against a writable VMA.
+                        // (PTE permissions still come from ELF p_flags.)
+                        flags:             0x7, // PROT_READ | PROT_WRITE | PROT_EXEC
                         object:            crate::vm_object::VMObject::new_anonymous((end - start) as u64),
                         offset:            0,
                         is_huge:           false,
@@ -1325,10 +1329,31 @@ pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
 pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     let current_pid = current_process_id()?;
     let parent = get_process(current_pid)?;
+    // IMPORTANT: do not hold the parent `Proc` lock across fd cloning.
+    // `fd_clone_for_fork()` calls `pid_to_fd_idx()` → `get_process()` → `proc.lock()`,
+    // which would deadlock if we kept this lock until the end of fork.
     let p_proc = parent.proc.lock();
+    let parent_resources = Arc::clone(&p_proc.resources);
+    let parent_name = p_proc.name;
+    let parent_signal_actions = p_proc.signal_actions;
+    let parent_ids = (p_proc.uid, p_proc.gid, p_proc.euid, p_proc.egid, p_proc.suid, p_proc.sgid);
+    let parent_misc = (
+        p_proc.is_linux,
+        p_proc.syscall_trace,
+        p_proc.mem_frames,
+        p_proc.cwd,
+        p_proc.cwd_len,
+        p_proc.pgid,
+        p_proc.sid,
+        p_proc.dynamic_linker_aux,
+        p_proc.umask,
+        p_proc.supplementary_groups,
+        p_proc.supplementary_groups_len,
+    );
+    drop(p_proc);
 
     // ── Phase 1: Expensive work BEFORE acquiring any kernel-global lock ──────
-    let child_cr3 = crate::memory::clone_process_paging(p_proc.resources.lock().page_table_phys);
+    let child_cr3 = crate::memory::clone_process_paging(parent_resources.lock().page_table_phys);
 
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
@@ -1343,9 +1368,24 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
         p = p.offset(-1); *p = parent_context.rip;    // RIP
         p
     };
+    crate::serial::serial_printf(format_args!(
+        "[fork] build_iret_frame parent_rip={:#x} parent_rsp={:#x} parent_rflags={:#x}\n",
+        parent_context.rip, parent_context.rsp, parent_context.rflags
+    ));
+    unsafe {
+        crate::serial::serial_printf(format_args!(
+            "[fork] child_iret @{:p}: RIP={:#x} CS={:#x} RFLAGS={:#x} RSP={:#x} SS={:#x}\n",
+            kstack_ptr,
+            *kstack_ptr,
+            *kstack_ptr.add(1),
+            *kstack_ptr.add(2),
+            *kstack_ptr.add(3),
+            *kstack_ptr.add(4),
+        ));
+    }
 
     let child_resources = {
-        let r = p_proc.resources.lock();
+        let r = parent_resources.lock();
         let mut child_vmas = Vec::new();
         for vma in r.vmas.iter() {
             let mut new_vma = vma.clone();
@@ -1361,7 +1401,10 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             page_table_phys: child_cr3,
             vmas: child_vmas,
             brk_current: r.brk_current,
-            fd_table_idx: r.fd_table_idx,
+            // IMPORTANT: this must be the child's PROCESS_TABLE slot index, not the parent's.
+            // We don't know the child's slot yet (it is chosen in Phase 2), so set a placeholder
+            // and fix it immediately after we reserve a slot.
+            fd_table_idx: 0,
         }))
     };
 
@@ -1385,26 +1428,26 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                     id: child_pid,
                     parent_pid: Some(current_pid),
                     resources: child_resources,
-                    name: p_proc.name,
-                    signal_actions: p_proc.signal_actions,
-                    uid: p_proc.uid, gid: p_proc.gid,
-                    euid: p_proc.euid, egid: p_proc.egid,
-                    suid: p_proc.suid, sgid: p_proc.sgid,
+                    name: parent_name,
+                    signal_actions: parent_signal_actions,
+                    uid: parent_ids.0, gid: parent_ids.1,
+                    euid: parent_ids.2, egid: parent_ids.3,
+                    suid: parent_ids.4, sgid: parent_ids.5,
                     exit_code: 0, exit_signal: 0,
                     notified_stopped: false, notified_continued: false,
-                    is_linux: p_proc.is_linux,
-                    syscall_trace: p_proc.syscall_trace,
-                    mem_frames: p_proc.mem_frames,
+                    is_linux: parent_misc.0,
+                    syscall_trace: parent_misc.1,
+                    mem_frames: parent_misc.2,
                     vfork_waiting_for_child: None,
                     vfork_shared_mm_with_parent: None,
-                    cwd: p_proc.cwd,
-                    cwd_len: p_proc.cwd_len,
-                    pgid: p_proc.pgid,
-                    sid: p_proc.sid,
-                    dynamic_linker_aux: p_proc.dynamic_linker_aux,
-                    umask: p_proc.umask,
-                    supplementary_groups: p_proc.supplementary_groups,
-                    supplementary_groups_len: p_proc.supplementary_groups_len,
+                    cwd: parent_misc.3,
+                    cwd_len: parent_misc.4,
+                    pgid: parent_misc.5,
+                    sid: parent_misc.6,
+                    dynamic_linker_aux: parent_misc.7,
+                    umask: parent_misc.8,
+                    supplementary_groups: parent_misc.9,
+                    supplementary_groups_len: parent_misc.10,
                 }));
 
                 let mut child = Process::new(child_pid, child_proc_obj);
@@ -1412,8 +1455,10 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.tgid = child_pid;
                 child.state = ProcessState::Blocked;
                 child.kernel_stack_top = kernel_stack_top_aligned;
-                child.fs_base = parent.fs_base;
-                child.gs_base = parent.gs_base;
+                // For clone(CLONE_SETTLS) we must honor the TLS base coming from the syscall context.
+                // Even for plain fork, parent_context.fs_base should match the parent's current FS_BASE.
+                child.fs_base = parent_context.fs_base;
+                child.gs_base = parent_context.gs_base;
                 child.priority = parent.priority;
                 child.vruntime = parent.vruntime;
                 child.weight = parent.weight;
@@ -1429,6 +1474,14 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.context.rsp = kstack_ptr as u64;
                 child.context.rax = 0; // fork() returns 0 in child
                 
+                // Fix up the child's FD table index now that slot_idx is known.
+                // Without this, parent and child would share the same FD table slot,
+                // causing silent FD corruption and random hangs right after fork().
+                {
+                    let proc = child.proc.lock();
+                    proc.resources.lock().fd_table_idx = slot_idx;
+                }
+
                 *slot = Some(child);
                 crate::ipc::register_pid_slot(child_pid, slot_idx);
                 return Some(child_pid);
@@ -1438,8 +1491,92 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     });
 
     let child_pid = result?;
+    crate::serial::serial_printf(format_args!(
+        "[fork] parent={} child={} before fd_clone_for_fork\n",
+        current_pid, child_pid
+    ));
     crate::fd::fd_clone_for_fork(current_pid, child_pid);
+    crate::serial::serial_printf(format_args!(
+        "[fork] parent={} child={} after fd_clone_for_fork\n",
+        current_pid, child_pid
+    ));
     Some(child_pid)
+}
+
+/// clone(CLONE_THREAD|CLONE_VM|CLONE_FILES|CLONE_SIGHAND|...): create a new thread (TID)
+/// sharing the same `Proc` (tgid/resources/fd table) as the parent.
+pub fn clone_thread_process(
+    parent_pid: ProcessId,
+    child_user_context: &Context,
+    clear_child_tid: u64,
+    set_child_tid: u64,
+) -> Option<ProcessId> {
+    let parent = get_process(parent_pid)?;
+    let parent_tgid = parent.tgid;
+    let parent_proc = Arc::clone(&parent.proc);
+
+    let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
+    let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+
+    let kstack_ptr = unsafe {
+        let mut p = kernel_stack_top_aligned as *mut u64;
+        p = p.offset(-1); *p = 0x23;                        // SS
+        p = p.offset(-1); *p = child_user_context.rsp;      // RSP
+        p = p.offset(-1); *p = child_user_context.rflags;   // RFLAGS
+        p = p.offset(-1); *p = 0x1b;                        // CS
+        p = p.offset(-1); *p = child_user_context.rip;      // RIP
+        p
+    };
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        let mut next_pid = NEXT_PID.lock();
+
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    && p.current_cpu == NO_CPU);
+            if !slot_available {
+                continue;
+            }
+
+            let child_tid = *next_pid;
+            *next_pid += 1;
+
+            let mut child = Process::new(child_tid, Arc::clone(&parent_proc));
+            child.kernel_stack = Some(kernel_stack);
+            child.kernel_stack_top = kernel_stack_top_aligned;
+            child.tgid = parent_tgid;
+            child.state = ProcessState::Blocked;
+
+            // Inherit scheduler-ish fields from parent.
+            child.priority = parent.priority;
+            child.vruntime = parent.vruntime;
+            child.weight = parent.weight;
+            child.time_slice = parent.time_slice;
+            child.cpu_affinity = parent.cpu_affinity;
+            child.signal_mask = parent.signal_mask;
+            child.sigaltstack = parent.sigaltstack;
+
+            // Thread-specific user context: child returns 0 from clone().
+            child.fs_base = child_user_context.fs_base;
+            child.gs_base = child_user_context.gs_base;
+
+            child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
+            child.context.rsp = kstack_ptr as u64;
+            child.context.rax = 0;
+
+            child.clear_child_tid = clear_child_tid;
+            child.set_child_tid = set_child_tid;
+
+            *slot = Some(child);
+            crate::ipc::register_pid_slot(child_tid, slot_idx);
+            return Some(child_tid);
+        }
+        None
+    })
 }
 
 /// `clone(CLONE_VM|CLONE_VFORK|…)` sin `CLONE_THREAD`: hijo comparte el mismo `ProcessResources`

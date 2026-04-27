@@ -2331,7 +2331,28 @@ extern "C" fn syscall_handler_rust(
     arg5: u64,
     arg6: u64,
     context: &mut SyscallContext,
+    frame_rbp: u64,
 ) -> u64 {
+    // `syscall_entry` builds an IRETQ frame on the kernel stack:
+    //   [rbp+8]  = RIP
+    //   [rbp+16] = CS
+    //   [rbp+24] = RFLAGS
+    //   [rbp+32] = RSP
+    //   [rbp+40] = SS
+    //
+    // The `context` pointer passed from assembly points to the saved GPR block
+    // (starting at r15) *below* RBP; it does NOT include RIP/RFLAGS/etc. If we
+    // leave these fields uninitialized, syscalls like fork/clone may see RIP=0
+    // and return the child to address 0x0.
+    unsafe {
+        let frame = frame_rbp as *const u64;
+        context.rip = frame.add(1).read_unaligned();
+        context.cs = frame.add(2).read_unaligned();
+        context.rflags = frame.add(3).read_unaligned();
+        context.rsp = frame.add(4).read_unaligned();
+        context.ss = frame.add(5).read_unaligned();
+    }
+
     crate::syscalls::syscall_handler(
         syscall_num,
         arg1,
@@ -2385,12 +2406,16 @@ unsafe extern "C" fn syscall_int80() {
         
         // Pasar puntero al contexto y arg6 en el stack
         "lea rax, [rbp - 112]", // Dirección de r15 (Context)
-        "push rax",             // 8º argumento
-        "push qword ptr [rbp - 64]", // 7º argumento (arg6 = saved r9)
+        // 9º argumento: RBP del frame (para localizar RIP/RFLAGS/RSP del IRET frame)
+        "push rbp",
+        // 8º argumento: puntero al bloque de GPRs (context)
+        "push rax",
+        // 7º argumento: arg6 = saved r9
+        "push qword ptr [rbp - 64]",
         
         "call {}",
         
-        "add rsp, 16", // Limpiar args en stack
+        "add rsp, 24", // Limpiar args en stack (arg6, context, frame_rbp)
         
         // Restaurar registros GP (ojo: RSP original está en RBP)
         "mov rsp, rbp",
@@ -2505,12 +2530,16 @@ unsafe extern "C" fn syscall_entry() {
         "mov r9, [rbp - 56]",   // arg5 = saved r8
         
         "lea rax, [rbp - 112]", // Context Ptr (address of r15)
-        "push rax",             // 8th arg (context)
-        "push qword ptr [rbp - 64]", // 7th arg (arg6 = saved r9)
+        // 9th arg: frame RBP (so Rust can find IRET frame)
+        "push rbp",
+        // 8th arg: context ptr (saved GPR block)
+        "push rax",
+        // 7th arg: arg6 = saved r9
+        "push qword ptr [rbp - 64]",
         
         "call {handler}",
         
-        "add rsp, 16", // Pop args
+        "add rsp, 24", // Pop args (arg6, context, frame_rbp)
         "mov rsp, rbp", // Restore stack to just after RBP push
         "sub rsp, 112", // Move to start of GPRs (r15)
         

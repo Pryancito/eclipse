@@ -349,6 +349,10 @@ pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
         Some(i) => i,
         None => return,
     };
+    crate::serial::serial_printf(format_args!(
+        "[fd_clone_for_fork] parent={} idx={} child={} idx={}\n",
+        parent_pid, parent_idx, child_pid, child_idx
+    ));
 
     // Collect FDs to dup before releasing the lock.
     let mut to_dup: [(usize, usize); MAX_FDS_PER_PROCESS] = [(0, 0); MAX_FDS_PER_PROCESS];
@@ -368,6 +372,10 @@ pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
     } // FD_TABLES lock released here
 
     // Notify each scheme that a handle has been inherited by the child (ref counting).
+    crate::serial::serial_printf(format_args!(
+        "[fd_clone_for_fork] dup_count={}\n",
+        dup_count
+    ));
     for i in 0..dup_count {
         let _ = crate::scheme::dup(to_dup[i].0, to_dup[i].1);
     }
