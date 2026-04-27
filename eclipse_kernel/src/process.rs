@@ -209,7 +209,7 @@ impl Process {
         Process {
             id,
             tgid: id,
-            state: ProcessState::Ready,
+            state: ProcessState::Blocked,
             context: Context::new(),
             stack_base: 0,
             stack_size: 0,
@@ -760,8 +760,23 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
         loaded.tls_base,
         loaded.dynamic_linker,
     ) {
+        crate::serial::serial_print("[debug] spawn_process: entering post-create block\n");
         x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::serial::serial_print("[debug] spawn_process: taking table lock\n");
             let mut table = PROCESS_TABLE.lock();
+            crate::serial::serial_print("[debug] spawn_process: table lock acquired\n");
+            let mut parent_info = None;
+            if let Some(parent_pid) = current_process_id() {
+                // Find parent in the ALREADY LOCKED table to avoid recursive deadlock
+                for p_entry in table.iter().flatten() {
+                    if p_entry.id == parent_pid {
+                        let p_proc = p_entry.proc.lock();
+                        parent_info = Some((p_proc.pgid, p_proc.sid, p_proc.cwd, p_proc.cwd_len));
+                        break;
+                    }
+                }
+            }
+
             if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                 if let Some(p) = table[slot].as_mut() {
                     let mut proc = p.proc.lock();
@@ -769,14 +784,11 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                     proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
                     proc.mem_frames += loaded.segment_frames;
                     
-                    if let Some(parent_pid) = current_process_id() {
-                        if let Some(parent) = get_process(parent_pid) {
-                            let p_proc = parent.proc.lock();
-                            proc.pgid = p_proc.pgid;
-                            proc.sid = p_proc.sid;
-                            proc.cwd = p_proc.cwd;
-                            proc.cwd_len = p_proc.cwd_len;
-                        }
+                    if let Some((pgid, sid, cwd, cwd_len)) = parent_info {
+                        proc.pgid = pgid;
+                        proc.sid = sid;
+                        proc.cwd = cwd;
+                        proc.cwd_len = cwd_len;
                     }
                 }
             }

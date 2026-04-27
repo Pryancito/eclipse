@@ -3,6 +3,7 @@ use crate::drm;
 use crate::serial;
 use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::collections::BTreeMap;
 use spin::Mutex;
 
 /// Virtual encoder ID used for the single simulated display path (encoder → CRTC 200).
@@ -30,6 +31,24 @@ struct DrmResource {
 }
 
 static OPEN_RESOURCES: Mutex<Vec<Option<DrmResource>>> = Mutex::new(Vec::new());
+
+/// User-created property blobs (MODE_ID, etc.).
+/// Key: blob_id, Value: raw bytes.
+static PROP_BLOBS: Mutex<BTreeMap<u32, Vec<u8>>> = Mutex::new(BTreeMap::new());
+static NEXT_BLOB_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+#[derive(Clone, Copy)]
+struct KmsState {
+    connector_crtc_id: u32,
+    crtc_active: u64,
+    crtc_mode_blob_id: u32,
+}
+
+static KMS_STATE: Mutex<KmsState> = Mutex::new(KmsState {
+    connector_crtc_id: 0,
+    crtc_active: 0,
+    crtc_mode_blob_id: 0,
+});
 
 fn alloc_resource(kind: DrmResourceKind) -> usize {
     let resource = DrmResource { kind, ref_count: 1 };
@@ -134,6 +153,10 @@ impl Scheme for DrmScheme {
         // Atomic KMS commit ioctl. Even if we don't fully support it yet,
         // the number must match Linux for correct feature probing.
         const DRM_IOCTL_MODE_ATOMIC: u32 = 0xC03864BC;
+        // Property blobs (MODE_ID, etc.)
+        // Linux: DRM_IOWR(0xBD, struct drm_mode_create_blob) and DRM_IOWR(0xBE, struct drm_mode_destroy_blob)
+        const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = 0xC01064BD;
+        const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = 0xC00464BE;
 
         // DRM leases (used by wlroots allocator path)
         const DRM_IOCTL_MODE_CREATE_LEASE: u32 = 0xC01864C6;
@@ -316,10 +339,8 @@ impl Scheme for DrmScheme {
                     1 => Ok(0),
                     // DRM_CLIENT_CAP_UNIVERSAL_PLANES (2)
                     2 => Ok(0),
-                    // DRM_CLIENT_CAP_ATOMIC (3): reject — DRM_IOCTL_MODE_ATOMIC is not
-                    // implemented; returning EINVAL here forces wlroots to fall back to
-                    // the legacy modesetting interface which IS supported.
-                    3 => Err(scheme_error::EINVAL),
+                    // DRM_CLIENT_CAP_ATOMIC (3)
+                    3 => Ok(0),
                     // DRM_CLIENT_CAP_ASPECT_RATIO (4)
                     4 => Ok(0),
                     // DRM_CLIENT_CAP_WRITEBACK_CONNECTORS (5)
@@ -752,90 +773,6 @@ impl Scheme for DrmScheme {
                     Err(scheme_error::EIO)
                 }
             }
-            DRM_IOCTL_MODE_GETPROPERTY => {
-                #[repr(C)]
-                struct DrmModeGetProperty {
-                    values_ptr: u64, enum_blob_ptr: u64,
-                    prop_id: u32, flags: u32,
-                    name: [u8; 32],
-                    count_values: u32, count_enum_blobs: u32,
-                }
-                let prop = unsafe { &mut *(arg as *mut DrmModeGetProperty) };
-                match prop.prop_id {
-                    1 => { // EDID
-                        let name = b"EDID\0";
-                        prop.name[..name.len()].copy_from_slice(name);
-                        prop.flags = 0x10; // DRM_MODE_PROP_BLOB
-                        prop.count_values = 0;
-                        prop.count_enum_blobs = 0;
-                        Ok(0)
-                    }
-                    2 => { // DPMS
-                        let name = b"DPMS\0";
-                        prop.name[..name.len()].copy_from_slice(name);
-                        prop.flags = 0x8; // DRM_MODE_PROP_ENUM
-                        prop.count_values = 4;
-                        Ok(0)
-                    }
-                    3 => { // type (for planes)
-                        let name = b"type\0";
-                        prop.name[..name.len()].copy_from_slice(name);
-                        prop.flags = 0x48; // DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE
-                        prop.count_values = 3;
-                        Ok(0)
-                    }
-                    _ => Err(scheme_error::ENOENT),
-                }
-            }
-            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
-                #[repr(C)]
-                struct DrmModeObjGetProps {
-                    props_ptr: u64, prop_values_ptr: u64,
-                    count_props: u32, obj_id: u32, obj_type: u32,
-                }
-                let o = unsafe { &mut *(arg as *mut DrmModeObjGetProps) };
-                let (props, values) = match o.obj_type {
-                    0xc0000000 => { // Connector
-                        (alloc::vec![1, 2], alloc::vec![10, 0]) // EDID=blob 10, DPMS=0
-                    }
-                    0xeeeeeeee => { // Plane
-                        (alloc::vec![3], alloc::vec![1]) // type=Primary
-                    }
-                    _ => (alloc::vec![], alloc::vec![]),
-                };
-
-                if o.props_ptr != 0 && o.prop_values_ptr != 0 && o.count_props >= props.len() as u32 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(props.as_ptr(), o.props_ptr as *mut u32, props.len());
-                        core::ptr::copy_nonoverlapping(values.as_ptr(), o.prop_values_ptr as *mut u64, values.len());
-                    }
-                }
-                o.count_props = props.len() as u32;
-                Ok(0)
-            }
-            DRM_IOCTL_MODE_GETPROPBLOB => {
-                #[repr(C)]
-                struct DrmModeGetBlob {
-                    blob_id: u32, length: u32, data: u64,
-                }
-                let b = unsafe { &mut *(arg as *mut DrmModeGetBlob) };
-                if b.blob_id == 10 { // Our fake EDID blob
-                    let edid = [0u8; 128]; // Minimal empty EDID
-                    if b.data != 0 && b.length >= 128 {
-                        unsafe { core::ptr::copy_nonoverlapping(edid.as_ptr(), b.data as *mut u8, 128); }
-                    }
-                    b.length = 128;
-                    Ok(0)
-                } else {
-                    Err(scheme_error::ENOENT)
-                }
-            }
-            DRM_IOCTL_MODE_ATOMIC => {
-                // Linux: struct drm_mode_atomic { flags(u32), count_objs(u32), objs_ptr(u64), count_props_ptr(u64),
-                //                                props_ptr(u64), prop_values_ptr(u64), reserved(u64), user_data(u64) }
-                // For now we don't implement atomic KMS; return ENOSYS so userspace can fall back when configured.
-                Err(scheme_error::ENOSYS)
-            }
             DRM_IOCTL_MODE_CREATE_LEASE => {
                 // Linux UAPI (include/uapi/drm/drm_mode.h): struct drm_mode_create_lease
                 // On success the kernel ioctl returns 0 and fills lessee_id + fd in the struct.
@@ -928,13 +865,30 @@ impl Scheme for DrmScheme {
                 }
             }
             DRM_IOCTL_MODE_GETPROPBLOB => {
-                // struct drm_mode_get_blob { uint32_t blob_id; uint32_t length; uint64_t data; }
-                // Return blob not found for any unknown blob id
                 #[repr(C)]
                 struct DrmModeGetBlob { blob_id: u32, length: u32, data: u64 }
                 let blob = unsafe { &mut *(arg as *mut DrmModeGetBlob) };
-                blob.length = 0;
-                Ok(0)
+                // EDID (optional): return minimal dummy EDID if requested
+                if blob.blob_id == 10 {
+                    let edid = [0u8; 128];
+                    if blob.data != 0 && blob.length >= 128 {
+                        unsafe { core::ptr::copy_nonoverlapping(edid.as_ptr(), blob.data as *mut u8, 128); }
+                    }
+                    blob.length = 128;
+                    return Ok(0);
+                }
+
+                // User-created blobs (MODE_ID, etc.)
+                let blobs = PROP_BLOBS.lock();
+                if let Some(data) = blobs.get(&blob.blob_id) {
+                    if blob.data != 0 && blob.length >= data.len() as u32 {
+                        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), blob.data as *mut u8, data.len()); }
+                    }
+                    blob.length = data.len() as u32;
+                    Ok(0)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
                 #[repr(C)]
@@ -1007,10 +961,9 @@ impl Scheme for DrmScheme {
                             PROP_CRTC_GAMMA_LUT_SIZE,
                             PROP_CRTC_VRR_ENABLED,
                         ];
-                        // Minimal defaults: inactive until modeset; others 0.
-                        let _ = obj_id;
-                        vals_small[0] = 0; // ACTIVE
-                        vals_small[1] = 0; // MODE_ID
+                        let st = *KMS_STATE.lock();
+                        vals_small[0] = st.crtc_active; // ACTIVE
+                        vals_small[1] = st.crtc_mode_blob_id as u64; // MODE_ID
                         vals_small[2] = 0; // GAMMA_LUT
                         vals_small[3] = 0; // GAMMA_LUT_SIZE
                         vals_small[4] = 0; // VRR_ENABLED
@@ -1019,8 +972,9 @@ impl Scheme for DrmScheme {
                     }
                     DRM_MODE_OBJECT_CONNECTOR => {
                         const IDS: [u32; 2] = [PROP_CONN_CRTC_ID, PROP_CONN_EDID];
-                        vals_small[0] = 0; // CRTC_ID
-                        vals_small[1] = 0; // EDID blob id (not implemented)
+                        let st = *KMS_STATE.lock();
+                        vals_small[0] = st.connector_crtc_id as u64; // CRTC_ID
+                        vals_small[1] = 10; // EDID blob id (dummy)
                         prop_ids = &IDS;
                         prop_vals = &vals_small[..IDS.len()];
                     }
@@ -1171,6 +1125,183 @@ impl Scheme for DrmScheme {
                     }
                 }
 
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_CREATEPROPBLOB => {
+                // Linux UAPI: struct drm_mode_create_blob { __u64 data; __u32 length; __u32 blob_id; }
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct DrmModeCreateBlob {
+                    data: u64,
+                    length: u32,
+                    blob_id: u32,
+                }
+                let ptr = arg as u64;
+                if !crate::syscalls::is_user_pointer(ptr, core::mem::size_of::<DrmModeCreateBlob>() as u64) {
+                    return Err(scheme_error::EFAULT);
+                }
+                let mut req = unsafe { (ptr as *const DrmModeCreateBlob).read_unaligned() };
+                if req.length == 0 || req.data == 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+                if !crate::syscalls::is_user_pointer(req.data, req.length as u64) {
+                    return Err(scheme_error::EFAULT);
+                }
+
+                let blob_id = NEXT_BLOB_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let mut v = Vec::with_capacity(req.length as usize);
+                unsafe {
+                    v.set_len(req.length as usize);
+                    core::ptr::copy_nonoverlapping(req.data as *const u8, v.as_mut_ptr(), req.length as usize);
+                }
+                PROP_BLOBS.lock().insert(blob_id, v);
+                req.blob_id = blob_id;
+                unsafe { (ptr as *mut DrmModeCreateBlob).write_unaligned(req) };
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_DESTROYPROPBLOB => {
+                // Linux UAPI: struct drm_mode_destroy_blob { __u32 blob_id; }
+                let ptr = arg as u64;
+                if !crate::syscalls::is_user_pointer(ptr, 4) {
+                    return Err(scheme_error::EFAULT);
+                }
+                let blob_id = unsafe { (ptr as *const u32).read_unaligned() };
+                PROP_BLOBS.lock().remove(&blob_id);
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_ATOMIC => {
+                // Linux: struct drm_mode_atomic
+                // { flags(u32), count_objs(u32), objs_ptr(u64), count_props_ptr(u64),
+                //   props_ptr(u64), prop_values_ptr(u64), reserved(u64), user_data(u64) }
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct DrmModeAtomic {
+                    flags: u32,
+                    count_objs: u32,
+                    objs_ptr: u64,
+                    count_props_ptr: u64,
+                    props_ptr: u64,
+                    prop_values_ptr: u64,
+                    reserved: u64,
+                    user_data: u64,
+                }
+
+                // Flags (subset) from drm_mode.h
+                const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x00000100;
+
+                let ptr = arg as u64;
+                if !crate::syscalls::is_user_pointer(ptr, core::mem::size_of::<DrmModeAtomic>() as u64) {
+                    return Err(scheme_error::EFAULT);
+                }
+                let req = unsafe { (ptr as *const DrmModeAtomic).read_unaligned() };
+
+                if req.count_objs == 0 {
+                    return Ok(0);
+                }
+                if req.objs_ptr == 0 || req.count_props_ptr == 0 || req.props_ptr == 0 || req.prop_values_ptr == 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+
+                let objs_len = (req.count_objs as usize) * core::mem::size_of::<u32>();
+                let counts_len = (req.count_objs as usize) * core::mem::size_of::<u32>();
+                if !crate::syscalls::is_user_pointer(req.objs_ptr, objs_len as u64)
+                    || !crate::syscalls::is_user_pointer(req.count_props_ptr, counts_len as u64)
+                {
+                    return Err(scheme_error::EFAULT);
+                }
+
+                // Read object IDs and per-object prop counts.
+                let mut obj_ids: Vec<u32> = Vec::with_capacity(req.count_objs as usize);
+                let mut prop_counts: Vec<u32> = Vec::with_capacity(req.count_objs as usize);
+                unsafe {
+                    obj_ids.set_len(req.count_objs as usize);
+                    prop_counts.set_len(req.count_objs as usize);
+                    core::ptr::copy_nonoverlapping(req.objs_ptr as *const u32, obj_ids.as_mut_ptr(), obj_ids.len());
+                    core::ptr::copy_nonoverlapping(req.count_props_ptr as *const u32, prop_counts.as_mut_ptr(), prop_counts.len());
+                }
+
+                let total_props: usize = prop_counts.iter().map(|&c| c as usize).sum();
+                if total_props == 0 {
+                    return Ok(0);
+                }
+
+                let props_len = total_props * core::mem::size_of::<u32>();
+                let vals_len = total_props * core::mem::size_of::<u64>();
+                if !crate::syscalls::is_user_pointer(req.props_ptr, props_len as u64)
+                    || !crate::syscalls::is_user_pointer(req.prop_values_ptr, vals_len as u64)
+                {
+                    return Err(scheme_error::EFAULT);
+                }
+
+                let mut prop_ids: Vec<u32> = Vec::with_capacity(total_props);
+                let mut prop_vals: Vec<u64> = Vec::with_capacity(total_props);
+                unsafe {
+                    prop_ids.set_len(total_props);
+                    prop_vals.set_len(total_props);
+                    core::ptr::copy_nonoverlapping(req.props_ptr as *const u32, prop_ids.as_mut_ptr(), total_props);
+                    core::ptr::copy_nonoverlapping(req.prop_values_ptr as *const u64, prop_vals.as_mut_ptr(), total_props);
+                }
+
+                // Apply the commit (very small subset) so wlroots can modeset via atomic.
+                // We support: connector CRTC_ID, CRTC ACTIVE/MODE_ID, primary plane FB_ID/CRTC_ID/src/dst.
+                let mut st = KMS_STATE.lock();
+                let mut cursor = 0usize;
+                let mut pending_fb: Option<u32> = None;
+                let mut pending_plane: Option<(u32, u32, i32, i32, u32, u32, u32, u32, u32, u32)> = None;
+
+                for (obj_i, &obj) in obj_ids.iter().enumerate() {
+                    let n = prop_counts.get(obj_i).copied().unwrap_or(0) as usize;
+                    for _ in 0..n {
+                        let pid = prop_ids.get(cursor).copied().unwrap_or(0);
+                        let val = prop_vals.get(cursor).copied().unwrap_or(0);
+                        cursor += 1;
+
+                        match pid {
+                            // Connector CRTC_ID
+                            0x200 => st.connector_crtc_id = val as u32,
+                            // CRTC ACTIVE
+                            0x100 => st.crtc_active = val,
+                            // CRTC MODE_ID
+                            0x101 => st.crtc_mode_blob_id = val as u32,
+
+                            // Plane properties
+                            0x301 => { pending_fb = Some(val as u32); }
+                            0x302 => {
+                                // Plane CRTC_ID; we infer primary plane id from obj.
+                                let _ = obj;
+                            }
+                            0x303 | 0x304 | 0x305 | 0x306 | 0x307 | 0x308 | 0x309 | 0x30A => {
+                                // Handled after we’ve collected everything; ignore here.
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Decode plane config from prop arrays (best-effort).
+                // wlroots sets SRC_* as 16.16 fixed point; we keep raw values.
+                // If anything is missing we still try a page flip.
+                if let Some(fb_id) = pending_fb {
+                    // Default full-screen, top-left.
+                    let (w, h) = crate::boot::get_fb_info()
+                        .map(|(_, w, h, _, _, _)| (w as u32, h as u32))
+                        .unwrap_or((640, 480));
+                    pending_plane = Some((300, st.connector_crtc_id, 0, 0, w, h, 0, 0, w << 16, h << 16));
+                    pending_fb = Some(fb_id);
+                }
+
+                let is_test = (req.flags & DRM_MODE_ATOMIC_TEST_ONLY) != 0;
+                if is_test {
+                    return Ok(0);
+                }
+                drop(st);
+
+                if let (Some(fb_id), Some((plane_id, crtc_id, x, y, w, h, src_x, src_y, src_w, src_h))) =
+                    (pending_fb, pending_plane)
+                {
+                    // In our minimal KMS, setting the primary plane is equivalent to presenting.
+                    let _ = drm::set_plane(plane_id, crtc_id, fb_id, x, y, w, h, src_x, src_y, src_w, src_h);
+                }
                 Ok(0)
             }
             DRM_IOCTL_GET_MAGIC => {

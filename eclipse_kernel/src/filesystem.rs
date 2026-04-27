@@ -257,7 +257,10 @@ impl Filesystem {
 
     unsafe {
         if FS.mounted {
-            return Err("Filesystem already mounted");
+            // Make mount idempotent. Userspace filesystem_service may try to mount
+            // the discovered root even if the kernel already mounted it earlier
+            // during boot probing.
+            return Ok(());
         }
         
         serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
@@ -325,59 +328,6 @@ impl Filesystem {
                 FS.header = Some(header.clone());
                 FS.mounted = true;
                 
-                // Initialize LFS: find the highest offset to set log_tail correctly
-                FS.use_lfs = true;
-                let mut highest_offset = header.inode_table_offset + header.inode_table_size;
-                
-                serial::serial_print("[FS] Scanning inode table for log_tail (optimized)...\n");
-                let chunk_size = 64 * 1024; // 64KB per read (4096 inodes)
-                let entries_per_chunk = chunk_size / constants::INODE_TABLE_ENTRY_SIZE;
-                let mut chunk_buf = vec![0u8; chunk_size];
-
-                for chunk_start in (0..header.total_inodes).step_by(entries_per_chunk) {
-                    let entries_in_chunk = core::cmp::min(entries_per_chunk as u32, header.total_inodes - chunk_start);
-                    let bytes_to_read = entries_in_chunk as usize * constants::INODE_TABLE_ENTRY_SIZE;
-                    
-                    let table_offset = header.inode_table_offset + (chunk_start as u64 * constants::INODE_TABLE_ENTRY_SIZE as u64);
-                    let abs_disk_offset = table_offset + (part_offset * BLOCK_SIZE as u64);
-                    
-                    if read_bytes_at(abs_disk_offset, &mut chunk_buf[..bytes_to_read]).is_ok() {
-                        for i in 0..entries_in_chunk {
-                            let entry_ptr = i as usize * constants::INODE_TABLE_ENTRY_SIZE;
-                            let offset = u64::from_le_bytes([
-                                chunk_buf[entry_ptr + 8], chunk_buf[entry_ptr + 9],
-                                chunk_buf[entry_ptr + 10], chunk_buf[entry_ptr + 11],
-                                chunk_buf[entry_ptr + 12], chunk_buf[entry_ptr + 13],
-                                chunk_buf[entry_ptr + 14], chunk_buf[entry_ptr + 15]
-                            ]);
-                            
-                            if offset != 0 {
-                                let abs_record_offset = header.inode_table_offset + header.inode_table_size + offset;
-                                // Need to know the record size to correctly set the tail.
-                                // We read the record header (first 8 bytes).
-                                let mut rec_header = [0u8; 8];
-                                let rec_abs_disk_offset = abs_record_offset + (part_offset * BLOCK_SIZE as u64);
-                                if read_bytes_at(rec_abs_disk_offset, &mut rec_header).is_ok() {
-                                    let record_size = u32::from_le_bytes([
-                                        rec_header[4], rec_header[5],
-                                        rec_header[6], rec_header[7]
-                                    ]) as u64;
-                                    
-                                    let end_offset = abs_record_offset + record_size;
-                                    if end_offset > highest_offset {
-                                        highest_offset = end_offset;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                FS.log_tail = (highest_offset + 4095) / 4096;
-                serial::serial_print("[FS] LFS Mode Enabled. Log Tail found at block ");
-                serial::serial_print_dec(FS.log_tail);
-                serial::serial_print("\n");
-
                 serial::serial_print("[FS] Filesystem mounted successfully.\n");
 
                 Ok(())

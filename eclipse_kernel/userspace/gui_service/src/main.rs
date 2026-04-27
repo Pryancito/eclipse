@@ -30,7 +30,11 @@ fn apply_wlroots_eclipse_env() {
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
     let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
     let _ = std::env::set_var("LIBINPUT_QUIRKS_DIR", "/usr/share/libinput");
-    //let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
+    // Bring-up default: allow pixman/software renderer if EGL/GBM isn't ready yet.
+    // If the user already set it, preserve their choice.
+    if std::env::var_os("WLR_RENDERER_ALLOW_SOFTWARE").is_none() {
+        let _ = std::env::set_var("WLR_RENDERER_ALLOW_SOFTWARE", "1");
+    }
 }
 
 /// labwc: `execve` directo. lunas se maneja en otra rama.

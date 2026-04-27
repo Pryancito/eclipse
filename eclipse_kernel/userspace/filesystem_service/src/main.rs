@@ -365,10 +365,8 @@ fn main() {
     }
 
     println!("[FS-SERVICE] Entering main loop...");
-    let ppid = unsafe { libc::getppid() };
-    if ppid > 0 {
-        let _ = libc::send_ipc(ppid as u32, 255, b"READY");
-    }
+    // IMPORTANT: no enviar otro READY aquí. Ya se envió READY temprano al arrancar.
+    // Mandar READY de nuevo confunde al init (puede estar esperando READY de otro servicio).
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

@@ -268,7 +268,8 @@ impl Scheme for DisplayScheme {
 // --- Input Scheme ---
 
 pub struct InputScheme {
-    queue: Mutex<VecDeque<u8>>,
+    kbd: Mutex<VecDeque<u8>>,
+    ptr: Mutex<VecDeque<u8>>,
 }
 
 impl InputScheme {
@@ -279,7 +280,8 @@ impl InputScheme {
 
     pub fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            kbd: Mutex::new(VecDeque::new()),
+            ptr: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -304,8 +306,17 @@ impl InputScheme {
 }
 
 impl Scheme for InputScheme {
-    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
-        Ok(0)
+    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        // Map common Linux-like nodes to stable IDs:
+        // - event0 / keyboard -> keyboard
+        // - event1 / mouse -> pointer
+        // - empty path (input:) is used by input_service as a write-only multiplexed endpoint
+        match path {
+            "" => Ok(2),
+            "keyboard" | "event0" => Ok(0),
+            "mouse" | "event1" => Ok(1),
+            _ => Ok(2),
+        }
     }
 
     fn read(&self, _id: usize, _buffer: &mut [u8], _offset: u64) -> Result<usize, usize> {
@@ -313,7 +324,11 @@ impl Scheme for InputScheme {
             return Ok(0);
         }
 
-        let mut q = self.queue.lock();
+        let mut q = match _id {
+            0 => self.kbd.lock(),
+            1 => self.ptr.lock(),
+            _ => return Ok(0),
+        };
         if q.is_empty() {
             return Ok(0);
         }
@@ -342,16 +357,26 @@ impl Scheme for InputScheme {
             return Ok(0);
         }
 
-        let mut q = self.queue.lock();
-        Self::trim_overflow(&mut q, aligned_len);
-        q.extend(&buf[..aligned_len]);
+        // Multiplex: route each 24-byte input_event by device_id (u32 at offset 0).
+        // Contract with userspace `InputEvent` in input_service: device_id 0=keyboard, 1=mouse/pointer.
+        for chunk in buf[..aligned_len].chunks_exact(Self::INPUT_EVENT_SIZE) {
+            let dev_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let mut q = if dev_id == 0 { self.kbd.lock() } else { self.ptr.lock() };
+            Self::trim_overflow(&mut q, Self::INPUT_EVENT_SIZE);
+            q.extend(chunk);
+        }
         Ok(aligned_len)
     }
 
     fn poll(&self, _id: usize, events: usize) -> Result<usize, usize> {
         let mut ready = 0;
         if (events & crate::scheme::event::POLLIN) != 0 {
-            if !self.queue.lock().is_empty() {
+            let has_data = match _id {
+                0 => !self.kbd.lock().is_empty(),
+                1 => !self.ptr.lock().is_empty(),
+                _ => false,
+            };
+            if has_data {
                 ready |= crate::scheme::event::POLLIN;
             }
         }
@@ -362,33 +387,157 @@ impl Scheme for InputScheme {
     }
 
     fn ioctl(&self, _id: usize, request: usize, arg: usize) -> Result<usize, usize> {
-        // Minimal evdev ioctls to satisfy libinput discovery
-        match request {
-            0x80044501 => { // EVIOCGVERSION
-                if crate::syscalls::is_user_pointer(arg as u64, 4) {
-                    unsafe { *(arg as *mut u32) = 0x010001; }
-                    Ok(0)
-                } else { Err(scheme_error::EFAULT) }
+        // evdev compatibility layer (x86_64 Linux ioctl encoding).
+        // Decode: dir(2) | size(14) | type(8) | nr(8)
+        let ty = ((request >> 8) & 0xFF) as u8;
+        let nr = (request & 0xFF) as u8;
+        let size = ((request >> 16) & 0x3FFF) as usize;
+
+        // Only handle 'E' (evdev) ioctls here.
+        if ty != 0x45 {
+            return Err(scheme_error::ENOSYS);
+        }
+
+        let dev_kind = match _id {
+            0 => 0, // keyboard
+            1 => 1, // pointer
+            _ => 1, // default to pointer-ish for writer handle
+        };
+
+        // Helpers
+        fn write_user(arg: usize, size: usize, src: &[u8]) -> Result<(), usize> {
+            if arg == 0 {
+                return Err(scheme_error::EFAULT);
             }
-            0x80084502 => { // EVIOCGID
-                if crate::syscalls::is_user_pointer(arg as u64, 8) {
-                    unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 8); }
-                    Ok(0)
-                } else { Err(scheme_error::EFAULT) }
+            if !crate::syscalls::is_user_pointer(arg as u64, size as u64) {
+                return Err(scheme_error::EFAULT);
             }
-            _ => {
-                // Return success for BIT queries (0x45 == 'E') to allow libinput probe
-                if (request >> 8) & 0xFF == 0x45 {
-                    return Ok(0);
+            unsafe {
+                core::ptr::write_bytes(arg as *mut u8, 0, size);
+                let n = core::cmp::min(size, src.len());
+                core::ptr::copy_nonoverlapping(src.as_ptr(), arg as *mut u8, n);
+            }
+            Ok(())
+        }
+
+        match nr {
+            // EVIOCGVERSION
+            0x01 => {
+                if !crate::syscalls::is_user_pointer(arg as u64, 4) {
+                    return Err(scheme_error::EFAULT);
                 }
-                Err(scheme_error::ENOSYS)
+                unsafe { *(arg as *mut u32) = 0x010001; } // EV_VERSION
+                Ok(0)
             }
+            // EVIOCGID (struct input_id: bustype,u16 vendor,u16 product,u16 version,u16)
+            0x02 => {
+                let mut id = [0u8; 8];
+                // bustype = BUS_VIRTUAL(0x06) as a harmless default
+                id[0..2].copy_from_slice(&(0x06u16).to_le_bytes());
+                // vendor/product/version left as 0
+                write_user(arg, 8, &id)?;
+                Ok(0)
+            }
+            // EVIOCGNAME(len)
+            0x06 => {
+                let name: &[u8] = if dev_kind == 0 { b"Eclipse Keyboard\0" } else { b"Eclipse Pointer\0" };
+                write_user(arg, size, name)?;
+                Ok(0)
+            }
+            // EVIOCGPHYS(len)
+            0x07 => {
+                let phys: &[u8] = if dev_kind == 0 { b"eclipse/input/keyboard0\0" } else { b"eclipse/input/pointer0\0" };
+                write_user(arg, size, phys)?;
+                Ok(0)
+            }
+            // EVIOCGUNIQ(len)
+            0x08 => {
+                let uniq = if dev_kind == 0 { b"kbd0\0" } else { b"ptr0\0" };
+                write_user(arg, size, uniq)?;
+                Ok(0)
+            }
+            // EVIOCGBIT(ev, len): nr = 0x20 + ev
+            n if (0x20..=0x3f).contains(&n) => {
+                let ev = (n - 0x20) as usize;
+                // Build bitmasks in Linux format: little-endian array of unsigned long bits.
+                // We keep it simple: return a byte array where each bit represents a code.
+                let mut out: Vec<u8> = Vec::new();
+                out.resize(size.max(1), 0u8);
+
+                // EV = 0: event types bitmask
+                if ev == 0 {
+                    // EV_SYN(0), EV_KEY(1)
+                    out[0] |= 1 << 0;
+                    out[0] |= 1 << 1;
+                    if dev_kind == 1 {
+                        // EV_REL(2)
+                        out[0] |= 1 << 2;
+                    }
+                } else if ev == 1 {
+                    // EV_KEY: key codes bitmask
+                    if dev_kind == 0 {
+                        // Mark a sane range of KEY_* as supported (0..=127).
+                        for code in 0u16..=127u16 {
+                            let idx = (code / 8) as usize;
+                            let bit = (code % 8) as u8;
+                            if idx < out.len() {
+                                out[idx] |= 1 << bit;
+                            }
+                        }
+                    } else {
+                        // Mouse buttons: BTN_LEFT(272), BTN_RIGHT(273), BTN_MIDDLE(274)
+                        for code in [272u16, 273u16, 274u16] {
+                            let idx = (code / 8) as usize;
+                            let bit = (code % 8) as u8;
+                            if idx < out.len() {
+                                out[idx] |= 1 << bit;
+                            }
+                        }
+                    }
+                } else if ev == 2 && dev_kind == 1 {
+                    // EV_REL: REL_X(0), REL_Y(1), REL_WHEEL(8)
+                    for code in [0u16, 1u16, 8u16] {
+                        let idx = (code / 8) as usize;
+                        let bit = (code % 8) as u8;
+                        if idx < out.len() {
+                            out[idx] |= 1 << bit;
+                        }
+                    }
+                }
+
+                write_user(arg, size, &out)?;
+                Ok(0)
+            }
+            // EVIOCGABS(abs): nr = 0x40 + abs
+            n if (0x40..=0x7f).contains(&n) => {
+                // Only meaningful for absolute devices; return zeros.
+                #[repr(C)]
+                struct InputAbsInfo {
+                    value: i32,
+                    minimum: i32,
+                    maximum: i32,
+                    fuzz: i32,
+                    flat: i32,
+                    resolution: i32,
+                }
+                let abs = InputAbsInfo { value: 0, minimum: 0, maximum: 0, fuzz: 0, flat: 0, resolution: 0 };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts((&abs as *const InputAbsInfo) as *const u8, core::mem::size_of::<InputAbsInfo>())
+                };
+                write_user(arg, size, bytes)?;
+                Ok(0)
+            }
+            _ => Err(scheme_error::ENOSYS),
         }
     }
 
     fn fstat(&self, _id: usize, stat: &mut Stat) -> Result<usize, usize> {
         stat.mode = 0o444 | 0x2000; // Character device, read-only (for userspace readers)
-        stat.size = self.queue.lock().len() as u64;
+        stat.size = match _id {
+            0 => self.kbd.lock().len() as u64,
+            1 => self.ptr.lock().len() as u64,
+            _ => 0,
+        };
         Ok(0)
     }
 
@@ -467,6 +616,7 @@ use spin::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {

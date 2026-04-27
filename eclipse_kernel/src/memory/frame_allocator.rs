@@ -110,10 +110,9 @@ impl BitMapFrameAllocator {
             let idx = (start + i) % self.total_frames;
             if self.is_free(idx) {
                 self.mark_used(idx);
-                self.last_allocated_index = idx;
                 USED_FRAMES.fetch_add(1, Ordering::SeqCst);
                 let phys = idx as u64 * 4096;
-                return Some(PhysFrame::from_start_address(PhysAddr::new(phys)).unwrap());
+                return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
             }
         }
         None

@@ -219,34 +219,38 @@ pub fn enqueue_process(pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let (target_cpu, vruntime, rt_deadline) = {
             let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[slot].as_mut() {
-                if p.id != pid { return; }
-                if p.state == ProcessState::Ready {
-                    return; // Already in a queue
-                }
-                if p.state == ProcessState::Running && p.current_cpu != crate::process::get_cpu_id() as u32 {
-                    return; // Running on another CPU
-                }
-                if p.state == ProcessState::Terminated {
+            if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+                if let Some(p) = table[slot].as_mut() {
+                    if p.id != pid { return; }
+                    if p.state == ProcessState::Ready {
+                        return; // Already in a queue
+                    }
+                    if p.state == ProcessState::Running && p.current_cpu != crate::process::get_cpu_id() as u32 {
+                        return; // Running on another CPU
+                    }
+                    if p.state == ProcessState::Terminated {
+                        return;
+                    }
+
+                    p.state = ProcessState::Ready;
+                    
+                    let active_cpus = crate::cpu::get_active_cpu_count();
+                    let _current_cpu = crate::process::get_cpu_id();
+
+                    let target = if let Some(aff) = p.cpu_affinity {
+                        aff as usize % MAX_CPUS
+                    } else if p.last_cpu != crate::process::NO_CPU {
+                        p.last_cpu as usize % MAX_CPUS
+                    } else {
+                        let next = NEW_PROC_RR_CPU.fetch_add(1, Ordering::Relaxed) as usize;
+                        next % active_cpus.max(1)
+                    };
+
+                    let rt_deadline = p.rt_params.as_ref().map(|rp| rp.next_deadline);
+                    (target, p.vruntime, rt_deadline)
+                } else {
                     return;
                 }
-
-                p.state = ProcessState::Ready;
-                
-                let active_cpus = crate::cpu::get_active_cpu_count();
-                let _current_cpu = crate::process::get_cpu_id();
-
-                let target = if let Some(aff) = p.cpu_affinity {
-                    aff as usize % MAX_CPUS
-                } else if p.last_cpu != crate::process::NO_CPU {
-                    p.last_cpu as usize % MAX_CPUS
-                } else {
-                    let next = NEW_PROC_RR_CPU.fetch_add(1, Ordering::Relaxed) as usize;
-                    next % active_cpus.max(1)
-                };
-
-                let rt_deadline = p.rt_params.as_ref().map(|rp| rp.next_deadline);
-                (target, p.vruntime, rt_deadline)
             } else {
                 return;
             }

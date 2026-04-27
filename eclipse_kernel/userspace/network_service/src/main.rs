@@ -508,6 +508,71 @@ fn main() {
         let _ = send_ipc(ppid as u32, 255, b"READY");
     }
 
+    let offline_ipc_loop = || -> ! {
+        // Mantener IPC vivo aunque no haya red; evita que otros servicios “dependientes”
+        // queden bloqueados o que init rehaga timeouts.
+        let mut offline_buf = [0u8; 1024];
+        loop {
+            let (len, sender_pid) = receive_ipc(&mut offline_buf);
+            if len > 0 {
+                let msg = &offline_buf[..len];
+                if msg.starts_with(b"GET_NET_EXT_STATS") {
+                    let stats = NetExtendedStats {
+                        lo_ipv4: [127, 0, 0, 1],
+                        lo_ipv4_prefix: 8,
+                        lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                        lo_ipv6_prefix: 128,
+                        lo_up: 1,
+                        eth0_ipv4: [0; 4],
+                        eth0_ipv4_prefix: 0,
+                        eth0_ipv6: [0; 16],
+                        eth0_ipv6_prefix: 0,
+                        eth0_up: 0,
+                        eth0_gateway: [0; 4],
+                        eth0_gateway_ipv6: [0; 16],
+                        eth0_dns: [0; 4],
+                        eth0_dns_ipv6: [0; 16],
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                    };
+                    let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
+                    resp[0..4].copy_from_slice(b"NEXS");
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &stats as *const _ as *const u8,
+                            resp.as_mut_ptr().add(4),
+                            core::mem::size_of::<NetExtendedStats>(),
+                        );
+                    }
+                    send_ipc(sender_pid, 0x08, &resp);
+                } else if msg.starts_with(b"GET_NET_STATS") {
+                    let mut resp = [0u8; 20];
+                    resp[0..4].copy_from_slice(b"NSTA");
+                    send_ipc(sender_pid, 0x08, &resp);
+                }
+            }
+            unsafe { sleep_ms(10); }
+        }
+    };
+
+    // Bringup: en este punto la inicialización real de red está causando PF (RIP=0)
+    // muy temprano (incluso antes de llegar al guard de smoltcp).
+    // Por defecto, mantenemos el servicio vivo SOLO para responder a IPC de estadísticas
+    // y evitar que el resto del sistema dependa de red durante el boot.
+    // Para habilitar el bringup real: export ECLIPSE_NET_ENABLE=1.
+    let enable_net = std::env::var("ECLIPSE_NET_ENABLE").ok().as_deref() == Some("1");
+    if !enable_net {
+        println!("[NETWORK-SERVICE] WARN: red deshabilitada (ECLIPSE_NET_ENABLE!=1). Offline IPC mode.");
+        offline_ipc_loop();
+    }
+
+    // Si todavía no tenemos un reloj monotónico funcional, smoltcp se comporta mal
+    // (y en tu caso actual termina en un RIP=0). Mejor degradar a “offline IPC”.
+    if get_now_ms() == 0 {
+        println!("[NETWORK-SERVICE] WARN: uptime_ms=0 (get_system_stats falló). Offline mode.");
+        offline_ipc_loop();
+    }
+
     // 1. Open the raw ethernet device
     let mut device = match RawEthernetDevice::new(0) {
         Some(d) => {
@@ -516,55 +581,22 @@ fn main() {
         }
         None => {
             println!("[NETWORK-SERVICE] ERROR: Could not open eth:0. Offline mode.");
-            // Still handle IPC so the compositor doesn't wait forever for stats.
-            let mut offline_buf = [0u8; 1024];
-            loop {
-                let (len, sender_pid) = receive_ipc(&mut offline_buf);
-                if len > 0 {
-                    let msg = &offline_buf[..len];
-                    if msg.starts_with(b"GET_NET_EXT_STATS") {
-                        let stats = NetExtendedStats {
-                            lo_ipv4: [127, 0, 0, 1],
-                            lo_ipv4_prefix: 8,
-                            lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                            lo_ipv6_prefix: 128,
-                            lo_up: 1,
-                            eth0_ipv4: [0; 4],
-                            eth0_ipv4_prefix: 0,
-                            eth0_ipv6: [0; 16],
-                            eth0_ipv6_prefix: 0,
-                            eth0_up: 0,
-                            eth0_gateway: [0; 4],
-                            eth0_gateway_ipv6: [0; 16],
-                            eth0_dns: [0; 4],
-                            eth0_dns_ipv6: [0; 16],
-                            rx_bytes: 0,
-                            tx_bytes: 0,
-                        };
-                        let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
-                        resp[0..4].copy_from_slice(b"NEXS");
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                &stats as *const _ as *const u8,
-                                resp.as_mut_ptr().add(4),
-                                core::mem::size_of::<NetExtendedStats>(),
-                            );
-                        }
-                        send_ipc(sender_pid, 0x08, &resp);
-                    } else if msg.starts_with(b"GET_NET_STATS") {
-                        let mut resp = [0u8; 20];
-                        resp[0..4].copy_from_slice(b"NSTA");
-                        // rx and tx are both zero in offline mode
-                        send_ipc(sender_pid, 0x08, &resp);
-                    }
-                }
-                unsafe { sleep_ms(10); }
-            }
+            offline_ipc_loop();
         }
     };
 
     // 2. Initialize the stack
     println!("[NETWORK-SERVICE] Initializing interfaces...");
+
+    // TODO(bringup): ahora mismo esta fase puede acabar en RIP=0 en Eclipse OS.
+    // Hasta depurarlo, dejamos el servicio en modo “IPC offline” por defecto.
+    // Para forzar smoltcp: export ECLIPSE_NET_SMOLTCP=1 en el entorno del servicio.
+    let enable_smoltcp = std::env::var("ECLIPSE_NET_SMOLTCP").ok().as_deref() == Some("1");
+    if !enable_smoltcp {
+        println!("[NETWORK-SERVICE] WARN: smoltcp deshabilitado (ECLIPSE_NET_SMOLTCP!=1). Offline mode.");
+        let _ = device; // mantener el descriptor abierto si hace falta debug; no usado aquí
+        offline_ipc_loop();
+    }
 
     // 2a. Loopback Interface
     let lo_config = Config::new(EthernetAddress([0, 0, 0, 0, 0, 0]).into());

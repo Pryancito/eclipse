@@ -230,11 +230,13 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
 
 /// Draw the startup logo using /dev/fb0 (open -> mmap -> draw). Used to test the /dev/fb0 path.
 fn draw_logo_via_dev_fb0(fb: &Framebuffer) -> bool {
-    const PATH: &str = "/dev/fb0";
-    let fd = match open_path(PATH) {
+    // En Eclipse OS, los nodos de dispositivo se exponen vía scheme `dev:`.
+    // `/dev/fb0` solo funcionará si el VFS monta un puente `/dev/* -> dev:*`.
+    // Para no bloquear el arranque, intentamos ambas rutas.
+    let fd = match open_path("/dev/fb0").or_else(|| open_path("dev:fb0")) {
         Some(f) => f,
         None => {
-            println!("[DISPLAY-SERVICE] draw_logo_via_dev_fb0: open(\"{}\") failed", PATH);
+            println!("[DISPLAY-SERVICE] draw_logo_via_dev_fb0: open(\"/dev/fb0\") y open(\"dev:fb0\") fallaron");
             return false;
         }
     };

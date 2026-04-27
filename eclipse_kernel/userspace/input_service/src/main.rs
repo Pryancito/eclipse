@@ -584,12 +584,9 @@ fn main() {
             }
         }
 
-        // Watchdog heartbeat para init (PID 1): cada 500ms para reducir tráfico IPC.
-        // Se usa uptime_ticks para que sea independiente de la carga o velocidad del bucle.
-        if stats.uptime_ticks >= heartbeat_last_ticks + 500 {
-            let _ = send_ipc(1, 0x40, b"HEART");
-            heartbeat_last_ticks = stats.uptime_ticks;
-        }
+        // No enviar heartbeats por IPC al init (PID 1). Durante el arranque init
+        // espera READY de otros servicios y cualquier mensaje extra complica el handshaking.
+        // Si necesitamos watchdog, se implementa como IPC dedicado o vía scheme, no aquí.
 
         // Sleep 1 ms so the kernel can HLT between polls.  A plain yield_cpu() returns
         // immediately when this is the only ready process, turning the loop into a
