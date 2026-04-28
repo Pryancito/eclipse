@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<openbox_menu>
+  <menu id="root-menu" label="Eclipse">
+    <item label="Terminal"><action name="Execute" command="eclipse-terminal"/></item>
+    <item label="Launcher"><action name="Execute" command="eclipse-launcher"/></item>
+    <item label="Files"><action name="Execute" command="eclipse-files"/></item>
+    <separator/>
+    <menu id="apps" label="Applications">
+      <item label="Editor"><action name="Execute" command="nano"/></item>
+      <item label="Browser"><action name="Execute" command="eclipse-browser"/></item>
+    </menu>
+    <separator/>
+    <item label="Reconfigure"><action name="Reconfigure"/></item>
+    <item label="Exit"><action name="Exit"/></item>
+  </menu>
+</openbox_menu>

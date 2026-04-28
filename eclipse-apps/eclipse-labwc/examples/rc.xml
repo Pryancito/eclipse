@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <core>
+    <decoration>server</decoration>
+    <gap>4</gap>
+    <adaptiveSync>no</adaptiveSync>
+    <reuseOutputMode>no</reuseOutputMode>
+  </core>
+
+  <theme>
+    <name>Default</name>
+    <cornerRadius>6</cornerRadius>
+    <font place="ActiveWindow" name="sans" size="10" slant="normal" weight="bold"/>
+    <font place="MenuItem"     name="sans" size="10"/>
+  </theme>
+
+  <focus>
+    <followMouse>no</followMouse>
+    <raiseOnFocus>yes</raiseOnFocus>
+  </focus>
+
+  <keyboard>
+    <keybind key="A-Tab"><action name="NextWindow"/></keybind>
+    <keybind key="A-S-Tab"><action name="PreviousWindow"/></keybind>
+    <keybind key="W-q"><action name="Close"/></keybind>
+    <keybind key="W-Up"><action name="Maximize"/></keybind>
+    <keybind key="W-Down"><action name="Iconify"/></keybind>
+    <keybind key="W-Return"><action name="Execute" command="eclipse-terminal"/></keybind>
+    <keybind key="W-d"><action name="Execute" command="eclipse-launcher"/></keybind>
+    <keybind key="C-A-Delete"><action name="Exit"/></keybind>
+    <keybind key="W-S-r"><action name="Reconfigure"/></keybind>
+    <keybind key="W-1"><action name="GoToDesktop" to="1"/></keybind>
+    <keybind key="W-2"><action name="GoToDesktop" to="2"/></keybind>
+    <keybind key="W-3"><action name="GoToDesktop" to="3"/></keybind>
+    <keybind key="W-4"><action name="GoToDesktop" to="4"/></keybind>
+  </keyboard>
+
+  <mouse>
+    <context name="Root">
+      <mousebind button="Right" action="Press"><action name="ShowMenu" menu="root-menu"/></mousebind>
+    </context>
+    <context name="Title">
+      <mousebind button="Left" action="Drag"><action name="Move"/></mousebind>
+      <mousebind button="Left" action="DoubleClick"><action name="ToggleMaximize"/></mousebind>
+    </context>
+    <context name="Frame">
+      <mousebind button="Left" action="Drag"><action name="Resize"/></mousebind>
+    </context>
+  </mouse>
+
+  <windowRules>
+    <windowRule identifier="firefox"><action name="Maximize"/></windowRule>
+  </windowRules>
+
+  <autostart>
+    <command>lunas-panel &amp;</command>
+  </autostart>
+</labwc_config>

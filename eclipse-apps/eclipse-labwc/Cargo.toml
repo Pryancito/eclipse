@@ -1,0 +1,103 @@
+## Eclipse-LabWC — clon de labwc 0.8 sobre **Smithay** nativo, adaptado a Eclipse OS.
+##
+## Ya no dependemos de `wayland-proto` ni `sidewind`. Usamos directamente:
+##   - `smithay`           → toda la implementación del compositor Wayland
+##   - `calloop`           → event loop
+##   - `xkbcommon`         → keysyms / mapas de teclado (vendored, sin libxkbcommon.so)
+##   - `drm` + `gbm`       → backend DRM/KMS (rust-drm, sin libdrm.so)
+##   - `input`             → libinput-rs (rust bindings, opcional)
+##   - `winit`             → backend de desarrollo en Linux host
+##   - `eclipse-syscall`   → syscalls del kernel Eclipse (proceso, fs, etc.)
+##   - `eclipse-relibc`    → libc Eclipse (open/read/socket/etc. → syscalls)
+##
+## En Eclipse OS, el `cfg(target_os = "eclipse")` reemplaza:
+##   - libc            → eclipse-relibc        (vía `[patch.crates-io]` del workspace)
+##   - rustix backend  → "libc" (forzado con RUSTFLAGS="--cfg rustix_use_libc")
+##   - eclipse_std     → con feature `std_compat` (no define lang items duplicados)
+## Esto es exactamente la ruta documentada en `docs/SMITHAY_INTEGRATION.md` y
+## `docs/WAYLAND_RS_ECLIPSE.md` del repo Eclipse OS.
+
+[package]
+name = "eclipse-labwc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Eclipse OS Team"]
+license = "MIT"
+description = "labwc 0.8 clone for Eclipse OS (Smithay-based)"
+
+# Aislamos del workspace eclipse-apps para que `cargo check` aquí no
+# arrastre los demás miembros (que asumen target Eclipse no_std).
+[workspace]
+
+[[bin]]
+name = "eclipse-labwc"
+path = "src/main.rs"
+
+[lib]
+name = "eclipse_labwc"
+path = "src/lib.rs"
+
+[dependencies]
+# Errors y logging
+anyhow = "1"
+tracing = "0.1"
+
+# Libc estándar (en target Eclipse, sustituido por eclipse-relibc via patch).
+libc = "0.2"
+
+# ── Smithay (compositor framework) ─────────────────────────────────────────
+# default-features = false: NO usamos los backends compilados de smithay
+# directamente; los habilitamos selectivamente para no arrastrar libudev/seatd
+# que no existen en Eclipse OS.
+smithay = { version = "0.7", default-features = false, features = [
+    "desktop",          # Window/Space/PopupManager (lo que usa labwc)
+    "wayland_frontend", # wayland-server + globals
+    "renderer_pixman",  # software renderer no_std-friendly
+    "xwayland",         # XWayland support
+    "backend_drm",      # DRM/KMS device + crtc
+    "backend_libinput", # libinput rust bindings
+    "backend_session",  # trait Session — implementamos EclipseSession en backend/session.rs
+    "backend_winit",    # solo para target host
+] }
+
+calloop      = "0.14"
+xkbcommon    = { version = "0.8", default-features = false }
+drm          = "0.14"
+gbm          = "0.18"
+input        = { version = "0.9", default-features = false }   # libinput-rs
+
+# Render
+tiny-skia    = { version = "0.11", default-features = false, features = ["no-std-float"] }
+pixman       = "0.2"
+
+# Datos / utilidades
+bitflags     = { version = "2.4", default-features = false }
+heapless     = "0.8"
+
+# Eclipse OS — kernel/FS layer.
+# IMPORTANTE: solo en target Eclipse (custom). En target Linux musl/gnu se usa libc/std normales.
+# Marcado opcional para que `cargo check` en host no requiera nightly+build-std.
+[target.'cfg(target_os = "eclipse")'.dependencies]
+eclipse-syscall = { path = "../../eclipse-syscall" }
+eclipse-relibc  = { path = "../../eclipse-relibc", features = ["allocator", "eclipse-syscall", "use_std"] }
+
+# ── Backend de desarrollo (host Linux) ─────────────────────────────────────
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = "0.30"
+
+[features]
+default = []
+trace-frames = []
+
+[package.metadata.eclipse]
+# Hint para el build.sh del workspace: este crate debe compilarse con:
+#   RUSTFLAGS="--cfg rustix_use_libc" cargo +nightly build \
+#       --target x86_64-unknown-eclipse \
+#       -Z build-std=core,alloc,std \
+#       -p eclipse-labwc --release
+#
+# El `[patch.crates-io]` del workspace ya redirige `libc` → `eclipse-relibc`
+# y los forks de `bitflags`/`errno`/`downcast-rs`/`wayland-sys` que viven en
+# `eclipse-apps/vendor/`.
+rustflags = "--cfg rustix_use_libc"
+target = "x86_64-unknown-eclipse"
