@@ -30,6 +30,14 @@ fn apply_wlroots_eclipse_env() {
     // Forzar el uso de /dev/dri/card0 para saltar el bucle de espera de udev en wlroots.
     let _ = std::env::set_var("WLR_DRM_DEVICES", "/dev/dri/card0");
     let _ = std::env::set_var("LIBINPUT_QUIRKS_DIR", "/usr/share/libinput");
+    // Fontconfig: algunos builds vienen con rutas absolutas del host embebidas.
+    // Forzamos el path runtime dentro del rootfs de Eclipse.
+    if std::env::var_os("FONTCONFIG_PATH").is_none() {
+        let _ = std::env::set_var("FONTCONFIG_PATH", "/etc/fonts");
+    }
+    if std::env::var_os("FONTCONFIG_FILE").is_none() {
+        let _ = std::env::set_var("FONTCONFIG_FILE", "/etc/fonts/fonts.conf");
+    }
     // Bring-up default: allow pixman/software renderer if EGL/GBM isn't ready yet.
     // If the user already set it, preserve their choice.
     if std::env::var_os("WLR_RENDERER_ALLOW_SOFTWARE").is_none() {
@@ -43,7 +51,9 @@ fn exec_wlroots_compositor() {
     apply_wlroots_eclipse_env();
     let path = CString::new(LABWC_EXEC_PATH).expect("labwc path");
     let arg0 = CString::new(LABWC_EXEC_PATH).expect("argv0");
-    let argv: [*const c_char; 2] = [arg0.as_ptr(), core::ptr::null()];
+    // `-d`: nivel de depuración de wlroots (WLR_DEBUG); necesario para el siguiente fallo tras Fontconfig.
+    let arg1 = CString::new("-d").expect("argv1");
+    let argv: [*const c_char; 3] = [arg0.as_ptr(), arg1.as_ptr(), core::ptr::null()];
     let envp = libc::environ_ptr();
     unsafe {
         let r = libc::execve(path.as_ptr(), argv.as_ptr(), envp);

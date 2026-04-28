@@ -1473,6 +1473,23 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
                 child.context.rsp = kstack_ptr as u64;
                 child.context.rax = 0; // fork() returns 0 in child
+
+                // Preserve user-visible GP registers across fork (Linux semantics):
+                // child returns with the same register state as parent, except RAX=0.
+                child.context.rbx = parent_context.rbx;
+                child.context.rcx = parent_context.rcx;
+                child.context.rdx = parent_context.rdx;
+                child.context.rsi = parent_context.rsi;
+                child.context.rdi = parent_context.rdi;
+                child.context.rbp = parent_context.rbp;
+                child.context.r8  = parent_context.r8;
+                child.context.r9  = parent_context.r9;
+                child.context.r10 = parent_context.r10;
+                child.context.r11 = parent_context.r11;
+                child.context.r12 = parent_context.r12;
+                child.context.r13 = parent_context.r13;
+                child.context.r14 = parent_context.r14;
+                child.context.r15 = parent_context.r15;
                 
                 // Fix up the child's FD table index now that slot_idx is known.
                 // Without this, parent and child would share the same FD table slot,
@@ -1528,6 +1545,21 @@ pub fn clone_thread_process(
         p = p.offset(-1); *p = child_user_context.rip;      // RIP
         p
     };
+    crate::serial::serial_printf(format_args!(
+        "[clone_thread] parent={} tgid={} child_rip={:#x} child_rsp={:#x} child_rflags={:#x} fs_base={:#x}\n",
+        parent_pid, parent_tgid, child_user_context.rip, child_user_context.rsp, child_user_context.rflags, child_user_context.fs_base
+    ));
+    unsafe {
+        crate::serial::serial_printf(format_args!(
+            "[clone_thread] iret @{:p}: RIP={:#x} CS={:#x} RFLAGS={:#x} RSP={:#x} SS={:#x}\n",
+            kstack_ptr,
+            *kstack_ptr,
+            *kstack_ptr.add(1),
+            *kstack_ptr.add(2),
+            *kstack_ptr.add(3),
+            *kstack_ptr.add(4),
+        ));
+    }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
@@ -1563,6 +1595,23 @@ pub fn clone_thread_process(
             // Thread-specific user context: child returns 0 from clone().
             child.fs_base = child_user_context.fs_base;
             child.gs_base = child_user_context.gs_base;
+
+            // Ensure user-visible GP registers match Linux semantics: on return from clone/fork
+            // the child sees the same register state as the parent except RAX=0.
+            child.context.rbx = child_user_context.rbx;
+            child.context.rcx = child_user_context.rcx;
+            child.context.rdx = child_user_context.rdx;
+            child.context.rsi = child_user_context.rsi;
+            child.context.rdi = child_user_context.rdi;
+            child.context.rbp = child_user_context.rbp;
+            child.context.r8  = child_user_context.r8;
+            child.context.r9  = child_user_context.r9;
+            child.context.r10 = child_user_context.r10;
+            child.context.r11 = child_user_context.r11;
+            child.context.r12 = child_user_context.r12;
+            child.context.r13 = child_user_context.r13;
+            child.context.r14 = child_user_context.r14;
+            child.context.r15 = child_user_context.r15;
 
             child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
             child.context.rsp = kstack_ptr as u64;

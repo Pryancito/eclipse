@@ -54,7 +54,27 @@ impl<T> ReentrantMutex<T> {
         ((state >> 32) as i32, (state & 0xFFFFFFFF) as u32)
     }
 
-    /// Get the current CPU's id for ownership tracking.
+    /// Current owner key for re-entrancy.
+    ///
+    /// IMPORTANT: this lock must remain re-entrant even if the scheduler migrates a task between
+    /// CPUs. Using only the CPU id can deadlock if a task acquires the lock, migrates, and then
+    /// tries to re-enter or unlock from another CPU.
+    ///
+    /// Strategy:
+    /// - Prefer the current process id (pid) when available.
+    /// - Fall back to CPU id early during boot / when no pid exists.
+    fn current_owner_key() -> u32 {
+        if let Some(pid) = crate::process::current_process_id() {
+            // 1-indexed so 0 still represents NO_CPU/unused in the packed state.
+            (pid as u32).wrapping_add(1)
+        } else {
+            // High-bit namespace for early/boot CPU-based ownership.
+            let cpu = crate::boot::get_cpu_id() as u32;
+            0x8000_0000u32 | cpu.wrapping_add(1)
+        }
+    }
+
+    /// Get the current CPU's id for debugging/telemetry.
     pub fn current_cpu() -> i32 {
         #[cfg(test)]
         {
@@ -84,7 +104,7 @@ impl<T> ReentrantMutex<T> {
     }
 
     pub fn lock(&self) -> ReentrantMutexGuard<'_, T> {
-        let me = (Self::current_cpu() as u32) + 1; // 1-indexed to allow 0 as NO_CPU
+        let me = Self::current_owner_key();
         loop {
             let current = self.state.load(Ordering::Acquire);
             let (owner_raw, depth) = Self::unpack(current);
@@ -110,7 +130,7 @@ impl<T> ReentrantMutex<T> {
     }
 
     pub fn try_lock(&self) -> Option<ReentrantMutexGuard<'_, T>> {
-        let me = (Self::current_cpu() as u32) + 1;
+        let me = Self::current_owner_key();
         let current = self.state.load(Ordering::Acquire);
         let (owner_raw, depth) = Self::unpack(current);
         let owner = owner_raw as u32;

@@ -143,17 +143,21 @@ fn read_bytes_at(abs_offset: u64, dest: &mut [u8]) -> Result<(), &'static str> {
     }
     let _lock = FILESYSTEM_LOCK.lock();
     unsafe {
-        if let Some(pid) = crate::process::current_process_id() {
-            let start_b = abs_offset / BLOCK_SIZE as u64;
-            let end_b = (abs_offset + dest.len() as u64 - 1) / BLOCK_SIZE as u64;
-            for block_num in start_b..=end_b {
-                if let Some(mut proc) = crate::process::get_process(pid) {
-                    proc.ai_profile.record_block_access(block_num);
-                    crate::process::update_process(pid, proc);
-                }
-            }
+        let trace_inode7_header = abs_offset >= 6_807_320 && abs_offset <= 6_807_420;
+        if trace_inode7_header {
+            serial::serial_printf(format_args!(
+                "[FS] read_bytes_at trace: enter abs_offset={} len={}\n",
+                abs_offset,
+                dest.len()
+            ));
         }
+        // NOTE: Avoid per-process profiling here. `read_bytes_at()` sits on hot VFS paths
+        // and is called while holding FILESYSTEM_LOCK. Touching process structures can
+        // re-enter filesystem/disk paths and deadlock.
 
+        if trace_inode7_header {
+            serial::serial_print("[FS] read_bytes_at trace: before scheme::read\n");
+        }
         match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, dest, abs_offset) {
             Ok(n) if n == dest.len() => Ok(()),
             Ok(n) => {
@@ -1009,11 +1013,26 @@ impl Filesystem {
     }
 
     pub fn inode_kind(inode: u32) -> Result<NodeKind, &'static str> {
+        if inode == 7 {
+            serial::serial_print("[FS] inode_kind trace: enter inode=7\n");
+        }
         let _lock = FILESYSTEM_LOCK.lock();
+        if inode == 7 {
+            serial::serial_print("[FS] inode_kind trace: lock acquired\n");
+        }
         let entry = Self::read_inode_entry(inode)?;
+        if inode == 7 {
+            serial::serial_printf(format_args!("[FS] inode_kind trace: inode_entry offset={}\n", entry.offset));
+        }
         let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
         let mut header_buf = [0u8; 8];
+        if inode == 7 {
+            serial::serial_printf(format_args!("[FS] inode_kind trace: read header @{}\n", abs_disk_offset));
+        }
         read_bytes_at(abs_disk_offset, &mut header_buf)?;
+        if inode == 7 {
+            serial::serial_print("[FS] inode_kind trace: header read OK\n");
+        }
         let raw_record_size = u32::from_le_bytes([
             header_buf[4], header_buf[5], header_buf[6], header_buf[7],
         ]) as usize;
@@ -1024,10 +1043,19 @@ impl Filesystem {
         } else {
             core::cmp::min(raw_record_size, 2 * BLOCK_SIZE)
         };
-        let mut scan_buf = vec![0u8; scan_len];
-        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
+
+        // Avoid heap allocation here: `inode_kind()` is used on hot paths (open/lookup),
+        // and allocator failures would otherwise hard-crash the kernel.
+        let mut scan_buf = [0u8; 2 * BLOCK_SIZE];
+        if inode == 7 {
+            serial::serial_printf(format_args!("[FS] inode_kind trace: read scan_len={} @{}\n", scan_len, abs_disk_offset));
+        }
+        read_bytes_at(abs_disk_offset, &mut scan_buf[..scan_len])?;
+        if inode == 7 {
+            serial::serial_print("[FS] inode_kind trace: scan read OK\n");
+        }
         let start = if raw_record_size < 8 { 16usize } else { 8usize };
-        if let Some(k) = Self::scan_node_type_from_buf(&scan_buf, start) {
+        if let Some(k) = Self::scan_node_type_from_buf(&scan_buf[..scan_len], start) {
             return Ok(match k {
                 1 => NodeKind::File,
                 2 => NodeKind::Directory,
@@ -1036,7 +1064,7 @@ impl Filesystem {
             });
         }
         if raw_record_size < 8 {
-            if let Some(k) = Self::scan_node_type_from_buf(&scan_buf, 8) {
+            if let Some(k) = Self::scan_node_type_from_buf(&scan_buf[..scan_len], 8) {
                 return Ok(match k {
                     1 => NodeKind::File,
                     2 => NodeKind::Directory,
@@ -1082,13 +1110,24 @@ impl Filesystem {
 
     fn lookup_path_recursive(path: &str, depth: usize) -> Result<u32, &'static str> {
         if depth > 32 { return Err("Too many symlink levels"); }
+        if path.ends_with("etc/fonts/fonts.conf") || path.ends_with("usr/etc/fonts/fonts.conf") {
+            serial::serial_printf(format_args!("[FS] lookup_path_recursive enter path='{}' depth={}\n", path, depth));
+        }
+
         let _lock = FILESYSTEM_LOCK.lock();
+
+        if path.ends_with("etc/fonts/fonts.conf") || path.ends_with("usr/etc/fonts/fonts.conf") {
+            serial::serial_print("[FS] lookup_path_recursive lock acquired\n");
+        }
         
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut current_inode = 1;
         
         for (i, part) in parts.iter().enumerate() {
             let is_last = i == parts.len() - 1;
+            if path.ends_with("etc/fonts/fonts.conf") || path.ends_with("usr/etc/fonts/fonts.conf") {
+                serial::serial_printf(format_args!("[FS] lookup step {} part='{}' inode={}\n", i, part, current_inode));
+            }
             
             // Standard lookup in current_inode (directory)
             let next_inode = {
@@ -1098,6 +1137,12 @@ impl Filesystem {
             };
 
             // Check if next_inode is a symlink
+            if path.ends_with("etc/fonts/fonts.conf") || path.ends_with("usr/etc/fonts/fonts.conf") {
+                serial::serial_printf(format_args!(
+                    "[FS] lookup next_inode={} (about to inode_kind)\n",
+                    next_inode
+                ));
+            }
             match Self::inode_kind(next_inode)? {
                 NodeKind::Symlink => {
                     let target = Self::read_symlink_target(next_inode)?;
@@ -1135,7 +1180,13 @@ impl Filesystem {
     }
 
     fn find_child_in_dir_btree(dir_inode: u32, name: &str) -> Result<u32, &'static str> {
-        // (Copied from existing lookup_path logic)
+        // NOTE: despite the name, this is currently implemented as a **linear** scan over
+        // DIRECTORY_ENTRIES TLV. This avoids relying on a B-Tree cache path that has shown to be
+        // fragile under corrupted/on-disk edge-cases during compositor bring-up.
+        let trace = (dir_inode == 1 && name == "etc") || (dir_inode == 7 && name == "fonts");
+        if trace {
+            serial::serial_printf(format_args!("[FS] find_child trace: start dir_inode={} name='{}'\n", dir_inode, name));
+        }
         let cached = {
             let mut dc = DIR_CACHE.lock();
             if let Some(idx) = dc.entries.iter().position(|e| e.0 == dir_inode) {
@@ -1144,50 +1195,95 @@ impl Filesystem {
                 Some(dc.entries[idx].2.clone())
             } else { None }
         };
+        if trace {
+            serial::serial_print(if cached.is_some() { "[FS] find_child trace: DIR_CACHE hit\n" } else { "[FS] find_child trace: DIR_CACHE miss\n" });
+        }
         let record_data = if let Some(data) = cached { data } else {
+            if trace {
+                serial::serial_print("[FS] find_child trace: read_inode_entry\n");
+            }
             let entry = Self::read_inode_entry(dir_inode)?;
+            if trace {
+                serial::serial_printf(format_args!("[FS] find_child trace: inode_entry offset={}\n", entry.offset));
+            }
             let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
             let mut header_buf = [0u8; 8];
+            if trace {
+                serial::serial_printf(format_args!("[FS] find_child trace: read header @{}\n", abs_disk_offset));
+            }
             read_bytes_at(abs_disk_offset, &mut header_buf)?;
             let record_size = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]) as usize;
+            if trace {
+                serial::serial_printf(format_args!("[FS] find_child trace: record_size={}\n", record_size));
+            }
             if record_size < 8 || record_size > MAX_RECORD_SIZE { return Err("Invalid directory record"); }
             let mut data = vec![0u8; record_size];
+            if trace {
+                serial::serial_print("[FS] find_child trace: read record bytes\n");
+            }
             read_bytes_at(abs_disk_offset, &mut data)?;
             DIR_CACHE.lock().insert(dir_inode, data.clone());
             data
         };
-        let mut cache = BTREE_CACHE.lock();
-        let btree = if let Some(bt) = cache.get(&dir_inode) {
-            alloc::sync::Arc::clone(bt)
-        } else {
-            let mut bt = eclipsefs_lib::btree::BTree::new();
-            let data = &record_data[8..];
-            let mut tlv_pos = 0usize;
-            while tlv_pos + 6 <= data.len() {
-                let tag = u16::from_le_bytes([data[tlv_pos], data[tlv_pos + 1]]);
-                let length = u32::from_le_bytes([data[tlv_pos+2], data[tlv_pos+3], data[tlv_pos+4], data[tlv_pos+5]]) as usize;
-                if tag == tlv_tags::DIRECTORY_ENTRIES && tlv_pos + 6 + length <= data.len() {
-                    let dir_data = &data[tlv_pos + 6..tlv_pos + 6 + length];
-                    let mut dir_off = 0usize;
-                    while dir_off + 8 <= dir_data.len() {
-                        let name_len = u32::from_le_bytes([dir_data[dir_off], dir_data[dir_off+1], dir_data[dir_off+2], dir_data[dir_off+3]]) as usize;
-                        let child_inode = u32::from_le_bytes([dir_data[dir_off+4], dir_data[dir_off+5], dir_data[dir_off+6], dir_data[dir_off+7]]);
-                        if name_len > 0 && dir_off + 8 + name_len <= dir_data.len() {
-                            let name_bytes = &dir_data[dir_off + 8..dir_off + 8 + name_len];
-                            if let Ok(name) = core::str::from_utf8(name_bytes) {
-                                let _ = bt.insert(alloc::string::String::from(name), child_inode);
+        if trace {
+            serial::serial_print("[FS] find_child trace: scan TLVs\n");
+        }
+        let data = &record_data[8..];
+        let mut tlv_pos = 0usize;
+        while tlv_pos + 6 <= data.len() {
+            let tag = u16::from_le_bytes([data[tlv_pos], data[tlv_pos + 1]]);
+            let length = u32::from_le_bytes([data[tlv_pos + 2], data[tlv_pos + 3], data[tlv_pos + 4], data[tlv_pos + 5]]) as usize;
+            let tlv_data_start = match tlv_pos.checked_add(6) { Some(v) => v, None => break };
+            let tlv_data_end = match tlv_data_start.checked_add(length) { Some(v) => v, None => break };
+            if tlv_data_end > data.len() {
+                break;
+            }
+
+            if tag == tlv_tags::DIRECTORY_ENTRIES {
+                let dir_data = &data[tlv_data_start..tlv_data_end];
+                let mut dir_off = 0usize;
+                while dir_off + 8 <= dir_data.len() {
+                    let name_len = u32::from_le_bytes([
+                        dir_data[dir_off],
+                        dir_data[dir_off + 1],
+                        dir_data[dir_off + 2],
+                        dir_data[dir_off + 3],
+                    ]) as usize;
+                    let child_inode = u32::from_le_bytes([
+                        dir_data[dir_off + 4],
+                        dir_data[dir_off + 5],
+                        dir_data[dir_off + 6],
+                        dir_data[dir_off + 7],
+                    ]);
+
+                    let name_start = match dir_off.checked_add(8) { Some(v) => v, None => break };
+                    let name_end = match name_start.checked_add(name_len) { Some(v) => v, None => break };
+                    if name_end > dir_data.len() {
+                        break;
+                    }
+
+                    if name_len > 0 {
+                        if let Ok(entry_name) = core::str::from_utf8(&dir_data[name_start..name_end]) {
+                            if entry_name == name {
+                                if trace {
+                                    serial::serial_printf(format_args!("[FS] find_child trace: FOUND inode={}\n", child_inode));
+                                }
+                                return Ok(child_inode);
                             }
                         }
-                        dir_off += 8 + name_len;
                     }
+
+                    dir_off = name_end;
                 }
-                tlv_pos += 6 + length;
             }
-            let arc_bt = alloc::sync::Arc::new(bt);
-            cache.insert(dir_inode, alloc::sync::Arc::clone(&arc_bt));
-            arc_bt
-        };
-        btree.search(name).ok_or("File not found")
+
+            tlv_pos = tlv_data_end;
+        }
+
+        if trace {
+            serial::serial_print("[FS] find_child trace: NOT FOUND\n");
+        }
+        Err("File not found")
     }
 
     pub fn lookup_path_no_follow(path: &str) -> Result<u32, &'static str> {
@@ -2036,7 +2132,21 @@ impl Scheme for FileSystemScheme {
                 if (flags & 3) == 1 { access_mask |= 2; } // O_WRONLY
                 if (flags & 3) == 2 { access_mask |= 6; } // O_RDWR
                 
+                if clean_path.ends_with("etc/fonts/fonts.conf") || clean_path.ends_with("usr/etc/fonts/fonts.conf") {
+                    serial::serial_printf(format_args!(
+                        "[FS-SCHEME] fontconfig open start clean_path='{}' flags={:#x}\n",
+                        clean_path, flags
+                    ));
+                }
+
                 let res = Filesystem::lookup_path_resolve_file_inode(clean_path);
+
+                if clean_path.ends_with("etc/fonts/fonts.conf") || clean_path.ends_with("usr/etc/fonts/fonts.conf") {
+                    serial::serial_printf(format_args!(
+                        "[FS-SCHEME] fontconfig lookup done res={}\n",
+                        if res.is_ok() { "OK" } else { "ERR" }
+                    ));
+                }
                 let (ino, size, id) = match res {
                     Ok(ino) => {
                         // Check access

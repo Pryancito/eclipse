@@ -124,14 +124,26 @@ impl Scheme for DiskScheme {
     }
 
     fn read(&self, id: usize, buffer: &mut [u8], offset: u64) -> Result<usize, usize> {
-        let mut open_disks = OPEN_DISKS.lock();
-        let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        if offset >= 6_807_320 && offset <= 6_807_420 {
+            crate::serial::serial_printf(format_args!(
+                "[DISK-SCHEME] trace: entered read(id={}, offset={}, len={})\n",
+                id, offset, buffer.len()
+            ));
+        }
+        // IMPORTANT: do not hold OPEN_DISKS lock while doing I/O or allocating pages.
+        // The filesystem path can re-enter disk reads (page-cache fill, metadata scans, etc.)
+        // and a non-reentrant spin::Mutex here would deadlock.
+        let (disk_idx, partition_offset, partition_size) = {
+            let mut open_disks = OPEN_DISKS.lock();
+            let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+            (disk.disk_idx, disk.partition_offset, disk.partition_size)
+        };
 
         // Clamp to partition bounds
-        let avail_in_partition = if disk.partition_size == u64::MAX {
+        let avail_in_partition = if partition_size == u64::MAX {
             buffer.len() as u64
         } else {
-            disk.partition_size.saturating_sub(offset)
+            partition_size.saturating_sub(offset)
         };
         if avail_in_partition == 0 { return Ok(0); }
         let read_len = core::cmp::min(buffer.len() as u64, avail_in_partition) as usize;
@@ -139,23 +151,51 @@ impl Scheme for DiskScheme {
         let mut total = 0usize;
         while total < read_len {
             let current_off = offset + total as u64;
-            let abs_offset = disk.partition_offset + current_off;
+            let abs_offset = partition_offset + current_off;
             let block_num = abs_offset / 4096;
             let offset_in_block = (abs_offset % 4096) as usize;
 
+            // Diagnostics: track the exact disk read that blocks fontconfig lookup.
+            // We keep it narrow to avoid log storms.
+            let trace_inode7_header = abs_offset >= 6_807_320 && abs_offset <= 6_807_420;
+            if trace_inode7_header {
+                crate::serial::serial_printf(format_args!(
+                    "[DISK-SCHEME] trace: read start id={} disk_idx={} abs_offset={} block={} off_in_block={} want={}B\n",
+                    id, disk_idx, abs_offset, block_num, offset_in_block, read_len
+                ));
+            }
+
             // Use Page Cache instead of old bcache
-            let page_arc = crate::page_cache::PAGE_CACHE.lock()
-                .get_or_create(disk.disk_idx, 0, block_num * 4096);
+            if trace_inode7_header {
+                crate::serial::serial_print("[DISK-SCHEME] trace: before PAGE_CACHE.lock\n");
+            }
+            let page_arc = crate::page_cache::PAGE_CACHE
+                .lock()
+                .get_or_create(disk_idx, 0, block_num * 4096);
+            if trace_inode7_header {
+                crate::serial::serial_print("[DISK-SCHEME] trace: after PAGE_CACHE.get_or_create\n");
+            }
             let mut page = page_arc.lock();
+            if trace_inode7_header {
+                crate::serial::serial_print("[DISK-SCHEME] trace: page lock acquired\n");
+            }
 
             // If we are reading and the page is not in the cache (or just allocated),
             // we should fill it.
             if !page.valid {
                  let mut temp = [0u8; 4096];
-                 if get_device(disk.disk_idx).unwrap().read(block_num, &mut temp).is_ok() {
+                 if trace_inode7_header {
+                     crate::serial::serial_print("[DISK-SCHEME] trace: page invalid, before device.read\n");
+                 }
+                 if get_device(disk_idx).unwrap().read(block_num, &mut temp).is_ok() {
+                     if trace_inode7_header {
+                         crate::serial::serial_print("[DISK-SCHEME] trace: device.read OK, filling cache\n");
+                     }
                      page.as_slice_mut().copy_from_slice(&temp);
                      page.valid = true;
                      page.dirty = false;
+                 } else if trace_inode7_header {
+                     crate::serial::serial_print("[DISK-SCHEME] trace: device.read ERR\n");
                  }
             }
 
@@ -174,13 +214,16 @@ impl Scheme for DiskScheme {
             return Ok(0);
         }
 
-        let mut open_disks = OPEN_DISKS.lock();
-        let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        let (disk_idx, partition_offset, partition_size) = {
+            let mut open_disks = OPEN_DISKS.lock();
+            let disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+            (disk.disk_idx, disk.partition_offset, disk.partition_size)
+        };
 
-        let avail_in_partition = if disk.partition_size == u64::MAX {
+        let avail_in_partition = if partition_size == u64::MAX {
             buffer.len() as u64
         } else {
-            disk.partition_size.saturating_sub(offset)
+            partition_size.saturating_sub(offset)
         };
         if avail_in_partition == 0 {
             return Ok(0);
@@ -190,7 +233,7 @@ impl Scheme for DiskScheme {
         let mut total = 0usize;
         while total < write_len {
             let current_off = offset + total as u64;
-            let abs_offset = disk.partition_offset + current_off;
+            let abs_offset = partition_offset + current_off;
             let block_num = abs_offset / 4096;
             let offset_in_block = (abs_offset % 4096) as usize;
             let chunk_remaining = write_len - total;
@@ -199,13 +242,13 @@ impl Scheme for DiskScheme {
 
             // Write through Page Cache
             let page_arc = crate::page_cache::PAGE_CACHE.lock()
-                .get_or_create(disk.disk_idx, 0, block_num * 4096);
+                .get_or_create(disk_idx, 0, block_num * 4096);
             let mut page = page_arc.lock();
             
             // If partial write, we need to read first
             if to_copy < 4096 && !page.valid {
                  let mut temp = [0u8; 4096];
-                 let _ = get_device(disk.disk_idx).unwrap().read(block_num, &mut temp);
+                 let _ = get_device(disk_idx).unwrap().read(block_num, &mut temp);
                  page.as_slice_mut().copy_from_slice(&temp);
                  page.valid = true;
             }

@@ -61,11 +61,48 @@ pub fn sys_open(path_ptr: u64, flags: u64, mode: u64) -> u64 {
     let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
     
     let pid = current_process_id().unwrap_or(0);
-    match crate::scheme::open(path, flags as usize, mode as u32) {
+    let open_path_storage;
+    let open_path: &str = if path.contains(':') {
+        // Already a scheme path.
+        path
+    } else if path.starts_with('/') {
+        // POSIX absolute paths → schemes.
+        open_path_storage = user_path_to_scheme_path(path);
+        open_path_storage.as_str()
+    } else {
+        // Relative path: best-effort treat as file: (cwd resolution is handled elsewhere in the kernel).
+        open_path_storage = format!("file:{}", path);
+        open_path_storage.as_str()
+    };
+
+    // Diagnóstico: labwc/Fontconfig suele colgar si open() se bloquea en el VFS.
+    // Este log nos da el path real que está intentando abrir (solo para los PIDs del compositor).
+    if pid == 9 || pid == 10 || pid == 11 {
+        crate::serial::serial_printf(format_args!(
+            "[open-diag] pid={} path='{}' open_path='{}' flags={:#x} mode={:#x}\n",
+            pid, path, open_path, flags, mode
+        ));
+    }
+
+    match crate::scheme::open(open_path, flags as usize, mode as u32) {
         Ok((scheme_id, resource_id)) => {
+            if pid == 9 || pid == 10 || pid == 11 {
+                crate::serial::serial_printf(format_args!(
+                    "[open-diag] pid={} OK scheme_id={} resource_id={}\n",
+                    pid, scheme_id, resource_id
+                ));
+            }
             crate::fd::fd_create(pid, scheme_id, resource_id).unwrap_or(0) as u64
         }
-        Err(e) => (-(e as isize)) as u64,
+        Err(e) => {
+            if pid == 9 || pid == 10 || pid == 11 {
+                crate::serial::serial_printf(format_args!(
+                    "[open-diag] pid={} ERR {}\n",
+                    pid, e
+                ));
+            }
+            (-(e as isize)) as u64
+        }
     }
 }
 
@@ -76,13 +113,36 @@ pub fn sys_openat(_dfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
 
 pub fn sys_close(fd: u64) -> u64 {
     let pid = current_process_id().unwrap_or(0);
-    if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-        crate::fd::fd_close(pid, fd as usize);
-        let _ = crate::scheme::close(fd_entry.scheme_id, fd_entry.resource_id);
-        0
-    } else {
-        linux_abi_error(9)
+    if crate::fd::fd_close(pid, fd as usize) { 0 } else { linux_abi_error(9) }
+}
+
+/// Rutas absolutas de usuario (`/…`) → schemes internos.
+/// - `/dev/dri/*`  → `drm:*`
+/// - `/dev/input/*`→ `input:*`
+/// - `/dev/shm/*`  → `shm:*`
+/// - `/dev/*`      → `dev:*`
+/// - resto         → `file:/…`
+fn user_path_to_scheme_path(path: &str) -> alloc::string::String {
+    if path == "/dev/dri" || path.starts_with("/dev/dri/") {
+        let rel = path.trim_start_matches("/dev/dri").trim_start_matches('/');
+        return format!("drm:{}", rel);
     }
+    if path == "/dev/input" || path.starts_with("/dev/input/") {
+        let rel = path.trim_start_matches("/dev/input").trim_start_matches('/');
+        return format!("input:{}", rel);
+    }
+    if path.starts_with("/dev/shm/") {
+        let rel = path.trim_start_matches("/dev/shm/").trim_start_matches('/');
+        return format!("shm:{}", rel);
+    }
+    if path == "/dev" || path.starts_with("/dev/") {
+        let rel = path.trim_start_matches("/dev").trim_start_matches('/');
+        return format!("dev:{}", rel);
+    }
+    if path.starts_with('/') {
+        return format!("file:{}", path);
+    }
+    alloc::string::String::from(path)
 }
 
 pub fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
@@ -1174,13 +1234,54 @@ pub fn sys_clone(flags: u64, stack: u64, parent_tid_ptr: u64, child_tid_ptr: u64
         gs_base: ctx.gs_base,
     };
     
+    // Linux encodes exit signal in the low 8 bits of flags.
+    // wlroots/musl usually pass SIGCHLD (17) or 0 for threads.
+    let exit_signal = flags & 0xFF;
+    let flags = flags & !0xFF;
+
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_FILES: u64 = 0x0000_0400;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_VFORK: u64 = 0x0000_4000;
     const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_SYSVSEM: u64 = 0x0004_0000;
+    const CLONE_SETTLS: u64 = 0x0008_0000;
     const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const CLONE_IO: u64 = 0x8000_0000;
+
+    // Allowed flags for thread-style clone (pthreads).
+    const THREAD_STYLE_ALLOWED: u64 = CLONE_VM
+        | CLONE_THREAD
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_VFORK
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID
+        | CLONE_IO;
+
+    // Allowed flags for fork-style clone (no CLONE_THREAD): accept the same set minus CLONE_THREAD.
+    const FORK_STYLE_ALLOWED: u64 = THREAD_STYLE_ALLOWED & !CLONE_THREAD;
 
     // Thread-style clone: share Proc/resources with parent.
     if (flags & CLONE_THREAD) != 0 {
+        // Fail fast on unexpected ABI/flags combinations.
+        if flags & !THREAD_STYLE_ALLOWED != 0 {
+            crate::serial::serial_printf(format_args!(
+                "[sys_clone] thread-style EINVAL: unsupported flags extra={:#x}\n",
+                flags & !THREAD_STYLE_ALLOWED
+            ));
+            return linux_abi_error(22); // EINVAL
+        }
+
         let current_pid = match current_process_id() {
             Some(p) => p,
             None => return u64::MAX,
@@ -1191,7 +1292,11 @@ pub fn sys_clone(flags: u64, stack: u64, parent_tid_ptr: u64, child_tid_ptr: u64
             Some(child_tid) => {
                 // Parent tid writeback: store child's TID in user memory.
                 if (flags & CLONE_PARENT_SETTID) != 0 && parent_tid_ptr != 0 && is_user_pointer(parent_tid_ptr, 4) {
-                    unsafe { (parent_tid_ptr as *mut u32).write_unaligned(child_tid); }
+                    // Touch first to fault in the page if needed, then write.
+                    unsafe {
+                        let _ = core::ptr::read_volatile(parent_tid_ptr as *const u32);
+                        core::ptr::write_volatile(parent_tid_ptr as *mut u32, child_tid);
+                    }
                 }
                 crate::scheduler::enqueue_process(child_tid);
                 return child_tid as u64;
@@ -1200,11 +1305,45 @@ pub fn sys_clone(flags: u64, stack: u64, parent_tid_ptr: u64, child_tid_ptr: u64
         }
     }
 
-    // Fallback: treat as process fork-like clone.
-    match crate::process::fork_process(&child_ctx) {
+    // Fork-style clone (no CLONE_THREAD): behave like fork(2) or vfork(2) depending on flags.
+    //
+    // Linux requires CLONE_VM with CLONE_VFORK.
+    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_VM) == 0 {
+        crate::serial::serial_printf(format_args!(
+            "[sys_clone] fork-style EINVAL: CLONE_VFORK without CLONE_VM exit_sig={}\n",
+            exit_signal
+        ));
+        return linux_abi_error(22); // EINVAL
+    }
+    if flags & !FORK_STYLE_ALLOWED != 0 {
+        crate::serial::serial_printf(format_args!(
+            "[sys_clone] fork-style EINVAL: unsupported flags extra={:#x}\n",
+            flags & !FORK_STYLE_ALLOWED
+        ));
+        return linux_abi_error(22); // EINVAL
+    }
+
+    let vfork_block_parent = (flags & CLONE_VFORK) != 0 && (flags & CLONE_VM) != 0;
+    if vfork_block_parent {
+        crate::serial::serial_printf(format_args!(
+            "[sys_clone] vfork-style: parent will block until child exec/exit (exit_sig={})\n",
+            exit_signal
+        ));
+    }
+
+    let child_pid_opt = if vfork_block_parent {
+        crate::process::vfork_process_shared_vm(&child_ctx)
+    } else {
+        crate::process::fork_process(&child_ctx)
+    };
+
+    match child_pid_opt {
         Some(child_pid) => {
             if (flags & CLONE_PARENT_SETTID) != 0 && parent_tid_ptr != 0 && is_user_pointer(parent_tid_ptr, 4) {
-                unsafe { (parent_tid_ptr as *mut u32).write_unaligned(child_pid); }
+                unsafe {
+                    let _ = core::ptr::read_volatile(parent_tid_ptr as *const u32);
+                    core::ptr::write_volatile(parent_tid_ptr as *mut u32, child_pid);
+                }
             }
             if (flags & CLONE_CHILD_CLEARTID) != 0 {
                 let _ = crate::process::modify_process(child_pid, |p| p.clear_child_tid = child_tid_ptr);
@@ -1213,128 +1352,227 @@ pub fn sys_clone(flags: u64, stack: u64, parent_tid_ptr: u64, child_tid_ptr: u64
                 let _ = crate::process::modify_process(child_pid, |p| p.set_child_tid = child_tid_ptr);
             }
             crate::scheduler::enqueue_process(child_pid);
+
+            if vfork_block_parent {
+                // Mark the parent as waiting for this child and spin-yield until released.
+                // The child releases the parent when it successfully execs or exits.
+                let Some(ppid) = current_process_id() else {
+                    return child_pid as u64;
+                };
+                let _ = crate::process::modify_process(ppid, |p| {
+                    p.proc.lock().vfork_waiting_for_child = Some(child_pid);
+                });
+                loop {
+                    let released = crate::process::get_process(ppid)
+                        .map(|p| p.proc.lock().vfork_waiting_for_child != Some(child_pid))
+                        .unwrap_or(true);
+                    if released {
+                        break;
+                    }
+                    crate::scheduler::yield_cpu();
+                }
+            }
+
             child_pid as u64
         }
         None => linux_abi_error(11),
     }
 }
 
-pub fn sys_execve(path_ptr: u64, _argv: u64, _envp: u64) -> u64 {
-    let len = strlen_user_unique(path_ptr, 1023);
-    if len == 0 { return linux_abi_error(2); }
-    let mut path_buf = [0u8; 1024];
-    if !copy_from_user(path_ptr, &mut path_buf[..len]) { return linux_abi_error(14); }
+pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    // 1) Leer path (NUL-terminado).
+    const MAX_PATH: usize = 1024;
+    let len = strlen_user_unique(path_ptr, MAX_PATH - 1);
+    let len_u64 = len as u64;
+    if len == 0 || !is_user_pointer(path_ptr, len_u64 + 1) {
+        return linux_abi_error(14); // EFAULT
+    }
+    let mut path_buf = [0u8; MAX_PATH];
+    if !copy_from_user(path_ptr, &mut path_buf[..len]) {
+        return linux_abi_error(14);
+    }
     let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
 
-    // Accept both "scheme:path" and POSIX-style "/path" execve calls.
-    // If no scheme is specified, default to "file:".
+    // Acepta "scheme:path" o rutas POSIX "/...".
     let open_path_storage;
     let open_path: &str = if path.contains(':') {
         path
+    } else if path.starts_with('/') {
+        open_path_storage = user_path_to_scheme_path(path);
+        open_path_storage.as_str()
     } else {
         open_path_storage = alloc::format!("file:{}", path);
         open_path_storage.as_str()
     };
 
-    match crate::scheme::open(open_path, 0, 0) {
-        Ok((sid, rid)) => {
-            let mut stat = crate::scheme::Stat::default();
-            let _ = crate::scheme::fstat(sid, rid, &mut stat);
-            let mut elf_data = Vec::with_capacity(stat.size as usize);
-            unsafe { elf_data.set_len(stat.size as usize); }
-            let read_res = crate::scheme::read(sid, rid, &mut elf_data, 0);
-            let _ = crate::scheme::close(sid, rid);
+    crate::serial::serial_printf(format_args!(
+        "[EXECVE] enter path='{}' open_path='{}' argv_ptr={:#x} envp_ptr={:#x}\n",
+        path, open_path, argv_ptr, envp_ptr
+    ));
 
-            if let Err(e) = read_res {
-                crate::serial::serial_printf(format_args!(
-                    "[EXECVE] read failed path='{}' open_path='{}' err={}\n",
-                    path, open_path, e
-                ));
-                return linux_abi_error(e as i32);
+    // 2) Leer argv/envp (punteros a C-strings).
+    // Límite anti-OOM (musl/wlroots pueden pasar buffers muy grandes en algunos paths).
+    const MAX_EXECVE_ARG_ENV_BYTES: usize = 4 * 1024 * 1024;
+    let mut total_bytes: usize = 0;
+
+    let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if argv_ptr != 0 {
+        let mut off = argv_ptr;
+        for _ in 0..256usize {
+            if !is_user_pointer(off, 8) { break; }
+            let mut raw = [0u8; 8];
+            if !copy_from_user(off, &mut raw) { break; }
+            let arg_ptr = u64::from_le_bytes(raw);
+            if arg_ptr == 0 { break; }
+
+            let alen = strlen_user_unique(arg_ptr, 4096);
+            let alen_u64 = alen as u64;
+            let mut s = if alen == 0 || !is_user_pointer(arg_ptr, alen_u64 + 1) {
+                alloc::vec![0u8]
+            } else {
+                let mut tmp = alloc::vec![0u8; alen as usize];
+                if !copy_from_user(arg_ptr, &mut tmp) { tmp.clear(); }
+                tmp.push(0);
+                tmp
+            };
+            total_bytes = total_bytes.saturating_add(s.len());
+            if total_bytes > MAX_EXECVE_ARG_ENV_BYTES {
+                return linux_abi_error(7); // E2BIG
             }
-            
-            let current_pid = current_process_id().expect("exec without process");
-            // Igual que sys_exec(): execve no debe "volver" a userspace con la vieja imagen.
-            // Debe reemplazar la imagen y saltar al nuevo entry con un stack limpio.
-            let _ = crate::process::vfork_detach_mm_for_exec_if_needed(current_pid);
-            match crate::elf_loader::replace_process_image(current_pid, &elf_data) {
-                Ok(res) => {
-                    crate::serial::serial_printf(format_args!(
-                        "[EXECVE] loaded OK path='{}' open_path='{}' entry={:#x} dyn_linker={}\n",
-                        path,
-                        open_path,
-                        res.entry_point,
-                        if res.dynamic_linker.is_some() { 1 } else { 0 }
-                    ));
-                    if let Some(mut process) = crate::process::get_process(current_pid) {
-                        {
-                            let proc = process.proc.lock();
-                            let mut r = proc.resources.lock();
-                            r.vmas.clear();
-                            r.brk_current = res.max_vaddr;
-                        }
-
-                        {
-                            let mut proc = process.proc.lock();
-                            proc.mem_frames = (0x100000 / 4096) + res.segment_frames;
-                            proc.dynamic_linker_aux = res.dynamic_linker;
-                        }
-
-                        // Si hay intérprete dinámico, FS base se inicializa en 0 (ld.so lo setea).
-                        process.fs_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
-                        crate::process::update_process(current_pid, process);
-                    }
-
-                    crate::process::clear_pending_process_args(current_pid);
-
-                    const STACK_BASE: u64 = 0x2000_0000;
-                    const STACK_SIZE: usize = 0x10_0000;
-                    let cr3 = crate::memory::get_cr3();
-                    let _ = crate::elf_loader::setup_user_stack(cr3, STACK_BASE, STACK_SIZE);
-                    crate::process::register_post_exec_vm_as(current_pid, &res, STACK_BASE, STACK_SIZE as u64);
-                    crate::fd::fd_ensure_stdio(current_pid);
-
-                    unsafe {
-                        let stack_top = STACK_BASE + STACK_SIZE as u64;
-                        crate::serial::serial_printf(format_args!(
-                            "[EXECVE] jumping to entry={:#x} stack_top={:#x}\n",
-                            res.entry_point, stack_top
-                        ));
-                        if res.dynamic_linker.is_some() {
-                            crate::elf_loader::jump_to_userspace_dynamic_linker(
-                                res.entry_point,
-                                stack_top,
-                                res.phdr_va,
-                                res.phnum,
-                                res.phentsize,
-                            );
-                        } else {
-                            crate::elf_loader::jump_to_userspace(
-                                res.entry_point,
-                                stack_top,
-                                res.phdr_va,
-                                res.phnum,
-                                res.phentsize,
-                            );
-                        }
-                    }
-                }
-                Err(_) => {
-                    crate::serial::serial_printf(format_args!(
-                        "[EXECVE] replace_process_image failed path='{}' open_path='{}' size={}\n",
-                        path, open_path, elf_data.len()
-                    ));
-                    linux_abi_error(8) // ENOEXEC
-                }
-            }
+            argv_strings.push(core::mem::take(&mut s));
+            off = off.wrapping_add(8);
         }
-        Err(e) => {
+    }
+    if argv_strings.is_empty() {
+        // argv[0] = basename del ejecutable.
+        let base = path.rsplit('/').next().unwrap_or(path);
+        let mut s = base.as_bytes().to_vec();
+        s.push(0);
+        total_bytes = total_bytes.saturating_add(s.len());
+        if total_bytes > MAX_EXECVE_ARG_ENV_BYTES {
+            return linux_abi_error(7);
+        }
+        argv_strings.push(s);
+    }
+
+    let mut envp_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if envp_ptr != 0 {
+        let mut off = envp_ptr;
+        for _ in 0..1024usize {
+            if !is_user_pointer(off, 8) { break; }
+            let mut raw = [0u8; 8];
+            if !copy_from_user(off, &mut raw) { break; }
+            let env_ptr = u64::from_le_bytes(raw);
+            if env_ptr == 0 { break; }
+
+            let elen = strlen_user_unique(env_ptr, 65536);
+            let elen_u64 = elen as u64;
+            if elen == 0 || !is_user_pointer(env_ptr, elen_u64 + 1) {
+                off = off.wrapping_add(8);
+                continue;
+            }
+            let mut tmp = alloc::vec![0u8; elen as usize];
+            if !copy_from_user(env_ptr, &mut tmp) {
+                off = off.wrapping_add(8);
+                continue;
+            }
+            tmp.push(0);
+            total_bytes = total_bytes.saturating_add(tmp.len());
+            if total_bytes > MAX_EXECVE_ARG_ENV_BYTES {
+                return linux_abi_error(7); // E2BIG
+            }
+            envp_strings.push(tmp);
+            off = off.wrapping_add(8);
+        }
+    }
+    if envp_strings.is_empty() {
+        // Env mínimo para musl/bash.
+        let minimal_bytes: usize = crate::elf_loader::MINIMAL_ENVP.iter().map(|e| e.len()).sum();
+        if total_bytes.saturating_add(minimal_bytes) > MAX_EXECVE_ARG_ENV_BYTES {
+            return linux_abi_error(7);
+        }
+        for e in crate::elf_loader::MINIMAL_ENVP {
+            envp_strings.push(e.to_vec());
+        }
+    }
+
+    // 3) Reemplazar imagen SIN copiar todo el ELF al heap del kernel.
+    // Usamos el loader por inode para evitar OOM con binarios grandes (p.ej. Mesa/labwc).
+    let current_pid = current_process_id().expect("exec without process");
+    let _ = crate::process::vfork_detach_mm_for_exec_if_needed(current_pid);
+    let fs_path_storage;
+    let fs_path: &str = if open_path.starts_with("file:") {
+        // Normal: file:/usr/bin/...
+        fs_path_storage = alloc::string::String::from(&open_path[5..]);
+        fs_path_storage.as_str()
+    } else {
+        // Best-effort: if the caller passed a raw POSIX path, feed it directly.
+        // Non-file schemes are not supported by replace_process_image_path yet.
+        path
+    };
+    crate::serial::serial_printf(format_args!(
+        "[EXECVE] pid={} loading via replace_process_image_path('{}') argc={} envc={}\n",
+        current_pid, fs_path, argv_strings.len(), envp_strings.len()
+    ));
+    let res = match crate::elf_loader::replace_process_image_path(current_pid, fs_path) {
+        Ok(r) => r,
+        Err(_) => {
             crate::serial::serial_printf(format_args!(
-                "[EXECVE] open failed path='{}' open_path='{}' err={}\n",
-                path, open_path, e
+                "[EXECVE] replace_process_image_path failed path='{}' open_path='{}'\n",
+                path, open_path
             ));
-            linux_abi_error(e as i32)
+            return linux_abi_error(8); // ENOEXEC
         }
+    };
+
+    // Actualizar metadatos del proceso.
+    if let Some(mut process) = crate::process::get_process(current_pid) {
+        {
+            let proc = process.proc.lock();
+            let mut r = proc.resources.lock();
+            r.vmas.clear();
+            r.brk_current = res.max_vaddr;
+        }
+        {
+            let mut proc = process.proc.lock();
+            proc.mem_frames = (0x100000 / 4096) + res.segment_frames;
+            proc.dynamic_linker_aux = res.dynamic_linker;
+            // Diagnóstico: activar strace para labwc (y heredar en threads).
+            if fs_path.ends_with("/labwc") || fs_path.contains("/labwc") {
+                proc.syscall_trace = true;
+            }
+        }
+        process.fs_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
+        crate::process::update_process(current_pid, process);
+    }
+    crate::process::clear_pending_process_args(current_pid);
+
+    const STACK_BASE: u64 = 0x2000_0000;
+    const STACK_SIZE: usize = 0x10_0000;
+    let cr3 = crate::memory::get_cr3();
+    if crate::elf_loader::setup_user_stack(cr3, STACK_BASE, STACK_SIZE).is_err() {
+        return linux_abi_error(12); // ENOMEM
+    }
+    crate::process::register_post_exec_vm_as(current_pid, &res, STACK_BASE, STACK_SIZE as u64);
+    crate::fd::fd_ensure_stdio(current_pid);
+
+    // vfork: liberar al padre cuando el exec está listo para saltar.
+    crate::process::vfork_wake_parent_waiting_for_child(current_pid);
+
+    let stack_top = STACK_BASE + STACK_SIZE as u64;
+    let tls_base = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
+    crate::serial::serial_printf(format_args!(
+        "[EXECVE] jumping entry={:#x} stack_top={:#x} argc={} envc={} tls={:#x}\n",
+        res.entry_point, stack_top, argv_strings.len(), envp_strings.len(), tls_base
+    ));
+    unsafe {
+        crate::elf_loader::jump_to_userspace_with_argv_envp(
+            &res,
+            stack_top,
+            &argv_strings,
+            &envp_strings,
+            tls_base,
+        );
     }
 }
 
