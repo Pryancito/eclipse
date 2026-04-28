@@ -1,0 +1,16 @@
+# Default theme — Eclipse-LabWC
+# Format compatible con Openbox 3 themerc (lo que usa labwc upstream).
+
+window.active.border.color:        #3584E4
+window.inactive.border.color:      #555555
+window.active.title.bg.color:      #242429
+window.inactive.title.bg.color:    #18181B
+window.active.label.text.color:    #EEEEEE
+window.inactive.label.text.color:  #999999
+
+menu.items.bg.color:           #2A2A2E
+menu.items.text.color:         #EEEEEE
+menu.items.active.bg.color:    #3584E4
+
+border.width:                  1
+window.handle.height:          28

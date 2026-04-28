@@ -1,0 +1,6 @@
+# Override del workspace .cargo/config.toml: queremos cargo check con el host
+# triple por defecto. Para target x86_64-unknown-linux-musl real, el usuario
+# añade --target x86_64-unknown-linux-musl en la cmdline.
+[build]
+
+[unstable]

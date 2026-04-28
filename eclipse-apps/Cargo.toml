@@ -11,6 +11,7 @@ members = [
     "nano",
     "glxgears",
     "smithay_app",
+    "eclipse-labwc",
     "rust-shell",
     "terminal",
     "xeyes",
@@ -67,4 +68,28 @@ strip = "symbols"
 [profile.dev]
 opt-level = "s"
 panic = "abort"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patches para que Smithay (y su árbol de deps) compile contra Eclipse OS.
+# Documentado en `docs/SMITHAY_INTEGRATION.md` y `docs/WAYLAND_RS_ECLIPSE.md`.
+#
+# Uso:
+#   - Target Eclipse: añadir `RUSTFLAGS="--cfg rustix_use_libc"` y compilar con
+#     `-Z build-std=core,alloc,std --target x86_64-unknown-eclipse`. El patch
+#     redirige `libc` a `eclipse-relibc` (que provee msghdr, sendmsg, recvmsg,
+#     SCM_RIGHTS, etc., requeridos por wayland-backend/rustix).
+#   - Target host (x86_64-unknown-linux-musl o linux-gnu): los patches NO se
+#     aplican (target_os = "linux"), Cargo usa libc/wayland-sys/etc. de
+#     crates.io normalmente.
+#
+# Si los forks `vendor/` aún no existen en tu checkout, comenta los patches
+# correspondientes — el crate `eclipse-labwc` NO los necesita en target Linux.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# [patch.crates-io]
+# libc          = { path = "../eclipse-relibc" }
+# wayland-sys   = { path = "vendor/wayland-sys" }
+# bitflags      = { path = "vendor/bitflags" }
+# errno         = { path = "vendor/errno" }
+# downcast-rs   = { path = "vendor/downcast-rs" }
 
