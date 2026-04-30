@@ -191,7 +191,10 @@ pub fn sys_pread64(fd: u64, buf_ptr: u64, len: u64, offset: u64) -> u64 {
         let mut kbuf = Vec::with_capacity(len as usize);
         unsafe { kbuf.set_len(len as usize); }
         match crate::scheme::pread(fd_entry.scheme_id, fd_entry.resource_id, &mut kbuf, offset) {
-            Ok(n) => n as u64,
+            Ok(n) => {
+                if n > 0 && !copy_to_user(buf_ptr, &kbuf[..n]) { return linux_abi_error(14); }
+                n as u64
+            }
             Err(e) => (-(e as isize)) as u64,
         }
     } else {
@@ -1652,12 +1655,31 @@ pub fn sys_prctl(option: u64, arg2: u64, _a: u64, _b: u64, _c: u64) -> u64 {
 pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     let pid = current_process_id().unwrap_or(0);
     match code {
-        0x1002 => { // SET_FS
+        0x1001 => { // ARCH_GET_FS: read the stored FS_BASE for this process into *addr
+            if !is_user_pointer(addr, 8) { return linux_abi_error(14); }
+            let fs_val = crate::process::get_process(pid).map(|p| p.fs_base).unwrap_or(0);
+            if !copy_to_user(addr, &fs_val.to_le_bytes()) { return linux_abi_error(14); }
+            0
+        }
+        0x1002 => { // ARCH_SET_FS
             if let Some(mut process) = crate::process::get_process(pid) {
                 process.fs_base = addr;
                 crate::process::update_process(pid, process);
             }
             set_fs_base(addr);
+            0
+        }
+        0x1003 => { // ARCH_SET_GS
+            unsafe { crate::cpu::wrmsr(0xC0000101, addr); } // GS_BASE
+            0
+        }
+        0x1004 => { // ARCH_GET_GS: read current user GS_BASE into *addr.
+            // syscall entry executes SWAPGS, so while in kernel mode GS_BASE (MSR 0xC0000101)
+            // holds the kernel value; the user's original GS is preserved in KERNEL_GS_BASE
+            // (MSR 0xC0000102) and will be swapped back on syscall return.
+            if !is_user_pointer(addr, 8) { return linux_abi_error(14); }
+            let gs_val = unsafe { crate::cpu::rdmsr(0xC0000102) }; // KERNEL_GS_BASE = saved user GS
+            if !copy_to_user(addr, &gs_val.to_le_bytes()) { return linux_abi_error(14); }
             0
         }
         _ => linux_abi_error(22),
@@ -2076,8 +2098,9 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
                             let mut r = p_proc.resources.lock();
                             if is_fixed { vma_remove_range(&mut r.vmas, target_vaddr, target_vaddr + aligned_len); }
                             
-                            // Map flags: Present=1, Writable=2, User=4 -> 7
-                            let mut pt_flags = (prot | 7) & 7;
+                            // Compute PTE leaf bits from the Linux prot flags, then add the
+                            // WC hint on top if fmap signalled it via bit 63.
+                            let mut pt_flags = crate::memory::linux_prot_to_leaf_pte_bits(prot);
                             if wc_requested {
                                 pt_flags |= 0x08; // PWT (Write-Through) -> Maps to PAT Index 1 (WC)
                             }
