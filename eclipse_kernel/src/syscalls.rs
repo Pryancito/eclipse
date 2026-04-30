@@ -501,35 +501,67 @@ pub fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
     u64::MAX
 }
 
-#[repr(C, packed)]
+/// Matches the Linux x86-64 `struct stat` layout exactly.
+///
+/// Offsets (confirmed against <sys/stat.h> on x86-64):
+///   0  st_dev      8
+///   8  st_ino      8
+///  16  st_nlink    8   ← nlink_t is `unsigned long` (8 bytes) on x86-64
+///  24  st_mode     4
+///  28  st_uid      4
+///  32  st_gid      4
+///  36  __pad0      4
+///  40  st_rdev     8
+///  48  st_size     8
+///  56  st_blksize  8
+///  64  st_blocks   8
+///  72  st_atim     16  (tv_sec + tv_nsec)
+///  88  st_mtim     16
+/// 104  st_ctim     16
+/// 120  __unused    24
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LegacyStat {
-    pub st_dev:     u64,
-    pub st_ino:     u64,
-    pub st_mode:    u32,
-    pub st_nlink:   u32,
-    pub st_uid:     u32,
-    pub st_gid:     u32,
-    pub st_rdev:    u64,
-    pub st_size:    u64,
-    pub st_atime:   i64,
-    pub st_mtime:   i64,
-    pub st_ctime:   i64,
+    pub st_dev:        u64,
+    pub st_ino:        u64,
+    pub st_nlink:      u64,
+    pub st_mode:       u32,
+    pub st_uid:        u32,
+    pub st_gid:        u32,
+    pub __pad0:        u32,
+    pub st_rdev:       u64,
+    pub st_size:       i64,
+    pub st_blksize:    i64,
+    pub st_blocks:     i64,
+    pub st_atime:      i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime:      i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime:      i64,
+    pub st_ctime_nsec: i64,
+    pub __unused:      [i64; 3],
 }
 
 fn scheme_stat_to_legacy_stat(s: &crate::scheme::Stat) -> LegacyStat {
     LegacyStat {
-        st_dev:     s.dev,
-        st_ino:     s.ino,
-        st_mode:    s.mode,
-        st_nlink:   s.nlink,
-        st_uid:     s.uid,
-        st_gid:     s.gid,
-        st_rdev:    s.rdev,
-        st_size:    s.size,
-        st_atime:   s.atime,
-        st_mtime:   s.mtime,
-        st_ctime:   s.ctime,
+        st_dev:        s.dev,
+        st_ino:        s.ino,
+        st_nlink:      s.nlink as u64,
+        st_mode:       s.mode,
+        st_uid:        s.uid,
+        st_gid:        s.gid,
+        __pad0:        0,
+        st_rdev:       s.rdev,
+        st_size:       s.size as i64,
+        st_blksize:    s.blksize as i64,
+        st_blocks:     s.blocks as i64,
+        st_atime:      s.atime,
+        st_atime_nsec: 0,
+        st_mtime:      s.mtime,
+        st_mtime_nsec: 0,
+        st_ctime:      s.ctime,
+        st_ctime_nsec: 0,
+        __unused:      [0; 3],
     }
 }
 
