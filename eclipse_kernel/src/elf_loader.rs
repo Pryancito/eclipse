@@ -960,15 +960,20 @@ fn load_elf_provider(provider: &dyn ElfDataProvider) -> Option<ProcessId> {
     }
 
     // Add segment frames and TLS base to the process accounting.
+    // Slot index comes from the PID→slot map (not `pid` as table index).
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(p) = table[pid as usize].as_mut() {
-            let mut proc = p.proc.lock();
-            proc.mem_frames += loaded.segment_frames;
-            if loaded.tls_base != 0 {
-                p.fs_base = loaded.tls_base;
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            if let Some(p) = table[slot].as_mut() {
+                if p.id == pid {
+                    let mut proc = p.proc.lock();
+                    proc.mem_frames += loaded.segment_frames;
+                    if loaded.tls_base != 0 {
+                        p.fs_base = loaded.tls_base;
+                    }
+                    proc.dynamic_linker_aux = loaded.dynamic_linker;
+                }
             }
-            proc.dynamic_linker_aux = loaded.dynamic_linker;
         }
     });
 
@@ -1103,6 +1108,7 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     phdr_va: u64,
     phnum: u64,
     phentsize: u64,
+    tls_arg: u64,
 ) -> ! {
     let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!(
@@ -1151,14 +1157,18 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
     let adjusted_stack = (rsp_raw & !0xF) as u64;
     let strings_base = adjusted_stack + table_bytes as u64;
 
-    let (tls_base, at_base, at_entry) = if let Some(pid) = current_process_id() {
+    let mut tls_msr = tls_arg;
+    let (at_base, at_entry) = if let Some(pid) = current_process_id() {
         if let Some(p) = get_process(pid) {
             unsafe {
                 memory::set_cr3(p.proc.lock().resources.lock().page_table_phys);
             }
+            if tls_msr == 0 {
+                tls_msr = p.fs_base;
+            }
             let aux = p.proc.lock().dynamic_linker_aux;
             match aux {
-                Some((b, e)) => (p.fs_base, b, e),
+                Some((b, e)) => (b, e),
                 None => {
                     crate::serial::serial_print("ERROR: jump_to_userspace_dynamic_linker without dynamic_linker_aux\n");
                     loop {
@@ -1167,10 +1177,10 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
                 }
             }
         } else {
-            (0u64, 0u64, 0u64)
+            (0u64, 0u64)
         }
     } else {
-        (0u64, 0u64, 0u64)
+        (0u64, 0u64)
     };
 
     unsafe {
@@ -1265,7 +1275,7 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
             rfl = in(reg) 0x202u64,
             usp = in(reg) adjusted_stack,
             ss = in(reg) 0x23u64,
-            in("r11") tls_base,
+            in("r11") tls_msr,
             options(noreturn)
         );
     }
@@ -1279,7 +1289,19 @@ pub unsafe extern "C" fn jump_to_userspace_dynamic_linker(
 /// This function constructs a stack frame and executes `iretq` to switch privilege levels.
 /// It MUST be called with a valid userspace entry point and stack top.
 /// CR3 should already be set to the correct process address space before calling this.
-pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phdr_va: u64, phnum: u64, phentsize: u64) -> ! {
+///
+/// `tls_arg` is the 6th SysV argument (register `r9` when entered via `switch_context`):
+/// it must match `Process.context.r9` / `fs_base` at process creation. Call sites that
+/// invoke this directly from Rust (e.g. `sys_exec`) must pass `ExecLoadResult.tls_base`
+/// explicitly so `IA32_FS_BASE` is not derived from a stale `r9`.
+pub unsafe extern "C" fn jump_to_userspace(
+    entry_point: u64,
+    stack_top: u64,
+    phdr_va: u64,
+    phnum: u64,
+    phentsize: u64,
+    tls_arg: u64,
+) -> ! {
     let _pid = current_process_id().unwrap_or(0xFFFF);
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x} phdr={:#x}\n", _pid, entry_point, stack_top, phdr_va));
     
@@ -1328,14 +1350,25 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
 
     crate::serial::serial_printf(format_args!("[ELF] PID {} jumping to userspace at {:#x} with RSP {:#x}\n", _pid, entry_point, adjusted_stack));
 
-    // Always reload CR3 to flush the TLB.
-    let tls_base: u64 = if let Some(pid) = current_process_id() {
+    // Reload CR3; resolve TLS for WRMSR(IA32_FS_BASE). Prefer `tls_arg` (R9 from PCB on
+    // first schedule); if zero, fall back to `proc.fs_base` so we never overwrite the
+    // scheduler's WRMSR with 0 when the clone of `Process` or `current_process_id` is wrong.
+    let mut tls_msr = tls_arg;
+    let mut proc_fs_base = 0u64;
+    if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
             let cr3 = proc.proc.lock().resources.lock().page_table_phys;
             unsafe { memory::set_cr3(cr3); }
-            proc.fs_base
-        } else { 0 }
-    } else { 0 };
+            if tls_msr == 0 {
+                tls_msr = proc.fs_base;
+            }
+            proc_fs_base = proc.fs_base;
+        }
+    }
+    crate::serial::serial_printf(format_args!(
+        "[ELF] PID {} tls_arg={:#x} proc.fs_base={:#x} tls_msr(wrmsr)={:#x}\n",
+        _pid, tls_arg, proc_fs_base, tls_msr
+    ));
 
     // Write strings into user stack.
     unsafe {
@@ -1435,7 +1468,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             rfl = in(reg) 0x202u64,
             usp = in(reg) adjusted_stack,
             ss  = in(reg) 0x23u64,
-            in("r11") tls_base,
+            in("r11") tls_msr,
             options(noreturn)
         );
     }

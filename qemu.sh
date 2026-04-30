@@ -40,8 +40,8 @@ fi
 
 # Variables de configuración
 DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si se especifica DISK=/dev/nvme0n1
-MEMORY="16G"
-CPUS="4"
+MEMORY="${MEMORY:-16G}"
+CPUS="${CPUS:-4}"
 USE_KVM="${USE_KVM:-1}"         # 1=activar KVM si está disponible, 0=forzar TCG (sin -enable-kvm)
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
 # Por defecto usamos dispositivos de entrada SOLO USB (teclado + ratón HID)

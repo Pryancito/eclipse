@@ -12,10 +12,12 @@ SECTIONS
 {
     . = KERNEL_BASE + KERNEL_PHYS_BASE;
 
-    /* Sección de inicio - debe ser la primera */
+    /* Sección de inicio - debe ser la primera absoluta */
     .init : AT(ADDR(.init) - KERNEL_BASE)
     {
+        _code_start = .;
         KEEP(*(.init))
+        KEEP(*(.init*))
     }
 
     /* Trampolín para SMP (Application Processors) */
@@ -35,19 +37,22 @@ SECTIONS
     /* Código ejecutable */
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_BASE)
     {
-        *(.text*)
+        *(.text .text.*)
+        *(.ltext .ltext.*)
     }
 
     /* Datos de solo lectura */
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_BASE)
     {
-        *(.rodata*)
+        *(.rodata .rodata.*)
+        *(.lrodata .lrodata.*)
     }
 
     /* Datos inicializados */
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_BASE)
     {
-        *(.data*)
+        *(.data .data.*)
+        *(.ldata .ldata.*)
     }
 
     /* Datos no inicializados (BSS) */
@@ -55,7 +60,8 @@ SECTIONS
     {
         __bss_start = .;
         *(COMMON)
-        *(.bss*)
+        *(.bss .bss.*)
+        *(.lbss .lbss.*)
         __bss_end = .;
     }
 

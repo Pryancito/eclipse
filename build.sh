@@ -1045,13 +1045,63 @@ export TERM=xterm-256color
 export PATH=/bin:/usr/bin:/sbin:/usr/sbin
 EOF
     chmod 644 "$BUILD_DIR/root/.bashrc"
-    cat > "$BUILD_DIR/etc/inputrc" << 'EOF'
-# /etc/inputrc - readline configuration for Eclipse OS
-set bell-style none
-set editing-mode emacs
-EOF
-    chmod 644 "$BUILD_DIR/etc/inputrc"
     print_status "Creados /etc/passwd, group, shadow, gshadow, nsswitch.conf, /root/.bashrc, /etc/inputrc y directorio /root"
+
+    # Config mínima para red y gestores de paquetes (apk/wget).
+    # - resolv.conf: QEMU usernet expone DNS en 10.0.2.3
+    # - repositories: repos Alpine (http para no depender de TLS en el primer arranque)
+    # - ca-certificates.crt: útil si luego pasamos a https
+    mkdir -p "$BUILD_DIR/etc/apk" "$BUILD_DIR/etc/apk/keys" "$BUILD_DIR/etc/ssl/certs"
+
+    # Claves de APK: sin ellas, `apk update` marca UNTRUSTED y no lista paquetes.
+    # Poblar /etc/apk/keys desde el paquete oficial alpine-keys (v3.20).
+    if ! ls "$BUILD_DIR/etc/apk/keys/"*.rsa.pub >/dev/null 2>&1; then
+        local _apk_keys_tmp
+        _apk_keys_tmp="$(mktemp -d 2>/dev/null || echo /tmp/eclipse-apk-keys.$$)"
+        mkdir -p "$_apk_keys_tmp"
+        # URL fija (v3.20/main/x86_64). Si cambia la versión, solo afecta a builds nuevos.
+        local _alpine_keys_url="http://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/alpine-keys-2.4-r1.apk"
+        print_status "Descargando alpine-keys para poblar /etc/apk/keys..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$_alpine_keys_url" -o "$_apk_keys_tmp/alpine-keys.apk" || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$_alpine_keys_url" -O "$_apk_keys_tmp/alpine-keys.apk" || true
+        else
+            print_error "No hay curl/wget en el host para descargar alpine-keys; /etc/apk/keys quedará vacío."
+        fi
+        if [ -s "$_apk_keys_tmp/alpine-keys.apk" ]; then
+            mkdir -p "$_apk_keys_tmp/extract"
+            # .apk es tar.gz
+            tar -xzf "$_apk_keys_tmp/alpine-keys.apk" -C "$_apk_keys_tmp/extract" 2>/dev/null || true
+            if ls "$_apk_keys_tmp/extract/etc/apk/keys/"*.rsa.pub >/dev/null 2>&1; then
+                cp -a "$_apk_keys_tmp/extract/etc/apk/keys/"*.rsa.pub "$BUILD_DIR/etc/apk/keys/" || true
+                chmod 644 "$BUILD_DIR/etc/apk/keys/"*.rsa.pub 2>/dev/null || true
+                print_status "Instaladas claves APK en /etc/apk/keys (alpine-keys)."
+            else
+                print_error "No se encontraron claves en alpine-keys.apk (extract fallido)."
+            fi
+        fi
+        rm -rf "$_apk_keys_tmp" 2>/dev/null || true
+    fi
+    if [ ! -s "$BUILD_DIR/etc/resolv.conf" ]; then
+        cat > "$BUILD_DIR/etc/resolv.conf" << 'EOF'
+nameserver 10.0.2.3
+nameserver 1.1.1.1
+EOF
+        print_status "Creado /etc/resolv.conf (DNS para QEMU usernet)"
+    fi
+    if [ ! -s "$BUILD_DIR/etc/apk/repositories" ]; then
+        cat > "$BUILD_DIR/etc/apk/repositories" << 'EOF'
+http://dl-cdn.alpinelinux.org/alpine/v3.20/main
+http://dl-cdn.alpinelinux.org/alpine/v3.20/community
+EOF
+        print_status "Creado /etc/apk/repositories (Alpine v3.20 main/community)"
+    fi
+    if [ ! -s "$BUILD_DIR/etc/ssl/certs/ca-certificates.crt" ] && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp -a /etc/ssl/certs/ca-certificates.crt "$BUILD_DIR/etc/ssl/certs/ca-certificates.crt"
+        chmod 644 "$BUILD_DIR/etc/ssl/certs/ca-certificates.crt" 2>/dev/null || true
+        print_status "Copiado /etc/ssl/certs/ca-certificates.crt (host → imagen)"
+    fi
     
     # Copiar el kernel
     if [ -f "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
@@ -1493,70 +1543,6 @@ userland_path = "/userland/bin/eclipse_userland"
 enable_debug = false
 log_level = "info"
 EOF
-    
-    # Crear symlink para fuentes (TinyX espera /usr/share/fonts/X11/)
-    mkdir -p "$BUILD_DIR/usr/share/fonts/X11/misc/"
-    if [ -d "eclipse-apps/sources/" ]; then
-        cp -f eclipse-apps/sources/* "$BUILD_DIR/usr/share/fonts/X11/misc/"
-        print_status "Copiado de fuentes a $BUILD_DIR/usr/share/fonts/X11/misc/"
-    fi
-
-    # Binarios musl dinámicos (p. ej. cargo/rustc del tarball): ld-musl usa /etc/ld-musl-x86_64.path
-    # para rutas extra; libgcc_s.so.1 aporta símbolos _Unwind_* (si falta: "relocating" + a veces EPERM por errno mal propagado).
-    mkdir -p "$BUILD_DIR/etc" "$BUILD_DIR/lib" "$BUILD_DIR/usr/lib"
-    if [ ! -s "$BUILD_DIR/etc/ld-musl-x86_64.path" ]; then
-        printf '%s\n' "/lib" "/usr/lib" > "$BUILD_DIR/etc/ld-musl-x86_64.path"
-        print_status "Instalado /etc/ld-musl-x86_64.path (/lib y /usr/lib)"
-    fi
-    local _musl_native_lib="$HOST_TOOLCHAINS_DIR/.stage/x86_64-linux-musl-native/lib"
-    if [ -f "$_musl_native_lib/libgcc_s.so.1" ]; then
-        cp -a "$_musl_native_lib"/libgcc_s.so* "$BUILD_DIR/lib/" 2>/dev/null || true
-        cp -a "$_musl_native_lib"/libgcc_s.so* "$BUILD_DIR/usr/lib/" 2>/dev/null || true
-        print_status "libgcc_s.so* (toolchain musl.cc) copiado a lib/ y usr/lib/"
-    elif [ -f "$BUILD_DIR/lib/libgcc_s.so.1" ]; then
-        print_status "libgcc_s.so.1 ya en $BUILD_DIR/lib (p. ej. por instalación previa del toolchain)"
-    else
-        print_warning "No hay libgcc_s.so.1 en $_musl_native_lib — ejecuta el paso de descarga musl o copia manual para cargo dinámico"
-    fi
-
-    # Intérprete dinámico musl: PT_INTERP de binarios enlazados con -dynamic-linker /lib/ld-musl-x86_64.so.1
-    # (wayfire, labwc, …). En musl el loader es el mismo binario que libc.so; en el .stage, ld-musl suele
-    # apuntar a /lib/libc.so — copiamos el .so real y hardlinkeamos el nombre del loader (el kernel
-    # no resolvía el intérprete si faltaba en /lib en EclipseFS).
-    if [ -f "$_musl_native_lib/libc.so" ]; then
-        if [ ! -f "$BUILD_DIR/lib/libc.so" ]; then
-            cp -a "$_musl_native_lib/libc.so" "$BUILD_DIR/lib/libc.so"
-            print_status "Instalado lib/libc.so (musl dinámico) desde musl native staging"
-        fi
-        if [ ! -e "$BUILD_DIR/lib/ld-musl-x86_64.so.1" ]; then
-            ln "$BUILD_DIR/lib/libc.so" "$BUILD_DIR/lib/ld-musl-x86_64.so.1" 2>/dev/null \
-                || cp -a "$BUILD_DIR/lib/libc.so" "$BUILD_DIR/lib/ld-musl-x86_64.so.1"
-            print_status "lib/ld-musl-x86_64.so.1 → mismo inodo que libc.so (cargador para execve/PT_INTERP)"
-        fi
-    else
-        print_warning "No hay $_musl_native_lib/libc.so — no se instala ld-musl; los binarios PIE/dinámicos fallarán al arrancar"
-    fi
-
-    # Árbol lib/gcc (specs, crt, includes): gcc en la imagen lo necesita; musl.cc no siempre trae `specs` en el .tgz.
-    local _musl_stage="$HOST_TOOLCHAINS_DIR/.stage/x86_64-linux-musl-native"
-    if [ -d "$_musl_stage/lib/gcc" ]; then
-        mkdir -p "$BUILD_DIR/lib"
-        cp -a "$_musl_stage/lib/gcc" "$BUILD_DIR/lib/"
-        print_status "Copiado lib/gcc desde musl.cc staging → $BUILD_DIR/lib/gcc"
-        local _mgcc="$_musl_stage/bin/x86_64-linux-musl-gcc"
-        if [ -x "$_mgcc" ]; then
-            shopt -s nullglob
-            for _specdir in "$BUILD_DIR"/lib/gcc/x86_64-linux-musl/*/; do
-                if [ -d "$_specdir" ] && [ ! -s "${_specdir}specs" ]; then
-                    if "$_mgcc" -dumpspecs > "${_specdir}specs" 2>/dev/null; then
-                        print_status "Generado ${_specdir}specs (x86_64-linux-musl-gcc -dumpspecs)"
-                    fi
-                fi
-            done
-            shopt -u nullglob
-        fi
-    fi
-
     # OpenSSL / libssl buscan este fichero por defecto (cargo, curl, etc.).
     mkdir -p "$BUILD_DIR/usr/local/ssl"
     if [ ! -s "$BUILD_DIR/usr/local/ssl/openssl.cnf" ]; then
@@ -1631,7 +1617,7 @@ EOF
     rm boot_temp.cfg
     
     # 2. Crear la partición EclipseFS
-    local ROOT_SIZE=64000
+    local ROOT_SIZE=16000
     local ROOT_OFFSET=130
     print_status "Creando partición EclipseFS (${ROOT_SIZE}MB) sin root..."
     rm -f "$ROOT_IMG"
@@ -1835,7 +1821,7 @@ build_eclipsefs_cli() {
 # Función principal
 main() {
     # Ejecutar pasos de construcción
-    download_host_musl_toolchains
+    #download_host_musl_toolchains
     build_eclipsefs_lib
     build_mkfs_eclipsefs
     build_populate_eclipsefs

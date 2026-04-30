@@ -692,7 +692,7 @@ pub fn schedule() -> u64 {
                         });
                     }
                 }
-            }
+            } 
             
             let current_tick = crate::interrupts::ticks();
             let mut min_wake = None;
@@ -774,7 +774,7 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
 }
 
 fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: ProcessId) {
-    let (to_ptr, to_kernel_stack, to_page_table, to_fs_base) = {
+    let (to_ptr, to_kernel_stack, to_page_table, to_fs_base, to_ctx_snapshot) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         // Use pid_to_slot_fast: to_pid may exceed 63 after slot reuse.
         let to_slot = match crate::ipc::pid_to_slot_fast(to_pid) {
@@ -792,9 +792,33 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
         let to_kernel_stack = to_process.kernel_stack_top;
         let to_page_table = to_process.proc.lock().resources.lock().page_table_phys;
         let to_fs_base = to_process.fs_base;
+        let to_ctx_snapshot = to_process.context;
         
-        (to_ctx_ptr, to_kernel_stack, to_page_table, to_fs_base)
+        (to_ctx_ptr, to_kernel_stack, to_page_table, to_fs_base, to_ctx_snapshot)
     };
+
+    // Diagnóstico puntual: crash reciente tras sys_mmap en thread (PID 10) acaba ejecutando RIP=0x400 con CS=0x8.
+    // Imprimimos el contexto del target justo antes del switch para ver si RIP/RSP ya vienen corruptos.
+    if to_pid == 10 {
+        crate::serial::serial_printf(format_args!(
+            "[SCHED-DIAG] to_pid=10 ctx.rip={:#x} ctx.rsp={:#x} ctx.rflags={:#x} fs_base={:#x} next_kstack_top={:#x}\n",
+            to_ctx_snapshot.rip,
+            to_ctx_snapshot.rsp,
+            to_ctx_snapshot.rflags,
+            to_fs_base,
+            to_kernel_stack,
+        ));
+    }
+
+    // Guard rail: switching to a near-null RIP in kernel is catastrophic (will `ret` into 0).
+    // If we ever see it, fail loudly here to pinpoint that the corruption is in scheduler/state.
+    if to_pid != 0 && to_ctx_snapshot.rip < 0x1000 {
+        crate::serial::serial_printf(format_args!(
+            "[SCHED-ERR] refusing switch: to_pid={} ctx.rip={:#x} ctx.rsp={:#x} rflags={:#x}\n",
+            to_pid, to_ctx_snapshot.rip, to_ctx_snapshot.rsp, to_ctx_snapshot.rflags
+        ));
+        panic!("scheduler attempted to switch to near-null RIP");
+    }
     
     // Update TSS RSP0
     crate::boot::set_tss_stack(to_kernel_stack);

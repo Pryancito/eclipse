@@ -15,6 +15,7 @@ members = [
     "rust-shell",
     "terminal",
     "xeyes",
+    "eclipse-labwc",
 ]
 exclude = ["libs/ipc_tests"]
 

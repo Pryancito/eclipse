@@ -509,43 +509,17 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     // dest_slot fue calculado arriba de forma segura (fuera de cualquier lock
     // de PROCESS_TABLE), así que lo usamos directamente.
     if dest_slot != 0xFF {
-        #[cfg(not(test))]
-        if to == 1 {
-            crate::serial::serial_printf(format_args!(
-                "[IPC-TRACE] send_message ->PID1 from={} type={:?} dest_slot={} len={}\n",
-                from, msg_type, dest_slot, data_len
-            ));
-        }
         return run_critical(|| {
             static P2P_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
             m.dest_slot = dest_slot;
-            #[cfg(not(test))]
-            if to == 1 {
-                crate::serial::serial_printf(format_args!(
-                    "[IPC-TRACE] send_message ->PID1 acquiring PROCESS_MAILBOXES lock...\n"
-                ));
-            }
             let mut mailboxes = PROCESS_MAILBOXES.lock();
-            #[cfg(not(test))]
-            if to == 1 {
-                crate::serial::serial_printf(format_args!(
-                    "[IPC-TRACE] send_message ->PID1 got PROCESS_MAILBOXES lock\n"
-                ));
-            }
             let ok = mailboxes[dest_slot as usize].push(m);
             if ok {
                 P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
             } else {
                 DROPPED_P2P_MSGS.fetch_add(1, Ordering::Relaxed);
-                #[cfg(not(test))]
-                if to == 1 {
-                    crate::serial::serial_printf(format_args!(
-                        "[IPC-TRACE] send_message ->PID1 mailbox FULL (slot={})\n",
-                        dest_slot
-                    ));
-                }
             }
             ok
         });
@@ -761,20 +735,7 @@ pub fn receive_message(pid: ClientId) -> Option<Message> {
     run_critical(|| {
         // 1. Intentar slot de proceso (P2P / Mailbox)
         if let Some(slot) = pid_to_slot_fast(pid) {
-            #[cfg(not(test))]
-            if pid == 1 {
-                crate::serial::serial_printf(format_args!(
-                    "[IPC-TRACE] receive_message PID1 slot={} acquiring PROCESS_MAILBOXES lock...\n",
-                    slot
-                ));
-            }
             let mut mailboxes = PROCESS_MAILBOXES.lock();
-            #[cfg(not(test))]
-            if pid == 1 {
-                crate::serial::serial_printf(format_args!(
-                    "[IPC-TRACE] receive_message PID1 got PROCESS_MAILBOXES lock\n"
-                ));
-            }
             if let Some(msg) = mailboxes[slot].pop() {
                 return Some(msg);
             }

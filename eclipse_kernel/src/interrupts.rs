@@ -19,6 +19,8 @@ static INTERRUPT_STATS: Mutex<InterruptStats> = Mutex::new(InterruptStats {
 });
 
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+// Diagnóstico mmap del hilo PID 10: 0=idle, 1=enter sys_mmap, 2=after sys_mmap return
+static MMAP10_STAGE: AtomicU64 = AtomicU64::new(0);
 
 /// Get current timer ticks (1 tick = 1ms at 1000Hz)
 pub fn ticks() -> u64 {
@@ -696,6 +698,15 @@ extern "C" fn exception_handler(context: &mut ExceptionContext) {
     let rfl = context.rflags;
     let cs  = context.cs;
     let ss  = context.ss;
+    if num == 14 && (cs & 3) == 0 {
+        let last_pid = crate::syscalls::LAST_SYSCALL_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let last_num = crate::syscalls::LAST_SYSCALL_NUM.load(core::sync::atomic::Ordering::Relaxed);
+        let mmap10_stage = MMAP10_STAGE.load(core::sync::atomic::Ordering::Relaxed);
+        crate::serial::serial_printf(format_args!(
+            "[PF-kdiag] cpu={} pid={} last_syscall: pid={} num={} mmap10_stage={} rip={:#x} cr2={:#x} err={:#x}\n",
+            cpu_id, pid, last_pid, last_num, mmap10_stage, rip, cr2, err
+        ));
+    }
 
     // ---- Demand Paging: satisfy a lazy anonymous page fault ----
     // When a page-not-present fault (#PF, vector 14) arrives from userspace and the
@@ -707,8 +718,26 @@ extern "C" fn exception_handler(context: &mut ExceptionContext) {
     if num == 14 && pid != 0 {
         // error_code bit 0 == 0 means "not present".
         // Allow handling faults for user-space addresses (< 0xFFFF...) even if triggered by the kernel.
-        if (err & 1) == 0 && cr2 < 0xFFFF_8000_0000_0000 {
+        // No intentar demand paging sobre la página cero: en userspace suele indicar
+        // un salto a NULL o un acceso NULL+desp, y además evitamos tomar locks/allocs
+        // en un caso que queremos diagnosticar explícitamente.
+        if (err & 1) == 0 && cr2 >= 0x1000 && cr2 < 0xFFFF_8000_0000_0000 {
+            // Diagnóstico bring-up labwc: si nos quedamos colgados tras un `mmap()` anónimo,
+            // lo más probable es entrar en #PF por demand paging. Logueamos sólo para los
+            // PIDs típicos del compositor/hilos (9-11) y sólo en el rango user-canónico.
+            if pid == 9 || pid == 10 || pid == 11 {
+                crate::serial::serial_printf(format_args!(
+                    "[PF-diag] pid={} cr2={:#x} err={:#x} rip={:#x} (anon-demand)\n",
+                    pid, cr2, err, rip
+                ));
+            }
             if crate::memory::handle_anon_page_fault(pid, cr2) {
+                if pid == 9 || pid == 10 || pid == 11 {
+                    crate::serial::serial_printf(format_args!(
+                        "[PF-diag] pid={} satisfied cr2={:#x}\n",
+                        pid, cr2
+                    ));
+                }
                 return; // Frame allocated — retry the faulting instruction.
             }
         }
@@ -723,21 +752,38 @@ extern "C" fn exception_handler(context: &mut ExceptionContext) {
     // ---- End Demand Paging ----
 
     // CR2 is only defined for #PF (14); on other faults it is stale — do not imply a page fault.
-    if num == 14 && cr2 < 4096 && pid != 0 {
-        // error bit 4 = instruction fetch; RIP≈CR2 suele ser call/jmp a NULL, no un simple *NULL.
-        let ifetch = (err & 0x10) != 0;
-        if rip < 4096 {
+    //
+    // Important: distinguish kernel vs userspace faults. A kernel-mode instruction fetch near 0
+    // usually means "ret/call through NULL" or corrupted return frame, not an app bug.
+    if num == 14 && cr2 < 4096 {
+        let ifetch = (err & 0x10) != 0; // bit 4 = instruction fetch
+        let cpl = (cs & 3) as u64;
+        if cpl == 0 {
             crate::serial::serial_printf(format_args!(
-                "\n[PF] CR2={:#x} RIP={:#x} err={:#x}: ejecución en página cero ({}). \
-Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras recurso no inicializado.\n",
-                cr2, rip, err,
+                "\n[PF] KERNEL CPL0 CR2={:#x} RIP={:#x} err={:#x} ({}). \
+Probable puntero NULL/retorno corrupto en kernel mientras atendía PID={}\n",
+                cr2,
+                rip,
+                err,
                 if ifetch { "fetch de instrucción" } else { "acceso" },
+                pid,
             ));
-        } else {
-            crate::serial::serial_printf(format_args!(
-                "\n[PF] CR2={:#x} RIP={:#x}: acceso a datos en primera página (NULL+desp); comprobar retorno de open/mmap.\n",
-                cr2, rip,
-            ));
+        } else if pid != 0 {
+            if rip < 4096 {
+                crate::serial::serial_printf(format_args!(
+                    "\n[PF] USER CPL3 CR2={:#x} RIP={:#x} err={:#x}: ejecución en página cero ({}). \
+Típico: puntero a función/backend a 0 tras recurso no inicializado.\n",
+                    cr2,
+                    rip,
+                    err,
+                    if ifetch { "fetch de instrucción" } else { "acceso" },
+                ));
+            } else {
+                crate::serial::serial_printf(format_args!(
+                    "\n[PF] USER CPL3 CR2={:#x} RIP={:#x}: acceso a datos en primera página (NULL+desp); comprobar retorno de open/mmap.\n",
+                    cr2, rip,
+                ));
+            }
         }
     }
     crate::serial::serial_printf(format_args!(
@@ -757,18 +803,94 @@ Típico en compositores: puntero a función / backend Wayland o wl_* a 0 tras re
         rfl, cs, ss
     ));
 
-    // For #GP (13) and #UD (6), dump instruction bytes at RIP to help identify the faulting instruction
-    if (num == 13 || num == 6) && pid != 0 && (cs & 3) == 3 {
-        if let Some(p) = crate::process::get_process(pid) {
-            let pt = p.proc.lock().resources.lock().page_table_phys;
-            crate::serial::serial_printf(format_args!("[FAULT] bytes at RIP({:#x}): ", rip));
-            for i in 0..15 {
-                match crate::memory::try_read_user_u8(pt, rip + i) {
-                    Some(b) => crate::serial::serial_printf(format_args!("{:02x} ", b)),
-                    None => crate::serial::serial_printf(format_args!("?? ")),
+    if num == 14 && (err & 0x08) != 0 {
+        crate::serial::serial_printf(format_args!("[PF-RSVD] RSVD bit set in #PF! Traversing page tables for CR2={:#x}\n", cr2));
+        unsafe {
+            let pml4_phys = cr3;
+            let pml4_virt = crate::memory::PHYS_MEM_OFFSET + pml4_phys;
+            let pml4 = &*(pml4_virt as *const crate::memory::PageTable);
+            let pml4_idx = ((cr2 >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((cr2 >> 30) & 0x1FF) as usize;
+            let pd_idx   = ((cr2 >> 21) & 0x1FF) as usize;
+            let pt_idx   = ((cr2 >> 12) & 0x1FF) as usize;
+            
+            let pml4e = &pml4.entries[pml4_idx];
+            let pml4e_val: u64 = core::mem::transmute_copy(pml4e);
+            crate::serial::serial_printf(format_args!("  PML4E: {:#018x}\n", pml4e_val));
+            if pml4e.present() {
+                let pdpt_virt = crate::memory::PHYS_MEM_OFFSET + pml4e.get_addr();
+                let pdpt = &*(pdpt_virt as *const crate::memory::PageTable);
+                let pdpte = &pdpt.entries[pdpt_idx];
+                let pdpte_val: u64 = core::mem::transmute_copy(pdpte);
+                crate::serial::serial_printf(format_args!("  PDPTE: {:#018x}\n", pdpte_val));
+                if pdpte.present() && !pdpte.is_huge() {
+                    let pd_virt = crate::memory::PHYS_MEM_OFFSET + pdpte.get_addr();
+                    let pd = &*(pd_virt as *const crate::memory::PageTable);
+                    let pde = &pd.entries[pd_idx];
+                    let pde_val: u64 = core::mem::transmute_copy(pde);
+                    crate::serial::serial_printf(format_args!("  PDE: {:#018x}\n", pde_val));
+                    if pde.present() && !pde.is_huge() {
+                        let pt_virt = crate::memory::PHYS_MEM_OFFSET + pde.get_addr();
+                        let pt = &*(pt_virt as *const crate::memory::PageTable);
+                        let pte = &pt.entries[pt_idx];
+                        let pte_val: u64 = core::mem::transmute_copy(pte);
+                        crate::serial::serial_printf(format_args!("  PTE: {:#018x}\n", pte_val));
+                    }
                 }
             }
-            crate::serial::serial_print("\n");
+        }
+    }
+
+    // For #GP (13) and #UD (6), dump instruction bytes at RIP to help identify the faulting instruction.
+    // - Userspace: read via the process page table.
+    // - Kernel: read directly (RIP is a kernel linear address).
+    if (num == 13 || num == 6) && pid != 0 {
+        crate::serial::serial_printf(format_args!("[FAULT] bytes at RIP({:#x}): ", rip));
+        if (cs & 3) == 3 {
+            if let Some(p) = crate::process::get_process(pid) {
+                let pt = p.proc.lock().resources.lock().page_table_phys;
+                for i in 0..15 {
+                    match crate::memory::try_read_user_u8(pt, rip + i) {
+                        Some(b) => crate::serial::serial_printf(format_args!("{:02x} ", b)),
+                        None => crate::serial::serial_printf(format_args!("?? ")),
+                    }
+                }
+            } else {
+                crate::serial::serial_print("?? (no process)\n");
+            }
+        } else {
+            unsafe {
+                for i in 0..15u64 {
+                    let p = (rip + i) as *const u8;
+                    // Best-effort: if this itself faults, we'll just crash again,
+                    // but in practice kernel text should be mapped and readable.
+                    let b = core::ptr::read_volatile(p);
+                    crate::serial::serial_printf(format_args!("{:02x} ", b));
+                }
+            }
+        }
+        crate::serial::serial_print("\n");
+    }
+
+    // Tiny kernel backtrace for CPL0 faults: follow RBP frame pointers.
+    if (cs & 3) == 0 && (num == 13 || num == 14 || num == 6) {
+        crate::serial::serial_printf(format_args!("[BT] rbp={:#x}\n", rbp));
+        let mut fp = rbp as *const u64;
+        for depth in 0..8 {
+            let fp_u = fp as u64;
+            if fp_u < 0xFFFF_8000_0000_0000 || (fp_u & 7) != 0 {
+                crate::serial::serial_printf(format_args!("[BT] stop: non-canonical/unaligned fp={:#x}\n", fp_u));
+                break;
+            }
+            unsafe {
+                let prev = core::ptr::read_volatile(fp);
+                let ret = core::ptr::read_volatile(fp.add(1));
+                crate::serial::serial_printf(format_args!("[BT] #{:02} fp={:#x} ret={:#x}\n", depth, fp_u, ret));
+                if prev == 0 || prev == fp_u {
+                    break;
+                }
+                fp = prev as *const u64;
+            }
         }
     }
 
@@ -2352,8 +2474,12 @@ extern "C" fn syscall_handler_rust(
         context.rsp = frame.add(4).read_unaligned();
         context.ss = frame.add(5).read_unaligned();
     }
+    let pid = crate::process::current_process_id().unwrap_or(0);
+    if pid == 10 && syscall_num == 9 {
+        MMAP10_STAGE.store(1, Ordering::Relaxed);
+    }
 
-    crate::syscalls::syscall_handler(
+    let ret = crate::syscalls::syscall_handler(
         syscall_num,
         arg1,
         arg2,
@@ -2362,7 +2488,41 @@ extern "C" fn syscall_handler_rust(
         arg5,
         arg6,
         context,
-    )
+    );
+
+    // Diagnóstico: el crash actual sucede tras `mmap()` en un hilo (pid=10) con CS=0x8/SS=0x10 y RIP=0.
+    // Dump del IRET frame ANTES de volver al asm/iretq para ver si el frame se corrompe aquí
+    // o más tarde en el camino de retorno.
+    if pid == 10 && syscall_num == 9 {
+        MMAP10_STAGE.store(2, Ordering::Relaxed);
+        crate::serial::serial_printf(format_args!(
+            "[SYSCALL-RET-FRAME] pid=10 mmap ret={:#x} frame_rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}\n",
+            ret, context.rip, context.cs, context.rflags, context.rsp, context.ss
+        ));
+    }
+
+    ret
+}
+
+#[no_mangle]
+extern "C" fn dump_bad_iret_frame(tag: u64, rsp: u64) -> ! {
+    // Stack layout at `rsp` (expected): [RIP, CS, RFLAGS, RSP, SS]
+    unsafe {
+        let rip = (rsp as *const u64).add(0).read_unaligned();
+        let cs = (rsp as *const u64).add(1).read_unaligned();
+        let rflags = (rsp as *const u64).add(2).read_unaligned();
+        let ursp = (rsp as *const u64).add(3).read_unaligned();
+        let ss = (rsp as *const u64).add(4).read_unaligned();
+        let pid = crate::process::current_process_id().unwrap_or(0);
+        let cpu = crate::process::get_cpu_id();
+        crate::serial::serial_printf(format_args!(
+            "\n[BAD-IRET] tag={} cpu={} pid={} rsp={:#x} frame: rip={:#x} cs={:#x} rflags={:#x} ursp={:#x} ss={:#x}\n",
+            tag, cpu, pid, rsp, rip, cs, rflags, ursp, ss
+        ));
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags)); }
+    }
 }
 
 #[unsafe(naked)]
@@ -2425,11 +2585,16 @@ unsafe extern "C" fn syscall_int80() {
         // Offset de RAX desde RBP es -8.
         "mov [rbp - 8], rax",
         
+        // SYSCALL ya enmascara IF vía IA32_FMASK; int $0x80 entra por puerta de interrupción (IF=0).
+        // Aun así, bloqueamos IRQ hasta iretq por simetría con syscall_entry (NMI, consistencia).
+        "cli",
+        
         // CRITICAL: Restore user data segments BEFORE popping registers
-        // We need to do this while RBP is still valid
-        "mov ax, 0x23",  // USER_DATA_SELECTOR
-        "mov ds, ax",
-        "mov es, ax",
+        // We need to do this while RBP is still valid.
+        // DO NOT use AX here: it would clobber the syscall return value in RAX.
+        "mov dx, 0x23",  // USER_DATA_SELECTOR
+        "mov ds, dx",
+        "mov es, dx",
         // FS and GS bases are managed by ARCH_SET_FS/GS MSRs
         
         "pop r15",
@@ -2536,21 +2701,23 @@ unsafe extern "C" fn syscall_entry() {
         "push rax",
         // 7th arg: arg6 = saved r9
         "push qword ptr [rbp - 64]",
-        
         "call {handler}",
         
         "add rsp, 24", // Pop args (arg6, context, frame_rbp)
         "mov rsp, rbp", // Restore stack to just after RBP push
         "sub rsp, 112", // Move to start of GPRs (r15)
-        
-        // El resultado está en RAX. Queremos que el RAX pusheado sea este resultado
-        // Offset de RAX desde RBP es -8.
-        "mov [rbp - 8], rax",
+
+        // Critical section: from here until IRETQ we progressively restore user-mode registers
+        // (including RBP) while still executing on the kernel stack.
+        // SYSCALL already clears IF (IA32_FMASK bit 9); this cli is still useful for NMIs and
+        // documents the invariant. (int $0x80 path uses cli above as well.)
+        "cli",
         
         // CRITICAL: Restore user data segments BEFORE popping registers
-        "mov ax, 0x23",  // USER_DATA_SELECTOR
-        "mov ds, ax",
-        "mov es, ax",
+        // DO NOT use AX here: it would clobber the syscall return value in RAX.
+        "mov dx, 0x23",  // USER_DATA_SELECTOR
+        "mov ds, dx",
+        "mov es, dx",
         // FS and GS must NOT be reloaded here as it would clear the Base address (MSR_FS_BASE)
         // configured by sys_arch_prctl. Since kernel doesn't change them, just leave as is.
 
@@ -2568,9 +2735,32 @@ unsafe extern "C" fn syscall_entry() {
         "pop rdx",
         "pop rcx",
         "pop rbx",
-        "pop rax",
+        // Do NOT restore the saved user RAX: keep the syscall return value in RAX.
+        // Skip the saved rax slot (rbp-8) instead.
+        "add rsp, 8",
         
         "pop rbp",
+
+        // Validate iret frame before returning to ring 3.
+        // Frame at RSP: [RIP, CS, RFLAGS, RSP, SS]
+        // IMPORTANT: do not clobber RAX here (it holds the syscall return value).
+        // RCX is already clobbered by the SYSCALL instruction, so it's safe scratch.
+        "mov rcx, [rsp + 8]",          // CS
+        "cmp rcx, 0x1b",
+        "je 10f",
+        "mov rdi, 1",                  // tag=1 (bad CS)
+        "mov rsi, rsp",
+        "and rsp, -16",
+        "call {dump_bad_iret_frame}",
+        "10:",
+        "mov rcx, [rsp + 32]",         // SS
+        "cmp rcx, 0x23",
+        "je 11f",
+        "mov rdi, 2",                  // tag=2 (bad SS)
+        "mov rsi, rsp",
+        "and rsp, -16",
+        "call {dump_bad_iret_frame}",
+        "11:",
 
         // Restore user GS before returning to ring 3.
         // At this point the kernel GS (CpuData) is active; swapgs swaps it back
@@ -2580,6 +2770,7 @@ unsafe extern "C" fn syscall_entry() {
         "iretq",
         
         handler = sym syscall_handler_rust,
+        dump_bad_iret_frame = sym dump_bad_iret_frame,
     );
 }
 
@@ -2606,6 +2797,7 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         
         // Restaurar selectores de datos
         "push rax",
+        // We saved RAX, so using AX here is safe and avoids clobbering RDX.
         "mov ax, 0x23", // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
@@ -2626,8 +2818,31 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         // El scheduler ya restauró los registros GP (rax, rbx, rsi, etc.)
         // El stack (RSP) ya apunta al frame IRETQ pushgeado por fork_process.
         
+        // Validar frame iret (debe ser ring3) antes de saltar.
+        // Frame at RSP: [RIP, CS, RFLAGS, RSP, SS]
+        // IMPORTANT: do not clobber RAX: for clone/fork the child must see RAX=0.
+        // Use RCX as scratch (it's clobbered by SYSCALL anyway).
+        "mov rcx, [rsp + 8]",          // CS
+        "cmp rcx, 0x1b",
+        "je 20f",
+        "mov rdi, 3",                  // tag=3 (fork tramp bad CS)
+        "mov rsi, rsp",
+        "and rsp, -16",
+        "call {dump_bad_iret_frame}",
+        "20:",
+        "mov rcx, [rsp + 32]",         // SS
+        "cmp rcx, 0x23",
+        "je 21f",
+        "mov rdi, 4",                  // tag=4 (fork tramp bad SS)
+        "mov rsi, rsp",
+        "and rsp, -16",
+        "call {dump_bad_iret_frame}",
+        "21:",
+
         // ¡Salto a Userspace!
         "iretq",
+
+        dump_bad_iret_frame = sym dump_bad_iret_frame,
     );
 }
 

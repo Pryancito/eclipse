@@ -122,49 +122,30 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 /// 
 /// Parámetros (x86_64 calling convention):
 /// - RDI: boot_info_ptr - Pointer to BootInfo structure
-#[cfg(not(test))]
+core::arch::global_asm!(
+    ".section .init, \"ax\"",
+    ".global _start",
+    "_start:",
+    "jmp 5f",
+    ".long 0x504C4345", // 'ECLP'
+    "5:",
+    // Wait until COM1 Transmitter Holding Register is empty (LSR bit 5)
+    "2:",
+    "mov dx, 0x3FD",
+    "in al, dx",
+    "test al, 0x20",
+    "jz 2b",
+    // Send 'K' to indicate kernel entry
+    "mov dx, 0x3F8",
+    "mov al, 0x4B",
+    "out dx, al",
+    // Call the Rust early entry point
+    "jmp kernel_early_init"
+);
+
+/// Punto de entrada temprano del kernel en Rust
 #[no_mangle]
-#[link_section = ".init"]
-pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
-    // 0. Emit a raw serial byte before ANY initialization to confirm the kernel
-    //    is executing.  This bypasses SERIAL_INITIALIZED and does not touch any
-    //    static variable, so it is safe even before BSS has been zeroed.
-    unsafe {
-        core::arch::asm!(
-            // Wait until COM1 Transmitter Holding Register is empty (LSR bit 5)
-            "2:",
-            "mov dx, 0x3FD",       // COM1 Line Status Register
-            "in al, dx",
-            "test al, 0x20",
-            "jz 2b",
-            // Send 'K' to indicate kernel entry
-            "mov dx, 0x3F8",
-            "mov al, 0x4B",        // 'K'
-            "out dx, al",
-            out("dx") _,
-            out("al") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    // 1. Zero BSS first (before serial::init so SERIAL_INITIALIZED is not erased)
-    // BSS must be zeroed before any static variable is written, because BSS
-    // zeroing resets every zero-initialized static (including SERIAL_INITIALIZED).
-    // If serial::init() runs first it sets SERIAL_INITIALIZED=true, but then BSS
-    // zeroing immediately clears it back to false, silencing all serial output.
-    extern "C" {
-        static mut __bss_start: u8;
-        static mut __bss_end: u8;
-    }
-    unsafe {
-        let mut curr = &raw mut __bss_start;
-        let end = &raw mut __bss_end;
-        while curr < end {
-            curr.write_volatile(0);
-            curr = curr.add(1);
-        }
-    }
-
+pub extern "C" fn kernel_early_init(boot_info_ptr: u64) -> ! {
     // 2. Initialize serial for diagnostics (after BSS zeroing so the init sticks)
     serial::init();
 
@@ -175,9 +156,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     boot::init(boot_info_ptr);
 
     // Confirm kernel is running with serial output before any framebuffer access
-    serial::serial_print("[KERNEL] Entered _start (Higher Half)\n");
-
-    // Switch to Higher Half Boot Stack immediately to allow removing identity mapping later
+    serial::serial_print("[KERNEL] Entered kernel_early_init (Higher Half)\n");
 
     // Diagnostic framebuffer squares using identity-mapped (physical) address only.
     // NOTE: HHDM-based framebuffer access (phys_to_virt) is intentionally NOT done

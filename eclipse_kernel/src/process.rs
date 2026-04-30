@@ -787,6 +787,11 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
                     let n = core::cmp::min(name.len(), 16);
                     proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
                     proc.mem_frames += loaded.segment_frames;
+                    // Diagnóstico temprano: trazar syscalls de init para depurar fallos en mmap/TLS
+                    // antes de que el userspace pueda imprimir.
+                    if name == "init" {
+                        proc.syscall_trace = true;
+                    }
                     
                     if let Some((pgid, sid, cwd, cwd_len)) = parent_info {
                         proc.pgid = pgid;

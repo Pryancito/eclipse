@@ -1506,11 +1506,25 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
         // Find the VMA containing the faulting address.
         let vma = r.vmas.iter().find(|v| fault_addr >= v.start && fault_addr < v.end);
         if let Some(v) = vma {
+            crate::serial::serial_printf(core::format_args!(
+                "[PF_DEBUG] Found VMA for CR2={:#018x}: start={:#018x} end={:#018x} prot={} is_huge={}\n",
+                fault_addr, v.start, v.end, v.flags, v.is_huge
+            ));
             (pt, v.flags, v.is_huge, v.start, v.object.clone(), v.offset)
         } else {
+            crate::serial::serial_printf(core::format_args!(
+                "[PF_DEBUG] NO VMA for CR2={:#018x}! Process VMAs:\n", fault_addr
+            ));
+            for (i, v) in r.vmas.iter().enumerate() {
+                crate::serial::serial_printf(core::format_args!(
+                    "  [{}] start={:#018x} end={:#018x} prot={}\n",
+                    i, v.start, v.end, v.flags
+                ));
+            }
             return false;
         }
     };
+
 
     // Huge Page (2MB) Handling
     if is_huge {
@@ -1533,6 +1547,10 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
         };
         drop(obj);
 
+        crate::serial::serial_printf(core::format_args!(
+            "[PF_DEBUG] Mapping 2MB phys={:#018x} at virt={:#018x} leaf_bits={:#018x}\n",
+            phys, page_addr, pte_leaf
+        ));
         map_user_page_2mb(page_table_phys, page_addr, phys, pte_leaf);
         return true;
     }
@@ -1569,6 +1587,11 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
     
     // Use the original linux_p for now to avoid breaking complex slack logic
     let pte_leaf = linux_prot_to_leaf_pte_bits(linux_p);
+    
+    crate::serial::serial_printf(core::format_args!(
+        "[PF_DEBUG] Mapping 4KB phys={:#018x} at virt={:#018x} leaf_bits={:#018x}\n",
+        phys, page_addr, pte_leaf
+    ));
     map_user_page_4kb(page_table_phys, page_addr, phys, pte_leaf);
     true
 }
@@ -1591,28 +1614,14 @@ pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
     if num_pages == 0 {
         return None;
     }
-    let bytes = num_pages.checked_mul(4096)?;
+    use crate::memory::frame_allocator;
+    use x86_64::structures::paging::PhysFrame;
 
-    let pool_start = anon_mmap_pool_start();
-    let pool_end = anon_mmap_pool_end();
-    loop {
-        let current = ANON_MMAP_NEXT.load(Ordering::SeqCst);
-        let start_phys = pool_start.checked_add(current)?;
-        let end_phys = start_phys.checked_add(bytes)?;
-
-        if end_phys > pool_end {
-            return None;
-        }
-
-        // Reserve the range atomically.
-        if ANON_MMAP_NEXT
-            .compare_exchange(current, current + bytes, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return Some(start_phys);
-        }
-        // If CAS fails, another thread reserved space; retry with updated cursor.
-    }
+    // IMPORTANT: do NOT allocate "contiguous" runs from a separate bump cursor without
+    // informing the bitmap frame allocator. Doing so can overlap with other allocations
+    // and corrupt page tables, which often manifests as #PF with RSVD=1.
+    let frame: PhysFrame = frame_allocator::alloc_contiguous_frames(num_pages as usize, 1)?;
+    Some(frame.start_address().as_u64())
 }
 
 /// Returns (total_frames, used_frames) for the userspace physical pool.

@@ -509,6 +509,8 @@ pub fn enable_cpu_features() {
         cr4 |= 1 << 9;  // OSFXSR: Soporte para FXSAVE/FXRSTOR
         cr4 |= 1 << 10; // OSXMMEXCPT: Soporte para excepciones SIMD (#XM)
 
+        asm!("mov cr4, {}", in(reg) cr4);
+        
         let cpuid_1 = core::arch::x86_64::__cpuid(1);
 
         // Habilitar XSAVE y AVX si están soportados
@@ -537,7 +539,5 @@ pub fn enable_cpu_features() {
         if (cpuid_7.ebx & (1 << 0)) != 0 {
             cr4 |= 1 << 16;
         }
-
-        asm!("mov cr4, {}", in(reg) cr4);
     }
 }

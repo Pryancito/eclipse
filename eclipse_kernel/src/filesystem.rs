@@ -2355,14 +2355,19 @@ impl Scheme for FileSystemScheme {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         match open_file {
-            OpenFile::Real { inode: _, size, .. } => {
+            OpenFile::Real { inode, size, .. } => {
+                stat.ino = *inode as u64;
+                stat.dev = 0x800; // Fake block device ID for the real disk
                 stat.size = *size;
                 stat.mode = 0o100644;
+                stat.nlink = 1;
                 Ok(0)
             }
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 let kind = VIRTUAL_KINDS.lock().get(&path_clone).cloned().unwrap_or(NodeKind::File);
+                stat.ino = 1; // Generic virtual inode
+                stat.dev = 0x10; // Generic virtual device
                 stat.mode = match kind {
                     NodeKind::File => 0o100644,
                     NodeKind::Directory => 0o040755,
@@ -2479,6 +2484,53 @@ impl Scheme for FileSystemScheme {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         match open_file {
+            OpenFile::Real { inode, size, .. } => {
+                // File-backed fmap for regular files.
+                // We currently implement this as "copy to contiguous physical memory" so that
+                // sys_mmap(file-backed) can map it into userspace. This enables dynamic loaders
+                // (musl) to mmap shared libraries even though demand-paging VMObjectType::File
+                // isn't implemented yet.
+                //
+                // Constraints:
+                // - offset must be page-aligned (Linux requirement for mmap of files).
+                // - len can be any; we round up to page size for allocation/mapping.
+                if (offset & 0xFFF) != 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+                let file_size = *size as usize;
+                if offset >= file_size {
+                    return Err(scheme_error::EINVAL);
+                }
+                let max_len = file_size - offset;
+                let want = core::cmp::min(len, max_len);
+                let aligned_len = (want + 0xFFF) & !0xFFF;
+                if aligned_len == 0 {
+                    return Err(scheme_error::EINVAL);
+                }
+
+                // Allocate contiguous physical pages from the userspace pool.
+                let pages = (aligned_len as u64 + 4095) / 4096;
+                let Some(start_phys) = crate::memory::alloc_phys_frames_contig(pages) else {
+                    return Err(scheme_error::ENOMEM);
+                };
+                // Mark refcounts so the frame allocator accounting doesn't think these pages are free.
+                for i in 0..pages {
+                    crate::memory::frame_info::set_refcount(start_phys + i * 4096, 1);
+                }
+
+                // Zero the whole region and read file bytes into it.
+                let kptr = (crate::memory::PHYS_MEM_OFFSET + start_phys) as *mut u8;
+                unsafe { core::ptr::write_bytes(kptr, 0, aligned_len); }
+                let dst = unsafe { core::slice::from_raw_parts_mut(kptr, want) };
+                match Filesystem::read_file_by_inode_at(*inode, dst, offset as u64) {
+                    Ok(_n) => {
+                        // Return a "physical mapping address" for sys_mmap.
+                        // sys_mmap expects a pure physical address (with optional bit 63 for WC).
+                        Ok(start_phys as usize)
+                    }
+                    Err(_) => Err(scheme_error::EIO),
+                }
+            }
             OpenFile::Framebuffer => {
                 let fb_info = &crate::boot::get_boot_info().framebuffer;
                 if fb_info.base_address == 0 { return Err(scheme_error::EIO); }

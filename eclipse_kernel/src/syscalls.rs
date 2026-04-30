@@ -498,6 +498,37 @@ pub fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
     u64::MAX
 }
 
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LegacyStat {
+    pub st_dev:     u64,
+    pub st_ino:     u64,
+    pub st_mode:    u32,
+    pub st_nlink:   u32,
+    pub st_uid:     u32,
+    pub st_gid:     u32,
+    pub st_rdev:    u64,
+    pub st_size:    u64,
+    pub st_atime:   i64,
+    pub st_mtime:   i64,
+    pub st_ctime:   i64,
+}
+
+fn scheme_stat_to_legacy_stat(s: &crate::scheme::Stat) -> LegacyStat {
+    LegacyStat {
+        st_dev:     s.dev,
+        st_ino:     s.ino,
+        st_mode:    s.mode,
+        st_nlink:   s.nlink,
+        st_uid:     s.uid,
+        st_gid:     s.gid,
+        st_rdev:    s.rdev,
+        st_size:    s.size,
+        st_atime:   s.atime,
+        st_mtime:   s.mtime,
+        st_ctime:   s.ctime,
+    }
+}
 
 pub fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
     let len = strlen_user_unique(path_ptr, 1023);
@@ -506,15 +537,16 @@ pub fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
     if !copy_from_user(path_ptr, &mut path_buf[..len]) { return linux_abi_error(14); }
     let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
     
-    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<LegacyStat>() as u64) {
         return linux_abi_error(14);
     }
 
     let mut s = crate::scheme::Stat::default();
     match crate::scheme::stat(path, &mut s) {
         Ok(_) => {
+            let legacy_s = scheme_stat_to_legacy_stat(&s);
             let out = unsafe {
-                core::slice::from_raw_parts(&s as *const crate::scheme::Stat as *const u8, core::mem::size_of::<crate::scheme::Stat>())
+                core::slice::from_raw_parts(&legacy_s as *const LegacyStat as *const u8, core::mem::size_of::<LegacyStat>())
             };
             if !copy_to_user(stat_ptr, out) { return linux_abi_error(14); }
             0
@@ -526,14 +558,15 @@ pub fn sys_stat(path_ptr: u64, stat_ptr: u64) -> u64 {
 pub fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let pid = current_process_id().unwrap_or(0);
     if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-        if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+        if !is_user_pointer(stat_ptr, core::mem::size_of::<LegacyStat>() as u64) {
             return linux_abi_error(14);
         }
         let mut s = crate::scheme::Stat::default();
         match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut s) {
             Ok(_) => {
+                let legacy_s = scheme_stat_to_legacy_stat(&s);
                 let out = unsafe {
-                    core::slice::from_raw_parts(&s as *const crate::scheme::Stat as *const u8, core::mem::size_of::<crate::scheme::Stat>())
+                    core::slice::from_raw_parts(&legacy_s as *const LegacyStat as *const u8, core::mem::size_of::<LegacyStat>())
                 };
                 if !copy_to_user(stat_ptr, out) { return linux_abi_error(14); }
                 0
@@ -988,10 +1021,25 @@ pub fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             
             unsafe {
                 let stack_top = STACK_BASE + STACK_SIZE as u64;
+                let tls = if res.dynamic_linker.is_some() { 0 } else { res.tls_base };
                 if res.dynamic_linker.is_some() {
-                    crate::elf_loader::jump_to_userspace_dynamic_linker(res.entry_point, stack_top, res.phdr_va, res.phnum, res.phentsize);
+                    crate::elf_loader::jump_to_userspace_dynamic_linker(
+                        res.entry_point,
+                        stack_top,
+                        res.phdr_va,
+                        res.phnum,
+                        res.phentsize,
+                        tls,
+                    );
                 } else {
-                    crate::elf_loader::jump_to_userspace(res.entry_point, stack_top, res.phdr_va, res.phnum, res.phentsize);
+                    crate::elf_loader::jump_to_userspace(
+                        res.entry_point,
+                        stack_top,
+                        res.phdr_va,
+                        res.phnum,
+                        res.phentsize,
+                        tls,
+                    );
                 }
             }
         }
@@ -1607,6 +1655,7 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         0x1002 => { // SET_FS
             if let Some(mut process) = crate::process::get_process(pid) {
                 process.fs_base = addr;
+                crate::process::update_process(pid, process);
             }
             set_fs_base(addr);
             0
@@ -2050,7 +2099,100 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
                         return target_vaddr;
                     }
                 }
-                Err(e) => return (-(e as isize)) as u64,
+                Err(e) => {
+                    // Fallback: algunos esquemas (p.ej. `file:`) no implementan fmap todavía.
+                    // Para soportar binarios dinámicos (musl mapea .so), hacemos un mmap "software":
+                    // reservamos un VMA anónimo y copiamos el contenido del fichero a frames mapeados.
+                    if e == crate::scheme::error::ENOSYS {
+                        crate::serial::serial_printf(format_args!(
+                            "[sys_mmap] fmap ENOSYS -> fallback copy fd={} off={} len={} prot={:#x} flags={:#x}\n",
+                            fd, offset, len, prot, flags
+                        ));
+                        let aligned_len = (len + 0xFFF) & !0xFFF;
+                        let target_vaddr = if is_fixed {
+                            if addr == 0 || (addr & 0xFFF) != 0 { return linux_abi_error(22); }
+                            addr
+                        } else {
+                            if let Some(proc) = crate::process::get_process(pid) {
+                                let p_proc = proc.proc.lock();
+                                let r = p_proc.resources.lock();
+                                if let Some(v) = vma_find_gap(&r.vmas, aligned_len) {
+                                    v
+                                } else { return linux_abi_error(12); }
+                            } else { return linux_abi_error(3); }
+                        };
+
+                        if let Some(mut proc) = crate::process::get_process(pid) {
+                            let obj = crate::vm_object::VMObject::new_anonymous(aligned_len);
+                            {
+                                let p_proc = proc.proc.lock();
+                                let mut r = p_proc.resources.lock();
+                                if is_fixed { vma_remove_range(&mut r.vmas, target_vaddr, target_vaddr + aligned_len); }
+
+                                // Registrar el VMA (para futuras comprobaciones de permisos).
+                                r.vmas.push(crate::process::VMARegion {
+                                    start: target_vaddr,
+                                    end: target_vaddr + aligned_len,
+                                    flags: prot,
+                                    object: obj.clone(),
+                                    offset: 0,
+                                    is_huge: false,
+                                    is_shared: (flags & linux_mmap_abi::MAP_SHARED) != 0,
+                                });
+                                vma_merge_adjacent(&mut r.vmas);
+
+                                // Mapear y copiar páginas ahora (eager), porque el page fault handler
+                                // para VMObjectType::File todavía no está implementado.
+                                let leaf = crate::memory::linux_prot_to_leaf_pte_bits(prot);
+                                let mut tmp = [0u8; 4096];
+                                let mut off_in_file = offset;
+                                let mut page_off = 0u64;
+                                while page_off < aligned_len {
+                                    let Some(phys) = crate::memory::alloc_phys_frame_for_anon_mmap() else {
+                                        return linux_abi_error(12); // ENOMEM
+                                    };
+                                    let fv = crate::memory::PHYS_MEM_OFFSET + phys;
+                                    unsafe { core::ptr::write_bytes(fv as *mut u8, 0, 4096); }
+
+                                    // Leer hasta 4KB desde el esquema al buffer temporal.
+                                    let want = core::cmp::min(4096u64, len.saturating_sub(page_off)) as usize;
+                                    if want > 0 {
+                                        // Limpiar el tmp para no filtrar datos viejos.
+                                        tmp.fill(0);
+                                        match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, &mut tmp[..want], off_in_file) {
+                                            Ok(n) => {
+                                                unsafe {
+                                                    core::ptr::copy_nonoverlapping(tmp.as_ptr(), fv as *mut u8, n);
+                                                }
+                                            }
+                                            Err(er) => {
+                                                crate::serial::serial_printf(format_args!(
+                                                    "[sys_mmap] fallback read failed: scheme_err={} fd={} off_in_file={} want={}\n",
+                                                    er, fd, off_in_file, want
+                                                ));
+                                                return linux_abi_error(5); // EIO
+                                            }
+                                        }
+                                        off_in_file = off_in_file.saturating_add(want as u64);
+                                    }
+
+                                    // Registrar la página en el objeto y mapearla en userspace.
+                                    {
+                                        let mut o = obj.lock();
+                                        let idx = page_off / 4096;
+                                        o.pages.insert(idx, phys);
+                                    }
+                                    crate::memory::map_user_page_4kb(r.page_table_phys, target_vaddr + page_off, phys, leaf);
+                                    page_off += 4096;
+                                }
+                            }
+                            crate::process::update_process(pid, proc);
+                            return target_vaddr;
+                        }
+                        return linux_abi_error(3);
+                    }
+                    return (-(e as isize)) as u64;
+                }
             }
         }
     }
@@ -2079,6 +2221,10 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         let mut r = p_proc.resources.lock();
         let (lo, hi) = mprotect_expand_anon_slack(&r.vmas, addr, addr + len, prot);
         vma_mprotect_range(&mut r.vmas, lo, hi, prot);
+        // Aplicar también a las PTE ya presentes. Sin esto, el loader dinámico (musl)
+        // puede mapear segmentos como RO y luego usar mprotect() para hacerlos RW
+        // durante relocations; si las PTE no cambian, obtenemos #PF de protección.
+        let _ = crate::memory::mprotect_user_range(r.page_table_phys, lo, hi - lo, prot);
         return 0;
     }
     linux_abi_error(3)
@@ -5391,12 +5537,6 @@ pub extern "C" fn syscall_handler(
     } else {
         (false, String::new())
     };
-    if strace {
-        crate::serial::serial_printf(format_args!(
-            "[strace] pid={} ({}) call {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})\n",
-            pid, p_name, num, arg1, arg2, arg3, arg4, arg5, arg6
-        ));
-    }
 
     let result = match num {
         // --- Filesystem (Linux) ---
@@ -5623,10 +5763,6 @@ pub extern "C" fn syscall_handler(
     };
 
     context.rax = result;
-
-    if strace {
-        crate::serial::serial_printf(format_args!("[strace] pid={} returns {:#x}\n", pid, result));
-    }
 
     // No entregar señales en la vuelta de exit / exit_group (el proceso termina).
     if num != 60 && num != 231 {

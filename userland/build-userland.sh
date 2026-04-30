@@ -1229,6 +1229,134 @@ build_fontconfig() {
 	ninja -C "$bld" install
 }
 
+build_apk_tools() {
+	check_toolchain
+	check_sysroot
+	export_musl_cross_env
+
+	local root="$USERLAND_DIR/apk-tools_src"
+	local cross="$root/meson.cross-eclipse"
+	local bld="$root/bld-eclipse"
+	require_file "$root/meson.build"
+
+	ensure_xfwl4_xfce_wayland_protocols
+	write_meson_cross "$cross"
+
+	# apk-tools needs a crypto backend. Prefer OpenSSL (already used elsewhere in the sysroot)
+	# but fall back to mbedtls if that's what the sysroot provides.
+	local crypto="openssl"
+	if ! PKG_CONFIG_PATH="$ECLIPSE_SYSROOT/usr/lib/pkgconfig:$ECLIPSE_SYSROOT/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+		pkg-config --exists openssl 2>/dev/null; then
+		# Auto-build mbedtls if it's present in userland/mbedtls_src.
+		if [[ -d "$USERLAND_DIR/mbedtls_src" ]]; then
+			warn "apk-tools: openssl no está en sysroot; construyendo mbedtls..."
+			build_mbedtls
+		fi
+		if PKG_CONFIG_PATH="$ECLIPSE_SYSROOT/usr/lib/pkgconfig:$ECLIPSE_SYSROOT/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+			pkg-config --exists mbedtls 2>/dev/null; then
+			crypto="mbedtls"
+		else
+			err "apk-tools: falta backend crypto en sysroot (openssl o mbedtls)."
+			err "Sugerencia: ./build-userland.sh mbedtls"
+			exit 1
+		fi
+	fi
+
+	info "Construyendo apk-tools..."
+	# url backend:
+	# - libfetch (fetchlib) es el backend preferido.
+	# - En Eclipse, si el sysroot no tiene OpenSSL, libfetch compila en modo HTTP-only (FETCH_NO_TLS).
+	local url_backend="${ECLIPSE_APK_URL_BACKEND:-libfetch}"
+
+	# Reconfigurar si ya existe el build dir (cambios de opciones como url_backend).
+	local setup_args=("$bld" "$root" --cross-file="$cross" --prefix="$ECLIPSE_SYSROOT/usr")
+	if [[ -d "$bld" ]]; then
+		setup_args+=(--reconfigure)
+	fi
+	meson setup "${setup_args[@]}" \
+		-Ddefault_library=${default_lib:-static} \
+		-Dcrypto_backend="$crypto" \
+		-Ddocs=disabled \
+		-Dhelp=disabled \
+		-Dlua=disabled \
+		-Dpython=disabled \
+		-Dtests=disabled \
+		-Dminimal=true \
+		-Dzstd=disabled \
+		-Durl_backend="$url_backend"
+	ninja -C "$bld" install
+	ok "apk-tools instalado en $ECLIPSE_SYSROOT/usr"
+}
+
+build_cage() {
+	check_toolchain
+	check_sysroot
+	export_musl_cross_env
+
+	local root="$USERLAND_DIR/cage_src"
+	local cross="$root/meson.cross-eclipse"
+	local bld="$root/bld-eclipse"
+	require_file "$root/meson.build"
+
+	ensure_xfwl4_xfce_wayland_protocols
+	# cage links against wlroots/wayland/xkbcommon as shared libs in our sysroot,
+	# so disable the global '-static' cross link args for this target.
+	local _sl="${ECLIPSE_MESON_STATIC_LINK:-0}"
+	ECLIPSE_MESON_STATIC_LINK=0
+	write_meson_cross "$cross"
+	ECLIPSE_MESON_STATIC_LINK="$_sl"
+
+	info "Construyendo cage..."
+	meson setup "$bld" "$root" --cross-file="$cross" --prefix="$ECLIPSE_SYSROOT/usr" \
+		--buildtype="$ECLIPSE_MESON_BUILDTYPE" \
+		-Ddefault_library=shared \
+		-Dman-pages=disabled \
+		-Dwerror=false \
+		-Dc_link_args="-lstdc++ -lsupc++ -lgcc_eh"
+	ninja -C "$bld" install
+	ok "cage instalado en $ECLIPSE_SYSROOT/usr/bin/cage"
+}
+
+build_mbedtls() {
+	check_toolchain
+	check_sysroot
+	export_musl_cross_env
+
+	local root="$USERLAND_DIR/mbedtls_src"
+	local bld="$root/bld-eclipse"
+	require_file "$root/CMakeLists.txt"
+	require_cmd cmake
+
+	info "Construyendo mbedtls..."
+	mkdir -p "$bld"
+	# Usar el GCC musl del sysroot y forzar find_root al sysroot Eclipse.
+	# Nota: mbedtls/tf-psa-crypto genera wrappers con Python y requiere jsonschema.
+	# Si existe un venv local, úsalo para evitar depender del python del sistema.
+	local pyexe="/usr/bin/python3"
+	if [[ -x "$BASE_DIR/.venv-mbedtls/bin/python" ]]; then
+		pyexe="$BASE_DIR/.venv-mbedtls/bin/python"
+	fi
+	cmake -S "$root" -B "$bld" \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+		-DCMAKE_C_COMPILER="$MUSL_GCC" \
+		-DCMAKE_AR="$MUSL_AR" \
+		-DCMAKE_RANLIB="$MUSL_RANLIB" \
+		-DCMAKE_INSTALL_PREFIX="$ECLIPSE_SYSROOT/usr" \
+		-DCMAKE_FIND_ROOT_PATH="$ECLIPSE_SYSROOT" \
+		-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+		-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+		-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+		-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+		-DPython3_EXECUTABLE="$pyexe" \
+		-DENABLE_PROGRAMS=OFF \
+		-DENABLE_TESTING=OFF
+	cmake --build "$bld" -j"$(nproc)"
+	cmake --install "$bld"
+	ok "mbedtls instalado en $ECLIPSE_SYSROOT/usr"
+}
+
 build_harfbuzz() {
 	check_toolchain
 	check_sysroot
@@ -1788,6 +1916,15 @@ main() {
 		;;
 	fontconfig)
 		build_fontconfig
+		;;
+	apk-tools)
+		build_apk_tools
+		;;
+	cage)
+		build_cage
+		;;
+	mbedtls)
+		build_mbedtls
 		;;
 	harfbuzz)
 		build_harfbuzz

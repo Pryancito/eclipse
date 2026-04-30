@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use eclipse_syscall as syscall;
+use eclipse_relibc as libc;
 
 use std::vec::Vec;
 
@@ -691,7 +692,31 @@ impl DisplayDevice {
             // Standard DRM Path
             let caps = match syscall::drm_get_caps() {
                 Ok(c) => c,
-                Err(_) => return Err(DisplayError::OpenFailed),
+                Err(e) => {
+                    // Fallback 2: framebuffer syscalls (503/504). Útil cuando DRM caps
+                    // todavía no están implementados en el kernel.
+                    unsafe {
+                        if let Some(fb) = libc::get_framebuffer_info() {
+                            if let Some(addr) = libc::map_framebuffer() {
+                                return Ok(DisplayDevice {
+                                    fd,
+                                    caps: DisplayCaps {
+                                        width: fb.width,
+                                        height: fb.height,
+                                        max_width: fb.width,
+                                        max_height: fb.height,
+                                        pitch: fb.pitch,
+                                    },
+                                    crtc: control::CrtcHandle(0),
+                                    connector: control::ConnectorHandle(0),
+                                    is_fallback: true,
+                                    fb_ptr: Some(addr as *mut u8),
+                                });
+                            }
+                        }
+                    }
+                    return Err(DisplayError::Syscall(e));
+                }
             };
 
             let width = if caps.max_width > 0 { caps.max_width } else { 1280 };
