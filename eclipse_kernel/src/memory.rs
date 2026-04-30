@@ -1526,6 +1526,12 @@ pub fn handle_anon_page_fault(pid: u32, fault_addr: u64) -> bool {
     };
 
 
+    // PROT_NONE: the VMA is reserved but inaccessible. Do not allocate a frame —
+    // let the fault propagate so the process receives SIGSEGV.
+    if linux_p == 0 {
+        return false;
+    }
+
     // Huge Page (2MB) Handling
     if is_huge {
         let page_addr = fault_addr & !0x1FFFFF_u64;
