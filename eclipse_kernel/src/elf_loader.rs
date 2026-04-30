@@ -1073,6 +1073,8 @@ fn replace_process_image_provider(pid: ProcessId, provider: &dyn ElfDataProvider
     // Tear down the old page table. teardown_process_paging uses reference-counted
     // frames, so COW-shared frames still owned by the parent are only decremented,
     // not freed.
+    // Safety guard: old_cr3 should never equal new_cr3 since new_cr3 is freshly
+    // allocated, but avoid tearing down the page table we just switched to.
     if old_cr3 != new_cr3 {
         crate::memory::teardown_process_paging(old_cr3);
     }
