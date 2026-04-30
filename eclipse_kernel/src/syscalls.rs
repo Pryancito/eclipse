@@ -191,7 +191,10 @@ pub fn sys_pread64(fd: u64, buf_ptr: u64, len: u64, offset: u64) -> u64 {
         let mut kbuf = Vec::with_capacity(len as usize);
         unsafe { kbuf.set_len(len as usize); }
         match crate::scheme::pread(fd_entry.scheme_id, fd_entry.resource_id, &mut kbuf, offset) {
-            Ok(n) => n as u64,
+            Ok(n) => {
+                if n > 0 && !copy_to_user(buf_ptr, &kbuf[..n]) { return linux_abi_error(14); }
+                n as u64
+            }
             Err(e) => (-(e as isize)) as u64,
         }
     } else {
