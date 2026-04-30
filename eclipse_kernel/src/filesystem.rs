@@ -2501,9 +2501,14 @@ impl Scheme for FileSystemScheme {
                 if offset >= file_size {
                     return Err(scheme_error::EINVAL);
                 }
+                // `want` is how many bytes actually exist in the file for this mapping.
+                // `len` may be larger (memsz > filesz) when the segment has a BSS extension.
+                // We must allocate pages for the full `len` so that the BSS region is backed
+                // by zeroed physical memory rather than whatever happened to follow the
+                // file-data allocation in the physical frame pool.
                 let max_len = file_size - offset;
                 let want = core::cmp::min(len, max_len);
-                let aligned_len = (want + 0xFFF) & !0xFFF;
+                let aligned_len = (len + 0xFFF) & !0xFFF;
                 if aligned_len == 0 {
                     return Err(scheme_error::EINVAL);
                 }
@@ -2518,7 +2523,8 @@ impl Scheme for FileSystemScheme {
                     crate::memory::frame_info::set_refcount(start_phys + i * 4096, 1);
                 }
 
-                // Zero the whole region and read file bytes into it.
+                // Zero the whole region (covers both file data and BSS extension), then
+                // copy only the file portion (`want` bytes) into the start of the buffer.
                 let kptr = (crate::memory::PHYS_MEM_OFFSET + start_phys) as *mut u8;
                 unsafe { core::ptr::write_bytes(kptr, 0, aligned_len); }
                 let dst = unsafe { core::slice::from_raw_parts_mut(kptr, want) };
