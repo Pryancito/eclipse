@@ -2205,9 +2205,10 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     let pid = current_process_id().unwrap_or(0);
     if let Some(proc) = crate::process::get_process(pid) {
         let p_proc = proc.proc.lock();
-        let mut _r = p_proc.resources.lock();
-        vma_remove_range(&mut _r.vmas, addr, addr + len);
-        // In a real kernel we would unmap pages from PT here
+        let mut r = p_proc.resources.lock();
+        vma_remove_range(&mut r.vmas, addr, addr + len);
+        // Unmap the pages from the page table and free the backing physical frames.
+        crate::memory::unmap_user_range(r.page_table_phys, addr, len);
         return 0;
     }
     linux_abi_error(3)

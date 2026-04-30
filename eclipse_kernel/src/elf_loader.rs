@@ -740,7 +740,10 @@ fn load_elf_dynamic_pair(page_table_phys: u64, main_provider: &dyn ElfDataProvid
 
     let mut res = ExecLoadResult {
         entry_point: interp_entry,
-        max_vaddr: max_v_interp,
+        // brk_current must start after the main binary, not after the interpreter.
+        // Using max_v_interp (which can be ~4 GiB) would place the heap in the
+        // upper half of the 32-bit address range, far from the main binary.
+        max_vaddr: max_v_main,
         phdr_va,
         phnum,
         phentsize: phent,
@@ -1044,7 +1047,39 @@ pub fn replace_process_image_path(pid: ProcessId, path: &str) -> Result<ExecLoad
 
 fn replace_process_image_provider(pid: ProcessId, provider: &dyn ElfDataProvider) -> Result<ExecLoadResult, &'static str> {
     serial::serial_printf(format_args!("[exec] replace_process_image for PID {}\n", pid));
-    load_elf_into_space(crate::memory::get_cr3(), provider)
+
+    // Always create a fresh page table so that:
+    //   1. COW-shared frames from a fork()+exec() parent are never written to
+    //      directly (which would corrupt the parent's address space).
+    //   2. Stale mappings from the old address space don't pollute the new one.
+    let new_cr3 = crate::memory::create_process_paging();
+
+    // Swap the stored page-table pointer atomically and capture the old one.
+    let old_cr3 = if let Some(process) = crate::process::get_process(pid) {
+        let proc = process.proc.lock();
+        let mut r = proc.resources.lock();
+        let old = r.page_table_phys;
+        r.page_table_phys = new_cr3;
+        old
+    } else {
+        crate::memory::get_cr3()
+    };
+
+    // Switch the CPU to the new page table *before* tearing down the old one.
+    // Both old and new page tables carry identical kernel-half mappings, so the
+    // kernel continues executing without interruption after the CR3 write.
+    unsafe { crate::memory::set_cr3(new_cr3); }
+
+    // Tear down the old page table. teardown_process_paging uses reference-counted
+    // frames, so COW-shared frames still owned by the parent are only decremented,
+    // not freed.
+    // Safety guard: old_cr3 should never equal new_cr3 since new_cr3 is freshly
+    // allocated, but avoid tearing down the page table we just switched to.
+    if old_cr3 != new_cr3 {
+        crate::memory::teardown_process_paging(old_cr3);
+    }
+
+    load_elf_into_space(new_cr3, provider)
 }
 
 /// Maximum bytes in a kernel process name (16 chars + NUL = 17, padded to 20 for alignment).
