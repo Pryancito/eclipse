@@ -132,7 +132,12 @@ mod virtio_drivers_ffi {
 
     #[no_mangle]
     extern "C" fn virtio_dma_alloc(pages: usize) -> PhysAddr {
-        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap();
+        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap_or_else(|| {
+            panic!(
+                "virtio_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o fragmentación)",
+                pages
+            );
+        });
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
         paddr
     }
@@ -163,7 +168,12 @@ mod drivers_ffi {
 
     #[no_mangle]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
-        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap();
+        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap_or_else(|| {
+            panic!(
+                "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o fragmentación)",
+                pages
+            );
+        });
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
         paddr
     }

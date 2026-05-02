@@ -1,0 +1,17 @@
+[package]
+name = "rboot"
+version = "0.1.6"
+authors = ["Runji Wang <wangrunji0408@163.com>"]
+edition = "2021"
+description = "The x86_64 UEFI bootloader for rCore"
+
+[dependencies]
+uefi = "0.16"
+uefi-services = { version = "0.13", optional = true }
+log = "=0.4.20"
+xmas-elf = "0.8"
+x86_64 = "=0.14.10"
+
+[features]
+rboot = ["uefi-services"]
+default = ["rboot"]
