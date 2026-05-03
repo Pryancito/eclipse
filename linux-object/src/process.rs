@@ -62,6 +62,7 @@ impl ProcessExt for Process {
                 current_working_directory: linux_parent_inner.current_working_directory.clone(),
                 files: linux_parent_inner.files.clone(),
                 signal_actions: linux_parent_inner.signal_actions.clone(),
+                pgid: linux_parent_inner.pgid,
                 ..Default::default()
             }),
         };
@@ -169,6 +170,8 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Signal actions
     signal_actions: SignalActions,
+    /// Process group ID (0 means use the process's own ID)
+    pgid: KoID,
 }
 
 #[derive(Clone)]
@@ -393,6 +396,16 @@ impl LinuxProcess {
     /// Set execute path.
     pub fn set_execute_path(&self, path: &str) {
         self.inner.lock().execute_path = String::from(path);
+    }
+
+    /// Get process group ID. Returns 0 if not set (caller should use the process's own ID).
+    pub fn pgid(&self) -> KoID {
+        self.inner.lock().pgid
+    }
+
+    /// Set process group ID.
+    pub fn set_pgid(&self, pgid: KoID) {
+        self.inner.lock().pgid = pgid;
     }
 
     /// Get signal action.
