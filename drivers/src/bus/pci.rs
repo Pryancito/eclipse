@@ -7,6 +7,7 @@ use pci::*;
 
 const PCI_COMMAND: u16 = 0x04;
 const BAR0: u16 = 0x10;
+const BAR5_REG: u16 = 0x24;
 const PCI_CAP_PTR: u16 = 0x34;
 const _PCI_INTERRUPT_LINE: u16 = 0x3c;
 const _PCI_INTERRUPT_PIN: u16 = 0x3d;
@@ -263,8 +264,6 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                     m.query_or_map(base_addr, map_len);
                 } else {
                     warn!("[xhci] CRÍTICO: No hay IoMapper disponible. El acceso a {:#x} causará un Page Fault si no está pre-mapeado.", base_addr);
-                    // Si no hay mapper, no podemos garantizar que el acceso sea seguro.
-                    // Podríamos intentar continuar, pero el pánico es casi seguro.
                 }
                 
                 let vaddr = phys_to_virt(addr as usize);
@@ -291,25 +290,35 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                         Err(e) => warn!("xHCI HID probe (poll) error: {:?}", e),
                     }
                 }
-           
             }
         }
     }
 
     if dev.id.class == 0x01 && dev.id.subclass == 0x06 {
-        // Mass storage class
-        // SATA subclass
-        if let Some(BAR::Memory(addr, _len, _, _)) = dev.bars[5] {
-            info!("Found AHCI dev {:?} BAR5 {:x?}", dev, addr);
-            /*
-            let irq = unsafe { enable(dev.loc) };
-            assert!(len as usize <= PAGE_SIZE);
-            let vaddr = phys_to_virt(addr as usize);
-            if let Some(driver) = ahci::init(irq, vaddr, len as usize) {
-                PCI_DRIVERS.lock().insert(dev.loc, driver);
+        // Mass storage class - SATA AHCI
+        // Ignore the potentially stale BAR info from PCIDevice and read RAW BAR5
+        let ops = &PortOpsImpl;
+        let am = PCI_ACCESS;
+        let raw_bar5 = unsafe { am.read32(ops, dev.loc, BAR5_REG) };
+        if raw_bar5 != 0 && raw_bar5 != 0xFFFF_FFFF {
+            let addr = (raw_bar5 & !0xF) as u64; // Mask out flags
+            warn!("[AHCI] Using RAW BAR5 address: {:#x}", addr);
+
+            // Map the ABAR registers (at least one full page)
+            let base_addr = (addr as usize) & !0xfff;
+            let map_len = 4096; // 4KB is enough for AHCI registers
+
+            if let Some(m) = mapper {
+                warn!("[AHCI] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
+                m.query_or_map(base_addr, map_len);
             }
-            */
-            return Err(DeviceError::NotSupported);
+
+            let irq = unsafe { enable(dev.loc, 0) };
+            let vaddr = phys_to_virt(addr as usize);
+            let blk = Arc::new(crate::ata::ahci::AhciInterface::new(vaddr, irq.unwrap_or(33))?);
+            return Ok(Device::Block(blk));
+        } else {
+            warn!("AHCI dev found but RAW BAR5 is invalid: {:#x}", raw_bar5);
         }
     }
 
@@ -317,25 +326,11 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
 }
 
 pub fn detach_driver(_loc: &Location) -> bool {
-    /*
-    match PCI_DRIVERS.lock().remove(loc) {
-        Some(driver) => {
-            DRIVERS
-                .write()
-                .retain(|dri| dri.get_id() != driver.get_id());
-            NET_DRIVERS
-                .write()
-                .retain(|dri| dri.get_id() != driver.get_id());
-            true
-        }
-        None => false,
-    }
-    */
     false
 }
 
 pub fn init(mapper: Option<Arc<dyn IoMapper>>) -> DeviceResult<Vec<Device>> {
-    let mapper_driver = if let Some(m) = mapper {
+    let _mapper_driver = if let Some(m) = mapper.clone() {
         m.query_or_map(PCI_BASE, PAGE_SIZE * 256 * 32 * 8);
         Some(m)
     } else {
@@ -359,7 +354,7 @@ pub fn init(mapper: Option<Arc<dyn IoMapper>>) -> DeviceResult<Vec<Device>> {
             dev.pic_interrupt_line,
             dev.interrupt_pin,
         );
-        let res = init_driver(&dev, &mapper_driver);
+        let res = init_driver(&dev, &mapper);
         match res {
             Ok(d) => dev_list.push(d),
             Err(e) => warn!(
@@ -388,9 +383,7 @@ pub fn get_bar0_mem(loc: Location) -> Option<(usize, usize)> {
     unsafe { probe_function(&PortOpsImpl, loc, PCI_ACCESS) }
         .and_then(|dev| dev.bars[0])
         .map(|bar| match bar {
-            BAR::Memory(addr, len, _, _) => (addr as usize, len as usize),
+            BAR::Memory(addr, len, _, _ ) => (addr as usize, len as usize),
             _ => unimplemented!(),
         })
 }
-
-// all devices stored in：AllDeviceList
