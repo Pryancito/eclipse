@@ -2,6 +2,9 @@
 
 ARCH ?= x86_64
 XTASK ?= 1
+LOG ?= warn
+GRAPHIC ?= on
+ACCEL ?= 1
 
 STRIP := $(ARCH)-linux-musl-strip
 export PATH=$(shell printenv PATH):$(CURDIR)/ignored/target/$(ARCH)/$(ARCH)-linux-musl-cross/bin/
@@ -41,7 +44,7 @@ other-test:
 	cargo other-test --arch $(ARCH)
 
 # build image from rootfs
-image:
+image: rootfs
 ifeq ($(XTASK), 1)
 	cargo image --arch $(ARCH)
 else ifeq ($(ARCH), riscv64)
@@ -79,3 +82,5 @@ clean-everything: clean
 # 	cd rootfs/x86_64 && git clone https://kernel.googlesource.com/pub/scm/linux/kernel/git/clrkwllms/rt-tests --depth 1
 # 	cd rootfs/x86_64/rt-tests && make
 # 	echo x86 gcc build rt-test,now need manual modificy.
+qemu: image
+	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL)

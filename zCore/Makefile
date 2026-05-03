@@ -16,7 +16,7 @@ V ?=
 USER ?=
 ZBI ?= bringup
 
-SMP ?= 1
+SMP ?= 4
 ACCEL ?=
 
 NET ?=
@@ -154,7 +154,7 @@ endif
 
 ################ QEMU options ################
 
-qemu_opts := -smp $(SMP)
+qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0,port=1 -device usb-tablet,bus=xhci.0,port=2
 
 ifeq ($(ARCH), x86_64)
   qemu_opts += \
