@@ -25,6 +25,12 @@ use zircon_object::vm::USER_STACK_PAGES;
 /// - [`gettid`](Self::sys_gettid)
 /// - [`getpid`](Self::sys_getpid)
 /// - [`getppid`](Self::sys_getppid)
+/// - [`getuid`](Self::sys_getuid)
+/// - [`geteuid`](Self::sys_geteuid)
+/// - [`getgid`](Self::sys_getgid)
+/// - [`getegid`](Self::sys_getegid)
+/// - [`setpgid`](Self::sys_setpgid)
+/// - [`getpgid`](Self::sys_getpgid)
 /// - [`exit`](Self::sys_exit)
 /// - [`exit_group`](Self::sys_exit_group)
 /// - [`nanosleep`](Self::sys_nanosleep)
@@ -338,6 +344,78 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let ppid = proc.parent().map(|p| p.id()).unwrap_or(0);
         Ok(ppid as usize)
+    }
+
+    /// `sys_getuid` returns the real user ID of the calling process
+    /// (see [linux man getuid(2)](https://www.man7.org/linux/man-pages/man2/getuid.2.html)).
+    /// This kernel runs all processes as root (uid 0).
+    pub fn sys_getuid(&self) -> SysResult {
+        info!("getuid:");
+        Ok(0)
+    }
+
+    /// `sys_geteuid` returns the effective user ID of the calling process
+    /// (see [linux man geteuid(2)](https://www.man7.org/linux/man-pages/man2/geteuid.2.html)).
+    /// This kernel runs all processes as root (uid 0).
+    pub fn sys_geteuid(&self) -> SysResult {
+        info!("geteuid:");
+        Ok(0)
+    }
+
+    /// `sys_getgid` returns the real group ID of the calling process
+    /// (see [linux man getgid(2)](https://www.man7.org/linux/man-pages/man2/getgid.2.html)).
+    /// This kernel runs all processes as root (gid 0).
+    pub fn sys_getgid(&self) -> SysResult {
+        info!("getgid:");
+        Ok(0)
+    }
+
+    /// `sys_getegid` returns the effective group ID of the calling process
+    /// (see [linux man getegid(2)](https://www.man7.org/linux/man-pages/man2/getegid.2.html)).
+    /// This kernel runs all processes as root (gid 0).
+    pub fn sys_getegid(&self) -> SysResult {
+        info!("getegid:");
+        Ok(0)
+    }
+
+    /// `sys_setpgid` sets the PGID of the process specified by `pid` to `pgid`
+    /// (see [linux man setpgid(2)](https://www.man7.org/linux/man-pages/man2/setpgid.2.html)).
+    /// If `pid` is 0 the process ID of the calling process is used.
+    /// If `pgid` is 0, the PGID of the process specified by `pid` is made the same as its PID.
+    /// Only setting the PGID of the calling process is supported.
+    pub fn sys_setpgid(&self, pid: usize, pgid: usize) -> SysResult {
+        info!("setpgid: pid={}, pgid={}", pid, pgid);
+        let proc = self.zircon_process();
+        let self_pid = proc.id();
+        // Only support setting pgid of the calling process
+        if pid != 0 && pid as u64 != self_pid {
+            warn!("setpgid: only supported for calling process, pid={}", pid);
+            return Ok(0);
+        }
+        let new_pgid = if pgid == 0 { self_pid } else { pgid as u64 };
+        self.linux_process().set_pgid(new_pgid);
+        Ok(0)
+    }
+
+    /// `sys_getpgid` returns the PGID of the process specified by `pid`
+    /// (see [linux man getpgid(2)](https://www.man7.org/linux/man-pages/man2/getpgid.2.html)).
+    /// If `pid` is 0 the process ID of the calling process is used.
+    pub fn sys_getpgid(&self, pid: usize) -> SysResult {
+        info!("getpgid: pid={}", pid);
+        let proc = self.zircon_process();
+        let self_pid = proc.id();
+        // Only support querying pgid of the calling process
+        if pid != 0 && pid as u64 != self_pid {
+            warn!("getpgid: only supported for calling process, pid={}", pid);
+            return Ok(self_pid as usize);
+        }
+        let pgid = self.linux_process().pgid();
+        // If pgid is 0 (unset), return the process's own ID
+        if pgid == 0 {
+            Ok(self_pid as usize)
+        } else {
+            Ok(pgid as usize)
+        }
     }
 
     /// `sys_exit` system call terminates only the calling thread
