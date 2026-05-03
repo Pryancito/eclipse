@@ -188,6 +188,11 @@ echo "http://dl-cdn.alpinelinux.org/alpine/v3.23/main" > /etc/apk/repositories
 echo "http://dl-cdn.alpinelinux.org/alpine/v3.23/community" >> /etc/apk/repositories
 ```
 
+Para instalar las claves de confianza de Alpine:
+```bash
+apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.23/main -u alpine-keys
+```
+
 ## Otros
 
 - [An English README](docs/README_EN.md)
