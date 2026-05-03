@@ -236,9 +236,9 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                     "Found Intel I211 ethernet controller dev {:?}, addr: {:x?}",
                     dev, addr
                 );
-            return Err(DeviceError::NotSupported);
+                return Err(DeviceError::NotSupported);
+            }
         }
-    }
         (0x10de, _) if dev.id.class == 0x03 => {
             // Nvidia GPU
             if let Some(BAR::Memory(bar0_addr, _bar0_len, _, _)) = dev.bars[0] {

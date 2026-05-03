@@ -12,7 +12,7 @@ endif
 .PHONY: build run header asm doc
 
 build:
-	cargo build $(BUILD_ARGS)
+	cargo build $(BUILD_ARGS) --ignore-rust-version
 
 clippy:
 	cargo clippy $(BUILD_ARGS)

@@ -114,11 +114,6 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     Some(fb_id)
 }
 
-/*
-pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
-    DRM_STATE.lock().framebuffers.iter().find(|fb| fb.id == fb_id).cloned()
-}
-*/
 
 pub fn page_flip(fb_id: u32) -> bool {
     if let Some(driver) = get_primary_driver() {
@@ -149,17 +144,6 @@ pub fn gem_close(handle_id: u32) -> bool {
     }
 }
 
-/*
-pub fn destroy_fb(fb_id: u32) -> bool {
-    let mut state = DRM_STATE.lock();
-    if let Some(pos) = state.framebuffers.iter().position(|fb| fb.id == fb_id) {
-        state.framebuffers.remove(pos);
-        true
-    } else {
-        false
-    }
-}
-*/
 
 pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let state = DRM_STATE.lock();
@@ -196,23 +180,6 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
     None
 }
 
-/*
-pub fn wait_vblank(crtc_id: u32) -> bool {
-    if let Some(driver) = get_primary_driver() {
-        driver.wait_vblank(crtc_id)
-    } else {
-        false
-    }
-}
-
-pub fn set_cursor(crtc_id: u32, x: i32, y: i32, handle: u32, flags: u32) -> bool {
-    if let Some(driver) = get_primary_driver() {
-        driver.set_cursor(crtc_id, x, y, handle, flags)
-    } else {
-        false
-    }
-}
-*/
 
 pub fn get_planes() -> Vec<u32> {
     let state = DRM_STATE.lock();
@@ -232,13 +199,3 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
     }
     None
 }
-
-/*
-pub fn set_plane(plane_id: u32, crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, src_x: u32, src_y: u32, src_w: u32, src_h: u32) -> bool {
-    if let Some(driver) = get_primary_driver() {
-        driver.set_plane(plane_id, crtc_id, fb_id, x, y, w, h, src_x, src_y, src_w, src_h)
-    } else {
-        false
-    }
-}
-*/

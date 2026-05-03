@@ -141,10 +141,9 @@ if libzstd_dep.found()
 	apk_cargs += [ '-DHAVE_ZSTD' ]
 endif
 
-libapk_lib = library(
+libapk_lib = static_library(
 	'apk',
 	libapk_src,
-	soversion: libapk_so_version,
 	install: not subproject,
 	dependencies: [
 		libfetch_dep,

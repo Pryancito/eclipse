@@ -181,34 +181,6 @@ cargo bin -m cr1825 -o z.bin
 
 zCore (Eclipse OS) utiliza `apk-tools` como gestor de paquetes. Para compilarlo y preparar el entorno:
 
-### Compilación de apk-tools
-
-Para realizar la compilación cruzada para Eclipse OS:
-
-```bash
-cd tools/apk
-# Configurar el entorno de construcción con el archivo de cross-compilación
-meson setup --cross-file meson.cross-eclipse eclipse
-# Compilar el binario
-ninja -C eclipse
-```
-
-El binario resultante se encontrará en `tools/apk/eclipse/src/apk`.
-
-### Preparación del Entorno APK
-
-Para que `apk` funcione correctamente en el sistema, es necesario crear la estructura de archivos mínima:
-
-1.  **Directorios de base de datos**: `/lib/apk/db/`
-2.  **Configuración de repositorios**: `/etc/apk/repositories`
-3.  **Claves de confianza**: `/etc/apk/keys/`
-
-Ejemplo de configuración de repositorios:
-```bash
-echo "http://dl-cdn.alpinelinux.org/alpine/v3.23/main" > /etc/apk/repositories
-echo "http://dl-cdn.alpinelinux.org/alpine/v3.23/community" >> /etc/apk/repositories
-```
-
 Para instalar las claves de confianza de Alpine:
 ```bash
 apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.23/main -u alpine-keys

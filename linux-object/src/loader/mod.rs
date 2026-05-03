@@ -6,7 +6,7 @@ use {
     crate::fs::INodeExt,
     alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec},
     rcore_fs::vfs::INode,
-    xmas_elf::{program::ProgramHeader, ElfFile},
+    xmas_elf::ElfFile,
     zircon_object::{util::elf_loader::*, vm::*, ZxError},
 };
 
@@ -55,13 +55,10 @@ impl LinuxElfLoader {
 
         let size = elf.load_segment_size();
         let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
-        let mut base = image_vmar.addr();
+        let base = image_vmar.addr();
         let vmo = image_vmar.load_from_elf(&elf)?;
         let entry = base + elf.header.pt2.entry_point() as usize;
 
-        // for static exec program
-        let ph: ProgramHeader = elf.program_iter().next().unwrap();
-        let static_prog_base = ph.virtual_addr() as usize / PAGE_SIZE * PAGE_SIZE;
         debug!(
             "load: vmar.addr & size: {:#x?}, base: {:#x?}, entry: {:#x?}",
             vmar.get_info(),
@@ -77,8 +74,10 @@ impl LinuxElfLoader {
         match elf.relocate(image_vmar) {
             Ok(()) => info!("elf relocate passed !"),
             Err(error) => {
-                base = static_prog_base;
-                warn!("elf relocate Err:{:?}, base {:x?}", error, base);
+                // Segments stay mapped under `image_vmar.addr()`; do not clobber `base` with the
+                // first program header vaddr (often not PT_LOAD). Wrong AT_BASE breaks PIE/musl
+                // (e.g. user PC stuck at raw e_entry like 0x423a7 → page fault NOT_FOUND).
+                warn!("elf relocate Err:{:?}, keeping load base {:#x}", error, base);
             }
         }
 

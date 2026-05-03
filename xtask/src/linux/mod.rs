@@ -1,4 +1,4 @@
-﻿mod image;
+mod image;
 mod opencv;
 mod test;
 
@@ -33,12 +33,25 @@ impl LinuxRootfs {
         // 准备最小系统需要的资源
         let musl = self.0.linux_musl_cross();
         let busybox = self.busybox(&musl);
-        // 创建目标目录
+        // 拷贝 apk
         let bin = dir.join("bin");
         let lib = dir.join("lib");
         dir::clear(&dir).unwrap();
-        fs::create_dir(&bin).unwrap();
-        fs::create_dir(&lib).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        
+        let apk = self.apk(&musl);
+        if apk.is_file() {
+            fs::copy(&apk, bin.join("apk")).unwrap();
+            let etc_apk = dir.join("etc").join("apk");
+            fs::create_dir_all(&etc_apk).unwrap();
+            fs::write(
+                etc_apk.join("repositories"),
+                "http://dl-cdn.alpinelinux.org/alpine/v3.18/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.18/community\n",
+            )
+            .unwrap();
+        }
+        
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
         // 拷贝 libc.so
@@ -48,7 +61,7 @@ impl LinuxRootfs {
             .join("libc.so");
         let to = lib.join(format!("ld-musl-{arch}.so.1", arch = self.0.name()));
         fs::copy(from, &to).unwrap();
-        Ext::new(self.strip(musl)).arg("-s").arg(to).invoke();
+        Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
         // 为常用功能建立符号链接
         const SH: &[&str] = &[
             "cat", "cp", "echo", "false", "grep", "gzip", "kill", "ln", "ls", "mkdir", "mv",
@@ -117,6 +130,100 @@ impl LinuxRootfs {
             .arg(&executable)
             .invoke();
         executable
+    }
+
+    /// 编译 apk-tools。
+    fn apk(&self, musl: &Path) -> PathBuf {
+        let apk_dir = PROJECT_DIR.join("tools").join("apk");
+        let bld_dir = apk_dir.join("bld-eclipse");
+        let executable = bld_dir.join("src/apk");
+
+        if executable.is_file() {
+            return executable;
+        }
+
+        println!("Compiling apk-tools...");
+        // Try to compile
+        let mut res = Ext::new("meson")
+            .current_dir(&apk_dir)
+            .arg("compile")
+            .arg("-C")
+            .arg("bld-eclipse")
+            .status();
+        
+        if !res.success() {
+            println!("Initial compile failed, trying to re-setup meson...");
+            dir::rm(&bld_dir).unwrap();
+            let cross_file = self.generate_apk_cross_file(musl);
+            
+            Ext::new("meson")
+                .current_dir(&apk_dir)
+                .arg("setup")
+                .arg("bld-eclipse")
+                .arg("--cross-file")
+                .arg(&cross_file)
+                .arg("-Dminimal=true")
+                .arg("-Dcrypto_backend=mbedtls")
+                .arg("-Durl_backend=libfetch")
+                .arg("-Dlua=disabled")
+                .arg("-Dpython=disabled")
+                .arg("-Dzstd=disabled")
+                .arg("-Dtests=disabled")
+                .invoke();
+
+            res = Ext::new("meson")
+                .current_dir(&apk_dir)
+                .arg("compile")
+                .arg("-C")
+                .arg("bld-eclipse")
+                .status();
+        }
+
+        if !res.success() {
+            println!("Failed to compile apk");
+        }
+
+        executable
+    }
+
+    fn generate_apk_cross_file(&self, musl: &Path) -> PathBuf {
+        let path = self.0.target().join("meson.cross-apk");
+        let musl_bin = musl.canonicalize().unwrap().join("bin");
+        let arch = self.0.name();
+        let cpu_family = if arch == "x86_64" { "x86_64" } else { arch };
+        
+        let zlib_path = PROJECT_DIR.join("tools").join("zlib");
+        let mbedtls_path = PROJECT_DIR.join("tools").join("mbedtls");
+        
+        let content = format!(
+r#"[binaries]
+c = '{bin}/{arch}-linux-musl-gcc'
+cpp = '{bin}/{arch}-linux-musl-g++'
+ar = '{bin}/{arch}-linux-musl-gcc-ar'
+nm = '{bin}/{arch}-linux-musl-gcc-nm'
+ranlib = '{bin}/{arch}-linux-musl-gcc-ranlib'
+strip = '{bin}/{arch}-linux-musl-strip'
+
+[host_machine]
+system = 'linux'
+cpu_family = '{cpu_family}'
+cpu = '{arch}'
+endian = 'little'
+
+[built-in options]
+c_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
+cpp_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
+c_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
+cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
+"# ,
+            bin = musl_bin.display(),
+            arch = arch,
+            cpu_family = cpu_family,
+            zlib = zlib_path.display(),
+            mbedtls = mbedtls_path.display()
+        );
+        fs::write(&path, content).unwrap();
+        path
     }
 
     fn strip(&self, musl: impl AsRef<Path>) -> PathBuf {

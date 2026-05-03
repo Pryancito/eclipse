@@ -1,4 +1,4 @@
-﻿//! Define physical frame allocation and dynamic memory allocation.
+//! Define physical frame allocation and dynamic memory allocation.
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
