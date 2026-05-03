@@ -186,6 +186,19 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 warn!("failed to mknod /dev/input/{}: {:?}", &fname, e);
             }
         }
+
+        // Register DRM drivers from kernel-hal
+        for drm in drivers::all_drm().as_vec().iter() {
+            devfs::drm::register_driver(drm.clone());
+        }
+
+        // Add DRM devices at `/dev/dri/card0`
+        let dri_dev = devfs_root
+            .add_dir("dri")
+            .expect("failed to mkdir /dev/dri");
+        if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
+            warn!("failed to mknod /dev/dri/card0: {:?}", e);
+        }
     }
 
     // Add uart devices at `/dev/ttyS{i}`

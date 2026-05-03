@@ -6,7 +6,7 @@ use core::convert::From;
 use lock::{RwLock, RwLockReadGuard};
 
 use zcore_drivers::scheme::{
-    BlockScheme, DisplayScheme, InputScheme, IrqScheme, NetScheme, Scheme, UartScheme,
+    BlockScheme, DisplayScheme, DrmScheme, InputScheme, IrqScheme, NetScheme, Scheme, UartScheme,
 };
 use zcore_drivers::{Device, DeviceError};
 
@@ -66,6 +66,7 @@ struct AllDeviceList {
     irq: DeviceList<dyn IrqScheme>,
     net: DeviceList<dyn NetScheme>,
     uart: DeviceList<dyn UartScheme>,
+    drm: DeviceList<dyn DrmScheme>,
 }
 
 impl AllDeviceList {
@@ -77,6 +78,7 @@ impl AllDeviceList {
             Device::Irq(d) => self.irq.add(d),
             Device::Net(d) => self.net.add(d),
             Device::Uart(d) => self.uart.add(d),
+            Device::Drm(d) => self.drm.add(d),
         }
     }
 }
@@ -117,6 +119,11 @@ pub fn all_net() -> &'static DeviceList<dyn NetScheme> {
 /// Returns all devices which implement the [`UartScheme`].
 pub fn all_uart() -> &'static DeviceList<dyn UartScheme> {
     &DEVICES.uart
+}
+
+/// Returns all devices which implement the [`DrmScheme`].
+pub fn all_drm() -> &'static DeviceList<dyn DrmScheme> {
+    &DEVICES.drm
 }
 
 impl From<DeviceError> for crate::HalError {

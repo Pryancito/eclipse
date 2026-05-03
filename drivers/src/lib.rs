@@ -81,6 +81,8 @@ pub enum Device {
     Net(Arc<dyn scheme::NetScheme>),
     /// Uart port
     Uart(Arc<dyn scheme::UartScheme>),
+    /// DRM device
+    Drm(Arc<dyn scheme::DrmScheme>),
 }
 
 impl Device {
@@ -93,6 +95,7 @@ impl Device {
             Self::Irq(d) => d.clone().upcast(),
             Self::Net(d) => d.clone().upcast(),
             Self::Uart(d) => d.clone().upcast(),
+            Self::Drm(d) => d.clone().upcast(),
         }
     }
 }
@@ -106,6 +109,7 @@ impl fmt::Debug for Device {
             Self::Irq(d) => write!(f, "IrqDevice({:?})", d.name()),
             Self::Net(d) => write!(f, "NetDevice({:?})", d.name()),
             Self::Uart(d) => write!(f, "UartDevice({:?})", d.name()),
+            Self::Drm(d) => write!(f, "DrmDevice({:?})", d.name()),
         }
     }
 }
