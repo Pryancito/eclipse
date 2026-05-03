@@ -33,6 +33,14 @@ pub mod scheme;
 pub mod uart;
 pub mod utils;
 
+#[cfg(all(
+    feature = "xhci-usb-hid",
+    target_arch = "x86_64",
+    not(feature = "mock"),
+    not(feature = "no-pci")
+))]
+pub mod usb;
+
 /// The error type for external device.
 #[derive(Debug)]
 pub enum DeviceError {

@@ -29,6 +29,12 @@ hal_fn_impl! {
         }
 
         fn timer_tick() {
+            #[cfg(all(
+                feature = "xhci-usb-hid",
+                target_arch = "x86_64",
+                not(feature = "no-pci")
+            ))]
+            zcore_drivers::usb::xhci_hid::poll();
             NAIVE_TIMER.lock().expire(timer_now());
         }
     }

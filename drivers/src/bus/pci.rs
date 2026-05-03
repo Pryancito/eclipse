@@ -1,5 +1,6 @@
 use super::{phys_to_virt, PAGE_SIZE};
 use crate::builder::IoMapper;
+use crate::scheme::SchemeUpcast;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::{format, sync::Arc, vec::Vec};
 use pci::*;
@@ -234,11 +235,38 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                     "Found Intel I211 ethernet controller dev {:?}, addr: {:x?}",
                     dev, addr
                 );
-                return Err(DeviceError::NotSupported);
+            return Err(DeviceError::NotSupported);
+        }
+    }
+    _ => {}
+    }
+
+    #[cfg(feature = "xhci-usb-hid")]
+    {
+        if dev.id.class == 0x0c && dev.id.subclass == 0x03 && dev.id.prog_if == 0x30 {
+            if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
+                let map_len = (len as usize).max(64 * 1024);
+                if let Some(m) = mapper {
+                    m.query_or_map(addr as usize, map_len);
+                }
+                let vaddr = phys_to_virt(addr as usize);
+                let msi_idx = unsafe { enable(dev.loc, 0) };
+                if let Some(idx) = msi_idx {
+                    let vector = idx + 32;
+                    match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, len as usize, vector) {
+                        Ok(input) => {
+                            crate::usb::xhci_hid::pci_note_pending_msi(vector, input.clone().upcast());
+                            return Ok(Device::Input(input));
+                        }
+                        Err(e) => warn!("xHCI HID probe: {:?}", e),
+                    }
+                } else {
+                    warn!("xHCI: dispositivo sin MSI; omitido");
+                }
             }
         }
-        _ => {}
     }
+
     if dev.id.class == 0x01 && dev.id.subclass == 0x06 {
         // Mass storage class
         // SATA subclass

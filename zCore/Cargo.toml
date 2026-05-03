@@ -41,7 +41,13 @@ baremetal-test = ["executor/baremetal-test"]
 # Run as Zircon mode
 zircon = ["zcore-loader/zircon"]
 # Run as Linux mode
-linux = ["zcore-loader/linux", "linux-object", "rcore-fs", "rcore-fs-sfs"]
+linux = [
+  "zcore-loader/linux",
+  "linux-object",
+  "rcore-fs",
+  "rcore-fs-sfs",
+  "kernel-hal/xhci-usb-hid",
+]
 # Run as LibOS mode
 libos = [
   "kernel-hal/libos",

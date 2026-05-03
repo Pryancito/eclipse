@@ -45,6 +45,13 @@ pub(super) fn init() -> DeviceResult {
     Apic::local_apic().set_timer_initial(cycles as u32);
     Apic::local_apic().disable_timer();
 
+    #[cfg(all(not(feature = "no-pci"), feature = "xhci-usb-hid"))]
+    {
+        use zcore_drivers::usb::xhci_hid;
+        let irq_apic: Arc<dyn zcore_drivers::scheme::IrqScheme> = irq.clone();
+        xhci_hid::pci_set_irq_host(irq_apic);
+    }
+
     drivers::add_device(Device::Irq(irq));
 
     #[cfg(not(feature = "no-pci"))]
@@ -54,6 +61,11 @@ pub(super) fn init() -> DeviceResult {
         let pci_devs = pci::init(None)?;
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
+        }
+        #[cfg(feature = "xhci-usb-hid")]
+        {
+            use zcore_drivers::usb::xhci_hid;
+            let _ = xhci_hid::pci_finish_msi_registrations();
         }
     }
 

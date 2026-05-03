@@ -13,6 +13,8 @@ mock = ["async-std", "sdl2"]
 virtio = ["virtio-drivers"]
 loopback = []
 no-pci = []
+# x86 bare: USB xHCI + HID (teclado/ratón/tablet) — experimental
+xhci-usb-hid = []
 
 # special drivers for hardwares
 
