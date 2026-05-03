@@ -29,9 +29,30 @@ zCore es una reimplementación del micronúcleo `Zircon` en Rust seguro como un 
 
    El sistema de archivos predeterminado incluirá la aplicación `busybox` y la biblioteca `musl-libc`. Estos se compilan automáticamente usando la cadena de herramientas de compilación cruzada correspondiente.
 
+## Configuración del Proceso Inicial (ROOTPROC)
+
+Para cambiar el proceso inicial (init) que zCore ejecuta al arrancar, se debe modificar el archivo de configuración `zCore/rboot.conf`.
+
+Dentro de este archivo, localice la línea `cmdline` y añada el parámetro `ROOTPROC`. Los parámetros en la línea de comandos se separan por el carácter `:`.
+
+**Ejemplo para ejecutar una shell de busybox (predeterminado):**
+```ini
+cmdline=LOG=warn:ROOTPROC=/bin/busybox?sh
+```
+
+**Ejemplo para ejecutar un binario específico con argumentos:**
+```ini
+cmdline=LOG=warn:ROOTPROC=/path/to/init?--option?value
+```
+
+**Formato:**
+- `ROOTPROC=/ruta/al/binario`: Especifica la ruta del ejecutable en el sistema de archivos.
+- `?`: Se usa para separar el comando de sus argumentos y los argumentos entre sí.
+
 ## Contenido
 
 - [Iniciar el Núcleo](#iniciar-el-núcleo)
+- [Configuración del Proceso Inicial (ROOTPROC)](#configuración-del-proceso-inicial-rootproc)
 - [Construcción del Proyecto](#construcción-del-proyecto)
   - [Comandos de Construcción](#comandos-de-construcción)
   - [Referencia de Comandos](#referencia-de-comandos)
