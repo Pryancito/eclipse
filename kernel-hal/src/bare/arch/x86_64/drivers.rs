@@ -58,7 +58,40 @@ pub(super) fn init() -> DeviceResult {
     {
         // PCI scan
         use zcore_drivers::bus::pci;
-        let pci_devs = pci::init(None)?;
+        use zcore_drivers::builder::IoMapper;
+        use crate::{PhysAddr, VirtAddr, MMUFlags, CachePolicy};
+        use crate::vm::{PageTable, GenericPageTable};
+
+        struct IoMapperImpl;
+        impl IoMapper for IoMapperImpl {
+            fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
+                let vaddr = crate::mem::phys_to_virt(paddr);
+                let mut pt = PageTable::from_current();
+                
+                if let Ok((paddr_mapped, _, _)) = pt.query(vaddr) {
+                    if paddr_mapped == paddr {
+                        return Some(vaddr);
+                    }
+                }
+
+                let size = (size + 0xfff) & !0xfff;
+                let flags = MMUFlags::READ 
+                    | MMUFlags::WRITE 
+                    | MMUFlags::DEVICE
+                    | MMUFlags::from_bits_truncate(CachePolicy::UncachedDevice as usize);
+                
+                warn!("[xhci] Mapeando BAR PCI en PT kernel: {:#x} -> {:#x} (size: {:#x})", paddr, vaddr, size);
+                if let Err(e) = pt.map_cont(vaddr, size, paddr, flags) {
+                    warn!("[xhci] Error crítico al mapear BAR: {:?}", e);
+                    return None;
+                }
+                
+                core::mem::forget(pt);
+                Some(vaddr)
+            }
+        }
+
+        let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
         }

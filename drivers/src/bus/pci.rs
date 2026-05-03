@@ -245,24 +245,53 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
     {
         if dev.id.class == 0x0c && dev.id.subclass == 0x03 && dev.id.prog_if == 0x30 {
             if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
-                let map_len = (len as usize).max(64 * 1024);
-                if let Some(m) = mapper {
-                    m.query_or_map(addr as usize, map_len);
+                if addr == 0 {
+                    warn!("xHCI: BAR0 es 0 (recursos no asignados por el firmware); omitido");
+                    return Err(DeviceError::NotSupported);
                 }
+                
+                warn!("[xhci] PCI BAR0 detectado en Phys:{:#x}, Len:{:#x}", addr, len);
+                
+                // Alineación a página (4KB)
+                let base_addr = (addr as usize) & !0xfff;
+                let offset = (addr as usize) & 0xfff;
+                // Forzamos un mapeo de al menos 128KB para asegurar que CAP, OP y RT estén cubiertos
+                let map_len = ((len as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+
+                if let Some(m) = mapper {
+                    warn!("[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
+                    m.query_or_map(base_addr, map_len);
+                } else {
+                    warn!("[xhci] CRÍTICO: No hay IoMapper disponible. El acceso a {:#x} causará un Page Fault si no está pre-mapeado.", base_addr);
+                    // Si no hay mapper, no podemos garantizar que el acceso sea seguro.
+                    // Podríamos intentar continuar, pero el pánico es casi seguro.
+                }
+                
                 let vaddr = phys_to_virt(addr as usize);
+                warn!("[xhci] VAddr mapeado: {:#x}. Intentando acceder a registros...", vaddr);
+
                 let msi_idx = unsafe { enable(dev.loc, 0) };
                 if let Some(idx) = msi_idx {
                     let vector = idx + 32;
+                    warn!("[xhci] Usando MSI (vector {})", vector);
                     match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, len as usize, vector) {
                         Ok(input) => {
                             crate::usb::xhci_hid::pci_note_pending_msi(vector, input.clone().upcast());
                             return Ok(Device::Input(input));
                         }
-                        Err(e) => warn!("xHCI HID probe: {:?}", e),
+                        Err(e) => warn!("xHCI HID probe error: {:?}", e),
                     }
                 } else {
-                    warn!("xHCI: dispositivo sin MSI; omitido");
+                    warn!("[xhci] MSI no disponible; iniciando modo polling (vector 0)");
+                    match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, len as usize, 0) {
+                        Ok(input) => {
+                            crate::usb::xhci_hid::set_poll_instance(Some(input.clone()));
+                            return Ok(Device::Input(input));
+                        }
+                        Err(e) => warn!("xHCI HID probe (poll) error: {:?}", e),
+                    }
                 }
+           
             }
         }
     }

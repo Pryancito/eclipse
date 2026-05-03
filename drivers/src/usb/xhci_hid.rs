@@ -564,6 +564,7 @@ pub struct XhciInner {
     pub max_slots: u8,
     pub max_ports: u8,
     context_size: usize,
+    pub msi_vector: usize,
     slot_speed: Vec<u8>,
     slot_port: Vec<u8>,
     dev_ctx: Vec<Option<DmaBuf>>,
@@ -589,7 +590,7 @@ struct HidDev {
 }
 
 impl XhciInner {
-    fn new(mmio: XhciMmio, max_slots: u8, max_ports: u8) -> DeviceResult<Self> {
+    fn new(mmio: XhciMmio, max_slots: u8, max_ports: u8, msi_vector: usize) -> DeviceResult<Self> {
         let hcc = mmio.read_cap(0x10);
         let context_size = if ((hcc >> 2) & 1) != 0 { 64 } else { 32 };
         let ns = max_slots as usize + 1;
@@ -607,6 +608,7 @@ impl XhciInner {
             max_slots,
             max_ports,
             context_size,
+            msi_vector,
             slot_speed: alloc::vec![0; ns],
             slot_port: alloc::vec![0; ns],
             dev_ctx,
@@ -888,10 +890,19 @@ impl XhciInner {
         m.write_rt(0x30, self.ev.erst_phys() as u32);
         m.write_rt(0x34, (self.ev.erst_phys() >> 32) as u32);
 
-        m.write_rt(0x20, 3);
-        m.write_rt(0x24, 0);
+        if self.msi_vector > 0 {
+            m.write_rt(0x20, 3);
+            m.write_rt(0x24, 0);
+        } else {
+            m.write_rt(0x20, 1);
+        }
 
-        m.write_op(0, m.read_op(0) | (1 << 2) | 1);
+        let mut cmd = m.read_op(0);
+        cmd |= 1; // R/S
+        if self.msi_vector > 0 {
+            cmd |= 1 << 2; // INTE
+        }
+        m.write_op(0, cmd);
 
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
@@ -1054,7 +1065,7 @@ impl XhciInner {
                     if (addr & 0x80) != 0 && (attr & 3) == 3 {
                         // Interrupt IN
                         if let Err(e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps) {
-                            warn!("[xhci] fallo init HID iface={}: {:?}", iface, e);
+                            warn!("[USB-HID] Port {}: found device", port);
                         }
                     }
                 }
@@ -1149,9 +1160,9 @@ impl XhciInner {
             tab_y: 0,
             tab_init: false,
         });
-        info!(
-            "[xhci] HID slot={} iface={} proto={} ep=0x{:02x} dci={}",
-            slot, iface, real_proto, ep_addr, dci
+        warn!(
+            "[USB-HID] Device at slot {}: detected HID (Interface {}, Protocol {})",
+            slot, iface, real_proto
         );
         Ok(())
     }
@@ -1555,7 +1566,7 @@ pub struct XhciUsbHid {
 /// Instancia global para drenar el event ring desde el timer (QEMU / IRQ perdidos).
 static POLL_INSTANCE: Mutex<Option<Arc<XhciUsbHid>>> = Mutex::new(None);
 
-fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
+pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
     *POLL_INSTANCE.lock() = dev;
 }
 
@@ -1589,9 +1600,10 @@ impl XhciUsbHid {
             return Err(DeviceError::InvalidParam);
         }
         let max_ports = ((hcsp >> 24) & 0xff) as u8;
-        let mut inner = XhciInner::new(mmio, max_slots, max_ports)?;
+        let mut inner = XhciInner::new(mmio, max_slots, max_ports, msi_vector)?;
         inner.reset_and_run()?;
         inner.enumerate_root_hid();
+        warn!("[USB-HID] xHCI controller initialized, msi_vector={}", msi_vector);
         let arc = Arc::new(Self {
             listener: EventListener::new(),
             inner: Mutex::new(Some(inner)),
