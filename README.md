@@ -1,65 +1,60 @@
-# zCore
+# zCore (Eclipse OS)
 
 [![CI](https://github.com/rcore-os/zCore/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/rcore-os/zCore/actions)
 [![Docs](https://img.shields.io/badge/docs-pages-green)](https://rcore-os.github.io/zCore/)
-[![Coverage Status](https://coveralls.io/repos/github/rcore-os/zCore/badge.svg?branch=master)](https://coveralls.io/github/rcore-os/zCore?branch=master)
-[![issue](https://img.shields.io/github/issues/rcore-os/zCore)](https://github.com/rcore-os/zCore/issues)
-[![forks](https://img.shields.io/github/forks/rcore-os/zCore)](https://github.com/rcore-os/zCore/fork)
-![stars](https://img.shields.io/github/stars/rcore-os/zCore)
-![license](https://img.shields.io/github/license/rcore-os/zCore)
+[![Estado de Cobertura](https://coveralls.io/repos/github/rcore-os/zCore/badge.svg?branch=master)](https://coveralls.io/github/rcore-os/zCore?branch=master)
+[![Issues](https://img.shields.io/github/issues/rcore-os/zCore)](https://github.com/rcore-os/zCore/issues)
+[![Forks](https://img.shields.io/github/forks/rcore-os/zCore)](https://github.com/rcore-os/zCore/fork)
+![Stars](https://img.shields.io/github/stars/rcore-os/zCore)
+![Licencia](https://img.shields.io/github/license/rcore-os/zCore)
 
-基于 zircon 并提供 Linux 兼容性的操作系统内核。
+Un núcleo de sistema operativo basado en Zircon que proporciona compatibilidad con Linux.
 
-## 原版README
+## Resumen del Proyecto
 
-  Reimplement `Zircon` microkernel in safe Rust as a userspace program!
+zCore es una reimplementación del micronúcleo `Zircon` en Rust seguro como un programa de espacio de usuario.
 
-- zCore设计架构概述
-- 支持bare-metal模式的Zircon & Linux
-- 支持libos模式的Zircon & Linux
-- 支持的图形应用程序等更多指导请查看[原版README文档](README-arch.md)。
+- Arquitectura de diseño de zCore.
+- Soporte para Zircon y Linux en modo bare-metal.
+- Soporte para Zircon y Linux en modo libos.
+- Para más guías sobre aplicaciones gráficas y otros detalles, consulte la [documentación original de arquitectura](README-arch.md).
 
-## 启动内核
+## Iniciar el Núcleo
 
    ```bash
-   cargo qemu --arch riscv64
+   cargo qemu --arch x86_64
    ```
 
-   这个命令会使用 qemu-system-riscv64 启动 zCore。
+   Este comando iniciará zCore usando QEMU para la arquitectura especificada.
 
-   默认的文件系统中将包含 busybox 应用程序和 musl-libc 链接器。它们是用自动下载的 musl-libc RISC-V 交叉编译工具链编译的。
+   El sistema de archivos predeterminado incluirá la aplicación `busybox` y la biblioteca `musl-libc`. Estos se compilan automáticamente usando la cadena de herramientas de compilación cruzada correspondiente.
 
-## 目录
+## Contenido
 
-- [启动内核](#启动内核)
-- [项目构建](#项目构建)
-  - [构建命令](#构建命令)
-  - [命令参考](#命令参考)
-- [平台支持](#平台支持)
-  - [Qemu/virt](#qemuvirt)
-  - [全志/哪吒](#全志哪吒)
-  - [赛昉/星光](#赛昉星光)
-  - [晶视/cr1825](#晶视cr1825)
+- [Iniciar el Núcleo](#iniciar-el-núcleo)
+- [Construcción del Proyecto](#construcción-del-proyecto)
+  - [Comandos de Construcción](#comandos-de-construcción)
+  - [Referencia de Comandos](#referencia-de-comandos)
+- [Soporte de Plataformas](#soporte-de-plataformas)
+  - [x86_64 (Qemu/ICH9)](#x86_64-qemuich9)
+  - [Qemu/virt (RISC-V)](#qemuvirt)
+  - [Allwinner D1/Nezha](#allwinner-d1nezha)
+  - [StarFive VisionFive](#starfive-visionfive)
+  - [CVITEK CR1825](#cvitek-cr1825)
 
-## 项目构建
+## Construcción del Proyecto
 
-项目构建采用 [xtask 模式](https://github.com/matklad/cargo-xtask)，常用操作被封装成 cargo 命令。
+La construcción del proyecto utiliza el [patrón xtask](https://github.com/matklad/cargo-xtask). Las operaciones comunes están encapsuladas en comandos de `cargo`.
 
-另外，还通过 [Makefile](Makefile) 提供 make 调用，以兼容一些旧脚本。
+Además, se proporciona un [Makefile](Makefile) para compatibilidad con algunos scripts antiguos.
 
-目前已测试的开发环境包括 Ubuntu20.04、Ubuntu22.04 和 Debian11，Ubuntu22.04 不能正确编译 x86_64 的 libc 测试。若不需要烧写到物理硬件，使用 WSL2 或其他虚拟机的操作与真机并无不同之处。
+Los entornos de desarrollo probados actualmente incluyen Ubuntu 20.04, Ubuntu 22.04 y Debian 11. 
 
-### 构建命令
+### Comandos de Construcción
 
-命令的基本格式为 `cargo <command> [--args [value]]`，这实际上是 `cargo run --package xtask --release -- <command> [--args [value]]` 的简写。`command` 被传递给 xtask 应用程序，解析并执行。
+El formato básico de los comandos es `cargo <comando> [--args [valor]]`. Esto es en realidad una abreviatura de `cargo run --package xtask --release -- <comando> [--args [valor]]`. El comando se pasa a la aplicación xtask para su análisis y ejecución.
 
-许多命令的效果受到仓库环境的影响，也会影响仓库的环境。为了使用方便，如果一个命令依赖于另一个命令的效果，它们被设计为递归的。命令的递归关系图如下，对于它们的详细解释在下一节：
-
----
-
-> **NOTICE** 建议使用等宽字体
-
----
+Muchos comandos dependen de otros para preparar el entorno. El diagrama de dependencias es el siguiente:
 
 ```text
 ┌────────────┐ ┌─────────────┐ ┌─────────────┐
@@ -80,191 +75,89 @@
                  | ffmpeg |──┘
                  └────────┘
 -------------------------------------------------------------------
-图例：A 递归执行 B（A 依赖 B 的结果，执行 A 时自动先执行 B）
-┌───┐  ┌───┐
-| A |─→| B |
-└───┘  └───┘
+Leyenda: A → B (A depende de B, ejecutar A ejecutará automáticamente B primero)
 ```
 
-### 命令参考
-
-如果下面的命令描述与行为不符，或怀疑此文档更新不及时，亦可直接查看[内联文档](xtask/src/main.rs#L48)。
-如果发现 `error: no such subcommand: ...`，查看[命令简写](.cargo/config.toml)为哪些命令设置了别名。
-
----
-
-> **NOTICE** 内联文档也是中英双语
-
----
+### Referencia de Comandos
 
 #### **update-all**
-
-更新工具链、依赖和 git 子模块。
-
-如果没有递归克隆子模块，可以使用这个命令克隆。
-
+Actualiza la cadena de herramientas, las dependencias y los submódulos de git.
 ```bash
 cargo update-all
 ```
 
 #### **check-style**
-
-静态检查。设置多种编译选项，检查代码能否编译。
-
+Chequeo estático. Verifica que el código compile con diversas opciones.
 ```bash
 cargo check-style
 ```
 
 #### **zircon-init**
-
-下载 zircon 模式所需的二进制文件。
-
+Descarga los archivos binarios necesarios para el modo Zircon.
 ```bash
 cargo zircon-init
 ```
 
-#### **asm**
-
-反汇并保存编指定架构的内核。默认保存到 `target/zcore.asm`。
-
-```bash
-cargo asm -m virt-riscv64 -o z.asm
-```
-
-#### **bin**
-
-生成内核 raw 镜像到指定位置。默认输出到 `target/{arch}/release/zcore.bin`。
-
-```bash
-cargo bin -m virt-riscv64 -o z.bin
-```
-
 #### **qemu**
-
-在 Qemu 中启动 zCore。这需要 Qemu 已经安装好了。
-
+Inicia zCore en QEMU. Requiere tener QEMU instalado.
 ```bash
-cargo qemu --arch riscv64 --smp 4
+cargo qemu --arch x86_64 --smp 4
 ```
 
-支持将 qemu 连接到 gdb：
-
+Soporte para conectar QEMU a GDB:
 ```bash
-cargo qemu --arch riscv64 --smp 4 --gdb 1234
+cargo qemu --arch x86_64 --smp 4 --gdb 1234
 ```
 
 #### **rootfs**
-
-重建 Linux rootfs。直接执行这个命令会清空已有的为此架构构造的 rootfs 目录，重建最小的 rootfs。
-
+Reconstruye el rootfs de Linux.
 ```bash
-cargo rootfs --arch riscv64
-```
-
-#### **musl-libs**
-
-将 musl 动态库拷贝到 rootfs 目录对应位置。
-
-```bash
-cargo musl-libs --arch riscv64
-```
-
-#### **ffmpeg**
-
-将 ffmpeg 动态库拷贝到 rootfs 目录对应位置。
-
-```bash
-cargo ffmpeg --arch riscv64
-```
-
-#### **opencv**
-
-将 opencv 动态库拷贝到 rootfs 目录对应位置。如果 ffmpeg 已经放好了，opencv 将会编译出包含 ffmepg 支持的版本。
-
-```bash
-cargo opencv --arch riscv64
-```
-
-#### **libc-test**
-
-将 libc 测试集拷贝到 rootfs 目录对应位置。
-
-```bash
-cargo libc-test --arch riscv64
-```
-
-#### **other-test**
-
-将其他测试集拷贝到 rootfs 目录对应位置。
-
-```bash
-cargo other-test --arch riscv64
+cargo rootfs --arch x86_64
 ```
 
 #### **image**
-
-从 rootfs 目录构建 Linux rootfs 镜像文件。
-
+Construye el archivo de imagen del rootfs de Linux a partir del directorio correspondiente.
 ```bash
-cargo image --arch riscv64
+cargo image --arch x86_64
 ```
 
-#### **linux-libos**
+## Soporte de Plataformas
 
-在 linux libos 模式下启动 zCore 并执行位于指定路径的应用程序。
+### x86_64 (Qemu/ICH9)
 
-> **NOTICE** libos 模式只能执行单个应用程序，完成就会退出。
+Soporte completo para arquitectura x86_64 mediante QEMU, con un driver AHCI/SATA de alto rendimiento.
 
-```bash
-cargo linux-libos --args "/bin/busybox"
-```
+- **Driver AHCI**: Soporta controladores ICH9, con mapeo dinámico de BAR5 (ABAR) y gestión de puertos.
+- **Estado**: El sistema identifica discos SATA, monta el sistema de archivos raíz y arranca con éxito hasta una shell de `busybox`.
 
-可以直接给应用程序传参数：
+### Qemu/virt (RISC-V)
 
-```bash
-cargo linux-libos --args "/bin/busybox ls"
-```
+Inicia directamente usando comandos de cargo, ver [Iniciar el Núcleo](#iniciar-el-núcleo).
 
-## 平台支持
+### Allwinner D1/Nezha
 
-### Qemu/virt
-
-直接使用命令启动，参见[启动内核](#启动内核)和 [`qemu` 命令](#qemu)。
-
-### 全志/哪吒
-
-使用以下命令构造系统镜像：
-
+Usa el siguiente comando para construir la imagen del sistema:
 ```bash
 cargo bin -m nezha -o z.bin
 ```
+Luego usa [rustsbi-d1](https://github.com/rustsbi/rustsbi-d1) para desplegar la imagen en Flash o DRAM.
 
-然后使用 [rustsbi-d1](https://github.com/rustsbi/rustsbi-d1) 将镜像部署到 Flash 或 DRAM。
+### StarFive VisionFive
 
-另: 可以查看[README for D1 文档](docs/README-D1.md)获知更多D1开发板有关的操作指导。
-
-### 赛昉/星光
-
-使用以下命令构造系统镜像：
-
+Usa el siguiente comando para construir la imagen:
 ```bash
 cargo bin -m visionfive -o z.bin
 ```
 
-然后根据[此文档](docs/README-visionfive.md)的详细说明通过 u-boot 网络启动系统。
+### CVITEK CR1825
 
-### 晶视/cr1825
-
-使用以下命令构造系统镜像：
-
+Usa el siguiente comando para construir la imagen:
 ```bash
 cargo bin -m cr1825 -o z.bin
 ```
 
-然后通过 u-boot 网络启动系统。
-
-## 其他
+## Otros
 
 - [An English README](docs/README_EN.md)
-- [开发者注意事项（草案）](docs/for-developers.md)
-- [构建系统更新日志](xtask/CHANGELOG.md)
+- [Notas para desarrolladores](docs/for-developers.md)
+- [Registro de cambios del sistema de construcción](xtask/CHANGELOG.md)
