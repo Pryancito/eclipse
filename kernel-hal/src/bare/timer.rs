@@ -7,7 +7,7 @@ use lock::Mutex;
 use naive_timer::Timer;
 
 #[allow(dead_code)]
-pub(super) const TICKS_PER_SEC: u64 = 1;
+pub(super) const TICKS_PER_SEC: u64 = 100;
 
 lazy_static::lazy_static! {
     static ref NAIVE_TIMER:Mutex<Timer> = Mutex::new(Timer::default());
@@ -30,7 +30,6 @@ hal_fn_impl! {
 
         fn timer_tick() {
             #[cfg(all(
-                feature = "xhci-usb-hid",
                 target_arch = "x86_64",
                 not(feature = "no-pci")
             ))]

@@ -29,10 +29,56 @@ lazy_static! {
                 false,
             );
         }
+        
+        // Suscribirse a dispositivos de entrada (teclados USB/virtio)
+        for input in kernel_hal::drivers::all_input().as_vec().iter() {
+            let cloned = stdin.clone();
+            use zcore_drivers::prelude::{InputEventType, InputEvent};
+            input.subscribe(
+                Box::new(move |event: &InputEvent| {
+                    if event.event_type == InputEventType::Key && event.value == 1 {
+                        if let Some(c) = input_event_to_char(event.code) {
+                            cloned.push(c);
+                        }
+                    }
+                }),
+                false,
+            );
+        }
         stdin
     };
     /// STDOUT global reference
     pub static ref STDOUT: Arc<Stdout> = Default::default();
+}
+
+fn input_event_to_char(code: u16) -> Option<char> {
+    use zcore_drivers::input::input_event_codes::key::*;
+    match code {
+        KEY_A => Some('a'), KEY_B => Some('b'), KEY_C => Some('c'), KEY_D => Some('d'),
+        KEY_E => Some('e'), KEY_F => Some('f'), KEY_G => Some('g'), KEY_H => Some('h'),
+        KEY_I => Some('i'), KEY_J => Some('j'), KEY_K => Some('k'), KEY_L => Some('l'),
+        KEY_M => Some('m'), KEY_N => Some('n'), KEY_O => Some('o'), KEY_P => Some('p'),
+        KEY_Q => Some('q'), KEY_R => Some('r'), KEY_S => Some('s'), KEY_T => Some('t'),
+        KEY_U => Some('u'), KEY_V => Some('v'), KEY_W => Some('w'), KEY_X => Some('x'),
+        KEY_Y => Some('y'), KEY_Z => Some('z'),
+        KEY_1 => Some('1'), KEY_2 => Some('2'), KEY_3 => Some('3'), KEY_4 => Some('4'),
+        KEY_5 => Some('5'), KEY_6 => Some('6'), KEY_7 => Some('7'), KEY_8 => Some('8'),
+        KEY_9 => Some('9'), KEY_0 => Some('0'),
+        KEY_ENTER | KEY_KPENTER => Some('\n'),
+        KEY_SPACE => Some(' '),
+        KEY_BACKSPACE => Some('\x08'),
+        KEY_TAB => Some('\t'),
+        KEY_DOT | KEY_KPDOT => Some('.'),
+        KEY_SLASH | KEY_KPSLASH => Some('/'),
+        KEY_MINUS | KEY_KPMINUS => Some('-'),
+        KEY_EQUAL => Some('='),
+        KEY_COMMA => Some(','),
+        KEY_SEMICOLON => Some(';'),
+        KEY_APOSTROPHE => Some('\''),
+        KEY_BACKSLASH => Some('\\'),
+        KEY_GRAVE => Some('`'),
+        _ => None,
+    }
 }
 
 /// Stdin struct, for Stdin buffer

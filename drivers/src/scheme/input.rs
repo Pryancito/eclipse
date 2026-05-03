@@ -5,7 +5,7 @@ use crate::input::input_event_codes::ev::*;
 
 numeric_enum_macro::numeric_enum! {
     #[repr(u16)]
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     /// Linux input event codes.
     ///
     /// Reference: <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/linux/input-event-codes.h>

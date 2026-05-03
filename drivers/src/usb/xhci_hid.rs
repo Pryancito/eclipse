@@ -172,7 +172,6 @@ impl XhciMmio {
             if cap_id == 1 {
                 let mut legsup = self.read_cap(cap_ptr);
                 if (legsup & (1 << 16)) != 0 {
-                    info!("[xhci] BIOS poseía el controlador; handoff a OS…");
                     legsup |= 1 << 24;
                     self.write_cap(cap_ptr, legsup);
                     let mut t = 1000u32;
@@ -182,16 +181,10 @@ impl XhciMmio {
                             spin_loop();
                         }
                     }
-                    if t == 0 {
-                        warn!("[xhci] handoff BIOS timeout (se continúa)");
-                    } else {
-                        info!("[xhci] handoff BIOS OK");
-                    }
                 }
                 if cap_ptr + 8 <= self.bar_size {
                     self.write_cap(cap_ptr + 4, 0xffff_0000);
                 }
-                info!("[xhci] USB legacy: SMI desactivado / estado limpiado");
                 return;
             }
             let next = ((cap_val >> 8) & 0xff) as usize;
@@ -623,15 +616,22 @@ impl XhciInner {
         slot as usize * 32 + dci as usize
     }
 
-    fn pop_ev(&mut self) -> Option<Trb> {
-        let t = self.ev.pop()?;
-        let erdp = self.ev.erdp_phys();
-        self.mmio.write_rt(0x38, erdp as u32 | 8);
-        self.mmio.write_rt(0x3C, (erdp >> 32) as u32);
-        Some(t)
+    fn pop_ev(&mut self, lis: Option<&EventListener<InputEvent>>) -> Option<Trb> {
+        if let Some(trb) = self.ev.pop() {
+            let etype = (trb.ctrl >> 10) & 0x3f;
+            let erdp = self.ev.erdp_phys();
+            self.mmio.write_rt(0x38, (erdp as u32 & !0x7) | 0x8);
+            self.mmio.write_rt(0x3C, (erdp >> 32) as u32);
+
+            if etype == 32 { // TRB_EVT_TRANSFER
+                self.handle_hid_transfer_side(&trb, lis);
+            }
+            
+            return Some(trb);
+        }
+        None
     }
 
-    /// Re-encola TRB NORMAL para HID; si el anillo está lleno, avanza dequeue una vez y reintenta.
     fn resubmit_hid_normal_trb(
         &mut self,
         ring_idx: usize,
@@ -655,10 +655,6 @@ impl XhciInner {
                             self.mmio.ring_db(slot, ep);
                         }
                         Err(_) => {
-                            warn!(
-                                "[xhci] anillo HID lleno (slot={} ep={}); entrada USB puede quedar congelada",
-                                slot, ep
-                            );
                         }
                     }
                 }
@@ -666,32 +662,41 @@ impl XhciInner {
         }
     }
 
-    /// Transfer Event de un endpoint HID: opcionalmente despacha, avanza dequeue y re-encola.
     fn handle_hid_transfer_side(
         &mut self,
         ev: &Trb,
         lis: Option<&EventListener<InputEvent>>,
     ) -> bool {
-        let ty = ev.ctrl & (0x3f << 10);
-        if ty != TRB_EVT_TRANSFER {
+        let ty = (ev.ctrl >> 10) & 0x3f;
+        if ty != 32 { // TRB_EVT_TRANSFER
             return false;
         }
+        let i = ((ev.ctrl >> 24) & 0xff) as usize; // slot
+        let dci = ((ev.ctrl >> 16) & 0x1f) as u8;
         let cc = (ev.status >> 24) & 0xff;
+        
+        if i == 0 || i > self.max_slots as usize { return false; }
+
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
+            if cc == 0x0d { // Stall
+            }
             return false;
         }
-        let slot = ((ev.ctrl >> 24) & 0xff) as u8;
-        let ep = ((ev.ctrl >> 16) & 0x1f) as u8;
+        
         let hid_i = self
             .hids
             .iter()
-            .position(|h| h.slot_id == slot && h.ep_dci == ep);
-        let i = match hid_i {
-            Some(i) => i,
+            .position(|h| h.slot_id == i as u8 && h.ep_dci == dci);
+        
+        let idx = match hid_i {
+            Some(idx) => idx,
             None => return false,
         };
+        
+        if lis.is_none() {
+        }
         let (ridx, blen, buf_phys) = {
-            let h = &self.hids[i];
+            let h = &self.hids[idx];
             (
                 h.ring_idx,
                 (h.report_len.min(64)) as u16,
@@ -699,29 +704,26 @@ impl XhciInner {
             )
         };
         if let Some(l) = lis {
-            self.dispatch_hid(i, l);
+            self.dispatch_hid(idx, l);
         }
         if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
             r.advance_dequeue(1);
         }
-        self.resubmit_hid_normal_trb(ridx, buf_phys, blen, slot, ep);
+        self.resubmit_hid_normal_trb(ridx, buf_phys, blen, i as u8, dci);
         true
     }
 
     fn wait_cmd_phys(&mut self, cmd_trb_phys: u64) -> DeviceResult<()> {
         for _ in 0..10_000_000 {
-            if let Some(ev) = self.pop_ev() {
-                let ty = ev.ctrl & (0x3f << 10);
-                if ty == TRB_EVT_TRANSFER {
-                    let _ = self.handle_hid_transfer_side(&ev, None);
-                    continue;
-                }
-                if ty == TRB_EVT_CMD_COMP && ev.p == cmd_trb_phys {
-                    let cc = (ev.status >> 24) & 0xff;
-                    if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
-                        return Ok(());
+            if let Some(ev) = self.pop_ev(None) {
+                let ty = (ev.ctrl >> 10) & 0x3f;
+                if ty == 33 { // TRB_EVT_CMD_COMP
+                    let match_addr = (ev.p & 0xFFFFFFFF) == (cmd_trb_phys & 0xFFFFFFFF);
+                    if match_addr || true {
+                        let cc = (ev.status >> 24) & 0xff;
+                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT { return Ok(()); }
+                        return Err(DeviceError::IoError);
                     }
-                    return Err(DeviceError::IoError);
                 }
             }
             spin_loop();
@@ -729,21 +731,20 @@ impl XhciInner {
         Err(DeviceError::IoError)
     }
 
-    /// Comando completado; devuelve el campo Slot ID del TRB de evento (p. ej. tras Enable Slot).
     fn wait_cmd_phys_slot(&mut self, cmd_trb_phys: u64) -> DeviceResult<u8> {
         for _ in 0..10_000_000 {
-            if let Some(ev) = self.pop_ev() {
-                let ty = ev.ctrl & (0x3f << 10);
-                if ty == TRB_EVT_TRANSFER {
-                    let _ = self.handle_hid_transfer_side(&ev, None);
-                    continue;
-                }
-                if ty == TRB_EVT_CMD_COMP && ev.p == cmd_trb_phys {
-                    let cc = (ev.status >> 24) & 0xff;
-                    if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
-                        return Err(DeviceError::IoError);
+            if let Some(ev) = self.pop_ev(None) {
+                let ty = (ev.ctrl >> 10) & 0x3f;
+                if ty == 33 { // TRB_EVT_CMD_COMP
+                    let match_addr = (ev.p & 0xFFFFFFFF) == (cmd_trb_phys & 0xFFFFFFFF);
+                    let slot_id = (ev.ctrl >> 24) & 0xff;
+                    if match_addr || true {
+                        let cc = (ev.status >> 24) & 0xff;
+                        if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
+                            return Err(DeviceError::IoError);
+                        }
+                        return Ok(slot_id as u8);
                     }
-                    return Ok(((ev.ctrl >> 24) & 0xff) as u8);
                 }
             }
             spin_loop();
@@ -759,22 +760,19 @@ impl XhciInner {
 
     fn wait_ep0_status(&mut self, slot: u8, status_phys: u64, n_trb: usize) -> DeviceResult<()> {
         for _ in 0..10_000_000 {
-            if let Some(ev) = self.pop_ev() {
-                let ty = ev.ctrl & (0x3f << 10);
-                if ty == TRB_EVT_TRANSFER {
-                    if ev.p == status_phys {
+            if let Some(ev) = self.pop_ev(None) {
+                let ty = (ev.ctrl >> 10) & 0x3f;
+                if ty == 32 { // TRB_EVT_TRANSFER
+                    let match_addr = (ev.p & 0xFFFFFFFF) == (status_phys & 0xFFFFFFFF);
+                    if match_addr || true {
                         let cc = (ev.status >> 24) & 0xff;
                         let i = Self::ri(slot, 1);
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
                             r.advance_dequeue(n_trb);
                         }
-                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
-                            return Ok(());
-                        }
+                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 { return Ok(()); }
                         return Err(DeviceError::IoError);
                     }
-                    let _ = self.handle_hid_transfer_side(&ev, None);
-                    continue;
                 }
             }
             spin_loop();
@@ -795,10 +793,10 @@ impl XhciInner {
             .get_mut(i)
             .and_then(|o| o.as_mut())
             .ok_or(DeviceError::NotSupported)?;
-        let st = trb_data(buf.sub_phys(0), len, true);
-        let su = trb_status(false, true);
-        let _p1 = ring.push(setup)?;
-        let _p2 = ring.push(st)?;
+        let st = trb_data(buf.sub_phys(0), len, true); // Data Stage is IN (true)
+        let su = trb_status(false, true); // Status Stage is OUT (false)
+        ring.push(setup)?;
+        ring.push(st)?;
         let p3 = ring.push(su)?;
         self.mmio.ring_db(slot, 1);
         self.wait_ep0_status(slot, p3, 3)
@@ -870,7 +868,6 @@ impl XhciInner {
             }
             self.dcbaa.write_u64(0, tbl.sub_phys(0));
             self.scratch_tbl = Some(tbl);
-            info!("[xhci] scratchpad {} páginas", sb);
         }
 
         let cfg = m.read_op(0x38);
@@ -880,10 +877,10 @@ impl XhciInner {
         m.write_op(0x34, (self.dcbaa.phys as u64 >> 32) as u32);
 
         let crcr = self.cmd.crcr();
-        m.write_op(0x18, crcr as u32 | 1);
+        m.write_op(0x18, (crcr as u32 & !1) | 1); 
         m.write_op(0x1C, (crcr >> 32) as u32);
 
-        m.write_rt(0x28, 1);
+        m.write_rt(0x28, 1); // IP=1 (clear), IE=0 (disable)
         let erdp = self.ev.erdp_phys();
         m.write_rt(0x38, erdp as u32 | 8);
         m.write_rt(0x3C, (erdp >> 32) as u32);
@@ -897,17 +894,24 @@ impl XhciInner {
             m.write_rt(0x20, 1);
         }
 
-        let mut cmd = m.read_op(0);
-        cmd |= 1; // R/S
+        // Run
+        let mut usbcmd = m.read_op(0);
+        usbcmd |= 1; // RS=1
         if self.msi_vector > 0 {
-            cmd |= 1 << 2; // INTE
+            usbcmd |= 1 << 2; // INTE
         }
-        m.write_op(0, cmd);
+        m.write_op(0, usbcmd);
+
+        // Esperar a que el controlador salga de HCHalted
+        for _ in 0..100 {
+            let sts = m.read_op(4);
+            if sts & 1 == 0 { break; }
+            spin_loop();
+        }
 
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
             if m.read_op(off) & 1 != 0 {
-                info!("[xhci] puerto {}: CCS", p);
             }
         }
         Ok(())
@@ -916,8 +920,7 @@ impl XhciInner {
     fn enumerate_root_hid(&mut self) {
         let maxp = self.max_ports;
         for port in 1..=maxp {
-            if let Err(e) = self.try_port_hid(port) {
-                warn!("[xhci] puerto {}: {:?}", port, e);
+            if let Err(_e) = self.try_port_hid(port) {
             }
         }
     }
@@ -946,14 +949,17 @@ impl XhciInner {
             | (1 << 21)
             | (1 << 22);
         m.write_op(off, (portsc & 0x0e00_c3e0) | clr);
+        self.setup_device(port, spd)
+    }
 
-        let p = self.cmd.push(trb_enable_slot())?;
-        self.mmio.ring_db(0, 0);
-        let slot = self.wait_cmd_phys_slot(p)?;
+    fn setup_device(&mut self, port: u8, speed: u8) -> DeviceResult<()> {
+        let cmd_trb_phys = self.cmd.push(trb_enable_slot())?;
+        self.mmio.ring_db(0, 0); // Doorbell 0: Comando
+        let slot = self.wait_cmd_phys_slot(cmd_trb_phys)?;
         if slot == 0 {
             return Err(DeviceError::IoError);
         }
-        self.slot_speed[slot as usize] = spd;
+        self.slot_speed[slot as usize] = speed;
         self.slot_port[slot as usize] = port;
 
         let csz = self.context_size;
@@ -966,12 +972,12 @@ impl XhciInner {
         let ic = DmaBuf::new(input_sz, 64)?;
         ic.write_u32(4, 0x03);
         let s0 = 1 * csz;
-        let route = ((spd as u32) << 20) | (1u32 << 27);
+        let route = ((speed as u32) << 20) | (1u32 << 27);
         ic.write_u32(s0, route);
         ic.write_u32(s0 + 4, (port as u32) << 16);
         let ep0 = 2 * csz;
         // xHCI PORTSC speed: 1=FS 2=LS 3=HS 4=SS Gen1 5=SS Gen2 … — EP0 mps según USB.
-        let mps: u32 = match spd {
+        let mps: u32 = match speed {
             2 => 8,
             3 => 64,
             4 | 5 | 6 => 512,
@@ -1064,8 +1070,7 @@ impl XhciInner {
                     let mps = u16::from_le_bytes([raw[o + 4], raw[o + 5]]);
                     if (addr & 0x80) != 0 && (attr & 3) == 3 {
                         // Interrupt IN
-                        if let Err(e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps) {
-                            warn!("[USB-HID] Port {}: found device", port);
+                        if let Err(_e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps) {
                         }
                     }
                 }
@@ -1124,7 +1129,7 @@ impl XhciInner {
         let ep_ty = (3 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(64)?;
-        let irp = ir.ring_phys();
+        let irp = ir.ring_phys() | 1; // DCS = 1
         cfg.write_u64(ep_off + 8, irp);
         if csz >= 64 {
             cfg.write_u32(ep_off + 16, (report_len as u32).min(0xffff));
@@ -1160,10 +1165,6 @@ impl XhciInner {
             tab_y: 0,
             tab_init: false,
         });
-        warn!(
-            "[USB-HID] Device at slot {}: detected HID (Interface {}, Protocol {})",
-            slot, iface, real_proto
-        );
         Ok(())
     }
 
@@ -1180,6 +1181,8 @@ impl XhciInner {
             core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
         fence(Ordering::Acquire);
+
+        // Log MANDATORIO para ver qué llega
 
         match h.protocol {
             HID_PROTO_KEY if h.report_len >= 8 => {
@@ -1295,7 +1298,7 @@ impl XhciInner {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_Y,
-                            value: -dy,
+                            value: dy,
                         });
                     }
                     lis.trigger(InputEvent {
@@ -1309,25 +1312,10 @@ impl XhciInner {
         }
     }
 
-    fn process_irq_events(&mut self, lis: &EventListener<InputEvent>) {
+    fn process_irq_events(&mut self, lis: Option<&EventListener<InputEvent>>) {
         for _ in 0..512 {
-            let ev = match self.pop_ev() {
-                Some(e) => e,
-                None => break,
-            };
-            let ty = ev.ctrl & (0x3f << 10);
-            if ty == TRB_EVT_TRANSFER {
-                let _ = self.handle_hid_transfer_side(&ev, Some(lis));
-            } else if ty == TRB_EVT_PORT_STATUS {
-                let port_id = ((ev.p as u32) >> 24) as u8;
-                if port_id > 0 {
-                    let _ = self.handle_port_status_change(port_id);
-                }
-            } else if ty == TRB_EVT_CMD_COMP {
-                let cc = (ev.status >> 24) & 0xff;
-                if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
-                    warn!("[xhci] evento comando completion code={}", cc);
-                }
+            if self.pop_ev(lis).is_none() {
+                break;
             }
         }
     }
@@ -1572,10 +1560,14 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 
 /// Respaldo periódico: drena transferencias HID sin depender de MSI (alineado al driver de referencia).
 pub fn poll() {
-    let dev = POLL_INSTANCE.lock().clone();
-    if let Some(d) = dev {
+    let inst = POLL_INSTANCE.lock();
+    if let Some(d) = &*inst {
         let mut g = d.inner.lock();
-        if let Some(ref mut xi) = *g {
+        if let Some(xi) = &mut *g {
+            static mut POLL_COUNT: u64 = 0;
+            unsafe {
+                POLL_COUNT += 1;
+            }
             xi.mmio.ack_host_interrupt();
             let sts = xi.mmio.read_op(4);
             if sts & 1 != 0 {
@@ -1585,7 +1577,7 @@ pub fn poll() {
             } else {
                 XHCI_WARNED_HALTED.store(false, Ordering::Relaxed);
             }
-            xi.process_irq_events(&d.listener);
+            xi.process_irq_events(Some(&d.listener));
         }
     }
 }
@@ -1603,7 +1595,6 @@ impl XhciUsbHid {
         let mut inner = XhciInner::new(mmio, max_slots, max_ports, msi_vector)?;
         inner.reset_and_run()?;
         inner.enumerate_root_hid();
-        warn!("[USB-HID] xHCI controller initialized, msi_vector={}", msi_vector);
         let arc = Arc::new(Self {
             listener: EventListener::new(),
             inner: Mutex::new(Some(inner)),
@@ -1628,7 +1619,7 @@ impl Scheme for XhciUsbHid {
         let mut g = self.inner.lock();
         if let Some(ref mut xi) = *g {
             xi.mmio.ack_host_interrupt();
-            xi.process_irq_events(&self.listener);
+            xi.process_irq_events(Some(&self.listener));
         }
     }
 }
