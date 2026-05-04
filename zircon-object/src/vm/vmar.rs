@@ -299,50 +299,41 @@ impl VmAddressRegion {
     }
 
     /// Change protections on a subset of the region of memory in the containing
-    /// address space.  If the requested range overlaps with a subregion,
-    /// protect() will fail.
+    /// address space.  Recursively handles child VMARs that overlap the range.
     pub fn protect(&self, addr: usize, len: usize, flags: MMUFlags) -> ZxResult {
         if !page_aligned(addr) || !page_aligned(len) {
             return Err(ZxError::INVALID_ARGS);
         }
-        let mut guard = self.inner.lock();
-        let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
         let end_addr = addr + len;
-        // check if there are overlapping subregion
-        if inner
-            .children
-            .iter()
-            .any(|child| child.end_addr() >= addr && child.addr() <= end_addr)
-        {
-            return Err(ZxError::INVALID_ARGS);
+
+        // Collect overlapping child VMARs first (to avoid holding inner lock while recursing).
+        let overlapping_children: Vec<Arc<VmAddressRegion>> = {
+            let guard = self.inner.lock();
+            let inner = guard.as_ref().ok_or(ZxError::BAD_STATE)?;
+            inner
+                .children
+                .iter()
+                .filter(|c| c.addr() < end_addr && c.end_addr() > addr)
+                .cloned()
+                .collect()
+        };
+
+        // Recurse into each overlapping child VMAR.
+        for child in overlapping_children {
+            let child_start = addr.max(child.addr());
+            let child_end = end_addr.min(child.end_addr());
+            if child_start < child_end {
+                child.protect(child_start, child_end - child_start, flags)?;
+            }
         }
-        let length: usize = inner
-            .mappings
-            .iter()
-            .filter_map(|map| {
-                if map.end_addr() >= addr && map.addr() <= end_addr {
-                    Some(end_addr.min(map.end_addr()) - addr.max(map.addr()))
-                } else {
-                    None
-                }
-            })
-            .sum();
-        if length != len {
-            return Err(ZxError::NOT_FOUND);
-        }
-        // check if protect flags is valid
-        if inner
-            .mappings
-            .iter()
-            .filter(|map| map.end_addr() >= addr && map.addr() <= end_addr) // get mappings in range: [addr, end_addr]
-            .any(|map| !map.is_valid_mapping_flags(flags))
-        {
-            return Err(ZxError::ACCESS_DENIED);
-        }
+
+        // Protect direct mappings within this VMAR.
+        let guard = self.inner.lock();
+        let inner = guard.as_ref().ok_or(ZxError::BAD_STATE)?;
         inner
             .mappings
             .iter()
-            .filter(|map| map.end_addr() >= addr && map.addr() <= end_addr)
+            .filter(|map| map.end_addr() > addr && map.addr() < end_addr)
             .for_each(|map| {
                 let start_index = pages(addr.max(map.addr()) - map.addr());
                 let end_index = pages(end_addr.min(map.end_addr()) - map.addr());
@@ -564,7 +555,12 @@ impl VmAddressRegion {
             return Err(ZxError::NOT_FOUND);
         }
         if let Some(child) = inner.children.iter().find(|ch| ch.contains(vaddr)) {
-            return child.handle_page_fault(vaddr, flags);
+            // If the child VMAR doesn't have a mapping at this address (e.g. a gap
+            // in a dynamic-linker image_vmar), fall through and check parent mappings.
+            match child.handle_page_fault(vaddr, flags) {
+                Err(ZxError::NOT_FOUND) => {}
+                other => return other,
+            }
         }
         if let Some(mapping) = inner.mappings.iter().find(|map| map.contains(vaddr)) {
             return mapping.handle_page_fault(vaddr, flags);
