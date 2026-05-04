@@ -169,7 +169,7 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Signal actions
     signal_actions: SignalActions,
-    /// Program break (end of heap / brk pointer). 0 = not yet initialised.
+    /// Program break (end of heap / brk pointer). 0 = not yet initialized.
     brk: usize,
 }
 
@@ -419,7 +419,7 @@ impl LinuxProcess {
         use zircon_object::vm::{pages, MMUFlags, VmObject};
         let current_brk = self.inner.lock().brk;
         if current_brk == 0 {
-            // Not yet initialised (should not happen after exec).
+            // Not yet initialized (should not happen after exec).
             return Ok(0);
         }
         if new_brk == 0 || new_brk <= current_brk {
@@ -435,7 +435,8 @@ impl LinuxProcess {
         match vmar.map(Some(vmar_offset), vmo, 0, len, mmu_flags) {
             Ok(_) => {
                 self.inner.lock().brk = new_brk_aligned;
-                Ok(new_brk)
+                // Return the actual (page-aligned) new break, consistent with stored value.
+                Ok(new_brk_aligned)
             }
             Err(_) => Ok(current_brk),
         }
