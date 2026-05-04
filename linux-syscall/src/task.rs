@@ -289,14 +289,12 @@ impl Syscall<'_> {
         // Modify exec path
         proc.set_execute_path(&path);
 
-        let (entry, sp, brk) = LinuxElfLoader {
+        let (entry, sp) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
         .load(&vmar, &data, args, envs, path)?;
-
-        proc.set_brk(brk);
 
         // TODO: use right signal
         // self.zircon_process().signal_set(Signal::SIGNALED);
