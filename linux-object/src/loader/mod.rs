@@ -23,7 +23,7 @@ pub struct LinuxElfLoader {
 }
 
 impl LinuxElfLoader {
-    /// load a Linux ElfFile and return a tuple of (entry,sp,brk)
+    /// load a Linux ElfFile and return a tuple of (entry,sp)
     pub fn load(
         &self,
         vmar: &Arc<VmAddressRegion>,
@@ -31,7 +31,7 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-    ) -> LxResult<(VirtAddr, VirtAddr, VirtAddr)> {
+    ) -> LxResult<(VirtAddr, VirtAddr)> {
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -44,105 +44,15 @@ impl LinuxElfLoader {
 
         debug!("elf info:  {:#x?}", elf.header.pt2);
 
-        // ── Dynamically-linked binary ────────────────────────────────────────
-        // Load the main binary AND the interpreter into separate child VMARs,
-        // then hand control to the interpreter with a correctly populated auxv.
         if let Ok(interp) = elf.get_interpreter() {
             info!("interp: {:?}, path: {:?}", interp, path);
-
-            // 1. Load the main application binary.
-            let app_size = elf.load_segment_size();
-            let app_vmar =
-                vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
-            let app_base = app_vmar.addr();
-            app_vmar.load_from_elf(&elf)?;
-            let app_entry = app_base + elf.header.pt2.entry_point() as usize;
-
-            match elf.relocate(app_vmar) {
-                Ok(()) => info!("app elf relocate passed!"),
-                Err(e) => warn!("app elf relocate: {:?} (may be OK for static binary)", e),
-            }
-
-            // 2. Load the interpreter (dynamic linker).
-            let interp_inode = self.root_inode.lookup(interp)?;
-            let interp_data = interp_inode.read_as_vec()?;
-            let interp_elf =
-                ElfFile::new(&interp_data).map_err(|_| ZxError::INVALID_ARGS)?;
-
-            let interp_size = interp_elf.load_segment_size();
-            let interp_vmar =
-                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
-            let interp_base = interp_vmar.addr();
-            interp_vmar.load_from_elf(&interp_elf)?;
-            let interp_entry =
-                interp_base + interp_elf.header.pt2.entry_point() as usize;
-
-            match interp_elf.relocate(interp_vmar) {
-                Ok(()) => info!("interp elf relocate passed!"),
-                Err(e) => warn!("interp elf relocate: {:?}", e),
-            }
-
-            // 3. Build initial stack with auxv pointing at the main binary.
-            let stack_vmo = VmObject::new_paged(self.stack_pages);
-            let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            let stack_bottom =
-                vmar.map(None, stack_vmo.clone(), 0, stack_vmo.len(), stack_flags)?;
-            let mut sp = stack_bottom + stack_vmo.len();
-
-            let info = abi::ProcInitInfo {
-                args,
-                envs,
-                auxv: {
-                    let mut map = BTreeMap::new();
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        // AT_BASE  = interpreter load base (for its own relocation)
-                        // AT_PHDR  = virtual address of the app's PHDR table
-                        // AT_ENTRY = app entry point (ld.so jumps here after reloc)
-                        map.insert(abi::AT_BASE, interp_base);
-                        map.insert(
-                            abi::AT_PHDR,
-                            app_base + elf.header.pt2.ph_offset() as usize,
-                        );
-                        map.insert(abi::AT_ENTRY, app_entry);
-                    }
-                    #[cfg(target_arch = "riscv64")]
-                    {
-                        if let Some(phdr_vaddr) = elf.get_phdr_vaddr() {
-                            map.insert(abi::AT_PHDR, app_base + phdr_vaddr as usize);
-                        }
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        map.insert(abi::AT_BASE, interp_base);
-                        map.insert(abi::AT_ENTRY, app_entry);
-                        if let Some(phdr_vaddr) = elf.get_phdr_vaddr() {
-                            map.insert(abi::AT_PHDR, app_base + phdr_vaddr as usize);
-                        }
-                    }
-                    map.insert(
-                        abi::AT_PHENT,
-                        elf.header.pt2.ph_entry_size() as usize,
-                    );
-                    map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
-                    map.insert(abi::AT_PAGESZ, PAGE_SIZE);
-                    map
-                },
-            };
-            let init_stack = info.push_at(sp);
-            stack_vmo
-                .write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
-            sp -= init_stack.len();
-
-            let brk = app_base + elf.load_segment_size();
-            debug!(
-                "dynamic load: interp_entry={:#x}, sp={:#x}, brk={:#x}",
-                interp_entry, sp, brk
-            );
-            return Ok((interp_entry, sp, brk));
+            let inode = self.root_inode.lookup(interp)?;
+            let data = inode.read_as_vec()?;
+            let mut new_args = vec![interp.into(), path.clone()];
+            new_args.extend_from_slice(&args[1..]);
+            return self.load(vmar, &data, new_args, envs, path);
         }
 
-        // ── Statically-linked (or no-interpreter) binary ─────────────────────
         let size = elf.load_segment_size();
         let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
         let base = image_vmar.addr();
@@ -215,7 +125,6 @@ impl LinuxElfLoader {
             info.auxv, entry, sp
         );
 
-        let brk = base + elf.load_segment_size();
-        Ok((entry, sp, brk))
+        Ok((entry, sp))
     }
 }
