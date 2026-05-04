@@ -140,7 +140,7 @@ impl Syscall<'_> {
             Sys::UMOUNT2 => self.unimplemented("umount2", Err(LxError::EACCES)),
 
             // memory
-            Sys::BRK => self.unimplemented("brk", Err(LxError::ENOMEM)),
+            Sys::BRK => self.sys_brk(a0),
             Sys::MMAP => self.sys_mmap(a0, a1, a2, a3, a4.into(), a5 as _).await,
             Sys::MPROTECT => self.sys_mprotect(a0, a1, a2),
             Sys::MUNMAP => self.sys_munmap(a0, a1),

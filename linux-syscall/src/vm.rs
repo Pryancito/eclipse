@@ -1,6 +1,6 @@
 use super::*;
 use bitflags::bitflags;
-use zircon_object::vm::{pages, MMUFlags, VmObject};
+use zircon_object::vm::{pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Syscalls for virtual memory.
 ///
@@ -110,10 +110,21 @@ impl Syscall<'_> {
         }
     }
 
+    /// Change the location of the program break
+    /// (see [linux man brk(2)](https://www.man7.org/linux/man-pages/man2/brk.2.html)).
+    ///
+    /// On success returns the new (or current, if `brk == 0`) program break.
+    /// On failure returns the current program break unchanged.
+    pub fn sys_brk(&self, brk: usize) -> SysResult {
+        info!("brk: brk={:#x}", brk);
+        let proc = self.linux_process();
+        let vmar = self.zircon_process().vmar();
+        let result = proc.brk(brk, &vmar)?;
+        Ok(result)
+    }
+
     /// Set protection on a region of memory
     /// (see [linux man mprotect(2)](https://www.man7.org/linux/man-pages/man2/mprotect.2.html)).
-    ///
-    /// **NOTE!** This syscall is now unimplemented. Calling it always return `Ok(0)`.
     ///
     /// `sys_mprotect` changes the access protections for the calling process's memory pages
     /// containing any part of the address range in the interval `[addr, addr+len-1]`.
@@ -144,7 +155,14 @@ impl Syscall<'_> {
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
         );
-        warn!("mprotect: unimplemented");
+        if len == 0 {
+            return Ok(0);
+        }
+        let proc = self.zircon_process();
+        let vmar = proc.vmar();
+        let aligned_len = pages(len) * PAGE_SIZE;
+        vmar.protect(addr, aligned_len, prot.to_flags())
+            .map_err(|_| LxError::EACCES)?;
         Ok(0)
     }
 
@@ -216,10 +234,6 @@ impl MmapProt {
         }
         if self.contains(MmapProt::EXEC) {
             flags |= MMUFlags::EXECUTE;
-        }
-        // FIXME: hack for unimplemented mprotect
-        if self.is_empty() {
-            flags |= MMUFlags::READ | MMUFlags::WRITE;
         }
         flags
     }

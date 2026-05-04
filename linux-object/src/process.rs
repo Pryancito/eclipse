@@ -169,6 +169,8 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Signal actions
     signal_actions: SignalActions,
+    /// Program break (end of heap / brk pointer). 0 = not yet initialized.
+    brk: usize,
 }
 
 #[derive(Clone)]
@@ -393,6 +395,51 @@ impl LinuxProcess {
     /// Set execute path.
     pub fn set_execute_path(&self, path: &str) {
         self.inner.lock().execute_path = String::from(path);
+    }
+
+    /// Set the initial program break after a successful exec.
+    pub fn set_brk(&self, brk: usize) {
+        self.inner.lock().brk = brk;
+    }
+
+    /// Get the current program break.
+    pub fn get_brk(&self) -> usize {
+        self.inner.lock().brk
+    }
+
+    /// Implement the `brk` syscall: set or extend the program break.
+    ///
+    /// Returns the current break (which may be higher than `new_brk` on success,
+    /// or unchanged if the request cannot be satisfied).
+    pub fn brk(
+        &self,
+        new_brk: usize,
+        vmar: &Arc<zircon_object::vm::VmAddressRegion>,
+    ) -> LxResult<usize> {
+        use zircon_object::vm::{pages, MMUFlags, VmObject};
+        let current_brk = self.inner.lock().brk;
+        if current_brk == 0 {
+            // Not yet initialized (should not happen after exec).
+            return Ok(0);
+        }
+        if new_brk == 0 || new_brk <= current_brk {
+            return Ok(current_brk);
+        }
+        // Align new_brk up to page boundary.
+        let new_brk_aligned = (new_brk + zircon_object::vm::PAGE_SIZE - 1)
+            & !(zircon_object::vm::PAGE_SIZE - 1);
+        let len = new_brk_aligned - current_brk;
+        let vmo = VmObject::new_paged(pages(len));
+        let mmu_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        let vmar_offset = current_brk - vmar.addr();
+        match vmar.map(Some(vmar_offset), vmo, 0, len, mmu_flags) {
+            Ok(_) => {
+                self.inner.lock().brk = new_brk_aligned;
+                // Return the actual (page-aligned) new break, consistent with stored value.
+                Ok(new_brk_aligned)
+            }
+            Err(_) => Ok(current_brk),
+        }
     }
 
     /// Get signal action.
