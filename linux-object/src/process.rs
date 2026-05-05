@@ -169,6 +169,8 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Signal actions
     signal_actions: SignalActions,
+    /// Program break (top of heap), set after ELF loading.
+    brk: usize,
 }
 
 #[derive(Clone)]
@@ -393,6 +395,16 @@ impl LinuxProcess {
     /// Set execute path.
     pub fn set_execute_path(&self, path: &str) {
         self.inner.lock().execute_path = String::from(path);
+    }
+
+    /// Get the current program break (top of heap).
+    pub fn brk(&self) -> usize {
+        self.inner.lock().brk
+    }
+
+    /// Set the current program break.
+    pub fn set_brk(&self, brk: usize) {
+        self.inner.lock().brk = brk;
     }
 
     /// Get signal action.

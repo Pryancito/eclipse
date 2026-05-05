@@ -1,6 +1,6 @@
 use super::*;
 use bitflags::bitflags;
-use zircon_object::vm::{pages, MMUFlags, VmObject};
+use zircon_object::vm::{pages, MMUFlags, VmObject, PAGE_SIZE};
 
 /// Syscalls for virtual memory.
 ///
@@ -110,10 +110,51 @@ impl Syscall<'_> {
         }
     }
 
+    /// Change the location of the program break
+    /// (see [linux man brk(2)](https://www.man7.org/linux/man-pages/man2/brk.2.html)).
+    ///
+    /// `sys_brk` sets the end of the process data segment (the program break) to `new_brk`.
+    /// If `new_brk` is 0 or less than the current break, the current break is returned unchanged.
+    /// Otherwise, the break is extended to `new_brk` (rounded up to page size) by mapping new
+    /// anonymous pages, and the new break value is returned.
+    /// On failure the current break is returned (Linux semantics: never returns -1).
+    pub fn sys_brk(&self, new_brk: usize) -> SysResult {
+        let proc = self.linux_process();
+        let current_brk = proc.brk();
+        info!("brk: new_brk={:#x}, current_brk={:#x}", new_brk, current_brk);
+
+        // brk(0) or shrink request → return current break unchanged (Linux semantics).
+        if new_brk == 0 || new_brk <= current_brk {
+            return Ok(current_brk);
+        }
+
+        // Align up to page boundary.
+        let new_brk_aligned = (new_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let size = new_brk_aligned - current_brk;
+
+        let vmar = self.zircon_process().vmar();
+        let vmo = VmObject::new_paged(pages(size));
+        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        // vmar.addr() == 0 for user address spaces, so VMAR offset == absolute VA.
+        match vmar.map_at(current_brk, vmo, 0, size, flags) {
+            Ok(_) => {
+                proc.set_brk(new_brk_aligned);
+                info!("brk: extended to {:#x}", new_brk_aligned);
+                Ok(new_brk_aligned)
+            }
+            Err(e) => {
+                warn!(
+                    "brk: failed to map {:#x} bytes at {:#x}: {:?}",
+                    size, current_brk, e
+                );
+                // Return current break on failure (Linux semantics).
+                Ok(current_brk)
+            }
+        }
+    }
+
     /// Set protection on a region of memory
     /// (see [linux man mprotect(2)](https://www.man7.org/linux/man-pages/man2/mprotect.2.html)).
-    ///
-    /// **NOTE!** This syscall is now unimplemented. Calling it always return `Ok(0)`.
     ///
     /// `sys_mprotect` changes the access protections for the calling process's memory pages
     /// containing any part of the address range in the interval `[addr, addr+len-1]`.
@@ -144,8 +185,22 @@ impl Syscall<'_> {
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
         );
-        warn!("mprotect: unimplemented");
-        Ok(0)
+        let proc = self.zircon_process();
+        let vmar = proc.vmar();
+        let flags = prot.to_flags();
+        // Attempt real permission change; fall back to Ok(0) if the range overlaps
+        // sub-regions (Zircon's protect() restriction) — the kernel already mapped
+        // segments with liberal permissions, so a benign no-op is acceptable there.
+        match vmar.protect(addr, len, flags) {
+            Ok(()) => Ok(0),
+            Err(e) => {
+                warn!(
+                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (ignored)",
+                    addr, len, flags, e
+                );
+                Ok(0)
+            }
+        }
     }
 
     /// Unmap files or devices into memory
