@@ -128,8 +128,8 @@ impl Syscall<'_> {
         if flags != 0x7d_0f00 && flags != 0x5d_0f00 {
             // 0x5d0f00: gcc of alpine linux
             // 0x7d0f00: pthread_create of alpine linux
-            // warn!("sys_clone only support musl pthread_create");
-            panic!("unsupported sys_clone flags: {:#x}", flags);
+            warn!("sys_clone: unsupported flags {:#x}", flags);
+            return Err(LxError::ENOSYS);
         }
         let new_thread = Thread::create_linux(self.zircon_process())?;
         let mut new_ctx = self.thread.context_cloned()?;
