@@ -10,6 +10,11 @@ use {
     zircon_object::{util::elf_loader::*, vm::*, ZxError},
 };
 
+/// Stack top: place the user stack at the very top of the user address space so
+/// that the heap (at `initial_brk` just after the loaded image) never collides
+/// with the stack.  Linux uses a similar high-address default for the stack.
+const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
+
 mod abi;
 
 /// Linux ELF Program Loader.
@@ -150,9 +155,17 @@ impl LinuxElfLoader {
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
             let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            let stack_bottom =
-                vmar.map(None, stack_vmo.clone(), 0, stack_vmo.len(), stack_flags)?;
-            let mut sp = stack_bottom + stack_vmo.len();
+            // Place the stack at the top of the user address space so the heap
+            // (which grows up from initial_brk) never collides with the stack.
+            let stack_bottom = STACK_TOP - stack_vmo.len();
+            vmar.map(
+                Some(stack_bottom - vmar.addr()),
+                stack_vmo.clone(),
+                0,
+                stack_vmo.len(),
+                stack_flags,
+            )?;
+            let mut sp = STACK_TOP;
 
             let info = abi::ProcInitInfo {
                 args,
