@@ -97,7 +97,7 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
         let child = inner.children.get(&pid).ok_or(LxError::ECHILD)?;
         if let Status::Exited(code) = child.status() {
             inner.children.remove(&pid);
-            return Ok(code as ExitCode);
+            return Ok((code as i32) << 8);
         }
         if nonblock {
             return Err(LxError::EAGAIN);
@@ -119,7 +119,7 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         for (&pid, child) in inner.children.iter() {
             if let Status::Exited(code) = child.status() {
                 inner.children.remove(&pid);
-                return Ok((pid, code as ExitCode));
+                return Ok((pid, (code as i32) << 8));
             }
         }
         drop(inner);

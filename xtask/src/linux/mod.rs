@@ -47,9 +47,23 @@ impl LinuxRootfs {
             fs::create_dir_all(&etc_apk).unwrap();
             fs::write(
                 etc_apk.join("repositories"),
-                "http://dl-cdn.alpinelinux.org/alpine/v3.18/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.18/community\n",
+                "http://dl-cdn.alpinelinux.org/alpine/v3.23/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.23/community\n",
             )
             .unwrap();
+            fs::write(etc_apk.join("world"), "").unwrap();
+            let lib_apk = dir.join("lib").join("apk");
+            fs::create_dir_all(&lib_apk).unwrap();
+            let lib_apk_db = lib_apk.join("db");
+            fs::create_dir_all(&lib_apk_db).unwrap();
+            fs::write(lib_apk_db.join("installed"), "").unwrap();
+
+            let var_lib = dir.join("var").join("lib");
+            fs::create_dir_all(&var_lib).unwrap();
+            #[cfg(unix)]
+            let _ = unix::fs::symlink("../../lib/apk", var_lib.join("apk"));
+
+            let var_cache_apk = dir.join("var").join("cache").join("apk");
+            fs::create_dir_all(&var_cache_apk).unwrap();
         }
         
         // 拷贝 busybox
