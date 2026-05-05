@@ -40,6 +40,34 @@ impl LinuxElfLoader {
             envs
         );
 
+        // Handle shebang scripts (#!)
+        if data.starts_with(b"#!") {
+            let newline = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+            let line = core::str::from_utf8(&data[2..newline])
+                .unwrap_or("")
+                .trim_end_matches('\r')
+                .trim();
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let interp = match parts.next() {
+                Some(i) if !i.is_empty() => i,
+                _ => return Err(ZxError::INVALID_ARGS.into()),
+            };
+            let interp_arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+            info!(
+                "shebang: interp={:?}, arg={:?}, script={:?}",
+                interp, interp_arg, path
+            );
+            let inode = self.root_inode.lookup(interp)?;
+            let interp_data = inode.read_as_vec()?;
+            let mut new_args = vec![interp.into()];
+            if let Some(arg) = interp_arg {
+                new_args.push(arg.into());
+            }
+            new_args.push(path.clone());
+            new_args.extend_from_slice(&args[1..]);
+            return self.load(vmar, &interp_data, new_args, envs, path);
+        }
+
         let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
 
         debug!("elf info:  {:#x?}", elf.header.pt2);
