@@ -23,7 +23,10 @@ pub struct LinuxElfLoader {
 }
 
 impl LinuxElfLoader {
-    /// load a Linux ElfFile and return a tuple of (entry,sp)
+    /// load a Linux ElfFile and return a tuple of (entry, sp, brk)
+    ///
+    /// `brk` is the initial program break (end of the loaded image, page-aligned).
+    /// Callers should store it on the process with `proc.linux().set_brk(brk)`.
     pub fn load(
         &self,
         vmar: &Arc<VmAddressRegion>,
@@ -31,7 +34,7 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-    ) -> LxResult<(VirtAddr, VirtAddr)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
         self.load_impl(vmar, data, args, envs, path, 0)
     }
 
@@ -47,7 +50,7 @@ impl LinuxElfLoader {
         envs: Vec<String>,
         path: String,
         depth: usize,
-    ) -> LxResult<(VirtAddr, VirtAddr)> {
+    ) -> LxResult<(VirtAddr, VirtAddr, usize)> {
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -199,7 +202,11 @@ impl LinuxElfLoader {
             stack_vmo.write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
             sp -= init_stack.len();
 
-            return Ok((interp_entry, sp));
+            // Initial brk: right after the interpreter (which is placed after the main
+            // program). Using interp_base + interp_size ensures brk does not overlap
+            // any already-allocated segment.
+            let initial_brk = interp_base + interp_size;
+            return Ok((interp_entry, sp, initial_brk));
         }
 
         let size = elf.load_segment_size();
@@ -277,6 +284,8 @@ impl LinuxElfLoader {
             info.auxv, entry, sp
         );
 
-        Ok((entry, sp))
+        // Initial brk: right after the loaded image.
+        let initial_brk = base + size;
+        Ok((entry, sp, initial_brk))
     }
 }
