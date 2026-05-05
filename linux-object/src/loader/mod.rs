@@ -73,7 +73,8 @@ impl LinuxElfLoader {
                 .map_err(|_| ZxError::INVALID_ARGS)?
                 .trim_end_matches('\r')
                 .trim();
-            let mut parts = line.splitn(2, char::is_whitespace);
+            // Split only on ASCII space/tab (POSIX shebang convention).
+            let mut parts = line.splitn(2, |c: char| c == ' ' || c == '\t');
             let interp = match parts.next() {
                 Some(i) if !i.is_empty() => i,
                 _ => return Err(ZxError::INVALID_ARGS.into()),
@@ -85,13 +86,14 @@ impl LinuxElfLoader {
             );
             let inode = self.root_inode.lookup(interp)?;
             let interp_data = inode.read_as_vec()?;
-            let mut new_args = vec![interp.into()];
+            let interp_path: String = interp.into();
+            let mut new_args = vec![interp_path.clone()];
             if let Some(arg) = interp_arg {
                 new_args.push(arg.into());
             }
-            new_args.push(path.clone());
-            new_args.extend_from_slice(&args[1..]);
-            return self.load_impl(vmar, &interp_data, new_args, envs, path, depth + 1);
+            new_args.push(path);
+            new_args.extend_from_slice(args.get(1..).unwrap_or_default());
+            return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, depth + 1);
         }
 
         let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
