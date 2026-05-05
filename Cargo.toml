@@ -17,3 +17,6 @@ exclude = ["zircon-user", "rboot"]
 [profile.release]
 lto = true
 debug = true
+
+[patch.crates-io]
+funty = { git = "https://github.com/ferrilab/funty", rev = "7ef0d89" }
