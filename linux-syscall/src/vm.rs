@@ -1,6 +1,6 @@
 use super::*;
 use bitflags::bitflags;
-use zircon_object::vm::{pages, MMUFlags, VmObject, PAGE_SIZE};
+use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject};
 
 /// Syscalls for virtual memory.
 ///
@@ -114,42 +114,69 @@ impl Syscall<'_> {
     /// (see [linux man brk(2)](https://www.man7.org/linux/man-pages/man2/brk.2.html)).
     ///
     /// `sys_brk` sets the end of the process data segment (the program break) to `new_brk`.
-    /// If `new_brk` is 0 or less than the current break, the current break is returned unchanged.
-    /// Otherwise, the break is extended to `new_brk` (rounded up to page size) by mapping new
-    /// anonymous pages, and the new break value is returned.
+    /// If `new_brk` is 0, the current break is returned unchanged (query mode).
+    /// If `new_brk` is below the current break, the heap is shrunk and the freed pages are
+    /// unmapped.  If `new_brk` is above the current break, new anonymous pages are mapped and
+    /// the new break value is returned.
     /// On failure the current break is returned (Linux semantics: never returns -1).
+    ///
+    /// The initial program break is set during ELF loading (end of all loaded segments) and
+    /// stored on the process via `LinuxProcess::set_brk`.  A value of 0 means not yet
+    /// initialized (e.g. the process called `brk` before any ELF was loaded).
     pub fn sys_brk(&self, new_brk: usize) -> SysResult {
         let proc = self.linux_process();
         let current_brk = proc.brk();
         info!("brk: new_brk={:#x}, current_brk={:#x}", new_brk, current_brk);
 
-        // brk(0) or shrink request → return current break unchanged (Linux semantics).
-        if new_brk == 0 || new_brk <= current_brk {
+        // brk(0) → return current break unchanged (query).
+        if new_brk == 0 {
             return Ok(current_brk);
         }
 
-        // Align up to page boundary.
-        let new_brk_aligned = (new_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let size = new_brk_aligned - current_brk;
-
+        let new_brk_aligned = roundup_pages(new_brk);
         let vmar = self.zircon_process().vmar();
-        let vmo = VmObject::new_paged(pages(size));
-        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-        // vmar.addr() == 0 for user address spaces, so VMAR offset == absolute VA.
-        match vmar.map_at(current_brk, vmo, 0, size, flags) {
-            Ok(_) => {
-                proc.set_brk(new_brk_aligned);
-                info!("brk: extended to {:#x}", new_brk_aligned);
-                Ok(new_brk_aligned)
+
+        if new_brk_aligned < current_brk {
+            // Shrink: unmap the freed pages [new_brk_aligned, current_brk).
+            let shrink_len = current_brk - new_brk_aligned;
+            match vmar.unmap(new_brk_aligned, shrink_len) {
+                Ok(()) => {
+                    proc.set_brk(new_brk_aligned);
+                    info!("brk: shrunk to {:#x}", new_brk_aligned);
+                    Ok(new_brk_aligned)
+                }
+                Err(e) => {
+                    warn!(
+                        "brk: failed to unmap {:#x} bytes at {:#x}: {:?}",
+                        shrink_len, new_brk_aligned, e
+                    );
+                    Ok(current_brk)
+                }
             }
-            Err(e) => {
-                warn!(
-                    "brk: failed to map {:#x} bytes at {:#x}: {:?}",
-                    size, current_brk, e
-                );
-                // Return current break on failure (Linux semantics).
-                Ok(current_brk)
+        } else if new_brk_aligned > current_brk {
+            // Grow: map new anonymous pages covering [current_brk, new_brk_aligned).
+            let size = new_brk_aligned - current_brk;
+            let vmo = VmObject::new_paged(pages(size));
+            let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            // vmar.addr() == 0 for user address spaces, so VMAR offset == absolute VA.
+            match vmar.map_at(current_brk, vmo, 0, size, flags) {
+                Ok(_) => {
+                    proc.set_brk(new_brk_aligned);
+                    info!("brk: extended to {:#x}", new_brk_aligned);
+                    Ok(new_brk_aligned)
+                }
+                Err(e) => {
+                    warn!(
+                        "brk: failed to map {:#x} bytes at {:#x}: {:?}",
+                        size, current_brk, e
+                    );
+                    // Return current break on failure (Linux semantics).
+                    Ok(current_brk)
+                }
             }
+        } else {
+            // Already at requested break (after rounding).
+            Ok(current_brk)
         }
     }
 

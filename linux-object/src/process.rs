@@ -169,7 +169,11 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Signal actions
     signal_actions: SignalActions,
-    /// Program break (top of heap), set after ELF loading.
+    /// Program break (top of heap).
+    ///
+    /// Initialized to 0; set to the end of the loaded ELF image by the loader
+    /// via [`LinuxProcess::set_brk`] before the first user instruction runs.
+    /// Updated by `sys_brk` as the heap grows or shrinks.
     brk: usize,
 }
 
