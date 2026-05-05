@@ -105,7 +105,7 @@ impl LinuxElfLoader {
             let inode = self.root_inode.lookup(interp)?;
             let data = inode.read_as_vec()?;
             let mut new_args = vec![interp.into(), path.clone()];
-            new_args.extend_from_slice(&args[1..]);
+            new_args.extend_from_slice(args.get(1..).unwrap_or_default());
             return self.load_impl(vmar, &data, new_args, envs, path, depth + 1);
         }
 
