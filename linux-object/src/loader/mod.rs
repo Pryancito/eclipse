@@ -279,6 +279,10 @@ impl LinuxElfLoader {
                     map.insert(abi::AT_BASE, 0usize);
                     // AT_PHDR: virtual address of program headers in memory.
                     // Use get_phdr_vaddr() which handles both PIE and non-PIE correctly.
+                    // If None, the ELF has no loadable segment covering the program headers
+                    // (degenerate case warned about inside get_phdr_vaddr()); fall back to
+                    // ph_offset() as a best-effort value — AT_PHDR is optional for static
+                    // binaries and musl only uses it for TLS initialisation.
                     let phdr_vaddr = elf
                         .get_phdr_vaddr()
                         .unwrap_or(elf.header.pt2.ph_offset() as u64)
