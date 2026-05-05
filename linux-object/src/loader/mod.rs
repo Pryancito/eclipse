@@ -102,11 +102,104 @@ impl LinuxElfLoader {
 
         if let Ok(interp) = elf.get_interpreter() {
             info!("interp: {:?}, path: {:?}", interp, path);
+
+            // Load the main program into the first sub-VMAR (allocated at offset 0 in an
+            // empty address space, so app_base is typically 0 for a non-PIE binary).
+            let app_size = elf.load_segment_size();
+            let app_vmar = vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+            let app_base = app_vmar.addr();
+            let app_vmo = app_vmar.load_from_elf(&elf)?;
+            let app_entry = app_base + elf.header.pt2.entry_point() as usize;
+
+            // Patch any in-binary syscall-entry trampoline present in the main program.
+            if let Some(offset) = elf.get_symbol_address("rcore_syscall_entry") {
+                app_vmo.write(offset as usize, &self.syscall_entry.to_ne_bytes())?;
+            }
+
+            // Load the interpreter (ld.so) into a second sub-VMAR placed right after the
+            // main program.  Because app_vmar occupies [0, app_size), the allocator places
+            // interp_vmar at interp_base = app_size (> 0).
+            //
+            // A non-zero AT_BASE tells musl/glibc it is running as a PT_INTERP interpreter
+            // rather than in standalone mode.  In interpreter mode the dynamic linker uses
+            // the already-kernel-mapped binary via AT_PHDR / AT_ENTRY instead of calling
+            // mmap() from user space to re-load it – which is the path that breaks in the
+            // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
             let inode = self.root_inode.lookup(interp)?;
-            let data = inode.read_as_vec()?;
-            let mut new_args = vec![interp.into(), path.clone()];
-            new_args.extend_from_slice(args.get(1..).unwrap_or_default());
-            return self.load_impl(vmar, &data, new_args, envs, path, depth + 1);
+            let interp_data = inode.read_as_vec()?;
+            let interp_elf = ElfFile::new(&interp_data).map_err(|_| ZxError::INVALID_ARGS)?;
+            let interp_size = interp_elf.load_segment_size();
+            let interp_vmar =
+                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)?;
+            let interp_base = interp_vmar.addr();
+            let _interp_vmo = interp_vmar.load_from_elf(&interp_elf)?;
+            let interp_entry = interp_base + interp_elf.header.pt2.entry_point() as usize;
+
+            match interp_elf.relocate(interp_vmar) {
+                Ok(()) => info!("interp relocate passed!"),
+                Err(e) => {
+                    warn!(
+                        "interp relocate Err: {:?}, keeping base {:#x}",
+                        e, interp_base
+                    )
+                }
+            }
+
+            let stack_vmo = VmObject::new_paged(self.stack_pages);
+            let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            let stack_bottom =
+                vmar.map(None, stack_vmo.clone(), 0, stack_vmo.len(), stack_flags)?;
+            let mut sp = stack_bottom + stack_vmo.len();
+
+            let info = abi::ProcInitInfo {
+                args,
+                envs,
+                auxv: {
+                    let mut map = BTreeMap::new();
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        // AT_BASE: interpreter load address; non-zero triggers interpreter
+                        // mode in musl/glibc.
+                        map.insert(abi::AT_BASE, interp_base);
+                        // AT_PHDR: virtual address of the main program's program-header
+                        // table in memory.  Use get_phdr_vaddr() which handles both PIE
+                        // (vaddr relative to load base) and non-PIE (absolute vaddr)
+                        // correctly, unlike the raw ph_offset() file field.
+                        let phdr_vaddr = elf
+                            .get_phdr_vaddr()
+                            .unwrap_or(elf.header.pt2.ph_offset() as u64)
+                            as usize;
+                        map.insert(abi::AT_PHDR, app_base + phdr_vaddr);
+                        // AT_ENTRY: main program's entry point.
+                        map.insert(abi::AT_ENTRY, app_entry);
+                    }
+                    #[cfg(target_arch = "riscv64")]
+                    {
+                        map.insert(abi::AT_BASE, interp_base);
+                        map.insert(abi::AT_ENTRY, app_entry);
+                        if let Some(phdr_vaddr) = elf.get_phdr_vaddr() {
+                            map.insert(abi::AT_PHDR, app_base + phdr_vaddr as usize);
+                        }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        map.insert(abi::AT_BASE, interp_base);
+                        map.insert(abi::AT_ENTRY, app_entry);
+                        if let Some(phdr_vaddr) = elf.get_phdr_vaddr() {
+                            map.insert(abi::AT_PHDR, app_base + phdr_vaddr as usize);
+                        }
+                    }
+                    map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
+                    map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
+                    map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+                    map
+                },
+            };
+            let init_stack = info.push_at(sp);
+            stack_vmo.write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
+            sp -= init_stack.len();
+
+            return Ok((interp_entry, sp));
         }
 
         let size = elf.load_segment_size();
@@ -133,7 +226,10 @@ impl LinuxElfLoader {
                 // Segments stay mapped under `image_vmar.addr()`; do not clobber `base` with the
                 // first program header vaddr (often not PT_LOAD). Wrong AT_BASE breaks PIE/musl
                 // (e.g. user PC stuck at raw e_entry like 0x423a7 → page fault NOT_FOUND).
-                warn!("elf relocate Err:{:?}, keeping load base {:#x}", error, base);
+                warn!(
+                    "elf relocate Err:{:?}, keeping load base {:#x}",
+                    error, base
+                );
             }
         }
 
