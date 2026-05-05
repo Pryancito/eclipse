@@ -443,10 +443,7 @@ impl VmAddressRegion {
         } else if len > self.size {
             Err(ZxError::INVALID_ARGS)
         } else {
-            match self.find_free_area(inner, 0, len, align) {
-                Some(offset) => Ok(offset),
-                None => Err(ZxError::NO_MEMORY),
-            }
+            self.find_free_area(inner, 0, len, align).ok_or(ZxError::NO_MEMORY)
         }
     }
 
@@ -523,18 +520,6 @@ impl VmAddressRegion {
     /// Get VmarFlags of this VMAR.
     pub fn get_flags(&self) -> VmarFlags {
         self.flags
-    }
-
-    /// Dump all mappings recursively.
-    pub fn dump(&self) {
-        let mut guard = self.inner.lock();
-        let inner = guard.as_mut().unwrap();
-        for map in inner.mappings.iter() {
-            debug!("{:#x?}", map);
-        }
-        for child in inner.children.iter() {
-            child.dump();
-        }
     }
 
     /// Get base address of vdso.
