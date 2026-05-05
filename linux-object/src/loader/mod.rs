@@ -32,6 +32,22 @@ impl LinuxElfLoader {
         envs: Vec<String>,
         path: String,
     ) -> LxResult<(VirtAddr, VirtAddr)> {
+        self.load_impl(vmar, data, args, envs, path, 0)
+    }
+
+    /// Maximum number of interpreter levels (shebang + ELF PT_INTERP combined).
+    const MAX_INTERP_DEPTH: usize = 4;
+
+    /// Internal recursive loader that tracks interpreter depth.
+    fn load_impl(
+        &self,
+        vmar: &Arc<VmAddressRegion>,
+        data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+        path: String,
+        depth: usize,
+    ) -> LxResult<(VirtAddr, VirtAddr)> {
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -40,11 +56,21 @@ impl LinuxElfLoader {
             envs
         );
 
-        // Handle shebang scripts (#!)
+        if depth > Self::MAX_INTERP_DEPTH {
+            error!("load: interpreter chain too deep (depth={})", depth);
+            return Err(ZxError::INVALID_ARGS.into());
+        }
+
+        // Handle shebang scripts (#!).
+        // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
         if data.starts_with(b"#!") {
-            let newline = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+            let scan_limit = data.len().min(512);
+            let newline = data[..scan_limit]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(scan_limit);
             let line = core::str::from_utf8(&data[2..newline])
-                .unwrap_or("")
+                .map_err(|_| ZxError::INVALID_ARGS)?
                 .trim_end_matches('\r')
                 .trim();
             let mut parts = line.splitn(2, char::is_whitespace);
@@ -65,7 +91,7 @@ impl LinuxElfLoader {
             }
             new_args.push(path.clone());
             new_args.extend_from_slice(&args[1..]);
-            return self.load(vmar, &interp_data, new_args, envs, path);
+            return self.load_impl(vmar, &interp_data, new_args, envs, path, depth + 1);
         }
 
         let elf = ElfFile::new(data).map_err(|_| ZxError::INVALID_ARGS)?;
@@ -78,7 +104,7 @@ impl LinuxElfLoader {
             let data = inode.read_as_vec()?;
             let mut new_args = vec![interp.into(), path.clone()];
             new_args.extend_from_slice(&args[1..]);
-            return self.load(vmar, &data, new_args, envs, path);
+            return self.load_impl(vmar, &data, new_args, envs, path, depth + 1);
         }
 
         let size = elf.load_segment_size();
