@@ -239,19 +239,53 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             }
         }
         (0x10de, _) if dev.id.class == 0x03 => {
-            // Nvidia GPU
+            // NVIDIA GPU
             if let Some(BAR::Memory(bar0_addr, _bar0_len, _, _)) = dev.bars[0] {
-                if let Some(BAR::Memory(bar1_addr, _bar1_len, _, _)) = dev.bars[1] {
-                    if let Some(m) = mapper {
-                        m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024); // 4MB for regs
-                        m.query_or_map(bar1_addr as usize, PAGE_SIZE * 1024 * 16); // 64MB for FB
+                // Map BAR0 first so we can probe the display registers for resolution
+                if let Some(m) = mapper {
+                    m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024); // 4 MiB for regs
+                }
+                let bar0_vaddr = phys_to_virt(bar0_addr as usize);
+
+                // For modern NVIDIA GPUs, BAR0 is a 64-bit BAR and occupies PCI
+                // BARs 0+1, so bars[1] is None.  The framebuffer (BAR2) is at
+                // bars[2].  Older GPUs with a 32-bit BAR0 have the FB at bars[1].
+                // Scan bars[1..6] and pick the first large (≥16 MiB) memory BAR.
+                let fb_bar = (1..6usize).find_map(|i| {
+                    if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
+                        if addr != 0 && (len as u64) >= (16 * 1024 * 1024) {
+                            Some((addr, len))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
-                    let bar0_vaddr = phys_to_virt(bar0_addr as usize);
-                    let bar1_vaddr = phys_to_virt(bar1_addr as usize);
-                    
-                    // Default to 1920x1080 if unknown
-                    let gpu = Arc::new(crate::display::NvidiaGpu::new(bar0_vaddr, bar1_vaddr, 1920, 1080)?);
-                    // Also register as DRM
+                });
+
+                if let Some((fb_addr, fb_len)) = fb_bar {
+                    if let Some(m) = mapper {
+                        m.query_or_map(fb_addr as usize, fb_len as usize);
+                    }
+                    let fb_vaddr = phys_to_virt(fb_addr as usize);
+
+                    // Unique name includes PCI bus:device.function
+                    let gpu_name = format!(
+                        "nvidia-gpu-{}:{}.{}",
+                        dev.loc.bus, dev.loc.device, dev.loc.function
+                    );
+                    warn!(
+                        "[NVIDIA] GPU at {} bar0={:#x} fb={:#x} fb_len={:#x}",
+                        gpu_name, bar0_addr, fb_addr, fb_len
+                    );
+                    let gpu = Arc::new(crate::display::NvidiaGpu::new(
+                        gpu_name,
+                        bar0_vaddr,
+                        fb_vaddr,
+                        fb_len as usize,
+                        1920,
+                        1080,
+                    )?);
                     return Ok(Device::Drm(gpu));
                 }
             }

@@ -718,8 +718,8 @@ impl XhciInner {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 { // TRB_EVT_CMD_COMP
-                    let match_addr = (ev.p & 0xFFFFFFFF) == (cmd_trb_phys & 0xFFFFFFFF);
-                    if match_addr || true {
+                    let match_addr = ev.p == cmd_trb_phys;
+                    if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
                         if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT { return Ok(()); }
                         return Err(DeviceError::IoError);
@@ -736,9 +736,9 @@ impl XhciInner {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 { // TRB_EVT_CMD_COMP
-                    let match_addr = (ev.p & 0xFFFFFFFF) == (cmd_trb_phys & 0xFFFFFFFF);
+                    let match_addr = ev.p == cmd_trb_phys;
                     let slot_id = (ev.ctrl >> 24) & 0xff;
-                    if match_addr || true {
+                    if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
                         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
                             return Err(DeviceError::IoError);
@@ -763,8 +763,8 @@ impl XhciInner {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 32 { // TRB_EVT_TRANSFER
-                    let match_addr = (ev.p & 0xFFFFFFFF) == (status_phys & 0xFFFFFFFF);
-                    if match_addr || true {
+                    let match_addr = ev.p == status_phys;
+                    if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
                         let i = Self::ri(slot, 1);
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
@@ -902,11 +902,15 @@ impl XhciInner {
         }
         m.write_op(0, usbcmd);
 
-        // Esperar a que el controlador salga de HCHalted
-        for _ in 0..100 {
+        // Wait for the controller to exit HCHalted (xHCI spec: max 5 ms)
+        for _ in 0..10_000 {
             let sts = m.read_op(4);
             if sts & 1 == 0 { break; }
             spin_loop();
+        }
+        if m.read_op(4) & 1 != 0 {
+            warn!("[xhci] Controller did not exit HCHalted after RS=1; aborting");
+            return Err(DeviceError::IoError);
         }
 
         for p in 1..=self.max_ports {
@@ -1068,9 +1072,10 @@ impl XhciInner {
                     let addr = raw[o + 2];
                     let attr = raw[o + 3];
                     let mps = u16::from_le_bytes([raw[o + 4], raw[o + 5]]);
+                    let interval = raw[o + 6];
                     if (addr & 0x80) != 0 && (attr & 3) == 3 {
                         // Interrupt IN
-                        if let Err(_e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps) {
+                        if let Err(_e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps, interval) {
                         }
                     }
                 }
@@ -1089,6 +1094,7 @@ impl XhciInner {
         proto: u8,
         ep_addr: u8,
         mps: u16,
+        interval: u8,
     ) -> DeviceResult<()> {
         let mut real_proto = proto;
         if real_proto == 0 {
@@ -1123,10 +1129,39 @@ impl XhciInner {
         }
 
         let cfg = DmaBuf::new(33 * csz, 64)?;
+        // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
         cfg.write_u32(4, 0x01 | (1u32 << dci));
-        cfg.write_u32(csz, ((dci as u32) << 27) | ((self.slot_speed[slot as usize] as u32) << 20));
+
+        // Copy the current Device Slot Context (at device-context offset 0) into the Input
+        // Slot Context (at input-context offset csz).  The xHCI spec requires software to
+        // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
+        // command – writing zeros would corrupt the USB device address and port fields.
+        if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
+            for i in 0..(csz / 4) {
+                cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
+            }
+        }
+        // Raise Context Entries to cover the new endpoint DCI.
+        let slot_dw0 = cfg.read_u32(csz);
+        let cur_entries = (slot_dw0 >> 27) & 0x1f;
+        let new_entries = (dci as u32).max(cur_entries);
+        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
+
         let ep_off = csz + csz + (dci - 1) * csz;
-        let ep_ty = (3 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
+
+        // Endpoint Context DW0: set Interval from the USB endpoint descriptor.
+        // For HS/SS (speed >= 3) bInterval is the exponent (0-15 are all valid per xHCI spec
+        // section 6.2.3.6).  For FS/LS bInterval is in frames and must be at least 1.
+        let speed = self.slot_speed[slot as usize];
+        let xhci_interval = if speed >= 3 {
+            interval.min(15)
+        } else {
+            interval.min(15).max(1)
+        };
+        cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
+
+        // Endpoint Context DW1: Error Count=3, EP Type, Max Packet Size
+        let ep_ty = (3u32) | EP_TYPE_INT_IN | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(64)?;
         let irp = ir.ring_phys() | 1; // DCS = 1

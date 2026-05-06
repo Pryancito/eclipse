@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
@@ -5,32 +6,80 @@ use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::DeviceResult;
 
 pub struct NvidiaGpu {
+    name: String,
     info: DisplayInfo,
     // BARs
     _bar0: usize, // Registers
     _bar1: usize, // Framebuffer
 }
 
+/// Try to read the active display resolution from NVIDIA GPU registers.
+///
+/// Probes HEAD 0 raster-size registers for both NV50+ and NV40 GPU families.
+/// Returns `(width, height)` if a plausible value is found, `None` otherwise.
+///
+/// # Safety
+/// `bar0` must be a valid virtual address for the mapped NVIDIA BAR0 region
+/// (at least 4 MiB must be mapped).
+unsafe fn probe_resolution_from_bar0(bar0: usize) -> Option<(u32, u32)> {
+    // NV50+ (GeForce 8xxx / 2006 onwards): HEAD0 raster size at BAR0 + 0x610798
+    // bits 31:16 = height, bits 15:0 = width
+    let reg = core::ptr::read_volatile((bar0 + 0x61_0798) as *const u32);
+    let (w, h) = (reg & 0xFFFF, reg >> 16);
+    if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+        return Some((w, h));
+    }
+
+    // NV40 (GeForce 6/7 series): PCRTC HEAD0 at BAR0 + 0x600000, offset 0x2C
+    // bits 31:16 = height, bits 15:0 = width
+    let reg = core::ptr::read_volatile((bar0 + 0x60_002C) as *const u32);
+    let (w, h) = (reg & 0xFFFF, reg >> 16);
+    if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+        return Some((w, h));
+    }
+
+    None
+}
+
 impl NvidiaGpu {
-    pub fn new(bar0: usize, bar1: usize, width: u32, height: u32) -> DeviceResult<Self> {
+    /// Create a new NvidiaGpu.
+    ///
+    /// * `name`    – unique device name (e.g. `"nvidia-gpu-0:2.0"`)
+    /// * `bar0`    – virtual address of NVIDIA register space (BAR0, ≥4 MiB mapped)
+    /// * `fb`      – virtual address of the linear framebuffer (BAR1/2/3)
+    /// * `fb_size` – size of the framebuffer in bytes
+    /// * `width`, `height` – fallback resolution (used when register probing fails)
+    pub fn new(
+        name: String,
+        bar0: usize,
+        fb: usize,
+        fb_size: usize,
+        width: u32,
+        height: u32,
+    ) -> DeviceResult<Self> {
+        // Prefer the resolution currently programmed into the GPU.
+        let (w, h) = unsafe { probe_resolution_from_bar0(bar0) }
+            .unwrap_or((width, height));
+
         let info = DisplayInfo {
-            width,
-            height,
+            width: w,
+            height: h,
             format: ColorFormat::ARGB8888,
-            fb_base_vaddr: bar1,
-            fb_size: (width * height * 4) as usize,
+            fb_base_vaddr: fb,
+            fb_size,
         };
         Ok(Self {
+            name,
             info,
             _bar0: bar0,
-            _bar1: bar1,
+            _bar1: fb,
         })
     }
 }
 
 impl Scheme for NvidiaGpu {
     fn name(&self) -> &str {
-        "nvidia-gpu"
+        &self.name
     }
 
     fn handle_irq(&self, _irq_num: usize) {
