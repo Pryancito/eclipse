@@ -117,7 +117,9 @@ pub(super) fn init() -> DeviceResult {
             fb_size: KCONFIG.fb_size as usize,
         }));
         crate::drivers::add_device(Device::Display(display.clone()));
-        crate::console::init_graphic_console(display);
+        crate::console::init_graphic_console(display.clone());
+        // Show boot logo immediately.
+        crate::boot_logo::draw_centered(&*display);
     }
 
     #[cfg(feature = "loopback")]

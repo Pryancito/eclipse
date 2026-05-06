@@ -34,13 +34,17 @@ cfg_if! {
     if #[cfg(feature = "graphic")] {
         use crate::utils::init_once::InitOnce;
         use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
         use zcore_drivers::{scheme::DisplayScheme, utils::GraphicConsole};
 
         static GRAPHIC_CONSOLE: InitOnce<Mutex<GraphicConsole>> = InitOnce::new();
         static CONSOLE_WIN_SIZE: InitOnce<ConsoleWinSize> = InitOnce::new();
+        static GRAPHIC_DISPLAY: InitOnce<Arc<dyn DisplayScheme>> = InitOnce::new();
+        static CLEAR_ON_NEXT_GRAPHIC_WRITE: AtomicBool = AtomicBool::new(false);
 
         pub(crate) fn init_graphic_console(display: Arc<dyn DisplayScheme>) {
             let info = display.info();
+            GRAPHIC_DISPLAY.init_once_by(display.clone());
             let cons = GraphicConsole::new(display);
             let winsz = ConsoleWinSize {
                 ws_row: cons.rows() as u16,
@@ -51,8 +55,34 @@ cfg_if! {
             CONSOLE_WIN_SIZE.init_once_by(winsz);
             GRAPHIC_CONSOLE.init_once_by(Mutex::new(cons));
         }
+
+        /// Request a one-shot clear-to-black of the graphic console before the next write.
+        pub fn request_clear_graphic_on_next_write() {
+            CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
+        }
+
+        fn maybe_clear_graphic_before_write() {
+            if !CLEAR_ON_NEXT_GRAPHIC_WRITE.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            if let (Some(display), Some(cons)) = (GRAPHIC_DISPLAY.try_get(), GRAPHIC_CONSOLE.try_get())
+            {
+                // Clear to black with opaque alpha (ARGB8888) and reset the console state.
+                let _ = crate::boot_logo::clear_screen(
+                    &**display,
+                    zcore_drivers::prelude::RgbColor::new(0, 0, 0),
+                );
+                *cons.lock() = GraphicConsole::new(display.clone());
+            }
+        }
     }
 }
+
+/// Request a one-shot clear-to-black of the graphic console before the next write.
+///
+/// When `feature="graphic"` is disabled, this is a no-op.
+#[cfg(not(feature = "graphic"))]
+pub fn request_clear_graphic_on_next_write() {}
 
 /// Writes a string slice into the serial.
 pub fn serial_write_str(s: &str) {
@@ -79,6 +109,7 @@ pub fn debug_write_fmt(fmt: Arguments) {
 pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+        maybe_clear_graphic_before_write();
         cons.lock().write_str(s).unwrap();
     }
 }
@@ -88,6 +119,7 @@ pub fn graphic_console_write_str(s: &str) {
 pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+        maybe_clear_graphic_before_write();
         cons.lock().write_fmt(fmt).unwrap();
     }
 }

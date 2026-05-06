@@ -31,6 +31,10 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let data = inode.read_as_vec().unwrap();
     let path = args[0].clone();
 
+    // Boot UX: clear to black right before the first graphic-console output (prompt).
+    // This call is a no-op when graphic mode is disabled.
+    kernel_hal::console::request_clear_graphic_on_next_write();
+
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
