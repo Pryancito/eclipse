@@ -94,6 +94,13 @@ const CMD_TABLE_STRIDE: usize = 256; // 128-aligned, fits CommandTable
 //   [4096..12288)  command tables: CMD_SLOTS × CMD_TABLE_STRIDE = 32 × 256 = 8192 B
 const DMA_PAGES: usize = 3;
 
+// AHCI spec §10.4.2: COMRESET must be asserted for at least 1 ms.
+// On modern x86 hardware each spin_loop() iteration is ~1 ns → 1_000_000 ≈ 1 ms.
+const COMRESET_DELAY_ITER: usize = 1_000_000;
+// AHCI spec §10.4.2: device reinitialization after COMRESET must complete within
+// 10 seconds; we give it 1 second worth of spin iterations.
+const PHY_LINK_TIMEOUT_ITER: usize = 1_000_000;
+
 struct AhciPort {
     base: usize,
     port_idx: u32,
@@ -187,12 +194,12 @@ impl AhciPort {
 
     fn reset_port(&self) {
         self.stop_engine();
-        // COMRESET: set DET=1, wait ≥1 ms, then clear DET
+        // COMRESET: set DET=1, wait ≥1 ms (AHCI spec §10.4.2), then clear DET
         self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
-        for _ in 0..1_000_000 { spin_loop(); }
+        for _ in 0..COMRESET_DELAY_ITER { spin_loop(); }
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
         // Wait for PHY to re-establish link (DET=3)
-        let mut timeout = 1_000_000;
+        let mut timeout = PHY_LINK_TIMEOUT_ITER;
         while self.read_reg(PORT_SSTS) & 0xF != 3 && timeout > 0 {
             timeout -= 1;
             spin_loop();
