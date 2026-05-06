@@ -488,10 +488,10 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             // config-space read for systems where the crate returns addr=0 or
             // fails to parse the 64-bit BAR.
             let (addr, len) = {
-                let (mut a, mut l) = (0u64, 0u32);
+                let (mut a, mut l) = (0u64, 0u64);
                 if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
                     a = ba;
-                    l = bl;
+                    l = bl as u64;
                 }
                 #[cfg(target_arch = "x86_64")]
                 if a == 0 {
@@ -501,8 +501,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                         a = ra;
                         // Probe actual size only if pci crate also returned l=0
                         if l == 0 {
-                            let sz = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, BAR0) };
-                            l = sz.min(u32::MAX as u64) as u32;
+                            l = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, BAR0) };
                         }
                     }
                 }
@@ -520,7 +519,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             let base_addr = (addr as usize) & !0xfff;
             let offset = (addr as usize) & 0xfff;
             // Forzamos un mapeo de al menos 128KB para asegurar que CAP, OP y RT estén cubiertos
-            let map_len = ((len as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+            let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
 
             if let Some(m) = mapper {
                 warn!("[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
