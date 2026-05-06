@@ -12,18 +12,26 @@ use bitflags::bitflags;
 use core::{mem::size_of, slice};
 use kernel_hal::{net::get_net_device, user::*};
 use lock::Mutex;
+use crate::fs::{OpenFlags, PollEvents, PollStatus};
 
-#[derive(Debug, Clone)]
+// Needed by `impl_kobject!`
+#[allow(unused_imports)]
+use zircon_object::object::*;
+
 pub struct NetlinkSocketState {
+    base: zircon_object::object::KObjectBase,
     data: Arc<Mutex<Vec<Vec<u8>>>>,
     _local_endpoint: Option<NetlinkEndpoint>,
+    flags: Arc<Mutex<OpenFlags>>,
 }
 
 impl Default for NetlinkSocketState {
     fn default() -> Self {
         Self {
+            base: zircon_object::object::KObjectBase::new(),
             data: Arc::new(Mutex::new(Vec::new())),
             _local_endpoint: Some(NetlinkEndpoint::new(0, 0)),
+            flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
         }
     }
 }
@@ -239,6 +247,58 @@ impl Socket for NetlinkSocketState {
 
     fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
         Ok(0)
+    }
+
+    fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        let readable = !self.data.lock().is_empty();
+        (readable, true, false)
+    }
+}
+
+zircon_object::impl_kobject!(NetlinkSocketState);
+
+#[async_trait]
+impl FileLike for NetlinkSocketState {
+    fn flags(&self) -> OpenFlags {
+        *self.flags.lock()
+    }
+
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        let flags = &mut *self.flags.lock();
+        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
+        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
+        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        Ok(())
+    }
+
+    async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
+        Socket::read(self, buf).await.0
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        unimplemented!()
+    }
+
+    fn write(&self, buf: &[u8]) -> LxResult<usize> {
+        Socket::write(self, buf, None)
+    }
+
+    fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        let (read, write, error) = Socket::poll(self, events);
+        Ok(PollStatus { read, write, error })
+    }
+
+    async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        let (read, write, error) = Socket::poll(self, events);
+        Ok(PollStatus { read, write, error })
+    }
+
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
+        Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    fn as_socket(&self) -> LxResult<&dyn Socket> {
+        Ok(self)
     }
 }
 

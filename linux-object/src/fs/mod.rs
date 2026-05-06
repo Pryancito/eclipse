@@ -4,6 +4,7 @@ mod devfs;
 mod file;
 mod ioctl;
 mod pipe;
+mod procfs;
 mod pseudo;
 pub mod rcore_fs_wrapper;
 mod stdio;
@@ -43,6 +44,7 @@ use crate::error::{LxError, LxResult};
 use crate::net::Socket;
 use crate::process::LinuxProcess;
 use devfs::RandomINode;
+use procfs::ProcFS;
 use pseudo::Pseudo;
 
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
@@ -223,6 +225,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /tmp")
     });
     tmp.mount(ramfs).expect("failed to mount RamFS");
+
+    // mount ProcFS at /proc
+    let proc = root.find(true, "proc").unwrap_or_else(|_| {
+        root.create("proc", FileType::Dir, 0o666)
+            .expect("failed to mkdir /proc")
+    });
+    proc.mount(Arc::new(ProcFS::new()))
+        .expect("failed to mount ProcFS");
 
     root
 }

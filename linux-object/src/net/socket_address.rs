@@ -215,9 +215,9 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 Ok(Endpoint::Ip((addr, port).into()))
             }
             AddressFamily::Unix => Err(LxError::EINVAL),
-            // AddressFamily::Packet => Ok(Endpoint::LinkLevel(LinkLevelEndpoint::new(
-            //     addr.addr_ll.sll_ifindex as usize,
-            // ))),
+            AddressFamily::Packet => Ok(Endpoint::LinkLevel(LinkLevelEndpoint::new(
+                addr.addr_ll.sll_ifindex as usize,
+            ))),
             AddressFamily::Netlink => Ok(Endpoint::Netlink(NetlinkEndpoint::new(
                 addr.addr_nl.nl_pid,
                 addr.addr_nl.nl_groups,

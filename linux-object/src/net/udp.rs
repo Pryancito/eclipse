@@ -5,6 +5,8 @@ use crate::fs::{FileLike, OpenFlags, PollStatus};
 use crate::net::*;
 use alloc::{boxed::Box, sync::Arc, vec};
 use async_trait::async_trait;
+use core::{mem::size_of, slice};
+use kernel_hal::net::get_net_device;
 use lock::Mutex;
 use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 
@@ -133,7 +135,13 @@ impl Socket for UdpSocketState {
         drop(sets);
         poll_ifaces();
 
-        Ok(data.len())
+        match _len {
+            Ok(()) => Ok(data.len()),
+            Err(err) => {
+                warn!("udp send_slice failed: {:?}", err);
+                Err(LxError::EIO)
+            }
+        }
     }
     /// connect
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -190,7 +198,12 @@ impl Socket for UdpSocketState {
             let mut set = sockets.lock();
             let mut socket = set.get::<UdpSocket>(self.inner.lock().handle.0);
             match socket.bind(ip) {
-                Ok(()) => Ok(0),
+                Ok(()) => {
+                    drop(socket);
+                    drop(set);
+                    poll_ifaces();
+                    Ok(0)
+                }
                 Err(_) => Err(LxError::EINVAL),
             }
         } else {
@@ -234,6 +247,108 @@ impl Socket for UdpSocketState {
         warn!("ioctl is unimplemented for this socket");
         info!("udp ioctrl");
         match request {
+            // SIOCGIFCONF: get list of interfaces
+            //
+            // BusyBox `ifconfig` uses this and may loop forever if `ifc_len`
+            // is not updated to the number of bytes actually written.
+            0x8912 => {
+                #[repr(C)]
+                struct IfConf {
+                    ifc_len: i32,
+                    ifc_buf: usize,
+                }
+
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                union IfReqUnion {
+                    addr: SockAddrPlaceholder,
+                    flags: i16,
+                }
+
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct IfReq {
+                    ifr_name: [u8; 16],
+                    ifr_ifru: IfReqUnion,
+                }
+
+                #[allow(unsafe_code)]
+                let ifc = unsafe { &mut *(arg1 as *mut IfConf) };
+                if ifc.ifc_len < 0 {
+                    return Err(LxError::EINVAL);
+                }
+                let buf_bytes = ifc.ifc_len as usize;
+                let req_size = size_of::<IfReq>();
+
+                let ifaces = get_net_device();
+                let max = if buf_bytes >= req_size {
+                    buf_bytes / req_size
+                } else {
+                    0
+                };
+                let count = core::cmp::min(max, ifaces.len());
+
+                #[allow(unsafe_code)]
+                let out = unsafe { slice::from_raw_parts_mut(ifc.ifc_buf as *mut u8, buf_bytes) };
+                for i in 0..count {
+                    let iface = &ifaces[i];
+
+                    let mut ifr_name = [0u8; 16];
+                    let name = iface.get_ifname();
+                    let n = core::cmp::min(15, name.as_bytes().len());
+                    ifr_name[..n].copy_from_slice(&name.as_bytes()[..n]);
+
+                    // Minimal placeholder address (0.0.0.0) with AF_INET.
+                    let addr = SockAddrPlaceholder {
+                        family: AddressFamily::Internet.into(),
+                        data: [0; 14],
+                    };
+                    let ifr = IfReq {
+                        ifr_name,
+                        ifr_ifru: IfReqUnion { addr },
+                    };
+
+                    let start = i * req_size;
+                    let end = start + req_size;
+                    if end <= out.len() {
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                &ifr as *const IfReq as *const u8,
+                                out[start..end].as_mut_ptr(),
+                                req_size,
+                            );
+                        }
+                    }
+                }
+
+                ifc.ifc_len = (count * req_size) as i32;
+                Ok(0)
+            }
+
+            // SIOCGIFFLAGS: get interface flags
+            0x8913 => {
+                #[repr(C)]
+                union IfReqUnion {
+                    addr: SockAddrPlaceholder,
+                    flags: i16,
+                }
+                #[repr(C)]
+                struct IfReq {
+                    ifr_name: [u8; 16],
+                    ifr_ifru: IfReqUnion,
+                }
+                const IFF_UP: i16 = 0x1;
+                const IFF_RUNNING: i16 = 0x40;
+
+                #[allow(unsafe_code)]
+                let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+                ifr.ifr_ifru = IfReqUnion {
+                    flags: IFF_UP | IFF_RUNNING,
+                };
+                Ok(0)
+            }
+
             // SIOCGARP
             0x8954 => {
                 // TODO: check addr

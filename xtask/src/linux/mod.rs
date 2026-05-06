@@ -43,7 +43,8 @@ impl LinuxRootfs {
         let apk = self.apk(&musl);
         if apk.is_file() {
             fs::copy(&apk, bin.join("apk")).unwrap();
-            let etc_apk = dir.join("etc").join("apk");
+            let etc = dir.join("etc");
+            let etc_apk = etc.join("apk");
             fs::create_dir_all(&etc_apk).unwrap();
             fs::write(
                 etc_apk.join("repositories"),
@@ -51,6 +52,9 @@ impl LinuxRootfs {
             )
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
+
+            // Add DNS resolution
+            fs::write(etc.join("resolv.conf"), "nameserver 8.8.8.8\nnameserver 1.1.1.1\n").unwrap();
             let lib_apk = dir.join("lib").join("apk");
             fs::create_dir_all(&lib_apk).unwrap();
             let lib_apk_db = lib_apk.join("db");
@@ -81,6 +85,7 @@ impl LinuxRootfs {
             "cat", "cp", "echo", "false", "grep", "gzip", "kill", "ln", "ls", "mkdir", "mv",
             "pidof", "ping", "ping6", "printenv", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
             "stat", "tar", "touch", "true", "uname", "usleep", "watch",
+            "ifconfig", "route", "udhcpc",
         ];
         let bin = dir.join("bin");
         for sh in SH {

@@ -1,16 +1,27 @@
-use crate::{error::LxError, net::*};
+use crate::{
+    error::{LxError, LxResult},
+    fs::{FileLike, OpenFlags, PollEvents, PollStatus},
+    net::*,
+};
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use async_trait::async_trait;
+use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
     wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet},
 };
 
+// Needed by `impl_kobject!`
+#[allow(unused_imports)]
+use zircon_object::object::*;
+
 /// missing documentation
-#[derive(Debug, Clone)]
 pub struct RawSocketState {
+    base: zircon_object::object::KObjectBase,
     handle: GlobalSocketHandle,
     header_included: bool,
+    flags: Arc<Mutex<OpenFlags>>,
 }
 
 impl RawSocketState {
@@ -33,8 +44,10 @@ impl RawSocketState {
         let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
 
         RawSocketState {
+            base: zircon_object::object::KObjectBase::new(),
             handle,
             header_included: false,
+            flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
         }
     }
 }
@@ -147,5 +160,61 @@ impl Socket for RawSocketState {
     }
     fn socket_type(&self) -> Option<SocketType> {
         Some(SocketType::SOCK_RAW)
+    }
+
+    fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        // Minimal implementation: raw sockets are generally writable,
+        // and readable if the underlying smoltcp socket can recv.
+        let sockets = get_sockets();
+        let mut sockets = sockets.lock();
+        let socket = sockets.get::<RawSocket>(self.handle.0);
+        (socket.can_recv(), socket.can_send(), false)
+    }
+}
+
+zircon_object::impl_kobject!(RawSocketState);
+
+#[async_trait]
+impl FileLike for RawSocketState {
+    fn flags(&self) -> OpenFlags {
+        *self.flags.lock()
+    }
+
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        let flags = &mut *self.flags.lock();
+        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
+        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
+        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        Ok(())
+    }
+
+    async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
+        Socket::read(self, buf).await.0
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        unimplemented!()
+    }
+
+    fn write(&self, buf: &[u8]) -> LxResult<usize> {
+        Socket::write(self, buf, None)
+    }
+
+    fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        let (read, write, error) = Socket::poll(self, events);
+        Ok(PollStatus { read, write, error })
+    }
+
+    async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        let (read, write, error) = Socket::poll(self, events);
+        Ok(PollStatus { read, write, error })
+    }
+
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
+        Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    fn as_socket(&self) -> LxResult<&dyn Socket> {
+        Ok(self)
     }
 }

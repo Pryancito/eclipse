@@ -29,37 +29,42 @@ impl Syscall<'_> {
         };
         // socket flags: SOCK_CLOEXEC SOCK_NONBLOCK
         let flags = OpenFlags::from_bits_truncate(_type & !SOCKET_TYPE_MASK);
-        let protocol = match Protocol::try_from(protocol) {
-            Ok(protocol) => protocol,
-            Err(_) => {
-                warn!("invalid protocol: {protocol}");
-                return Err(LxError::EINVAL);
-            }
-        };
+        let protocol_num = protocol;
+        let protocol = Protocol::try_from(protocol_num).ok();
+
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
-            (Domain::AF_INET, SocketType::SOCK_STREAM, Protocol::IPPROTO_IP)
-            | (Domain::AF_INET, SocketType::SOCK_STREAM, Protocol::IPPROTO_TCP) => {
+            (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
                 Arc::new(TcpSocketState::new())
             }
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, Protocol::IPPROTO_IP)
-            | (Domain::AF_INET, SocketType::SOCK_DGRAM, Protocol::IPPROTO_UDP) => {
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
                 Arc::new(UdpSocketState::new())
             }
+            // Be tolerant for AF_INET datagram sockets.
+            // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new()),
+            // AF_INET raw sockets (some userlands probe these)
+            (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
+                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8))
+            }
+            // AF_NETLINK sockets for interface/address discovery (iproute-style)
+            (Domain::AF_NETLINK, SocketType::SOCK_RAW, _) => Arc::new(NetlinkSocketState::default()),
+            // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
+            (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
+            | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => Arc::new(PacketSocketState::new()),
             /*
             (AF_INET, SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new(protocol as u8))
             }
             // TODO, UnixSocket
             (AF_UNIX, SOCK_STREAM, Protocol::IPPROTO_IP) => {}
-            (AF_NETLINK, SOCK_RAW, _) => {
-                Arc::new(NetlinkSocketState::new())
-            }
             (AF_PACKET, SOCK_RAW, _) => {}
             */
             (_, _, _) => {
                 warn!(
                     "unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
-                    domain, socket_type, protocol
+                    domain, socket_type, protocol_num
                 );
                 return Err(LxError::ENOSYS);
             }
