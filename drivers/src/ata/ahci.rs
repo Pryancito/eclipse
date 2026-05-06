@@ -56,7 +56,9 @@ const ATA_CMD_IDENTIFY: u8 = 0xEC;
 
 const SECTOR_SIZE: usize = 512;
 
-#[repr(C, align(1024))]
+// AHCI spec §4.2.2: each Command Header is 32 bytes; the Command List base
+// address must be 1 KiB-aligned (provided by drivers_dma_alloc → 4 KiB page).
+#[repr(C)]
 struct CommandHeader {
     cfl: u8,
     pm: u8,
@@ -85,6 +87,12 @@ struct CommandTable {
 
 const CMD_SLOTS: usize = 32;
 const CMD_TABLE_STRIDE: usize = 256; // 128-aligned, fits CommandTable
+
+// DMA memory layout (3 pages = 12 288 bytes):
+//   [0..1024)      command list  : CMD_SLOTS × sizeof(CommandHeader) = 32 × 32 = 1024 B
+//   [1024..1280)   FIS recv area : 256 B  (256-byte aligned ✓)
+//   [4096..12288)  command tables: CMD_SLOTS × CMD_TABLE_STRIDE = 32 × 256 = 8192 B
+const DMA_PAGES: usize = 3;
 
 struct AhciPort {
     base: usize,
@@ -177,6 +185,23 @@ impl AhciPort {
         self.start_engine();
     }
 
+    fn reset_port(&self) {
+        self.stop_engine();
+        // COMRESET: set DET=1, wait ≥1 ms, then clear DET
+        self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
+        for _ in 0..1_000_000 { spin_loop(); }
+        self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
+        // Wait for PHY to re-establish link (DET=3)
+        let mut timeout = 1_000_000;
+        while self.read_reg(PORT_SSTS) & 0xF != 3 && timeout > 0 {
+            timeout -= 1;
+            spin_loop();
+        }
+        self.write_reg(PORT_SERR, 0xFFFF_FFFF);
+        self.write_reg(PORT_IS, 0xFFFF_FFFF);
+        self.start_engine();
+    }
+
     fn exec_cmd(&self, slot: u32) -> DeviceResult {
         fence(Ordering::SeqCst);
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
@@ -190,11 +215,13 @@ impl AhciPort {
 
         if timeout == 0 {
             error!("[AHCI] Port {} command timeout", self.port_idx);
+            self.reset_port();
             return Err(DeviceError::IoError);
         }
 
         if self.read_reg(PORT_IS) & (1 << 30) != 0 {
             error!("[AHCI] Port {} task file error", self.port_idx);
+            self.reset_port();
             return Err(DeviceError::IoError);
         }
 
@@ -203,9 +230,19 @@ impl AhciPort {
 
     fn rw_block(&self, lba: u64, buf_phys: u64, buf_len: usize, write: bool) -> DeviceResult {
         let slot = 0u32;
-        
-        while self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) != 0 {
+
+        // Wait for port to become ready; bound the spin to avoid infinite hangs
+        let mut tfd_timeout = 2_000_000;
+        while self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) != 0
+            && tfd_timeout > 0
+        {
+            tfd_timeout -= 1;
             spin_loop();
+        }
+        if tfd_timeout == 0 {
+            error!("[AHCI] Port {} TFD busy timeout before command", self.port_idx);
+            self.reset_port();
+            return Err(DeviceError::IoError);
         }
 
         unsafe {
@@ -302,7 +339,7 @@ impl AhciInterface {
         for i in 0..32 {
             if pi & (1 << i) != 0 {
                 let pbase = base + 0x100 + (i * 0x80);
-                let dma_paddr = unsafe { drivers_dma_alloc(2) };
+                let dma_paddr = unsafe { drivers_dma_alloc(DMA_PAGES) };
                 let dma_vaddr = phys_to_virt(dma_paddr);
 
                 let port = AhciPort {
