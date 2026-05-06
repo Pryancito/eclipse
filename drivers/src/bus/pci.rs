@@ -112,9 +112,10 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     // 23 and lower are used
     static mut MSI_IRQ: u32 = 23;
 
-    let _orig = am.read16(ops, loc, PCI_COMMAND);
-    // IO Space | MEM Space | Bus Mastering | Special Cycles | PCI Interrupt Disable
-    // am.write32(ops, loc, PCI_COMMAND, (orig | 0x40f) as u32);
+    let orig = am.read16(ops, loc, PCI_COMMAND);
+    // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
+    // regardless of whether MSI is available.
+    am.write16(ops, loc, PCI_COMMAND, orig | 0x6);
 
     // find MSI cap
     let mut msi_found = false;
@@ -154,8 +155,6 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     }
 
     if !msi_found {
-        // am.write16(ops, loc, PCI_COMMAND, (0x2) as u16);
-        am.write16(ops, loc, PCI_COMMAND, 0x6);
         am.write32(ops, loc, _PCI_INTERRUPT_LINE, 33);
         debug!("MSI not found, using PCI interrupt");
     }
