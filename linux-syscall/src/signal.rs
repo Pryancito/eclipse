@@ -151,43 +151,53 @@ impl Syscall<'_> {
             _ => unimplemented!(),
         };
         let parent = self.zircon_process().clone();
-        match target {
-            SendTarget::Pid(pid) => {
-                match parent.job().get_child(pid as u64) {
-                    Ok(obj) => {
-                        match signal {
-                            Signal::SIGKILL => {
-                                let current_pid = parent.id();
-                                if current_pid == (pid as u64) {
-                                    // killing myself
-                                    parent.exit((128 + Signal::SIGKILL as i32) as i64);
-                                } else {
-                                    let process: Arc<Process> = obj.downcast_arc().unwrap();
-                                    process.exit((128 + Signal::SIGKILL as i32) as i64);
-                                }
-                            }
-                            sig => {
+        let send_to_pid = |pid: KoID| -> SysResult {
+            match parent.job().get_child(pid as u64) {
+                Ok(obj) => {
+                    match signal {
+                        Signal::SIGKILL => {
+                            let current_pid = parent.id();
+                            if current_pid == (pid as u64) {
+                                parent.exit((128 + Signal::SIGKILL as i32) as i64);
+                            } else {
                                 let process: Arc<Process> = obj.downcast_arc().unwrap();
-                                let tids = process.thread_ids();
-                                for tid in tids {
-                                    let thread = process.get_child(tid).unwrap();
-                                    let thread: Arc<Thread> = thread.downcast_arc().unwrap();
-                                    let mut thread_linux = thread.lock_linux();
-                                    if thread_linux.signal_mask.contains(sig) {
-                                        continue;
-                                    } else {
-                                        thread_linux.signals.insert(signal);
-                                        break;
-                                    }
+                                process.exit((128 + Signal::SIGKILL as i32) as i64);
+                            }
+                        }
+                        sig => {
+                            let process: Arc<Process> = obj.downcast_arc().unwrap();
+                            let tids = process.thread_ids();
+                            for tid in tids {
+                                let thread = process.get_child(tid).unwrap();
+                                let thread: Arc<Thread> = thread.downcast_arc().unwrap();
+                                let mut thread_linux = thread.lock_linux();
+                                if thread_linux.signal_mask.contains(sig) {
+                                    continue;
+                                } else {
+                                    thread_linux.signals.insert(signal);
+                                    break;
                                 }
                             }
-                        };
-                        Ok(0)
-                    }
-                    Err(_) => Err(LxError::EINVAL),
+                        }
+                    };
+                    Ok(0)
                 }
+                Err(_) => Err(LxError::EINVAL),
             }
-            _ => unimplemented!(),
+        };
+        match target {
+            SendTarget::Pid(pid) => send_to_pid(pid),
+            SendTarget::EveryProcessInGroup => {
+                // Minimal process-group support: without a real setpgid/pgid table,
+                // treat "current process group" as the current process ID.
+                send_to_pid(parent.id() as KoID)
+            }
+            SendTarget::EveryProcessInGroupByPID(pgid) => {
+                // Minimal process-group support: treat pgid as the leader's pid.
+                // This matches the common shell behavior of setting fg_pgrp = child pid.
+                send_to_pid(pgid)
+            }
+            SendTarget::EveryProcess => unimplemented!(),
         }
     }
 

@@ -23,6 +23,7 @@ impl Syscall<'_> {
         nfds: usize,
         timeout_msecs: isize,
     ) -> SysResult {
+        let _ = self.maybe_handle_tty_intr()?;
         let mut polls = ufds.read_array(nfds)?;
         info!(
             "poll: ufds: {:?}, nfds: {:?}, timeout_msecs: {}",
@@ -188,6 +189,7 @@ impl Syscall<'_> {
         err: UserInOutPtr<u32>,
         timeout: UserInPtr<TimeVal>,
     ) -> SysResult {
+        let _ = self.maybe_handle_tty_intr()?;
         info!(
             "select: nfds: {}, read: {:?}, write: {:?}, err: {:?}, timeout: {:?}",
             nfds, read, write, err, timeout

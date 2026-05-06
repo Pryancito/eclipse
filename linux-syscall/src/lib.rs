@@ -61,6 +61,36 @@ pub struct Syscall<'a> {
 }
 
 impl Syscall<'_> {
+    /// Handle terminal-generated Ctrl+C (SIGINT) in a uniform way.
+    ///
+    /// This is intentionally centralized so we don't sprinkle per-program hacks.
+    fn maybe_handle_tty_intr(&mut self) -> SysResult {
+        if !linux_object::fs::stdio::ctrl_c_pending_take() {
+            return Ok(0);
+        }
+        use linux_object::signal::Signal;
+
+        // Best-effort: deliver SIGINT to foreground pgrp if the fd0 "tty" provides one.
+        let proc = self.linux_process();
+        if let Ok(file_like) = proc.get_file_like(0.into()) {
+            let mut pgid: i32 = 0;
+            let _ = file_like.ioctl(
+                linux_object::fs::ioctl::TIOCGPGRP,
+                &mut pgid as *mut i32 as usize,
+                0,
+                0,
+            );
+            if pgid != 0 {
+                let _ = self.sys_kill(-(pgid as isize), Signal::SIGINT as usize);
+                return Err(LxError::EINTR);
+            }
+        }
+
+        // Fallback: current process.
+        let _ = self.sys_kill(self.zircon_process().id() as isize, Signal::SIGINT as usize);
+        Err(LxError::EINTR)
+    }
+
     /// syscall entry function
     pub async fn syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
         trace!(

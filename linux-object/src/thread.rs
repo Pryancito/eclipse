@@ -191,7 +191,8 @@ impl LinuxThread {
         if check != 0 {
             error!("unsupported signal fields : {:b}", check);
             trace!("uctx = {:x?}", *user_ctx);
-            panic!("unsupported signal fields");
+            // Be tolerant: userland may legally modify parts of ucontext/siginfo.
+            // We restore the saved context and only honor the restored PC/mask below.
         }
         *ctx = *old_ctx;
         ctx.set_field(UserContextField::InstrPointer, user_ctx.context.get_pc());

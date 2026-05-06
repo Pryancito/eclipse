@@ -24,6 +24,14 @@ impl Syscall<'_> {
         let file_like = proc.get_file_like(fd)?;
         let mut buf = vec![0u8; len];
         let len = file_like.read(&mut buf).await?;
+
+        if len > 0 && usize::from(fd) == 0 && buf[0] == 0x03 {
+            // Convert ETX into a terminal interrupt.
+            // We set the pending latch and let the centralized handler deliver SIGINT.
+            linux_object::fs::stdio::ctrl_c_pending_set();
+            return Err(LxError::EINTR);
+        }
+
         base.write_array(&buf[..len])?;
         Ok(len)
     }

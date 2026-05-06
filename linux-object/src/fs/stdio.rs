@@ -13,6 +13,27 @@ use kernel_hal::console::{self, ConsoleWinSize};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
+use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::AtomicBool;
+
+// Foreground process group for the (single) controlling TTY.
+// This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
+static TTY_FG_PGRP: AtomicI32 = AtomicI32::new(0);
+
+// Global Ctrl+C latch. Since many programs (e.g. udhcpc) never read stdin while running,
+// we need a way for syscalls like recvfrom/poll to observe a pending terminal interrupt.
+static CTRL_C_PENDING: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub fn ctrl_c_pending_take() -> bool {
+    CTRL_C_PENDING.swap(false, Ordering::SeqCst)
+}
+
+#[allow(dead_code)]
+pub fn ctrl_c_pending_set() {
+    CTRL_C_PENDING.store(true, Ordering::SeqCst);
+}
 
 lazy_static! {
     /// STDIN global reference
@@ -36,7 +57,29 @@ lazy_static! {
             use zcore_drivers::prelude::{InputEventType, InputEvent};
             input.subscribe(
                 Box::new(move |event: &InputEvent| {
-                    if event.event_type == InputEventType::Key && event.value == 1 {
+                    if event.event_type != InputEventType::Key {
+                        return;
+                    }
+                    // Linux input: value 1 = key press, 0 = release, 2 = autorepeat.
+                    use zcore_drivers::input::input_event_codes::key::*;
+                    match event.code {
+                        KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                            if event.value == 1 {
+                                CTRL_DOWN.store(true, Ordering::SeqCst);
+                            } else if event.value == 0 {
+                                CTRL_DOWN.store(false, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    if event.value == 1 || event.value == 2 {
+                        // Ctrl+C => ETX (0x03)
+                        if CTRL_DOWN.load(Ordering::SeqCst) && event.code == KEY_C {
+                            cloned.push('\u{3}');
+                            return;
+                        }
                         if let Some(c) = input_event_to_char(event.code) {
                             cloned.push(c);
                         }
@@ -91,6 +134,9 @@ pub struct Stdin {
 impl Stdin {
     /// push a char in Stdin buffer
     pub fn push(&self, c: char) {
+        if c == '\u{3}' {
+            ctrl_c_pending_set();
+        }
         self.buf.lock().push_back(c);
         self.eventbus.lock().set(Event::READABLE);
     }
@@ -169,16 +215,23 @@ impl INode for Stdin {
                 unsafe { *winsize = console::console_win_size() };
                 Ok(0)
             }
-            TCGETS | TIOCSPGRP => {
-                warn!("stdin TCGETS | TIOCSPGRP, pretend to be tty.");
-                // pretend to be tty
+            TCGETS => {
+                warn!("stdin TCGETS, pretend to be tty.");
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                // Set foreground process group.
+                // `data` is a user pointer to an int.
+                // TODO: validate pointer in a proper usercopy layer.
+                let pgid = unsafe { *(data as *const i32) };
+                TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
                 Ok(0)
             }
             TIOCGPGRP => {
-                warn!("stdin TIOCGPGRP, pretend to be have a tty process group.");
-                // pretend to be have a tty process group
+                // Get foreground process group.
                 // TODO: verify pointer
-                unsafe { *(data as *mut u32) = 0 };
+                let pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
@@ -214,15 +267,20 @@ impl INode for Stdout {
                 unsafe { *winsize = console::console_win_size() };
                 Ok(0)
             }
-            TCGETS | TIOCSPGRP => {
-                warn!("stdout TCGETS | TIOCSPGRP, pretend to be tty.");
-                // pretend to be tty
+            TCGETS => {
+                warn!("stdout TCGETS, pretend to be tty.");
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                let pgid = unsafe { *(data as *const i32) };
+                TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
                 Ok(0)
             }
             TIOCGPGRP => {
                 // pretend to be have a tty process group
                 // TODO: verify pointer
-                unsafe { *(data as *mut u32) = 0 };
+                let pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

@@ -117,12 +117,13 @@ impl Syscall<'_> {
 
     /// clock nanosleep
     pub async fn sys_clock_nanosleep(
-        &self,
+        &mut self,
         clockid: usize,
         flags: usize,
         req: UserInPtr<TimeSpec>,
         rem: UserOutPtr<TimeSpec>,
     ) -> SysResult {
+        let _ = self.maybe_handle_tty_intr()?;
         info!(
             "clock_nanosleep: clockid={:?}, flags={:?}, req={:?}, rem={:?}",
             clockid,

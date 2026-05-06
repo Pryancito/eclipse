@@ -231,6 +231,7 @@ impl Syscall<'_> {
         src_addr: UserOutPtr<SockAddr>,
         addrlen: UserInOutPtr<u32>,
     ) -> SysResult {
+        let _ = self.maybe_handle_tty_intr()?;
         info!(
             "sys_recvfrom: sockfd:{}, buffer:{:?}, length:{}, flags:{} , src_addr:{:?}, addrlen:{:?}",
             sockfd, buf, len, flags, src_addr, addrlen

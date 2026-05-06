@@ -2,12 +2,12 @@
 
 mod devfs;
 mod file;
-mod ioctl;
+pub mod ioctl;
 mod pipe;
 mod procfs;
 mod pseudo;
 pub mod rcore_fs_wrapper;
-mod stdio;
+pub mod stdio;
 
 #[cfg(feature = "mock-disk")]
 pub mod mock;

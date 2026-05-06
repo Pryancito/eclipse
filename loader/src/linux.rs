@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin};
 use linux_object::signal::{
-    MachineContext, SigInfo, Signal, SignalActionFlags, SignalUserContext, Sigset,
+    MachineContext, SigInfo, Signal, SignalUserContext, Sigset, SIG_DFL, SIG_IGN,
 };
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
@@ -101,6 +101,18 @@ fn handle_signal(
     let user_sp = ctx.get_field(UserContextField::StackPointer);
     let user_pc = ctx.get_field(UserContextField::InstrPointer);
     let action = thread.proc().linux().signal_action(signal);
+    // Handle default/ignore actions without entering a handler.
+    if action.handler == SIG_IGN {
+        thread.inner().lock_linux().handling_signal = None;
+        return ctx;
+    }
+    if action.handler == SIG_DFL {
+        // Minimal default dispositions: for Ctrl+C (SIGINT) terminate the process.
+        // TODO: implement per-signal default table.
+        let code = 128 + signal as i32;
+        thread.proc().exit(code as i64);
+        return ctx;
+    }
     let signal_info = SigInfo::default();
     let signal_context = SignalUserContext {
         sig_mask: sigmask,
@@ -110,15 +122,12 @@ fn handle_signal(
     // push `siginfo` `uctx` into user stack
     const RED_ZONE_MAX_SIZE: usize = 0x100; // 256Bytes
     let mut sp = user_sp - RED_ZONE_MAX_SIZE;
-    let (siginfo_ptr, uctx_ptr) = if action.flags.contains(SignalActionFlags::SIGINFO) {
-        sp = push_stack(sp & !0xF, signal_info); // & !0xF for 16 bytes aligned
-        let siginfo_ptr = sp;
-        sp = push_stack(sp & !0xF, signal_context);
-        (siginfo_ptr, sp)
-    } else {
-        error!("unimplementd signal flags");
-        (0, 0)
-    };
+    // Always use the 3-argument SA_SIGINFO calling convention; extra args are harmless
+    // for 1-argument handlers on SysV ABIs, and avoids crashing when flags are unset.
+    sp = push_stack(sp & !0xF, signal_info); // & !0xF for 16 bytes aligned
+    let siginfo_ptr = sp;
+    sp = push_stack(sp & !0xF, signal_context);
+    let uctx_ptr = sp;
     // backup current context
     thread.backup_context(*ctx, siginfo_ptr, uctx_ptr);
     // set user return address as `action.restorer`
