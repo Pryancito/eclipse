@@ -24,6 +24,66 @@ const PCI_CAP_ID_MSI: u8 = 0x05;
 
 struct PortOpsImpl;
 
+/// Read a BAR's physical base address directly from PCI config space.
+/// Handles both 32-bit and 64-bit memory BARs without probing (no side effects).
+/// `bar_reg` is the config-space byte offset (0x10 for BAR0, 0x14 for BAR1, etc.).
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_bar_addr(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Location, bar_reg: u16) -> u64 {
+    let lo = am.read32(ops, loc, bar_reg);
+    if lo == 0 {
+        return 0;
+    }
+    if (lo & 0x1) != 0 {
+        // I/O space BAR: bits 31:2 = port, bits 1:0 = flags
+        (lo & !0x3u32) as u64
+    } else if (lo & 0x6) == 0x4 {
+        // 64-bit memory BAR: combine with the next 32 bits
+        let hi = am.read32(ops, loc, bar_reg + 4);
+        ((lo & !0xFu32) as u64) | ((hi as u64) << 32)
+    } else {
+        // 32-bit memory BAR
+        (lo & !0xFu32) as u64
+    }
+}
+
+/// Probe the size of a BAR by writing all-ones and reading back.
+/// Handles both 32-bit and 64-bit memory BARs.
+/// Temporarily disables Memory/IO decoding (per PCI spec) to avoid bus errors.
+/// Returns 0 if the BAR is not implemented or the size cannot be determined.
+#[cfg(target_arch = "x86_64")]
+unsafe fn probe_bar_size(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Location, bar_reg: u16) -> u64 {
+    let orig_cmd = am.read16(ops, loc, PCI_COMMAND);
+    // Disable Memory and I/O decoding while probing (PCI spec requirement)
+    am.write16(ops, loc, PCI_COMMAND, orig_cmd & !0x03u16);
+
+    let orig_lo = am.read32(ops, loc, bar_reg);
+    am.write32(ops, loc, bar_reg, 0xFFFF_FFFF);
+    let mask_lo = am.read32(ops, loc, bar_reg);
+    am.write32(ops, loc, bar_reg, orig_lo);
+
+    let size = if (orig_lo & 0x1) != 0 {
+        // I/O space BAR
+        let s = !(mask_lo & !0x3u32).wrapping_add(1);
+        s as u64 & 0xFFFF_FFFF
+    } else if (orig_lo & 0x6) == 0x4 {
+        // 64-bit memory BAR: must probe both halves to get full size
+        let orig_hi = am.read32(ops, loc, bar_reg + 4);
+        am.write32(ops, loc, bar_reg + 4, 0xFFFF_FFFF);
+        let mask_hi = am.read32(ops, loc, bar_reg + 4);
+        am.write32(ops, loc, bar_reg + 4, orig_hi);
+        let full_mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
+        let sz_mask = full_mask & !0xFu64;
+        if sz_mask == 0 { 0 } else { (!sz_mask).wrapping_add(1) }
+    } else {
+        // 32-bit memory BAR
+        let sz_mask = mask_lo & !0xFu32;
+        if sz_mask == 0 { 0 } else { (!(sz_mask)).wrapping_add(1) as u64 & 0xFFFF_FFFF }
+    };
+
+    am.write16(ops, loc, PCI_COMMAND, orig_cmd);
+    size
+}
+
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::port::Port;
 
@@ -240,7 +300,24 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
         }
         (0x10de, _) if dev.id.class == 0x03 => {
             // NVIDIA GPU
-            if let Some(BAR::Memory(bar0_addr, _bar0_len, _, _)) = dev.bars[0] {
+            // Prefer pci-crate BAR0; fall back to direct config-space read for
+            // systems where the crate fails to parse the 64-bit BAR.
+            #[cfg(target_arch = "x86_64")]
+            let bar0_addr = {
+                if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+                    if a != 0 { a } else {
+                        let ops = &PortOpsImpl;
+                        unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                    }
+                } else {
+                    let ops = &PortOpsImpl;
+                    unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                }
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] { a } else { 0 };
+
+            if bar0_addr != 0 {
                 // Map BAR0 first so we can probe the display registers for resolution
                 if let Some(m) = mapper {
                     m.query_or_map(bar0_addr as usize, PAGE_SIZE * 1024); // 4 MiB for regs
@@ -251,10 +328,28 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 // BARs 0+1, so bars[1] is None.  The framebuffer (BAR2) is at
                 // bars[2].  Older GPUs with a 32-bit BAR0 have the FB at bars[1].
                 // Scan bars[1..6] and pick the first large (≥16 MiB) memory BAR.
+                // Note: when Resizable BAR (ReBAR) is active the FB BAR can be
+                // ≥ 4 GiB; the pci crate stores len=0 in that case (32-bit
+                // overflow), so we probe the real size from config space.
                 let fb_bar = (1..6usize).find_map(|i| {
                     if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
-                        if addr != 0 && (len as u64) >= (16 * 1024 * 1024) {
-                            Some((addr, len))
+                        if addr == 0 { return None; }
+                        let actual_len: u64 = if len == 0 {
+                            // pci crate 32-bit overflow → probe size directly
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                let bar_reg = BAR0 + (i as u16 * 4);
+                                let ops = &PortOpsImpl;
+                                let sz = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, bar_reg) };
+                                if sz == 0 { 256 * 1024 * 1024 } else { sz }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            { 256 * 1024 * 1024 }
+                        } else {
+                            len as u64
+                        };
+                        if actual_len >= (16 * 1024 * 1024) {
+                            Some((addr, actual_len))
                         } else {
                             None
                         }
@@ -389,64 +484,98 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
     #[cfg(feature = "xhci-usb-hid")]
     {
         if dev.id.class == 0x0c && dev.id.subclass == 0x03 && dev.id.prog_if == 0x30 {
-            if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
-                if addr == 0 {
-                    warn!("xHCI: BAR0 es 0 (recursos no asignados por el firmware); omitido");
-                    return Err(DeviceError::NotSupported);
+            // Resolve BAR0: prefer the pci-crate value; fall back to a direct
+            // config-space read for systems where the crate returns addr=0 or
+            // fails to parse the 64-bit BAR.
+            let (addr, len) = {
+                let (mut a, mut l) = (0u64, 0u64);
+                if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
+                    a = ba;
+                    l = bl as u64;
                 }
-                
-                warn!("[xhci] PCI BAR0 detectado en Phys:{:#x}, Len:{:#x}", addr, len);
-                
-                // Alineación a página (4KB)
-                let base_addr = (addr as usize) & !0xfff;
-                let offset = (addr as usize) & 0xfff;
-                // Forzamos un mapeo de al menos 128KB para asegurar que CAP, OP y RT estén cubiertos
-                let map_len = ((len as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
-
-                if let Some(m) = mapper {
-                    warn!("[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
-                    m.query_or_map(base_addr, map_len);
-                } else {
-                    warn!("[xhci] CRÍTICO: No hay IoMapper disponible. El acceso a {:#x} causará un Page Fault si no está pre-mapeado.", base_addr);
+                #[cfg(target_arch = "x86_64")]
+                if a == 0 {
+                    let ops = &PortOpsImpl;
+                    let ra = unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) };
+                    if ra != 0 {
+                        a = ra;
+                        // Probe actual size only if pci crate also returned l=0
+                        if l == 0 {
+                            l = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, BAR0) };
+                        }
+                    }
                 }
-                
-                let vaddr = phys_to_virt(addr as usize);
-                warn!("[xhci] VAddr mapeado: {:#x}. Intentando acceder a registros...", vaddr);
+                (a, l)
+            };
 
-                let msi_idx = unsafe { enable(dev.loc, 0) };
-                if let Some(idx) = msi_idx {
-                    let vector = idx + 32;
-                    warn!("[xhci] Usando MSI (vector {})", vector);
-                    match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, len as usize, vector) {
-                        Ok(input) => {
-                            crate::usb::xhci_hid::pci_note_pending_msi(vector, input.clone().upcast());
-                            return Ok(Device::Input(input));
-                        }
-                        Err(e) => warn!("xHCI HID probe error: {:?}", e),
+            if addr == 0 {
+                warn!("xHCI: BAR0 es 0 (recursos no asignados por el firmware); omitido");
+                return Err(DeviceError::NotSupported);
+            }
+
+            warn!("[xhci] PCI BAR0 detectado en Phys:{:#x}, Len:{:#x}", addr, len);
+
+            // Alineación a página (4KB)
+            let base_addr = (addr as usize) & !0xfff;
+            let offset = (addr as usize) & 0xfff;
+            // Forzamos un mapeo de al menos 128KB para asegurar que CAP, OP y RT estén cubiertos
+            let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+
+            if let Some(m) = mapper {
+                warn!("[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
+                m.query_or_map(base_addr, map_len);
+            } else {
+                warn!("[xhci] CRÍTICO: No hay IoMapper disponible. El acceso a {:#x} causará un Page Fault si no está pre-mapeado.", base_addr);
+            }
+
+            let vaddr = phys_to_virt(addr as usize);
+            warn!("[xhci] VAddr mapeado: {:#x}. Intentando acceder a registros...", vaddr);
+
+            let msi_idx = unsafe { enable(dev.loc, 0) };
+            if let Some(idx) = msi_idx {
+                let vector = idx + 32;
+                warn!("[xhci] Usando MSI (vector {})", vector);
+                match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, map_len, vector) {
+                    Ok(input) => {
+                        crate::usb::xhci_hid::pci_note_pending_msi(vector, input.clone().upcast());
+                        return Ok(Device::Input(input));
                     }
-                } else {
-                    warn!("[xhci] MSI no disponible; iniciando modo polling (vector 0)");
-                    match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, len as usize, 0) {
-                        Ok(input) => {
-                            crate::usb::xhci_hid::set_poll_instance(Some(input.clone()));
-                            return Ok(Device::Input(input));
-                        }
-                        Err(e) => warn!("xHCI HID probe (poll) error: {:?}", e),
+                    Err(e) => warn!("xHCI HID probe error: {:?}", e),
+                }
+            } else {
+                warn!("[xhci] MSI no disponible; iniciando modo polling (vector 0)");
+                match crate::usb::xhci_hid::XhciUsbHid::probe(dev, vaddr, map_len, 0) {
+                    Ok(input) => {
+                        crate::usb::xhci_hid::set_poll_instance(Some(input.clone()));
+                        return Ok(Device::Input(input));
                     }
+                    Err(e) => warn!("xHCI HID probe (poll) error: {:?}", e),
                 }
             }
         }
     }
 
-    if dev.id.class == 0x01 && dev.id.subclass == 0x06 {
-        // Mass storage class - SATA AHCI
-        // Ignore the potentially stale BAR info from PCIDevice and read RAW BAR5
+    // Mass storage class - SATA AHCI.
+    // Match (per eclipse-old pci.rs find_all_sata_ahci):
+    //   class=0x01, subclass=0x06, prog_if=0x01  — standard AHCI
+    //   class=0x01, subclass=0x01, prog_if=0x01  — Intel PCH in "IDE mode" with AHCI
+    if dev.id.class == 0x01
+        && dev.id.prog_if == 0x01
+        && (dev.id.subclass == 0x06 || dev.id.subclass == 0x01)
+    {
+        // Read ABAR (BAR5) directly from config space; use the 64-bit helper on
+        // x86_64 so controllers whose ABAR is above 4 GiB are handled correctly.
         let ops = &PortOpsImpl;
         let am = PCI_ACCESS;
-        let raw_bar5 = unsafe { am.read32(ops, dev.loc, BAR5_REG) };
-        if raw_bar5 != 0 && raw_bar5 != 0xFFFF_FFFF {
-            let addr = (raw_bar5 & !0xF) as u64; // Mask out flags
-            warn!("[AHCI] Using RAW BAR5 address: {:#x}", addr);
+        #[cfg(target_arch = "x86_64")]
+        let addr: u64 = unsafe { read_bar_addr(ops, am, dev.loc, BAR5_REG) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let addr: u64 = {
+            let raw = unsafe { am.read32(ops, dev.loc, BAR5_REG) };
+            (raw & !0xFu32) as u64
+        };
+        if addr != 0 {
+            warn!("[AHCI] Using BAR5 address: {:#x}", addr);
 
             // Map the ABAR registers (at least one full page)
             let base_addr = (addr as usize) & !0xfff;
@@ -462,7 +591,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             let blk = Arc::new(crate::ata::ahci::AhciInterface::new(vaddr, irq.unwrap_or(33))?);
             return Ok(Device::Block(blk));
         } else {
-            warn!("AHCI dev found but RAW BAR5 is invalid: {:#x}", raw_bar5);
+            warn!("AHCI dev found but BAR5 address is 0");
         }
     }
 
