@@ -902,14 +902,14 @@ impl XhciInner {
         }
         m.write_op(0, usbcmd);
 
-        // Esperar a que el controlador salga de HCHalted (xHCI spec: max 5 ms)
+        // Wait for the controller to exit HCHalted (xHCI spec: max 5 ms)
         for _ in 0..10_000 {
             let sts = m.read_op(4);
             if sts & 1 == 0 { break; }
             spin_loop();
         }
         if m.read_op(4) & 1 != 0 {
-            warn!("[xhci] El controlador no salió de HCHalted tras RS=1; abortando");
+            warn!("[xhci] Controller did not exit HCHalted after RS=1; aborting");
             return Err(DeviceError::IoError);
         }
 
@@ -1150,9 +1150,14 @@ impl XhciInner {
         let ep_off = csz + csz + (dci - 1) * csz;
 
         // Endpoint Context DW0: set Interval from the USB endpoint descriptor.
-        // For HS/SS the value is used directly (bInterval 1-16 → xHCI 0-15).
-        // For FS/LS we cap at 15; a value of 0 is reserved so we ensure at least 1.
-        let xhci_interval = interval.min(15).max(1);
+        // For HS/SS (speed >= 3) bInterval is the exponent (0-15 are all valid per xHCI spec
+        // section 6.2.3.6).  For FS/LS bInterval is in frames and must be at least 1.
+        let speed = self.slot_speed[slot as usize];
+        let xhci_interval = if speed >= 3 {
+            interval.min(15)
+        } else {
+            interval.min(15).max(1)
+        };
         cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
 
         // Endpoint Context DW1: Error Count=3, EP Type, Max Packet Size
