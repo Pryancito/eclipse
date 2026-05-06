@@ -104,22 +104,26 @@ pub(super) fn init() -> DeviceResult {
 
     #[cfg(feature = "graphic")]
     {
-        use crate::KCONFIG;
-        use zcore_drivers::display::UefiDisplay;
-        use zcore_drivers::prelude::{ColorFormat, DisplayInfo};
+        // If display was already created in init_early(), just hook up the graphic console.
+        // Otherwise create it here (fallback).
+        if let Some(display) = crate::drivers::all_display().first() {
+            crate::console::init_graphic_console(display.clone());
+        } else {
+            use crate::KCONFIG;
+            use zcore_drivers::display::UefiDisplay;
+            use zcore_drivers::prelude::{ColorFormat, DisplayInfo};
 
-        let (width, height) = KCONFIG.fb_mode.resolution();
-        let display = Arc::new(UefiDisplay::new(DisplayInfo {
-            width: width as _,
-            height: height as _,
-            format: ColorFormat::ARGB8888, // uefi::proto::console::gop::PixelFormat::Bgr
-            fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
-            fb_size: KCONFIG.fb_size as usize,
-        }));
-        crate::drivers::add_device(Device::Display(display.clone()));
-        crate::console::init_graphic_console(display.clone());
-        // Show boot logo immediately.
-        crate::boot_logo::draw_centered(&*display);
+            let (width, height) = KCONFIG.fb_mode.resolution();
+            let display = Arc::new(UefiDisplay::new(DisplayInfo {
+                width: width as _,
+                height: height as _,
+                format: ColorFormat::ARGB8888, // uefi::proto::console::gop::PixelFormat::Bgr
+                fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
+                fb_size: KCONFIG.fb_size as usize,
+            }));
+            crate::drivers::add_device(Device::Display(display.clone()));
+            crate::console::init_graphic_console(display.clone());
+        }
     }
 
     #[cfg(feature = "loopback")]

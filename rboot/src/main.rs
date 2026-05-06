@@ -32,6 +32,7 @@ use xmas_elf::ElfFile;
 
 mod config;
 mod page_table;
+mod logo;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
 
@@ -39,7 +40,7 @@ const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     uefi_services::init(&mut st).expect("failed to initialize utilities");
 
-    info!("bootloader is running");
+    //info!("bootloader is running");
     let bs = st.boot_services();
     let config = {
         let mut file = open_file(bs, CONFIG_PATH);
@@ -48,7 +49,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     };
 
     let graphic_info = init_graphic(bs, config.resolution);
-    info!("config: {:#x?}", config);
+    // Draw splash logo immediately after GOP init.
+    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
+    //info!("config: {:#x?}", config);
 
     let acpi2_addr = st
         .config_table()
@@ -56,7 +59,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .find(|entry| entry.guid == ACPI2_GUID)
         .expect("failed to find ACPI 2 RSDP")
         .address;
-    info!("acpi2: {:?}", acpi2_addr);
+    //info!("acpi2: {:?}", acpi2_addr);
 
     let smbios_addr = st
         .config_table()
@@ -64,7 +67,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .find(|entry| entry.guid == SMBIOS_GUID)
         .expect("failed to find SMBIOS")
         .address;
-    info!("smbios: {:?}", smbios_addr);
+    //info!("smbios: {:?}", smbios_addr);
 
     let elf = {
         let mut file = open_file(bs, config.kernel_path);
@@ -122,7 +125,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
 
-    info!("exit boot services");
+    //info!("exit boot services");
 
     let mut memory_map = Vec::with_capacity(128);
 
@@ -151,7 +154,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 }
 
 fn open_file(bs: &BootServices, path: &str) -> RegularFile {
-    info!("opening file: {}", path);
+    //info!("opening file: {}", path);
     let fs = bs
         .locate_protocol::<SimpleFileSystem>()
         .expect("failed to get FileSystem");
@@ -170,7 +173,7 @@ fn open_file(bs: &BootServices, path: &str) -> RegularFile {
 }
 
 fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
-    info!("loading file to memory");
+    //info!("loading file to memory");
     let mut info_buf = [0u8; 0x100];
     let info = file
         .get_info::<FileInfo>(&mut info_buf)
@@ -198,7 +201,7 @@ fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Graphi
                 info.resolution() == resolution
             })
             .expect("graphic mode not found");
-        info!("switching graphic mode");
+        //info!("switching graphic mode");
         gop.set_mode(&mode).expect("Failed to set graphics mode");
     }
     GraphicInfo {
