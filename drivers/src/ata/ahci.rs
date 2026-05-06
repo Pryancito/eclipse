@@ -109,7 +109,9 @@ impl AhciPort {
     fn stop_engine(&self) {
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_ST);
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) & !CMD_FRE);
-        // AHCI spec: wait up to 500 ms for CR and FR to clear.
+        // AHCI spec requires CR and FR to clear within 500 ms of clearing ST/FRE.
+        // Iteration-based timeout consistent with the rest of this driver; each
+        // spin_loop() iteration is roughly 1 ns on modern x86 hardware.
         let mut timeout = 500_000;
         while self.read_reg(PORT_CMD) & (CMD_CR | CMD_FR) != 0 && timeout > 0 {
             timeout -= 1;
@@ -122,6 +124,7 @@ impl AhciPort {
 
     fn start_engine(&self) {
         // AHCI spec: wait for CR to clear before setting FRE and ST.
+        // Iteration-based timeout consistent with the rest of this driver.
         let mut timeout = 500_000;
         while self.read_reg(PORT_CMD) & CMD_CR != 0 && timeout > 0 {
             timeout -= 1;
