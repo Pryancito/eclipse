@@ -1312,8 +1312,8 @@ impl XhciInner {
         };
         cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
 
-        // Endpoint Context DW1: Error Count=3, EP Type, Max Packet Size
-        // Bits 2:1 carry Error Count=3, i.e. allow up to 3 retries after the first attempt.
+        // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
+        // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
         let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(64)?;
