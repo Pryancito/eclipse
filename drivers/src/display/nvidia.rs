@@ -35,6 +35,20 @@ mod regs {
     pub const NV40_PCRTC_HEAD0_SIZE: u32 = 0x60002C;
 }
 
+static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
+
+#[derive(Debug, Clone, Copy)]
+struct BootFbInfo {
+    _phys: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+
+pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
+    *BOOT_FB_INFO.lock() = Some(BootFbInfo { _phys: phys, width, height, pitch });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
     Unknown,
@@ -51,6 +65,7 @@ pub struct NvidiaGpu {
     architecture: NvidiaArchitecture,
     gpu_model: &'static str,
     vram_size_mb: u32,
+    pitch_override: Option<u32>,
     _bar0: usize,
     _bar1: usize,
     vram_allocator: Mutex<Option<NvidiaVramAllocator>>,
@@ -123,6 +138,10 @@ impl NvidiaVramAllocator {
 
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
+        if let Some(p) = self.pitch_override {
+            return (p / 4) as usize;
+        }
+
         let width = self.info.width as usize;
         let height = self.info.height as usize;
         if width == 0 || height == 0 {
@@ -134,6 +153,13 @@ impl NvidiaGpu {
         // than the visible framebuffer and would produce a bogus inferred pitch.
         const MAX_PITCH_PADDING_PIXELS: usize = 4096;
         let bytes_per_pixel = self.info.format.bytes() as usize;
+        
+        // If fb_size is suspiciously large (entire BAR), don't infer pitch from it.
+        // A typical 1080p framebuffer is ~8MB. BARs are usually 256MB+.
+        if self.info.fb_size >= 16 * 1024 * 1024 {
+             return width;
+        }
+
         let visible_size = width
             .saturating_mul(height)
             .saturating_mul(bytes_per_pixel);
@@ -150,45 +176,82 @@ impl NvidiaGpu {
 
     pub fn new(
         name: String,
+        device_id: u16,
         bar0: usize,
-        fb: usize,
+        fb_vaddr: usize,
         fb_size: usize,
-        width: u32,
-        height: u32,
+        default_width: u32,
+        default_height: u32,
     ) -> DeviceResult<Self> {
         // 1. Identify Architecture
         let boot0 = unsafe { core::ptr::read_volatile((bar0 + regs::NV_PMC_BOOT_0 as usize) as *const u32) };
         let arch = arch_from_pmc_boot0(boot0);
         
-        // 2. Identify Model (simplified matching)
-        let gpu_model = match arch {
-            NvidiaArchitecture::Turing => "NVIDIA Turing GPU",
-            NvidiaArchitecture::Ampere => "NVIDIA Ampere GPU",
-            NvidiaArchitecture::AdaLovelace => "NVIDIA Ada Lovelace GPU",
-            NvidiaArchitecture::Hopper => "NVIDIA Hopper GPU",
-            NvidiaArchitecture::Blackwell => "NVIDIA Blackwell GPU",
-            _ => "Unknown NVIDIA GPU",
-        };
+        // 2. Identify Model using PCI ID + architecture cross-check
+        let (pci_arch, gpu_model, _vram_mb_pci) = identify_gpu(device_id);
+        let arch = if arch == NvidiaArchitecture::Unknown { pci_arch } else { arch };
 
         // 3. Read VRAM Size
         let vram_size_mb = unsafe {
             core::ptr::read_volatile((bar0 + regs::NV_PFB_CSTATUS as usize) as *const u32)
         } & regs::NV_PFB_CSTATUS_MEM_SIZE_MASK;
 
-        // 4. Read Temperature
+        // 4. Resolution probing and inheritance
+        let mut w = default_width;
+        let mut h = default_height;
+        let mut pitch_override = None;
+        let final_fb_vaddr = fb_vaddr;
+
+        // Try legacy probe first
+        if let Some((pw, ph)) = unsafe { probe_resolution_from_bar0(bar0) } {
+            w = pw;
+            h = ph;
+        }
+
+        // Check if this GPU matches the boot framebuffer (UEFI GOP)
+        if let Some(boot_info) = *BOOT_FB_INFO.lock() {
+            // How do we know the physical address of fb_vaddr?
+            // In zCore/drivers, we usually don't have a direct way back to phys,
+            // but we can assume fb_vaddr is mapped to a BAR.
+            // We'll trust the PCI scan to have passed the correct bar1_phys in some way,
+            // but since we only have fb_vaddr here, we might need more info.
+            // However, we can use a heuristic: if we have 2 GPUs, and boot_info.phys
+            // is within the range of this GPU's BAR1, then this is the primary GPU.
+            
+            // For now, let's assume the caller will set the correct resolution
+            // if it knows it. But if it doesn't, we can try to match.
+            // Since we don't have the phys address of fb_vaddr here easily
+            // without a page table lookup, let's rely on the fact that
+            // KCONFIG info is usually more accurate than hardcoded 1920x1080.
+            
+            // If the default provided is the "magic" 1920x1080 from pci.rs, 
+            // and we have boot_info, use boot_info.
+            if default_width == 1920 && default_height == 1080 {
+                w = boot_info.width;
+                h = boot_info.height;
+                pitch_override = Some(boot_info.pitch);
+                
+                // If the boot phys is within this aperture, we might need to adjust fb_vaddr
+                // But usually fb_vaddr is the start of the BAR. GOP might be offset.
+                // In eclipse-old: fb_phys = boot_info.phys; offset = fb_phys - bar1_phys;
+                // Here we'll just assume the pitch is the main fix needed for now.
+                log::info!("[NVIDIA] Inheriting boot resolution: {}x{} (pitch: {})", w, h, boot_info.pitch);
+            }
+        }
+
         let temperature = read_temperature(bar0);
 
-        // 5. Resolution probing (prefer programmed resolution)
-        let (w, h) = unsafe { probe_resolution_from_bar0(bar0) }.unwrap_or((width, height));
+        log::warn!("[NVIDIA] Detected {} ({:?}), VRAM: {} MB, Temp: {:?}°C, Res: {}x{}", 
+            gpu_model, arch, vram_size_mb, temperature, w, h);
 
-        log::warn!("[NVIDIA] Detected {} ({:?}), VRAM: {} MB, Temp: {:?}°C", 
-            gpu_model, arch, vram_size_mb, temperature);
+        let pitch = pitch_override.unwrap_or(w * 4);
 
         let info = DisplayInfo {
             width: w,
             height: h,
+            pitch,
             format: ColorFormat::ARGB8888,
-            fb_base_vaddr: fb,
+            fb_base_vaddr: final_fb_vaddr,
             fb_size,
         };
 
@@ -198,9 +261,10 @@ impl NvidiaGpu {
             architecture: arch,
             gpu_model,
             vram_size_mb,
+            pitch_override,
             _bar0: bar0,
-            _bar1: fb,
-            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(fb as u64, fb_size as u64))),
+            _bar1: final_fb_vaddr,
+            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(fb_vaddr as u64, fb_size as u64))),
         })
     }
 
@@ -313,6 +377,49 @@ unsafe fn probe_resolution_from_bar0(bar0: usize) -> Option<(u32, u32)> {
     let (w, h) = (reg & 0xFFFF, reg >> 16);
     if w > 0 && h > 0 && w <= 16384 && h <= 16384 { return Some((w, h)); }
     None
+}
+
+/// Identify GPU based on PCI device ID.
+/// Returns (architecture, name, memory_mb).
+fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32) {
+    match device_id {
+        // Blackwell
+        0x2B85 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5090", 32768),
+        0x2B89 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5080", 16384),
+        0x2C00 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070 Ti", 16384),
+        0x2C20 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070", 12288),
+        
+        // Ada Lovelace
+        0x2684 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090", 24576),
+        0x2704 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080", 16384),
+        0x2782 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti", 12288),
+        0x2786 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070", 12288),
+        0x2803 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Ti", 8192),
+        0x2882 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060", 8192),
+        
+        // Ampere
+        0x2204 => (NvidiaArchitecture::Ampere, "GeForce RTX 3090", 24576),
+        0x2206 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080", 10240),
+        0x2484 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070", 8192),
+        0x2489 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 Ti", 8192),
+        0x2503 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060", 12288),
+        0x2571 => (NvidiaArchitecture::Ampere, "GeForce RTX 3050", 8192),
+        
+        // Turing
+        0x1E02 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Ti", 11264),
+        0x1E04 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Super", 8192),
+        0x1E07 => (NvidiaArchitecture::Turing, "GeForce RTX 2080", 8192),
+        0x1E82 => (NvidiaArchitecture::Turing, "GeForce RTX 2070 Super", 8192),
+        0x1E84 => (NvidiaArchitecture::Turing, "GeForce RTX 2070", 8192),
+        0x1F02 | 0x1F06 | 0x1F07 => (NvidiaArchitecture::Turing, "GeForce RTX 2060 Super", 8192),
+        0x1F03 | 0x1F08 | 0x1F0A | 0x1F0B => (NvidiaArchitecture::Turing, "GeForce RTX 2060", 6144),
+        0x1F36 => (NvidiaArchitecture::Turing, "GeForce GTX 1660 Super", 6144),
+        0x1F82 => (NvidiaArchitecture::Turing, "GeForce GTX 1660", 6144),
+        0x1F91 => (NvidiaArchitecture::Turing, "GeForce GTX 1650 Super", 4096),
+        0x1F99 => (NvidiaArchitecture::Turing, "GeForce GTX 1650", 4096),
+        
+        _ => (NvidiaArchitecture::Unknown, "Unknown NVIDIA GPU", 0),
+    }
 }
 
 impl Scheme for NvidiaGpu {

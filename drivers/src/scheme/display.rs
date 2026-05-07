@@ -32,6 +32,8 @@ pub struct DisplayInfo {
     pub width: u32,
     /// visible height
     pub height: u32,
+    /// Number of bytes between each row of the frame buffer.
+    pub pitch: u32,
     /// color encoding format of RGBA
     pub format: ColorFormat,
     /// frame buffer base virtual address
@@ -156,7 +158,11 @@ impl DisplayInfo {
     /// Number of bytes between each row of the frame buffer.
     #[inline]
     pub const fn pitch(self) -> u32 {
-        self.width * self.format.bytes() as u32
+        if self.pitch != 0 {
+            self.pitch
+        } else {
+            self.width * self.format.bytes() as u32
+        }
     }
 }
 
@@ -170,7 +176,10 @@ pub trait DisplayScheme: Scheme {
     #[inline]
     fn draw_pixel(&self, x: u32, y: u32, color: RgbColor) {
         let info = self.info();
-        let offset = (x + y * info.width) as usize * info.format.bytes() as usize;
+        if x >= info.width || y >= info.height {
+            return;
+        }
+        let offset = (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
         if offset < info.fb_size {
             unsafe { self.fb().write_color(offset, color, info.format) };
         }

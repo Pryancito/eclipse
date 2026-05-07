@@ -91,6 +91,15 @@ pub(super) fn init() -> DeviceResult {
             }
         }
 
+        // Pass boot framebuffer info to display drivers for native resolution inheritance
+        #[cfg(feature = "graphic")]
+        {
+            use crate::KCONFIG;
+            let (width, height) = KCONFIG.fb_mode.resolution();
+            let stride = KCONFIG.fb_mode.stride();
+            zcore_drivers::display::set_boot_fb_info(KCONFIG.fb_addr, width as u32, height as u32, (stride * 4) as u32);
+        }
+
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
@@ -114,9 +123,11 @@ pub(super) fn init() -> DeviceResult {
             use zcore_drivers::prelude::{ColorFormat, DisplayInfo};
 
             let (width, height) = KCONFIG.fb_mode.resolution();
+            let stride = KCONFIG.fb_mode.stride();
             let display = Arc::new(UefiDisplay::new(DisplayInfo {
                 width: width as _,
                 height: height as _,
+                pitch: (stride * 4) as u32,
                 format: ColorFormat::ARGB8888, // uefi::proto::console::gop::PixelFormat::Bgr
                 fb_base_vaddr: crate::mem::phys_to_virt(KCONFIG.fb_addr as usize),
                 fb_size: KCONFIG.fb_size as usize,

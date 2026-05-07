@@ -375,6 +375,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                     );
                     let gpu = Arc::new(crate::display::NvidiaGpu::new(
                         gpu_name,
+                        dev.id.device_id,
                         bar0_vaddr,
                         fb_vaddr,
                         fb_len as usize,
