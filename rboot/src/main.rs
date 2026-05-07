@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use log::LevelFilter;
 use rboot::{BootInfo, GraphicInfo};
-use uefi::proto::console::gop::GraphicsOutput;
+use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::*;
@@ -286,11 +286,54 @@ fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
     &mut buf[..len]
 }
 
+/// Return the handle of the best GOP to use.
+///
+/// On systems with multiple GPUs (e.g. dual NVIDIA RTX) UEFI exposes one GOP
+/// handle per GPU.  `locate_protocol` returns an arbitrary one which may be
+/// the inactive/secondary card.  We enumerate all handles and prefer the one
+/// with the largest accessible (non-BltOnly) framebuffer, which is
+/// consistently the active/connected display on tested systems.
+fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
+    let handles = bs
+        .locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>())
+        .ok()?;
+
+    let mut best: Option<Handle> = None;
+    let mut best_size: usize = 0;
+
+    for &h in handles.handles().iter() {
+        if let Ok(cell) = bs.handle_protocol::<GraphicsOutput>(h) {
+            let gop = unsafe { &mut *cell.get() };
+            // BltOnly means there is no direct framebuffer.
+            if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
+                continue;
+            }
+            let sz = gop.frame_buffer().size();
+            if sz > best_size {
+                best_size = sz;
+                best = Some(h);
+            }
+        }
+    }
+
+    // If every handle was BltOnly (no direct framebuffer), return None so the
+    // caller can fall back to locate_protocol.
+    best
+}
+
 fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> GraphicInfo {
-    let gop = bs
-        .locate_protocol::<GraphicsOutput>()
-        .expect("failed to get GraphicsOutput");
-    let gop = unsafe { &mut *gop.get() };
+    let gop = if let Some(handle) = find_active_gop_handle(bs) {
+        let cell = bs
+            .handle_protocol::<GraphicsOutput>(handle)
+            .expect("failed to open chosen GOP handle");
+        unsafe { &mut *cell.get() }
+    } else {
+        // Fallback for firmware that does not support locate_handle_buffer.
+        let cell = bs
+            .locate_protocol::<GraphicsOutput>()
+            .expect("failed to get GraphicsOutput");
+        unsafe { &mut *cell.get() }
+    };
 
     if let Some(resolution) = resolution {
         let mode = gop

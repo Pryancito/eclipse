@@ -133,7 +133,11 @@ fn stroke_rect(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: u
 /// `pixel` encoding matches existing `logo.rs`: 0x00RRGGBB.
 pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     let fmt = mode.pixel_format();
-    if fmt != PixelFormat::Bgr && fmt != PixelFormat::BltOnly && fmt != PixelFormat::Rgb {
+    // BltOnly has no direct framebuffer access; skip.
+    // Bitmask (used by NVIDIA and other vendors) and all other 32bpp formats
+    // are written with white (0x00FF_FFFF) and black (0x0000_0000), which are
+    // channel-layout-independent, so drawing proceeds regardless.
+    if fmt == PixelFormat::BltOnly {
         return;
     }
 
