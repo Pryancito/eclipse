@@ -124,7 +124,12 @@ impl NvidiaVramAllocator {
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
         let width = self.info.width as usize;
-        let height = self.info.height.max(1) as usize;
+        let height = self.info.height as usize;
+        if width == 0 || height == 0 {
+            return width;
+        }
+
+        const MAX_PITCH_PADDING_PIXELS: usize = 4096;
         let bytes_per_pixel = self.info.format.bytes() as usize;
         let visible_size = width
             .saturating_mul(height)
@@ -132,7 +137,7 @@ impl NvidiaGpu {
 
         if self.info.fb_size >= visible_size {
             let inferred = self.info.fb_size / height / bytes_per_pixel;
-            if inferred >= width && inferred <= width + 4096 {
+            if inferred >= width && inferred <= width + MAX_PITCH_PADDING_PIXELS {
                 return inferred;
             }
         }
