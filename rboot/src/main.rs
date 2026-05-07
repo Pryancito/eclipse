@@ -142,16 +142,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
         // On real hardware UEFI has already set EFER.NXE before we run, so
         // NO_EXECUTE bits we write into page-table entries are enforced.
-        // If any kernel ELF segment is mis-flagged as non-executable (e.g.
-        // because the linker emits a single LOAD segment without PF_X), the
-        // CPU faults on the very first instruction (triple-fault / silent
-        // reset) — the "bar reaches 100% but kernel never runs" symptom on
-        // physical machines.  Clear NXE so those bits are treated as reserved
-        // (harmless for data accesses; instruction-fetch from NX-marked pages
-        // still faults, which is the desired behaviour).  The kernel's own
-        // virtual-memory code sets up fresh page tables with proper NX policy.
-        // On QEMU, OVMF typically leaves NXE clear, so the bug was invisible
-        // there.
+        // Keep NXE enabled while running under firmware page tables. Some
+        // UEFI mappings may already use NX bits and clearing NXE can fault
+        // immediately on real hardware.
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
