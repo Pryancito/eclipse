@@ -122,6 +122,24 @@ impl NvidiaVramAllocator {
 }
 
 impl NvidiaGpu {
+    fn pitch_pixels(&self) -> usize {
+        let width = self.info.width as usize;
+        let height = self.info.height.max(1) as usize;
+        let bytes_per_pixel = self.info.format.bytes() as usize;
+        let visible_size = width
+            .saturating_mul(height)
+            .saturating_mul(bytes_per_pixel);
+
+        if self.info.fb_size >= visible_size {
+            let inferred = self.info.fb_size / height / bytes_per_pixel;
+            if inferred >= width && inferred <= width + 4096 {
+                return inferred;
+            }
+        }
+
+        width
+    }
+
     pub fn new(
         name: String,
         bar0: usize,
@@ -195,7 +213,7 @@ impl NvidiaGpu {
         if w == 0 || h == 0 { return; }
 
         let ptr = self.info.fb_base_vaddr as *mut u32;
-        let pitch_u32 = width as usize; // Simplified pitch
+        let pitch_u32 = self.pitch_pixels();
 
         for py in 0..h {
             let row_start = (y + py) as usize * pitch_u32 + (x as usize);
@@ -215,11 +233,22 @@ impl NvidiaGpu {
         if w == 0 || h == 0 { return; }
 
         let ptr = self.info.fb_base_vaddr as *mut u32;
-        let pitch_u32 = width as usize;
+        let pitch_u32 = self.pitch_pixels();
 
+        let same_row_overlap = dst_y == src_y && dst_x > src_x && dst_x < src_x + w;
         let overlap_down = dst_y > src_y && dst_y < src_y + h;
 
-        if overlap_down {
+        if same_row_overlap {
+            for py in 0..h {
+                let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
+                let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+                unsafe {
+                    for i in (0..w as usize).rev() {
+                        core::ptr::write(ptr.add(dst_row + i), core::ptr::read(ptr.add(src_row + i)));
+                    }
+                }
+            }
+        } else if overlap_down {
             for py in (0..h).rev() {
                 let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
                 let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
@@ -383,4 +412,3 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 }
-
