@@ -3,9 +3,17 @@
 //! Minimal, no_std-friendly: draws a centered progress bar directly into GOP fb.
 
 use uefi::proto::console::gop::{ModeInfo, PixelFormat};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // 8x8 font for ASCII 0x20..0x7F (same data format as kernel-hal).
 const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
+
+static ROT180: AtomicBool = AtomicBool::new(false);
+
+/// Rotate all progress drawing by 180 degrees (useful on some real panels/firmware).
+pub fn set_rot180(enable: bool) {
+    ROT180.store(enable, Ordering::SeqCst);
+}
 
 fn pixel_white(fmt: PixelFormat) -> u32 {
     match fmt {
@@ -21,7 +29,12 @@ fn pixel_black(_fmt: PixelFormat) -> u32 {
     0x0000_0000
 }
 
-fn put_pixel(fb: *mut u32, stride: usize, x: usize, y: usize, pixel: u32) {
+fn put_pixel(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, pixel: u32) {
+    let (mut x, mut y) = (x, y);
+    if ROT180.load(Ordering::SeqCst) {
+        x = sw.saturating_sub(1).saturating_sub(x);
+        y = sh.saturating_sub(1).saturating_sub(y);
+    }
     unsafe { core::ptr::write_volatile(fb.add(y * stride + x), pixel) };
 }
 
@@ -51,10 +64,10 @@ fn draw_char_8x16(
             let on = (bits & (1 << (7 - gx))) != 0;
             let color = if on { fg } else { bg };
             if py0 < sh {
-                put_pixel(fb, stride, px, py0, color);
+                put_pixel(fb, stride, sw, sh, px, py0, color);
             }
             if py0 + 1 < sh {
-                put_pixel(fb, stride, px, py0 + 1, color);
+                put_pixel(fb, stride, sw, sh, px, py0 + 1, color);
             }
         }
     }
@@ -81,12 +94,22 @@ fn draw_text_8x16(
     }
 }
 
-fn fill_rect(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, w: usize, h: usize, pixel: u32) {
+fn fill_rect(
+    fb: *mut u32,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pixel: u32,
+) {
     let x1 = (x + w).min(sw);
     let y1 = (y + h).min(sh);
     for yy in y..y1 {
         for xx in x..x1 {
-            put_pixel(fb, stride, xx, yy, pixel);
+            put_pixel(fb, stride, sw, sh, xx, yy, pixel);
         }
     }
 }
@@ -167,5 +190,94 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     let tx = x + (bar_w.saturating_sub(text_w)) / 2;
     let ty = y + bar_h + 15;
     draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, white, black);
+}
+
+/// Draw the same bar using raw framebuffer parameters.
+pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32) {
+    let fb = fb_addr as *mut u32;
+    let progress = (progress.min(100)) as usize;
+    let bar_w: usize = 400;
+    let bar_h: usize = 20;
+    let x = sw.saturating_sub(bar_w) / 2;
+    let y = sh.saturating_sub(bar_h) / 2;
+    let white: u32 = 0x00FF_FFFF;
+    let black: u32 = 0x0000_0000;
+
+    stroke_rect(
+        fb,
+        stride,
+        sw,
+        sh,
+        x.saturating_sub(2),
+        y.saturating_sub(2),
+        bar_w + 4,
+        bar_h + 4,
+        1,
+        white,
+    );
+    let fill_w = (bar_w * progress) / 100;
+    if fill_w > 0 {
+        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, white);
+    }
+    if fill_w < bar_w {
+        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, black);
+    }
+
+    // Percentage text (fixed width).
+    let p = progress as u32;
+    let mut buf = [b' '; 4];
+    buf[3] = b'%';
+    if p == 100 {
+        buf[0] = b'1';
+        buf[1] = b'0';
+        buf[2] = b'0';
+    } else if p >= 10 {
+        buf[1] = b'0' + (p / 10) as u8;
+        buf[2] = b'0' + (p % 10) as u8;
+    } else {
+        buf[2] = b'0' + p as u8;
+    }
+    let text_w = 4 * 8;
+    let tx = x + (bar_w.saturating_sub(text_w)) / 2;
+    let ty = y + bar_h + 15;
+    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, white, black);
+}
+
+/// Draw a small fault marker block at top-left, encoding `tag` and `code` as pixels.
+pub fn fault_block_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, tag: u32, code: u32) {
+    let fb = fb_addr as *mut u32;
+    let w = sw.min(64);
+    let h = sh.min(32);
+    let base_x = 8usize;
+    let base_y = 8usize;
+    let white: u32 = 0x00FF_FFFF;
+    let red: u32 = 0x0000_00FF; // best-effort visible
+    let black: u32 = 0x0000_0000;
+
+    // Background.
+    fill_rect(fb, stride, sw, sh, base_x, base_y, w - 16, h - 16, black);
+    // Border.
+    stroke_rect(fb, stride, sw, sh, base_x, base_y, w - 16, h - 16, 1, white);
+    // A red stripe.
+    fill_rect(fb, stride, sw, sh, base_x + 2, base_y + 2, 8, h - 20, red);
+
+    // Encode tag/code in a few pixels.
+    let t = tag ^ (code.rotate_left(7));
+    for i in 0..16usize {
+        let bit = (t >> i) & 1;
+        let px = base_x + 14 + i;
+        let py = base_y + 4;
+        if px < sw && py < sh {
+            put_pixel(
+                fb,
+                stride,
+                sw,
+                sh,
+                px,
+                py,
+                if bit == 1 { white } else { black },
+            );
+        }
+    }
 }
 

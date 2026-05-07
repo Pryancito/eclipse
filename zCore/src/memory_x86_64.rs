@@ -8,6 +8,7 @@ use lock::Mutex;
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
 const PAGE_BITS: usize = 12;
+const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64GiB
 
 /// Global physical frame allocator
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
@@ -26,8 +27,20 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     debug!("init_frame_allocator regions: {regions:x?}");
     let mut ba = FRAME_ALLOCATOR.lock();
     for region in regions {
-        let frame_start = phys_addr_to_frame_idx(region.start);
-        let frame_end = phys_addr_to_frame_idx(region.end - 1) + 1;
+        let start = region.start.min(MAX_MANAGED_PADDR_EXCLUSIVE);
+        let end = region.end.min(MAX_MANAGED_PADDR_EXCLUSIVE);
+        if end <= start {
+            continue;
+        }
+        if end != region.end {
+            warn!(
+                "Frame allocator: recortando region >64GiB: {:#x?} -> {:#x?}",
+                region,
+                start..end
+            );
+        }
+        let frame_start = phys_addr_to_frame_idx(start);
+        let frame_end = phys_addr_to_frame_idx(end - 1) + 1;
         if frame_start < frame_end {
             ba.insert(frame_start..frame_end);
             info!(

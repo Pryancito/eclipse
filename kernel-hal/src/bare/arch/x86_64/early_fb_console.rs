@@ -21,6 +21,7 @@ static FB_STRIDE_PIXELS: AtomicU32 = AtomicU32::new(0);
 static CUR_X: AtomicU32 = AtomicU32::new(0);
 static CUR_Y: AtomicU32 = AtomicU32::new(0);
 static CLEAR_ON_NEXT_TEXT_WRITE: AtomicBool = AtomicBool::new(false);
+static ROT180: AtomicBool = AtomicBool::new(false);
 
 const CHAR_W: u32 = 8;
 const CHAR_H: u32 = 16;
@@ -44,9 +45,14 @@ fn try_init() -> bool {
     FB_HEIGHT.store(h as u32, Ordering::SeqCst);
     // Use the actual GOP stride. Real hardware often pads rows.
     FB_STRIDE_PIXELS.store(stride as u32, Ordering::SeqCst);
+    if cfg.cmdline.contains("FB_ROT180=1") || cfg.cmdline.contains("FB_ROT180=true") || cfg.cmdline.contains("FB_ROT180=on") || cfg.cmdline.contains("FB_ROT180") {
+        ROT180.store(true, Ordering::SeqCst);
+    }
 
-    // Clear to black with opaque alpha.
-    clear_black();
+    // IMPORTANT: do NOT clear on init.
+    // We want the boot progress bar to be continuous from the bootloader (rboot)
+    // into the kernel. The kernel will request a clear later when the native
+    // graphic console takes over.
     INITED.store(true, Ordering::SeqCst);
     true
 }
@@ -75,6 +81,11 @@ fn put_pixel(x: u32, y: u32, argb: u32) {
     let h = FB_HEIGHT.load(Ordering::SeqCst);
     if base == 0 || x >= w || y >= h {
         return;
+    }
+    let (mut x, mut y) = (x, y);
+    if ROT180.load(Ordering::SeqCst) {
+        x = w - 1 - x;
+        y = h - 1 - y;
     }
     let stride = FB_STRIDE_PIXELS.load(Ordering::SeqCst) as usize;
     let idx = (y as usize) * stride + (x as usize);

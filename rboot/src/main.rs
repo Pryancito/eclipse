@@ -9,6 +9,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_efiapi)]
+#![feature(abi_x86_interrupt)]
 
 #[macro_use]
 extern crate alloc;
@@ -36,6 +37,7 @@ mod config;
 mod page_table;
 mod logo;
 mod progress;
+mod idt;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
 
@@ -52,6 +54,18 @@ fn parse_log_level_from_cmdline(cmdline: &str) -> Option<LevelFilter> {
         }
     }
     None
+}
+
+fn has_cmdline_flag(cmdline: &str, key: &str) -> bool {
+    for part in cmdline.split(':') {
+        let mut it = part.splitn(2, '=');
+        let k = it.next().unwrap_or("").trim();
+        let v = it.next().unwrap_or("").trim();
+        if k.eq_ignore_ascii_case(key) {
+            return v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+        }
+    }
+    false
 }
 
 #[entry]
@@ -72,10 +86,21 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     info!("rboot: start (log={:?})", log::max_level());
 
     let graphic_info = init_graphic(bs, config.resolution);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 10);
+    // Optional: install a minimal IDT so faults after ExitBootServices aren't silent.
+    // Enabled via `RBOOT_IDT=1` in cmdline, because some firmware/QEMU setups
+    // behave unexpectedly when replacing the UEFI IDT early.
+    if has_cmdline_flag(config.cmdline, "RBOOT_IDT") {
+        idt::init(graphic_info.mode, graphic_info.fb_addr);
+    }
+    // Boot progress is continuous across rboot (0..50) and kernel (50..100).
+    if has_cmdline_flag(config.cmdline, "FB_ROT180") {
+        progress::set_rot180(true);
+    }
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
     // Draw splash logo immediately after GOP init.
     //logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
     debug!("rboot config: {:#x?}", config);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
 
     let acpi2_addr = st
         .config_table()
@@ -98,7 +123,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         let buf = load_file(bs, &mut file);
         ElfFile::new(buf).expect("failed to parse ELF")
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 30);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 15);
     debug!("kernel elf loaded: entry={:#x}", elf.header.pt2.entry_point());
     unsafe {
         ENTRY = elf.header.pt2.entry_point() as usize;
@@ -112,7 +137,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     } else {
         (0, 0)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 40);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 20);
 
     let max_mmap_size = st.boot_services().memory_map_size().map_size;
     let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
@@ -134,8 +159,12 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             // phys_to_virt(fb_addr) would translate to an unmapped virtual
             // address and triple-fault in early_fb_console::try_init().
             .max(graphic_info.fb_addr + graphic_info.fb_size)
+            // Ensure initramfs is always within the mapped range too. Some firmware
+            // allocates LOADER_DATA at high physical addresses that are above the
+            // highest conventional RAM entry in the memory map we iterated.
+            .max(initramfs_addr + initramfs_size)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 60);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 30);
 
     let mut page_table = current_page_table();
     unsafe {
@@ -162,30 +191,32 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut page_table,
         &mut UEFIFrameAllocator(bs),
     );
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 75);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 40);
+
+    // Sanity checks while Boot Services are still alive.
+    // If these fault on real hardware, the firmware is much more likely to show a dump.
+    let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 42);
+    unsafe {
+        // 1) Confirm the entry virtual address is mapped & readable.
+        let entry_va = ENTRY as *const u8;
+        let _first_byte = core::ptr::read_volatile(entry_va);
+        // 2) Confirm the stack top page is mapped & writable.
+        let sp_probe = (stacktop - 8) as *mut u64;
+        core::ptr::write_volatile(sp_probe, 0);
+    }
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 44);
     unsafe {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
 
     //info!("exit boot services");
 
-    let mut memory_map = Vec::with_capacity(128);
-
-    // On some real machines, ExitBootServices can be the point where things go wrong.
-    // Update the bar just before attempting it so we can pinpoint the hang visually.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 85);
-    let (_rt, mmap_iter) = st
-        .exit_boot_services(image, mmap_storage)
-        .expect("Failed to exit boot services");
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 90);
-
-    for desc in mmap_iter {
-        memory_map.push(desc);
-    }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 95);
-
-    let bootinfo = BootInfo {
-        memory_map,
+    let mut memory_map = Vec::with_capacity(256);
+    // Pre-allocate BootInfo on the heap while boot services are still available.
+    // We'll fill it with the real memory map after ExitBootServices.
+    let mut bootinfo_box = Box::new(BootInfo {
+        memory_map: Vec::new(),
         physical_memory_offset: config.physical_memory_offset,
         graphic_info,
         acpi2_rsdp_addr: acpi2_addr as u64,
@@ -193,11 +224,31 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         initramfs_addr,
         initramfs_size,
         cmdline: config.cmdline,
-    };
-    let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 100);
+    });
+
+    // On some real machines, ExitBootServices can be the point where things go wrong.
+    // Update the bar just before attempting it so we can pinpoint the hang visually.
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
+    let (_rt, mmap_iter) = st
+        .exit_boot_services(image, mmap_storage)
+        .expect("Failed to exit boot services");
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
+
+    for desc in mmap_iter {
+        memory_map.push(desc);
+    }
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
+
+    bootinfo_box.memory_map = memory_map;
+    let bootinfo: &'static BootInfo = Box::leak(bootinfo_box);
+    // Hand-off point to the kernel.
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 50);
+
     unsafe {
-        jump_to_entry(&bootinfo, stacktop);
+        // If we see 51% but not the kernel marker (52%), the hang is inside the
+        // handoff asm / very first instruction fetch.
+        progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
+        jump_to_entry(bootinfo, stacktop);
     }
 }
 
@@ -280,8 +331,24 @@ unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
 
 unsafe fn jump_to_entry(bootinfo: *const BootInfo, stacktop: u64) -> ! {
     asm!(
+        // Rust/x86_64 assumes DF=0 for string ops.
+        "cld",
+        // After ExitBootServices the firmware IDT/handlers are no longer valid.
+        // Ensure we don't take any interrupt before the kernel installs its own IDT.
+        "cli",
+        // Clean frame pointer for a predictable initial state.
+        "xor rbp, rbp",
+        // NOTE: Avoid touching CET MSRs here. On many real machines, writing
+        // IA32_S_CET/IA32_U_CET without explicit support triggers #GP in firmware
+        // context. If CET/IBT turns out to be required, we should gate it behind
+        // CPUID feature detection.
+        // Set stack and call kernel entry with SysV ABI:
+        // - RDI = bootinfo
+        // - RSP 16-byte aligned before `call`
+        // Use `jmp` with ABI-correct stack alignment (rsp%16==8 at entry).
         "mov rsp, {stacktop}",
-        "call {entry}",
+        "sub rsp, 8",
+        "jmp {entry}",
         stacktop = in(reg) stacktop,
         entry   = in(reg) ENTRY,
         in("rdi") bootinfo,

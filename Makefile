@@ -2,7 +2,7 @@
 
 ARCH ?= x86_64
 XTASK ?= 1
-LOG ?= debug
+LOG ?= error
 GRAPHIC ?= on
 ACCEL ?= 1
 

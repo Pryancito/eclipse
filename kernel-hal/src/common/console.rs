@@ -65,6 +65,9 @@ cfg_if! {
 
         /// Request a one-shot clear-to-black of the graphic console before the next write.
         pub fn request_clear_graphic_on_next_write() {
+            // Finalize the boot progress indicator before switching to a cleared
+            // native graphic console.
+            crate::hal_fn::console::console_progress_early(100);
             CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
         }
 
@@ -89,7 +92,9 @@ cfg_if! {
 ///
 /// When `feature="graphic"` is disabled, this is a no-op.
 #[cfg(not(feature = "graphic"))]
-pub fn request_clear_graphic_on_next_write() {}
+pub fn request_clear_graphic_on_next_write() {
+    crate::hal_fn::console::console_progress_early(100);
+}
 
 /// Writes a string slice into the serial.
 pub fn serial_write_str(s: &str) {
