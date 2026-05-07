@@ -981,31 +981,43 @@ impl XhciInner {
 
     fn try_port_hid(&mut self, port: u8) -> DeviceResult<()> {
         let off = 0x400 + (port as usize - 1) * 0x10;
-        let m = &self.mmio;
-        let mut portsc = m.read_op(off);
+        let mut portsc = self.mmio.read_op(off);
         if (portsc & 1) == 0 {
             return Ok(());
         }
+        if self
+            .slot_port
+            .iter()
+            .enumerate()
+            .skip(1)
+            .any(|(_, &p)| p == port)
+        {
+            self.cleanup_port(port)?;
+            portsc = self.mmio.read_op(off);
+            if (portsc & 1) == 0 {
+                return Ok(());
+            }
+        }
         // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
-            m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 9));
+            self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 9));
             for _ in 0..2_000_000 {
                 spin_loop();
             }
-            portsc = m.read_op(off);
+            portsc = self.mmio.read_op(off);
         }
         let pre_spd = ((portsc >> 10) & 0x0f) as u8;
         let needs_reset = pre_spd == 0 || pre_spd <= 3;
 
         // Reset del puerto (PR=1)
         if needs_reset {
-            m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
+            self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
 
             // Robust wait: on real hardware reset can take noticeably longer than in QEMU.
             let mut success = false;
             for _ in 0..50 {
                 for _ in 0..1_000_000 {
-                    let s = m.read_op(off);
+                    let s = self.mmio.read_op(off);
                     if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
                         success = true;
                         break;
@@ -1019,24 +1031,54 @@ impl XhciInner {
         }
 
         let spd = self.wait_port_ready(off, needs_reset).unwrap_or_else(|| {
-            let s = m.read_op(off);
+            let s = self.mmio.read_op(off);
             ((s >> 10) & 0x0f) as u8
         });
-        portsc = m.read_op(off);
+        portsc = self.mmio.read_op(off);
 
         // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1
         let clr = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
-        m.write_op(off, (portsc & 0x0e00_c3e0) | clr);
+        self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | clr);
 
         // Pequeño delay tras reset para estabilización del link
         for _ in 0..500_000 {
             spin_loop();
         }
 
-        if spd == 0 {
+        if spd == 0 || (self.mmio.read_op(off) & 1) == 0 {
             return Ok(());
         }
-        self.setup_device(port, spd)
+        match self.setup_device(port, spd) {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                warn!(
+                    "[xhci] puerto {}: primer intento de enumeración falló ({:?}), reintentando",
+                    port, first_err
+                );
+                self.cleanup_port(port)?;
+                let mut s = self.mmio.read_op(off);
+                if (s & 1) == 0 {
+                    return Ok(());
+                }
+                self.mmio.write_op(off, (s & 0x0e00_c3e0) | (1 << 4));
+                for _ in 0..2_000_000 {
+                    spin_loop();
+                }
+                let spd_retry = self.wait_port_ready(off, true).unwrap_or_else(|| {
+                    s = self.mmio.read_op(off);
+                    ((s >> 10) & 0x0f) as u8
+                });
+                s = self.mmio.read_op(off);
+                self.mmio.write_op(off, (s & 0x0e00_c3e0) | clr);
+                for _ in 0..500_000 {
+                    spin_loop();
+                }
+                if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
+                    return Ok(());
+                }
+                self.setup_device(port, spd_retry)
+            }
+        }
     }
 
     fn setup_device(&mut self, port: u8, speed: u8) -> DeviceResult<()> {
