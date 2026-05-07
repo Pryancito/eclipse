@@ -948,38 +948,80 @@ impl XhciInner {
         }
     }
 
+    fn wait_port_ready(&self, off: usize, require_pr_clear: bool) -> Option<u8> {
+        let m = &self.mmio;
+        // Require multiple consecutive "ready" samples to filter transient link-state flaps.
+        const STABLE_SAMPLES: u32 = 256;
+        let mut stable = 0u32;
+        for _ in 0..8_000_000 {
+            let s = m.read_op(off);
+            let ccs = (s & 1) != 0;
+            let ped = (s & (1 << 1)) != 0;
+            let pr = (s & (1 << 4)) != 0;
+            let spd = ((s >> 10) & 0x0f) as u8;
+            let ready = ccs && spd != 0 && (ped || spd >= 4) && (!require_pr_clear || !pr);
+            if ready {
+                stable = stable.saturating_add(1);
+                if stable >= STABLE_SAMPLES {
+                    return Some(spd);
+                }
+            } else {
+                stable = 0;
+            }
+            spin_loop();
+        }
+        None
+    }
+
     fn try_port_hid(&mut self, port: u8) -> DeviceResult<()> {
         let off = 0x400 + (port as usize - 1) * 0x10;
         let m = &self.mmio;
-        if m.read_op(off) & 1 == 0 {
+        let mut portsc = m.read_op(off);
+        if (portsc & 1) == 0 {
             return Ok(());
         }
-        let mut portsc = m.read_op(off);
-        // Reset del puerto (PR=1)
-        m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
-        
-        // Espera robusta: en hardware real el reset puede tardar > 20ms.
-        // QEMU es instantáneo, pero aquí pecamos de precavidos.
-        let mut success = false;
-        for _ in 0..10 { // 10 reintentos de 1M ciclos (~100ms total)
-            for _ in 0..1_000_000 {
-                let s = m.read_op(off);
-                if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
-                    success = true;
-                    break;
-                }
+        // Ensure port power if the controller reports it as off.
+        if (portsc & (1 << 9)) == 0 {
+            m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 9));
+            for _ in 0..2_000_000 {
                 spin_loop();
             }
-            if success { break; }
+            portsc = m.read_op(off);
         }
-        
+        let pre_spd = ((portsc >> 10) & 0x0f) as u8;
+        let needs_reset = pre_spd == 0 || pre_spd <= 3;
+
+        // Reset del puerto (PR=1)
+        if needs_reset {
+            m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
+
+            // Robust wait: on real hardware reset can take noticeably longer than in QEMU.
+            let mut success = false;
+            for _ in 0..50 {
+                for _ in 0..1_000_000 {
+                    let s = m.read_op(off);
+                    if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
+                        success = true;
+                        break;
+                    }
+                    spin_loop();
+                }
+                if success {
+                    break;
+                }
+            }
+        }
+
+        let spd = self.wait_port_ready(off, needs_reset).unwrap_or_else(|| {
+            let s = m.read_op(off);
+            ((s >> 10) & 0x0f) as u8
+        });
         portsc = m.read_op(off);
-        let spd = ((portsc >> 10) & 0x0f) as u8;
-        
+
         // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1
         let clr = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
         m.write_op(off, (portsc & 0x0e00_c3e0) | clr);
-        
+
         // Pequeño delay tras reset para estabilización del link
         for _ in 0..500_000 { spin_loop(); }
 
