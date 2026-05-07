@@ -1064,14 +1064,14 @@ impl XhciInner {
         ic.write_u32(s0 + 4, (port as u32) << 16);
         let ep0 = 2 * csz;
         // xHCI PORTSC speed: 1=FS 2=LS 3=HS 4=SS Gen1 5=SS Gen2 …
-        // For FS devices the default control pipe must start at 8 bytes until the
+        // FS/LS devices must start the default control pipe at 8 bytes until the
         // device descriptor tells us the real bMaxPacketSize0. Using 64 here breaks
-        // enumeration for common HID keyboards/mice that come up as full-speed.
+        // enumeration for common HID keyboards/mice that come up on USB 1.x/2.0.
         let mps: u32 = match speed {
             1 | 2 => 8,
             3 => 64,
-            4 | 5 | 6 => 512,
-            _ => 8,
+            4..=15 => 512,
+            _ => return Err(DeviceError::InvalidParam),
         };
         ic.write_u32(ep0 + 4, (3 << 1) | EP_TYPE_CONTROL | (mps << 16));
         let ep0_ring = XferRing::new(32)?;
