@@ -97,8 +97,14 @@ impl INode for ProcRootINode {
             "." => Ok(Arc::new(ProcRootINode)),
             ".." => Ok(Arc::new(ProcRootINode)),
             "net" => Ok(Arc::new(ProcNetDirINode)),
-            "meminfo" => Ok(Arc::new(Pseudo::new(&proc_meminfo_content(), FileType::File))),
-            "uptime" => Ok(Arc::new(Pseudo::new(&proc_uptime_content(), FileType::File))),
+            "meminfo" => Ok(Arc::new(Pseudo::new(
+                &proc_meminfo_content(),
+                FileType::File,
+            ))),
+            "uptime" => Ok(Arc::new(Pseudo::new(
+                &proc_uptime_content(),
+                FileType::File,
+            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -164,7 +170,10 @@ impl INode for ProcNetDirINode {
         match name {
             "." => Ok(Arc::new(ProcNetDirINode)),
             ".." => Ok(Arc::new(ProcRootINode)),
-            "dev" => Ok(Arc::new(Pseudo::new(&proc_net_dev_content(), FileType::File))),
+            "dev" => Ok(Arc::new(Pseudo::new(
+                &proc_net_dev_content(),
+                FileType::File,
+            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -193,23 +202,13 @@ fn proc_net_dev_content() -> String {
 
     let ifaces = drivers::all_net().as_vec();
     if ifaces.is_empty() {
-        let _ = writeln!(
-            s,
-            "{:>6}: {}",
-            "lo",
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        );
+        let _ = writeln!(s, "{:>6}: {}", "lo", "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
         return s;
     }
 
     for iface in ifaces.iter() {
         let name = iface.get_ifname();
-        let _ = writeln!(
-            s,
-            "{:>6}: {}",
-            name,
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        );
+        let _ = writeln!(s, "{:>6}: {}", name, "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
     }
     s
 }
@@ -233,4 +232,3 @@ fn proc_meminfo_content() -> String {
     let _ = writeln!(s, "Cached:          0 kB");
     s
 }
-

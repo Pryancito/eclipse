@@ -39,7 +39,7 @@ impl LinuxRootfs {
         dir::clear(&dir).unwrap();
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&lib).unwrap();
-        
+
         let apk = self.apk(&musl);
         if apk.is_file() {
             fs::copy(&apk, bin.join("apk")).unwrap();
@@ -54,7 +54,11 @@ impl LinuxRootfs {
             fs::write(etc_apk.join("world"), "").unwrap();
 
             // Add DNS resolution
-            fs::write(etc.join("resolv.conf"), "nameserver 8.8.8.8\nnameserver 1.1.1.1\n").unwrap();
+            fs::write(
+                etc.join("resolv.conf"),
+                "nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+            )
+            .unwrap();
             let lib_apk = dir.join("lib").join("apk");
             fs::create_dir_all(&lib_apk).unwrap();
             let lib_apk_db = lib_apk.join("db");
@@ -69,7 +73,7 @@ impl LinuxRootfs {
             let var_cache_apk = dir.join("var").join("cache").join("apk");
             fs::create_dir_all(&var_cache_apk).unwrap();
         }
-        
+
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
         // 拷贝 libc.so
@@ -84,8 +88,8 @@ impl LinuxRootfs {
         const SH: &[&str] = &[
             "cat", "cp", "echo", "false", "grep", "gzip", "kill", "ln", "ls", "mkdir", "mv",
             "pidof", "ping", "ping6", "printenv", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
-            "stat", "tar", "touch", "true", "uname", "usleep", "watch",
-            "ifconfig", "route", "udhcpc",
+            "stat", "tar", "touch", "true", "uname", "usleep", "watch", "ifconfig", "route",
+            "udhcpc",
         ];
         let bin = dir.join("bin");
         for sh in SH {
@@ -169,12 +173,12 @@ impl LinuxRootfs {
             .arg("-C")
             .arg("bld-eclipse")
             .status();
-        
+
         if !res.success() {
             println!("Initial compile failed, trying to re-setup meson...");
             dir::rm(&bld_dir).unwrap();
             let cross_file = self.generate_apk_cross_file(musl);
-            
+
             Ext::new("meson")
                 .current_dir(&apk_dir)
                 .arg("setup")
@@ -210,12 +214,12 @@ impl LinuxRootfs {
         let musl_bin = musl.canonicalize().unwrap().join("bin");
         let arch = self.0.name();
         let cpu_family = if arch == "x86_64" { "x86_64" } else { arch };
-        
+
         let zlib_path = PROJECT_DIR.join("tools").join("zlib");
         let mbedtls_path = PROJECT_DIR.join("tools").join("mbedtls");
-        
+
         let content = format!(
-r#"[binaries]
+            r#"[binaries]
 c = '{bin}/{arch}-linux-musl-gcc'
 cpp = '{bin}/{arch}-linux-musl-g++'
 ar = '{bin}/{arch}-linux-musl-gcc-ar'
@@ -234,7 +238,7 @@ c_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
 cpp_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
 c_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
 cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
-"# ,
+"#,
             bin = musl_bin.display(),
             arch = arch,
             cpu_family = cpu_family,

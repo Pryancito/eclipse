@@ -15,9 +15,7 @@ use crate::{mem::phys_to_virt, PhysAddr, KCONFIG, PAGE_SIZE};
 fn memory_type_is_usable_ram(ty: MemoryType) -> bool {
     matches!(
         ty,
-        MemoryType::CONVENTIONAL
-            | MemoryType::BOOT_SERVICES_CODE
-            | MemoryType::BOOT_SERVICES_DATA
+        MemoryType::CONVENTIONAL | MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA
     )
 }
 

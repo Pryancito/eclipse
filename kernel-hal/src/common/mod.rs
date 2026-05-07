@@ -6,9 +6,9 @@ pub(super) mod vdso;
 pub(super) mod vm;
 
 pub mod addr;
-pub mod console;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
+pub mod console;
 pub mod context;
 pub mod ipi;
 pub mod user;

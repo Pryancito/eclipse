@@ -179,7 +179,8 @@ pub trait DisplayScheme: Scheme {
         if x >= info.width || y >= info.height {
             return;
         }
-        let offset = (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
+        let offset =
+            (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
         if offset < info.fb_size {
             unsafe { self.fb().write_color(offset, color, info.format) };
         }

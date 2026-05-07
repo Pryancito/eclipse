@@ -2,8 +2,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
-use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
+use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::DeviceResult;
 use lock::Mutex;
 
@@ -12,7 +12,7 @@ mod regs {
     pub const NV_PMC_BOOT_0: u32 = 0x0000_0000;
     pub const PMC_BOOT0_CHIP_ID_SHIFT: u32 = 20;
     pub const PMC_BOOT0_CHIP_ID_MASK: u32 = 0xFFF;
-    
+
     pub const PMC_BOOT0_CHIPID_TURING_MIN: u32 = 0x160;
     pub const PMC_BOOT0_CHIPID_TURING_MAX: u32 = 0x16F;
     pub const PMC_BOOT0_CHIPID_AMPERE_MIN: u32 = 0x170;
@@ -46,7 +46,12 @@ struct BootFbInfo {
 }
 
 pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
-    *BOOT_FB_INFO.lock() = Some(BootFbInfo { _phys: phys, width, height, pitch });
+    *BOOT_FB_INFO.lock() = Some(BootFbInfo {
+        _phys: phys,
+        width,
+        height,
+        pitch,
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,18 +98,20 @@ impl NvidiaVramAllocator {
         let num_pages = (size + 4095) / 4096;
         let align_pages = (align.max(4096) / 4096).max(1);
         let total_bits = (self.total_size / 4096) as usize;
-        
+
         let mut count = 0;
         let mut start_bit = 0;
-        
+
         for bit in 0..total_bits {
             let uidx = bit / 64;
             let ubit = bit % 64;
             let is_free = (self.bitmap[uidx] & (1 << ubit)) == 0;
-            
+
             if is_free {
                 if count == 0 {
-                    if bit % align_pages != 0 { continue; }
+                    if bit % align_pages != 0 {
+                        continue;
+                    }
                     start_bit = bit;
                 }
                 count += 1;
@@ -124,7 +131,9 @@ impl NvidiaVramAllocator {
 
     fn free(&mut self, phys_addr: u64, size: usize) {
         let offset = phys_addr.saturating_sub(self.base_phys);
-        if offset >= self.total_size { return; }
+        if offset >= self.total_size {
+            return;
+        }
         let start_bit = (offset / 4096) as usize;
         let num_pages = (size + 4095) / 4096;
         for i in 0..num_pages {
@@ -153,16 +162,14 @@ impl NvidiaGpu {
         // than the visible framebuffer and would produce a bogus inferred pitch.
         const MAX_PITCH_PADDING_PIXELS: usize = 4096;
         let bytes_per_pixel = self.info.format.bytes() as usize;
-        
+
         // If fb_size is suspiciously large (entire BAR), don't infer pitch from it.
         // A typical 1080p framebuffer is ~8MB. BARs are usually 256MB+.
         if self.info.fb_size >= 16 * 1024 * 1024 {
-             return width;
+            return width;
         }
 
-        let visible_size = width
-            .saturating_mul(height)
-            .saturating_mul(bytes_per_pixel);
+        let visible_size = width.saturating_mul(height).saturating_mul(bytes_per_pixel);
 
         if self.info.fb_size >= visible_size {
             let inferred = self.info.fb_size / height / bytes_per_pixel;
@@ -184,12 +191,18 @@ impl NvidiaGpu {
         default_height: u32,
     ) -> DeviceResult<Self> {
         // 1. Identify Architecture
-        let boot0 = unsafe { core::ptr::read_volatile((bar0 + regs::NV_PMC_BOOT_0 as usize) as *const u32) };
+        let boot0 = unsafe {
+            core::ptr::read_volatile((bar0 + regs::NV_PMC_BOOT_0 as usize) as *const u32)
+        };
         let arch = arch_from_pmc_boot0(boot0);
-        
+
         // 2. Identify Model using PCI ID + architecture cross-check
         let (pci_arch, gpu_model, _vram_mb_pci) = identify_gpu(device_id);
-        let arch = if arch == NvidiaArchitecture::Unknown { pci_arch } else { arch };
+        let arch = if arch == NvidiaArchitecture::Unknown {
+            pci_arch
+        } else {
+            arch
+        };
 
         // 3. Read VRAM Size
         let vram_size_mb = unsafe {
@@ -217,32 +230,44 @@ impl NvidiaGpu {
             // but since we only have fb_vaddr here, we might need more info.
             // However, we can use a heuristic: if we have 2 GPUs, and boot_info.phys
             // is within the range of this GPU's BAR1, then this is the primary GPU.
-            
+
             // For now, let's assume the caller will set the correct resolution
             // if it knows it. But if it doesn't, we can try to match.
             // Since we don't have the phys address of fb_vaddr here easily
             // without a page table lookup, let's rely on the fact that
             // KCONFIG info is usually more accurate than hardcoded 1920x1080.
-            
-            // If the default provided is the "magic" 1920x1080 from pci.rs, 
+
+            // If the default provided is the "magic" 1920x1080 from pci.rs,
             // and we have boot_info, use boot_info.
             if default_width == 1920 && default_height == 1080 {
                 w = boot_info.width;
                 h = boot_info.height;
                 pitch_override = Some(boot_info.pitch);
-                
+
                 // If the boot phys is within this aperture, we might need to adjust fb_vaddr
                 // But usually fb_vaddr is the start of the BAR. GOP might be offset.
                 // In eclipse-old: fb_phys = boot_info.phys; offset = fb_phys - bar1_phys;
                 // Here we'll just assume the pitch is the main fix needed for now.
-                log::info!("[NVIDIA] Inheriting boot resolution: {}x{} (pitch: {})", w, h, boot_info.pitch);
+                log::info!(
+                    "[NVIDIA] Inheriting boot resolution: {}x{} (pitch: {})",
+                    w,
+                    h,
+                    boot_info.pitch
+                );
             }
         }
 
         let temperature = read_temperature(bar0);
 
-        log::warn!("[NVIDIA] Detected {} ({:?}), VRAM: {} MB, Temp: {:?}°C, Res: {}x{}", 
-            gpu_model, arch, vram_size_mb, temperature, w, h);
+        log::warn!(
+            "[NVIDIA] Detected {} ({:?}), VRAM: {} MB, Temp: {:?}°C, Res: {}x{}",
+            gpu_model,
+            arch,
+            vram_size_mb,
+            temperature,
+            w,
+            h
+        );
 
         let pitch = pitch_override.unwrap_or(w * 4);
 
@@ -264,13 +289,22 @@ impl NvidiaGpu {
             pitch_override,
             _bar0: bar0,
             _bar1: final_fb_vaddr,
-            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(fb_vaddr as u64, fb_size as u64))),
+            vram_allocator: Mutex::new(Some(NvidiaVramAllocator::new(
+                fb_vaddr as u64,
+                fb_size as u64,
+            ))),
         })
     }
 
-    pub fn architecture(&self) -> NvidiaArchitecture { self.architecture }
-    pub fn model(&self) -> &'static str { self.gpu_model }
-    pub fn vram_size_mb(&self) -> u32 { self.vram_size_mb }
+    pub fn architecture(&self) -> NvidiaArchitecture {
+        self.architecture
+    }
+    pub fn model(&self) -> &'static str {
+        self.gpu_model
+    }
+    pub fn vram_size_mb(&self) -> u32 {
+        self.vram_size_mb
+    }
     pub fn temperature(&self) -> Option<i32> {
         read_temperature(self._bar0)
     }
@@ -282,7 +316,9 @@ impl NvidiaGpu {
         let y = y.min(height);
         let w = w.min(width.saturating_sub(x));
         let h = h.min(height.saturating_sub(y));
-        if w == 0 || h == 0 { return; }
+        if w == 0 || h == 0 {
+            return;
+        }
 
         let ptr = self.info.fb_base_vaddr as *mut u32;
         let pitch_u32 = self.pitch_pixels();
@@ -300,9 +336,15 @@ impl NvidiaGpu {
     pub fn blit_rect(&self, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32, w: u32, h: u32) {
         let width = self.info.width;
         let height = self.info.height;
-        let w = w.min(width.saturating_sub(src_x)).min(width.saturating_sub(dst_x));
-        let h = h.min(height.saturating_sub(src_y)).min(height.saturating_sub(dst_y));
-        if w == 0 || h == 0 { return; }
+        let w = w
+            .min(width.saturating_sub(src_x))
+            .min(width.saturating_sub(dst_x));
+        let h = h
+            .min(height.saturating_sub(src_y))
+            .min(height.saturating_sub(dst_y));
+        if w == 0 || h == 0 {
+            return;
+        }
 
         let ptr = self.info.fb_base_vaddr as *mut u32;
         let pitch_u32 = self.pitch_pixels();
@@ -316,7 +358,10 @@ impl NvidiaGpu {
                 let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
                 unsafe {
                     for i in (0..w as usize).rev() {
-                        core::ptr::write(ptr.add(dst_row + i), core::ptr::read(ptr.add(src_row + i)));
+                        core::ptr::write(
+                            ptr.add(dst_row + i),
+                            core::ptr::read(ptr.add(src_row + i)),
+                        );
                     }
                 }
             }
@@ -344,13 +389,20 @@ fn arch_from_pmc_boot0(boot0: u32) -> NvidiaArchitecture {
     let chip_id = (boot0 >> regs::PMC_BOOT0_CHIP_ID_SHIFT) & regs::PMC_BOOT0_CHIP_ID_MASK;
     if chip_id >= regs::PMC_BOOT0_CHIPID_BLACKWELL_MIN {
         NvidiaArchitecture::Blackwell
-    } else if chip_id >= regs::PMC_BOOT0_CHIPID_HOPPER_MIN && chip_id <= regs::PMC_BOOT0_CHIPID_HOPPER_MAX {
+    } else if chip_id >= regs::PMC_BOOT0_CHIPID_HOPPER_MIN
+        && chip_id <= regs::PMC_BOOT0_CHIPID_HOPPER_MAX
+    {
         NvidiaArchitecture::Hopper
-    } else if chip_id >= regs::PMC_BOOT0_CHIPID_ADA_MIN && chip_id <= regs::PMC_BOOT0_CHIPID_ADA_MAX {
+    } else if chip_id >= regs::PMC_BOOT0_CHIPID_ADA_MIN && chip_id <= regs::PMC_BOOT0_CHIPID_ADA_MAX
+    {
         NvidiaArchitecture::AdaLovelace
-    } else if chip_id >= regs::PMC_BOOT0_CHIPID_AMPERE_MIN && chip_id <= regs::PMC_BOOT0_CHIPID_AMPERE_MAX {
+    } else if chip_id >= regs::PMC_BOOT0_CHIPID_AMPERE_MIN
+        && chip_id <= regs::PMC_BOOT0_CHIPID_AMPERE_MAX
+    {
         NvidiaArchitecture::Ampere
-    } else if chip_id >= regs::PMC_BOOT0_CHIPID_TURING_MIN && chip_id <= regs::PMC_BOOT0_CHIPID_TURING_MAX {
+    } else if chip_id >= regs::PMC_BOOT0_CHIPID_TURING_MIN
+        && chip_id <= regs::PMC_BOOT0_CHIPID_TURING_MAX
+    {
         NvidiaArchitecture::Turing
     } else {
         NvidiaArchitecture::Unknown
@@ -358,8 +410,11 @@ fn arch_from_pmc_boot0(boot0: u32) -> NvidiaArchitecture {
 }
 
 fn read_temperature(bar0: usize) -> Option<i32> {
-    let raw = unsafe { core::ptr::read_volatile((bar0 + regs::NV_THERM_TEMP as usize) as *const u32) };
-    if raw == 0 || raw == 0xFFFF_FFFF { return None; }
+    let raw =
+        unsafe { core::ptr::read_volatile((bar0 + regs::NV_THERM_TEMP as usize) as *const u32) };
+    if raw == 0 || raw == 0xFFFF_FFFF {
+        return None;
+    }
     let raw9 = raw & regs::NV_THERM_TEMP_VALUE_MASK;
     if (raw9 & regs::NV_THERM_TEMP_VALUE_SIGN_BIT) != 0 {
         Some((raw9 as i32) - 512)
@@ -369,13 +424,18 @@ fn read_temperature(bar0: usize) -> Option<i32> {
 }
 
 unsafe fn probe_resolution_from_bar0(bar0: usize) -> Option<(u32, u32)> {
-    let reg = core::ptr::read_volatile((bar0 + regs::NV50_HEAD0_RASTER_SIZE as usize) as *const u32);
+    let reg =
+        core::ptr::read_volatile((bar0 + regs::NV50_HEAD0_RASTER_SIZE as usize) as *const u32);
     let (w, h) = (reg & 0xFFFF, reg >> 16);
-    if w > 0 && h > 0 && w <= 16384 && h <= 16384 { return Some((w, h)); }
+    if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+        return Some((w, h));
+    }
 
     let reg = core::ptr::read_volatile((bar0 + regs::NV40_PCRTC_HEAD0_SIZE as usize) as *const u32);
     let (w, h) = (reg & 0xFFFF, reg >> 16);
-    if w > 0 && h > 0 && w <= 16384 && h <= 16384 { return Some((w, h)); }
+    if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+        return Some((w, h));
+    }
     None
 }
 
@@ -388,15 +448,19 @@ fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32) {
         0x2B89 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5080", 16384),
         0x2C00 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070 Ti", 16384),
         0x2C20 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070", 12288),
-        
+
         // Ada Lovelace
         0x2684 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090", 24576),
         0x2704 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080", 16384),
-        0x2782 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti", 12288),
+        0x2782 => (
+            NvidiaArchitecture::AdaLovelace,
+            "GeForce RTX 4070 Ti",
+            12288,
+        ),
         0x2786 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070", 12288),
         0x2803 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Ti", 8192),
         0x2882 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060", 8192),
-        
+
         // Ampere
         0x2204 => (NvidiaArchitecture::Ampere, "GeForce RTX 3090", 24576),
         0x2206 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080", 10240),
@@ -404,7 +468,7 @@ fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32) {
         0x2489 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 Ti", 8192),
         0x2503 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060", 12288),
         0x2571 => (NvidiaArchitecture::Ampere, "GeForce RTX 3050", 8192),
-        
+
         // Turing
         0x1E02 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Ti", 11264),
         0x1E04 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Super", 8192),
@@ -417,20 +481,26 @@ fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32) {
         0x1F82 => (NvidiaArchitecture::Turing, "GeForce GTX 1660", 6144),
         0x1F91 => (NvidiaArchitecture::Turing, "GeForce GTX 1650 Super", 4096),
         0x1F99 => (NvidiaArchitecture::Turing, "GeForce GTX 1650", 4096),
-        
+
         _ => (NvidiaArchitecture::Unknown, "Unknown NVIDIA GPU", 0),
     }
 }
 
 impl Scheme for NvidiaGpu {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn handle_irq(&self, _irq_num: usize) {}
 }
 
 impl DisplayScheme for NvidiaGpu {
-    fn info(&self) -> DisplayInfo { self.info }
+    fn info(&self) -> DisplayInfo {
+        self.info
+    }
     fn fb(&self) -> FrameBuffer<'_> {
-        unsafe { FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size) }
+        unsafe {
+            FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
+        }
     }
 }
 
@@ -444,7 +514,9 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
-    fn import_buffer(&self, _handle: GemHandle) -> bool { true }
+    fn import_buffer(&self, _handle: GemHandle) -> bool {
+        true
+    }
 
     fn free_buffer(&self, handle: GemHandle) {
         if let Some(ref mut a) = *self.vram_allocator.lock() {
@@ -456,7 +528,9 @@ impl DrmScheme for NvidiaGpu {
         Some(handle_id)
     }
 
-    fn page_flip(&self, _fb_id: u32) -> bool { true }
+    fn page_flip(&self, _fb_id: u32) -> bool {
+        true
+    }
 
     fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, flags: u32) -> bool {
         const DRM_CURSOR_MOVE: u32 = 0x02;
@@ -467,7 +541,9 @@ impl DrmScheme for NvidiaGpu {
         false
     }
 
-    fn wait_vblank(&self, _crtc_id: u32) -> bool { true }
+    fn wait_vblank(&self, _crtc_id: u32) -> bool {
+        true
+    }
 
     fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         (Vec::new(), alloc::vec![2001], alloc::vec![1001])
@@ -475,54 +551,95 @@ impl DrmScheme for NvidiaGpu {
 
     fn get_connector(&self, id: u32) -> Option<DrmConnector> {
         if id == 1001 {
-            Some(DrmConnector { id, connected: true, mm_width: 0, mm_height: 0 })
-        } else { None }
+            Some(DrmConnector {
+                id,
+                connected: true,
+                mm_width: 0,
+                mm_height: 0,
+            })
+        } else {
+            None
+        }
     }
 
     fn get_crtc(&self, id: u32) -> Option<DrmCrtc> {
         if id == 2001 {
-            Some(DrmCrtc { id, fb_id: 0, x: 0, y: 0 })
-        } else { None }
+            Some(DrmCrtc {
+                id,
+                fb_id: 0,
+                x: 0,
+                y: 0,
+            })
+        } else {
+            None
+        }
     }
 
     fn get_plane(&self, id: u32) -> Option<DrmPlane> {
         if id == 3001 {
-            Some(DrmPlane { id, crtc_id: 2001, fb_id: 0, possible_crtcs: 1, plane_type: 1 })
-        } else { None }
+            Some(DrmPlane {
+                id,
+                crtc_id: 2001,
+                fb_id: 0,
+                possible_crtcs: 1,
+                plane_type: 1,
+            })
+        } else {
+            None
+        }
     }
 
-    fn get_planes(&self) -> Vec<u32> { alloc::vec![3001] }
+    fn get_planes(&self) -> Vec<u32> {
+        alloc::vec![3001]
+    }
 
-    fn set_plane(&self, _plane_id: u32, _crtc_id: u32, _fb_id: u32, _x: i32, _y: i32, _w: u32, _h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
+    fn set_plane(
+        &self,
+        _plane_id: u32,
+        _crtc_id: u32,
+        _fb_id: u32,
+        _x: i32,
+        _y: i32,
+        _w: u32,
+        _h: u32,
+        _src_x: u32,
+        _src_y: u32,
+        _src_w: u32,
+        _src_h: u32,
+    ) -> bool {
         true
     }
-    
+
     fn ioctl(&self, request: u32, arg: usize) -> Result<usize, i32> {
         match request {
-            0x10DE0001 => { // Get Temperature
+            0x10DE0001 => {
+                // Get Temperature
                 if let Some(t) = self.temperature() {
                     Ok(t as usize)
                 } else {
                     Err(22) // EINVAL
                 }
-            },
-            0x10DE0002 => { // Get VRAM size MB
+            }
+            0x10DE0002 => {
+                // Get VRAM size MB
                 Ok(self.vram_size_mb as usize)
-            },
-            0x10DE0010 => { // Fill Rect (arg is pointer to [u32; 5]: x, y, w, h, color)
+            }
+            0x10DE0010 => {
+                // Fill Rect (arg is pointer to [u32; 5]: x, y, w, h, color)
                 let p = arg as *const u32;
                 unsafe {
                     self.fill_rect(*p, *p.add(1), *p.add(2), *p.add(3), *p.add(4));
                 }
                 Ok(0)
-            },
-            0x10DE0011 => { // Blit Rect (arg is pointer to [u32; 6]: sx, sy, dx, dy, w, h)
+            }
+            0x10DE0011 => {
+                // Blit Rect (arg is pointer to [u32; 6]: sx, sy, dx, dy, w, h)
                 let p = arg as *const u32;
                 unsafe {
                     self.blit_rect(*p, *p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5));
                 }
                 Ok(0)
-            },
+            }
             _ => Err(38), // ENOSYS
         }
     }

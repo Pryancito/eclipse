@@ -49,7 +49,9 @@ impl Syscall<'_> {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8))
             }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
-            (Domain::AF_NETLINK, SocketType::SOCK_RAW, _) => Arc::new(NetlinkSocketState::default()),
+            (Domain::AF_NETLINK, SocketType::SOCK_RAW, _) => {
+                Arc::new(NetlinkSocketState::default())
+            }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
             | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => Arc::new(PacketSocketState::new()),

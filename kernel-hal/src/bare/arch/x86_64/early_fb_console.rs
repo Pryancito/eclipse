@@ -40,12 +40,19 @@ fn try_init() -> bool {
 
     let (w, h) = cfg.fb_mode.resolution();
     let stride = cfg.fb_mode.stride();
-    FB_BASE.store(crate::mem::phys_to_virt(cfg.fb_addr as usize), Ordering::SeqCst);
+    FB_BASE.store(
+        crate::mem::phys_to_virt(cfg.fb_addr as usize),
+        Ordering::SeqCst,
+    );
     FB_WIDTH.store(w as u32, Ordering::SeqCst);
     FB_HEIGHT.store(h as u32, Ordering::SeqCst);
     // Use the actual GOP stride. Real hardware often pads rows.
     FB_STRIDE_PIXELS.store(stride as u32, Ordering::SeqCst);
-    if cfg.cmdline.contains("FB_ROT180=1") || cfg.cmdline.contains("FB_ROT180=true") || cfg.cmdline.contains("FB_ROT180=on") || cfg.cmdline.contains("FB_ROT180") {
+    if cfg.cmdline.contains("FB_ROT180=1")
+        || cfg.cmdline.contains("FB_ROT180=true")
+        || cfg.cmdline.contains("FB_ROT180=on")
+        || cfg.cmdline.contains("FB_ROT180")
+    {
         ROT180.store(true, Ordering::SeqCst);
     }
 
@@ -123,7 +130,13 @@ fn stroke_rect(x: u32, y: u32, w: u32, h: u32, thickness: u32, argb: u32) {
     if h > thickness * 2 {
         fill_rect(x, y + thickness, thickness, h - thickness * 2, argb);
         if w > thickness {
-            fill_rect(x + w - thickness, y + thickness, thickness, h - thickness * 2, argb);
+            fill_rect(
+                x + w - thickness,
+                y + thickness,
+                thickness,
+                h - thickness * 2,
+                argb,
+            );
         }
     }
 }
@@ -230,7 +243,14 @@ pub fn draw_progress_bar(progress: u32) {
     let y = sh.saturating_sub(bar_h) / 2;
 
     // Outer border (1px) with 2px margin like the reference.
-    stroke_rect(x.saturating_sub(2), y.saturating_sub(2), bar_w + 4, bar_h + 4, 1, 0xFFFF_FFFF);
+    stroke_rect(
+        x.saturating_sub(2),
+        y.saturating_sub(2),
+        bar_w + 4,
+        bar_h + 4,
+        1,
+        0xFFFF_FFFF,
+    );
 
     // Inner fill.
     let fill_w = (bar_w * progress) / 100;

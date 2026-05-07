@@ -308,7 +308,7 @@ impl FileLike for File {
                 Ok(vmo)
             }
             FileType::CharDevice => {
-                use super::devfs::{FbDev, DrmDev};
+                use super::devfs::{DrmDev, FbDev};
                 if let Some(fbdev) = inner.inode.downcast_ref::<FbDev>() {
                     fbdev.get_vmo(offset, len)
                 } else if let Some(drmdev) = inner.inode.downcast_ref::<DrmDev>() {

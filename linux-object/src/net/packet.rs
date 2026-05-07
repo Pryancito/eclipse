@@ -41,7 +41,10 @@ impl Socket for PacketSocketState {
         };
         match dev.recv(data) {
             Ok(n) if n > 0 => (Ok(n), Endpoint::Ip(smoltcp::wire::IpEndpoint::UNSPECIFIED)),
-            _ => (Err(LxError::EAGAIN), Endpoint::Ip(smoltcp::wire::IpEndpoint::UNSPECIFIED)),
+            _ => (
+                Err(LxError::EAGAIN),
+                Endpoint::Ip(smoltcp::wire::IpEndpoint::UNSPECIFIED),
+            ),
         }
     }
 
@@ -122,4 +125,3 @@ impl FileLike for PacketSocketState {
         Ok(self)
     }
 }
-
