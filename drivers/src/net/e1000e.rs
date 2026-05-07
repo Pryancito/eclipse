@@ -92,6 +92,8 @@ const TCTL_COLD_64:  u32 = 0x40 << 12;
 const TX_CMD_EOP:    u8  = 1 << 0;
 const TX_CMD_IFCS:   u8  = 1 << 1;
 const TX_CMD_RS:     u8  = 1 << 3;
+const RX_STATUS_DD:  u8  = 1 << 0;
+const RX_STATUS_EOP: u8  = 1 << 1;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
@@ -130,6 +132,7 @@ extern "C" {
     fn drivers_dma_alloc(pages: usize) -> usize;  // returns phys addr
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: usize) -> usize;
+    fn drivers_virt_to_phys(vaddr: usize) -> usize;
 }
 
 fn alloc_dma_pages(pages: usize) -> (usize /*virt*/, usize /*phys*/) {
@@ -139,7 +142,7 @@ fn alloc_dma_pages(pages: usize) -> (usize /*virt*/, usize /*phys*/) {
 }
 
 fn dealloc_dma_pages(virt: usize, pages: usize) {
-    let phys = unsafe { drivers_phys_to_virt(virt) }; // symmetric
+    let phys = unsafe { drivers_virt_to_phys(virt) };
     unsafe { drivers_dma_dealloc(phys, pages) };
 }
 
@@ -183,6 +186,15 @@ struct E1000eHw {
 }
 
 impl E1000eHw {
+    fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
+        desc.status = 0;
+        desc.errors = 0;
+        desc.addr = self.rx_bufs_pa[idx] as u64;
+        fence(Ordering::SeqCst);
+        self.rx_tail = idx;
+        unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
+    }
+
     // -----------------------------------------------------------------------
     // NVM word read via EERD (works on all e1000e silicon)
     // -----------------------------------------------------------------------
@@ -224,7 +236,7 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     // Full hardware reset + init
     // -----------------------------------------------------------------------
-    unsafe fn reset_and_init(&mut self) {
+    unsafe fn reset_and_init(&mut self) -> DeviceResult {
         // 1. Disable all interrupts before reset
         mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
         // Flush with a read (device still alive here)
@@ -253,7 +265,7 @@ impl E1000eHw {
         }
         if !ready {
             warn!("[e1000e] device did not respond after reset — aborting init");
-            return;
+            return Err(DeviceError::IoError);
         }
 
         // 4. Disable interrupts again (RST clears IMC)
@@ -321,6 +333,7 @@ impl E1000eHw {
             status,
             if status & STATUS_LU != 0 { "UP" } else { "DOWN" }
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -333,7 +346,12 @@ impl E1000eHw {
 
         fence(Ordering::SeqCst);
         // Status bit 0 = DD (Descriptor Done)
-        if desc.status & 0x01 == 0 {
+        if desc.status & RX_STATUS_DD == 0 {
+            return None;
+        }
+        // Must be a complete frame and fit in our DMA buffer.
+        if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
+            self.recycle_rx_desc(next, desc);
             return None;
         }
         let len = desc.len as usize;
@@ -342,13 +360,7 @@ impl E1000eHw {
         };
         let pkt = buf.to_vec();
 
-        // Reset descriptor for reuse
-        desc.status = 0;
-        desc.addr = self.rx_bufs_pa[next] as u64;
-        fence(Ordering::SeqCst);
-
-        self.rx_tail = next;
-        unsafe { mmio_write(self.base, E1000E_RDT, next as u32) };
+        self.recycle_rx_desc(next, desc);
         Some(pkt)
     }
 
@@ -365,7 +377,14 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
     // Send one frame
     // -----------------------------------------------------------------------
-    fn send(&mut self, data: &[u8]) {
+    fn send(&mut self, data: &[u8]) -> DeviceResult {
+        if !self.can_send() {
+            return Err(DeviceError::NotReady);
+        }
+        if data.is_empty() || data.len() > BUF_SIZE {
+            return Err(DeviceError::InvalidParam);
+        }
+
         let ring = self.tx_ring_va as *mut TxDesc;
         let idx = self.tx_tail;
         let desc = unsafe { &mut *ring.add(idx) };
@@ -376,7 +395,7 @@ impl E1000eHw {
         buf.copy_from_slice(data);
 
         desc.addr   = self.tx_bufs_pa[idx] as u64;
-        desc.len    = (data.len() as u16) + 4; // +4 for CRC
+        desc.len    = data.len() as u16;
         desc.cmd    = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
         desc.status = 0;
         fence(Ordering::SeqCst);
@@ -388,6 +407,7 @@ impl E1000eHw {
         if self.tx_tail == 0 {
             self.tx_first = false;
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -473,12 +493,8 @@ impl NetScheme for E1000eInterface {
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
         let mut hw = self.driver.0.lock();
-        if hw.can_send() {
-            hw.send(data);
-            Ok(data.len())
-        } else {
-            Err(DeviceError::NotReady)
-        }
+        hw.send(data)?;
+        Ok(data.len())
     }
 }
 
@@ -517,7 +533,8 @@ impl phy::TxToken for E1000eTxToken {
     where F: FnOnce(&mut [u8]) -> SmolResult<R> {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
-        self.0.0.lock().send(&buf);
+        let mut hw = self.0.0.lock();
+        hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
         Ok(result)
     }
 }
@@ -566,7 +583,7 @@ pub fn init(
         tx_first: true,
     };
 
-    unsafe { hw.reset_and_init(); }
+    unsafe { hw.reset_and_init()?; }
 
     let mac_bytes = hw.mac;
     let hw = Arc::new(Mutex::new(hw));
