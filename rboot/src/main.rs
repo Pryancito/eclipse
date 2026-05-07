@@ -127,6 +127,13 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             .max()
             .unwrap()
             .max(0x1_0000_0000) // include IOAPIC MMIO area
+            // Ensure the GOP framebuffer is always within the mapped range.
+            // On most systems the framebuffer is listed in the UEFI memory map,
+            // but on some firmware/GPU combinations the framebuffer BAR can sit
+            // above the highest RAM entry.  Without this the kernel's
+            // phys_to_virt(fb_addr) would translate to an unmapped virtual
+            // address and triple-fault in early_fb_console::try_init().
+            .max(graphic_info.fb_addr + graphic_info.fb_size)
     };
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 60);
 
@@ -135,11 +142,14 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
         // On real hardware UEFI has already set EFER.NXE before we run, so
         // NO_EXECUTE bits we write into page-table entries are enforced.
-        // If any kernel ELF segment is mis-flagged as non-executable the CPU
-        // would fault on the very first instruction (triple-fault / silent
-        // reset), which is the "bar reaches 100% but kernel never runs" symptom
-        // seen on physical machines.  Clear NXE now so the NO_EXECUTE bits we
-        // set are ignored until the kernel re-enables NXE with its own tables.
+        // If any kernel ELF segment is mis-flagged as non-executable (e.g.
+        // because the linker emits a single LOAD segment without PF_X), the
+        // CPU faults on the very first instruction (triple-fault / silent
+        // reset) — the "bar reaches 100% but kernel never runs" symptom on
+        // physical machines.  Clear NXE so those bits are treated as reserved
+        // (harmless for data accesses; instruction-fetch from NX-marked pages
+        // still faults, which is the desired behaviour).  The kernel's own
+        // virtual-memory code sets up fresh page tables with proper NX policy.
         // On QEMU, OVMF typically leaves NXE clear, so the bug was invisible
         // there.
         Efer::update(|f| f.remove(EferFlags::NO_EXECUTE_ENABLE));
