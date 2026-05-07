@@ -950,8 +950,10 @@ impl XhciInner {
 
     fn wait_port_ready(&self, off: usize, require_pr_clear: bool) -> Option<u8> {
         let m = &self.mmio;
+        // Require multiple consecutive "ready" samples to filter transient link-state flaps.
+        const STABLE_SAMPLES: u32 = 256;
         let mut stable = 0u32;
-        for _ in 0..20_000_000 {
+        for _ in 0..8_000_000 {
             let s = m.read_op(off);
             let ccs = (s & 1) != 0;
             let ped = (s & (1 << 1)) != 0;
@@ -960,7 +962,7 @@ impl XhciInner {
             let ready = ccs && spd != 0 && (ped || spd >= 4) && (!require_pr_clear || !pr);
             if ready {
                 stable = stable.saturating_add(1);
-                if stable >= 1024 {
+                if stable >= STABLE_SAMPLES {
                     return Some(spd);
                 }
             } else {
@@ -978,7 +980,7 @@ impl XhciInner {
         if (portsc & 1) == 0 {
             return Ok(());
         }
-        // Asegurar energía del puerto si el controlador la reporta apagada.
+        // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
             m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 9));
             for _ in 0..2_000_000 {
@@ -993,7 +995,7 @@ impl XhciInner {
         if needs_reset {
             m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
 
-            // Espera robusta: en hardware real el reset puede tardar sensiblemente más que en QEMU.
+            // Robust wait: on real hardware reset can take noticeably longer than in QEMU.
             let mut success = false;
             for _ in 0..50 {
                 for _ in 0..1_000_000 {
