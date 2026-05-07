@@ -92,6 +92,8 @@ const TCTL_COLD_64:  u32 = 0x40 << 12;
 const TX_CMD_EOP:    u8  = 1 << 0;
 const TX_CMD_IFCS:   u8  = 1 << 1;
 const TX_CMD_RS:     u8  = 1 << 3;
+const RX_STATUS_DD:  u8  = 1 << 0;
+const RX_STATUS_EOP: u8  = 1 << 1;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
@@ -184,6 +186,15 @@ struct E1000eHw {
 }
 
 impl E1000eHw {
+    fn recycle_rx_desc(&mut self, idx: usize, desc: &mut RxDesc) {
+        desc.status = 0;
+        desc.errors = 0;
+        desc.addr = self.rx_bufs_pa[idx] as u64;
+        fence(Ordering::SeqCst);
+        self.rx_tail = idx;
+        unsafe { mmio_write(self.base, E1000E_RDT, idx as u32) };
+    }
+
     // -----------------------------------------------------------------------
     // NVM word read via EERD (works on all e1000e silicon)
     // -----------------------------------------------------------------------
@@ -335,17 +346,12 @@ impl E1000eHw {
 
         fence(Ordering::SeqCst);
         // Status bit 0 = DD (Descriptor Done)
-        if desc.status & 0x01 == 0 {
+        if desc.status & RX_STATUS_DD == 0 {
             return None;
         }
         // Must be a complete frame and fit in our DMA buffer.
-        if desc.status & 0x02 == 0 || (desc.len as usize) > BUF_SIZE {
-            desc.status = 0;
-            desc.errors = 0;
-            desc.addr = self.rx_bufs_pa[next] as u64;
-            fence(Ordering::SeqCst);
-            self.rx_tail = next;
-            unsafe { mmio_write(self.base, E1000E_RDT, next as u32) };
+        if desc.status & RX_STATUS_EOP == 0 || (desc.len as usize) > BUF_SIZE {
+            self.recycle_rx_desc(next, desc);
             return None;
         }
         let len = desc.len as usize;
@@ -354,14 +360,7 @@ impl E1000eHw {
         };
         let pkt = buf.to_vec();
 
-        // Reset descriptor for reuse
-        desc.status = 0;
-        desc.errors = 0;
-        desc.addr = self.rx_bufs_pa[next] as u64;
-        fence(Ordering::SeqCst);
-
-        self.rx_tail = next;
-        unsafe { mmio_write(self.base, E1000E_RDT, next as u32) };
+        self.recycle_rx_desc(next, desc);
         Some(pkt)
     }
 
