@@ -146,13 +146,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // because the linker emits a single LOAD segment without PF_X), the
         // CPU faults on the very first instruction (triple-fault / silent
         // reset) — the "bar reaches 100% but kernel never runs" symptom on
-        // physical machines.  Clear NXE so those bits are treated as reserved
-        // (harmless for data accesses; instruction-fetch from NX-marked pages
-        // still faults, which is the desired behaviour).  The kernel's own
-        // virtual-memory code sets up fresh page tables with proper NX policy.
-        // On QEMU, OVMF typically leaves NXE clear, so the bug was invisible
-        // there.
-        Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
+        // physical machines. Keep NXE clear here so NO_EXECUTE bits in these
+        // temporary mappings don't block the initial handoff to the kernel.
+        // The kernel later installs its own page tables and NX policy.
+        Efer::update(|f| f.remove(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
