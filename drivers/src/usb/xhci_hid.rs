@@ -1475,22 +1475,24 @@ impl XhciInner {
             None => return,
         };
         let v = phys_to_virt(h.buf.phys);
-        let mut tmp = [0u8; 8];
-        let n = h.report_len.min(tmp.len()).min(8);
-        tmp[..n].fill(0);
-        unsafe {
-            core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
-        }
         // Asegurar consistencia de datos en arquitecturas con caché no coherente o mapeos WB.
         #[cfg(target_arch = "x86_64")]
         {
             let mut addr = v;
             let end = v + h.report_len as usize;
             while addr < end {
-                unsafe { _mm_clflush(addr as *const u8); }
+                unsafe {
+                    _mm_clflush(addr as *const u8);
+                }
                 addr += 64;
             }
             fence(Ordering::SeqCst);
+        }
+        let mut tmp = [0u8; 8];
+        let n = h.report_len.min(tmp.len()).min(8);
+        tmp[..n].fill(0);
+        unsafe {
+            core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
 
         match h.protocol {
