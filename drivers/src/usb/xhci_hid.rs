@@ -37,10 +37,7 @@ pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
 static XHCI_WARNED_HALTED: AtomicBool = AtomicBool::new(false);
 
 pub fn pci_finish_msi_registrations() -> DeviceResult<()> {
-    let host = MSI_IRQ_HOST
-        .lock()
-        .clone()
-        .ok_or(DeviceError::NotReady)?;
+    let host = MSI_IRQ_HOST.lock().clone().ok_or(DeviceError::NotReady)?;
     let mut q = MSI_PENDING.lock();
     for (v, d) in q.drain(..) {
         host.register_device(v, d)?;
@@ -132,7 +129,8 @@ impl XhciMmio {
         let caplength = (unsafe { read_volatile(cap as *const u32) } & 0xFF) as u64;
         let rtsoff = (unsafe { read_volatile((cap + 0x18) as *const u32) } & 0xFFFF_FFFC) as u64;
         let dboff = (unsafe { read_volatile((cap + 0x14) as *const u32) } & 0xFFFF_FFFC) as u64;
-        if caplength as usize > bar_size || rtsoff as usize > bar_size || dboff as usize > bar_size {
+        if caplength as usize > bar_size || rtsoff as usize > bar_size || dboff as usize > bar_size
+        {
             return Err(DeviceError::InvalidParam);
         }
         Ok(Self {
@@ -234,7 +232,10 @@ impl XhciMmio {
     pub fn ring_db(&self, slot: u8, doorbell: u8) {
         fence(Ordering::Release);
         unsafe {
-            write_volatile((self.db_base + (slot as usize) * 4) as *mut u32, doorbell as u32);
+            write_volatile(
+                (self.db_base + (slot as usize) * 4) as *mut u32,
+                doorbell as u32,
+            );
         }
         fence(Ordering::Release);
     }
@@ -644,10 +645,11 @@ impl XhciInner {
             self.mmio.write_rt(0x38, (erdp as u32 & !0x7) | 0x8);
             self.mmio.write_rt(0x3C, (erdp >> 32) as u32);
 
-            if etype == 32 { // TRB_EVT_TRANSFER
+            if etype == 32 {
+                // TRB_EVT_TRANSFER
                 self.handle_hid_transfer_side(&trb, lis);
             }
-            
+
             return Some(trb);
         }
         None
@@ -675,8 +677,7 @@ impl XhciInner {
                             fence(Ordering::SeqCst);
                             self.mmio.ring_db(slot, ep);
                         }
-                        Err(_) => {
-                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -689,40 +690,38 @@ impl XhciInner {
         lis: Option<&EventListener<InputEvent>>,
     ) -> bool {
         let ty = (ev.ctrl >> 10) & 0x3f;
-        if ty != 32 { // TRB_EVT_TRANSFER
+        if ty != 32 {
+            // TRB_EVT_TRANSFER
             return false;
         }
         let i = ((ev.ctrl >> 24) & 0xff) as usize; // slot
         let dci = ((ev.ctrl >> 16) & 0x1f) as u8;
         let cc = (ev.status >> 24) & 0xff;
-        
-        if i == 0 || i > self.max_slots as usize { return false; }
+
+        if i == 0 || i > self.max_slots as usize {
+            return false;
+        }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
             if cc == 0x0d { // Stall
             }
             return false;
         }
-        
+
         let hid_i = self
             .hids
             .iter()
             .position(|h| h.slot_id == i as u8 && h.ep_dci == dci);
-        
+
         let idx = match hid_i {
             Some(idx) => idx,
             None => return false,
         };
-        
-        if lis.is_none() {
-        }
+
+        if lis.is_none() {}
         let (ridx, blen, buf_phys) = {
             let h = &self.hids[idx];
-            (
-                h.ring_idx,
-                (h.report_len.min(64)) as u16,
-                h.buf.sub_phys(0),
-            )
+            (h.ring_idx, (h.report_len.min(64)) as u16, h.buf.sub_phys(0))
         };
         if let Some(l) = lis {
             self.dispatch_hid(idx, l);
@@ -738,11 +737,14 @@ impl XhciInner {
         for _ in 0..10_000_000 {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
-                if ty == 33 { // TRB_EVT_CMD_COMP
+                if ty == 33 {
+                    // TRB_EVT_CMD_COMP
                     let match_addr = ev.p == cmd_trb_phys;
                     if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
-                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT { return Ok(()); }
+                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
+                            return Ok(());
+                        }
                         return Err(DeviceError::IoError);
                     }
                 }
@@ -756,7 +758,8 @@ impl XhciInner {
         for _ in 0..10_000_000 {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
-                if ty == 33 { // TRB_EVT_CMD_COMP
+                if ty == 33 {
+                    // TRB_EVT_CMD_COMP
                     let match_addr = ev.p == cmd_trb_phys;
                     let slot_id = (ev.ctrl >> 24) & 0xff;
                     if match_addr {
@@ -783,7 +786,8 @@ impl XhciInner {
         for _ in 0..10_000_000 {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
-                if ty == 32 { // TRB_EVT_TRANSFER
+                if ty == 32 {
+                    // TRB_EVT_TRANSFER
                     let match_addr = ev.p == status_phys;
                     if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
@@ -791,7 +795,9 @@ impl XhciInner {
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
                             r.advance_dequeue(n_trb);
                         }
-                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 { return Ok(()); }
+                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 {
+                            return Ok(());
+                        }
                         return Err(DeviceError::IoError);
                     }
                 }
@@ -801,13 +807,7 @@ impl XhciInner {
         Err(DeviceError::IoError)
     }
 
-    fn ep0_control_in(
-        &mut self,
-        slot: u8,
-        setup: Trb,
-        buf: &DmaBuf,
-        len: u32,
-    ) -> DeviceResult<()> {
+    fn ep0_control_in(&mut self, slot: u8, setup: Trb, buf: &DmaBuf, len: u32) -> DeviceResult<()> {
         let i = Self::ri(slot, 1);
         let ring = self
             .xfer_rings
@@ -823,12 +823,7 @@ impl XhciInner {
         self.wait_ep0_status(slot, p3, 3)
     }
 
-    fn ep0_control_out0(
-        &mut self,
-        slot: u8,
-        setup: Trb,
-        status_in: bool,
-    ) -> DeviceResult<()> {
+    fn ep0_control_out0(&mut self, slot: u8, setup: Trb, status_in: bool) -> DeviceResult<()> {
         let i = Self::ri(slot, 1);
         let ring = self
             .xfer_rings
@@ -902,7 +897,7 @@ impl XhciInner {
         m.write_op(0x34, (self.dcbaa.phys as u64 >> 32) as u32);
 
         let crcr = self.cmd.crcr();
-        m.write_op(0x18, (crcr as u32 & !1) | 1); 
+        m.write_op(0x18, (crcr as u32 & !1) | 1);
         m.write_op(0x1C, (crcr >> 32) as u32);
 
         m.write_rt(0x28, 1); // IP=1 (clear)
@@ -930,7 +925,9 @@ impl XhciInner {
         // Wait for the controller to exit HCHalted
         for _ in 0..100_000 {
             let sts = m.read_op(4);
-            if sts & 1 == 0 { break; }
+            if sts & 1 == 0 {
+                break;
+            }
             spin_loop();
         }
 
@@ -943,7 +940,9 @@ impl XhciInner {
             }
         }
         // Pequeña espera tras dar energía
-        for _ in 0..100_000 { spin_loop(); }
+        for _ in 0..100_000 {
+            spin_loop();
+        }
 
         Ok(())
     }
@@ -951,8 +950,7 @@ impl XhciInner {
     fn enumerate_root_hid(&mut self) {
         let maxp = self.max_ports;
         for port in 1..=maxp {
-            if let Err(_e) = self.try_port_hid(port) {
-            }
+            if let Err(_e) = self.try_port_hid(port) {}
         }
     }
 
@@ -1031,7 +1029,9 @@ impl XhciInner {
         m.write_op(off, (portsc & 0x0e00_c3e0) | clr);
 
         // Pequeño delay tras reset para estabilización del link
-        for _ in 0..500_000 { spin_loop(); }
+        for _ in 0..500_000 {
+            spin_loop();
+        }
 
         if spd == 0 {
             return Ok(());
@@ -1073,10 +1073,7 @@ impl XhciInner {
             4 | 5 | 6 => 512,
             _ => 8,
         };
-        ic.write_u32(
-            ep0 + 4,
-            (3 << 1) | EP_TYPE_CONTROL | (mps << 16),
-        );
+        ic.write_u32(ep0 + 4, (3 << 1) | EP_TYPE_CONTROL | (mps << 16));
         let ep0_ring = XferRing::new(32)?;
         let ep0_phys = ep0_ring.ring_phys();
         ic.write_u64(ep0 + 8, ep0_phys);
@@ -1088,12 +1085,7 @@ impl XhciInner {
         self.wait_cmd_phys(p2)?;
 
         let desc = DmaBuf::new(64, 64)?;
-        self.ep0_control_in(
-            slot,
-            trb_setup(0x80, 0x06, 0x0100, 0, 18, 3),
-            &desc,
-            18,
-        )?;
+        self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0100, 0, 18, 3), &desc, 18)?;
 
         // Leer bMaxPacketSize0 (byte 7) y actualizar contexto de EP0
         let mut raw_desc = [0u8; 18];
@@ -1102,7 +1094,7 @@ impl XhciInner {
         if real_mps != mps && real_mps >= 8 {
             let ic_upd = DmaBuf::new(input_sz, 64)?;
             ic_upd.write_u32(4, 0x02); // Add EP0
-            // Copiar contexto actual
+                                       // Copiar contexto actual
             if let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() {
                 // Copiar Slot Context (dev index 0 -> input index 1)
                 for i in 0..(csz / 4) {
@@ -1116,8 +1108,10 @@ impl XhciInner {
             // Actualizar MPS en el contexto de EP0
             let ep0_dw1 = ic_upd.read_u32(ep0 + 4);
             ic_upd.write_u32(ep0 + 4, (ep0_dw1 & 0x0000FFFF) | (real_mps << 16));
-            
-            let p_upd = self.cmd.push(trb_configure_endpoint(ic_upd.sub_phys(0), slot))?;
+
+            let p_upd = self
+                .cmd
+                .push(trb_configure_endpoint(ic_upd.sub_phys(0), slot))?;
             self.mmio.ring_db(0, 0);
             let _ = self.wait_cmd_phys(p_upd);
         }
@@ -1129,12 +1123,7 @@ impl XhciInner {
 
     fn setup_hid_from_config(&mut self, slot: u8, csz: usize, port: u8) -> DeviceResult<()> {
         let sniff = DmaBuf::new(64, 64)?;
-        self.ep0_control_in(
-            slot,
-            trb_setup(0x80, 0x06, 0x0200, 0, 9, 3),
-            &sniff,
-            9,
-        )?;
+        self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)?;
         let mut hdr = [0u8; 9];
         sniff.read_into(0, &mut hdr);
         let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
@@ -1188,7 +1177,9 @@ impl XhciInner {
                     let interval = raw[o + 6];
                     if (addr & 0x80) != 0 && (attr & 3) == 3 {
                         // Interrupt IN
-                        if let Err(_e) = self.init_single_hid(slot, csz, port, iface, proto, addr, mps, interval) {
+                        if let Err(_e) =
+                            self.init_single_hid(slot, csz, port, iface, proto, addr, mps, interval)
+                        {
                         }
                     }
                 }
@@ -1212,7 +1203,7 @@ impl XhciInner {
         let mut real_proto = proto;
         if real_proto == 0 {
             // Heurística: si no tiene protocolo, probamos según el tipo de interfaz o por defecto ratón/teclado.
-            real_proto = HID_PROTO_MOUSE; 
+            real_proto = HID_PROTO_MOUSE;
         }
 
         let report_len = match real_proto {
@@ -1285,7 +1276,9 @@ impl XhciInner {
         let ridx = Self::ri(slot, dci as u8);
         self.xfer_rings[ridx] = Some(ir);
 
-        let p = self.cmd.push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
+        let p = self
+            .cmd
+            .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
         self.mmio.ring_db(0, 0);
         self.wait_cmd_phys(p)?;
 
@@ -1335,9 +1328,7 @@ impl XhciInner {
         match h.protocol {
             HID_PROTO_KEY if h.report_len >= 8 => {
                 let mods = tmp[0];
-                let keys = [
-                    tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7],
-                ];
+                let keys = [tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]];
                 emit_keyboard_delta(lis, h.last_mods, mods, &h.last_keys, &keys);
                 h.last_mods = mods;
                 h.last_keys = keys;
@@ -1408,8 +1399,10 @@ impl XhciInner {
                 let btn = tmp[0];
                 let ax = u16::from_le_bytes([tmp[1], tmp[2]]) as u32;
                 let ay = u16::from_le_bytes([tmp[3], tmp[4]]) as u32;
-                let sx = ((ax as u64 * self.fb_width as u64) / (TABLET_RANGE as u64 + 1)).min(self.fb_width as u64 - 1) as i32;
-                let sy = ((ay as u64 * self.fb_height as u64) / (TABLET_RANGE as u64 + 1)).min(self.fb_height as u64 - 1) as i32;
+                let sx = ((ax as u64 * self.fb_width as u64) / (TABLET_RANGE as u64 + 1))
+                    .min(self.fb_width as u64 - 1) as i32;
+                let sy = ((ay as u64 * self.fb_height as u64) / (TABLET_RANGE as u64 + 1))
+                    .min(self.fb_height as u64 - 1) as i32;
                 if !h.tab_init {
                     h.tab_init = true;
                     h.tab_x = sx as u16;
@@ -1419,11 +1412,7 @@ impl XhciInner {
                     let dy = (sy - h.tab_y as i32).clamp(-127, 127);
                     h.tab_x = sx as u16;
                     h.tab_y = sy as u16;
-                    for (mask, code) in [
-                        (1u8, BTN_LEFT),
-                        (2u8, BTN_RIGHT),
-                        (4u8, BTN_MIDDLE),
-                    ] {
+                    for (mask, code) in [(1u8, BTN_LEFT), (2u8, BTN_RIGHT), (4u8, BTN_MIDDLE)] {
                         let down = (btn & mask) != 0;
                         let was = (h.last_mods & mask) != 0;
                         if down != was {
@@ -1495,7 +1484,10 @@ impl XhciInner {
             }
         }
         if let Some(slot) = found_slot {
-            info!("[xhci] desconexión en puerto {}, liberando slot {}", port_id, slot);
+            info!(
+                "[xhci] desconexión en puerto {}, liberando slot {}",
+                port_id, slot
+            );
             let _ = self.exec_cmd(trb_disable_slot(slot));
             self.dev_ctx[slot as usize] = None;
             self.slot_port[slot as usize] = 0;
@@ -1731,7 +1723,12 @@ pub fn poll() {
 }
 
 impl XhciUsbHid {
-    pub fn probe(dev: &PCIDevice, mmio_vaddr: usize, bar_size: usize, msi_vector: usize) -> DeviceResult<Arc<Self>> {
+    pub fn probe(
+        dev: &PCIDevice,
+        mmio_vaddr: usize,
+        bar_size: usize,
+        msi_vector: usize,
+    ) -> DeviceResult<Arc<Self>> {
         let _ = dev;
         let mmio = XhciMmio::from_virt(mmio_vaddr, bar_size)?;
         let hcsp = mmio.read_cap(4);
