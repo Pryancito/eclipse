@@ -1070,7 +1070,7 @@ impl XhciInner {
         let mps: u32 = match speed {
             1 | 2 => 8,
             3 => 64,
-            4..=15 => 512,
+            4..=6 => 512,
             _ => return Err(DeviceError::InvalidParam),
         };
         ic.write_u32(ep0 + 4, (3 << 1) | EP_TYPE_CONTROL | (mps << 16));
@@ -1265,6 +1265,7 @@ impl XhciInner {
         cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
 
         // Endpoint Context DW1: Error Count=3, EP Type, Max Packet Size
+        // Bits 2:1 carry Error Count; keep the xHCI-recommended value of 3 retries.
         let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(64)?;
