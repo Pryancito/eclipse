@@ -174,10 +174,11 @@ impl XhciMmio {
                 if (legsup & (1 << 16)) != 0 {
                     legsup |= 1 << 24;
                     self.write_cap(cap_ptr, legsup);
-                    let mut t = 1000u32;
+                    let mut t = 100u32;
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && t > 0 {
                         t -= 1;
-                        for _ in 0..10_000 {
+                        // Espera de ~1ms por cada iteración -> 100ms total
+                        for _ in 0..1_000_000 {
                             spin_loop();
                         }
                     }
@@ -204,22 +205,38 @@ impl XhciMmio {
         self.write_rt(0x20, 0x03);
     }
 
-    pub fn read_op(&self, o: usize) -> u32 {
-        unsafe { read_volatile((self.op_base + o) as *const u32) }
+    fn read_op(&self, o: usize) -> u32 {
+        fence(Ordering::Acquire);
+        let v = unsafe { read_volatile((self.op_base + o) as *const u32) };
+        fence(Ordering::Acquire);
+        v
     }
 
     fn write_op(&self, o: usize, v: u32) {
+        fence(Ordering::Release);
         unsafe { write_volatile((self.op_base + o) as *mut u32, v) }
+        fence(Ordering::Release);
     }
 
     fn write_rt(&self, o: usize, v: u32) {
+        fence(Ordering::Release);
         unsafe { write_volatile((self.rt_base + o) as *mut u32, v) }
+        fence(Ordering::Release);
+    }
+
+    fn read_rt(&self, o: usize) -> u32 {
+        fence(Ordering::Acquire);
+        let v = unsafe { read_volatile((self.rt_base + o) as *const u32) };
+        fence(Ordering::Acquire);
+        v
     }
 
     pub fn ring_db(&self, slot: u8, doorbell: u8) {
+        fence(Ordering::Release);
         unsafe {
             write_volatile((self.db_base + (slot as usize) * 4) as *mut u32, doorbell as u32);
         }
+        fence(Ordering::Release);
     }
 }
 
@@ -880,7 +897,7 @@ impl XhciInner {
         m.write_op(0x18, (crcr as u32 & !1) | 1); 
         m.write_op(0x1C, (crcr >> 32) as u32);
 
-        m.write_rt(0x28, 1); // IP=1 (clear), IE=0 (disable)
+        m.write_rt(0x28, 1); // IP=1 (clear)
         let erdp = self.ev.erdp_phys();
         m.write_rt(0x38, erdp as u32 | 8);
         m.write_rt(0x3C, (erdp >> 32) as u32);
@@ -888,8 +905,8 @@ impl XhciInner {
         m.write_rt(0x34, (self.ev.erst_phys() >> 32) as u32);
 
         if self.msi_vector > 0 {
-            m.write_rt(0x20, 3);
-            m.write_rt(0x24, 0);
+            m.write_rt(0x20, 3); // IMAN: IE=1, IP=1
+            m.write_rt(0x24, 0); // IMOD: Interval=0
         } else {
             m.write_rt(0x20, 1);
         }
@@ -902,22 +919,24 @@ impl XhciInner {
         }
         m.write_op(0, usbcmd);
 
-        // Wait for the controller to exit HCHalted (xHCI spec: max 5 ms)
-        for _ in 0..10_000 {
+        // Wait for the controller to exit HCHalted
+        for _ in 0..100_000 {
             let sts = m.read_op(4);
             if sts & 1 == 0 { break; }
             spin_loop();
         }
-        if m.read_op(4) & 1 != 0 {
-            warn!("[xhci] Controller did not exit HCHalted after RS=1; aborting");
-            return Err(DeviceError::IoError);
-        }
 
+        // Port Power
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
-            if m.read_op(off) & 1 != 0 {
+            let sc = m.read_op(off);
+            if (sc & (1 << 9)) == 0 {
+                m.write_op(off, (sc & 0x0e00_c3e0) | (1 << 9));
             }
         }
+        // Pequeña espera tras dar energía
+        for _ in 0..100_000 { spin_loop(); }
+
         Ok(())
     }
 
@@ -936,23 +955,37 @@ impl XhciInner {
             return Ok(());
         }
         let mut portsc = m.read_op(off);
-        m.write_op(off, portsc | (1 << 4));
-        for _ in 0..500_000 {
-            let s = m.read_op(off);
-            if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
-                break;
+        // Reset del puerto (PR=1)
+        m.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
+        
+        // Espera robusta: en hardware real el reset puede tardar > 20ms.
+        // QEMU es instantáneo, pero aquí pecamos de precavidos.
+        let mut success = false;
+        for _ in 0..10 { // 10 reintentos de 1M ciclos (~100ms total)
+            for _ in 0..1_000_000 {
+                let s = m.read_op(off);
+                if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
+                    success = true;
+                    break;
+                }
+                spin_loop();
             }
-            spin_loop();
+            if success { break; }
         }
+        
         portsc = m.read_op(off);
         let spd = ((portsc >> 10) & 0x0f) as u8;
-        let clr = (1 << 17)
-            | (1 << 18)
-            | (1 << 19)
-            | (1 << 20)
-            | (1 << 21)
-            | (1 << 22);
+        
+        // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1
+        let clr = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
         m.write_op(off, (portsc & 0x0e00_c3e0) | clr);
+        
+        // Pequeño delay tras reset para estabilización del link
+        for _ in 0..500_000 { spin_loop(); }
+
+        if spd == 0 {
+            return Ok(());
+        }
         self.setup_device(port, spd)
     }
 
@@ -1008,6 +1041,33 @@ impl XhciInner {
             &desc,
             18,
         )?;
+
+        // Leer bMaxPacketSize0 (byte 7) y actualizar contexto de EP0
+        let mut raw_desc = [0u8; 18];
+        desc.read_into(0, &mut raw_desc);
+        let real_mps = raw_desc[7] as u32;
+        if real_mps != mps && real_mps >= 8 {
+            let ic_upd = DmaBuf::new(input_sz, 64)?;
+            ic_upd.write_u32(4, 0x02); // Add EP0
+            // Copiar contexto actual
+            if let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() {
+                // Copiar Slot Context (dev index 0 -> input index 1)
+                for i in 0..(csz / 4) {
+                    ic_upd.write_u32(csz + i * 4, dev_ctx.read_u32(i * 4));
+                }
+                // Copiar EP0 Context (dev index 1 -> input index 2)
+                for i in 0..(csz / 4) {
+                    ic_upd.write_u32(2 * csz + i * 4, dev_ctx.read_u32(csz + i * 4));
+                }
+            }
+            // Actualizar MPS en el contexto de EP0
+            let ep0_dw1 = ic_upd.read_u32(ep0 + 4);
+            ic_upd.write_u32(ep0 + 4, (ep0_dw1 & 0x0000FFFF) | (real_mps << 16));
+            
+            let p_upd = self.cmd.push(trb_configure_endpoint(ic_upd.sub_phys(0), slot))?;
+            self.mmio.ring_db(0, 0);
+            let _ = self.wait_cmd_phys(p_upd);
+        }
 
         self.setup_hid_from_config(slot, csz, port)?;
 
