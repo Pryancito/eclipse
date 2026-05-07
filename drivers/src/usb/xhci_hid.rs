@@ -1488,7 +1488,6 @@ impl XhciInner {
         }
         let mut tmp = [0u8; 8];
         let n = h.report_len.min(tmp.len()).min(8);
-        tmp[..n].fill(0);
         unsafe {
             core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
