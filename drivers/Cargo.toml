@@ -20,6 +20,7 @@ xhci-usb-hid = []
 
 allwinner = ["d1-pac"]
 fu740 = []
+board_malta = []
 
 [dependencies]
 log = "0.4"

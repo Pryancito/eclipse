@@ -97,10 +97,7 @@ impl<'a> DisplayScheme for VirtIoGpu<'a> {
         self.info
     }
 
-    fn fb(&self) -> FrameBuffer {
-        unsafe {
-            FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
-        }
+    fn fb(&self) -> FrameBuffer<'_> {
     }
 
     fn need_flush(&self) -> bool {
