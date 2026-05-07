@@ -1076,7 +1076,13 @@ impl XhciInner {
                 if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
                     return Ok(());
                 }
-                self.setup_device(port, spd_retry)
+                match self.setup_device(port, spd_retry) {
+                    Ok(()) => Ok(()),
+                    Err(second_err) => {
+                        let _ = self.cleanup_port(port);
+                        Err(second_err)
+                    }
+                }
             }
         }
     }
