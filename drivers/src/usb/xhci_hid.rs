@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_mm_clflush;
 
 use lock::Mutex;
 use pci::PCIDevice;
@@ -20,6 +22,66 @@ use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{DeviceError, DeviceResult};
+
+// PORTSC bits RW1C (port change). Hay que mantenerlos a 0 salvo cuando queramos limpiarlos.
+const PORTSC_CHANGE_BITS: u32 =
+    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
+
+// ——— USB legacy (EHCI/OHCI/UHCI) ———
+//
+// El usuario pidió unificar: mantenemos el cableado aquí (aunque el nombre del
+// fichero sea `xhci_hid.rs`) para evitar proliferación de módulos.
+
+#[cfg(feature = "legacy-usb-hid")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LegacyUsbKind {
+    Uhci,
+    Ohci,
+    Ehci,
+}
+
+#[cfg(feature = "legacy-usb-hid")]
+pub struct LegacyUsbHid {
+    #[allow(dead_code)]
+    listener: EventListener<InputEvent>,
+    #[allow(dead_code)]
+    kind: LegacyUsbKind,
+}
+
+#[cfg(feature = "legacy-usb-hid")]
+impl LegacyUsbHid {
+    pub fn probe(
+        kind: LegacyUsbKind,
+        _dev: &PCIDevice,
+        _mmio_vaddr: usize,
+        _bar_size: usize,
+        _msi_vector: usize,
+    ) -> DeviceResult<Arc<Self>> {
+        let _ = kind;
+        Err(DeviceError::NotSupported)
+    }
+}
+
+#[cfg(feature = "legacy-usb-hid")]
+impl_event_scheme!(LegacyUsbHid, InputEvent);
+
+#[cfg(feature = "legacy-usb-hid")]
+impl Scheme for LegacyUsbHid {
+    fn name(&self) -> &str {
+        match self.kind {
+            LegacyUsbKind::Uhci => "uhci-usb-hid",
+            LegacyUsbKind::Ohci => "ohci-usb-hid",
+            LegacyUsbKind::Ehci => "ehci-usb-hid",
+        }
+    }
+}
+
+#[cfg(feature = "legacy-usb-hid")]
+impl InputScheme for LegacyUsbHid {
+    fn capability(&self, _cap_type: CapabilityType) -> InputCapability {
+        InputCapability::empty()
+    }
+}
 
 // ——— MSI diferido ———
 
@@ -168,9 +230,11 @@ impl XhciMmio {
             let cap_val = self.read_cap(cap_ptr);
             let cap_id = (cap_val & 0xff) as u8;
             if cap_id == 1 {
+                // USB Legacy Support
                 let mut legsup = self.read_cap(cap_ptr);
                 if (legsup & (1 << 16)) != 0 {
-                    legsup |= 1 << 24;
+                    info!("[xhci] BIOS posee el controlador, solicitando handoff...");
+                    legsup |= 1 << 24; // OS Owned Semaphore
                     self.write_cap(cap_ptr, legsup);
                     let mut t = 500u32;
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && t > 0 {
@@ -181,8 +245,16 @@ impl XhciMmio {
                             spin_loop();
                         }
                     }
+                    if (self.read_cap(cap_ptr) & (1 << 16)) != 0 {
+                        warn!("[xhci] handoff fallido por timeout, forzando control");
+                    } else {
+                        info!("[xhci] handoff completado con éxito");
+                    }
                 }
-                if cap_ptr + 8 <= self.bar_size {
+
+                // Desactivar SMIs y limpiar estados pendientes (USBLEGCTLSTS = offset 4)
+                // Escribir 0xFFFF0000 para limpiar bits RW1C y desactivar enable bits.
+                if cap_ptr + 4 <= self.bar_size {
                     self.write_cap(cap_ptr + 4, 0xffff_0000);
                 }
                 return;
@@ -850,9 +922,10 @@ impl XhciInner {
         let m = &self.mmio;
         m.perform_bios_handoff();
 
-        // 1. Halt the controller if it's already running (spec §4.2.1)
+        // 1. Detener el controlador si está corriendo (spec §4.2.1)
         let usbcmd = m.read_op(0);
         if (usbcmd & 1) != 0 {
+            info!("[xhci] deteniendo controlador antes del reset");
             m.write_op(0, usbcmd & !1); // RS=0
             let mut timeout = 100_000;
             while (m.read_op(4) & 1) == 0 && timeout > 0 {
@@ -861,14 +934,19 @@ impl XhciInner {
             }
         }
 
-        // 2. Wait for CNR (Controller Not Ready) to clear before reset
-        let mut timeout = 100_000;
+        // 2. Esperar a que CNR (Controller Not Ready) se limpie antes del reset
+        let mut timeout = 1_000_000;
         while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
             timeout -= 1;
             spin_loop();
         }
+        if timeout == 0 {
+            error!("[xhci] timeout esperando CNR antes de reset");
+            return Err(DeviceError::NotReady);
+        }
 
-        // 3. Issue HCRST (bit 1 of USBCMD)
+        // 3. Emitir HCRST (bit 1 de USBCMD)
+        info!("[xhci] emitiendo HCRST");
         m.write_op(0, m.read_op(0) | 2);
         timeout = 100_000;
         while (m.read_op(0) & 2) != 0 && timeout > 0 {
@@ -876,18 +954,25 @@ impl XhciInner {
             spin_loop();
         }
 
-        // 4. Wait for CNR to clear again after reset
-        timeout = 100_000;
+        // 4. Esperar a que CNR se limpie de nuevo tras reset
+        timeout = 1_000_000;
         while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
             timeout -= 1;
             spin_loop();
         }
+        if timeout == 0 {
+            error!("[xhci] timeout esperando CNR tras reset");
+            return Err(DeviceError::NotReady);
+        }
+        info!("[xhci] reset completado");
 
+        // Configurar Scratchpad buffers si son necesarios
         let hcsp2 = m.read_cap(8);
         let sb_lo = (hcsp2 >> 27) & 0x1f;
         let sb_hi = (hcsp2 >> 21) & 0x1f;
         let sb = sb_lo | (sb_hi << 5);
         if sb > 0 {
+            info!("[xhci] reservando {} scratchpad buffers", sb);
             let tbl = DmaBuf::new(sb as usize * 8, 64)?;
             for i in 0..sb as usize {
                 let pg = DmaBuf::new(PAGE_SIZE, PAGE_SIZE)?;
@@ -898,6 +983,7 @@ impl XhciInner {
             self.scratch_tbl = Some(tbl);
         }
 
+        // Configurar Max Slots y bases de datos
         let cfg = m.read_op(0x38);
         m.write_op(0x38, (cfg & !0xff) | self.max_slots as u32);
 
@@ -908,21 +994,24 @@ impl XhciInner {
         m.write_op(0x18, (crcr as u32 & !1) | 1);
         m.write_op(0x1C, (crcr >> 32) as u32);
 
-        m.write_rt(0x28, 1); // IP=1 (clear)
+        // Configurar Event Ring e Interrupter
+        m.write_rt(0x28, 1); // IP=1 (limpiar)
         let erdp = self.ev.erdp_phys();
         m.write_rt(0x38, erdp as u32 | 8);
         m.write_rt(0x3C, (erdp >> 32) as u32);
         m.write_rt(0x30, self.ev.erst_phys() as u32);
         m.write_rt(0x34, (self.ev.erst_phys() >> 32) as u32);
 
+        // Moderación de interrupciones (Energía): IMOD=0 (máxima respuesta)
+        m.write_rt(0x24, 0); 
+
         if self.msi_vector > 0 {
             m.write_rt(0x20, 3); // IMAN: IE=1, IP=1
-            m.write_rt(0x24, 0); // IMOD: Interval=0
         } else {
-            m.write_rt(0x20, 1);
+            m.write_rt(0x20, 1); // IP=1
         }
 
-        // Run
+        // Iniciar controlador (Run)
         let mut usbcmd = m.read_op(0);
         usbcmd |= 1; // RS=1
         if self.msi_vector > 0 {
@@ -930,7 +1019,7 @@ impl XhciInner {
         }
         m.write_op(0, usbcmd);
 
-        // Wait for the controller to exit HCHalted
+        // Esperar a que el controlador salga de HCHalted
         for _ in 0..100_000 {
             let sts = m.read_op(4);
             if sts & 1 == 0 {
@@ -938,13 +1027,15 @@ impl XhciInner {
             }
             spin_loop();
         }
+        info!("[xhci] controlador en marcha");
 
-        // Port Power
+        // Energía de puertos (Port Power)
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
             let sc = m.read_op(off);
             if (sc & (1 << 9)) == 0 {
-                m.write_op(off, (sc & 0x0e00_c3e0) | (1 << 9));
+                // Importante: no limpiar bits RW como PED al tocar PP.
+                m.write_op(off, (sc & !PORTSC_CHANGE_BITS) | (1 << 9));
             }
         }
         // Pequeña espera tras dar energía (USB spec exige ≥100ms de VBUS estable antes de
@@ -1009,7 +1100,7 @@ impl XhciInner {
         }
         // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
-            self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 9));
+            self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | (1 << 9));
             for _ in 0..2_000_000 {
                 spin_loop();
             }
@@ -1020,22 +1111,24 @@ impl XhciInner {
 
         // Reset del puerto (PR=1)
         if needs_reset {
-            self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | (1 << 4));
+            info!("[xhci] puerto {}: emitiendo reset", port);
+            self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | (1 << 4));
 
-            // Robust wait: on real hardware reset can take noticeably longer than in QEMU.
+            // Espera robusta de reset (100ms simulados)
             let mut success = false;
-            for _ in 0..50 {
-                for _ in 0..1_000_000 {
-                    let s = self.mmio.read_op(off);
-                    if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
-                        success = true;
-                        break;
-                    }
-                    spin_loop();
-                }
-                if success {
+            for _ in 0..100 {
+                let s = self.mmio.read_op(off);
+                if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
+                    success = true;
                     break;
                 }
+                // Simulación de ~1ms
+                for _ in 0..1_000_000 {
+                    spin_loop();
+                }
+            }
+            if !success {
+                warn!("[xhci] puerto {}: timeout en reset", port);
             }
         }
 
@@ -1046,11 +1139,11 @@ impl XhciInner {
         portsc = self.mmio.read_op(off);
 
         // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1
-        let clr = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
-        self.mmio.write_op(off, (portsc & 0x0e00_c3e0) | clr);
+        let clr = PORTSC_CHANGE_BITS;
+        self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | clr);
 
         // Pequeño delay tras reset para estabilización del link
-        for _ in 0..500_000 {
+        for _ in 0..10_000_000 {
             spin_loop();
         }
 
@@ -1069,7 +1162,7 @@ impl XhciInner {
                 if (s & 1) == 0 {
                     return Ok(());
                 }
-                self.mmio.write_op(off, (s & 0x0e00_c3e0) | (1 << 4));
+                self.mmio.write_op(off, (s & !PORTSC_CHANGE_BITS) | (1 << 4));
                 for _ in 0..2_000_000 {
                     spin_loop();
                 }
@@ -1078,7 +1171,7 @@ impl XhciInner {
                     ((s >> 10) & 0x0f) as u8
                 });
                 s = self.mmio.read_op(off);
-                self.mmio.write_op(off, (s & 0x0e00_c3e0) | clr);
+                self.mmio.write_op(off, (s & !PORTSC_CHANGE_BITS) | clr);
                 for _ in 0..500_000 {
                     spin_loop();
                 }
@@ -1147,6 +1240,13 @@ impl XhciInner {
         // Leer bMaxPacketSize0 (byte 7) y actualizar contexto de EP0
         let mut raw_desc = [0u8; 18];
         desc.read_into(0, &mut raw_desc);
+        let vid = u16::from_le_bytes([raw_desc[8], raw_desc[9]]);
+        let pid = u16::from_le_bytes([raw_desc[10], raw_desc[11]]);
+        info!(
+            "[xhci] puerto {}: dispositivo detectado VID={:04x} PID={:04x} class={:02x}",
+            port, vid, pid, raw_desc[4]
+        );
+
         let real_mps = raw_desc[7] as u32;
         if real_mps != mps && real_mps >= 8 {
             let ic_upd = DmaBuf::new(input_sz, 64)?;
@@ -1381,9 +1481,17 @@ impl XhciInner {
         unsafe {
             core::ptr::copy_nonoverlapping(v as *const u8, tmp.as_mut_ptr(), n);
         }
-        fence(Ordering::Acquire);
-
-        // Log MANDATORIO para ver qué llega
+        // Asegurar consistencia de datos en arquitecturas con caché no coherente o mapeos WB.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut addr = v;
+            let end = v + h.report_len as usize;
+            while addr < end {
+                unsafe { _mm_clflush(addr as *const u8); }
+                addr += 64;
+            }
+            fence(Ordering::SeqCst);
+        }
 
         match h.protocol {
             HID_PROTO_KEY if h.report_len >= 8 => {
@@ -1531,7 +1639,9 @@ impl XhciInner {
                 self.cleanup_port(port_id)?;
             }
         }
-        self.mmio.write_op(off, (sc & 0x0e00_c3e0) | 0x7e_0000);
+        // Limpiar RW1C sin apagar el puerto (PP) ni tocar bits RW como PED.
+        self.mmio
+            .write_op(off, (sc & !PORTSC_CHANGE_BITS) | PORTSC_CHANGE_BITS);
         Ok(())
     }
 

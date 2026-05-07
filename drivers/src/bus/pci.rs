@@ -1,5 +1,6 @@
 use super::{phys_to_virt, PAGE_SIZE};
 use crate::builder::IoMapper;
+#[cfg(feature = "xhci-usb-hid")]
 use crate::scheme::SchemeUpcast;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::{format, sync::Arc, vec::Vec};
@@ -620,6 +621,82 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                         return Ok(Device::Input(input));
                     }
                     Err(e) => warn!("xHCI HID probe (poll) error: {:?}", e),
+                }
+            }
+        }
+    }
+
+    // USB “legacy” controllers (UHCI/OHCI/EHCI) + HID.
+    // prog_if:
+    //   0x00 = UHCI, 0x10 = OHCI, 0x20 = EHCI, 0x30 = xHCI
+    if dev.id.class == 0x0c && dev.id.subclass == 0x03 && dev.id.prog_if != 0x30 {
+        #[cfg(not(feature = "legacy-usb-hid"))]
+        {
+            warn!(
+                "[usb] Controlador USB legacy detectado (prog_if={:#x}); habilita feature legacy-usb-hid para intentar inicializarlo",
+                dev.id.prog_if
+            );
+        }
+
+        #[cfg(feature = "legacy-usb-hid")]
+        {
+            // Por ahora: stubs que devuelven NotSupported. Se deja el cableado y el mapeo BAR.
+            let (addr, len) = if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
+                (ba, bl as u64)
+            } else {
+                (0, 0)
+            };
+            if addr == 0 {
+                warn!("[usb] USB legacy: BAR0 es 0; omitido");
+                return Err(DeviceError::NotSupported);
+            }
+
+            let base_addr = (addr as usize) & !0xfff;
+            let offset = (addr as usize) & 0xfff;
+            let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+            if let Some(m) = mapper {
+                m.query_or_map(base_addr, map_len);
+            }
+            let vaddr = phys_to_virt(addr as usize);
+            let msi_idx = unsafe { enable(dev.loc, 0) };
+            let vector = msi_idx.map(|idx| idx + 32).unwrap_or(0);
+
+            match dev.id.prog_if {
+                0x20 => {
+                    if let Ok(input) = crate::usb::xhci_hid::LegacyUsbHid::probe(
+                        crate::usb::xhci_hid::LegacyUsbKind::Ehci,
+                        dev,
+                        vaddr,
+                        map_len,
+                        vector,
+                    ) {
+                        return Ok(Device::Input(input));
+                    }
+                }
+                0x10 => {
+                    if let Ok(input) = crate::usb::xhci_hid::LegacyUsbHid::probe(
+                        crate::usb::xhci_hid::LegacyUsbKind::Ohci,
+                        dev,
+                        vaddr,
+                        map_len,
+                        vector,
+                    ) {
+                        return Ok(Device::Input(input));
+                    }
+                }
+                0x00 => {
+                    if let Ok(input) = crate::usb::xhci_hid::LegacyUsbHid::probe(
+                        crate::usb::xhci_hid::LegacyUsbKind::Uhci,
+                        dev,
+                        vaddr,
+                        map_len,
+                        vector,
+                    ) {
+                        return Ok(Device::Input(input));
+                    }
+                }
+                _ => {
+                    warn!("[usb] prog_if USB desconocido: {:#x}", dev.id.prog_if);
                 }
             }
         }

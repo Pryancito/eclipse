@@ -35,7 +35,7 @@ pub mod uart;
 pub mod utils;
 
 #[cfg(all(
-    feature = "xhci-usb-hid",
+    any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
     target_arch = "x86_64",
     not(feature = "mock"),
     not(feature = "no-pci")
