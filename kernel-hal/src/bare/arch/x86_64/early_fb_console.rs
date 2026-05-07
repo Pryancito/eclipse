@@ -20,6 +20,7 @@ static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static FB_STRIDE_PIXELS: AtomicU32 = AtomicU32::new(0);
 static CUR_X: AtomicU32 = AtomicU32::new(0);
 static CUR_Y: AtomicU32 = AtomicU32::new(0);
+static CLEAR_ON_NEXT_TEXT_WRITE: AtomicBool = AtomicBool::new(false);
 
 const CHAR_W: u32 = 8;
 const CHAR_H: u32 = 16;
@@ -185,6 +186,11 @@ pub fn write_str(s: &str) {
     if !try_init() {
         return;
     }
+    if CLEAR_ON_NEXT_TEXT_WRITE.swap(false, Ordering::SeqCst) {
+        clear_black();
+        CUR_X.store(0, Ordering::SeqCst);
+        CUR_Y.store(0, Ordering::SeqCst);
+    }
     for &b in s.as_bytes() {
         draw_char(b);
     }
@@ -204,6 +210,9 @@ pub fn draw_progress_bar(progress: u32) {
     }
 
     let progress = progress.min(100);
+    if progress >= 100 {
+        CLEAR_ON_NEXT_TEXT_WRITE.store(true, Ordering::SeqCst);
+    }
     let bar_w: u32 = 400;
     let bar_h: u32 = 20;
     let x = sw.saturating_sub(bar_w) / 2;
@@ -242,4 +251,3 @@ pub fn draw_progress_bar(progress: u32) {
         draw_char_at(tx + (i as u32) * 8, ty, ch, 0xFFFF_FFFF, 0xFF00_0000);
     }
 }
-

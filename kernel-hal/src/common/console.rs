@@ -12,6 +12,10 @@ impl Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> Result {
         if let Some(uart) = drivers::all_uart().first() {
             uart.write_str(s).unwrap();
+            #[cfg(feature = "graphic")]
+            if GRAPHIC_CONSOLE.try_get().is_none() {
+                crate::hal_fn::console::console_write_early(s);
+            }
         } else {
             crate::hal_fn::console::console_write_early(s);
         }
