@@ -13,7 +13,7 @@ pub struct LocalApic {
 
 impl LocalApic {
     pub unsafe fn get<'a>() -> &'a mut LocalApic {
-        LOCAL_APIC
+        (*core::ptr::addr_of_mut!(LOCAL_APIC))
             .as_mut()
             .expect("Local APIC is not initialized by BSP")
     }
