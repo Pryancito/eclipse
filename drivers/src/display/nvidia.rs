@@ -129,6 +129,9 @@ impl NvidiaGpu {
             return width;
         }
 
+        // Accept moderately padded scanlines (for example 2048-wide alignment on
+        // a 1920-wide mode) while rejecting BAR apertures that are far larger
+        // than the visible framebuffer and would produce a bogus inferred pitch.
         const MAX_PITCH_PADDING_PIXELS: usize = 4096;
         let bytes_per_pixel = self.info.format.bytes() as usize;
         let visible_size = width
