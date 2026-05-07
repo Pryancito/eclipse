@@ -142,14 +142,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
         // On real hardware UEFI has already set EFER.NXE before we run, so
         // NO_EXECUTE bits we write into page-table entries are enforced.
-        // If any kernel ELF segment is mis-flagged as non-executable (e.g.
-        // because the linker emits a single LOAD segment without PF_X), the
-        // CPU faults on the very first instruction (triple-fault / silent
-        // reset) — the "bar reaches 100% but kernel never runs" symptom on
-        // physical machines. Keep NXE clear here so NO_EXECUTE bits in these
-        // temporary mappings don't block the initial handoff to the kernel.
-        // The kernel later installs its own page tables and NX policy.
-        Efer::update(|f| f.remove(EferFlags::NO_EXECUTE_ENABLE));
+        // Keep NXE enabled while running under firmware page tables. Some
+        // UEFI mappings may already use NX bits and clearing NXE can fault
+        // immediately on real hardware.
+        Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
