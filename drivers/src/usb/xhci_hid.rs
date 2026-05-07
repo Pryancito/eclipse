@@ -1106,7 +1106,7 @@ impl XhciInner {
         ic.write_u32(s0 + 4, (port as u32) << 16);
         let ep0 = 2 * csz;
         // xHCI PORTSC speed: 1=FS 2=LS 3=HS 4=SS Gen1 5=SS Gen2 …
-        // FS/LS devices must start the default control pipe at 8 bytes until the
+        // Both FS(speed=1) and LS(speed=2) devices must start EP0 at 8 bytes until the
         // device descriptor tells us the real bMaxPacketSize0. Using 64 here breaks
         // enumeration for common HID keyboards/mice that come up on USB 1.x/2.0.
         let mps: u32 = match speed {
@@ -1307,7 +1307,7 @@ impl XhciInner {
         cfg.write_u32(ep_off, (xhci_interval as u32) << 24);
 
         // Endpoint Context DW1: Error Count=3, EP Type, Max Packet Size
-        // Bits 2:1 carry Error Count; keep the xHCI-recommended value of 3 retries.
+        // Bits 2:1 carry Error Count=3, i.e. allow up to 3 retries after the first attempt.
         let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(64)?;
