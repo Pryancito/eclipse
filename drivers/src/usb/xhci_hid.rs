@@ -1481,9 +1481,7 @@ impl XhciInner {
             let mut addr = v;
             let end = v + h.report_len as usize;
             while addr < end {
-                unsafe {
-                    _mm_clflush(addr as *const u8);
-                }
+                unsafe { _mm_clflush(addr as *const u8); }
                 addr += 64;
             }
             fence(Ordering::SeqCst);
