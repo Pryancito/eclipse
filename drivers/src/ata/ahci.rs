@@ -3,13 +3,13 @@
 //! Adapted from the previous Eclipse OS AHCI driver to work with the new
 //! zCore-based driver architecture.
 
-use alloc::string::String;
 use alloc::format;
+use alloc::string::String;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-use crate::bus::{phys_to_virt, virt_to_phys, drivers_dma_alloc};
+use crate::bus::{drivers_dma_alloc, phys_to_virt, virt_to_phys};
 use crate::scheme::{BlockScheme, Scheme};
 use crate::{DeviceError, DeviceResult};
 
@@ -133,7 +133,10 @@ impl AhciPort {
             spin_loop();
         }
         if timeout == 0 {
-            warn!("[AHCI] Port {} stop_engine timeout (CR/FR stuck)", self.port_idx);
+            warn!(
+                "[AHCI] Port {} stop_engine timeout (CR/FR stuck)",
+                self.port_idx
+            );
         }
     }
 
@@ -146,7 +149,10 @@ impl AhciPort {
             spin_loop();
         }
         if timeout == 0 {
-            warn!("[AHCI] Port {} start_engine timeout (CR stuck)", self.port_idx);
+            warn!(
+                "[AHCI] Port {} start_engine timeout (CR stuck)",
+                self.port_idx
+            );
         }
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) | CMD_FRE | CMD_ST);
     }
@@ -174,12 +180,17 @@ impl AhciPort {
 
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
         self.write_reg(PORT_SERR, 0xFFFF_FFFF);
-        self.write_reg(PORT_IE, 0); 
+        self.write_reg(PORT_IE, 0);
 
-        self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) | CMD_POD | CMD_SUD | CMD_FRE);
-        
+        self.write_reg(
+            PORT_CMD,
+            self.read_reg(PORT_CMD) | CMD_POD | CMD_SUD | CMD_FRE,
+        );
+
         self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
-        for _ in 0..1_000_000 { spin_loop(); }
+        for _ in 0..1_000_000 {
+            spin_loop();
+        }
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
 
         let mut timeout = 1_000_000;
@@ -196,7 +207,9 @@ impl AhciPort {
         self.stop_engine();
         // COMRESET: set DET=1, wait ≥1 ms (AHCI spec §10.4.2), then clear DET
         self.write_reg(PORT_SCTL, (self.read_reg(PORT_SCTL) & !0xF) | 1);
-        for _ in 0..COMRESET_DELAY_ITER { spin_loop(); }
+        for _ in 0..COMRESET_DELAY_ITER {
+            spin_loop();
+        }
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
         // Wait for PHY to re-establish link (DET=3)
         let mut timeout = PHY_LINK_TIMEOUT_ITER;
@@ -247,19 +260,30 @@ impl AhciPort {
             spin_loop();
         }
         if tfd_timeout == 0 {
-            error!("[AHCI] Port {} TFD busy timeout before command", self.port_idx);
+            error!(
+                "[AHCI] Port {} TFD busy timeout before command",
+                self.port_idx
+            );
             self.reset_port();
             return Err(DeviceError::IoError);
         }
 
         unsafe {
             let cmd_table = self.ct_virt as *mut CommandTable;
-            core::ptr::write_bytes(cmd_table as *mut u8, 0, core::mem::size_of::<CommandTable>());
+            core::ptr::write_bytes(
+                cmd_table as *mut u8,
+                0,
+                core::mem::size_of::<CommandTable>(),
+            );
 
             let fis = (*cmd_table).cfis.as_mut_ptr();
             *fis.add(0) = FIS_TYPE_REG_H2D;
             *fis.add(1) = 0x80;
-            *fis.add(2) = if write { ATA_CMD_WRITE_DMA_EXT } else { ATA_CMD_READ_DMA_EXT };
+            *fis.add(2) = if write {
+                ATA_CMD_WRITE_DMA_EXT
+            } else {
+                ATA_CMD_READ_DMA_EXT
+            };
             *fis.add(4) = lba as u8;
             *fis.add(5) = (lba >> 8) as u8;
             *fis.add(6) = (lba >> 16) as u8;
@@ -291,7 +315,11 @@ impl AhciPort {
 
         unsafe {
             let cmd_table = self.ct_virt as *mut CommandTable;
-            core::ptr::write_bytes(cmd_table as *mut u8, 0, core::mem::size_of::<CommandTable>());
+            core::ptr::write_bytes(
+                cmd_table as *mut u8,
+                0,
+                core::mem::size_of::<CommandTable>(),
+            );
 
             let fis = (*cmd_table).cfis.as_mut_ptr();
             *fis.add(0) = FIS_TYPE_REG_H2D;
@@ -313,7 +341,10 @@ impl AhciPort {
         }
 
         let id = unsafe { core::slice::from_raw_parts(vaddr as *const u16, 256) };
-        let lba48 = (id[100] as u64) | ((id[101] as u64) << 16) | ((id[102] as u64) << 32) | ((id[103] as u64) << 48);
+        let lba48 = (id[100] as u64)
+            | ((id[101] as u64) << 16)
+            | ((id[102] as u64) << 32)
+            | ((id[103] as u64) << 48);
         let lba28 = (id[60] as u64) | ((id[61] as u64) << 16);
         let sectors = if lba48 != 0 { lba48 } else { lba28 };
 
@@ -338,11 +369,13 @@ impl AhciInterface {
                 spin_loop();
             }
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
-            for _ in 0..1_000_000 { spin_loop(); }
+            for _ in 0..1_000_000 {
+                spin_loop();
+            }
         }
 
         let pi = unsafe { read_volatile((base + HBA_PI) as *const u32) };
-        
+
         for i in 0..32 {
             if pi & (1 << i) != 0 {
                 let pbase = base + 0x100 + (i * 0x80);
@@ -368,13 +401,19 @@ impl AhciInterface {
                     if sig != 0 && sig != 0xFFFF_FFFF {
                         break;
                     }
-                    for _ in 0..100_000 { spin_loop(); }
+                    for _ in 0..100_000 {
+                        spin_loop();
+                    }
                 }
 
                 if sig == HBA_SIG_ATA {
                     if let Some(sectors) = port.identify() {
-                        warn!("[AHCI] Port {} found: SATA disk, {} sectors ({} MiB)", 
-                            i, sectors, sectors / 2048);
+                        warn!(
+                            "[AHCI] Port {} found: SATA disk, {} sectors ({} MiB)",
+                            i,
+                            sectors,
+                            sectors / 2048
+                        );
                         return Ok(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
@@ -393,13 +432,17 @@ impl BlockScheme for AhciInterface {
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         let lba = (block_id * (read_buf.len() / SECTOR_SIZE)) as u64;
         let paddr = virt_to_phys(read_buf.as_ptr() as usize);
-        self.port.lock().rw_block(lba, paddr as u64, read_buf.len(), false)
+        self.port
+            .lock()
+            .rw_block(lba, paddr as u64, read_buf.len(), false)
     }
 
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
         let lba = (block_id * (write_buf.len() / SECTOR_SIZE)) as u64;
         let paddr = virt_to_phys(write_buf.as_ptr() as usize);
-        self.port.lock().rw_block(lba, paddr as u64, write_buf.len(), true)
+        self.port
+            .lock()
+            .rw_block(lba, paddr as u64, write_buf.len(), true)
     }
 
     fn flush(&self) -> DeviceResult {
@@ -412,6 +455,5 @@ impl Scheme for AhciInterface {
         &self.name
     }
 
-    fn handle_irq(&self, _irq: usize) {
-    }
+    fn handle_irq(&self, _irq: usize) {}
 }

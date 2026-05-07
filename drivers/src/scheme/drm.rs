@@ -2,8 +2,8 @@
 //!
 //! This trait allows drivers to implement DRM/KMS functionality.
 
-use alloc::vec::Vec;
 use super::Scheme;
+use alloc::vec::Vec;
 
 /// DRM Device capabilities
 #[repr(C)]
@@ -54,19 +54,21 @@ pub struct DrmPlane {
 /// Abstract trait for DRM Driver implementations
 pub trait DrmScheme: Scheme {
     fn get_caps(&self) -> DrmCaps;
-    
+
     /// Import a buffer allocated by the kernel (DRM core)
-    fn import_buffer(&self, _handle: GemHandle) -> bool { true }
-    
+    fn import_buffer(&self, _handle: GemHandle) -> bool {
+        true
+    }
+
     /// Free a buffer
     fn free_buffer(&self, _handle: GemHandle) {}
-    
+
     /// Create a framebuffer from a GEM handle
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32>;
-    
+
     /// Page flip: atomically switch to a new framebuffer
     fn page_flip(&self, fb_id: u32) -> bool;
-    
+
     /// Set hardware cursor position and/or image
     fn set_cursor(&self, crtc_id: u32, x: i32, y: i32, handle: u32, flags: u32) -> bool;
 
@@ -89,7 +91,20 @@ pub trait DrmScheme: Scheme {
     fn get_planes(&self) -> Vec<u32>;
 
     /// Set plane properties
-    fn set_plane(&self, plane_id: u32, crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, src_x: u32, src_y: u32, src_w: u32, src_h: u32) -> bool;
+    fn set_plane(
+        &self,
+        plane_id: u32,
+        crtc_id: u32,
+        fb_id: u32,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        src_x: u32,
+        src_y: u32,
+        src_w: u32,
+        src_h: u32,
+    ) -> bool;
 
     /// Driver-specific IOCTLs
     fn ioctl(&self, _request: u32, _arg: usize) -> Result<usize, i32> {

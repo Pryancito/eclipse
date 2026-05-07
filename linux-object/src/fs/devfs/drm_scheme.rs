@@ -30,7 +30,10 @@ impl DrmDev {
         let handle_id = offset as u32;
         if let Some(handle) = drm::get_handle(handle_id) {
             let len = len.min(handle.size);
-            Ok(VmObject::new_physical(handle.phys_addr as usize, pages(len)))
+            Ok(VmObject::new_physical(
+                handle.phys_addr as usize,
+                pages(len),
+            ))
         } else {
             Err(FsError::InvalidParam)
         }
@@ -95,8 +98,10 @@ struct DrmModeCardRes {
     count_crtcs: u32,
     count_connectors: u32,
     count_encoders: u32,
-    min_width: u32, max_width: u32,
-    min_height: u32, max_height: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
 }
 
 #[repr(C)]
@@ -238,11 +243,11 @@ impl INode for DrmDev {
                 v.version_major = 1;
                 v.version_minor = 0;
                 v.version_patchlevel = 0;
-                
+
                 let name = b"zcore\0";
                 let date = b"20260503\0";
                 let desc = b"zCore DRM Driver\0";
-                
+
                 unsafe {
                     if v.name_len > 0 && !v.name.is_null() {
                         let len = core::cmp::min(v.name_len, name.len());
@@ -277,9 +282,9 @@ impl INode for DrmDev {
             DRM_IOCTL_GET_CAP => {
                 let cap = unsafe { &mut *(data as *mut DrmGetCap) };
                 match cap.capability {
-                    0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
-                    0x5 => cap.value = 3, // DRM_CAP_PRIME: IMPORT|EXPORT
-                    0x6 => cap.value = 1, // DRM_CAP_TIMESTAMP_MONOTONIC
+                    0x1 => cap.value = 1,  // DRM_CAP_DUMB_BUFFER
+                    0x5 => cap.value = 3,  // DRM_CAP_PRIME: IMPORT|EXPORT
+                    0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
                     0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
                     0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
                     0x10 => cap.value = 1, // DRM_CAP_ADDFB2_MODIFIERS
@@ -287,13 +292,13 @@ impl INode for DrmDev {
                 }
                 Ok(0)
             }
-            DRM_IOCTL_SET_CLIENT_CAP => { Ok(0) }
+            DRM_IOCTL_SET_CLIENT_CAP => Ok(0),
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
                 let bpp = info.bpp.max(32);
                 let pitch = (info.width * bpp / 8 + 63) & !63;
                 let size = (pitch * info.height) as usize;
-                
+
                 if let Some(handle) = drm::alloc_buffer(size) {
                     info.handle = handle.id;
                     info.pitch = pitch;
@@ -319,24 +324,50 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                if drm::page_flip(flip.fb_id) { Ok(0) } else { Err(FsError::DeviceError) }
+                if drm::page_flip(flip.fb_id) {
+                    Ok(0)
+                } else {
+                    Err(FsError::DeviceError)
+                }
             }
             DRM_IOCTL_GEM_CLOSE => {
                 let handle = unsafe { *(data as *const u32) };
-                if drm::gem_close(handle) { Ok(0) } else { Err(FsError::InvalidParam) }
+                if drm::gem_close(handle) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
             }
             DRM_IOCTL_MODE_GETRESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
                 let (fbs, crtcs, connectors) = drm::get_resources();
-                
+
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
-                    unsafe { core::ptr::copy_nonoverlapping(fbs.as_ptr(), res.fb_id_ptr as *mut u32, fbs.len()); }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            fbs.as_ptr(),
+                            res.fb_id_ptr as *mut u32,
+                            fbs.len(),
+                        );
+                    }
                 }
                 if res.crtc_id_ptr != 0 && res.count_crtcs >= crtcs.len() as u32 {
-                    unsafe { core::ptr::copy_nonoverlapping(crtcs.as_ptr(), res.crtc_id_ptr as *mut u32, crtcs.len()); }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            crtcs.as_ptr(),
+                            res.crtc_id_ptr as *mut u32,
+                            crtcs.len(),
+                        );
+                    }
                 }
                 if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
-                    unsafe { core::ptr::copy_nonoverlapping(connectors.as_ptr(), res.connector_id_ptr as *mut u32, connectors.len()); }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            connectors.as_ptr(),
+                            res.connector_id_ptr as *mut u32,
+                            connectors.len(),
+                        );
+                    }
                 }
 
                 res.count_fbs = fbs.len() as u32;
@@ -380,7 +411,13 @@ impl INode for DrmDev {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
                 let planes = drm::get_planes();
                 if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
-                    unsafe { core::ptr::copy_nonoverlapping(planes.as_ptr(), res.plane_id_ptr as *mut u32, planes.len()); }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            planes.as_ptr(),
+                            res.plane_id_ptr as *mut u32,
+                            planes.len(),
+                        );
+                    }
                 }
                 res.count_planes = planes.len() as u32;
                 Ok(0)
@@ -410,5 +447,7 @@ impl INode for DrmDev {
         }
     }
 
-    fn as_any_ref(&self) -> &dyn Any { self }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
 }

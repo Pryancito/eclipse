@@ -57,17 +57,17 @@ pub(super) fn init() -> DeviceResult {
     #[cfg(not(feature = "no-pci"))]
     {
         // PCI scan
-        use zcore_drivers::bus::pci;
+        use crate::vm::{GenericPageTable, PageTable};
+        use crate::{CachePolicy, MMUFlags, PhysAddr, VirtAddr};
         use zcore_drivers::builder::IoMapper;
-        use crate::{PhysAddr, VirtAddr, MMUFlags, CachePolicy};
-        use crate::vm::{PageTable, GenericPageTable};
+        use zcore_drivers::bus::pci;
 
         struct IoMapperImpl;
         impl IoMapper for IoMapperImpl {
             fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
                 let vaddr = crate::mem::phys_to_virt(paddr);
                 let mut pt = PageTable::from_current();
-                
+
                 if let Ok((paddr_mapped, _, _)) = pt.query(vaddr) {
                     if paddr_mapped == paddr {
                         return Some(vaddr);
@@ -75,17 +75,20 @@ pub(super) fn init() -> DeviceResult {
                 }
 
                 let size = (size + 0xfff) & !0xfff;
-                let flags = MMUFlags::READ 
-                    | MMUFlags::WRITE 
+                let flags = MMUFlags::READ
+                    | MMUFlags::WRITE
                     | MMUFlags::DEVICE
                     | MMUFlags::from_bits_truncate(CachePolicy::UncachedDevice as usize);
-                
-                warn!("[xhci] Mapeando BAR PCI en PT kernel: {:#x} -> {:#x} (size: {:#x})", paddr, vaddr, size);
+
+                warn!(
+                    "[xhci] Mapeando BAR PCI en PT kernel: {:#x} -> {:#x} (size: {:#x})",
+                    paddr, vaddr, size
+                );
                 if let Err(e) = pt.map_cont(vaddr, size, paddr, flags) {
                     warn!("[xhci] Error crítico al mapear BAR: {:?}", e);
                     return None;
                 }
-                
+
                 core::mem::forget(pt);
                 Some(vaddr)
             }
@@ -97,7 +100,12 @@ pub(super) fn init() -> DeviceResult {
             use crate::KCONFIG;
             let (width, height) = KCONFIG.fb_mode.resolution();
             let stride = KCONFIG.fb_mode.stride();
-            zcore_drivers::display::set_boot_fb_info(KCONFIG.fb_addr, width as u32, height as u32, (stride * 4) as u32);
+            zcore_drivers::display::set_boot_fb_info(
+                KCONFIG.fb_addr,
+                width as u32,
+                height as u32,
+                (stride * 4) as u32,
+            );
         }
 
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;

@@ -8,13 +8,13 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicI32, Ordering};
 use core::task::{Context, Poll};
 use kernel_hal::console::{self, ConsoleWinSize};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
-use core::sync::atomic::{AtomicI32, Ordering};
-use core::sync::atomic::AtomicBool;
 
 // Foreground process group for the (single) controlling TTY.
 // This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
@@ -50,7 +50,7 @@ lazy_static! {
                 false,
             );
         }
-        
+
         // Suscribirse a dispositivos de entrada (teclados USB/virtio)
         for input in kernel_hal::drivers::all_input().as_vec().iter() {
             let cloned = stdin.clone();
@@ -97,16 +97,42 @@ lazy_static! {
 fn input_event_to_char(code: u16) -> Option<char> {
     use zcore_drivers::input::input_event_codes::key::*;
     match code {
-        KEY_A => Some('a'), KEY_B => Some('b'), KEY_C => Some('c'), KEY_D => Some('d'),
-        KEY_E => Some('e'), KEY_F => Some('f'), KEY_G => Some('g'), KEY_H => Some('h'),
-        KEY_I => Some('i'), KEY_J => Some('j'), KEY_K => Some('k'), KEY_L => Some('l'),
-        KEY_M => Some('m'), KEY_N => Some('n'), KEY_O => Some('o'), KEY_P => Some('p'),
-        KEY_Q => Some('q'), KEY_R => Some('r'), KEY_S => Some('s'), KEY_T => Some('t'),
-        KEY_U => Some('u'), KEY_V => Some('v'), KEY_W => Some('w'), KEY_X => Some('x'),
-        KEY_Y => Some('y'), KEY_Z => Some('z'),
-        KEY_1 => Some('1'), KEY_2 => Some('2'), KEY_3 => Some('3'), KEY_4 => Some('4'),
-        KEY_5 => Some('5'), KEY_6 => Some('6'), KEY_7 => Some('7'), KEY_8 => Some('8'),
-        KEY_9 => Some('9'), KEY_0 => Some('0'),
+        KEY_A => Some('a'),
+        KEY_B => Some('b'),
+        KEY_C => Some('c'),
+        KEY_D => Some('d'),
+        KEY_E => Some('e'),
+        KEY_F => Some('f'),
+        KEY_G => Some('g'),
+        KEY_H => Some('h'),
+        KEY_I => Some('i'),
+        KEY_J => Some('j'),
+        KEY_K => Some('k'),
+        KEY_L => Some('l'),
+        KEY_M => Some('m'),
+        KEY_N => Some('n'),
+        KEY_O => Some('o'),
+        KEY_P => Some('p'),
+        KEY_Q => Some('q'),
+        KEY_R => Some('r'),
+        KEY_S => Some('s'),
+        KEY_T => Some('t'),
+        KEY_U => Some('u'),
+        KEY_V => Some('v'),
+        KEY_W => Some('w'),
+        KEY_X => Some('x'),
+        KEY_Y => Some('y'),
+        KEY_Z => Some('z'),
+        KEY_1 => Some('1'),
+        KEY_2 => Some('2'),
+        KEY_3 => Some('3'),
+        KEY_4 => Some('4'),
+        KEY_5 => Some('5'),
+        KEY_6 => Some('6'),
+        KEY_7 => Some('7'),
+        KEY_8 => Some('8'),
+        KEY_9 => Some('9'),
+        KEY_0 => Some('0'),
         KEY_ENTER | KEY_KPENTER => Some('\n'),
         KEY_SPACE => Some(' '),
         KEY_BACKSPACE => Some('\x08'),

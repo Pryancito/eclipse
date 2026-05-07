@@ -443,7 +443,8 @@ impl VmAddressRegion {
         } else if len > self.size {
             Err(ZxError::INVALID_ARGS)
         } else {
-            self.find_free_area(inner, 0, len, align).ok_or(ZxError::NO_MEMORY)
+            self.find_free_area(inner, 0, len, align)
+                .ok_or(ZxError::NO_MEMORY)
         }
     }
 

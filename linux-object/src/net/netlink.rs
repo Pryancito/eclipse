@@ -1,6 +1,7 @@
 // udpsocket
 
 use super::socket_address::*;
+use crate::fs::{OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
@@ -12,7 +13,6 @@ use bitflags::bitflags;
 use core::{mem::size_of, slice};
 use kernel_hal::{net::get_net_device, user::*};
 use lock::Mutex;
-use crate::fs::{OpenFlags, PollEvents, PollStatus};
 
 // Needed by `impl_kobject!`
 #[allow(unused_imports)]

@@ -28,7 +28,12 @@ struct PortOpsImpl;
 /// Handles both 32-bit and 64-bit memory BARs without probing (no side effects).
 /// `bar_reg` is the config-space byte offset (0x10 for BAR0, 0x14 for BAR1, etc.).
 #[cfg(target_arch = "x86_64")]
-unsafe fn read_bar_addr(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Location, bar_reg: u16) -> u64 {
+unsafe fn read_bar_addr(
+    ops: &PortOpsImpl,
+    am: CSpaceAccessMethod,
+    loc: Location,
+    bar_reg: u16,
+) -> u64 {
     let lo = am.read32(ops, loc, bar_reg);
     if lo == 0 {
         return 0;
@@ -51,7 +56,12 @@ unsafe fn read_bar_addr(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Location
 /// Temporarily disables Memory/IO decoding (per PCI spec) to avoid bus errors.
 /// Returns 0 if the BAR is not implemented or the size cannot be determined.
 #[cfg(target_arch = "x86_64")]
-unsafe fn probe_bar_size(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Location, bar_reg: u16) -> u64 {
+unsafe fn probe_bar_size(
+    ops: &PortOpsImpl,
+    am: CSpaceAccessMethod,
+    loc: Location,
+    bar_reg: u16,
+) -> u64 {
     let orig_cmd = am.read16(ops, loc, PCI_COMMAND);
     // Disable Memory and I/O decoding while probing (PCI spec requirement)
     am.write16(ops, loc, PCI_COMMAND, orig_cmd & !0x03u16);
@@ -73,11 +83,19 @@ unsafe fn probe_bar_size(ops: &PortOpsImpl, am: CSpaceAccessMethod, loc: Locatio
         am.write32(ops, loc, bar_reg + 4, orig_hi);
         let full_mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
         let sz_mask = full_mask & !0xFu64;
-        if sz_mask == 0 { 0 } else { (!sz_mask).wrapping_add(1) }
+        if sz_mask == 0 {
+            0
+        } else {
+            (!sz_mask).wrapping_add(1)
+        }
     } else {
         // 32-bit memory BAR
         let sz_mask = mask_lo & !0xFu32;
-        if sz_mask == 0 { 0 } else { (!(sz_mask)).wrapping_add(1) as u64 & 0xFFFF_FFFF }
+        if sz_mask == 0 {
+            0
+        } else {
+            (!(sz_mask)).wrapping_add(1) as u64 & 0xFFFF_FFFF
+        }
     };
 
     am.write16(ops, loc, PCI_COMMAND, orig_cmd);
@@ -305,7 +323,9 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             #[cfg(target_arch = "x86_64")]
             let bar0_addr = {
                 if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
-                    if a != 0 { a } else {
+                    if a != 0 {
+                        a
+                    } else {
                         let ops = &PortOpsImpl;
                         unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
                     }
@@ -315,7 +335,11 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 }
             };
             #[cfg(not(target_arch = "x86_64"))]
-            let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] { a } else { 0 };
+            let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+                a
+            } else {
+                0
+            };
 
             if bar0_addr != 0 {
                 // Map BAR0 first so we can probe the display registers for resolution
@@ -333,18 +357,27 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 // overflow), so we probe the real size from config space.
                 let fb_bar = (1..6usize).find_map(|i| {
                     if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[i] {
-                        if addr == 0 { return None; }
+                        if addr == 0 {
+                            return None;
+                        }
                         let actual_len: u64 = if len == 0 {
                             // pci crate 32-bit overflow → probe size directly
                             #[cfg(target_arch = "x86_64")]
                             {
                                 let bar_reg = BAR0 + (i as u16 * 4);
                                 let ops = &PortOpsImpl;
-                                let sz = unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, bar_reg) };
-                                if sz == 0 { 256 * 1024 * 1024 } else { sz }
+                                let sz =
+                                    unsafe { probe_bar_size(ops, PCI_ACCESS, dev.loc, bar_reg) };
+                                if sz == 0 {
+                                    256 * 1024 * 1024
+                                } else {
+                                    sz
+                                }
                             }
                             #[cfg(not(target_arch = "x86_64"))]
-                            { 256 * 1024 * 1024 }
+                            {
+                                256 * 1024 * 1024
+                            }
                         } else {
                             len as u64
                         };
@@ -389,32 +422,36 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
         (0x1af4, 0x1050) => {
             // VirtIO GPU
             warn!("VirtIO GPU found!");
-            
+
             #[cfg(feature = "virtio")]
             {
                 let ops = &PortOpsImpl;
                 let am = PCI_ACCESS;
                 let mut cap_ptr = unsafe { am.read8(ops, dev.loc, 0x34) } as u16;
-                
+
                 let mut common_cfg = None;
                 let mut device_cfg = None;
                 let mut notify_cfg = None;
-                
+
                 while cap_ptr > 0 {
                     let cap_id = unsafe { am.read8(ops, dev.loc, cap_ptr) };
-                    if cap_id == 0x09 { // Vendor Specific
+                    if cap_id == 0x09 {
+                        // Vendor Specific
                         let cfg_type = unsafe { am.read8(ops, dev.loc, cap_ptr + 3) };
                         let bar = unsafe { am.read8(ops, dev.loc, cap_ptr + 4) };
                         let offset = unsafe { am.read32(ops, dev.loc, cap_ptr + 8) };
                         let length = unsafe { am.read32(ops, dev.loc, cap_ptr + 12) };
-                        
+
                         match cfg_type {
                             1 => common_cfg = Some((bar, offset, length)),
                             2 => notify_cfg = Some((bar, offset, length)),
                             4 => device_cfg = Some((bar, offset, length)),
                             _ => {}
                         }
-                        warn!("VirtIO Cap: type={}, bar={}, offset={:#x}, len={}", cfg_type, bar, offset, length);
+                        warn!(
+                            "VirtIO Cap: type={}, bar={}, offset={:#x}, len={}",
+                            cfg_type, bar, offset, length
+                        );
                     }
                     cap_ptr = unsafe { am.read8(ops, dev.loc, cap_ptr + 1) } as u16;
                 }
@@ -426,46 +463,67 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                             m.query_or_map(addr as usize, bar_len as usize);
                         }
                         let common_vaddr = phys_to_virt(addr as usize + offset as usize);
-                        
+
                         let device_vaddr = if let Some((d_bar, d_offset, _)) = device_cfg {
-                            if let Some(BAR::Memory(d_addr, d_len, _, _)) = dev.bars[d_bar as usize] {
+                            if let Some(BAR::Memory(d_addr, d_len, _, _)) = dev.bars[d_bar as usize]
+                            {
                                 if d_bar != bar {
                                     if let Some(m) = mapper {
                                         m.query_or_map(d_addr as usize, d_len as usize);
                                     }
                                 }
                                 phys_to_virt(d_addr as usize + d_offset as usize)
-                            } else { 0 }
-                        } else { 0 };
-                        
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+
                         let notify_vaddr = if let Some((n_bar, n_offset, _)) = notify_cfg {
-                            if let Some(BAR::Memory(n_addr, n_len, _, _)) = dev.bars[n_bar as usize] {
-                                if n_bar != bar && n_bar != (device_cfg.map(|(b, _, _)| b).unwrap_or(255)) {
+                            if let Some(BAR::Memory(n_addr, n_len, _, _)) = dev.bars[n_bar as usize]
+                            {
+                                if n_bar != bar
+                                    && n_bar != (device_cfg.map(|(b, _, _)| b).unwrap_or(255))
+                                {
                                     if let Some(m) = mapper {
                                         m.query_or_map(n_addr as usize, n_len as usize);
                                     }
                                 }
                                 phys_to_virt(n_addr as usize + n_offset as usize)
-                            } else { 0 }
-                        } else { 0 };
-
-                        let (fb_vaddr, fb_size) = if let Some(BAR::Memory(fb_addr, fb_len, _, _)) = dev.bars[0] {
-                            if let Some(m) = mapper {
-                                m.query_or_map(fb_addr as usize, fb_len as usize);
+                            } else {
+                                0
                             }
-                            (phys_to_virt(fb_addr as usize), fb_len as usize)
-                        } else { (0, 0) };
+                        } else {
+                            0
+                        };
 
-                        match crate::virtio::VirtIoGpu::new_modern(common_vaddr, device_vaddr, notify_vaddr, fb_vaddr, fb_size) {
+                        let (fb_vaddr, fb_size) =
+                            if let Some(BAR::Memory(fb_addr, fb_len, _, _)) = dev.bars[0] {
+                                if let Some(m) = mapper {
+                                    m.query_or_map(fb_addr as usize, fb_len as usize);
+                                }
+                                (phys_to_virt(fb_addr as usize), fb_len as usize)
+                            } else {
+                                (0, 0)
+                            };
+
+                        match crate::virtio::VirtIoGpu::new_modern(
+                            common_vaddr,
+                            device_vaddr,
+                            notify_vaddr,
+                            fb_vaddr,
+                            fb_size,
+                        ) {
                             Ok(gpu) => {
                                 warn!("VirtIO Modern GPU initialized successfully!");
                                 return Ok(Device::Drm(Arc::new(gpu)));
-                            },
+                            }
                             Err(e) => warn!("VirtIO Modern GPU init failed: {:?}", e),
                         }
                     }
                 }
-                
+
                 // Fallback to legacy if no modern caps found or failed
                 if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
                     if let Some(m) = mapper {
@@ -514,23 +572,34 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 return Err(DeviceError::NotSupported);
             }
 
-            warn!("[xhci] PCI BAR0 detectado en Phys:{:#x}, Len:{:#x}", addr, len);
+            warn!(
+                "[xhci] PCI BAR0 detectado en Phys:{:#x}, Len:{:#x}",
+                addr, len
+            );
 
             // Alineación a página (4KB)
             let base_addr = (addr as usize) & !0xfff;
             let offset = (addr as usize) & 0xfff;
             // Forzamos un mapeo de al menos 128KB para asegurar que CAP, OP y RT estén cubiertos
-            let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+            let map_len =
+                ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
 
             if let Some(m) = mapper {
-                warn!("[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
+                warn!(
+                    "[xhci] Solicitando mapeo kernel: [{:#x} - {:#x}]",
+                    base_addr,
+                    base_addr + map_len
+                );
                 m.query_or_map(base_addr, map_len);
             } else {
                 warn!("[xhci] CRÍTICO: No hay IoMapper disponible. El acceso a {:#x} causará un Page Fault si no está pre-mapeado.", base_addr);
             }
 
             let vaddr = phys_to_virt(addr as usize);
-            warn!("[xhci] VAddr mapeado: {:#x}. Intentando acceder a registros...", vaddr);
+            warn!(
+                "[xhci] VAddr mapeado: {:#x}. Intentando acceder a registros...",
+                vaddr
+            );
 
             let msi_idx = unsafe { enable(dev.loc, 0) };
             if let Some(idx) = msi_idx {
@@ -583,13 +652,20 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             let map_len = 4096; // 4KB is enough for AHCI registers
 
             if let Some(m) = mapper {
-                warn!("[AHCI] Solicitando mapeo kernel: [{:#x} - {:#x}]", base_addr, base_addr + map_len);
+                warn!(
+                    "[AHCI] Solicitando mapeo kernel: [{:#x} - {:#x}]",
+                    base_addr,
+                    base_addr + map_len
+                );
                 m.query_or_map(base_addr, map_len);
             }
 
             let irq = unsafe { enable(dev.loc, 0) };
             let vaddr = phys_to_virt(addr as usize);
-            let blk = Arc::new(crate::ata::ahci::AhciInterface::new(vaddr, irq.unwrap_or(33))?);
+            let blk = Arc::new(crate::ata::ahci::AhciInterface::new(
+                vaddr,
+                irq.unwrap_or(33),
+            )?);
             return Ok(Device::Block(blk));
         } else {
             warn!("AHCI dev found but BAR5 address is 0");
@@ -657,7 +733,7 @@ pub fn get_bar0_mem(loc: Location) -> Option<(usize, usize)> {
     unsafe { probe_function(&PortOpsImpl, loc, PCI_ACCESS) }
         .and_then(|dev| dev.bars[0])
         .map(|bar| match bar {
-            BAR::Memory(addr, len, _, _ ) => (addr as usize, len as usize),
+            BAR::Memory(addr, len, _, _) => (addr as usize, len as usize),
             _ => unimplemented!(),
         })
 }

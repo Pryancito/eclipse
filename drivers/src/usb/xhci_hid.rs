@@ -172,10 +172,11 @@ impl XhciMmio {
                 if (legsup & (1 << 16)) != 0 {
                     legsup |= 1 << 24;
                     self.write_cap(cap_ptr, legsup);
-                    let mut t = 100u32;
+                    let mut t = 500u32;
                     while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && t > 0 {
                         t -= 1;
-                        // Espera de ~1ms por cada iteración -> 100ms total
+                        // Espera de ~1ms por cada iteración -> 500ms total
+                        // Algunos BIOS reales tardan >100ms en liberar el controlador xHCI.
                         for _ in 0..1_000_000 {
                             spin_loop();
                         }
@@ -648,6 +649,13 @@ impl XhciInner {
             if etype == 32 {
                 // TRB_EVT_TRANSFER
                 self.handle_hid_transfer_side(&trb, lis);
+            } else if etype == 34 {
+                // TRB_EVT_PORT_STATUS: re-enumerar el puerto si hay cambio de conexión.
+                // El Port ID está en los bits 31:24 de DW0 (campo p[31:24]).
+                let port_id = ((trb.p >> 24) & 0xff) as u8;
+                if port_id >= 1 {
+                    let _ = self.handle_port_status_change(port_id);
+                }
             }
 
             return Some(trb);
@@ -939,8 +947,9 @@ impl XhciInner {
                 m.write_op(off, (sc & 0x0e00_c3e0) | (1 << 9));
             }
         }
-        // Pequeña espera tras dar energía
-        for _ in 0..100_000 {
+        // Pequeña espera tras dar energía (USB spec exige ≥100ms de VBUS estable antes de
+        // que el dispositivo pueda responder; los devices gaming con firmware complejo lo necesitan).
+        for _ in 0..2_000_000 {
             spin_loop();
         }
 
@@ -1302,11 +1311,13 @@ impl XhciInner {
         let ep_off = csz + csz + (dci - 1) * csz;
 
         // Endpoint Context DW0: set Interval from the USB endpoint descriptor.
-        // For HS/SS (speed >= 3) bInterval is the exponent (0-15 are all valid per xHCI spec
-        // section 6.2.3.6).  For FS/LS bInterval is in frames and must be at least 1.
+        // For HS/SS (speed >= 3): USB bInterval is the exponent N where the period is
+        // 2^(N-1) × 125 µs, but xHCI Interval is M where the period is 2^M × 125 µs.
+        // Therefore xhci_interval = bInterval - 1 (per xHCI spec §6.2.3.6).
+        // For FS/LS: bInterval is in frames (1 ms each); the field must be at least 1.
         let speed = self.slot_speed[slot as usize];
         let xhci_interval = if speed >= 3 {
-            interval.min(15)
+            interval.saturating_sub(1).min(15)
         } else {
             interval.min(15).max(1)
         };

@@ -1,7 +1,7 @@
 //! Only UEFI Display currently.
 
-mod uefi;
 mod nvidia;
+mod uefi;
 
+pub use nvidia::{set_boot_fb_info, NvidiaGpu};
 pub use uefi::UefiDisplay;
-pub use nvidia::{NvidiaGpu, set_boot_fb_info};

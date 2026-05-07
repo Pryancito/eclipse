@@ -33,9 +33,15 @@ impl<'a> VirtIoGpu<'a> {
     }
 
     /// Initialize a VirtIO GPU in Modern mode (PCI)
-    pub fn new_modern(common_vaddr: usize, _device_vaddr: usize, _notify_vaddr: usize, fb_vaddr: usize, fb_size: usize) -> DeviceResult<Self> {
+    pub fn new_modern(
+        common_vaddr: usize,
+        _device_vaddr: usize,
+        _notify_vaddr: usize,
+        fb_vaddr: usize,
+        fb_size: usize,
+    ) -> DeviceResult<Self> {
         let common = unsafe { &mut *(common_vaddr as *mut VirtioPciCommonCfg) };
-        
+
         // Basic initialization for Modern PCI
         common.device_status = 0; // Reset
         common.device_status |= 1; // ACK
@@ -53,10 +59,7 @@ impl<'a> VirtIoGpu<'a> {
         };
 
         // In Modern mode, we don't use the legacy InnerDriver because it requires a legacy header.
-        Ok(Self {
-            info,
-            inner: None,
-        })
+        Ok(Self { info, inner: None })
     }
 }
 
@@ -155,27 +158,62 @@ impl<'a> DrmScheme for VirtIoGpu<'a> {
 
     fn get_connector(&self, id: u32) -> Option<DrmConnector> {
         if id == 1000 {
-            Some(DrmConnector { id, connected: true, mm_width: 0, mm_height: 0 })
-        } else { None }
+            Some(DrmConnector {
+                id,
+                connected: true,
+                mm_width: 0,
+                mm_height: 0,
+            })
+        } else {
+            None
+        }
     }
 
     fn get_crtc(&self, id: u32) -> Option<DrmCrtc> {
         if id == 2000 {
-            Some(DrmCrtc { id, fb_id: 0, x: 0, y: 0 })
-        } else { None }
+            Some(DrmCrtc {
+                id,
+                fb_id: 0,
+                x: 0,
+                y: 0,
+            })
+        } else {
+            None
+        }
     }
 
     fn get_plane(&self, id: u32) -> Option<DrmPlane> {
         if id == 3000 {
-            Some(DrmPlane { id, crtc_id: 2000, fb_id: 0, possible_crtcs: 1, plane_type: 1 })
-        } else { None }
+            Some(DrmPlane {
+                id,
+                crtc_id: 2000,
+                fb_id: 0,
+                possible_crtcs: 1,
+                plane_type: 1,
+            })
+        } else {
+            None
+        }
     }
 
     fn get_planes(&self) -> Vec<u32> {
         alloc::vec![3000]
     }
 
-    fn set_plane(&self, _plane_id: u32, _crtc_id: u32, _fb_id: u32, _x: i32, _y: i32, _w: u32, _h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
+    fn set_plane(
+        &self,
+        _plane_id: u32,
+        _crtc_id: u32,
+        _fb_id: u32,
+        _x: i32,
+        _y: i32,
+        _w: u32,
+        _h: u32,
+        _src_x: u32,
+        _src_y: u32,
+        _src_w: u32,
+        _src_h: u32,
+    ) -> bool {
         true
     }
 

@@ -126,7 +126,10 @@ impl Syscall<'_> {
     pub fn sys_brk(&self, new_brk: usize) -> SysResult {
         let proc = self.linux_process();
         let current_brk = proc.brk();
-        info!("brk: new_brk={:#x}, current_brk={:#x}", new_brk, current_brk);
+        info!(
+            "brk: new_brk={:#x}, current_brk={:#x}",
+            new_brk, current_brk
+        );
 
         // brk(0) → return current break unchanged (query).
         if new_brk == 0 {
