@@ -1,4 +1,6 @@
 mod drivers;
+#[cfg(feature = "graphic")]
+mod early_fb_console;
 mod trap;
 
 pub mod config;
@@ -11,7 +13,25 @@ pub mod vm;
 #[doc(cfg(target_arch = "x86_64"))]
 pub mod special;
 
-hal_fn_impl_default!(crate::hal_fn::console);
+hal_fn_impl! {
+    impl mod crate::hal_fn::console {
+        fn console_write_early(s: &str) {
+            #[cfg(feature = "graphic")]
+            {
+                // Note: this is within the kernel-hal crate, so we can reference the private
+                // `imp::arch` module.
+                crate::imp::arch::early_fb_console::write_str(s);
+            }
+        }
+
+        fn console_progress_early(progress: u32) {
+            #[cfg(feature = "graphic")]
+            {
+                crate::imp::arch::early_fb_console::draw_progress_bar(progress);
+            }
+        }
+    }
+}
 
 use crate::{mem::phys_to_virt, KCONFIG};
 use x86_64::registers::control::{Cr4, Cr4Flags};

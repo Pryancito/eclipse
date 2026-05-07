@@ -13,11 +13,13 @@
 #[macro_use]
 extern crate alloc;
 
+#[macro_use]
 extern crate log;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
+use log::LevelFilter;
 use rboot::{BootInfo, GraphicInfo};
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::proto::media::file::*;
@@ -33,8 +35,24 @@ use xmas_elf::ElfFile;
 mod config;
 mod page_table;
 mod logo;
+mod progress;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
+
+fn parse_log_level_from_cmdline(cmdline: &str) -> Option<LevelFilter> {
+    // cmdline format example:
+    //   "LOG=debug:ROOTPROC=/bin/busybox?sh:TERM=xterm-256color"
+    // We keep this parser intentionally tiny (no alloc) and tolerant.
+    for part in cmdline.split(':') {
+        let mut it = part.splitn(2, '=');
+        let k = it.next()?.trim();
+        let v = it.next().unwrap_or("").trim();
+        if k.eq_ignore_ascii_case("LOG") {
+            return Some(v.parse().unwrap_or(LevelFilter::Info));
+        }
+    }
+    None
+}
 
 #[entry]
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
@@ -48,10 +66,16 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         config::Config::parse(buf)
     };
 
+    if let Some(level) = parse_log_level_from_cmdline(config.cmdline) {
+        log::set_max_level(level);
+    }
+    info!("rboot: start (log={:?})", log::max_level());
+
     let graphic_info = init_graphic(bs, config.resolution);
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 10);
     // Draw splash logo immediately after GOP init.
-    logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
-    //info!("config: {:#x?}", config);
+    //logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
+    debug!("rboot config: {:#x?}", config);
 
     let acpi2_addr = st
         .config_table()
@@ -59,7 +83,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .find(|entry| entry.guid == ACPI2_GUID)
         .expect("failed to find ACPI 2 RSDP")
         .address;
-    //info!("acpi2: {:?}", acpi2_addr);
+    debug!("acpi2 rsdp: {:?}", acpi2_addr);
 
     let smbios_addr = st
         .config_table()
@@ -67,13 +91,15 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .find(|entry| entry.guid == SMBIOS_GUID)
         .expect("failed to find SMBIOS")
         .address;
-    //info!("smbios: {:?}", smbios_addr);
+    debug!("smbios: {:?}", smbios_addr);
 
     let elf = {
         let mut file = open_file(bs, config.kernel_path);
         let buf = load_file(bs, &mut file);
         ElfFile::new(buf).expect("failed to parse ELF")
     };
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 30);
+    debug!("kernel elf loaded: entry={:#x}", elf.header.pt2.entry_point());
     unsafe {
         ENTRY = elf.header.pt2.entry_point() as usize;
     }
@@ -81,10 +107,12 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     let (initramfs_addr, initramfs_size) = if let Some(path) = config.initramfs {
         let mut file = open_file(bs, path);
         let buf = load_file(bs, &mut file);
+        debug!("initramfs loaded: addr={:#x} size={:#x}", buf.as_ptr() as u64, buf.len());
         (buf.as_ptr() as u64, buf.len() as u64)
     } else {
         (0, 0)
     };
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 40);
 
     let max_mmap_size = st.boot_services().memory_map_size().map_size;
     let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
@@ -100,11 +128,15 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             .unwrap()
             .max(0x1_0000_0000) // include IOAPIC MMIO area
     };
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 60);
 
     let mut page_table = current_page_table();
     unsafe {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
-        Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
+        // Disable NX enforcement during early bring-up. If the kernel ELF flags are
+        // mis-detected, marking text as NX would cause an immediate fault on entry.
+        // We can re-enable NX once the mapping logic is proven correct.
+        // Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
@@ -121,6 +153,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut page_table,
         &mut UEFIFrameAllocator(bs),
     );
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 75);
     unsafe {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
@@ -129,13 +162,18 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     let mut memory_map = Vec::with_capacity(128);
 
+    // On some real machines, ExitBootServices can be the point where things go wrong.
+    // Update the bar just before attempting it so we can pinpoint the hang visually.
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 85);
     let (_rt, mmap_iter) = st
         .exit_boot_services(image, mmap_storage)
         .expect("Failed to exit boot services");
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 90);
 
     for desc in mmap_iter {
         memory_map.push(desc);
     }
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 95);
 
     let bootinfo = BootInfo {
         memory_map,
@@ -148,6 +186,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         cmdline: config.cmdline,
     };
     let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
+    progress::bar(graphic_info.mode, graphic_info.fb_addr, 100);
     unsafe {
         jump_to_entry(&bootinfo, stacktop);
     }

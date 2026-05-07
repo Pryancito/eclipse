@@ -2,7 +2,7 @@
 
 ARCH ?= x86_64
 XTASK ?= 1
-LOG ?= error
+LOG ?= debug
 GRAPHIC ?= on
 ACCEL ?= 1
 
@@ -10,6 +10,7 @@ STRIP := $(ARCH)-linux-musl-strip
 export PATH=$(shell printenv PATH):$(CURDIR)/ignored/target/$(ARCH)/$(ARCH)-linux-musl-cross/bin/
 
 .PHONY: help zircon-init update rootfs libc-test other-test image check doc clean
+.PHONY: iso qcow2 img
 
 # print top level help
 help:
@@ -84,3 +85,93 @@ clean-everything: clean
 # 	echo x86 gcc build rt-test,now need manual modificy.
 qemu: image
 	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL)
+
+################ Distribution images ################
+#
+# - `make iso`   builds a UEFI-bootable ISO image.
+# - `make qcow2` builds a qcow2 disk image that contains the ESP filesystem.
+#
+# Both targets rely on the existing ESP directory produced by `zCore/Makefile`
+# when building for x86_64.
+
+DIST_DIR := $(CURDIR)/dist
+BUILD_DIR := $(CURDIR)/build
+MODE ?= release
+ESP_DIR := $(CURDIR)/target/$(ARCH)/$(MODE)/esp
+
+ISO_STAGING := $(BUILD_DIR)/iso-root
+ESP_IMG := $(BUILD_DIR)/esp.img
+DISK_IMG := $(BUILD_DIR)/disk.img
+ISO_OUT := $(DIST_DIR)/eclipse-$(ARCH).iso
+QCOW2_OUT := $(DIST_DIR)/eclipse-$(ARCH).qcow2
+IMG_OUT := $(DIST_DIR)/eclipse-$(ARCH).img
+
+iso: image
+ifeq ($(ARCH), x86_64)
+	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)" "$(ISO_STAGING)"
+	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
+	@rm -rf "$(ISO_STAGING)/EFI" && cp -a "$(ESP_DIR)/EFI" "$(ISO_STAGING)/"
+	@command -v mkfs.vfat >/dev/null || (echo "falta mkfs.vfat (paquete: dosfstools)"; exit 1)
+	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
+	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
+	@command -v xorriso >/dev/null || (echo "falta xorriso"; exit 1)
+	@rm -f "$(ESP_IMG)"
+	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=64 status=none
+	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
+	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
+	@xorriso -as mkisofs \
+		-R -J -V "ECLIPSE" \
+		-append_partition 2 0xef "$(ESP_IMG)" \
+		-e --interval:appended_partition_2:all:: \
+		-no-emul-boot \
+		-o "$(ISO_OUT)" \
+		"$(ISO_STAGING)" >/dev/null
+	@echo "ISO generado: $(ISO_OUT)"
+else
+	@echo "iso: solo soportado para ARCH=x86_64 por ahora"
+	@exit 1
+endif
+
+qcow2: image
+ifeq ($(ARCH), x86_64)
+	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)"
+	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
+	@command -v mkfs.vfat >/dev/null || (echo "falta mkfs.vfat (paquete: dosfstools)"; exit 1)
+	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
+	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
+	@command -v qemu-img >/dev/null || (echo "falta qemu-img"; exit 1)
+	@rm -f "$(ESP_IMG)"
+	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=64 status=none
+	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
+	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
+	@qemu-img convert -f raw "$(ESP_IMG)" -O qcow2 "$(QCOW2_OUT)" >/dev/null
+	@echo "qcow2 generado: $(QCOW2_OUT)"
+else
+	@echo "qcow2: solo soportado para ARCH=x86_64 por ahora"
+	@exit 1
+endif
+
+img: image
+ifeq ($(ARCH), x86_64)
+	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)"
+	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
+	@command -v sgdisk >/dev/null || (echo "falta sgdisk (paquete: gdisk)"; exit 1)
+	@command -v mformat >/dev/null || (echo "falta mformat (paquete: mtools)"; exit 1)
+	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
+	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
+	@rm -f "$(DISK_IMG)"
+	@dd if=/dev/zero of="$(DISK_IMG)" bs=1M count=128 status=none
+	@sgdisk -o "$(DISK_IMG)" >/dev/null
+	@sgdisk -n 1:2048:+64M -t 1:ef00 -c 1:EFI "$(DISK_IMG)" >/dev/null
+	@# FAT32 ESP starts at 2048 * 512 = 1048576 bytes (1MiB)
+	@mformat -i "$(DISK_IMG)@@1048576" -F -v EFI :: >/dev/null
+	@mmd -i "$(DISK_IMG)@@1048576" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@mcopy -i "$(DISK_IMG)@@1048576" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
+	@cp -f "$(DISK_IMG)" "$(IMG_OUT)"
+	@echo "img generado: $(IMG_OUT)"
+else
+	@echo "img: solo soportado para ARCH=x86_64 por ahora"
+	@exit 1
+endif

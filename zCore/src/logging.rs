@@ -117,6 +117,7 @@ impl Log for SimpleLogger {
             Level::Debug => ColorCode::Cyan,
             Level::Trace => ColorCode::BrightBlack,
         };
+        // Primary log output: serial + (later) native graphic console.
         print(with_color!(
             ColorCode::White,
             "[{time} {level} {info} {data}\n",
@@ -135,6 +136,46 @@ impl Log for SimpleLogger {
             info = with_color!(ColorCode::White, "{cpu_id} {pid}:{tid} {target}]"),
             data = with_color!(args_color, "{args}", args = record.args()),
         ));
+
+        // When running with `LOG=debug` (or more verbose) we still don't have a native GPU
+        // driver early in boot. Mirror logs to the UEFI GOP framebuffer console so we can
+        // see early boot progress on real hardware.
+        //
+        // IMPORTANT: The early framebuffer console can't interpret ANSI escapes, so
+        // keep this output plain (no colors).
+        #[cfg(feature = "graphic")]
+        if log::max_level() >= LevelFilter::Debug {
+            cfg_if! {
+                if #[cfg(feature = "libos")] {
+                    use chrono::{TimeZone, Local};
+                    kernel_hal::console::debug_write_fmt(format_args!(
+                        "[{time} {level:<5} {cpu_id} {pid}:{tid} {target}] {args}\n",
+                        time = Local.timestamp_nanos(now.as_nanos() as _).format("%Y-%m-%d %H:%M:%S%.6f"),
+                        level = level,
+                        cpu_id = cpu_id,
+                        pid = pid,
+                        tid = tid,
+                        target = target,
+                        args = record.args(),
+                    ));
+                } else {
+                    let micros = now.as_micros();
+                    let s = micros / 1_000_000;
+                    let us = micros % 1_000_000;
+                    kernel_hal::console::debug_write_fmt(format_args!(
+                        "[{s:>3}.{us:06} {level:<5} {cpu_id} {pid}:{tid} {target}] {args}\n",
+                        s = s,
+                        us = us,
+                        level = level,
+                        cpu_id = cpu_id,
+                        pid = pid,
+                        tid = tid,
+                        target = target,
+                        args = record.args(),
+                    ));
+                }
+            }
+        }
     }
 
     fn flush(&self) {}

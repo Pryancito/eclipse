@@ -1,0 +1,171 @@
+//! Boot progress bar drawing (UEFI GOP framebuffer).
+//!
+//! Minimal, no_std-friendly: draws a centered progress bar directly into GOP fb.
+
+use uefi::proto::console::gop::{ModeInfo, PixelFormat};
+
+// 8x8 font for ASCII 0x20..0x7F (same data format as kernel-hal).
+const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
+
+fn pixel_white(fmt: PixelFormat) -> u32 {
+    match fmt {
+        // Our code writes low bytes as B,G,R so 0x00RRGGBB works for Bgr.
+        PixelFormat::Bgr | PixelFormat::BltOnly => 0x00FF_FFFF,
+        // For Rgb, low bytes are R,G,B, so use 0x00BBGGRR (white is same either way).
+        PixelFormat::Rgb => 0x00FF_FFFF,
+        _ => 0x00FF_FFFF,
+    }
+}
+
+fn pixel_black(_fmt: PixelFormat) -> u32 {
+    0x0000_0000
+}
+
+fn put_pixel(fb: *mut u32, stride: usize, x: usize, y: usize, pixel: u32) {
+    unsafe { core::ptr::write_volatile(fb.add(y * stride + x), pixel) };
+}
+
+fn draw_char_8x16(
+    fb: *mut u32,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    x: usize,
+    y: usize,
+    c: u8,
+    fg: u32,
+    bg: u32,
+) {
+    let c = if (0x20..0x80).contains(&c) { c } else { b'?' };
+    let glyph = &FONT8X8[(c - 0x20) as usize];
+    for (gy, bits) in glyph.iter().copied().enumerate() {
+        let py0 = y + gy * 2;
+        if py0 >= sh {
+            break;
+        }
+        for gx in 0..8 {
+            let px = x + gx;
+            if px >= sw {
+                break;
+            }
+            let on = (bits & (1 << (7 - gx))) != 0;
+            let color = if on { fg } else { bg };
+            if py0 < sh {
+                put_pixel(fb, stride, px, py0, color);
+            }
+            if py0 + 1 < sh {
+                put_pixel(fb, stride, px, py0 + 1, color);
+            }
+        }
+    }
+}
+
+fn draw_text_8x16(
+    fb: *mut u32,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    x: usize,
+    y: usize,
+    text: &[u8],
+    fg: u32,
+    bg: u32,
+) {
+    let mut cx = x;
+    for &ch in text {
+        draw_char_8x16(fb, stride, sw, sh, cx, y, ch, fg, bg);
+        cx = cx.saturating_add(8);
+        if cx >= sw {
+            break;
+        }
+    }
+}
+
+fn fill_rect(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, w: usize, h: usize, pixel: u32) {
+    let x1 = (x + w).min(sw);
+    let y1 = (y + h).min(sh);
+    for yy in y..y1 {
+        for xx in x..x1 {
+            put_pixel(fb, stride, xx, yy, pixel);
+        }
+    }
+}
+
+fn stroke_rect(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, w: usize, h: usize, t: usize, pixel: u32) {
+    if w == 0 || h == 0 || t == 0 { return; }
+    fill_rect(fb, stride, sw, sh, x, y, w, t, pixel);
+    if h > t {
+        fill_rect(fb, stride, sw, sh, x, y + h - t, w, t, pixel);
+    }
+    if h > t * 2 {
+        fill_rect(fb, stride, sw, sh, x, y + t, t, h - t * 2, pixel);
+        if w > t {
+            fill_rect(fb, stride, sw, sh, x + w - t, y + t, t, h - t * 2, pixel);
+        }
+    }
+}
+
+/// Draw a centered progress bar (0..=100).
+///
+/// `pixel` encoding matches existing `logo.rs`: 0x00RRGGBB.
+pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
+    let fmt = mode.pixel_format();
+    if fmt != PixelFormat::Bgr && fmt != PixelFormat::BltOnly && fmt != PixelFormat::Rgb {
+        return;
+    }
+
+    let (sw, sh) = mode.resolution();
+    let sw = sw as usize;
+    let sh = sh as usize;
+    let stride = mode.stride() as usize;
+    let fb = fb_addr as *mut u32;
+
+    let progress = (progress.min(100)) as usize;
+    let bar_w: usize = 400;
+    let bar_h: usize = 20;
+    let x = sw.saturating_sub(bar_w) / 2;
+    let y = sh.saturating_sub(bar_h) / 2;
+
+    // Border (white) and inner content (white fill / black remainder).
+    let white = pixel_white(fmt);
+    let black = pixel_black(fmt);
+    stroke_rect(
+        fb,
+        stride,
+        sw,
+        sh,
+        x.saturating_sub(2),
+        y.saturating_sub(2),
+        bar_w + 4,
+        bar_h + 4,
+        1,
+        white,
+    );
+    let fill_w = (bar_w * progress) / 100;
+    if fill_w > 0 {
+        fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, white);
+    }
+    if fill_w < bar_w {
+        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, black);
+    }
+
+    // Fixed-width percentage text (4 chars: "100%" or "  7%"/" 42%").
+    let p = progress.min(100);
+    let mut buf = [b' '; 4];
+    buf[3] = b'%';
+    if p == 100 {
+        buf[0] = b'1';
+        buf[1] = b'0';
+        buf[2] = b'0';
+    } else if p >= 10 {
+        buf[1] = b'0' + (p / 10) as u8;
+        buf[2] = b'0' + (p % 10) as u8;
+    } else {
+        buf[2] = b'0' + p as u8;
+    }
+    let text_w = 4 * 8;
+    let tx = x + (bar_w.saturating_sub(text_w)) / 2;
+    let ty = y + bar_h + 15;
+    draw_text_8x16(fb, stride, sw, sh, tx, ty, &buf, white, black);
+}
+

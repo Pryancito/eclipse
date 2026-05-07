@@ -13,9 +13,9 @@ hal_fn_impl! {
         }
 
         fn primary_init_early(cfg: KernelConfig, handler: &'static impl KernelHandler) {
-            info!("Primary CPU {} init early...", crate::cpu::cpu_id());
             KCONFIG.init_once_by(cfg);
             KHANDLER.init_once_by(handler);
+            info!("Primary CPU {} init early...", crate::cpu::cpu_id());
             super::arch::primary_init_early();
         }
 

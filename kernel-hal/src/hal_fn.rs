@@ -142,6 +142,7 @@ hal_fn_def! {
 
     pub mod console {
         pub fn console_write_early(_s: &str) {}
+        pub fn console_progress_early(_progress: u32) {}
     }
 
     /// Thread spawning.

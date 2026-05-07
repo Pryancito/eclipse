@@ -54,6 +54,9 @@ cfg_if! {
             };
             CONSOLE_WIN_SIZE.init_once_by(winsz);
             GRAPHIC_CONSOLE.init_once_by(Mutex::new(cons));
+            // Make boot UX robust on real hardware: clear once on first graphic write
+            // even if userspace/loader ordering differs.
+            CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
         }
 
         /// Request a one-shot clear-to-black of the graphic console before the next write.
@@ -102,6 +105,13 @@ pub fn debug_write_str(s: &str) {
 /// Writes formatted data into the serial through sbi call..
 pub fn debug_write_fmt(fmt: Arguments) {
     DEBUG_WRITER.lock().write_fmt(fmt).unwrap();
+}
+
+/// Draw a boot progress bar on the early framebuffer console (UEFI GOP), if available.
+///
+/// This is intended for very early boot stages before the native graphic driver exists.
+pub fn early_progress_bar(progress: u32) {
+    crate::hal_fn::console::console_progress_early(progress);
 }
 
 /// Writes a string slice into the graphic console.
