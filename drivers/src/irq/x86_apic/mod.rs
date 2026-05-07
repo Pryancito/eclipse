@@ -120,16 +120,28 @@ impl IrqScheme for Apic {
     }
 
     fn register_handler(&self, gsi: usize, handler: IrqHandler) -> DeviceResult {
-        let gsi = gsi as u32;
-        self.with_ioapic(gsi, |apic| {
-            let vector = apic.get_vector(gsi) as _; // if not mapped, allocate an available vector by `register_handler()`.
-            let vector = self
-                .manager_ioapic
+        let gsi32 = gsi as u32;
+        if self.ioapic_list.find(gsi32).is_some() {
+            // Interrupción gestionada por IOAPIC (IRQ legacy/PCI-INTx).
+            self.with_ioapic(gsi32, |apic| {
+                let vector = apic.get_vector(gsi32) as _;
+                let vector = self
+                    .manager_ioapic
+                    .lock()
+                    .register_handler(vector, handler)? as u8;
+                apic.map_vector(gsi32, vector);
+                Ok(())
+            })
+        } else {
+            // No hay IOAPIC para este GSI → es un vector MSI.
+            // El hardware escribe el vector directamente en el LAPIC,
+            // así que registramos el handler en manager_ioapic.table[gsi]
+            // sin pasar por el IOAPIC.
+            self.manager_ioapic
                 .lock()
-                .register_handler(vector, handler)? as u8;
-            apic.map_vector(gsi, vector);
-            Ok(())
-        })
+                .register_handler(gsi, handler)
+                .map(|_| ())
+        }
     }
 
     fn unregister(&self, gsi: usize) -> DeviceResult {

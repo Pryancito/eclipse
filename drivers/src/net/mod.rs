@@ -6,6 +6,7 @@ use lock::Mutex;
 use smoltcp::socket::SocketSet;
 
 pub mod e1000;
+pub mod e1000e;
 pub mod loopback;
 pub use isomorphic_drivers::provider::Provider;
 pub use loopback::LoopbackInterface;

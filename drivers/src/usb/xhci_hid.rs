@@ -22,10 +22,20 @@ use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{DeviceError, DeviceResult};
+use crate::bus::drivers_timer_now_as_micros;
+
+fn timer_now_us() -> u64 {
+    unsafe { drivers_timer_now_as_micros() }
+}
 
 // PORTSC bits RW1C (port change). Hay que mantenerlos a 0 salvo cuando queramos limpiarlos.
 const PORTSC_CHANGE_BITS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
+
+// PORTSC bits que son RW1C pero NO son "change" flags — escribir 1 los borra.
+// PED (bit 1) es RW1C: escribir 1 deshabilita el puerto. Siempre hay que enmascararlo
+// cuando modificamos PORTSC para no tirar accidentalmente la habilitación del puerto.
+const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1); // incluye PED
 
 // ——— USB legacy (EHCI/OHCI/UHCI) ———
 //
@@ -171,6 +181,20 @@ impl DmaBuf {
     fn sub_phys(&self, off: usize) -> u64 {
         (self.phys + off) as u64
     }
+
+    fn flush(&self, off: usize, len: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut addr = self.virt + off;
+            let end = addr + len;
+            while addr < end {
+                unsafe { _mm_clflush(addr as *const u8); }
+                addr += 64;
+            }
+            fence(Ordering::SeqCst);
+        }
+        let _ = (off, len);
+    }
 }
 
 pub struct XhciMmio {
@@ -236,15 +260,12 @@ impl XhciMmio {
                     info!("[xhci] BIOS posee el controlador, solicitando handoff...");
                     legsup |= 1 << 24; // OS Owned Semaphore
                     self.write_cap(cap_ptr, legsup);
-                    let mut t = 500u32;
-                    while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && t > 0 {
-                        t -= 1;
-                        // Espera de ~1ms por cada iteración -> 500ms total
-                        // Algunos BIOS reales tardan >100ms en liberar el controlador xHCI.
-                        for _ in 0..1_000_000 {
-                            spin_loop();
-                        }
+                    
+                    let start = timer_now_us();
+                    while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && (timer_now_us() - start) < 500_000 {
+                        spin_loop();
                     }
+                    
                     if (self.read_cap(cap_ptr) & (1 << 16)) != 0 {
                         warn!("[xhci] handoff fallido por timeout, forzando control");
                     } else {
@@ -474,6 +495,7 @@ impl CmdRing {
         self.buf.write_u32(off + 8, t.status);
         fence(Ordering::Release);
         self.buf.write_u32(off + 12, t.ctrl);
+        self.buf.flush(off, 16);
         self.enq += 1;
         if self.enq >= self.cap {
             self.enq = 0;
@@ -552,6 +574,7 @@ impl XferRing {
         self.buf.write_u32(off + 8, t.status);
         fence(Ordering::Release);
         self.buf.write_u32(off + 12, t.ctrl);
+        self.buf.flush(off, 16);
         self.enq += 1;
         if self.enq >= self.cap {
             self.enq = 0;
@@ -596,6 +619,19 @@ impl EventRing {
 
     fn peek(&self) -> Option<Trb> {
         let off = self.deq * 16;
+        // El controlador xHCI escribe eventos en RAM via DMA.
+        // En x86_64, aunque el hardware hace cache snooping en la mayoría de sistemas,
+        // algunos entornos (IOMMU no coherente, VMs con passthrough parcial, etc.)
+        // pueden dejar la línea de caché marcada como válida con los ceros originales.
+        // USBSTS.EINT=1 pero 0 eventos visibles es la firma exacta de este problema.
+        // Solución: invalidar la línea de caché del TRB actual antes de leerlo.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // Cada TRB = 16 bytes. Una línea de caché = 64 bytes = 4 TRBs.
+            // clflush invalida toda la línea, así que un solo flush es suficiente.
+            core::arch::x86_64::_mm_clflush((self.seg.virt + off) as *const u8);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
         let c = self.seg.read_u32(off + 12);
         if (c & 1) == (self.cycle as u32) {
             Some(Trb {
@@ -658,6 +694,8 @@ pub struct XhciInner {
     hids: Vec<HidDev>,
     pub fb_width: u32,
     pub fb_height: u32,
+    /// Cambios de puerto diferidos para evitar re-entrada recursiva en pop_ev.
+    pending_port_changes: Vec<u8>,
 }
 
 struct HidDev {
@@ -704,6 +742,7 @@ impl XhciInner {
             hids: Vec::new(),
             fb_width: 1024,
             fb_height: 768,
+            pending_port_changes: Vec::new(),
         })
     }
 
@@ -719,20 +758,33 @@ impl XhciInner {
             self.mmio.write_rt(0x3C, (erdp >> 32) as u32);
 
             if etype == 32 {
-                // TRB_EVT_TRANSFER
-                self.handle_hid_transfer_side(&trb, lis);
+                // TRB_EVT_TRANSFER — solo despachar si tenemos listener (modo poll/IRQ).
+                // Durante enumeración (lis=None desde wait_ep0*) no llamamos a
+                // handle_hid_transfer_side para evitar confundir el state machine.
+                if lis.is_some() {
+                    self.handle_hid_transfer_side(&trb, lis);
+                }
             } else if etype == 34 {
-                // TRB_EVT_PORT_STATUS: re-enumerar el puerto si hay cambio de conexión.
-                // El Port ID está en los bits 31:24 de DW0 (campo p[31:24]).
+                // TRB_EVT_PORT_STATUS: diferir para evitar re-entrada recursiva
+                // durante la enumeración (pop_ev -> try_port_hid -> pop_ev).
                 let port_id = ((trb.p >> 24) & 0xff) as u8;
-                if port_id >= 1 {
-                    let _ = self.handle_port_status_change(port_id);
+                if port_id >= 1 && !self.pending_port_changes.contains(&port_id) {
+                    self.pending_port_changes.push(port_id);
                 }
             }
 
             return Some(trb);
         }
         None
+    }
+
+    /// Procesar cambios de puerto diferidos. Llamar solo desde contextos no-reentrantes
+    /// (process_irq_events, poll, enumerate_root_hid tras cada puerto).
+    fn drain_pending_port_changes(&mut self) {
+        let ports: Vec<u8> = self.pending_port_changes.drain(..).collect();
+        for port_id in ports {
+            let _ = self.handle_port_status_change(port_id);
+        }
     }
 
     fn resubmit_hid_normal_trb(
@@ -814,7 +866,8 @@ impl XhciInner {
     }
 
     fn wait_cmd_phys(&mut self, cmd_trb_phys: u64) -> DeviceResult<()> {
-        for _ in 0..10_000_000 {
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 5_000_000 { // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 {
@@ -825,17 +878,20 @@ impl XhciInner {
                         if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
                             return Ok(());
                         }
+                        warn!("[xhci] comando falló con CC={}", cc);
                         return Err(DeviceError::IoError);
                     }
                 }
             }
             spin_loop();
         }
+        error!("[xhci] timeout esperando comando");
         Err(DeviceError::IoError)
     }
 
     fn wait_cmd_phys_slot(&mut self, cmd_trb_phys: u64) -> DeviceResult<u8> {
-        for _ in 0..10_000_000 {
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 5_000_000 { // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 {
@@ -845,6 +901,7 @@ impl XhciInner {
                     if match_addr {
                         let cc = (ev.status >> 24) & 0xff;
                         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
+                            warn!("[xhci] comando de slot falló con CC={}", cc);
                             return Err(DeviceError::IoError);
                         }
                         return Ok(slot_id as u8);
@@ -853,6 +910,7 @@ impl XhciInner {
             }
             spin_loop();
         }
+        error!("[xhci] timeout esperando comando de slot");
         Err(DeviceError::IoError)
     }
 
@@ -862,60 +920,138 @@ impl XhciInner {
         self.wait_cmd_phys(p)
     }
 
-    fn wait_ep0_status(&mut self, slot: u8, status_phys: u64, n_trb: usize) -> DeviceResult<()> {
-        for _ in 0..10_000_000 {
+    fn wait_ep0_status_any(
+        &mut self,
+        slot: u8,
+        setup_phys: u64,
+        data_phys: u64,
+        status_phys: u64,
+        n_trb: usize,
+        timeout_us: u64,
+    ) -> DeviceResult<()> {
+        info!("[xhci] EP0 slot={} esperando: setup={:#x} data={:#x} status={:#x}",
+            slot, setup_phys, data_phys, status_phys);
+        let start = timer_now_us();
+        let mut ev_count = 0u32;
+        while (timer_now_us() - start) < timeout_us {
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
+                ev_count += 1;
                 if ty == 32 {
-                    // TRB_EVT_TRANSFER
-                    let match_addr = ev.p == status_phys;
-                    if match_addr {
-                        let cc = (ev.status >> 24) & 0xff;
+                    let ev_slot = ((ev.ctrl >> 24) & 0xff) as u8;
+                    let ev_dci  = ((ev.ctrl >> 16) & 0x1f) as u8;
+                    let cc      = (ev.status >> 24) & 0xff;
+                    info!("[xhci] EP0 ev#{}: type=Transfer slot={} dci={} p={:#x} CC={}",
+                        ev_count, ev_slot, ev_dci, ev.p, cc);
+                    let in_range = ev.p == setup_phys || ev.p == data_phys || ev.p == status_phys;
+                    if ev_slot == slot && in_range {
                         let i = Self::ri(slot, 1);
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
                             r.advance_dequeue(n_trb);
                         }
                         if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 {
+                            info!("[xhci] EP0 slot={} OK (CC={})", slot, cc);
                             return Ok(());
                         }
+                        warn!("[xhci] EP0 slot={} error CC={}", slot, cc);
                         return Err(DeviceError::IoError);
+                    } else {
+                        // Evento descartado — diagnosticar por qué
+                        if ev_slot != slot {
+                            // evento de otro slot, normal durante enumeración concurrente
+                        } else {
+                            warn!("[xhci] EP0 slot={} ev p={:#x} FUERA de rango", slot, ev.p);
+                        }
                     }
+                } else {
+                    info!("[xhci] EP0 espera: ev#{} type={}", ev_count, ty);
                 }
             }
             spin_loop();
         }
+        error!("[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
+            slot, ev_count, setup_phys);
+        // Volcar estado de USBSTS para diagnóstico
+        let sts = self.mmio.read_op(4);
+        error!("[xhci] USBSTS={:#010x}", sts);
         Err(DeviceError::IoError)
     }
 
     fn ep0_control_in(&mut self, slot: u8, setup: Trb, buf: &DmaBuf, len: u32) -> DeviceResult<()> {
         let i = Self::ri(slot, 1);
-        let ring = self
-            .xfer_rings
-            .get_mut(i)
-            .and_then(|o| o.as_mut())
-            .ok_or(DeviceError::NotSupported)?;
-        let st = trb_data(buf.sub_phys(0), len, true); // Data Stage is IN (true)
-        let su = trb_status(false, true); // Status Stage is OUT (false)
-        ring.push(setup)?;
-        ring.push(st)?;
-        let p3 = ring.push(su)?;
+        // Diagnóstico: estado del anillo EP0 antes de pushear TRBs
+        if let Some(r) = self.xfer_rings.get(i).and_then(|o| o.as_ref()) {
+            warn!("[xhci] ep0_ctrl_in slot={} ring.phys={:#x} enq={} cycle={} cap={}",
+                slot, r.buf.phys, r.enq, r.cycle as u8, r.cap);
+        }
+        let (setup_phys, data_phys, status_phys) = {
+            let ring = self
+                .xfer_rings
+                .get_mut(i)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            let st = trb_data(buf.sub_phys(0), len, true); // Data Stage is IN (true)
+            let su = trb_status(false, true); // Status Stage is OUT (false)
+            let p1 = ring.push(setup)?;
+            let p2 = ring.push(st)?;
+            let p3 = ring.push(su)?;
+            (p1, p2, p3)
+        };
+        // Flush the transfer ring so the controller sees the TRBs before we ring the doorbell.
+        if let Some(r) = self.xfer_rings.get(i).and_then(|o| o.as_ref()) {
+            r.buf.flush(0, r.buf.len);
+        }
         self.mmio.ring_db(slot, 1);
-        self.wait_ep0_status(slot, p3, 3)
+        self.wait_ep0_status_any(slot, setup_phys, data_phys, status_phys, 3, 2_000_000)
     }
 
     fn ep0_control_out0(&mut self, slot: u8, setup: Trb, status_in: bool) -> DeviceResult<()> {
         let i = Self::ri(slot, 1);
-        let ring = self
-            .xfer_rings
-            .get_mut(i)
-            .and_then(|o| o.as_mut())
-            .ok_or(DeviceError::NotSupported)?;
-        let su = trb_status(status_in, true);
-        let p1 = ring.push(setup)?;
-        let p2 = ring.push(su)?;
-        let _ = p1;
+        let (setup_phys, status_phys) = {
+            let ring = self
+                .xfer_rings
+                .get_mut(i)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            let su = trb_status(status_in, true);
+            let p1 = ring.push(setup)?;
+            let p2 = ring.push(su)?;
+            (p1, p2)
+        };
+        if let Some(r) = self.xfer_rings.get(i).and_then(|o| o.as_ref()) {
+            r.buf.flush(0, r.buf.len);
+        }
         self.mmio.ring_db(slot, 1);
-        self.wait_ep0_status(slot, p2, 2)
+        self.wait_ep0_status_any(slot, setup_phys, setup_phys, status_phys, 2, 2_000_000)
+    }
+
+    /// Igual que ep0_control_out0 pero con timeout corto (200ms) para comandos opcionales
+    /// HID como SET_IDLE o SET_PROTOCOL que algunos dispositivos no responden.
+    fn ep0_control_out0_optional(
+        &mut self,
+        slot: u8,
+        setup: Trb,
+        status_in: bool,
+    ) -> DeviceResult<()> {
+        let i = Self::ri(slot, 1);
+        let (setup_phys, status_phys) = {
+            let ring = self
+                .xfer_rings
+                .get_mut(i)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            let su = trb_status(status_in, true);
+            let p1 = ring.push(setup)?;
+            let p2 = ring.push(su)?;
+            (p1, p2)
+        };
+        if let Some(r) = self.xfer_rings.get(i).and_then(|o| o.as_ref()) {
+            r.buf.flush(0, r.buf.len);
+        }
+        self.mmio.ring_db(slot, 1);
+        // 200ms: suficiente para dispositivos lentos, no bloquea si el dispositivo
+        // no responde (SET_IDLE es opcional en USB HID spec).
+        self.wait_ep0_status_any(slot, setup_phys, setup_phys, status_phys, 2, 200_000)
     }
 
     pub fn reset_and_run(&mut self) -> DeviceResult<()> {
@@ -927,20 +1063,18 @@ impl XhciInner {
         if (usbcmd & 1) != 0 {
             info!("[xhci] deteniendo controlador antes del reset");
             m.write_op(0, usbcmd & !1); // RS=0
-            let mut timeout = 100_000;
-            while (m.read_op(4) & 1) == 0 && timeout > 0 {
-                timeout -= 1;
+            let start = timer_now_us();
+            while (m.read_op(4) & 1) == 0 && (timer_now_us() - start) < 100_000 {
                 spin_loop();
             }
         }
 
         // 2. Esperar a que CNR (Controller Not Ready) se limpie antes del reset
-        let mut timeout = 1_000_000;
-        while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
-            timeout -= 1;
+        let start = timer_now_us();
+        while (m.read_op(4) & (1 << 11)) != 0 && (timer_now_us() - start) < 1_000_000 {
             spin_loop();
         }
-        if timeout == 0 {
+        if (m.read_op(4) & (1 << 11)) != 0 {
             error!("[xhci] timeout esperando CNR antes de reset");
             return Err(DeviceError::NotReady);
         }
@@ -948,19 +1082,17 @@ impl XhciInner {
         // 3. Emitir HCRST (bit 1 de USBCMD)
         info!("[xhci] emitiendo HCRST");
         m.write_op(0, m.read_op(0) | 2);
-        timeout = 100_000;
-        while (m.read_op(0) & 2) != 0 && timeout > 0 {
-            timeout -= 1;
+        let start = timer_now_us();
+        while (m.read_op(0) & 2) != 0 && (timer_now_us() - start) < 100_000 {
             spin_loop();
         }
 
         // 4. Esperar a que CNR se limpie de nuevo tras reset
-        timeout = 1_000_000;
-        while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
-            timeout -= 1;
+        let start = timer_now_us();
+        while (m.read_op(4) & (1 << 11)) != 0 && (timer_now_us() - start) < 1_000_000 {
             spin_loop();
         }
-        if timeout == 0 {
+        if (m.read_op(4) & (1 << 11)) != 0 {
             error!("[xhci] timeout esperando CNR tras reset");
             return Err(DeviceError::NotReady);
         }
@@ -994,21 +1126,24 @@ impl XhciInner {
         m.write_op(0x18, (crcr as u32 & !1) | 1);
         m.write_op(0x1C, (crcr >> 32) as u32);
 
-        // Configurar Event Ring e Interrupter
-        m.write_rt(0x28, 1); // IP=1 (limpiar)
-        let erdp = self.ev.erdp_phys();
-        m.write_rt(0x38, erdp as u32 | 8);
-        m.write_rt(0x3C, (erdp >> 32) as u32);
+        // Configurar Interrupter 0 del Event Ring.
+        // Orden mandatorio por spec xHCI §5.5.2:
+        //   1. Limpiar IP en IMAN (offset 0x20)
+        //   2. Poner IMOD (offset 0x24)
+        //   3. Escribir ERSTSZ (offset 0x28) = número de segmentos (1)
+        //   4. Escribir ERSTBA (offsets 0x30/0x34)
+        //   5. Escribir ERDP (offsets 0x38/0x3C)
+        m.write_rt(0x20, 1); // IMAN: limpiar IP (bit 0), IE=0 de momento
+        m.write_rt(0x24, 0); // IMOD=0 (máxima respuesta, sin moderación)
+        m.write_rt(0x28, 1); // ERSTSZ = 1 segmento
         m.write_rt(0x30, self.ev.erst_phys() as u32);
         m.write_rt(0x34, (self.ev.erst_phys() >> 32) as u32);
-
-        // Moderación de interrupciones (Energía): IMOD=0 (máxima respuesta)
-        m.write_rt(0x24, 0); 
+        let erdp = self.ev.erdp_phys();
+        m.write_rt(0x38, erdp as u32 | 8); // EHB=1 para limpiar el bit de busy inicial
+        m.write_rt(0x3C, (erdp >> 32) as u32);
 
         if self.msi_vector > 0 {
-            m.write_rt(0x20, 3); // IMAN: IE=1, IP=1
-        } else {
-            m.write_rt(0x20, 1); // IP=1
+            m.write_rt(0x20, 3); // IMAN: IE=1, IP=1 (habilitar interrupciones)
         }
 
         // Iniciar controlador (Run)
@@ -1019,28 +1154,41 @@ impl XhciInner {
         }
         m.write_op(0, usbcmd);
 
-        // Esperar a que el controlador salga de HCHalted
-        for _ in 0..100_000 {
+        // Esperar a que el controlador salga de HCHalted (bit 0 de USBSTS=1 = halted).
+        // NOTA: la condición es sts & 1 != 0 — el controlador está DETENIDO mientras ese bit esté en 1.
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 100_000 {
             let sts = m.read_op(4);
-            if sts & 1 == 0 {
+            if (sts & 1) == 0 {
+                // HCHalted=0 → controlador corriendo
                 break;
             }
             spin_loop();
         }
+        {
+            let sts = m.read_op(4);
+            if (sts & 1) != 0 {
+                error!("[xhci] controlador no arrancó (HCHalted persiste), USBSTS={:#010x}", sts);
+                return Err(DeviceError::NotReady);
+            }
+        }
         info!("[xhci] controlador en marcha");
 
-        // Energía de puertos (Port Power)
+        // Energía de puertos (Port Power, PP = bit 9).
+        // Se usa PORTSC_RW1C_AND_RO_MASK para nunca escribir 1 en PED (bit 1, RW1C) ni en
+        // los bits de cambio, lo que borraría accidentalmente la habilitación del puerto.
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
             let sc = m.read_op(off);
             if (sc & (1 << 9)) == 0 {
-                // Importante: no limpiar bits RW como PED al tocar PP.
-                m.write_op(off, (sc & !PORTSC_CHANGE_BITS) | (1 << 9));
+                info!("[xhci] encendiendo puerto {} (PP=0 → 1)", p);
+                m.write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
             }
         }
         // Pequeña espera tras dar energía (USB spec exige ≥100ms de VBUS estable antes de
         // que el dispositivo pueda responder; los devices gaming con firmware complejo lo necesitan).
-        for _ in 0..2_000_000 {
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 100_000 {
             spin_loop();
         }
 
@@ -1051,6 +1199,8 @@ impl XhciInner {
         let maxp = self.max_ports;
         for port in 1..=maxp {
             if let Err(_e) = self.try_port_hid(port) {}
+            // Procesar cambios de estado pendientes entre puertos para no acumularlos.
+            self.drain_pending_port_changes();
         }
     }
 
@@ -1059,7 +1209,8 @@ impl XhciInner {
         // Require multiple consecutive "ready" samples to filter transient link-state flaps.
         const STABLE_SAMPLES: u32 = 256;
         let mut stable = 0u32;
-        for _ in 0..8_000_000 {
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 1_000_000 { // Max 1s
             let s = m.read_op(off);
             let ccs = (s & 1) != 0;
             let ped = (s & (1 << 1)) != 0;
@@ -1100,32 +1251,35 @@ impl XhciInner {
         }
         // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
-            self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | (1 << 9));
-            for _ in 0..2_000_000 {
+            info!("[xhci] puerto {}: PP=0, encendiendo", port);
+            self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
+            let start = timer_now_us();
+            while (timer_now_us() - start) < 100_000 {
                 spin_loop();
             }
             portsc = self.mmio.read_op(off);
         }
         let pre_spd = ((portsc >> 10) & 0x0f) as u8;
-        let needs_reset = pre_spd == 0 || pre_spd <= 3;
+        // needs_reset: solo si no hay velocidad asignada o el enlace no está habilitado.
+        // spd >= 4 = SuperSpeed: PED no aplica de la misma forma; el port ya está listo.
+        let ped = (portsc & (1 << 1)) != 0;
+        let needs_reset = pre_spd == 0 || (!ped && pre_spd <= 3);
 
         // Reset del puerto (PR=1)
         if needs_reset {
             info!("[xhci] puerto {}: emitiendo reset", port);
-            self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | (1 << 4));
+            self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
 
-            // Espera robusta de reset (100ms simulados)
+            // Espera robusta de reset (100ms)
             let mut success = false;
-            for _ in 0..100 {
+            let start = timer_now_us();
+            while (timer_now_us() - start) < 100_000 {
                 let s = self.mmio.read_op(off);
                 if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
                     success = true;
                     break;
                 }
-                // Simulación de ~1ms
-                for _ in 0..1_000_000 {
-                    spin_loop();
-                }
+                spin_loop();
             }
             if !success {
                 warn!("[xhci] puerto {}: timeout en reset", port);
@@ -1138,12 +1292,13 @@ impl XhciInner {
         });
         portsc = self.mmio.read_op(off);
 
-        // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1
+        // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1; conservar PP, PED, etc.
         let clr = PORTSC_CHANGE_BITS;
-        self.mmio.write_op(off, (portsc & !PORTSC_CHANGE_BITS) | clr);
+        self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | clr);
 
         // Pequeño delay tras reset para estabilización del link
-        for _ in 0..10_000_000 {
+        let start = timer_now_us();
+        while (timer_now_us() - start) < 10_000 {
             spin_loop();
         }
 
@@ -1162,8 +1317,9 @@ impl XhciInner {
                 if (s & 1) == 0 {
                     return Ok(());
                 }
-                self.mmio.write_op(off, (s & !PORTSC_CHANGE_BITS) | (1 << 4));
-                for _ in 0..2_000_000 {
+                self.mmio.write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
+                let start = timer_now_us();
+                while (timer_now_us() - start) < 100_000 {
                     spin_loop();
                 }
                 let spd_retry = self.wait_port_ready(off, true).unwrap_or_else(|| {
@@ -1171,8 +1327,9 @@ impl XhciInner {
                     ((s >> 10) & 0x0f) as u8
                 });
                 s = self.mmio.read_op(off);
-                self.mmio.write_op(off, (s & !PORTSC_CHANGE_BITS) | clr);
-                for _ in 0..500_000 {
+                self.mmio.write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | clr);
+                let start = timer_now_us();
+                while (timer_now_us() - start) < 50_000 {
                     spin_loop();
                 }
                 if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
@@ -1202,7 +1359,11 @@ impl XhciInner {
         let csz = self.context_size;
         let dev_sz = 32 * csz;
         let dev = DmaBuf::new(dev_sz, 64)?;
+        // Flush DCBAA entry: el controlador lee este puntero vía DMA.
+        // También hay que asegurarse de que el buffer de contexto esté en RAM (ceros).
+        dev.flush(0, dev_sz);
         self.dcbaa.write_u64(slot as usize * 8, dev.sub_phys(0));
+        self.dcbaa.flush(slot as usize * 8, 8);
         self.dev_ctx[slot as usize] = Some(dev);
 
         let input_sz = 33 * csz;
@@ -1227,15 +1388,48 @@ impl XhciInner {
         let ep0_ring = XferRing::new(32)?;
         let ep0_phys = ep0_ring.ring_phys();
         ic.write_u64(ep0 + 8, ep0_phys);
+        ic.flush(0, input_sz);
         let ri = Self::ri(slot, 1);
+
+        warn!("[xhci] setup slot={} port={} speed={} csz={}", slot, port, speed, csz);
+        warn!("[xhci]   dcbaa[{}]={:#x}", slot, self.dcbaa.read_u64(slot as usize * 8));
+        warn!("[xhci]   ic phys={:#x} ep0_ring_phys={:#x}", ic.sub_phys(0), ep0_phys);
+        warn!("[xhci]   ic.DW1(add)={:#010x} SlotCtx_DW0={:#010x} SlotCtx_DW1={:#010x}",
+            ic.read_u32(4), ic.read_u32(s0), ic.read_u32(s0 + 4));
+        warn!("[xhci]   EP0Ctx_DW1={:#010x} EP0_TRDeqPtr={:#x}",
+            ic.read_u32(ep0 + 4), ic.read_u64(ep0 + 8));
+
         self.xfer_rings[ri] = Some(ep0_ring);
 
         let p2 = self.cmd.push(trb_address_device(ic.sub_phys(0), slot))?;
         self.mmio.ring_db(0, 0);
         self.wait_cmd_phys(p2)?;
+        // ic must stay alive until after wait_cmd_phys: xHC reads it asynchronously via DMA.
+        // Rust would drop it here after the semicolon, which is correct (after wait completes).
+        let _ = &ic; // force ic to live until this point
 
+        warn!("[xhci] Address Device completado slot={} USBSTS={:#010x}",
+            slot, self.mmio.read_op(4));
+
+        // Pequeña pausa tras Address Device: algunos dispositivos FS/LS necesitan
+        // tiempo para procesar el SET_ADDRESS y estar listos en la nueva dirección.
+        {
+            let start = timer_now_us();
+            while (timer_now_us() - start) < 2_000 { spin_loop(); } // 2ms
+        }
+
+        // Invalidar la caché del descriptor buffer antes de pasarlo al controlador
+        // (el controlador escribirá en él via DMA; queremos ver los datos frescos).
         let desc = DmaBuf::new(64, 64)?;
+        desc.flush(0, 64);
+        warn!("[xhci] GET_DESCRIPTOR slot={} desc.phys={:#x} ep0_ring.phys={:#x}",
+            slot,
+            desc.phys,
+            self.xfer_rings.get(ri).and_then(|o| o.as_ref()).map(|r| r.buf.phys).unwrap_or(0));
         self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0100, 0, 18, 3), &desc, 18)?;
+
+        // Invalidar caché del buffer de descriptor para ver los datos escritos por DMA.
+        desc.flush(0, 64);
 
         // Leer bMaxPacketSize0 (byte 7) y actualizar contexto de EP0
         let mut raw_desc = [0u8; 18];
@@ -1253,6 +1447,8 @@ impl XhciInner {
             ic_upd.write_u32(4, 0x02); // Add EP0
                                        // Copiar contexto actual
             if let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() {
+                // Invalidar caché antes de leer datos escritos por el controlador via DMA.
+                dev_ctx.flush(0, dev_sz);
                 // Copiar Slot Context (dev index 0 -> input index 1)
                 for i in 0..(csz / 4) {
                     ic_upd.write_u32(csz + i * 4, dev_ctx.read_u32(i * 4));
@@ -1269,6 +1465,7 @@ impl XhciInner {
             let p_upd = self
                 .cmd
                 .push(trb_configure_endpoint(ic_upd.sub_phys(0), slot))?;
+            ic_upd.flush(0, input_sz);
             self.mmio.ring_db(0, 0);
             let _ = self.wait_cmd_phys(p_upd);
         }
@@ -1280,7 +1477,9 @@ impl XhciInner {
 
     fn setup_hid_from_config(&mut self, slot: u8, csz: usize, port: u8) -> DeviceResult<()> {
         let sniff = DmaBuf::new(64, 64)?;
+        sniff.flush(0, 64); // evict stale zeros before DMA
         self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)?;
+        sniff.flush(0, 64); // invalidate so CPU reads fresh DMA data
         let mut hdr = [0u8; 9];
         sniff.read_into(0, &mut hdr);
         let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
@@ -1289,12 +1488,14 @@ impl XhciInner {
         }
         let buf_len = ((total + 63) / 64 * 64).max(64);
         let cfgb = DmaBuf::new(buf_len, 64)?;
+        cfgb.flush(0, buf_len); // evict stale zeros before DMA
         self.ep0_control_in(
             slot,
             trb_setup(0x80, 0x06, 0x0200, 0, total as u16, 3),
             &cfgb,
             total as u32,
         )?;
+        cfgb.flush(0, buf_len); // invalidate so CPU reads fresh DMA data
 
         let mut raw = alloc::vec![0u8; total];
         cfgb.read_into(0, &mut raw[..total]);
@@ -1370,14 +1571,16 @@ impl XhciInner {
             _ => 8usize,
         };
 
-        // Forzar protocolo de boot (si el dispositivo lo soporta)
-        let _ = self.ep0_control_out0(
+        // Forzar protocolo de boot (si el dispositivo lo soporta).
+        // Algunos dispositivos no responden a SET_PROTOCOL → timeout corto (200ms).
+        let _ = self.ep0_control_out0_optional(
             slot,
             trb_setup(0x21, HID_REQ_SET_PROTOCOL, 0, iface as u16, 0, 0),
             true,
         );
-        // Evitar inundación de reportes si no hay cambios
-        let _ = self.ep0_control_out0(
+        // SET_IDLE es opcional en USB HID spec: si el dispositivo no responde
+        // (QEMU emula algunos dispositivos que ignoran SET_IDLE), continuar de todos modos.
+        let _ = self.ep0_control_out0_optional(
             slot,
             trb_setup(0x21, HID_REQ_SET_IDLE, 0, iface as u16, 0, 0),
             true,
@@ -1439,6 +1642,7 @@ impl XhciInner {
         let p = self
             .cmd
             .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
+        cfg.flush(0, 33 * csz);
         self.mmio.ring_db(0, 0);
         self.wait_cmd_phys(p)?;
 
@@ -1623,6 +1827,9 @@ impl XhciInner {
                 break;
             }
         }
+        // En modo poll/IRQ, procesar los cambios de puerto diferidos ahora que
+        // no estamos en medio de enumeración.
+        self.drain_pending_port_changes();
     }
 
     fn handle_port_status_change(&mut self, port_id: u8) -> DeviceResult<()> {
@@ -1641,7 +1848,7 @@ impl XhciInner {
         }
         // Limpiar RW1C sin apagar el puerto (PP) ni tocar bits RW como PED.
         self.mmio
-            .write_op(off, (sc & !PORTSC_CHANGE_BITS) | PORTSC_CHANGE_BITS);
+            .write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | PORTSC_CHANGE_BITS);
         Ok(())
     }
 

@@ -15,6 +15,7 @@ extern "C" {
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr;
     fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr;
+    pub fn drivers_timer_now_as_micros() -> u64;
 }
 
 pub const PAGE_SIZE: usize = 4096;

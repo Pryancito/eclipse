@@ -246,6 +246,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
     let name = format!("enp{}s{}f{}", dev.loc.bus, dev.loc.device, dev.loc.function);
     match (dev.id.vendor_id, dev.id.device_id) {
+        // ---- e1000 (QEMU virtio-style emulation) ----
         (0x8086, 0x100e) | (0x8086, 0x100f) | (0x8086, 0x10d3) => {
             if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
                 #[cfg(target_arch = "riscv64")]
@@ -264,6 +265,73 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                     0,
                 )?));
                 return Ok(dev);
+            }
+        }
+
+        // ---- e1000e family (real hardware: 82574/82579/I217/I218/I219) ----
+        // Device IDs mirror the Linux e1000e driver's PCI table.
+        (0x8086, did) if matches!(did,
+            // 82567 (ICH9/10 on-die)
+            0x10bf | 0x10cb | 0x10cc | 0x10cd | 0x10ce |
+            0x10de | 0x10df | 0x10e5 | 0x10f5 |
+            // 82577 / 82578
+            0x10ea | 0x10eb | 0x10ef | 0x10f0 |
+            // 82579
+            0x1502 | 0x1503 |
+            // I217
+            0x153a | 0x153b |
+            // I218
+            0x155a | 0x1559 | 0x15a0 | 0x15a1 | 0x15a2 | 0x15a3 |
+            // I219 (Skylake / Kaby Lake / Coffee Lake / Comet Lake / Ice Lake / Tiger Lake / Alder Lake / Raptor Lake)
+            0x15b7 | 0x15b8 | 0x15b9 |
+            0x15bc | 0x15bd | 0x15be |
+            0x15d6 | 0x15d7 | 0x15d8 |
+            0x15e3 | 0x15d9 | 0x15bb | 0x15da |
+            0x15df | 0x15e0 | 0x15e1 | 0x15e2 |
+            0x15f4 | 0x15f5 | 0x15f9 | 0x15fa | 0x15fb | 0x15fc |
+            0x0d4c | 0x0d4d | 0x0d4e | 0x0d4f |
+            0x1a1c | 0x1a1d | 0x1a1e | 0x1a1f |
+            0x550a | 0x550b | 0x550c | 0x550d | 0x550e | 0x550f |
+            0x5502 | 0x5503 |
+            // I219 (Meteor Lake)
+            0x57a0 | 0x57a1 | 0x57b3
+        ) => {
+            // Read BAR0 (may be 64-bit)
+            let bar0_addr: u64 = {
+                if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
+                    if a != 0 { a } else {
+                        #[cfg(target_arch = "x86_64")]
+                        { let ops = &PortOpsImpl;
+                          unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) } }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        { 0 }
+                    }
+                } else {
+                    #[cfg(target_arch = "x86_64")]
+                    { let ops = &PortOpsImpl;
+                      unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) } }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { 0 }
+                }
+            };
+            if bar0_addr != 0 {
+                // e1000e registers fit in 128 KB
+                let map_len = 128 * 1024;
+                if let Some(m) = mapper {
+                    m.query_or_map(bar0_addr as usize, map_len);
+                }
+                let irq  = unsafe { enable(dev.loc, 0) };
+                let vaddr = phys_to_virt(bar0_addr as usize);
+                info!(
+                    "[e1000e] PCI {:04x}:{:04x} at {:#x} vaddr={:#x} irq={:?}",
+                    dev.id.vendor_id, did, bar0_addr, vaddr, irq
+                );
+                match crate::net::e1000e::init(name, irq.unwrap_or(0), vaddr, 0) {
+                    Ok(iface) => return Ok(Device::Net(Arc::new(iface))),
+                    Err(e)    => warn!("[e1000e] init error: {:?}", e),
+                }
+            } else {
+                warn!("[e1000e] BAR0=0, device {:04x} skipped", did);
             }
         }
 
