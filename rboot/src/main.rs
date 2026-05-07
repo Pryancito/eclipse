@@ -152,7 +152,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // virtual-memory code sets up fresh page tables with proper NX policy.
         // On QEMU, OVMF typically leaves NXE clear, so the bug was invisible
         // there.
-        Efer::update(|f| f.remove(EferFlags::NO_EXECUTE_ENABLE));
+        Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
