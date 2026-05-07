@@ -133,10 +133,16 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     let mut page_table = current_page_table();
     unsafe {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
-        // Disable NX enforcement during early bring-up. If the kernel ELF flags are
-        // mis-detected, marking text as NX would cause an immediate fault on entry.
-        // We can re-enable NX once the mapping logic is proven correct.
-        // Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
+        // On real hardware UEFI has already set EFER.NXE before we run, so
+        // NO_EXECUTE bits we write into page-table entries are enforced.
+        // If any kernel ELF segment is mis-flagged as non-executable the CPU
+        // would fault on the very first instruction (triple-fault / silent
+        // reset), which is the "bar reaches 100% but kernel never runs" symptom
+        // seen on physical machines.  Clear NXE now so the NO_EXECUTE bits we
+        // set are ignored until the kernel re-enables NXE with its own tables.
+        // On QEMU, OVMF typically leaves NXE clear, so the bug was invisible
+        // there.
+        Efer::update(|f| f.remove(EferFlags::NO_EXECUTE_ENABLE));
     }
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
@@ -270,10 +276,14 @@ unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
 }
 
 unsafe fn jump_to_entry(bootinfo: *const BootInfo, stacktop: u64) -> ! {
-    asm!("mov rsp, {}; call {}", in(reg) stacktop, in(reg) ENTRY, in("rdi") bootinfo);
-    loop {
-        asm!("nop");
-    }
+    asm!(
+        "mov rsp, {stacktop}",
+        "call {entry}",
+        stacktop = in(reg) stacktop,
+        entry   = in(reg) ENTRY,
+        in("rdi") bootinfo,
+        options(noreturn),
+    );
 }
 
 static mut ENTRY: usize = 0;
