@@ -582,6 +582,8 @@ pub struct XhciInner {
     scratch_tbl: Option<DmaBuf>,
     scratch_pages: Vec<DmaBuf>,
     hids: Vec<HidDev>,
+    pub fb_width: u32,
+    pub fb_height: u32,
 }
 
 struct HidDev {
@@ -626,6 +628,8 @@ impl XhciInner {
             scratch_tbl: None,
             scratch_pages: Vec::new(),
             hids: Vec::new(),
+            fb_width: 1024,
+            fb_height: 768,
         })
     }
 
@@ -842,33 +846,37 @@ impl XhciInner {
     pub fn reset_and_run(&mut self) -> DeviceResult<()> {
         let m = &self.mmio;
         m.perform_bios_handoff();
-        let c = m.read_op(0);
-        if c & 1 != 0 {
-            m.write_op(0, c & !1);
-            for _ in 0..100_000 {
-                if m.read_op(4) & 1 != 0 {
-                    break;
-                }
+
+        // 1. Halt the controller if it's already running (spec §4.2.1)
+        let usbcmd = m.read_op(0);
+        if (usbcmd & 1) != 0 {
+            m.write_op(0, usbcmd & !1); // RS=0
+            let mut timeout = 100_000;
+            while (m.read_op(4) & 1) == 0 && timeout > 0 {
+                timeout -= 1;
                 spin_loop();
             }
         }
-        for _ in 0..100_000 {
-            if m.read_op(4) & (1 << 11) == 0 {
-                break;
-            }
+
+        // 2. Wait for CNR (Controller Not Ready) to clear before reset
+        let mut timeout = 100_000;
+        while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
+            timeout -= 1;
             spin_loop();
         }
+
+        // 3. Issue HCRST (bit 1 of USBCMD)
         m.write_op(0, m.read_op(0) | 2);
-        for _ in 0..100_000 {
-            if m.read_op(0) & 2 == 0 {
-                break;
-            }
+        timeout = 100_000;
+        while (m.read_op(0) & 2) != 0 && timeout > 0 {
+            timeout -= 1;
             spin_loop();
         }
-        for _ in 0..100_000 {
-            if m.read_op(4) & (1 << 11) == 0 {
-                break;
-            }
+
+        // 4. Wait for CNR to clear again after reset
+        timeout = 100_000;
+        while (m.read_op(4) & (1 << 11)) != 0 && timeout > 0 {
+            timeout -= 1;
             spin_loop();
         }
 
@@ -1397,8 +1405,8 @@ impl XhciInner {
                 let btn = tmp[0];
                 let ax = u16::from_le_bytes([tmp[1], tmp[2]]) as u32;
                 let ay = u16::from_le_bytes([tmp[3], tmp[4]]) as u32;
-                let sx = ((ax as u64 * 1024) / (TABLET_RANGE as u64 + 1)).min(1023) as i32;
-                let sy = ((ay as u64 * 768) / (TABLET_RANGE as u64 + 1)).min(767) as i32;
+                let sx = ((ax as u64 * self.fb_width as u64) / (TABLET_RANGE as u64 + 1)).min(self.fb_width as u64 - 1) as i32;
+                let sy = ((ay as u64 * self.fb_height as u64) / (TABLET_RANGE as u64 + 1)).min(self.fb_height as u64 - 1) as i32;
                 if !h.tab_init {
                     h.tab_init = true;
                     h.tab_x = sx as u16;
