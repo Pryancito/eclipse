@@ -66,6 +66,12 @@ fn map_segment(
 
     let flags = segment.flags();
     let mut page_table_flags = PageTableFlags::PRESENT;
+    // EFER.NXE is cleared by the caller before map_elf() runs, so bit 63 in a
+    // page-table entry is treated as a reserved bit.  On x86 CPUs that follow
+    // the Intel SDM strictly, a reserved-bit PTE only causes a fault on an
+    // *instruction fetch*, not on data reads/writes — so setting NO_EXECUTE
+    // here is harmless for normal data accesses while still preventing
+    // accidental code execution from data pages.
     if !flags.is_execute() {
         page_table_flags |= PageTableFlags::NO_EXECUTE
     };
