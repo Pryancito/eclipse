@@ -379,7 +379,10 @@ impl E1000eHw {
     // Send one frame
     // -----------------------------------------------------------------------
     fn send(&mut self, data: &[u8]) -> DeviceResult {
-        if data.is_empty() || data.len() > BUF_SIZE || data.len() > u16::MAX as usize {
+        if !self.can_send() {
+            return Err(DeviceError::NotReady);
+        }
+        if data.is_empty() || data.len() > BUF_SIZE {
             return Err(DeviceError::InvalidParam);
         }
 
@@ -491,12 +494,8 @@ impl NetScheme for E1000eInterface {
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
         let mut hw = self.driver.0.lock();
-        if hw.can_send() {
-            hw.send(data)?;
-            Ok(data.len())
-        } else {
-            Err(DeviceError::NotReady)
-        }
+        hw.send(data)?;
+        Ok(data.len())
     }
 }
 
@@ -535,11 +534,8 @@ impl phy::TxToken for E1000eTxToken {
     where F: FnOnce(&mut [u8]) -> SmolResult<R> {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
-        if self.0.0.lock().can_send() {
-            self.0.0.lock().send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
-        } else {
-            return Err(smoltcp::Error::Exhausted);
-        }
+        let mut hw = self.0.0.lock();
+        hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
         Ok(result)
     }
 }
