@@ -7,22 +7,22 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_mm_clflush;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_mm_clflush;
 
 use lock::Mutex;
 use pci::PCIDevice;
 
+use crate::bus::drivers_timer_now_as_micros;
 use crate::bus::{phys_to_virt, PAGE_SIZE};
 use crate::input::input_event_codes::{ev::*, key::*, rel::*, syn::*};
 use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{DeviceError, DeviceResult};
-use crate::bus::drivers_timer_now_as_micros;
 
 fn timer_now_us() -> u64 {
     unsafe { drivers_timer_now_as_micros() }
@@ -188,7 +188,9 @@ impl DmaBuf {
             let mut addr = self.virt + off;
             let end = addr + len;
             while addr < end {
-                unsafe { _mm_clflush(addr as *const u8); }
+                unsafe {
+                    _mm_clflush(addr as *const u8);
+                }
                 addr += 64;
             }
             fence(Ordering::SeqCst);
@@ -260,12 +262,14 @@ impl XhciMmio {
                     info!("[xhci] BIOS posee el controlador, solicitando handoff...");
                     legsup |= 1 << 24; // OS Owned Semaphore
                     self.write_cap(cap_ptr, legsup);
-                    
+
                     let start = timer_now_us();
-                    while (self.read_cap(cap_ptr) & (1 << 16)) != 0 && (timer_now_us() - start) < 500_000 {
+                    while (self.read_cap(cap_ptr) & (1 << 16)) != 0
+                        && (timer_now_us() - start) < 500_000
+                    {
                         spin_loop();
                     }
-                    
+
                     if (self.read_cap(cap_ptr) & (1 << 16)) != 0 {
                         warn!("[xhci] handoff fallido por timeout, forzando control");
                     } else {
@@ -867,7 +871,8 @@ impl XhciInner {
 
     fn wait_cmd_phys(&mut self, cmd_trb_phys: u64) -> DeviceResult<()> {
         let start = timer_now_us();
-        while (timer_now_us() - start) < 5_000_000 { // 5s
+        while (timer_now_us() - start) < 5_000_000 {
+            // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 {
@@ -891,7 +896,8 @@ impl XhciInner {
 
     fn wait_cmd_phys_slot(&mut self, cmd_trb_phys: u64) -> DeviceResult<u8> {
         let start = timer_now_us();
-        while (timer_now_us() - start) < 5_000_000 { // 5s
+        while (timer_now_us() - start) < 5_000_000 {
+            // 5s
             if let Some(ev) = self.pop_ev(None) {
                 let ty = (ev.ctrl >> 10) & 0x3f;
                 if ty == 33 {
@@ -929,8 +935,10 @@ impl XhciInner {
         n_trb: usize,
         timeout_us: u64,
     ) -> DeviceResult<()> {
-        info!("[xhci] EP0 slot={} esperando: setup={:#x} data={:#x} status={:#x}",
-            slot, setup_phys, data_phys, status_phys);
+        info!(
+            "[xhci] EP0 slot={} esperando: setup={:#x} data={:#x} status={:#x}",
+            slot, setup_phys, data_phys, status_phys
+        );
         let start = timer_now_us();
         let mut ev_count = 0u32;
         while (timer_now_us() - start) < timeout_us {
@@ -939,10 +947,12 @@ impl XhciInner {
                 ev_count += 1;
                 if ty == 32 {
                     let ev_slot = ((ev.ctrl >> 24) & 0xff) as u8;
-                    let ev_dci  = ((ev.ctrl >> 16) & 0x1f) as u8;
-                    let cc      = (ev.status >> 24) & 0xff;
-                    info!("[xhci] EP0 ev#{}: type=Transfer slot={} dci={} p={:#x} CC={}",
-                        ev_count, ev_slot, ev_dci, ev.p, cc);
+                    let ev_dci = ((ev.ctrl >> 16) & 0x1f) as u8;
+                    let cc = (ev.status >> 24) & 0xff;
+                    info!(
+                        "[xhci] EP0 ev#{}: type=Transfer slot={} dci={} p={:#x} CC={}",
+                        ev_count, ev_slot, ev_dci, ev.p, cc
+                    );
                     let in_range = ev.p == setup_phys || ev.p == data_phys || ev.p == status_phys;
                     if ev_slot == slot && in_range {
                         let i = Self::ri(slot, 1);
@@ -969,8 +979,10 @@ impl XhciInner {
             }
             spin_loop();
         }
-        error!("[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
-            slot, ev_count, setup_phys);
+        error!(
+            "[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
+            slot, ev_count, setup_phys
+        );
         // Volcar estado de USBSTS para diagnóstico
         let sts = self.mmio.read_op(4);
         error!("[xhci] USBSTS={:#010x}", sts);
@@ -981,8 +993,10 @@ impl XhciInner {
         let i = Self::ri(slot, 1);
         // Diagnóstico: estado del anillo EP0 antes de pushear TRBs
         if let Some(r) = self.xfer_rings.get(i).and_then(|o| o.as_ref()) {
-            warn!("[xhci] ep0_ctrl_in slot={} ring.phys={:#x} enq={} cycle={} cap={}",
-                slot, r.buf.phys, r.enq, r.cycle as u8, r.cap);
+            warn!(
+                "[xhci] ep0_ctrl_in slot={} ring.phys={:#x} enq={} cycle={} cap={}",
+                slot, r.buf.phys, r.enq, r.cycle as u8, r.cap
+            );
         }
         let (setup_phys, data_phys, status_phys) = {
             let ring = self
@@ -1168,7 +1182,10 @@ impl XhciInner {
         {
             let sts = m.read_op(4);
             if (sts & 1) != 0 {
-                error!("[xhci] controlador no arrancó (HCHalted persiste), USBSTS={:#010x}", sts);
+                error!(
+                    "[xhci] controlador no arrancó (HCHalted persiste), USBSTS={:#010x}",
+                    sts
+                );
                 return Err(DeviceError::NotReady);
             }
         }
@@ -1210,7 +1227,8 @@ impl XhciInner {
         const STABLE_SAMPLES: u32 = 256;
         let mut stable = 0u32;
         let start = timer_now_us();
-        while (timer_now_us() - start) < 1_000_000 { // Max 1s
+        while (timer_now_us() - start) < 1_000_000 {
+            // Max 1s
             let s = m.read_op(off);
             let ccs = (s & 1) != 0;
             let ped = (s & (1 << 1)) != 0;
@@ -1252,7 +1270,8 @@ impl XhciInner {
         // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
             info!("[xhci] puerto {}: PP=0, encendiendo", port);
-            self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
+            self.mmio
+                .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
             let start = timer_now_us();
             while (timer_now_us() - start) < 100_000 {
                 spin_loop();
@@ -1268,7 +1287,8 @@ impl XhciInner {
         // Reset del puerto (PR=1)
         if needs_reset {
             info!("[xhci] puerto {}: emitiendo reset", port);
-            self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
+            self.mmio
+                .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
 
             // Espera robusta de reset (100ms)
             let mut success = false;
@@ -1294,7 +1314,8 @@ impl XhciInner {
 
         // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1; conservar PP, PED, etc.
         let clr = PORTSC_CHANGE_BITS;
-        self.mmio.write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | clr);
+        self.mmio
+            .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | clr);
 
         // Pequeño delay tras reset para estabilización del link
         let start = timer_now_us();
@@ -1317,7 +1338,8 @@ impl XhciInner {
                 if (s & 1) == 0 {
                     return Ok(());
                 }
-                self.mmio.write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
+                self.mmio
+                    .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
                 let start = timer_now_us();
                 while (timer_now_us() - start) < 100_000 {
                     spin_loop();
@@ -1327,7 +1349,8 @@ impl XhciInner {
                     ((s >> 10) & 0x0f) as u8
                 });
                 s = self.mmio.read_op(off);
-                self.mmio.write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | clr);
+                self.mmio
+                    .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | clr);
                 let start = timer_now_us();
                 while (timer_now_us() - start) < 50_000 {
                     spin_loop();
@@ -1391,13 +1414,31 @@ impl XhciInner {
         ic.flush(0, input_sz);
         let ri = Self::ri(slot, 1);
 
-        warn!("[xhci] setup slot={} port={} speed={} csz={}", slot, port, speed, csz);
-        warn!("[xhci]   dcbaa[{}]={:#x}", slot, self.dcbaa.read_u64(slot as usize * 8));
-        warn!("[xhci]   ic phys={:#x} ep0_ring_phys={:#x}", ic.sub_phys(0), ep0_phys);
-        warn!("[xhci]   ic.DW1(add)={:#010x} SlotCtx_DW0={:#010x} SlotCtx_DW1={:#010x}",
-            ic.read_u32(4), ic.read_u32(s0), ic.read_u32(s0 + 4));
-        warn!("[xhci]   EP0Ctx_DW1={:#010x} EP0_TRDeqPtr={:#x}",
-            ic.read_u32(ep0 + 4), ic.read_u64(ep0 + 8));
+        warn!(
+            "[xhci] setup slot={} port={} speed={} csz={}",
+            slot, port, speed, csz
+        );
+        warn!(
+            "[xhci]   dcbaa[{}]={:#x}",
+            slot,
+            self.dcbaa.read_u64(slot as usize * 8)
+        );
+        warn!(
+            "[xhci]   ic phys={:#x} ep0_ring_phys={:#x}",
+            ic.sub_phys(0),
+            ep0_phys
+        );
+        warn!(
+            "[xhci]   ic.DW1(add)={:#010x} SlotCtx_DW0={:#010x} SlotCtx_DW1={:#010x}",
+            ic.read_u32(4),
+            ic.read_u32(s0),
+            ic.read_u32(s0 + 4)
+        );
+        warn!(
+            "[xhci]   EP0Ctx_DW1={:#010x} EP0_TRDeqPtr={:#x}",
+            ic.read_u32(ep0 + 4),
+            ic.read_u64(ep0 + 8)
+        );
 
         self.xfer_rings[ri] = Some(ep0_ring);
 
@@ -1408,24 +1449,35 @@ impl XhciInner {
         // Rust would drop it here after the semicolon, which is correct (after wait completes).
         let _ = &ic; // force ic to live until this point
 
-        warn!("[xhci] Address Device completado slot={} USBSTS={:#010x}",
-            slot, self.mmio.read_op(4));
+        warn!(
+            "[xhci] Address Device completado slot={} USBSTS={:#010x}",
+            slot,
+            self.mmio.read_op(4)
+        );
 
         // Pequeña pausa tras Address Device: algunos dispositivos FS/LS necesitan
         // tiempo para procesar el SET_ADDRESS y estar listos en la nueva dirección.
         {
             let start = timer_now_us();
-            while (timer_now_us() - start) < 2_000 { spin_loop(); } // 2ms
+            while (timer_now_us() - start) < 2_000 {
+                spin_loop();
+            } // 2ms
         }
 
         // Invalidar la caché del descriptor buffer antes de pasarlo al controlador
         // (el controlador escribirá en él via DMA; queremos ver los datos frescos).
         let desc = DmaBuf::new(64, 64)?;
         desc.flush(0, 64);
-        warn!("[xhci] GET_DESCRIPTOR slot={} desc.phys={:#x} ep0_ring.phys={:#x}",
+        warn!(
+            "[xhci] GET_DESCRIPTOR slot={} desc.phys={:#x} ep0_ring.phys={:#x}",
             slot,
             desc.phys,
-            self.xfer_rings.get(ri).and_then(|o| o.as_ref()).map(|r| r.buf.phys).unwrap_or(0));
+            self.xfer_rings
+                .get(ri)
+                .and_then(|o| o.as_ref())
+                .map(|r| r.buf.phys)
+                .unwrap_or(0)
+        );
         self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0100, 0, 18, 3), &desc, 18)?;
 
         // Invalidar caché del buffer de descriptor para ver los datos escritos por DMA.
@@ -1691,7 +1743,9 @@ impl XhciInner {
             let mut addr = v;
             let end = v + h.report_len as usize;
             while addr < end {
-                unsafe { _mm_clflush(addr as *const u8); }
+                unsafe {
+                    _mm_clflush(addr as *const u8);
+                }
                 addr += 64;
             }
             fence(Ordering::SeqCst);
