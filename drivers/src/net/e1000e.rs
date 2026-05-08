@@ -29,71 +29,75 @@ use super::timer_now_as_micros;
 // ---------------------------------------------------------------------------
 // Register offsets (byte addresses / 4 → u32 index)
 // ---------------------------------------------------------------------------
-const E1000E_CTRL:    usize = 0x0000 / 4;
-const E1000E_STATUS:  usize = 0x0008 / 4;
-const E1000E_EECD:    usize = 0x0010 / 4;
-const E1000E_EERD:    usize = 0x0014 / 4;
-const E1000E_ICR:     usize = 0x00C0 / 4;
-const E1000E_IMS:     usize = 0x00D0 / 4;
-const E1000E_IMC:     usize = 0x00D8 / 4;
-const E1000E_RCTL:    usize = 0x0100 / 4;
-const E1000E_TCTL:    usize = 0x0400 / 4;
-const E1000E_TIPG:    usize = 0x0410 / 4;
-// Receive descriptor ring (e1000e uses 0xC000, not 0x2800 like the old e1000)
-const E1000E_RDBAL:   usize = 0x2800 / 4;
-const E1000E_RDBAH:   usize = 0x2804 / 4;
-const E1000E_RDLEN:   usize = 0x2808 / 4;
-const E1000E_RDH:     usize = 0x2810 / 4;
-const E1000E_RDT:     usize = 0x2818 / 4;
+const E1000E_CTRL: usize = 0x0000 / 4;
+const E1000E_STATUS: usize = 0x0008 / 4;
+const E1000E_EECD: usize = 0x0010 / 4;
+const E1000E_EERD: usize = 0x0014 / 4;
+const E1000E_ICR: usize = 0x00C0 / 4;
+const E1000E_IMS: usize = 0x00D0 / 4;
+const E1000E_IMC: usize = 0x00D8 / 4;
+const E1000E_RCTL: usize = 0x0100 / 4;
+const E1000E_TCTL: usize = 0x0400 / 4;
+const E1000E_TIPG: usize = 0x0410 / 4;
+// Receive descriptor ring queue 0.  0x2800 is correct for all e1000e silicon;
+// queues ≥4 use 0xC400 + 0x100*(n-4), but this driver only uses queue 0.
+const E1000E_RDBAL: usize = 0x2800 / 4;
+const E1000E_RDBAH: usize = 0x2804 / 4;
+const E1000E_RDLEN: usize = 0x2808 / 4;
+const E1000E_RDH: usize = 0x2810 / 4;
+const E1000E_RDT: usize = 0x2818 / 4;
 // Transmit descriptor ring
-const E1000E_TDBAL:   usize = 0x3800 / 4;
-const E1000E_TDBAH:   usize = 0x3804 / 4;
-const E1000E_TDLEN:   usize = 0x3808 / 4;
-const E1000E_TDH:     usize = 0x3810 / 4;
-const E1000E_TDT:     usize = 0x3818 / 4;
+const E1000E_TDBAL: usize = 0x3800 / 4;
+const E1000E_TDBAH: usize = 0x3804 / 4;
+const E1000E_TDLEN: usize = 0x3808 / 4;
+const E1000E_TDH: usize = 0x3810 / 4;
+const E1000E_TDT: usize = 0x3818 / 4;
 // Receive address
-const E1000E_RAL0:    usize = 0x5400 / 4;
-const E1000E_RAH0:    usize = 0x5404 / 4;
+const E1000E_RAL0: usize = 0x5400 / 4;
+const E1000E_RAH0: usize = 0x5404 / 4;
 // Multicast table (128 × u32)
 const E1000E_MTA_BASE: usize = 0x5200 / 4;
-const E1000E_MTA_LEN:  usize = 128;
+const E1000E_MTA_LEN: usize = 128;
 
 // CTRL bits
-const CTRL_RST:      u32 = 1 << 26;  // full MAC + PHY reset
-const CTRL_SLU:      u32 = 1 << 6;   // set link up
-const CTRL_ASDE:     u32 = 1 << 5;   // auto-speed detection enable
+const CTRL_RST: u32 = 1 << 26; // full MAC + PHY reset
+const CTRL_SLU: u32 = 1 << 6; // set link up
+const CTRL_ASDE: u32 = 1 << 5; // auto-speed detection enable
 
 // STATUS bits
-const STATUS_LU:     u32 = 1 << 1;   // link up
+const STATUS_LU: u32 = 1 << 1; // link up
 
 // EERD bits (e1000e uses bit 4 for DONE, NOT bit 1 like the legacy e1000)
-const EERD_START:    u32 = 1 << 0;
-const EERD_DONE:     u32 = 1 << 4;   // bit 4 on e1000e / 82574L
+const EERD_START: u32 = 1 << 0;
+const EERD_DONE: u32 = 1 << 4; // bit 4 on e1000e / 82574L
 const EERD_ADDR_SHIFT: u32 = 2;
 const EERD_DATA_SHIFT: u32 = 16;
 
-// How many spin-loop iterations we treat as ~1 µs (conservative on real hw)
-const SPINS_PER_US:  u32 = 100;
-// Hard silence after RST before ANY MMIO read (10 ms minimum per datasheet §4.6)
-const POST_RST_SPINS: u32 = 10_000 * SPINS_PER_US;
+// Post-reset silence: 10 ms minimum before any MMIO read (datasheet §4.6).
+// Measured with the kernel timer so the delay is correct on all CPU speeds.
+const POST_RST_US: u64 = 10_000;
+// STATUS-ready poll: 150 ms covers PCH-based NICs (I217/I218/I219).
+const STATUS_POLL_US: u64 = 150_000;
+// NVM EERD-done poll: 10 ms is more than enough for any e1000e silicon.
+const NVM_POLL_US: u64 = 10_000;
 
 // RCTL bits
-const RCTL_EN:       u32 = 1 << 1;
-const RCTL_BAM:      u32 = 1 << 15;  // broadcast accept
+const RCTL_EN: u32 = 1 << 1;
+const RCTL_BAM: u32 = 1 << 15; // broadcast accept
 const RCTL_BSIZE_4K: u32 = (3 << 16) | (1 << 25); // BSIZE=3, BSEX=1 → 4096 B
-const RCTL_SECRC:    u32 = 1 << 26;  // strip CRC
+const RCTL_SECRC: u32 = 1 << 26; // strip CRC
 
 // TCTL bits
-const TCTL_EN:       u32 = 1 << 1;
-const TCTL_PSP:      u32 = 1 << 3;
-const TCTL_CT_16:    u32 = 0x10 << 4;
-const TCTL_COLD_64:  u32 = 0x40 << 12;
+const TCTL_EN: u32 = 1 << 1;
+const TCTL_PSP: u32 = 1 << 3;
+const TCTL_CT_16: u32 = 0x10 << 4;
+const TCTL_COLD_64: u32 = 0x40 << 12;
 
-const TX_CMD_EOP:    u8  = 1 << 0;
-const TX_CMD_IFCS:   u8  = 1 << 1;
-const TX_CMD_RS:     u8  = 1 << 3;
-const RX_STATUS_DD:  u8  = 1 << 0;
-const RX_STATUS_EOP: u8  = 1 << 1;
+const TX_CMD_EOP: u8 = 1 << 0;
+const TX_CMD_IFCS: u8 = 1 << 1;
+const TX_CMD_RS: u8 = 1 << 3;
+const RX_STATUS_DD: u8 = 1 << 0;
+const RX_STATUS_EOP: u8 = 1 << 1;
 
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
@@ -105,23 +109,23 @@ const BUF_SIZE: usize = 4096;
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct RxDesc {
-    addr:    u64,
-    len:     u16,
-    chksum:  u16,
-    status:  u8,
-    errors:  u8,
+    addr: u64,
+    len: u16,
+    chksum: u16,
+    status: u8,
+    errors: u8,
     special: u16,
 }
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct TxDesc {
-    addr:    u64,
-    len:     u16,
-    cso:     u8,
-    cmd:     u8,
-    status:  u8,
-    css:     u8,
+    addr: u64,
+    len: u16,
+    cso: u8,
+    cmd: u8,
+    status: u8,
+    css: u8,
     special: u16,
 }
 
@@ -129,7 +133,7 @@ struct TxDesc {
 // DMA allocation helpers (thin wrappers over the kernel C FFI)
 // ---------------------------------------------------------------------------
 extern "C" {
-    fn drivers_dma_alloc(pages: usize) -> usize;  // returns phys addr
+    fn drivers_dma_alloc(pages: usize) -> usize; // returns phys addr
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: usize) -> usize;
     fn drivers_virt_to_phys(vaddr: usize) -> usize;
@@ -167,22 +171,22 @@ unsafe fn mmio_flush(base: usize, reg: usize) {
 // E1000eHw — raw hardware state
 // ---------------------------------------------------------------------------
 struct E1000eHw {
-    base:        usize,   // MMIO virtual base
-    mac:         [u8; 6],
+    base: usize, // MMIO virtual base
+    mac: [u8; 6],
 
-    rx_ring_va:  usize,
-    rx_ring_pa:  usize,
-    rx_bufs_va:  Vec<usize>,
-    rx_bufs_pa:  Vec<usize>,
-    rx_tail:     usize,
+    rx_ring_va: usize,
+    rx_ring_pa: usize,
+    rx_bufs_va: Vec<usize>,
+    rx_bufs_pa: Vec<usize>,
+    rx_tail: usize,
 
-    tx_ring_va:  usize,
-    tx_ring_pa:  usize,
-    tx_bufs_va:  Vec<usize>,
-    tx_bufs_pa:  Vec<usize>,
-    tx_tail:     usize,
+    tx_ring_va: usize,
+    tx_ring_pa: usize,
+    tx_bufs_va: Vec<usize>,
+    tx_bufs_pa: Vec<usize>,
+    tx_tail: usize,
     tx_head_shadow: usize,
-    tx_first:    bool,
+    tx_first: bool,
 }
 
 impl E1000eHw {
@@ -201,16 +205,19 @@ impl E1000eHw {
     unsafe fn nvm_read_word(&self, offset: u16) -> u16 {
         let cmd = ((offset as u32) << EERD_ADDR_SHIFT) | EERD_START;
         mmio_write(self.base, E1000E_EERD, cmd);
-        // poll DONE bit (max ~10 µs on real hw)
-        for _ in 0..10_000 {
+        // Poll DONE bit with a real timer so the timeout is correct on any CPU.
+        let t0 = timer_now_as_micros();
+        loop {
             let v = mmio_read(self.base, E1000E_EERD);
             if v & EERD_DONE != 0 {
                 return (v >> EERD_DATA_SHIFT) as u16;
             }
+            if timer_now_as_micros().wrapping_sub(t0) >= NVM_POLL_US {
+                warn!("[e1000e] NVM read timeout at offset {}", offset);
+                return 0;
+            }
             core::hint::spin_loop();
         }
-        warn!("[e1000e] NVM read timeout at offset {}", offset);
-        0
     }
 
     // -----------------------------------------------------------------------
@@ -228,8 +235,7 @@ impl E1000eHw {
         self.mac[5] = (w2 >> 8) as u8;
         info!(
             "[e1000e] MAC from NVM: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac[0], self.mac[1], self.mac[2],
-            self.mac[3], self.mac[4], self.mac[5]
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
         );
     }
 
@@ -246,22 +252,29 @@ impl E1000eHw {
         //    CRITICAL: On e1000e (I217/I218/I219/82574) the datasheet (§4.6)
         //    requires NO MMIO reads for at least 10 ms after setting RST.
         //    Reading MMIO during that window can stall the PCI bus on real HW.
+        //    Use a real timer so the delay is correct on fast CPUs.
         let ctrl = mmio_read(self.base, E1000E_CTRL);
         mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
 
-        // Hard silence: spin ~10 ms with no MMIO accesses whatsoever.
-        for _ in 0..POST_RST_SPINS { core::hint::spin_loop(); }
+        // Hard silence: spin for at least 10 ms, timed with the kernel clock.
+        let t_rst = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t_rst) < POST_RST_US {
+            core::hint::spin_loop();
+        }
 
         // 3. Poll STATUS until the device is ready (not 0xFFFF_FFFF = bus turnaround).
-        //    Timeout after ~100 ms to avoid an infinite hang if hardware is broken.
+        //    Timeout after 150 ms — PCH-based NICs (I217/I218/I219) can need up
+        //    to ~100 ms. Note: STATUS = 0 is a valid post-reset value (no link,
+        //    speeds not yet resolved) and must NOT be treated as "not ready".
         let mut ready = false;
-        for _ in 0..10_000u32 {
+        let t_poll = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t_poll) < STATUS_POLL_US {
             let s = mmio_read(self.base, E1000E_STATUS);
-            if s != 0xFFFF_FFFF && s != 0 {
+            if s != 0xFFFF_FFFF {
                 ready = true;
                 break;
             }
-            for _ in 0..SPINS_PER_US { core::hint::spin_loop(); }
+            core::hint::spin_loop();
         }
         if !ready {
             warn!("[e1000e] device did not respond after reset — aborting init");
@@ -288,9 +301,7 @@ impl E1000eHw {
             | ((self.mac[1] as u32) << 8)
             | ((self.mac[2] as u32) << 16)
             | ((self.mac[3] as u32) << 24);
-        let rah = (self.mac[4] as u32)
-            | ((self.mac[5] as u32) << 8)
-            | (1u32 << 31); // AV (Address Valid) bit
+        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | (1u32 << 31); // AV (Address Valid) bit
         mmio_write(self.base, E1000E_RAL0, ral);
         mmio_write(self.base, E1000E_RAH0, rah);
 
@@ -306,22 +317,36 @@ impl E1000eHw {
         // 10. Configure TX ring
         mmio_write(self.base, E1000E_TDBAL, self.tx_ring_pa as u32);
         mmio_write(self.base, E1000E_TDBAH, (self.tx_ring_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_TDLEN, (NUM_TX * size_of::<TxDesc>()) as u32);
+        mmio_write(
+            self.base,
+            E1000E_TDLEN,
+            (NUM_TX * size_of::<TxDesc>()) as u32,
+        );
         mmio_write(self.base, E1000E_TDH, 0);
         mmio_write(self.base, E1000E_TDT, 0);
-        mmio_write(self.base, E1000E_TCTL,
-            TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64);
+        mmio_write(
+            self.base,
+            E1000E_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_16 | TCTL_COLD_64,
+        );
         // TIPG: IPGT=10, IPGR1=8, IPGR2=12 (IEEE 802.3 recommended)
         mmio_write(self.base, E1000E_TIPG, 10u32 | (8 << 10) | (12 << 20));
 
         // 11. Configure RX ring
         mmio_write(self.base, E1000E_RDBAL, self.rx_ring_pa as u32);
         mmio_write(self.base, E1000E_RDBAH, (self.rx_ring_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
+        mmio_write(
+            self.base,
+            E1000E_RDLEN,
+            (NUM_RX * size_of::<RxDesc>()) as u32,
+        );
         mmio_write(self.base, E1000E_RDH, 0);
         mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
-        mmio_write(self.base, E1000E_RCTL,
-            RCTL_EN | RCTL_BAM | RCTL_BSIZE_4K | RCTL_SECRC);
+        mmio_write(
+            self.base,
+            E1000E_RCTL,
+            RCTL_EN | RCTL_BAM | RCTL_BSIZE_4K | RCTL_SECRC,
+        );
 
         // 12. Clear any pending interrupts, then enable RX (RXT0 = bit 7)
         mmio_write(self.base, E1000E_ICR, 0xFFFF_FFFF);
@@ -331,7 +356,11 @@ impl E1000eHw {
         info!(
             "[e1000e] init done. STATUS={:#010x} link={}",
             status,
-            if status & STATUS_LU != 0 { "UP" } else { "DOWN" }
+            if status & STATUS_LU != 0 {
+                "UP"
+            } else {
+                "DOWN"
+            }
         );
         Ok(())
     }
@@ -355,9 +384,7 @@ impl E1000eHw {
             return None;
         }
         let len = desc.len as usize;
-        let buf = unsafe {
-            core::slice::from_raw_parts(self.rx_bufs_va[next] as *const u8, len)
-        };
+        let buf = unsafe { core::slice::from_raw_parts(self.rx_bufs_va[next] as *const u8, len) };
         let pkt = buf.to_vec();
 
         self.recycle_rx_desc(next, desc);
@@ -389,14 +416,13 @@ impl E1000eHw {
         let idx = self.tx_tail;
         let desc = unsafe { &mut *ring.add(idx) };
 
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(self.tx_bufs_va[idx] as *mut u8, data.len())
-        };
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(self.tx_bufs_va[idx] as *mut u8, data.len()) };
         buf.copy_from_slice(data);
 
-        desc.addr   = self.tx_bufs_pa[idx] as u64;
-        desc.len    = data.len() as u16;
-        desc.cmd    = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
+        desc.addr = self.tx_bufs_pa[idx] as u64;
+        desc.len = data.len() as u16;
+        desc.cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
         desc.status = 0;
         fence(Ordering::SeqCst);
 
@@ -430,8 +456,12 @@ impl Drop for E1000eHw {
         let tx_pages = (NUM_TX * size_of::<TxDesc>() + 4095) / 4096;
         dealloc_dma_pages(self.rx_ring_va, rx_pages);
         dealloc_dma_pages(self.tx_ring_va, tx_pages);
-        for v in &self.rx_bufs_va { dealloc_dma_pages(*v, 1); }
-        for v in &self.tx_bufs_va { dealloc_dma_pages(*v, 1); }
+        for v in &self.rx_bufs_va {
+            dealloc_dma_pages(*v, 1);
+        }
+        for v in &self.tx_bufs_va {
+            dealloc_dma_pages(*v, 1);
+        }
     }
 }
 
@@ -443,17 +473,21 @@ pub struct E1000eDriver(Arc<Mutex<E1000eHw>>);
 
 #[derive(Clone)]
 pub struct E1000eInterface {
-    iface:  Arc<Mutex<Interface<'static, E1000eDriver>>>,
+    iface: Arc<Mutex<Interface<'static, E1000eDriver>>>,
     driver: E1000eDriver,
-    name:   String,
-    irq:    usize,
+    name: String,
+    irq: usize,
 }
 
 impl Scheme for E1000eInterface {
-    fn name(&self) -> &str { "e1000e" }
+    fn name(&self) -> &str {
+        "e1000e"
+    }
 
     fn handle_irq(&self, irq: usize) {
-        if irq != self.irq { return; }
+        if irq != self.irq {
+            return;
+        }
         let had_data = self.driver.0.lock().handle_interrupt();
         if had_data {
             let ts = Instant::from_micros(timer_now_as_micros() as i64);
@@ -470,7 +504,9 @@ impl NetScheme for E1000eInterface {
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
-    fn get_ifname(&self) -> String { self.name.clone() }
+    fn get_ifname(&self) -> String {
+        self.name.clone()
+    }
     fn get_ip_address(&self) -> Vec<IpCidr> {
         Vec::from(self.iface.lock().ip_addrs())
     }
@@ -478,7 +514,9 @@ impl NetScheme for E1000eInterface {
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
-        self.iface.lock().poll(&mut sockets, ts)
+        self.iface
+            .lock()
+            .poll(&mut sockets, ts)
             .map(|_| ())
             .map_err(|_| DeviceError::IoError)
     }
@@ -509,11 +547,17 @@ impl phy::Device<'_> for E1000eDriver {
     type TxToken = E1000eTxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.0.lock().receive()
+        self.0
+            .lock()
+            .receive()
             .map(|pkt| (E1000eRxToken(pkt), E1000eTxToken(self.clone())))
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.0.lock().can_send() { Some(E1000eTxToken(self.clone())) } else { None }
+        if self.0.lock().can_send() {
+            Some(E1000eTxToken(self.clone()))
+        } else {
+            None
+        }
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -525,15 +569,21 @@ impl phy::Device<'_> for E1000eDriver {
 
 impl phy::RxToken for E1000eRxToken {
     fn consume<R, F>(mut self, _ts: Instant, f: F) -> SmolResult<R>
-    where F: FnOnce(&mut [u8]) -> SmolResult<R> { f(&mut self.0) }
+    where
+        F: FnOnce(&mut [u8]) -> SmolResult<R>,
+    {
+        f(&mut self.0)
+    }
 }
 
 impl phy::TxToken for E1000eTxToken {
     fn consume<R, F>(self, _ts: Instant, len: usize, f: F) -> SmolResult<R>
-    where F: FnOnce(&mut [u8]) -> SmolResult<R> {
+    where
+        F: FnOnce(&mut [u8]) -> SmolResult<R>,
+    {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
-        let mut hw = self.0.0.lock();
+        let mut hw = self.0 .0.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
         Ok(result)
     }
@@ -543,12 +593,15 @@ impl phy::TxToken for E1000eTxToken {
 // Public init — called from pci.rs
 // ---------------------------------------------------------------------------
 pub fn init(
-    name:   String,
-    irq:    usize,
-    vaddr:  usize,     // MMIO virtual base
-    index:  usize,     // card index for IP suffix
+    name: String,
+    irq: usize,
+    vaddr: usize, // MMIO virtual base
+    index: usize, // card index for IP suffix
 ) -> DeviceResult<E1000eInterface> {
-    info!("[e1000e] probing {} at vaddr={:#x} irq={}", name, vaddr, irq);
+    info!(
+        "[e1000e] probing {} at vaddr={:#x} irq={}",
+        name, vaddr, irq
+    );
 
     // Allocate DMA rings
     let rx_ring_pages = (NUM_RX * size_of::<RxDesc>() + 4095) / 4096;
@@ -563,36 +616,42 @@ pub fn init(
 
     for _ in 0..NUM_RX {
         let (v, p) = alloc_dma_pages(BUF_SIZE / 4096);
-        rx_bufs_va.push(v); rx_bufs_pa.push(p);
+        rx_bufs_va.push(v);
+        rx_bufs_pa.push(p);
     }
     for _ in 0..NUM_TX {
         let (v, p) = alloc_dma_pages(BUF_SIZE / 4096);
-        tx_bufs_va.push(v); tx_bufs_pa.push(p);
+        tx_bufs_va.push(v);
+        tx_bufs_pa.push(p);
     }
 
     let mut hw = E1000eHw {
         base: vaddr,
         mac: [0u8; 6],
-        rx_ring_va, rx_ring_pa,
-        rx_bufs_va, rx_bufs_pa,
+        rx_ring_va,
+        rx_ring_pa,
+        rx_bufs_va,
+        rx_bufs_pa,
         rx_tail: NUM_RX - 1,
-        tx_ring_va, tx_ring_pa,
-        tx_bufs_va, tx_bufs_pa,
+        tx_ring_va,
+        tx_ring_pa,
+        tx_bufs_va,
+        tx_bufs_pa,
         tx_tail: 0,
         tx_head_shadow: 0,
         tx_first: true,
     };
 
-    unsafe { hw.reset_and_init()?; }
+    unsafe {
+        hw.reset_and_init()?;
+    }
 
     let mac_bytes = hw.mac;
     let hw = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver(hw);
 
     let ethernet_addr = EthernetAddress::from_bytes(&mac_bytes);
-    let ip_addrs = [IpCidr::new(
-        IpAddress::v4(10, 0, 2, (15 + index) as u8), 24,
-    )];
+    let ip_addrs = [IpCidr::new(IpAddress::v4(10, 0, 2, (15 + index) as u8), 24)];
     let default_gw = Ipv4Address::new(10, 0, 2, 2);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
@@ -607,9 +666,7 @@ pub fn init(
 
     info!(
         "[e1000e] interface {} up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        name,
-        mac_bytes[0], mac_bytes[1], mac_bytes[2],
-        mac_bytes[3], mac_bytes[4], mac_bytes[5]
+        name, mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
     );
 
     Ok(E1000eInterface {

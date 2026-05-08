@@ -270,9 +270,11 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
 
         // ---- e1000e family (real hardware: 82574/82579/I217/I218/I219) ----
         // Device IDs mirror the Linux e1000e driver's PCI table.
-        (0x8086, did) if matches!(did,
-            // 82567 (ICH9/10 on-die)
-            0x10bf | 0x10cb | 0x10cc | 0x10cd | 0x10ce |
+        (0x8086, did)
+            if matches!(
+                did,
+                // 82567 (ICH9/10 on-die)
+                0x10bf | 0x10cb | 0x10cc | 0x10cd | 0x10ce |
             0x10de | 0x10df | 0x10e5 | 0x10f5 |
             // 82577 / 82578
             0x10ea | 0x10eb | 0x10ef | 0x10f0 |
@@ -295,23 +297,34 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
             0x5502 | 0x5503 |
             // I219 (Meteor Lake)
             0x57a0 | 0x57a1 | 0x57b3
-        ) => {
+            ) =>
+        {
             // Read BAR0 (may be 64-bit)
             let bar0_addr: u64 = {
                 if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
-                    if a != 0 { a } else {
+                    if a != 0 {
+                        a
+                    } else {
                         #[cfg(target_arch = "x86_64")]
-                        { let ops = &PortOpsImpl;
-                          unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) } }
+                        {
+                            let ops = &PortOpsImpl;
+                            unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                        }
                         #[cfg(not(target_arch = "x86_64"))]
-                        { 0 }
+                        {
+                            0
+                        }
                     }
                 } else {
                     #[cfg(target_arch = "x86_64")]
-                    { let ops = &PortOpsImpl;
-                      unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) } }
+                    {
+                        let ops = &PortOpsImpl;
+                        unsafe { read_bar_addr(ops, PCI_ACCESS, dev.loc, BAR0) }
+                    }
                     #[cfg(not(target_arch = "x86_64"))]
-                    { 0 }
+                    {
+                        0
+                    }
                 }
             };
             if bar0_addr != 0 {
@@ -320,7 +333,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 if let Some(m) = mapper {
                     m.query_or_map(bar0_addr as usize, map_len);
                 }
-                let irq  = unsafe { enable(dev.loc, 0) };
+                let irq = unsafe { enable(dev.loc, 0) };
                 let vaddr = phys_to_virt(bar0_addr as usize);
                 info!(
                     "[e1000e] PCI {:04x}:{:04x} at {:#x} vaddr={:#x} irq={:?}",
@@ -328,7 +341,7 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
                 );
                 match crate::net::e1000e::init(name, irq.unwrap_or(0), vaddr, 0) {
                     Ok(iface) => return Ok(Device::Net(Arc::new(iface))),
-                    Err(e)    => warn!("[e1000e] init error: {:?}", e),
+                    Err(e) => warn!("[e1000e] init error: {:?}", e),
                 }
             } else {
                 warn!("[e1000e] BAR0=0, device {:04x} skipped", did);
@@ -721,7 +734,8 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
 
             let base_addr = (addr as usize) & !0xfff;
             let offset = (addr as usize) & 0xfff;
-            let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+            let map_len =
+                ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
             if let Some(m) = mapper {
                 m.query_or_map(base_addr, map_len);
             }
