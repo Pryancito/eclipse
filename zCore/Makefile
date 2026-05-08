@@ -191,7 +191,7 @@ else ifeq ($(ARCH), aarch64)
 endif
 
 qemu_opts += \
-	-netdev user,id=net1,hostfwd=tcp::8000-:80,hostfwd=tcp::2222-:2222,hostfwd=udp::6969-:6969 \
+	-netdev user,id=net1 \
 	-device e1000e,netdev=net1
 	# -netdev tap,id=net1,script=ifup.sh,downscript=ifdown.sh
 
