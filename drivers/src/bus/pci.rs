@@ -14,7 +14,7 @@ const PCI_INTERRUPT_LINE: u16 = 0x3c;
 const PCI_INTERRUPT_PIN: u16 = 0x3d;
 
 #[allow(dead_code)]
-const PCI_MSI_CTRL_CAP: u16 = 0x00;
+const PCI_MSI_CTRL_CAP: u16 = 0x02;
 #[allow(dead_code)]
 const PCI_MSI_ADDR: u16 = 0x04;
 #[allow(dead_code)]
@@ -23,6 +23,8 @@ const PCI_MSI_UPPER_ADDR: u16 = 0x08;
 const PCI_MSI_DATA_32: u16 = 0x08;
 #[allow(dead_code)]
 const PCI_MSI_DATA_64: u16 = 0x0C;
+#[allow(dead_code)]
+const PCI_MSI_CTRL_ENABLE: u16 = 1 << 0;
 
 #[allow(dead_code)]
 const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
@@ -239,7 +241,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
         cap_steps = cap_steps.saturating_add(1);
         let cap_id = am.read8(ops, loc, cap_ptr);
         if cap_id == PCI_CAP_ID_MSI {
-            let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
+            let orig_ctrl = am.read16(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
             // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
             // 0 is (usually) the apic id of the bsp.
             //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
@@ -248,19 +250,25 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
             let irq = MSI_IRQ;
             assigned_irq = Some(irq as usize);
             // we offset all our irq numbers by 32
-            if (orig_ctrl >> 16) & (1 << 7) != 0 {
+            if (orig_ctrl & (1 << 7)) != 0 {
                 // 64bit
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
+                am.write32(ops, loc, cap_ptr + PCI_MSI_UPPER_ADDR, 0);
+                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_64, (irq + 32) as u16);
             } else {
                 // 32bit
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
+                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_32, (irq + 32) as u16);
             }
 
-            // enable MSI interrupt, assuming 64bit for now
-            am.write32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP, orig_ctrl | 0x10000);
+            // Enable MSI while preserving all existing control bits.
+            am.write16(
+                ops,
+                loc,
+                cap_ptr + PCI_MSI_CTRL_CAP,
+                orig_ctrl | PCI_MSI_CTRL_ENABLE,
+            );
             debug!(
                 "MSI control {:#b}, enabling MSI interrupt {}",
-                orig_ctrl >> 16,
+                orig_ctrl,
                 irq
             );
             msi_found = true;
