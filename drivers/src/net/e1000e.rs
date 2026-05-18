@@ -21,7 +21,7 @@ const E1000E_CONVENTIONAL: bool = true;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250517-status-spd";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250518-alloc-clflush-rdt-fix";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -1805,21 +1805,35 @@ impl E1000eHw {
             desc.addr = self.rx_bufs[i].paddr() as u64;
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
+            // I219 metal: flush descriptor to RAM so that:
+            // (a) hardware reads the correct buffer address after the doorbell, and
+            // (b) the cache line is CLEAN when desc_done's invalidate_cpu_cache_for_read
+            //     (_mm_clflush) runs.  Without this flush the CPU WB cache holds a dirty
+            //     staterr=0.  desc_done's clflush would then write that stale value back,
+            //     clobbering hardware's DD=1 write-back and making the packet invisible
+            //     to the driver (RX stall / "no receive" on real I219 hardware).
+            if self.is_i219_metal_rx_hacks() {
+                core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+            }
+
+            posted += 1;
+            i = (i + 1) % NUM_RX;
+
+            // Linux `e1000_alloc_rx_buffers`: ring doorbell at next_to_use (one past
+            // the last written descriptor) every RX_BUFFER_WRITE slots, matching the
+            // Intel spec that "RDT points to the first free receive descriptor".
             if (i & (RX_BUFFER_WRITE - 1)) == 0 {
                 fence(Ordering::SeqCst);
                 mmio_write(self.base, E1000E_RDT, i as u32);
                 let _ = mmio_read(self.base, E1000E_RDT);
             }
-
-            posted += 1;
-            i = (i + 1) % NUM_RX;
         }
         self.rx_next_to_use = i;
-        // Linux jumbo alloc path: always doorbell the last posted index.
+        // Linux `e1000_alloc_rx_buffers`: always doorbell next_to_use after the last
+        // posted descriptor so hardware sees every slot we just filled.
         if posted > 0 {
-            let last = if i == 0 { NUM_RX - 1 } else { i - 1 };
             fence(Ordering::SeqCst);
-            mmio_write(self.base, E1000E_RDT, last as u32);
+            mmio_write(self.base, E1000E_RDT, i as u32);
             let _ = mmio_read(self.base, E1000E_RDT);
         }
     }
@@ -3720,7 +3734,17 @@ impl Scheme for E1000eInterface {
         // miss the RX event and never wake the polling loop.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
-            self.ims_rearm();
+            if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+                let poll_pending = self.poll_pending.clone();
+                let self_clone = self.clone();
+                crate::utils::deferred_job::push_deferred_job(move || {
+                    let _ = self_clone.poll();
+                    poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                });
+            } else {
+                self.ims_rearm();
+            }
             return;
         }
 

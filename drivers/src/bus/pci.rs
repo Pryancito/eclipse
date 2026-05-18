@@ -1,5 +1,7 @@
 use super::PAGE_SIZE;
 use crate::builder::IoMapper;
+#[cfg(target_arch = "x86_64")]
+use crate::irq::x86::Apic;
 const PCI_COMMAND: u16 = 0x04;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::{sync::Arc, vec::Vec};
@@ -14,7 +16,7 @@ const PCI_INTERRUPT_LINE: u16 = 0x3c;
 const PCI_INTERRUPT_PIN: u16 = 0x3d;
 
 #[allow(dead_code)]
-const PCI_MSI_CTRL_CAP: u16 = 0x00;
+const PCI_MSI_CTRL_CAP: u16 = 0x02;
 #[allow(dead_code)]
 const PCI_MSI_ADDR: u16 = 0x04;
 #[allow(dead_code)]
@@ -23,6 +25,8 @@ const PCI_MSI_UPPER_ADDR: u16 = 0x08;
 const PCI_MSI_DATA_32: u16 = 0x08;
 #[allow(dead_code)]
 const PCI_MSI_DATA_64: u16 = 0x0C;
+#[allow(dead_code)]
+const PCI_MSI_CTRL_ENABLE: u16 = 1 << 0;
 
 #[allow(dead_code)]
 const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
@@ -203,9 +207,14 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     static mut MSI_IRQ: u32 = 23;
 
     let orig = am.read16(ops, loc, PCI_COMMAND);
-    // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
-    // regardless of whether MSI is available.
-    am.write16(ops, loc, PCI_COMMAND, orig | 0x6);
+    // Always enable MEM space + Bus Mastering. Start with INTx enabled so
+    // legacy fallback works even if firmware left INTx disabled.
+    am.write16(
+        ops,
+        loc,
+        PCI_COMMAND,
+        (orig | 0x6) & !PCI_COMMAND_INTX_DISABLE,
+    );
 
     // find MSI cap
     let mut msi_found = false;
@@ -239,28 +248,40 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
         cap_steps = cap_steps.saturating_add(1);
         let cap_id = am.read8(ops, loc, cap_ptr);
         if cap_id == PCI_CAP_ID_MSI {
-            let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
+            let orig_ctrl = am.read16(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
             // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
-            // 0 is (usually) the apic id of the bsp.
-            //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
-            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
+            #[cfg(target_arch = "x86_64")]
+            let msi_addr = {
+                let bsp_id = Apic::bsp_id() as u32;
+                0xfee00000 | (bsp_id << 12)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let msi_addr = 0xfee00000;
+            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, msi_addr);
             MSI_IRQ += 1;
             let irq = MSI_IRQ;
             assigned_irq = Some(irq as usize);
             // we offset all our irq numbers by 32
-            if (orig_ctrl >> 16) & (1 << 7) != 0 {
+            if (orig_ctrl & (1 << 7)) != 0 {
                 // 64bit
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
+                am.write32(ops, loc, cap_ptr + PCI_MSI_UPPER_ADDR, 0);
+                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_64, (irq + 32) as u16);
             } else {
                 // 32bit
-                am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
+                am.write16(ops, loc, cap_ptr + PCI_MSI_DATA_32, (irq + 32) as u16);
             }
 
-            // enable MSI interrupt, assuming 64bit for now
-            am.write32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP, orig_ctrl | 0x10000);
+            // Enable MSI while preserving all existing control bits.
+            am.write16(
+                ops,
+                loc,
+                cap_ptr + PCI_MSI_CTRL_CAP,
+                orig_ctrl | PCI_MSI_CTRL_ENABLE,
+            );
             debug!(
-                "MSI control {:#b}, enabling MSI interrupt {}",
-                orig_ctrl >> 16,
+                "MSI control {:#b}, msi_addr={:#x}, enabling MSI interrupt {}",
+                orig_ctrl,
+                msi_addr,
                 irq
             );
             msi_found = true;
@@ -271,8 +292,15 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     }
 
     if !msi_found {
+        // Explicitly keep INTx enabled for legacy interrupt delivery.
+        let cmd = am.read16(ops, loc, PCI_COMMAND);
+        am.write16(ops, loc, PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
         am.write32(ops, loc, PCI_INTERRUPT_LINE, 33);
         debug!("MSI not found, using PCI interrupt");
+    } else {
+        // MSI active: disable legacy INTx line to avoid double-delivery.
+        let cmd = am.read16(ops, loc, PCI_COMMAND);
+        am.write16(ops, loc, PCI_COMMAND, cmd | PCI_COMMAND_INTX_DISABLE);
     }
 
     warn!("pci device enable done");

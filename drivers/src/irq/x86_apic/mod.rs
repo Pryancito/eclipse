@@ -66,6 +66,10 @@ impl Apic {
         unsafe { LocalApic::get() }
     }
 
+    pub fn bsp_id() -> u8 {
+        LocalApic::bsp_id()
+    }
+
     pub fn register_local_apic_handler(&self, vector: usize, handler: IrqHandler) -> DeviceResult {
         if vector >= X86_INT_LOCAL_APIC_BASE {
             self.manager_lapic
