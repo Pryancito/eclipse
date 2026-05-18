@@ -191,6 +191,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     let ops = &PortOpsImpl;
     //let am = CSpaceAccessMethod::IO;
     let am = PCI_ACCESS;
+    let force_legacy_irq = loc.class == 0x0c && loc.subclass == 0x03 && loc.prog_if == 0x30;
 
     if paddr != 0 {
         // reveal PCI regs by setting paddr
@@ -222,7 +223,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     let mut assigned_irq = None;
     let mut cap_steps = 0usize;
     let mut prev_cap_ptr = 0u16;
-    while cap_ptr > 0 {
+    while cap_ptr > 0 && !force_legacy_irq {
         if cap_steps >= PCI_MAX_CAP_TRAVERSAL {
             warn!(
                 "PCI capability chain too long or cyclic at {:?}, aborting traversal",
@@ -296,7 +297,11 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
         let cmd = am.read16(ops, loc, PCI_COMMAND);
         am.write16(ops, loc, PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
         am.write32(ops, loc, PCI_INTERRUPT_LINE, 33);
-        debug!("MSI not found, using PCI interrupt");
+        if force_legacy_irq {
+            warn!("xHCI forcing legacy IRQ/poll fallback; MSI disabled for stability");
+        } else {
+            debug!("MSI not found, using PCI interrupt");
+        }
     } else {
         // MSI active: disable legacy INTx line to avoid double-delivery.
         let cmd = am.read16(ops, loc, PCI_COMMAND);
