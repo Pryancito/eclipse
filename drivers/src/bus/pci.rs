@@ -207,9 +207,14 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     static mut MSI_IRQ: u32 = 23;
 
     let orig = am.read16(ops, loc, PCI_COMMAND);
-    // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
-    // regardless of whether MSI is available.
-    am.write16(ops, loc, PCI_COMMAND, orig | 0x6);
+    // Always enable MEM space + Bus Mastering. Start with INTx enabled so
+    // legacy fallback works even if firmware left INTx disabled.
+    am.write16(
+        ops,
+        loc,
+        PCI_COMMAND,
+        (orig | 0x6) & !PCI_COMMAND_INTX_DISABLE,
+    );
 
     // find MSI cap
     let mut msi_found = false;
@@ -287,8 +292,15 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     }
 
     if !msi_found {
+        // Explicitly keep INTx enabled for legacy interrupt delivery.
+        let cmd = am.read16(ops, loc, PCI_COMMAND);
+        am.write16(ops, loc, PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
         am.write32(ops, loc, PCI_INTERRUPT_LINE, 33);
         debug!("MSI not found, using PCI interrupt");
+    } else {
+        // MSI active: disable legacy INTx line to avoid double-delivery.
+        let cmd = am.read16(ops, loc, PCI_COMMAND);
+        am.write16(ops, loc, PCI_COMMAND, cmd | PCI_COMMAND_INTX_DISABLE);
     }
 
     warn!("pci device enable done");
