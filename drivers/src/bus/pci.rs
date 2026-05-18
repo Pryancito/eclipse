@@ -1,5 +1,7 @@
 use super::PAGE_SIZE;
 use crate::builder::IoMapper;
+#[cfg(target_arch = "x86_64")]
+use crate::irq::x86::Apic;
 const PCI_COMMAND: u16 = 0x04;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::{sync::Arc, vec::Vec};
@@ -243,9 +245,14 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
         if cap_id == PCI_CAP_ID_MSI {
             let orig_ctrl = am.read16(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
             // The manual Volume 3 Chapter 10.11 Message Signalled Interrupts
-            // 0 is (usually) the apic id of the bsp.
-            //am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000 | (0 << 12));
-            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee00000);
+            #[cfg(target_arch = "x86_64")]
+            let msi_addr = {
+                let bsp_id = Apic::bsp_id() as u32;
+                0xfee00000 | (bsp_id << 12)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let msi_addr = 0xfee00000;
+            am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, msi_addr);
             MSI_IRQ += 1;
             let irq = MSI_IRQ;
             assigned_irq = Some(irq as usize);
@@ -267,8 +274,9 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
                 orig_ctrl | PCI_MSI_CTRL_ENABLE,
             );
             debug!(
-                "MSI control {:#b}, enabling MSI interrupt {}",
+                "MSI control {:#b}, msi_addr={:#x}, enabling MSI interrupt {}",
                 orig_ctrl,
+                msi_addr,
                 irq
             );
             msi_found = true;
