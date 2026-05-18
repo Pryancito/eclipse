@@ -7,60 +7,71 @@ use alloc::sync::Arc;
 use async_trait::async_trait;
 use lock::Mutex;
 use smoltcp::{
-    socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
-    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet},
+    socket::{IcmpEndpoint, IcmpPacketMetadata, IcmpSocket, IcmpSocketBuffer},
+    wire::IpAddress,
 };
 
 #[allow(unused_imports)]
 use zircon_object::object::*;
 
-pub struct RawSocketState {
+pub struct IcmpSocketState {
     base: KObjectBase,
-    inner: Arc<RawSocketInner>,
+    inner: Arc<IcmpSocketInner>,
 }
 
 #[derive(Debug)]
-struct RawSocketInner {
+struct IcmpSocketInner {
     handle: GlobalSocketHandle,
-    header_included: Mutex<bool>,
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
 }
 
-impl RawSocketState {
+impl IcmpSocketState {
     /// missing documentation
-    pub fn new(protocol: u8) -> Self {
-        let rx_buffer = RawSocketBuffer::new(
-            vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
-            vec![0; RAW_RECVBUF],
+    pub fn new() -> Self {
+        let rx_buffer = IcmpSocketBuffer::new(
+            vec![IcmpPacketMetadata::EMPTY; ICMP_METADATA_BUF],
+            vec![0; ICMP_RECVBUF],
         );
-        let tx_buffer = RawSocketBuffer::new(
-            vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
-            vec![0; RAW_SENDBUF],
+        let tx_buffer = IcmpSocketBuffer::new(
+            vec![IcmpPacketMetadata::EMPTY; ICMP_METADATA_BUF],
+            vec![0; ICMP_SENDBUF],
         );
-        let socket = RawSocket::new(
-            IpVersion::Ipv4,
-            IpProtocol::from(protocol),
-            rx_buffer,
-            tx_buffer,
-        );
+        let socket = IcmpSocket::new(rx_buffer, tx_buffer);
         let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
 
-        RawSocketState {
+        IcmpSocketState {
             base: KObjectBase::new(),
-            inner: Arc::new(RawSocketInner {
+            inner: Arc::new(IcmpSocketInner {
                 handle,
-                header_included: Mutex::new(false),
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
             }),
         }
     }
+
+    fn ensure_bound(&self, data: &[u8]) -> LxResult {
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let mut socket = set.get::<IcmpSocket>(self.inner.handle.0);
+        if socket.is_open() {
+            return Ok(());
+        }
+        if data.len() >= 6 {
+            let ident = u16::from_be_bytes([data[4], data[5]]);
+            socket
+                .bind(IcmpEndpoint::Ident(ident))
+                .map_err(|_| LxError::EINVAL)?;
+            return Ok(());
+        }
+        socket
+            .bind(IcmpEndpoint::Ident(0))
+            .map_err(|_| LxError::EINVAL)
+    }
 }
 
-/// missing in implementation
 #[async_trait]
-impl Socket for RawSocketState {
+impl Socket for IcmpSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
             drain_net_poll(4);
@@ -69,19 +80,16 @@ impl Socket for RawSocketState {
             }
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
-            let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
+            let mut socket = sockets.get::<IcmpSocket>(self.inner.handle.0);
             if socket.can_recv() {
-                if let Ok(size) = socket.recv_slice(data) {
-                    let packet = Ipv4Packet::new_unchecked(data);
+                if let Ok((size, addr)) = socket.recv_slice(data) {
+                    let endpoint = match addr {
+                        IpAddress::Ipv4(v4) => IpEndpoint::new(v4.into(), 0),
+                        _ => IpEndpoint::UNSPECIFIED,
+                    };
                     drop(socket);
                     drop(sockets);
-                    return (
-                        Ok(size),
-                        Endpoint::Ip(IpEndpoint {
-                            addr: IpAddress::Ipv4(packet.src_addr()),
-                            port: 0,
-                        }),
-                    );
+                    return (Ok(size), Endpoint::Ip(endpoint));
                 }
             }
             let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
@@ -105,58 +113,28 @@ impl Socket for RawSocketState {
             Some(ep) => Some(ep),
             None => self.inner.remote.lock().clone(),
         };
-        let net_sockets = get_sockets();
-        let mut sockets = net_sockets.lock();
-        let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
-        if *self.inner.header_included.lock() {
-            let result = match socket.send_slice(data) {
-                Ok(()) => Ok(data.len()),
-                Err(_) => Err(LxError::ENOBUFS),
-            };
-            drop(socket);
-            drop(sockets);
-            if result.is_ok() {
-                drain_net_poll(32);
-            }
-            return result;
-        }
         let Endpoint::Ip(ip) = endpoint.ok_or(LxError::ENOTCONN)? else {
             return Err(LxError::EINVAL);
         };
-        let IpAddress::Ipv4(mut v4_dst) = ip.addr else {
+        let IpAddress::Ipv4(dst) = ip.addr else {
             return Err(LxError::EINVAL);
         };
-        if v4_dst.is_unspecified() {
-            v4_dst = Ipv4Address::new(127, 0, 0, 1);
-        }
-        if !v4_dst.is_unicast() && !v4_dst.is_broadcast() && !v4_dst.is_multicast() {
-            warn!("raw socket: invalid destination address {:?}", v4_dst);
+        if !dst.is_unicast() {
             return Err(LxError::EINVAL);
         }
 
-        let len = data.len();
-        let mut buffer = vec![0u8; len + 20];
-        let mut packet = Ipv4Packet::new_unchecked(&mut buffer);
-        packet.set_version(4);
-        packet.set_header_len(20);
-        packet.set_total_len((20 + len) as u16);
-        packet.set_protocol(socket.ip_protocol());
-        // Unspecified → smoltcp fills src from the interface address (post-DHCP).
-        packet.set_src_addr(Ipv4Address::UNSPECIFIED);
-        packet.set_dst_addr(v4_dst);
-        packet.set_hop_limit(64);
-        packet.payload_mut().copy_from_slice(data);
-        packet.fill_checksum();
+        self.ensure_bound(data)?;
 
-        socket.send_slice(&buffer).map_err(|e| {
-            warn!("raw socket send_slice failed: {:?}", e);
-            LxError::ENOBUFS
-        })?;
-
+        let net_sockets = get_sockets();
+        let mut sockets = net_sockets.lock();
+        let mut socket = sockets.get::<IcmpSocket>(self.inner.handle.0);
+        socket
+            .send_slice(data, IpAddress::Ipv4(dst))
+            .map_err(|_| LxError::ENOBUFS)?;
         drop(socket);
         drop(sockets);
         drain_net_poll(32);
-        Ok(len)
+        Ok(data.len())
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -168,45 +146,51 @@ impl Socket for RawSocketState {
         }
     }
 
-    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
-        match (level, opt) {
-            (IPPROTO_IP, IP_HDRINCL) => {
-                if let Some(arg) = data.first() {
-                    *self.inner.header_included.lock() = *arg > 0;
-                    debug!("hdrincl set to {}", *self.inner.header_included.lock());
-                }
-            }
-            _ => {}
-        }
+    fn bind(&self, endpoint: Endpoint) -> SysResult {
+        let Endpoint::Ip(ip) = endpoint else {
+            return Err(LxError::EINVAL);
+        };
+        let ident = ip.port;
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let mut socket = set.get::<IcmpSocket>(self.inner.handle.0);
+        socket
+            .bind(IcmpEndpoint::Ident(ident))
+            .map_err(|_| LxError::EINVAL)?;
         Ok(0)
     }
+
+    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
+        Ok(0)
+    }
+
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
         let sockets = get_sockets();
         let mut s = sockets.lock();
-        let socket = s.get::<RawSocket>(self.inner.handle.0);
-        let (recv_ca, send_ca) = (
+        let socket = s.get::<IcmpSocket>(self.inner.handle.0);
+        Some((
             socket.payload_recv_capacity(),
             socket.payload_send_capacity(),
-        );
-        Some((recv_ca, send_ca))
+        ))
     }
+
     fn socket_type(&self) -> Option<SocketType> {
-        Some(SocketType::SOCK_RAW)
+        Some(SocketType::SOCK_DGRAM)
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         drain_net_poll(1);
         let s = get_sockets();
         let mut s = s.lock();
-        let socket = s.get::<RawSocket>(self.inner.handle.0);
+        let socket = s.get::<IcmpSocket>(self.inner.handle.0);
         (socket.can_recv(), socket.can_send(), false)
     }
 }
 
-zircon_object::impl_kobject!(RawSocketState);
+zircon_object::impl_kobject!(IcmpSocketState);
 
 #[async_trait]
-impl FileLike for RawSocketState {
+impl FileLike for IcmpSocketState {
     fn flags(&self) -> OpenFlags {
         *self.inner.flags.lock()
     }

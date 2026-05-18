@@ -158,7 +158,7 @@ pub fn set_packet_callback(callback: fn(&[u8])) {
 
 /// Dispatches a received packet to the registered callback.
 pub fn net_dispatch_packet(data: &[u8]) {
-    warn!("[net] dispatching packet of {} bytes to callback", data.len());
+    // Hot path for AF_PACKET / edhcpc — keep quiet (was warn! per packet).
     let flag = intr_get();
     if flag { intr_off(); }
     

@@ -418,6 +418,22 @@ static int fd_readable_now(int fd) {
     return (pfd.revents & POLLIN) ? 1 : 0;
 }
 
+/// Block up to `timeout_ms`, polling NIC via Eclipse's poll(2) (poll_ifaces) each tick.
+/// Do not use usleep() here — it never drains the e1000e RX ring on bare metal.
+static void wait_for_rx_ms(int packet_fd, int udp_fd, int timeout_ms) {
+    struct pollfd pfds[2];
+    int n = 0;
+    pfds[n].fd = packet_fd;
+    pfds[n].events = POLLIN;
+    n++;
+    if (udp_fd >= 0) {
+        pfds[n].fd = udp_fd;
+        pfds[n].events = POLLIN;
+        n++;
+    }
+    (void)poll(pfds, n, timeout_ms);
+}
+
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                      int *msg_type_out) {
     int ready = fd_readable_now(pfd);
@@ -506,7 +522,7 @@ static int recv_dhcp_message_any(int packet_fd, int udp_fd, uint32_t xid_be, str
         if (udp_result == 0) return 0;
         if (udp_result < 0) return -1;
 
-        usleep(50 * 1000);
+        wait_for_rx_ms(packet_fd, udp_fd, 50);
     }
 }
 
@@ -790,6 +806,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "edhcpc: discover sent via udp only\n");
         }
+        wait_for_rx_ms(pfd, fd, 100);
 
         fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
         uint64_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt

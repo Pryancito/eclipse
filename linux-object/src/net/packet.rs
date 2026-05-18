@@ -10,6 +10,7 @@ use async_trait::async_trait;
 
 // use kernel_hal::user::UserInOutPtr;
 use kernel_hal::{drivers, thread};
+use zcore_drivers::scheme::NetScheme;
 use lock::Mutex;
 use zircon_object::object::*;
 use lazy_static::lazy_static;
@@ -61,7 +62,6 @@ pub fn push_packet(packet: &[u8]) {
                 let mut queue = state.inner.packet_queue.lock();
                 // Limit queue size to avoid OOM
                 if queue.len() < 1000 {
-                    warn!("[packet] pushing packet to socket (type={:#x}, protocol={:#x}, len={})", ethertype, protocol, packet.len());
                     queue.push_back(packet.to_vec());
                     state.base.signal_set(Signal::READABLE);
                 }
@@ -129,13 +129,17 @@ impl Socket for PacketSocketState {
             let ifindex = *self.inner.ifindex.lock();
             {
                 let ifaces = drivers::all_net();
+                let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
+                    let _ = net.poll();
+                    let _ = net.poll();
+                };
                 if ifindex > 0 {
                     if let Some(net) = ifaces.try_get(ifindex as usize - 1) {
-                        let _ = net.poll();
+                        poll_net(net.as_ref());
                     }
                 } else {
                     for net in ifaces.as_vec().iter() {
-                        let _ = net.poll();
+                        poll_net(net.as_ref());
                     }
                 }
             }

@@ -2082,6 +2082,8 @@ fn hid_usage_to_linux(u: u8) -> Option<u16> {
         0x2f => KEY_LEFTBRACE,
         0x30 => KEY_RIGHTBRACE,
         0x31 => KEY_BACKSLASH,
+        0x32 => KEY_102ND,
+        0x64 => KEY_102ND,
         0x33 => KEY_SEMICOLON,
         0x34 => KEY_APOSTROPHE,
         0x35 => KEY_GRAVE,

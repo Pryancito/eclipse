@@ -7,7 +7,7 @@ pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
 use crate::error::{LxError, LxResult};
 use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
-use smoltcp::wire::{Ipv4Cidr, IpCidr, IpEndpoint};
+use smoltcp::wire::{IpCidr, IpEndpoint, Ipv4Cidr};
 pub use socket_address::*;
 use log::*;
 
@@ -107,8 +107,8 @@ pub mod listen_table;
 pub use listen_table::*;
 
 /// missing documentation
-// pub mod icmp;
-// pub use icmp::*;
+pub mod icmp;
+pub use icmp::*;
 
 // pub mod stack;
 
@@ -454,6 +454,14 @@ pub fn poll_ifaces() {
                 warn!("error : {:?}", e)
             }
         }
+    }
+}
+
+/// Drive smoltcp until ARP/TX/RX make progress (needed after raw/icmp sends).
+pub fn drain_net_poll(rounds: usize) {
+    for _ in 0..rounds {
+        poll_ifaces();
+        kernel_hal::deferred_job::drain_deferred_jobs();
     }
 }
 

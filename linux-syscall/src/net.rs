@@ -44,6 +44,10 @@ impl Syscall<'_> {
             | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
                 Arc::new(UdpSocketState::new())
             }
+            // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
+                Arc::new(IcmpSocketState::new())
+            }
             // Be tolerant for AF_INET datagram sockets.
             // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
             (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new()),
@@ -263,6 +267,7 @@ impl Syscall<'_> {
             .clone()
             .as_socket()?
             .write(buf.as_slice(len)?, endpoint)?;
+        linux_object::net::drain_net_poll(32);
         Ok(len)
     }
 
