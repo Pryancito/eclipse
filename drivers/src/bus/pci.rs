@@ -14,6 +14,9 @@ const PCI_CAP_PTR: u16 = 0x34;
 const PCI_INTERRUPT_LINE: u16 = 0x3c;
 #[allow(dead_code)]
 const PCI_INTERRUPT_PIN: u16 = 0x3d;
+const PCI_CLASS_CODE: u16 = 0x0b;
+const PCI_SUBCLASS: u16 = 0x0a;
+const PCI_PROG_IF: u16 = 0x09;
 
 #[allow(dead_code)]
 const PCI_MSI_CTRL_CAP: u16 = 0x02;
@@ -191,7 +194,9 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     let ops = &PortOpsImpl;
     //let am = CSpaceAccessMethod::IO;
     let am = PCI_ACCESS;
-    let force_legacy_irq = loc.class == 0x0c && loc.subclass == 0x03 && loc.prog_if == 0x30;
+    let force_legacy_irq = am.read8(ops, loc, PCI_CLASS_CODE) == 0x0c
+        && am.read8(ops, loc, PCI_SUBCLASS) == 0x03
+        && am.read8(ops, loc, PCI_PROG_IF) == 0x30;
 
     if paddr != 0 {
         // reveal PCI regs by setting paddr
