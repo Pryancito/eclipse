@@ -390,8 +390,6 @@ const ADVERTISE_ALL_COPPER: u16 = ADVERTISE_CSMA
     | ADVERTISE_100FULL
     | ADVERTISE_PAUSE_CAP
     | ADVERTISE_PAUSE_ASYM;
-/// Restrict autoneg when PHY is stuck at 10M despite 100M HCD (marginal cable/pairs).
-const ADVERTISE_10_ONLY: u16 = ADVERTISE_CSMA | ADVERTISE_10HALF | ADVERTISE_10FULL;
 const ADVERTISE_1000FULL: u16 = 0x0200;
 const CTL1000_AS_MASTER: u16 = 0x0800;
 const CTL1000_ENABLE_MASTER: u16 = 0x1000;
@@ -1257,6 +1255,7 @@ impl E1000eHw {
     }
 
     /// Last resort when both PHY reg26 and MAC STATUS say 10M but MII HCD is higher.
+    /// Retry full copper autoneg once; do not force 10-only advertisement.
     unsafe fn phy_accept_10m_degraded_mode(&mut self, phy_addr: u8) {
         if self.link_10m_degraded {
             return;
@@ -1272,10 +1271,14 @@ impl E1000eHw {
         }
         self.link_10m_degraded = true;
         crate::klog_warn!(
-            "[e1000e] PHY{} 10 Mb/s degraded link — autoneg 10-only\n",
+            "[e1000e] PHY{} reg26/STATUS at 10 Mb/s while MII HCD is higher — retry full autoneg\n",
             phy_addr
         );
-        let _ = self.phy_copper_autoneg_restart_adv(phy_addr, ADVERTISE_10_ONLY, 0);
+        let _ = self.phy_copper_autoneg_restart_adv(
+            phy_addr,
+            ADVERTISE_ALL_COPPER,
+            Self::ctrl1000_for_ms(ADVERTISE_1000FULL, None),
+        );
         let _ = self.phy_wait_reg26_settled(phy_addr, 4000);
     }
 
