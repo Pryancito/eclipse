@@ -2457,13 +2457,20 @@ impl E1000eHw {
                         copy_len
                     );
                 }
-            } else if !self.rx_needs_cache_invalidation() {
-                copy_len = frame_need;
-                crate::klog_warn!(
-                    "[e1000e] RX len fix: desc {} → {} (ip_tot_len, qemu)\n",
-                    desc_len,
-                    frame_need
-                );
+            } else {
+                // On real hardware we have seen WB descriptor len shorter than IPv4 total
+                // length for non-DHCP traffic as well. Re-read the full DMA buffer and
+                // trust frame_need only if the frame header is self-consistent.
+                Self::invalidate_cpu_cache_for_read(buf_vaddr, BUF_SIZE);
+                let full = core::slice::from_raw_parts(buf_vaddr as *const u8, BUF_SIZE);
+                if frame_need <= full.len() && Self::eth_ipv4_frame_complete(&full[..frame_need]) {
+                    copy_len = frame_need;
+                    crate::klog_warn!(
+                        "[e1000e] RX len fix: desc {} → {} (ip_tot_len)\n",
+                        desc_len,
+                        frame_need
+                    );
+                }
             }
         }
         copy_len
@@ -4208,7 +4215,18 @@ impl Scheme for E1000eInterface {
         // miss the RX event and never wake the polling loop.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
-            self.ims_rearm();
+            if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                self.poll_pending
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+                let poll_pending = self.poll_pending.clone();
+                let self_clone = self.clone();
+                crate::utils::deferred_job::push_deferred_job(move || {
+                    let _ = self_clone.poll();
+                    poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                });
+            } else {
+                self.ims_rearm();
+            }
             return;
         }
 
