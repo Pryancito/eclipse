@@ -10,7 +10,7 @@ pub mod e1000e;
 // pub mod ixgbe;
 pub mod loopback;
 pub use isomorphic_drivers::provider::Provider;
-pub use loopback::LoopbackInterface;
+pub use loopback::{LoopbackInterface, LoopbackDevice};
 
 use crate::scheme::{IrqScheme, Scheme};
 use crate::DeviceResult;

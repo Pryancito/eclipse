@@ -1,5 +1,6 @@
 // smoltcp
-use smoltcp::{iface::Interface, phy::Loopback, time::Instant};
+use smoltcp::{iface::Interface, phy::{self, DeviceCapabilities, Medium}, time::Instant, Result};
+use alloc::collections::VecDeque;
 
 use crate::net::get_sockets;
 use alloc::sync::Arc;
@@ -7,17 +8,107 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use lock::Mutex;
 
-use crate::scheme::{NetScheme, Scheme, RouteInfo};
+use crate::scheme::{NetScheme, Scheme, RouteInfo, NetStats};
 use crate::{DeviceError, DeviceResult};
 
 use alloc::vec::Vec;
 use smoltcp::wire::EthernetAddress;
 use smoltcp::wire::{IpCidr, Ipv4Cidr};
 
+pub struct LoopbackDevice {
+    queue: VecDeque<Vec<u8>>,
+    medium: Medium,
+    stats: Arc<Mutex<NetStats>>,
+}
+
+impl LoopbackDevice {
+    pub fn new(medium: Medium, stats: Arc<Mutex<NetStats>>) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            medium,
+            stats,
+        }
+    }
+}
+
+impl<'a> phy::Device<'a> for LoopbackDevice {
+    type RxToken = LoopbackRxToken;
+    type TxToken = LoopbackTxToken<'a>;
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 65535;
+        caps.medium = self.medium;
+        caps
+    }
+
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
+        let stats = self.stats.clone();
+        self.queue.pop_front().map(move |buffer| {
+            let rx = LoopbackRxToken { buffer, stats: stats.clone() };
+            let tx = LoopbackTxToken {
+                queue: &mut self.queue,
+                stats,
+            };
+            (rx, tx)
+        })
+    }
+
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
+        Some(LoopbackTxToken {
+            queue: &mut self.queue,
+            stats: self.stats.clone(),
+        })
+    }
+}
+
+pub struct LoopbackRxToken {
+    buffer: Vec<u8>,
+    stats: Arc<Mutex<NetStats>>,
+}
+
+impl phy::RxToken for LoopbackRxToken {
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut [u8]) -> Result<R>,
+    {
+        let mut stats = self.stats.lock();
+        stats.rx_packets += 1;
+        stats.rx_bytes += self.buffer.len() as u64;
+        drop(stats);
+
+        f(&mut self.buffer)
+    }
+}
+
+pub struct LoopbackTxToken<'a> {
+    queue: &'a mut VecDeque<Vec<u8>>,
+    stats: Arc<Mutex<NetStats>>,
+}
+
+impl<'a> phy::TxToken for LoopbackTxToken<'a> {
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut [u8]) -> Result<R>,
+    {
+        let mut buffer = alloc::vec![0u8; len];
+        let result = f(&mut buffer);
+
+        let mut stats = self.stats.lock();
+        stats.tx_packets += 1;
+        stats.tx_bytes += len as u64;
+        drop(stats);
+
+        self.queue.push_back(buffer);
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct LoopbackInterface {
-    pub iface: Arc<Mutex<Interface<'static, Loopback>>>,
+    pub iface: Arc<Mutex<Interface<'static, LoopbackDevice>>>,
     pub name: String,
+    pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
 }
 
@@ -90,5 +181,9 @@ impl NetScheme for LoopbackInterface {
             }
         }
         res
+    }
+
+    fn get_stats(&self) -> NetStats {
+        self.stats.lock().clone()
     }
 }

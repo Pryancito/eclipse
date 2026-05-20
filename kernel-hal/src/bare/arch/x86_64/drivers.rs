@@ -198,11 +198,8 @@ pub(super) fn init() -> DeviceResult {
 
     drivers::klog_graphics_device_summary(graphics_console_note.as_deref());
 
-    #[cfg(feature = "loopback")]
-    {
-        use crate::net;
-        net::init();
-    }
+    use crate::net;
+    net::init();
 
     crate::klog_info!("Eclipse: drivers init complete");
     Ok(())

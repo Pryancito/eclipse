@@ -43,10 +43,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     let options = utils::boot_options();
     logging::set_max_level(&options.log_level);
     kernel_hal::console::early_progress_bar(70);
+    #[cfg(feature = "linux")]
+    let root_proc = &options.root_proc;
+    #[cfg(not(feature = "linux"))]
+    let root_proc = "N/A";
+
     klog_info!(
         "Eclipse: boot options log_level={} root_proc={}",
         options.log_level,
-        options.root_proc
+        root_proc
     );
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
