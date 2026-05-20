@@ -6,8 +6,8 @@ use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
     net::{
-        AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, IFF_BROADCAST, IFF_CHANGE_ALL,
-        IFF_LOWER_UP, IFF_RUNNING, IFF_UP,
+        AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST,
+        IFF_LOOPBACK, IFF_NOARP, IFF_CHANGE_ALL, IFF_LOWER_UP, IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -105,12 +105,20 @@ impl Socket for NetlinkSocketState {
                     };
                     msg.push_ext(new_header);
 
+                    let is_loopback = iface.get_ifname() == "loopback";
+                    let ifi_type = if is_loopback { ARPHRD_LOOPBACK } else { ARPHRD_ETHER };
+                    let ifi_flags = if is_loopback {
+                        IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP | IFF_LOWER_UP
+                    } else {
+                        IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP
+                    };
+
                     let if_info = IfaceInfoMsg {
                         ifi_family: (u16::from(AddressFamily::Unspecified)) as u8,
                         ifi_pad: 0,
-                        ifi_type: ARPHRD_ETHER,
+                        ifi_type,
                         ifi_index: (i as i32) + 1, // Linux interface indices start at 1
-                        ifi_flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_LOWER_UP,
+                        ifi_flags,
                         ifi_change: IFF_CHANGE_ALL, // all flags changeable (kernel convention)
                     };
                     msg.align4();
@@ -122,15 +130,17 @@ impl Socket for NetlinkSocketState {
                     push_rtattr_bytes(
                         &mut attrs,
                         RouteAttrTypes::Address.into(),
-                        mac_addr.as_bytes(),
+                        if is_loopback { &[0; 6] } else { mac_addr.as_bytes() },
                     );
 
-                    // Broadcast MAC for Ethernet.
-                    push_rtattr_bytes(
-                        &mut attrs,
-                        RouteAttrTypes::Broadcast.into(),
-                        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-                    );
+                    if !is_loopback {
+                        // Broadcast MAC for Ethernet.
+                        push_rtattr_bytes(
+                            &mut attrs,
+                            RouteAttrTypes::Broadcast.into(),
+                            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                        );
+                    }
 
                     // MTU (best-effort default; drivers can expose real value later).
                     push_rtattr_u32(&mut attrs, RouteAttrTypes::MTU.into(), 1500);

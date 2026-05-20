@@ -2763,15 +2763,16 @@ impl E1000eHw {
             return;
         }
 
-        // For non-Stage 4, first check if the PHY link is up.
+        // For non-Stage 4, first check if the PHY link is up and auto-negotiation is complete.
         let phy = self.phy_addr;
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         let phy_link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
+        let aneg_complete = (bmsr & BMSR_ANEG_COMPLETE) != 0;
 
-        if phy_link_up {
+        if phy_link_up && aneg_complete {
             e1000e_vlog!(
-                "[e1000e] PHY link up detected in stage {}. Waiting 1.5s for MAC to settle...\n",
+                "[e1000e] PHY link up and Auto-Negotiation complete detected in stage {}. Waiting 1.5s for MAC to settle...\n",
                 self.link_bringup_stage
             );
             self.link_bringup_stage = 4;
@@ -3638,127 +3639,47 @@ impl E1000eHw {
             core::arch::x86_64::_mm_sfence();
         }
 
-        // GPTC is clear-on-read: snapshot once before doorbell, once after wait.
-        let gptc_before = if self.is_pch_lpt_or_later() {
-            unsafe { mmio_read(self.base, E1000E_GPTC) }
-        } else {
-            0
-        };
-
         self.tx_tail = (idx + 1) % NUM_TX;
         unsafe { 
             mmio_write(self.base, E1000E_TDT, self.tx_tail as u32);
-            let _ = mmio_read(self.base, E1000E_TDT); // serialise MMIO write
+            let _ = mmio_read(self.base, E1000E_TDT); // Serializar escritura MMIO
         }
 
-        let tx_wait_steps = if self.is_pch_lpt_or_later() {
-            let st2 = unsafe {
-                self.mdic_read(self.active_phy_addr(), MII_PHY_STATUS_2)
-                    .unwrap_or(0)
-            };
-            if Self::speed_mbps_from_phy_st2(st2) == SPEED_10 {
-                2000
-            } else {
-                500
-            }
-        } else {
-            500
-        };
+        // Espera segura para bare-metal (Solo para asegurar el reporte en logs iniciales)
         let mut tx_dd = false;
-        for _ in 0..tx_wait_steps {
+        for _ in 0..1000 {
             unsafe {
                 Self::dma_rmb_after_device();
                 if self.is_pch_lpt_or_later() {
-                    // I219 metal: drop stale cache lines so DD write-back is visible.
                     Self::invalidate_cpu_cache_for_read(
                         ring.add(idx) as usize,
                         core::mem::size_of::<TxDesc>(),
                     );
                 }
-                let tdh = mmio_read(self.base, E1000E_TDH);
-                if tdh as usize > idx {
-                    tx_dd = true;
-                    break;
-                }
-                // Legacy TxDesc: DD is bit 0 of `status` at offset 12 — not u32[2] (len/cso/cmd).
+                
+                // Comprobación segura del bit DD en el campo status descriptor de transmisión convencional
                 let status = read_volatile(&(*ring.add(idx)).status);
                 if status & 0x01 != 0 {
                     tx_dd = true;
                     break;
                 }
             }
-            Self::udelay(50);
-        }
-        let gptc_snap = if self.is_pch_lpt_or_later() {
-            unsafe { mmio_read(self.base, E1000E_GPTC) }
-        } else {
-            0
-        };
-        let tx_mib = self.is_pch_lpt_or_later() && gptc_snap > gptc_before;
-        if !tx_dd && tx_mib {
-            tx_dd = true;
-            if self.stats.tx_packets <= 4 {
-                e1000e_vlog!(
-                    "[e1000e] TX {} slot={} MIB ok (GPTC {}->{}) but no DD WB — check TXDCTL\n",
-                    info,
-                    idx,
-                    gptc_before,
-                    gptc_snap
-                );
-            }
+            Self::udelay(10);
         }
 
+        // LOGS e incremento de estadísticas básicas
         if first_tx {
-            let gptc = gptc_snap;
-            crate::klog_info!(
-                "[e1000e] first TX {} ({} bytes) DD={} GPTC={}\n",
-                info,
-                data.len(),
-                tx_dd,
-                gptc
-            );
-            if !tx_dd {
-                let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
-                let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
-                crate::klog_warn!(
-                    "[e1000e] first TX: DD never set — TDH={} TDT={} GPTC {}->{}\n",
-                    tdh,
-                    tdt,
-                    gptc_before,
-                    gptc_snap
-                );
-            }
+            crate::klog_info!("[e1000e] first TX {} ({} bytes) enviado.\n", info, data.len());
         }
 
-        if tx_dd {
-            Ok(())
-        } else {
-            if self.stats.tx_packets <= 8 {
-                let tdh = unsafe { mmio_read(self.base, E1000E_TDH) };
-                let tdt = unsafe { mmio_read(self.base, E1000E_TDT) };
-                crate::klog_warn!(
-                    "[e1000e] TX {} ({} bytes) slot={} timeout DD=0 GPTC {}->{} TDH={} TDT={}\n",
-                    info,
-                    data.len(),
-                    idx,
-                    gptc_before,
-                    gptc_snap,
-                    tdh,
-                    tdt
-                );
-            }
-            if self.is_pch_lpt_or_later() {
-                unsafe {
-                    self.restart_tx_datapath_linux();
-                }
-            } else {
-                self.tx_tail = idx;
-                unsafe {
-                    mmio_write(self.base, E1000E_TDT, idx as u32);
-                }
-            }
-            Err(DeviceError::NotReady)
+        // COMPORTAMIENTO CORRECTO:
+        // No dispares un reset si tx_dd es falso. El DMA procesará el paquete asíncronamente.
+        // Solo retorna Ok(()) indicando que el paquete se encoló con éxito en el hardware.
+        if !tx_dd && self.stats.tx_packets <= 5 {
+            e1000e_vlog!("[e1000e] TX descriptor {} procesándose asíncronamente por el hardware\n", idx);
         }
+
+        Ok(())
     }
 
 }

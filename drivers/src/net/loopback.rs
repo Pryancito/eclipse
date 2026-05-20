@@ -141,7 +141,7 @@ impl NetScheme for LoopbackInterface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        EthernetAddress::default()
     }
 
     fn get_ifname(&self) -> String {

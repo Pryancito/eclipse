@@ -183,12 +183,13 @@ impl From<Endpoint> for SockAddr {
         } else if let Endpoint::LinkLevel(link_level) = endpoint {
             let mut sll_addr = [0u8; 8];
             sll_addr.copy_from_slice(&link_level.addr);
+            let hatype = if link_level.interface_index == 1 { ARPHRD_LOOPBACK } else { ARPHRD_ETHER };
             SockAddr {
                 addr_ll: SockAddrLl {
                     sll_family: AddressFamily::Packet.into(),
                     sll_protocol: link_level.protocol.to_be(),
                     sll_ifindex: link_level.interface_index as u32,
-                    sll_hatype: ARPHRD_ETHER, // Assume Ethernet
+                    sll_hatype: hatype,
                     sll_pkttype: 0,
                     sll_halen: link_level.halen,
                     sll_addr,

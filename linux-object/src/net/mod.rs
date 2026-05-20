@@ -189,6 +189,7 @@ pub const SIOCGIFHWADDR: usize = 0x8927;
 pub const SIOCGIFINDEX: usize = 0x8933;
 pub const SIOCGARP: usize = 0x8954;
 pub const ARPHRD_ETHER: u16 = 1;
+pub const ARPHRD_LOOPBACK: u16 = 772;
 
 pub const IFF_UP: u32 = 0x1;
 pub const IFF_BROADCAST: u32 = 0x2;
@@ -573,8 +574,14 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
         SIOCGIFFLAGS => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let flags = if ifname == "loopback" {
+                IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
+            } else {
+                IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST
+            };
             ifr.ifr_ifru = IfReqUnion {
-                flags: (IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST) as i16,
+                flags: flags as i16,
             };
             Ok(0)
         }
@@ -662,8 +669,13 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
             let iface = iface_by_name(ifname)?;
             let mac = iface.get_mac();
             unsafe {
-                ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
-                ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
+                if ifname == "loopback" {
+                    ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_LOOPBACK;
+                    ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(&[0; 6]);
+                } else {
+                    ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
+                    ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
+                }
             }
             Ok(0)
         }

@@ -443,7 +443,6 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
 
     uint8_t buf[2048];
     ssize_t n = recv(pfd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n > 0) fprintf(stderr, "edhcpc: packet received, len=%zd\n", n);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
@@ -487,7 +486,10 @@ static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer
     const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udp_hdr);
     if ((const uint8_t *)payload + payload_len > ip_data + ip_data_len) return 1;
 
-    if (parse_dhcp_payload(payload, payload_len, xid_be, offer_out, msg_type_out) == 0) return 0;
+    if (parse_dhcp_payload(payload, payload_len, xid_be, offer_out, msg_type_out) == 0) {
+        fprintf(stderr, "edhcpc: packet received (DHCP candidate), len=%zd\n", n);
+        return 0;
+    }
     return 1;
 }
 
@@ -756,12 +758,14 @@ int main(int argc, char **argv) {
 
     uint32_t xid = weak_xid();
     uint32_t xid_be = htonl(xid);
-    uint64_t now_ms_val = now_ms();
-    uint64_t deadline = now_ms_val + (uint64_t)timeout_sec * 1000u;
+    uint8_t dhcp_buf[600];
+    size_t dhcp_len;
+    struct dhcp_offer offer;
+    int mt = 0;
 
     // Prefer AF_PACKET because smoltcp may not emit IPv4 broadcast before the
     // interface has an address. The packet path crafts Ethernet/IP/UDP manually.
-    int pfd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
+    int pfd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_IP));
     if (pfd < 0) die("socket(AF_PACKET)");
 
     // Bind packet socket to interface index (1-based in Eclipse OS).
@@ -769,7 +773,7 @@ int main(int argc, char **argv) {
     memset(&sall, 0, sizeof(sall));
     sall.sll_family = AF_PACKET;
     sall.sll_ifindex = ifindex;
-    sall.sll_protocol = htons(ETH_P_ALL);
+    sall.sll_protocol = htons(ETH_P_IP);
     sall.sll_halen = 6;
     if (bind(pfd, (struct sockaddr *)&sall, sizeof(sall)) < 0) die("bind(AF_PACKET)");
 
@@ -777,55 +781,46 @@ int main(int argc, char **argv) {
     if (pfl < 0) die("fcntl(F_GETFL,packet)");
     if (fcntl(pfd, F_SETFL, pfl | O_NONBLOCK) < 0) die("fcntl(F_SETFL,packet)");
 
-    uint8_t dhcp_buf[600];
-    size_t dhcp_len = build_dhcp_discover(dhcp_buf, sizeof(dhcp_buf), mac, xid_be);
+    dhcp_len = build_dhcp_discover(dhcp_buf, sizeof(dhcp_buf), mac, xid_be);
     if (dhcp_len == 0) die("build_dhcp_discover");
-
-    struct dhcp_offer offer;
-    int mt = 0;
-    int attempts = 0;
-    const int max_attempts = 5;
 
     fprintf(stderr, "edhcpc: starting DHCP negotiation on %s (MAC %02x:%02x:%02x:%02x:%02x:%02x)\n",
             ifname, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    while (attempts < max_attempts) {
-        fprintf(stderr, "edhcpc: sending DISCOVER (attempt %d/%d)...\n", ++attempts, max_attempts);
-        int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
-        int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
-        if (sent_packet < 0) warnx("send(packet:discover) failed");
-        if (sent_udp < 0) warnx("send(udp:discover) failed");
-        if (sent_packet < 0 && sent_udp < 0) {
-            usleep(1000 * 1000);
-            continue;
-        }
-        if (sent_packet == 0 && sent_udp == 0) {
-            fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
-        } else if (sent_packet == 0) {
-            fprintf(stderr, "edhcpc: discover sent via packet only\n");
-        } else {
-            fprintf(stderr, "edhcpc: discover sent via udp only\n");
-        }
-        wait_for_rx_ms(pfd, fd, 100);
+    fprintf(stderr, "edhcpc: sending DISCOVER...\n");
+    int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
+    int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
+    if (sent_packet < 0) warnx("send(packet:discover) failed");
+    if (sent_udp < 0) warnx("send(udp:discover) failed");
+    if (sent_packet == 0 && sent_udp == 0) {
+        fprintf(stderr, "edhcpc: discover sent via packet+udp\n");
+    } else if (sent_packet == 0) {
+        fprintf(stderr, "edhcpc: discover sent via packet only\n");
+    } else {
+        fprintf(stderr, "edhcpc: discover sent via udp only\n");
+    }
+    wait_for_rx_ms(pfd, fd, 100);
 
-        fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
-        uint64_t sub_deadline = now_ms() + 3000; // 3 seconds per attempt
-        while (now_ms() < sub_deadline) {
-            int r = recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, sub_deadline);
-            if (r == 0) {
-                if (mt == DHCPOFFER) goto got_offer;
-                fprintf(stderr, "edhcpc: ignoring DHCP message type %d while waiting for OFFER\n", mt);
-            } else if (r < 0) {
-                // error or timeout inside recv_dhcp_message_any
+    fprintf(stderr, "edhcpc: waiting for DHCPOFFER...\n");
+    uint64_t offer_deadline = now_ms() + 120000;
+    bool got_offer_flag = false;
+    while (now_ms() < offer_deadline) {
+        int r = recv_dhcp_message_any(pfd, fd, xid_be, &offer, &mt, offer_deadline);
+        if (r == 0) {
+            if (mt == DHCPOFFER) {
+                got_offer_flag = true;
                 break;
             }
-            // else r == 1 (no packet yet), continue looping until sub_deadline
+            fprintf(stderr, "edhcpc: ignoring DHCP message type %d while waiting for OFFER\n", mt);
+        } else if (r < 0) {
+            break;
         }
-        if (now_ms() >= deadline) break;
     }
 
-    warnx("timeout waiting for DHCPOFFER");
-    return 1;
+    if (!got_offer_flag) {
+        warnx("timeout waiting for DHCPOFFER");
+        return 1;
+    }
 
 got_offer:
     fprintf(stderr, "edhcpc: received DHCPOFFER for ");
@@ -842,40 +837,36 @@ got_offer:
     struct dhcp_offer ack;
     int mt2 = 0;
     fprintf(stderr, "edhcpc: waiting for DHCPACK...\n");
-    int request_attempts = 0;
-    const int max_request_attempts = 5;
-    const useconds_t request_retry_delay_us = 200 * 1000;
-    const uint64_t ack_wait_window_ms = 1000;
-    while (request_attempts < max_request_attempts && now_ms() < deadline) {
-        request_attempts++;
-        fprintf(stderr, "edhcpc: sending REQUEST (attempt %d/%d)...\n", request_attempts, max_request_attempts);
-        int sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
-        int sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
-        if (sent_packet < 0) warnx("send(packet:request) failed");
-        if (sent_udp < 0) warnx("send(udp:request) failed");
-        if (sent_packet < 0 && sent_udp < 0) {
-            usleep(request_retry_delay_us);
-            continue;
-        }
-        if (sent_packet == 0 && sent_udp == 0) {
-            fprintf(stderr, "edhcpc: request sent via packet+udp\n");
-        } else if (sent_packet == 0) {
-            fprintf(stderr, "edhcpc: request sent via packet only\n");
-        } else {
-            fprintf(stderr, "edhcpc: request sent via udp only\n");
-        }
 
-        uint64_t ack_deadline = now_ms() + ack_wait_window_ms;
-        if (ack_deadline > deadline) ack_deadline = deadline;
-        while (now_ms() < ack_deadline) {
-            int r = recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, ack_deadline);
-            if (r < 0) break;
-            if (mt2 == DHCPACK || mt2 == DHCPNAK) goto got_ack_or_nak;
-            fprintf(stderr, "edhcpc: ignoring message type %d while waiting for ACK\n", mt2);
-        }
+    fprintf(stderr, "edhcpc: sending REQUEST...\n");
+    sent_packet = send_dhcp_packet(pfd, mac, dhcp_buf, dhcp_len);
+    sent_udp = send_dhcp_udp_broadcast(fd, dhcp_buf, dhcp_len);
+    if (sent_packet < 0) warnx("send(packet:request) failed");
+    if (sent_udp < 0) warnx("send(udp:request) failed");
+    if (sent_packet == 0 && sent_udp == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet+udp\n");
+    } else if (sent_packet == 0) {
+        fprintf(stderr, "edhcpc: request sent via packet only\n");
+    } else {
+        fprintf(stderr, "edhcpc: request sent via udp only\n");
     }
-    warnx("timeout waiting for DHCPACK");
-    return 1;
+
+    uint64_t ack_deadline = now_ms() + 15000;
+    bool got_ack_flag = false;
+    while (now_ms() < ack_deadline) {
+        int r = recv_dhcp_message_any(pfd, fd, xid_be, &ack, &mt2, ack_deadline);
+        if (r < 0) break;
+        if (mt2 == DHCPACK || mt2 == DHCPNAK) {
+            got_ack_flag = true;
+            break;
+        }
+        fprintf(stderr, "edhcpc: ignoring message type %d while waiting for ACK\n", mt2);
+    }
+
+    if (!got_ack_flag) {
+        warnx("timeout waiting for DHCPACK");
+        return 1;
+    }
 
 got_ack_or_nak:
     if (mt2 == DHCPNAK) {
