@@ -4208,7 +4208,18 @@ impl Scheme for E1000eInterface {
         // miss the RX event and never wake the polling loop.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
-            self.ims_rearm();
+            if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                self.poll_pending
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+                let poll_pending = self.poll_pending.clone();
+                let self_clone = self.clone();
+                crate::utils::deferred_job::push_deferred_job(move || {
+                    let _ = self_clone.poll();
+                    poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                });
+            } else {
+                self.ims_rearm();
+            }
             return;
         }
 
