@@ -53,6 +53,24 @@ impl LinuxRootfs {
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
 
+            // Alpine repo signatures: without /etc/apk/keys/*.rsa.pub apk reports
+            // "UNTRUSTED signature" and leaves 0 packages after a slow index download.
+            let keys_dst = etc_apk.join("keys");
+            fs::create_dir_all(&keys_dst).unwrap();
+            let keys_src = PROJECT_DIR.join("prebuilt").join("alpine-apk-keys");
+            if keys_src.is_dir() {
+                for entry in fs::read_dir(&keys_src).unwrap().flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("pub") {
+                        fs::copy(&path, keys_dst.join(entry.file_name())).unwrap();
+                    }
+                }
+            } else {
+                eprintln!(
+                    "warning: missing prebuilt/alpine-apk-keys — apk update will show UNTRUSTED signature"
+                );
+            }
+
             // Add DNS resolution
             fs::write(
                 etc.join("resolv.conf"),

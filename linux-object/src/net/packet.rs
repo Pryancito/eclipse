@@ -60,11 +60,12 @@ pub fn push_packet(packet: &[u8]) {
                 }
 
                 let mut queue = state.inner.packet_queue.lock();
-                // Limit queue size to avoid OOM
-                if queue.len() < 1000 {
-                    queue.push_back(packet.to_vec());
-                    state.base.signal_set(Signal::READABLE);
+                // Limit queue size to avoid OOM by dropping the oldest packet when full
+                if queue.len() >= 1000 {
+                    queue.pop_front();
                 }
+                queue.push_back(packet.to_vec());
+                state.base.signal_set(Signal::READABLE);
             }
         } else {
             to_remove.push(i);

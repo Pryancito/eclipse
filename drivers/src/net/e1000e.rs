@@ -21,7 +21,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250520-phy-spd-fix";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-cookie-gate2";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -161,7 +161,18 @@ const E1000E_TXDCTL1: usize = E1000E_TXDCTL + (0x100 / 4);
 const E1000E_TIDV: usize = 0x03820 / 4;
 const E1000E_TADV: usize = 0x0382C / 4;
 const E1000E_RXDCTL: usize = 0x02828 / 4;
-const E1000E_SRRCTL: usize = 0x02100 / 4;
+/// SRRCTL queue 0: Linux `E1000_SRRCTL(_n)` = `0x0280C + (_n)*0x100` for n < 4.
+/// The previous wrong value 0x02100 left the real SRRCTL at its hardware reset
+/// default (BSIZEPACKET=0), which limits DMA to the 60-byte Ethernet minimum
+/// frame size — exactly the truncation seen in the DHCP debug log.
+const E1000E_SRRCTL: usize = 0x0280C / 4;
+/// BSIZEPACKET field: 2 = 2 KB RX buffers (Linux default for e1000e).
+const SRRCTL_BSIZE_2K: u32 = 2;
+const SRRCTL_DROP_EN: u32 = 1 << 31;
+/// DESCTYPE field (bits 25–27) must be 0 for legacy extended WB (RFCTL_EXTEN).
+const SRRCTL_DESCTYPE_MASK: u32 = 0x0E00_0000;
+/// Linux `E1000_RCTL_SZ_2048` — 2 KB RX buffers when not using jumbo/SRRCTL alone.
+const RCTL_SZ_2048: u32 = 0x0003_0000;
 const E1000E_FEXTNVM4: usize = 0x000E0 / 4;
 const E1000E_FEXTNVM9: usize = 0x05BB4 / 4;
 const E1000E_PBECCSTS: usize = 0x0100C / 4;
@@ -547,6 +558,14 @@ pub struct E1000eHw {
     last_link_check_us: u64,
     /// Start of current bring-up stage in microseconds.
     stage_start_us: u64,
+    /// Whether the hardware supports and is using extended write-back descriptors.
+    use_extended_descriptors: bool,
+    /// Scatter-gather assembly buffer for multi-descriptor (non-EOP) frames.
+    /// Fragments with EOP=0 are appended here; the final EOP=1 fragment delivers
+    /// the assembled frame. Reset to empty after delivery or on error.
+    rx_sg_buf: Vec<u8>,
+    /// SRRCTL at 0x280C does not read back on some steppings (e.g. 15b8); use RCTL only.
+    srrctl_absent: bool,
 }
 
 impl E1000eHw {
@@ -659,6 +678,13 @@ impl E1000eHw {
     /// I219 / PCH-SPT paths that break QEMU 82574 (coherent DMA — no clflush before DD).
     fn is_i219_metal_rx_hacks(&self) -> bool {
         self.is_pch_lpt_or_later()
+    }
+
+    /// Returns true for all bare-metal / real hardware devices that require CPU cache invalidation.
+    /// QEMU uses device ID 0x10d3, and virtual environments have coherent DMA.
+    /// Discrete cards and integrated chips on bare metal all run under WB cache mapping.
+    fn rx_needs_cache_invalidation(&self) -> bool {
+        self.device_id != 0x10d3
     }
 
     /// Returns true for PCH-SPT (I219) and later silicon.
@@ -888,6 +914,7 @@ impl E1000eHw {
             core::arch::x86_64::_mm_clflush(p as *const u8);
             p += 64;
         }
+        core::arch::x86_64::_mm_mfence();
         fence(Ordering::SeqCst);
     }
 
@@ -911,6 +938,7 @@ impl E1000eHw {
             core::arch::x86_64::_mm_clflush(p as *const u8);
             p += 64;
         }
+        core::arch::x86_64::_mm_mfence();
         fence(Ordering::SeqCst);
     }
 
@@ -926,7 +954,7 @@ impl E1000eHw {
     /// RX payload after device DMA — cache invalidate only on I219 metal (not QEMU).
     unsafe fn dma_copy_in_rx_buffer(&self, dst: &mut Vec<u8>, vaddr: usize, len: usize) {
         Self::dma_rmb_after_device();
-        if self.is_i219_metal_rx_hacks() {
+        if self.rx_needs_cache_invalidation() {
             Self::invalidate_cpu_cache_for_read(vaddr, len);
         }
         Self::dma_copy_in(dst, vaddr, len);
@@ -1908,6 +1936,11 @@ impl E1000eHw {
             write_volatile(&mut desc.addr, self.rx_bufs[i].paddr() as u64);
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
+            // Invalidate the cache for the packet buffer on physical hardware before the hardware writes to it.
+            if self.rx_needs_cache_invalidation() {
+                Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+            }
+
             // CRITICAL: For physical hardware with Write-Back cached memory, we
             // MUST flush the modified descriptor to physical RAM. Otherwise the
             // NIC DMA engine reads stale descriptor addresses or old status bits.
@@ -2152,19 +2185,288 @@ impl E1000eHw {
         }
     }
 
+    /// Linux `e1000_setup_rctl` for 2 KB buffers + `RFCTL_EXTEN` extended descriptors.
     unsafe fn rctl_rx_bits(&self) -> u32 {
         let mut rctl = mmio_read(self.base, E1000E_RCTL);
-        rctl &= !(RCTL_MO_MASK | 0xC0); // MO + loopback mode → LBM_NO (Linux setup_rctl)
-        // Linux e1000_setup_rctl: EN | BAM | SECRC, 2048-byte (SZ_2048 = 0 in size field).
+        rctl &= !(RCTL_MO_MASK | 0xC0); // MO + loopback mode → LBM_NO
         rctl |= RCTL_EN | RCTL_BAM | RCTL_SECRC;
-        rctl &= !(RCTL_SBP | RCTL_LPE | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK);
-        // I219 bare metal only — do not change RCTL on QEMU 82574 (device 10d3).
-        if self.is_i219_metal_rx_hacks() {
-            rctl |= RCTL_UPE | RCTL_MPE;
-        } else {
-            rctl &= !(RCTL_UPE | RCTL_MPE);
-        }
+        // Standard MTU: LPE off (Linux clears LPE when mtu <= 1500).
+        rctl &= !(RCTL_SBP | RCTL_DTYP_PS | RCTL_LPE | RCTL_BSEX | RCTL_RX_SZ_MASK);
+        rctl |= RCTL_SZ_2048;
+        rctl &= !(RCTL_UPE | RCTL_MPE);
         rctl
+    }
+
+    /// Program queue-0 SRRCTL when the register exists (Linux e1000e uses RCTL_SZ_2048 for
+    /// standard RX; SRRCTL is mainly for packet-split). On I219-V the MMIO readback is often 0.
+    unsafe fn program_srrctl_rx_queue0(&mut self) {
+        if self.srrctl_absent {
+            return;
+        }
+        let rctl_saved = mmio_read(self.base, E1000E_RCTL);
+        mmio_write(self.base, E1000E_RCTL, rctl_saved & !RCTL_EN);
+        for _ in 0..200 {
+            if mmio_read(self.base, E1000E_RCTL) & RCTL_EN == 0 {
+                break;
+            }
+            Self::udelay(10);
+        }
+        let _ = mmio_read(self.base, E1000E_RCTL);
+
+        let mut v = mmio_read(self.base, E1000E_SRRCTL);
+        v &= !SRRCTL_DESCTYPE_MASK;
+        v &= !0xF;
+        v |= SRRCTL_BSIZE_2K | SRRCTL_DROP_EN;
+        mmio_write(self.base, E1000E_SRRCTL, v);
+        let _ = mmio_read(self.base, E1000E_SRRCTL);
+        Self::udelay(50);
+        let rd = mmio_read(self.base, E1000E_SRRCTL);
+        if rd == 0 && v != 0 {
+            self.srrctl_absent = true;
+            crate::klog_info!(
+                "[e1000e] SRRCTL not present (wrote {:#x}, read 0) — using RCTL_SZ_2048 only\n",
+                v
+            );
+        } else if (rd & 0xF) != SRRCTL_BSIZE_2K || (rd & SRRCTL_DESCTYPE_MASK) != 0 {
+            crate::klog_warn!(
+                "[e1000e] SRRCTL bad readback: wrote {:#x} got {:#x}\n",
+                v,
+                rd
+            );
+        }
+        if rctl_saved & RCTL_EN != 0 {
+            mmio_write(self.base, E1000E_RCTL, rctl_saved);
+        }
+    }
+
+    /// L2 length of a complete IPv4 frame (supports 802.1Q).
+    fn eth_ipv4_frame_length(data: &[u8]) -> Option<usize> {
+        if data.len() < 14 + 20 {
+            return None;
+        }
+        let mut l2 = 14usize;
+        let mut et = u16::from_be_bytes([data[12], data[13]]);
+        if et == 0x8100 {
+            if data.len() < 18 + 20 {
+                return None;
+            }
+            l2 = 18;
+            et = u16::from_be_bytes([data[16], data[17]]);
+        }
+        if et != 0x0800 {
+            return None;
+        }
+        let ihl = ((data[l2] & 0x0f) as usize) * 4;
+        if ihl < 20 || data.len() < l2 + ihl {
+            return None;
+        }
+        let ip_tot = u16::from_be_bytes([data[l2 + 2], data[l2 + 3]]) as usize;
+        if ip_tot < ihl || ip_tot > 9000 {
+            return None;
+        }
+        Some(l2 + ip_tot)
+    }
+
+    fn eth_ipv4_frame_complete(data: &[u8]) -> bool {
+        Self::eth_ipv4_frame_length(data)
+            .map(|need| data.len() >= need)
+            .unwrap_or(false)
+    }
+
+    /// True if `data` begins with a plausible Ethernet (+ optional VLAN) + IPv4 header.
+    /// Continuation fragments of a split RX descriptor do not pass this test.
+    fn is_eth_ipv4_header_start(data: &[u8]) -> bool {
+        if data.len() < 14 + 20 {
+            return false;
+        }
+        let mut l2 = 14usize;
+        let mut et = u16::from_be_bytes([data[12], data[13]]);
+        if et == 0x8100 {
+            if data.len() < 18 + 20 {
+                return false;
+            }
+            l2 = 18;
+            et = u16::from_be_bytes([data[16], data[17]]);
+        }
+        et == 0x0800 && (data[l2] >> 4) == 4
+    }
+
+    /// `(l2, ihl, frame_need, is_dhcp)` when `data` holds a valid IPv4 frame header.
+    fn eth_ipv4_header_info(data: &[u8]) -> Option<(usize, usize, usize, bool)> {
+        if data.len() < 14 + 20 {
+            return None;
+        }
+        let mut l2 = 14usize;
+        let mut et = u16::from_be_bytes([data[12], data[13]]);
+        if et == 0x8100 {
+            if data.len() < 18 + 20 {
+                return None;
+            }
+            l2 = 18;
+            et = u16::from_be_bytes([data[16], data[17]]);
+        }
+        if et != 0x0800 || data.len() < l2 + 20 {
+            return None;
+        }
+        let ihl = ((data[l2] & 0x0f) as usize) * 4;
+        if ihl < 20 || data.len() < l2 + ihl + 8 {
+            return None;
+        }
+        let ip_tot = u16::from_be_bytes([data[l2 + 2], data[l2 + 3]]) as usize;
+        if ip_tot < ihl || ip_tot > 9000 {
+            return None;
+        }
+        let udp = l2 + ihl;
+        let sport = u16::from_be_bytes([data[udp], data[udp + 1]]);
+        let dport = u16::from_be_bytes([data[udp + 2], data[udp + 3]]);
+        let is_dhcp = (sport == 67 && dport == 68) || (sport == 68 && dport == 67);
+        Some((l2, ihl, l2 + ip_tot, is_dhcp))
+    }
+
+    fn dhcp_cookie_valid_in_frame(data: &[u8]) -> bool {
+        let Some((l2, ihl, _, _)) = Self::eth_ipv4_header_info(data) else {
+            return false;
+        };
+        if !Self::is_bootp_udp(data, l2, ihl) {
+            return true;
+        }
+        Self::peek_dhcp_magic_cookie(data, l2, ihl)
+    }
+
+    fn is_bootp_udp(peek: &[u8], l2: usize, ihl: usize) -> bool {
+        if peek.len() < l2 + ihl + 9 {
+            return false;
+        }
+        let udp = l2 + ihl;
+        let sport = u16::from_be_bytes([peek[udp], peek[udp + 1]]);
+        let dport = u16::from_be_bytes([peek[udp + 2], peek[udp + 3]]);
+        if (sport == 67 && dport == 68) || (sport == 68 && dport == 67) {
+            return true;
+        }
+        let op = peek[l2 + ihl + 8];
+        op == 1 || op == 2
+    }
+
+    /// Do not deliver a frame that only satisfies ip_tot while the DHCP cookie is still fill bytes.
+    fn rx_ipv4_deliverable(data: &[u8]) -> bool {
+        if !Self::eth_ipv4_frame_complete(data) {
+            return false;
+        }
+        Self::dhcp_cookie_valid_in_frame(data)
+    }
+
+    fn trim_to_ipv4_frame(mut data: Vec<u8>) -> Vec<u8> {
+        if let Some(need) = Self::eth_ipv4_frame_length(&data) {
+            if data.len() > need {
+                data.truncate(need);
+            }
+        }
+        data
+    }
+
+    fn peek_dhcp_magic_cookie(peek: &[u8], l2: usize, ihl: usize) -> bool {
+        const DHCP_COOKIE: u32 = 0x6382_5363;
+        let off = l2 + ihl + 8 + 236;
+        peek.len() >= off + 4
+            && u32::from_be_bytes([peek[off], peek[off + 1], peek[off + 2], peek[off + 3]])
+                == DHCP_COOKIE
+    }
+
+    /// Scan for RFC 2131 magic cookie anywhere in a received frame (I219 may DMA it in
+    /// while the descriptor WB length / ip_tot lie about the tail).
+    fn scan_dhcp_magic_cookie_offset(buf: &[u8]) -> Option<usize> {
+        const MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+        if buf.len() < 4 {
+            return None;
+        }
+        for i in 0..=buf.len() - 4 {
+            if buf[i..i + 4] == MAGIC {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Descriptor WB length can be shorter than the frame in the DMA buffer (I219 quirk).
+    /// Also extend when desc_len already matches ip_tot but the DHCP magic cookie is missing
+    /// (stale tail / false length in WB).
+    unsafe fn recover_rx_copy_len(&self, buf_vaddr: usize, desc_len: usize) -> usize {
+        if !self.rx_needs_cache_invalidation() {
+            return desc_len;
+        }
+        let inv = desc_len.max(512).min(BUF_SIZE);
+        Self::invalidate_cpu_cache_for_read(buf_vaddr, inv);
+        let peek = core::slice::from_raw_parts(buf_vaddr as *const u8, inv);
+        let (l2, ihl, frame_need) = {
+            if peek.len() < 34 {
+                return desc_len;
+            }
+            let mut l2 = 14usize;
+            let mut et = u16::from_be_bytes([peek[12], peek[13]]);
+            if et == 0x8100 {
+                if peek.len() < 38 {
+                    return desc_len;
+                }
+                l2 = 18;
+                et = u16::from_be_bytes([peek[16], peek[17]]);
+            }
+            if et != 0x0800 {
+                return desc_len;
+            }
+            let ihl = ((peek[l2] & 0x0f) as usize) * 4;
+            if ihl < 20 || peek.len() < l2 + ihl + 8 {
+                return desc_len;
+            }
+            let ip_tot = u16::from_be_bytes([peek[l2 + 2], peek[l2 + 3]]) as usize;
+            if ip_tot < ihl || ip_tot > 9000 {
+                return desc_len;
+            }
+            (l2, ihl, l2 + ip_tot)
+        };
+        if frame_need > BUF_SIZE {
+            return desc_len;
+        }
+
+        let is_bootp = Self::is_bootp_udp(peek, l2, ihl);
+        let cookie_ok = Self::peek_dhcp_magic_cookie(peek, l2, ihl);
+        let mut copy_len = desc_len;
+
+        if frame_need > copy_len {
+            if cookie_ok {
+                copy_len = frame_need;
+                crate::klog_warn!(
+                    "[e1000e] RX len fix: desc {} → {} (cookie @236)\n",
+                    desc_len,
+                    frame_need
+                );
+            } else if is_bootp {
+                Self::invalidate_cpu_cache_for_read(buf_vaddr, BUF_SIZE);
+                let full = core::slice::from_raw_parts(buf_vaddr as *const u8, BUF_SIZE);
+                if Self::peek_dhcp_magic_cookie(full, l2, ihl) {
+                    copy_len = frame_need;
+                    crate::klog_warn!(
+                        "[e1000e] RX len fix: desc {} → {} (BOOTP cookie after reinvalidate)\n",
+                        desc_len,
+                        frame_need
+                    );
+                } else {
+                    crate::klog_info!(
+                        "[e1000e] RX BOOTP desc {} ip_tot {} B, no cookie @236 — keep {} B (SG)\n",
+                        desc_len,
+                        frame_need,
+                        copy_len
+                    );
+                }
+            } else if !self.rx_needs_cache_invalidation() {
+                copy_len = frame_need;
+                crate::klog_warn!(
+                    "[e1000e] RX len fix: desc {} → {} (ip_tot_len, qemu)\n",
+                    desc_len,
+                    frame_need
+                );
+            }
+        }
+        copy_len
     }
 
     /// Linux `e1000_access_phy_wakeup_reg_bm` — page-800 regs use opcodes 0x11/0x12 on PHY1.
@@ -2590,9 +2892,10 @@ impl E1000eHw {
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
         rfctl |= RFCTL_EXTEN | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
+        let rfctl_rd = mmio_read(self.base, E1000E_RFCTL);
+        self.use_extended_descriptors = (rfctl_rd & RFCTL_EXTEN) != 0;
 
-        // SRRCTL: 2 KB buffer size + Drop_Enable (bit 31).
-        mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
+        unsafe { self.program_srrctl_rx_queue0() };
 
         // I219: toggle RXDCTL/RCTL like Linux before posting a fresh ring after link events.
         if self.is_i219_metal_rx_hacks() {
@@ -2880,7 +3183,7 @@ impl E1000eHw {
                 self.rx_next_to_clean
             );
         }
-        if self.is_i219_metal_rx_hacks() && self.stats.rx_packets == 0 {
+        if self.rx_needs_cache_invalidation() && self.stats.rx_packets == 0 {
             let i = self.rx_next_to_clean;
             let ring = self.rx_ring.as_ptr::<RxDesc>();
             let desc_addr = unsafe { ring.add(i) as usize };
@@ -3203,6 +3506,7 @@ impl E1000eHw {
             desc.addr = self.rx_bufs[i].paddr() as u64;
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
+        core::arch::x86_64::_mm_sfence();
         fence(Ordering::SeqCst);
 
         // 10. Configure TX
@@ -3297,17 +3601,21 @@ impl E1000eHw {
             let rfctl_rd = mmio_read(self.base, E1000E_RFCTL);
             if rfctl_rd & RFCTL_EXTEN == 0 {
                 crate::klog_warn!("[e1000e] RFCTL EXTEN missing after write! ({:#x})\n", rfctl_rd);
+                self.use_extended_descriptors = false;
+            } else {
+                self.use_extended_descriptors = true;
             }
         }
         mmio_write(self.base, E1000E_MRQC, 0);
         mmio_write(self.base, E1000E_VET, 0);
         
-        // SRRCTL: buffer size 2 KB + Drop Enable (bit 31).
-        // Bits [3:0] = buffer size in 1 KB units → 2 = 2 KB.
-        // Bit 31 (Drop_En) tells hardware to silently drop frames when the
-        // ring is full instead of generating a PCIe error / hanging.
-        // Without Drop_En the I219 can stall the TX path when RX overflows.
-        mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
+        unsafe {
+            self.program_srrctl_rx_queue0();
+            crate::klog_info!(
+                "[e1000e] SRRCTL queue 0 = {:#x} (2 KB, ext-desc, Drop_En)\n",
+                mmio_read(self.base, E1000E_SRRCTL)
+            );
+        }
 
         if self.is_pch_lpt_or_later() {
             mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
@@ -3374,6 +3682,11 @@ impl E1000eHw {
             // Zero the WB region (HW→CPU field) so old DD bits don't linger.
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
+            // Invalidate the cache for the packet buffer on physical hardware.
+            if self.rx_needs_cache_invalidation() {
+                Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+            }
+
             // Evict and write back cache lines to physical RAM.
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
@@ -3426,16 +3739,25 @@ impl E1000eHw {
         let read_wb = || {
             // lfence: all preceding loads complete before we read the WB region.
             Self::dma_rmb_after_device();
-            let staterr = read_volatile((desc_addr + 8) as *const u32);
-            if staterr & RXD_EXT_DD != 0 {
-                let len = read_volatile((desc_addr + 12) as *const u16) as usize;
-                return Some((staterr, len));
+            if self.use_extended_descriptors {
+                let staterr = read_volatile((desc_addr + 8) as *const u32);
+                if staterr & RXD_EXT_DD != 0 {
+                    let len = read_volatile((desc_addr + 12) as *const u16) as usize;
+                    return Some((staterr, len));
+                }
+            } else {
+                let status = read_volatile((desc_addr + 12) as *const u8);
+                if status & 0x01 != 0 { // DD
+                    let len = read_volatile((desc_addr + 8) as *const u16) as usize;
+                    let staterr = status as u32;
+                    return Some((staterr, len));
+                }
             }
             None
         };
-        // I219 bare-metal: invalidate CPU cache FIRST so the subsequent read
+        // Bare-metal: invalidate CPU cache FIRST so the subsequent read
         // fetches from physical RAM (where the NIC's DMA write-back landed).
-        if self.is_i219_metal_rx_hacks() {
+        if self.rx_needs_cache_invalidation() {
             Self::invalidate_cpu_cache_for_read(desc_addr, core::mem::size_of::<RxDesc>());
             return read_wb();
         }
@@ -3457,55 +3779,159 @@ impl E1000eHw {
         let (staterr, len) = unsafe { self.desc_done(desc_addr)? };
         fence(Ordering::Acquire);
 
-        if staterr & RXD_EXT_EOP == 0 {
-            warn!(
-                "[e1000e] RX: DD without EOP slot {} staterr={:#x}\n",
-                i,
-                staterr
-            );
-        } else if len > 0 && len <= BUF_SIZE {
-            let buf_vaddr = self.rx_bufs[i].vaddr();
-            let mut data = Vec::new();
-            unsafe { self.dma_copy_in_rx_buffer(&mut data, buf_vaddr, len) };
-
+        // Recycle descriptor regardless of EOP/error status.
+        let recycle = |hw: &mut Self| {
             unsafe {
                 write_volatile((desc_addr + 8) as *mut u64, 0);
                 Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
             }
-
-            self.rx_next_to_clean = (i + 1) % NUM_RX;
-            let unused = self.rx_desc_unused();
+            hw.rx_next_to_clean = (i + 1) % NUM_RX;
+            let unused = hw.rx_desc_unused();
             if unused > 0 {
-                unsafe { self.alloc_rx_buffers(unused) };
+                unsafe { hw.alloc_rx_buffers(unused) };
             }
+        };
 
-            self.stats.rx_packets += 1;
-            self.stats.rx_bytes += len as u64;
-            if self.stats.rx_packets == 1 {
-                let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
-                self.last_hw_rx_packets = self.last_hw_rx_packets.wrapping_add(gprc);
+        if len == 0 || len > BUF_SIZE {
+            // Descriptor is done but length is implausible — discard and recycle.
+            crate::klog_warn!(
+                "[e1000e] RX slot {} bad len={} staterr={:#x} — discarding\n",
+                i, len, staterr
+            );
+            self.rx_sg_buf.clear();
+            recycle(self);
+            return None;
+        }
+
+        // Copy this fragment out of the DMA buffer before recycling the descriptor.
+        let buf_vaddr = self.rx_bufs[i].vaddr();
+        let copy_len = unsafe { self.recover_rx_copy_len(buf_vaddr, len) };
+        let mut frag = Vec::new();
+        unsafe { self.dma_copy_in_rx_buffer(&mut frag, buf_vaddr, copy_len) };
+
+        // Unified split-RX (QEMU + bare metal): buffer only real continuations, never glue
+        // a new Ethernet header onto a stale partial (the old 60+381 B DHCP bug).
+        const RX_SG_MAX: usize = 9216;
+        let data = if staterr & RXD_EXT_EOP == 0 {
+            if Self::rx_ipv4_deliverable(&frag) {
                 crate::klog_info!(
-                    "[e1000e] first RX frame {} bytes staterr={:#x} GPRC={} RDT={} RDH={}\n",
-                    len,
-                    staterr,
-                    gprc,
-                    unsafe { mmio_read(self.base, E1000E_RDT) },
-                    unsafe { mmio_read(self.base, E1000E_RDH) }
+                    "[e1000e] RX slot {} EOP=0 deliverable ({} B)\n",
+                    i,
+                    frag.len()
                 );
+                self.rx_sg_buf.clear();
+                Self::trim_to_ipv4_frame(frag)
+            } else if Self::is_eth_ipv4_header_start(&frag) {
+                if !self.rx_sg_buf.is_empty() {
+                    crate::klog_info!(
+                        "[e1000e] RX slot {} new frame start — drop partial ({} B)\n",
+                        i,
+                        self.rx_sg_buf.len()
+                    );
+                    self.rx_sg_buf.clear();
+                }
+                crate::klog_info!(
+                    "[e1000e] RX slot {} fragment {} B EOP=0 — buffer head\n",
+                    i,
+                    frag.len()
+                );
+                self.rx_sg_buf.extend_from_slice(&frag);
+                recycle(self);
+                return None;
+            } else if !self.rx_sg_buf.is_empty() {
+                if self.rx_sg_buf.len() + frag.len() > RX_SG_MAX {
+                    self.rx_sg_buf.clear();
+                    recycle(self);
+                    return None;
+                }
+                crate::klog_info!(
+                    "[e1000e] RX slot {} continuation {} B EOP=0 — buffer\n",
+                    i,
+                    frag.len()
+                );
+                self.rx_sg_buf.extend_from_slice(&frag);
+                recycle(self);
+                return None;
+            } else {
+                recycle(self);
+                return None;
             }
-            return Some(data);
+        } else if !self.rx_sg_buf.is_empty() {
+            if Self::is_eth_ipv4_header_start(&frag) {
+                crate::klog_info!(
+                    "[e1000e] RX slot {} EOP=1 new frame — drop partial ({} B), deliver {} B\n",
+                    i,
+                    self.rx_sg_buf.len(),
+                    frag.len()
+                );
+                self.rx_sg_buf.clear();
+                Self::trim_to_ipv4_frame(frag)
+            } else {
+                let mut assembled = core::mem::take(&mut self.rx_sg_buf);
+                assembled.extend_from_slice(&frag);
+                if Self::rx_ipv4_deliverable(&assembled) {
+                    crate::klog_info!(
+                        "[e1000e] RX slot {} EOP: assembled {} B\n",
+                        i,
+                        assembled.len()
+                    );
+                    Self::trim_to_ipv4_frame(assembled)
+                } else {
+                    crate::klog_warn!(
+                        "[e1000e] RX slot {} assembled {} B still incomplete — discard\n",
+                        i,
+                        assembled.len()
+                    );
+                    recycle(self);
+                    return None;
+                }
+            }
+        } else {
+            Self::trim_to_ipv4_frame(frag)
+        };
+
+        if data.len() >= 20 {
+            let ethertype = u16::from_be_bytes([data[12], data[13]]);
+            if ethertype == 0x0800 {
+                let b = &data;
+                let ver_ihl = b[14];
+                let ihl = ((ver_ihl & 0x0f) * 4) as usize;
+                if ihl >= 20 && data.len() >= 14 + ihl {
+                    let ip_tot_len = u16::from_be_bytes([b[16], b[17]]) as usize;
+                    let expected = 14 + ip_tot_len;
+                    if ip_tot_len >= ihl && expected > data.len() {
+                        crate::klog_warn!(
+                            "[e1000e] RX TRUNCATED slot={} desc_len={} frame={} ip_tot_len={} (need {} B) RCTL={:#x} SRRCTL={:#x}\n",
+                            i,
+                            len,
+                            data.len(),
+                            ip_tot_len,
+                            expected,
+                            unsafe { mmio_read(self.base, E1000E_RCTL) },
+                            unsafe { mmio_read(self.base, E1000E_SRRCTL) }
+                        );
+                    }
+                }
+            }
         }
 
-        unsafe {
-            write_volatile((desc_addr + 8) as *mut u64, 0);
-            Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
+        recycle(self);
+
+        self.stats.rx_packets += 1;
+        self.stats.rx_bytes += data.len() as u64;
+        if self.stats.rx_packets == 1 {
+            let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
+            self.last_hw_rx_packets = self.last_hw_rx_packets.wrapping_add(gprc);
+            crate::klog_info!(
+                "[e1000e] first RX frame {} bytes staterr={:#x} GPRC={} RDT={} RDH={}\n",
+                data.len(),
+                staterr,
+                gprc,
+                unsafe { mmio_read(self.base, E1000E_RDT) },
+                unsafe { mmio_read(self.base, E1000E_RDH) }
+            );
         }
-        self.rx_next_to_clean = (i + 1) % NUM_RX;
-        let unused = self.rx_desc_unused();
-        if unused > 0 {
-            unsafe { self.alloc_rx_buffers(unused) };
-        }
-        None
+        Some(data)
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
@@ -3513,26 +3939,26 @@ impl E1000eHw {
             unsafe { self.kick_rx_writeback() };
         }
 
-        let start = self.rx_next_to_clean;
-        if let Some(pkt) = self.receive_slot(start) {
-            return Some(pkt);
-        }
-
-        // I219 metal: scan the whole ring — never use GPRC here (clear-on-read).
-        if self.is_i219_metal_rx_hacks() {
-            for n in 1..NUM_RX {
-                let i = (start + n) % NUM_RX;
-                if let Some(pkt) = self.receive_slot(i) {
-                    if n > 1 {
-                        e1000e_vlog!(
-                            "[e1000e] RX ring scan: packet at slot {} (clean={})\n",
-                            i,
-                            start
-                        );
-                    }
-                    return Some(pkt);
-                }
+        // Loop to collect all SG fragments into rx_sg_buf before returning.
+        // A non-EOP descriptor (EOP=0) consumes the slot, appends to rx_sg_buf,
+        // and returns None. We immediately try the next slot so the assembled
+        // frame is delivered in this single call rather than spread across poll ticks.
+        // Guard against a run-away loop (ring wrap or EOP never set by HW).
+        let max_frags = NUM_RX;
+        for _ in 0..max_frags {
+            let i = self.rx_next_to_clean;
+            if let Some(frame) = self.receive_slot(i) {
+                return Some(frame);
             }
+            // receive_slot returned None either because:
+            //  (a) no descriptor was DD yet (desc_done returned None), or
+            //  (b) a non-EOP fragment was buffered into rx_sg_buf.
+            // Distinguish: if rx_sg_buf is non-empty we may have more fragments;
+            // keep looping. If rx_sg_buf is empty, nothing is ready — stop.
+            if self.rx_sg_buf.is_empty() {
+                break;
+            }
+            // SG fragment was buffered; the ring index advanced — try the next slot.
         }
         None
     }
@@ -3578,7 +4004,7 @@ impl E1000eHw {
             _ => "Other",
         };
 
-        // warn!("[e1000e] TX: {} ({} bytes)", info, data.len());
+        warn!("[e1000e] TX: {} ({} bytes)", info, data.len());
 
         if !self.can_send() {
             return Err(DeviceError::NotReady);
@@ -4146,6 +4572,9 @@ pub fn init(
         link_duplex: false,
         last_link_check_us: 0,
         stage_start_us: 0,
+        use_extended_descriptors: true,
+        rx_sg_buf: Vec::new(),
+        srrctl_absent: false,
     };
 
     unsafe {

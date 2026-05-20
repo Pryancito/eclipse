@@ -388,15 +388,74 @@ static int send_dhcp_udp_broadcast(int udp_fd, const uint8_t *dhcp, size_t dhcp_
     return ((size_t)n == dhcp_len) ? 0 : -1;
 }
 
+enum { DHCP_COOKIE_OFF = 236 };
+
+static uint32_t dhcp_cookie_at(const uint8_t *payload, size_t payload_len) {
+    if (payload_len < DHCP_COOKIE_OFF + 4) return 0;
+    const uint8_t *p = payload + DHCP_COOKIE_OFF;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static ssize_t dhcp_cookie_scan_offset(const uint8_t *payload, size_t payload_len) {
+    for (size_t i = 0; i + 4 <= payload_len && i <= 280; i++) {
+        if (payload[i] == 0x63 && payload[i + 1] == 0x82 && payload[i + 2] == 0x53 && payload[i + 3] == 0x63) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+/// Map Ethernet frame to IPv4 payload (handles 802.1Q). Returns 0 on success.
+static int eth_ipv4_payload(const uint8_t *buf, size_t n, const uint8_t **ip_data, size_t *ip_data_len) {
+    if (n < 14 + sizeof(struct ipv4_hdr)) return -1;
+    size_t l2 = 14;
+    uint16_t et = ntohs(*(const uint16_t *)(buf + 12));
+    if (et == 0x8100) {
+        if (n < 18 + sizeof(struct ipv4_hdr)) return -1;
+        l2 = 18;
+        et = ntohs(*(const uint16_t *)(buf + 16));
+    }
+    if (et != ETHERTYPE_IP) return -1;
+    *ip_data = buf + l2;
+    *ip_data_len = n - l2;
+    return 0;
+}
+
+static size_t dhcp_udp_payload_len(const struct ipv4_hdr *ip, size_t ip_data_len, const struct udp_hdr *udp) {
+    const uint8_t ihl = (uint8_t)((ip->ver_ihl & 0x0f) * 4);
+    const size_t avail = (size_t)((const uint8_t *)ip + ip_data_len - (const uint8_t *)udp - sizeof(*udp));
+    size_t from_udp = 0;
+    const uint16_t ulen = ntohs(udp->len);
+    if (ulen >= sizeof(struct udp_hdr)) from_udp = (size_t)ulen - sizeof(struct udp_hdr);
+    size_t from_ip = 0;
+    if (ip_data_len >= (size_t)ihl + sizeof(struct udp_hdr)) {
+        from_ip = ip_data_len - (size_t)ihl - sizeof(struct udp_hdr);
+    }
+    size_t len = from_udp;
+    if (from_ip > len) len = from_ip;
+    if (len > avail) len = avail;
+    return len;
+}
+
 static int parse_dhcp_payload(const uint8_t *payload, size_t payload_len, uint32_t xid_be,
                               struct dhcp_offer *offer_out, int *msg_type_out) {
     size_t opt_off = offsetof(struct dhcp_msg, options);
-    if (payload_len <= opt_off) return -1;
+    if (payload_len < opt_off) return -1;
 
     const struct dhcp_msg *m = (const struct dhcp_msg *)payload;
     if (m->op != BOOTREPLY) return -1;
     if (m->xid != xid_be) return -1;
-    if (ntohl(m->cookie) != 0x63825363) return -1;
+    uint32_t cookie = ntohl(m->cookie);
+    if (cookie != 0x63825363) cookie = dhcp_cookie_at(payload, payload_len);
+    if (cookie != 0x63825363) {
+        ssize_t alt = dhcp_cookie_scan_offset(payload, payload_len);
+        if (alt >= 0 && (size_t)alt != DHCP_COOKIE_OFF) {
+            fprintf(stderr,
+                    "edhcpc: DHCP cookie at offset %zd (expected %d) — driver/RX alignment bug\n",
+                    alt, DHCP_COOKIE_OFF);
+        }
+        return -1;
+    }
 
     struct dhcp_offer offer;
     int msg_type = 0;
@@ -436,69 +495,77 @@ static void wait_for_rx_ms(int packet_fd, int udp_fd, int timeout_ms) {
 
 static int try_recv_dhcp_packet_once(int pfd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                      int *msg_type_out) {
-    int ready = fd_readable_now(pfd);
-    // In this helper: 1 means "no packet yet, retry loop", -1 means error.
-    if (ready == 0) return 1;
-    if (ready < 0) return -1;
-
+    /* One frame per call — do not drain the queue here. On a busy LAN (mDNS) an inner
+     * loop never reaches EAGAIN and edhcpc looks hung after a valid DHCP frame. */
     uint8_t buf[2048];
     ssize_t n = recv(pfd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
+
     const uint8_t *ip_data = NULL;
     size_t ip_data_len = 0;
-
-    // Normal AF_PACKET/SOCK_RAW path: Ethernet frame.
-    if ((size_t)n >= sizeof(struct ether_header) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) {
-        const struct ether_header *eth = (const struct ether_header *)buf;
-        if (ntohs(eth->ether_type) == ETHERTYPE_IP) {
-            ip_data = buf + sizeof(*eth);
-            ip_data_len = (size_t)n - sizeof(*eth);
-        }
-    }
-
-    // Some drivers may deliver L3 payload directly to packet taps.
-    if (!ip_data && (size_t)n >= sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)) {
-        const uint8_t ver = (uint8_t)(buf[0] >> 4);
-        if (ver == 4) {
+    if (eth_ipv4_payload(buf, (size_t)n, &ip_data, &ip_data_len) != 0) {
+        if ((size_t)n >= sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr) && (uint8_t)(buf[0] >> 4) == 4) {
             ip_data = buf;
             ip_data_len = (size_t)n;
+        } else {
+            return 1;
         }
     }
-    if (!ip_data) return 1;
 
     const struct ipv4_hdr *ip = (const struct ipv4_hdr *)ip_data;
     const uint8_t ihl = (uint8_t)((ip->ver_ihl & 0x0f) * 4);
-    if ((ip->ver_ihl >> 4) != 4) return 1;
-    if (ihl < sizeof(struct ipv4_hdr)) return 1;
+    if ((ip->ver_ihl >> 4) != 4 || ihl < sizeof(struct ipv4_hdr)) return 1;
     if (ip->proto != 17) return 1;
-
     if (ip_data_len < (size_t)ihl + sizeof(struct udp_hdr)) return 1;
+
     const struct udp_hdr *udp = (const struct udp_hdr *)(ip_data + ihl);
     if (ntohs(udp->dport) != DHCP_CLIENT_PORT) return 1;
     if (ntohs(udp->sport) != DHCP_SERVER_PORT) return 1;
 
-    const uint16_t ulen = ntohs(udp->len);
-    if (ulen < sizeof(struct udp_hdr)) return 1;
-    const size_t payload_len = (size_t)ulen - sizeof(struct udp_hdr);
+    if (ntohs(udp->len) < sizeof(struct udp_hdr)) return 1;
     const uint8_t *payload = (const uint8_t *)udp + sizeof(struct udp_hdr);
-    if ((const uint8_t *)payload + payload_len > ip_data + ip_data_len) return 1;
+    size_t payload_len = dhcp_udp_payload_len(ip, ip_data_len, udp);
+    if (payload_len < offsetof(struct dhcp_msg, options)) return 1;
 
     if (parse_dhcp_payload(payload, payload_len, xid_be, offer_out, msg_type_out) == 0) {
-        fprintf(stderr, "edhcpc: packet received (DHCP candidate), len=%zd\n", n);
+        fprintf(stderr, "edhcpc: packet received, len=%zd dhcp_payload=%zu\n", n, payload_len);
         return 0;
     }
+
+    const struct dhcp_msg *m = (const struct dhcp_msg *)payload;
+    int mt = 0;
+    struct dhcp_offer scratch;
+    parse_options(m->options, payload_len - offsetof(struct dhcp_msg, options), &mt, &scratch);
+    const uint32_t ck = dhcp_cookie_at(payload, payload_len);
+    fprintf(stderr,
+            "edhcpc: DHCP from server ignored (frame=%zd payload=%zu op=%u xid=0x%08x cookie=0x%08x opt53=%d)\n",
+            n, payload_len, (unsigned)m->op, (unsigned)ntohl(m->xid), ck, mt);
+    if (payload_len >= DHCP_COOKIE_OFF + 4) {
+        fprintf(stderr,
+                "edhcpc: cookie bytes @%d: %02x %02x %02x %02x (expect 63 82 53 63)\n",
+                DHCP_COOKIE_OFF,
+                payload[DHCP_COOKIE_OFF], payload[DHCP_COOKIE_OFF + 1], payload[DHCP_COOKIE_OFF + 2],
+                payload[DHCP_COOKIE_OFF + 3]);
+        if (payload[DHCP_COOKIE_OFF] == 0xa5 && payload[DHCP_COOKIE_OFF + 1] == 0x5a) {
+            fprintf(stderr,
+                    "edhcpc: a5 5a is RX buffer fill, not the server — NIC DMA stopped at BOOTP byte 236\n");
+        }
+    }
+    {
+        ssize_t alt = dhcp_cookie_scan_offset(payload, payload_len);
+        if (alt >= 0) {
+            fprintf(stderr, "edhcpc: magic cookie also found at payload offset %zd\n", alt);
+        }
+    }
+    fprintf(stderr, "edhcpc: offsetof(options)=%zu\n", offsetof(struct dhcp_msg, options));
     return 1;
 }
 
 static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer *offer_out,
                                   int *msg_type_out) {
-    int ready = fd_readable_now(udp_fd);
-    if (ready == 0) return 1;
-    if (ready < 0) return -1;
-
     uint8_t buf[2048];
     ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n < 0) {
@@ -506,7 +573,9 @@ static int try_recv_dhcp_udp_once(int udp_fd, uint32_t xid_be, struct dhcp_offer
         return -1;
     }
     if (n == 0) return 1;
-    if (parse_dhcp_payload(buf, (size_t)n, xid_be, offer_out, msg_type_out) == 0) return 0;
+    if (parse_dhcp_payload(buf, (size_t)n, xid_be, offer_out, msg_type_out) == 0) {
+        return 0;
+    }
     return 1;
 }
 
