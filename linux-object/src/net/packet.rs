@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 
 // use kernel_hal::user::UserInOutPtr;
-use kernel_hal::{drivers, thread};
+use kernel_hal::{thread, net::get_net_device};
 use zcore_drivers::scheme::NetScheme;
 use lock::Mutex;
 use zircon_object::object::*;
@@ -128,17 +128,17 @@ impl Socket for PacketSocketState {
 
             let ifindex = *self.inner.ifindex.lock();
             {
-                let ifaces = drivers::all_net();
+                let ifaces = get_net_device();
                 let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
                     let _ = net.poll();
                     let _ = net.poll();
                 };
                 if ifindex > 0 {
-                    if let Some(net) = ifaces.try_get(ifindex as usize - 1) {
+                    if let Some(net) = ifaces.get(ifindex as usize - 1) {
                         poll_net(net.as_ref());
                     }
                 } else {
-                    for net in ifaces.as_vec().iter() {
+                    for net in ifaces.iter() {
                         poll_net(net.as_ref());
                     }
                 }
@@ -184,12 +184,12 @@ impl Socket for PacketSocketState {
         }
     }
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
-        let ifaces = drivers::all_net();
+        let ifaces = get_net_device();
         let ifindex = *self.inner.ifindex.lock();
         let dev = if ifindex > 0 {
-            ifaces.try_get(ifindex as usize - 1)
+            ifaces.get(ifindex as usize - 1).cloned()
         } else {
-            ifaces.first()
+            ifaces.first().cloned()
         }.ok_or(LxError::ENODEV)?;
 
         if self.inner.socket_type == SocketType::SOCK_DGRAM {
@@ -257,12 +257,12 @@ impl Socket for PacketSocketState {
         kernel_hal::deferred_job::drain_deferred_jobs();
         crate::net::poll_ifaces();
         let readable = !self.inner.packet_queue.lock().is_empty();
-        let ifaces = drivers::all_net();
+        let ifaces = get_net_device();
         let ifindex = *self.inner.ifindex.lock();
         let dev = if ifindex > 0 {
-            ifaces.try_get(ifindex as usize - 1)
+            ifaces.get(ifindex as usize - 1).cloned()
         } else {
-            ifaces.first()
+            ifaces.first().cloned()
         };
         let writable = dev.as_ref().map_or(false, |d| d.can_send());
         (readable, writable, false)

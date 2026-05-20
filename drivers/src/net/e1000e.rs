@@ -651,11 +651,8 @@ impl E1000eHw {
 
     /// Returns true for PCH-LPT (I217/I218) and later integrated NICs.
     fn is_pch_lpt_or_later(&self) -> bool {
-        matches!(self.device_id,
-            0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 |
-            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 |
-            0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f |
-            0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba
+        self.is_pch_spt_or_later() || matches!(self.device_id,
+            0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3
         )
     }
 
@@ -4118,6 +4115,7 @@ impl phy::Device<'_> for E1000eDriver {
         }
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
+        crate::klog_info!("e1000e: transmit() called\n");
         if self.hw.lock().can_send() {
             Some(E1000eTxToken(self.clone()))
         } else {
@@ -4153,13 +4151,16 @@ impl phy::TxToken for E1000eTxToken {
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
+        crate::klog_info!("e1000e: consume() called, len={}\n", len);
         let mut buf = vec![0u8; len];
         // NOTE: do NOT call net_dispatch_packet here. The buffer is empty at this point
         // (smoltcp fills it via the closure below). Dispatching it as a received packet
         // would inject garbage frames into AF_PACKET sockets.
         let result = f(&mut buf)?;
+        crate::klog_info!("e1000e: consume() closure returned, first bytes: {:02x?}\n", &buf[..core::cmp::min(14, buf.len())]);
         let mut hw = self.0.hw.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
+        crate::klog_info!("e1000e: hw.send() completed successfully\n");
         Ok(result)
     }
 }
@@ -4310,14 +4311,14 @@ impl PciDriver for E1000eDriverPci {
             device_id,
             // 82574L, 82583V
             0x10d3 | 0x10f5 | 0x150c |
-            // I217, I218
-            0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 |
-            // I219
-            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 | 0x0d4c..=0x0d4f | 
-            0x15f4..=0x15fc | 0x1a1c..=0x1a1f | 0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 
-            0x57a0..=0x57a1 | 0x57b3..=0x57ba |
             // I210/I211 (sometimes handled by e1000e)
-            0x1533 | 0x1539 | 0x157b | 0x157c
+            0x1533 | 0x1539 | 0x157b | 0x157c |
+            // I217, I218, I219 (PCH-LPT or later)
+            0x1502..=0x1503 | 0x153a..=0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 |
+            0x156f..=0x1570 | 0x15b7..=0x15be | 0x15d6..=0x15d8 | 0x15e3 |
+            0x0d4c..=0x0d4f | 0x15f4..=0x15fc | 0x1a1c..=0x1a1f |
+            0x0dc5..=0x0dc8 | 0x550a..=0x5511 | 0x57a0..=0x57a1 | 0x57b3..=0x57ba |
+            0x15df..=0x15e2 | 0x0d53 | 0x0d55
         )
     }
 

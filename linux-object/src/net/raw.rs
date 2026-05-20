@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
-    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet},
+    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, IpCidr},
 };
+use kernel_hal::net::get_net_device;
+
 
 #[allow(unused_imports)]
 use zircon_object::object::*;
@@ -141,8 +143,32 @@ impl Socket for RawSocketState {
         packet.set_header_len(20);
         packet.set_total_len((20 + len) as u16);
         packet.set_protocol(socket.ip_protocol());
-        // Unspecified → smoltcp fills src from the interface address (post-DHCP).
-        packet.set_src_addr(Ipv4Address::UNSPECIFIED);
+        let mut src_addr = Ipv4Address::UNSPECIFIED;
+        for iface in get_net_device().iter() {
+            for ip in iface.get_ip_address() {
+                if let IpCidr::Ipv4(cidr) = ip {
+                    if cidr.address() != Ipv4Address::UNSPECIFIED {
+                        if cidr.contains_addr(&v4_dst) {
+                            src_addr = cidr.address();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if src_addr.is_unspecified() {
+            for iface in get_net_device().iter() {
+                for ip in iface.get_ip_address() {
+                    if let IpCidr::Ipv4(cidr) = ip {
+                        if cidr.address() != Ipv4Address::UNSPECIFIED {
+                            src_addr = cidr.address();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        packet.set_src_addr(src_addr);
         packet.set_dst_addr(v4_dst);
         packet.set_hop_limit(64);
         packet.payload_mut().copy_from_slice(data);

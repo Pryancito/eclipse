@@ -257,7 +257,7 @@ fn proc_net_dev_content() -> String {
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
     );
 
-    let ifaces = drivers::all_net().as_vec();
+    let ifaces = kernel_hal::net::get_net_device();
     if ifaces.is_empty() {
         let _ = writeln!(s, "{:>6}: {}", "lo", "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
         return s;

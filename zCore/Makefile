@@ -191,7 +191,7 @@ else ifeq ($(ARCH), aarch64)
 endif
 
 qemu_opts += \
-	-netdev user,id=net1,hostfwd=tcp::8000-:80,hostfwd=tcp::2222-:2222 \
+	-netdev user,id=net1 \
 	-device e1000e,netdev=net1
 
 ifeq ($(DISK), on)

@@ -223,6 +223,7 @@ pub union IfReqUnion {
     pub ifmtu: i32,
     pub ifmetric: i32,
     pub flags: i16,
+    pub ifru_pad: [u64; 3],
 }
 
 #[repr(C)]
@@ -558,8 +559,8 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let ifaces = kernel_hal::drivers::all_net();
-            for (i, iface) in ifaces.as_vec().iter().enumerate() {
+            let ifaces = get_net_device();
+            for (i, iface) in ifaces.iter().enumerate() {
                 if iface.get_ifname() == ifname {
                     ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
                     return Ok(0);
@@ -658,18 +659,13 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let ifaces = kernel_hal::drivers::all_net();
-            for iface in ifaces.as_vec().iter() {
-                if iface.get_ifname() == ifname {
-                    let mac = iface.get_mac();
-                    unsafe {
-                        ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
-                        ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
-                    }
-                    return Ok(0);
-                }
+            let iface = iface_by_name(ifname)?;
+            let mac = iface.get_mac();
+            unsafe {
+                ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_ETHER;
+                ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
             }
-            Err(LxError::ENODEV)
+            Ok(0)
         }
 
         // SIOCGIFMTU: get MTU
