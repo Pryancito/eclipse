@@ -21,7 +21,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-cookie-gate2";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-bootp-udp";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -2337,14 +2337,14 @@ impl E1000eHw {
         if peek.len() < l2 + ihl + 9 {
             return false;
         }
+        // BOOTP lives in UDP; ICMP/ARP mis-parse if we read "ports" at the L4 offset.
+        if peek[l2 + 9] != 17 {
+            return false;
+        }
         let udp = l2 + ihl;
         let sport = u16::from_be_bytes([peek[udp], peek[udp + 1]]);
         let dport = u16::from_be_bytes([peek[udp + 2], peek[udp + 3]]);
-        if (sport == 67 && dport == 68) || (sport == 68 && dport == 67) {
-            return true;
-        }
-        let op = peek[l2 + ihl + 8];
-        op == 1 || op == 2
+        (sport == 67 && dport == 68) || (sport == 68 && dport == 67)
     }
 
     /// Do not deliver a frame that only satisfies ip_tot while the DHCP cookie is still fill bytes.

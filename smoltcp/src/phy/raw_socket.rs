@@ -4,13 +4,13 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::vec::Vec;
 
-use crate::phy::{self, Device, DeviceCapabilities, Medium, sys};
+use crate::phy::{self, sys, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
+use crate::Result;
 
 /// A socket that captures or transmits the complete frame.
 #[derive(Debug)]
 pub struct RawSocket {
-    medium: Medium,
     lower: Rc<RefCell<sys::RawSocketDesc>>,
     mtu: usize,
 }
@@ -26,57 +26,30 @@ impl RawSocket {
     ///
     /// This requires superuser privileges or a corresponding capability bit
     /// set on the executable.
-    pub fn new(name: &str, medium: Medium) -> io::Result<RawSocket> {
-        let mut lower = sys::RawSocketDesc::new(name, medium)?;
+    pub fn new(name: &str) -> io::Result<RawSocket> {
+        let mut lower = sys::RawSocketDesc::new(name)?;
         lower.bind_interface()?;
-
-        let mut mtu = lower.interface_mtu()?;
-
-        #[cfg(feature = "medium-ieee802154")]
-        if medium == Medium::Ieee802154 {
-            // SIOCGIFMTU returns 127 - (ACK_PSDU - FCS - 1) - FCS.
-            //                    127 - (5 - 2 - 1) - 2 = 123
-            // For IEEE802154, we want to add (ACK_PSDU - FCS - 1), since that is what SIOCGIFMTU
-            // uses as the size of the link layer header.
-            //
-            // https://github.com/torvalds/linux/blob/7475e51b87969e01a6812eac713a1c8310372e8a/net/mac802154/iface.c#L541
-            mtu += 2;
-        }
-
-        #[cfg(feature = "medium-ethernet")]
-        if medium == Medium::Ethernet {
-            // SIOCGIFMTU returns the IP MTU (typically 1500 bytes.)
-            // smoltcp counts the entire Ethernet packet in the MTU, so add the Ethernet header size to it.
-            mtu += crate::wire::EthernetFrame::<&[u8]>::header_len()
-        }
-
+        let mtu = lower.interface_mtu()?;
         Ok(RawSocket {
-            medium,
             lower: Rc::new(RefCell::new(lower)),
-            mtu,
+            mtu: mtu,
         })
     }
 }
 
-impl Device for RawSocket {
-    type RxToken<'a>
-        = RxToken
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = TxToken
-    where
-        Self: 'a;
+impl<'a> Device<'a> for RawSocket {
+    type RxToken = RxToken;
+    type TxToken = TxToken;
 
     fn capabilities(&self) -> DeviceCapabilities {
         DeviceCapabilities {
             max_transmission_unit: self.mtu,
-            medium: self.medium,
+            medium: Medium::Ethernet,
             ..DeviceCapabilities::default()
         }
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut lower = self.lower.borrow_mut();
         let mut buffer = vec![0; self.mtu];
         match lower.recv(&mut buffer[..]) {
@@ -88,12 +61,12 @@ impl Device for RawSocket {
                 };
                 Some((rx, tx))
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => None,
             Err(err) => panic!("{}", err),
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
         Some(TxToken {
             lower: self.lower.clone(),
         })
@@ -106,11 +79,11 @@ pub struct RxToken {
 }
 
 impl phy::RxToken for RxToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
     where
-        F: FnOnce(&[u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        f(&self.buffer[..])
+        f(&mut self.buffer[..])
     }
 }
 
@@ -120,20 +93,14 @@ pub struct TxToken {
 }
 
 impl phy::TxToken for TxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
         let mut lower = self.lower.borrow_mut();
         let mut buffer = vec![0; len];
         let result = f(&mut buffer);
-        match lower.send(&buffer[..]) {
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                net_debug!("phy: tx failed due to WouldBlock")
-            }
-            Err(err) => panic!("{}", err),
-        }
+        lower.send(&buffer[..]).unwrap();
         result
     }
 }

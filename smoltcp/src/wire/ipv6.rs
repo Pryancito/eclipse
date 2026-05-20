@@ -3,9 +3,10 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
-use crate::wire::HardwareAddress;
 use crate::wire::ip::pretty_print_ip_payload;
+#[cfg(feature = "proto-ipv4")]
+use crate::wire::ipv4;
+use crate::{Error, Result};
 
 pub use super::IpProtocol as Protocol;
 
@@ -14,226 +15,270 @@ pub use super::IpProtocol as Protocol;
 /// [RFC 8200 § 5]: https://tools.ietf.org/html/rfc8200#section-5
 pub const MIN_MTU: usize = 1280;
 
-/// Size of IPv6 adderess in octets.
-///
-/// [RFC 8200 § 2]: https://www.rfc-editor.org/rfc/rfc4291#section-2
-pub const ADDR_SIZE: usize = 16;
+/// A sixteen-octet IPv6 address.
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Address(pub [u8; 16]);
 
-/// The link-local [all nodes multicast address].
-///
-/// [all nodes multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
-pub const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+impl Address {
+    /// The [unspecified address].
+    ///
+    /// [unspecified address]: https://tools.ietf.org/html/rfc4291#section-2.5.2
+    pub const UNSPECIFIED: Address = Address([0x00; 16]);
 
-/// The link-local [all routers multicast address].
-///
-/// [all routers multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
-pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+    /// The link-local [all routers multicast address].
+    ///
+    /// [all routers multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
+    pub const LINK_LOCAL_ALL_NODES: Address = Address([
+        0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ]);
 
-/// The link-local [all MLVDv2-capable routers multicast address].
-///
-/// [all MLVDv2-capable routers multicast address]: https://tools.ietf.org/html/rfc3810#section-11
-pub const LINK_LOCAL_ALL_MLDV2_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
+    /// The link-local [all nodes multicast address].
+    ///
+    /// [all nodes multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
+    pub const LINK_LOCAL_ALL_ROUTERS: Address = Address([
+        0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02,
+    ]);
 
-/// The link-local [all RPL nodes multicast address].
-///
-/// [all RPL nodes multicast address]: https://www.rfc-editor.org/rfc/rfc6550.html#section-20.19
-pub const LINK_LOCAL_ALL_RPL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1a);
+    /// The [loopback address].
+    ///
+    /// [loopback address]: https://tools.ietf.org/html/rfc4291#section-2.5.3
+    pub const LOOPBACK: Address = Address([
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ]);
 
-/// The [scope] of an address.
-///
-/// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MulticastScope {
-    /// Interface Local scope
-    InterfaceLocal = 0x1,
-    /// Link local scope
-    LinkLocal = 0x2,
-    /// Administratively configured
-    AdminLocal = 0x4,
-    /// Single site scope
-    SiteLocal = 0x5,
-    /// Organization scope
-    OrganizationLocal = 0x8,
-    /// Global scope
-    Global = 0xE,
-    /// Unknown scope
-    Unknown = 0xFF,
-}
+    /// Construct an IPv6 address from parts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(a0: u16, a1: u16, a2: u16, a3: u16, a4: u16, a5: u16, a6: u16, a7: u16) -> Address {
+        let mut addr = [0u8; 16];
+        NetworkEndian::write_u16(&mut addr[0..2], a0);
+        NetworkEndian::write_u16(&mut addr[2..4], a1);
+        NetworkEndian::write_u16(&mut addr[4..6], a2);
+        NetworkEndian::write_u16(&mut addr[6..8], a3);
+        NetworkEndian::write_u16(&mut addr[8..10], a4);
+        NetworkEndian::write_u16(&mut addr[10..12], a5);
+        NetworkEndian::write_u16(&mut addr[12..14], a6);
+        NetworkEndian::write_u16(&mut addr[14..16], a7);
+        Address(addr)
+    }
 
-impl From<u8> for MulticastScope {
-    fn from(value: u8) -> Self {
-        match value {
-            0x1 => Self::InterfaceLocal,
-            0x2 => Self::LinkLocal,
-            0x4 => Self::AdminLocal,
-            0x5 => Self::SiteLocal,
-            0x8 => Self::OrganizationLocal,
-            0xE => Self::Global,
-            _ => Self::Unknown,
+    /// Construct an IPv6 address from a sequence of octets, in big-endian.
+    ///
+    /// # Panics
+    /// The function panics if `data` is not sixteen octets long.
+    pub fn from_bytes(data: &[u8]) -> Address {
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(data);
+        Address(bytes)
+    }
+
+    /// Construct an IPv6 address from a sequence of words, in big-endian.
+    ///
+    /// # Panics
+    /// The function panics if `data` is not 8 words long.
+    pub fn from_parts(data: &[u16]) -> Address {
+        assert!(data.len() >= 8);
+        let mut bytes = [0; 16];
+        for (word_idx, chunk) in bytes.chunks_mut(2).enumerate() {
+            NetworkEndian::write_u16(chunk, data[word_idx]);
+        }
+        Address(bytes)
+    }
+
+    /// Write a IPv6 address to the given slice.
+    ///
+    /// # Panics
+    /// The function panics if `data` is not 8 words long.
+    pub fn write_parts(&self, data: &mut [u16]) {
+        assert!(data.len() >= 8);
+        for (i, chunk) in self.0.chunks(2).enumerate() {
+            data[i] = NetworkEndian::read_u16(chunk);
         }
     }
-}
 
-pub use core::net::Ipv6Addr as Address;
-
-pub(crate) trait AddressExt {
-    /// Create an IPv6 address based on the provided prefix and hardware identifier.
-    fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Address>;
+    /// Return an IPv6 address as a sequence of octets, in big-endian.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
     /// Query whether the IPv6 address is an [unicast address].
     ///
     /// [unicast address]: https://tools.ietf.org/html/rfc4291#section-2.5
-    ///
-    /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
-    fn x_is_unicast(&self) -> bool;
+    pub fn is_unicast(&self) -> bool {
+        !(self.is_multicast() || self.is_unspecified())
+    }
 
-    /// Query whether the IPv6 address is a [global unicast address].
+    /// Query whether the IPv6 address is a [multicast address].
     ///
-    /// [global unicast address]: https://datatracker.ietf.org/doc/html/rfc3587
-    fn is_global_unicast(&self) -> bool;
+    /// [multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7
+    pub fn is_multicast(&self) -> bool {
+        self.0[0] == 0xff
+    }
+
+    /// Query whether the IPv6 address is the [unspecified address].
+    ///
+    /// [unspecified address]: https://tools.ietf.org/html/rfc4291#section-2.5.2
+    pub fn is_unspecified(&self) -> bool {
+        self.0 == [0x00; 16]
+    }
 
     /// Query whether the IPv6 address is in the [link-local] scope.
     ///
     /// [link-local]: https://tools.ietf.org/html/rfc4291#section-2.5.6
-    fn is_link_local(&self) -> bool;
+    pub fn is_link_local(&self) -> bool {
+        self.0[0..8] == [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
 
-    /// Helper function used to mask an address given a prefix.
+    /// Query whether the IPv6 address is the [loopback address].
     ///
-    /// # Panics
-    /// This function panics if `mask` is greater than 128.
-    fn mask(&self, mask: u8) -> [u8; ADDR_SIZE];
+    /// [loopback address]: https://tools.ietf.org/html/rfc4291#section-2.5.3
+    pub fn is_loopback(&self) -> bool {
+        *self == Self::LOOPBACK
+    }
 
-    /// The solicited node for the given unicast address.
+    /// Query whether the IPv6 address is an [IPv4 mapped IPv6 address].
     ///
-    /// # Panics
-    /// This function panics if the given address is not
-    /// unicast.
-    fn solicited_node(&self) -> Address;
+    /// [IPv4 mapped IPv6 address]: https://tools.ietf.org/html/rfc4291#section-2.5.5.2
+    pub fn is_ipv4_mapped(&self) -> bool {
+        self.0[0..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+    }
 
-    /// Return the scope of the address.
-    ///
-    /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
-    fn x_multicast_scope(&self) -> MulticastScope;
-
-    /// Query whether the IPv6 address is a [solicited-node multicast address].
-    ///
-    /// [Solicited-node multicast address]: https://datatracker.ietf.org/doc/html/rfc4291#section-2.7.1
-    fn is_solicited_node_multicast(&self) -> bool;
-
-    /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
-    fn prefix_len(&self) -> Option<u8>;
-}
-
-impl AddressExt for Address {
-    fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Address> {
-        if let Some(eui64) = interface_identifier.as_eui_64() {
-            if link_prefix.prefix_len() != 64 {
-                return None;
-            }
-            let mut bytes = [0; 16];
-            bytes[0..8].copy_from_slice(&link_prefix.address().octets()[0..8]);
-            bytes[8..16].copy_from_slice(&eui64);
-            Some(Address::from_octets(bytes))
+    #[cfg(feature = "proto-ipv4")]
+    /// Convert an IPv4 mapped IPv6 address to an IPv4 address.
+    pub fn as_ipv4(&self) -> Option<ipv4::Address> {
+        if self.is_ipv4_mapped() {
+            Some(ipv4::Address::new(
+                self.0[12], self.0[13], self.0[14], self.0[15],
+            ))
         } else {
             None
         }
     }
 
-    fn x_is_unicast(&self) -> bool {
-        !(self.is_multicast() || self.is_unspecified())
-    }
-
-    fn is_global_unicast(&self) -> bool {
-        (self.octets()[0] >> 5) == 0b001
-    }
-
-    fn is_link_local(&self) -> bool {
-        self.octets()[0..8] == [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-    }
-
-    fn mask(&self, mask: u8) -> [u8; ADDR_SIZE] {
+    /// Helper function used to mask an addres given a prefix.
+    ///
+    /// # Panics
+    /// This function panics if `mask` is greater than 128.
+    pub(super) fn mask(&self, mask: u8) -> [u8; 16] {
         assert!(mask <= 128);
-        let mut bytes = [0u8; ADDR_SIZE];
+        let mut bytes = [0u8; 16];
         let idx = (mask as usize) / 8;
         let modulus = (mask as usize) % 8;
-        let octets = self.octets();
-        let (first, second) = octets.split_at(idx);
+        let (first, second) = self.0.split_at(idx);
         bytes[0..idx].copy_from_slice(first);
-        if idx < ADDR_SIZE {
+        if idx < 16 {
             let part = second[0];
             bytes[idx] = part & (!(0xff >> modulus) as u8);
         }
         bytes
     }
 
-    fn solicited_node(&self) -> Address {
-        assert!(self.x_is_unicast());
-        let o = self.octets();
-        Address::from([
-            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, o[13],
-            o[14], o[15],
-        ])
+    /// The solicited node for the given unicast address.
+    ///
+    /// # Panics
+    /// This function panics if the given address is not
+    /// unicast.
+    pub fn solicited_node(&self) -> Address {
+        assert!(self.is_unicast());
+        let mut bytes = [
+            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        bytes[14..].copy_from_slice(&self.0[14..]);
+        Address(bytes)
     }
+}
 
-    fn x_multicast_scope(&self) -> MulticastScope {
-        if self.is_multicast() {
-            return MulticastScope::from(self.octets()[1] & 0b1111);
+#[cfg(feature = "std")]
+impl From<::std::net::Ipv6Addr> for Address {
+    fn from(x: ::std::net::Ipv6Addr) -> Address {
+        Address(x.octets())
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<Address> for ::std::net::Ipv6Addr {
+    fn from(Address(x): Address) -> ::std::net::Ipv6Addr {
+        x.into()
+    }
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.is_ipv4_mapped() {
+            return write!(
+                f,
+                "::ffff:{}.{}.{}.{}",
+                self.0[12], self.0[13], self.0[14], self.0[15]
+            );
         }
 
-        if self.is_link_local() {
-            MulticastScope::LinkLocal
-        } else if self.is_unique_local() || self.is_global_unicast() {
-            // ULA are considered global scope
-            // https://www.rfc-editor.org/rfc/rfc6724#section-3.1
-            MulticastScope::Global
-        } else {
-            MulticastScope::Unknown
+        // The string representation of an IPv6 address should
+        // collapse a series of 16 bit sections that evaluate
+        // to 0 to "::"
+        //
+        // See https://tools.ietf.org/html/rfc4291#section-2.2
+        // for details.
+        enum State {
+            Head,
+            HeadBody,
+            Tail,
+            TailBody,
         }
-    }
-
-    fn is_solicited_node_multicast(&self) -> bool {
-        self.octets()[0..13]
-            == [
-                0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF,
-            ]
-    }
-
-    fn prefix_len(&self) -> Option<u8> {
-        let mut ones = true;
-        let mut prefix_len = 0;
-        for byte in self.octets() {
-            let mut mask = 0x80;
-            for _ in 0..8 {
-                let one = byte & mask != 0;
-                if ones {
-                    // Expect 1s until first 0
-                    if one {
-                        prefix_len += 1;
-                    } else {
-                        ones = false;
-                    }
-                } else if one {
-                    // 1 where 0 was expected
-                    return None;
+        let mut words = [0u16; 8];
+        self.write_parts(&mut words);
+        let mut state = State::Head;
+        for word in words.iter() {
+            state = match (*word, &state) {
+                // Once a u16 equal to zero write a double colon and
+                // skip to the next non-zero u16.
+                (0, &State::Head) | (0, &State::HeadBody) => {
+                    write!(f, "::")?;
+                    State::Tail
                 }
-                mask >>= 1;
+                // Continue iterating without writing any characters until
+                // we hit anothing non-zero value.
+                (0, &State::Tail) => State::Tail,
+                // When the state is Head or Tail write a u16 in hexadecimal
+                // without the leading colon if the value is not 0.
+                (_, &State::Head) => {
+                    write!(f, "{:x}", word)?;
+                    State::HeadBody
+                }
+                (_, &State::Tail) => {
+                    write!(f, "{:x}", word)?;
+                    State::TailBody
+                }
+                // Write the u16 with a leading colon when parsing a value
+                // that isn't the first in a section
+                (_, &State::HeadBody) | (_, &State::TailBody) => {
+                    write!(f, ":{:x}", word)?;
+                    state
+                }
             }
         }
-        Some(prefix_len)
+        Ok(())
+    }
+}
+
+#[cfg(feature = "proto-ipv4")]
+/// Convert the given IPv4 address into a IPv4-mapped IPv6 address
+impl From<ipv4::Address> for Address {
+    fn from(address: ipv4::Address) -> Self {
+        let octets = address.0;
+        Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, octets[0], octets[1], octets[2], octets[3],
+        ])
     }
 }
 
 /// A specification of an IPv6 CIDR block, containing an address and a variable-length
 /// subnet masking prefix length.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Cidr {
     address: Address,
     prefix_len: u8,
@@ -244,21 +289,18 @@ impl Cidr {
     ///
     /// [solicited node prefix]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     pub const SOLICITED_NODE_PREFIX: Cidr = Cidr {
-        address: Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0),
+        address: Address([
+            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00,
+            0x00, 0x00,
+        ]),
         prefix_len: 104,
-    };
-
-    /// The link-local address prefix.
-    pub const LINK_LOCAL_PREFIX: Cidr = Cidr {
-        address: Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
-        prefix_len: 10,
     };
 
     /// Create an IPv6 CIDR block from the given address and prefix length.
     ///
     /// # Panics
     /// This function panics if the prefix length is larger than 128.
-    pub const fn new(address: Address, prefix_len: u8) -> Cidr {
+    pub fn new(address: Address, prefix_len: u8) -> Cidr {
         assert!(prefix_len <= 128);
         Cidr {
             address,
@@ -266,22 +308,13 @@ impl Cidr {
         }
     }
 
-    /// Create an IPv6 CIDR based on the provided prefix and hardware identifier.
-    pub fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Self> {
-        Address::from_link_prefix(link_prefix, interface_identifier)
-            .map(|address| Self::new(address, link_prefix.prefix_len()))
-    }
-
     /// Return the address of this IPv6 CIDR block.
-    pub const fn address(&self) -> Address {
+    pub fn address(&self) -> Address {
         self.address
     }
 
     /// Return the prefix length of this IPv6 CIDR block.
-    pub const fn prefix_len(&self) -> u8 {
+    pub fn prefix_len(&self) -> u8 {
         self.prefix_len
     }
 
@@ -293,7 +326,8 @@ impl Cidr {
             return true;
         }
 
-        self.address.mask(self.prefix_len) == addr.mask(self.prefix_len)
+        let shift = 128 - self.prefix_len;
+        self.address.mask(shift) == addr.mask(shift)
     }
 
     /// Query whether the subnetwork described by this IPV6 CIDR block contains
@@ -310,15 +344,8 @@ impl fmt::Display for Cidr {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Cidr {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}/{=u8}", self.address, self.prefix_len);
-    }
-}
-
 /// A read/write wrapper around an Internet Protocol version 6 packet buffer.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
@@ -375,7 +402,7 @@ pub const HEADER_LEN: usize = field::DST_ADDR.end;
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Create a raw octet buffer with an IPv6 packet structure.
     #[inline]
-    pub const fn new_unchecked(buffer: T) -> Packet<T> {
+    pub fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -391,7 +418,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
+    /// Returns `Err(Error::Truncated)` if the buffer is too short.
     ///
     /// The result of this check is invalidated by calling [set_payload_len].
     ///
@@ -400,7 +427,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::DST_ADDR.end || len < self.total_len() {
-            Err(Error)
+            Err(Error::Truncated)
         } else {
             Ok(())
         }
@@ -414,7 +441,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the header length.
     #[inline]
-    pub const fn header_len(&self) -> usize {
+    pub fn header_len(&self) -> usize {
         // This is not a strictly necessary function, but it makes
         // code more readable.
         field::DST_ADDR.end
@@ -472,14 +499,14 @@ impl<T: AsRef<[u8]>> Packet<T> {
     #[inline]
     pub fn src_addr(&self) -> Address {
         let data = self.buffer.as_ref();
-        Address::from_octets(data[field::SRC_ADDR].try_into().unwrap())
+        Address::from_bytes(&data[field::SRC_ADDR])
     }
 
     /// Return the destination address field.
     #[inline]
     pub fn dst_addr(&self) -> Address {
         let data = self.buffer.as_ref();
-        Address::from_octets(data[field::DST_ADDR].try_into().unwrap())
+        Address::from_bytes(&data[field::DST_ADDR])
     }
 }
 
@@ -549,14 +576,14 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     #[inline]
     pub fn set_src_addr(&mut self, value: Address) {
         let data = self.buffer.as_mut();
-        data[field::SRC_ADDR].copy_from_slice(&value.octets());
+        data[field::SRC_ADDR].copy_from_slice(value.as_bytes());
     }
 
     /// Set the destination address field.
     #[inline]
     pub fn set_dst_addr(&mut self, value: Address) {
         let data = self.buffer.as_mut();
-        data[field::DST_ADDR].copy_from_slice(&value.octets());
+        data[field::DST_ADDR].copy_from_slice(value.as_bytes());
     }
 
     /// Return a mutable pointer to the payload.
@@ -568,12 +595,12 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     }
 }
 
-impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
+impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match Repr::parse(self) {
-            Ok(repr) => write!(f, "{repr}"),
+            Ok(repr) => write!(f, "{}", repr),
             Err(err) => {
-                write!(f, "IPv6 ({err})")?;
+                write!(f, "IPv6 ({})", err)?;
                 Ok(())
             }
         }
@@ -588,6 +615,7 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an Internet Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr {
     /// IPv6 address of the source node.
     pub src_addr: Address,
@@ -607,7 +635,7 @@ impl Repr {
         // Ensure basic accessors will work
         packet.check_len()?;
         if packet.version() != 6 {
-            return Err(Error);
+            return Err(Error::Malformed);
         }
         Ok(Repr {
             src_addr: packet.src_addr(),
@@ -619,7 +647,7 @@ impl Repr {
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub const fn buffer_len(&self) -> usize {
+    pub fn buffer_len(&self) -> usize {
         // This function is not strictly necessary, but it can make client code more readable.
         field::DST_ADDR.end
     }
@@ -649,20 +677,6 @@ impl fmt::Display for Repr {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Repr {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(
-            fmt,
-            "IPv6 src={} dst={} nxt_hdr={} hop_limit={}",
-            self.src_addr,
-            self.dst_addr,
-            self.next_header,
-            self.hop_limit
-        )
-    }
-}
-
 use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
 
 // TODO: This is very similar to the implementation for IPv4. Make
@@ -674,11 +688,11 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
+            Err(err) => return write!(f, "{}({})", indent, err),
             Ok(ip_packet) => match Repr::parse(&ip_packet) {
                 Err(_) => return Ok(()),
                 Ok(ip_repr) => {
-                    write!(f, "{indent}{ip_repr}")?;
+                    write!(f, "{}{}", indent, ip_repr)?;
                     (ip_repr, ip_packet.payload())
                 }
             },
@@ -689,43 +703,29 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 }
 
 #[cfg(test)]
-pub(crate) mod test {
-    use super::*;
+mod test {
+    use super::{Address, Cidr};
+    use super::{Packet, Protocol, Repr};
     use crate::wire::pretty_print::PrettyPrinter;
+    use crate::Error;
 
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_1: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_2: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_3: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_4: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 4);
-    #[allow(unused)]
-    pub(crate) const MOCK_UNSPECIFIED: Address = Address::UNSPECIFIED;
+    #[cfg(feature = "proto-ipv4")]
+    use crate::wire::ipv4::Address as Ipv4Address;
 
-    const LINK_LOCAL_ADDR: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    const UNIQUE_LOCAL_ADDR: Address = Address::new(0xfd00, 0, 0, 201, 1, 1, 1, 1);
-    const GLOBAL_UNICAST_ADDR: Address = Address::new(0x2001, 0xdb8, 0x3, 0, 0, 0, 0, 1);
-
-    const TEST_SOL_NODE_MCAST_ADDR: Address = Address::new(0xff02, 0, 0, 0, 0, 1, 0xff01, 101);
-
+    static LINK_LOCAL_ADDR: Address = Address([
+        0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ]);
     #[test]
     fn test_basic_multicast() {
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_unspecified());
-        assert!(LINK_LOCAL_ALL_ROUTERS.is_multicast());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_link_local());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_loopback());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_global_unicast());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_solicited_node_multicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_unspecified());
-        assert!(LINK_LOCAL_ALL_NODES.is_multicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_link_local());
-        assert!(!LINK_LOCAL_ALL_NODES.is_loopback());
-        assert!(!LINK_LOCAL_ALL_NODES.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_NODES.is_global_unicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_solicited_node_multicast());
+        assert!(!Address::LINK_LOCAL_ALL_ROUTERS.is_unspecified());
+        assert!(Address::LINK_LOCAL_ALL_ROUTERS.is_multicast());
+        assert!(!Address::LINK_LOCAL_ALL_ROUTERS.is_link_local());
+        assert!(!Address::LINK_LOCAL_ALL_ROUTERS.is_loopback());
+        assert!(!Address::LINK_LOCAL_ALL_NODES.is_unspecified());
+        assert!(Address::LINK_LOCAL_ALL_NODES.is_multicast());
+        assert!(!Address::LINK_LOCAL_ALL_NODES.is_link_local());
+        assert!(!Address::LINK_LOCAL_ALL_NODES.is_loopback());
     }
 
     #[test]
@@ -734,53 +734,91 @@ pub(crate) mod test {
         assert!(!LINK_LOCAL_ADDR.is_multicast());
         assert!(LINK_LOCAL_ADDR.is_link_local());
         assert!(!LINK_LOCAL_ADDR.is_loopback());
-        assert!(!LINK_LOCAL_ADDR.is_unique_local());
-        assert!(!LINK_LOCAL_ADDR.is_global_unicast());
-        assert!(!LINK_LOCAL_ADDR.is_solicited_node_multicast());
     }
 
     #[test]
     fn test_basic_loopback() {
-        assert!(!Address::LOCALHOST.is_unspecified());
-        assert!(!Address::LOCALHOST.is_multicast());
-        assert!(!Address::LOCALHOST.is_link_local());
-        assert!(Address::LOCALHOST.is_loopback());
-        assert!(!Address::LOCALHOST.is_unique_local());
-        assert!(!Address::LOCALHOST.is_global_unicast());
-        assert!(!Address::LOCALHOST.is_solicited_node_multicast());
+        assert!(!Address::LOOPBACK.is_unspecified());
+        assert!(!Address::LOOPBACK.is_multicast());
+        assert!(!Address::LOOPBACK.is_link_local());
+        assert!(Address::LOOPBACK.is_loopback());
     }
 
     #[test]
-    fn test_unique_local() {
-        assert!(!UNIQUE_LOCAL_ADDR.is_unspecified());
-        assert!(!UNIQUE_LOCAL_ADDR.is_multicast());
-        assert!(!UNIQUE_LOCAL_ADDR.is_link_local());
-        assert!(!UNIQUE_LOCAL_ADDR.is_loopback());
-        assert!(UNIQUE_LOCAL_ADDR.is_unique_local());
-        assert!(!UNIQUE_LOCAL_ADDR.is_global_unicast());
-        assert!(!UNIQUE_LOCAL_ADDR.is_solicited_node_multicast());
+    fn test_address_format() {
+        assert_eq!("ff02::1", format!("{}", Address::LINK_LOCAL_ALL_NODES));
+        assert_eq!("fe80::1", format!("{}", LINK_LOCAL_ADDR));
+        assert_eq!(
+            "fe80::7f00:0:1",
+            format!(
+                "{}",
+                Address::new(0xfe80, 0, 0, 0, 0, 0x7f00, 0x0000, 0x0001)
+            )
+        );
+        assert_eq!("::", format!("{}", Address::UNSPECIFIED));
+        assert_eq!("::1", format!("{}", Address::LOOPBACK));
+
+        #[cfg(feature = "proto-ipv4")]
+        assert_eq!(
+            "::ffff:192.168.1.1",
+            format!("{}", Address::from(Ipv4Address::new(192, 168, 1, 1)))
+        );
     }
 
     #[test]
-    fn test_global_unicast() {
-        assert!(!GLOBAL_UNICAST_ADDR.is_unspecified());
-        assert!(!GLOBAL_UNICAST_ADDR.is_multicast());
-        assert!(!GLOBAL_UNICAST_ADDR.is_link_local());
-        assert!(!GLOBAL_UNICAST_ADDR.is_loopback());
-        assert!(!GLOBAL_UNICAST_ADDR.is_unique_local());
-        assert!(GLOBAL_UNICAST_ADDR.is_global_unicast());
-        assert!(!GLOBAL_UNICAST_ADDR.is_solicited_node_multicast());
+    fn test_new() {
+        assert_eq!(
+            Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+            Address::LINK_LOCAL_ALL_NODES
+        );
+        assert_eq!(
+            Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
+            Address::LINK_LOCAL_ALL_ROUTERS
+        );
+        assert_eq!(Address::new(0, 0, 0, 0, 0, 0, 0, 1), Address::LOOPBACK);
+        assert_eq!(Address::new(0, 0, 0, 0, 0, 0, 0, 0), Address::UNSPECIFIED);
+        assert_eq!(Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), LINK_LOCAL_ADDR);
     }
 
     #[test]
-    fn test_sollicited_node_multicast() {
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_unspecified());
-        assert!(TEST_SOL_NODE_MCAST_ADDR.is_multicast());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_link_local());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_loopback());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_unique_local());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_global_unicast());
-        assert!(TEST_SOL_NODE_MCAST_ADDR.is_solicited_node_multicast());
+    fn test_from_parts() {
+        assert_eq!(
+            Address::from_parts(&[0xff02, 0, 0, 0, 0, 0, 0, 1]),
+            Address::LINK_LOCAL_ALL_NODES
+        );
+        assert_eq!(
+            Address::from_parts(&[0xff02, 0, 0, 0, 0, 0, 0, 2]),
+            Address::LINK_LOCAL_ALL_ROUTERS
+        );
+        assert_eq!(
+            Address::from_parts(&[0, 0, 0, 0, 0, 0, 0, 1]),
+            Address::LOOPBACK
+        );
+        assert_eq!(
+            Address::from_parts(&[0, 0, 0, 0, 0, 0, 0, 0]),
+            Address::UNSPECIFIED
+        );
+        assert_eq!(
+            Address::from_parts(&[0xfe80, 0, 0, 0, 0, 0, 0, 1]),
+            LINK_LOCAL_ADDR
+        );
+    }
+
+    #[test]
+    fn test_write_parts() {
+        let mut bytes = [0u16; 8];
+        {
+            Address::LOOPBACK.write_parts(&mut bytes);
+            assert_eq!(Address::LOOPBACK, Address::from_parts(&bytes));
+        }
+        {
+            Address::LINK_LOCAL_ALL_ROUTERS.write_parts(&mut bytes);
+            assert_eq!(Address::LINK_LOCAL_ALL_ROUTERS, Address::from_parts(&bytes));
+        }
+        {
+            LINK_LOCAL_ADDR.write_parts(&mut bytes);
+            assert_eq!(LINK_LOCAL_ADDR, Address::from_parts(&bytes));
+        }
     }
 
     #[test]
@@ -800,42 +838,60 @@ pub(crate) mod test {
         );
         assert_eq!(
             addr.mask(128),
-            [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
-            ]
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
         );
         assert_eq!(
             addr.mask(127),
-            [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[cfg(feature = "proto-ipv4")]
+    #[test]
+    fn test_is_ipv4_mapped() {
+        assert!(!Address::UNSPECIFIED.is_ipv4_mapped());
+        assert!(Address::from(Ipv4Address::new(192, 168, 1, 1)).is_ipv4_mapped());
+    }
+
+    #[cfg(feature = "proto-ipv4")]
+    #[test]
+    fn test_as_ipv4() {
+        assert_eq!(None, Address::UNSPECIFIED.as_ipv4());
+
+        let ipv4 = Ipv4Address::new(192, 168, 1, 1);
+        assert_eq!(Some(ipv4), Address::from(ipv4).as_ipv4());
+    }
+
+    #[cfg(feature = "proto-ipv4")]
+    #[test]
+    fn test_from_ipv4_address() {
+        assert_eq!(
+            Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 1]),
+            Address::from(Ipv4Address::new(192, 168, 1, 1))
+        );
+        assert_eq!(
+            Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 222, 1, 41, 90]),
+            Address::from(Ipv4Address::new(222, 1, 41, 90))
         );
     }
 
     #[test]
     fn test_cidr() {
-        // fe80::1/56
-        // 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-        // 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        let cidr = Cidr::new(LINK_LOCAL_ADDR, 56);
+        let cidr = Cidr::new(LINK_LOCAL_ADDR, 64);
 
         let inside_subnet = [
-            // fe80::2
             [
                 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x02,
             ],
-            // fe80::1122:3344:5566:7788
             [
                 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
                 0x77, 0x88,
             ],
-            // fe80::ff00:0:0:0
             [
                 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00,
             ],
-            // fe80::ff
             [
                 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0xff,
@@ -843,22 +899,18 @@ pub(crate) mod test {
         ];
 
         let outside_subnet = [
-            // fe80:0:0:101::1
             [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x01,
             ],
-            // ::1
             [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x01,
             ],
-            // ff02::1
             [
                 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x01,
             ],
-            // ff02::2
             [
                 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x02,
@@ -866,7 +918,6 @@ pub(crate) mod test {
         ];
 
         let subnets = [
-            // fe80::ffff:ffff:ffff:ffff/65
             (
                 [
                     0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -874,7 +925,6 @@ pub(crate) mod test {
                 ],
                 65,
             ),
-            // fe80::1/128
             (
                 [
                     0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -882,7 +932,6 @@ pub(crate) mod test {
                 ],
                 128,
             ),
-            // fe80::1234:5678/96
             (
                 [
                     0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
@@ -893,31 +942,27 @@ pub(crate) mod test {
         ];
 
         let not_subnets = [
-            // fe80::101:ffff:ffff:ffff:ffff/55
             (
                 [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff,
                     0xff, 0xff, 0xff,
                 ],
-                55,
+                63,
             ),
-            // fe80::101:ffff:ffff:ffff:ffff/56
             (
                 [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
                     0xff, 0xff, 0xff,
                 ],
-                56,
+                64,
             ),
-            // fe80::101:ffff:ffff:ffff:ffff/57
             (
                 [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
                     0xff, 0xff, 0xff,
                 ],
-                57,
+                65,
             ),
-            // ::1/128
             (
                 [
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -927,118 +972,36 @@ pub(crate) mod test {
             ),
         ];
 
-        for addr in inside_subnet.iter().map(|a| Address::from_octets(*a)) {
+        for addr in inside_subnet.iter().map(|a| Address::from_bytes(a)) {
             assert!(cidr.contains_addr(&addr));
         }
 
-        for addr in outside_subnet.iter().map(|a| Address::from_octets(*a)) {
+        for addr in outside_subnet.iter().map(|a| Address::from_bytes(a)) {
             assert!(!cidr.contains_addr(&addr));
         }
 
-        for subnet in subnets.iter().map(|&(a, p)| Cidr::new(Address::from(a), p)) {
+        for subnet in subnets.iter().map(|&(a, p)| Cidr::new(Address(a), p)) {
             assert!(cidr.contains_subnet(&subnet));
         }
 
-        for subnet in not_subnets
-            .iter()
-            .map(|&(a, p)| Cidr::new(Address::from(a), p))
-        {
+        for subnet in not_subnets.iter().map(|&(a, p)| Cidr::new(Address(a), p)) {
             assert!(!cidr.contains_subnet(&subnet));
         }
 
         let cidr_without_prefix = Cidr::new(LINK_LOCAL_ADDR, 0);
-        assert!(cidr_without_prefix.contains_addr(&Address::LOCALHOST));
+        assert!(cidr_without_prefix.contains_addr(&Address::LOOPBACK));
     }
 
     #[test]
-    fn test_from_eui_64() {
-        #[cfg(feature = "medium-ethernet")]
-        use crate::wire::EthernetAddress;
-        #[cfg(feature = "medium-ieee802154")]
-        use crate::wire::Ieee802154Address;
-        let tests: std::vec::Vec<(HardwareAddress, Address)> = vec![
-            #[cfg(feature = "medium-ethernet")]
-            (
-                HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
-                    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-                ])),
-                Address::new(0x2001, 0xdb8, 0x3, 0x0, 0xa8bb, 0xccff, 0xfedd, 0xeeff),
-            ),
-            #[cfg(feature = "medium-ieee802154")]
-            (
-                HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(&[
-                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                ])),
-                Address::new(0x2001, 0xdb8, 0x3, 0x0, 0x0211, 0x2233, 0x4455, 0x6677),
-            ),
-        ];
-
-        let prefix = Cidr::new(GLOBAL_UNICAST_ADDR.mask(64).into(), 64);
-        let wrong_prefix = Cidr::new(GLOBAL_UNICAST_ADDR.mask(72).into(), 72);
-
-        for (hardware, result) in tests {
-            let generated = Address::from_link_prefix(&prefix, hardware).unwrap();
-            assert!(prefix.contains_addr(&generated));
-            assert_eq!(generated, result);
-            assert!(Address::from_link_prefix(&wrong_prefix, hardware).is_none());
-
-            let generated = Cidr::from_link_prefix(&prefix, hardware).unwrap();
-            assert!(prefix.contains_subnet(&generated));
-            assert_eq!(generated.address(), result);
-            assert!(Cidr::from_link_prefix(&wrong_prefix, hardware).is_none());
-        }
+    #[should_panic(expected = "length")]
+    fn test_from_bytes_too_long() {
+        let _ = Address::from_bytes(&[0u8; 15]);
     }
 
     #[test]
-    fn test_scope() {
-        use super::*;
-        assert_eq!(
-            Address::new(0xff01, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::InterfaceLocal
-        );
-        assert_eq!(
-            Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-        assert_eq!(
-            Address::new(0xff03, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Unknown
-        );
-        assert_eq!(
-            Address::new(0xff04, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::AdminLocal
-        );
-        assert_eq!(
-            Address::new(0xff05, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::SiteLocal
-        );
-        assert_eq!(
-            Address::new(0xff08, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::OrganizationLocal
-        );
-        assert_eq!(
-            Address::new(0xff0e, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Global
-        );
-
-        assert_eq!(
-            LINK_LOCAL_ALL_NODES.x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-
-        // For source address selection, unicast addresses also have a scope:
-        assert_eq!(
-            LINK_LOCAL_ADDR.x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-        assert_eq!(
-            GLOBAL_UNICAST_ADDR.x_multicast_scope(),
-            MulticastScope::Global
-        );
-        assert_eq!(
-            UNIQUE_LOCAL_ADDR.x_multicast_scope(),
-            MulticastScope::Global
-        );
+    #[should_panic(expected = "data.len() >= 8")]
+    fn test_from_parts_too_long() {
+        let _ = Address::from_parts(&[0u16; 7]);
     }
 
     static REPR_PACKET_BYTES: [u8; 52] = [
@@ -1051,10 +1014,13 @@ pub(crate) mod test {
         0x00, 0x01, 0x00, 0x02, 0x00, 0x0c, 0x02, 0x4e, 0xff, 0xff, 0xff, 0xff,
     ];
 
-    const fn packet_repr() -> Repr {
+    fn packet_repr() -> Repr {
         Repr {
-            src_addr: Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
-            dst_addr: LINK_LOCAL_ALL_NODES,
+            src_addr: Address([
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01,
+            ]),
+            dst_addr: Address::LINK_LOCAL_ALL_NODES,
             next_header: Protocol::Udp,
             payload_len: 12,
             hop_limit: 64,
@@ -1072,8 +1038,14 @@ pub(crate) mod test {
         assert_eq!(packet.payload_len() as usize, REPR_PAYLOAD_BYTES.len());
         assert_eq!(packet.next_header(), Protocol::Udp);
         assert_eq!(packet.hop_limit(), 0x40);
-        assert_eq!(packet.src_addr(), Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-        assert_eq!(packet.dst_addr(), LINK_LOCAL_ALL_NODES);
+        assert_eq!(
+            packet.src_addr(),
+            Address([
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01
+            ])
+        );
+        assert_eq!(packet.dst_addr(), Address::LINK_LOCAL_ALL_NODES);
         assert_eq!(packet.payload(), &REPR_PAYLOAD_BYTES[..]);
     }
 
@@ -1095,8 +1067,8 @@ pub(crate) mod test {
         packet.set_payload_len(0xc);
         packet.set_next_header(Protocol::Udp);
         packet.set_hop_limit(0xfe);
-        packet.set_src_addr(LINK_LOCAL_ALL_ROUTERS);
-        packet.set_dst_addr(LINK_LOCAL_ALL_NODES);
+        packet.set_src_addr(Address::LINK_LOCAL_ALL_ROUTERS);
+        packet.set_dst_addr(Address::LINK_LOCAL_ALL_NODES);
         packet
             .payload_mut()
             .copy_from_slice(&REPR_PAYLOAD_BYTES[..]);
@@ -1109,7 +1081,7 @@ pub(crate) mod test {
         let start = expected_bytes.len() - REPR_PAYLOAD_BYTES.len();
         expected_bytes[start..].copy_from_slice(&REPR_PAYLOAD_BYTES[..]);
         assert_eq!(packet.check_len(), Ok(()));
-        assert_eq!(&*packet.into_inner(), &expected_bytes[..]);
+        assert_eq!(&packet.into_inner()[..], &expected_bytes[..]);
     }
 
     #[test]
@@ -1134,7 +1106,7 @@ pub(crate) mod test {
         bytes.extend(&REPR_PACKET_BYTES[..]);
         Packet::new_unchecked(&mut bytes).set_payload_len(0x80);
 
-        assert_eq!(Packet::new_checked(&bytes).unwrap_err(), Error);
+        assert_eq!(Packet::new_checked(&bytes).unwrap_err(), Error::Truncated);
     }
 
     #[test]
@@ -1146,32 +1118,32 @@ pub(crate) mod test {
 
     #[test]
     fn test_repr_parse_bad_version() {
-        let mut bytes = [0; 40];
+        let mut bytes = vec![0; 40];
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(4);
         packet.set_payload_len(0);
         let packet = Packet::new_unchecked(&*packet.into_inner());
-        assert_eq!(Repr::parse(&packet), Err(Error));
+        assert_eq!(Repr::parse(&packet), Err(Error::Malformed));
     }
 
     #[test]
     fn test_repr_parse_smaller_than_header() {
-        let mut bytes = [0; 40];
+        let mut bytes = vec![0; 40];
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(6);
         packet.set_payload_len(39);
         let packet = Packet::new_unchecked(&*packet.into_inner());
-        assert_eq!(Repr::parse(&packet), Err(Error));
+        assert_eq!(Repr::parse(&packet), Err(Error::Truncated));
     }
 
     #[test]
     fn test_repr_parse_smaller_than_payload() {
-        let mut bytes = [0; 40];
+        let mut bytes = vec![0; 40];
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(6);
         packet.set_payload_len(1);
         let packet = Packet::new_unchecked(&*packet.into_inner());
-        assert_eq!(Repr::parse(&packet), Err(Error));
+        assert_eq!(Repr::parse(&packet), Err(Error::Truncated));
     }
 
     #[test]
@@ -1181,7 +1153,7 @@ pub(crate) mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         repr.emit(&mut packet);
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
-        assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &REPR_PACKET_BYTES[..]);
     }
 
     #[test]

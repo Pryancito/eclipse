@@ -3,14 +3,15 @@
 #![allow(clippy::collapsible_if)]
 
 #[cfg(feature = "std")]
+#[allow(dead_code)]
 mod utils;
 
 use core::str;
 use log::{debug, error, info};
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, Loopback, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::iface::{InterfaceBuilder, NeighborCache};
+use smoltcp::phy::{Loopback, Medium};
+use smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
 
@@ -41,20 +42,22 @@ mod mock {
 #[cfg(feature = "std")]
 mod mock {
     use smoltcp::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    // should be AtomicU64 but that's unstable
     #[derive(Debug, Clone)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    pub struct Clock(Arc<AtomicU64>);
+    pub struct Clock(Arc<AtomicUsize>);
 
     impl Clock {
         pub fn new() -> Clock {
-            Clock(Arc::new(AtomicU64::new(0)))
+            Clock(Arc::new(AtomicUsize::new(0)))
         }
 
         pub fn advance(&self, duration: Duration) {
-            self.0.fetch_add(duration.total_millis(), Ordering::SeqCst);
+            self.0
+                .fetch_add(duration.total_millis() as usize, Ordering::SeqCst);
         }
 
         pub fn elapsed(&self) -> Instant {
@@ -68,7 +71,7 @@ fn main() {
     let device = Loopback::new(Medium::Ethernet);
 
     #[cfg(feature = "std")]
-    let mut device = {
+    let device = {
         let clock = clock.clone();
         utils::setup_logging_with_clock("", move || clock.elapsed());
 
@@ -79,23 +82,16 @@ fn main() {
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ true)
     };
 
-    // Create interface
-    let mut config = match device.capabilities().medium {
-        Medium::Ethernet => {
-            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
-        }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
-        Medium::Ieee802154 => todo!(),
-    };
+    let mut neighbor_cache_entries = [None; 8];
+    let mut neighbor_cache = NeighborCache::new(&mut neighbor_cache_entries[..]);
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
-    iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
-            .unwrap();
-    });
+    let mut ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
+    let mut iface = InterfaceBuilder::new(device)
+        .ethernet_addr(EthernetAddress::default())
+        .neighbor_cache(neighbor_cache)
+        .ip_addrs(ip_addrs)
+        .finalize();
 
-    // Create sockets
     let server_socket = {
         // It is not strictly necessary to use a `static mut` and unsafe code here, but
         // on embedded systems that smoltcp targets it is far better to allocate the data
@@ -103,67 +99,78 @@ fn main() {
         // when stack overflows.
         static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
         static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
+        let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 
     let client_socket = {
         static mut TCP_CLIENT_RX_DATA: [u8; 1024] = [0; 1024];
         static mut TCP_CLIENT_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
+        let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
+        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 
-    let mut sockets: [_; 2] = Default::default();
-    let mut sockets = SocketSet::new(&mut sockets[..]);
-    let server_handle = sockets.add(server_socket);
-    let client_handle = sockets.add(client_socket);
+    let mut socket_set_entries: [_; 2] = Default::default();
+    let mut socket_set = SocketSet::new(&mut socket_set_entries[..]);
+    let server_handle = socket_set.add(server_socket);
+    let client_handle = socket_set.add(client_socket);
 
     let mut did_listen = false;
     let mut did_connect = false;
     let mut done = false;
     while !done && clock.elapsed() < Instant::from_millis(10_000) {
-        iface.poll(clock.elapsed(), &mut device, &mut sockets);
-
-        let mut socket = sockets.get_mut::<tcp::Socket>(server_handle);
-        if !socket.is_active() && !socket.is_listening() {
-            if !did_listen {
-                debug!("listening");
-                socket.listen(1234).unwrap();
-                did_listen = true;
+        match iface.poll(&mut socket_set, clock.elapsed()) {
+            Ok(_) => {}
+            Err(e) => {
+                debug!("poll error: {}", e);
             }
         }
 
-        if socket.can_recv() {
-            debug!(
-                "got {:?}",
-                socket.recv(|buffer| { (buffer.len(), str::from_utf8(buffer).unwrap()) })
-            );
-            socket.close();
-            done = true;
-        }
+        {
+            let mut socket = socket_set.get::<TcpSocket>(server_handle);
+            if !socket.is_active() && !socket.is_listening() {
+                if !did_listen {
+                    debug!("listening");
+                    socket.listen(1234).unwrap();
+                    did_listen = true;
+                }
+            }
 
-        let mut socket = sockets.get_mut::<tcp::Socket>(client_handle);
-        let cx = iface.context();
-        if !socket.is_open() {
-            if !did_connect {
-                debug!("connecting");
-                socket
-                    .connect(cx, (IpAddress::v4(127, 0, 0, 1), 1234), 65000)
-                    .unwrap();
-                did_connect = true;
+            if socket.can_recv() {
+                debug!(
+                    "got {:?}",
+                    socket.recv(|buffer| { (buffer.len(), str::from_utf8(buffer).unwrap()) })
+                );
+                socket.close();
+                done = true;
             }
         }
 
-        if socket.can_send() {
-            debug!("sending");
-            socket.send_slice(b"0123456789abcdef").unwrap();
-            socket.close();
+        {
+            let mut socket = socket_set.get::<TcpSocket>(client_handle);
+            if !socket.is_open() {
+                if !did_connect {
+                    debug!("connecting");
+                    socket
+                        .connect(
+                            (IpAddress::v4(127, 0, 0, 1), 1234),
+                            (IpAddress::Unspecified, 65000),
+                        )
+                        .unwrap();
+                    did_connect = true;
+                }
+            }
+
+            if socket.can_send() {
+                debug!("sending");
+                socket.send_slice(b"0123456789abcdef").unwrap();
+                socket.close();
+            }
         }
 
-        match iface.poll_delay(clock.elapsed(), &sockets) {
+        match iface.poll_delay(&socket_set, clock.elapsed()) {
             Some(Duration::ZERO) => debug!("resuming"),
             Some(delay) => {
                 debug!("sleeping for {} ms", delay);

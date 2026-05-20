@@ -4,7 +4,7 @@ The `time` module contains structures used to represent both
 absolute and relative time.
 
  - [Instant] is used to represent absolute time.
- - [Duration] is used to represent relative time.
+ - [Duration] is used to represet relative time.
 
 [Instant]: struct.Instant.html
 [Duration]: struct.Duration.html
@@ -15,20 +15,19 @@ use core::{fmt, ops};
 /// A representation of an absolute time value.
 ///
 /// The `Instant` type is a wrapper around a `i64` value that
-/// represents a number of microseconds, monotonically increasing
+/// represents a number of milliseconds, monotonically increasing
 /// since an arbitrary moment in time, such as system startup.
 ///
 /// * A value of `0` is inherently arbitrary.
 /// * A value less than `0` indicates a time before the starting
 ///   point.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Instant {
     micros: i64,
 }
 
 impl Instant {
-    pub const ZERO: Instant = Instant::from_micros_const(0);
-
     /// Create a new `Instant` from a number of microseconds.
     pub fn from_micros<T: Into<i64>>(micros: T) -> Instant {
         Instant {
@@ -91,12 +90,12 @@ impl Instant {
     }
 
     /// The total number of milliseconds that have passed since
-    /// the beginning of time.
+    /// the biginning of time.
     pub const fn total_millis(&self) -> i64 {
         self.micros / 1000
     }
     /// The total number of milliseconds that have passed since
-    /// the beginning of time.
+    /// the biginning of time.
     pub const fn total_micros(&self) -> i64 {
         self.micros
     }
@@ -129,14 +128,7 @@ impl From<Instant> for ::std::time::SystemTime {
 
 impl fmt::Display for Instant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{:0>3}s", self.secs(), self.millis())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Instant {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
+        write!(f, "{}.{}s", self.secs(), self.millis())
     }
 }
 
@@ -172,21 +164,20 @@ impl ops::Sub<Instant> for Instant {
     type Output = Duration;
 
     fn sub(self, rhs: Instant) -> Duration {
-        Duration::from_micros((self.micros - rhs.micros).unsigned_abs())
+        Duration::from_micros((self.micros - rhs.micros).abs() as u64)
     }
 }
 
 /// A relative amount of time.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Duration {
     micros: u64,
 }
 
 impl Duration {
     pub const ZERO: Duration = Duration::from_micros(0);
-    /// The longest possible duration we can encode.
-    pub const MAX: Duration = Duration::from_micros(u64::MAX);
-    /// Create a new `Duration` from a number of microseconds.
+    /// Create a new `Duration` from a number of microeconds.
     pub const fn from_micros(micros: u64) -> Duration {
         Duration { micros }
     }
@@ -198,7 +189,7 @@ impl Duration {
         }
     }
 
-    /// Create a new `Duration` from a number of seconds.
+    /// Create a new `Instant` from a number of seconds.
     pub const fn from_secs(secs: u64) -> Duration {
         Duration {
             micros: secs * 1000000,
@@ -234,13 +225,6 @@ impl Duration {
 impl fmt::Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}.{:03}s", self.secs(), self.millis())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Duration {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
     }
 }
 
@@ -375,9 +359,8 @@ mod test {
 
     #[test]
     fn test_instant_display() {
-        assert_eq!(format!("{}", Instant::from_millis(74)), "0.074s");
         assert_eq!(format!("{}", Instant::from_millis(5674)), "5.674s");
-        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.000s");
+        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.0s");
     }
 
     #[test]

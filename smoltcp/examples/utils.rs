@@ -4,7 +4,7 @@
 use env_logger::Builder;
 use getopts::{Matches, Options};
 #[cfg(feature = "log")]
-use log::{Level, LevelFilter, trace};
+use log::{trace, Level, LevelFilter};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
@@ -12,6 +12,7 @@ use std::process;
 use std::str::{self, FromStr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use smoltcp::phy::RawSocket;
 #[cfg(feature = "phy-tuntap_interface")]
 use smoltcp::phy::TunTapInterface;
 use smoltcp::phy::{Device, FaultInjector, Medium, Tracer};
@@ -26,7 +27,7 @@ where
     Builder::new()
         .format(move |buf, record| {
             let elapsed = since_startup();
-            let timestamp = format!("[{elapsed}]");
+            let timestamp = format!("[{}]", elapsed);
             if record.target().starts_with("smoltcp::") {
                 writeln!(
                     buf,
@@ -41,7 +42,7 @@ where
                     buf,
                     "\x1b[37m{} {}\x1b[0m",
                     timestamp,
-                    message.replace('\n', "\n             ")
+                    message.replace("\n", "\n             ")
                 )
             } else {
                 writeln!(
@@ -54,8 +55,8 @@ where
             }
         })
         .filter(None, LevelFilter::Trace)
-        .parse_filters(filter)
-        .parse_env("RUST_LOG")
+        .parse(filter)
+        .parse(&env::var("RUST_LOG").unwrap_or_else(|_| "".to_owned()))
         .init();
 }
 
@@ -73,7 +74,7 @@ pub fn create_options() -> (Options, Vec<&'static str>) {
 pub fn parse_options(options: &Options, free: Vec<&str>) -> Matches {
     match options.parse(env::args().skip(1)) {
         Err(err) => {
-            println!("{err}");
+            println!("{}", err);
             process::exit(1)
         }
         Ok(matches) => {
@@ -84,14 +85,18 @@ pub fn parse_options(options: &Options, free: Vec<&str>) -> Matches {
                     free.join(" ")
                 );
                 print!("{}", options.usage(&brief));
-                process::exit((matches.free.len() != free.len()) as _);
+                process::exit(if matches.free.len() != free.len() {
+                    1
+                } else {
+                    0
+                })
             }
             matches
         }
     }
 }
 
-pub fn add_tuntap_options(opts: &mut Options, _free: &mut [&str]) {
+pub fn add_tuntap_options(opts: &mut Options, _free: &mut Vec<&str>) {
     opts.optopt("", "tun", "TUN interface to use", "tun0");
     opts.optopt("", "tap", "TAP interface to use", "tap0");
 }
@@ -107,7 +112,12 @@ pub fn parse_tuntap_options(matches: &mut Matches) -> TunTapInterface {
     }
 }
 
-pub fn add_middleware_options(opts: &mut Options, _free: &mut [&str]) {
+pub fn parse_raw_socket_options(matches: &mut Matches) -> RawSocket {
+    let interface = matches.free.remove(0);
+    RawSocket::new(&interface).unwrap()
+}
+
+pub fn add_middleware_options(opts: &mut Options, _free: &mut Vec<&str>) {
     opts.optopt("", "pcap", "Write a packet capture file", "FILE");
     opts.optopt(
         "",
@@ -155,7 +165,7 @@ pub fn parse_middleware_options<D>(
     loopback: bool,
 ) -> FaultInjector<Tracer<PcapWriter<D, Box<dyn io::Write>>>>
 where
-    D: Device,
+    D: for<'a> Device<'a>,
 {
     let drop_chance = matches
         .opt_str("drop-chance")
@@ -182,10 +192,12 @@ where
         .map(|s| u64::from_str(&s).unwrap())
         .unwrap_or(0);
 
-    let pcap_writer: Box<dyn io::Write> = match matches.opt_str("pcap") {
-        Some(pcap_filename) => Box::new(File::create(pcap_filename).expect("cannot open file")),
-        None => Box::new(io::sink()),
-    };
+    let pcap_writer: Box<dyn io::Write>;
+    if let Some(pcap_filename) = matches.opt_str("pcap") {
+        pcap_writer = Box::new(File::create(pcap_filename).expect("cannot open file"))
+    } else {
+        pcap_writer = Box::new(io::sink())
+    }
 
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

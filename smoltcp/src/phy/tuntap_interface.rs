@@ -4,8 +4,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::vec::Vec;
 
-use crate::phy::{self, Device, DeviceCapabilities, Medium, sys};
+use crate::phy::{self, sys, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
+use crate::Result;
 
 /// A virtual TUN (IP) or TAP (Ethernet) interface.
 #[derive(Debug)]
@@ -28,21 +29,9 @@ impl TunTapInterface {
     /// no special privileges are needed. Otherwise, this requires superuser privileges
     /// or a corresponding capability set on the executable.
     pub fn new(name: &str, medium: Medium) -> io::Result<TunTapInterface> {
-        let lower = sys::TunTapInterfaceDesc::new(name, medium)?;
+        let mut lower = sys::TunTapInterfaceDesc::new(name, medium)?;
+        lower.attach_interface()?;
         let mtu = lower.interface_mtu()?;
-        Ok(TunTapInterface {
-            lower: Rc::new(RefCell::new(lower)),
-            mtu,
-            medium,
-        })
-    }
-
-    /// Attaches to a TUN/TAP interface specified by file descriptor `fd`.
-    ///
-    /// On platforms like Android, a file descriptor to a tun interface is exposed.
-    /// On these platforms, a TunTapInterface cannot be instantiated with a name.
-    pub fn from_fd(fd: RawFd, medium: Medium, mtu: usize) -> io::Result<TunTapInterface> {
-        let lower = sys::TunTapInterfaceDesc::from_fd(fd, mtu)?;
         Ok(TunTapInterface {
             lower: Rc::new(RefCell::new(lower)),
             mtu,
@@ -51,9 +40,9 @@ impl TunTapInterface {
     }
 }
 
-impl Device for TunTapInterface {
-    type RxToken<'a> = RxToken;
-    type TxToken<'a> = TxToken;
+impl<'a> Device<'a> for TunTapInterface {
+    type RxToken = RxToken;
+    type TxToken = TxToken;
 
     fn capabilities(&self) -> DeviceCapabilities {
         DeviceCapabilities {
@@ -63,7 +52,7 @@ impl Device for TunTapInterface {
         }
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut lower = self.lower.borrow_mut();
         let mut buffer = vec![0; self.mtu];
         match lower.recv(&mut buffer[..]) {
@@ -75,12 +64,12 @@ impl Device for TunTapInterface {
                 };
                 Some((rx, tx))
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => None,
             Err(err) => panic!("{}", err),
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
         Some(TxToken {
             lower: self.lower.clone(),
         })
@@ -93,11 +82,11 @@ pub struct RxToken {
 }
 
 impl phy::RxToken for RxToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
     where
-        F: FnOnce(&[u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        f(&self.buffer[..])
+        f(&mut self.buffer[..])
     }
 }
 
@@ -107,20 +96,14 @@ pub struct TxToken {
 }
 
 impl phy::TxToken for TxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
         let mut lower = self.lower.borrow_mut();
         let mut buffer = vec![0; len];
         let result = f(&mut buffer);
-        match lower.send(&buffer[..]) {
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                net_debug!("phy: tx failed due to WouldBlock")
-            }
-            Err(err) => panic!("{}", err),
-        }
+        lower.send(&buffer[..]).unwrap();
         result
     }
 }

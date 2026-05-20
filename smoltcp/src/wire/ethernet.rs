@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
+use crate::{Error, Result};
 
 enum_with_unknown! {
     /// Ethernet protocol type.
@@ -18,13 +18,14 @@ impl fmt::Display for EtherType {
             EtherType::Ipv4 => write!(f, "IPv4"),
             EtherType::Ipv6 => write!(f, "IPv6"),
             EtherType::Arp => write!(f, "ARP"),
-            EtherType::Unknown(id) => write!(f, "0x{id:04x}"),
+            EtherType::Unknown(id) => write!(f, "0x{:04x}", id),
         }
     }
 }
 
 /// A six-octet Ethernet II address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Address(pub [u8; 6]);
 
 impl Address {
@@ -42,7 +43,7 @@ impl Address {
     }
 
     /// Return an Ethernet address as a sequence of octets, in big-endian.
-    pub const fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
@@ -57,24 +58,13 @@ impl Address {
     }
 
     /// Query whether the "multicast" bit in the OUI is set.
-    pub const fn is_multicast(&self) -> bool {
+    pub fn is_multicast(&self) -> bool {
         self.0[0] & 0x01 != 0
     }
 
     /// Query whether the "locally administered" bit in the OUI is set.
-    pub const fn is_local(&self) -> bool {
+    pub fn is_local(&self) -> bool {
         self.0[0] & 0x02 != 0
-    }
-
-    /// Convert the address to an Extended Unique Identifier (EUI-64)
-    pub fn as_eui_64(&self) -> Option<[u8; 8]> {
-        let mut bytes = [0; 8];
-        bytes[0..3].copy_from_slice(&self.0[0..3]);
-        bytes[3] = 0xFF;
-        bytes[4] = 0xFE;
-        bytes[5..8].copy_from_slice(&self.0[3..6]);
-        bytes[0] ^= 1 << 1;
-        Some(bytes)
     }
 }
 
@@ -85,23 +75,6 @@ impl fmt::Display for Address {
             f,
             "{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}",
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-        )
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Address {
-    fn format(&self, fmt: defmt::Formatter) {
-        let bytes = self.0;
-        defmt::write!(
-            fmt,
-            "{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}",
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-            bytes[4],
-            bytes[5]
         )
     }
 }
@@ -127,7 +100,7 @@ pub const HEADER_LEN: usize = field::PAYLOAD.start;
 
 impl<T: AsRef<[u8]>> Frame<T> {
     /// Imbue a raw octet buffer with Ethernet frame structure.
-    pub const fn new_unchecked(buffer: T) -> Frame<T> {
+    pub fn new_unchecked(buffer: T) -> Frame<T> {
         Frame { buffer }
     }
 
@@ -142,10 +115,14 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
+    /// Returns `Err(Error::Truncated)` if the buffer is too short.
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
-        if len < HEADER_LEN { Err(Error) } else { Ok(()) }
+        if len < HEADER_LEN {
+            Err(Error::Truncated)
+        } else {
+            Ok(())
+        }
     }
 
     /// Consumes the frame, returning the underlying buffer.
@@ -154,13 +131,13 @@ impl<T: AsRef<[u8]>> Frame<T> {
     }
 
     /// Return the length of a frame header.
-    pub const fn header_len() -> usize {
+    pub fn header_len() -> usize {
         HEADER_LEN
     }
 
     /// Return the length of a buffer required to hold a packet with the payload
     /// of a given length.
-    pub const fn buffer_len(payload_len: usize) -> usize {
+    pub fn buffer_len(payload_len: usize) -> usize {
         HEADER_LEN + payload_len
     }
 
@@ -253,10 +230,10 @@ impl<T: AsRef<[u8]>> PrettyPrint for Frame<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         let frame = match Frame::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
+            Err(err) => return write!(f, "{}({})", indent, err),
             Ok(frame) => frame,
         };
-        write!(f, "{indent}{frame}")?;
+        write!(f, "{}{}", indent, frame)?;
 
         match frame.ethertype() {
             #[cfg(feature = "proto-ipv4")]
@@ -300,13 +277,12 @@ impl Repr {
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub const fn buffer_len(&self) -> usize {
+    pub fn buffer_len(&self) -> usize {
         HEADER_LEN
     }
 
     /// Emit a high-level representation into an Ethernet II frame.
     pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, frame: &mut Frame<T>) {
-        assert!(frame.buffer.as_ref().len() >= self.buffer_len());
         frame.set_src_addr(self.src_addr);
         frame.set_dst_addr(self.dst_addr);
         frame.set_ethertype(self.ethertype);

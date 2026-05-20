@@ -4,7 +4,6 @@
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/crates/d/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/matrix/smoltcp:matrix.org)](https://matrix.to/#/#smoltcp:matrix.org)
-[![codecov](https://codecov.io/github/smoltcp-rs/smoltcp/branch/master/graph/badge.svg?token=3KbAR9xH1t)](https://codecov.io/github/smoltcp-rs/smoltcp)
 
 _smoltcp_ is a standalone, event-driven TCP/IP stack that is designed for bare-metal,
 real-time systems. Its design goals are simplicity and robustness. Its design anti-goals
@@ -12,7 +11,7 @@ include complicated compile-time computations, such as macro or type tricks, eve
 at cost of performance degradation.
 
 _smoltcp_ does not need heap allocation *at all*, is [extensively documented][docs],
-and compiles on stable Rust 1.91 and later.
+and compiles on stable Rust 1.53 and later.
 
 _smoltcp_ achieves [~Gbps of throughput](#examplesbenchmarkrs) when tested against
 the Linux TCP stack in loopback mode.
@@ -26,9 +25,8 @@ To set expectations right, both implemented and omitted features are listed.
 
 ### Media layer
 
-There are 3 supported mediums.
+The only supported medium is Ethernet.
 
-* Ethernet
   * Regular Ethernet II frames are supported.
   * Unicast, broadcast and multicast packets are supported.
   * ARP packets (including gratuitous requests and replies) are supported.
@@ -36,10 +34,6 @@ There are 3 supported mediums.
   * Cached ARP entries expire after one minute.
   * 802.3 frames and 802.1Q are **not** supported.
   * Jumbo frames are **not** supported.
-* IP
-  * Unicast, broadcast and multicast packets are supported.
-* IEEE 802.15.4
-  * Only support for data frames.
 
 ### IP layer
 
@@ -49,7 +43,7 @@ There are 3 supported mediums.
   * IPv4 time-to-live value is configurable per socket, set to 64 by default.
   * IPv4 default gateway is supported.
   * Routing outgoing IPv4 packets is supported, through a default gateway or a CIDR route table.
-  * IPv4 fragmentation and reassembly is supported.
+  * IPv4 fragmentation is **not** supported.
   * IPv4 options are **not** supported and are silently ignored.
 
 #### IPv6
@@ -60,14 +54,6 @@ There are 3 supported mediums.
   * ICMPv6 parameter problem message is generated in response to an unrecognized IPv6 next header.
   * ICMPv6 parameter problem message is **not** generated in response to an unknown IPv6
     hop-by-hop option.
-
-#### 6LoWPAN
-
-  * Implementation of [RFC6282](https://tools.ietf.org/rfc/rfc6282.txt).
-  * Fragmentation is supported, as defined in [RFC4944](https://tools.ietf.org/rfc/rfc4944.txt).
-  * UDP header compression/decompression is supported.
-  * Extension header compression/decompression is supported.
-  * Uncompressed IPv6 Extension Headers are **not** supported.
 
 ### IP multicast
 
@@ -86,7 +72,7 @@ The IGMPv1 and IGMPv2 protocols are supported, and IPv4 multicast is available.
 The ICMPv4 protocol is supported, and ICMP sockets are available.
 
   * ICMPv4 header checksum is supported.
-  * ICMPv4 echo replies are generated in response to echo requests by default.
+  * ICMPv4 echo replies are generated in response to echo requests.
   * ICMP sockets can listen to ICMPv4 Port Unreachable messages, or any ICMPv4 messages with
     a given IPv4 identifier field.
   * ICMPv4 protocol unreachable messages are **not** passed to higher layers when received.
@@ -94,17 +80,17 @@ The ICMPv4 protocol is supported, and ICMP sockets are available.
 
 #### ICMPv6
 
-The ICMPv6 protocol is supported, and ICMP sockets are available.
+The ICMPv6 protocol is supported, but is **not** available via ICMP sockets.
 
   * ICMPv6 header checksum is supported.
-  * ICMPv6 echo replies are generated in response to echo requests by default.
+  * ICMPv6 echo replies are generated in response to echo requests.
   * ICMPv6 protocol unreachable messages are **not** passed to higher layers when received.
 
 #### NDISC
 
   * Neighbor Advertisement messages are generated in response to Neighbor Solicitations.
-  * Router Advertisement messages are read, but **not** generated.
-  * Router Solicitation messages are generated, but **not** read.
+  * Router Advertisement messages are **not** generated or read.
+  * Router Solicitation messages are **not** generated or read.
   * Redirected Header messages are **not** generated or read.
 
 ### UDP layer
@@ -129,13 +115,13 @@ The TCP protocol is supported over IPv4 and IPv6, and server and client TCP sock
   * Time-wait timeout has a fixed interval of 10 s.
   * User timeout has a configurable interval.
   * Delayed acknowledgements are supported, with configurable delay.
-  * Nagle's algorithm is implemented.
   * Selective acknowledgements are **not** implemented.
   * Silly window syndrome avoidance is **not** implemented.
-  * Congestion control is optional, `CUBIC` and `Reno` are implemented.
+  * Nagle's algorithm is **not** implemented.
+  * Congestion control is **not** implemented.
   * Timestamping is **not** supported.
   * Urgent pointer is **ignored**.
-  * Probing Zero Windows is implemented.
+  * Probing Zero Windows is **not** implemented.
   * Packetization Layer Path MTU Discovery [PLPMTU](https://tools.ietf.org/rfc/rfc4821.txt) is **not** implemented.
 
 ## Installation
@@ -144,7 +130,7 @@ To use the _smoltcp_ library in your project, add the following to `Cargo.toml`:
 
 ```toml
 [dependencies]
-smoltcp = "0.10.0"
+smoltcp = "0.7.5"
 ```
 
 The default configuration assumes a hosted environment, for ease of evaluation.
@@ -152,10 +138,8 @@ You probably want to disable default features and configure them one by one:
 
 ```toml
 [dependencies]
-smoltcp = { version = "0.10.0", default-features = false, features = ["log"] }
+smoltcp = { version = "0.7.5", default-features = false, features = ["log"] }
 ```
-
-## Feature flags
 
 ### Feature `std`
 
@@ -182,14 +166,6 @@ the DEBUG log level.
 
 This feature is enabled by default.
 
-### Feature `defmt`
-
-The `defmt` feature enables logging of events with the [defmt crate][defmt].
-
-[defmt]: https://crates.io/crates/defmt
-
-This feature is disabled by default, and cannot be used at the same time as `log`.
-
 ### Feature `verbose`
 
 The `verbose` feature enables logging of events where the logging itself may incur very high
@@ -205,93 +181,19 @@ Enable `smoltcp::phy::RawSocket` and `smoltcp::phy::TunTapInterface`, respective
 
 These features are enabled by default.
 
-### Features `socket-raw`, `socket-udp`, `socket-tcp`, `socket-icmp`, `socket-dhcpv4`, `socket-dns`
+### Features `socket-raw`, `socket-udp`, and `socket-tcp`
 
-Enable the corresponding socket type.
+Enable `smoltcp::socket::RawSocket`, `smoltcp::socket::UdpSocket`,
+and `smoltcp::socket::TcpSocket`, respectively.
 
 These features are enabled by default.
 
-### Features `proto-ipv4`, `proto-ipv6` and `proto-sixlowpan`
+### Features `proto-ipv4` and `proto-ipv6`
 
-Enable [IPv4], [IPv6] and [6LoWPAN] respectively.
+Enable [IPv4] and [IPv6] respectively.
 
 [IPv4]: https://tools.ietf.org/rfc/rfc791.txt
 [IPv6]: https://tools.ietf.org/rfc/rfc8200.txt
-[6LoWPAN]: https://tools.ietf.org/rfc/rfc6282.txt
-
-## Configuration
-
-_smoltcp_ has some configuration settings that are set at compile time, affecting sizes
-and counts of buffers.
-
-They can be set in two ways:
-
-- Via Cargo features: enable a feature like `<name>-<value>`. `name` must be in lowercase and
-use dashes instead of underscores. For example. `iface-max-addr-count-3`. Only a selection of values
-is available, check `Cargo.toml` for the list.
-- Via environment variables at build time: set the variable named `SMOLTCP_<value>`. For example
-`SMOLTCP_IFACE_MAX_ADDR_COUNT=3 cargo build`. You can also set them in the `[env]` section of `.cargo/config.toml`.
-Any value can be set, unlike with Cargo features.
-
-Environment variables take precedence over Cargo features. If two Cargo features are enabled for the same setting
-with different values, compilation fails.
-
-### `IFACE_MAX_ADDR_COUNT`
-
-Max amount of IP addresses that can be assigned to one interface (counting both IPv4 and IPv6 addresses). Default: 2.
-
-### `IFACE_MAX_MULTICAST_GROUP_COUNT`
-
-Max amount of multicast groups that can be joined by one interface. Default: 4.
-
-### `IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT`
-
-Max amount of 6LoWPAN address contexts that can be assigned to one interface. Default: 4.
-
-### `IFACE_NEIGHBOR_CACHE_COUNT`
-
-Amount of "IP address -> hardware address" entries the neighbor cache (also known as the "ARP cache" or the "ARP table") holds. Default: 4.
-
-### `IFACE_MAX_ROUTE_COUNT`
-
-Max amount of routes that can be added to one interface. Includes the default route. Includes both IPv4 and IPv6. Default: 2.
-
-### `IFACE_MAX_PREFIX_COUNT`
-
-Max amount of IPv6 prefixes that can be added to one interface via SLAAC.
-Should be lower or equal to `IFACE_MAX_ADDR_COUNT`.
-
-### `FRAGMENTATION_BUFFER_SIZE`
-
-Size of the buffer used for fragmenting outgoing packets larger than the MTU. Packets larger than this setting will be dropped instead of fragmented. Default: 1500.
-
-### `ASSEMBLER_MAX_SEGMENT_COUNT`
-
-Maximum number of non-contiguous segments the assembler can hold. Used for both packet reassembly and TCP stream reassembly. Default: 4.
-
-### `REASSEMBLY_BUFFER_SIZE`
-
-Size of the buffer used for reassembling (de-fragmenting) incoming packets. If the reassembled packet is larger than this setting, it will be dropped instead of reassembled. Default: 1500.
-
-### `REASSEMBLY_BUFFER_COUNT`
-
-Number of reassembly buffers, i.e how many different incoming packets can be reassembled at the same time. Default: 1.
-
-### `DNS_MAX_RESULT_COUNT`
-
-Maximum amount of address results for a given DNS query that will be kept. For example, if this is set to 2 and the queried name has 4 `A` records, only the first 2 will be returned. Default: 1.
-
-### `DNS_MAX_SERVER_COUNT`
-
-Maximum amount of DNS servers that can be configured in one DNS socket. Default: 1.
-
-### `DNS_MAX_NAME_SIZE`
-
-Maximum length of DNS names that can be queried. Default: 255.
-
-### IPV6_HBH_MAX_OPTIONS
-
-The maximum amount of parsed options the IPv6 Hop-by-Hop header can hold. Default: 4.
 
 ## Hosted usage examples
 
@@ -299,7 +201,7 @@ _smoltcp_, being a freestanding networking stack, needs to be able to transmit a
 raw frames. For testing purposes, we will use a regular OS, and run _smoltcp_ in
 a userspace process. Only Linux is supported (right now).
 
-On \*nix OSes, transmitting and receiving raw frames normally requires superuser privileges, but
+On \*nix OSes, transmiting and receiving raw frames normally requires superuser privileges, but
 on Linux it is possible to create a _persistent tap interface_ that can be manipulated by
 a specific user:
 
@@ -320,53 +222,6 @@ sudo iptables -t nat -A POSTROUTING -s 192.168.69.0/24 -j MASQUERADE
 sudo sysctl net.ipv4.ip_forward=1
 sudo ip6tables -t nat -A POSTROUTING -s fdaa::/64 -j MASQUERADE
 sudo sysctl -w net.ipv6.conf.all.forwarding=1
-
-# Some distros have a default policy of DROP. This allows the traffic.
-sudo iptables -A FORWARD -i tap0 -s 192.168.69.0/24 -j ACCEPT
-sudo iptables -A FORWARD -o tap0 -d 192.168.69.0/24 -j ACCEPT
-```
-
-### Bridged connection
-
-Instead of the routed connection above, you may also set up a bridged (switched)
-connection. This will make smoltcp speak directly to your LAN, with real ARP, etc.
-It is needed to run the DHCP example.
-
-NOTE: In this case, the examples' IP configuration must match your LAN's!
-
-NOTE: this ONLY works with actual wired Ethernet connections. It
-will NOT work on a WiFi connection.
-
-```sh
-# Replace with your wired Ethernet interface name
-ETH=enp0s20f0u1u1
-
-sudo modprobe bridge
-sudo modprobe br_netfilter
-
-sudo sysctl -w net.bridge.bridge-nf-call-arptables=0
-sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
-sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
-
-sudo ip tuntap add name tap0 mode tap user $USER
-sudo brctl addbr br0
-sudo brctl addif br0 tap0
-sudo brctl addif br0 $ETH
-sudo ip link set tap0 up
-sudo ip link set $ETH up
-sudo ip link set br0 up
-
-# This connects your host system to the internet, so you can use it
-# at the same time you run the examples.
-sudo dhcpcd br0
-```
-
-To tear down:
-
-```
-sudo killall dhcpcd
-sudo ip link set br0 down
-sudo brctl delbr br0
 ```
 
 ### Fault injection
@@ -476,7 +331,7 @@ It responds to:
 
   * pings (`ping 192.168.69.1`);
   * UDP packets on port 6969 (`socat stdio udp4-connect:192.168.69.1:6969 <<<"abcdefg"`),
-    where it will respond with reversed chunks of the input indefinitely;
+    where it will respond "hello" to any incoming packet;
   * TCP connections on port 6969 (`socat stdio tcp4-connect:192.168.69.1:6969`),
     where it will respond "hello" to any incoming connection and immediately close it;
   * TCP connections on port 6970 (`socat stdio tcp4-connect:192.168.69.1:6970 <<<"abcdefg"`),
@@ -518,14 +373,14 @@ cargo run --release --example benchmark -- --tap tap0 [reader|writer]
 It establishes a connection to itself from a different thread and reads or writes a large amount
 of data in one direction.
 
-A typical result (achieved on a Intel Core i5-13500H CPU and a Linux 6.9.9 x86_64 kernel running
-on a LENOVO XiaoXinPro 14 IRH8 laptop) is as follows:
+A typical result (achieved on a Intel Core i7-7500U CPU and a Linux 4.9.65 x86_64 kernel running
+on a Dell XPS 13 9360 laptop) is as follows:
 
 ```
 $ cargo run -q --release --example benchmark -- --tap tap0 reader
-throughput: 3.673 Gbps
+throughput: 2.556 Gbps
 $ cargo run -q --release --example benchmark -- --tap tap0 writer
-throughput: 7.905 Gbps
+throughput: 5.301 Gbps
 ```
 
 ## Bare-metal usage examples
@@ -557,30 +412,6 @@ If the `std` feature is enabled, it will print logs and packet dumps, and fault 
 is possible; otherwise, nothing at all will be displayed and no options are accepted.
 
 [wireshark]: https://wireshark.org
-
-### examples/loopback\_benchmark.rs
-
-_examples/loopback_benchmark.rs_ is another simple throughput benchmark.
-
-Read its [source code](/examples/loopback_benchmark.rs), then run it as:
-
-```sh
-cargo run --release --example loopback_benchmark
-```
-
-It establishes a connection to itself via a loopback interface and transfers a large amount
-of data in one direction.
-
-A typical result (achieved on a Intel Core i5-13500H CPU and a Linux 6.9.9 x86_64 kernel running
-on a LENOVO XiaoXinPro 14 IRH8 laptop) is as follows:
-
-```
-$ cargo run --release --example loopback_benchmark
-done in 0.558 s, bandwidth is 15.395083 Gbps
-```
-
-Note: Although the loopback interface can be used in bare-metal environments,
-this benchmark _does_ rely on `std` to be able to measure the time cost.
 
 ## License
 

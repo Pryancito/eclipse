@@ -1,5 +1,12 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![deny(unsafe_code)]
+#![cfg_attr(
+    all(
+        any(feature = "proto-ipv4", feature = "proto-ipv6"),
+        feature = "medium-ethernet"
+    ),
+    deny(unused)
+)]
 
 //! The _smoltcp_ library is built in a layered structure, with the layers corresponding
 //! to the levels of API abstraction. Only the highest layers would be used by a typical
@@ -40,7 +47,7 @@
 //! Unlike the higher layers, the wire layer APIs will not be used by a typical application.
 //! They however are the bedrock of _smoltcp_, and everything else is built on top of them.
 //!
-//! The wire layer APIs are designed by the principle "make illegal states ir-representable".
+//! The wire layer APIs are designed by the principle "make illegal states irrepresentable".
 //! If a wire layer object can be constructed, then it can also be parsed from or emitted to
 //! a lower level.
 //!
@@ -65,11 +72,11 @@
 //!
 //! # Minimum Supported Rust Version (MSRV)
 //!
-//! This crate is guaranteed to compile on stable Rust 1.91 and up with any valid set of features.
+//! This crate is guaranteed to compile on stable Rust 1.46 and up with any valid set of features.
 //! It *might* compile on older versions but that may change in any new patch release.
 //!
 //! The exception is when using the `defmt` feature, in which case `defmt`'s MSRV applies, which
-//! is higher.
+//! is higher than 1.46.
 //!
 //! [wire]: wire/index.html
 //! [osi]: https://en.wikipedia.org/wiki/OSI_model
@@ -86,19 +93,12 @@ compile_error!("at least one socket needs to be enabled"); */
 #![allow(clippy::identity_op)]
 #![allow(clippy::option_map_unit_fn)]
 #![allow(clippy::unit_arg)]
-#![allow(clippy::new_without_default)]
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 extern crate alloc;
 
-#[cfg(not(any(
-    feature = "proto-ipv4",
-    feature = "proto-ipv6",
-    feature = "proto-sixlowpan"
-)))]
-compile_error!(
-    "You must enable at least one of the following features: proto-ipv4, proto-ipv6, proto-sixlowpan"
-);
+#[cfg(not(any(feature = "proto-ipv4", feature = "proto-ipv6")))]
+compile_error!("You must enable at least one of the following features: proto-ipv4, proto-ipv6");
 
 #[cfg(all(
     feature = "socket",
@@ -107,76 +107,26 @@ compile_error!(
         feature = "socket-udp",
         feature = "socket-tcp",
         feature = "socket-icmp",
-        feature = "socket-dhcpv4",
-        feature = "socket-dns",
     ))
 ))]
-compile_error!(
-    "If you enable the socket feature, you must enable at least one of the following features: socket-raw, socket-udp, socket-tcp, socket-icmp, socket-dhcpv4, socket-dns"
-);
+compile_error!("If you enable the socket feature, you must enable at least one of the following features: socket-raw, socket-udp, socket-tcp, socket-icmp");
 
 #[cfg(all(
     feature = "socket",
-    not(any(
-        feature = "medium-ethernet",
-        feature = "medium-ip",
-        feature = "medium-ieee802154",
-    ))
+    not(any(feature = "medium-ethernet", feature = "medium-ip",))
 ))]
-compile_error!(
-    "If you enable the socket feature, you must enable at least one of the following features: medium-ip, medium-ethernet, medium-ieee802154"
-);
-
-#[cfg(all(
-    feature = "proto-ipv6-slaac",
-    not(any(feature = "medium-ethernet", feature = "medium-ieee802154",))
-))]
-compile_error!(
-    "If you enable the `proto-ipv6-slaac` feature, you must enable at least one of the following features: medium-ethernet, medium-ieee802154"
-);
+compile_error!("If you enable the socket feature, you must enable at least one of the following features: medium-ip, medium-ethernet");
 
 #[cfg(all(feature = "defmt", feature = "log"))]
 compile_error!("You must enable at most one of the following features: defmt, log");
 
+use core::fmt;
+
 #[macro_use]
 mod macros;
 mod parsers;
-mod rand;
 
-#[cfg(test)]
-pub mod config {
-    #![allow(unused)]
-    pub const ASSEMBLER_MAX_SEGMENT_COUNT: usize = 4;
-    pub const DNS_MAX_NAME_SIZE: usize = 255;
-    pub const DNS_MAX_RESULT_COUNT: usize = 1;
-    pub const DNS_MAX_SERVER_COUNT: usize = 1;
-    pub const FRAGMENTATION_BUFFER_SIZE: usize = 4096;
-    pub const IFACE_MAX_ADDR_COUNT: usize = 8;
-    pub const IFACE_MAX_MULTICAST_GROUP_COUNT: usize = 4;
-    pub const IFACE_MAX_ROUTE_COUNT: usize = 4;
-    pub const IFACE_MAX_PREFIX_COUNT: usize = 1;
-    pub const IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT: usize = 4;
-    pub const IFACE_NEIGHBOR_CACHE_COUNT: usize = 3;
-    pub const REASSEMBLY_BUFFER_COUNT: usize = 4;
-    pub const REASSEMBLY_BUFFER_SIZE: usize = 1500;
-    pub const RPL_RELATIONS_BUFFER_COUNT: usize = 16;
-    pub const RPL_PARENTS_BUFFER_COUNT: usize = 8;
-    pub const IPV6_HBH_MAX_OPTIONS: usize = 4;
-}
-
-#[cfg(not(test))]
-pub mod config {
-    #![allow(unused)]
-    include!(concat!(env!("OUT_DIR"), "/config.rs"));
-}
-
-#[cfg(any(
-    feature = "medium-ethernet",
-    feature = "medium-ip",
-    feature = "medium-ieee802154"
-))]
 pub mod iface;
-
 pub mod phy;
 #[cfg(feature = "socket")]
 pub mod socket;
@@ -184,12 +134,63 @@ pub mod storage;
 pub mod time;
 pub mod wire;
 
-#[cfg(all(
-    test,
-    any(
-        feature = "medium-ethernet",
-        feature = "medium-ip",
-        feature = "medium-ieee802154"
-    )
-))]
-mod tests;
+/// The error type for the networking stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    /// An operation cannot proceed because a buffer is empty or full.
+    Exhausted,
+    /// An operation is not permitted in the current state.
+    Illegal,
+    /// An endpoint or address of a remote host could not be translated to a lower level address.
+    /// E.g. there was no an Ethernet address corresponding to an IPv4 address in the ARP cache,
+    /// or a TCP connection attempt was made to an unspecified endpoint.
+    Unaddressable,
+
+    /// The operation is finished.
+    /// E.g. when reading from a TCP socket, there's no more data to read because the remote
+    /// has closed the connection.
+    Finished,
+
+    /// An incoming packet could not be parsed because some of its fields were out of bounds
+    /// of the received data.
+    Truncated,
+    /// An incoming packet had an incorrect checksum and was dropped.
+    Checksum,
+    /// An incoming packet could not be recognized and was dropped.
+    /// E.g. an Ethernet packet with an unknown EtherType.
+    Unrecognized,
+    /// An incoming IP packet has been split into several IP fragments and was dropped,
+    /// since IP reassembly is not supported.
+    Fragmented,
+    /// An incoming packet was recognized but was self-contradictory.
+    /// E.g. a TCP packet with both SYN and FIN flags set.
+    Malformed,
+    /// An incoming packet was recognized but contradicted internal state.
+    /// E.g. a TCP packet addressed to a socket that doesn't exist.
+    Dropped,
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+/// The result type for the networking stack.
+pub type Result<T> = core::result::Result<T, Error>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Error::Exhausted => write!(f, "buffer space exhausted"),
+            Error::Illegal => write!(f, "illegal operation"),
+            Error::Unaddressable => write!(f, "unaddressable destination"),
+            Error::Finished => write!(f, "operation finished"),
+            Error::Truncated => write!(f, "truncated packet"),
+            Error::Checksum => write!(f, "checksum error"),
+            Error::Unrecognized => write!(f, "unrecognized packet"),
+            Error::Fragmented => write!(f, "fragmented packet"),
+            Error::Malformed => write!(f, "malformed packet"),
+            Error::Dropped => write!(f, "dropped by socket"),
+        }
+    }
+}

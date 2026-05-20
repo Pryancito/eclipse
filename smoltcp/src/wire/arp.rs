@@ -1,8 +1,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
-use super::{EthernetAddress, Ipv4Address};
+use crate::{Error, Result};
 
 pub use super::EthernetProtocol as Protocol;
 
@@ -22,7 +21,7 @@ enum_with_unknown! {
 }
 
 /// A read/write wrapper around an Address Resolution Protocol packet buffer.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
@@ -40,25 +39,25 @@ mod field {
     pub const OPER: Field = 6..8;
 
     #[inline]
-    pub const fn SHA(hardware_len: u8, _protocol_len: u8) -> Field {
+    pub fn SHA(hardware_len: u8, _protocol_len: u8) -> Field {
         let start = OPER.end;
         start..(start + hardware_len as usize)
     }
 
     #[inline]
-    pub const fn SPA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub fn SPA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = SHA(hardware_len, protocol_len).end;
         start..(start + protocol_len as usize)
     }
 
     #[inline]
-    pub const fn THA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub fn THA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = SPA(hardware_len, protocol_len).end;
         start..(start + hardware_len as usize)
     }
 
     #[inline]
-    pub const fn TPA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub fn TPA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = THA(hardware_len, protocol_len).end;
         start..(start + protocol_len as usize)
     }
@@ -66,7 +65,7 @@ mod field {
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with ARP packet structure.
-    pub const fn new_unchecked(buffer: T) -> Packet<T> {
+    pub fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -81,7 +80,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
+    /// Returns `Err(Error::Truncated)` if the buffer is too short.
     ///
     /// The result of this check is invalidated by calling [set_hardware_len] or
     /// [set_protocol_len].
@@ -92,9 +91,9 @@ impl<T: AsRef<[u8]>> Packet<T> {
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::OPER.end {
-            Err(Error)
+            Err(Error::Truncated)
         } else if len < field::TPA(self.hardware_len(), self.protocol_len()).end {
-            Err(Error)
+            Err(Error::Truncated)
         } else {
             Ok(())
         }
@@ -251,6 +250,8 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
     }
 }
 
+use crate::wire::{EthernetAddress, Ipv4Address};
+
 /// A high-level representation of an Address Resolution Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -268,10 +269,8 @@ pub enum Repr {
 
 impl Repr {
     /// Parse an Address Resolution Protocol packet and return a high-level representation,
-    /// or return `Err(Error)` if the packet is not recognized.
+    /// or return `Err(Error::Unrecognized)` if the packet is not recognized.
     pub fn parse<T: AsRef<[u8]>>(packet: &Packet<T>) -> Result<Repr> {
-        packet.check_len()?;
-
         match (
             packet.hardware_type(),
             packet.protocol_type(),
@@ -281,20 +280,16 @@ impl Repr {
             (Hardware::Ethernet, Protocol::Ipv4, 6, 4) => Ok(Repr::EthernetIpv4 {
                 operation: packet.operation(),
                 source_hardware_addr: EthernetAddress::from_bytes(packet.source_hardware_addr()),
-                source_protocol_addr: Ipv4Address::from_octets(
-                    packet.source_protocol_addr().try_into().unwrap(),
-                ),
+                source_protocol_addr: Ipv4Address::from_bytes(packet.source_protocol_addr()),
                 target_hardware_addr: EthernetAddress::from_bytes(packet.target_hardware_addr()),
-                target_protocol_addr: Ipv4Address::from_octets(
-                    packet.target_protocol_addr().try_into().unwrap(),
-                ),
+                target_protocol_addr: Ipv4Address::from_bytes(packet.target_protocol_addr()),
             }),
-            _ => Err(Error),
+            _ => Err(Error::Unrecognized),
         }
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub const fn buffer_len(&self) -> usize {
+    pub fn buffer_len(&self) -> usize {
         match *self {
             Repr::EthernetIpv4 { .. } => field::TPA(6, 4).end,
         }
@@ -316,9 +311,9 @@ impl Repr {
                 packet.set_protocol_len(4);
                 packet.set_operation(operation);
                 packet.set_source_hardware_addr(source_hardware_addr.as_bytes());
-                packet.set_source_protocol_addr(&source_protocol_addr.octets());
+                packet.set_source_protocol_addr(source_protocol_addr.as_bytes());
                 packet.set_target_hardware_addr(target_hardware_addr.as_bytes());
-                packet.set_target_protocol_addr(&target_protocol_addr.octets());
+                packet.set_target_protocol_addr(target_protocol_addr.as_bytes());
             }
         }
     }
@@ -327,7 +322,7 @@ impl Repr {
 impl<T: AsRef<[u8]>> fmt::Display for Packet<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match Repr::parse(self) {
-            Ok(repr) => write!(f, "{repr}"),
+            Ok(repr) => write!(f, "{}", repr),
             _ => {
                 write!(f, "ARP (unrecognized)")?;
                 write!(
@@ -365,7 +360,12 @@ impl fmt::Display for Repr {
             } => {
                 write!(
                     f,
-                    "ARP type=Ethernet+IPv4 src={source_hardware_addr}/{source_protocol_addr} tgt={target_hardware_addr}/{target_protocol_addr} op={operation:?}"
+                    "ARP type=Ethernet+IPv4 src={}/{} tgt={}/{} op={:?}",
+                    source_hardware_addr,
+                    source_protocol_addr,
+                    target_hardware_addr,
+                    target_protocol_addr,
+                    operation
                 )
             }
         }
@@ -381,8 +381,8 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         match Packet::new_checked(buffer) {
-            Err(err) => write!(f, "{indent}({err})"),
-            Ok(packet) => write!(f, "{indent}{packet}"),
+            Err(err) => write!(f, "{}({})", indent, err),
+            Ok(packet) => write!(f, "{}{}", indent, packet),
         }
     }
 }
@@ -429,7 +429,7 @@ mod test {
         packet.set_source_protocol_addr(&[0x21, 0x22, 0x23, 0x24]);
         packet.set_target_hardware_addr(&[0x31, 0x32, 0x33, 0x34, 0x35, 0x36]);
         packet.set_target_protocol_addr(&[0x41, 0x42, 0x43, 0x44]);
-        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
     }
 
     fn packet_repr() -> Repr {
@@ -438,11 +438,11 @@ mod test {
             source_hardware_addr: EthernetAddress::from_bytes(&[
                 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
             ]),
-            source_protocol_addr: Ipv4Address::from_octets([0x21, 0x22, 0x23, 0x24]),
+            source_protocol_addr: Ipv4Address::from_bytes(&[0x21, 0x22, 0x23, 0x24]),
             target_hardware_addr: EthernetAddress::from_bytes(&[
                 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
             ]),
-            target_protocol_addr: Ipv4Address::from_octets([0x41, 0x42, 0x43, 0x44]),
+            target_protocol_addr: Ipv4Address::from_bytes(&[0x41, 0x42, 0x43, 0x44]),
         }
     }
 
@@ -458,6 +458,6 @@ mod test {
         let mut bytes = vec![0xa5; 28];
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet_repr().emit(&mut packet);
-        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
     }
 }

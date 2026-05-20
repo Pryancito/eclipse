@@ -1,19 +1,13 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::{cmp, fmt};
 
-use super::{Error, Result};
 use crate::phy::ChecksumCapabilities;
-use crate::wire::MldRepr;
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use crate::wire::NdiscRepr;
-#[cfg(feature = "proto-rpl")]
-use crate::wire::RplRepr;
 use crate::wire::ip::checksum;
-use crate::wire::{IPV6_HEADER_LEN, IPV6_MIN_MTU};
-use crate::wire::{IpProtocol, Ipv6Address, Ipv6Packet, Ipv6Repr};
-
-/// Error packets must not exceed min MTU
-const MAX_ERROR_PACKET_LEN: usize = IPV6_MIN_MTU - IPV6_HEADER_LEN;
+use crate::wire::MldRepr;
+#[cfg(feature = "medium-ethernet")]
+use crate::wire::NdiscRepr;
+use crate::wire::{IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr};
+use crate::{Error, Result};
 
 enum_with_unknown! {
     /// Internet protocol control message type.
@@ -43,9 +37,7 @@ enum_with_unknown! {
         /// Redirect
         Redirect        = 0x89,
         /// Multicast Listener Report
-        MldReport       = 0x8f,
-        /// RPL Control Message
-        RplControl      = 0x9b,
+        MldReport       = 0x8f
     }
 }
 
@@ -63,7 +55,7 @@ impl Message {
     /// is an [NDISC] message type.
     ///
     /// [NDISC]: https://tools.ietf.org/html/rfc4861
-    pub const fn is_ndisc(&self) -> bool {
+    pub fn is_ndisc(&self) -> bool {
         match *self {
             Message::RouterSolicit
             | Message::RouterAdvert
@@ -78,7 +70,7 @@ impl Message {
     /// is an [MLD] message type.
     ///
     /// [MLD]: https://tools.ietf.org/html/rfc3810
-    pub const fn is_mld(&self) -> bool {
+    pub fn is_mld(&self) -> bool {
         match *self {
             Message::MldQuery | Message::MldReport => true,
             _ => false,
@@ -102,8 +94,7 @@ impl fmt::Display for Message {
             Message::Redirect => write!(f, "redirect"),
             Message::MldQuery => write!(f, "multicast listener query"),
             Message::MldReport => write!(f, "multicast listener report"),
-            Message::RplControl => write!(f, "RPL control message"),
-            Message::Unknown(id) => write!(f, "{id}"),
+            Message::Unknown(id) => write!(f, "{}", id),
         }
     }
 }
@@ -143,7 +134,7 @@ impl fmt::Display for DstUnreachable {
                 write!(f, "source address failed ingress/egress policy")
             }
             DstUnreachable::RejectRoute => write!(f, "reject route to destination"),
-            DstUnreachable::Unknown(id) => write!(f, "{id}"),
+            DstUnreachable::Unknown(id) => write!(f, "{}", id),
         }
     }
 }
@@ -166,7 +157,7 @@ impl fmt::Display for ParamProblem {
             ParamProblem::ErroneousHdrField => write!(f, "erroneous header field."),
             ParamProblem::UnrecognizedNxtHdr => write!(f, "unrecognized next header type."),
             ParamProblem::UnrecognizedOption => write!(f, "unrecognized IPv6 option."),
-            ParamProblem::Unknown(id) => write!(f, "{id}"),
+            ParamProblem::Unknown(id) => write!(f, "{}", id),
         }
     }
 }
@@ -186,13 +177,13 @@ impl fmt::Display for TimeExceeded {
         match *self {
             TimeExceeded::HopLimitExceeded => write!(f, "hop limit exceeded in transit"),
             TimeExceeded::FragReassemExceeded => write!(f, "fragment reassembly time exceeded"),
-            TimeExceeded::Unknown(id) => write!(f, "{id}"),
+            TimeExceeded::Unknown(id) => write!(f, "{}", id),
         }
     }
 }
 
 /// A read/write wrapper around an Internet Control Message Protocol version 6 packet buffer.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     pub(super) buffer: T,
@@ -256,7 +247,7 @@ pub(super) mod field {
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with ICMPv6 packet structure.
-    pub const fn new_unchecked(buffer: T) -> Packet<T> {
+    pub fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -271,71 +262,14 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
+    /// Returns `Err(Error::Truncated)` if the buffer is too short.
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
-
-        if len < 4 {
-            return Err(Error);
+        if len < field::HEADER_END || len < self.header_len() {
+            Err(Error::Truncated)
+        } else {
+            Ok(())
         }
-
-        match self.msg_type() {
-            Message::DstUnreachable
-            | Message::PktTooBig
-            | Message::TimeExceeded
-            | Message::ParamProblem
-            | Message::EchoRequest
-            | Message::EchoReply
-            | Message::MldQuery
-            | Message::RouterSolicit
-            | Message::RouterAdvert
-            | Message::NeighborSolicit
-            | Message::NeighborAdvert
-            | Message::Redirect
-            | Message::MldReport => {
-                if len < field::HEADER_END || len < self.header_len() {
-                    return Err(Error);
-                }
-            }
-            #[cfg(feature = "proto-rpl")]
-            Message::RplControl => match super::rpl::RplControlMessage::from(self.msg_code()) {
-                super::rpl::RplControlMessage::DodagInformationSolicitation => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 6 {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DodagInformationObject => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 28 {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DestinationAdvertisementObject => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DestinationAdvertisementObjectAck => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::SecureDodagInformationSolicitation
-                | super::rpl::RplControlMessage::SecureDodagInformationObject
-                | super::rpl::RplControlMessage::SecureDestinationAdvertisementObject
-                | super::rpl::RplControlMessage::SecureDestinationAdvertisementObjectAck
-                | super::rpl::RplControlMessage::ConsistencyCheck => return Err(Error),
-                super::rpl::RplControlMessage::Unknown(_) => return Err(Error),
-            },
-            #[cfg(not(feature = "proto-rpl"))]
-            Message::RplControl => return Err(Error),
-            Message::Unknown(_) => return Err(Error),
-        }
-
-        Ok(())
     }
 
     /// Consume the packet, returning the underlying buffer.
@@ -421,14 +355,14 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// # Fuzzing
     /// This function always returns `true` when fuzzing.
-    pub fn verify_checksum(&self, src_addr: &Ipv6Address, dst_addr: &Ipv6Address) -> bool {
+    pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
         if cfg!(fuzzing) {
             return true;
         }
 
         let data = self.buffer.as_ref();
         checksum::combine(&[
-            checksum::pseudo_header_v6(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
+            checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
             checksum::data(data),
         ]) == !0
     }
@@ -484,7 +418,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
                 let data = self.buffer.as_mut();
                 NetworkEndian::write_u16(&mut data[field::RECORD_RESV], 0);
             }
-            ty => panic!("Message type `{ty}` does not have any reserved fields."),
+            ty => panic!("Message type `{}` does not have any reserved fields.", ty),
         }
     }
 
@@ -535,17 +469,12 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     }
 
     /// Compute and fill in the header checksum.
-    pub fn fill_checksum(&mut self, src_addr: &Ipv6Address, dst_addr: &Ipv6Address) {
+    pub fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
         self.set_checksum(0);
         let checksum = {
             let data = self.buffer.as_ref();
             !checksum::combine(&[
-                checksum::pseudo_header_v6(
-                    src_addr,
-                    dst_addr,
-                    IpProtocol::Icmpv6,
-                    data.len() as u32,
-                ),
+                checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
                 checksum::data(data),
             ])
         };
@@ -603,53 +532,45 @@ pub enum Repr<'a> {
         seq_no: u16,
         data: &'a [u8],
     },
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    #[cfg(feature = "medium-ethernet")]
     Ndisc(NdiscRepr<'a>),
     Mld(MldRepr<'a>),
-    #[cfg(feature = "proto-rpl")]
-    Rpl(RplRepr<'a>),
 }
 
 impl<'a> Repr<'a> {
     /// Parse an Internet Control Message Protocol version 6 packet and return
     /// a high-level representation.
     pub fn parse<T>(
-        src_addr: &Ipv6Address,
-        dst_addr: &Ipv6Address,
+        src_addr: &IpAddress,
+        dst_addr: &IpAddress,
         packet: &Packet<&'a T>,
         checksum_caps: &ChecksumCapabilities,
     ) -> Result<Repr<'a>>
     where
         T: AsRef<[u8]> + ?Sized,
     {
-        packet.check_len()?;
-
         fn create_packet_from_payload<'a, T>(packet: &Packet<&'a T>) -> Result<(&'a [u8], Ipv6Repr)>
         where
             T: AsRef<[u8]> + ?Sized,
         {
-            // The packet must be truncated to fit the min MTU. Since we don't know the offset of
-            // the ICMPv6 header in the L2 frame, we should only check whether the payload's IPv6
-            // header is present, the rest is allowed to be truncated.
-            let ip_packet = if packet.payload().len() >= IPV6_HEADER_LEN {
-                Ipv6Packet::new_unchecked(packet.payload())
-            } else {
-                return Err(Error);
-            };
+            let ip_packet = Ipv6Packet::new_checked(packet.payload())?;
 
-            let payload = &packet.payload()[ip_packet.header_len()..];
+            let payload = &packet.payload()[ip_packet.header_len() as usize..];
+            if payload.len() < 8 {
+                return Err(Error::Truncated);
+            }
             let repr = Ipv6Repr {
                 src_addr: ip_packet.src_addr(),
                 dst_addr: ip_packet.dst_addr(),
                 next_header: ip_packet.next_header(),
-                payload_len: ip_packet.payload_len().into(),
+                payload_len: payload.len(),
                 hop_limit: ip_packet.hop_limit(),
             };
             Ok((payload, repr))
         }
         // Valid checksum is expected.
         if checksum_caps.icmpv6.rx() && !packet.verify_checksum(src_addr, dst_addr) {
-            return Err(Error);
+            return Err(Error::Checksum);
         }
 
         match (packet.msg_type(), packet.msg_code()) {
@@ -696,12 +617,10 @@ impl<'a> Repr<'a> {
                 seq_no: packet.echo_seq_no(),
                 data: packet.payload(),
             }),
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            #[cfg(feature = "medium-ethernet")]
             (msg_type, 0) if msg_type.is_ndisc() => NdiscRepr::parse(packet).map(Repr::Ndisc),
             (msg_type, 0) if msg_type.is_mld() => MldRepr::parse(packet).map(Repr::Mld),
-            #[cfg(feature = "proto-rpl")]
-            (Message::RplControl, _) => RplRepr::parse(packet).map(Repr::Rpl),
-            _ => Err(Error),
+            _ => Err(Error::Unrecognized),
         }
     }
 
@@ -711,18 +630,15 @@ impl<'a> Repr<'a> {
             &Repr::DstUnreachable { header, data, .. }
             | &Repr::PktTooBig { header, data, .. }
             | &Repr::TimeExceeded { header, data, .. }
-            | &Repr::ParamProblem { header, data, .. } => cmp::min(
-                field::UNUSED.end + header.buffer_len() + data.len(),
-                MAX_ERROR_PACKET_LEN,
-            ),
+            | &Repr::ParamProblem { header, data, .. } => {
+                field::UNUSED.end + header.buffer_len() + data.len()
+            }
             &Repr::EchoRequest { data, .. } | &Repr::EchoReply { data, .. } => {
                 field::ECHO_SEQNO.end + data.len()
             }
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            #[cfg(feature = "medium-ethernet")]
             &Repr::Ndisc(ndisc) => ndisc.buffer_len(),
             &Repr::Mld(mld) => mld.buffer_len(),
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(rpl) => rpl.buffer_len(),
         }
     }
 
@@ -730,28 +646,18 @@ impl<'a> Repr<'a> {
     /// packet.
     pub fn emit<T>(
         &self,
-        src_addr: &Ipv6Address,
-        dst_addr: &Ipv6Address,
+        src_addr: &IpAddress,
+        dst_addr: &IpAddress,
         packet: &mut Packet<&mut T>,
         checksum_caps: &ChecksumCapabilities,
     ) where
         T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
     {
-        fn emit_contained_packet<T>(packet: &mut Packet<&mut T>, header: Ipv6Repr, data: &[u8])
-        where
-            T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
-        {
-            let icmp_header_len = packet.header_len();
-            let mut ip_packet = Ipv6Packet::new_unchecked(packet.payload_mut());
+        fn emit_contained_packet(buffer: &mut [u8], header: Ipv6Repr, data: &[u8]) {
+            let mut ip_packet = Ipv6Packet::new_unchecked(buffer);
             header.emit(&mut ip_packet);
             let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
-            // FIXME: this should rather be checked at link level, as we can't know in advance how
-            // much space we have for the packet due to IPv6 options and etc
-            let payload_len = cmp::min(
-                data.len(),
-                MAX_ERROR_PACKET_LEN - icmp_header_len - IPV6_HEADER_LEN,
-            );
-            payload[..payload_len].copy_from_slice(&data[..payload_len]);
+            payload.copy_from_slice(data);
         }
 
         match *self {
@@ -763,7 +669,7 @@ impl<'a> Repr<'a> {
                 packet.set_msg_type(Message::DstUnreachable);
                 packet.set_msg_code(reason.into());
 
-                emit_contained_packet(packet, header, data);
+                emit_contained_packet(packet.payload_mut(), header, data);
             }
 
             Repr::PktTooBig { mtu, header, data } => {
@@ -771,7 +677,7 @@ impl<'a> Repr<'a> {
                 packet.set_msg_code(0);
                 packet.set_pkt_too_big_mtu(mtu);
 
-                emit_contained_packet(packet, header, data);
+                emit_contained_packet(packet.payload_mut(), header, data);
             }
 
             Repr::TimeExceeded {
@@ -782,7 +688,7 @@ impl<'a> Repr<'a> {
                 packet.set_msg_type(Message::TimeExceeded);
                 packet.set_msg_code(reason.into());
 
-                emit_contained_packet(packet, header, data);
+                emit_contained_packet(packet.payload_mut(), header, data);
             }
 
             Repr::ParamProblem {
@@ -795,7 +701,7 @@ impl<'a> Repr<'a> {
                 packet.set_msg_code(reason.into());
                 packet.set_param_problem_ptr(pointer);
 
-                emit_contained_packet(packet, header, data);
+                emit_contained_packet(packet.payload_mut(), header, data);
             }
 
             Repr::EchoRequest {
@@ -824,13 +730,10 @@ impl<'a> Repr<'a> {
                 packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
             }
 
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            #[cfg(feature = "medium-ethernet")]
             Repr::Ndisc(ndisc) => ndisc.emit(packet),
 
             Repr::Mld(mld) => mld.emit(packet),
-
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(ref rpl) => rpl.emit(packet),
         }
 
         if checksum_caps.icmpv6.tx() {
@@ -845,10 +748,8 @@ impl<'a> Repr<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::wire::ip::test::{MOCK_IP_ADDR_1, MOCK_IP_ADDR_2};
     use crate::wire::{IpProtocol, Ipv6Address, Ipv6Repr};
-
-    const MOCK_IP_ADDR_1: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    const MOCK_IP_ADDR_2: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
 
     static ECHO_PACKET_BYTES: [u8; 12] = [
         0x80, 0x00, 0x19, 0xb3, 0x12, 0x34, 0xab, 0xcd, 0xaa, 0x00, 0x00, 0xff,
@@ -886,8 +787,14 @@ mod test {
         Repr::PktTooBig {
             mtu: 1500,
             header: Ipv6Repr {
-                src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
-                dst_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+                src_addr: Ipv6Address([
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x01,
+                ]),
+                dst_addr: Ipv6Address([
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x02,
+                ]),
                 next_header: IpProtocol::Udp,
                 payload_len: 12,
                 hop_limit: 0x40,
@@ -921,7 +828,7 @@ mod test {
             .payload_mut()
             .copy_from_slice(&ECHO_PACKET_PAYLOAD[..]);
         packet.fill_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2);
-        assert_eq!(&*packet.into_inner(), &ECHO_PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &ECHO_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -948,7 +855,7 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&*packet.into_inner(), &ECHO_PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &ECHO_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -974,7 +881,7 @@ mod test {
             .payload_mut()
             .copy_from_slice(&PKT_TOO_BIG_IP_PAYLOAD[..]);
         packet.fill_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2);
-        assert_eq!(&*packet.into_inner(), &PKT_TOO_BIG_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &PKT_TOO_BIG_BYTES[..]);
     }
 
     #[test]
@@ -1001,90 +908,6 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&*packet.into_inner(), &PKT_TOO_BIG_BYTES[..]);
-    }
-
-    #[test]
-    fn test_buffer_length_is_truncated_to_mtu() {
-        let repr = Repr::PktTooBig {
-            mtu: 1280,
-            header: Ipv6Repr {
-                src_addr: Ipv6Address::UNSPECIFIED,
-                dst_addr: Ipv6Address::UNSPECIFIED,
-                next_header: IpProtocol::Tcp,
-                hop_limit: 64,
-                payload_len: 1280,
-            },
-            data: &vec![0; 9999],
-        };
-        assert_eq!(repr.buffer_len(), 1280 - IPV6_HEADER_LEN);
-    }
-
-    #[test]
-    fn test_mtu_truncated_payload_roundtrip() {
-        let ip_packet_repr = Ipv6Repr {
-            src_addr: Ipv6Address::UNSPECIFIED,
-            dst_addr: Ipv6Address::UNSPECIFIED,
-            next_header: IpProtocol::Tcp,
-            hop_limit: 64,
-            payload_len: IPV6_MIN_MTU - IPV6_HEADER_LEN,
-        };
-        let mut ip_packet = Ipv6Packet::new_unchecked(vec![0; IPV6_MIN_MTU]);
-        ip_packet_repr.emit(&mut ip_packet);
-
-        let repr1 = Repr::PktTooBig {
-            mtu: IPV6_MIN_MTU as u32,
-            header: ip_packet_repr,
-            data: &ip_packet.as_ref()[IPV6_HEADER_LEN..],
-        };
-        // this is needed to make sure roundtrip gives the same value
-        // it is not needed for ensuring the correct bytes get emitted
-        let repr1 = Repr::PktTooBig {
-            mtu: IPV6_MIN_MTU as u32,
-            header: ip_packet_repr,
-            data: &ip_packet.as_ref()[IPV6_HEADER_LEN..repr1.buffer_len() - field::UNUSED.end],
-        };
-        let mut data = vec![0; MAX_ERROR_PACKET_LEN];
-        let mut packet = Packet::new_unchecked(&mut data);
-        repr1.emit(
-            &MOCK_IP_ADDR_1,
-            &MOCK_IP_ADDR_2,
-            &mut packet,
-            &ChecksumCapabilities::default(),
-        );
-
-        let packet = Packet::new_unchecked(&data);
-        let repr2 = Repr::parse(
-            &MOCK_IP_ADDR_1,
-            &MOCK_IP_ADDR_2,
-            &packet,
-            &ChecksumCapabilities::default(),
-        )
-        .unwrap();
-
-        assert_eq!(repr1, repr2);
-    }
-
-    #[test]
-    fn test_truncated_payload_ipv6_header_parse_fails() {
-        let repr = too_big_packet_repr();
-        let mut bytes = vec![0xa5; repr.buffer_len()];
-        let mut packet = Packet::new_unchecked(&mut bytes);
-        repr.emit(
-            &MOCK_IP_ADDR_1,
-            &MOCK_IP_ADDR_2,
-            &mut packet,
-            &ChecksumCapabilities::default(),
-        );
-        let packet = Packet::new_unchecked(&bytes[..field::HEADER_END + IPV6_HEADER_LEN - 1]);
-        assert!(
-            Repr::parse(
-                &MOCK_IP_ADDR_1,
-                &MOCK_IP_ADDR_2,
-                &packet,
-                &ChecksumCapabilities::ignored(),
-            )
-            .is_err()
-        );
+        assert_eq!(&packet.into_inner()[..], &PKT_TOO_BIG_BYTES[..]);
     }
 }

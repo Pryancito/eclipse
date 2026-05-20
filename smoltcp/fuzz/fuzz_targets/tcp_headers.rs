@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use smoltcp::iface::{InterfaceBuilder, NeighborCache};
 use smoltcp::phy::{Loopback, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Packet, Ipv6Packet, TcpPacket};
@@ -13,20 +13,22 @@ mod utils;
 
 mod mock {
     use smoltcp::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    // should be AtomicU64 but that's unstable
     #[derive(Debug, Clone)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    pub struct Clock(Arc<AtomicU64>);
+    pub struct Clock(Arc<AtomicUsize>);
 
     impl Clock {
         pub fn new() -> Clock {
-            Clock(Arc::new(AtomicU64::new(0)))
+            Clock(Arc::new(AtomicUsize::new(0)))
         }
 
         pub fn advance(&self, duration: Duration) {
-            self.0.fetch_add(duration.total_millis(), Ordering::SeqCst);
+            self.0
+                .fetch_add(duration.total_millis() as usize, Ordering::SeqCst);
         }
 
         pub fn elapsed(&self) -> Instant {
@@ -130,11 +132,11 @@ fuzz_target!(|data: &[u8]| {
     let neighbor_cache = NeighborCache::new(&mut neighbor_cache_entries[..]);
 
     let ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
-    let mut iface = InterfaceBuilder::new()
+    let mut iface = InterfaceBuilder::new(device)
         .ethernet_addr(EthernetAddress::default())
         .neighbor_cache(neighbor_cache)
         .ip_addrs(ip_addrs)
-        .finalize(&mut device);
+        .finalize();
 
     let server_socket = {
         // It is not strictly necessary to use a `static mut` and unsafe code here, but
@@ -143,17 +145,17 @@ fuzz_target!(|data: &[u8]| {
         // when stack overflows.
         static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
         static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
+        let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 
     let client_socket = {
         static mut TCP_CLIENT_RX_DATA: [u8; 1024] = [0; 1024];
         static mut TCP_CLIENT_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
-        let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
+        let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
+        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
     };
 
     let mut socket_set_entries: [_; 2] = Default::default();
@@ -168,7 +170,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = iface.poll(&mut socket_set, clock.elapsed());
 
         {
-            let mut socket = socket_set.get::<tcp::Socket>(server_handle);
+            let mut socket = socket_set.get::<TcpSocket>(server_handle);
             if !socket.is_active() && !socket.is_listening() {
                 if !did_listen {
                     socket.listen(1234).unwrap();
@@ -183,7 +185,7 @@ fuzz_target!(|data: &[u8]| {
         }
 
         {
-            let mut socket = socket_set.get::<tcp::Socket>(client_handle);
+            let mut socket = socket_set.get::<TcpSocket>(client_handle);
             if !socket.is_open() {
                 if !did_connect {
                     socket

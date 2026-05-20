@@ -1,9 +1,9 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
 use crate::time::Duration;
 use crate::wire::ip::checksum;
+use crate::{Error, Result};
 
 use crate::wire::Ipv4Address;
 
@@ -44,7 +44,7 @@ impl fmt::Display for Message {
             Message::MembershipReportV2 => write!(f, "version 2 membership report"),
             Message::LeaveGroup => write!(f, "leave group"),
             Message::MembershipReportV1 => write!(f, "version 1 membership report"),
-            Message::Unknown(id) => write!(f, "{id}"),
+            Message::Unknown(id) => write!(f, "{}", id),
         }
     }
 }
@@ -54,7 +54,7 @@ impl fmt::Display for Message {
 /// [RFC 2236]: https://tools.ietf.org/html/rfc2236
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with IGMPv2 packet structure.
-    pub const fn new_unchecked(buffer: T) -> Packet<T> {
+    pub fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -69,11 +69,11 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
+    /// Returns `Err(Error::Truncated)` if the buffer is too short.
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
-        if len < field::GROUP_ADDRESS.end {
-            Err(Error)
+        if len < field::GROUP_ADDRESS.end as usize {
+            Err(Error::Truncated)
         } else {
             Ok(())
         }
@@ -112,7 +112,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     #[inline]
     pub fn group_addr(&self) -> Ipv4Address {
         let data = self.buffer.as_ref();
-        Ipv4Address::from_octets(data[field::GROUP_ADDRESS].try_into().unwrap())
+        Ipv4Address::from_bytes(&data[field::GROUP_ADDRESS])
     }
 
     /// Validate the header checksum.
@@ -156,7 +156,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     #[inline]
     pub fn set_group_address(&mut self, addr: Ipv4Address) {
         let data = self.buffer.as_mut();
-        data[field::GROUP_ADDRESS].copy_from_slice(&addr.octets());
+        data[field::GROUP_ADDRESS].copy_from_slice(addr.as_bytes());
     }
 
     /// Compute and fill in the header checksum.
@@ -205,12 +205,10 @@ impl Repr {
     where
         T: AsRef<[u8]> + ?Sized,
     {
-        packet.check_len()?;
-
         // Check if the address is 0.0.0.0 or multicast
         let addr = packet.group_addr();
         if !addr.is_unspecified() && !addr.is_multicast() {
-            return Err(Error);
+            return Err(Error::Malformed);
         }
 
         // construct a packet based on the Type field
@@ -243,12 +241,12 @@ impl Repr {
                     version: IgmpVersion::Version1,
                 })
             }
-            _ => Err(Error),
+            _ => Err(Error::Unrecognized),
         }
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub const fn buffer_len(&self) -> usize {
+    pub fn buffer_len(&self) -> usize {
         // always 8 bytes
         field::GROUP_ADDRESS.end
     }
@@ -306,7 +304,7 @@ fn max_resp_code_to_duration(value: u8) -> Duration {
     Duration::from_millis(decisecs * 100)
 }
 
-const fn duration_to_max_resp_code(duration: Duration) -> u8 {
+fn duration_to_max_resp_code(duration: Duration) -> u8 {
     let decisecs = duration.total_millis() / 100;
     if decisecs < 128 {
         decisecs as u8
@@ -323,35 +321,41 @@ const fn duration_to_max_resp_code(duration: Duration) -> u8 {
     }
 }
 
-impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
+impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match Repr::parse(self) {
-            Ok(repr) => write!(f, "{repr}"),
-            Err(err) => write!(f, "IGMP ({err})"),
+            Ok(repr) => write!(f, "{}", repr),
+            Err(err) => write!(f, "IGMP ({})", err),
         }
     }
 }
 
-impl fmt::Display for Repr {
+impl<'a> fmt::Display for Repr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Repr::MembershipQuery {
                 max_resp_time,
                 group_addr,
                 version,
-            } => write!(
-                f,
-                "IGMP membership query max_resp_time={max_resp_time} group_addr={group_addr} version={version:?}"
-            ),
+            } => {
+                write!(
+                    f,
+                    "IGMP membership query max_resp_time={} group_addr={} version={:?}",
+                    max_resp_time, group_addr, version
+                )
+            }
             Repr::MembershipReport {
                 group_addr,
                 version,
-            } => write!(
-                f,
-                "IGMP membership report group_addr={group_addr} version={version:?}"
-            ),
+            } => {
+                write!(
+                    f,
+                    "IGMP membership report group_addr={} version={:?}",
+                    group_addr, version
+                )
+            }
             Repr::LeaveGroup { group_addr } => {
-                write!(f, "IGMP leave group group_addr={group_addr})")
+                write!(f, "IGMP leave group group_addr={})", group_addr)
             }
         }
     }
@@ -366,8 +370,8 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         match Packet::new_checked(buffer) {
-            Err(err) => writeln!(f, "{indent}({err})"),
-            Ok(packet) => writeln!(f, "{indent}{packet}"),
+            Err(err) => writeln!(f, "{}({})", indent, err),
+            Ok(packet) => writeln!(f, "{}{}", indent, packet),
         }
     }
 }
@@ -387,7 +391,7 @@ mod test {
         assert_eq!(packet.checksum(), 0x269);
         assert_eq!(
             packet.group_addr(),
-            Ipv4Address::from_octets([224, 0, 6, 150])
+            Ipv4Address::from_bytes(&[224, 0, 6, 150])
         );
         assert!(packet.verify_checksum());
     }
@@ -400,7 +404,7 @@ mod test {
         assert_eq!(packet.checksum(), 0x08da);
         assert_eq!(
             packet.group_addr(),
-            Ipv4Address::from_octets([225, 0, 0, 37])
+            Ipv4Address::from_bytes(&[225, 0, 0, 37])
         );
         assert!(packet.verify_checksum());
     }
@@ -411,9 +415,9 @@ mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet.set_msg_type(Message::LeaveGroup);
         packet.set_max_resp_code(0);
-        packet.set_group_address(Ipv4Address::from_octets([224, 0, 6, 150]));
+        packet.set_group_address(Ipv4Address::from_bytes(&[224, 0, 6, 150]));
         packet.fill_checksum();
-        assert_eq!(&*packet.into_inner(), &LEAVE_PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &LEAVE_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -422,9 +426,9 @@ mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet.set_msg_type(Message::MembershipReportV2);
         packet.set_max_resp_code(0);
-        packet.set_group_address(Ipv4Address::from_octets([225, 0, 0, 37]));
+        packet.set_group_address(Ipv4Address::from_bytes(&[225, 0, 0, 37]));
         packet.fill_checksum();
-        assert_eq!(&*packet.into_inner(), &REPORT_PACKET_BYTES[..]);
+        assert_eq!(&packet.into_inner()[..], &REPORT_PACKET_BYTES[..]);
     }
 
     #[test]

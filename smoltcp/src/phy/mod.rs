@@ -20,6 +20,7 @@ An implementation of the [Device](trait.Device.html) trait for a simple hardware
 Ethernet controller could look as follows:
 
 ```rust
+use smoltcp::Result;
 use smoltcp::phy::{self, DeviceCapabilities, Device, Medium};
 use smoltcp::time::Instant;
 
@@ -37,16 +38,16 @@ impl<'a> StmPhy {
     }
 }
 
-impl phy::Device for StmPhy {
-    type RxToken<'a> = StmPhyRxToken<'a> where Self: 'a;
-    type TxToken<'a> = StmPhyTxToken<'a> where Self: 'a;
+impl<'a> phy::Device<'a> for StmPhy {
+    type RxToken = StmPhyRxToken<'a>;
+    type TxToken = StmPhyTxToken<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         Some((StmPhyRxToken(&mut self.rx_buffer[..]),
               StmPhyTxToken(&mut self.tx_buffer[..])))
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
         Some(StmPhyTxToken(&mut self.tx_buffer[..]))
     }
 
@@ -62,11 +63,11 @@ impl phy::Device for StmPhy {
 struct StmPhyRxToken<'a>(&'a mut [u8]);
 
 impl<'a> phy::RxToken for StmPhyRxToken<'a> {
-    fn consume<R, F>(self, f: F) -> R
-        where F: FnOnce(& [u8]) -> R
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
     {
         // TODO: receive packet into buffer
-        let result = f(&self.0);
+        let result = f(&mut self.0);
         println!("rx called");
         result
     }
@@ -75,8 +76,8 @@ impl<'a> phy::RxToken for StmPhyRxToken<'a> {
 struct StmPhyTxToken<'a>(&'a mut [u8]);
 
 impl<'a> phy::TxToken for StmPhyTxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-        where F: FnOnce(&mut [u8]) -> R
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
     {
         let result = f(&mut self.0[..len]);
         println!("tx called {}", len);
@@ -89,6 +90,7 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
 )]
 
 use crate::time::Instant;
+use crate::Result;
 
 #[cfg(all(
     any(feature = "phy-raw_socket", feature = "phy-tuntap_interface"),
@@ -97,9 +99,8 @@ use crate::time::Instant;
 mod sys;
 
 mod fault_injector;
-#[cfg(feature = "alloc")]
 mod fuzz_injector;
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 mod loopback;
 mod pcap_writer;
 #[cfg(all(feature = "phy-raw_socket", unix))]
@@ -118,64 +119,24 @@ mod tuntap_interface;
 pub use self::sys::wait;
 
 pub use self::fault_injector::FaultInjector;
-#[cfg(feature = "alloc")]
 pub use self::fuzz_injector::{FuzzInjector, Fuzzer};
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::loopback::Loopback;
 pub use self::pcap_writer::{PcapLinkType, PcapMode, PcapSink, PcapWriter};
 #[cfg(all(feature = "phy-raw_socket", unix))]
 pub use self::raw_socket::RawSocket;
-pub use self::tracer::{Tracer, TracerDirection, TracerPacket};
+pub use self::tracer::Tracer;
 #[cfg(all(
     feature = "phy-tuntap_interface",
     any(target_os = "linux", target_os = "android")
 ))]
 pub use self::tuntap_interface::TunTapInterface;
 
-/// The IPV4 payload fragment size must be an increment of this value.
-#[cfg(feature = "proto-ipv4-fragmentation")]
-pub const IPV4_FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
-
-/// Metadata associated to a packet.
-///
-/// The packet metadata is a set of attributes associated to network packets
-/// as they travel up or down the stack. The metadata is get/set by the
-/// [`Device`] implementations or by the user when sending/receiving packets from a
-/// socket.
-///
-/// Metadata fields are enabled via Cargo features. If no field is enabled, this
-/// struct becomes zero-sized, which allows the compiler to optimize it out as if
-/// the packet metadata mechanism didn't exist at all.
-///
-/// Currently only UDP sockets allow setting/retrieving packet metadata. The metadata
-/// for packets emitted with other sockets will be all default values.
-///
-/// This struct is marked as `#[non_exhaustive]`. This means it is not possible to
-/// create it directly by specifying all fields. You have to instead create it with
-/// default values and then set the fields you want. This makes adding metadata
-/// fields a non-breaking change.
-///
-/// ```rust
-/// let mut meta = smoltcp::phy::PacketMeta::default();
-/// #[cfg(feature = "packetmeta-id")]
-/// {
-///     meta.id = 15;
-/// }
-/// ```
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
-#[non_exhaustive]
-pub struct PacketMeta {
-    #[cfg(feature = "packetmeta-id")]
-    pub id: u32,
-}
-
 /// A description of checksum behavior for a particular protocol.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Checksum {
     /// Verify checksum when receiving and compute checksum when sending.
-    #[default]
     Both,
     /// Verify checksum when receiving.
     Rx,
@@ -183,6 +144,12 @@ pub enum Checksum {
     Tx,
     /// Ignore checksum completely.
     None,
+}
+
+impl Default for Checksum {
+    fn default() -> Checksum {
+        Checksum::Both
+    }
 }
 
 impl Checksum {
@@ -287,16 +254,7 @@ impl DeviceCapabilities {
             }
             #[cfg(feature = "medium-ip")]
             Medium::Ip => self.max_transmission_unit,
-            #[cfg(feature = "medium-ieee802154")]
-            Medium::Ieee802154 => self.max_transmission_unit, // TODO(thvdveld): what is the MTU for Medium::IEEE802
         }
-    }
-
-    /// Special case method to determine the maximum payload size that is based on the MTU and also aligned per spec.
-    #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {
-        let payload_mtu = self.ip_mtu() - ip_header_len;
-        payload_mtu - (payload_mtu % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
     }
 }
 
@@ -317,9 +275,6 @@ pub enum Medium {
     /// Examples of devices of this type are the Linux `tun`, PPP interfaces, VPNs in tun (layer 3) mode.
     #[cfg(feature = "medium-ip")]
     Ip,
-
-    #[cfg(feature = "medium-ieee802154")]
-    Ieee802154,
 }
 
 impl Default for Medium {
@@ -328,18 +283,8 @@ impl Default for Medium {
         return Medium::Ethernet;
         #[cfg(all(feature = "medium-ip", not(feature = "medium-ethernet")))]
         return Medium::Ip;
-        #[cfg(all(
-            feature = "medium-ieee802154",
-            not(feature = "medium-ip"),
-            not(feature = "medium-ethernet")
-        ))]
-        return Medium::Ieee802154;
-        #[cfg(all(
-            not(feature = "medium-ip"),
-            not(feature = "medium-ethernet"),
-            not(feature = "medium-ieee802154")
-        ))]
-        return panic!("No medium enabled");
+        #[cfg(all(not(feature = "medium-ip"), not(feature = "medium-ethernet")))]
+        panic!("No medium enabled");
     }
 }
 
@@ -348,13 +293,9 @@ impl Default for Medium {
 /// The interface is based on _tokens_, which are types that allow to receive/transmit a
 /// single packet. The `receive` and `transmit` functions only construct such tokens, the
 /// real sending/receiving operation are performed when the tokens are consumed.
-pub trait Device {
-    type RxToken<'a>: RxToken
-    where
-        Self: 'a;
-    type TxToken<'a>: TxToken
-    where
-        Self: 'a;
+pub trait Device<'a> {
+    type RxToken: RxToken + 'a;
+    type TxToken: TxToken + 'a;
 
     /// Construct a token pair consisting of one receive token and one transmit token.
     ///
@@ -362,16 +303,10 @@ pub trait Device {
     /// on the contents of the received packet. For example, this makes it possible to
     /// handle arbitrarily large ICMP echo ("ping") requests, where the all received bytes
     /// need to be sent back, without heap allocation.
-    ///
-    /// The timestamp must be a number of milliseconds, monotonically increasing since an
-    /// arbitrary moment in time, such as system startup.
-    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)>;
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)>;
 
     /// Construct a transmit token.
-    ///
-    /// The timestamp must be a number of milliseconds, monotonically increasing since an
-    /// arbitrary moment in time, such as system startup.
-    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>>;
+    fn transmit(&'a mut self) -> Option<Self::TxToken>;
 
     /// Get a description of device capabilities.
     fn capabilities(&self) -> DeviceCapabilities;
@@ -383,14 +318,12 @@ pub trait RxToken {
     ///
     /// This method receives a packet and then calls the given closure `f` with the raw
     /// packet bytes as argument.
-    fn consume<R, F>(self, f: F) -> R
+    ///
+    /// The timestamp must be a number of milliseconds, monotonically increasing since an
+    /// arbitrary moment in time, such as system startup.
+    fn consume<R, F>(self, timestamp: Instant, f: F) -> Result<R>
     where
-        F: FnOnce(&[u8]) -> R;
-
-    /// The Packet ID associated with the frame received by this [`RxToken`]
-    fn meta(&self) -> PacketMeta {
-        PacketMeta::default()
-    }
+        F: FnOnce(&mut [u8]) -> Result<R>;
 }
 
 /// A token to transmit a single network packet.
@@ -401,11 +334,10 @@ pub trait TxToken {
     /// closure `f` with a mutable reference to that buffer. The closure should construct
     /// a valid network packet (e.g. an ethernet packet) in the buffer. When the closure
     /// returns, the transmit buffer is sent out.
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    ///
+    /// The timestamp must be a number of milliseconds, monotonically increasing since an
+    /// arbitrary moment in time, such as system startup.
+    fn consume<R, F>(self, timestamp: Instant, len: usize, f: F) -> Result<R>
     where
-        F: FnOnce(&mut [u8]) -> R;
-
-    /// The Packet ID to be associated with the frame to be transmitted by this [`TxToken`].
-    #[allow(unused_variables)]
-    fn set_meta(&mut self, meta: PacketMeta) {}
+        F: FnOnce(&mut [u8]) -> Result<R>;
 }

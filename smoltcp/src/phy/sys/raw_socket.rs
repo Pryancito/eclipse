@@ -1,11 +1,10 @@
 use super::*;
-use crate::phy::Medium;
+use crate::wire::EthernetFrame;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::{io, mem};
 
 #[derive(Debug)]
 pub struct RawSocketDesc {
-    protocol: libc::c_short,
     lower: libc::c_int,
     ifreq: ifreq,
 }
@@ -17,21 +16,12 @@ impl AsRawFd for RawSocketDesc {
 }
 
 impl RawSocketDesc {
-    pub fn new(name: &str, medium: Medium) -> io::Result<RawSocketDesc> {
-        let protocol = match medium {
-            #[cfg(feature = "medium-ethernet")]
-            Medium::Ethernet => imp::ETH_P_ALL,
-            #[cfg(feature = "medium-ip")]
-            Medium::Ip => imp::ETH_P_ALL,
-            #[cfg(feature = "medium-ieee802154")]
-            Medium::Ieee802154 => imp::ETH_P_IEEE802154,
-        };
-
+    pub fn new(name: &str) -> io::Result<RawSocketDesc> {
         let lower = unsafe {
             let lower = libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK,
-                protocol.to_be() as i32,
+                imp::ETH_P_ALL.to_be() as i32,
             );
             if lower == -1 {
                 return Err(io::Error::last_os_error());
@@ -40,20 +30,23 @@ impl RawSocketDesc {
         };
 
         Ok(RawSocketDesc {
-            protocol,
-            lower,
+            lower: lower,
             ifreq: ifreq_for(name),
         })
     }
 
     pub fn interface_mtu(&mut self) -> io::Result<usize> {
-        ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFMTU).map(|mtu| mtu as usize)
+        // SIOCGIFMTU returns the IP MTU (typically 1500 bytes.)
+        // smoltcp counts the entire Ethernet packet in the MTU, so add the Ethernet header size to it.
+        let ip_mtu =
+            ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFMTU).map(|mtu| mtu as usize)?;
+        Ok(ip_mtu + EthernetFrame::<&[u8]>::header_len())
     }
 
     pub fn bind_interface(&mut self) -> io::Result<()> {
         let sockaddr = libc::sockaddr_ll {
             sll_family: libc::AF_PACKET as u16,
-            sll_protocol: self.protocol.to_be() as u16,
+            sll_protocol: imp::ETH_P_ALL.to_be() as u16,
             sll_ifindex: ifreq_ioctl(self.lower, &mut self.ifreq, imp::SIOCGIFINDEX)?,
             sll_hatype: 1,
             sll_pkttype: 0,
@@ -65,7 +58,7 @@ impl RawSocketDesc {
             let res = libc::bind(
                 self.lower,
                 &sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr,
-                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                mem::size_of::<libc::sockaddr_ll>() as u32,
             );
             if res == -1 {
                 return Err(io::Error::last_os_error());
@@ -99,7 +92,7 @@ impl RawSocketDesc {
                 0,
             );
             if len == -1 {
-                return Err(io::Error::last_os_error());
+                Err(io::Error::last_os_error()).unwrap()
             }
             Ok(len as usize)
         }

@@ -1,14 +1,17 @@
+#[cfg(not(feature = "rust-1_28"))]
 use alloc::collections::VecDeque;
-use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "rust-1_28")]
+use alloc::VecDeque;
 
-use crate::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use crate::phy::{self, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
+use crate::Result;
 
 /// A loopback device.
 #[derive(Debug)]
 pub struct Loopback {
-    pub(crate) queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Vec<u8>>,
     medium: Medium,
 }
 
@@ -26,20 +29,19 @@ impl Loopback {
     }
 }
 
-impl Device for Loopback {
-    type RxToken<'a> = RxToken;
-    type TxToken<'a> = TxToken<'a>;
+impl<'a> Device<'a> for Loopback {
+    type RxToken = RxToken;
+    type TxToken = TxToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
         DeviceCapabilities {
             max_transmission_unit: 65535,
             medium: self.medium,
-            checksum: ChecksumCapabilities::ignored(),
             ..DeviceCapabilities::default()
         }
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         self.queue.pop_front().map(move |buffer| {
             let rx = RxToken { buffer };
             let tx = TxToken {
@@ -49,7 +51,7 @@ impl Device for Loopback {
         })
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
         Some(TxToken {
             queue: &mut self.queue,
         })
@@ -62,26 +64,26 @@ pub struct RxToken {
 }
 
 impl phy::RxToken for RxToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
     where
-        F: FnOnce(&[u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        f(&self.buffer)
+        f(&mut self.buffer)
     }
 }
 
 #[doc(hidden)]
-#[derive(Debug)]
 pub struct TxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
 }
 
 impl<'a> phy::TxToken for TxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&mut [u8]) -> Result<R>,
     {
-        let mut buffer = vec![0; len];
+        let mut buffer = Vec::new();
+        buffer.resize(len, 0);
         let result = f(&mut buffer);
         self.queue.push_back(buffer);
         result
