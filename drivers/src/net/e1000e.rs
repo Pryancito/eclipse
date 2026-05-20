@@ -2457,13 +2457,20 @@ impl E1000eHw {
                         copy_len
                     );
                 }
-            } else if !self.rx_needs_cache_invalidation() {
-                copy_len = frame_need;
-                crate::klog_warn!(
-                    "[e1000e] RX len fix: desc {} → {} (ip_tot_len, qemu)\n",
-                    desc_len,
-                    frame_need
-                );
+            } else {
+                // On real hardware we have seen WB descriptor len shorter than IPv4 total
+                // length for non-DHCP traffic as well. Re-read the full DMA buffer and
+                // trust frame_need only if the frame header is self-consistent.
+                Self::invalidate_cpu_cache_for_read(buf_vaddr, BUF_SIZE);
+                let full = core::slice::from_raw_parts(buf_vaddr as *const u8, BUF_SIZE);
+                if frame_need <= full.len() && Self::eth_ipv4_frame_complete(&full[..frame_need]) {
+                    copy_len = frame_need;
+                    crate::klog_warn!(
+                        "[e1000e] RX len fix: desc {} → {} (ip_tot_len)\n",
+                        desc_len,
+                        frame_need
+                    );
+                }
             }
         }
         copy_len
