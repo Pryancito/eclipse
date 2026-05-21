@@ -1,6 +1,6 @@
 //! Minimal procfs implementation for Linux userland compatibility.
 
-use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
+use alloc::{fmt::Write as _, string::String, sync::Arc};
 use core::any::Any;
 
 use kernel_hal::drivers;
@@ -341,18 +341,34 @@ fn proc_meminfo_content() -> String {
 }
 fn proc_net_arp_content() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "IP address       HW type     Flags       HW address            Mask     Device");
-    let ifaces = drivers::all_net().as_vec();
-    for iface in ifaces.iter() {
-        let content = iface.get_arp_content();
-        if !content.is_empty() {
-            // Skip header from device content if we already have one
-            let lines: Vec<&str> = content.lines().collect();
-            for line in lines.iter().skip(1) {
-                s.push_str(line);
-                s.push('\n');
-            }
-        }
+    let _ = writeln!(
+        s,
+        "IP address       HW type     Flags       HW address            Mask     Device"
+    );
+    let entries = crate::net::arp_cache::get_entries();
+    for (ip, mac) in entries {
+        let dev_name = if let Ok(dev) = crate::net::netdev_for_ipv4(ip) {
+            dev.get_ifname()
+        } else {
+            kernel_hal::net::get_net_device()
+                .iter()
+                .find(|d| d.get_ifname() != "loopback")
+                .map(|d| d.get_ifname())
+                .unwrap_or_else(|| "eth0".into())
+        };
+        let mac_bytes = mac.as_bytes();
+        let _ = writeln!(
+            s,
+            "{:<15}  0x1         0x2         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        {}",
+            ip,
+            mac_bytes[0],
+            mac_bytes[1],
+            mac_bytes[2],
+            mac_bytes[3],
+            mac_bytes[4],
+            mac_bytes[5],
+            dev_name
+        );
     }
     s
 }

@@ -4515,26 +4515,9 @@ impl NetScheme for E1000eInterface {
     fn get_stats(&self) -> NetStats {
         self.driver.hw.lock().merged_stats()
     }
-    fn get_arp_content(&self) -> String {
-        use alloc::fmt::Write;
-        let mut s = String::new();
-        // Do not call get_routes() here: it locks smoltcp's iface mutex and can
-        // deadlock with TX/RX/poll paths. /proc/net/arp only needs tracked routes.
-        let routes = self.routes.lock();
-        let _ = writeln!(s, "IP address       HW type     Flags       HW address            Mask     Device");
-        for route in routes.iter() {
-            if let Some(IpAddress::Ipv4(gw)) = route.gateway {
-                let _ = writeln!(
-                    s,
-                    "{:<15}  0x1         0x2         52:54:00:12:34:56     *        {}",
-                    gw,
-                    self.name
-                );
-            }
-        }
-        s
-    }
 }
+
+
 
 // ---------------------------------------------------------------------------
 // smoltcp Device impl
