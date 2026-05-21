@@ -8,6 +8,7 @@ use {
     alloc::vec::Vec,
     lock::Mutex,
 };
+use lazy_static::lazy_static;
 
 /// Control a group of processes
 ///
@@ -68,7 +69,28 @@ struct JobInner {
     self_ref: Weak<Job>,
 }
 
+lazy_static! {
+    /// Global root job.
+    pub static ref ROOT_JOB: Arc<Job> = Job::root();
+}
+
 impl Job {
+    /// Find process by KoID recursively.
+    pub fn find_process(&self, id: KoID) -> Option<Arc<Process>> {
+        let inner = self.inner.lock();
+        if let Some(proc) = inner.processes.iter().find(|p| p.id() == id) {
+            return Some(proc.clone());
+        }
+        for child_weak in &inner.children {
+            if let Some(child) = child_weak.upgrade() {
+                if let Some(proc) = child.find_process(id) {
+                    return Some(proc);
+                }
+            }
+        }
+        None
+    }
+
     /// Create the root job.
     pub fn root() -> Arc<Self> {
         let job = Arc::new(Job {

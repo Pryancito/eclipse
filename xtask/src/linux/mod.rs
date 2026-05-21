@@ -28,6 +28,7 @@ impl LinuxRootfs {
         // 若已存在且不需要清空，可以直接退出
         let dir = self.path();
         if dir.is_dir() && !clear {
+            Self::install_ca_certs(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -71,12 +72,7 @@ impl LinuxRootfs {
                 );
             }
 
-            // Add DNS resolution
-            fs::write(
-                etc.join("resolv.conf"),
-                "nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
-            )
-            .unwrap();
+            Self::write_resolv_conf(&etc);
             let lib_apk = dir.join("lib").join("apk");
             fs::create_dir_all(&lib_apk).unwrap();
             let lib_apk_db = lib_apk.join("db");
@@ -95,8 +91,16 @@ impl LinuxRootfs {
         // 拷贝 busybox
         fs::copy(busybox, bin.join("busybox")).unwrap();
 
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        if !etc.join("resolv.conf").exists() {
+            Self::write_resolv_conf(&etc);
+        }
+        Self::write_profile(&etc);
+        Self::install_ca_certs(&dir);
+
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
-        let machine_id = dir.join("etc/machine-id");
+        let machine_id = etc.join("machine-id");
         if !machine_id.exists() {
             fs::write(&machine_id, b"eclipseoseclipseoseclipseoseclip\n").unwrap();
         }
@@ -253,6 +257,80 @@ impl LinuxRootfs {
         }
     }
 
+    fn write_resolv_conf(etc: &Path) {
+        fs::write(
+            etc.join("resolv.conf"),
+            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+        )
+        .unwrap();
+    }
+
+    fn write_profile(etc: &Path) {
+        fs::write(
+            etc.join("profile"),
+            b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
+              export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
+              export SSL_CERT_DIR=/etc/ssl/certs\n\
+              export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n",
+        )
+        .unwrap();
+    }
+
+    const CA_PEM_URL: &str = "https://curl.se/ca/cacert.pem";
+
+    /// Descarga (si hace falta) el bundle Mozilla y lo deja en `prebuilt/cacert.pem`.
+    fn ensure_prebuilt_ca_pem() -> PathBuf {
+        let prebuilt = PROJECT_DIR.join("prebuilt/cacert.pem");
+        if prebuilt.is_file() {
+            return prebuilt;
+        }
+        if let Some(parent) = prebuilt.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        println!(
+            "Fetching CA bundle from {} -> {}",
+            Self::CA_PEM_URL,
+            prebuilt.display()
+        );
+        let status = std::process::Command::new("wget")
+            .args(["-q", "--show-progress", "-O"])
+            .arg(&prebuilt)
+            .arg(Self::CA_PEM_URL)
+            .status()
+            .expect("failed to run wget for CA bundle");
+        if !status.success() || !prebuilt.is_file() {
+            panic!(
+                "CA bundle missing: could not download {}\n\
+                 Fix: wget -O prebuilt/cacert.pem {}\n\
+                 or run: cargo xtask linux rootfs --arch <arch> --clear",
+                prebuilt.display(),
+                Self::CA_PEM_URL
+            );
+        }
+        prebuilt
+    }
+
+    /// Instala certificados raíz en el rootfs (requerido para wget https).
+    fn install_ca_certs(root: &Path) {
+        let src = Self::ensure_prebuilt_ca_pem();
+        let certs_dir = root.join("etc/ssl/certs");
+        fs::create_dir_all(&certs_dir).unwrap();
+        let bundle = certs_dir.join("ca-certificates.crt");
+        fs::copy(&src, &bundle).unwrap();
+        // Alias usado por varias herramientas.
+        let alias = certs_dir.join("ca-bundle.crt");
+        let _ = fs::remove_file(&alias);
+        #[cfg(unix)]
+        unix::fs::symlink("ca-certificates.crt", &alias).unwrap();
+        #[cfg(not(unix))]
+        fs::copy(&bundle, &alias).unwrap();
+        println!(
+            "Installed CA bundle ({} bytes) -> {}",
+            fs::metadata(&bundle).map(|m| m.len()).unwrap_or(0),
+            bundle.display()
+        );
+    }
+
     /// 将 musl 动态库放入 rootfs。
     pub fn put_musl_libs(&self) -> PathBuf {
         // 递归 rootfs
@@ -338,98 +416,60 @@ impl LinuxRootfs {
         executable
     }
 
-    /// 编译 apk-tools。
-    fn apk(&self, musl: &Path) -> PathBuf {
-        let apk_dir = PROJECT_DIR.join("tools").join("apk");
-        let bld_dir = apk_dir.join("bld-eclipse");
-        let executable = bld_dir.join("src/apk");
 
-        if executable.is_file() {
-            return executable;
-        }
+    /// Descarga (o actualiza) el binario estático de apk-tools desde Chimera Linux.
+    ///
+    /// El binario se almacena en `tools/apk/apk-<arch>.static`, junto al código
+    /// fuente del que ya no se compilará apk.  Se usa `wget --timestamping` (-N)
+    /// para que la descarga solo ocurra si el servidor publica una versión más
+    /// nueva que la copia local — comportamiento idéntico a los mirrors de Alpine.
+    ///
+    /// Arquitecturas disponibles en Chimera Linux que también soporta Eclipse OS:
+    ///   x86_64 · aarch64 · riscv64
+    fn apk(&self, _musl: &Path) -> PathBuf {
+        const CHIMERA_APK_BASE: &str = "https://repo.chimera-linux.org/apk/latest";
 
-        println!("Compiling apk-tools...");
-        // Try to compile
-        let mut res = Ext::new("meson")
-            .current_dir(&apk_dir)
-            .arg("compile")
-            .arg("-C")
-            .arg("bld-eclipse")
+        let arch = self.0.name(); // "x86_64", "aarch64", "riscv64"
+        let filename = format!("apk-{arch}.static");
+        let url = format!("{CHIMERA_APK_BASE}/{filename}");
+
+        // Almacenar en tools/apk/ junto al código fuente.
+        let apk_src_dir = PROJECT_DIR.join("tools").join("apk");
+        let stored = apk_src_dir.join(&filename); // e.g. tools/apk/apk-x86_64.static
+
+        println!("Checking apk ({arch}) against Chimera Linux repo...");
+        // -N / --timestamping: sólo descarga si el servidor tiene versión más nueva.
+        // -q: silencioso excepto errores.  -P: directorio destino.
+        let status = Ext::new("wget")
+            .arg("-N")
+            .arg("-q")
+            .arg("--show-progress")
+            .arg("-P")
+            .arg(&apk_src_dir)
+            .arg(&url)
             .status();
 
-        if !res.success() {
-            println!("Initial compile failed, trying to re-setup meson...");
-            dir::rm(&bld_dir).unwrap();
-            let cross_file = self.generate_apk_cross_file(musl);
-
-            Ext::new("meson")
-                .current_dir(&apk_dir)
-                .arg("setup")
-                .arg("bld-eclipse")
-                .arg("--cross-file")
-                .arg(&cross_file)
-                .arg("-Dminimal=true")
-                .arg("-Dcrypto_backend=mbedtls")
-                .arg("-Durl_backend=libfetch")
-                .arg("-Dlua=disabled")
-                .arg("-Dpython=disabled")
-                .arg("-Dzstd=disabled")
-                .arg("-Dtests=disabled")
-                .invoke();
-
-            res = Ext::new("meson")
-                .current_dir(&apk_dir)
-                .arg("compile")
-                .arg("-C")
-                .arg("bld-eclipse")
-                .status();
+        if status.success() {
+            if stored.is_file() {
+                // Asegurarse de que tiene permisos de ejecución.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&stored).unwrap().permissions();
+                    if perms.mode() & 0o111 == 0 {
+                        perms.set_mode(perms.mode() | 0o755);
+                        fs::set_permissions(&stored, perms).unwrap();
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "warning: no se pudo descargar/actualizar apk ({arch}) desde {url}. \
+                 Se usará la copia local si existe."
+            );
         }
 
-        if !res.success() {
-            println!("Failed to compile apk");
-        }
-
-        executable
-    }
-
-    fn generate_apk_cross_file(&self, musl: &Path) -> PathBuf {
-        let path = self.0.target().join("meson.cross-apk");
-        let musl_bin = musl.canonicalize().unwrap().join("bin");
-        let arch = self.0.name();
-        let cpu_family = if arch == "x86_64" { "x86_64" } else { arch };
-
-        let zlib_path = PROJECT_DIR.join("tools").join("zlib");
-        let mbedtls_path = PROJECT_DIR.join("tools").join("mbedtls");
-
-        let content = format!(
-            r#"[binaries]
-c = '{bin}/{arch}-linux-musl-gcc'
-cpp = '{bin}/{arch}-linux-musl-g++'
-ar = '{bin}/{arch}-linux-musl-gcc-ar'
-nm = '{bin}/{arch}-linux-musl-gcc-nm'
-ranlib = '{bin}/{arch}-linux-musl-gcc-ranlib'
-strip = '{bin}/{arch}-linux-musl-strip'
-
-[host_machine]
-system = 'linux'
-cpu_family = '{cpu_family}'
-cpu = '{arch}'
-endian = 'little'
-
-[built-in options]
-c_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
-cpp_args = ['-static', '-I{zlib}', '-I{mbedtls}/include']
-c_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
-cpp_link_args = ['-static', '-L{zlib}', '-L{mbedtls}/bld-eclipse/library', '-lz', '-lmbedcrypto', '-lmbedtls', '-lmbedx509']
-"#,
-            bin = musl_bin.display(),
-            arch = arch,
-            cpu_family = cpu_family,
-            zlib = zlib_path.display(),
-            mbedtls = mbedtls_path.display()
-        );
-        fs::write(&path, content).unwrap();
-        path
+        stored
     }
 
     /// 编译 nl_dump (static netlink dump helper).

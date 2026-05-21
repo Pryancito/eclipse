@@ -11,7 +11,7 @@ use kernel_hal::interrupt::intr_on;
 use linux_object::fs::{vfs::FileSystem, INodeExt};
 use linux_object::thread::{CurrentThreadExt, ThreadExt};
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
-use zircon_object::task::{CurrentThread, Job, Process, Thread, ThreadState};
+use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
 use zircon_object::{object::KernelObject, vm::USER_STACK_PAGES, ZxError, ZxResult};
 
 /// Create and run main Linux process
@@ -20,7 +20,7 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
 
     linux_object::net::init();
 
-    let job = Job::root();
+    let job = zircon_object::task::ROOT_JOB.clone();
     let proc = Process::create_linux(&job, rootfs.clone()).unwrap();
     let thread = Thread::create_linux(&proc).unwrap();
     let loader = LinuxElfLoader {

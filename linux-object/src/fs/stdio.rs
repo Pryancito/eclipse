@@ -279,6 +279,10 @@ impl Stdin {
     pub fn push(&self, c: char) {
         if c == '\u{3}' {
             ctrl_c_pending_set();
+            let pgid = get_foreground_pgrp();
+            if pgid > 0 {
+                let _ = crate::process::send_signal_to_process(pgid as usize, crate::signal::Signal::SIGINT);
+            }
         }
         self.buf.lock().push_back(c);
         // Signal availability. If we can grab the eventbus cheaply, notify

@@ -356,6 +356,7 @@ impl SockAddr {
             #[allow(unsafe_code)]
             unsafe {
                 let source = core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
+                info!("write_to_msg: family={}, msg_namelen={}, written_len={}, source={:x?}", self.family, hdr.msg_namelen, written_len, source);
                 // Use transmute_copy to convert UserInOutPtr<SockAddr> to UserOutPtr<u8> for byte-wise writing
                 let mut addr_ptr: UserOutPtr<u8> = core::mem::transmute_copy(&hdr.msg_name);
                 addr_ptr.write_array(source)?;

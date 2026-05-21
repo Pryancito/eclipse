@@ -208,6 +208,12 @@ impl Process {
         res
     }
 
+    /// Set process status to Running.
+    pub fn set_status_running(&self) {
+        self.inner.lock().status = Status::Running;
+    }
+
+
     /// Exit current process with `retcode`.
     /// The process do not terminate immediately when exited.
     /// It will terminate after all its child threads are terminated.

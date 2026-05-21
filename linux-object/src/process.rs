@@ -22,7 +22,7 @@ use rcore_fs::vfs::{FileSystem, INode};
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
     signal::Futex,
-    task::{Job, Process, Status, Thread},
+    task::{Job, Process, Status, Thread, ROOT_JOB},
     ZxResult,
 };
 
@@ -81,6 +81,7 @@ impl ProcessExt for Process {
         };
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         new_proc.vmar().fork_from(&parent.vmar())?;
+        new_proc.set_status_running();
         linux_parent_inner
             .children
             .insert(new_proc.id(), new_proc.clone());
@@ -592,4 +593,28 @@ pub fn check_signals() -> LxResult<()> {
         }
     }
     Ok(())
+}
+
+/// Send a signal to a process by its KoID.
+pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
+    if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
+        let tids = process.thread_ids();
+        for tid in tids {
+            if let Ok(thread_obj) = process.get_child(tid) {
+                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
+                    use crate::thread::ThreadExt;
+                    let mut thread_linux = thread.lock_linux();
+                    if thread_linux.signal_mask.contains(signal) {
+                        continue;
+                    } else {
+                        thread_linux.signals.insert(signal);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    } else {
+        Err(LxError::ESRCH)
+    }
 }

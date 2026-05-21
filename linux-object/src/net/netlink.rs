@@ -69,6 +69,7 @@ impl Socket for NetlinkSocketState {
                     if n != 0 {
                         data[..n].copy_from_slice(&msg[..n]);
                     }
+                    info!("[netlink] read hex: {:?}", &msg[..n]);
                     return (Ok(n), endpoint);
                 }
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
@@ -90,7 +91,9 @@ impl Socket for NetlinkSocketState {
             return Err(LxError::EINVAL);
         }
         let message_type = NetlinkMessageType::from(header.nlmsg_type);
-        info!("Netlink write: message_type={:?}, len={}, seq={}", message_type, header.nlmsg_len, header.nlmsg_seq);
+        info!("Netlink write: message_type={:?}, len={}, seq={}, hex: {:?}", message_type, header.nlmsg_len, header.nlmsg_seq, data);
+        let reduced = self.base.id % u32::MAX as u64;
+        let nl_pid = (reduced as u32).max(1);
         let mut buffer = self.data.lock();
         buffer.clear();
         match message_type {
@@ -104,7 +107,7 @@ impl Socket for NetlinkSocketState {
                         nlmsg_type: NetlinkMessageType::NewLink.into(),
                         nlmsg_flags: NetlinkMessageFlags::MULTI,
                         nlmsg_seq: header.nlmsg_seq,
-                        nlmsg_pid: 0, // kernel responses use pid 0
+                        nlmsg_pid: nl_pid,
                     };
                     msg.push_ext(new_header);
 
@@ -190,7 +193,7 @@ impl Socket for NetlinkSocketState {
                             nlmsg_type: NetlinkMessageType::NewAddr.into(),
                             nlmsg_flags: NetlinkMessageFlags::MULTI,
                             nlmsg_seq: header.nlmsg_seq,
-                            nlmsg_pid: 0, // kernel responses use pid 0
+                            nlmsg_pid: nl_pid,
                         };
                         msg.push_ext(new_header);
 
@@ -306,7 +309,7 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK (error=0)
-                push_ack(&mut buffer, header.nlmsg_seq);
+                push_ack(&mut buffer, header.nlmsg_seq, nl_pid);
             }
             NetlinkMessageType::NewRoute => {
                 // RTM_NEWROUTE: add a routing entry (default gateway etc.)
@@ -359,7 +362,7 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 // ACK
-                push_ack(&mut buffer, header.nlmsg_seq);
+                push_ack(&mut buffer, header.nlmsg_seq, nl_pid);
             }
             NetlinkMessageType::GetRoute => {
                 // RTM_GETROUTE: dump the routing table.
@@ -375,13 +378,13 @@ impl Socket for NetlinkSocketState {
                 // implemented yet (clients treat a non-fatal error gracefully,
                 // but a clean ACK avoids unnecessary log noise).
                 info!("[netlink] DelAddr: ACK (address removal not yet implemented)");
-                push_ack(&mut buffer, header.nlmsg_seq);
+                push_ack(&mut buffer, header.nlmsg_seq, nl_pid);
             }
             NetlinkMessageType::DelRoute => {
                 // RTM_DELROUTE: remove a routing entry.
                 // Return a success ACK; same rationale as DelAddr above.
                 info!("[netlink] DelRoute: ACK (route removal not yet implemented)");
-                push_ack(&mut buffer, header.nlmsg_seq);
+                push_ack(&mut buffer, header.nlmsg_seq, nl_pid);
             }
             _ => {
                 // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
@@ -406,7 +409,7 @@ impl Socket for NetlinkSocketState {
                     nlmsg_type: NetlinkMessageType::Error.into(),
                     nlmsg_flags: NetlinkMessageFlags::MULTI,
                     nlmsg_seq: header.nlmsg_seq,
-                    nlmsg_pid: 0,
+                    nlmsg_pid: nl_pid,
                 };
                 msg.push_ext(new_header);
                 msg.align4();
@@ -422,9 +425,11 @@ impl Socket for NetlinkSocketState {
             nlmsg_type: NetlinkMessageType::Done.into(),
             nlmsg_flags: NetlinkMessageFlags::MULTI,
             nlmsg_seq: header.nlmsg_seq,
-            nlmsg_pid: 0, // kernel responses use pid 0
+            nlmsg_pid: nl_pid,
         };
         msg.push_ext(new_header);
+        msg.align4();
+        msg.push_ext(0i32);
         msg.align4();
         msg.set_ext(0, msg.len() as u32);
         buffer.push(msg);
@@ -729,13 +734,13 @@ fn push_rtattr_u32(dst: &mut Vec<u8>, rta_type: u16, v: u32) {
 }
 
 /// Build a success ACK (NLMSG_ERROR with error=0) and push it onto `buffer`.
-fn push_ack(buffer: &mut Vec<Vec<u8>>, seq: u32) {
+fn push_ack(buffer: &mut Vec<Vec<u8>>, seq: u32, nl_pid: u32) {
     let ack = NetlinkMessageHeader {
         nlmsg_len: (size_of::<NetlinkMessageHeader>() + size_of::<i32>()) as u32,
         nlmsg_type: NetlinkMessageType::Error.into(),
         nlmsg_flags: NetlinkMessageFlags::empty(),
         nlmsg_seq: seq,
-        nlmsg_pid: 0,
+        nlmsg_pid: nl_pid,
     };
     let mut msg = Vec::new();
     msg.push_ext(ack);
