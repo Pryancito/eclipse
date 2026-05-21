@@ -1948,11 +1948,9 @@ impl E1000eHw {
             // NIC DMA engine reads stale descriptor addresses or old status bits.
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
 
-            if (i & (RX_BUFFER_WRITE - 1)) == 0 {
-                fence(Ordering::SeqCst);
-                mmio_write(self.base, E1000E_RDT, i as u32);
-                let _ = mmio_read(self.base, E1000E_RDT);
-            }
+            fence(Ordering::SeqCst);
+            mmio_write(self.base, E1000E_RDT, i as u32);
+            let _ = mmio_read(self.base, E1000E_RDT);
 
             posted += 1;
             i = (i + 1) % NUM_RX;
@@ -2960,16 +2958,29 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_FCRTH, 0);
     }
 
-    /// Aligned with Linux `check_for_link` (watchdog / LSC handler).
-    /// Returns true if link is up, false if link is down.
+    /// Versión optimizada basada en el watchdog in-tree de Linux:
+    /// Resuelve de forma segura el enlace físico y evita bucles infinitos de AN.
     unsafe fn check_for_link_linux(&mut self) -> bool {
         let is_pch = self.is_pch_lpt_or_later();
         let phy = self.phy_addr;
 
-        // 1. Read BMSR twice (due to sticky latch-low bit)
+        // 1. Leer BMSR dos veces para limpiar el bit pegajoso de "Latch-Low".
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
-        let link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
+        
+        // Manejo de cable desconectado o hardware ausente
+        if bmsr == 0 || bmsr == 0xFFFF {
+            if self.link_up {
+                crate::klog_warn!("[e1000e] Link is Down (PHY read failure or detached)\n");
+                self.link_up = false;
+                self.link_speed = 0;
+                self.link_duplex = false;
+                self.rx_link_armed = false;
+            }
+            return false;
+        }
+
+        let link_up = (bmsr & 0x0004) != 0;
 
         if !link_up {
             if self.link_up {
@@ -2982,42 +2993,56 @@ impl E1000eHw {
             return false;
         }
 
-        // 2. Link is up! Resolve speed and duplex.
-        let (speed, duplex_full) = self.resolve_link_speed_duplex();
+        // 2. El enlace físico está arriba. Resolvemos ground-truth leyendo el estado real del PHY.
+        let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
+        let (speed, duplex_full, src) = self.phy_operational_speed(phy, st2);
 
-        // 3. If link was previously down, or speed/duplex changed:
+        // 3. Control de degradación crítica: Si el enlace se congela a 10M pero el HCD (Highest Common Denominator)
+        // de la línea soporta más, la Autonegociación colapsó o el cable tiene atenuación extrema.
+        if speed == SPEED_10 && !self.link_10m_degraded {
+            if let Some(hcd_speed) = self.phy_reg26_below_mii_hcd(phy, st2) {
+                if hcd_speed > SPEED_10 {
+                    // Evitamos martillar el hardware: entramos en modo degradado controlado y relanzamos AN
+                    self.phy_accept_10m_degraded_mode(phy);
+                    return false; 
+                }
+            }
+        }
+
+        // 4. Si el enlace ha cambiado o acaba de levantarse:
         if !self.link_up || self.link_speed != speed || self.link_duplex != duplex_full {
             let was_down = !self.link_up;
             crate::klog_info!(
-                "[e1000e] Link is Up @ {} Mbps {} Duplex\n",
+                "[e1000e] Link is Up @ {} Mbps {} Duplex (Validated via {})\n",
                 speed,
-                if duplex_full { "Full" } else { "Half" }
+                if duplex_full { "Full" } else { "Half" },
+                src
             );
 
             self.link_up = true;
             self.link_speed = speed;
             self.link_duplex = duplex_full;
 
-            // 4. Align MAC speed/duplex CTRL register.
+            // 5. Forzar la sincronización del registro de la MAC con la velocidad resuelta por el PHY.
             self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
 
-            // 5. Apply workarounds/adjustments for PCH devices
+            // 6. Aplicar parches específicos de silicio según la velocidad real negociada
             if is_pch {
                 self.program_link_tipg_emi_linux(phy, speed, duplex_full);
                 self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
+                
+                // Errata Intel crucial: El bit TARC0_SPEED_MODE debe apagarse a 10/100M, 
+                // de lo contrario el motor de transmisión se congela (TX DMA lockup).
                 self.program_tarc_with_tctl_gate(speed);
                 self.config_collision_dist_linux();
 
-                // Linux `e1000_configure_k1_ich8lan`: K1 must be disabled at
-                // 10/100M on PCH or the MAC-PHY link oscillates and drops RX
-                // frames silently on real silicon (QEMU doesn't simulate K1).
-                self.pch_disable_k1();
-
-                // Linux `e1000_copper_link_setup_82577`: CRS-on-TX + auto MDI/MDIX.
-                // Previously only called from pch_post_link_phy_tune (never reached).
+                // Deshabilitar K1 (Power Management) a 10/100M para evitar oscilaciones cíclicas del enlace.
+                if speed < SPEED_1000 {
+                    self.pch_disable_k1();
+                }
+                
                 self.phy_setup_82577_copper(phy);
 
-                // I219 ptr_gap workaround
                 if self.is_pch_spt_or_later() {
                     self.pch_spt_ptr_gap_workaround(phy, speed);
                 }
@@ -3025,10 +3050,9 @@ impl E1000eHw {
                 self.config_collision_dist_linux();
             }
 
-            // 6. Flow control configuration
             self.configure_flow_control_after_link(speed, duplex_full);
 
-            // 7. If transitioning from down to up, arm the RX unit and datapath.
+            // 7. Si el enlace viene de estar caído, armamos el anillo RX limpio de forma segura
             if was_down {
                 self.enable_rx_after_link();
             }
@@ -3037,7 +3061,8 @@ impl E1000eHw {
         true
     }
 
-    /// One slice of deferred link recovery. Never blocks, so `poll()` stays responsive.
+    /// Máquina de estados asíncrona optimizada para Bringup.
+    /// No bloquea el hilo principal y respeta los tiempos del firmware del PHY.
     unsafe fn deferred_link_bringup_tick(&mut self) {
         if !self.link_bringup_pending {
             return;
@@ -3048,32 +3073,21 @@ impl E1000eHw {
             return;
         }
 
-        if self.link_bringup_stage == 0 && self.link_bringup_attempts >= 3 {
-            self.link_bringup_pending = false;
-            self.link_bringup_stage = 0;
-            self.link_up = false;
-            self.link_speed = 0;
-            self.link_duplex = false;
-            crate::klog_warn!("[e1000e] deferred link bringup gave up after 3 tries\n");
-            return;
-        }
-
         let now = timer_now_as_micros();
         let elapsed_us = now.wrapping_sub(self.stage_start_us);
 
-        // Stage 4: Wait for MAC auto-speed detection to settle (1.5s) after PHY link-up is detected.
+        // Estado 4: Espera activa tras estabilización física del PHY.
+        // Damos 1.5 segundos para que la detección automática de velocidad de la MAC se sincronice.
         if self.link_bringup_stage == 4 {
             if elapsed_us >= 1_500_000 {
-                // 1.5s has passed. Now finish link bringup!
-                let link = self.check_for_link_linux();
-                if link {
-                    e1000e_vlog!("[e1000e] Link settled and verified up.\n");
+                if self.check_for_link_linux() {
+                    e1000e_vlog!("[e1000e] Bringup: Link resuelto y estable.\n");
                     self.link_bringup_pending = false;
                     self.link_bringup_stage = 0;
                     self.link_bringup_attempts = 0;
                 } else {
-                    // Stale/ghost link or went down. Go back to Stage 0.
-                    crate::klog_warn!("[e1000e] Link went down before settling. Retrying...\n");
+                    // Falso positivo. Volvemos al estado de detección.
+                    crate::klog_warn!("[e1000e] Bringup: El enlace se cayó antes de estabilizarse. Reintentando...\n");
                     self.link_bringup_stage = 0;
                     self.stage_start_us = now;
                 }
@@ -3081,76 +3095,72 @@ impl E1000eHw {
             return;
         }
 
-        // For non-Stage 4, first check if the PHY link is up and auto-negotiation is complete.
+        // Lectura de control del PHY antes de evaluar timeouts de estados
         let phy = self.phy_addr;
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         let phy_link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
         let aneg_complete = (bmsr & BMSR_ANEG_COMPLETE) != 0;
 
+        // Si el PHY reporta enlace físico y AN resuelto, saltamos directamente al filtro de estabilización (Estado 4)
         if phy_link_up && aneg_complete {
+            let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
             e1000e_vlog!(
-                "[e1000e] PHY link up and Auto-Negotiation complete detected in stage {}. Waiting 1.5s for MAC to settle...\n",
-                self.link_bringup_stage
+                "[e1000e] Bringup: Link de capa 1 detectado (Reg26={:#x}, Stage {}). Pasando a estabilización.\n",
+                st2, self.link_bringup_stage
             );
             self.link_bringup_stage = 4;
             self.stage_start_us = now;
-            self.get_link_status = true; // force read of speed/duplex
             return;
         }
 
-        // If PHY link is not up, handle stage timeouts.
-        if !self.is_pch_lpt_or_later() {
-            // For discrete devices, we just kick autoneg and wait.
-            if self.link_bringup_stage == 0 {
-                self.link_bringup_attempts = self.link_bringup_attempts.saturating_add(1);
-                self.pch_kick_autoneg_mdio();
-                self.link_bringup_stage = 1;
-                self.stage_start_us = now;
-            } else if elapsed_us >= 4_000_000 {
-                // Timeout after 4s, restart stage 0.
-                self.link_bringup_stage = 0;
-                self.stage_start_us = now;
-            }
+        // Si excedemos el número máximo de intentos duros sin portadora, apagamos la bandera para no saturar el kernel
+        if self.link_bringup_stage == 0 && self.link_bringup_attempts >= 3 {
+            self.link_bringup_pending = false;
+            self.link_bringup_stage = 0;
+            self.link_up = false;
+            crate::klog_warn!("[e1000e] Bringup: No se detectó portadora física tras 3 ciclos de hardware.\n");
             return;
         }
 
-        // For integrated PCH devices (I217, I218, I219)
+        // Máquina de estados para dispositivos integrados (PCH)
         match self.link_bringup_stage {
             0 => {
                 self.link_bringup_attempts = self.link_bringup_attempts.saturating_add(1);
-                e1000e_vlog!(
-                    "[e1000e] PCH link bringup attempt {}/3\n",
-                    self.link_bringup_attempts
-                );
+                e1000e_vlog!("[e1000e] Bringup PCH: Ciclo de inicialización {}/3\n", self.link_bringup_attempts);
+                
                 self.pch_disable_lplu_gbe();
+                self.mac_allow_autoneg();
                 self.pch_kick_autoneg_mdio();
+                
                 self.link_bringup_stage = 1;
                 self.stage_start_us = now;
             }
             1 => {
+                // Timeout del Estado 1 (4 segundos esperando portadora inicial con configuraciones base)
                 if elapsed_us >= 4_000_000 {
-                    e1000e_vlog!("[e1000e] PCH Stage 1 timeout (4s). Kicking autoneg + MAC/PHY sync.\n");
-                    // Sync MAC and kick autoneg
-                    self.mac_allow_autoneg();
+                    e1000e_vlog!("[e1000e] Bringup PCH: Timeout en Stage 1 (4s). Forzando sincronización de registros MAC/PHY.\n");
+                    self.mac_setup_copper_link_linux();
                     self.pch_kick_autoneg_mdio();
                     self.link_bringup_stage = 2;
                     self.stage_start_us = now;
                 }
             }
             2 => {
+                // Timeout del Estado 2 (2 segundos adicionales). Si sigue colapsado, disparamos un reset eléctrico del PHY vía LANPHYPC.
                 if elapsed_us >= 2_000_000 {
-                    e1000e_vlog!("[e1000e] PCH Stage 2 timeout (2s). Performing hard PHY reset (LANPHYPC).\n");
-                    // Hard reset via LANPHYPC
+                    crate::klog_warn!("[e1000e] Bringup PCH: Timeout en Stage 2. Disparando reset físico por hardware (LANPHYPC).\n");
                     self.toggle_lanphypc();
+                    self.pch_disable_lplu_gbe();
                     self.pch_kick_autoneg_mdio();
                     self.link_bringup_stage = 3;
                     self.stage_start_us = now;
                 }
             }
             3 => {
+                // Timeout del Estado 3 (4 segundos esperando estabilización tras el reset eléctrico). Si falla, reinicia el ciclo completo.
                 if elapsed_us >= 4_000_000 {
-                    e1000e_vlog!("[e1000e] PCH Stage 3 timeout (4s). Restarting bringup flow.\n");
+                    e1000e_vlog!("[e1000e] Bringup PCH: Reset de hardware sin respuesta. Reiniciando secuencia...\n");
                     self.link_bringup_stage = 0;
                     self.stage_start_us = now;
                 }
@@ -3451,6 +3461,16 @@ impl E1000eHw {
         if self.is_pch_lpt_or_later() {
             self.pch_apply_silicon_workarounds();
             self.pch_disable_lplu_gbe();
+
+            // Force K1 disabled and lock PLL clock gating to GbE active from the first millisecond of bring-up
+            self.pch_disable_k1();
+            let phy_addr = self.active_phy_addr();
+            let pll_reg = Self::phy_reg_paged(772, 28);
+            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, pll_reg) {
+                phy_reg &= !I217_PLL_CLOCK_GATE_MASK;
+                phy_reg |= 0xFA; // Force GbE clock active
+                let _ = self.mdic_write_phy(phy_addr, pll_reg, phy_reg);
+            }
         }
 
         if !E1000E_CONVENTIONAL && self.is_pch_lpt_or_later() {
