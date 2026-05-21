@@ -36,8 +36,8 @@ struct UnixInner {
     flags: OpenFlags,
     /// Local bound path (set by bind or inherited on accept)
     path: String,
-    /// Weak ref to the connected peer socket
-    peer: Option<Weak<UnixSocketState>>,
+    /// Weak ref to the connected peer socket's inner state
+    peer: Option<Weak<Mutex<UnixInner>>>,
     /// Inbound data buffer
     buffer: VecDeque<u8>,
     eventbus: EventBus,
@@ -49,6 +49,8 @@ struct UnixInner {
     connected: bool,
     /// True when the peer has closed / disconnected
     peer_closed: bool,
+    read_closed: bool,
+    write_closed: bool,
 }
 
 impl Default for UnixSocketState {
@@ -65,6 +67,8 @@ impl Default for UnixSocketState {
                 accept_queue: VecDeque::new(),
                 connected: false,
                 peer_closed: false,
+                read_closed: false,
+                write_closed: false,
             })),
         }
     }
@@ -81,13 +85,13 @@ impl UnixSocketState {
     pub fn connect_pair(a: &Arc<Self>, b: &Arc<Self>) {
         {
             let mut ai = a.inner.lock();
-            ai.peer = Some(Arc::downgrade(b));
+            ai.peer = Some(Arc::downgrade(&b.inner));
             ai.connected = true;
             ai.eventbus.set(Event::WRITABLE);
         }
         {
             let mut bi = b.inner.lock();
-            bi.peer = Some(Arc::downgrade(a));
+            bi.peer = Some(Arc::downgrade(&a.inner));
             bi.connected = true;
             bi.eventbus.set(Event::WRITABLE);
         }
@@ -146,9 +150,13 @@ impl Socket for UnixSocketState {
     // read — dequeue bytes from our inbound buffer
     // -----------------------------------------------------------------------
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
-        let endpoint = || Endpoint::Unix(self.inner.lock().path.clone());
         loop {
             let mut inner = self.inner.lock();
+            let path = inner.path.clone();
+
+            if inner.read_closed {
+                return (Ok(0), Endpoint::Unix(path));
+            }
 
             if !inner.buffer.is_empty() {
                 let len = core::cmp::min(data.len(), inner.buffer.len());
@@ -158,18 +166,18 @@ impl Socket for UnixSocketState {
                 if inner.buffer.is_empty() {
                     inner.eventbus.clear(Event::READABLE);
                 }
-                return (Ok(len), endpoint());
+                return (Ok(len), Endpoint::Unix(path));
             }
 
             // EOF: peer gone
             let peer_gone = inner.peer_closed
                 || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
             if peer_gone && inner.connected {
-                return (Ok(0), endpoint());
+                return (Ok(0), Endpoint::Unix(path));
             }
 
             if inner.flags.contains(OpenFlags::NON_BLOCK) {
-                return (Err(LxError::EAGAIN), endpoint());
+                return (Err(LxError::EAGAIN), Endpoint::Unix(path));
             }
 
             drop(inner);
@@ -182,9 +190,15 @@ impl Socket for UnixSocketState {
     // -----------------------------------------------------------------------
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
         let inner = self.inner.lock();
+        if inner.write_closed {
+            return Err(LxError::EPIPE);
+        }
         if let Some(peer_weak) = &inner.peer {
             if let Some(peer) = peer_weak.upgrade() {
-                let mut pi = peer.inner.lock();
+                let mut pi = peer.lock();
+                if pi.read_closed {
+                    return Err(LxError::EPIPE);
+                }
                 pi.buffer.extend(data.iter().copied());
                 pi.eventbus.set(Event::READABLE);
                 Ok(data.len())
@@ -280,14 +294,20 @@ impl Socket for UnixSocketState {
         }
     }
 
-    fn shutdown(&self) -> SysResult {
+    fn shutdown(&self, howto: usize) -> SysResult {
         let mut inner = self.inner.lock();
-        inner.peer_closed = true;
-        if let Some(peer_weak) = &inner.peer {
-            if let Some(peer) = peer_weak.upgrade() {
-                let mut pi = peer.inner.lock();
-                pi.peer_closed = true;
-                pi.eventbus.set(Event::READABLE); // wake blocked reader
+        if howto == 0 || howto == 2 {
+            inner.read_closed = true;
+            inner.eventbus.set(Event::READABLE); // wake blocked reader
+        }
+        if howto == 1 || howto == 2 {
+            inner.write_closed = true;
+            if let Some(peer_weak) = &inner.peer {
+                if let Some(peer) = peer_weak.upgrade() {
+                    let mut pi = peer.lock();
+                    pi.peer_closed = true;
+                    pi.eventbus.set(Event::READABLE); // wake blocked reader
+                }
             }
         }
         Ok(0)
@@ -301,7 +321,7 @@ impl Socket for UnixSocketState {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         let inner = self.inner.lock();
         inner.peer.as_ref()?.upgrade().map(|p| {
-            Endpoint::Unix(p.inner.lock().path.clone())
+            Endpoint::Unix(p.lock().path.clone())
         })
     }
 
@@ -370,13 +390,15 @@ impl FileLike for UnixSocketState {
             loop {
                 {
                     let inner = self.inner.lock();
+                    let peer_gone = inner.peer_closed
+                        || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
                     let readable = !inner.buffer.is_empty()
                         || (inner.is_listening && !inner.accept_queue.is_empty())
-                        || inner.peer_closed;
+                        || peer_gone;
                     let want_read = events.contains(PollEvents::IN);
                     let want_write = events.contains(PollEvents::OUT);
-                    let writable = inner.peer.as_ref().map_or(false, |w| w.strong_count() > 0);
-                    if (want_read && readable) || (want_write && writable) {
+                    let writable = !peer_gone;
+                    if (want_read && readable) || (want_write && (writable || peer_gone)) {
                         break;
                     }
                 }

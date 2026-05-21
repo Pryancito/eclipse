@@ -1036,7 +1036,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
         Err(LxError::EINVAL)
     }
     /// missing documentation
-    fn shutdown(&self) -> SysResult {
+    fn shutdown(&self, _howto: usize) -> SysResult {
         Err(LxError::EINVAL)
     }
     /// missing documentation

@@ -71,36 +71,22 @@ impl Socket for RawSocketState {
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
-            let ip_proto = socket.ip_protocol();
             if socket.can_recv() {
                 if let Ok(size) = socket.recv_slice(data) {
                     drop(socket);
                     drop(sockets);
-                    // ping(8) SOCK_DGRAM/RAW ICMP expects ICMP payload only, not the IPv4 header.
-                    if ip_proto == IpProtocol::Icmp {
-                        if let Ok(pkt) = Ipv4Packet::new_checked(&data[..size]) {
-                            let hdr = pkt.header_len() as usize;
-                            let src_addr = pkt.src_addr();
-                            if hdr <= size {
-                                let payload_len = size - hdr;
-                                data.copy_within(hdr..size, 0);
-                                return (
-                                    Ok(payload_len),
-                                    Endpoint::Ip(IpEndpoint {
-                                        addr: IpAddress::Ipv4(src_addr),
-                                        port: 0,
-                                    }),
-                                );
-                            }
-                        }
+                    if let Ok(packet) = Ipv4Packet::new_checked(&data[..size]) {
+                        return (
+                            Ok(size),
+                            Endpoint::Ip(IpEndpoint {
+                                addr: IpAddress::Ipv4(packet.src_addr()),
+                                port: 0,
+                            }),
+                        );
                     }
-                    let packet = Ipv4Packet::new_unchecked(data);
                     return (
-                        Ok(size),
-                        Endpoint::Ip(IpEndpoint {
-                            addr: IpAddress::Ipv4(packet.src_addr()),
-                            port: 0,
-                        }),
+                        Err(LxError::EINVAL),
+                        Endpoint::Ip(IpEndpoint::UNSPECIFIED),
                     );
                 }
             }
@@ -191,6 +177,10 @@ impl Socket for RawSocketState {
         }
     }
 
+    fn bind(&self, _endpoint: Endpoint) -> SysResult {
+        Ok(0)
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         match (level, opt) {
             (IPPROTO_IP, IP_HDRINCL) => {
@@ -212,6 +202,15 @@ impl Socket for RawSocketState {
             socket.payload_send_capacity(),
         );
         Some((recv_ca, send_ca))
+    }
+    fn endpoint(&self) -> Option<Endpoint> {
+        Some(Endpoint::Ip(IpEndpoint {
+            addr: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 0,
+        }))
+    }
+    fn remote_endpoint(&self) -> Option<Endpoint> {
+        self.inner.remote.lock().clone()
     }
     fn socket_type(&self) -> Option<SocketType> {
         Some(SocketType::SOCK_RAW)

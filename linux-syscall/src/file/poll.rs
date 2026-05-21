@@ -391,6 +391,8 @@ struct FdSet {
     addr: UserInOutPtr<u32>,
     /// FdSet bit buffer
     origin: BitVec<Lsb0, u32>,
+    /// Ready bit buffer
+    ready: BitVec<Lsb0, u32>,
 }
 
 impl FdSet {
@@ -401,6 +403,7 @@ impl FdSet {
             Ok(FdSet {
                 addr,
                 origin: BitVec::new(),
+                ready: BitVec::new(),
             })
         } else {
             let len = (nfds + FD_PER_ITEM - 1) / FD_PER_ITEM;
@@ -412,7 +415,8 @@ impl FdSet {
             let mut vec0 = Vec::<u32>::new();
             vec0.resize(len, 0);
             addr.write_array(&vec0)?;
-            Ok(FdSet { addr, origin })
+            let ready = BitVec::from_slice(&vec0).unwrap();
+            Ok(FdSet { addr, origin, ready })
         }
     }
 
@@ -421,11 +425,11 @@ impl FdSet {
     /// Fd should be less than nfds
     fn set(&mut self, fd: FileDesc) -> bool {
         let fd: usize = fd.into();
-        if self.origin.is_empty() {
+        if self.ready.is_empty() {
             return false;
         }
-        self.origin.set(fd, true);
-        let vec: Vec<u32> = self.origin.clone().into();
+        self.ready.set(fd, true);
+        let vec: Vec<u32> = self.ready.clone().into();
         self.addr.write_array(&vec).is_ok()
     }
 

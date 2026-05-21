@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities};
+use smoltcp::phy::{self, DeviceCapabilities, Checksum};
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result;
@@ -217,8 +217,12 @@ impl phy::Device<'_> for E1000Driver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1536;
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(64);
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
         caps
     }
 }

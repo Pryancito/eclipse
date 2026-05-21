@@ -121,7 +121,8 @@ impl LinuxRootfs {
             "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6", 
             "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort", 
             "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr", 
-            "id", "date", "env", "chmod", "chown", "vi", "top", "less"
+            "id", "date", "env", "chmod", "chown", "vi", "top", "less",
+            "ssl_client", "ssl_server", "wget", "traceroute", "traceroute6",
         ].into_iter().map(String::from).collect();
 
         // Try to complement the list with busybox --list if it can run on host
@@ -184,6 +185,53 @@ impl LinuxRootfs {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&udhcpc_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // openssl wrapper to busybox ssl_client
+        let usr_sbin = dir.join("usr/sbin");
+        fs::create_dir_all(&usr_sbin).unwrap();
+        let openssl_script = usr_sbin.join("openssl");
+        fs::write(&openssl_script,
+            b"#!/bin/sh\n\
+              if [ \"$1\" != \"s_client\" ]; then\n\
+                echo \"openssl wrapper: command '$1' not supported\" >&2\n\
+                exit 1\n\
+              fi\n\
+              shift\n\
+              CONNECT=\"\"\n\
+              SERVERNAME=\"\"\n\
+              while [ $# -gt 0 ]; do\n\
+                case \"$1\" in\n\
+                  -connect)\n\
+                    CONNECT=\"$2\"\n\
+                    shift 2\n\
+                    ;;\n\
+                  -servername)\n\
+                    SERVERNAME=\"$2\"\n\
+                    shift 2\n\
+                    ;;\n\
+                  -quiet)\n\
+                    shift 1\n\
+                    ;;\n\
+                  *)\n\
+                    shift 1\n\
+                    ;;\n\
+                esac\n\
+              done\n\
+              if [ -z \"$CONNECT\" ]; then\n\
+                echo \"openssl wrapper: missing -connect\" >&2\n\
+                exit 1\n\
+              fi\n\
+              if [ -n \"$SERVERNAME\" ]; then\n\
+                exec ssl_client -n \"$SERVERNAME\" \"$CONNECT\"\n\
+              else\n\
+                exec ssl_client \"$CONNECT\"\n\
+              fi\n"
+        ).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&openssl_script, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         // 拷贝 nl_dump (netlink dump helper).
@@ -249,11 +297,19 @@ impl LinuxRootfs {
         Ext::new("sed")
             .current_dir(&target)
             .arg("-i")
-            .arg("s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/\
-                  s/.*CONFIG_PIE.*/CONFIG_PIE=n/\
-                  s/.*CONFIG_FEATURE_INDIVIDUAL.*/CONFIG_FEATURE_INDIVIDUAL=n/\
-                  s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/")
+            .arg("s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/;\
+                  s/.*CONFIG_PIE.*/CONFIG_PIE=n/;\
+                  s/.*CONFIG_FEATURE_INDIVIDUAL.*/CONFIG_FEATURE_INDIVIDUAL=n/;\
+                  s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/;\
+                  s/.*CONFIG_FEATURE_WGET_OPENSSL.*/CONFIG_FEATURE_WGET_OPENSSL=n/;\
+                  s/.*CONFIG_FEATURE_WGET_HTTPS.*/CONFIG_FEATURE_WGET_HTTPS=y/;\
+                  s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/")
             .arg(".config")
+            .invoke();
+        Ext::new("sh")
+            .current_dir(&target)
+            .arg("-c")
+            .arg("yes '' | make oldconfig")
             .invoke();
 
         // 编译

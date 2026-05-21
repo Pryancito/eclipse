@@ -72,7 +72,10 @@ impl Socket for NetlinkSocketState {
                     return (Ok(n), endpoint);
                 }
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
-                None => thread::yield_now().await,
+                None => {
+                    kernel_hal::deferred_job::drain_deferred_jobs();
+                    thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+                }
             }
         }
     }
@@ -454,7 +457,7 @@ impl Socket for NetlinkSocketState {
         unimplemented!()
     }
 
-    fn shutdown(&self) -> SysResult {
+    fn shutdown(&self, _howto: usize) -> SysResult {
         unimplemented!()
     }
 

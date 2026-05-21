@@ -173,9 +173,11 @@ impl From<Endpoint> for SockAddr {
                     },
                 },
                 IpAddress::Unspecified => SockAddr {
-                    addr_ph: SockAddrPlaceholder {
-                        family: AddressFamily::Unspecified.into(),
-                        data: [0; 14],
+                    addr_in: SockAddrIn {
+                        sin_family: AddressFamily::Internet.into(),
+                        sin_port: u16::to_be(ip.port),
+                        sin_addr: 0,
+                        sin_zero: [0; 8],
                     },
                 },
                 _ => unimplemented!("only ipv4"),

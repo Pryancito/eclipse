@@ -28,22 +28,40 @@ pub struct PipeData {
     buf: VecDeque<u8>,
     /// event bus for pipe
     eventbus: EventBus,
-    /// number of pipe ends
-    end_cnt: i32,
+    /// number of read ends
+    read_cnt: i32,
+    /// number of write ends
+    write_cnt: i32,
 }
 
 /// pipe struct
-#[derive(Clone)]
 pub struct Pipe {
     data: Arc<Mutex<PipeData>>,
     direction: PipeEnd,
+}
+
+impl Clone for Pipe {
+    fn clone(&self) -> Self {
+        let mut data = self.data.lock();
+        match self.direction {
+            PipeEnd::Read => data.read_cnt += 1,
+            PipeEnd::Write => data.write_cnt += 1,
+        }
+        Pipe {
+            data: self.data.clone(),
+            direction: self.direction.clone(),
+        }
+    }
 }
 
 impl Drop for Pipe {
     fn drop(&mut self) {
         // pipe end closed
         let mut data = self.data.lock();
-        data.end_cnt -= 1;
+        match self.direction {
+            PipeEnd::Read => data.read_cnt -= 1,
+            PipeEnd::Write => data.write_cnt -= 1,
+        }
         data.eventbus.set(Event::CLOSED);
     }
 }
@@ -55,7 +73,8 @@ impl Pipe {
         let inner = PipeData {
             buf: VecDeque::new(),
             eventbus: EventBus::default(),
-            end_cnt: 2, // one read, one write
+            read_cnt: 1,
+            write_cnt: 1,
         };
         let data = Arc::new(Mutex::new(inner));
         (
@@ -74,7 +93,7 @@ impl Pipe {
         if let PipeEnd::Read = self.direction {
             // true
             let data = self.data.lock();
-            !data.buf.is_empty() || data.end_cnt < 2 // other end closed
+            !data.buf.is_empty() || data.write_cnt == 0 // other end closed
         } else {
             false
         }
@@ -83,7 +102,7 @@ impl Pipe {
     /// whether the pipe struct is writeable
     fn can_write(&self) -> bool {
         if let PipeEnd::Write = self.direction {
-            self.data.lock().end_cnt == 2
+            self.data.lock().read_cnt > 0
         } else {
             false
         }
@@ -98,7 +117,7 @@ impl INode for Pipe {
         }
         if let PipeEnd::Read = self.direction {
             let mut data = self.data.lock();
-            if data.buf.is_empty() && data.end_cnt == 2 {
+            if data.buf.is_empty() && data.write_cnt > 0 {
                 Err(FsError::Again)
             } else {
                 let len = min(buf.len(), data.buf.len());

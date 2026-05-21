@@ -41,7 +41,21 @@ pub trait ProcessExt {
 impl ProcessExt for Process {
     fn create_linux(job: &Arc<Job>, rootfs: Arc<dyn FileSystem>) -> ZxResult<Arc<Self>> {
         let linux_proc = LinuxProcess::new(rootfs);
-        Process::create_with_ext(job, "root", linux_proc)
+        let proc = Process::create_with_ext(job, "root", linux_proc)?;
+        let weak_proc = Arc::downgrade(&proc);
+        proc.add_signal_callback(Box::new(move |signal| {
+            if signal.contains(Signal::PROCESS_TERMINATED) {
+                if let Some(proc) = weak_proc.upgrade() {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.files.clear();
+                    inner.semaphores = Default::default();
+                    inner.shm_identifiers = Default::default();
+                }
+                return true;
+            }
+            false
+        }));
+        Ok(proc)
     }
 
     fn linux(&self) -> &LinuxProcess {
@@ -73,15 +87,19 @@ impl ProcessExt for Process {
 
         // notify parent on terminated
         let parent = parent.clone();
-        new_proc.add_signal_callback(Box::new({
-            let parent = parent.clone();
-            let _pid = new_proc.id();
-            move |signal| {
-                if signal.contains(Signal::PROCESS_TERMINATED) {
-                    parent.signal_set(Signal::SIGCHLD);
+        let weak_proc = Arc::downgrade(&new_proc);
+        new_proc.add_signal_callback(Box::new(move |signal| {
+            if signal.contains(Signal::PROCESS_TERMINATED) {
+                parent.signal_set(Signal::SIGCHLD);
+                if let Some(proc) = weak_proc.upgrade() {
+                    let mut inner = proc.linux().inner.lock();
+                    inner.files.clear();
+                    inner.semaphores = Default::default();
+                    inner.shm_identifiers = Default::default();
                 }
-                false
+                return true;
             }
+            false
         }));
         Ok(new_proc)
     }

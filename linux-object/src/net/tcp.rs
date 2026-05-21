@@ -104,6 +104,9 @@ impl Socket for TcpSocketState {
                         .remote_endpoint();
                     return (Ok(size), Endpoint::Ip(endpoint));
                 }
+                Err(smoltcp::Error::Finished) => {
+                    return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                }
                 Err(err) => {
                     error!("Tcp socket read error: {:?}", err);
                     return (
@@ -115,7 +118,8 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            thread::yield_now().await;
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
         }
     }
     /// write from buffer
@@ -150,33 +154,49 @@ impl Socket for TcpSocketState {
                 .connect(ip, get_ephemeral_port())
                 .map_err(|_| LxError::ENOBUFS)?;
 
-            let mut tc = 0;
-            // wait for connection result
+            // Use a 30-second wall-clock deadline. Each iteration sleeps 5ms,
+            // so we have up to 6000 tries before giving up — plenty of time for
+            // a real internet round-trip through QEMU slirp.
+            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
             loop {
-                //Submit a SYN
+                // Transmit pending packets (SYN, ACK, etc.)
                 poll_ifaces();
+                kernel_hal::deferred_job::drain_deferred_jobs();
 
                 match get_sockets()
                     .lock()
                     .get::<TcpSocket>(inner.handle.0)
                     .state()
                 {
-                    TcpState::SynSent => {
-                        // still connecting
+                    TcpState::SynSent | TcpState::SynReceived => {
+                        // still connecting — keep waiting
                     }
                     TcpState::Established => {
                         return Ok(0);
                     }
-                    _ => {
-                        warn!("connect failed ...");
-                        if tc < 10 {
-                            tc += 1;
-                        } else {
-                            return Err(LxError::ECONNREFUSED);
+                    // Terminal failure states: RST received or connection refused
+                    TcpState::Closed | TcpState::TimeWait => {
+                        // Only give up if a meaningful amount of time has passed
+                        // (the socket starts in Closed before SYN is sent, so we
+                        // must not fail immediately on the very first iteration).
+                        if kernel_hal::timer::timer_now() >= deadline {
+                            warn!("connect: timed out after 30s");
+                            return Err(LxError::ETIMEDOUT);
                         }
+                        // Short initial delay then continue; the SYN may not have
+                        // been transmitted yet.
+                    }
+                    _ => {
+                        warn!("connect: unexpected state, retrying");
                     }
                 }
-                thread::yield_now().await;
+
+                thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+
+                if kernel_hal::timer::timer_now() >= deadline {
+                    warn!("connect: timed out after 30s");
+                    return Err(LxError::ETIMEDOUT);
+                }
             }
         } else {
             error!("connect: bad endpoint");
@@ -211,7 +231,6 @@ impl Socket for TcpSocketState {
         let mut sets = sets.lock();
         let socket = sets.get::<TcpSocket>(inner.handle.0);
 
-        //Todo, syscall async poll needs to be executed after first Pending
         if inner.is_listening {
             if let Some(ep) = inner.local_endpoint {
                 if let Ok(true) = crate::net::LISTEN_TABLE.can_accept(ep.port) {
@@ -220,9 +239,18 @@ impl Socket for TcpSocketState {
             }
         } else if !socket.is_open() {
             error = true;
+            read = true;
+            write = true;
         } else {
             if socket.can_recv() {
                 read = true; // POLLIN
+            } else {
+                match socket.state() {
+                    TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
+                        read = true;
+                    }
+                    _ => {}
+                }
             }
             if socket.can_send() {
                 write = true; // POLLOUT
@@ -261,7 +289,7 @@ impl Socket for TcpSocketState {
         Ok(0)
     }
 
-    fn shutdown(&self) -> SysResult {
+    fn shutdown(&self, howto: usize) -> SysResult {
         let mut inner = self.inner.lock();
         if inner.is_listening {
             if let Some(ep) = inner.local_endpoint {
@@ -272,7 +300,9 @@ impl Socket for TcpSocketState {
         let sets = get_sockets();
         let mut sets = sets.lock();
         let mut socket = sets.get::<TcpSocket>(inner.handle.0);
-        socket.close();
+        if howto == 1 || howto == 2 {
+            socket.close();
+        }
         Ok(0)
     }
 
@@ -303,24 +333,20 @@ impl Socket for TcpSocketState {
                     return Err(LxError::EAGAIN);
                 }
                 poll_ifaces();
-                kernel_hal::thread::yield_now().await;
+                kernel_hal::deferred_job::drain_deferred_jobs();
+                thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
             }
         }
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.inner.lock();
-        inner.local_endpoint.map(Endpoint::Ip).or_else(|| {
+        Some(Endpoint::Ip(inner.local_endpoint.unwrap_or_else(|| {
             let sets = get_sockets();
             let mut sets = sets.lock();
             let socket = sets.get::<TcpSocket>(inner.handle.0);
-            let endpoint = socket.local_endpoint();
-            if endpoint.port != 0 {
-                Some(Endpoint::Ip(endpoint))
-            } else {
-                None
-            }
-        })
+            socket.local_endpoint()
+        })))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {

@@ -113,7 +113,8 @@ impl Socket for UdpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            thread::yield_now().await;
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
         }
     }
     /// write from buffer
@@ -159,6 +160,19 @@ impl Socket for UdpSocketState {
     /// connect
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::Ip(ip) = endpoint {
+            let handle = self.inner.lock().handle.0;
+            let sockets = get_sockets();
+            let mut set = sockets.lock();
+            let mut socket = set.get::<UdpSocket>(handle);
+            if socket.endpoint().port == 0 {
+                if let Err(e) = socket.bind(IpEndpoint::new(IpAddress::Unspecified, get_ephemeral_port())) {
+                    warn!("udp connect: implicit bind failed: {:?}", e);
+                    return Err(LxError::EINVAL);
+                }
+            }
+            drop(socket);
+            drop(set);
+
             self.inner.lock().remote_endpoint = Some(ip);
             Ok(0)
         } else {
@@ -227,7 +241,7 @@ impl Socket for UdpSocketState {
         warn!("listen is unimplemented");
         Err(LxError::EINVAL)
     }
-    fn shutdown(&self) -> SysResult {
+    fn shutdown(&self, _howto: usize) -> SysResult {
         warn!("shutdown is unimplemented");
         Err(LxError::EINVAL)
     }
@@ -240,12 +254,7 @@ impl Socket for UdpSocketState {
         let mut sockets = net_sockets.lock();
         let socket = sockets.get::<UdpSocket>(self.inner.lock().handle.0);
 
-        let endpoint = socket.endpoint();
-        if endpoint.port != 0 {
-            Some(Endpoint::Ip(endpoint))
-        } else {
-            None
-        }
+        Some(Endpoint::Ip(socket.endpoint()))
     }
     fn remote_endpoint(&self) -> Option<Endpoint> {
         self.inner.lock().remote_endpoint.map(Endpoint::Ip)

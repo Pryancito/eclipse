@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use lock::Mutex;
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, Checksum};
 // use smoltcp::socket::SocketSet;
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
@@ -216,9 +216,13 @@ impl<'a> Device<'a> for RTLxDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1536;
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(64);
         caps.medium = Medium::Ethernet;
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
         caps
     }
 

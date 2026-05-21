@@ -452,9 +452,8 @@ impl Syscall<'_> {
     /// shutdown a socket
     pub fn sys_shutdown(&mut self, sockfd: usize, howto: usize) -> SysResult {
         info!("sys_shutdown: sockfd:{}, howto:{}", sockfd, howto);
-        // todo: how to use 'howto'
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like.clone().as_socket()?.shutdown()
+        file_like.clone().as_socket()?.shutdown(howto)
     }
 
     /// accept() is used with connection-based socket types (SOCK_STREAM, SOCK_SEQPACKET).
