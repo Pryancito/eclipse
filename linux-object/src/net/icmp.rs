@@ -45,11 +45,20 @@ impl IcmpSocketState {
     }
 
     fn kick_rx(&self) {
-        let Some(dst) = self.remote_ipv4() else {
-            return;
-        };
-        if let Ok(dev) = netdev_for_ipv4(dst) {
-            netdev_drain_rx(dev.as_ref());
+        // If we have a known remote, drain only that interface's RX ring.
+        // Otherwise drain all non-loopback interfaces so we don't miss the
+        // ICMP reply when ping uses sendto() without a prior connect().
+        if let Some(dst) = self.remote_ipv4() {
+            if let Ok(dev) = netdev_for_ipv4(dst) {
+                netdev_drain_rx(dev.as_ref());
+                return;
+            }
+        }
+        // Fallback: drain all non-loopback devices.
+        for dev in kernel_hal::net::get_net_device().iter() {
+            if dev.get_ifname() != "loopback" {
+                netdev_drain_rx(dev.as_ref());
+            }
         }
     }
 }
@@ -67,6 +76,15 @@ impl Socket for IcmpSocketState {
                 );
             }
 
+            // Drain deferred jobs first: the NIC IRQ handler pushes a deferred
+            // poll() job that routes incoming frames through smoltcp and then
+            // calls push_packet -> deliver_from_frame. Without draining here,
+            // the ICMP echo reply sits in the deferred queue forever.
+            kernel_hal::deferred_job::drain_deferred_jobs();
+
+            // Direct RX drain bypasses smoltcp and calls push_packet/deliver_from_frame
+            // immediately — covers the case where the reply arrived before the
+            // deferred poll job was scheduled (tight timing on QEMU).
             self.kick_rx();
 
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
@@ -154,6 +172,7 @@ impl Socket for IcmpSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        kernel_hal::deferred_job::drain_deferred_jobs();
         self.kick_rx();
         let readable = icmp_rx::pending();
         (readable, true, false)
@@ -205,6 +224,7 @@ impl FileLike for IcmpSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        kernel_hal::deferred_job::drain_deferred_jobs();
         let (read, write, error) = Socket::poll(self, events);
         Ok(PollStatus {
             read,

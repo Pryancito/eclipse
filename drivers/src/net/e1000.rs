@@ -39,6 +39,7 @@ pub struct E1000Interface {
     irq: usize,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
+    pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
 }
 
 impl Scheme for E1000Interface {
@@ -77,7 +78,7 @@ impl NetScheme for E1000Interface {
 
     // get ip addresses
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        Vec::from(self.iface.lock().ip_addrs())
+        self.ip_addrs.lock().clone()
     }
 
     fn poll(&self) -> DeviceResult {
@@ -133,6 +134,7 @@ impl NetScheme for E1000Interface {
                 *first = IpCidr::Ipv4(cidr);
             }
         });
+        *self.ip_addrs.lock() = vec![IpCidr::Ipv4(cidr)];
         Ok(())
     }
 
@@ -302,6 +304,7 @@ pub fn init(
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
             gateway: Some(IpAddress::Ipv4(default_v4_gw)),
         }])),
+        ip_addrs: Arc::new(Mutex::new(Vec::from(ip_addrs))),
     };
 
     Ok(e1000_iface)

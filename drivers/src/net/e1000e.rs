@@ -4203,6 +4203,7 @@ pub struct E1000eInterface {
     /// Avoid queueing multiple background link-bringup jobs at once.
     bringup_job_scheduled: Arc<AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
+    pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
 }
 
 impl E1000eInterface {
@@ -4318,7 +4319,7 @@ impl NetScheme for E1000eInterface {
         self.name.clone()
     }
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        Vec::from(self.iface.lock().ip_addrs())
+        self.ip_addrs.lock().clone()
     }
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
         e1000e_vlog!("{}: IPv4 address set to {}", self.name, cidr);
@@ -4333,6 +4334,7 @@ impl NetScheme for E1000eInterface {
                 *slot = IpCidr::Ipv4(cidr);
             }
         });
+        *self.ip_addrs.lock() = vec![IpCidr::Ipv4(cidr)];
         Ok(())
     }
     
@@ -4724,6 +4726,7 @@ pub fn init(
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
             gateway: Some(IpAddress::Ipv4(default_v4_gw)),
         }])),
+        ip_addrs: Arc::new(Mutex::new(Vec::from(ip_addrs))),
     };
 
     Ok(e1000e_iface)
