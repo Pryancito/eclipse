@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
-    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, IpCidr},
+    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet},
 };
-use kernel_hal::net::get_net_device;
 
 
 #[allow(unused_imports)]
@@ -72,11 +71,30 @@ impl Socket for RawSocketState {
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
+            let ip_proto = socket.ip_protocol();
             if socket.can_recv() {
                 if let Ok(size) = socket.recv_slice(data) {
-                    let packet = Ipv4Packet::new_unchecked(data);
                     drop(socket);
                     drop(sockets);
+                    // ping(8) SOCK_DGRAM/RAW ICMP expects ICMP payload only, not the IPv4 header.
+                    if ip_proto == IpProtocol::Icmp {
+                        if let Ok(pkt) = Ipv4Packet::new_checked(&data[..size]) {
+                            let hdr = pkt.header_len() as usize;
+                            let src_addr = pkt.src_addr();
+                            if hdr <= size {
+                                let payload_len = size - hdr;
+                                data.copy_within(hdr..size, 0);
+                                return (
+                                    Ok(payload_len),
+                                    Endpoint::Ip(IpEndpoint {
+                                        addr: IpAddress::Ipv4(src_addr),
+                                        port: 0,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    let packet = Ipv4Packet::new_unchecked(data);
                     return (
                         Ok(size),
                         Endpoint::Ip(IpEndpoint {
@@ -118,7 +136,7 @@ impl Socket for RawSocketState {
             drop(socket);
             drop(sockets);
             if result.is_ok() {
-                drain_net_poll(32);
+                flush_socket_egress();
             }
             return result;
         }
@@ -143,30 +161,9 @@ impl Socket for RawSocketState {
         packet.set_header_len(20);
         packet.set_total_len((20 + len) as u16);
         packet.set_protocol(socket.ip_protocol());
-        let mut src_addr = Ipv4Address::UNSPECIFIED;
-        for iface in get_net_device().iter() {
-            for ip in iface.get_ip_address() {
-                if let IpCidr::Ipv4(cidr) = ip {
-                    if cidr.address() != Ipv4Address::UNSPECIFIED {
-                        if cidr.contains_addr(&v4_dst) {
-                            src_addr = cidr.address();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let src_addr = select_ipv4_for_dst(v4_dst);
         if src_addr.is_unspecified() {
-            for iface in get_net_device().iter() {
-                for ip in iface.get_ip_address() {
-                    if let IpCidr::Ipv4(cidr) = ip {
-                        if cidr.address() != Ipv4Address::UNSPECIFIED {
-                            src_addr = cidr.address();
-                            break;
-                        }
-                    }
-                }
-            }
+            return Err(LxError::EINVAL);
         }
         packet.set_src_addr(src_addr);
         packet.set_dst_addr(v4_dst);
@@ -181,7 +178,7 @@ impl Socket for RawSocketState {
 
         drop(socket);
         drop(sockets);
-        drain_net_poll(32);
+        flush_socket_egress();
         Ok(len)
     }
 

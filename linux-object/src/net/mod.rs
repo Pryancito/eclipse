@@ -19,6 +19,12 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
 /// Global initialization for the network stack.
 pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);
+    refresh_arp_local_macs();
+}
+
+pub fn refresh_arp_local_macs() {
+    let macs = get_net_device().iter().map(|d| d.get_mac()).collect();
+    arp_cache::refresh_local_macs(macs);
 }
 
 pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
@@ -26,6 +32,59 @@ pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::Ne
         .into_iter()
         .find(|iface| iface.get_ifname() == ifname)
         .ok_or(LxError::ENODEV)
+}
+
+/// Map Linux `ifindex` (1-based, see `SIOCGIFINDEX`) to our netdev list order.
+pub fn iface_by_linux_ifindex(idx: u32) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    if idx == 0 {
+        return Err(LxError::ENODEV);
+    }
+    get_net_device()
+        .get((idx as usize).saturating_sub(1))
+        .cloned()
+        .ok_or(LxError::ENODEV)
+}
+
+/// Pick the Ethernet netdev for an IPv4 destination (never loopback).
+pub fn netdev_for_ipv4(dst: smoltcp::wire::Ipv4Address) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    use smoltcp::wire::IpCidr;
+    let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
+    for iface in get_net_device().iter() {
+        if iface.get_ifname() == "loopback" {
+            continue;
+        }
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv4(cidr) = ip {
+                if cidr.prefix_len() == 0 || cidr.address().is_unspecified() {
+                    continue;
+                }
+                if cidr.contains_addr(&dst) {
+                    if best.as_ref().map_or(true, |(p, _)| cidr.prefix_len() > *p) {
+                        best = Some((cidr.prefix_len(), iface.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, dev)) = best {
+        return Ok(dev);
+    }
+    for iface in get_net_device().iter() {
+        if iface.get_ifname() == "loopback" {
+            continue;
+        }
+        let has_v4 = iface.get_ip_address().iter().any(|ip| {
+            matches!(
+                ip,
+                IpCidr::Ipv4(cidr)
+                    if cidr.prefix_len() > 0 && !cidr.address().is_unspecified()
+            )
+        });
+        if has_v4 {
+            return Ok(iface.clone());
+        }
+    }
+    Err(LxError::ENODEV)
 }
 
 pub fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
@@ -109,6 +168,14 @@ pub use listen_table::*;
 /// missing documentation
 pub mod icmp;
 pub use icmp::*;
+
+/// IPv4 → MAC cache (fed from RX frames).
+pub mod arp_cache;
+pub use arp_cache::*;
+
+/// ICMP echo replies from `push_packet` (ping RX).
+pub mod icmp_rx;
+pub use icmp_rx::*;
 
 // pub mod stack;
 
@@ -450,6 +517,9 @@ use kernel_hal::net::get_net_device;
 /// miss doc
 pub fn poll_ifaces() {
     for iface in get_net_device().iter() {
+        if iface.get_ifname() == "loopback" {
+            continue;
+        }
         match iface.poll() {
             Ok(_) => {}
             Err(e) => {
@@ -459,12 +529,157 @@ pub fn poll_ifaces() {
     }
 }
 
+/// Poll a single NIC once (smoltcp path — can hold the global socket set lock).
+pub fn poll_netdev(dev: &dyn zcore_drivers::scheme::NetScheme) {
+    kernel_hal::deferred_job::drain_deferred_jobs();
+    let _ = dev.poll();
+    kernel_hal::deferred_job::drain_deferred_jobs();
+}
+
+/// Pull RX frames from the NIC and feed `push_packet` / `icmp_rx` without smoltcp.
+pub fn netdev_drain_rx(dev: &dyn zcore_drivers::scheme::NetScheme) {
+    let mut buf = [0u8; 2048];
+    for _ in 0..32 {
+        match dev.recv(&mut buf) {
+            Ok(n) if n > 0 => packet::push_packet(&buf[..n]),
+            _ => break,
+        }
+    }
+    kernel_hal::deferred_job::drain_deferred_jobs();
+}
+
 /// Drive smoltcp until ARP/TX/RX make progress (needed after raw/icmp sends).
 pub fn drain_net_poll(rounds: usize) {
     for _ in 0..rounds {
         poll_ifaces();
         kernel_hal::deferred_job::drain_deferred_jobs();
     }
+}
+
+/// Pick a concrete IPv4 source for `dst` (skip 0.0.0.0/0 catch-all; prefer longest prefix).
+pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ipv4Address {
+    use smoltcp::wire::{IpCidr, Ipv4Address};
+    let mut best: Option<(u8, Ipv4Address)> = None;
+    for iface in get_net_device().iter() {
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv4(cidr) = ip {
+                let addr = cidr.address();
+                if addr.is_unspecified() || cidr.prefix_len() == 0 {
+                    continue;
+                }
+                if cidr.contains_addr(&dst) {
+                    if best.map_or(true, |(p, _)| cidr.prefix_len() > p) {
+                        best = Some((cidr.prefix_len(), addr));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, a)) = best {
+        return a;
+    }
+    for iface in get_net_device().iter() {
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv4(cidr) = ip {
+                let addr = cidr.address();
+                if !addr.is_unspecified() && cidr.prefix_len() > 0 {
+                    return addr;
+                }
+            }
+        }
+    }
+    Ipv4Address::UNSPECIFIED
+}
+
+/// Drive iface poll until pending smoltcp egress (ARP + TX) has had time to complete.
+pub fn flush_socket_egress() {
+    drain_net_poll(128);
+}
+
+/// Send a complete IPv4 datagram on the wire (same path as DHCP `PacketSocket`).
+pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, Ipv4Packet,
+    };
+
+    if ip.len() < 20 {
+        return Err(LxError::EINVAL);
+    }
+    let pkt = Ipv4Packet::new_checked(ip).map_err(|_| LxError::EINVAL)?;
+    let dst = pkt.dst_addr();
+    if !dst.is_unicast() {
+        return Err(LxError::EINVAL);
+    }
+    let src = pkt.src_addr();
+    if src.is_unspecified() {
+        return Err(LxError::EINVAL);
+    }
+
+    let dev = netdev_for_ipv4(dst)?;
+    let our_mac_eth = dev.get_mac();
+
+    let on_same_subnet = get_net_device().iter().any(|iface| {
+        iface.get_ip_address().iter().any(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => {
+                cidr.prefix_len() > 0 && !cidr.address().is_unspecified() && cidr.contains_addr(&dst)
+            }
+            _ => false,
+        })
+    });
+
+    // Same subnet (QEMU slirp): L2 broadcast is enough; skip slow ARP + poll storms.
+    if on_same_subnet {
+        let mut frame = vec![0u8; 14 + ip.len()];
+        let mut eth = EthernetFrame::new_unchecked(&mut frame);
+        eth.set_dst_addr(EthernetAddress::BROADCAST);
+        eth.set_src_addr(our_mac_eth);
+        eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
+        eth.payload_mut().copy_from_slice(ip);
+        dev.send(&frame).map_err(|_| LxError::EIO)?;
+        netdev_drain_rx(dev.as_ref());
+        return Ok(());
+    }
+
+    const ARP_TRIES: usize = 4;
+    for attempt in 0..ARP_TRIES {
+        if let Some(dst_mac) = arp_cache::lookup(dst) {
+            let mut frame = vec![0u8; 14 + ip.len()];
+            let mut eth = EthernetFrame::new_unchecked(&mut frame);
+            eth.set_dst_addr(dst_mac);
+            eth.set_src_addr(our_mac_eth);
+            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
+            eth.payload_mut().copy_from_slice(ip);
+            dev.send(&frame).map_err(|_| LxError::EIO)?;
+            netdev_drain_rx(dev.as_ref());
+            return Ok(());
+        }
+
+        // Broadcast ARP who-has (QEMU gateway answers quickly after DHCP).
+        let mut arp_buf = vec![0u8; 14 + 28];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut arp_buf);
+            eth.set_dst_addr(EthernetAddress::BROADCAST);
+            eth.set_src_addr(our_mac_eth);
+            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Arp);
+            let repr = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request,
+                source_hardware_addr: our_mac_eth,
+                source_protocol_addr: src,
+                target_hardware_addr: EthernetAddress::BROADCAST,
+                target_protocol_addr: dst,
+            };
+            repr.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
+        }
+        dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
+        netdev_drain_rx(dev.as_ref());
+        if arp_cache::lookup(dst).is_some() {
+            continue;
+        }
+        if attempt + 1 == ARP_TRIES {
+            break;
+        }
+    }
+    Err(LxError::EINVAL)
 }
 
 // ============= SocketHandle =============

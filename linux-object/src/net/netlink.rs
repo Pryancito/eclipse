@@ -253,7 +253,6 @@ impl Socket for NetlinkSocketState {
             NetlinkMessageType::NewAddr => {
                 // RTM_NEWADDR: configure an IP address on an interface.
                 // Payload: IfaceAddrMsg + IFA_* attributes.
-                use kernel_hal::net::get_net_device;
                 if data.len() < size_of::<NetlinkMessageHeader>() + size_of::<IfaceAddrMsg>() {
                     return Err(LxError::EINVAL);
                 }
@@ -287,11 +286,20 @@ impl Socket for NetlinkSocketState {
                         smoltcp::wire::Ipv4Address::from_bytes(&bytes),
                         ifa.ifa_prefixlen,
                     );
-                    let iface_idx = (ifa.ifa_index as usize).saturating_sub(1);
-                    let ifaces = get_net_device();
-                    if let Some(iface) = ifaces.get(iface_idx) {
+                    if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifa.ifa_index) {
+                        crate::net::arp_cache::clear();
+                        crate::net::refresh_arp_local_macs();
                         let _ = iface.set_ipv4_address(cidr);
-                        info!("[netlink] NewAddr: set {}.{}.{}.{}/{} on if{}", bytes[0], bytes[1], bytes[2], bytes[3], ifa.ifa_prefixlen, iface_idx);
+                        info!(
+                            "[netlink] NewAddr: set {}.{}.{}.{}/{} on {} (ifindex {})",
+                            bytes[0],
+                            bytes[1],
+                            bytes[2],
+                            bytes[3],
+                            ifa.ifa_prefixlen,
+                            iface.get_ifname(),
+                            ifa.ifa_index
+                        );
                     }
                 }
                 // ACK (error=0)
@@ -300,7 +308,6 @@ impl Socket for NetlinkSocketState {
             NetlinkMessageType::NewRoute => {
                 // RTM_NEWROUTE: add a routing entry (default gateway etc.)
                 // Payload: rtmsg + RTA_GATEWAY attribute.
-                use kernel_hal::net::get_net_device;
                 use smoltcp::wire::IpAddress;
                 // RTA_GATEWAY = 5
                 const RTA_GATEWAY: u16 = 5;
@@ -311,7 +318,7 @@ impl Socket for NetlinkSocketState {
                     return Err(LxError::EINVAL);
                 }
                 let mut gw_bytes: Option<[u8; 4]> = None;
-                let mut ifindex: usize = 0;
+                let mut linux_oif: u32 = 0;
                 let mut ptr = rtm_off + RTM_SIZE;
                 // RTA_OIF = 4
                 const RTA_OIF: u16 = 4;
@@ -326,18 +333,26 @@ impl Socket for NetlinkSocketState {
                         arr.copy_from_slice(payload);
                         gw_bytes = Some(arr);
                     } else if rta.rta_type == RTA_OIF && payload.len() == 4 {
-                        #[allow(unsafe_code)]
-                        let idx = unsafe { *(payload.as_ptr() as *const u32) } as usize;
-                        ifindex = idx.saturating_sub(1);
+                        linux_oif = {
+                            #[allow(unsafe_code)]
+                            unsafe { *(payload.as_ptr() as *const u32) }
+                        };
                     }
                     ptr += (rta_len + 3) & !3;
                 }
                 if let Some(gw) = gw_bytes {
-                    let ifaces = get_net_device();
-                    if let Some(iface) = ifaces.get(ifindex) {
+                    if let Ok(iface) = crate::net::iface_by_linux_ifindex(linux_oif) {
                         let gw_addr = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&gw));
                         let _ = iface.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(gw_addr));
-                        info!("[netlink] NewRoute: default gw {}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
+                        info!(
+                            "[netlink] NewRoute: default gw {}.{}.{}.{} via {} (oif {})",
+                            gw[0],
+                            gw[1],
+                            gw[2],
+                            gw[3],
+                            iface.get_ifname(),
+                            linux_oif
+                        );
                     }
                 }
                 // ACK

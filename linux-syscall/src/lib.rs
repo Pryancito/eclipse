@@ -235,6 +235,7 @@ impl Syscall<'_> {
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
+            Sys::ALARM => self.sys_alarm(a0),
             Sys::GETTIMEOFDAY => self.sys_gettimeofday(a0.into(), a1.into()),
             Sys::CLOCK_GETTIME => self.sys_clock_gettime(a0, a1.into()),
             Sys::CLOCK_GETRES => self.unimplemented("clock_getres", Ok(0)),

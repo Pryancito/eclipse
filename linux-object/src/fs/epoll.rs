@@ -115,7 +115,7 @@ impl Epoll {
             if let Err(e) = crate::process::check_signals() {
                 return Err(e);
             }
-            crate::net::poll_ifaces();
+            kernel_hal::deferred_job::drain_deferred_jobs();
             let mut events = Vec::new();
             let interest_list = self.inner.lock().interest_list.clone();
             for (fd, event) in interest_list {

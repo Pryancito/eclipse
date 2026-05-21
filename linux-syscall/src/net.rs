@@ -267,7 +267,8 @@ impl Syscall<'_> {
             .clone()
             .as_socket()?
             .write(buf.as_slice(len)?, endpoint)?;
-        linux_object::net::drain_net_poll(32);
+        // Do not drain_net_poll here — busybox ping uses sendto; 32× poll_ifaces
+        // blocks for a long time (smoltcp + SOCKETS lock). Sockets drive RX in read/poll.
         Ok(len)
     }
 
@@ -282,6 +283,9 @@ impl Syscall<'_> {
         addrlen: UserInOutPtr<u32>,
     ) -> SysResult {
         let _ = self.maybe_handle_tty_intr()?;
+        if let Err(e) = linux_object::process::check_signals() {
+            return Err(e);
+        }
         info!(
             "sys_recvfrom: sockfd:{}, buffer:{:?}, length:{}, flags:{} , src_addr:{:?}, addrlen:{:?}",
             sockfd, buf, len, flags, src_addr, addrlen

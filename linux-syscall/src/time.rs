@@ -209,4 +209,25 @@ impl Syscall<'_> {
         }
         Ok(0)
     }
+
+    /// Schedule SIGALRM (busybox `ping` uses this for read timeouts).
+    pub fn sys_alarm(&self, seconds: usize) -> SysResult {
+        if seconds == 0 {
+            return Ok(0);
+        }
+        let duration = Duration::from_secs(seconds as u64);
+        let deadline = kernel_hal::timer::timer_now() + duration;
+        let proc = self.zircon_process().clone();
+        kernel_hal::timer::timer_set(deadline, Box::new(move |_| {
+            for tid in proc.thread_ids() {
+                if let Ok(obj) = proc.get_child(tid) {
+                    if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                        thread.lock_linux().signals.insert(Signal::SIGALRM);
+                        thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+                    }
+                }
+            }
+        }));
+        Ok(0)
+    }
 }

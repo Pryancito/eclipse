@@ -46,7 +46,7 @@ impl Syscall<'_> {
                 if let Err(e) = linux_object::process::check_signals() {
                     return Poll::Ready(Err(e));
                 }
-                linux_object::net::poll_ifaces();
+                kernel_hal::deferred_job::drain_deferred_jobs();
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
 
@@ -232,7 +232,7 @@ impl Syscall<'_> {
                 if let Err(e) = linux_object::process::check_signals() {
                     return Poll::Ready(Err(e));
                 }
-                linux_object::net::poll_ifaces();
+                kernel_hal::deferred_job::drain_deferred_jobs();
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;

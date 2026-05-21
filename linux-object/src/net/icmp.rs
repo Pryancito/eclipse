@@ -6,10 +6,7 @@ use crate::{
 use alloc::sync::Arc;
 use async_trait::async_trait;
 use lock::Mutex;
-use smoltcp::{
-    socket::{IcmpEndpoint, IcmpPacketMetadata, IcmpSocket, IcmpSocketBuffer},
-    wire::IpAddress,
-};
+use smoltcp::wire::{IpAddress, Ipv4Address};
 
 #[allow(unused_imports)]
 use zircon_object::object::*;
@@ -21,7 +18,6 @@ pub struct IcmpSocketState {
 
 #[derive(Debug)]
 struct IcmpSocketInner {
-    handle: GlobalSocketHandle,
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
 }
@@ -29,44 +25,32 @@ struct IcmpSocketInner {
 impl IcmpSocketState {
     /// missing documentation
     pub fn new() -> Self {
-        let rx_buffer = IcmpSocketBuffer::new(
-            vec![IcmpPacketMetadata::EMPTY; ICMP_METADATA_BUF],
-            vec![0; ICMP_RECVBUF],
-        );
-        let tx_buffer = IcmpSocketBuffer::new(
-            vec![IcmpPacketMetadata::EMPTY; ICMP_METADATA_BUF],
-            vec![0; ICMP_SENDBUF],
-        );
-        let socket = IcmpSocket::new(rx_buffer, tx_buffer);
-        let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
-
         IcmpSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(IcmpSocketInner {
-                handle,
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
             }),
         }
     }
 
-    fn ensure_bound(&self, data: &[u8]) -> LxResult {
-        let sockets = get_sockets();
-        let mut set = sockets.lock();
-        let mut socket = set.get::<IcmpSocket>(self.inner.handle.0);
-        if socket.is_open() {
-            return Ok(());
+    fn remote_ipv4(&self) -> Option<Ipv4Address> {
+        let Endpoint::Ip(ip) = self.inner.remote.lock().clone()? else {
+            return None;
+        };
+        match ip.addr {
+            IpAddress::Ipv4(v4) => Some(v4),
+            _ => None,
         }
-        if data.len() >= 6 {
-            let ident = u16::from_be_bytes([data[4], data[5]]);
-            socket
-                .bind(IcmpEndpoint::Ident(ident))
-                .map_err(|_| LxError::EINVAL)?;
-            return Ok(());
+    }
+
+    fn kick_rx(&self) {
+        let Some(dst) = self.remote_ipv4() else {
+            return;
+        };
+        if let Ok(dev) = netdev_for_ipv4(dst) {
+            netdev_drain_rx(dev.as_ref());
         }
-        socket
-            .bind(IcmpEndpoint::Ident(0))
-            .map_err(|_| LxError::EINVAL)
     }
 }
 
@@ -74,28 +58,25 @@ impl IcmpSocketState {
 impl Socket for IcmpSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
-            drain_net_poll(4);
+            if let Some((pkt, src)) = icmp_rx::pop() {
+                let n = pkt.len().min(data.len());
+                data[..n].copy_from_slice(&pkt[..n]);
+                return (
+                    Ok(n),
+                    Endpoint::Ip(IpEndpoint::new(src.into(), 0)),
+                );
+            }
+
+            self.kick_rx();
+
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            let net_sockets = get_sockets();
-            let mut sockets = net_sockets.lock();
-            let mut socket = sockets.get::<IcmpSocket>(self.inner.handle.0);
-            if socket.can_recv() {
-                if let Ok((size, addr)) = socket.recv_slice(data) {
-                    let endpoint = match addr {
-                        IpAddress::Ipv4(v4) => IpEndpoint::new(v4.into(), 0),
-                        _ => IpEndpoint::UNSPECIFIED,
-                    };
-                    drop(socket);
-                    drop(sockets);
-                    return (Ok(size), Endpoint::Ip(endpoint));
-                }
+            if let Err(e) = crate::process::check_signals() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
-            drop(socket);
-            drop(sockets);
-            if non_block {
+
+            if self.inner.flags.lock().contains(OpenFlags::NON_BLOCK) {
                 return (
                     Err(LxError::EAGAIN),
                     Endpoint::Ip(IpEndpoint::UNSPECIFIED),
@@ -123,17 +104,27 @@ impl Socket for IcmpSocketState {
             return Err(LxError::EINVAL);
         }
 
-        self.ensure_bound(data)?;
+        let src = select_ipv4_for_dst(dst);
+        if src.is_unspecified() {
+            return Err(LxError::EINVAL);
+        }
 
-        let net_sockets = get_sockets();
-        let mut sockets = net_sockets.lock();
-        let mut socket = sockets.get::<IcmpSocket>(self.inner.handle.0);
-        socket
-            .send_slice(data, IpAddress::Ipv4(dst))
-            .map_err(|_| LxError::ENOBUFS)?;
-        drop(socket);
-        drop(sockets);
-        drain_net_poll(32);
+        let ip_len = 20 + data.len();
+        let mut ip = vec![0u8; ip_len];
+        {
+            let mut pkt = smoltcp::wire::Ipv4Packet::new_unchecked(&mut ip);
+            pkt.set_version(4);
+            pkt.set_header_len(20);
+            pkt.set_total_len(ip_len as u16);
+            pkt.set_protocol(smoltcp::wire::IpProtocol::Icmp);
+            pkt.set_src_addr(src);
+            pkt.set_dst_addr(dst);
+            pkt.set_hop_limit(64);
+            pkt.payload_mut().copy_from_slice(data);
+            pkt.fill_checksum();
+        }
+        send_ip_ethernet(&ip)?;
+        self.kick_rx();
         Ok(data.len())
     }
 
@@ -146,17 +137,7 @@ impl Socket for IcmpSocketState {
         }
     }
 
-    fn bind(&self, endpoint: Endpoint) -> SysResult {
-        let Endpoint::Ip(ip) = endpoint else {
-            return Err(LxError::EINVAL);
-        };
-        let ident = ip.port;
-        let sockets = get_sockets();
-        let mut set = sockets.lock();
-        let mut socket = set.get::<IcmpSocket>(self.inner.handle.0);
-        socket
-            .bind(IcmpEndpoint::Ident(ident))
-            .map_err(|_| LxError::EINVAL)?;
+    fn bind(&self, _endpoint: Endpoint) -> SysResult {
         Ok(0)
     }
 
@@ -165,13 +146,7 @@ impl Socket for IcmpSocketState {
     }
 
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
-        let sockets = get_sockets();
-        let mut s = sockets.lock();
-        let socket = s.get::<IcmpSocket>(self.inner.handle.0);
-        Some((
-            socket.payload_recv_capacity(),
-            socket.payload_send_capacity(),
-        ))
+        Some((ICMP_RECVBUF, ICMP_SENDBUF))
     }
 
     fn socket_type(&self) -> Option<SocketType> {
@@ -179,11 +154,9 @@ impl Socket for IcmpSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        drain_net_poll(1);
-        let s = get_sockets();
-        let mut s = s.lock();
-        let socket = s.get::<IcmpSocket>(self.inner.handle.0);
-        (socket.can_recv(), socket.can_send(), false)
+        self.kick_rx();
+        let readable = icmp_rx::pending();
+        (readable, true, false)
     }
 }
 
@@ -215,7 +188,7 @@ impl FileLike for IcmpSocketState {
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        unimplemented!()
+        Err(LxError::ESPIPE)
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {

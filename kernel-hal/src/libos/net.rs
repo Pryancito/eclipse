@@ -60,6 +60,6 @@ pub fn init() {
 
 pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
     let mut devices = all_net().as_vec().clone();
-    devices.sort_by_key(|d| d.get_ifname() != "loopback");
+    devices.sort_by_key(|d| if d.get_ifname() == "loopback" { 1 } else { 0 });
     devices
 }

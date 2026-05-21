@@ -22,6 +22,8 @@ lazy_static! {
 
 /// Dispatches a received packet to all registered AF_PACKET sockets.
 pub fn push_packet(packet: &[u8]) {
+    crate::net::arp_cache::learn_from_frame(packet);
+    crate::net::icmp_rx::deliver_from_frame(packet);
     let flag = kernel_hal::interrupt::intr_get();
     if flag { kernel_hal::interrupt::intr_off(); }
     let mut sockets = PACKET_SOCKETS.lock();
@@ -129,18 +131,19 @@ impl Socket for PacketSocketState {
 
             let ifindex = *self.inner.ifindex.lock();
             {
-                let ifaces = get_net_device();
                 let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
                     let _ = net.poll();
                     let _ = net.poll();
                 };
                 if ifindex > 0 {
-                    if let Some(net) = ifaces.get(ifindex as usize - 1) {
+                    if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
                         poll_net(net.as_ref());
                     }
                 } else {
-                    for net in ifaces.iter() {
-                        poll_net(net.as_ref());
+                    for net in get_net_device().iter() {
+                        if net.get_ifname() != "loopback" {
+                            poll_net(net.as_ref());
+                        }
                     }
                 }
             }
@@ -185,13 +188,18 @@ impl Socket for PacketSocketState {
         }
     }
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
-        let ifaces = get_net_device();
         let ifindex = *self.inner.ifindex.lock();
         let dev = if ifindex > 0 {
-            ifaces.get(ifindex as usize - 1).cloned()
+            crate::net::iface_by_linux_ifindex(ifindex)?
         } else {
-            ifaces.first().cloned()
-        }.ok_or(LxError::ENODEV)?;
+            crate::net::netdev_for_ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
+                .or_else(|_| {
+                    get_net_device()
+                        .into_iter()
+                        .find(|n| n.get_ifname() != "loopback")
+                        .ok_or(LxError::ENODEV)
+                })?
+        };
 
         if self.inner.socket_type == SocketType::SOCK_DGRAM {
             if let Some(Endpoint::LinkLevel(ll)) = sendto_endpoint {
@@ -207,21 +215,33 @@ impl Socket for PacketSocketState {
                 let protocol = protocol_raw;
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut().copy_from_slice(data);
-                dev.send(&buf).map_err(|_| LxError::EIO)?;
-                crate::net::poll_ifaces();
-                kernel_hal::deferred_job::drain_deferred_jobs();
-                info!("PacketSocket: sent {} bytes (DGRAM, proto (host)={:#x})", data.len(), protocol);
-                return Ok(data.len());
+                for _ in 0..16 {
+                    if dev.send(&buf).is_ok() {
+                        kernel_hal::deferred_job::drain_deferred_jobs();
+                        return Ok(data.len());
+                    }
+                    kernel_hal::deferred_job::drain_deferred_jobs();
+                }
+                return Err(LxError::EAGAIN);
             }
             // If no endpoint, we can't send SOCK_DGRAM (no destination MAC).
             return Err(LxError::EINVAL);
         }
         
-        dev.send(data).map_err(|_| LxError::EIO)?;
-        crate::net::poll_ifaces();
-        kernel_hal::deferred_job::drain_deferred_jobs();
-        info!("PacketSocket: sent {} bytes (ifindex={})", data.len(), ifindex);
-        Ok(data.len())
+        // Do not call full poll_ifaces() here — edhcpc blocks inside send() while
+        // waiting for DHCPOFFER; a heavy poll (link bringup + full RX drain) looks hung.
+        for _ in 0..16 {
+            match dev.send(data) {
+                Ok(n) => {
+                    kernel_hal::deferred_job::drain_deferred_jobs();
+                    return Ok(n);
+                }
+                Err(_) => {
+                    kernel_hal::deferred_job::drain_deferred_jobs();
+                }
+            }
+        }
+        Err(LxError::EAGAIN)
     }
 
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
@@ -258,12 +278,13 @@ impl Socket for PacketSocketState {
         kernel_hal::deferred_job::drain_deferred_jobs();
         crate::net::poll_ifaces();
         let readable = !self.inner.packet_queue.lock().is_empty();
-        let ifaces = get_net_device();
         let ifindex = *self.inner.ifindex.lock();
         let dev = if ifindex > 0 {
-            ifaces.get(ifindex as usize - 1).cloned()
+            crate::net::iface_by_linux_ifindex(ifindex).ok()
         } else {
-            ifaces.first().cloned()
+            get_net_device()
+                .into_iter()
+                .find(|n| n.get_ifname() != "loopback")
         };
         let writable = dev.as_ref().map_or(false, |d| d.can_send());
         (readable, writable, false)

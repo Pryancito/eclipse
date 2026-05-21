@@ -21,7 +21,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-bootp-udp";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-icmp-gw";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -537,6 +537,8 @@ pub struct E1000eHw {
     /// Last GPRC snapshot (clear-on-read); used to detect HW RX without DD.
     last_hw_rx_packets: u32,
     rx_diag_counter: u32,
+    /// Cap frames delivered per `poll()` so AF_PACKET `send()` does not drain the whole ring.
+    rx_poll_budget: u8,
     /// Full PHY/link tuning deferred to `poll()` so PCI probe does not block the shell.
     link_bringup_pending: bool,
     link_bringup_attempts: u8,
@@ -2334,10 +2336,10 @@ impl E1000eHw {
     }
 
     fn is_bootp_udp(peek: &[u8], l2: usize, ihl: usize) -> bool {
-        if peek.len() < l2 + ihl + 9 {
+        if peek.len() < l2 + ihl + 8 {
             return false;
         }
-        // BOOTP lives in UDP; ICMP/ARP mis-parse if we read "ports" at the L4 offset.
+        // BOOTP is UDP-only; at the L4 offset ICMP uses type/code, not UDP ports.
         if peek[l2 + 9] != 17 {
             return false;
         }
@@ -2351,6 +2353,13 @@ impl E1000eHw {
     fn rx_ipv4_deliverable(data: &[u8]) -> bool {
         if !Self::eth_ipv4_frame_complete(data) {
             return false;
+        }
+        let Some((l2, _, _, _)) = Self::eth_ipv4_header_info(data) else {
+            return false;
+        };
+        // ICMP/ARP/etc. must reach smoltcp (ping to 10.0.2.2); cookie gate is DHCP-only.
+        if data[l2 + 9] != 17 {
+            return true;
         }
         Self::dhcp_cookie_valid_in_frame(data)
     }
@@ -3040,6 +3049,11 @@ impl E1000eHw {
             return;
         }
 
+        if self.device_id == 0x10d3 {
+            self.qemu_finish_link_if_up();
+            return;
+        }
+
         if self.link_bringup_stage == 0 && self.link_bringup_attempts >= 3 {
             self.link_bringup_pending = false;
             self.link_bringup_stage = 0;
@@ -3668,7 +3682,38 @@ impl E1000eHw {
         self.link_up = false;
         self.link_speed = 0;
         self.link_duplex = false;
+        self.rx_poll_budget = 32;
+        unsafe {
+            self.qemu_finish_link_if_up();
+        }
         Ok(())
+    }
+
+    /// QEMU e1000 (0x10d3): trust STATUS.LU, skip multi-second PHY MDIO bringup.
+    unsafe fn qemu_finish_link_if_up(&mut self) {
+        if self.device_id != 0x10d3 {
+            return;
+        }
+        let status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 {
+            return;
+        }
+        self.link_bringup_pending = false;
+        if self.link_up && self.rx_link_armed {
+            return;
+        }
+        self.link_up = true;
+        self.link_speed = Self::speed_mbps_from_status(status);
+        self.link_duplex = status & STATUS_FD != 0;
+        self.config_collision_dist_linux();
+        if !self.rx_link_armed {
+            self.enable_rx_after_link();
+        }
+        crate::klog_info!(
+            "[e1000e] QEMU fast link: {} Mb/s {} duplex\n",
+            self.link_speed,
+            if self.link_duplex { "full" } else { "half" }
+        );
     }
 
     unsafe fn restore_ctrl_autoneg_after_link(&self) {
@@ -3942,6 +3987,9 @@ impl E1000eHw {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
+        if self.rx_poll_budget == 0 {
+            return None;
+        }
         if self.is_i219_metal_rx_hacks() {
             unsafe { self.kick_rx_writeback() };
         }
@@ -3955,6 +4003,7 @@ impl E1000eHw {
         for _ in 0..max_frags {
             let i = self.rx_next_to_clean;
             if let Some(frame) = self.receive_slot(i) {
+                self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
                 return Some(frame);
             }
             // receive_slot returned None either because:
@@ -4020,7 +4069,18 @@ impl E1000eHw {
             return Err(DeviceError::InvalidParam);
         }
         if !self.link_up {
-            return Err(DeviceError::NotReady);
+            if self.device_id == 0x10d3 {
+                let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+                if status & STATUS_LU != 0 {
+                    self.link_up = true;
+                    self.link_speed = Self::speed_mbps_from_status(status);
+                    self.link_duplex = status & STATUS_FD != 0;
+                } else {
+                    return Err(DeviceError::NotReady);
+                }
+            } else {
+                return Err(DeviceError::NotReady);
+            }
         }
         if !unsafe { self.ensure_tx_engine_ready() } {
             crate::klog_warn!("[e1000e] send: TX engine not ready (TCTL/TXDCTL/GIO) despite link up\n");
@@ -4325,6 +4385,10 @@ impl NetScheme for E1000eInterface {
 
         // RX/TX: smoltcp (ping/ARP) + AF_PACKET dispatch in RxToken::consume.
         {
+            let mut hw = self.driver.hw.lock();
+            hw.rx_poll_budget = 32;
+        }
+        {
             let mut sockets = sockets.lock();
             let _ = self.iface.lock().poll(&mut sockets, ts);
         }
@@ -4579,6 +4643,7 @@ pub fn init(
         stats: NetStats::default(),
         last_hw_rx_packets: 0,
         rx_diag_counter: 0,
+        rx_poll_budget: 32,
         link_bringup_pending: false,
         link_bringup_attempts: 0,
         link_bringup_stage: 0,
