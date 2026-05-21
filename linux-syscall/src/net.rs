@@ -6,6 +6,8 @@ use linux_object::{
     net::*,
 };
 
+const MSG_DONTWAIT: usize = 0x40;
+
 impl Syscall<'_> {
     /// creates an endpoint for communication and returns a file descriptor that refers to that endpoint.
     pub fn sys_socket(&mut self, domain: usize, _type: usize, protocol: usize) -> SysResult {
@@ -291,9 +293,17 @@ impl Syscall<'_> {
             sockfd, buf, len, flags, src_addr, addrlen
         );
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let old_flags = file_like.flags();
+        let force_nonblock = (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
+        if force_nonblock {
+            file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
+        }
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
         let mut data = vec![0u8; len];
         let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
+        if force_nonblock {
+            let _ = file_like.set_flags(old_flags);
+        }
         if let Ok(received) = result {
             if !src_addr.is_null() {
                 let sockaddr_in = SockAddr::from(endpoint);
@@ -341,11 +351,11 @@ impl Syscall<'_> {
         &mut self,
         sockfd: usize,
         msg: UserInOutPtr<MsgHdr>,
-        _flags: usize,
+        flags: usize,
     ) -> SysResult {
         info!(
             "sys_recvmsg: sockfd:{}, msg:{:?}, flags:{}",
-            sockfd, msg, _flags
+            sockfd, msg, flags
         );
         let hdr = msg.read()?;
 
@@ -355,7 +365,15 @@ impl Syscall<'_> {
         let mut data = vec![0u8; iovs.total_len()];
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let old_flags = file_like.flags();
+        let force_nonblock = (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
+        if force_nonblock {
+            file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
+        }
         let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
+        if force_nonblock {
+            let _ = file_like.set_flags(old_flags);
+        }
 
         let addr = hdr.msg_name;
         if let Ok(len) = result {

@@ -596,6 +596,43 @@ pub fn flush_socket_egress() {
     drain_net_poll(128);
 }
 
+fn resolve_ipv4_next_hop(
+    dev: &dyn zcore_drivers::scheme::NetScheme,
+    dst: smoltcp::wire::Ipv4Address,
+) -> smoltcp::wire::Ipv4Address {
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+
+    let on_link = dev.get_ip_address().iter().any(|cidr| match cidr {
+        IpCidr::Ipv4(v4) => {
+            v4.prefix_len() > 0 && !v4.address().is_unspecified() && v4.contains_addr(&dst)
+        }
+        _ => false,
+    });
+    if on_link {
+        return dst;
+    }
+
+    let mut best: Option<(u8, Ipv4Address)> = None;
+    for route in dev.get_routes() {
+        let (prefix, matched) = match route.dst {
+            IpCidr::Ipv4(cidr) => (cidr.prefix_len(), cidr.contains_addr(&dst)),
+            _ => (0, false),
+        };
+        if !matched {
+            continue;
+        }
+        let next_hop = match route.gateway {
+            Some(IpAddress::Ipv4(gw)) => gw,
+            _ => dst,
+        };
+        if best.map_or(true, |(p, _)| prefix > p) {
+            best = Some((prefix, next_hop));
+        }
+    }
+
+    best.map_or(dst, |(_, hop)| hop)
+}
+
 /// Send a complete IPv4 datagram on the wire (same path as DHCP `PacketSocket`).
 pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
     use smoltcp::wire::{
@@ -616,33 +653,12 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
     }
 
     let dev = netdev_for_ipv4(dst)?;
+    let arp_target = resolve_ipv4_next_hop(dev.as_ref(), dst);
     let our_mac_eth = dev.get_mac();
-
-    let on_same_subnet = get_net_device().iter().any(|iface| {
-        iface.get_ip_address().iter().any(|cidr| match cidr {
-            IpCidr::Ipv4(cidr) => {
-                cidr.prefix_len() > 0 && !cidr.address().is_unspecified() && cidr.contains_addr(&dst)
-            }
-            _ => false,
-        })
-    });
-
-    // Same subnet (QEMU slirp): L2 broadcast is enough; skip slow ARP + poll storms.
-    if on_same_subnet {
-        let mut frame = vec![0u8; 14 + ip.len()];
-        let mut eth = EthernetFrame::new_unchecked(&mut frame);
-        eth.set_dst_addr(EthernetAddress::BROADCAST);
-        eth.set_src_addr(our_mac_eth);
-        eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
-        eth.payload_mut().copy_from_slice(ip);
-        dev.send(&frame).map_err(|_| LxError::EIO)?;
-        netdev_drain_rx(dev.as_ref());
-        return Ok(());
-    }
 
     const ARP_TRIES: usize = 4;
     for attempt in 0..ARP_TRIES {
-        if let Some(dst_mac) = arp_cache::lookup(dst) {
+        if let Some(dst_mac) = arp_cache::lookup(arp_target) {
             let mut frame = vec![0u8; 14 + ip.len()];
             let mut eth = EthernetFrame::new_unchecked(&mut frame);
             eth.set_dst_addr(dst_mac);
@@ -665,14 +681,14 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
                 operation: ArpOperation::Request,
                 source_hardware_addr: our_mac_eth,
                 source_protocol_addr: src,
-                target_hardware_addr: EthernetAddress::BROADCAST,
-                target_protocol_addr: dst,
+                target_hardware_addr: EthernetAddress([0; 6]),
+                target_protocol_addr: arp_target,
             };
             repr.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
         }
         dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
         netdev_drain_rx(dev.as_ref());
-        if arp_cache::lookup(dst).is_some() {
+        if arp_cache::lookup(arp_target).is_some() {
             continue;
         }
         if attempt + 1 == ARP_TRIES {
