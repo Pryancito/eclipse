@@ -21,13 +21,324 @@ use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use pci::{PCIDevice, BAR};
-use isomorphic_drivers::net::ethernet::intel::e1000::E1000;
-use isomorphic_drivers::net::ethernet::structs::EthernetAddress as DriverEthernetAddress;
 use lock::Mutex;
+use crate::utils::dma::DmaRegion;
+use core::sync::atomic::{fence, Ordering};
+
+const NUM_DESC: usize = 256;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct E1000SendDesc {
+    addr: u64,
+    len: u16,
+    cso: u8,
+    cmd: u8,
+    status: u8,
+    css: u8,
+    special: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct E1000RecvDesc {
+    addr: u64,
+    len: u16,
+    chksum: u16,
+    status: u8,
+    errors: u8,
+    special: u16,
+}
+
+pub struct E1000 {
+    base: usize,
+    size: usize,
+    mac: EthernetAddress,
+    
+    // RX ring & buffers
+    rx_ring: DmaRegion,
+    rx_bufs: Vec<DmaRegion>,
+    rx_next_to_clean: usize,
+    
+    // TX ring & buffers
+    tx_ring: DmaRegion,
+    tx_bufs: Vec<DmaRegion>,
+    tx_next_to_use: usize,
+    first_trans: bool,
+}
+
+#[inline]
+unsafe fn mmio_read(base: usize, reg: usize) -> u32 {
+    core::ptr::read_volatile((base + reg * 4) as *const u32)
+}
+
+#[inline]
+unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
+    core::ptr::write_volatile((base + reg * 4) as *mut u32, val);
+}
+
+const E1000_CTRL: usize = 0x0000 / 4;
+const E1000_STATUS: usize = 0x0008 / 4;
+const E1000_ICR: usize = 0x00C0 / 4;
+const E1000_IMS: usize = 0x00D0 / 4;
+const E1000_IMC: usize = 0x00D8 / 4;
+const E1000_RCTL: usize = 0x0100 / 4;
+const E1000_TCTL: usize = 0x0400 / 4;
+const E1000_TIPG: usize = 0x0410 / 4;
+const E1000_RDBAL: usize = 0x2800 / 4;
+const E1000_RDBAH: usize = 0x2804 / 4;
+const E1000_RDLEN: usize = 0x2808 / 4;
+const E1000_RDH: usize = 0x2810 / 4;
+const E1000_RDT: usize = 0x2818 / 4;
+const E1000_TDBAL: usize = 0x3800 / 4;
+const E1000_TDBAH: usize = 0x3804 / 4;
+const E1000_TDLEN: usize = 0x3808 / 4;
+const E1000_TDH: usize = 0x3810 / 4;
+const E1000_TDT: usize = 0x3818 / 4;
+const E1000_MTA: usize = 0x5200 / 4;
+const E1000_RAL: usize = 0x5400 / 4;
+const E1000_RAH: usize = 0x5404 / 4;
+
+impl E1000 {
+    fn udelay(us: u64) {
+        let t0 = timer_now_as_micros();
+        const MAX_SPINS: u64 = 10_000_000;
+        let mut spins = 0u64;
+        while timer_now_as_micros().wrapping_sub(t0) < us {
+            core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins >= MAX_SPINS {
+                break;
+            }
+        }
+    }
+
+    pub fn new(base: usize, size: usize, mac: EthernetAddress) -> DeviceResult<Self> {
+        let rx_ring = DmaRegion::alloc(4096).ok_or(DeviceError::IoError)?;
+        let tx_ring = DmaRegion::alloc(4096).ok_or(DeviceError::IoError)?;
+
+        let mut rx_bufs = Vec::with_capacity(NUM_DESC);
+        let mut tx_bufs = Vec::with_capacity(NUM_DESC);
+
+        for _ in 0..NUM_DESC {
+            let buf = DmaRegion::alloc_uninit(4096).ok_or(DeviceError::IoError)?;
+            rx_bufs.push(buf);
+        }
+
+        for _ in 0..NUM_DESC {
+            let buf = DmaRegion::alloc_uninit(4096).ok_or(DeviceError::IoError)?;
+            tx_bufs.push(buf);
+        }
+
+        // Initialize descriptors
+        let rx_desc_slice = unsafe {
+            core::slice::from_raw_parts_mut(rx_ring.as_ptr::<E1000RecvDesc>(), NUM_DESC)
+        };
+        for (i, desc) in rx_desc_slice.iter_mut().enumerate() {
+            desc.addr = rx_bufs[i].paddr() as u64;
+            desc.status = 0;
+            desc.errors = 0;
+            desc.len = 0;
+            desc.chksum = 0;
+            desc.special = 0;
+        }
+
+        let tx_desc_slice = unsafe {
+            core::slice::from_raw_parts_mut(tx_ring.as_ptr::<E1000SendDesc>(), NUM_DESC)
+        };
+        for (i, desc) in tx_desc_slice.iter_mut().enumerate() {
+            desc.addr = tx_bufs[i].paddr() as u64;
+            desc.len = 0;
+            desc.cso = 0;
+            desc.cmd = 0;
+            desc.status = 0;
+            desc.css = 0;
+            desc.special = 0;
+        }
+
+        unsafe {
+            // 1. Disable interrupts
+            mmio_write(base, E1000_IMC, 0xffffffff);
+            let _ = mmio_read(base, E1000_IMC);
+
+            // 2. Device Reset
+            let ctrl = mmio_read(base, E1000_CTRL);
+            mmio_write(base, E1000_CTRL, ctrl | (1 << 26)); // Device Reset (RST)
+            
+            // Wait for reset to complete
+            Self::udelay(10_000); // 10ms
+
+            // 3. Disable interrupts again just in case
+            mmio_write(base, E1000_IMC, 0xffffffff);
+            let _ = mmio_read(base, E1000_IMC);
+
+            // 4. Configure link (Set Link Up, Auto-Speed, Full Duplex)
+            let ctrl = mmio_read(base, E1000_CTRL);
+            mmio_write(base, E1000_CTRL, ctrl | (1 << 6) | (1 << 5) | (1 << 0)); // SLU | ASDE | FD
+
+            // Program transmit descriptor base and length
+            mmio_write(base, E1000_TDBAL, tx_ring.paddr() as u32);
+            mmio_write(base, E1000_TDBAH, (tx_ring.paddr() >> 32) as u32);
+            mmio_write(base, E1000_TDLEN, 4096);
+            
+            // Initialize head and tail to 0
+            mmio_write(base, E1000_TDH, 0);
+            mmio_write(base, E1000_TDT, 0);
+            
+            // TCTL: EN | PSP | CT=0x10 | COLD=0x40
+            mmio_write(base, E1000_TCTL, (1 << 1) | (1 << 3) | (0x10 << 4) | (0x40 << 12));
+            // TIPG: IPGT=0xa | IPGR1=0x8 | IPGR2=0xc
+            mmio_write(base, E1000_TIPG, 0xa | (0x8 << 10) | (0xc << 20));
+
+            // Write MAC address to RAL / RAH
+            let mut ral: u32 = 0;
+            let mut rah: u32 = 0;
+            for i in 0..4 {
+                ral |= (mac.as_bytes()[i] as u32) << (i * 8);
+            }
+            for i in 0..2 {
+                rah |= (mac.as_bytes()[i + 4] as u32) << (i * 8);
+            }
+            mmio_write(base, E1000_RAL, ral);
+            mmio_write(base, E1000_RAH, rah | (1 << 31)); // AV | AS=DA
+
+            // Clear MTA (Multicast Table Array)
+            for i in E1000_MTA..E1000_RAL {
+                mmio_write(base, i, 0);
+            }
+
+            // Program receive descriptor base and length
+            mmio_write(base, E1000_RDBAL, rx_ring.paddr() as u32);
+            mmio_write(base, E1000_RDBAH, (rx_ring.paddr() >> 32) as u32);
+            mmio_write(base, E1000_RDLEN, 4096);
+
+            // Initialize head and tail
+            mmio_write(base, E1000_RDH, 0);
+            mmio_write(base, E1000_RDT, (NUM_DESC - 1) as u32);
+
+            // RCTL: EN | BAM | SECRC | BSIZE=0 (2048 bytes buffer size), BSEX=0
+            mmio_write(base, E1000_RCTL, (1 << 1) | (1 << 15) | (1 << 26));
+
+            // Clear pending interrupts
+            let _icr = mmio_read(base, E1000_ICR);
+            
+            // Enable RXT0 and LSC interrupts
+            mmio_write(base, E1000_IMS, (1 << 7) | (1 << 2)); // RXT0 | LSC
+            let _ = mmio_read(base, E1000_IMS);
+        }
+
+        Ok(E1000 {
+            base,
+            size,
+            mac,
+            rx_ring,
+            rx_bufs,
+            rx_next_to_clean: 0,
+            tx_ring,
+            tx_bufs,
+            tx_next_to_use: 0,
+            first_trans: true,
+        })
+    }
+
+    pub fn handle_interrupt(&mut self) -> bool {
+        unsafe {
+            let icr = mmio_read(self.base, E1000_ICR);
+            if icr != 0 {
+                if (icr & (1 << 2)) != 0 {
+                    let status = mmio_read(self.base, E1000_STATUS);
+                    let link_up = (status & (1 << 1)) != 0;
+                    info!("[e1000] Link status changed. Link is {}", if link_up { "UP" } else { "DOWN" });
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn receive(&mut self) -> Option<Vec<u8>> {
+        let ring = self.rx_ring.as_ptr::<E1000RecvDesc>();
+        let desc_addr = unsafe { ring.add(self.rx_next_to_clean) };
+        let status = unsafe { core::ptr::read_volatile(&((*desc_addr).status)) };
+        
+        if (status & 1) == 0 {
+            return None;
+        }
+
+        fence(Ordering::Acquire);
+
+        let len = unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize;
+
+        let buf_vaddr = self.rx_bufs[self.rx_next_to_clean].vaddr();
+        let buffer = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
+        let pkt = buffer.to_vec();
+
+        unsafe {
+            core::ptr::write_volatile(&mut (*desc_addr).status, 0);
+            core::ptr::write_volatile(&mut (*desc_addr).errors, 0);
+        }
+
+        fence(Ordering::Release);
+
+        unsafe {
+            mmio_write(self.base, E1000_RDT, self.rx_next_to_clean as u32);
+        }
+
+        self.rx_next_to_clean = (self.rx_next_to_clean + 1) % NUM_DESC;
+
+        Some(pkt)
+    }
+
+    pub fn can_send(&self) -> bool {
+        if self.first_trans {
+            return true;
+        }
+        let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
+        let desc_addr = unsafe { ring.add(self.tx_next_to_use) };
+        let status = unsafe { core::ptr::read_volatile(&((*desc_addr).status)) };
+        (status & 1) != 0
+    }
+
+    pub fn send(&mut self, buffer: &[u8]) {
+        let index = self.tx_next_to_use;
+        let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
+        let desc_addr = unsafe { ring.add(index) };
+
+        assert!(self.first_trans || unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 });
+
+        let buf_vaddr = self.tx_bufs[index].vaddr();
+        let target = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, buffer.len()) };
+        target[..buffer.len()].copy_from_slice(buffer);
+
+        unsafe {
+            core::ptr::write_volatile(&mut (*desc_addr).len, buffer.len() as u16);
+            core::ptr::write_volatile(&mut (*desc_addr).cmd, (1 << 3) | (1 << 1) | (1 << 0)); // RS | IFCS | EOP
+            core::ptr::write_volatile(&mut (*desc_addr).status, 0);
+            core::ptr::write_volatile(&mut (*desc_addr).cso, 0);
+            core::ptr::write_volatile(&mut (*desc_addr).css, 0);
+            core::ptr::write_volatile(&mut (*desc_addr).special, 0);
+        }
+
+        fence(Ordering::SeqCst);
+
+        self.tx_next_to_use = (self.tx_next_to_use + 1) % NUM_DESC;
+
+        unsafe {
+            mmio_write(self.base, E1000_TDT, self.tx_next_to_use as u32);
+        }
+
+        fence(Ordering::SeqCst);
+
+        if self.tx_next_to_use == 0 {
+            self.first_trans = false;
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct E1000Driver {
-    pub hw: Arc<Mutex<E1000<crate::net::ProviderImpl>>>,
+    pub hw: Arc<Mutex<E1000>>,
     pub stats: Arc<Mutex<NetStats>>,
 }
 
@@ -37,9 +348,20 @@ pub struct E1000Interface {
     driver: E1000Driver,
     name: String,
     irq: usize,
+    base: usize,
+    poll_pending: Arc<core::sync::atomic::AtomicBool>,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
+}
+
+impl E1000Interface {
+    fn ims_rearm(&self) {
+        unsafe {
+            mmio_write(self.base, E1000_IMS, (1 << 7) | (1 << 2)); // RXT0 | LSC
+            let _ = mmio_read(self.base, E1000_IMS);
+        }
+    }
 }
 
 impl Scheme for E1000Interface {
@@ -52,17 +374,28 @@ impl Scheme for E1000Interface {
             return;
         }
 
-        let mut hw = self.driver.hw.lock();
-        if hw.handle_interrupt() {
+        let icr = unsafe { mmio_read(self.base, E1000_ICR) };
+        if icr == 0 {
+            if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                self.ims_rearm();
+            }
+            return;
+        }
+
+        if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+            self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+            unsafe {
+                mmio_write(self.base, E1000_IMC, 0xffffffff);
+                let _ = mmio_read(self.base, E1000_IMC);
+            }
+            let poll_pending = self.poll_pending.clone();
             let self_clone = self.clone();
             crate::utils::deferred_job::push_deferred_job(move || {
-                let ts = Instant::from_micros(timer_now_as_micros() as i64);
-                let sockets = get_sockets();
-                let mut sockets = sockets.lock();
-                if let Err(e) = self_clone.iface.lock().poll(&mut sockets, ts) {
-                    warn!("[e1000] poll error: {}", e);
-                }
+                let _ = self_clone.poll();
+                poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
             });
+        } else {
+            self.ims_rearm();
         }
     }
 }
@@ -85,7 +418,7 @@ impl NetScheme for E1000Interface {
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
-        match self.iface.lock().poll(&mut sockets, timestamp) {
+        let res = match self.iface.lock().poll(&mut sockets, timestamp) {
             Ok(p) => {
                 trace!("e1000 NetScheme poll: {:?}", p);
                 Ok(())
@@ -94,7 +427,9 @@ impl NetScheme for E1000Interface {
                 warn!("poll got err {}", err);
                 Err(DeviceError::IoError)
             }
-        }
+        };
+        self.ims_rearm();
+        res
     }
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
@@ -273,12 +608,12 @@ pub fn init(
     info!("Probing e1000 {}", name);
 
     let mac: [u8; 6] = [0x54, 0x51, 0x9F, 0x71, 0xC0, index as u8];
-    let e1000 = E1000::new(header, size, DriverEthernetAddress::from_bytes(&mac));
+    let ethernet_addr = EthernetAddress::from_bytes(&mac);
+    let e1000 = E1000::new(header, size, ethernet_addr)?;
     let hw = Arc::new(Mutex::new(e1000));
     let stats = Arc::new(Mutex::new(NetStats::default()));
     let net_driver = E1000Driver { hw: hw.clone(), stats: stats.clone() };
 
-    let ethernet_addr = EthernetAddress::from_bytes(&mac);
     let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
     let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
@@ -293,16 +628,14 @@ pub fn init(
         .routes(routes)
         .finalize();
 
-    info!(
-        "e1000 interface {} up with addr 10.0.2.{}/24",
-        name,
-        15 + index
-    );
+    crate::klog_info!("e1000 interface {} discovered", name);
     let e1000_iface = E1000Interface {
         iface: Arc::new(Mutex::new(iface)),
         driver: net_driver,
         name,
         irq,
+        base: header,
+        poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         stats,
         routes: Arc::new(Mutex::new(vec![RouteInfo {
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),

@@ -196,8 +196,7 @@ endif
 
 qemu_opts += \
 	-netdev user,id=net1 \
-	-device e1000e,netdev=net1 \
-	-object filter-dump,id=f1,netdev=net1,file=dump.pcap
+	-device e1000e,netdev=net1
 
 ifeq ($(DISK), on)
   ifeq ($(ARCH), x86_64)
