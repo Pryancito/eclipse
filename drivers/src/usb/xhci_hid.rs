@@ -355,9 +355,21 @@ impl XhciMmio {
         fence(Ordering::Release);
     }
 
+    fn write_op64(&self, o: usize, v: u64) {
+        fence(Ordering::Release);
+        unsafe { write_volatile((self.op_base + o) as *mut u64, v) }
+        fence(Ordering::Release);
+    }
+
     fn write_rt(&self, o: usize, v: u32) {
         fence(Ordering::Release);
         unsafe { write_volatile((self.rt_base + o) as *mut u32, v) }
+        fence(Ordering::Release);
+    }
+
+    fn write_rt64(&self, o: usize, v: u64) {
+        fence(Ordering::Release);
+        unsafe { write_volatile((self.rt_base + o) as *mut u64, v) }
         fence(Ordering::Release);
     }
 
@@ -436,6 +448,22 @@ fn trb_configure_endpoint(input_ctx: u64, slot: u8) -> Trb {
         p: input_ctx,
         status: 0,
         ctrl: (12u32 << 10) | ((slot as u32) << 24),
+    }
+}
+
+fn trb_reset_endpoint(slot: u8, dci: u8) -> Trb {
+    Trb {
+        p: 0,
+        status: 0,
+        ctrl: (14u32 << 10) | ((dci as u32) << 16) | ((slot as u32) << 24),
+    }
+}
+
+fn trb_set_tr_dequeue_pointer(new_deq_phys: u64, dcs: bool, slot: u8, dci: u8) -> Trb {
+    Trb {
+        p: (new_deq_phys & !0xf) | (dcs as u64),
+        status: 0,
+        ctrl: (16u32 << 10) | ((dci as u32) << 16) | ((slot as u32) << 24),
     }
 }
 
@@ -645,6 +673,20 @@ impl XferRing {
             self.xfer_deq = (self.xfer_deq + 1) % self.cap;
         }
     }
+
+    fn deq_phys(&self) -> u64 {
+        (self.buf.phys + self.xfer_deq * 16) as u64
+    }
+
+    fn deq_cycle(&self) -> bool {
+        if self.xfer_deq == self.enq {
+            self.cycle
+        } else {
+            let off = self.xfer_deq * 16;
+            let ctrl = self.buf.read_u32(off + 12);
+            (ctrl & 1) != 0
+        }
+    }
 }
 
 struct EventRing {
@@ -820,8 +862,7 @@ impl XhciInner {
         if let Some(trb) = self.ev.pop() {
             let etype = (trb.ctrl >> 10) & 0x3f;
             let erdp = self.ev.erdp_phys();
-            self.mmio.write_rt(0x38, (erdp as u32 & !0x7) | 0x8);
-            self.mmio.write_rt(0x3C, (erdp >> 32) as u32);
+            self.mmio.write_rt64(0x38, (erdp as u64 & !0xf) | 0x8);
 
             if etype == 32 {
                 // TRB_EVT_TRANSFER — solo despachar si tenemos listener (modo poll/IRQ).
@@ -1000,6 +1041,28 @@ impl XhciInner {
         self.wait_cmd_phys(p)
     }
 
+    fn reset_endpoint_and_dequeue(&mut self, slot: u8, dci: u8) -> DeviceResult<()> {
+        info!("[xhci] reset_endpoint_and_dequeue slot={} dci={}", slot, dci);
+        let p_reset = self.cmd.push(trb_reset_endpoint(slot, dci))?;
+        self.mmio.ring_db(0, 0);
+        if let Err(e) = self.wait_cmd_phys(p_reset) {
+            warn!("[xhci] reset endpoint command failed: {:?}", e);
+        }
+
+        let ri = Self::ri(slot, dci);
+        if let Some(ring) = self.xfer_rings.get(ri).and_then(|o| o.as_ref()) {
+            let deq_phys = ring.deq_phys();
+            let dcs = ring.deq_cycle();
+            info!("[xhci] set tr dequeue pointer: deq_phys={:#x} dcs={}", deq_phys, dcs);
+            let p_deq = self.cmd.push(trb_set_tr_dequeue_pointer(deq_phys, dcs, slot, dci))?;
+            self.mmio.ring_db(0, 0);
+            if let Err(e) = self.wait_cmd_phys(p_deq) {
+                warn!("[xhci] set tr dequeue pointer command failed: {:?}", e);
+            }
+        }
+        Ok(())
+    }
+
     fn wait_ep0_status_any(
         &mut self,
         slot: u8,
@@ -1009,10 +1072,16 @@ impl XhciInner {
         n_trb: usize,
         timeout_us: u64,
     ) -> DeviceResult<()> {
+        let speed = self.slot_speed[slot as usize];
         info!(
-            "[xhci] EP0 slot={} esperando: setup={:#x} data={:#x} status={:#x}",
-            slot, setup_phys, data_phys, status_phys
+            "[xhci] EP0 slot={} speed={} esperando: setup={:#x} data={:#x} status={:#x}",
+            slot, speed, setup_phys, data_phys, status_phys
         );
+        // Calcular el rango del anillo EP0 para este slot para hacer matching flexible.
+        // VirtualBox a veces reporta ev.p apuntando al TRB siguiente al completado,
+        // así que comprobamos si p cae en la ventana [setup_phys, status_phys+16).
+        let lo = setup_phys.min(data_phys).min(status_phys);
+        let hi = setup_phys.max(data_phys).max(status_phys) + 16;
         let start = timer_now_us();
         let mut spins = 0u64;
         let mut ev_count = 0u32;
@@ -1028,17 +1097,26 @@ impl XhciInner {
                         "[xhci] EP0 ev#{}: type=Transfer slot={} dci={} p={:#x} CC={}",
                         ev_count, ev_slot, ev_dci, ev.p, cc
                     );
-                    let in_range = ev.p == setup_phys || ev.p == data_phys || ev.p == status_phys;
+                    // Matching flexible: dirección exacta (QEMU) o dentro del rango de la
+                    // transferencia de control EP0 (VirtualBox puede reportar TRB+N).
+                    let in_range = ev.p == setup_phys
+                        || ev.p == data_phys
+                        || ev.p == status_phys
+                        || (ev.p >= lo && ev.p < hi);
                     if ev_slot == slot && in_range {
                         let i = Self::ri(slot, 1);
                         if let Some(r) = self.xfer_rings.get_mut(i).and_then(|o| o.as_mut()) {
                             r.advance_dequeue(n_trb);
                         }
+                        // CC=1 Success, CC=13 Short Packet: ambos son éxito para Control.
+                        // CC=6 (TRB Error) es también success en Status Stage de algunos HCs
+                        // (VirtualBox, algunos Intel xHCI físicos).
                         if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 {
                             info!("[xhci] EP0 slot={} OK (CC={})", slot, cc);
                             return Ok(());
                         }
-                        warn!("[xhci] EP0 slot={} error CC={}", slot, cc);
+                        warn!("[xhci] EP0 slot={} error CC={}. Intentando reset_endpoint.", slot, cc);
+                        let _ = self.reset_endpoint_and_dequeue(slot, 1);
                         return Err(DeviceError::IoError);
                     } else {
                         // Evento descartado — diagnosticar por qué
@@ -1062,9 +1140,9 @@ impl XhciInner {
             "[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
             slot, ev_count, setup_phys
         );
-        // Volcar estado de USBSTS para diagnóstico
         let sts = self.mmio.read_op(4);
         error!("[xhci] USBSTS={:#010x}", sts);
+        let _ = self.reset_endpoint_and_dequeue(slot, 1);
         Err(DeviceError::IoError)
     }
 
@@ -1236,12 +1314,10 @@ impl XhciInner {
         let cfg = m.read_op(0x38);
         m.write_op(0x38, (cfg & !0xff) | self.max_slots as u32);
 
-        m.write_op(0x30, self.dcbaa.phys as u32);
-        m.write_op(0x34, (self.dcbaa.phys as u64 >> 32) as u32);
+        m.write_op64(0x30, self.dcbaa.phys as u64);
 
         let crcr = self.cmd.crcr();
-        m.write_op(0x18, (crcr as u32 & !1) | 1);
-        m.write_op(0x1C, (crcr >> 32) as u32);
+        m.write_op64(0x18, (crcr as u64 & !0x3F) | 1);
 
         // Configurar Interrupter 0 del Event Ring.
         // Orden mandatorio por spec xHCI §5.5.2:
@@ -1253,11 +1329,9 @@ impl XhciInner {
         m.write_rt(0x20, 1); // IMAN: limpiar IP (bit 0), IE=0 de momento
         m.write_rt(0x24, 0); // IMOD=0 (máxima respuesta, sin moderación)
         m.write_rt(0x28, 1); // ERSTSZ = 1 segmento
-        m.write_rt(0x30, self.ev.erst_phys() as u32);
-        m.write_rt(0x34, (self.ev.erst_phys() >> 32) as u32);
+        m.write_rt64(0x30, self.ev.erst_phys() as u64);
         let erdp = self.ev.erdp_phys();
-        m.write_rt(0x38, erdp as u32 | 8); // EHB=1 para limpiar el bit de busy inicial
-        m.write_rt(0x3C, (erdp >> 32) as u32);
+        m.write_rt64(0x38, (erdp as u64 & !0xf) | 8);
 
         if self.msi_vector > 0 {
             m.write_rt(0x20, 3); // IMAN: IE=1, IP=1 (habilitar interrupciones)
@@ -1493,8 +1567,14 @@ impl XhciInner {
         let ic = DmaBuf::new(input_sz, 64)?;
         ic.write_u32(4, 0x03);
         let s0 = 1 * csz;
-        let route = ((speed as u32) << 20) | (1u32 << 27);
-        ic.write_u32(s0, route);
+        // Slot Context DW0 (§6.2.2):
+        //   bits [19: 0] Route String = 0 (root hub, no hub entre medias)
+        //   bits [23:20] Speed        = PORTSC speed code
+        //   bit  [26]    MTT          = 0 (sin Multi-Transaction Translator)
+        //   bit  [27]    Hub          = 0 (no es un hub)
+        //   bits [31:28] Ctx Entries  = 1 (solo EP0 inicial; se actualizará en Configure Endpoint)
+        let slot_dw0 = ((speed as u32) << 20) | (1u32 << 28); // Speed + Context Entries=1
+        ic.write_u32(s0, slot_dw0);
         ic.write_u32(s0 + 4, (port as u32) << 16);
         let ep0 = 2 * csz;
         // xHCI PORTSC speed: 1=FS 2=LS 3=HS 4=SS Gen1 5=SS Gen2 …
@@ -1648,6 +1728,7 @@ impl XhciInner {
 
         let mut raw = alloc::vec![0u8; total];
         cfgb.read_into(0, &mut raw[..total]);
+        info!("[xhci] Configuration Descriptor slot={} bytes: {:?}", slot, raw);
         let config_val = raw.get(5).copied().unwrap_or(1).max(1);
 
         // SET_CONFIGURATION

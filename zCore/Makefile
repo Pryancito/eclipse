@@ -338,6 +338,8 @@ ifeq ($(ARCH), x86_64)
 	mkdir -p $(esp)/EFI/zCore $(esp)/EFI/Boot
 	cp ../rboot/target/x86_64-unknown-uefi/release/rboot.efi $(esp)/EFI/Boot/BootX64.efi
 	cp rboot.conf $(esp)/EFI/Boot/rboot.conf
+	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
+	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 	cp $(kernel_elf) $(esp)/EFI/zCore/zcore.elf
 	cp $(user_img) $(esp)/EFI/zCore/
 else ifeq ($(ARCH), riscv64)

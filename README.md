@@ -1,13 +1,5 @@
 # zCore (Eclipse OS)
 
-[![CI](https://github.com/rcore-os/zCore/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/rcore-os/zCore/actions)
-[![Docs](https://img.shields.io/badge/docs-pages-green)](https://rcore-os.github.io/zCore/)
-[![Estado de Cobertura](https://coveralls.io/repos/github/rcore-os/zCore/badge.svg?branch=master)](https://coveralls.io/github/rcore-os/zCore?branch=master)
-[![Issues](https://img.shields.io/github/issues/rcore-os/zCore)](https://github.com/rcore-os/zCore/issues)
-[![Forks](https://img.shields.io/github/forks/rcore-os/zCore)](https://github.com/rcore-os/zCore/fork)
-![Stars](https://img.shields.io/github/stars/rcore-os/zCore)
-![Licencia](https://img.shields.io/github/license/rcore-os/zCore)
-
 Un núcleo de sistema operativo basado en Zircon que proporciona compatibilidad con Linux.
 
 ## Resumen del Proyecto
@@ -22,7 +14,7 @@ zCore es una reimplementación del micronúcleo `Zircon` en Rust seguro como un 
 ## Iniciar el Núcleo
 
    ```bash
-   cargo qemu --arch x86_64
+   make qemu ARCH=x86_64
    ```
 
    Este comando iniciará zCore usando QEMU para la arquitectura especificada.
