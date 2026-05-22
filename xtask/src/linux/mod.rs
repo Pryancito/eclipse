@@ -271,7 +271,10 @@ impl LinuxRootfs {
             b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
-              export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n",
+              export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
+              if [ -f /bin/edhcpc ]; then\n\
+                  /bin/edhcpc -i eth0 &\n\
+              fi\n",
         )
         .unwrap();
     }
