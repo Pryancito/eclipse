@@ -18,6 +18,10 @@ ZBI ?= bringup
 
 SMP ?= 4
 ACCEL ?=
+IFACE ?= $(shell ip route show | grep default | grep -oE 'dev [^ ]+' | cut -d' ' -f2)
+ifeq ($(IFACE),)
+  IFACE := eno1
+endif
 
 NET ?=
 OBJDUMP :=
@@ -358,6 +362,8 @@ VMDISK := $(build_path)/boot.vdi
 
 .PHONY: vbox
 vbox: build
+	# Update rboot.conf with the current CMDLINE/LOG settings
+	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 	# Create a temporary raw image of 128MB
 	dd if=/dev/zero of=$(build_path)/boot.raw bs=1M count=128
 	# Format it as FAT32
@@ -383,7 +389,7 @@ vbox: build
 	vboxmanage createvm --name EclipseOS --basefolder $(build_path) --register
 	vboxmanage storagectl EclipseOS --name DiskCtrlr --controller IntelAhci --add sata
 	vboxmanage storageattach EclipseOS --storagectl DiskCtrlr --port 0 --device 0 --type hdd --medium $(VMDISK)
-	vboxmanage modifyvm EclipseOS --memory 1024 --firmware efi --usbxhci on --keyboard usb --mouse usbtablet --uart1 0x3F8 4 --uartmode1 file $(abspath $(build_path)/serial.log)
+	vboxmanage modifyvm EclipseOS --memory 1024 --firmware efi --usbxhci on --keyboard usb --mouse usbtablet --uart1 0x3F8 4 --uartmode1 file $(abspath $(build_path)/serial.log) --nic1 bridged --bridgeadapter1 $(IFACE) --nictype1 82540EM --cableconnected1 on
 	# Start the VM
 	vboxmanage startvm EclipseOS
 

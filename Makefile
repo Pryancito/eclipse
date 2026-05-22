@@ -88,7 +88,7 @@ qemu: image
 	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL)
 
 vbox: image
-	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL)
+	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) IFACE=$(IFACE)
 
 # Macvtap networking: VM gets its own MAC/IP on the physical LAN.
 # Useful for testing the I219-V driver on bare metal.
