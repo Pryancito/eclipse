@@ -358,22 +358,34 @@ VMDISK := $(build_path)/boot.vdi
 
 .PHONY: vbox
 vbox: build
-ifneq "$(VMDISK)" "$(wildcard $(VMDISK))"
-	vboxmanage createvm --name zCoreVM --basefolder $(build_path) --register
-	cp ../prebuilt/zircon/empty.vdi $(VMDISK)
-	vboxmanage storagectl zCoreVM --name DiskCtrlr --controller IntelAhci --add sata
-	vboxmanage storageattach zCoreVM --storagectl DiskCtrlr --port 0 --type hdd --medium $(VMDISK)
-	vboxmanage modifyvm zCoreVM --memory 1024 --firmware efi
-	tar -cvf $(build_path)/esp.tar -C $(build_path)/esp EFI
-	sudo LIBGUESTFS_DEBUG=1 guestfish -a $(VMDISK) -m /dev/sda1 tar-in $(build_path)/esp.tar / : quit
-endif
-	# depencency: libguestfs-tools
-	tar -cvf $(build_path)/esp.tar -C $(build_path)/esp EFI
-	sudo guestfish -a $(VMDISK) -m /dev/sda1 tar-in $(build_path)/esp.tar / : quit
-	# sudo LIBGUESTFS_DEBUG=1 guestfish -a $(VMDISK) -m /dev/sda1 tar-in $(build_path)/esp.tar / : quit
-	# -a $(VMDISK) $(build_path)/esp.tar /
-	rm $(build_path)/esp.tar
-	vboxmanage startvm zCoreVM
+	# Create a temporary raw image of 128MB
+	dd if=/dev/zero of=$(build_path)/boot.raw bs=1M count=128
+	# Format it as FAT32
+	/usr/sbin/mkfs.vfat -F 32 $(build_path)/boot.raw
+	# Create folders inside the fat image
+	mmd -i $(build_path)/boot.raw ::/EFI
+	mmd -i $(build_path)/boot.raw ::/EFI/Boot
+	mmd -i $(build_path)/boot.raw ::/EFI/zCore
+	# Copy files into it
+	mcopy -i $(build_path)/boot.raw -s $(build_path)/esp/EFI/Boot/* ::/EFI/Boot/
+	mcopy -i $(build_path)/boot.raw -s $(build_path)/esp/EFI/zCore/* ::/EFI/zCore/
+	# Unregister and delete VM if it exists to reset state
+	-vboxmanage unregistervm EclipseOS --delete >/dev/null 2>&1
+	# Close old medium in VirtualBox registry
+	-vboxmanage closemedium disk $(VMDISK) >/dev/null 2>&1
+	# Remove old VDI
+	rm -f $(VMDISK)
+	# Convert raw to VDI
+	vboxmanage convertfromraw $(build_path)/boot.raw $(VMDISK) --format VDI
+	# Clean up temporary raw image
+	rm -f $(build_path)/boot.raw
+	# Create VM and configure it
+	vboxmanage createvm --name EclipseOS --basefolder $(build_path) --register
+	vboxmanage storagectl EclipseOS --name DiskCtrlr --controller IntelAhci --add sata
+	vboxmanage storageattach EclipseOS --storagectl DiskCtrlr --port 0 --device 0 --type hdd --medium $(VMDISK)
+	vboxmanage modifyvm EclipseOS --memory 1024 --firmware efi --usbxhci on --keyboard usb --mouse usbtablet --uart1 0x3F8 4 --uartmode1 file $(abspath $(build_path)/serial.log)
+	# Start the VM
+	vboxmanage startvm EclipseOS
 
 $(qemu_disk):
 ifeq ($(ARCH), riscv64)

@@ -33,8 +33,11 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     debug!("init_frame_allocator regions: {regions:x?}");
     let mut ba = FRAME_ALLOCATOR.lock();
     for region in regions {
-        let start = region.start.min(MAX_MANAGED_PADDR_EXCLUSIVE);
+        let mut start = region.start.min(MAX_MANAGED_PADDR_EXCLUSIVE);
         let end = region.end.min(MAX_MANAGED_PADDR_EXCLUSIVE);
+        if start < 0x1000 {
+            start = 0x1000;
+        }
         if end <= start {
             continue;
         }
