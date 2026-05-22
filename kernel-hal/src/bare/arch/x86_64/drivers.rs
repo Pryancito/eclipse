@@ -138,6 +138,7 @@ pub(super) fn init() -> DeviceResult {
         #[cfg(feature = "xhci-usb-hid")]
         {
             use zcore_drivers::usb::xhci_hid;
+            xhci_hid::pci_set_irq_host(irq.clone());
             let _ = xhci_hid::pci_finish_msi_registrations();
         }
 

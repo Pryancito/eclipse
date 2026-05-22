@@ -1111,8 +1111,13 @@ impl XhciInner {
                         // CC=1 Success, CC=13 Short Packet: ambos son éxito para Control.
                         // CC=6 (TRB Error) es también success en Status Stage de algunos HCs
                         // (VirtualBox, algunos Intel xHCI físicos).
-                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT || cc == 6 {
+                        if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
                             info!("[xhci] EP0 slot={} OK (CC={})", slot, cc);
+                            return Ok(());
+                        }
+                        if cc == 6 {
+                            info!("[xhci] EP0 slot={} STALL (CC=6). Clearing halt, returning OK.", slot);
+                            let _ = self.reset_endpoint_and_dequeue(slot, 1);
                             return Ok(());
                         }
                         warn!("[xhci] EP0 slot={} error CC={}. Intentando reset_endpoint.", slot, cc);
@@ -1404,7 +1409,7 @@ impl XhciInner {
     fn wait_port_ready(&self, off: usize, require_pr_clear: bool) -> Option<u8> {
         let m = &self.mmio;
         // Require multiple consecutive "ready" samples to filter transient link-state flaps.
-        const STABLE_SAMPLES: u32 = 256;
+        const STABLE_SAMPLES: u32 = 5;
         let mut stable = 0u32;
         let timeout_us = 1_000_000;
         let start = timer_now_us();
@@ -1426,7 +1431,7 @@ impl XhciInner {
                 stable = 0;
             }
             spins = spins.saturating_add(1);
-            spin_loop();
+            xhci_spin_delay_us(1000);
         }
         None
     }
@@ -1837,9 +1842,9 @@ impl XhciInner {
         }
         // Raise Context Entries to cover the new endpoint DCI.
         let slot_dw0 = cfg.read_u32(csz);
-        let cur_entries = (slot_dw0 >> 27) & 0x1f;
+        let cur_entries = (slot_dw0 >> 28) & 0x0f;
         let new_entries = (dci as u32).max(cur_entries);
-        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
+        cfg.write_u32(csz, (slot_dw0 & !(0x0f << 28)) | (new_entries << 28));
 
         let ep_off = csz + csz + (dci - 1) * csz;
 
