@@ -273,7 +273,8 @@ impl LinuxRootfs {
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
               if [ -f /bin/edhcpc ]; then\n\
-                  /bin/edhcpc -i eth0 &\n\
+                  echo \"Iniciando cliente DHCP...\r\n\"\n\
+                  /bin/edhcpc -i eth0 >/dev/null 2>/dev/null &\n\
               fi\n",
         )
         .unwrap();
