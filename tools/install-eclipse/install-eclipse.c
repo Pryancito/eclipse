@@ -5,11 +5,14 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 #include <errno.h>
 
 #define SECTOR_SIZE 512
 #define PART1_START 2048
 #define PART1_SECTORS 204800  // 100 MB
+#define MAX_DISKS 64
 
 // ANSI escape codes for styling
 #define COLOR_RESET   "\x1b[0m"
@@ -24,6 +27,22 @@
 #define BG_BLUE       "\x1b[44m"
 
 int struct_file_exists(const char *path);
+
+// Get block device size in bytes using ioctl; falls back to lseek.
+// stat().st_size is always 0 for block devices on Linux.
+uint64_t get_disk_size_bytes(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint64_t size = 0;
+    if (ioctl(fd, BLKGETSIZE64, &size) != 0) {
+        // Fallback: seek to end
+        off_t end = lseek(fd, 0, SEEK_END);
+        if (end > 0)
+            size = (uint64_t)end;
+    }
+    close(fd);
+    return size;
+}
 
 void clear_screen() {
     printf("\x1b[2J\x1b[H");
@@ -49,6 +68,8 @@ struct partition_entry {
 int main() {
     char disk_path[128] = "/dev/sda";
     char input[64];
+    // Store up to MAX_DISKS discovered disk paths
+    char disk_list[MAX_DISKS][128];
     
     print_header();
     
@@ -56,29 +77,67 @@ int main() {
     
     // Scan for /dev/sd* devices
     int found_disks = 0;
-    for (char c = 'a'; c <= 'z'; c++) {
+    for (char c = 'a'; c <= 'z' && found_disks < MAX_DISKS; c++) {
         char path[128];
         snprintf(path, sizeof(path), "/dev/sd%c", c);
         
         struct stat st;
-        if (stat(path, &st) == 0) {
-            uint64_t size_bytes = st.st_size;
+        if (stat(path, &st) == 0 && S_ISBLK(st.st_mode)) {
+            uint64_t size_bytes = get_disk_size_bytes(path);
             double size_mb = (double)size_bytes / (1024.0 * 1024.0);
             printf("  [%d] " COLOR_YELLOW "%s" COLOR_RESET " (%.2f MB / %.2f GB)\n", 
                    found_disks + 1, path, size_mb, size_mb / 1024.0);
-            
-            if (found_disks == 0) {
-                strncpy(disk_path, path, sizeof(disk_path));
+            strncpy(disk_list[found_disks], path, sizeof(disk_list[found_disks]) - 1);
+            disk_list[found_disks][sizeof(disk_list[found_disks]) - 1] = '\0';
+            found_disks++;
+        }
+    }
+
+    // Scan for /dev/nvme[0-9]n[1-9] devices (NVMe drives)
+    for (int ctrl = 0; ctrl <= 9 && found_disks < MAX_DISKS; ctrl++) {
+        for (int ns = 1; ns <= 9 && found_disks < MAX_DISKS; ns++) {
+            char path[128];
+            snprintf(path, sizeof(path), "/dev/nvme%dn%d", ctrl, ns);
+
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISBLK(st.st_mode)) {
+                uint64_t size_bytes = get_disk_size_bytes(path);
+                double size_mb = (double)size_bytes / (1024.0 * 1024.0);
+                printf("  [%d] " COLOR_YELLOW "%s" COLOR_RESET " (%.2f MB / %.2f GB)\n",
+                       found_disks + 1, path, size_mb, size_mb / 1024.0);
+                strncpy(disk_list[found_disks], path, sizeof(disk_list[found_disks]) - 1);
+                disk_list[found_disks][sizeof(disk_list[found_disks]) - 1] = '\0';
+                found_disks++;
             }
+        }
+    }
+
+    // Scan for /dev/vd* devices (virtio/KVM)
+    for (char c = 'a'; c <= 'z' && found_disks < MAX_DISKS; c++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/dev/vd%c", c);
+
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISBLK(st.st_mode)) {
+            uint64_t size_bytes = get_disk_size_bytes(path);
+            double size_mb = (double)size_bytes / (1024.0 * 1024.0);
+            printf("  [%d] " COLOR_YELLOW "%s" COLOR_RESET " (%.2f MB / %.2f GB)\n",
+                   found_disks + 1, path, size_mb, size_mb / 1024.0);
+            strncpy(disk_list[found_disks], path, sizeof(disk_list[found_disks]) - 1);
+            disk_list[found_disks][sizeof(disk_list[found_disks]) - 1] = '\0';
             found_disks++;
         }
     }
     
     if (found_disks == 0) {
-        printf(COLOR_RED COLOR_BOLD "ERROR: No se detectaron discos de almacenamiento (/dev/sd*).\n" COLOR_RESET);
-        printf("Asegúrese de haber iniciado la máquina virtual con un disco adjunto.\n");
+        printf(COLOR_RED COLOR_BOLD "ERROR: No se detectaron discos de almacenamiento.\n" COLOR_RESET);
+        printf("Asegúrese de haber iniciado la máquina con un disco adjunto.\n");
         return 1;
     }
+
+    // Default to first disk found
+    strncpy(disk_path, disk_list[0], sizeof(disk_path) - 1);
+    disk_path[sizeof(disk_path) - 1] = '\0';
     
     printf("\nSeleccione el disco de destino [por defecto: %s]: ", disk_path);
     if (fgets(input, sizeof(input), stdin)) {
@@ -88,11 +147,12 @@ int main() {
             if (input[0] >= '1' && input[0] <= '9') {
                 int idx = input[0] - '1';
                 if (idx >= 0 && idx < found_disks) {
-                    char c = 'a' + idx;
-                    snprintf(disk_path, sizeof(disk_path), "/dev/sd%c", c);
+                    strncpy(disk_path, disk_list[idx], sizeof(disk_path) - 1);
+                    disk_path[sizeof(disk_path) - 1] = '\0';
                 }
             } else {
-                strncpy(disk_path, input, sizeof(disk_path));
+                strncpy(disk_path, input, sizeof(disk_path) - 1);
+                disk_path[sizeof(disk_path) - 1] = '\0';
             }
         }
     }
@@ -100,13 +160,13 @@ int main() {
     print_header();
     printf("Disco seleccionado: " COLOR_YELLOW "%s" COLOR_RESET "\n\n", disk_path);
     
-    // Get disk size
-    struct stat st;
-    if (stat(disk_path, &st) != 0) {
+    // Get disk size using ioctl (stat().st_size is 0 for block devices)
+    uint64_t disk_size_bytes = get_disk_size_bytes(disk_path);
+    if (disk_size_bytes == 0) {
         printf(COLOR_RED COLOR_BOLD "ERROR: No se pudo acceder al disco %s\n" COLOR_RESET, disk_path);
         return 1;
     }
-    uint64_t disk_sectors = st.st_size / SECTOR_SIZE;
+    uint64_t disk_sectors = disk_size_bytes / SECTOR_SIZE;
     if (disk_sectors < PART1_START + PART1_SECTORS + 2048) {
         printf(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño (requiere al menos 200 MB).\n" COLOR_RESET);
         return 1;
@@ -142,7 +202,7 @@ int main() {
     pe2->type = 0x83; // Linux Native / ext2
     pe2->ending_chs[0] = 0x00; pe2->ending_chs[1] = 0x02; pe2->ending_chs[2] = 0x00;
     pe2->starting_lba = PART1_START + PART1_SECTORS;
-    pe2->sectors_count = disk_sectors - pe2->starting_lba;
+    pe2->sectors_count = (uint32_t)(disk_sectors - pe2->starting_lba);
     
     // MBR signature
     mbr[510] = 0x55;
@@ -162,6 +222,12 @@ int main() {
         close(fd);
         return 1;
     }
+    if (fsync(fd) != 0) {
+        printf(COLOR_RED COLOR_BOLD "ERROR: fsync falló tras escribir MBR (errno=%d: %s).\n" COLOR_RESET,
+               errno, strerror(errno));
+        close(fd);
+        return 1;
+    }
     close(fd);
     printf("  Tabla de particiones escrita correctamente.\n\n");
     
@@ -173,7 +239,7 @@ int main() {
     }
     
     char cmd_efi[256];
-    snprintf(cmd_efi, sizeof(cmd_efi), "zcat /boot/efi.img.gz | dd of=%s bs=512 seek=%d status=none 2>/dev/null", 
+    snprintf(cmd_efi, sizeof(cmd_efi), "zcat /boot/efi.img.gz | dd of=%s bs=512 seek=%d status=progress",
              disk_path, PART1_START);
     
     if (system(cmd_efi) != 0) {
@@ -190,13 +256,14 @@ int main() {
     }
     
     char cmd_rootfs[256];
-    snprintf(cmd_rootfs, sizeof(cmd_rootfs), "zcat /boot/rootfs.ext2.gz | dd of=%s bs=512 seek=%d status=none 2>/dev/null", 
+    snprintf(cmd_rootfs, sizeof(cmd_rootfs), "zcat /boot/rootfs.ext2.gz | dd of=%s bs=512 seek=%d status=progress",
              disk_path, PART1_START + PART1_SECTORS);
     
     if (system(cmd_rootfs) != 0) {
         printf(COLOR_RED COLOR_BOLD "ERROR: Falló al copiar la partición raíz ext2.\n" COLOR_RESET);
         return 1;
     }
+    sync();
     printf("  Sistema de archivos raíz ext2 copiado correctamente.\n\n");
     
     printf(COLOR_GREEN COLOR_BOLD "========================================================\n" COLOR_RESET);
