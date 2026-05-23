@@ -437,6 +437,37 @@ impl LinuxProcess {
         String::from("/") + &self.inner.lock().current_working_directory
     }
 
+    /// Get absolute path from dirfd and relative path.
+    pub fn get_absolute_path(&self, dirfd: FileDesc, path: &str) -> LxResult<String> {
+        if path.is_empty() {
+            return Ok(String::from("/"));
+        }
+        let base_path = if path.starts_with('/') {
+            String::new()
+        } else if dirfd == FileDesc::CWD {
+            self.inner.lock().current_working_directory.clone()
+        } else {
+            let file = self.get_file(dirfd)?;
+            let file_path = file.path().clone();
+            if file_path.starts_with('/') {
+                String::from(&file_path[1..])
+            } else {
+                file_path
+            }
+        };
+        let mut cwd_vec: Vec<_> = base_path.split('/').filter(|x| !x.is_empty()).collect();
+        for seg in path.split('/') {
+            match seg {
+                ".." => {
+                    cwd_vec.pop();
+                }
+                "." | "" => {}
+                _ => cwd_vec.push(seg),
+            }
+        }
+        Ok(String::from("/") + &cwd_vec.join("/"))
+    }
+
     /// Change working directory.
     pub fn change_directory(&self, path: &str) {
         if path.is_empty() {

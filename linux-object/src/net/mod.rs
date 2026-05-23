@@ -915,7 +915,9 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
         SIOCGIFMTU => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
-            ifr.ifr_ifru = IfReqUnion { ifmtu: 1500 };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let iface = iface_by_name(ifname)?;
+            ifr.ifr_ifru = IfReqUnion { ifmtu: iface.get_mtu() as i32 };
             Ok(0)
         }
 

@@ -1,4 +1,4 @@
-﻿//! Directory operations
+//! Directory operations
 //!
 //! - getcwd
 //! - chdir
@@ -252,6 +252,50 @@ impl Syscall<'_> {
         let len = inode.read_at(0, &mut buf)?;
         base.write_array(&buf[..len])?;
         Ok(len)
+    }
+
+    /// Change the current directory to the one specified by the file descriptor.
+    pub fn sys_fchdir(&self, fd: FileDesc) -> SysResult {
+        info!("fchdir: fd={:?}", fd);
+
+        let proc = self.linux_process();
+        let file = proc.get_file(fd)?;
+        let info = file.metadata()?;
+        if info.type_ != FileType::Dir {
+            return Err(LxError::ENOTDIR);
+        }
+        proc.change_directory(file.path());
+        Ok(0)
+    }
+
+    /// create a symbolic link relative to directory file descriptor
+    pub fn sys_symlinkat(
+        &self,
+        target: UserInPtr<u8>,
+        newdirfd: FileDesc,
+        linkpath: UserInPtr<u8>,
+    ) -> SysResult {
+        let target = target.as_c_str()?;
+        let linkpath = linkpath.as_c_str()?;
+        info!(
+            "symlinkat: target={:?}, newdirfd={:?}, linkpath={:?}",
+            target, newdirfd, linkpath
+        );
+
+        let (dir_path, file_name) = split_path(linkpath);
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
+        if inode.find(file_name).is_ok() {
+            return Err(LxError::EEXIST);
+        }
+        let symlink_inode = inode.create(file_name, FileType::SymLink, 0o777)?;
+        symlink_inode.write_at(0, target.as_bytes())?;
+        Ok(0)
+    }
+
+    /// create a symbolic link
+    pub fn sys_symlink(&self, target: UserInPtr<u8>, linkpath: UserInPtr<u8>) -> SysResult {
+        self.sys_symlinkat(target, FileDesc::CWD, linkpath)
     }
 }
 

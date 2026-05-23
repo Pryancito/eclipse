@@ -109,9 +109,10 @@ impl Syscall<'_> {
                         if current_time_ms >= deadline {
                             return Poll::Ready(Ok(0));
                         } else {
+                            let next_check = (current_time_ms + 10).min(deadline);
                             let waker = cx.waker().clone();
                             timer::timer_set(
-                                Duration::from_millis(deadline as u64),
+                                Duration::from_millis(next_check as u64),
                                 Box::new(move |_| waker.wake_by_ref()),
                             );
                         }
@@ -277,9 +278,10 @@ impl Syscall<'_> {
                         if current_time_ms >= deadline {
                             return Poll::Ready(Ok(0));
                         } else {
+                            let next_check = (current_time_ms + 10).min(deadline);
                             let waker = cx.waker().clone();
                             timer::timer_set(
-                                Duration::from_millis(deadline as u64),
+                                Duration::from_millis(next_check as u64),
                                 Box::new(move |_| waker.wake_by_ref()),
                             );
                         }

@@ -186,4 +186,7 @@ impl NetScheme for LoopbackInterface {
     fn get_stats(&self) -> NetStats {
         self.stats.lock().clone()
     }
+    fn get_mtu(&self) -> usize {
+        65535
+    }
 }

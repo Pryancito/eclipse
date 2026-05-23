@@ -58,7 +58,8 @@ impl Syscall<'_> {
         if inode.metadata()?.type_ == FileType::Dir && flags.writable() {
             return Err(LxError::EISDIR);
         }
-        let file = File::new(inode, flags, path.into());
+        let abs_path = proc.get_absolute_path(dir_fd, path)?;
+        let file = File::new(inode, flags, abs_path);
         let fd = proc.add_file(file)?;
         Ok(fd.into())
     }

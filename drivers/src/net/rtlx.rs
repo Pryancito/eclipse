@@ -205,6 +205,9 @@ impl NetScheme for RTLxInterface {
             Err(DeviceError::NotReady)
         }
     }
+    fn get_mtu(&self) -> usize {
+        1400
+    }
 }
 
 pub struct RTLxRxToken(Vec<u8>);
@@ -216,13 +219,13 @@ impl<'a> Device<'a> for RTLxDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1514;
+        caps.max_transmission_unit = 1414;
         caps.max_burst_size = Some(64);
         caps.medium = Medium::Ethernet;
-        caps.checksum.ipv4 = Checksum::Tx;
-        caps.checksum.tcp = Checksum::Tx;
-        caps.checksum.udp = Checksum::Tx;
-        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.ipv4 = Checksum::Both;
+        caps.checksum.tcp = Checksum::Both;
+        caps.checksum.udp = Checksum::Both;
+        caps.checksum.icmpv4 = Checksum::Both;
         caps
     }
 

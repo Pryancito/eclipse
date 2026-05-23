@@ -1,5 +1,5 @@
-﻿use crate::{commands::wget, Arch, PROJECT_DIR};
-use os_xtask_utils::{dir, CommandExt, Qemu, Tar};
+use crate::{commands::wget, Arch, PROJECT_DIR};
+use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
 impl super::LinuxRootfs {
@@ -31,13 +31,6 @@ impl super::LinuxRootfs {
         }
         // 生成镜像
         fuse(self.path(), &image);
-        // 扩充一些额外空间，供某些测试使用
-        Qemu::img()
-            .arg("resize")
-            .args(&["-f", "raw"])
-            .arg(image)
-            .arg("+5M")
-            .invoke();
     }
 }
 
@@ -55,8 +48,10 @@ fn fuse(dir: impl AsRef<Path>, image: impl AsRef<Path>) {
         .truncate(true)
         .open(image)
         .expect("failed to open image");
-    const MAX_SPACE: usize = 1024 * 1024 * 1024; // 1GiB
-    let fs = SimpleFileSystem::create(Arc::new(Mutex::new(file)), MAX_SPACE)
+    const FS_SIZE: usize = 48 * 1024 * 1024; // 48MiB
+    file.set_len(FS_SIZE as u64).expect("failed to set image size");
+    let fs = SimpleFileSystem::create(Arc::new(Mutex::new(file)), FS_SIZE)
         .expect("failed to create sfs");
     zip_dir(dir.as_ref(), fs.root_inode()).expect("failed to zip fs");
 }
+

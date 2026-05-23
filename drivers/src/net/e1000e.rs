@@ -2190,9 +2190,9 @@ impl E1000eHw {
         let mut rctl = mmio_read(self.base, E1000E_RCTL);
         rctl &= !(RCTL_MO_MASK | 0xC0); // MO + loopback mode → LBM_NO
         rctl |= RCTL_EN | RCTL_BAM | RCTL_SECRC;
-        // Standard MTU: LPE off (Linux clears LPE when mtu <= 1500).
-        rctl &= !(RCTL_SBP | RCTL_DTYP_PS | RCTL_LPE | RCTL_BSEX | RCTL_RX_SZ_MASK);
-        rctl |= RCTL_SZ_2048;
+        // Standard MTU: LPE on (enabling long packet support to avoid packet drops with 802.1Q tags or extra padding)
+        rctl &= !(RCTL_SBP | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK);
+        rctl |= RCTL_SZ_2048 | RCTL_LPE;
         rctl &= !(RCTL_UPE | RCTL_MPE);
         rctl
     }
@@ -4515,6 +4515,9 @@ impl NetScheme for E1000eInterface {
     fn get_stats(&self) -> NetStats {
         self.driver.hw.lock().merged_stats()
     }
+    fn get_mtu(&self) -> usize {
+        1400
+    }
 }
 
 
@@ -4559,12 +4562,12 @@ impl phy::Device<'_> for E1000eDriver {
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1514;
+        caps.max_transmission_unit = 1414;
         caps.max_burst_size = Some(64);
-        caps.checksum.ipv4 = Checksum::Tx;
-        caps.checksum.tcp = Checksum::Tx;
-        caps.checksum.udp = Checksum::Tx;
-        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.ipv4 = Checksum::Both;
+        caps.checksum.tcp = Checksum::Both;
+        caps.checksum.udp = Checksum::Both;
+        caps.checksum.icmpv4 = Checksum::Both;
         caps
     }
 }

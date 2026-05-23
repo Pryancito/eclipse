@@ -118,10 +118,12 @@ impl ElfExt for ElfFile<'_> {
 
     fn get_symbol_address(&self, symbol: &str) -> Option<u64> {
         for section in self.section_iter() {
-            if let SectionData::SymbolTable64(entries) = section.get_data(self).unwrap() {
+            if let Ok(SectionData::SymbolTable64(entries)) = section.get_data(self) {
                 for e in entries {
-                    if e.get_name(self).unwrap() == symbol {
-                        return Some(e.value());
+                    if let Ok(name) = e.get_name(self) {
+                        if name == symbol {
+                            return Some(e.value());
+                        }
                     }
                 }
             }
