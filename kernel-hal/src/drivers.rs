@@ -231,6 +231,14 @@ mod virtio_drivers_ffi {
 
     #[no_mangle]
     extern "C" fn virtio_virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            use crate::vm::{GenericPageTable, PageTable};
+            let pt = PageTable::from_current();
+            if let Ok((paddr, _, _)) = pt.query(vaddr) {
+                return paddr;
+            }
+        }
         vaddr - KCONFIG.phys_to_virt_offset
     }
 }
@@ -267,6 +275,14 @@ mod drivers_ffi {
 
     #[no_mangle]
     extern "C" fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            use crate::vm::{GenericPageTable, PageTable};
+            let pt = PageTable::from_current();
+            if let Ok((paddr, _, _)) = pt.query(vaddr) {
+                return paddr;
+            }
+        }
         vaddr - KCONFIG.phys_to_virt_offset
     }
 

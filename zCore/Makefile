@@ -196,11 +196,13 @@ endif
 
 qemu_opts += \
 	-netdev user,id=net1 \
-	-device e1000e,netdev=net1
+	-device e1000e,netdev=net1 \
+	-trace "ahci_*" \
+	-trace "ide_*"
 
 ifeq ($(DISK), on)
   ifeq ($(ARCH), x86_64)
-    qemu_opts += -device ide-hd,bus=ahci.0,drive=userdisk
+    qemu_opts += -device ide-hd,drive=userdisk
   else ifeq ($(ARCH), riscv64)
     qemu_opts += -device virtio-blk-device,drive=userdisk
   endif
@@ -399,5 +401,5 @@ ifeq ($(ARCH), riscv64)
 	@qemu-img convert -f raw riscv64.img -O qcow2 $@
 	@qemu-img resize $@ +5M
 else
-	@qemu-img create -f qcow2 $@ 100M
+	@qemu-img create -f qcow2 $@ 512M
 endif

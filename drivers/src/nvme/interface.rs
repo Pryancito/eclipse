@@ -344,6 +344,10 @@ impl BlockScheme for NvmeInterface {
     fn flush(&self) -> DeviceResult {
         Ok(())
     }
+
+    fn block_count(&self) -> usize {
+        0
+    }
 }
 
 impl Scheme for NvmeInterface {

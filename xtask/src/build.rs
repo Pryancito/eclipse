@@ -1,4 +1,4 @@
-﻿use crate::{linux::LinuxRootfs, Arch, ArchArg, PROJECT_DIR};
+use crate::{linux::LinuxRootfs, Arch, ArchArg, PROJECT_DIR};
 use once_cell::sync::Lazy;
 use os_xtask_utils::{dir, BinUtil, Cargo, CommandExt, Ext, Qemu};
 use std::{
@@ -113,6 +113,7 @@ impl BuildConfig {
             .target(INNER.join(format!("{}.json", self.arch.name())))
             .args(&["-Z", "build-std=core,alloc"])
             .args(&["-Z", "build-std-features=compiler-builtins-mem"])
+            .args(&["-Z", "json-target-spec"])
             .conditional(!self.debug, |cargo| {
                 cargo.release();
             });

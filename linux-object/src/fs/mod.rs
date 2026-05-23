@@ -216,6 +216,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
+    // Add block devices at `/dev/sd{a,b,c...}`
+    for (i, block) in drivers::all_block().as_vec().iter().enumerate() {
+        let name_char = (b'a' + i as u8) as char;
+        let fname = format!("sd{}", name_char);
+        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(i, block.clone()))) {
+            warn!("failed to mknod /dev/{}: {:?}", &fname, e);
+        }
+    }
+
     // mount DevFS at /dev
     let dev = root.find(true, "dev").unwrap_or_else(|_| {
         root.create("dev", FileType::Dir, 0o666)

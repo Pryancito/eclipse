@@ -56,6 +56,8 @@ const FIS_TYPE_REG_H2D: u8 = 0x27;
 
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_CMD_READ_DMA: u8 = 0xC8;
+const ATA_CMD_WRITE_DMA: u8 = 0xCA;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 
 const SECTOR_SIZE: usize = 512;
@@ -215,13 +217,16 @@ impl AhciPort {
         // Configure command list
         unsafe {
             let headers = self.cl_virt as *mut CommandHeader;
+            core::ptr::write_bytes(
+                headers as *mut u8,
+                0,
+                CMD_SLOTS * core::mem::size_of::<CommandHeader>(),
+            );
             for i in 0..CMD_SLOTS {
                 let h = &mut *headers.add(i);
                 let ct_phys = self.ct_phys + (i * CMD_TABLE_STRIDE) as u64;
                 h.ctba = ct_phys as u32;
-                h.ctbau = (ct_phys >> 32) as u32;
-                h.prdtl = 0;
-                h.cfl = 0;
+                h.ctbau = (ct_phys >> 32) as u64 as u32;
             }
         }
 
@@ -277,18 +282,37 @@ impl AhciPort {
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
         self.write_reg(PORT_CI, 1 << slot);
 
-        if !wait_until(timeout_us, || self.read_reg(PORT_CI) & (1 << slot) == 0) {
+        if !wait_until(timeout_us, || {
+            if self.read_reg(PORT_IS) & (1 << 30) != 0 {
+                return true;
+            }
+            self.read_reg(PORT_CI) & (1 << slot) == 0
+        }) {
+            let tfd = self.read_reg(PORT_TFD);
+            let ssts = self.read_reg(PORT_SSTS);
+            let serr = self.read_reg(PORT_SERR);
+            let is = self.read_reg(PORT_IS);
+            let ci = self.read_reg(PORT_CI);
             crate::klog_err!(
-                "[AHCI] port {} command timeout ({} ms)",
+                "[AHCI] port {} command timeout ({} ms), TFD={:#x}, SSTS={:#x}, SERR={:#x}, IS={:#x}, CI={:#x}",
                 self.port_idx,
-                timeout_us / 1000
+                timeout_us / 1000,
+                tfd, ssts, serr, is, ci
             );
             self.reset_port();
             return Err(DeviceError::IoError);
         }
 
         if self.read_reg(PORT_IS) & (1 << 30) != 0 {
-            crate::klog_err!("[AHCI] port {} task file error", self.port_idx);
+            let tfd = self.read_reg(PORT_TFD);
+            let ssts = self.read_reg(PORT_SSTS);
+            let serr = self.read_reg(PORT_SERR);
+            let is = self.read_reg(PORT_IS);
+            let ci = self.read_reg(PORT_CI);
+            crate::klog_err!(
+                "[AHCI] port {} task file error, TFD={:#x}, SSTS={:#x}, SERR={:#x}, IS={:#x}, CI={:#x}",
+                self.port_idx, tfd, ssts, serr, is, ci
+            );
             self.reset_port();
             return Err(DeviceError::IoError);
         }
@@ -320,23 +344,34 @@ impl AhciPort {
             );
 
             let fis = (*cmd_table).cfis.as_mut_ptr();
+            let use_lba48 = true;
             *fis.add(0) = FIS_TYPE_REG_H2D;
             *fis.add(1) = 0x80;
             *fis.add(2) = if write {
-                ATA_CMD_WRITE_DMA_EXT
+                if use_lba48 { ATA_CMD_WRITE_DMA_EXT } else { ATA_CMD_WRITE_DMA }
             } else {
-                ATA_CMD_READ_DMA_EXT
+                if use_lba48 { ATA_CMD_READ_DMA_EXT } else { ATA_CMD_READ_DMA }
             };
-            *fis.add(4) = lba as u8;
-            *fis.add(5) = (lba >> 8) as u8;
-            *fis.add(6) = (lba >> 16) as u8;
-            *fis.add(7) = 1 << 6;
-            *fis.add(8) = (lba >> 24) as u8;
-            *fis.add(9) = (lba >> 32) as u8;
-            *fis.add(10) = (lba >> 40) as u8;
-            let count = (buf_len / SECTOR_SIZE) as u16;
-            *fis.add(12) = count as u8;
-            *fis.add(13) = (count >> 8) as u8;
+            if use_lba48 {
+                *fis.add(4) = lba as u8;
+                *fis.add(5) = (lba >> 8) as u8;
+                *fis.add(6) = (lba >> 16) as u8;
+                *fis.add(7) = 0x40;
+                *fis.add(8) = (lba >> 24) as u8;
+                *fis.add(9) = (lba >> 32) as u8;
+                *fis.add(10) = (lba >> 40) as u8;
+                let count = (buf_len / SECTOR_SIZE) as u16;
+                *fis.add(12) = count as u8;
+                *fis.add(13) = (count >> 8) as u8;
+            } else {
+                *fis.add(4) = lba as u8;
+                *fis.add(5) = (lba >> 8) as u8;
+                *fis.add(6) = (lba >> 16) as u8;
+                *fis.add(7) = 0xE0 | ((lba >> 24) & 0x0F) as u8;
+                let count = (buf_len / SECTOR_SIZE) as u16;
+                *fis.add(12) = count as u8;
+                *fis.add(13) = 0;
+            }
 
             (*cmd_table).prdt[0].dba = buf_phys as u32;
             (*cmd_table).prdt[0].dbau = (buf_phys >> 32) as u32;
@@ -344,6 +379,7 @@ impl AhciPort {
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5 | (if write { 1 << 6 } else { 0 });
+            (*header).pm = 4; // Clear busy upon R_OK (c = 1)
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
@@ -368,6 +404,7 @@ impl AhciPort {
             *fis.add(0) = FIS_TYPE_REG_H2D;
             *fis.add(1) = 0x80;
             *fis.add(2) = ATA_CMD_IDENTIFY;
+            *fis.add(7) = 0xA0; // Device (0xA0 is for master)
 
             (*cmd_table).prdt[0].dba = paddr as u32;
             (*cmd_table).prdt[0].dbau = (paddr >> 32) as u32;
@@ -375,6 +412,7 @@ impl AhciPort {
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5;
+            (*header).pm = 4; // Clear busy upon R_OK (c = 1)
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
@@ -481,6 +519,7 @@ impl BlockScheme for AhciInterface {
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         let lba = (block_id * (read_buf.len() / SECTOR_SIZE)) as u64;
         let paddr = virt_to_phys(read_buf.as_ptr() as usize);
+        crate::klog_warn!("[AHCI] read_block: block_id={}, lba={}, vaddr={:#x}, paddr={:#x}", block_id, lba, read_buf.as_ptr() as usize, paddr);
         self.port
             .lock()
             .rw_block(lba, paddr as u64, read_buf.len(), false)
@@ -489,6 +528,7 @@ impl BlockScheme for AhciInterface {
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
         let lba = (block_id * (write_buf.len() / SECTOR_SIZE)) as u64;
         let paddr = virt_to_phys(write_buf.as_ptr() as usize);
+        crate::klog_warn!("[AHCI] write_block: block_id={}, lba={}, vaddr={:#x}, paddr={:#x}", block_id, lba, write_buf.as_ptr() as usize, paddr);
         self.port
             .lock()
             .rw_block(lba, paddr as u64, write_buf.len(), true)
@@ -496,6 +536,10 @@ impl BlockScheme for AhciInterface {
 
     fn flush(&self) -> DeviceResult {
         Ok(())
+    }
+
+    fn block_count(&self) -> usize {
+        self._capacity as usize
     }
 }
 

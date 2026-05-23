@@ -6,12 +6,18 @@ use crate::DeviceResult;
 
 pub struct VirtIoBlk<'a> {
     inner: Mutex<InnerDriver<'a>>,
+    capacity: usize,
 }
 
 impl<'a> VirtIoBlk<'a> {
     pub fn new(header: &'static mut VirtIOHeader) -> DeviceResult<Self> {
+        let capacity = unsafe {
+            let config = &*(header.config_space() as *const u64);
+            *config as usize
+        };
         Ok(Self {
             inner: Mutex::new(InnerDriver::new(header)?),
+            capacity,
         })
     }
 }
@@ -39,5 +45,9 @@ impl<'a> BlockScheme for VirtIoBlk<'a> {
 
     fn flush(&self) -> DeviceResult {
         Ok(())
+    }
+
+    fn block_count(&self) -> usize {
+        self.capacity
     }
 }
