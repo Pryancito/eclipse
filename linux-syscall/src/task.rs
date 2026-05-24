@@ -329,6 +329,8 @@ impl Syscall<'_> {
         // Read program file
         let proc = self.linux_process();
         let inode = proc.lookup_inode(path_str)?;
+        let metadata = inode.metadata()?;
+        proc.check_access(&metadata, 0o1, true)?;
         let data = inode.read_as_vec()?;
 
         proc.remove_cloexec_files();
@@ -351,6 +353,7 @@ impl Syscall<'_> {
         })?;
         proc.set_execute_path(&execute_path);
         proc.set_brk(initial_brk);
+        proc.apply_exec_metadata(&metadata);
 
         self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
@@ -486,24 +489,94 @@ impl Syscall<'_> {
     /// `getuid` returns the real user ID of the calling process.
     pub fn sys_getuid(&self) -> SysResult {
         debug!("getuid");
-        Ok(0)
+        Ok(self.linux_process().uid() as usize)
     }
 
     /// `geteuid` returns the effective user ID of the calling process.
     pub fn sys_geteuid(&self) -> SysResult {
         debug!("geteuid");
-        Ok(0)
+        Ok(self.linux_process().euid() as usize)
     }
 
     /// `getgid` returns the real group ID of the calling process.
     pub fn sys_getgid(&self) -> SysResult {
         debug!("getgid");
-        Ok(0)
+        Ok(self.linux_process().gid() as usize)
     }
 
     /// `getegid` returns the effective group ID of the calling process.
     pub fn sys_getegid(&self) -> SysResult {
         debug!("getegid");
+        Ok(self.linux_process().egid() as usize)
+    }
+
+    /// `umask` updates and returns the previous creation mask.
+    pub fn sys_umask(&self, mask: usize) -> SysResult {
+        Ok(self.linux_process().set_umask(mask as u16) as usize)
+    }
+
+    /// `setuid` changes the calling process user identity.
+    pub fn sys_setuid(&self, uid: usize) -> SysResult {
+        self.linux_process().set_uid(uid as u32)?;
+        Ok(0)
+    }
+
+    /// `setgid` changes the calling process group identity.
+    pub fn sys_setgid(&self, gid: usize) -> SysResult {
+        self.linux_process().set_gid(gid as u32)?;
+        Ok(0)
+    }
+
+    /// `setreuid` changes the real/effective user IDs.
+    pub fn sys_setreuid(&self, ruid: usize, euid: usize) -> SysResult {
+        self.linux_process().set_reuid(ruid as u32, euid as u32)?;
+        Ok(0)
+    }
+
+    /// `setregid` changes the real/effective group IDs.
+    pub fn sys_setregid(&self, rgid: usize, egid: usize) -> SysResult {
+        self.linux_process().set_regid(rgid as u32, egid as u32)?;
+        Ok(0)
+    }
+
+    /// `setresuid` changes the real/effective/saved user IDs.
+    pub fn sys_setresuid(&self, ruid: usize, euid: usize, suid: usize) -> SysResult {
+        self.linux_process()
+            .set_resuid(ruid as u32, euid as u32, suid as u32)?;
+        Ok(0)
+    }
+
+    /// `setresgid` changes the real/effective/saved group IDs.
+    pub fn sys_setresgid(&self, rgid: usize, egid: usize, sgid: usize) -> SysResult {
+        self.linux_process()
+            .set_resgid(rgid as u32, egid as u32, sgid as u32)?;
+        Ok(0)
+    }
+
+    /// `getgroups` returns supplementary group IDs.
+    pub fn sys_getgroups(&self, size: usize, mut list: UserOutPtr<u32>) -> SysResult {
+        let groups = self.linux_process().groups();
+        if size == 0 {
+            return Ok(groups.len());
+        }
+        if size < groups.len() {
+            return Err(LxError::EINVAL);
+        }
+        list.write_array(groups.as_slice())?;
+        Ok(groups.len())
+    }
+
+    /// `setgroups` updates supplementary group IDs.
+    pub fn sys_setgroups(&self, size: usize, list: UserInPtr<u32>) -> SysResult {
+        if !self.linux_process().is_superuser() {
+            return Err(LxError::EPERM);
+        }
+        let groups = if size == 0 {
+            Vec::new()
+        } else {
+            list.read_array(size)?
+        };
+        self.linux_process().set_groups(groups);
         Ok(0)
     }
 
@@ -535,9 +608,13 @@ impl Syscall<'_> {
 
     /// `chmod` changes the mode of the file specified by path.
     pub fn sys_chmod(&self, path: UserInPtr<u8>, mode: usize) -> SysResult {
-        let _path = path.as_c_str()?;
-        debug!("chmod: path={:?}, mode={:#o}", _path, mode);
-        // Stub: return success
+        let path = path.as_c_str()?;
+        debug!("chmod: path={:?}, mode={:#o}", path, mode);
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode(path)?;
+        let mut metadata = inode.metadata()?;
+        proc.chmod_metadata(&mut metadata, mode as u16)?;
+        inode.set_metadata(&metadata)?;
         Ok(0)
     }
 }

@@ -43,6 +43,7 @@ impl Syscall<'_> {
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
+        proc.check_access(&info, 0o1, true)?;
         proc.change_directory(path);
         Ok(0)
     }
@@ -66,10 +67,14 @@ impl Syscall<'_> {
         let (dir_path, file_name) = split_path(path);
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let dir_metadata = inode.metadata()?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
         if inode.find(file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
-        inode.create(file_name, FileType::Dir, mode as u32)?;
+        let create_mode = proc.apply_umask(mode as u16);
+        let created = inode.create(file_name, FileType::Dir, create_mode as u32)?;
+        proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
         Ok(0)
     }
     /// Remove a directory.
@@ -81,10 +86,14 @@ impl Syscall<'_> {
         let (dir_path, file_name) = split_path(path);
         let proc = self.linux_process();
         let dir_inode = proc.lookup_inode(dir_path)?;
+        let dir_metadata = dir_inode.metadata()?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let file_inode = dir_inode.find(file_name)?;
-        if file_inode.metadata()?.type_ != FileType::Dir {
+        let file_metadata = file_inode.metadata()?;
+        if file_metadata.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
+        proc.check_sticky(&dir_metadata, &file_metadata)?;
         dir_inode.unlink(file_name)?;
         Ok(0)
     }
@@ -153,6 +162,8 @@ impl Syscall<'_> {
         let (new_dir_path, new_file_name) = split_path(newpath);
         let inode = proc.lookup_inode_at(olddirfd, oldpath, true)?;
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
+        let new_dir_metadata = new_dir_inode.metadata()?;
+        proc.check_access(&new_dir_metadata, 0o3, true)?;
         new_dir_inode.link(new_file_name, &inode)?;
         Ok(0)
     }
@@ -184,10 +195,14 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let (dir_path, file_name) = split_path(path);
         let dir_inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let dir_metadata = dir_inode.metadata()?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let file_inode = dir_inode.find(file_name)?;
-        if file_inode.metadata()?.type_ == FileType::Dir {
+        let file_metadata = file_inode.metadata()?;
+        if file_metadata.type_ == FileType::Dir {
             return Err(LxError::EISDIR);
         }
+        proc.check_sticky(&dir_metadata, &file_metadata)?;
         dir_inode.unlink(file_name)?;
         Ok(0)
     }
@@ -217,6 +232,13 @@ impl Syscall<'_> {
         let (new_dir_path, new_file_name) = split_path(newpath);
         let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, false)?;
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, false)?;
+        let old_dir_metadata = old_dir_inode.metadata()?;
+        let new_dir_metadata = new_dir_inode.metadata()?;
+        proc.check_access(&old_dir_metadata, 0o3, true)?;
+        proc.check_access(&new_dir_metadata, 0o3, true)?;
+        let old_inode = old_dir_inode.find(old_file_name)?;
+        let old_metadata = old_inode.metadata()?;
+        proc.check_sticky(&old_dir_metadata, &old_metadata)?;
         old_dir_inode.move_(old_file_name, &new_dir_inode, new_file_name)?;
         Ok(0)
     }
@@ -264,6 +286,7 @@ impl Syscall<'_> {
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
+        proc.check_access(&info, 0o1, true)?;
         proc.change_directory(file.path());
         Ok(0)
     }
@@ -285,10 +308,14 @@ impl Syscall<'_> {
         let (dir_path, file_name) = split_path(linkpath);
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
+        let dir_metadata = inode.metadata()?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
         if inode.find(file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
-        let symlink_inode = inode.create(file_name, FileType::SymLink, 0o777)?;
+        let mode = proc.apply_umask(0o777);
+        let symlink_inode = inode.create(file_name, FileType::SymLink, mode as u32)?;
+        proc.initialize_created_metadata(&symlink_inode, Some(&dir_metadata), mode, false)?;
         symlink_inode.write_at(0, target.as_bytes())?;
         Ok(0)
     }
