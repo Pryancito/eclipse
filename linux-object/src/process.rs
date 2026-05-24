@@ -11,13 +11,14 @@ use alloc::{
     boxed::Box,
     string::String,
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use core::sync::atomic::AtomicI32;
 use hashbrown::HashMap;
 use kernel_hal::VirtAddr;
 use lock::{Mutex, MutexGuard};
-use rcore_fs::vfs::{FileSystem, INode};
+use rcore_fs::vfs::{FileSystem, INode, Metadata};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
@@ -36,6 +37,43 @@ pub trait ProcessExt {
     fn linux(&self) -> &LinuxProcess;
     /// fork from current linux process
     fn fork_from(parent: &Arc<Self>, vfork: bool) -> ZxResult<Arc<Self>>;
+}
+
+const ROOT_UID: u32 = 0;
+const NO_ID: u32 = u32::MAX;
+const ACCESS_READ: u16 = 0o4;
+const ACCESS_WRITE: u16 = 0o2;
+const ACCESS_EXEC: u16 = 0o1;
+const MODE_PERM_MASK: u16 = 0o7777;
+const MODE_SET_UID: u16 = 0o4000;
+const MODE_SET_GID: u16 = 0o2000;
+const MODE_STICKY: u16 = 0o1000;
+
+#[derive(Clone, Debug)]
+pub struct Credentials {
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub groups: Vec<u32>,
+    pub umask: u16,
+}
+
+impl Default for Credentials {
+    fn default() -> Self {
+        Self {
+            ruid: ROOT_UID,
+            euid: ROOT_UID,
+            suid: ROOT_UID,
+            rgid: ROOT_UID,
+            egid: ROOT_UID,
+            sgid: ROOT_UID,
+            groups: vec![ROOT_UID],
+            umask: 0o022,
+        }
+    }
 }
 
 impl ProcessExt for Process {
@@ -76,6 +114,7 @@ impl ProcessExt for Process {
                 current_working_directory: linux_parent_inner.current_working_directory.clone(),
                 files: linux_parent_inner.files.clone(),
                 signal_actions: linux_parent_inner.signal_actions.clone(),
+                credentials: linux_parent_inner.credentials.clone(),
                 ..Default::default()
             }),
         };
@@ -225,6 +264,8 @@ struct LinuxProcessInner {
     /// via [`LinuxProcess::set_brk`] before the first user instruction runs.
     /// Updated by `sys_brk` as the heap grows or shrinks.
     brk: usize,
+    /// Process credentials.
+    credentials: Credentials,
 }
 
 #[derive(Clone)]
@@ -425,6 +466,378 @@ impl LinuxProcess {
     /// Get root INode of the process.
     pub fn root_inode(&self) -> &Arc<dyn INode> {
         &self.root_inode
+    }
+
+    /// Get a snapshot of current credentials.
+    pub fn credentials(&self) -> Credentials {
+        self.inner.lock().credentials.clone()
+    }
+
+    /// Get real uid.
+    pub fn uid(&self) -> u32 {
+        self.inner.lock().credentials.ruid
+    }
+
+    /// Get effective uid.
+    pub fn euid(&self) -> u32 {
+        self.inner.lock().credentials.euid
+    }
+
+    /// Get saved uid.
+    pub fn suid(&self) -> u32 {
+        self.inner.lock().credentials.suid
+    }
+
+    /// Get real gid.
+    pub fn gid(&self) -> u32 {
+        self.inner.lock().credentials.rgid
+    }
+
+    /// Get effective gid.
+    pub fn egid(&self) -> u32 {
+        self.inner.lock().credentials.egid
+    }
+
+    /// Get saved gid.
+    pub fn sgid(&self) -> u32 {
+        self.inner.lock().credentials.sgid
+    }
+
+    /// Get supplementary groups.
+    pub fn groups(&self) -> Vec<u32> {
+        self.inner.lock().credentials.groups.clone()
+    }
+
+    /// Get umask.
+    pub fn umask(&self) -> u16 {
+        self.inner.lock().credentials.umask
+    }
+
+    /// Set umask and return the previous one.
+    pub fn set_umask(&self, mask: u16) -> u16 {
+        let mut inner = self.inner.lock();
+        let old = inner.credentials.umask;
+        inner.credentials.umask = mask & 0o777;
+        old
+    }
+
+    /// Whether the current effective uid is root.
+    pub fn is_superuser(&self) -> bool {
+        self.euid() == ROOT_UID
+    }
+
+    /// Apply umask to file creation mode.
+    pub fn apply_umask(&self, mode: u16) -> u16 {
+        mode & !self.umask()
+    }
+
+    fn gid_in_groups(creds: &Credentials, gid: u32) -> bool {
+        creds.egid == gid || creds.rgid == gid || creds.groups.iter().any(|group| *group == gid)
+    }
+
+    fn allowed_uid(creds: &Credentials, uid: u32) -> bool {
+        uid == creds.ruid || uid == creds.euid || uid == creds.suid
+    }
+
+    fn allowed_gid(creds: &Credentials, gid: u32) -> bool {
+        gid == creds.rgid || gid == creds.egid || gid == creds.sgid
+    }
+
+    fn check_requested_access(mode: u16, requested: u16) -> bool {
+        requested == 0 || (mode & requested) == requested
+    }
+
+    fn access_bits_for(creds: &Credentials, metadata: &Metadata, use_effective: bool) -> u16 {
+        let uid = if use_effective { creds.euid } else { creds.ruid };
+        let gid = if use_effective { creds.egid } else { creds.rgid };
+        if uid == ROOT_UID {
+            return metadata.mode as u16 & 0o777;
+        }
+        if uid == metadata.uid as u32 {
+            return ((metadata.mode as u16) >> 6) & 0o7;
+        }
+        let in_group = if use_effective {
+            Self::gid_in_groups(creds, metadata.gid as u32)
+        } else {
+            gid == metadata.gid as u32
+                || creds
+                    .groups
+                    .iter()
+                    .any(|group| *group == metadata.gid as u32)
+        };
+        if in_group {
+            return ((metadata.mode as u16) >> 3) & 0o7;
+        }
+        metadata.mode as u16 & 0o7
+    }
+
+    /// Check inode access against current credentials.
+    pub fn check_access(&self, metadata: &Metadata, requested: u16, use_effective: bool) -> LxResult {
+        let creds = self.credentials();
+        let granted = Self::access_bits_for(&creds, metadata, use_effective);
+        if creds.euid == ROOT_UID && requested == ACCESS_EXEC && granted & ACCESS_EXEC == 0 {
+            return Err(LxError::EACCES);
+        }
+        if creds.euid == ROOT_UID
+            && Self::check_requested_access(granted, requested & (ACCESS_READ | ACCESS_WRITE))
+        {
+            return Ok(());
+        }
+        if Self::check_requested_access(granted, requested) {
+            Ok(())
+        } else {
+            Err(LxError::EACCES)
+        }
+    }
+
+    /// Check inode access by fetching metadata first.
+    pub fn check_inode_access(
+        &self,
+        inode: &Arc<dyn INode>,
+        requested: u16,
+        use_effective: bool,
+    ) -> LxResult {
+        let metadata = inode.metadata()?;
+        self.check_access(&metadata, requested, use_effective)
+    }
+
+    /// Check parent directory mutation rights.
+    pub fn check_directory_write(&self, inode: &Arc<dyn INode>) -> LxResult {
+        self.check_inode_access(inode, ACCESS_WRITE | ACCESS_EXEC, true)
+    }
+
+    /// Check if sticky-directory removal/rename is allowed.
+    pub fn check_sticky(
+        &self,
+        dir_metadata: &Metadata,
+        target_metadata: &Metadata,
+    ) -> LxResult {
+        if (dir_metadata.mode as u16 & MODE_STICKY) == 0 {
+            return Ok(());
+        }
+        let creds = self.credentials();
+        if creds.euid == ROOT_UID
+            || creds.euid == dir_metadata.uid as u32
+            || creds.euid == target_metadata.uid as u32
+        {
+            Ok(())
+        } else {
+            Err(LxError::EPERM)
+        }
+    }
+
+    /// Change mode if current process is owner or root.
+    pub fn chmod_metadata(&self, metadata: &mut Metadata, mode: u16) -> LxResult {
+        let creds = self.credentials();
+        if creds.euid != ROOT_UID && creds.euid != metadata.uid as u32 {
+            return Err(LxError::EPERM);
+        }
+        metadata.mode = (metadata.mode as u16 & !MODE_PERM_MASK | (mode & MODE_PERM_MASK)) as _;
+        if creds.euid != ROOT_UID {
+            metadata.mode &= !(MODE_SET_UID | MODE_SET_GID) as u32;
+        }
+        Ok(())
+    }
+
+    /// Change owner/group following a conservative POSIX-compatible policy.
+    pub fn chown_metadata(&self, metadata: &mut Metadata, uid: u32, gid: u32) -> LxResult {
+        let creds = self.credentials();
+        let privileged = creds.euid == ROOT_UID;
+        if !privileged {
+            if uid != NO_ID && uid != metadata.uid as u32 {
+                return Err(LxError::EPERM);
+            }
+            if creds.euid != metadata.uid as u32 {
+                return Err(LxError::EPERM);
+            }
+            if gid != NO_ID && !Self::gid_in_groups(&creds, gid) {
+                return Err(LxError::EPERM);
+            }
+        }
+        if uid != NO_ID {
+            metadata.uid = uid as _;
+        }
+        if gid != NO_ID {
+            metadata.gid = gid as _;
+        }
+        metadata.mode &= !(MODE_SET_UID | MODE_SET_GID) as u32;
+        Ok(())
+    }
+
+    /// Set owner/group for a newly created inode.
+    pub fn initialize_created_metadata(
+        &self,
+        inode: &Arc<dyn INode>,
+        parent_metadata: Option<&Metadata>,
+        mode: u16,
+        is_dir: bool,
+    ) -> LxResult {
+        let creds = self.credentials();
+        let mut metadata = inode.metadata()?;
+        metadata.uid = creds.euid as _;
+        metadata.gid = parent_metadata
+            .filter(|meta| (meta.mode as u16 & MODE_SET_GID) != 0)
+            .map(|meta| meta.gid)
+            .unwrap_or(creds.egid as _);
+        let mut final_mode = mode & MODE_PERM_MASK;
+        if let Some(parent) = parent_metadata {
+            if (parent.mode as u16 & MODE_SET_GID) != 0 && is_dir {
+                final_mode |= MODE_SET_GID;
+            }
+        }
+        metadata.mode = (metadata.mode as u16 & !MODE_PERM_MASK | final_mode) as _;
+        inode.set_metadata(&metadata)?;
+        Ok(())
+    }
+
+    /// Apply setuid/setgid exec transitions.
+    pub fn apply_exec_metadata(&self, metadata: &Metadata) {
+        let mut inner = self.inner.lock();
+        if (metadata.mode as u16 & MODE_SET_UID) != 0 {
+            inner.credentials.euid = metadata.uid as u32;
+            inner.credentials.suid = metadata.uid as u32;
+        }
+        if (metadata.mode as u16 & MODE_SET_GID) != 0 {
+            inner.credentials.egid = metadata.gid as u32;
+            inner.credentials.sgid = metadata.gid as u32;
+        }
+    }
+
+    /// Set supplementary groups.
+    pub fn set_groups(&self, groups: Vec<u32>) {
+        self.inner.lock().credentials.groups = groups;
+    }
+
+    /// Set uid according to current privileges.
+    pub fn set_uid(&self, uid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if privileged {
+            inner.credentials.ruid = uid;
+            inner.credentials.euid = uid;
+            inner.credentials.suid = uid;
+            return Ok(());
+        }
+        if Self::allowed_uid(&inner.credentials, uid) {
+            inner.credentials.euid = uid;
+            Ok(())
+        } else {
+            Err(LxError::EPERM)
+        }
+    }
+
+    /// Set gid according to current privileges.
+    pub fn set_gid(&self, gid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if privileged {
+            inner.credentials.rgid = gid;
+            inner.credentials.egid = gid;
+            inner.credentials.sgid = gid;
+            return Ok(());
+        }
+        if Self::allowed_gid(&inner.credentials, gid) {
+            inner.credentials.egid = gid;
+            Ok(())
+        } else {
+            Err(LxError::EPERM)
+        }
+    }
+
+    /// Set real/effective uid.
+    pub fn set_reuid(&self, ruid: u32, euid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if !privileged {
+            if ruid != NO_ID && !Self::allowed_uid(&inner.credentials, ruid) {
+                return Err(LxError::EPERM);
+            }
+            if euid != NO_ID && !Self::allowed_uid(&inner.credentials, euid) {
+                return Err(LxError::EPERM);
+            }
+        }
+        let old_ruid = inner.credentials.ruid;
+        if ruid != NO_ID {
+            inner.credentials.ruid = ruid;
+        }
+        if euid != NO_ID {
+            inner.credentials.euid = euid;
+        }
+        if privileged || ruid != NO_ID || (euid != NO_ID && euid != old_ruid) {
+            inner.credentials.suid = inner.credentials.euid;
+        }
+        Ok(())
+    }
+
+    /// Set real/effective gid.
+    pub fn set_regid(&self, rgid: u32, egid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if !privileged {
+            if rgid != NO_ID && !Self::allowed_gid(&inner.credentials, rgid) {
+                return Err(LxError::EPERM);
+            }
+            if egid != NO_ID && !Self::allowed_gid(&inner.credentials, egid) {
+                return Err(LxError::EPERM);
+            }
+        }
+        let old_rgid = inner.credentials.rgid;
+        if rgid != NO_ID {
+            inner.credentials.rgid = rgid;
+        }
+        if egid != NO_ID {
+            inner.credentials.egid = egid;
+        }
+        if privileged || rgid != NO_ID || (egid != NO_ID && egid != old_rgid) {
+            inner.credentials.sgid = inner.credentials.egid;
+        }
+        Ok(())
+    }
+
+    /// Set real/effective/saved uid.
+    pub fn set_resuid(&self, ruid: u32, euid: u32, suid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if !privileged {
+            for uid in [ruid, euid, suid] {
+                if uid != NO_ID && !Self::allowed_uid(&inner.credentials, uid) {
+                    return Err(LxError::EPERM);
+                }
+            }
+        }
+        if ruid != NO_ID {
+            inner.credentials.ruid = ruid;
+        }
+        if euid != NO_ID {
+            inner.credentials.euid = euid;
+        }
+        if suid != NO_ID {
+            inner.credentials.suid = suid;
+        }
+        Ok(())
+    }
+
+    /// Set real/effective/saved gid.
+    pub fn set_resgid(&self, rgid: u32, egid: u32, sgid: u32) -> LxResult {
+        let mut inner = self.inner.lock();
+        let privileged = inner.credentials.euid == ROOT_UID;
+        if !privileged {
+            for gid in [rgid, egid, sgid] {
+                if gid != NO_ID && !Self::allowed_gid(&inner.credentials, gid) {
+                    return Err(LxError::EPERM);
+                }
+            }
+        }
+        if rgid != NO_ID {
+            inner.credentials.rgid = rgid;
+        }
+        if egid != NO_ID {
+            inner.credentials.egid = egid;
+        }
+        if sgid != NO_ID {
+            inner.credentials.sgid = sgid;
+        }
+        Ok(())
     }
 
     /// Get parent process.

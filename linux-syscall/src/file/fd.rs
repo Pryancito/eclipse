@@ -40,23 +40,48 @@ impl Syscall<'_> {
             let (dir_path, file_name) = split_path(path);
             // relative to cwd
             let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+            let dir_metadata = dir_inode.metadata()?;
+            proc.check_access(&dir_metadata, 0o3, true)?;
             match dir_inode.find(file_name) {
                 Ok(file_inode) => {
                     if flags.contains(OpenFlags::EXCLUSIVE) {
                         return Err(LxError::EEXIST);
                     }
+                    let metadata = file_inode.metadata()?;
+                    if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
+                        proc.check_access(&metadata, 0o2, true)?;
+                    }
+                    if flags.readable() {
+                        proc.check_access(&metadata, 0o4, true)?;
+                    }
                     file_inode
                 }
                 Err(FsError::EntryNotFound) => {
-                    dir_inode.create(file_name, FileType::File, mode as u32)?
+                    let create_mode = proc.apply_umask(mode as u16);
+                    let inode = dir_inode.create(file_name, FileType::File, create_mode as u32)?;
+                    proc.initialize_created_metadata(&inode, Some(&dir_metadata), create_mode, false)?;
+                    inode
                 }
                 Err(e) => return Err(LxError::from(e)),
             }
         } else {
-            proc.lookup_inode_at(dir_fd, path, true)?
+            let inode = proc.lookup_inode_at(dir_fd, path, true)?;
+            let metadata = inode.metadata()?;
+            if flags.readable() {
+                proc.check_access(&metadata, 0o4, true)?;
+            }
+            if flags.writable() {
+                proc.check_access(&metadata, 0o2, true)?;
+            }
+            inode
         };
-        if inode.metadata()?.type_ == FileType::Dir && flags.writable() {
+        let metadata = inode.metadata()?;
+        if metadata.type_ == FileType::Dir && flags.writable() {
             return Err(LxError::EISDIR);
+        }
+        if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
+            proc.check_access(&metadata, 0o2, true)?;
+            inode.resize(0)?;
         }
         let abs_path = proc.get_absolute_path(dir_fd, path)?;
         let file = File::new(inode, flags, abs_path);

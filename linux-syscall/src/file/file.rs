@@ -153,7 +153,11 @@ impl Syscall<'_> {
     pub fn sys_truncate(&self, path: UserInPtr<u8>, len: usize) -> SysResult {
         let path = path.as_c_str()?;
         info!("truncate: path={:?}, len={}", path, len);
-        self.linux_process().lookup_inode(path)?.resize(len)?;
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode(path)?;
+        let metadata = inode.metadata()?;
+        proc.check_access(&metadata, 0o2, true)?;
+        inode.resize(len)?;
         Ok(0)
     }
 
@@ -349,7 +353,6 @@ impl Syscall<'_> {
     }
 
     /// Check user's permissions of a file relative to a directory file descriptor
-    /// TODO: check permissions based on uid/gid
     pub fn sys_faccessat(
         &self,
         dirfd: FileDesc,
@@ -357,7 +360,6 @@ impl Syscall<'_> {
         mode: usize,
         flags: usize,
     ) -> SysResult {
-        // TODO: check permissions based on uid/gid
         let path = path.as_c_str()?;
         let flags = AtFlags::from_bits_truncate(flags);
         info!(
@@ -366,7 +368,69 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
-        let _inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        let metadata = inode.metadata()?;
+        let requested = (mode & 0o7) as u16;
+        proc.check_access(&metadata, requested, false)?;
+        Ok(0)
+    }
+
+    /// Change file mode by descriptor.
+    pub fn sys_fchmod(&self, fd: FileDesc, mode: usize) -> SysResult {
+        let proc = self.linux_process();
+        let inode = proc.get_file(fd)?.inode();
+        let mut metadata = inode.metadata()?;
+        proc.chmod_metadata(&mut metadata, mode as u16)?;
+        inode.set_metadata(&metadata)?;
+        Ok(0)
+    }
+
+    /// Change file mode relative to a directory file descriptor.
+    pub fn sys_fchmodat(
+        &self,
+        dirfd: FileDesc,
+        path: UserInPtr<u8>,
+        mode: usize,
+        flags: usize,
+    ) -> SysResult {
+        let path = path.as_c_str()?;
+        let flags = AtFlags::from_bits_truncate(flags);
+        let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        let mut metadata = inode.metadata()?;
+        proc.chmod_metadata(&mut metadata, mode as u16)?;
+        inode.set_metadata(&metadata)?;
+        Ok(0)
+    }
+
+    /// Change file owner/group by descriptor.
+    pub fn sys_fchown(&self, fd: FileDesc, uid: usize, gid: usize) -> SysResult {
+        let proc = self.linux_process();
+        let inode = proc.get_file(fd)?.inode();
+        let mut metadata = inode.metadata()?;
+        proc.chown_metadata(&mut metadata, uid as u32, gid as u32)?;
+        inode.set_metadata(&metadata)?;
+        Ok(0)
+    }
+
+    /// Change file owner/group relative to a directory file descriptor.
+    pub fn sys_fchownat(
+        &self,
+        dirfd: FileDesc,
+        path: UserInPtr<u8>,
+        uid: usize,
+        gid: usize,
+        flags: usize,
+    ) -> SysResult {
+        let path = path.as_c_str()?;
+        let flags = AtFlags::from_bits_truncate(flags);
+        let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        let mut metadata = inode.metadata()?;
+        proc.chown_metadata(&mut metadata, uid as u32, gid as u32)?;
+        inode.set_metadata(&metadata)?;
         Ok(0)
     }
 
