@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use rcore_fs::vfs::{make_rdev, FileType, FsError, INode, Metadata, PollStatus, Result, Timespec};
 use rcore_fs_devfs::DevFS;
-use zcore_drivers::{scheme::BlockScheme, DeviceError};
+use zcore_drivers::{scheme::BlockScheme, scheme::Scheme, DeviceError};
 
 /// Linux `BLKGETSIZE64` — total size in bytes (`linux/fs.h`).
 const BLKGETSIZE64: u32 = 0x8008_1272;
@@ -168,3 +168,134 @@ fn convert_error(e: DeviceError) -> FsError {
         | DeviceError::NoResources => FsError::DeviceError,
     }
 }
+
+/// A wrapper block device that represents a partition on a physical block device.
+pub struct PartitionBlock {
+    parent: Arc<dyn BlockScheme>,
+    name: alloc::string::String,
+    start_block: usize,
+    block_count: usize,
+}
+
+impl PartitionBlock {
+    pub fn new(
+        parent: Arc<dyn BlockScheme>,
+        name: alloc::string::String,
+        start_block: usize,
+        block_count: usize,
+    ) -> Self {
+        Self {
+            parent,
+            name,
+            start_block,
+            block_count,
+        }
+    }
+}
+
+impl Scheme for PartitionBlock {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn handle_irq(&self, irq_num: usize) {
+        self.parent.handle_irq(irq_num);
+    }
+}
+
+impl BlockScheme for PartitionBlock {
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> zcore_drivers::DeviceResult {
+        if block_id >= self.block_count {
+            return Err(zcore_drivers::DeviceError::InvalidParam);
+        }
+        self.parent.read_block(self.start_block + block_id, buf)
+    }
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) -> zcore_drivers::DeviceResult {
+        if block_id >= self.block_count {
+            return Err(zcore_drivers::DeviceError::InvalidParam);
+        }
+        self.parent.write_block(self.start_block + block_id, buf)
+    }
+
+    fn flush(&self) -> zcore_drivers::DeviceResult {
+        self.parent.flush()
+    }
+
+    fn block_count(&self) -> usize {
+        self.block_count
+    }
+}
+
+/// Scans a block device for partition tables (MBR/GPT) and returns a vector
+/// of partitions as (start_sector, size_sectors) pairs.
+pub fn scan_partitions(block: &Arc<dyn BlockScheme>) -> alloc::vec::Vec<(usize, usize)> {
+    let mut partitions = alloc::vec::Vec::new();
+    #[repr(align(4096))]
+    struct AlignedBuf([u8; 512]);
+    let mut mbr_buffer = AlignedBuf([0u8; 512]);
+    if block.read_block(0, &mut mbr_buffer.0).is_err() {
+        return partitions;
+    }
+    let boot_signature = u16::from_le_bytes([mbr_buffer.0[510], mbr_buffer.0[511]]);
+    if boot_signature != 0xAA55 {
+        return partitions;
+    }
+
+    // Check for GPT protective MBR or GPT header signature
+    let is_gpt_mbr = mbr_buffer.0[450] == 0xEE;
+    let mut is_gpt_header = false;
+    let mut gpt_header_buf = AlignedBuf([0u8; 512]);
+    if block.read_block(1, &mut gpt_header_buf.0).is_ok() {
+        if &gpt_header_buf.0[0..8] == b"EFI PART" {
+            is_gpt_header = true;
+        }
+    }
+
+    if is_gpt_mbr || is_gpt_header {
+        // GPT: read entries from sectors 2..=5 (up to 16 partitions)
+        let mut gpt_buffer = AlignedBuf([0u8; 512]);
+        for sector_id in 2..=5 {
+            if block.read_block(sector_id, &mut gpt_buffer.0).is_err() {
+                break;
+            }
+            for i in 0..4 {
+                let offset = i * 128;
+                let partition_entry = &gpt_buffer.0[offset..offset + 128];
+                if !partition_entry.iter().all(|&b| b == 0) {
+                    let start_sector = u64::from_le_bytes([
+                        partition_entry[32], partition_entry[33], partition_entry[34], partition_entry[35],
+                        partition_entry[36], partition_entry[37], partition_entry[38], partition_entry[39],
+                    ]) as usize;
+                    let end_sector = u64::from_le_bytes([
+                        partition_entry[40], partition_entry[41], partition_entry[42], partition_entry[43],
+                        partition_entry[44], partition_entry[45], partition_entry[46], partition_entry[47],
+                    ]) as usize;
+                    if end_sector >= start_sector && start_sector > 0 {
+                        let size_sectors = end_sector - start_sector + 1;
+                        partitions.push((start_sector, size_sectors));
+                    }
+                }
+            }
+        }
+    } else {
+        // MBR: parse partitions from sector 0
+        for i in 0..4 {
+            let offset = 446 + (i * 16);
+            let partition_entry = &mbr_buffer.0[offset..offset + 16];
+            let part_type = partition_entry[4];
+            if part_type != 0 {
+                let start_sector = u32::from_le_bytes([
+                    partition_entry[8], partition_entry[9], partition_entry[10], partition_entry[11],
+                ]) as usize;
+                let size_sectors = u32::from_le_bytes([
+                    partition_entry[12], partition_entry[13], partition_entry[14], partition_entry[15],
+                ]) as usize;
+                if size_sectors > 0 && start_sector > 0 {
+                    partitions.push((start_sector, size_sectors));
+                }
+            }
+        }
+    }
+    partitions
+}
+

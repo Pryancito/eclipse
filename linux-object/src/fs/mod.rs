@@ -298,8 +298,34 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             let name_char = (b'a' + (other_idx % 26) as u8) as char;
             format!("sd{}", name_char)
         };
-        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(i, block.clone()))) {
+        
+        // Use i * 16 as the base index for minor numbers to leave room for partitions
+        let base_index = i * 16;
+        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(base_index, block.clone()))) {
             warn!("failed to mknod /dev/{}: {:?}", &fname, e);
+        }
+
+        // Scan for partitions on this block device
+        let partitions = devfs::blockdev::scan_partitions(block);
+        for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
+            let part_num = part_idx + 1;
+            let part_name = if fname.starts_with("nvme") {
+                format!("{}p{}", fname, part_num)
+            } else {
+                format!("{}{}", fname, part_num)
+            };
+            let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
+                block.clone(),
+                format!("{}-part{}", name, part_num),
+                start_block,
+                block_count,
+            ));
+            let part_dev_index = base_index + part_num;
+            if let Err(e) = devfs_root.add(&part_name, Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver))) {
+                warn!("failed to mknod /dev/{}: {:?}", &part_name, e);
+            } else {
+                info!("Registered partition /dev/{} (start: {}, count: {})", part_name, start_block, block_count);
+            }
         }
     }
 

@@ -72,6 +72,23 @@ impl NvmeInterface {
     }
 }
 
+fn clflush_range(vaddr: usize, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{_mm_clflush, _mm_mfence};
+        let line_size = 64;
+        let start = vaddr & !(line_size - 1);
+        let end = (vaddr + len + line_size - 1) & !(line_size - 1);
+        unsafe {
+            _mm_mfence();
+            for addr in (start..end).step_by(line_size) {
+                _mm_clflush(addr as *const u8);
+            }
+            _mm_mfence();
+        }
+    }
+}
+
 impl NvmeInterface {
     fn wait_cq_complete(
         queue: &mut NvmeQueue<ProviderImpl>,
@@ -184,6 +201,11 @@ impl NvmeInterface {
         }
         warn!("[nvme] Controller ready!");
 
+        let data_va = phys_to_virt(data_dma_pa as usize);
+
+        // Invalidate cache before command so no dirty lines are written back
+        clflush_range(data_va, 4096);
+
         // config identify (CNS = 1: Identify Controller)
         let mut cmd = NvmeIdentify::new();
         cmd.prp1 = data_dma_pa;
@@ -205,6 +227,9 @@ impl NvmeInterface {
         Self::wait_cq_complete(&mut admin_queue, "identify admin queue")?;
         unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
 
+        // Invalidate cache after command so CPU reads from RAM
+        clflush_range(data_va, 4096);
+
         // config identify (CNS = 0: Identify Namespace)
         let mut cmd = NvmeIdentify::new();
         cmd.cns = 0;
@@ -225,10 +250,27 @@ impl NvmeInterface {
         Self::wait_cq_complete(&mut admin_queue, "identify namespace")?;
         unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
 
-        // read namespace size
-        let nsze = unsafe { *(phys_to_virt(data_dma_pa as usize) as *const u64) };
-        self.capacity = nsze as usize;
-        warn!("[nvme] Identified namespace size: {} sectors", nsze);
+        // Invalidate cache after command so CPU reads from RAM
+        clflush_range(data_va, 4096);
+
+        // read namespace size and check LBA size format
+        let nsze = unsafe { core::ptr::read_volatile(data_va as *const u64) };
+        let flbas = unsafe { core::ptr::read_volatile((data_va + 26) as *const u8) };
+        let lbaf_index = (flbas & 0xF) as usize;
+        let lbaf_offset = 128 + lbaf_index * 4;
+        let lbaf = unsafe { core::ptr::read_volatile((data_va + lbaf_offset) as *const u32) };
+        let lbads = ((lbaf >> 16) & 0xFF) as u8;
+        let block_size = if lbads >= 9 && lbads <= 16 {
+            1 << lbads
+        } else {
+            512
+        };
+
+        self.capacity = nsze as usize * (block_size / 512);
+        warn!(
+            "[nvme] Identified namespace size: {} blocks (block_size: {}B), capacity: {} sectors (512B)",
+            nsze, block_size, self.capacity
+        );
 
         Ok(())
     }
@@ -321,6 +363,10 @@ impl BlockScheme for NvmeInterface {
 
         let ptr = read_buf.as_mut_ptr();
         let addr = virt_to_phys(ptr as usize);
+        let buf_len = read_buf.len();
+
+        // Invalidate cache before command so no dirty lines are written back
+        clflush_range(ptr as usize, buf_len);
 
         // build nvme read command
         let mut cmd = NvmeRWCommand::new_read_command();
@@ -345,6 +391,9 @@ impl BlockScheme for NvmeInterface {
         // wait for command complete on io_queue
         Self::wait_cq_complete(&mut io_queue, "read block")?;
 
+        // Invalidate cache after command so CPU reads from RAM
+        clflush_range(ptr as usize, buf_len);
+
         // write CQ head doorbell
         let stride = db_offset / 2;
         unsafe { write_volatile((dbs + db_offset + stride) as *mut u32, io_queue.cq_head as u32) }
@@ -360,6 +409,10 @@ impl BlockScheme for NvmeInterface {
 
         let ptr = write_buf.as_ptr();
         let addr = virt_to_phys(ptr as usize);
+        let buf_len = write_buf.len();
+
+        // Flush cache before command so device reads fresh data from RAM
+        clflush_range(ptr as usize, buf_len);
 
         // build nvme write command
         let mut cmd = NvmeRWCommand::new_write_command();

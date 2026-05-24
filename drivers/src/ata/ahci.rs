@@ -253,8 +253,15 @@ impl AhciPort {
                 h.ctba = ct_phys as u32;
                 h.ctbau = (ct_phys >> 32) as u64 as u32;
             }
+            // Zero the FIS receive area (size 256 bytes, located at cl_virt + 1024)
+            core::ptr::write_bytes(
+                (self.cl_virt + 1024) as *mut u8,
+                0,
+                256,
+            );
         }
         clflush_range(self.cl_virt, CMD_SLOTS * core::mem::size_of::<CommandHeader>());
+        clflush_range(self.cl_virt + 1024, 256);
 
         self.write_reg(PORT_CLB, self.cl_phys as u32);
         self.write_reg(PORT_CLBU, (self.cl_phys >> 32) as u32);
@@ -411,20 +418,29 @@ impl AhciPort {
         }
         clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
         clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
-        if write {
-            let vaddr = phys_to_virt(buf_phys as usize);
-            clflush_range(vaddr, buf_len);
-        }
+        let vaddr = phys_to_virt(buf_phys as usize);
+        clflush_range(vaddr, buf_len);
 
         let res = self.exec_cmd(slot);
         if res.is_ok() && !write {
-            let vaddr = phys_to_virt(buf_phys as usize);
             clflush_range(vaddr, buf_len);
         }
         res
     }
 
     fn identify(&self) -> Option<u64> {
+        // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
+        if !wait_until(TFD_TIMEOUT_US, || {
+            self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
+        }) {
+            warn!(
+                "[AHCI] Port {} TFD busy timeout before IDENTIFY",
+                self.port_idx
+            );
+            self.reset_port();
+            return None;
+        }
+
         let slot = 0u32;
         let paddr = unsafe { drivers_dma_alloc(1) };
         let vaddr = phys_to_virt(paddr);
@@ -479,6 +495,18 @@ impl AhciPort {
         } else {
             lba28
         };
+
+        crate::klog_warn!(
+            "[AHCI] identify: lba48_supported={}, lba28={}, lba48={}, sectors={}, id[83]={:#x}, id[60]={:#x}, id[61]={:#x}, id[100]={:#x}",
+            lba48_supported,
+            lba28,
+            lba48,
+            sectors,
+            id[83],
+            id[60],
+            id[61],
+            id[100]
+        );
 
         unsafe {
             drivers_dma_dealloc(paddr, 1);
