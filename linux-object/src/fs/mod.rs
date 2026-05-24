@@ -169,42 +169,55 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
     if let Some(display) = drivers::all_display().first() {
-        use devfs::{EventDev, FbDev, MiceDev};
+        use devfs::FbDev;
 
         // Add framebuffer device at `/dev/fb0`
         if let Err(e) = devfs_root.add("fb0", Arc::new(FbDev::new(display.clone()))) {
             warn!("failed to mknod /dev/fb0: {:?}", e);
         }
+    }
 
-        let input_dev = devfs_root
-            .add_dir("input")
-            .expect("failed to mkdir /dev/input");
+    // Add input devices at `/dev/input/`
+    {
+        use devfs::{EventDev, MiceDev};
+        if !drivers::all_input().as_vec().is_empty() {
+            if let Ok(input_dev) = devfs_root.add_dir("input") {
+                // Add mouse devices at `/dev/input/mouseX` and `/dev/input/mice`
+                for (id, m) in MiceDev::from_input_devices(&drivers::all_input().as_vec()) {
+                    let fname = id.map_or("mice".to_string(), |id| format!("mouse{}", id));
+                    if let Err(e) = input_dev.add(&fname, Arc::new(m)) {
+                        warn!("failed to mknod /dev/input/{}: {:?}", &fname, e);
+                    }
+                }
 
-        // Add mouse devices at `/dev/input/mouseX` and `/dev/input/mice`
-        for (id, m) in MiceDev::from_input_devices(&drivers::all_input().as_vec()) {
-            let fname = id.map_or("mice".to_string(), |id| format!("mouse{}", id));
-            if let Err(e) = input_dev.add(&fname, Arc::new(m)) {
-                warn!("failed to mknod /dev/input/{}: {:?}", &fname, e);
+                // Add input event devices at `/dev/input/eventX`
+                for (id, i) in drivers::all_input().as_vec().iter().enumerate() {
+                    let fname = format!("event{}", id);
+                    if let Err(e) = input_dev.add(&fname, Arc::new(EventDev::new(i.clone(), id))) {
+                        warn!("failed to mknod /dev/input/{}: {:?}", &fname, e);
+                    }
+                }
+            } else {
+                warn!("failed to mkdir /dev/input");
             }
         }
+    }
 
-        // Add input event devices at `/dev/input/eventX`
-        for (id, i) in drivers::all_input().as_vec().iter().enumerate() {
-            let fname = format!("event{}", id);
-            if let Err(e) = input_dev.add(&fname, Arc::new(EventDev::new(i.clone(), id))) {
-                warn!("failed to mknod /dev/input/{}: {:?}", &fname, e);
-            }
-        }
-
+    // Register DRM drivers and add DRM devices
+    {
         // Register DRM drivers from kernel-hal
         for drm in drivers::all_drm().as_vec().iter() {
             devfs::drm::register_driver(drm.clone());
         }
 
-        // Add DRM devices at `/dev/dri/card0`
-        let dri_dev = devfs_root.add_dir("dri").expect("failed to mkdir /dev/dri");
-        if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
-            warn!("failed to mknod /dev/dri/card0: {:?}", e);
+        if !drivers::all_drm().as_vec().is_empty() {
+            if let Ok(dri_dev) = devfs_root.add_dir("dri") {
+                if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
+                    warn!("failed to mknod /dev/dri/card0: {:?}", e);
+                }
+            } else {
+                warn!("failed to mkdir /dev/dri");
+            }
         }
     }
 

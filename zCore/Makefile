@@ -10,6 +10,7 @@ LIBOS ?=
 TEST ?=
 GRAPHIC ?=
 DISK ?=
+DISK_SIZE ?= 512M
 HYPERVISOR ?=
 V ?=
 
@@ -196,13 +197,11 @@ endif
 
 qemu_opts += \
 	-netdev user,id=net1 \
-	-device e1000e,netdev=net1 \
-	-trace "ahci_*" \
-	-trace "ide_*"
+	-device e1000e,netdev=net1
 
 ifeq ($(DISK), on)
   ifeq ($(ARCH), x86_64)
-    qemu_opts += -device ide-hd,drive=userdisk
+    qemu_opts += -device virtio-blk-pci,drive=userdisk
   else ifeq ($(ARCH), riscv64)
     qemu_opts += -device virtio-blk-device,drive=userdisk
   endif
@@ -266,7 +265,6 @@ endif
 .PHONY: justrun
 justrun: $(qemu_disk)
 ifeq ($(ARCH), x86_64)
-	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 endif
 ifeq ($(ARCH), aarch64)
@@ -293,7 +291,6 @@ endif
 debugrun: $(qemu_disk)
 	cp .gdbinit_$(ARCH) .gdbinit
 ifeq ($(ARCH), x86_64)
-	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 endif
 ifeq ($(ARCH), aarch64)
@@ -343,10 +340,11 @@ ifeq ($(ARCH), x86_64)
 	mkdir -p $(esp)/EFI/zCore $(esp)/EFI/Boot
 	cp ../rboot/target/x86_64-unknown-uefi/release/rboot.efi $(esp)/EFI/Boot/BootX64.efi
 	cp rboot.conf $(esp)/EFI/Boot/rboot.conf
-	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 	cp $(kernel_elf) $(esp)/EFI/zCore/zcore.elf
-	cp $(user_img) $(esp)/EFI/zCore/
+	rm -f $(esp)/EFI/zCore/initramfs.img $(esp)/EFI/zCore/$(ARCH).img
+	rm -f $(esp)/EFI/zCore/x86_64.img $(esp)/EFI/zCore/aarch64.img $(esp)/EFI/zCore/riscv64.img
+	cp $(user_img) $(esp)/EFI/zCore/initramfs.img
 else ifeq ($(ARCH), riscv64)
 	$(OBJCOPY) $(kernel_elf) --strip-all -O binary $@
 endif
@@ -401,5 +399,5 @@ ifeq ($(ARCH), riscv64)
 	@qemu-img convert -f raw riscv64.img -O qcow2 $@
 	@qemu-img resize $@ +5M
 else
-	@qemu-img create -f qcow2 $@ 512M
+	@qemu-img create -f qcow2 $@ $(DISK_SIZE)
 endif

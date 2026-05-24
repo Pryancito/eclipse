@@ -622,17 +622,35 @@ impl LinuxRootfs {
         let arch = self.0.name();
         let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
         let strip = self.strip(&musl);
+        let zlib = PROJECT_DIR.join("tools").join("zlib");
+        let zlib_sources = [
+            "adler32.c",
+            "crc32.c",
+            "inflate.c",
+            "inffast.c",
+            "inftrees.c",
+            "zutil.c",
+            "gzlib.c",
+            "gzread.c",
+            "gzclose.c",
+        ];
 
         fs::create_dir_all(&dir).unwrap();
-        let status = Ext::new(&cc)
-            .current_dir(&dir)
+        let mut cmd = Ext::new(&cc);
+        cmd.current_dir(&dir)
             .arg("-static")
             .arg("-O2")
             .arg("-s")
+            .arg("-D_LARGEFILE64_SOURCE=1")
+            .arg("-DNO_GZCOMPRESS")
+            .arg(format!("-I{}", zlib.display()))
             .arg("-o")
             .arg(&executable)
-            .arg(&source)
-            .status();
+            .arg(&source);
+        for src in zlib_sources {
+            cmd.arg(zlib.join(src));
+        }
+        let status = cmd.status();
         if !status.success() {
             println!("Failed to compile install-eclipse");
             return executable;

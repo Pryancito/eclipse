@@ -13,15 +13,27 @@
 #include <sys/wait.h>
 #include <linux/fs.h>
 #include <errno.h>
+#include <zlib.h>
 
 #define SECTOR_SIZE 512ULL
 #define PART1_START 2048ULL
 #define PART1_SECTORS 204800ULL
+#define GPT_BACKUP_RESERVED_SECTORS 34ULL
 #define MAX_DISKS 64
 #define LINE_BUF 4096
 #define SHA256_HEX_LEN 64
+#define VERIFY_PREFIX_BYTES (16U * 4096U)
 #define GIB (1024ULL * 1024ULL * 1024ULL)
 #define MIB (1024ULL * 1024ULL)
+
+#define UPD_STAGING_IMG "/tmp/eclipse-upd-efi.img"
+#define UPD_STAGING_MNT "/tmp/eclipse-upd-staging"
+#define UPD_EFI_MNT     "/tmp/eclipse-upd-efi"
+#define UPD_ROOT_MNT    "/tmp/eclipse-upd-root"
+#define EFI_IMAGE_GZ    "/boot/efi.img.gz"
+
+#define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+#define GPT_LINUX_TYPE "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
 
 // ANSI escape codes for styling
 #define COLOR_RESET   "\x1b[0m"
@@ -101,6 +113,11 @@ struct partition_plan {
     int verify_after_write;
 };
 
+struct discovered_partitions {
+    int efi_part_num;
+    int root_part_num;
+};
+
 static FILE *g_log_file = NULL;
 
 int struct_file_exists(const char *path);
@@ -111,6 +128,10 @@ static uint64_t get_disk_size_bytes(const char *path);
 static int scan_disks(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128]);
 static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks, const char *path);
 static void trim_newline(char *s);
+static void trim_leading_ws(char *s);
+static int prompt_tty_fd(void);
+static int safe_flush_input(char *buf, size_t size);
+static int parse_menu_index(const char *input, int max_value, int *out_index);
 static uint64_t align_up_u64(uint64_t value, uint64_t alignment);
 static uint64_t align_down_u64(uint64_t value, uint64_t alignment);
 static void format_size(char *buf, size_t buf_size, uint64_t size_bytes);
@@ -130,14 +151,258 @@ static int command_exists(const char *name);
 static int run_command_logged(const char *cmd, int dry_run);
 static int run_command_capture_token(const char *cmd, char *out, size_t out_size);
 static int verify_sha256_file(const char *image_path);
-static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bitcount;
+    uint8_t buffer[64];
+} sha256_ctx;
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+};
+
+static uint32_t sha256_rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32U - n));
+}
+
+static void sha256_init(sha256_ctx *ctx) {
+    ctx->state[0] = 0x6a09e667U;
+    ctx->state[1] = 0xbb67ae85U;
+    ctx->state[2] = 0x3c6ef372U;
+    ctx->state[3] = 0xa54ff53aU;
+    ctx->state[4] = 0x510e527fU;
+    ctx->state[5] = 0x9b05688cU;
+    ctx->state[6] = 0x1f83d9abU;
+    ctx->state[7] = 0x5be0cd19U;
+    ctx->bitcount = 0;
+    memset(ctx->buffer, 0, sizeof(ctx->buffer));
+}
+
+static void sha256_transform(sha256_ctx *ctx, const uint8_t block[64]) {
+    uint32_t w[64];
+    uint32_t a, b, c, d, e, f, g, h;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)block[i * 4] << 24) |
+               ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) |
+               ((uint32_t)block[i * 4 + 3]);
+    }
+    for (i = 16; i < 64; i++) {
+        uint32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+
+    for (i = 0; i < 64; i++) {
+        uint32_t s1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + s1 + ch + sha256_k[i] + w[i];
+        uint32_t s0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = s0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
+    size_t i = 0;
+
+    while (i < len) {
+        size_t fill = (size_t)(ctx->bitcount / 8 % 64);
+        size_t left = 64 - fill;
+        size_t chunk = len - i;
+
+        if (chunk >= left) {
+            memcpy(ctx->buffer + fill, data + i, left);
+            ctx->bitcount += (uint64_t)left * 8U;
+            sha256_transform(ctx, ctx->buffer);
+            i += left;
+        } else {
+            memcpy(ctx->buffer + fill, data + i, chunk);
+            ctx->bitcount += (uint64_t)chunk * 8U;
+            break;
+        }
+    }
+}
+
+static void sha256_final(sha256_ctx *ctx, uint8_t digest[32]) {
+    uint8_t pad[64];
+    size_t fill = (size_t)((ctx->bitcount / 8) % 64);
+    size_t padlen = (fill < 56) ? (56 - fill) : (64 + 56 - fill);
+    uint64_t bits = ctx->bitcount;
+    uint8_t len_be[8];
+    int i;
+
+    memset(pad, 0, sizeof(pad));
+    pad[0] = 0x80;
+    sha256_update(ctx, pad, padlen);
+    for (i = 7; i >= 0; i--) {
+        len_be[i] = (uint8_t)(bits & 0xffU);
+        bits >>= 8;
+    }
+    sha256_update(ctx, len_be, sizeof(len_be));
+
+    for (i = 0; i < 8; i++) {
+        digest[i * 4] = (uint8_t)(ctx->state[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)(ctx->state[i]);
+    }
+}
+
+static void sha256_hex_digest(const uint8_t digest[32], char *out) {
+    static const char hex[] = "0123456789abcdef";
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[64] = 0;
+}
+
+static void sha256_hex_buffer(const uint8_t *data, size_t len, char *out) {
+    sha256_ctx ctx;
+    uint8_t digest[32];
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, data, len);
+    sha256_final(&ctx, digest);
+    sha256_hex_digest(digest, out);
+}
+
+static ssize_t disk_pread_all(int fd, void *buf, size_t len, uint64_t offset) {
+    uint8_t *p = buf;
+    size_t left = len;
+
+    while (left > 0) {
+        ssize_t n = pread(fd, p, left, (off_t)offset);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            break;
+        }
+        p += (size_t)n;
+        offset += (uint64_t)n;
+        left -= (size_t)n;
+    }
+    return (ssize_t)(len - left);
+}
+
+static int sha256_file_path(const char *path, char *hex_out) {
+    uint8_t buf[4096];
+    sha256_ctx ctx;
+    uint8_t digest[32];
+    FILE *fp;
+    size_t nread;
+
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    sha256_init(&ctx);
+    while ((nread = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        sha256_update(&ctx, buf, nread);
+    }
+    if (ferror(fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    sha256_final(&ctx, digest);
+    sha256_hex_digest(digest, hex_out);
+    return 0;
+}
+
+static int read_gz_prefix(const char *gz_path, uint8_t *buf, size_t len) {
+    gzFile gz;
+    size_t total = 0;
+
+    gz = gzopen(gz_path, "rb");
+    if (gz == NULL) {
+        return -1;
+    }
+
+    while (total < len) {
+        int nread = gzread(gz, buf + total, (unsigned)(len - total));
+        if (nread < 0) {
+            gzclose(gz);
+            return -1;
+        }
+        if (nread == 0) {
+            break;
+        }
+        total += (size_t)nread;
+    }
+
+    if (gzclose(gz) != Z_OK) {
+        return -1;
+    }
+    return (total == len) ? 0 : -1;
+}
+
+static int build_partition_plan(enum layout_mode layout, enum table_mode table, uint64_t disk_sectors,
                                 struct partition_plan *parts, int *part_count,
                                 char *summary, size_t summary_size);
 static int prepare_gpt_or_fallback(enum table_mode *table);
 static int write_mbr_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run);
+static int write_gpt_partition_table_native(const char *disk_path, const struct partition_plan *parts, int part_count);
 static int write_gpt_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run);
 static int write_partition_image_with_retry(const char *disk_path, const struct partition_plan *part, int dry_run);
+static ssize_t disk_pwrite_all(int fd, const void *buf, size_t len, uint64_t offset);
+static int decompress_gz_to_path(const char *gz_path, const char *out_path, int dry_run);
+static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, uint64_t start_sector, int dry_run);
 static int verify_partition_write(const char *disk_path, const struct partition_plan *part, int dry_run);
+static int partition_dev_path(const char *disk_path, int part_num, char *out, size_t out_size);
+static int discover_partitions(const char *disk_path, struct discovered_partitions *out);
+static int shell_mkdir_p(const char *path, int dry_run);
+static int shell_copy_file(const char *src, const char *dst, int dry_run);
+static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run);
+static int shell_umount(const char *target, int dry_run);
+static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run);
+static int run_upgrade(const char *disk_path, int dry_run);
 static void close_log_file(void);
 
 static void close_log_file(void) {
@@ -187,7 +452,13 @@ static uint64_t get_disk_size_bytes(const char *path) {
     }
 
     uint64_t size = 0;
-    if (ioctl(fd, BLKGETSIZE64, &size) != 0) {
+    if (ioctl(fd, BLKGETSIZE64, &size) != 0 || size == 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode) && (uint64_t)st.st_size > 0) {
+            size = (uint64_t)st.st_size;
+        }
+    }
+    if (size == 0) {
         off_t end = lseek(fd, 0, SEEK_END);
         if (end > 0) {
             size = (uint64_t)end;
@@ -203,6 +474,95 @@ static void trim_newline(char *s) {
         return;
     }
     s[strcspn(s, "\r\n")] = 0;
+}
+
+static void trim_leading_ws(char *s) {
+    size_t skip;
+
+    if (s == NULL) {
+        return;
+    }
+    skip = strspn(s, " \t");
+    if (skip > 0) {
+        memmove(s, s + skip, strlen(s + skip) + 1);
+    }
+}
+
+/// TTY de consola para prompts interactivos (evita stdin redirigido o sin eco).
+static int prompt_tty_fd(void) {
+    static int tty_fd = -2;
+
+    if (tty_fd == -2) {
+        tty_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+        if (tty_fd < 0) {
+            tty_fd = STDIN_FILENO;
+        }
+    }
+    return tty_fd;
+}
+
+/// Lee una línea desde /dev/tty byte a byte (sin depender del line discipline de musl).
+static int safe_flush_input(char *buf, size_t size) {
+    int fd;
+    size_t pos;
+    char c;
+
+    if (buf == NULL || size < 2) {
+        return -1;
+    }
+
+    fd = prompt_tty_fd();
+    fflush(stdout);
+    pos = 0;
+
+    while (pos + 1 < size) {
+        ssize_t n;
+
+        do {
+            n = read(fd, &c, 1);
+        } while (n < 0 && errno == EINTR);
+
+        if (n <= 0) {
+            buf[pos] = '\0';
+            return (pos == 0) ? -1 : 0;
+        }
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            break;
+        }
+        if (c == '\b' || c == 127) {
+            if (pos > 0) {
+                pos--;
+            }
+            continue;
+        }
+        buf[pos++] = c;
+    }
+
+    buf[pos] = '\0';
+    trim_leading_ws(buf);
+    return 0;
+}
+
+/// Parse a menu index like "1" or "2". Returns 1 on success, 0 for empty input
+/// (use default), -1 if the value is not a valid index in [1, max_value].
+static int parse_menu_index(const char *input, int max_value, int *out_index) {
+    char *end;
+
+    if (input == NULL || input[0] == '\0') {
+        return 0;
+    }
+
+    {
+        long value = strtol(input, &end, 10);
+        if (*end != '\0' || value < 1 || value > max_value) {
+            return -1;
+        }
+        *out_index = (int)value;
+    }
+    return 1;
 }
 
 static uint64_t align_up_u64(uint64_t value, uint64_t alignment) {
@@ -464,21 +824,25 @@ static int prompt_disk_selection(struct config *cfg, struct disk_info disks[MAX_
 
     char input[64];
     log("Seleccione el disco de destino [por defecto: %s]:", cfg->disk_path);
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (safe_flush_input(input, sizeof(input)) != 0) {
         log("Entrada vacía: usando %s.", cfg->disk_path);
         return 0;
     }
-    trim_newline(input);
 
-    if (input[0] == 0) {
+    if (input[0] == '\0') {
         return 0;
     }
 
-    if (input[0] >= 1 && input[0] <= 9) {
-        int idx = input[0] - 1;
-        if (idx >= 0 && idx < found_disks) {
-            strncpy(cfg->disk_path, disk_list[idx], sizeof(cfg->disk_path) - 1);
+    {
+        int idx = 0;
+        int parsed = parse_menu_index(input, found_disks, &idx);
+        if (parsed == 1) {
+            strncpy(cfg->disk_path, disk_list[idx - 1], sizeof(cfg->disk_path) - 1);
             cfg->disk_path[sizeof(cfg->disk_path) - 1] = 0;
+            return 0;
+        }
+        if (parsed == -1 && strspn(input, "0123456789") == strlen(input)) {
+            log(COLOR_RED "Opción numérica fuera de rango o inválida." COLOR_RESET);
             return 0;
         }
     }
@@ -511,23 +875,23 @@ static int prompt_install_mode(struct config *cfg, const struct existing_install
     char input[32];
     log("Seleccione el modo de instalación:");
     log("  [1] Nueva instalación (reparticiona y reescribe imágenes)");
-    log("  [2] Actualización (solo reescribe EFI y ROOT, sin reparticionar)");
+    log("  [2] Actualización (Sin reparticionado ni reinstalacion de sistema.)");
     log("Opción recomendada [%d]:", suggested == MODE_NEW ? 1 : 2);
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->mode = suggested;
         return 0;
     }
-    trim_newline(input);
 
-    if (input[0] == '2') {
-        cfg->mode = MODE_UPGRADE;
-    } else if (input[0] == '1' || input[0] == '\0') {
-        cfg->mode = suggested;
-        if (input[0] == '1') {
+    {
+        int choice = 0;
+        int parsed = parse_menu_index(input, 2, &choice);
+        if (parsed == 1 && choice == 2) {
+            cfg->mode = MODE_UPGRADE;
+        } else if (parsed == 1 && choice == 1) {
             cfg->mode = MODE_NEW;
+        } else {
+            cfg->mode = suggested;
         }
-    } else {
-        cfg->mode = suggested;
     }
 
     return 0;
@@ -550,12 +914,16 @@ static int prompt_layout(struct config *cfg) {
     log("  [1] Simple    -> EFI 100MB + ROOT resto");
     log("  [2] Avanzado  -> EFI 100MB + ROOT + HOME + SWAP");
     log("Opción recomendada [1]:");
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->layout = LAYOUT_SIMPLE;
         return 0;
     }
-    trim_newline(input);
-    cfg->layout = (input[0] == '2') ? LAYOUT_ADVANCED : LAYOUT_SIMPLE;
+
+    {
+        int choice = 0;
+        int parsed = parse_menu_index(input, 2, &choice);
+        cfg->layout = (parsed == 1 && choice == 2) ? LAYOUT_ADVANCED : LAYOUT_SIMPLE;
+    }
     return 0;
 }
 
@@ -580,17 +948,21 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
     log("  [1] MBR/BIOS");
     log("  [2] GPT/UEFI");
     log("Opción recomendada [%d]:", suggested == TABLE_MBR ? 1 : 2);
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->table = suggested;
         return 0;
     }
-    trim_newline(input);
-    if (input[0] == '1') {
-        cfg->table = TABLE_MBR;
-    } else if (input[0] == '2') {
-        cfg->table = TABLE_GPT;
-    } else {
-        cfg->table = suggested;
+
+    {
+        int choice = 0;
+        int parsed = parse_menu_index(input, 2, &choice);
+        if (parsed == 1 && choice == 1) {
+            cfg->table = TABLE_MBR;
+        } else if (parsed == 1 && choice == 2) {
+            cfg->table = TABLE_GPT;
+        } else {
+            cfg->table = suggested;
+        }
     }
     return 0;
 }
@@ -603,11 +975,7 @@ static int ask_yes_no(const char *prompt, int default_yes, int auto_yes) {
 
     char input[32];
     log("%s", prompt);
-    if (fgets(input, sizeof(input), stdin) == NULL) {
-        return default_yes;
-    }
-    trim_newline(input);
-    if (input[0] == 0) {
+    if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         return default_yes;
     }
     return input[0] == 'y' || input[0] == 'Y' || input[0] == 's' || input[0] == 'S';
@@ -714,11 +1082,9 @@ static int verify_sha256_file(const char *image_path) {
     }
     fclose(fp);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sha256sum %s", image_path);
     char actual[SHA256_HEX_LEN + 1];
-    if (run_command_capture_token(cmd, actual, sizeof(actual)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo calcular sha256sum de %s." COLOR_RESET, image_path);
+    if (sha256_file_path(image_path, actual) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo calcular SHA-256 de %s." COLOR_RESET, image_path);
         return -1;
     }
 
@@ -733,13 +1099,37 @@ static int verify_sha256_file(const char *image_path) {
     return 0;
 }
 
-static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
+static uint64_t last_partitionable_lba(uint64_t disk_sectors, enum table_mode table) {
+    if (table == TABLE_GPT && disk_sectors > GPT_BACKUP_RESERVED_SECTORS) {
+        return disk_sectors - GPT_BACKUP_RESERVED_SECTORS;
+    }
+    return disk_sectors - 1ULL;
+}
+
+static uint64_t sectors_from_start(uint64_t disk_sectors, uint64_t start_sector, enum table_mode table) {
+    uint64_t last_lba = last_partitionable_lba(disk_sectors, table);
+
+    if (start_sector > last_lba) {
+        return 0;
+    }
+    return last_lba - start_sector + 1ULL;
+}
+
+static int build_partition_plan(enum layout_mode layout, enum table_mode table, uint64_t disk_sectors,
                                 struct partition_plan *parts, int *part_count,
                                 char *summary, size_t summary_size) {
+    uint64_t last_lba = last_partitionable_lba(disk_sectors, table);
+
     memset(parts, 0, sizeof(struct partition_plan) * 4);
 
     if (disk_sectors < PART1_START + PART1_SECTORS + 4096ULL) {
         log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para instalar Eclipse OS." COLOR_RESET);
+        return -1;
+    }
+    if (table == TABLE_GPT && last_lba < PART1_START + PART1_SECTORS + 2048ULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para GPT (se reservan %llu sectores al final)."
+            COLOR_RESET,
+            (unsigned long long)GPT_BACKUP_RESERVED_SECTORS);
         return -1;
     }
 
@@ -757,7 +1147,11 @@ static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
     if (layout == LAYOUT_SIMPLE) {
         strcpy(parts[1].name, "ROOT");
         parts[1].start_sector = next_start;
-        parts[1].sectors = disk_sectors - parts[1].start_sector;
+        parts[1].sectors = sectors_from_start(disk_sectors, parts[1].start_sector, table);
+        if (parts[1].sectors < 2048ULL) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No hay espacio suficiente para ROOT." COLOR_RESET);
+            return -1;
+        }
         parts[1].mbr_type = 0x83;
         parts[1].gpt_type = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
         parts[1].image_path = "/boot/rootfs.ext2.gz";
@@ -779,12 +1173,12 @@ static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
     if (disk_sectors * SECTOR_SIZE >= 30ULL * GIB) {
         root_target = (10ULL * GIB) / SECTOR_SIZE;
     } else {
-        uint64_t remaining = disk_sectors - next_start;
+        uint64_t remaining = (last_lba + 1ULL) - next_start;
         root_target = remaining / 2ULL;
     }
     root_target = align_up_u64(root_target, 2048ULL);
 
-    uint64_t swap_start = align_down_u64(disk_sectors - swap_target, 2048ULL);
+    uint64_t swap_start = align_down_u64(last_lba + 1ULL - swap_target, 2048ULL);
     if (swap_start <= next_start + 4096ULL) {
         log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para el esquema avanzado." COLOR_RESET);
         return -1;
@@ -822,7 +1216,7 @@ static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
 
     strcpy(parts[3].name, "SWAP");
     parts[3].start_sector = swap_start;
-    parts[3].sectors = disk_sectors - swap_start;
+    parts[3].sectors = last_lba - swap_start + 1ULL;
     parts[3].mbr_type = 0x82;
     parts[3].gpt_type = "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F";
     parts[3].image_path = NULL;
@@ -834,17 +1228,271 @@ static int build_partition_plan(enum layout_mode layout, uint64_t disk_sectors,
     return 0;
 }
 
+#define GPT_HEADER_SIZE 92U
+#define GPT_NUM_ENTRIES 128U
+#define GPT_ENTRY_SIZE 128U
+#define GPT_ENTRY_SECTORS 32U
+
+typedef struct {
+    uint64_t signature;
+    uint32_t revision;
+    uint32_t header_size;
+    uint32_t header_crc32;
+    uint32_t reserved;
+    uint64_t my_lba;
+    uint64_t alternate_lba;
+    uint64_t first_usable_lba;
+    uint64_t last_usable_lba;
+    uint8_t disk_guid[16];
+    uint64_t partition_entry_lba;
+    uint32_t num_partition_entries;
+    uint32_t size_of_partition_entry;
+    uint32_t partition_entry_array_crc32;
+} __attribute__((packed)) gpt_header;
+
+typedef struct {
+    uint8_t type_guid[16];
+    uint8_t partition_guid[16];
+    uint64_t first_lba;
+    uint64_t last_lba;
+    uint64_t attributes;
+    uint16_t name[36];
+} __attribute__((packed)) gpt_partition_entry;
+
+static uint32_t gpt_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xffffffffU;
+    size_t i;
+    int bit;
+
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (bit = 0; bit < 8; bit++) {
+            if (crc & 1U) {
+                crc = (crc >> 1) ^ 0xedb88320U;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return ~crc;
+}
+
+static int parse_gpt_uuid(const char *text, uint8_t out[16]) {
+    unsigned int data1;
+    unsigned int data2;
+    unsigned int data3;
+    unsigned int b[8];
+
+    if (text == NULL || out == NULL) {
+        return -1;
+    }
+    if (sscanf(text, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x",
+               &data1, &data2, &data3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) {
+        return -1;
+    }
+    out[0] = (uint8_t)(data1 & 0xffU);
+    out[1] = (uint8_t)((data1 >> 8) & 0xffU);
+    out[2] = (uint8_t)((data1 >> 16) & 0xffU);
+    out[3] = (uint8_t)((data1 >> 24) & 0xffU);
+    out[4] = (uint8_t)(data2 & 0xffU);
+    out[5] = (uint8_t)((data2 >> 8) & 0xffU);
+    out[6] = (uint8_t)(data3 & 0xffU);
+    out[7] = (uint8_t)((data3 >> 8) & 0xffU);
+    out[8] = (uint8_t)b[0];
+    out[9] = (uint8_t)b[1];
+    out[10] = (uint8_t)b[2];
+    out[11] = (uint8_t)b[3];
+    out[12] = (uint8_t)b[4];
+    out[13] = (uint8_t)b[5];
+    out[14] = (uint8_t)b[6];
+    out[15] = (uint8_t)b[7];
+    return 0;
+}
+
+static void utf16le_name(const char *ascii, uint16_t out[36]) {
+    size_t i;
+
+    for (i = 0; i < 35 && ascii != NULL && ascii[i] != '\0'; i++) {
+        out[i] = (uint16_t)ascii[i];
+    }
+    out[i] = 0;
+}
+
+static void generate_guid(uint8_t guid[16], uint64_t salt) {
+    uint64_t t = (uint64_t)time(NULL) ^ salt;
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        t = t * 6364136223846793005ULL + 1ULL;
+        guid[i] = (uint8_t)(t >> 33);
+    }
+    guid[6] = (uint8_t)((guid[6] & 0x0fU) | 0x40U);
+    guid[8] = (uint8_t)((guid[8] & 0x3fU) | 0x80U);
+}
+
+static ssize_t disk_pwrite_all(int fd, const void *buf, size_t len, uint64_t offset) {
+    const uint8_t *p = buf;
+    size_t left = len;
+
+    while (left > 0) {
+        ssize_t n = pwrite(fd, p, left, (off_t)offset);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EINVAL || errno == ENOSYS || errno == ESPIPE) {
+                if (lseek(fd, (off_t)offset, SEEK_SET) < 0) {
+                    return -1;
+                }
+                n = write(fd, p, left);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+        if (n == 0) {
+            errno = EIO;
+            return -1;
+        }
+        p += (size_t)n;
+        offset += (uint64_t)n;
+        left -= (size_t)n;
+    }
+    return (ssize_t)len;
+}
+
+static int write_disk_lba(int fd, uint64_t lba, const void *buf, size_t len) {
+    if (disk_pwrite_all(fd, buf, len, lba * SECTOR_SIZE) != (ssize_t)len) {
+        return -1;
+    }
+    return 0;
+}
+
+static int write_gpt_partition_table_native(const char *disk_path, const struct partition_plan *parts, int part_count) {
+    uint64_t disk_bytes = get_disk_size_bytes(disk_path);
+    uint64_t last_lba;
+    uint64_t backup_entries_lba;
+    uint64_t first_usable;
+    uint64_t last_usable;
+    uint8_t mbr[SECTOR_SIZE];
+    gpt_header primary;
+    gpt_header backup;
+    gpt_partition_entry entries[GPT_NUM_ENTRIES];
+    uint8_t disk_guid[16];
+    int fd;
+    int i;
+
+    if (disk_bytes < (PART1_START + PART1_SECTORS + 4096ULL) * SECTOR_SIZE) {
+        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para GPT." COLOR_RESET);
+        return -1;
+    }
+    if (part_count <= 0 || part_count > (int)GPT_NUM_ENTRIES) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Número de particiones GPT inválido." COLOR_RESET);
+        return -1;
+    }
+
+    last_lba = (disk_bytes / SECTOR_SIZE) - 1ULL;
+    if (last_lba < GPT_ENTRY_SECTORS + 34ULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para la cabecera GPT de respaldo." COLOR_RESET);
+        return -1;
+    }
+
+    backup_entries_lba = last_lba - GPT_ENTRY_SECTORS;
+    first_usable = GPT_ENTRY_SECTORS + 2ULL;
+    last_usable = backup_entries_lba - 1ULL;
+
+    memset(mbr, 0, sizeof(mbr));
+    {
+        struct partition_entry *pe = (struct partition_entry *)&mbr[446];
+        pe->type = 0xee;
+        pe->starting_lba = 1;
+        pe->sectors_count = (last_lba > UINT32_MAX) ? UINT32_MAX : (uint32_t)last_lba;
+    }
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+
+    memset(entries, 0, sizeof(entries));
+    generate_guid(disk_guid, 0x4750545f4449534bULL);
+    for (i = 0; i < part_count; i++) {
+        uint64_t end_lba = parts[i].start_sector + parts[i].sectors - 1ULL;
+
+        if (parts[i].start_sector < first_usable || end_lba > last_usable) {
+            log(COLOR_RED COLOR_BOLD "ERROR: La partición %s queda fuera del rango GPT utilizable." COLOR_RESET,
+                parts[i].name);
+            return -1;
+        }
+        if (parse_gpt_uuid(parts[i].gpt_type, entries[i].type_guid) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: GUID GPT inválido para %s." COLOR_RESET, parts[i].name);
+            return -1;
+        }
+        generate_guid(entries[i].partition_guid, (uint64_t)i + 1ULL);
+        entries[i].first_lba = parts[i].start_sector;
+        entries[i].last_lba = end_lba;
+        entries[i].attributes = 0;
+        {
+            uint16_t part_name[36];
+            utf16le_name(parts[i].name, part_name);
+            memcpy(entries[i].name, part_name, sizeof(part_name));
+        }
+    }
+
+    memset(&primary, 0, sizeof(primary));
+    primary.signature = 0x5452415020494645ULL; /* "EFI PART" */
+    primary.revision = 0x00010000U;
+    primary.header_size = GPT_HEADER_SIZE;
+    primary.my_lba = 1;
+    primary.alternate_lba = last_lba;
+    primary.first_usable_lba = first_usable;
+    primary.last_usable_lba = last_usable;
+    memcpy(primary.disk_guid, disk_guid, sizeof(disk_guid));
+    primary.partition_entry_lba = 2;
+    primary.num_partition_entries = GPT_NUM_ENTRIES;
+    primary.size_of_partition_entry = GPT_ENTRY_SIZE;
+    primary.partition_entry_array_crc32 = gpt_crc32((const uint8_t *)entries, sizeof(entries));
+    primary.header_crc32 = gpt_crc32((const uint8_t *)&primary, GPT_HEADER_SIZE);
+
+    backup = primary;
+    backup.my_lba = last_lba;
+    backup.alternate_lba = 1;
+    backup.partition_entry_lba = backup_entries_lba;
+    backup.header_crc32 = 0;
+    backup.header_crc32 = gpt_crc32((const uint8_t *)&backup, GPT_HEADER_SIZE);
+
+    fd = open(disk_path, O_RDWR);
+    if (fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET, disk_path, strerror(errno));
+        return -1;
+    }
+
+    if (write_disk_lba(fd, 0, mbr, sizeof(mbr)) != 0 ||
+        write_disk_lba(fd, 1, &primary, sizeof(primary)) != 0 ||
+        write_disk_lba(fd, 2, entries, sizeof(entries)) != 0 ||
+        write_disk_lba(fd, backup_entries_lba, entries, sizeof(entries)) != 0 ||
+        write_disk_lba(fd, last_lba, &backup, sizeof(backup)) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Falló la escritura de la tabla GPT en %s (%s)." COLOR_RESET,
+            disk_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (fsync(fd) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: fsync falló tras escribir GPT (%s)." COLOR_RESET, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    log(COLOR_GREEN "Tabla GPT escrita correctamente (escritor integrado)." COLOR_RESET);
+    return 0;
+}
+
 static int prepare_gpt_or_fallback(enum table_mode *table) {
-    if (*table != TABLE_GPT) {
-        return 0;
-    }
-
-    if (command_exists("sgdisk") || command_exists("gdisk")) {
-        return 0;
-    }
-
-    log(COLOR_YELLOW COLOR_BOLD "ADVERTENCIA: ni sgdisk ni gdisk están disponibles; se usará MBR como alternativa." COLOR_RESET);
-    *table = TABLE_MBR;
+    (void)table;
     return 0;
 }
 
@@ -905,9 +1553,17 @@ static int write_mbr_partition_table(const char *disk_path, const struct partiti
 }
 
 static int write_gpt_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run) {
-    char cmd[4096];
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] Se escribiría tabla GPT en %s." COLOR_RESET, disk_path);
+        return 0;
+    }
+
+    if (write_gpt_partition_table_native(disk_path, parts, part_count) == 0) {
+        return 0;
+    }
 
     if (command_exists("sgdisk")) {
+        char cmd[4096];
         int pos = snprintf(cmd, sizeof(cmd), "sgdisk -og");
         for (int i = 0; i < part_count && pos > 0 && pos < (int)sizeof(cmd); i++) {
             uint64_t end_sector = parts[i].start_sector + parts[i].sectors - 1ULL;
@@ -918,37 +1574,163 @@ static int write_gpt_partition_table(const char *disk_path, const struct partiti
                             i + 1, parts[i].name);
         }
         snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " %s", disk_path);
+        log(COLOR_YELLOW "Reintentando GPT con sgdisk externo..." COLOR_RESET);
         return run_command_logged(cmd, dry_run);
     }
 
-    if (!command_exists("gdisk")) {
-        log(COLOR_RED COLOR_BOLD "ERROR: GPT solicitado pero no hay sgdisk/gdisk disponible." COLOR_RESET);
+    if (command_exists("gdisk")) {
+        char cmd[4096];
+        char script[2048];
+        int spos = snprintf(script, sizeof(script), "o\\ny\\n");
+        for (int i = 0; i < part_count && spos > 0 && spos < (int)sizeof(script); i++) {
+            uint64_t end_sector = parts[i].start_sector + parts[i].sectors - 1ULL;
+            const char *type_code = (parts[i].mbr_type == 0xEF) ? "ef00" :
+                                    (parts[i].mbr_type == 0x82 ? "8200" : "8300");
+            spos += snprintf(script + spos, sizeof(script) - (size_t)spos,
+                             "n\\n%d\\n%" PRIu64 "\\n%" PRIu64 "\\n%s\\n",
+                             i + 1, parts[i].start_sector, end_sector, type_code);
+        }
+        snprintf(script + strlen(script), sizeof(script) - strlen(script), "w\\ny\\n");
+        snprintf(cmd, sizeof(cmd), "sh -c \"printf %%b %s | gdisk %s\"", script, disk_path);
+        log(COLOR_YELLOW "Reintentando GPT con gdisk externo..." COLOR_RESET);
+        return run_command_logged(cmd, dry_run);
+    }
+
+    log(COLOR_RED COLOR_BOLD "ERROR: No se pudo escribir la tabla GPT." COLOR_RESET);
+    return -1;
+}
+
+static int decompress_gz_to_path(const char *gz_path, const char *out_path, int dry_run) {
+    uint8_t buf[4096];
+    gzFile gz;
+    int out_fd;
+    size_t total = 0;
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s" COLOR_RESET, gz_path, out_path);
+        return 0;
+    }
+
+    gz = gzopen(gz_path, "rb");
+    if (gz == NULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para descompresión." COLOR_RESET, gz_path);
         return -1;
     }
 
-    char script[2048];
-    int spos = snprintf(script, sizeof(script), "o\\ny\\n");
-    for (int i = 0; i < part_count && spos > 0 && spos < (int)sizeof(script); i++) {
-        uint64_t end_sector = parts[i].start_sector + parts[i].sectors - 1ULL;
-        const char *type_code = (parts[i].mbr_type == 0xEF) ? "ef00" :
-                                (parts[i].mbr_type == 0x82 ? "8200" : "8300");
-        spos += snprintf(script + spos, sizeof(script) - (size_t)spos,
-                         "n\\n%d\\n%" PRIu64 "\\n%" PRIu64 "\\n%s\\n",
-                         i + 1, parts[i].start_sector, end_sector, type_code);
+    out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear %s (%s)." COLOR_RESET,
+            out_path, strerror(errno));
+        gzclose(gz);
+        return -1;
     }
-    snprintf(script + strlen(script), sizeof(script) - strlen(script), "w\\ny\\n");
-    snprintf(cmd, sizeof(cmd), "bash -lc \"printf %%b %s | gdisk %s\"", script, disk_path);
-    return run_command_logged(cmd, dry_run);
+
+    for (;;) {
+        int nread = gzread(gz, buf, sizeof(buf));
+        if (nread < 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
+                gz_path, gzerror(gz, NULL));
+            close(out_fd);
+            gzclose(gz);
+            return -1;
+        }
+        if (nread == 0) {
+            break;
+        }
+
+        ssize_t nwritten = write(out_fd, buf, (size_t)nread);
+        if (nwritten < 0 || (size_t)nwritten != (size_t)nread) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
+                out_path, strerror(errno));
+            close(out_fd);
+            gzclose(gz);
+            return -1;
+        }
+        total += (size_t)nread;
+    }
+
+    if (fsync(out_fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, out_path, strerror(errno));
+    }
+    close(out_fd);
+    if (gzclose(gz) != Z_OK) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Cierre de %s falló." COLOR_RESET, gz_path);
+        return -1;
+    }
+
+    log("Descomprimidos %zu bytes de %s a %s.", total, gz_path, out_path);
+    return 0;
+}
+
+static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, uint64_t start_sector, int dry_run) {
+    uint8_t buf[4096];
+    gzFile gz;
+    uint64_t offset;
+    size_t total = 0;
+    int disk_fd;
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s @ sector %" PRIu64 COLOR_RESET,
+            gz_path, disk_path, start_sector);
+        return 0;
+    }
+
+    gz = gzopen(gz_path, "rb");
+    if (gz == NULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para descompresión." COLOR_RESET, gz_path);
+        return -1;
+    }
+
+    disk_fd = open(disk_path, O_RDWR | O_CLOEXEC);
+    if (disk_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para escritura (%s)." COLOR_RESET,
+            disk_path, strerror(errno));
+        gzclose(gz);
+        return -1;
+    }
+
+    offset = start_sector * SECTOR_SIZE;
+    for (;;) {
+        int nread = gzread(gz, buf, sizeof(buf));
+        if (nread < 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
+                gz_path, gzerror(gz, NULL));
+            close(disk_fd);
+            gzclose(gz);
+            return -1;
+        }
+        if (nread == 0) {
+            break;
+        }
+
+        if (disk_pwrite_all(disk_fd, buf, (size_t)nread, offset) != nread) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s @ %" PRIu64 " falló (%s)." COLOR_RESET,
+                disk_path, offset, strerror(errno));
+            close(disk_fd);
+            gzclose(gz);
+            return -1;
+        }
+
+        offset += (uint64_t)nread;
+        total += (size_t)nread;
+    }
+
+    if (fsync(disk_fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, disk_path, strerror(errno));
+    }
+    close(disk_fd);
+    if (gzclose(gz) != Z_OK) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Cierre de %s falló." COLOR_RESET, gz_path);
+        return -1;
+    }
+
+    log("Escritos %zu bytes en %s (sector inicial %" PRIu64 ").", total, disk_path, start_sector);
+    return 0;
 }
 
 static int write_partition_image_with_retry(const char *disk_path, const struct partition_plan *part, int dry_run) {
-    char cmd[1024];
     for (int attempt = 1; attempt <= 3; attempt++) {
-        snprintf(cmd, sizeof(cmd),
-                 "bash -lc \"set -o pipefail; zcat %s | dd of=%s bs=512 seek=%" PRIu64 " status=progress\"",
-                 part->image_path, disk_path, part->start_sector);
-
-        if (run_command_logged(cmd, dry_run) == 0) {
+        if (write_gz_image_to_disk(part->image_path, disk_path, part->start_sector, dry_run) == 0) {
             log(COLOR_GREEN "%s escrita correctamente en intento %d." COLOR_RESET, part->name, attempt);
             return 0;
         }
@@ -960,30 +1742,46 @@ static int write_partition_image_with_retry(const char *disk_path, const struct 
 }
 
 static int verify_partition_write(const char *disk_path, const struct partition_plan *part, int dry_run) {
-    uint64_t skip_blocks = (part->start_sector * SECTOR_SIZE) / 4096ULL;
-    char disk_cmd[1024];
-    char src_cmd[1024];
-
-    snprintf(disk_cmd, sizeof(disk_cmd),
-             "bash -lc \"dd if=%s bs=4096 skip=%" PRIu64 " count=16 2>/dev/null | sha256sum\"",
-             disk_path, skip_blocks);
-    snprintf(src_cmd, sizeof(src_cmd),
-             "bash -lc \"zcat %s | dd bs=4096 count=16 2>/dev/null | sha256sum\"",
-             part->image_path);
+    uint8_t disk_buf[VERIFY_PREFIX_BYTES];
+    uint8_t src_buf[VERIFY_PREFIX_BYTES];
+    char disk_sha[SHA256_HEX_LEN + 1];
+    char src_sha[SHA256_HEX_LEN + 1];
+    uint64_t offset;
+    int fd;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Verificación posterior: %s" COLOR_RESET, disk_cmd);
-        log(COLOR_YELLOW "[dry-run] Verificación posterior: %s" COLOR_RESET, src_cmd);
+        log(COLOR_YELLOW "[dry-run] Verificación posterior de %s (primeros %u bytes)." COLOR_RESET,
+            part->name, VERIFY_PREFIX_BYTES);
         return 0;
     }
 
-    char disk_sha[SHA256_HEX_LEN + 1];
-    char src_sha[SHA256_HEX_LEN + 1];
-    if (run_command_capture_token(disk_cmd, disk_sha, sizeof(disk_sha)) != 0 ||
-        run_command_capture_token(src_cmd, src_sha, sizeof(src_sha)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo verificar %s tras la escritura." COLOR_RESET, part->name);
+    if (part->image_path == NULL) {
+        return 0;
+    }
+
+    fd = open(disk_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para verificación (%s)." COLOR_RESET,
+            disk_path, strerror(errno));
         return -1;
     }
+
+    offset = part->start_sector * SECTOR_SIZE;
+    if (disk_pread_all(fd, disk_buf, sizeof(disk_buf), offset) != (ssize_t)sizeof(disk_buf)) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer %s @ %" PRIu64 " para verificación (%s)." COLOR_RESET,
+            disk_path, offset, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (read_gz_prefix(part->image_path, src_buf, sizeof(src_buf)) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer %s para verificación." COLOR_RESET, part->image_path);
+        return -1;
+    }
+
+    sha256_hex_buffer(disk_buf, sizeof(disk_buf), disk_sha);
+    sha256_hex_buffer(src_buf, sizeof(src_buf), src_sha);
 
     if (strcasecmp(disk_sha, src_sha) != 0) {
         log(COLOR_RED COLOR_BOLD "ERROR: Verificación post-escritura falló para %s." COLOR_RESET, part->name);
@@ -994,6 +1792,287 @@ static int verify_partition_write(const char *disk_path, const struct partition_
 
     log(COLOR_GREEN "Verificación post-escritura correcta para %s." COLOR_RESET, part->name);
     return 0;
+}
+
+static int partition_dev_path(const char *disk_path, int part_num, char *out, size_t out_size) {
+    const char *base = disk_basename(disk_path);
+
+    if (part_num <= 0) {
+        return -1;
+    }
+    if (strstr(base, "nvme") != NULL) {
+        return snprintf(out, out_size, "%sp%d", disk_path, part_num) >= (int)out_size ? -1 : 0;
+    }
+    return snprintf(out, out_size, "%s%d", disk_path, part_num) >= (int)out_size ? -1 : 0;
+}
+
+static int gpt_entry_is_type(const gpt_partition_entry *entry, const char *type_uuid) {
+    uint8_t expected[16];
+
+    if (entry == NULL || type_uuid == NULL) {
+        return 0;
+    }
+    if (entry->first_lba == 0 && entry->last_lba == 0) {
+        return 0;
+    }
+    if (parse_gpt_uuid(type_uuid, expected) != 0) {
+        return 0;
+    }
+    return memcmp(entry->type_guid, expected, 16) == 0;
+}
+
+static int discover_partitions(const char *disk_path, struct discovered_partitions *out) {
+    unsigned char sector0[SECTOR_SIZE];
+    unsigned char sector1[SECTOR_SIZE];
+    int fd;
+    ssize_t nread;
+
+    memset(out, 0, sizeof(*out));
+
+    fd = open(disk_path, O_RDONLY);
+    if (fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para localizar particiones (%s)." COLOR_RESET,
+            disk_path, strerror(errno));
+        return -1;
+    }
+
+    nread = pread(fd, sector1, sizeof(sector1), (off_t)SECTOR_SIZE);
+    if (nread == (ssize_t)sizeof(sector1) && memcmp(sector1, "EFI PART", 8) == 0) {
+        const gpt_header *hdr = (const gpt_header *)sector1;
+        uint64_t entry_lba = hdr->partition_entry_lba;
+        uint32_t num_entries = hdr->num_partition_entries;
+        uint32_t entry_size = hdr->size_of_partition_entry;
+        size_t table_bytes;
+        uint8_t *table = NULL;
+        uint64_t root_first_lba = UINT64_MAX;
+
+        if (entry_size < sizeof(gpt_partition_entry) || num_entries == 0 || num_entries > GPT_NUM_ENTRIES) {
+            close(fd);
+            log(COLOR_YELLOW "Tabla GPT inválida; usando particiones 1 (EFI) y 2 (ROOT) por defecto." COLOR_RESET);
+            out->efi_part_num = 1;
+            out->root_part_num = 2;
+            return 0;
+        }
+
+        table_bytes = (size_t)num_entries * (size_t)entry_size;
+        table = calloc(1, table_bytes);
+        if (table == NULL) {
+            close(fd);
+            log(COLOR_RED COLOR_BOLD "ERROR: Sin memoria para leer entradas GPT." COLOR_RESET);
+            return -1;
+        }
+
+        nread = pread(fd, table, table_bytes, (off_t)(entry_lba * SECTOR_SIZE));
+        close(fd);
+        if (nread != (ssize_t)table_bytes) {
+            free(table);
+            log(COLOR_YELLOW "No se pudieron leer entradas GPT; usando particiones 1/2 por defecto." COLOR_RESET);
+            out->efi_part_num = 1;
+            out->root_part_num = 2;
+            return 0;
+        }
+
+        for (uint32_t i = 0; i < num_entries; i++) {
+            const gpt_partition_entry *entry =
+                (const gpt_partition_entry *)(table + ((size_t)i * (size_t)entry_size));
+            int part_num = (int)i + 1;
+
+            if (gpt_entry_is_type(entry, GPT_ESP_TYPE)) {
+                out->efi_part_num = part_num;
+            }
+            if (gpt_entry_is_type(entry, GPT_LINUX_TYPE) && entry->first_lba < root_first_lba) {
+                root_first_lba = entry->first_lba;
+                out->root_part_num = part_num;
+            }
+        }
+        free(table);
+    } else {
+        nread = pread(fd, sector0, sizeof(sector0), 0);
+        close(fd);
+        if (nread != (ssize_t)sizeof(sector0)) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer el MBR de %s." COLOR_RESET, disk_path);
+            return -1;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            const struct partition_entry *pe =
+                (const struct partition_entry *)&sector0[446 + (i * 16)];
+            int part_num = i + 1;
+
+            if (pe->type == 0xEF && pe->sectors_count > 0) {
+                out->efi_part_num = part_num;
+            }
+            if (pe->type == 0x83 && pe->sectors_count > 0 && out->root_part_num == 0) {
+                out->root_part_num = part_num;
+            }
+        }
+    }
+
+    if (out->efi_part_num == 0) {
+        out->efi_part_num = 1;
+        log(COLOR_YELLOW "No se encontró partición EFI; se asume la partición %d." COLOR_RESET, out->efi_part_num);
+    }
+    if (out->root_part_num == 0) {
+        out->root_part_num = 2;
+        log(COLOR_YELLOW "No se encontró partición ROOT; se asume la partición %d." COLOR_RESET, out->root_part_num);
+    }
+
+    return 0;
+}
+
+static int shell_mkdir_p(const char *path, int dry_run) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "sh -c \"mkdir -p '%s'\"", path);
+    return run_command_logged(cmd, dry_run);
+}
+
+static int shell_copy_file(const char *src, const char *dst, int dry_run) {
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "sh -c \"cp -f '%s' '%s'\"", src, dst);
+    return run_command_logged(cmd, dry_run);
+}
+
+static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run) {
+    char cmd[1024];
+    if (fstype != NULL && fstype[0] != '\0') {
+        if (loop) {
+            snprintf(cmd, sizeof(cmd), "sh -c \"mount -t %s -o loop '%s' '%s'\"",
+                     fstype, source, target);
+        } else {
+            snprintf(cmd, sizeof(cmd), "sh -c \"mount -t %s '%s' '%s'\"",
+                     fstype, source, target);
+        }
+    } else if (loop) {
+        snprintf(cmd, sizeof(cmd), "sh -c \"mount -o loop '%s' '%s'\"", source, target);
+    } else {
+        snprintf(cmd, sizeof(cmd), "sh -c \"mount '%s' '%s'\"", source, target);
+    }
+    return run_command_logged(cmd, dry_run);
+}
+
+static int shell_umount(const char *target, int dry_run) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "sh -c \"umount '%s' 2>/dev/null || true\"", target);
+    return run_command_logged(cmd, dry_run);
+}
+
+static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run) {
+    if (!struct_file_exists(src)) {
+        log(COLOR_YELLOW "Omitido (no presente en el medio de instalación): %s" COLOR_RESET, src);
+        return 0;
+    }
+    if (shell_copy_file(src, dst, dry_run) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo copiar %s -> %s." COLOR_RESET, src, dst);
+        return -1;
+    }
+    log(COLOR_GREEN "Actualizado: %s" COLOR_RESET, dst);
+    return 0;
+}
+
+static int run_upgrade(const char *disk_path, int dry_run) {
+    struct discovered_partitions parts;
+    char efi_dev[160];
+    char root_dev[160];
+    char cmd[1024];
+    int rc = 0;
+
+    if (discover_partitions(disk_path, &parts) != 0) {
+        return -1;
+    }
+    if (partition_dev_path(disk_path, parts.efi_part_num, efi_dev, sizeof(efi_dev)) != 0 ||
+        partition_dev_path(disk_path, parts.root_part_num, root_dev, sizeof(root_dev)) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Ruta de partición demasiado larga." COLOR_RESET);
+        return -1;
+    }
+
+    log("Partición EFI detectada:  %s", efi_dev);
+    log("Partición ROOT detectada: %s", root_dev);
+
+    if (!struct_file_exists(EFI_IMAGE_GZ)) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s (fuente del bootloader/kernel)." COLOR_RESET, EFI_IMAGE_GZ);
+        return -1;
+    }
+    if (!struct_file_exists("/bin/edhcpc")) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/edhcpc en el medio de instalación." COLOR_RESET);
+        return -1;
+    }
+    if (!struct_file_exists("/bin/eclipse-useradd")) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/eclipse-useradd en el medio de instalación." COLOR_RESET);
+        return -1;
+    }
+
+    if (shell_mkdir_p(UPD_STAGING_MNT, dry_run) != 0 ||
+        shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0 ||
+        shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
+        return -1;
+    }
+
+    if (decompress_gz_to_path(EFI_IMAGE_GZ, UPD_STAGING_IMG, dry_run) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s." COLOR_RESET, EFI_IMAGE_GZ);
+        return -1;
+    }
+
+    if (shell_mount(UPD_STAGING_IMG, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI de origen." COLOR_RESET);
+        return -1;
+    }
+    if (shell_mount(efi_dev, UPD_EFI_MNT, "vfat", 0, dry_run) != 0) {
+        shell_umount(UPD_STAGING_MNT, dry_run);
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, efi_dev);
+        return -1;
+    }
+    if (shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+        shell_umount(UPD_EFI_MNT, dry_run);
+        shell_umount(UPD_STAGING_MNT, dry_run);
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, root_dev);
+        return -1;
+    }
+
+    log(COLOR_GREEN "[1/2] Actualizando bootloader y kernel en EFI (copia selectiva, sin dd)..." COLOR_RESET);
+    if (shell_mkdir_p(UPD_EFI_MNT "/EFI/Boot", dry_run) != 0 ||
+        shell_mkdir_p(UPD_EFI_MNT "/EFI/zCore", dry_run) != 0) {
+        rc = -1;
+        goto cleanup;
+    }
+
+    if (copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/Boot/BootX64.efi",
+                                       UPD_EFI_MNT "/EFI/Boot/BootX64.efi", dry_run) != 0 ||
+        copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/Boot/rboot.conf",
+                                       UPD_EFI_MNT "/EFI/Boot/rboot.conf", dry_run) != 0 ||
+        copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/zCore/zcore.elf",
+                                       UPD_EFI_MNT "/EFI/zCore/zcore.elf", dry_run) != 0) {
+        rc = -1;
+        goto cleanup;
+    }
+    copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/zCore/initramfs.img",
+                                   UPD_EFI_MNT "/EFI/zCore/initramfs.img", dry_run);
+
+    log(COLOR_GREEN "[2/2] Actualizando binarios base en ROOT (edhcpc, eclipse-useradd)..." COLOR_RESET);
+    if (shell_mkdir_p(UPD_ROOT_MNT "/bin", dry_run) != 0) {
+        rc = -1;
+        goto cleanup;
+    }
+    if (copy_upgrade_payload_if_exists("/bin/edhcpc", UPD_ROOT_MNT "/bin/edhcpc", dry_run) != 0 ||
+        copy_upgrade_payload_if_exists("/bin/eclipse-useradd", UPD_ROOT_MNT "/bin/eclipse-useradd", dry_run) != 0) {
+        rc = -1;
+        goto cleanup;
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "sh -c \"chmod 755 '%s/bin/edhcpc' '%s/bin/eclipse-useradd'\"",
+             UPD_ROOT_MNT, UPD_ROOT_MNT);
+    if (run_command_logged(cmd, dry_run) != 0) {
+        rc = -1;
+    }
+
+cleanup:
+    shell_umount(UPD_ROOT_MNT, dry_run);
+    shell_umount(UPD_EFI_MNT, dry_run);
+    shell_umount(UPD_STAGING_MNT, dry_run);
+    if (!dry_run) {
+        unlink(UPD_STAGING_IMG);
+    }
+    return rc;
 }
 
 int main(int argc, char **argv) {
@@ -1070,7 +2149,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        log(COLOR_GREEN "Modo actualización: se omite el reparticionado." COLOR_RESET);
+        log(COLOR_GREEN "Modo actualización: copia selectiva de archivos (sin dd ni reparticionado)." COLOR_RESET);
     }
 
     int removable = is_removable_disk(cfg.disk_path);
@@ -1087,50 +2166,50 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!struct_file_exists("/boot/efi.img.gz")) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/efi.img.gz" COLOR_RESET);
-        return 1;
-    }
-    if (!struct_file_exists("/boot/rootfs.ext2.gz")) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/rootfs.ext2.gz" COLOR_RESET);
-        return 1;
-    }
-
-    if (verify_sha256_file("/boot/efi.img.gz") != 0) {
-        return 1;
-    }
-    if (verify_sha256_file("/boot/rootfs.ext2.gz") != 0) {
-        return 1;
+    if (cfg.mode == MODE_NEW) {
+        if (!struct_file_exists("/boot/efi.img.gz")) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/efi.img.gz" COLOR_RESET);
+            return 1;
+        }
+        if (!struct_file_exists("/boot/rootfs.ext2.gz")) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/rootfs.ext2.gz" COLOR_RESET);
+            return 1;
+        }
+        if (verify_sha256_file("/boot/efi.img.gz") != 0) {
+            return 1;
+        }
+        if (verify_sha256_file("/boot/rootfs.ext2.gz") != 0) {
+            return 1;
+        }
+    } else {
+        if (!struct_file_exists(EFI_IMAGE_GZ)) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, EFI_IMAGE_GZ);
+            return 1;
+        }
+        if (!struct_file_exists("/bin/edhcpc")) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/edhcpc en el medio de instalación." COLOR_RESET);
+            return 1;
+        }
+        if (!struct_file_exists("/bin/eclipse-useradd")) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/eclipse-useradd en el medio de instalación." COLOR_RESET);
+            return 1;
+        }
+        if (verify_sha256_file(EFI_IMAGE_GZ) != 0) {
+            return 1;
+        }
     }
 
     struct partition_plan parts[4];
     int part_count = 0;
-    char partition_summary[128] = "Existentes (sin reparticionar)";
+    char partition_summary[128];
     if (cfg.mode == MODE_NEW) {
-        if (build_partition_plan(cfg.layout, disk_sectors, parts, &part_count,
+        if (build_partition_plan(cfg.layout, cfg.table, disk_sectors, parts, &part_count,
                                  partition_summary, sizeof(partition_summary)) != 0) {
             return 1;
         }
     } else {
-        memset(parts, 0, sizeof(parts));
-        strcpy(parts[0].name, "EFI");
-        parts[0].start_sector = PART1_START;
-        parts[0].sectors = PART1_SECTORS;
-        parts[0].mbr_type = 0xEF;
-        parts[0].gpt_type = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
-        parts[0].image_path = "/boot/efi.img.gz";
-        parts[0].write_image = 1;
-        parts[0].verify_after_write = 1;
-
-        strcpy(parts[1].name, "ROOT");
-        parts[1].start_sector = align_up_u64(PART1_START + PART1_SECTORS, 2048ULL);
-        parts[1].sectors = (disk_sectors > parts[1].start_sector) ? (disk_sectors - parts[1].start_sector) : 0;
-        parts[1].mbr_type = 0x83;
-        parts[1].gpt_type = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
-        parts[1].image_path = "/boot/rootfs.ext2.gz";
-        parts[1].write_image = 1;
-        parts[1].verify_after_write = 1;
-        part_count = 2;
+        snprintf(partition_summary, sizeof(partition_summary),
+                 "Actualización selectiva (EFI: boot+kernel; ROOT: edhcpc, eclipse-useradd)");
     }
 
     log("========================================");
@@ -1158,28 +2237,30 @@ int main(int argc, char **argv) {
         if (table_rc != 0) {
             return 1;
         }
+
+        log(COLOR_GREEN "[2/3] Escribiendo partición EFI..." COLOR_RESET);
+        if (write_partition_image_with_retry(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
+            return 1;
+        }
+        if (verify_partition_write(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
+            return 1;
+        }
+
+        log(COLOR_GREEN "[3/3] Escribiendo partición ROOT..." COLOR_RESET);
+        if (write_partition_image_with_retry(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
+            return 1;
+        }
+        if (verify_partition_write(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
+            return 1;
+        }
+
+        if (cfg.layout == LAYOUT_ADVANCED) {
+            log(COLOR_GREEN "Información: las particiones HOME y SWAP fueron creadas sin sobrescribir contenido adicional." COLOR_RESET);
+        }
     } else {
-        log(COLOR_GREEN "[1/3] Actualización seleccionada: se omite la tabla de particiones." COLOR_RESET);
-    }
-
-    log(COLOR_GREEN "[2/3] Escribiendo partición EFI..." COLOR_RESET);
-    if (write_partition_image_with_retry(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
-        return 1;
-    }
-    if (verify_partition_write(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
-        return 1;
-    }
-
-    log(COLOR_GREEN "[3/3] Escribiendo partición ROOT..." COLOR_RESET);
-    if (write_partition_image_with_retry(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
-        return 1;
-    }
-    if (verify_partition_write(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
-        return 1;
-    }
-
-    if (cfg.mode == MODE_NEW && cfg.layout == LAYOUT_ADVANCED) {
-        log(COLOR_GREEN "Información: las particiones HOME y SWAP fueron creadas sin sobrescribir contenido adicional." COLOR_RESET);
+        if (run_upgrade(cfg.disk_path, cfg.dry_run) != 0) {
+            return 1;
+        }
     }
 
     sync();
@@ -1192,9 +2273,16 @@ int main(int argc, char **argv) {
     int seconds = (int)(elapsed % 60);
 
     log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
-    log(COLOR_GREEN COLOR_BOLD " *          INSTALACIÓN COMPLETADA CON ÉXITO          *" COLOR_RESET);
-    log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
-    log("Eclipse OS se ha instalado correctamente en %s.", cfg.disk_path);
+    if (cfg.mode == MODE_UPGRADE) {
+        log(COLOR_GREEN COLOR_BOLD " *         ACTUALIZACIÓN COMPLETADA CON ÉXITO         *" COLOR_RESET);
+        log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
+        log("Eclipse OS se ha actualizado correctamente en %s.", cfg.disk_path);
+        log("El resto del sistema puede actualizarse con apk (p. ej. apk update && apk upgrade).");
+    } else {
+        log(COLOR_GREEN COLOR_BOLD " *          INSTALACIÓN COMPLETADA CON ÉXITO          *" COLOR_RESET);
+        log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
+        log("Eclipse OS se ha instalado correctamente en %s.", cfg.disk_path);
+    }
     log("Tiempo total transcurrido: %02d:%02d:%02d", hours, minutes, seconds);
 
     return 0;

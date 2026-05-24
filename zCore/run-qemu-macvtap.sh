@@ -21,11 +21,8 @@ make -C "$SCRIPT_DIR" build \
     GRAPHIC="$GRAPHIC" \
     ACCEL="$ACCEL"
 
-# Update rboot.conf with correct initramfs path and cmdline
-USER_IMG="$SCRIPT_DIR/../target/x86_64/release/x86_64.img"
+# Update rboot.conf cmdline (initramfs path is fixed in rboot.conf)
 ESP="$SCRIPT_DIR/../target/x86_64/release/esp"
-sed -i "s#initramfs=.*#initramfs=\\\\EFI\\\\zCore\\\\x86_64.img#" \
-    "$ESP/EFI/Boot/rboot.conf"
 sed -i "s#cmdline=.*#cmdline=LOG=$LOG#" \
     "$ESP/EFI/Boot/rboot.conf"
 

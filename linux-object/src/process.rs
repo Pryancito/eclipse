@@ -41,7 +41,6 @@ pub trait ProcessExt {
 
 const ROOT_UID: u32 = 0;
 const NO_ID: u32 = u32::MAX;
-const ACCESS_READ: u16 = 0o4;
 const ACCESS_WRITE: u16 = 0o2;
 const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
@@ -637,7 +636,7 @@ impl LinuxProcess {
         }
         metadata.mode = (metadata.mode as u16 & !MODE_PERM_MASK | (mode & MODE_PERM_MASK)) as _;
         if creds.euid != ROOT_UID {
-            metadata.mode &= !(MODE_SET_UID | MODE_SET_GID) as u32;
+            metadata.mode &= !(MODE_SET_UID | MODE_SET_GID);
         }
         Ok(())
     }
@@ -663,7 +662,7 @@ impl LinuxProcess {
         if gid != NO_ID {
             metadata.gid = gid as _;
         }
-        metadata.mode &= !(MODE_SET_UID | MODE_SET_GID) as u32;
+        metadata.mode &= !(MODE_SET_UID | MODE_SET_GID);
         Ok(())
     }
 

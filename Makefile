@@ -113,6 +113,8 @@ ESP_DIR := $(CURDIR)/target/$(ARCH)/$(MODE)/esp
 ISO_STAGING := $(BUILD_DIR)/iso-root
 ESP_IMG := $(BUILD_DIR)/esp.img
 DISK_IMG := $(BUILD_DIR)/disk.img
+ESP_IMG_SIZE_MB ?= 128
+DISK_IMG_SIZE_MB ?= 256
 ISO_OUT := $(DIST_DIR)/eclipse-$(ARCH).iso
 QCOW2_OUT := $(DIST_DIR)/eclipse-$(ARCH).qcow2
 IMG_OUT := $(DIST_DIR)/eclipse-$(ARCH).img
@@ -127,15 +129,19 @@ ifeq ($(ARCH), x86_64)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
 	@command -v xorriso >/dev/null || (echo "falta xorriso"; exit 1)
 	@rm -f "$(ESP_IMG)"
-	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=64 status=none
+	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
 	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
+	@mkdir -p "$(ISO_STAGING)/boot"
+	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
 	@xorriso -as mkisofs \
 		-R -J -V "ECLIPSE" \
-		-append_partition 2 0xef "$(ESP_IMG)" \
-		-e --interval:appended_partition_2:all:: \
+		-eltorito-alt-boot \
+		-e "boot/efi.img" \
 		-no-emul-boot \
+		-isohybrid-gpt-basdat \
+		-append_partition 2 0xef "$(ESP_IMG)" \
 		-o "$(ISO_OUT)" \
 		"$(ISO_STAGING)" >/dev/null
 	@echo "ISO generado: $(ISO_OUT)"
@@ -153,7 +159,7 @@ ifeq ($(ARCH), x86_64)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
 	@command -v qemu-img >/dev/null || (echo "falta qemu-img"; exit 1)
 	@rm -f "$(ESP_IMG)"
-	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=64 status=none
+	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
 	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
@@ -173,9 +179,9 @@ ifeq ($(ARCH), x86_64)
 	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
 	@rm -f "$(DISK_IMG)"
-	@dd if=/dev/zero of="$(DISK_IMG)" bs=1M count=128 status=none
+	@dd if=/dev/zero of="$(DISK_IMG)" bs=1M count=$(DISK_IMG_SIZE_MB) status=none
 	@sgdisk -o "$(DISK_IMG)" >/dev/null
-	@sgdisk -n 1:2048:+64M -t 1:ef00 -c 1:EFI "$(DISK_IMG)" >/dev/null
+	@sgdisk -n 1:2048:+$(ESP_IMG_SIZE_MB)M -t 1:ef00 -c 1:EFI "$(DISK_IMG)" >/dev/null
 	@# FAT32 ESP starts at 2048 * 512 = 1048576 bytes (1MiB)
 	@mformat -i "$(DISK_IMG)@@1048576" -F -v EFI :: >/dev/null
 	@mmd -i "$(DISK_IMG)@@1048576" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null

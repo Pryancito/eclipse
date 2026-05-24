@@ -8,12 +8,12 @@ pub(super) const _X86_INT_APIC_ERROR: usize = X86_INT_LOCAL_APIC_BASE + 0x2;
 
 // ISA IRQ numbers
 pub(super) const _X86_ISA_IRQ_PIT: usize = 0;
-pub(super) const _X86_ISA_IRQ_KEYBOARD: usize = 1;
+pub(super) const X86_ISA_IRQ_KEYBOARD: usize = 1;
 pub(super) const _X86_ISA_IRQ_PIC2: usize = 2;
 pub(super) const X86_ISA_IRQ_COM2: usize = 3;
 pub(super) const X86_ISA_IRQ_COM1: usize = 4;
 pub(super) const _X86_ISA_IRQ_CMOSRTC: usize = 8;
-pub(super) const _X86_ISA_IRQ_MOUSE: usize = 12;
+pub(super) const X86_ISA_IRQ_MOUSE: usize = 12;
 pub(super) const _X86_ISA_IRQ_IDE: usize = 14;
 
 fn breakpoint() {

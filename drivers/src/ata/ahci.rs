@@ -164,6 +164,31 @@ fn wait_until<F: Fn() -> bool>(timeout_us: u64, pred: F) -> bool {
     }
 }
 
+extern "C" {
+    fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn clflush_range(vaddr: usize, len: usize) {
+    use core::arch::x86_64::{_mm_clflush, _mm_mfence};
+    let mut addr = vaddr & !63;
+    let end = vaddr + len;
+    while addr < end {
+        unsafe {
+            _mm_clflush(addr as *const u8);
+        }
+        addr += 64;
+    }
+    unsafe {
+        _mm_mfence();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn clflush_range(_vaddr: usize, _len: usize) {}
+
 struct AhciPort {
     base: usize,
     port_idx: u32,
@@ -229,6 +254,7 @@ impl AhciPort {
                 h.ctbau = (ct_phys >> 32) as u64 as u32;
             }
         }
+        clflush_range(self.cl_virt, CMD_SLOTS * core::mem::size_of::<CommandHeader>());
 
         self.write_reg(PORT_CLB, self.cl_phys as u32);
         self.write_reg(PORT_CLBU, (self.cl_phys >> 32) as u32);
@@ -383,8 +409,19 @@ impl AhciPort {
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
+        clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
+        clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+        if write {
+            let vaddr = phys_to_virt(buf_phys as usize);
+            clflush_range(vaddr, buf_len);
+        }
 
-        self.exec_cmd(slot)
+        let res = self.exec_cmd(slot);
+        if res.is_ok() && !write {
+            let vaddr = phys_to_virt(buf_phys as usize);
+            clflush_range(vaddr, buf_len);
+        }
+        res
     }
 
     fn identify(&self) -> Option<u64> {
@@ -416,10 +453,18 @@ impl AhciPort {
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
+        clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
+        clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+        clflush_range(vaddr, 512);
 
         if self.exec_cmd_with_timeout(slot, IDENTIFY_TIMEOUT_US).is_err() {
+            unsafe {
+                drivers_dma_dealloc(paddr, 1);
+            }
             return None;
         }
+
+        clflush_range(vaddr, 512);
 
         let id = unsafe { core::slice::from_raw_parts(vaddr as *const u16, 256) };
         let lba48 = (id[100] as u64)
@@ -427,7 +472,16 @@ impl AhciPort {
             | ((id[102] as u64) << 32)
             | ((id[103] as u64) << 48);
         let lba28 = (id[60] as u64) | ((id[61] as u64) << 16);
-        let sectors = if lba48 != 0 { lba48 } else { lba28 };
+        let lba48_supported = (id[83] & (1 << 10)) != 0;
+        let sectors = if lba48_supported && lba48 != 0 {
+            lba48
+        } else {
+            lba28
+        };
+
+        unsafe {
+            drivers_dma_dealloc(paddr, 1);
+        }
 
         Some(sectors)
     }
@@ -495,12 +549,21 @@ impl AhciInterface {
 
                 if sig == HBA_SIG_ATA {
                     if let Some(sectors) = port.identify() {
-                        crate::klog_info!(
-                            "ahci{}: SATA disk attached, {} sectors ({} MiB)",
-                            i,
-                            sectors,
-                            sectors / 2048
-                        );
+                        if sectors >= 2097152 {
+                            crate::klog_info!(
+                                "ahci{}: SATA disk attached, {} sectors ({} GiB)",
+                                i,
+                                sectors,
+                                sectors / 2097152
+                            );
+                        } else {
+                            crate::klog_info!(
+                                "ahci{}: SATA disk attached, {} sectors ({} MiB)",
+                                i,
+                                sectors,
+                                sectors / 2048
+                            );
+                        }
                         return Ok(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),

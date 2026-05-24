@@ -73,10 +73,6 @@ impl super::LinuxRootfs {
             let rboot_conf = PROJECT_DIR.join("zCore/rboot.conf");
             let zcore_elf = PROJECT_DIR.join("target/x86_64/release/zcore");
 
-            let rboot_conf_content = fs::read_to_string(&rboot_conf).unwrap();
-            let temp_rboot_conf = TARGET.join("rboot.conf");
-            fs::write(&temp_rboot_conf, rboot_conf_content).unwrap();
-
             let status = std::process::Command::new("mcopy")
                 .arg("-i")
                 .arg(&efi_img)
@@ -89,7 +85,7 @@ impl super::LinuxRootfs {
             let status = std::process::Command::new("mcopy")
                 .arg("-i")
                 .arg(&efi_img)
-                .arg(&temp_rboot_conf)
+                .arg(&rboot_conf)
                 .arg("::/EFI/Boot/rboot.conf")
                 .status()
                 .unwrap();
@@ -108,10 +104,10 @@ impl super::LinuxRootfs {
                 .arg("-i")
                 .arg(&efi_img)
                 .arg(&clean_img)
-                .arg("::/EFI/zCore/x86_64.img")
+                .arg("::/EFI/zCore/initramfs.img")
                 .status()
                 .unwrap();
-            assert!(status.success(), "Failed to copy clean x86_64.img");
+            assert!(status.success(), "Failed to copy initramfs.img");
 
             println!("Compressing efi.img -> efi.img.gz...");
             let efi_gz = boot_dir.join("efi.img.gz");

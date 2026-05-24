@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_mm_clflush;
+use core::arch::x86_64::{_mm_clflush, _mm_lfence, _mm_mfence};
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
@@ -221,7 +221,9 @@ impl DmaBuf {
                 }
                 addr += 64;
             }
-            fence(Ordering::SeqCst);
+            unsafe {
+                _mm_mfence();
+            }
         }
         let _ = (off, len);
     }
@@ -333,13 +335,13 @@ impl XhciMmio {
         }
     }
 
-    /// Tras IRQ (MSI o legacy): RW1C `USBSTS.EINT` y limpiar `IMAN.IP` manteniendo `IE`.
     fn ack_host_interrupt(&self) {
         let usbsts = self.read_op(0x04);
         if (usbsts & 0x08) != 0 {
             self.write_op(0x04, 0x08);
         }
-        self.write_rt(0x20, 0x03);
+        let iman = self.read_rt(0x20);
+        self.write_rt(0x20, (iman & 0x02) | 0x01);
     }
 
     fn read_op(&self, o: usize) -> u32 {
@@ -733,8 +735,8 @@ impl EventRing {
         unsafe {
             // Cada TRB = 16 bytes. Una línea de caché = 64 bytes = 4 TRBs.
             // clflush invalida toda la línea, así que un solo flush es suficiente.
-            core::arch::x86_64::_mm_clflush((self.seg.virt + off) as *const u8);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            _mm_clflush((self.seg.virt + off) as *const u8);
+            _mm_lfence();
         }
         let c = self.seg.read_u32(off + 12);
         if (c & 1) == (self.cycle as u32) {
@@ -1577,8 +1579,8 @@ impl XhciInner {
         //   bits [23:20] Speed        = PORTSC speed code
         //   bit  [26]    MTT          = 0 (sin Multi-Transaction Translator)
         //   bit  [27]    Hub          = 0 (no es un hub)
-        //   bits [31:28] Ctx Entries  = 1 (solo EP0 inicial; se actualizará en Configure Endpoint)
-        let slot_dw0 = ((speed as u32) << 20) | (1u32 << 28); // Speed + Context Entries=1
+        //   bits [31:27] Ctx Entries  = 1 (solo EP0 inicial; se actualizará en Configure Endpoint)
+        let slot_dw0 = ((speed as u32) << 20) | (1u32 << 27); // Speed + Context Entries=1
         ic.write_u32(s0, slot_dw0);
         ic.write_u32(s0 + 4, (port as u32) << 16);
         let ep0 = 2 * csz;
@@ -1678,7 +1680,7 @@ impl XhciInner {
         let real_mps = raw_desc[7] as u32;
         if real_mps != mps && real_mps >= 8 {
             let ic_upd = DmaBuf::new(input_sz, 64)?;
-            ic_upd.write_u32(4, 0x02); // Add EP0
+            ic_upd.write_u32(4, 0x03); // Add Slot (A0) and EP0 (A1)
                                        // Copiar contexto actual
             if let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() {
                 // Invalidar caché antes de leer datos escritos por el controlador via DMA.
@@ -1836,15 +1838,16 @@ impl XhciInner {
         // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
         // command – writing zeros would corrupt the USB device address and port fields.
         if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
+            dev.flush(0, csz); // Invalidate cache lines so we read the fresh Device Context updated by the controller
             for i in 0..(csz / 4) {
                 cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
             }
         }
         // Raise Context Entries to cover the new endpoint DCI.
         let slot_dw0 = cfg.read_u32(csz);
-        let cur_entries = (slot_dw0 >> 28) & 0x0f;
+        let cur_entries = (slot_dw0 >> 27) & 0x1f;
         let new_entries = (dci as u32).max(cur_entries);
-        cfg.write_u32(csz, (slot_dw0 & !(0x0f << 28)) | (new_entries << 28));
+        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
 
         let ep_off = csz + csz + (dci - 1) * csz;
 
@@ -1929,7 +1932,9 @@ impl XhciInner {
                 }
                 addr += 64;
             }
-            fence(Ordering::SeqCst);
+            unsafe {
+                _mm_lfence();
+            }
         }
 
         unsafe {

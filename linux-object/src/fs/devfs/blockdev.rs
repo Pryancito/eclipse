@@ -4,6 +4,11 @@ use rcore_fs::vfs::{make_rdev, FileType, FsError, INode, Metadata, PollStatus, R
 use rcore_fs_devfs::DevFS;
 use zcore_drivers::{scheme::BlockScheme, DeviceError};
 
+/// Linux `BLKGETSIZE64` — total size in bytes (`linux/fs.h`).
+const BLKGETSIZE64: u32 = 0x8008_1272;
+/// Linux `BLKGETSIZE` — size in 512-byte sectors (`linux/fs.h`).
+const BLKGETSIZE: u32 = 0x0000_1260;
+
 /// Block device INode.
 pub struct BlockDev {
     index: usize,
@@ -97,7 +102,7 @@ impl INode for BlockDev {
 
     fn metadata(&self) -> Result<Metadata> {
         let blocks = self.block.block_count();
-        let size = blocks * 512;
+        let size = blocks.saturating_mul(512);
         Ok(Metadata {
             dev: 1,
             inode: self.inode_id,
@@ -116,8 +121,41 @@ impl INode for BlockDev {
         })
     }
 
+    #[allow(unsafe_code)]
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        if data == 0 {
+            return Err(FsError::InvalidParam);
+        }
+        let sectors = self.block.block_count() as u64;
+        match cmd {
+            BLKGETSIZE64 => {
+                let size = sectors.saturating_mul(512);
+                unsafe {
+                    *(data as *mut u64) = size;
+                }
+                Ok(0)
+            }
+            BLKGETSIZE => {
+                let legacy = sectors.min(u64::from(u32::MAX)) as u32;
+                unsafe {
+                    *(data as *mut u32) = legacy;
+                }
+                Ok(0)
+            }
+            _ => Err(FsError::NotSupported),
+        }
+    }
+
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        Ok(())
     }
 }
 

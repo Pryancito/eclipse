@@ -21,6 +21,7 @@ use zircon_object::task::Thread;
 // Foreground process group for the (single) controlling TTY.
 // This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
 static TTY_FG_PGRP: AtomicI32 = AtomicI32::new(0);
+static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios::default_tty());
 
 pub fn get_foreground_pgrp() -> i32 {
     TTY_FG_PGRP.load(Ordering::Relaxed)
@@ -197,16 +198,16 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_X => Some(mods.letter('x')),
         KEY_Y => Some(mods.letter('y')),
         KEY_Z => Some(mods.letter('z')),
-        KEY_1 => Some(mods.pick('1', '!', '|', '@')),
-        KEY_2 => Some(mods.pick('2', '"', '@', '@')),
-        KEY_3 => Some(mods.pick('3', '·', '#', '#')),
-        KEY_4 => Some(mods.pick('4', '$', '~', '~')),
-        KEY_5 => Some(mods.pick('5', '%', '½', '½')),
-        KEY_6 => Some(mods.pick('6', '&', '¾', '¾')),
-        KEY_7 => Some(mods.pick('7', '/', '{', '{')),
-        KEY_8 => Some(mods.pick('8', '(', '[', '[')),
-        KEY_9 => Some(mods.pick('9', ')', ']', ']')),
-        KEY_0 => Some(mods.pick('0', '=', '}', '}')),
+        KEY_1 => Some('1'),
+        KEY_2 => Some('2'),
+        KEY_3 => Some('3'),
+        KEY_4 => Some('4'),
+        KEY_5 => Some('5'),
+        KEY_6 => Some('6'),
+        KEY_7 => Some('7'),
+        KEY_8 => Some('8'),
+        KEY_9 => Some('9'),
+        KEY_0 => Some('0'),
         KEY_MINUS => Some(mods.pick('\'', '?', '\\', '|')),
         KEY_EQUAL => Some(mods.pick('¡', '¿', '¡', '¿')),
         KEY_GRAVE => Some(mods.pick('º', 'ª', 'º', 'ª')),
@@ -269,6 +270,23 @@ impl Default for Stdin {
 }
 
 impl Stdin {
+    fn echo_char(c: char) {
+        const ECHO: u32 = 0x0008;
+        if TTY_TERMIOS.lock().c_lflag & ECHO == 0 {
+            return;
+        }
+        match c {
+            '\u{8}' | '\u{7f}' => kernel_hal::console::console_write_str("\x08 \x08"),
+            '\n' => kernel_hal::console::console_write_str("\r\n"),
+            '\r' => {}
+            c if c.is_control() => {}
+            c => {
+                let mut buf = [0u8; 4];
+                kernel_hal::console::console_write_str(c.encode_utf8(&mut buf));
+            }
+        }
+    }
+
     /// Push a char into the Stdin buffer.
     ///
     /// Safe to call from IRQ context: acquires `buf` lock briefly (with
@@ -284,6 +302,7 @@ impl Stdin {
                 let _ = crate::process::send_signal_to_process(pgid as usize, crate::signal::Signal::SIGINT);
             }
         }
+        Self::echo_char(c);
         self.buf.lock().push_back(c);
         // Signal availability. If we can grab the eventbus cheaply, notify
         // waiters immediately; otherwise leave the flag for later executor-side
@@ -400,7 +419,11 @@ impl INode for Stdin {
                 Ok(0)
             }
             TCGETS => {
-                warn!("stdin TCGETS, pretend to be tty.");
+                let termios = data as *mut Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                unsafe { *termios = *TTY_TERMIOS.lock() };
                 Ok(0)
             }
             TIOCSPGRP => {
@@ -430,7 +453,11 @@ impl INode for Stdin {
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
-                debug!("stdin TCSETS/W/F, stubbed.");
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *TTY_TERMIOS.lock() = unsafe { *termios };
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

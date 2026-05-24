@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use alloc::format;
 
 use zcore_drivers::irq::x86::Apic;
-use zcore_drivers::scheme::IrqScheme;
+use zcore_drivers::scheme::{IrqScheme, SchemeUpcast};
 use zcore_drivers::uart::{BufferedUart, Uart16550Pmio};
 use zcore_drivers::{Device, DeviceResult};
 
@@ -45,6 +45,14 @@ pub(super) fn init() -> DeviceResult {
             irq.unmask(trap::X86_ISA_IRQ_COM2)?;
         }
     }
+
+    // PS/2 Keyboard and Mouse initialization and registration
+    let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
+    irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
+    irq.unmask(trap::X86_ISA_IRQ_KEYBOARD)?;
+    irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
+    irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
+    drivers::add_device(Device::Input(ps2_input));
 
     use x2apic::lapic::{TimerDivide, TimerMode};
 
