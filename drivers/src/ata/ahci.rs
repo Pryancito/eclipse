@@ -22,9 +22,15 @@ use lock::Mutex;
 // --- HBA global register offsets ---
 const HBA_GHC: usize = 0x04;
 const HBA_PI: usize = 0x0C;
+const HBA_BOHC: usize = 0x28; // BIOS/OS Handoff Control and Status
 
 const GHC_AE: u32 = 1 << 31;
 const GHC_HR: u32 = 1 << 0;
+
+// BOHC bits (AHCI spec §10.6)
+const BOHC_BOS: u32 = 1 << 0; // BIOS Owns Semaphore
+const BOHC_OOS: u32 = 1 << 1; // OS Owns Semaphore
+const BOHC_BB: u32 = 1 << 4;  // BIOS Busy
 
 // --- Per-port register offsets ---
 const PORT_CLB: usize = 0x00;
@@ -525,6 +531,30 @@ pub struct AhciInterface {
 impl AhciInterface {
     pub fn new(base: usize, _irq: usize) -> DeviceResult<Self> {
         unsafe {
+            // AHCI spec §10.6: BIOS/OS Handoff.
+            // On real hardware the BIOS may still own the HBA (BOHC.BOS=1).
+            // Request ownership and wait for the BIOS to release before resetting.
+            let bohc = read_volatile((base + HBA_BOHC) as *const u32);
+            if bohc & BOHC_BOS != 0 {
+                crate::klog_info!("[AHCI] BIOS owns HBA (BOHC={:#x}), requesting handoff", bohc);
+                write_volatile((base + HBA_BOHC) as *mut u32, bohc | BOHC_OOS);
+                // Wait up to 25 ms for BIOS to clear BOS
+                wait_until(25_000, || {
+                    read_volatile((base + HBA_BOHC) as *const u32) & BOHC_BOS == 0
+                });
+                // If BIOS is still busy (BB=1) wait up to 2 s more
+                if read_volatile((base + HBA_BOHC) as *const u32) & BOHC_BB != 0 {
+                    wait_until(2_000_000, || {
+                        read_volatile((base + HBA_BOHC) as *const u32) & BOHC_BB == 0
+                    });
+                }
+                crate::klog_info!(
+                    "[AHCI] BOHC after handoff: {:#x}",
+                    read_volatile((base + HBA_BOHC) as *const u32)
+                );
+            }
+
+            // Global HBA reset
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE | GHC_HR);
             // Wait for HBA Global Reset to self-clear (spec: ≤1 second)
@@ -533,12 +563,26 @@ impl AhciInterface {
             }) {
                 crate::klog_err!("[AHCI] HBA reset timeout — controller may not be functional");
             }
+            // Re-enable AHCI mode (do NOT set GHC_IE — polling mode only)
             write_volatile((base + HBA_GHC) as *mut u32, GHC_AE);
-            // AHCI spec §10.1.2: minimum 1 ms after GHC.HR before touching registers.
+            // Let the HBA and PHY layers stabilise (~1 ms)
             udelay(1_000);
         }
 
         let pi = unsafe { read_volatile((base + HBA_PI) as *const u32) };
+
+        // After a global HBA reset the SATA link can take up to 2 seconds to
+        // re-establish.  Wait until at least one implemented port shows DET≠0
+        // before scanning individual ports, so we don't skip them prematurely.
+        let _ = wait_until(2_000_000, || {
+            for i in 0..32u32 {
+                if pi & (1 << i) == 0 { continue; }
+                let pbase = base + 0x100 + (i as usize * 0x80);
+                let det = unsafe { read_volatile((pbase + PORT_SSTS) as *const u32) } & 0xF;
+                if det != 0 { return true; }
+            }
+            false
+        });
 
         for i in 0..32 {
             if pi & (1 << i) != 0 {
@@ -557,16 +601,15 @@ impl AhciInterface {
                     ct_virt: dma_vaddr + 4096,
                 };
 
-                // Skip COMRESET/link waits on ports with no device (DET=0).
-                if port.read_reg(PORT_SSTS) & 0xF == 0 {
+                // Skip ports with no device (DET=0 or DET=4 = offline).
+                let det = port.read_reg(PORT_SSTS) & 0xF;
+                if det == 0 || det == 4 {
                     continue;
                 }
 
                 port.init();
 
-                // Wait up to 1 second for PORT_SIG to become valid
-                // (10ms × 100 = 1 s). Use TSC-based udelay to avoid
-                // non-deterministic spin counts on different CPUs.
+                // Wait up to 1 second for PORT_SIG to become valid.
                 let mut sig = 0;
                 for _ in 0..100 {
                     sig = port.read_reg(PORT_SIG);
@@ -576,7 +619,13 @@ impl AhciInterface {
                     udelay(10_000); // 10 ms between polls
                 }
 
-                if sig == HBA_SIG_ATA {
+                // Accept known ATA signature or any non-zero SIG when DET=3
+                // (device present, PHY comms up). Some real controllers populate
+                // SIG asynchronously and may show 0 even after link-up; IDENTIFY
+                // will confirm whether a disk is actually there.
+                let is_ata = sig == HBA_SIG_ATA
+                    || (sig == 0 && port.read_reg(PORT_SSTS) & 0xF == 3);
+                if is_ata {
                     if let Some(sectors) = port.identify() {
                         if sectors == 0 {
                             crate::klog_warn!(
