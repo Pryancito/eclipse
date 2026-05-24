@@ -62,11 +62,33 @@ fn dir_metadata() -> Metadata {
 
 fn list_block_devices() -> Vec<String> {
     let blocks = drivers::all_block().as_vec();
-    blocks
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("sd{}", (b'a' + i as u8) as char))
-        .collect()
+    let mut names = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let name = block.name();
+        let fname = if name.starts_with("nvme") {
+            let nvme_idx = blocks[..i]
+                .iter()
+                .filter(|b| b.name().starts_with("nvme"))
+                .count();
+            format!("nvme{}n1", nvme_idx)
+        } else if name.starts_with("virtio") {
+            let virtio_idx = blocks[..i]
+                .iter()
+                .filter(|b| b.name().starts_with("virtio"))
+                .count();
+            let name_char = (b'a' + (virtio_idx % 26) as u8) as char;
+            format!("vd{}", name_char)
+        } else {
+            let other_idx = blocks[..i]
+                .iter()
+                .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
+                .count();
+            let name_char = (b'a' + (other_idx % 26) as u8) as char;
+            format!("sd{}", name_char)
+        };
+        names.push(fname);
+    }
+    names
 }
 
 fn block_index_by_name(name: &str) -> Option<usize> {

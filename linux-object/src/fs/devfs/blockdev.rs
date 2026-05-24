@@ -121,7 +121,6 @@ impl INode for BlockDev {
         })
     }
 
-    #[allow(unsafe_code)]
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         if data == 0 {
             return Err(FsError::InvalidParam);
@@ -130,16 +129,14 @@ impl INode for BlockDev {
         match cmd {
             BLKGETSIZE64 => {
                 let size = sectors.saturating_mul(512);
-                unsafe {
-                    *(data as *mut u64) = size;
-                }
+                let mut out_ptr = kernel_hal::user::UserOutPtr::<u64>::from(data);
+                out_ptr.write(size).map_err(|_| FsError::InvalidParam)?;
                 Ok(0)
             }
             BLKGETSIZE => {
-                let legacy = sectors.min(u64::from(u32::MAX)) as u32;
-                unsafe {
-                    *(data as *mut u32) = legacy;
-                }
+                let legacy = sectors as usize;
+                let mut out_ptr = kernel_hal::user::UserOutPtr::<usize>::from(data);
+                out_ptr.write(legacy).map_err(|_| FsError::InvalidParam)?;
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

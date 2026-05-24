@@ -273,10 +273,31 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
-    // Add block devices at `/dev/sd{a,b,c...}`
-    for (i, block) in drivers::all_block().as_vec().iter().enumerate() {
-        let name_char = (b'a' + i as u8) as char;
-        let fname = format!("sd{}", name_char);
+    // Add block devices at `/dev/` using Linux naming conventions
+    let blocks = drivers::all_block().as_vec();
+    for (i, block) in blocks.iter().enumerate() {
+        let name = block.name();
+        let fname = if name.starts_with("nvme") {
+            let nvme_idx = blocks[..i]
+                .iter()
+                .filter(|b| b.name().starts_with("nvme"))
+                .count();
+            format!("nvme{}n1", nvme_idx)
+        } else if name.starts_with("virtio") {
+            let virtio_idx = blocks[..i]
+                .iter()
+                .filter(|b| b.name().starts_with("virtio"))
+                .count();
+            let name_char = (b'a' + (virtio_idx % 26) as u8) as char;
+            format!("vd{}", name_char)
+        } else {
+            let other_idx = blocks[..i]
+                .iter()
+                .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
+                .count();
+            let name_char = (b'a' + (other_idx % 26) as u8) as char;
+            format!("sd{}", name_char)
+        };
         if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(i, block.clone()))) {
             warn!("failed to mknod /dev/{}: {:?}", &fname, e);
         }

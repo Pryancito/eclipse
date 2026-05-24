@@ -33,18 +33,30 @@ pub struct NvmeQueue<P: Provider> {
 
 impl<P: Provider> NvmeQueue<P> {
     pub fn new(qid: usize, db_offset: usize) -> Self {
-        let (data_va, data_pa) = P::alloc_dma(P::PAGE_SIZE * 2);
-        let (sq_va, sq_pa) = P::alloc_dma(P::PAGE_SIZE * 2);
-        let (cq_va, cq_pa) = P::alloc_dma(P::PAGE_SIZE * 2);
+        // qid = 0 is admin queue (size 32), qid > 0 is io queue (size 128)
+        let q_size = if qid == 0 { 32 } else { 128 };
 
-        trace!("data_va: {:x}, data_pa: {:x}", data_va, data_pa);
+        // SQ: 64 bytes per entry. CQ: 16 bytes per entry.
+        let sq_bytes = q_size * 64;
+        let cq_bytes = q_size * 16;
+
+        // Round up to page size
+        let sq_pages = (sq_bytes + P::PAGE_SIZE - 1) / P::PAGE_SIZE;
+        let cq_pages = (cq_bytes + P::PAGE_SIZE - 1) / P::PAGE_SIZE;
+
+        let (data_va, data_pa) = P::alloc_dma(P::PAGE_SIZE * 2);
+        let (sq_va, sq_pa) = P::alloc_dma(sq_pages * P::PAGE_SIZE);
+        let (cq_va, cq_pa) = P::alloc_dma(cq_pages * P::PAGE_SIZE);
+
+        trace!("data_va: {:x}, sq_pa: {:x}, cq_pa: {:x}", data_va, sq_pa, cq_pa);
 
         let submit_queue = unsafe {
-            slice::from_raw_parts_mut(sq_va as *mut Volatile<NvmeCommonCommand>, PAGE_SIZE)
+            slice::from_raw_parts_mut(sq_va as *mut Volatile<NvmeCommonCommand>, q_size)
         };
 
-        let complete_queue =
-            unsafe { slice::from_raw_parts_mut(cq_va as *mut Volatile<NvmeCompletion>, PAGE_SIZE) };
+        let complete_queue = unsafe {
+            slice::from_raw_parts_mut(cq_va as *mut Volatile<NvmeCompletion>, q_size)
+        };
 
         NvmeQueue {
             provider: PhantomData,
@@ -53,7 +65,7 @@ impl<P: Provider> NvmeQueue<P> {
             db_offset,
             qid,
             cq_head: 0,
-            cq_phase: 0,
+            cq_phase: 1, // Phase starts at 1
             sq_tail: 0,
             last_sq_tail: 0,
             sq_pa,

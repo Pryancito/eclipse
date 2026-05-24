@@ -436,6 +436,7 @@ impl AhciPort {
                 0,
                 core::mem::size_of::<CommandTable>(),
             );
+            core::ptr::write_bytes(vaddr as *mut u8, 0, 512);
 
             let fis = (*cmd_table).cfis.as_mut_ptr();
             *fis.add(0) = FIS_TYPE_REG_H2D;
