@@ -574,13 +574,16 @@ impl LinuxProcess {
     /// Check inode access against current credentials.
     pub fn check_access(&self, metadata: &Metadata, requested: u16, use_effective: bool) -> LxResult {
         let creds = self.credentials();
+        let selected_uid = if use_effective {
+            creds.euid
+        } else {
+            creds.ruid
+        };
         let granted = Self::access_bits_for(&creds, metadata, use_effective);
-        if creds.euid == ROOT_UID && requested == ACCESS_EXEC && granted & ACCESS_EXEC == 0 {
-            return Err(LxError::EACCES);
-        }
-        if creds.euid == ROOT_UID
-            && Self::check_requested_access(granted, requested & (ACCESS_READ | ACCESS_WRITE))
-        {
+        if selected_uid == ROOT_UID {
+            if requested & ACCESS_EXEC != 0 && granted & ACCESS_EXEC == 0 {
+                return Err(LxError::EACCES);
+            }
             return Ok(());
         }
         if Self::check_requested_access(granted, requested) {
