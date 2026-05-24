@@ -156,9 +156,7 @@ impl super::LinuxRootfs {
             // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
             println!("Building final installer-enabled image...");
             let image = PROJECT_DIR.join("zCore").join(format!("{arch}.img", arch = self.0.name()));
-            if initramfs_img != image {
-                fs::copy(&initramfs_img, &image).unwrap();
-            }
+            fuse(&rootfs_path, &image, 80 * 1024 * 1024);
 
             let _ = fs::remove_file(efi_gz);
             let _ = fs::remove_file(ext2_gz);

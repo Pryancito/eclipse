@@ -89,7 +89,7 @@ struct PrdEntry {
     dbc_ioc: u32,
 }
 
-#[repr(C, align(128))]
+#[repr(C, align(1024))]
 struct CommandTable {
     cfis: [u8; 64],
     acmd: [u8; 16],
@@ -97,14 +97,20 @@ struct CommandTable {
     prdt: [PrdEntry; 1],
 }
 
-const CMD_SLOTS: usize = 32;
-const CMD_TABLE_STRIDE: usize = 256; // 128-aligned, fits CommandTable
+const _: () = {
+    assert!(core::mem::size_of::<CommandHeader>() == 32);
+    assert!(core::mem::size_of::<PrdEntry>() == 16);
+    assert!(core::mem::size_of::<CommandTable>() == 1024);
+};
 
-// DMA memory layout (3 pages = 12 288 bytes):
+const CMD_SLOTS: usize = 32;
+const CMD_TABLE_STRIDE: usize = 1024; // 1024-aligned to support strict controllers
+
+// DMA memory layout (9 pages = 36 864 bytes):
 //   [0..1024)      command list  : CMD_SLOTS × sizeof(CommandHeader) = 32 × 32 = 1024 B
 //   [1024..1280)   FIS recv area : 256 B  (256-byte aligned ✓)
-//   [4096..12288)  command tables: CMD_SLOTS × CMD_TABLE_STRIDE = 32 × 256 = 8192 B
-const DMA_PAGES: usize = 3;
+//   [4096..36864)  command tables: CMD_SLOTS × CMD_TABLE_STRIDE = 32 × 1024 = 32 768 B
+const DMA_PAGES: usize = 9;
 
 // AHCI spec §10.4.2: COMRESET must be asserted for at least 1 ms.
 const COMRESET_US: u64 = 1_000;
@@ -178,6 +184,9 @@ extern "C" {
 #[inline(always)]
 fn clflush_range(vaddr: usize, len: usize) {
     use core::arch::x86_64::{_mm_clflush, _mm_mfence};
+    unsafe {
+        _mm_mfence();
+    }
     let mut addr = vaddr & !63;
     let end = vaddr + len;
     while addr < end {
@@ -242,7 +251,7 @@ impl AhciPort {
         self.write_reg(PORT_CMD, self.read_reg(PORT_CMD) | CMD_FRE | CMD_ST);
     }
 
-    fn init(&self) {
+    fn init(&self) -> bool {
         self.stop_engine();
 
         // Configure command list
@@ -257,7 +266,7 @@ impl AhciPort {
                 let h = &mut *headers.add(i);
                 let ct_phys = self.ct_phys + (i * CMD_TABLE_STRIDE) as u64;
                 h.ctba = ct_phys as u32;
-                h.ctbau = (ct_phys >> 32) as u64 as u32;
+                h.ctbau = (ct_phys >> 32) as u32;
             }
             // Zero the FIS receive area (size 256 bytes, located at cl_virt + 1024)
             core::ptr::write_bytes(
@@ -288,13 +297,21 @@ impl AhciPort {
         udelay(COMRESET_US);
         self.write_reg(PORT_SCTL, self.read_reg(PORT_SCTL) & !0xF);
 
+        // Wait for PHY to show some sign of device presence (DET != 0), max 50 ms.
+        // This avoids waiting the full 1 second timeout on empty ports.
+        if !wait_until(50_000, || self.read_reg(PORT_SSTS) & 0xF != 0) {
+            return false;
+        }
+
         // Wait for PHY to establish link (DET=3), max 1 second
         if !wait_until(PHY_LINK_TIMEOUT_US, || self.read_reg(PORT_SSTS) & 0xF == 3) {
             crate::klog_warn!("[AHCI] port {} PHY link timeout", self.port_idx);
+            return false;
         }
 
         self.write_reg(PORT_SERR, 0xFFFF_FFFF);
         self.start_engine();
+        true
     }
 
     fn reset_port(&self) {
@@ -418,7 +435,7 @@ impl AhciPort {
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5 | (if write { 1 << 6 } else { 0 });
-            (*header).pm = 4; // Clear busy upon R_OK (c = 1)
+            (*header).pm = 0; // Do NOT clear busy upon R_OK (c = 0) for data commands
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
@@ -430,6 +447,7 @@ impl AhciPort {
         let res = self.exec_cmd(slot);
         if res.is_ok() && !write {
             clflush_range(vaddr, buf_len);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         res
     }
@@ -472,7 +490,7 @@ impl AhciPort {
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5;
-            (*header).pm = 4; // Clear busy upon R_OK (c = 1)
+            (*header).pm = 0; // Do NOT clear busy upon R_OK (c = 0) for data commands
             (*header).prdtl = 1;
             (*header).prdbc = 0;
         }
@@ -488,15 +506,20 @@ impl AhciPort {
         }
 
         clflush_range(vaddr, 512);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let id = unsafe { core::slice::from_raw_parts(vaddr as *const u16, 256) };
-        let lba48 = (id[100] as u64)
-            | ((id[101] as u64) << 16)
-            | ((id[102] as u64) << 32)
-            | ((id[103] as u64) << 48);
-        let lba28 = (id[60] as u64) | ((id[61] as u64) << 16);
-        let lba48_supported = (id[83] & (1 << 10)) != 0;
-        let sectors = if lba48_supported && lba48 != 0 {
+        let id_ptr = vaddr as *const u16;
+        let read_id = |idx: usize| -> u16 {
+            unsafe { read_volatile(id_ptr.add(idx)) }
+        };
+
+        let lba48 = (read_id(100) as u64)
+            | ((read_id(101) as u64) << 16)
+            | ((read_id(102) as u64) << 32)
+            | ((read_id(103) as u64) << 48);
+        let lba28 = (read_id(60) as u64) | ((read_id(61) as u64) << 16);
+        let lba48_supported = (read_id(83) & (1 << 10)) != 0;
+        let sectors = if (lba48_supported || lba48 > lba28) && lba48 != 0 {
             lba48
         } else {
             lba28
@@ -508,10 +531,10 @@ impl AhciPort {
             lba28,
             lba48,
             sectors,
-            id[83],
-            id[60],
-            id[61],
-            id[100]
+            read_id(83),
+            read_id(60),
+            read_id(61),
+            read_id(100)
         );
 
         unsafe {
@@ -601,13 +624,23 @@ impl AhciInterface {
                     ct_virt: dma_vaddr + 4096,
                 };
 
-                // Skip ports with no device (DET=0 or DET=4 = offline).
+                // Skip ports that are explicitly disabled (DET=4).
+                // Do NOT skip DET=0, because link negotiation might not have
+                // completed yet or requires a COMRESET to start.
                 let det = port.read_reg(PORT_SSTS) & 0xF;
-                if det == 0 || det == 4 {
+                if det == 4 {
+                    unsafe {
+                        drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                    }
                     continue;
                 }
 
-                port.init();
+                if !port.init() {
+                    unsafe {
+                        drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                    }
+                    continue;
+                }
 
                 // Wait up to 1 second for PORT_SIG to become valid.
                 let mut sig = 0;
@@ -632,6 +665,9 @@ impl AhciInterface {
                                 "[AHCI] port {} reported 0 sectors after IDENTIFY; skipping device",
                                 i
                             );
+                            unsafe {
+                                drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                            }
                             continue;
                         }
                         if sectors >= 2097152 {
@@ -654,6 +690,16 @@ impl AhciInterface {
                             port: Mutex::new(port),
                             _capacity: sectors,
                         });
+                    } else {
+                        crate::klog_warn!("[AHCI] port {} IDENTIFY failed", i);
+                        unsafe {
+                            drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                        }
+                    }
+                } else {
+                    crate::klog_warn!("[AHCI] port {} signature is not ATA: {:#x}", i, sig);
+                    unsafe {
+                        drivers_dma_dealloc(dma_paddr, DMA_PAGES);
                     }
                 }
             }
@@ -711,8 +757,9 @@ impl PciDriver for AhciDriverPci {
     }
 
     fn matched_dev(&self, dev: &PCIDevice) -> bool {
-        // Match standard AHCI: class=0x01 (mass storage), subclass=0x06 (SATA), prog_if=0x01 (AHCI)
-        dev.id.class == 0x01 && dev.id.subclass == 0x06 && dev.id.prog_if == 0x01
+        // Match standard AHCI (SATA, IDE, or RAID subclass in AHCI mode):
+        // class=0x01 (mass storage), prog_if=0x01 (AHCI)
+        dev.id.class == 0x01 && dev.id.prog_if == 0x01 && (dev.id.subclass == 0x06 || dev.id.subclass == 0x01 || dev.id.subclass == 0x04)
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
@@ -730,6 +777,14 @@ impl PciDriver for AhciDriverPci {
 
         if let Some(m) = mapper {
             m.query_or_map(addr, map_len);
+        }
+
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        unsafe {
+            let ops = &crate::bus::pci::PortOpsImpl;
+            let am = crate::bus::pci::PCI_ACCESS;
+            let pci_command = am.read16(ops, dev.loc, 0x04);
+            am.write16(ops, dev.loc, 0x04, pci_command | 0x0004 | 0x0002 | 0x0001);
         }
 
         let vaddr = phys_to_virt(addr);

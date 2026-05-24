@@ -214,6 +214,7 @@ impl Scheme for Ps2Input {
                             0x4B => 105, // Left
                             0x4D => 106, // Right
                             0x1D => 97,  // RCtrl
+                            0x38 => 100, // RAlt / AltGr
                             0x35 => 98,  // KP_Divide
                             0x1C => 96,  // KP_Enter
                             0x53 => 111, // Delete

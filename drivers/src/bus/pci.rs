@@ -205,7 +205,7 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     let orig = am.read16(ops, loc, PCI_COMMAND);
     // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
     // regardless of whether MSI is available.
-    am.write16(ops, loc, PCI_COMMAND, orig | 0x6);
+    am.write16(ops, loc, PCI_COMMAND, orig | 0x7);
 
     // find MSI cap
     let mut msi_found = false;

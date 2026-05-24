@@ -25,6 +25,8 @@ lazy_static! {
     pub(super) static ref MOCK_PHYS_MEM: MockMemory = MockMemory::new(PMEM_SIZE);
 }
 
+pub(super) static USED_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 hal_fn_impl! {
     impl mod crate::hal_fn::mem {
         fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
@@ -68,7 +70,7 @@ hal_fn_impl! {
         }
 
         fn memory_usage() -> (usize, usize) {
-            let used = FRAME_ALLOCATOR.lock().used_count() * PAGE_SIZE;
+            let used = USED_PAGES.load(core::sync::atomic::Ordering::Relaxed) * PAGE_SIZE;
             (used, PMEM_SIZE)
         }
     }
