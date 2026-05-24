@@ -775,7 +775,11 @@ static int scan_disks_sysfs(struct disk_info disks[MAX_DISKS], char disk_list[MA
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL && found_disks < MAX_DISKS) {
         const char *name = ent->d_name;
+        size_t name_len = strnlen(name, 128);
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        if (name_len == 0 || name_len >= 96) {
             continue;
         }
         if (!is_supported_disk_name(name)) {
@@ -783,13 +787,13 @@ static int scan_disks_sysfs(struct disk_info disks[MAX_DISKS], char disk_list[MA
         }
 
         char partition_path[256];
-        snprintf(partition_path, sizeof(partition_path), "/sys/class/block/%s/partition", name);
+        snprintf(partition_path, sizeof(partition_path), "/sys/class/block/%.*s/partition", (int)name_len, name);
         if (access(partition_path, F_OK) == 0) {
             continue;
         }
 
         char dev_path[128];
-        snprintf(dev_path, sizeof(dev_path), "/dev/%s", name);
+        snprintf(dev_path, sizeof(dev_path), "/dev/%.*s", (int)name_len, name);
         found_disks = add_disk_if_present(disks, disk_list, found_disks, dev_path);
     }
 
