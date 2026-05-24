@@ -345,14 +345,7 @@ fn proc_meminfo_content() -> String {
 }
 
 fn proc_mounts_content() -> String {
-    let mut s = String::new();
-    let _ = writeln!(s, "rootfs / rootfs rw 0 0");
-    let _ = writeln!(s, "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0");
-    let _ = writeln!(s, "devfs /dev devtmpfs rw,nosuid 0 0");
-    let _ = writeln!(s, "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0");
-    let _ = writeln!(s, "tmpfs /run tmpfs rw,nosuid,nodev 0 0");
-    let _ = writeln!(s, "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0");
-    s
+    super::proc_mounts_content()
 }
 
 fn proc_net_arp_content() -> String {
