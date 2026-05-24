@@ -578,6 +578,13 @@ impl AhciInterface {
 
                 if sig == HBA_SIG_ATA {
                     if let Some(sectors) = port.identify() {
+                        if sectors == 0 {
+                            crate::klog_warn!(
+                                "[AHCI] port {} reported 0 sectors after IDENTIFY; skipping device",
+                                i
+                            );
+                            continue;
+                        }
                         if sectors >= 2097152 {
                             crate::klog_info!(
                                 "ahci{}: SATA disk attached, {} sectors ({} GiB)",

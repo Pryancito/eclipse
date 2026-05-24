@@ -127,7 +127,7 @@ static void installer_log(const char *fmt, ...);
 static void clear_screen(void);
 static void print_header(void);
 static uint64_t get_disk_size_bytes(const char *path);
-static uint64_t get_disk_size_bytes_sysfs(const char *path);
+static uint64_t get_disk_size_raw_sysfs(const char *path);
 static int scan_disks(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128]);
 static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks, const char *path);
 static int scan_disks_sysfs(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks);
@@ -464,22 +464,28 @@ static uint64_t read_u64_from_file(const char *path) {
     return (uint64_t)value;
 }
 
-static uint64_t get_disk_size_bytes_sysfs(const char *path) {
+static uint64_t get_disk_size_raw_sysfs(const char *path) {
     char size_path[256];
     const char *base = disk_basename(path);
     snprintf(size_path, sizeof(size_path), "/sys/class/block/%s/size", base);
-    uint64_t sectors = read_u64_from_file(size_path);
-    if (sectors == 0) {
+    uint64_t raw = read_u64_from_file(size_path);
+    if (raw == 0) {
         return 0;
     }
-    return sectors * SECTOR_SIZE;
+    return raw;
 }
 
 static uint64_t get_disk_size_bytes(const char *path) {
-    uint64_t sysfs_size = get_disk_size_bytes_sysfs(path);
+    uint64_t sysfs_raw = get_disk_size_raw_sysfs(path);
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        return sysfs_size;
+        if (sysfs_raw == 0) {
+            return 0;
+        }
+        if (sysfs_raw > (UINT64_MAX / SECTOR_SIZE)) {
+            return sysfs_raw;
+        }
+        return sysfs_raw * SECTOR_SIZE;
     }
 
     uint64_t size = 0;
@@ -498,16 +504,33 @@ static uint64_t get_disk_size_bytes(const char *path) {
 
     close(fd);
 
-    if (sysfs_size == 0) {
+    if (sysfs_raw == 0) {
         return size;
     }
+
+    uint64_t sysfs_as_sectors = (sysfs_raw > (UINT64_MAX / SECTOR_SIZE)) ? 0 : (sysfs_raw * SECTOR_SIZE);
+    uint64_t sysfs_size = sysfs_as_sectors;
+    if (size > 0) {
+        uint64_t sysfs_as_bytes = sysfs_raw;
+        if (sysfs_as_bytes > 0) {
+            uint64_t diff_bytes = (size > sysfs_as_bytes) ? (size - sysfs_as_bytes) : (sysfs_as_bytes - size);
+            uint64_t diff_sectors = (size > sysfs_as_sectors) ? (size - sysfs_as_sectors) : (sysfs_as_sectors - size);
+            if (diff_bytes < diff_sectors) {
+                sysfs_size = sysfs_as_bytes;
+            }
+        }
+    }
+
     if (size == 0) {
         return sysfs_size;
+    }
+    if (sysfs_size == 0) {
+        return size;
     }
 
     uint64_t diff = (size > sysfs_size) ? (size - sysfs_size) : (sysfs_size - size);
     if (diff > (sysfs_size / 20U)) {
-        return sysfs_size;
+        return (size < sysfs_size) ? size : sysfs_size;
     }
     return size;
 }
@@ -741,6 +764,9 @@ static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list
     }
 
     uint64_t size_bytes = get_disk_size_bytes(path);
+    if (size_bytes == 0) {
+        return found_disks;
+    }
     char size_buf[64];
     format_size(size_buf, sizeof(size_buf), size_bytes);
     log("  [%d] " COLOR_YELLOW "%s" COLOR_RESET " (%s)", found_disks + 1, path, size_buf);
