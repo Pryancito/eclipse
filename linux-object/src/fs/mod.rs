@@ -7,6 +7,7 @@ mod pipe;
 mod procfs;
 mod proc_self;
 mod pseudo;
+mod sysfs;
 mod epoll;
 mod eventfd;
 pub mod rcore_fs_wrapper;
@@ -48,6 +49,7 @@ use crate::process::LinuxProcess;
 use devfs::RandomINode;
 use procfs::ProcFS;
 use pseudo::Pseudo;
+use sysfs::SysFS;
 
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
 pub use pipe::Pipe;
@@ -275,6 +277,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     proc.mount(Arc::new(ProcFS::new()))
         .expect("failed to mount ProcFS");
+
+    // mount SysFS at /sys
+    let sys = root.find(true, "sys").unwrap_or_else(|_| {
+        root.create("sys", FileType::Dir, 0o755)
+            .expect("failed to mkdir /sys")
+    });
+    sys.mount(Arc::new(SysFS::new()))
+        .expect("failed to mount SysFS");
 
     root
 }
