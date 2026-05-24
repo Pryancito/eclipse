@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <time.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -125,8 +126,10 @@ static void installer_log(const char *fmt, ...);
 static void clear_screen(void);
 static void print_header(void);
 static uint64_t get_disk_size_bytes(const char *path);
+static uint64_t get_disk_size_bytes_sysfs(const char *path);
 static int scan_disks(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128]);
 static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks, const char *path);
+static int scan_disks_sysfs(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks);
 static void trim_newline(char *s);
 static void trim_leading_ws(char *s);
 static int prompt_tty_fd(void);
@@ -445,10 +448,37 @@ static void print_header(void) {
     log(COLOR_CYAN COLOR_BOLD "========================================================\n" COLOR_RESET);
 }
 
+static uint64_t read_u64_from_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    unsigned long long value = 0;
+    int scanned = fscanf(fp, "%llu", &value);
+    fclose(fp);
+    if (scanned != 1) {
+        return 0;
+    }
+    return (uint64_t)value;
+}
+
+static uint64_t get_disk_size_bytes_sysfs(const char *path) {
+    char size_path[256];
+    const char *base = disk_basename(path);
+    snprintf(size_path, sizeof(size_path), "/sys/class/block/%s/size", base);
+    uint64_t sectors = read_u64_from_file(size_path);
+    if (sectors == 0) {
+        return 0;
+    }
+    return sectors * SECTOR_SIZE;
+}
+
 static uint64_t get_disk_size_bytes(const char *path) {
+    uint64_t sysfs_size = get_disk_size_bytes_sysfs(path);
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        return 0;
+        return sysfs_size;
     }
 
     uint64_t size = 0;
@@ -466,6 +496,18 @@ static uint64_t get_disk_size_bytes(const char *path) {
     }
 
     close(fd);
+
+    if (sysfs_size == 0) {
+        return size;
+    }
+    if (size == 0) {
+        return sysfs_size;
+    }
+
+    uint64_t diff = (size > sysfs_size) ? (size - sysfs_size) : (sysfs_size - size);
+    if (diff > (sysfs_size / 20U)) {
+        return sysfs_size;
+    }
     return size;
 }
 
@@ -686,6 +728,12 @@ static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list
         return found_disks;
     }
 
+    for (int i = 0; i < found_disks; i++) {
+        if (strcmp(disks[i].path, path) == 0) {
+            return found_disks;
+        }
+    }
+
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISBLK(st.st_mode)) {
         return found_disks;
@@ -706,8 +754,55 @@ static int add_disk_if_present(struct disk_info disks[MAX_DISKS], char disk_list
     return found_disks + 1;
 }
 
+static int is_supported_disk_name(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    return strncmp(name, "sd", 2) == 0 ||
+           strncmp(name, "vd", 2) == 0 ||
+           strncmp(name, "xvd", 3) == 0 ||
+           strncmp(name, "hd", 2) == 0 ||
+           strncmp(name, "nvme", 4) == 0 ||
+           strncmp(name, "mmcblk", 6) == 0;
+}
+
+static int scan_disks_sysfs(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks) {
+    DIR *dir = opendir("/sys/class/block");
+    if (dir == NULL) {
+        return found_disks;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && found_disks < MAX_DISKS) {
+        const char *name = ent->d_name;
+        size_t name_len = strnlen(name, 128);
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        if (name_len == 0 || name_len >= 96) {
+            continue;
+        }
+        if (!is_supported_disk_name(name)) {
+            continue;
+        }
+
+        char partition_path[256];
+        snprintf(partition_path, sizeof(partition_path), "/sys/class/block/%.*s/partition", (int)name_len, name);
+        if (access(partition_path, F_OK) == 0) {
+            continue;
+        }
+
+        char dev_path[128];
+        snprintf(dev_path, sizeof(dev_path), "/dev/%.*s", (int)name_len, name);
+        found_disks = add_disk_if_present(disks, disk_list, found_disks, dev_path);
+    }
+
+    closedir(dir);
+    return found_disks;
+}
+
 static int scan_disks(struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128]) {
-    int found_disks = 0;
+    int found_disks = scan_disks_sysfs(disks, disk_list, 0);
 
     for (char c = 'a'; c <= 'z' && found_disks < MAX_DISKS; c++) {
         char path[128];

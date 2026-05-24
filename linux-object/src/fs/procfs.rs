@@ -48,8 +48,8 @@ impl FileSystem for ProcFS {
 struct ProcRootINode;
 
 impl ProcRootINode {
-    fn entries() -> [&'static str; 3] {
-        ["net", "meminfo", "uptime"]
+    fn entries() -> [&'static str; 4] {
+        ["net", "meminfo", "uptime", "mounts"]
     }
 }
 
@@ -104,6 +104,10 @@ impl INode for ProcRootINode {
             ))),
             "uptime" => Ok(Arc::new(Pseudo::new(
                 &proc_uptime_content(),
+                FileType::File,
+            ))),
+            "mounts" => Ok(Arc::new(Pseudo::new(
+                &proc_mounts_content(),
                 FileType::File,
             ))),
             _ => Err(FsError::EntryNotFound),
@@ -339,6 +343,11 @@ fn proc_meminfo_content() -> String {
     let _ = writeln!(s, "Cached:                0 kB");
     s
 }
+
+fn proc_mounts_content() -> String {
+    super::proc_mounts_content()
+}
+
 fn proc_net_arp_content() -> String {
     let mut s = String::new();
     let _ = writeln!(

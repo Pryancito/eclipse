@@ -7,6 +7,7 @@ mod pipe;
 mod procfs;
 mod proc_self;
 mod pseudo;
+mod sysfs;
 mod epoll;
 mod eventfd;
 pub mod rcore_fs_wrapper;
@@ -27,10 +28,12 @@ pub fn mock_block() -> mock::MockBlock {
     mock::MockBlock::new()
 }
 
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, fmt::Write as _, string::String, string::ToString, sync::Arc, vec::Vec};
 use core::convert::TryFrom;
 
 use async_trait::async_trait;
+use lazy_static::lazy_static;
+use lock::Mutex;
 
 use kernel_hal::drivers;
 use rcore_fs::vfs::{FileSystem, FileType, INode, Result};
@@ -48,6 +51,7 @@ use crate::process::LinuxProcess;
 use devfs::RandomINode;
 use procfs::ProcFS;
 use pseudo::Pseudo;
+use sysfs::SysFS;
 
 pub use file::{File, OpenFlags, PollEvents, SeekFrom};
 pub use pipe::Pipe;
@@ -55,6 +59,44 @@ pub use epoll::{Epoll, EpollEvent};
 pub use eventfd::EventFd;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use stdio::{STDIN, STDOUT};
+
+#[derive(Clone)]
+struct MountEntry {
+    source: String,
+    target: String,
+    fstype: String,
+    options: String,
+}
+
+lazy_static! {
+    static ref MOUNT_TABLE: Mutex<Vec<MountEntry>> = Mutex::new(Vec::new());
+}
+
+fn reset_mount_table() {
+    MOUNT_TABLE.lock().clear();
+}
+
+fn register_mount(source: &str, target: &str, fstype: &str, options: &str) {
+    MOUNT_TABLE.lock().push(MountEntry {
+        source: source.to_string(),
+        target: target.to_string(),
+        fstype: fstype.to_string(),
+        options: options.to_string(),
+    });
+}
+
+pub(crate) fn proc_mounts_content() -> String {
+    let mounts = MOUNT_TABLE.lock();
+    let mut out = String::new();
+    for m in mounts.iter() {
+        let _ = writeln!(
+            out,
+            "{} {} {} {} 0 0",
+            m.source, m.target, m.fstype, m.options
+        );
+    }
+    out
+}
 
 #[async_trait]
 /// Generic file interface
@@ -146,6 +188,8 @@ impl From<FileDesc> for i32 {
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     let rootfs = MountFS::new(rootfs);
     let root = rootfs.mountpoint_root_inode();
+    reset_mount_table();
+    register_mount("rootfs", "/", "rootfs", "rw");
 
     // create DevFS
     let devfs = DevFS::new();
@@ -244,6 +288,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /dev")
     });
     dev.mount(devfs).expect("failed to mount DevFS");
+    register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid");
 
     // mount RamFS at /tmp
     let ramfs = RamFS::new();
@@ -252,6 +297,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /tmp")
     });
     tmp.mount(ramfs).expect("failed to mount RamFS");
+    register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev");
 
     // mount RamFS at /run (essential for DHCP clients and other daemons)
     let run_ramfs = RamFS::new();
@@ -260,6 +306,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /run")
     });
     run.mount(run_ramfs).expect("failed to mount RamFS at /run");
+    register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev");
 
     // Ensure /var/run exists and can be used (often it's a symlink or needs its own mount)
     if let Ok(var) = root.find(true, "var") {
@@ -275,6 +322,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     proc.mount(Arc::new(ProcFS::new()))
         .expect("failed to mount ProcFS");
+    register_mount("proc", "/proc", "proc", "rw,nosuid,nodev,noexec,relatime");
+
+    // mount SysFS at /sys
+    let sys = root.find(true, "sys").unwrap_or_else(|_| {
+        root.create("sys", FileType::Dir, 0o755)
+            .expect("failed to mkdir /sys")
+    });
+    sys.mount(Arc::new(SysFS::new()))
+        .expect("failed to mount SysFS");
+    register_mount("sysfs", "/sys", "sysfs", "rw,nosuid,nodev,noexec,relatime");
 
     root
 }
