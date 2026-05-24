@@ -25,6 +25,25 @@ cfg_if! {
                 #[cfg(not(feature = "mock-disk"))] {
                     use linux_object::fs::rcore_fs_wrapper::*;
                     if let Some(initrd) = init_ram_disk() {
+                        const SFS_MAGIC: u32 = 0x2f8dbe2b;
+                        if initrd.len() >= 4 {
+                            let magic = u32::from_le_bytes([
+                                initrd[0], initrd[1], initrd[2], initrd[3],
+                            ]);
+                            if magic != SFS_MAGIC {
+                                crate::klog_err!(
+                                    "initramfs: magic {:#x} != SFS {:#x} (size={})",
+                                    magic,
+                                    SFS_MAGIC,
+                                    initrd.len()
+                                );
+                            }
+                        } else {
+                            crate::klog_err!(
+                                "initramfs demasiado pequeño para SFS (size={})",
+                                initrd.len()
+                            );
+                        }
                         Arc::new(MemBuf::new(initrd))
                     } else {
                         let block = kernel_hal::drivers::all_block().first_unwrap();

@@ -32,12 +32,12 @@ impl super::LinuxRootfs {
             });
             build_config.invoke(os_xtask_utils::Cargo::build);
 
-            // 3. Build clean x86_64.img (SFS, 48MB)
-            println!("Building clean_x86_64.img...");
-            let clean_img = TARGET.join("clean_x86_64.img");
-            fuse(&rootfs_path, &clean_img, 48 * 1024 * 1024);
+            // 3. Build initramfs SFS (x86_64.img, 80MB)
+            println!("Building x86_64.img...");
+            let initramfs_img = PROJECT_DIR.join("zCore").join("x86_64.img");
+            fuse(&rootfs_path, &initramfs_img, 80 * 1024 * 1024);
 
-            // 4. Build efi.img (FAT32, 100MB)
+            // 4. Build efi.img (FAT32, 128MB)
             println!("Building efi.img...");
             let efi_img = TARGET.join("efi.img");
             let _ = fs::remove_file(&efi_img);
@@ -48,7 +48,7 @@ impl super::LinuxRootfs {
                 .truncate(true)
                 .open(&efi_img)
                 .unwrap();
-            file.set_len(100 * 1024 * 1024).unwrap();
+            file.set_len(128 * 1024 * 1024).unwrap();
             drop(file);
 
             let status = std::process::Command::new("mkfs.vfat")
@@ -103,7 +103,7 @@ impl super::LinuxRootfs {
             let status = std::process::Command::new("mcopy")
                 .arg("-i")
                 .arg(&efi_img)
-                .arg(&clean_img)
+                .arg(&initramfs_img)
                 .arg("::/EFI/zCore/initramfs.img")
                 .status()
                 .unwrap();
@@ -153,10 +153,12 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress rootfs.ext2");
 
-            // 6. Build the final installer-enabled x86_64.img (SFS, 80MB)
+            // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
             println!("Building final installer-enabled image...");
             let image = PROJECT_DIR.join("zCore").join(format!("{arch}.img", arch = self.0.name()));
-            fuse(&rootfs_path, &image, 80 * 1024 * 1024);
+            if initramfs_img != image {
+                fs::copy(&initramfs_img, &image).unwrap();
+            }
 
             let _ = fs::remove_file(efi_gz);
             let _ = fs::remove_file(ext2_gz);

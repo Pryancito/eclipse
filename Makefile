@@ -113,7 +113,7 @@ ESP_DIR := $(CURDIR)/target/$(ARCH)/$(MODE)/esp
 ISO_STAGING := $(BUILD_DIR)/iso-root
 ESP_IMG := $(BUILD_DIR)/esp.img
 DISK_IMG := $(BUILD_DIR)/disk.img
-ESP_IMG_SIZE_MB ?= 128
+ESP_IMG_SIZE_MB ?= 192
 DISK_IMG_SIZE_MB ?= 256
 ISO_OUT := $(DIST_DIR)/eclipse-$(ARCH).iso
 QCOW2_OUT := $(DIST_DIR)/eclipse-$(ARCH).qcow2
@@ -132,6 +132,8 @@ ifeq ($(ARCH), x86_64)
 	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
 	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
+		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@mkdir -p "$(ISO_STAGING)/boot"
 	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
@@ -162,6 +164,8 @@ ifeq ($(ARCH), x86_64)
 	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
 	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
+		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@qemu-img convert -f raw "$(ESP_IMG)" -O qcow2 "$(QCOW2_OUT)" >/dev/null
 	@echo "qcow2 generado: $(QCOW2_OUT)"
@@ -185,6 +189,8 @@ ifeq ($(ARCH), x86_64)
 	@# FAT32 ESP starts at 2048 * 512 = 1048576 bytes (1MiB)
 	@mformat -i "$(DISK_IMG)@@1048576" -F -v EFI :: >/dev/null
 	@mmd -i "$(DISK_IMG)@@1048576" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
+	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
+		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@mcopy -i "$(DISK_IMG)@@1048576" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@cp -f "$(DISK_IMG)" "$(IMG_OUT)"
 	@echo "img generado: $(IMG_OUT)"

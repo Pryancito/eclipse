@@ -45,6 +45,9 @@ pub fn cmdline() -> alloc::string::String {
 }
 
 pub fn init_ram_disk() -> Option<&'static mut [u8]> {
+    if KCONFIG.initrd_start == 0 || KCONFIG.initrd_size == 0 {
+        return None;
+    }
     let start = phys_to_virt(KCONFIG.initrd_start as usize);
     Some(unsafe { core::slice::from_raw_parts_mut(start as *mut u8, KCONFIG.initrd_size as usize) })
 }

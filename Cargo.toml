@@ -37,3 +37,12 @@ time-core = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
 [patch."https://github.com/smoltcp-rs/smoltcp"]
 smoltcp = { path = "./smoltcp" }
 
+[patch."https://github.com/rcore-os/rcore-fs"]
+rcore-fs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs" }
+rcore-fs-sfs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-sfs" }
+rcore-fs-fuse = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-fuse" }
+rcore-fs-ramfs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-ramfs" }
+rcore-fs-mountfs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-mountfs" }
+rcore-fs-devfs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-devfs" }
+rcore-fs-hostfs = { path = "ignored/origin/repos/rcore-fs-temp/rcore-fs-hostfs" }
+
