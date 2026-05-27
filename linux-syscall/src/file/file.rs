@@ -18,22 +18,45 @@ impl Syscall<'_> {
     /// - fd – file descriptor
     /// - base – pointer to the buffer to fill with read contents
     /// - len – number of bytes to read
-    pub async fn sys_read(&self, fd: FileDesc, mut base: UserOutPtr<u8>, len: usize) -> SysResult {
+    pub async fn sys_read(&self, fd: FileDesc, base: UserOutPtr<u8>, len: usize) -> SysResult {
         info!("read: fd={:?}, base={:?}, len={:#x}", fd, base, len);
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let mut buf = vec![0u8; len];
-        let len = file_like.read(&mut buf).await?;
 
-        if len > 0 && usize::from(fd) == 0 && buf[0] == 0x03 {
-            // Convert ETX into a terminal interrupt.
-            // We set the pending latch and let the centralized handler deliver SIGINT.
-            linux_object::fs::stdio::ctrl_c_pending_set();
-            return Err(LxError::EINTR);
+        let is_seekable = if let Ok(file) = file_like.clone().downcast_arc::<linux_object::fs::File>() {
+            if let Ok(meta) = file.metadata() {
+                meta.type_ == linux_object::fs::vfs::FileType::File
+                    || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let chunk_size = len.min(1024 * 1024);
+        let mut buf = vec![0u8; chunk_size];
+        let mut read_len = 0;
+
+        while read_len < len {
+            let current_len = (len - read_len).min(chunk_size);
+            let n = file_like.read(&mut buf[..current_len]).await?;
+            if n == 0 {
+                break;
+            }
+            if n > 0 && usize::from(fd) == 0 && buf[0] == 0x03 {
+                // Convert ETX into a terminal interrupt.
+                // We set the pending latch and let the centralized handler deliver SIGINT.
+                linux_object::fs::stdio::ctrl_c_pending_set();
+                return Err(LxError::EINTR);
+            }
+            base.add(read_len).write_array(&buf[..n])?;
+            read_len += n;
+            if n < current_len || !is_seekable {
+                break;
+            }
         }
-
-        base.write_array(&buf[..len])?;
-        Ok(len)
+        Ok(read_len)
     }
 
     /// Writes to a specified file using a file descriptor. Before using this call,
@@ -54,7 +77,7 @@ impl Syscall<'_> {
     pub async fn sys_pread(
         &self,
         fd: FileDesc,
-        mut base: UserOutPtr<u8>,
+        base: UserOutPtr<u8>,
         len: usize,
         offset: u64,
     ) -> SysResult {
@@ -64,10 +87,24 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let mut buf = vec![0u8; len];
-        let len = file_like.read_at(offset, &mut buf).await?;
-        base.write_array(&buf[..len])?;
-        Ok(len)
+
+        let chunk_size = len.min(1024 * 1024);
+        let mut buf = vec![0u8; chunk_size];
+        let mut read_len = 0;
+
+        while read_len < len {
+            let current_len = (len - read_len).min(chunk_size);
+            let n = file_like.read_at(offset + read_len as u64, &mut buf[..current_len]).await?;
+            if n == 0 {
+                break;
+            }
+            base.add(read_len).write_array(&buf[..n])?;
+            read_len += n;
+            if n < current_len {
+                break;
+            }
+        }
+        Ok(read_len)
     }
 
     /// writes up to count bytes from the buffer
@@ -101,9 +138,10 @@ impl Syscall<'_> {
         let mut iovs = iov_ptr.read_iovecs(iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let mut buf = vec![0u8; iovs.total_len()];
+        let total_len = iovs.total_len().min(1024 * 1024);
+        let mut buf = vec![0u8; total_len];
         let len = file_like.read(&mut buf).await?;
-        iovs.write_from_buf(&buf)?;
+        iovs.write_from_buf(&buf[..len])?;
         Ok(len)
     }
 
@@ -371,7 +409,8 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode_at(dirfd, path, follow)?;
         let metadata = inode.metadata()?;
         let requested = (mode & 0o7) as u16;
-        proc.check_access(&metadata, requested, false)?;
+        let use_effective = flags.contains(AtFlags::EACCESS);
+        proc.check_access(&metadata, requested, use_effective)?;
         Ok(0)
     }
 

@@ -215,6 +215,18 @@ impl Syscall<'_> {
         }
     }
 
+    /// `getrlimit` gets resource limits.
+    pub fn sys_getrlimit(&mut self, resource: usize, rlim: UserOutPtr<RLimit>) -> SysResult {
+        info!("getrlimit: resource={}, rlim={:?}", resource, rlim);
+        self.sys_prlimit64(0, resource, 0.into(), rlim)
+    }
+
+    /// `setrlimit` sets resource limits.
+    pub fn sys_setrlimit(&mut self, resource: usize, rlim: UserInPtr<RLimit>) -> SysResult {
+        info!("setrlimit: resource={}, rlim={:?}", resource, rlim);
+        self.sys_prlimit64(0, resource, rlim, 0.into())
+    }
+
     #[allow(unsafe_code)]
     /// fills the buffer pointed to by `buf` with up to `buflen` random bytes.
     /// - `buf` - buffer that needed to fill
@@ -288,11 +300,17 @@ impl Syscall<'_> {
     ///   - GRND_RANDOM
     ///   - GRND_NONBLOCK
     /// - returns the number of bytes that were copied to the buffer buf.
-    pub fn sys_getrandom(&mut self, mut buf: UserOutPtr<u8>, len: usize, flag: u32) -> SysResult {
+    pub fn sys_getrandom(&mut self, buf: UserOutPtr<u8>, len: usize, flag: u32) -> SysResult {
         info!("getrandom: buf: {:?}, len: {:?}, flag {:?}", buf, len, flag);
-        let mut buffer = vec![0u8; len];
-        kernel_hal::rand::fill_random(&mut buffer);
-        buf.write_array(&buffer[..len])?;
+        let mut written = 0;
+        let mut chunk = [0u8; 1024];
+        while written < len {
+            let left = len - written;
+            let current_len = left.min(chunk.len());
+            kernel_hal::rand::fill_random(&mut chunk[..current_len]);
+            buf.add(written).write_array(&chunk[..current_len])?;
+            written += current_len;
+        }
         Ok(len)
     }
 }

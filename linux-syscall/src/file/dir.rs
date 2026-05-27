@@ -117,7 +117,8 @@ impl Syscall<'_> {
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
-        let mut kbuf = vec![0; buf_size];
+        let cap_size = buf_size.min(256 * 1024);
+        let mut kbuf = vec![0; cap_size];
         let mut writer = DirentBufWriter::new(&mut kbuf);
         loop {
             let name = match file.read_entry() {
@@ -270,7 +271,8 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         // TODO: recursive link resolution and loop detection
-        let mut buf = vec![0; len];
+        let cap_len = len.min(4096);
+        let mut buf = vec![0; cap_len];
         let len = inode.read_at(0, &mut buf)?;
         base.write_array(&buf[..len])?;
         Ok(len)
@@ -431,5 +433,6 @@ bitflags! {
     pub struct AtFlags: usize {
         const EMPTY_PATH = 0x1000;
         const SYMLINK_NOFOLLOW = 0x100;
+        const EACCESS = 0x200;
     }
 }

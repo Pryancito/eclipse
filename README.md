@@ -136,12 +136,17 @@ cargo image --arch x86_64
 
 ## Soporte de Plataformas
 
-### x86_64 (Qemu/ICH9)
+### x86_64 (Qemu y Hardware Real)
 
-Soporte completo para arquitectura x86_64 mediante QEMU, con un driver AHCI/SATA de alto rendimiento.
+Soporte completo para arquitectura x86_64 en emuladores (QEMU) y en hardware real con mejoras significativas de compatibilidad:
 
-- **Driver AHCI**: Soporta controladores ICH9, con mapeo dinámico de BAR5 (ABAR) y gestión de puertos.
-- **Estado**: El sistema identifica discos SATA, monta el sistema de archivos raíz y arranca con éxito hasta una shell de `busybox`.
+- **Driver AHCI/SATA**: Soporte mejorado con inicialización robusta que incluye el protocolo de handoff BIOS/OS, estabilización del enlace físico PHY (SATA DET) y verificación flexible de firmas de dispositivos (`PORT_SIG`). También se activa el Bus Mastering PCI para prevenir fallos de Master Abort en hardware real.
+- **Driver NVMe**: Soporte para controladores de almacenamiento NVMe con consistencia de caché por DMA utilizando instrucciones `clflush`.
+- **Detección y Particionado Automático**: Detección dinámica de esquemas de particionamiento MBR y GPT al arranque del sistema. Las particiones (como `/dev/sda1` o `/dev/nvme0n1p1`) se registran automáticamente en `devfs` y se exponen como dispositivos independientes.
+- **Entrada y Teclado**: Soporte para teclado PS/2 con mapeo completo de la distribución de teclado en español, permitiendo el uso correcto de caracteres especiales y acentos (`ñ`, `Ñ`, `@`, `#`, `[`, `]`, `{`, `}`, `|`, `\`, `~`, `€`) a través de modificadores (AltGr y Shift).
+- **Instalador del Sistema (`install-eclipse`)**: Herramienta de instalación optimizada para desplegar el sistema en discos físicos y virtuales, con detección precisa de tamaño de disco combinando consultas a `sysfs` y la llamada `BLKGETSIZE64`.
+- **Estabilidad de Memoria ante Presión (OOM)**: Mitigación de pánicos del kernel por agotamiento de heap (BuddyAllocator) mediante límites estrictos de asignación temporal (1 MB) y procesamiento fragmentado (chunked) en syscalls de E/S (`sys_read`, `sys_pread`, etc.), y una estrategia de carga ELF (`sys_execve`) robusta utilizando mapeos dinámicos bajo demanda de `VmObject`s paginados en la región virtual del kernel (`KERNEL_ASPACE`) sin asignar memoria física contigua.
+- **Estado**: El sistema arranca con éxito en hardware real e inicializa los controladores de almacenamiento, monta el sistema de archivos de forma nativa e inicia la consola interactiva (`busybox`).
 
 ### Qemu/virt (RISC-V)
 

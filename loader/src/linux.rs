@@ -30,7 +30,7 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     };
 
     let inode = rootfs.root_inode().lookup(&args[0]).unwrap();
-    let data = inode.read_as_vec().unwrap();
+    let vmo = inode.read_as_vmo().unwrap();
     let path = args[0].clone();
 
     // Boot UX: clear to black right before the first graphic-console output (prompt).
@@ -40,7 +40,7 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    let (entry, sp, initial_brk, execute_path) = loader.load(&proc.vmar(), &data, args, envs, path).unwrap();
+    let (entry, sp, initial_brk, execute_path) = loader.load(&proc.vmar(), &vmo, args, envs, path).unwrap();
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_brk(initial_brk);
 

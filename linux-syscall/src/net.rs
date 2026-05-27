@@ -299,7 +299,8 @@ impl Syscall<'_> {
             file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
         }
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
-        let mut data = vec![0u8; len];
+        let cap_len = len.min(1024 * 1024);
+        let mut data = vec![0u8; cap_len];
         let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
         if force_nonblock {
             let _ = file_like.set_flags(old_flags);
@@ -362,7 +363,8 @@ impl Syscall<'_> {
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
         let mut iovs = iov_ptr.read_iovecs(iovlen)?;
-        let mut data = vec![0u8; iovs.total_len()];
+        let total_len = iovs.total_len().min(1024 * 1024);
+        let mut data = vec![0u8; total_len];
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let old_flags = file_like.flags();

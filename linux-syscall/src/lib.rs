@@ -147,6 +147,7 @@ impl Syscall<'_> {
             Sys::FCHOWN => self.sys_fchown(a0.into(), a1, a2),
             Sys::FCHOWNAT => self.sys_fchownat(a0.into(), a1.into(), a2, a3, a4),
             Sys::FACCESSAT => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
+            Sys::FACCESSAT2 => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
             Sys::DUP => self.sys_dup(a0.into()),
             Sys::DUP3 => self.sys_dup2(a0.into(), a1.into()), // TODO: handle `flags`
             Sys::PIPE2 => self.sys_pipe2(a0.into(), a1),      // TODO: handle `flags`
@@ -265,8 +266,8 @@ impl Syscall<'_> {
             Sys::UNAME => self.sys_uname(a0.into()),
             Sys::SYSLOG => self.sys_syslog(a0 as i32, a1.into(), a2 as i32),
             Sys::UMASK => self.sys_umask(a0),
-            //            Sys::GETRLIMIT => self.sys_getrlimit(),
-            //            Sys::SETRLIMIT => self.sys_setrlimit(),
+            Sys::GETRLIMIT => self.sys_getrlimit(a0, a1.into()),
+            Sys::SETRLIMIT => self.sys_setrlimit(a0, a1.into()),
             Sys::GETRUSAGE => self.sys_getrusage(a0, a1.into()),
             Sys::SYSINFO => self.sys_sysinfo(a0.into()),
             Sys::TIMES => self.sys_times(a0.into()),
@@ -278,6 +279,10 @@ impl Syscall<'_> {
             Sys::SETREGID => self.sys_setregid(a0, a1),
             Sys::SETRESUID => self.sys_setresuid(a0, a1, a2),
             Sys::SETRESGID => self.sys_setresgid(a0, a1, a2),
+            Sys::GETRESUID => self.sys_getresuid(a0.into(), a1.into(), a2.into()),
+            Sys::GETRESGID => self.sys_getresgid(a0.into(), a1.into(), a2.into()),
+            Sys::SETFSUID => self.sys_setfsuid(a0),
+            Sys::SETFSGID => self.sys_setfsgid(a0),
             Sys::GETEUID => self.sys_geteuid(),
             Sys::GETEGID => self.sys_getegid(),
             Sys::SETPGID => self.sys_setpgid(a0, a1),
@@ -292,6 +297,7 @@ impl Syscall<'_> {
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1 as usize, a2 as u32),
+            Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
             Sys::RT_SIGQUEUEINFO => self.unimplemented("rt_sigqueueinfo", Ok(0)),
 
             // kernel module

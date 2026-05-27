@@ -32,15 +32,32 @@ impl LinuxElfLoader {
     ///
     /// `brk` is the initial program break (end of the loaded image, page-aligned).
     /// Callers should store it on the process with `proc.linux().set_brk(brk)`.
+    /// load a Linux ElfFile and return a tuple of (entry, sp, brk)
+    ///
+    /// `brk` is the initial program break (end of the loaded image, page-aligned).
+    /// Callers should store it on the process with `proc.linux().set_brk(brk)`.
     pub fn load(
         &self,
         vmar: &Arc<VmAddressRegion>,
-        data: &[u8],
+        vmo: &Arc<VmObject>,
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
     ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
-        self.load_impl(vmar, data, args, envs, path, 0)
+        let size = zircon_object::vm::roundup_pages(vmo.len());
+        let virt_addr = zircon_object::vm::KERNEL_ASPACE.map(
+            None,
+            vmo.clone(),
+            0,
+            size,
+            zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE,
+        )?;
+        let data = unsafe { core::slice::from_raw_parts(virt_addr as *const u8, vmo.len()) };
+
+        let res = self.load_impl(vmar, data, args, envs, path, 0);
+
+        zircon_object::vm::KERNEL_ASPACE.unmap(virt_addr, size)?;
+        res
     }
 
     /// Maximum number of interpreter levels (shebang + ELF PT_INTERP combined).
@@ -101,10 +118,20 @@ impl LinuxElfLoader {
                 error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
-            let interp_data = inode.read_as_vec().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo().map_err(|e| {
                 error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
+            let interp_size = zircon_object::vm::roundup_pages(interp_vmo.len());
+            let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
+                None,
+                interp_vmo.clone(),
+                0,
+                interp_size,
+                zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE,
+            )?;
+            let interp_data = unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
+
             let interp_path: String = interp.into();
             let mut new_args = vec![interp_path.clone()];
             if let Some(arg) = interp_arg {
@@ -112,7 +139,10 @@ impl LinuxElfLoader {
             }
             new_args.push(path);
             new_args.extend_from_slice(args.get(1..).unwrap_or_default());
-            return self.load_impl(vmar, &interp_data, new_args, envs, interp_path, recursion + 1);
+            let res = self.load_impl(vmar, interp_data, new_args, envs, interp_path, recursion + 1);
+
+            zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size)?;
+            return res;
         }
 
         let elf = ElfFile::new(data).map_err(|e| {
@@ -158,11 +188,21 @@ impl LinuxElfLoader {
                 error!("elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)", interp, e);
                 e
             })?;
-            let interp_data = inode.read_as_vec().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo().map_err(|e| {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;
-            let interp_elf = ElfFile::new(&interp_data).map_err(|_| {
+            let interp_size_aligned = zircon_object::vm::roundup_pages(interp_vmo.len());
+            let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
+                None,
+                interp_vmo.clone(),
+                0,
+                interp_size_aligned,
+                zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE,
+            )?;
+            let interp_data = unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
+
+            let interp_elf = ElfFile::new(interp_data).map_err(|_| {
                 error!("elf: interp {:?} is not a valid ELF", interp);
                 ZxError::INVALID_ARGS
             })?;
@@ -188,6 +228,8 @@ impl LinuxElfLoader {
                     )
                 }
             }
+
+            zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size_aligned)?;
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
             let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;

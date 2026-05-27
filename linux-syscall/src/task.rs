@@ -331,7 +331,7 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
-        let data = inode.read_as_vec()?;
+        let vmo = inode.read_as_vmo()?;
 
         proc.remove_cloexec_files();
 
@@ -346,7 +346,7 @@ impl Syscall<'_> {
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
-        .load(&vmar, &data, args, envs, path_str)
+        .load(&vmar, &vmo, args, envs, path_str)
         .map_err(|e| {
             error!("execve: LinuxElfLoader::load failed: {:?}", e);
             e
@@ -616,6 +616,50 @@ impl Syscall<'_> {
         proc.chmod_metadata(&mut metadata, mode as u16)?;
         inode.set_metadata(&metadata)?;
         Ok(0)
+    }
+
+    /// `getresuid` returns the real, effective, and saved user IDs.
+    pub fn sys_getresuid(
+        &self,
+        mut ruid: UserOutPtr<u32>,
+        mut euid: UserOutPtr<u32>,
+        mut suid: UserOutPtr<u32>,
+    ) -> SysResult {
+        debug!("getresuid: ruid={:?}, euid={:?}, suid={:?}", ruid, euid, suid);
+        let creds = self.linux_process().credentials();
+        ruid.write(creds.ruid)?;
+        euid.write(creds.euid)?;
+        suid.write(creds.suid)?;
+        Ok(0)
+    }
+
+    /// `getresgid` returns the real, effective, and saved group IDs.
+    pub fn sys_getresgid(
+        &self,
+        mut rgid: UserOutPtr<u32>,
+        mut egid: UserOutPtr<u32>,
+        mut sgid: UserOutPtr<u32>,
+    ) -> SysResult {
+        debug!("getresgid: rgid={:?}, egid={:?}, sgid={:?}", rgid, egid, sgid);
+        let creds = self.linux_process().credentials();
+        rgid.write(creds.rgid)?;
+        egid.write(creds.egid)?;
+        sgid.write(creds.sgid)?;
+        Ok(0)
+    }
+
+    /// `setfsuid` sets the user ID used for filesystem checks.
+    pub fn sys_setfsuid(&self, fsuid: usize) -> SysResult {
+        debug!("setfsuid: fsuid={}", fsuid);
+        let old_fsuid = self.linux_process().euid() as usize;
+        Ok(old_fsuid)
+    }
+
+    /// `setfsgid` sets the group ID used for filesystem checks.
+    pub fn sys_setfsgid(&self, fsgid: usize) -> SysResult {
+        debug!("setfsgid: fsgid={}", fsgid);
+        let old_fsgid = self.linux_process().egid() as usize;
+        Ok(old_fsgid)
     }
 }
 
