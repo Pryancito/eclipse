@@ -547,12 +547,8 @@ impl Syscall<'_> {
         let path = path.as_c_str()?;
         info!("statfs: path={:?}, buf={:?}", path, buf);
 
-        // TODO
-        // 现在 `path` 没用到，因为没实现真正的挂载，不可能搞一个非主要文件系统的路径。
-        // 实现挂载之后，要用 `path` 分辨路径在哪个文件系统里，根据对应文件系统的特性返回统计信息。
-        // （以及根据挂载选项填写 `StatFs::f_flags`！）
-
-        let info = self.linux_process().root_inode().fs().info();
+        let inode = self.linux_process().lookup_inode(path)?;
+        let info = inode.fs().info();
         buf.write(info.into())?;
         Ok(0)
     }

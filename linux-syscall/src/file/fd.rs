@@ -109,9 +109,16 @@ impl Syscall<'_> {
     pub fn sys_dup2(&self, fd1: FileDesc, fd2: FileDesc) -> SysResult {
         info!("dup2: from {:?} to {:?}", fd1, fd2);
         let proc = self.linux_process();
+        if fd1 == fd2 {
+            let _ = proc.get_file_like(fd1)?;
+            return Ok(fd2.into());
+        }
         // close fd2 first if it is opened
         let _ = proc.close_file(fd2);
         let file_like = proc.get_file_like(fd1)?.dup();
+        let mut flags = file_like.flags();
+        flags -= OpenFlags::CLOEXEC;
+        file_like.set_flags(flags)?;
         let fd2 = proc.add_file_at(fd2, file_like)?;
         Ok(fd2.into())
     }
@@ -121,6 +128,9 @@ impl Syscall<'_> {
         info!("dup: from {:?}", fd1);
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd1)?.dup();
+        let mut flags = file_like.flags();
+        flags -= OpenFlags::CLOEXEC;
+        file_like.set_flags(flags)?;
         let fd2 = proc.add_file(file_like)?;
         Ok(fd2.into())
     }
