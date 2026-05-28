@@ -117,6 +117,39 @@ impl Socket for UdpSocketState {
             thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
         }
     }
+    async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
+        let inner = self.inner.lock();
+        loop {
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            let mut socket = sets.get::<UdpSocket>(inner.handle.0);
+            let copied_len = socket.peek_slice(data);
+            drop(socket);
+            drop(sets);
+
+            match copied_len {
+                Ok((size, endpoint)) => return (Ok(size), Endpoint::Ip(*endpoint)),
+                Err(smoltcp::Error::Exhausted) => {
+                    poll_ifaces();
+                    if inner.flags.contains(OpenFlags::NON_BLOCK) {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                }
+                Err(err) => {
+                    error!("udp socket peek_slice error: {:?}", err);
+                    return (
+                        Err(LxError::ENOTCONN),
+                        Endpoint::Ip(IpEndpoint::UNSPECIFIED),
+                    );
+                }
+            }
+            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+        }
+    }
     /// write from buffer
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         info!("udp write");

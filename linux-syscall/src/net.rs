@@ -7,6 +7,7 @@ use linux_object::{
 };
 
 const MSG_DONTWAIT: usize = 0x40;
+const MSG_PEEK: usize = 0x2;
 
 impl Syscall<'_> {
     /// creates an endpoint for communication and returns a file descriptor that refers to that endpoint.
@@ -301,7 +302,12 @@ impl Syscall<'_> {
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
         let cap_len = len.min(1024 * 1024);
         let mut data = vec![0u8; cap_len];
-        let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
+        let socket = file_like.as_socket()?;
+        let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
+            socket.peek(&mut data).await
+        } else {
+            socket.read(&mut data).await
+        };
         if force_nonblock {
             let _ = file_like.set_flags(old_flags);
         }
@@ -372,7 +378,12 @@ impl Syscall<'_> {
         if force_nonblock {
             file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
         }
-        let (result, endpoint) = file_like.clone().as_socket()?.read(&mut data).await;
+        let socket = file_like.as_socket()?;
+        let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
+            socket.peek(&mut data).await
+        } else {
+            socket.read(&mut data).await
+        };
         if force_nonblock {
             let _ = file_like.set_flags(old_flags);
         }
