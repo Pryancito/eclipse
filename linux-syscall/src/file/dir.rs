@@ -125,8 +125,12 @@ impl Syscall<'_> {
                 Err(LxError::ENOENT) => break,
                 r => r,
             }?;
-            // TODO: get ino from dirent
-            let ok = writer.try_write(0, DirentType::from(info.type_).bits(), &name);
+            // Query child inode to report correct file type
+            let child_type = file.inode().find(&name)
+                .and_then(|c| c.metadata())
+                .map(|m| m.type_)
+                .unwrap_or(FileType::File);
+            let ok = writer.try_write(0, DirentType::from(child_type).bits(), &name);
             if !ok {
                 break;
             }

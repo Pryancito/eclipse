@@ -73,7 +73,7 @@ impl INode for ProcRootINode {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 0,
+            inode: 10,
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -91,6 +91,10 @@ impl INode for ProcRootINode {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
@@ -151,7 +155,7 @@ impl INode for ProcNetDirINode {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 0,
+            inode: 20,
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -169,6 +173,10 @@ impl INode for ProcNetDirINode {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
@@ -228,7 +236,7 @@ impl INode for ProcNetDevINode {
         let size = proc_net_dev_content().len();
         Ok(Metadata {
             dev: 0,
-            inode: 0,
+            inode: 30,
             size,
             blk_size: 4096,
             blocks: (size + 4095) / 4096,
@@ -246,6 +254,10 @@ impl INode for ProcNetDevINode {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
     }
 }
 

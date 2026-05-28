@@ -45,11 +45,11 @@ impl Syscall<'_> {
 
         let strings = [
             "Linux",                            // sysname
-            "zcore",                            // nodename
+            "Eclipse",                          // nodename
             release.as_str(),                   // release
             vdso_const.version_string.as_str(), // version
             arch,                               // machine
-            "rcore-os",                         // domainname
+            "Eclipse-OS",                       // domainname
         ];
 
         for (i, &s) in strings.iter().enumerate() {

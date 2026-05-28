@@ -123,6 +123,9 @@ impl LinuxRootfs {
             fs::write(&machine_id, b"eclipseoseclipseoseclipseoseclip\n").unwrap();
         }
 
+        // /etc/hostname
+        fs::write(etc.join("hostname"), b"Eclipse\n").unwrap();
+
         // 拷贝 libc.so
         let from = musl
             .join(format!("{}-linux-musl", self.0.name()))

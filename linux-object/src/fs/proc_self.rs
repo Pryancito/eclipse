@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use rcore_fs::vfs::*;
 use zircon_object::task::Process;
+use zircon_object::object::KernelObject;
 use crate::process::ProcessExt;
 use crate::fs::pseudo::Pseudo;
 
@@ -28,7 +29,7 @@ impl INode for ProcSelfFdDir {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 0,
+            inode: 40 + self.process.id() as usize,
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -45,6 +46,9 @@ impl INode for ProcSelfFdDir {
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(crate::fs::procfs::ProcFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
