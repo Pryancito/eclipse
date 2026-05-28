@@ -136,6 +136,63 @@ impl Socket for TcpSocketState {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
+    async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
+        let (handle, flags) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.flags)
+        };
+        loop {
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            poll_ifaces();
+
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            let mut socket = sets.get::<TcpSocket>(handle);
+            let state = socket.state();
+            let mut copied_len = socket.peek_slice(data);
+            if let Ok(0) = copied_len {
+                if !data.is_empty() {
+                    copied_len = Err(smoltcp::Error::Exhausted);
+                }
+            }
+            log::warn!(
+                "[tcp peek debug] data.len()={}, state={:?}, result={:?}",
+                data.len(),
+                state,
+                copied_len
+            );
+            drop(socket);
+            drop(sets);
+            match copied_len {
+                Err(smoltcp::Error::Exhausted) => {
+                    if flags.contains(OpenFlags::NON_BLOCK) {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                }
+                Ok(size) => {
+                    let endpoint = get_sockets()
+                        .lock()
+                        .get::<TcpSocket>(handle)
+                        .remote_endpoint();
+                    return (Ok(size), Endpoint::Ip(endpoint));
+                }
+                Err(smoltcp::Error::Finished) => {
+                    return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                }
+                Err(err) => {
+                    error!("Tcp socket peek error: {:?}", err);
+                    return (
+                        Err(LxError::ENOTCONN),
+                        Endpoint::Ip(IpEndpoint::UNSPECIFIED),
+                    );
+                }
+            }
+            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+        }
+    }
     /// write from buffer
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
         //loop {

@@ -1021,6 +1021,10 @@ use async_trait::async_trait;
 pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// missing documentation
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint);
+    /// Receive without consuming buffered data when supported.
+    async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
+        self.read(data).await
+    }
     /// missing documentation
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult;
     /// wait for some event (in, out, err) on a fd
