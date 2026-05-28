@@ -4415,6 +4415,9 @@ impl NetScheme for E1000eInterface {
             let mut sockets = sockets.lock();
             let _ = self.iface.lock().poll(&mut sockets, ts);
         }
+        // Wake any TCP read tasks that were sleeping waiting for RX data.
+        // This replaces the 5 ms timer as the primary wake-up mechanism.
+        super::wake_net_rx_waiters();
         self.driver.hw.lock().maybe_log_rx_diag();
         self.ims_rearm();
         Ok(())

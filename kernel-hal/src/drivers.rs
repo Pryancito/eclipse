@@ -317,4 +317,11 @@ mod drivers_ffi {
             klog_emit(priority, s);
         }
     }
+
+    /// Wake all tasks blocked in TcpSocket::read waiting for RX data.
+    /// Called by the NIC driver (e1000e) after iface.poll() processes packets.
+    #[no_mangle]
+    extern "C" fn drivers_wake_net_rx_waiters() {
+        crate::net::wake_net_rx_waiters();
+    }
 }

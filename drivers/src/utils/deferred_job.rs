@@ -12,11 +12,36 @@ use lock::Mutex;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+extern "C" {
+    fn drivers_intr_on();
+    fn drivers_intr_off();
+    fn drivers_intr_get() -> bool;
+}
+
+fn intr_get() -> bool {
+    unsafe { drivers_intr_get() }
+}
+
+fn intr_off() {
+    unsafe { drivers_intr_off() }
+}
+
+fn intr_on() {
+    unsafe { drivers_intr_on() }
+}
+
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
 /// Enqueue a closure to be executed later outside of IRQ context.
 pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
+    let flag = intr_get();
+    if flag {
+        intr_off();
+    }
     JOBS.lock().push(Box::new(f));
+    if flag {
+        intr_on();
+    }
 }
 
 /// Execute all currently queued deferred jobs.
@@ -24,10 +49,17 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
 /// Should be called from a non-atomic context (e.g. the kernel idle loop or a
 /// timer tick handler).
 pub fn drain_deferred_jobs() {
+    let flag = intr_get();
+    if flag {
+        intr_off();
+    }
     let jobs: Vec<Job> = {
         let mut q = JOBS.lock();
         core::mem::take(&mut *q)
     };
+    if flag {
+        intr_on();
+    }
     for job in jobs {
         job();
     }

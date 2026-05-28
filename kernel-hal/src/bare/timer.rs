@@ -25,7 +25,14 @@ hal_fn_impl! {
 
         fn timer_set(deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send + Sync>) {
             debug!("Set timer at: {:?}", deadline);
+            let enable = crate::interrupt::intr_get();
+            if enable {
+                crate::interrupt::intr_off();
+            }
             NAIVE_TIMER.lock().add(deadline, callback);
+            if enable {
+                crate::interrupt::intr_on();
+            }
         }
 
         fn timer_tick() {

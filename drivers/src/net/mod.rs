@@ -134,6 +134,13 @@ extern "C" {
     fn drivers_intr_on();
     fn drivers_intr_off();
     fn drivers_intr_get() -> bool;
+    fn drivers_wake_net_rx_waiters();
+}
+
+/// Wake all tasks waiting for TCP/UDP RX data.
+/// Call this after `iface.poll()` processes incoming packets.
+pub fn wake_net_rx_waiters() {
+    unsafe { drivers_wake_net_rx_waiters() }
 }
 
 pub const PAGE_SIZE: usize = 4096;

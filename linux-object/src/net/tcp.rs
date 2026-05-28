@@ -74,33 +74,45 @@ impl Socket for TcpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         info!("tcp read");
-        let inner = self.inner.lock();
+        let (handle, flags) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.flags)
+        };
         loop {
-            //poll_ifaces();
+            // Drive the NIC FIRST so any buffered or deferred RX data is
+            // deposited into the smoltcp socket before we call recv_slice.
+            // Without this ordering the data sits in the NIC ring/deferred-job
+            // queue while recv_slice sees an empty socket, causing a full
+            // extra sleep cycle (up to 5 ms) before the data is visible.
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            poll_ifaces();
 
             let sets = get_sockets();
             let mut sets = sets.lock();
-            let mut socket = sets.get::<TcpSocket>(inner.handle.0);
+            let mut socket = sets.get::<TcpSocket>(handle);
 
-            let copied_len = socket.recv_slice(data);
+            let state = socket.state();
+            let mut copied_len = socket.recv_slice(data);
+            if let Ok(0) = copied_len {
+                if !data.is_empty() {
+                    copied_len = Err(smoltcp::Error::Exhausted);
+                }
+            }
+            log::warn!("[tcp read debug] data.len()={}, state={:?}, result={:?}", data.len(), state, copied_len);
             // avoid deadlock in poll_ifaces()
             drop(socket);
             drop(sets);
-
             match copied_len {
-                Ok(0) | Err(smoltcp::Error::Exhausted) => {
-                    poll_ifaces();
-                    if inner.flags.contains(OpenFlags::NON_BLOCK) {
+                Err(smoltcp::Error::Exhausted) => {
+                    if flags.contains(OpenFlags::NON_BLOCK) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-                    } else {
-                        // Continue reading
-                        trace!("Continue reading");
                     }
+                    // No data after driving NIC — wait for next interrupt or timeout.
                 }
                 Ok(size) => {
                     let endpoint = get_sockets()
                         .lock()
-                        .get::<TcpSocket>(inner.handle.0)
+                        .get::<TcpSocket>(handle)
                         .remote_endpoint();
                     return (Ok(size), Endpoint::Ip(endpoint));
                 }
@@ -118,8 +130,10 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+            // Wait for NIC RX notification (woken by e1000e::poll →
+            // wake_net_rx_waiters) or fall back after 5 ms so smoltcp
+            // retransmit timers can tick.
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     /// write from buffer

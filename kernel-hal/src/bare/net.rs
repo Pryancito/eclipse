@@ -5,6 +5,7 @@ use smoltcp::{
     wire::{IpAddress, IpCidr},
 };
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -63,4 +64,78 @@ pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
     // Real NICs first; loopback last (matches Linux ifindex 1 = first Ethernet).
     devices.sort_by_key(|d| if d.get_ifname() == "loopback" { 1 } else { 0 });
     devices
+}
+
+// ---------------------------------------------------------------------------
+// Network RX waker registry
+// ---------------------------------------------------------------------------
+// TCP read futures register a Waker here before sleeping.
+// E1000eInterface::poll() calls wake_net_rx_waiters() after iface.poll()
+// so any task waiting for RX data is woken immediately instead of after 5 ms.
+
+use core::task::Waker;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref NET_RX_WAKERS: Mutex<Vec<Waker>> = Mutex::new(Vec::new());
+}
+
+/// Register the current task's Waker to be notified when RX data arrives.
+pub fn register_net_rx_waker(waker: Waker) {
+    NET_RX_WAKERS.lock().push(waker);
+}
+
+/// Wake every task waiting for RX data and clear the registry.
+/// Called by the NIC driver after `iface.poll()` processes incoming packets.
+pub fn wake_net_rx_waiters() {
+    let wakers: Vec<Waker> = core::mem::take(&mut *NET_RX_WAKERS.lock());
+    for w in wakers {
+        w.wake();
+    }
+}
+
+/// Future that resolves when either:
+///   (a) `wake_net_rx_waiters()` is called (NIC received data), or
+///   (b) the timeout expires.
+///
+/// On first poll it registers the waker in NET_RX_WAKERS **and** installs
+/// a fallback timer, so progress is guaranteed even if a wake is missed.
+pub struct NetRxOrTimeoutFuture {
+    registered: bool,
+    deadline: core::time::Duration,
+}
+
+impl NetRxOrTimeoutFuture {
+    pub fn new(timeout_ms: u64) -> Self {
+        Self {
+            registered: false,
+            deadline: crate::timer::timer_now()
+                + core::time::Duration::from_millis(timeout_ms),
+        }
+    }
+}
+
+impl core::future::Future for NetRxOrTimeoutFuture {
+    type Output = ();
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        // Second poll: woken by net data or timer → done.
+        if self.registered {
+            return core::task::Poll::Ready(());
+        }
+        if crate::timer::timer_now() >= self.deadline {
+            return core::task::Poll::Ready(());
+        }
+        // Register waker for immediate NIC notification.
+        NET_RX_WAKERS.lock().push(cx.waker().clone());
+        // Fallback timer so we don't hang if the NIC wake is missed.
+        let waker = cx.waker().clone();
+        let dl = self.deadline;
+        crate::timer::timer_set(dl, Box::new(move |_| waker.wake_by_ref()));
+        self.registered = true;
+        core::task::Poll::Pending
+    }
 }
