@@ -1430,8 +1430,8 @@ impl E1000eHw {
         let _ = self.phy_wait_reg26_settled(phy_addr, 4000);
     }
 
-    /// Set negotiated speed in CTRL from PHY reg 26 (IEEE 802.3 autoneg result).
-    unsafe fn mac_sync_ctrl_speed_from_st2(&self, st2: u16) -> bool {
+    /// Set negotiated speed in CTRL from PHY reg 26 and resolved duplex.
+    unsafe fn mac_sync_ctrl_speed_from_st2(&self, st2: u16, duplex_full: bool) -> bool {
         let Some((speed_idx, duplex)) = Self::phy_resolve_speed_duplex_st2(st2) else {
             return false;
         };
@@ -1440,7 +1440,12 @@ impl E1000eHw {
             1 => SPEED_100,
             _ => SPEED_10,
         };
-        self.mac_sync_ctrl_speed_mbps(speed_mbps, duplex != 0);
+        let fd = if speed_mbps == SPEED_10 {
+            duplex_full
+        } else {
+            duplex != 0
+        };
+        self.mac_sync_ctrl_speed_mbps(speed_mbps, fd);
         true
     }
 
@@ -1872,7 +1877,7 @@ impl E1000eHw {
                 );
                 self.mac_sync_ctrl_speed_mbps(op_spd, op_fd);
             } else {
-                let _ = self.mac_sync_ctrl_speed_from_st2(st2);
+                let _ = self.mac_sync_ctrl_speed_from_st2(st2, op_fd);
             }
             self.mac_speed_sync_pulse();
             if status_speed != op_spd {
