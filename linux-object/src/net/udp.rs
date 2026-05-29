@@ -123,12 +123,16 @@ impl Socket for UdpSocketState {
             let sets = get_sockets();
             let mut sets = sets.lock();
             let mut socket = sets.get::<UdpSocket>(inner.handle.0);
-            let copied_len = socket.peek_slice(data);
+            // peek_slice returns &IpEndpoint which borrows `socket`.
+            // Dereference (copy) it immediately so the borrow ends inside
+            // this block, allowing drop(socket) below.
+            let copied_len: Result<(usize, IpEndpoint), _> =
+                socket.peek_slice(data).map(|(n, ep)| (n, *ep));
             drop(socket);
             drop(sets);
 
             match copied_len {
-                Ok((size, endpoint)) => return (Ok(size), Endpoint::Ip(*endpoint)),
+                Ok((size, endpoint)) => return (Ok(size), Endpoint::Ip(endpoint)),
                 Err(smoltcp::Error::Exhausted) => {
                     poll_ifaces();
                     if inner.flags.contains(OpenFlags::NON_BLOCK) {
@@ -355,7 +359,14 @@ impl FileLike for UdpSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        let (read, write, error) = Socket::poll(self, events);
+        let (mut read, mut write, mut error) = Socket::poll(self, events);
+        let ready = (events.contains(PollEvents::IN) && read)
+            || (events.contains(PollEvents::OUT) && write)
+            || error;
+        if !ready {
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            (read, write, error) = Socket::poll(self, events);
+        }
         Ok(PollStatus { read, write, error })
     }
 

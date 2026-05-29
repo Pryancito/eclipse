@@ -46,13 +46,22 @@ impl TimeVal {
 }
 
 impl TimeSpec {
-    /// create TimeSpec
-    pub fn now() -> TimeSpec {
-        let time = kernel_hal::timer::timer_now();
+    /// Build from a kernel `Duration` (seconds since Unix epoch for wall clock).
+    pub fn from_duration(time: Duration) -> TimeSpec {
         TimeSpec {
             sec: time.as_secs() as usize,
-            nsec: (time.as_nanos() % 1_000_000_000) as usize,
+            nsec: time.subsec_nanos() as usize,
         }
+    }
+
+    /// Wall-clock time (`CLOCK_REALTIME`, `gettimeofday`, `date`).
+    pub fn now() -> TimeSpec {
+        Self::from_duration(kernel_hal::timer::wall_clock_now())
+    }
+
+    /// Monotonic time since boot (`CLOCK_MONOTONIC`).
+    pub fn now_monotonic() -> TimeSpec {
+        Self::from_duration(kernel_hal::timer::timer_now())
     }
 
     /// update TimeSpec for a file inode

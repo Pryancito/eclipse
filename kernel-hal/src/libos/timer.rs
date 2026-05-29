@@ -20,3 +20,11 @@ hal_fn_impl! {
         }
     }
 }
+
+/// Wall-clock (libos: host time from `SystemTime`).
+pub fn wall_clock_now() -> Duration {
+    timer_now()
+}
+
+/// Adjust wall clock (libos: no effect on host; satisfies syscall for tests).
+pub fn wall_clock_set(_target: Duration) {}

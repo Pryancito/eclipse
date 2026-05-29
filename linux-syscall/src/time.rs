@@ -22,12 +22,44 @@ impl Syscall<'_> {
         if buf.is_null() {
             return Err(LxError::EINVAL);
         }
-        // TODO: handle clock_settime
-        let ts = TimeSpec::now();
+        let ts = match clock {
+            0 | 5 => TimeSpec::now(), // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
+            1 | 4 | 6 | 7 => TimeSpec::now_monotonic(),
+            _ => return Err(LxError::EINVAL),
+        };
         buf.write(ts)?;
 
         info!("TimeSpec: {:?}", ts);
 
+        Ok(0)
+    }
+
+    /// set the time of the clock with id clockid
+    pub fn sys_clock_settime(&self, clock: usize, timespec: UserInPtr<TimeSpec>) -> SysResult {
+        info!("clock_settime: id={:?} timespec={:?}", clock, timespec.read_if_not_null()?);
+        if clock != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let ts = timespec.read()?;
+        let target = Duration::new(ts.sec as u64, ts.nsec as u32);
+        kernel_hal::timer::wall_clock_set(target);
+        Ok(0)
+    }
+
+    /// legacy settimeofday (seconds + microseconds since Unix epoch)
+    pub fn sys_settimeofday(
+        &mut self,
+        tv: UserInPtr<TimeVal>,
+        tz: UserInPtr<u8>,
+    ) -> SysResult {
+        info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
+        if !tz.is_null() {
+            return Err(LxError::EINVAL);
+        }
+        let timeval = tv.read()?;
+        let target =
+            Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
+        kernel_hal::timer::wall_clock_set(target);
         Ok(0)
     }
 

@@ -10,7 +10,20 @@ use naive_timer::Timer;
 pub(super) const TICKS_PER_SEC: u64 = 100;
 
 lazy_static::lazy_static! {
-    static ref NAIVE_TIMER:Mutex<Timer> = Mutex::new(Timer::default());
+    static ref NAIVE_TIMER: Mutex<Timer> = Mutex::new(Timer::default());
+    /// Offset added to monotonic boot time for CLOCK_REALTIME / gettimeofday.
+    static ref WALL_CLOCK_OFFSET: Mutex<Duration> = Mutex::new(Duration::ZERO);
+}
+
+/// Wall-clock time (Unix epoch): monotonic since boot + adjustable offset.
+pub fn wall_clock_now() -> Duration {
+    timer_now() + *WALL_CLOCK_OFFSET.lock()
+}
+
+/// Set wall-clock instant (`CLOCK_REALTIME` / `settimeofday`).
+pub fn wall_clock_set(target: Duration) {
+    let mono = timer_now();
+    *WALL_CLOCK_OFFSET.lock() = target.saturating_sub(mono);
 }
 
 hal_fn_impl! {

@@ -110,12 +110,13 @@ impl FileLike for Epoll {
 impl Epoll {
     /// wait for events on the interest list
     pub async fn wait(&self, maxevents: usize, process: &crate::process::LinuxProcess, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
-        let begin_time_ms = crate::time::TimeVal::now().to_msec();
+        let begin_time = kernel_hal::timer::timer_now();
         loop {
             if let Err(e) = crate::process::check_signals() {
                 return Err(e);
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
+            crate::net::poll_ifaces();
             let mut events = Vec::new();
             let interest_list = self.inner.lock().interest_list.clone();
             for (fd, event) in interest_list {
@@ -150,15 +151,17 @@ impl Epoll {
             }
 
             if timeout_msecs >= 0 {
-                let current_time_ms = crate::time::TimeVal::now().to_msec();
-                if current_time_ms >= begin_time_ms + timeout_msecs as usize {
+                let deadline =
+                    begin_time + core::time::Duration::from_millis(timeout_msecs as u64);
+                if kernel_hal::timer::timer_now() >= deadline {
                     return Ok(Vec::new());
                 }
             }
-            
-            // TODO: properly wait for ANY of the files to become ready.
-            // For now, we yield and try again. This is inefficient but avoids complex multi-wait logic for now.
-            kernel_hal::thread::yield_now().await;
+
+            kernel_hal::thread::sleep_until(
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
+            )
+            .await;
         }
     }
 }

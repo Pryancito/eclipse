@@ -73,17 +73,21 @@ impl TcpSocketState {
 impl Socket for TcpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        info!("tcp read");
         let (handle, flags) = {
             let inner = self.inner.lock();
             (inner.handle.0, inner.flags)
         };
+        debug!(
+            "tcp read handle={} req_len={} nonblock={}",
+            handle,
+            data.len(),
+            flags.contains(OpenFlags::NON_BLOCK)
+        );
+        let deadline =
+            kernel_hal::timer::timer_now() + core::time::Duration::from_secs(120);
         loop {
-            // Drive the NIC FIRST so any buffered or deferred RX data is
-            // deposited into the smoltcp socket before we call recv_slice.
-            // Without this ordering the data sits in the NIC ring/deferred-job
-            // queue while recv_slice sees an empty socket, causing a full
-            // extra sleep cycle (up to 5 ms) before the data is visible.
+            // Drive the NIC FIRST so any deferred RX is in the socket before
+            // recv_slice is called.
             kernel_hal::deferred_job::drain_deferred_jobs();
             poll_ifaces();
 
@@ -92,24 +96,56 @@ impl Socket for TcpSocketState {
             let mut socket = sets.get::<TcpSocket>(handle);
 
             let state = socket.state();
+
+            // Detect closed/reset connection BEFORE calling recv_slice.
+            // When the peer sends RST or FIN, smoltcp transitions the socket
+            // out of Established, but recv_slice may still return Exhausted
+            // (empty RX buffer) instead of Finished, causing an infinite loop.
+            let peer_closed = matches!(
+                state,
+                TcpState::Closed
+                    | TcpState::CloseWait
+                    | TcpState::TimeWait
+                    | TcpState::FinWait2
+            );
+
             let mut copied_len = socket.recv_slice(data);
             if let Ok(0) = copied_len {
                 if !data.is_empty() {
                     copied_len = Err(smoltcp::Error::Exhausted);
                 }
             }
-            log::warn!("[tcp read debug] data.len()={}, state={:?}, result={:?}", data.len(), state, copied_len);
-            // avoid deadlock in poll_ifaces()
+            trace!("[tcp read] state={:?} result={:?}", state, copied_len);
             drop(socket);
             drop(sets);
+
+            // If the peer has closed but recv_slice returned Exhausted (empty
+            // buffer), treat it as EOF so callers don't loop forever.
+            if peer_closed {
+                if let Err(smoltcp::Error::Exhausted) = copied_len {
+                    return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                }
+            }
+
             match copied_len {
                 Err(smoltcp::Error::Exhausted) => {
                     if flags.contains(OpenFlags::NON_BLOCK) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
-                    // No data after driving NIC — wait for next interrupt or timeout.
+                    // Hard timeout: avoid blocking forever if the peer goes silent.
+                    if kernel_hal::timer::timer_now() >= deadline {
+                        warn!("[tcp read] deadline exceeded, returning EOF");
+                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
                 }
                 Ok(size) => {
+                    // We just freed RX buffer space via recv_slice. Drive the
+                    // NIC again so smoltcp emits the window-update/ACK now,
+                    // instead of on the next read() call. Without this, a peer
+                    // sending more than one receive-window (TLS handshakes and
+                    // large downloads exceed the 64 KiB window) can stall
+                    // waiting for the window to reopen.
+                    poll_ifaces();
                     let endpoint = get_sockets()
                         .lock()
                         .get::<TcpSocket>(handle)
@@ -130,10 +166,14 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            // Wait for NIC RX notification (woken by e1000e::poll →
-            // wake_net_rx_waiters) or fall back after 5 ms so smoltcp
-            // retransmit timers can tick.
-            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            // Re-queue immediately instead of timer-sleeping. The timer-backed
+            // wake (sleep_until / NetRxOrTimeoutFuture) does NOT resume a
+            // blocking socket read in this executor — the task is parked and
+            // never re-polled, which froze every TLS handshake (the client
+            // sends ClientHello, then blocks reading ServerHello forever).
+            // yield_now keeps the task runnable so the loop keeps driving
+            // poll_ifaces and picks up RX data as soon as it lands.
+            thread::yield_now().await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
@@ -190,29 +230,58 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            // See read(): timer-backed wakes don't resume a blocking socket op
+            // in this executor, so keep the task runnable via yield_now.
+            thread::yield_now().await;
         }
     }
     /// write from buffer
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
-        //loop {
-        let sets = get_sockets();
-        let mut sets = sets.lock();
-        let mut socket = sets.get::<TcpSocket>(self.inner.lock().handle.0);
-        let copied_len = socket.send_slice(data);
+        let (handle, flags) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.flags)
+        };
+        if data.is_empty() {
+            return Ok(0);
+        }
+        // Retry until at least one byte is queued. A full TX buffer returns
+        // Ok(0); for a blocking socket we must keep draining ACKs (poll_ifaces)
+        // and try again instead of returning a 0-length write, which makes
+        // libc/busybox spin or treat the write as failed.
+        let deadline =
+            kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        loop {
+            let copied_len = {
+                let sets = get_sockets();
+                let mut sets = sets.lock();
+                let mut socket = sets.get::<TcpSocket>(handle);
+                socket.send_slice(data)
+            };
+            poll_ifaces();
 
-        drop(socket);
-        drop(sets);
-        poll_ifaces();
-
-        match copied_len {
-            Ok(size) => Ok(size),
-            Err(err) => {
-                error!("Tcp socket write error: {:?}", err);
-                Err(LxError::ENOBUFS)
+            match copied_len {
+                Ok(0) => {
+                    if flags.contains(OpenFlags::NON_BLOCK) {
+                        return Err(LxError::EAGAIN);
+                    }
+                    if kernel_hal::timer::timer_now() >= deadline {
+                        warn!("[tcp write] TX buffer full, deadline exceeded");
+                        return Err(LxError::ENOBUFS);
+                    }
+                    // Synchronous trait: drain ACKs so the peer's window frees
+                    // up TX buffer space before retrying.
+                    kernel_hal::deferred_job::drain_deferred_jobs();
+                    poll_ifaces();
+                }
+                Ok(size) => {
+                    return Ok(size);
+                }
+                Err(err) => {
+                    error!("Tcp socket write error: {:?}", err);
+                    return Err(LxError::ENOBUFS);
+                }
             }
         }
-        //}
     }
     /// connect
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -487,7 +556,14 @@ impl FileLike for TcpSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        let (read, write, error) = Socket::poll(self, events);
+        let (mut read, mut write, mut error) = Socket::poll(self, events);
+        let ready = (events.contains(PollEvents::IN) && read)
+            || (events.contains(PollEvents::OUT) && write)
+            || error;
+        if !ready {
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            (read, write, error) = Socket::poll(self, events);
+        }
         Ok(PollStatus { read, write, error })
     }
 

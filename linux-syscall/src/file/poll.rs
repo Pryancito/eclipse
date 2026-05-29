@@ -15,6 +15,17 @@ use kernel_hal::timer;
 use linux_object::fs::{FileDesc, PollEvents};
 use linux_object::time::*;
 
+/// Monotonic time since boot — must match `timer::timer_set` deadlines (not wall clock).
+fn mono_now() -> Duration {
+    timer::timer_now()
+}
+
+fn schedule_poll_wakeup(cx: &mut Context, after: Duration) {
+    let waker = cx.waker().clone();
+    let deadline = mono_now() + after;
+    timer::timer_set(deadline, Box::new(move |_| waker.wake_by_ref()));
+}
+
 impl Syscall<'_> {
     /// Wait for some event on a file descriptor
     pub async fn sys_poll(
@@ -30,12 +41,12 @@ impl Syscall<'_> {
             polls, nfds, timeout_msecs
         );
 
-        let begin_time_ms = TimeVal::now().to_msec();
+        let begin_time = mono_now();
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct PollFuture<'a> {
             polls: &'a mut Vec<PollFd>,
             timeout_msecs: isize,
-            begin_time_ms: usize,
+            begin_time: Duration,
             syscall: &'a Syscall<'a>,
         }
         impl<'a> Future for PollFuture<'a> {
@@ -47,6 +58,7 @@ impl Syscall<'_> {
                     return Poll::Ready(Err(e));
                 }
                 kernel_hal::deferred_job::drain_deferred_jobs();
+                linux_object::net::poll_ifaces();
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
 
@@ -104,29 +116,17 @@ impl Syscall<'_> {
                     // no timeout, return now;
                     0 => return Poll::Ready(Ok(0)),
                     1.. => {
-                        let current_time_ms = TimeVal::now().to_msec();
-                        let deadline = self.begin_time_ms + self.timeout_msecs as usize;
-                        if current_time_ms >= deadline {
+                        let deadline =
+                            self.begin_time + Duration::from_millis(self.timeout_msecs as u64);
+                        if mono_now() >= deadline {
                             return Poll::Ready(Ok(0));
-                        } else {
-                            let next_check = (current_time_ms + 10).min(deadline);
-                            let waker = cx.waker().clone();
-                            timer::timer_set(
-                                Duration::from_millis(next_check as u64),
-                                Box::new(move |_| waker.wake_by_ref()),
-                            );
                         }
+                        let remaining = deadline.saturating_sub(mono_now());
+                        let wake_in = remaining.min(Duration::from_millis(10));
+                        schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
-                        // When the timeout = -1, the poll blocks indefinitely.
-                        // Fixme. So Check this Future regularly every 10ms
-                        let current_time_ms = TimeVal::now().to_msec();
-                        let deadline = current_time_ms + 10;
-                        let waker = cx.waker().clone();
-                        timer::timer_set(
-                            Duration::from_millis(deadline as u64),
-                            Box::new(move |_| waker.wake_by_ref()),
-                        );
+                        schedule_poll_wakeup(cx, Duration::from_millis(10));
                     }
                     _ => {
                         info!("No waker. timeout: {:?}", self.timeout_msecs);
@@ -140,7 +140,7 @@ impl Syscall<'_> {
         let future = PollFuture {
             polls: &mut polls,
             timeout_msecs,
-            begin_time_ms,
+            begin_time,
             syscall: self,
         };
         let result = future.await;
@@ -214,7 +214,7 @@ impl Syscall<'_> {
             // infinity
             -1
         };
-        let begin_time_ms = TimeVal::now().to_msec();
+        let begin_time = mono_now();
 
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SelectFuture<'a> {
@@ -222,7 +222,7 @@ impl Syscall<'_> {
             write_fds: &'a mut FdSet,
             err_fds: &'a mut FdSet,
             timeout_msecs: isize,
-            begin_time_ms: usize,
+            begin_time: Duration,
             syscall: &'a Syscall<'a>,
         }
 
@@ -234,6 +234,7 @@ impl Syscall<'_> {
                     return Poll::Ready(Err(e));
                 }
                 kernel_hal::deferred_job::drain_deferred_jobs();
+                linux_object::net::poll_ifaces();
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;
@@ -273,29 +274,17 @@ impl Syscall<'_> {
                     // no timeout, return now;
                     0 => return Poll::Ready(Ok(0)),
                     1.. => {
-                        let current_time_ms = TimeVal::now().to_msec();
-                        let deadline = self.begin_time_ms + self.timeout_msecs as usize;
-                        if current_time_ms >= deadline {
+                        let deadline =
+                            self.begin_time + Duration::from_millis(self.timeout_msecs as u64);
+                        if mono_now() >= deadline {
                             return Poll::Ready(Ok(0));
-                        } else {
-                            let next_check = (current_time_ms + 10).min(deadline);
-                            let waker = cx.waker().clone();
-                            timer::timer_set(
-                                Duration::from_millis(next_check as u64),
-                                Box::new(move |_| waker.wake_by_ref()),
-                            );
                         }
+                        let remaining = deadline.saturating_sub(mono_now());
+                        let wake_in = remaining.min(Duration::from_millis(10));
+                        schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
-                        // When the timeout = -1, the select blocks indefinitely.
-                        // Check this Future regularly every 10ms
-                        let current_time_ms = TimeVal::now().to_msec();
-                        let deadline = current_time_ms + 10;
-                        let waker = cx.waker().clone();
-                        timer::timer_set(
-                            Duration::from_millis(deadline as u64),
-                            Box::new(move |_| waker.wake_by_ref()),
-                        );
+                        schedule_poll_wakeup(cx, Duration::from_millis(10));
                     }
                     _ => {}
                 }
@@ -307,7 +296,7 @@ impl Syscall<'_> {
             write_fds: &mut write_fds,
             err_fds: &mut err_fds,
             timeout_msecs,
-            begin_time_ms,
+            begin_time,
             syscall: self,
         };
         future.await

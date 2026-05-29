@@ -4005,7 +4005,6 @@ impl E1000eHw {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
-        log::warn!("[e1000e] receive: rx_next_to_clean={}, budget={}", self.rx_next_to_clean, self.rx_poll_budget);
         if self.rx_poll_budget == 0 {
             return None;
         }
@@ -4359,7 +4358,6 @@ impl NetScheme for E1000eInterface {
     }
     
     fn poll(&self) -> DeviceResult {
-        log::warn!("[e1000e] poll() called");
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
 

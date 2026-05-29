@@ -239,7 +239,9 @@ impl Syscall<'_> {
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
             Sys::ALARM => self.sys_alarm(a0),
             Sys::GETTIMEOFDAY => self.sys_gettimeofday(a0.into(), a1.into()),
+            Sys::SETTIMEOFDAY => self.sys_settimeofday(a0.into(), a1.into()),
             Sys::CLOCK_GETTIME => self.sys_clock_gettime(a0, a1.into()),
+            Sys::CLOCK_SETTIME => self.sys_clock_settime(a0, a1.into()),
             Sys::CLOCK_GETRES => self.unimplemented("clock_getres", Ok(0)),
 
             // sem
