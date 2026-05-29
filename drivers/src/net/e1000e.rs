@@ -1368,19 +1368,20 @@ impl E1000eHw {
             }
         }
 
-        // On I219/PCH, the MAC STATUS speed bits reflect what the MAC was last
-        // programmed to, NOT the actual negotiated wire speed — they can stay at
-        // 1000 Mb/s while the PHY has already settled at 10 Mb/s via autoneg.
-        // PHY reg26 (and reg17 when RESOLVED) are the ground truth for wire speed.
-        // Therefore: STATUS must NEVER elevate speed above what the PHY reports.
-        // We only use STATUS for the duplex sense when PHY speed == 10M (reg26
-        // duplex field is unreliable at 10M on some Marvell revisions).
+        // On real hardware, some discrete cards or integrated PHYs do not support/report
+        // resolved speed on PHY reg26 (MII_PHY_STATUS_2) or reg17, returning 0 (SPEED_10).
+        // Therefore, if the MAC STATUS register (which is hardware-updated when Link Up is set)
+        // reports a higher speed, we must trust it and override the PHY-resolved speed.
+        // Otherwise, forcing the MAC to 10 Mbps disables auto-speed detection and locks the NIC at 10 Mbps.
         let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU != 0 {
             let status_speed = Self::speed_mbps_from_status(status);
             let status_fd = status & STATUS_FD != 0;
-            // Only trust STATUS speed if PHY completely failed to report a rate.
-            if speed == SPEED_10 && status_speed == SPEED_10 {
+            if status_speed > speed {
+                speed = status_speed;
+                duplex_full = status_fd;
+                src = "STATUS(override)";
+            } else if speed == SPEED_10 && status_speed == SPEED_10 {
                 // PHY and STATUS agree on 10M: use STATUS for duplex sense.
                 duplex_full = status_fd;
                 src = if self.link_10m_degraded {
@@ -1388,14 +1389,6 @@ impl E1000eHw {
                 } else {
                     "reg26+STATUS"
                 };
-            }
-            // If status_speed > speed: do NOT override — STATUS is stale/wrong.
-            // Log a warning so we can track this in dmesg.
-            if status_speed > speed {
-                crate::klog_warn!(
-                    "[e1000e] STATUS says {} Mb/s but PHY reg26/reg17 says {} Mb/s — trusting PHY\n",
-                    status_speed, speed
-                );
             }
         }
 
@@ -1425,7 +1418,7 @@ impl E1000eHw {
         let _ = self.phy_copper_autoneg_restart_adv(
             phy_addr,
             ADVERTISE_ALL_COPPER,
-            Self::ctrl1000_for_ms(ADVERTISE_1000FULL, Some(false)),
+            Self::ctrl1000_for_ms(ADVERTISE_1000FULL, None),
         );
         let _ = self.phy_wait_reg26_settled(phy_addr, 4000);
     }
@@ -1577,7 +1570,7 @@ impl E1000eHw {
         self.phy_copper_autoneg_restart_adv(
             phy_addr,
             ADVERTISE_ALL_COPPER,
-            Self::ctrl1000_for_ms(ADVERTISE_1000FULL, Some(false)),
+            Self::ctrl1000_for_ms(ADVERTISE_1000FULL, None),
         )
     }
 
