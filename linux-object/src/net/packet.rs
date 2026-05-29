@@ -341,11 +341,21 @@ impl FileLike for PacketSocketState {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
-        // Drain deferred jobs so IRQ-delivered packets are visible before reporting
-        // readability. Without this, select/epoll can miss a DHCPOFFER that arrived
-        // via the NIC interrupt while we were waiting.
+        // Fast path: drain deferred jobs so any IRQ-enqueued packets are visible.
         kernel_hal::deferred_job::drain_deferred_jobs();
         let (read, write, error) = Socket::poll(self, events);
+
+        // If the caller is waiting for readability (e.g. select/epoll in udhcpc)
+        // and the queue is currently empty, sleep briefly and re-poll.
+        // Without this, select() returns immediately with read=false every 5 ms
+        // (from the executor tick), burning CPU and missing DHCPOFFER/DHCPACK
+        // windows on slow links.
+        if events.contains(PollEvents::IN) && !read && !error {
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            let (read2, write2, error2) = Socket::poll(self, events);
+            return Ok(PollStatus { read: read2, write: write2, error: error2 });
+        }
         Ok(PollStatus { read, write, error })
     }
 

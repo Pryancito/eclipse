@@ -59,7 +59,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
 
 use smoltcp::iface::*;
 use smoltcp::phy::{self, DeviceCapabilities, Checksum};
@@ -452,41 +452,40 @@ const RX_BUFFER_WRITE: usize = 16;
 // ---------------------------------------------------------------------------
 // Descriptor layouts (§3.2.3 / §3.3.3 of 82574 datasheet)
 // ---------------------------------------------------------------------------
-// align(16) is mandatory: the I219-V DMA engine requires all descriptors
-// to be naturally aligned to 16 bytes. A second #[repr(C)] would silently
-// drop the alignment, causing hard failures on real silicon.
-// Legacy RX descriptor (used only for ring setup — addr field)
-// The hardware writes back in *extended* format when RFCTL_EXTEN is set,
-// so we never read the legacy fields; we only write the buffer address.
+// align(16): the NIC DMA engine requires 16-byte alignment. CRITICALLY, the
+// hardware ALWAYS uses a fixed 16-byte descriptor stride (RDLEN/16 = slots).
+// Padding to 64 bytes would make size_of::<RxDesc>()=64 → RDLEN=256×64=16384
+// → NIC sees 1024 slots, with 768 entries having addr=0 (our padding) →
+// DMA writes frames to physical address 0 → completely broken RX ring.
+//
+// Cache-line false-sharing is mitigated by flushing ALL descriptors before
+// the single RDT doorbell write, preventing CPU/NIC races on the same line.
+
+/// Legacy RX descriptor (16 bytes). Hardware writes back in extended format
+/// when RFCTL_EXTEN is set; we only write the buffer address field.
 #[repr(C, align(16))]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 struct RxDesc {
-    addr:     u64,  // [63:0]  — buffer physical address (we write this)
-    reserved: u64,  // [127:64] — written back by HW as ExtRxWb
+    addr:     u64,  // buffer physical address (written by driver)
+    reserved: u64,  // written back by HW: staterr[31:0] @ +8, length[47:32] @ +12
 }
 
-// Extended write-back layout (RFCTL_EXTEN=1, always used on I219).
-// Hardware fills this after DMA completes:
-//   [31:0]  mrq / rss_type      (ignored)
-//   [63:32] vlan / staterr_hi   (ignored)
-//   [95:64] staterr (DD=bit0, EOP=bit1, errors in upper bytes)
-//   [111:96] length (bytes in buffer)
-//   [127:112] vlan tag          (ignored)
-//
-// In Rust memory layout (little-endian):
-//   +0  u64 addr  (written by driver)
-//   +8  u32 staterr   (written by HW — DD at bit 0, EOP at bit 1)
-//   +12 u16 length    (written by HW)
-//   +14 u16 vlan      (ignored)
+// Extended RX write-back layout (RFCTL_EXTEN=1, I219 default):
+//   +0  addr     (driver → HW)
+//   +8  staterr  (HW → driver: DD=bit0, EOP=bit1)
+//   +12 length   (HW → driver: byte count in buffer)
+//   +14 vlan     (ignored)
+
+/// Legacy TX descriptor (16 bytes).
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct TxDesc {
-    addr: u64,
-    len: u16,
-    cso: u8,
-    cmd: u8,
-    status: u8,
-    css: u8,
+    addr:    u64,
+    len:     u16,
+    cso:     u8,
+    cmd:     u8,
+    status:  u8,
+    css:     u8,
     special: u16,
 }
 
@@ -1946,19 +1945,23 @@ impl E1000eHw {
             // CRITICAL: For physical hardware with Write-Back cached memory, we
             // MUST flush the modified descriptor to physical RAM. Otherwise the
             // NIC DMA engine reads stale descriptor addresses or old status bits.
+            // Note: 4 descriptors share each 64-byte cache line; clflush evicts
+            // all 4 at once. This is safe because we write ALL descriptors
+            // before issuing the single RDT doorbell, so there is no race.
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-
-            fence(Ordering::SeqCst);
-            mmio_write(self.base, E1000E_RDT, i as u32);
-            let _ = mmio_read(self.base, E1000E_RDT);
 
             posted += 1;
             i = (i + 1) % NUM_RX;
         }
         self.rx_next_to_use = i;
         // Linux jumbo alloc path: always doorbell the last posted index.
+        // compiler_fence(SeqCst) prevents LLVM from moving Rust state updates
+        // (rx_next_to_use, descriptor writes) *after* the MMIO store to RDT.
+        // The hardware-level ordering is already guaranteed by the preceding
+        // _mm_clflush + mfence inside invalidate_cpu_cache_for_read / dma_wbinv_range.
         if posted > 0 {
             let last = if i == 0 { NUM_RX - 1 } else { i - 1 };
+            compiler_fence(Ordering::SeqCst);
             fence(Ordering::SeqCst);
             mmio_write(self.base, E1000E_RDT, last as u32);
             let _ = mmio_read(self.base, E1000E_RDT);
@@ -1967,17 +1970,20 @@ impl E1000eHw {
 
     /// Linux `e1000_configure_rx` final step: RCTL with EN already set in setup_rctl.
     ///
-    /// Correct silicon initialization sequence:
+    /// Correct silicon initialization sequence (Intel-mandated order):
     ///   1. Ensure the RX engine is disabled (RCTL.EN = 0) so the hardware is quiet.
     ///   2. Reset software descriptor indices (rx_next_to_clean/use = 0).
-    ///   3. Write RDH = 0 and RDT = 0 to establish the baseline pointers.
-    ///   4. Re-post descriptors into the ring (reinit_rx_ring) with physical addresses
-    ///      and flush them via clflush so they are visible in physical RAM.
-    ///   5. Configure RXDCTL burst size but do NOT enable the queue yet.
-    ///   6. Call alloc_rx_buffers to populate all (NUM_RX - 1) buffers. This writes
-    ///      the final index to the RDT register as a doorbell. Now RDH (0) != RDT (NUM_RX-1).
-    ///   7. Enable RXDCTL.QUEUE_ENABLE (on PCH-SPT/later) and wait for it to latch.
-    ///   8. Finally, enable RCTL.EN. The HW wakes up, sees RDH != RDT, and begins safe DMA.
+    ///   3. Write RDH = 0 and RDT = 0 while RCTL.EN is clear.
+    ///   4. Re-post descriptors into the ring (reinit_rx_ring) — flushes via clflush
+    ///      so physical RAM already contains valid buffer addresses and zero WB fields.
+    ///   5. Configure RXDCTL burst parameters (no QUEUE_ENABLE yet).
+    ///   6. Enable RXDCTL.QUEUE_ENABLE (PCH-SPT/later) and wait for it to latch.
+    ///   7. Enable RCTL.EN — the DMA engine is now fully armed.
+    ///   8. ONLY THEN advance RDT via alloc_rx_buffers. The shadow register inside
+    ///      the silicon only latches the doorbell correctly once RCTL.EN + QUEUE_ENABLE
+    ///      are both set. Writing RDT while the engine is off desynchronises the
+    ///      internal shadow pointer from the MMIO-visible value, causing the chip to
+    ///      wake up in an undefined state ("no valid descriptors" or instant overflow).
     unsafe fn arm_rx_unit_linux(&mut self) {
         // Step 1: Ensure RX engine is disabled.
         let rctl = mmio_read(self.base, E1000E_RCTL);
@@ -1989,12 +1995,17 @@ impl E1000eHw {
         self.rx_next_to_use = 0;
 
         // Step 3: Write RDH=0, RDT=0 while DMA engine is completely disabled.
+        // Do NOT write a non-zero RDT here — doing so while RCTL.EN=0 desynchronises
+        // the NIC's internal shadow register from the MMIO-visible value.
         mmio_write(self.base, E1000E_RDH, 0);
         let _ = mmio_read(self.base, E1000E_RDH);
         mmio_write(self.base, E1000E_RDT, 0);
         let _ = mmio_read(self.base, E1000E_RDT);
 
         // Step 4: Re-initialize and flush descriptors to RAM.
+        // reinit_rx_ring writes buffer addresses + zeroes the WB fields for every
+        // slot, then clflushes them into physical RAM. The RDT doorbell is NOT
+        // touched here — the engine is still off.
         self.reinit_rx_ring();
 
         // Step 5: Configure RXDCTL parameters (DMA burst) without enabling the queue yet.
@@ -2004,11 +2015,8 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RXDCTL, rxdctl);
         let _ = mmio_read(self.base, E1000E_RXDCTL);
 
-        // Step 6: Populate buffers; alloc_rx_buffers writes the real RDT doorbell.
-        let n = self.rx_desc_unused();
-        self.alloc_rx_buffers(n);
-
-        // Step 7: Enable RXDCTL.QUEUE_ENABLE (PCH-SPT or later) and wait for it to latch.
+        // Step 6: Enable RXDCTL.QUEUE_ENABLE (PCH-SPT or later) and wait for it to latch
+        // BEFORE raising RCTL.EN, so the DMA queue is fully enabled when EN fires.
         if self.is_pch_spt_or_later() {
             let mut rxd = mmio_read(self.base, E1000E_RXDCTL);
             rxd |= RXDCTL_QUEUE_ENABLE;
@@ -2020,10 +2028,17 @@ impl E1000eHw {
             }
         }
 
-        // Step 8: Enable RX engine (RCTL.EN).
+        // Step 7: Enable RX engine (RCTL.EN). The MAC is now running.
         let rctl = self.rctl_rx_bits() | RCTL_EN;
         mmio_write(self.base, E1000E_RCTL, rctl);
+        // Read back to flush the posted write and confirm the bit has latched
+        // in silicon before we advance the RDT doorbell below.
         let _ = mmio_read(self.base, E1000E_RCTL);
+
+        // Step 8: NOW advance RDT. The engine is running and will see RDH (0) ≠ RDT
+        // immediately and begin DMA. This is the Intel-mandated order.
+        let n = self.rx_desc_unused();
+        self.alloc_rx_buffers(n);
 
         self.kick_rx_writeback();
         self.verify_rx_engine();
@@ -4143,6 +4158,10 @@ impl E1000eHw {
         // buffers — on real hardware DMA memory may be mapped WC, in which case
         // clflush alone does NOT flush WC stores. QEMU doesn't simulate WC so this
         // difference explains why TX works in QEMU but silently fails on I219-V.
+        //
+        // 16-byte descriptors: 4 per 64-byte cache line. clflush flushes the
+        // whole line, but since all TX slots are initialized before TDT rings,
+        // there is no race between CPU and NIC on adjacent descriptors.
         unsafe {
             Self::dma_wbinv_range(self.tx_bufs[idx].vaddr(), data.len());
             Self::dma_wbinv_range(desc as *const TxDesc as usize, core::mem::size_of::<TxDesc>());
@@ -4151,9 +4170,13 @@ impl E1000eHw {
         }
 
         self.tx_tail = (idx + 1) % NUM_TX;
-        unsafe { 
+        // compiler_fence(SeqCst) prevents LLVM from reordering the tx_tail store
+        // or any earlier Rust-visible writes past the MMIO doorbell write.
+        // The hardware ordering is already covered by _mm_sfence / _mm_clflush above.
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
             mmio_write(self.base, E1000E_TDT, self.tx_tail as u32);
-            let _ = mmio_read(self.base, E1000E_TDT); // Serializar escritura MMIO
+            let _ = mmio_read(self.base, E1000E_TDT); // flush posted MMIO write
         }
 
         // Espera segura para bare-metal (Solo para asegurar el reporte en logs iniciales)
@@ -4554,7 +4577,6 @@ impl phy::Device<'_> for E1000eDriver {
         }
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
-        crate::klog_info!("e1000e: transmit() called\n");
         if self.hw.lock().can_send() {
             Some(E1000eTxToken(self.clone()))
         } else {
@@ -4594,16 +4616,13 @@ impl phy::TxToken for E1000eTxToken {
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
-        crate::klog_info!("e1000e: consume() called, len={}\n", len);
         let mut buf = vec![0u8; len];
         // NOTE: do NOT call net_dispatch_packet here. The buffer is empty at this point
         // (smoltcp fills it via the closure below). Dispatching it as a received packet
         // would inject garbage frames into AF_PACKET sockets.
         let result = f(&mut buf)?;
-        crate::klog_info!("e1000e: consume() closure returned, first bytes: {:02x?}\n", &buf[..core::cmp::min(14, buf.len())]);
         let mut hw = self.0.hw.lock();
         hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
-        crate::klog_info!("e1000e: hw.send() completed successfully\n");
         Ok(result)
     }
 }

@@ -272,6 +272,7 @@ pub const IFF_MASTER: u32 = 0x400;
 pub const IFF_SLAVE: u32 = 0x800;
 pub const IFF_MULTICAST: u32 = 0x1000;
 pub const IFF_LOWER_UP: u32 = 0x1_0000;
+/// Kernel-writable bits mask for SIOCSIFFLAGS (ignored — we accept any write).
 pub const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
 
 
@@ -809,7 +810,9 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
             let flags = if ifname == "loopback" {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
             } else {
-                IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST
+                // IFF_LOWER_UP signals that the physical link is up.
+                // udhcpc and ifconfig check this before attempting DHCP.
+                IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST | IFF_LOWER_UP
             };
             ifr.ifr_ifru = IfReqUnion {
                 flags: flags as i16,
@@ -843,10 +846,18 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
             let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
             let prefix_len = iface_ipv4_cidr(&*iface)
                 .map(|cidr| cidr.prefix_len())
-                .unwrap_or(32);
+                .unwrap_or(24); // default /24 until SIOCSIFNETMASK sets the real prefix
+            info!("SIOCSIFADDR: {} -> {}/{}", ifname, addr, prefix_len);
             iface
                 .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                 .map_err(|_| LxError::EINVAL)?;
+            Ok(0)
+        }
+
+        // SIOCSIFBRDADDR: set broadcast address.
+        // The broadcast is fully determined by addr + netmask; we just accept the
+        // write silently and return success so udhcpc / ifconfig don't error out.
+        SIOCSIFBRDADDR => {
             Ok(0)
         }
 
