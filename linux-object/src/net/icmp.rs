@@ -20,6 +20,8 @@ pub struct IcmpSocketState {
 struct IcmpSocketInner {
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
+    echo_seq: Mutex<u16>,
+    echo_id: u16,
     ipv6: bool,
 }
 
@@ -31,9 +33,27 @@ impl IcmpSocketState {
             inner: Arc::new(IcmpSocketInner {
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
+                echo_seq: Mutex::new(0),
+                echo_id: (kernel_hal::timer::timer_now().as_micros() as u16).wrapping_add(1),
                 ipv6,
             }),
         }
+    }
+
+    fn make_echo_request_payload(&self, data: &[u8]) -> alloc::vec::Vec<u8> {
+        let expect_type = if self.inner.ipv6 { 128 } else { 8 };
+        if data.len() >= 8 && data[0] == expect_type && data[1] == 0 {
+            return data.to_vec();
+        }
+        let mut out = vec![0u8; 8 + data.len()];
+        out[0] = expect_type;
+        out[1] = 0;
+        out[4..6].copy_from_slice(&self.inner.echo_id.to_be_bytes());
+        let mut seq = self.inner.echo_seq.lock();
+        out[6..8].copy_from_slice(&seq.to_be_bytes());
+        *seq = seq.wrapping_add(1);
+        out[8..].copy_from_slice(data);
+        out
     }
 
     fn remote_ipv4(&self) -> Option<Ipv4Address> {
@@ -149,17 +169,18 @@ impl Socket for IcmpSocketState {
                 return Err(LxError::EINVAL);
             }
 
-            let ip_len = 40 + data.len();
+            let icmp_payload = self.make_echo_request_payload(data);
+            let ip_len = 40 + icmp_payload.len();
             let mut ip = vec![0u8; ip_len];
             {
                 let mut pkt = smoltcp::wire::Ipv6Packet::new_unchecked(&mut ip);
                 pkt.set_version(6);
-                pkt.set_payload_len(data.len() as u16);
+                pkt.set_payload_len(icmp_payload.len() as u16);
                 pkt.set_next_header(smoltcp::wire::IpProtocol::Icmpv6);
                 pkt.set_src_addr(src);
                 pkt.set_dst_addr(dst);
                 pkt.set_hop_limit(64);
-                pkt.payload_mut().copy_from_slice(data);
+                pkt.payload_mut().copy_from_slice(&icmp_payload);
 
                 let mut icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(pkt.payload_mut());
                 icmp_pkt.fill_checksum(&IpAddress::Ipv6(src), &IpAddress::Ipv6(dst));
@@ -188,7 +209,8 @@ impl Socket for IcmpSocketState {
                 return Err(LxError::EINVAL);
             }
 
-            let ip_len = 20 + data.len();
+            let icmp_payload = self.make_echo_request_payload(data);
+            let ip_len = 20 + icmp_payload.len();
             let mut ip = vec![0u8; ip_len];
             {
                 let mut pkt = smoltcp::wire::Ipv4Packet::new_unchecked(&mut ip);
@@ -199,7 +221,9 @@ impl Socket for IcmpSocketState {
                 pkt.set_src_addr(src);
                 pkt.set_dst_addr(dst);
                 pkt.set_hop_limit(64);
-                pkt.payload_mut().copy_from_slice(data);
+                pkt.payload_mut().copy_from_slice(&icmp_payload);
+                let mut icmp_pkt = smoltcp::wire::Icmpv4Packet::new_unchecked(pkt.payload_mut());
+                icmp_pkt.fill_checksum();
                 pkt.fill_checksum();
             }
             if dst.is_loopback() {
