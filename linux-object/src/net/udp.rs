@@ -49,7 +49,6 @@ impl Default for UdpSocketState {
 
 // Moved to mod.rs as public structures
 
-
 // Helpers moved to mod.rs
 
 impl UdpSocketState {
@@ -76,6 +75,21 @@ impl UdpSocketState {
                 ipv6,
             })),
         }
+    }
+
+    fn family_addr(ipv6: bool) -> IpAddress {
+        if ipv6 {
+            IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        }
+    }
+
+    fn endpoint_matches_family(ipv6: bool, ep: &IpEndpoint) -> bool {
+        matches!(
+            (ipv6, ep.addr),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        )
     }
 }
 
@@ -118,7 +132,10 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+            thread::sleep_until(
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+            )
+            .await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
@@ -155,7 +172,10 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+            thread::sleep_until(
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+            )
+            .await;
         }
     }
     /// write from buffer
@@ -171,12 +191,18 @@ impl Socket for UdpSocketState {
                 return Err(LxError::ENOTCONN);
             }
         };
+        if !Self::endpoint_matches_family(inner.ipv6, remote_endpoint) {
+            return Err(LxError::EINVAL);
+        }
 
         let sets = get_sockets();
         let mut sets = sets.lock();
         let mut socket = sets.get::<UdpSocket>(inner.handle.0);
         if socket.endpoint().port == 0 {
-            if let Err(e) = socket.bind(IpEndpoint::new(IpAddress::Unspecified, get_ephemeral_port())) {
+            if let Err(e) = socket.bind(IpEndpoint::new(
+                Self::family_addr(inner.ipv6),
+                get_ephemeral_port(),
+            )) {
                 warn!("udp bind failed: {:?}", e);
                 drop(socket);
                 drop(sets);
@@ -201,12 +227,19 @@ impl Socket for UdpSocketState {
     /// connect
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::Ip(ip) = endpoint {
+            let is_ipv6 = self.inner.lock().ipv6;
+            if !Self::endpoint_matches_family(is_ipv6, &ip) {
+                return Err(LxError::EINVAL);
+            }
             let handle = self.inner.lock().handle.0;
             let sockets = get_sockets();
             let mut set = sockets.lock();
             let mut socket = set.get::<UdpSocket>(handle);
             if socket.endpoint().port == 0 {
-                if let Err(e) = socket.bind(IpEndpoint::new(IpAddress::Unspecified, get_ephemeral_port())) {
+                if let Err(e) = socket.bind(IpEndpoint::new(
+                    Self::family_addr(is_ipv6),
+                    get_ephemeral_port(),
+                )) {
                     warn!("udp connect: implicit bind failed: {:?}", e);
                     return Err(LxError::EINVAL);
                 }
@@ -259,6 +292,10 @@ impl Socket for UdpSocketState {
         info!("udp bind");
         #[allow(irrefutable_let_patterns)]
         if let Endpoint::Ip(mut ip) = endpoint {
+            let is_ipv6 = self.inner.lock().ipv6;
+            if !Self::endpoint_matches_family(is_ipv6, &ip) {
+                return Err(LxError::EINVAL);
+            }
             if ip.port == 0 {
                 ip.port = get_ephemeral_port();
             }

@@ -71,6 +71,13 @@ impl TcpSocketState {
             })),
         }
     }
+
+    fn endpoint_matches_family(ipv6: bool, ep: &IpEndpoint) -> bool {
+        matches!(
+            (ipv6, ep.addr),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        )
+    }
 }
 
 #[async_trait]
@@ -87,8 +94,7 @@ impl Socket for TcpSocketState {
             data.len(),
             flags.contains(OpenFlags::NON_BLOCK)
         );
-        let deadline =
-            kernel_hal::timer::timer_now() + core::time::Duration::from_secs(120);
+        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(120);
         loop {
             // Drive the NIC FIRST so any deferred RX is in the socket before
             // recv_slice is called.
@@ -107,10 +113,7 @@ impl Socket for TcpSocketState {
             // (empty RX buffer) instead of Finished, causing an infinite loop.
             let peer_closed = matches!(
                 state,
-                TcpState::Closed
-                    | TcpState::CloseWait
-                    | TcpState::TimeWait
-                    | TcpState::FinWait2
+                TcpState::Closed | TcpState::CloseWait | TcpState::TimeWait | TcpState::FinWait2
             );
 
             let mut copied_len = socket.recv_slice(data);
@@ -252,8 +255,7 @@ impl Socket for TcpSocketState {
         // Ok(0); for a blocking socket we must keep draining ACKs (poll_ifaces)
         // and try again instead of returning a 0-length write, which makes
         // libc/busybox spin or treat the write as failed.
-        let deadline =
-            kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
         loop {
             let copied_len = {
                 let sets = get_sockets();
@@ -292,6 +294,9 @@ impl Socket for TcpSocketState {
         let inner = self.inner.lock();
         #[allow(warnings)]
         if let Endpoint::Ip(ip) = endpoint {
+            if !Self::endpoint_matches_family(inner.ipv6, &ip) {
+                return Err(LxError::EINVAL);
+            }
             get_sockets()
                 .lock()
                 .get::<TcpSocket>(inner.handle.0)
@@ -335,7 +340,10 @@ impl Socket for TcpSocketState {
                     }
                 }
 
-                thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+                thread::sleep_until(
+                    kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+                )
+                .await;
 
                 if kernel_hal::timer::timer_now() >= deadline {
                     warn!("connect: timed out after 30s");
@@ -390,7 +398,10 @@ impl Socket for TcpSocketState {
                 read = true; // POLLIN
             } else {
                 match socket.state() {
-                    TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
+                    TcpState::CloseWait
+                    | TcpState::Closing
+                    | TcpState::LastAck
+                    | TcpState::TimeWait => {
                         read = true;
                     }
                     _ => {}
@@ -407,6 +418,9 @@ impl Socket for TcpSocketState {
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         let mut inner = self.inner.lock();
         if let Endpoint::Ip(mut ip) = endpoint {
+            if !Self::endpoint_matches_family(inner.ipv6, &ip) {
+                return Err(LxError::EINVAL);
+            }
             if ip.port == 0 {
                 ip.port = get_ephemeral_port();
             }
@@ -456,7 +470,7 @@ impl Socket for TcpSocketState {
         let non_block = inner.flags.contains(OpenFlags::NON_BLOCK);
         let is_ipv6 = inner.ipv6;
         drop(inner);
-        
+
         loop {
             if let Ok((handle, (local, remote))) = crate::net::LISTEN_TABLE.accept(endpoint.port) {
                 let new_handle = GlobalSocketHandle(handle);
@@ -470,17 +484,17 @@ impl Socket for TcpSocketState {
                         ipv6: is_ipv6,
                     })),
                 });
-                return Ok((
-                    new_socket as Arc<dyn FileLike>,
-                    Endpoint::Ip(remote),
-                ));
+                return Ok((new_socket as Arc<dyn FileLike>, Endpoint::Ip(remote)));
             } else {
                 if non_block {
                     return Err(LxError::EAGAIN);
                 }
                 poll_ifaces();
                 kernel_hal::deferred_job::drain_deferred_jobs();
-                thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+                thread::sleep_until(
+                    kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+                )
+                .await;
             }
         }
     }

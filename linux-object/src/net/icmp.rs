@@ -46,6 +46,13 @@ impl IcmpSocketState {
         }
     }
 
+    fn remote_ip(&self) -> Option<IpAddress> {
+        let Endpoint::Ip(ip) = self.inner.remote.lock().clone()? else {
+            return None;
+        };
+        Some(ip.addr)
+    }
+
     fn kick_rx(&self) {
         // If we have a known remote, drain only that interface's RX ring.
         // Otherwise drain all non-loopback interfaces so we don't miss the
@@ -90,13 +97,11 @@ impl IcmpSocketState {
 impl Socket for IcmpSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
-            if let Some((pkt, src)) = icmp_rx::pop() {
+            let remote = self.remote_ip();
+            if let Some((pkt, src)) = icmp_rx::pop_for(self.inner.ipv6, remote) {
                 let n = pkt.len().min(data.len());
                 data[..n].copy_from_slice(&pkt[..n]);
-                return (
-                    Ok(n),
-                    Endpoint::Ip(IpEndpoint::new(src.into(), 0)),
-                );
+                return (Ok(n), Endpoint::Ip(IpEndpoint::new(src.into(), 0)));
             }
 
             // Drain deferred jobs first: the NIC IRQ handler pushes a deferred
@@ -118,10 +123,7 @@ impl Socket for IcmpSocketState {
             }
 
             if self.inner.flags.lock().contains(OpenFlags::NON_BLOCK) {
-                return (
-                    Err(LxError::EAGAIN),
-                    Endpoint::Ip(IpEndpoint::UNSPECIFIED),
-                );
+                return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::thread::sleep_until(
                 kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
@@ -215,12 +217,18 @@ impl Socket for IcmpSocketState {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
-        if matches!(endpoint, Endpoint::Ip(_)) {
-            *self.inner.remote.lock() = Some(endpoint);
-            Ok(0)
-        } else {
-            Err(LxError::EINVAL)
+        let Endpoint::Ip(ip) = endpoint else {
+            return Err(LxError::EINVAL);
+        };
+        let family_ok = matches!(
+            (self.inner.ipv6, ip.addr),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        );
+        if !family_ok {
+            return Err(LxError::EINVAL);
         }
+        *self.inner.remote.lock() = Some(Endpoint::Ip(ip));
+        Ok(0)
     }
 
     fn bind(&self, _endpoint: Endpoint) -> SysResult {
@@ -284,21 +292,13 @@ impl FileLike for IcmpSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus {
-            read,
-            write,
-            error,
-        })
+        Ok(PollStatus { read, write, error })
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus {
-            read,
-            write,
-            error,
-        })
+        Ok(PollStatus { read, write, error })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
