@@ -38,6 +38,12 @@ pub trait NetScheme: Scheme {
     fn set_ipv4_address(&self, _cidr: Ipv4Cidr) -> DeviceResult {
         Err(DeviceError::NotSupported)
     }
+    fn add_ip_address(&self, _cidr: IpCidr) -> DeviceResult {
+        Err(DeviceError::NotSupported)
+    }
+    fn remove_ip_address(&self, _cidr: IpCidr) -> DeviceResult {
+        Err(DeviceError::NotSupported)
+    }
     fn add_route(&self, _cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
         Err(DeviceError::NotSupported)
     }

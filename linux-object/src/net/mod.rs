@@ -16,15 +16,29 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
 }
 
+fn loopback_tx_handler(packet: &[u8]) {
+    let version = packet.get(0).map(|b| b >> 4).unwrap_or(4);
+    info!("[loopback tx] packet version={}, len={}", version, packet.len());
+    let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
+    let mut eth_frame = alloc::vec![0u8; 14 + packet.len()];
+    eth_frame[0..6].copy_from_slice(&[0; 6]);
+    eth_frame[6..12].copy_from_slice(&[0; 6]);
+    eth_frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    eth_frame[14..].copy_from_slice(packet);
+    packet::push_packet(&eth_frame);
+}
+
 /// Global initialization for the network stack.
 pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);
+    zcore_drivers::net::loopback::register_loopback_tx_callback(loopback_tx_handler);
     refresh_arp_local_macs();
 }
 
 pub fn refresh_arp_local_macs() {
-    let macs = get_net_device().iter().map(|d| d.get_mac()).collect();
-    arp_cache::refresh_local_macs(macs);
+    let macs: alloc::vec::Vec<_> = get_net_device().iter().map(|d| d.get_mac()).collect();
+    arp_cache::refresh_local_macs(macs.clone());
+    ndp_cache::refresh_local_macs(macs);
 }
 
 pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
@@ -81,6 +95,48 @@ pub fn netdev_for_ipv4(dst: smoltcp::wire::Ipv4Address) -> LxResult<Arc<dyn zcor
             )
         });
         if has_v4 {
+            return Ok(iface.clone());
+        }
+    }
+    Err(LxError::ENODEV)
+}
+
+/// Pick the Ethernet netdev for an IPv6 destination (never loopback).
+pub fn netdev_for_ipv6(dst: smoltcp::wire::Ipv6Address) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    use smoltcp::wire::IpCidr;
+    let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
+    for iface in get_net_device().iter() {
+        if iface.get_ifname() == "loopback" {
+            continue;
+        }
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv6(cidr) = ip {
+                if cidr.prefix_len() == 0 || cidr.address().is_unspecified() {
+                    continue;
+                }
+                if cidr.contains_addr(&dst) {
+                    if best.as_ref().map_or(true, |(p, _)| cidr.prefix_len() > *p) {
+                        best = Some((cidr.prefix_len(), iface.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, dev)) = best {
+        return Ok(dev);
+    }
+    for iface in get_net_device().iter() {
+        if iface.get_ifname() == "loopback" {
+            continue;
+        }
+        let has_v6 = iface.get_ip_address().iter().any(|ip| {
+            matches!(
+                ip,
+                IpCidr::Ipv6(cidr)
+                    if cidr.prefix_len() > 0 && !cidr.address().is_unspecified()
+            )
+        });
+        if has_v6 {
             return Ok(iface.clone());
         }
     }
@@ -172,6 +228,9 @@ pub use icmp::*;
 /// IPv4 → MAC cache (fed from RX frames).
 pub mod arp_cache;
 pub use arp_cache::*;
+
+/// IPv6 → MAC cache (fed from RX frames).
+pub mod ndp_cache;
 
 /// ICMP echo replies from `push_packet` (ping RX).
 pub mod icmp_rx;
@@ -518,9 +577,6 @@ use kernel_hal::net::get_net_device;
 /// miss doc
 pub fn poll_ifaces() {
     for iface in get_net_device().iter() {
-        if iface.get_ifname() == "loopback" {
-            continue;
-        }
         match iface.poll() {
             Ok(_) => {}
             Err(e) => {
@@ -693,6 +749,194 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
             continue;
         }
         if attempt + 1 == ARP_TRIES {
+            break;
+        }
+    }
+    Err(LxError::EINVAL)
+}
+
+/// Pick a concrete IPv6 source for `dst` (skip ::/0 catch-all; prefer longest prefix).
+pub fn select_ipv6_for_dst(dst: smoltcp::wire::Ipv6Address) -> smoltcp::wire::Ipv6Address {
+    use smoltcp::wire::{IpCidr, Ipv6Address};
+    let mut best: Option<(u8, Ipv6Address)> = None;
+    for iface in get_net_device().iter() {
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv6(cidr) = ip {
+                let addr = cidr.address();
+                if addr.is_unspecified() || cidr.prefix_len() == 0 {
+                    continue;
+                }
+                if cidr.contains_addr(&dst) {
+                    if best.map_or(true, |(p, _)| cidr.prefix_len() > p) {
+                        best = Some((cidr.prefix_len(), addr));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, a)) = best {
+        return a;
+    }
+    for iface in get_net_device().iter() {
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv6(cidr) = ip {
+                let addr = cidr.address();
+                if !addr.is_unspecified() && cidr.prefix_len() > 0 {
+                    return addr;
+                }
+            }
+        }
+    }
+    Ipv6Address::UNSPECIFIED
+}
+
+fn resolve_ipv6_next_hop(
+    dev: &dyn zcore_drivers::scheme::NetScheme,
+    dst: smoltcp::wire::Ipv6Address,
+) -> smoltcp::wire::Ipv6Address {
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address};
+
+    let on_link = dev.get_ip_address().iter().any(|cidr| match cidr {
+        IpCidr::Ipv6(v6) => {
+            v6.prefix_len() > 0 && !v6.address().is_unspecified() && v6.contains_addr(&dst)
+        }
+        _ => false,
+    });
+    if on_link {
+        return dst;
+    }
+
+    let mut best: Option<(u8, Ipv6Address)> = None;
+    for route in dev.get_routes() {
+        let (prefix, matched) = match route.dst {
+            IpCidr::Ipv6(cidr) => (cidr.prefix_len(), cidr.contains_addr(&dst)),
+            _ => (0, false),
+        };
+        if !matched {
+            continue;
+        }
+        let next_hop = match route.gateway {
+            Some(IpAddress::Ipv6(gw)) => gw,
+            _ => dst,
+        };
+        if best.map_or(true, |(p, _)| prefix > p) {
+            best = Some((prefix, next_hop));
+        }
+    }
+
+    best.map_or(dst, |(_, hop)| hop)
+}
+
+/// Send a complete IPv6 datagram on the wire.
+pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
+    use smoltcp::wire::{
+        EthernetAddress, EthernetFrame, Ipv6Packet, Ipv6Repr, Icmpv6Packet, Icmpv6Repr, NdiscRepr, IpAddress, IpProtocol,
+    };
+
+    if ip.len() < 40 {
+        return Err(LxError::EINVAL);
+    }
+    let pkt = Ipv6Packet::new_checked(ip).map_err(|_| LxError::EINVAL)?;
+    let dst = pkt.dst_addr();
+    if dst.is_multicast() {
+        // Send directly to the mapped multicast MAC address
+        let dev = netdev_for_ipv6(dst)?;
+        let our_mac_eth = dev.get_mac();
+        let dst_mac = EthernetAddress([
+            0x33,
+            0x33,
+            dst.as_bytes()[12],
+            dst.as_bytes()[13],
+            dst.as_bytes()[14],
+            dst.as_bytes()[15],
+        ]);
+        let mut frame = vec![0u8; 14 + ip.len()];
+        let mut eth = EthernetFrame::new_unchecked(&mut frame);
+        eth.set_dst_addr(dst_mac);
+        eth.set_src_addr(our_mac_eth);
+        eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
+        eth.payload_mut().copy_from_slice(ip);
+        dev.send(&frame).map_err(|_| LxError::EIO)?;
+        return Ok(());
+    }
+
+    if !dst.is_unicast() {
+        return Err(LxError::EINVAL);
+    }
+    let src = pkt.src_addr();
+    if src.is_unspecified() {
+        return Err(LxError::EINVAL);
+    }
+
+    let dev = netdev_for_ipv6(dst)?;
+    let ndp_target = resolve_ipv6_next_hop(dev.as_ref(), dst);
+    let our_mac_eth = dev.get_mac();
+
+    const NDP_TRIES: usize = 4;
+    for attempt in 0..NDP_TRIES {
+        if let Some(dst_mac) = ndp_cache::lookup(ndp_target) {
+            let mut frame = vec![0u8; 14 + ip.len()];
+            let mut eth = EthernetFrame::new_unchecked(&mut frame);
+            eth.set_dst_addr(dst_mac);
+            eth.set_src_addr(our_mac_eth);
+            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
+            eth.payload_mut().copy_from_slice(ip);
+            dev.send(&frame).map_err(|_| LxError::EIO)?;
+            netdev_drain_rx(dev.as_ref());
+            return Ok(());
+        }
+
+        // Send Neighbor Solicitation (NDP who-has) to the target's solicited node multicast address
+        let solicited_node_ip = ndp_target.solicited_node();
+        let dst_mac = EthernetAddress([
+            0x33,
+            0x33,
+            solicited_node_ip.as_bytes()[12],
+            solicited_node_ip.as_bytes()[13],
+            solicited_node_ip.as_bytes()[14],
+            solicited_node_ip.as_bytes()[15],
+        ]);
+
+        // Construct NS packet
+        let ns_repr = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: ndp_target,
+            lladdr: Some(our_mac_eth),
+        });
+        
+        let ip_repr = Ipv6Repr {
+            src_addr: src,
+            dst_addr: solicited_node_ip,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: ns_repr.buffer_len(),
+            hop_limit: 255,
+        };
+
+        let total_len = 14 + ip_repr.buffer_len() + ns_repr.buffer_len();
+        let mut ns_buf = vec![0u8; total_len];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut ns_buf);
+            eth.set_dst_addr(dst_mac);
+            eth.set_src_addr(our_mac_eth);
+            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
+            
+            let mut ip_packet = Ipv6Packet::new_unchecked(eth.payload_mut());
+            ip_repr.emit(&mut ip_packet);
+            
+            let mut icmp_packet = Icmpv6Packet::new_unchecked(ip_packet.payload_mut());
+            ns_repr.emit(
+                &IpAddress::Ipv6(src),
+                &IpAddress::Ipv6(solicited_node_ip),
+                &mut icmp_packet,
+                &smoltcp::phy::ChecksumCapabilities::default(),
+            );
+        }
+
+        dev.send(&ns_buf).map_err(|_| LxError::EIO)?;
+        netdev_drain_rx(dev.as_ref());
+        if ndp_cache::lookup(ndp_target).is_some() {
+            continue;
+        }
+        if attempt + 1 == NDP_TRIES {
             break;
         }
     }

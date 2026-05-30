@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use lock::Mutex;
 use smoltcp::{
     socket::{RawPacketMetadata, RawSocket, RawSocketBuffer},
-    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet},
+    wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, Ipv6Repr},
 };
 
 
@@ -26,11 +26,12 @@ struct RawSocketInner {
     header_included: Mutex<bool>,
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
+    ipv6: bool,
 }
 
 impl RawSocketState {
     /// missing documentation
-    pub fn new(protocol: u8) -> Self {
+    pub fn new(protocol: u8, ipv6: bool) -> Self {
         let rx_buffer = RawSocketBuffer::new(
             vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
             vec![0; RAW_RECVBUF],
@@ -40,7 +41,7 @@ impl RawSocketState {
             vec![0; RAW_SENDBUF],
         );
         let socket = RawSocket::new(
-            IpVersion::Ipv4,
+            if ipv6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 },
             IpProtocol::from(protocol),
             rx_buffer,
             tx_buffer,
@@ -54,6 +55,7 @@ impl RawSocketState {
                 header_included: Mutex::new(false),
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
+                ipv6,
             }),
         }
     }
@@ -75,14 +77,26 @@ impl Socket for RawSocketState {
                 if let Ok(size) = socket.recv_slice(data) {
                     drop(socket);
                     drop(sockets);
-                    if let Ok(packet) = Ipv4Packet::new_checked(&data[..size]) {
-                        return (
-                            Ok(size),
-                            Endpoint::Ip(IpEndpoint {
-                                addr: IpAddress::Ipv4(packet.src_addr()),
-                                port: 0,
-                            }),
-                        );
+                    if self.inner.ipv6 {
+                        if let Ok(packet) = Ipv6Packet::new_checked(&data[..size]) {
+                            return (
+                                Ok(size),
+                                Endpoint::Ip(IpEndpoint {
+                                    addr: IpAddress::Ipv6(packet.src_addr()),
+                                    port: 0,
+                                }),
+                            );
+                        }
+                    } else {
+                        if let Ok(packet) = Ipv4Packet::new_checked(&data[..size]) {
+                            return (
+                                Ok(size),
+                                Endpoint::Ip(IpEndpoint {
+                                    addr: IpAddress::Ipv4(packet.src_addr()),
+                                    port: 0,
+                                }),
+                            );
+                        }
                     }
                     return (
                         Err(LxError::EINVAL),
@@ -129,43 +143,76 @@ impl Socket for RawSocketState {
         let Endpoint::Ip(ip) = endpoint.ok_or(LxError::ENOTCONN)? else {
             return Err(LxError::EINVAL);
         };
-        let IpAddress::Ipv4(mut v4_dst) = ip.addr else {
-            return Err(LxError::EINVAL);
-        };
-        if v4_dst.is_unspecified() {
-            v4_dst = Ipv4Address::new(127, 0, 0, 1);
-        }
-        if !v4_dst.is_unicast() && !v4_dst.is_broadcast() && !v4_dst.is_multicast() {
-            warn!("raw socket: invalid destination address {:?}", v4_dst);
-            return Err(LxError::EINVAL);
-        }
+        if self.inner.ipv6 {
+            let IpAddress::Ipv6(dst) = ip.addr else {
+                return Err(LxError::EINVAL);
+            };
+            let src = select_ipv6_for_dst(dst);
+            if src.is_unspecified() {
+                return Err(LxError::EINVAL);
+            }
 
-        let len = data.len();
-        let mut buffer = vec![0u8; len + 20];
-        let mut packet = Ipv4Packet::new_unchecked(&mut buffer);
-        packet.set_version(4);
-        packet.set_header_len(20);
-        packet.set_total_len((20 + len) as u16);
-        packet.set_protocol(socket.ip_protocol());
-        let src_addr = select_ipv4_for_dst(v4_dst);
-        if src_addr.is_unspecified() {
-            return Err(LxError::EINVAL);
+            let len = data.len();
+            let mut buffer = vec![0u8; len + 40];
+            let mut packet = Ipv6Packet::new_unchecked(&mut buffer);
+            let ip_repr = Ipv6Repr {
+                src_addr: src,
+                dst_addr: dst,
+                next_header: socket.ip_protocol(),
+                payload_len: len,
+                hop_limit: 64,
+            };
+            ip_repr.emit(&mut packet);
+            packet.payload_mut().copy_from_slice(data);
+
+            socket.send_slice(&buffer).map_err(|e| {
+                warn!("raw socket send_slice failed: {:?}", e);
+                LxError::ENOBUFS
+            })?;
+
+            drop(socket);
+            drop(sockets);
+            flush_socket_egress();
+            Ok(len)
+        } else {
+            let IpAddress::Ipv4(mut v4_dst) = ip.addr else {
+                return Err(LxError::EINVAL);
+            };
+            if v4_dst.is_unspecified() {
+                v4_dst = Ipv4Address::new(127, 0, 0, 1);
+            }
+            if !v4_dst.is_unicast() && !v4_dst.is_broadcast() && !v4_dst.is_multicast() {
+                warn!("raw socket: invalid destination address {:?}", v4_dst);
+                return Err(LxError::EINVAL);
+            }
+
+            let len = data.len();
+            let mut buffer = vec![0u8; len + 20];
+            let mut packet = Ipv4Packet::new_unchecked(&mut buffer);
+            packet.set_version(4);
+            packet.set_header_len(20);
+            packet.set_total_len((20 + len) as u16);
+            packet.set_protocol(socket.ip_protocol());
+            let src_addr = select_ipv4_for_dst(v4_dst);
+            if src_addr.is_unspecified() {
+                return Err(LxError::EINVAL);
+            }
+            packet.set_src_addr(src_addr);
+            packet.set_dst_addr(v4_dst);
+            packet.set_hop_limit(64);
+            packet.payload_mut().copy_from_slice(data);
+            packet.fill_checksum();
+
+            socket.send_slice(&buffer).map_err(|e| {
+                warn!("raw socket send_slice failed: {:?}", e);
+                LxError::ENOBUFS
+            })?;
+
+            drop(socket);
+            drop(sockets);
+            flush_socket_egress();
+            Ok(len)
         }
-        packet.set_src_addr(src_addr);
-        packet.set_dst_addr(v4_dst);
-        packet.set_hop_limit(64);
-        packet.payload_mut().copy_from_slice(data);
-        packet.fill_checksum();
-
-        socket.send_slice(&buffer).map_err(|e| {
-            warn!("raw socket send_slice failed: {:?}", e);
-            LxError::ENOBUFS
-        })?;
-
-        drop(socket);
-        drop(sockets);
-        flush_socket_egress();
-        Ok(len)
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -204,8 +251,13 @@ impl Socket for RawSocketState {
         Some((recv_ca, send_ca))
     }
     fn endpoint(&self) -> Option<Endpoint> {
+        let addr = if self.inner.ipv6 {
+            IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        };
         Some(Endpoint::Ip(IpEndpoint {
-            addr: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            addr,
             port: 0,
         }))
     }

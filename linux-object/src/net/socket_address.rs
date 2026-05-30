@@ -7,7 +7,7 @@ use crate::error::LxError;
 // use crate::net::Endpoint;
 
 // smoltcp
-pub use smoltcp::wire::{IpAddress, Ipv4Address};
+pub use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 use crate::net::*;
 use kernel_hal::user::{UserInOutPtr, UserOutPtr};
@@ -23,6 +23,8 @@ pub union SockAddr {
     /// missing documentation
     pub addr_in: SockAddrIn,
     /// missing documentation
+    pub addr_in6: SockAddrIn6,
+    /// missing documentation
     pub addr_un: SockAddrUn,
     /// missing documentation
     pub addr_ll: SockAddrLl,
@@ -30,6 +32,17 @@ pub union SockAddr {
     pub addr_nl: SockAddrNl,
     /// missing documentation
     pub addr_ph: SockAddrPlaceholder,
+}
+
+/// missing documentation
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SockAddrIn6 {
+    pub sin6_family: u16,
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
 }
 
 /// missing documentation
@@ -172,7 +185,16 @@ impl From<Endpoint> for SockAddr {
                         sin_zero: [0; 8],
                     },
                 },
-                IpAddress::Unspecified => SockAddr {
+                IpAddress::Ipv6(ipv6) => SockAddr {
+                    addr_in6: SockAddrIn6 {
+                        sin6_family: AddressFamily::Internet6.into(),
+                        sin6_port: u16::to_be(ip.port),
+                        sin6_flowinfo: 0,
+                        sin6_addr: ipv6.0,
+                        sin6_scope_id: 0,
+                    },
+                },
+                IpAddress::Unspecified | _ => SockAddr {
                     addr_in: SockAddrIn {
                         sin_family: AddressFamily::Internet.into(),
                         sin_port: u16::to_be(ip.port),
@@ -180,7 +202,6 @@ impl From<Endpoint> for SockAddr {
                         sin_zero: [0; 8],
                     },
                 },
-                _ => unimplemented!("only ipv4"),
             }
         } else if let Endpoint::LinkLevel(link_level) = endpoint {
             let mut sll_addr = [0u8; 8];
@@ -240,6 +261,11 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                 ));
                 Ok(Endpoint::Ip((addr, port).into()))
             }
+            AddressFamily::Internet6 => {
+                let port = u16::from_be(addr.addr_in6.sin6_port);
+                let addr = IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.addr_in6.sin6_addr));
+                Ok(Endpoint::Ip((addr, port).into()))
+            }
             AddressFamily::Packet => {
                 let mut endpoint = LinkLevelEndpoint::new(addr.addr_ll.sll_ifindex as usize);
                 endpoint.halen = addr.addr_ll.sll_halen;
@@ -274,6 +300,7 @@ impl SockAddr {
         #[allow(unsafe_code)]
         match AddressFamily::from(unsafe { self.family }) {
             AddressFamily::Internet => Ok(size_of::<SockAddrIn>()),
+            AddressFamily::Internet6 => Ok(size_of::<SockAddrIn6>()),
             AddressFamily::Packet => Ok(size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(size_of::<SockAddrNl>()),
             AddressFamily::Unix => Ok(2),
@@ -433,6 +460,8 @@ enum_with_unknown! {
         Unix = 1,
         /// Internet IP Protocol
         Internet = 2,
+        /// IPv6 Internet IP Protocol
+        Internet6 = 10,
         /// Netlink
         Netlink = 16,
         /// Packet family

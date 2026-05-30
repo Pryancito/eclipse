@@ -266,7 +266,7 @@ impl Socket for NetlinkSocketState {
 
                 // Walk attributes to find IFA_LOCAL / IFA_ADDRESS
                 let attrs_off = ifa_off + size_of::<IfaceAddrMsg>();
-                let mut ip_bytes: Option<[u8; 4]> = None;
+                let mut ip_bytes: Option<alloc::vec::Vec<u8>> = None;
                 let mut ptr = attrs_off;
                 while ptr + size_of::<RouteAttr>() <= data.len() {
                     #[allow(unsafe_code)]
@@ -276,34 +276,45 @@ impl Socket for NetlinkSocketState {
                     let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
                     let t = IfAddrAttrTypes::from(rta.rta_type);
                     if matches!(t, IfAddrAttrTypes::Local | IfAddrAttrTypes::Address) {
-                        if payload.len() == 4 {
-                            let mut arr = [0u8; 4];
-                            arr.copy_from_slice(payload);
-                            ip_bytes = Some(arr);
+                        if payload.len() == 4 || payload.len() == 16 {
+                            ip_bytes = Some(payload.to_vec());
                         }
                     }
                     // rtattr entries are aligned to 4 bytes
                     ptr += (rta_len + 3) & !3;
                 }
                 if let Some(bytes) = ip_bytes {
-                    let cidr = smoltcp::wire::Ipv4Cidr::new(
-                        smoltcp::wire::Ipv4Address::from_bytes(&bytes),
-                        ifa.ifa_prefixlen,
-                    );
-                    if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifa.ifa_index) {
-                        crate::net::arp_cache::clear();
-                        crate::net::refresh_arp_local_macs();
-                        let _ = iface.set_ipv4_address(cidr);
-                        info!(
-                            "[netlink] NewAddr: set {}.{}.{}.{}/{} on {} (ifindex {})",
-                            bytes[0],
-                            bytes[1],
-                            bytes[2],
-                            bytes[3],
+                    let ip_cidr = if bytes.len() == 4 {
+                        let mut arr = [0u8; 4];
+                        arr.copy_from_slice(&bytes);
+                        Some(IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+                            smoltcp::wire::Ipv4Address::from_bytes(&arr),
                             ifa.ifa_prefixlen,
-                            iface.get_ifname(),
-                            ifa.ifa_index
-                        );
+                        )))
+                    } else if bytes.len() == 16 {
+                        let mut arr = [0u8; 16];
+                        arr.copy_from_slice(&bytes);
+                        Some(IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(
+                            smoltcp::wire::Ipv6Address::from_bytes(&arr),
+                            ifa.ifa_prefixlen,
+                        )))
+                    } else {
+                        None
+                    };
+
+                    if let Some(cidr) = ip_cidr {
+                        if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifa.ifa_index) {
+                            crate::net::arp_cache::clear();
+                            crate::net::ndp_cache::clear();
+                            crate::net::refresh_arp_local_macs();
+                            let _ = iface.add_ip_address(cidr);
+                            info!(
+                                "[netlink] NewAddr: set {} on {} (ifindex {})",
+                                cidr,
+                                iface.get_ifname(),
+                                ifa.ifa_index
+                            );
+                        }
                     }
                 }
                 // ACK (error=0)
@@ -321,7 +332,7 @@ impl Socket for NetlinkSocketState {
                 if data.len() < rtm_off + RTM_SIZE {
                     return Err(LxError::EINVAL);
                 }
-                let mut gw_bytes: Option<[u8; 4]> = None;
+                let mut gw_ip: Option<IpAddress> = None;
                 let mut linux_oif: u32 = 0;
                 let mut ptr = rtm_off + RTM_SIZE;
                 // RTA_OIF = 4
@@ -332,10 +343,16 @@ impl Socket for NetlinkSocketState {
                     let rta_len = rta.rta_len as usize;
                     if rta_len < size_of::<RouteAttr>() { break; }
                     let payload = &data[ptr + size_of::<RouteAttr>()..ptr + rta_len];
-                    if rta.rta_type == RTA_GATEWAY && payload.len() == 4 {
-                        let mut arr = [0u8; 4];
-                        arr.copy_from_slice(payload);
-                        gw_bytes = Some(arr);
+                    if rta.rta_type == RTA_GATEWAY {
+                        if payload.len() == 4 {
+                            let mut arr = [0u8; 4];
+                            arr.copy_from_slice(payload);
+                            gw_ip = Some(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&arr)));
+                        } else if payload.len() == 16 {
+                            let mut arr = [0u8; 16];
+                            arr.copy_from_slice(payload);
+                            gw_ip = Some(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_bytes(&arr)));
+                        }
                     } else if rta.rta_type == RTA_OIF && payload.len() == 4 {
                         linux_oif = {
                             #[allow(unsafe_code)]
@@ -344,19 +361,22 @@ impl Socket for NetlinkSocketState {
                     }
                     ptr += (rta_len + 3) & !3;
                 }
-                if let Some(gw) = gw_bytes {
+                if let Some(gw_addr) = gw_ip {
                     if let Ok(iface) = crate::net::iface_by_linux_ifindex(linux_oif) {
-                        let gw_addr = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&gw));
-                        let _ = iface.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(gw_addr));
-                        info!(
-                            "[netlink] NewRoute: default gw {}.{}.{}.{} via {} (oif {})",
-                            gw[0],
-                            gw[1],
-                            gw[2],
-                            gw[3],
-                            iface.get_ifname(),
-                            linux_oif
-                        );
+                        let dst_cidr = match gw_addr {
+                            IpAddress::Ipv4(_) => Some(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)),
+                            IpAddress::Ipv6(_) => Some(IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0)),
+                            _ => None,
+                        };
+                        if let Some(dst_cidr) = dst_cidr {
+                            let _ = iface.add_route(dst_cidr, Some(gw_addr));
+                            info!(
+                                "[netlink] NewRoute: default gw {} via {} (oif {})",
+                                gw_addr,
+                                iface.get_ifname(),
+                                linux_oif
+                            );
+                        }
                     }
                 }
                 // ACK

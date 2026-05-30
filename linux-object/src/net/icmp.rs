@@ -20,16 +20,18 @@ pub struct IcmpSocketState {
 struct IcmpSocketInner {
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
+    ipv6: bool,
 }
 
 impl IcmpSocketState {
     /// missing documentation
-    pub fn new() -> Self {
+    pub fn new(ipv6: bool) -> Self {
         IcmpSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(IcmpSocketInner {
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
+                ipv6,
             }),
         }
     }
@@ -48,16 +50,37 @@ impl IcmpSocketState {
         // If we have a known remote, drain only that interface's RX ring.
         // Otherwise drain all non-loopback interfaces so we don't miss the
         // ICMP reply when ping uses sendto() without a prior connect().
-        if let Some(dst) = self.remote_ipv4() {
-            if let Ok(dev) = netdev_for_ipv4(dst) {
-                netdev_drain_rx(dev.as_ref());
-                return;
+        if self.inner.ipv6 {
+            if let Some(Endpoint::Ip(ip)) = self.inner.remote.lock().clone() {
+                if let IpAddress::Ipv6(dst) = ip.addr {
+                    if dst.is_loopback() {
+                        crate::net::poll_ifaces();
+                        return;
+                    }
+                    if let Ok(dev) = netdev_for_ipv6(dst) {
+                        netdev_drain_rx(dev.as_ref());
+                        return;
+                    }
+                }
+            }
+        } else {
+            if let Some(dst) = self.remote_ipv4() {
+                if dst.is_loopback() {
+                    crate::net::poll_ifaces();
+                    return;
+                }
+                if let Ok(dev) = netdev_for_ipv4(dst) {
+                    netdev_drain_rx(dev.as_ref());
+                    return;
+                }
             }
         }
         // Fallback: drain all non-loopback devices.
         for dev in kernel_hal::net::get_net_device().iter() {
             if dev.get_ifname() != "loopback" {
                 netdev_drain_rx(dev.as_ref());
+            } else {
+                crate::net::poll_ifaces();
             }
         }
     }
@@ -115,35 +138,80 @@ impl Socket for IcmpSocketState {
         let Endpoint::Ip(ip) = endpoint.ok_or(LxError::ENOTCONN)? else {
             return Err(LxError::EINVAL);
         };
-        let IpAddress::Ipv4(dst) = ip.addr else {
-            return Err(LxError::EINVAL);
-        };
-        if !dst.is_unicast() {
-            return Err(LxError::EINVAL);
-        }
+        if self.inner.ipv6 {
+            let IpAddress::Ipv6(dst) = ip.addr else {
+                return Err(LxError::EINVAL);
+            };
+            let src = select_ipv6_for_dst(dst);
+            if src.is_unspecified() {
+                return Err(LxError::EINVAL);
+            }
 
-        let src = select_ipv4_for_dst(dst);
-        if src.is_unspecified() {
-            return Err(LxError::EINVAL);
-        }
+            let ip_len = 40 + data.len();
+            let mut ip = vec![0u8; ip_len];
+            {
+                let mut pkt = smoltcp::wire::Ipv6Packet::new_unchecked(&mut ip);
+                pkt.set_version(6);
+                pkt.set_payload_len(data.len() as u16);
+                pkt.set_next_header(smoltcp::wire::IpProtocol::Icmpv6);
+                pkt.set_src_addr(src);
+                pkt.set_dst_addr(dst);
+                pkt.set_hop_limit(64);
+                pkt.payload_mut().copy_from_slice(data);
 
-        let ip_len = 20 + data.len();
-        let mut ip = vec![0u8; ip_len];
-        {
-            let mut pkt = smoltcp::wire::Ipv4Packet::new_unchecked(&mut ip);
-            pkt.set_version(4);
-            pkt.set_header_len(20);
-            pkt.set_total_len(ip_len as u16);
-            pkt.set_protocol(smoltcp::wire::IpProtocol::Icmp);
-            pkt.set_src_addr(src);
-            pkt.set_dst_addr(dst);
-            pkt.set_hop_limit(64);
-            pkt.payload_mut().copy_from_slice(data);
-            pkt.fill_checksum();
+                let mut icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(pkt.payload_mut());
+                icmp_pkt.fill_checksum(&IpAddress::Ipv6(src), &IpAddress::Ipv6(dst));
+            }
+            if dst.is_loopback() {
+                if let Ok(dev) = crate::net::iface_by_name("loopback") {
+                    dev.send(&ip).map_err(|_| LxError::EIO)?;
+                    crate::net::poll_ifaces();
+                    self.kick_rx();
+                    return Ok(data.len());
+                }
+            }
+            send_ip6_ethernet(&ip)?;
+            self.kick_rx();
+            Ok(data.len())
+        } else {
+            let IpAddress::Ipv4(dst) = ip.addr else {
+                return Err(LxError::EINVAL);
+            };
+            if !dst.is_unicast() {
+                return Err(LxError::EINVAL);
+            }
+
+            let src = select_ipv4_for_dst(dst);
+            if src.is_unspecified() {
+                return Err(LxError::EINVAL);
+            }
+
+            let ip_len = 20 + data.len();
+            let mut ip = vec![0u8; ip_len];
+            {
+                let mut pkt = smoltcp::wire::Ipv4Packet::new_unchecked(&mut ip);
+                pkt.set_version(4);
+                pkt.set_header_len(20);
+                pkt.set_total_len(ip_len as u16);
+                pkt.set_protocol(smoltcp::wire::IpProtocol::Icmp);
+                pkt.set_src_addr(src);
+                pkt.set_dst_addr(dst);
+                pkt.set_hop_limit(64);
+                pkt.payload_mut().copy_from_slice(data);
+                pkt.fill_checksum();
+            }
+            if dst.is_loopback() {
+                if let Ok(dev) = crate::net::iface_by_name("loopback") {
+                    dev.send(&ip).map_err(|_| LxError::EIO)?;
+                    crate::net::poll_ifaces();
+                    self.kick_rx();
+                    return Ok(data.len());
+                }
+            }
+            send_ip_ethernet(&ip)?;
+            self.kick_rx();
+            Ok(data.len())
         }
-        send_ip_ethernet(&ip)?;
-        self.kick_rx();
-        Ok(data.len())
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {

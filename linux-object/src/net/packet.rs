@@ -23,6 +23,7 @@ lazy_static! {
 /// Dispatches a received packet to all registered AF_PACKET sockets.
 pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
+    crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
     let flag = kernel_hal::interrupt::intr_get();
     if flag { kernel_hal::interrupt::intr_off(); }
@@ -49,6 +50,23 @@ pub fn push_packet(packet: &[u8]) {
                                     
                                     if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
                                     crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if ethertype == 0x86dd { // IPv6
+                    if let Ok(ipv6_packet) = smoltcp::wire::Ipv6Packet::new_checked(frame.payload()) {
+                        if ipv6_packet.next_header() == smoltcp::wire::IpProtocol::Tcp {
+                            if let Ok(tcp_packet) = smoltcp::wire::TcpPacket::new_checked(ipv6_packet.payload()) {
+                                let is_first = tcp_packet.syn() && !tcp_packet.ack();
+                                if is_first {
+                                    use smoltcp::wire::{IpAddress, IpEndpoint};
+                                    let src_addr = IpEndpoint::new(IpAddress::Ipv6(ipv6_packet.src_addr()), tcp_packet.src_port());
+                                    let dst_addr = IpEndpoint::new(IpAddress::Ipv6(ipv6_packet.dst_addr()), tcp_packet.dst_port());
+                                    
+                                    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
+                                        crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
                                     }
                                 }
                             }

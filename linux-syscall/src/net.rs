@@ -41,22 +41,37 @@ impl Syscall<'_> {
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
-                Arc::new(TcpSocketState::new())
+                Arc::new(TcpSocketState::new(false))
+            }
+            (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
+                Arc::new(TcpSocketState::new(true))
             }
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
-                Arc::new(UdpSocketState::new())
+                Arc::new(UdpSocketState::new(false))
+            }
+            (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
+                Arc::new(UdpSocketState::new(true))
             }
             // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
-                Arc::new(IcmpSocketState::new())
+                Arc::new(IcmpSocketState::new(false))
             }
-            // Be tolerant for AF_INET datagram sockets.
+            (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
+                Arc::new(IcmpSocketState::new(true))
+            }
+            // Be tolerant for AF_INET/AF_INET6 datagram sockets.
             // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new()),
-            // AF_INET raw sockets (some userlands probe these)
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(false)),
+            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(true)),
+            // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8))
+                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false))
+            }
+            (Domain::AF_INET6, SocketType::SOCK_RAW, _) => {
+                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, true))
             }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)

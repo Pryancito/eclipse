@@ -335,6 +335,21 @@ impl Cidr {
     pub fn contains_subnet(&self, subnet: &Cidr) -> bool {
         self.prefix_len <= subnet.prefix_len && self.contains_addr(&subnet.address)
     }
+
+    /// Return the network block of this IPv6 CIDR.
+    pub fn network(&self) -> Cidr {
+        if self.prefix_len == 0 {
+            return Cidr {
+                address: Address::UNSPECIFIED,
+                prefix_len: 0,
+            };
+        }
+        let shift = 128 - self.prefix_len;
+        Cidr {
+            address: Address(self.address.mask(shift)),
+            prefix_len: self.prefix_len,
+        }
+    }
 }
 
 impl fmt::Display for Cidr {

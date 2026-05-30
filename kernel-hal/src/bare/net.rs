@@ -36,10 +36,15 @@ pub fn init() {
     // 为 设备 分配 网络 身份
 
     // ip 地址
-    let ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
+    let ip_addrs = vec![
+        IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
+        IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+    ];
     
     // Loopback does not require any default route/gateway
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
+    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
 
     // 设置 主要 设置 iface

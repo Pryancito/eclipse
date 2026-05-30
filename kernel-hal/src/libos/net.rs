@@ -35,10 +35,15 @@ pub fn init() {
     // 为 设备 分配 网络 身份
 
     // ip 地址: 127.0.0.1/8 matches the whole loopback subnet
-    let ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
+    let ip_addrs = vec![
+        IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
+        IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+    ];
     
     // Loopback does not require any default route/gateway
-    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 1] = [None; 1];
+    static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
 
     // 设置 主要 设置 iface
@@ -62,4 +67,28 @@ pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
     let mut devices = all_net().as_vec().clone();
     devices.sort_by_key(|d| if d.get_ifname() == "loopback" { 1 } else { 0 });
     devices
+}
+
+pub struct NetRxOrTimeoutFuture {
+    deadline: core::time::Duration,
+}
+
+impl NetRxOrTimeoutFuture {
+    pub fn new(timeout_ms: u64) -> Self {
+        Self {
+            deadline: crate::timer::timer_now() + core::time::Duration::from_millis(timeout_ms),
+        }
+    }
+}
+
+impl core::future::Future for NetRxOrTimeoutFuture {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
+        if crate::timer::timer_now() >= self.deadline {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    }
 }

@@ -130,8 +130,8 @@ impl INode for ProcRootINode {
 struct ProcNetDirINode;
 
 impl ProcNetDirINode {
-    fn entries() -> [&'static str; 3] {
-        ["dev", "route", "arp"]
+    fn entries() -> [&'static str; 4] {
+        ["dev", "route", "arp", "if_inet6"]
     }
 }
 
@@ -190,6 +190,10 @@ impl INode for ProcNetDirINode {
             ))),
             "arp" => Ok(Arc::new(Pseudo::new(
                 &proc_net_arp_content(),
+                FileType::File,
+            ))),
+            "if_inet6" => Ok(Arc::new(Pseudo::new(
+                &proc_net_if_inet6_content(),
                 FileType::File,
             ))),
             _ => Err(FsError::EntryNotFound),
@@ -390,6 +394,47 @@ fn proc_net_arp_content() -> String {
             mac_bytes[5],
             dev_name
         );
+    }
+    s
+}
+
+fn proc_net_if_inet6_content() -> String {
+    let mut s = String::new();
+    let ifaces = kernel_hal::net::get_net_device();
+    for (idx, iface) in ifaces.iter().enumerate() {
+        let name = iface.get_ifname();
+        let ifindex = idx + 1;
+        for ip in iface.get_ip_address() {
+            if let IpCidr::Ipv6(cidr) = ip {
+                let addr = cidr.address();
+                if addr.is_unspecified() {
+                    continue;
+                }
+                let mut addr_hex = String::new();
+                for &byte in addr.as_bytes() {
+                    let _ = write!(addr_hex, "{:02x}", byte);
+                }
+                let ifindex_hex = format!("{:02x}", ifindex);
+                let prefix_hex = format!("{:02x}", cidr.prefix_len());
+                let scope_hex = if addr.is_loopback() {
+                    "10"
+                } else if addr.is_link_local() {
+                    "20"
+                } else {
+                    "00"
+                };
+                let flags_hex = if addr.is_loopback() {
+                    "80"
+                } else {
+                    "00"
+                };
+                let _ = writeln!(
+                    s,
+                    "{} {} {} {} {} {}",
+                    addr_hex, ifindex_hex, prefix_hex, scope_hex, flags_hex, name
+                );
+            }
+        }
     }
     s
 }

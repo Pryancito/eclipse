@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
+use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 // use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
 // third part
@@ -34,11 +35,13 @@ pub struct UdpInner {
     remote_endpoint: Option<IpEndpoint>,
     /// flags on the socket
     flags: OpenFlags,
+    /// ipv6 domain socket flag
+    ipv6: bool,
 }
 
 impl Default for UdpSocketState {
     fn default() -> Self {
-        UdpSocketState::new()
+        UdpSocketState::new(false)
     }
 }
 
@@ -51,7 +54,7 @@ impl Default for UdpSocketState {
 
 impl UdpSocketState {
     /// missing documentation
-    pub fn new() -> Self {
+    pub fn new(ipv6: bool) -> Self {
         info!("udp new");
         let rx_buffer = UdpSocketBuffer::new(
             vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
@@ -70,6 +73,7 @@ impl UdpSocketState {
                 handle,
                 remote_endpoint: None,
                 flags: OpenFlags::RDWR,
+                ipv6,
             })),
         }
     }
@@ -289,12 +293,34 @@ impl Socket for UdpSocketState {
     fn endpoint(&self) -> Option<Endpoint> {
         let net_sockets = get_sockets();
         let mut sockets = net_sockets.lock();
-        let socket = sockets.get::<UdpSocket>(self.inner.lock().handle.0);
-
-        Some(Endpoint::Ip(socket.endpoint()))
+        let inner = self.inner.lock();
+        let socket = sockets.get::<UdpSocket>(inner.handle.0);
+        let ep = socket.endpoint();
+        let addr = if ep.addr.is_unspecified() {
+            if inner.ipv6 {
+                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+            } else {
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+            }
+        } else {
+            ep.addr
+        };
+        Some(Endpoint::Ip(IpEndpoint::new(addr, ep.port)))
     }
     fn remote_endpoint(&self) -> Option<Endpoint> {
-        self.inner.lock().remote_endpoint.map(Endpoint::Ip)
+        let inner = self.inner.lock();
+        inner.remote_endpoint.map(|ep| {
+            let addr = if ep.addr.is_unspecified() {
+                if inner.ipv6 {
+                    IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+                } else {
+                    IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+                }
+            } else {
+                ep.addr
+            };
+            Endpoint::Ip(IpEndpoint::new(addr, ep.port))
+        })
     }
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
         warn!("setsockopt is unimplemented");

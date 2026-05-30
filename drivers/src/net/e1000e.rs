@@ -4374,7 +4374,41 @@ impl NetScheme for E1000eInterface {
                 *slot = IpCidr::Ipv4(cidr);
             }
         });
-        *self.ip_addrs.lock() = vec![IpCidr::Ipv4(cidr)];
+        *self.ip_addrs.lock() = self.iface.lock().ip_addrs().to_vec();
+        Ok(())
+    }
+
+    fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            if addrs.contains(&cidr) {
+                return;
+            }
+            for slot in addrs.iter_mut() {
+                if slot.address().is_unspecified() && slot.prefix_len() == 0 {
+                    *slot = cidr;
+                    return;
+                }
+            }
+            if let Some(slot) = addrs.iter_mut().last() {
+                *slot = cidr;
+            }
+        });
+        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
+        Ok(())
+    }
+
+    fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            for slot in addrs.iter_mut() {
+                if *slot == cidr {
+                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+                    return;
+                }
+            }
+        });
+        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
         Ok(())
     }
     
@@ -4474,38 +4508,51 @@ impl NetScheme for E1000eInterface {
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-
         let mut iface = self.iface.lock();
-        match (cidr, gateway) {
-            (IpCidr::Ipv4(c), Some(IpAddress::Ipv4(gw))) if c.prefix_len() == 0 => {
-                iface
-                    .routes_mut()
-                    .add_default_ipv4_route(gw)
-                    .map_err(|_| DeviceError::IoError)?;
-                
+        match gateway {
+            Some(IpAddress::Ipv4(gw)) => {
+                if cidr.prefix_len() == 0 {
+                    iface
+                        .routes_mut()
+                        .add_default_ipv4_route(gw)
+                        .map_err(|_| DeviceError::IoError)?;
+                }
                 let mut routes = self.routes.lock();
-                routes.retain(|r| r.dst.prefix_len() != 0);
+                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv4(gw)),
                 });
             }
-            _ => {
-                warn!("[e1000e] non-default routes are not yet fully supported by this smoltcp version; tracking in driver only");
+            Some(IpAddress::Ipv6(gw)) => {
+                if cidr.prefix_len() == 0 {
+                    iface
+                        .routes_mut()
+                        .add_default_ipv6_route(gw)
+                        .map_err(|_| DeviceError::IoError)?;
+                }
+                let mut routes = self.routes.lock();
+                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
+                routes.push(RouteInfo {
+                    dst: cidr,
+                    gateway: Some(IpAddress::Ipv6(gw)),
+                });
+            }
+            None => {
                 self.routes.lock().push(RouteInfo { dst: cidr, gateway });
             }
+            _ => {}
         }
-
         Ok(())
     }
 
     fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-
         let mut iface = self.iface.lock();
-        if let IpCidr::Ipv4(c) = cidr {
-            if c.prefix_len() == 0 {
-                // iface.routes_mut().remove_default_ipv4_route(); // Might not exist
-                // Set to unspecified if needed, or just let it be if we can't remove.
+        if cidr.prefix_len() == 0 {
+            match cidr {
+                IpCidr::Ipv4(_) => { let _ = iface.routes_mut().remove_default_ipv4_route(); }
+                IpCidr::Ipv6(_) => { /* no simple remove_default_ipv6_route in smoltcp but tracked in routes */ }
+                _ => {}
             }
         }
         self.routes.lock().retain(|r| r.dst != cidr);
@@ -4521,14 +4568,24 @@ impl NetScheme for E1000eInterface {
         
         // 2. Add direct routes for each assigned IP address
         for cidr in iface.ip_addrs() {
-            if let IpCidr::Ipv4(v4) = cidr {
-                if v4.prefix_len() > 0 {
-                    // Use v4.network() directly if it returns IpCidr
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv4(v4.network()),
-                        gateway: None,
-                    });
+            match cidr {
+                IpCidr::Ipv4(v4) => {
+                    if v4.prefix_len() > 0 {
+                        res.push(RouteInfo {
+                            dst: IpCidr::Ipv4(v4.network()),
+                            gateway: None,
+                        });
+                    }
                 }
+                IpCidr::Ipv6(v6) => {
+                    if v6.prefix_len() > 0 {
+                        res.push(RouteInfo {
+                            dst: IpCidr::Ipv6(v6.network()),
+                            gateway: None,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         res
@@ -4724,7 +4781,29 @@ pub fn init(
     // Start with unspecified address (0.0.0.0/0) so smoltcp accepts all ARP
     // probes and DHCP can assign the real address without routing conflicts.
     // A /24 here would make smoltcp reject ARP for IPs outside that subnet.
-    let ip_addrs = [IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
+    let mut eui64 = [0u8; 8];
+    eui64[0] = mac_bytes[0] ^ 2;
+    eui64[1] = mac_bytes[1];
+    eui64[2] = mac_bytes[2];
+    eui64[3] = 0xff;
+    eui64[4] = 0xfe;
+    eui64[5] = mac_bytes[3];
+    eui64[6] = mac_bytes[4];
+    eui64[7] = mac_bytes[5];
+    let link_local = Ipv6Address::new(
+        0xfe80, 0, 0, 0,
+        (eui64[0] as u16) << 8 | eui64[1] as u16,
+        (eui64[2] as u16) << 8 | eui64[3] as u16,
+        (eui64[4] as u16) << 8 | eui64[5] as u16,
+        (eui64[6] as u16) << 8 | eui64[7] as u16,
+    );
+
+    let ip_addrs = vec![
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64)),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+    ];
     let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
@@ -4734,7 +4813,7 @@ pub fn init(
     let iface = InterfaceBuilder::new(driver.clone())
         .ethernet_addr(ethernet_addr)
         .neighbor_cache(neighbor_cache)
-        .ip_addrs(ip_addrs)
+        .ip_addrs(ip_addrs.clone())
         .routes(routes)
         .finalize();
 
@@ -4755,7 +4834,7 @@ pub fn init(
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
             gateway: Some(IpAddress::Ipv4(default_v4_gw)),
         }])),
-        ip_addrs: Arc::new(Mutex::new(Vec::from(ip_addrs))),
+        ip_addrs: Arc::new(Mutex::new(ip_addrs)),
     };
 
     Ok(e1000e_iface)

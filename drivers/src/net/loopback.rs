@@ -13,7 +13,7 @@ use crate::{DeviceError, DeviceResult};
 
 use alloc::vec::Vec;
 use smoltcp::wire::EthernetAddress;
-use smoltcp::wire::{IpCidr, Ipv4Cidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Cidr};
 
 pub struct LoopbackDevice {
     queue: VecDeque<Vec<u8>>,
@@ -81,6 +81,14 @@ impl phy::RxToken for LoopbackRxToken {
     }
 }
 
+pub static mut LOOPBACK_TX_CALLBACK: Option<fn(&[u8])> = None;
+
+pub fn register_loopback_tx_callback(cb: fn(&[u8])) {
+    unsafe {
+        LOOPBACK_TX_CALLBACK = Some(cb);
+    }
+}
+
 pub struct LoopbackTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
     stats: Arc<Mutex<NetStats>>,
@@ -98,6 +106,12 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
         stats.tx_packets += 1;
         stats.tx_bytes += len as u64;
         drop(stats);
+
+        unsafe {
+            if let Some(cb) = LOOPBACK_TX_CALLBACK {
+                cb(&buffer);
+            }
+        }
 
         self.queue.push_back(buffer);
         result
@@ -124,8 +138,10 @@ impl NetScheme for LoopbackInterface {
     fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
         unimplemented!()
     }
-    fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
-        unimplemented!()
+    fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
+        let mut iface = self.iface.lock();
+        iface.device_mut().queue.push_back(buf.to_vec());
+        Ok(buf.len())
     }
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(crate::net::timer_now_as_micros() as i64);
@@ -151,6 +167,38 @@ impl NetScheme for LoopbackInterface {
     fn get_ip_address(&self) -> Vec<IpCidr> {
         Vec::from(self.iface.lock().ip_addrs())
     }
+
+    fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            if addrs.contains(&cidr) {
+                return;
+            }
+            for slot in addrs.iter_mut() {
+                if slot.address().is_unspecified() && slot.prefix_len() == 0 {
+                    *slot = cidr;
+                    return;
+                }
+            }
+            if let Some(slot) = addrs.iter_mut().last() {
+                *slot = cidr;
+            }
+        });
+        Ok(())
+    }
+
+    fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
+            for slot in addrs.iter_mut() {
+                if *slot == cidr {
+                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+                    return;
+                }
+            }
+        });
+        Ok(())
+    }
     
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
         self.routes.lock().push(RouteInfo { dst: cidr, gateway });
@@ -171,13 +219,24 @@ impl NetScheme for LoopbackInterface {
 
         // 2. Add direct routes
         for cidr in iface.ip_addrs() {
-            if let IpCidr::Ipv4(v4) = cidr {
-                if v4.prefix_len() > 0 {
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv4(v4.network()),
-                        gateway: None,
-                    });
+            match cidr {
+                IpCidr::Ipv4(v4) => {
+                    if v4.prefix_len() > 0 {
+                        res.push(RouteInfo {
+                            dst: IpCidr::Ipv4(v4.network()),
+                            gateway: None,
+                        });
+                    }
                 }
+                IpCidr::Ipv6(v6) => {
+                    if v6.prefix_len() > 0 {
+                        res.push(RouteInfo {
+                            dst: IpCidr::Ipv6(v6.network()),
+                            gateway: None,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         res

@@ -14,6 +14,7 @@ use alloc::vec;
 
 // smoltcp
 use smoltcp::socket::{TcpSocket, TcpSocketBuffer, TcpState};
+use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 // async
 use async_trait::async_trait;
@@ -41,17 +42,19 @@ pub struct TcpInner {
     is_listening: bool,
     /// flags on the socket
     flags: OpenFlags,
+    /// ipv6 domain socket flag
+    ipv6: bool,
 }
 
 impl Default for TcpSocketState {
     fn default() -> Self {
-        TcpSocketState::new()
+        TcpSocketState::new(false)
     }
 }
 
 impl TcpSocketState {
     /// missing documentation
-    pub fn new() -> Self {
+    pub fn new(ipv6: bool) -> Self {
         let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
         let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
         let socket = TcpSocket::new(rx_buffer, tx_buffer);
@@ -64,6 +67,7 @@ impl TcpSocketState {
                 local_endpoint: None,
                 is_listening: false,
                 flags: OpenFlags::RDWR,
+                ipv6,
             })),
         }
     }
@@ -450,6 +454,7 @@ impl Socket for TcpSocketState {
         let inner = self.inner.lock();
         let endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
         let non_block = inner.flags.contains(OpenFlags::NON_BLOCK);
+        let is_ipv6 = inner.ipv6;
         drop(inner);
         
         loop {
@@ -462,6 +467,7 @@ impl Socket for TcpSocketState {
                         local_endpoint: Some(local),
                         is_listening: false,
                         flags: OpenFlags::RDWR,
+                        ipv6: is_ipv6,
                     })),
                 });
                 return Ok((
@@ -481,20 +487,41 @@ impl Socket for TcpSocketState {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.inner.lock();
-        Some(Endpoint::Ip(inner.local_endpoint.unwrap_or_else(|| {
+        let ep = inner.local_endpoint.unwrap_or_else(|| {
             let sets = get_sockets();
             let mut sets = sets.lock();
             let socket = sets.get::<TcpSocket>(inner.handle.0);
             socket.local_endpoint()
-        })))
+        });
+        let addr = if ep.addr.is_unspecified() {
+            if inner.ipv6 {
+                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+            } else {
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+            }
+        } else {
+            ep.addr
+        };
+        Some(Endpoint::Ip(IpEndpoint::new(addr, ep.port)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
         let sets = get_sockets();
         let mut sets = sets.lock();
-        let socket = sets.get::<TcpSocket>(self.inner.lock().handle.0);
+        let inner = self.inner.lock();
+        let socket = sets.get::<TcpSocket>(inner.handle.0);
         if socket.is_open() {
-            Some(Endpoint::Ip(socket.remote_endpoint()))
+            let ep = socket.remote_endpoint();
+            let addr = if ep.addr.is_unspecified() {
+                if inner.ipv6 {
+                    IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+                } else {
+                    IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+                }
+            } else {
+                ep.addr
+            };
+            Some(Endpoint::Ip(IpEndpoint::new(addr, ep.port)))
         } else {
             None
         }
