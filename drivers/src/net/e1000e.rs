@@ -4642,10 +4642,10 @@ impl phy::Device<'_> for E1000eDriver {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1414;
         caps.max_burst_size = Some(64);
-        caps.checksum.ipv4 = Checksum::Both;
-        caps.checksum.tcp = Checksum::Both;
-        caps.checksum.udp = Checksum::Both;
-        caps.checksum.icmpv4 = Checksum::Both;
+        caps.checksum.ipv4 = Checksum::None;
+        caps.checksum.tcp = Checksum::None;
+        caps.checksum.udp = Checksum::None;
+        caps.checksum.icmpv4 = Checksum::None;
         caps
     }
 }
