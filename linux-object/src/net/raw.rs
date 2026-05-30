@@ -11,7 +11,6 @@ use smoltcp::{
     wire::{IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, Ipv6Repr},
 };
 
-
 #[allow(unused_imports)]
 use zircon_object::object::*;
 
@@ -41,7 +40,11 @@ impl RawSocketState {
             vec![0; RAW_SENDBUF],
         );
         let socket = RawSocket::new(
-            if ipv6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 },
+            if ipv6 {
+                IpVersion::Ipv6
+            } else {
+                IpVersion::Ipv4
+            },
             IpProtocol::from(protocol),
             rx_buffer,
             tx_buffer,
@@ -98,20 +101,14 @@ impl Socket for RawSocketState {
                             );
                         }
                     }
-                    return (
-                        Err(LxError::EINVAL),
-                        Endpoint::Ip(IpEndpoint::UNSPECIFIED),
-                    );
+                    return (Err(LxError::EINVAL), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                 }
             }
             let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
             drop(socket);
             drop(sockets);
             if non_block {
-                return (
-                    Err(LxError::EAGAIN),
-                    Endpoint::Ip(IpEndpoint::UNSPECIFIED),
-                );
+                return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::thread::sleep_until(
                 kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
@@ -216,12 +213,18 @@ impl Socket for RawSocketState {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
-        if matches!(endpoint, Endpoint::Ip(_)) {
-            *self.inner.remote.lock() = Some(endpoint);
-            Ok(0)
-        } else {
-            Err(LxError::EINVAL)
+        let Endpoint::Ip(ip) = endpoint else {
+            return Err(LxError::EINVAL);
+        };
+        let family_ok = matches!(
+            (self.inner.ipv6, ip.addr),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        );
+        if !family_ok {
+            return Err(LxError::EINVAL);
         }
+        *self.inner.remote.lock() = Some(Endpoint::Ip(ip));
+        Ok(0)
     }
 
     fn bind(&self, _endpoint: Endpoint) -> SysResult {
@@ -256,10 +259,7 @@ impl Socket for RawSocketState {
         } else {
             IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
         };
-        Some(Endpoint::Ip(IpEndpoint {
-            addr,
-            port: 0,
-        }))
+        Some(Endpoint::Ip(IpEndpoint { addr, port: 0 }))
     }
     fn remote_endpoint(&self) -> Option<Endpoint> {
         self.inner.remote.lock().clone()
@@ -314,20 +314,12 @@ impl FileLike for RawSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus {
-            read,
-            write,
-            error,
-        })
+        Ok(PollStatus { read, write, error })
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
-        Ok(PollStatus {
-            read,
-            write,
-            error,
-        })
+        Ok(PollStatus { read, write, error })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {

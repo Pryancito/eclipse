@@ -27,12 +27,12 @@ fn is_our_ip(addr: IpAddress) -> bool {
         for ip in dev.get_ip_address() {
             match (ip, addr) {
                 (IpCidr::Ipv4(cidr), IpAddress::Ipv4(a)) => {
-                    if cidr.prefix_len() > 0 && cidr.contains_addr(&a) {
+                    if cidr.prefix_len() > 0 && cidr.address() == a {
                         return true;
                     }
                 }
                 (IpCidr::Ipv6(cidr), IpAddress::Ipv6(a)) => {
-                    if cidr.prefix_len() > 0 && cidr.contains_addr(&a) {
+                    if cidr.prefix_len() > 0 && cidr.address() == a {
                         return true;
                     }
                 }
@@ -63,7 +63,12 @@ pub fn deliver_from_frame(frame: &[u8]) {
             return;
         }
         let pkt = Ipv4Packet::new_unchecked(ip);
-        info!("[icmp_rx] IPv4 packet: protocol={}, src={}, dst={}", pkt.protocol(), pkt.src_addr(), pkt.dst_addr());
+        info!(
+            "[icmp_rx] IPv4 packet: protocol={}, src={}, dst={}",
+            pkt.protocol(),
+            pkt.src_addr(),
+            pkt.dst_addr()
+        );
         if pkt.protocol() != IpProtocol::Icmp {
             return;
         }
@@ -78,7 +83,11 @@ pub fn deliver_from_frame(frame: &[u8]) {
             info!("[icmp_rx] payload is empty");
             return;
         }
-        info!("[icmp_rx] ICMPv4 packet: type={}, code={}", payload[0], payload.get(1).unwrap_or(&0));
+        info!(
+            "[icmp_rx] ICMPv4 packet: type={}, code={}",
+            payload[0],
+            payload.get(1).unwrap_or(&0)
+        );
         if payload[0] != 0 {
             // 0 = Echo Reply
             return;
@@ -100,7 +109,12 @@ pub fn deliver_from_frame(frame: &[u8]) {
             return;
         }
         let pkt = Ipv6Packet::new_unchecked(ip);
-        info!("[icmp_rx] IPv6 packet: next_header={}, src={}, dst={}", pkt.next_header(), pkt.src_addr(), pkt.dst_addr());
+        info!(
+            "[icmp_rx] IPv6 packet: next_header={}, src={}, dst={}",
+            pkt.next_header(),
+            pkt.src_addr(),
+            pkt.dst_addr()
+        );
         if pkt.next_header() != IpProtocol::Icmpv6 {
             return;
         }
@@ -115,7 +129,11 @@ pub fn deliver_from_frame(frame: &[u8]) {
             info!("[icmp_rx] payload is empty");
             return;
         }
-        info!("[icmp_rx] ICMPv6 packet: type={}, code={}", payload[0], payload.get(1).unwrap_or(&0));
+        info!(
+            "[icmp_rx] ICMPv6 packet: type={}, code={}",
+            payload[0],
+            payload.get(1).unwrap_or(&0)
+        );
         if payload[0] != 129 {
             // 129 = Echo Reply
             return;
@@ -132,11 +150,22 @@ pub fn deliver_from_frame(frame: &[u8]) {
     }
 }
 
-pub fn pop() -> Option<(Vec<u8>, IpAddress)> {
-    RX_QUEUE
-        .lock()
-        .pop_front()
-        .map(|p| (p.data, p.src))
+pub fn pop_for(ipv6: bool, remote: Option<IpAddress>) -> Option<(Vec<u8>, IpAddress)> {
+    let mut q = RX_QUEUE.lock();
+    let idx = q.iter().position(|pkt| {
+        let family_ok = matches!(
+            (ipv6, pkt.src),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        );
+        if !family_ok {
+            return false;
+        }
+        match remote {
+            Some(remote_ip) => pkt.src == remote_ip,
+            None => true,
+        }
+    })?;
+    q.remove(idx).map(|p| (p.data, p.src))
 }
 
 pub fn pending() -> bool {
