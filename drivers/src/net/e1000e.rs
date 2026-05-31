@@ -4363,7 +4363,8 @@ impl NetScheme for E1000eInterface {
     }
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
         e1000e_vlog!("{}: IPv4 address set to {}", self.name, cidr);
-        self.iface.lock().update_ip_addrs(|addrs| {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if let IpCidr::Ipv4(v4) = slot {
                     *slot = IpCidr::Ipv4(cidr);
@@ -4374,7 +4375,8 @@ impl NetScheme for E1000eInterface {
                 *slot = IpCidr::Ipv4(cidr);
             }
         });
-        *self.ip_addrs.lock() = self.iface.lock().ip_addrs().to_vec();
+        let addrs_vec = iface.ip_addrs().to_vec();
+        *self.ip_addrs.lock() = addrs_vec;
         Ok(())
     }
 
@@ -4644,10 +4646,6 @@ impl phy::Device<'_> for E1000eDriver {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1414;
         caps.max_burst_size = Some(64);
-        caps.checksum.ipv4 = Checksum::None;
-        caps.checksum.tcp = Checksum::None;
-        caps.checksum.udp = Checksum::None;
-        caps.checksum.icmpv4 = Checksum::None;
         caps
     }
 }

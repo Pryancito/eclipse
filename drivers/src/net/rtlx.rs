@@ -281,10 +281,6 @@ impl<'a> Device<'a> for RTLxDriver {
         caps.max_transmission_unit = 1414;
         caps.max_burst_size = Some(64);
         caps.medium = Medium::Ethernet;
-        caps.checksum.ipv4 = Checksum::None;
-        caps.checksum.tcp = Checksum::None;
-        caps.checksum.udp = Checksum::None;
-        caps.checksum.icmpv4 = Checksum::None;
         caps
     }
 
