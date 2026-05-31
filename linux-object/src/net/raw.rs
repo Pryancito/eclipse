@@ -82,10 +82,13 @@ impl Socket for RawSocketState {
                     drop(sockets);
                     if self.inner.ipv6 {
                         if let Ok(packet) = Ipv6Packet::new_checked(&data[..size]) {
+                            let src_addr = packet.src_addr();
+                            let payload_len = size.saturating_sub(40);
+                            data.copy_within(40..size, 0);
                             return (
-                                Ok(size),
+                                Ok(payload_len),
                                 Endpoint::Ip(IpEndpoint {
-                                    addr: IpAddress::Ipv6(packet.src_addr()),
+                                    addr: IpAddress::Ipv6(src_addr),
                                     port: 0,
                                 }),
                             );
@@ -161,6 +164,11 @@ impl Socket for RawSocketState {
             };
             ip_repr.emit(&mut packet);
             packet.payload_mut().copy_from_slice(data);
+
+            if socket.ip_protocol() == IpProtocol::Icmpv6 {
+                let mut icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(packet.payload_mut());
+                icmp_pkt.fill_checksum(&IpAddress::Ipv6(src), &IpAddress::Ipv6(dst));
+            }
 
             socket.send_slice(&buffer).map_err(|e| {
                 warn!("raw socket send_slice failed: {:?}", e);
@@ -323,7 +331,7 @@ impl FileLike for RawSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
-        handle_net_ioctl(request, arg1, arg2, arg3)
+        handle_net_ioctl(request, arg1, arg2, arg3, self.inner.ipv6)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

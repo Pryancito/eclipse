@@ -609,7 +609,8 @@ impl FileLike for TcpSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
-        handle_net_ioctl(request, arg1, arg2, arg3)
+        let ipv6 = self.inner.lock().ipv6;
+        handle_net_ioctl(request, arg1, arg2, arg3, ipv6)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

@@ -124,6 +124,7 @@ pub struct LoopbackInterface {
     pub name: String,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
+    pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
 }
 
 impl Scheme for LoopbackInterface {
@@ -165,7 +166,7 @@ impl NetScheme for LoopbackInterface {
     }
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        Vec::from(self.iface.lock().ip_addrs())
+        self.ip_addrs.lock().clone()
     }
 
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
@@ -175,7 +176,9 @@ impl NetScheme for LoopbackInterface {
                 return;
             }
             for slot in addrs.iter_mut() {
-                if slot.address().is_unspecified() && slot.prefix_len() == 0 {
+                if (slot.address().is_unspecified() && slot.prefix_len() == 0)
+                    || (slot.address() == IpAddress::v4(240, 0, 0, 0) && slot.prefix_len() == 32)
+                {
                     *slot = cidr;
                     return;
                 }
@@ -184,6 +187,7 @@ impl NetScheme for LoopbackInterface {
                 *slot = cidr;
             }
         });
+        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
         Ok(())
     }
 
@@ -192,11 +196,12 @@ impl NetScheme for LoopbackInterface {
         iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+                    *slot = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
                     return;
                 }
             }
         });
+        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
         Ok(())
     }
     

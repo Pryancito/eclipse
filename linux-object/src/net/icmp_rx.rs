@@ -23,6 +23,11 @@ fn is_our_ip(addr: IpAddress) -> bool {
     if addr.is_unspecified() {
         return false;
     }
+    match addr {
+        IpAddress::Ipv4(a) if a.is_loopback() => return true,
+        IpAddress::Ipv6(a) if a.is_loopback() => return true,
+        _ => {}
+    }
     for dev in get_net_device().iter() {
         for ip in dev.get_ip_address() {
             match (ip, addr) {
@@ -118,8 +123,18 @@ pub fn deliver_from_frame(frame: &[u8]) {
         if pkt.next_header() != IpProtocol::Icmpv6 {
             return;
         }
+        let icmp_bytes = pkt.payload();
+        let icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(icmp_bytes);
         let src = IpAddress::Ipv6(pkt.src_addr());
         let dst = IpAddress::Ipv6(pkt.dst_addr());
+        let cs_ok = icmp_pkt.verify_checksum(&src, &dst);
+        info!(
+            "[icmp_rx] ICMPv6 packet length: {}, checksum field: 0x{:04x}, calculated cs_ok: {}, bytes: {:?}",
+            icmp_bytes.len(),
+            icmp_pkt.checksum(),
+            cs_ok,
+            icmp_bytes
+        );
         if !is_our_ip(dst) {
             info!("[icmp_rx] dst {} is not our IP", dst);
             return;

@@ -4385,7 +4385,9 @@ impl NetScheme for E1000eInterface {
                 return;
             }
             for slot in addrs.iter_mut() {
-                if slot.address().is_unspecified() && slot.prefix_len() == 0 {
+                if (slot.address().is_unspecified() && slot.prefix_len() == 0)
+                    || (slot.address() == IpAddress::v4(240, 0, 0, 0) && slot.prefix_len() == 32)
+                {
                     *slot = cidr;
                     return;
                 }
@@ -4403,7 +4405,7 @@ impl NetScheme for E1000eInterface {
         iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+                    *slot = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
                     return;
                 }
             }
@@ -4799,10 +4801,10 @@ pub fn init(
     );
 
     let ip_addrs = vec![
-        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
         IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64)),
-        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
     ];
     let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];

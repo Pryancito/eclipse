@@ -39,14 +39,15 @@ pub fn init() {
     let ip_addrs = vec![
         IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
         IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
-        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
     ];
     
     // Loopback does not require any default route/gateway
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
 
+    let ip_addrs_clone = ip_addrs.clone();
     // 设置 主要 设置 iface
     let iface = InterfaceBuilder::new(loopback)
         .ip_addrs(ip_addrs)
@@ -58,6 +59,7 @@ pub fn init() {
         name,
         stats,
         routes: Arc::new(Mutex::new(vec![])),
+        ip_addrs: Arc::new(Mutex::new(ip_addrs_clone)),
     };
     // loopback_iface
     let dev = Device::Net(Arc::new(loopback_iface));

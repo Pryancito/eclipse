@@ -390,6 +390,20 @@ pub struct RtEntry {
 }
 
 #[repr(C)]
+pub struct In6RtMsg {
+    pub rtmsg_dst: [u8; 16],
+    pub rtmsg_src: [u8; 16],
+    pub rtmsg_gateway: [u8; 16],
+    pub rtmsg_type: u32,
+    pub rtmsg_dst_len: u16,
+    pub rtmsg_src_len: u16,
+    pub rtmsg_metric: u32,
+    pub rtmsg_info: usize,
+    pub rtmsg_flags: u32,
+    pub rtmsg_ifindex: i32,
+}
+
+#[repr(C)]
 pub struct IfConf {
     pub ifc_len: i32,
     pub ifc_buf: usize,
@@ -976,7 +990,7 @@ fn get_ephemeral_port() -> u16 {
 // ============= Rand Port =============
 // ============= IOCTL =============
 
-pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
+pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize, ipv6: bool) -> LxResult<usize> {
     match request {
         // SIOCGIFCONF: get list of interfaces
         SIOCGIFCONF => {
@@ -1186,58 +1200,102 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize)
 
         // SIOCADDRT: add route
         SIOCADDRT => {
-            #[allow(unsafe_code)]
-            let rt = unsafe { &*(arg1 as *const RtEntry) };
-            let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
-                let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
-                Some(IpAddress::Ipv4(addr))
-            } else {
-                None
-            };
-            let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
-            let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
-            let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
-            let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
-
-            let ifname = if !rt.rt_dev.is_null() {
+            if ipv6 {
                 #[allow(unsafe_code)]
-                unsafe { from_cstr(rt.rt_dev) }
+                let rt = unsafe { &*(arg1 as *const In6RtMsg) };
+                use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
+                let dst_addr = Ipv6Address::from_bytes(&rt.rtmsg_dst);
+                let gateway = if (rt.rtmsg_flags & RTF_GATEWAY as u32) != 0 {
+                    let addr = Ipv6Address::from_bytes(&rt.rtmsg_gateway);
+                    Some(IpAddress::Ipv6(addr))
+                } else {
+                    None
+                };
+                let cidr = IpCidr::Ipv6(Ipv6Cidr::new(dst_addr, rt.rtmsg_dst_len as u8));
+                let iface = if rt.rtmsg_ifindex > 0 {
+                    iface_by_linux_ifindex(rt.rtmsg_ifindex as u32)?
+                } else {
+                    iface_by_name("eth0")?
+                };
+                info!("SIOCADDRT IPv6: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, iface.get_ifname());
+                iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+                Ok(0)
             } else {
-                "eth0" // default to eth0 if not specified
-            };
+                #[allow(unsafe_code)]
+                let rt = unsafe { &*(arg1 as *const RtEntry) };
+                let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
+                    let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
+                    Some(IpAddress::Ipv4(addr))
+                } else {
+                    None
+                };
+                let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
+                let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
+                let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
+                let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
 
-            info!("SIOCADDRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
-            let iface = iface_by_name(ifname)?;
-            iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
-            Ok(0)
+                let ifname = if !rt.rt_dev.is_null() {
+                    #[allow(unsafe_code)]
+                    unsafe { from_cstr(rt.rt_dev) }
+                } else {
+                    "eth0" // default to eth0 if not specified
+                };
+
+                info!("SIOCADDRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+                let iface = iface_by_name(ifname)?;
+                iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+                Ok(0)
+            }
         }
 
         // SIOCDELRT: delete route
         SIOCDELRT => {
-            #[allow(unsafe_code)]
-            let rt = unsafe { &*(arg1 as *const RtEntry) };
-            let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
-                let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
-                Some(IpAddress::Ipv4(addr))
-            } else {
-                None
-            };
-            let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
-            let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
-            let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
-            let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
-
-            let ifname = if !rt.rt_dev.is_null() {
+            if ipv6 {
                 #[allow(unsafe_code)]
-                unsafe { from_cstr(rt.rt_dev) }
+                let rt = unsafe { &*(arg1 as *const In6RtMsg) };
+                use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
+                let dst_addr = Ipv6Address::from_bytes(&rt.rtmsg_dst);
+                let gateway = if (rt.rtmsg_flags & RTF_GATEWAY as u32) != 0 {
+                    let addr = Ipv6Address::from_bytes(&rt.rtmsg_gateway);
+                    Some(IpAddress::Ipv6(addr))
+                } else {
+                    None
+                };
+                let cidr = IpCidr::Ipv6(Ipv6Cidr::new(dst_addr, rt.rtmsg_dst_len as u8));
+                let iface = if rt.rtmsg_ifindex > 0 {
+                    iface_by_linux_ifindex(rt.rtmsg_ifindex as u32)?
+                } else {
+                    iface_by_name("eth0")?
+                };
+                info!("SIOCDELRT IPv6: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, iface.get_ifname());
+                iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+                Ok(0)
             } else {
-                "eth0" // default to eth0 if not specified
-            };
+                #[allow(unsafe_code)]
+                let rt = unsafe { &*(arg1 as *const RtEntry) };
+                let gateway = if (rt.rt_flags & RTF_GATEWAY) != 0 {
+                    let addr = Ipv4Address::from_bytes(&rt.rt_gateway.sin_addr.to_ne_bytes());
+                    Some(IpAddress::Ipv4(addr))
+                } else {
+                    None
+                };
+                let dst_addr = Ipv4Address::from_bytes(&rt.rt_dst.sin_addr.to_ne_bytes());
+                let genmask = Ipv4Address::from_bytes(&rt.rt_genmask.sin_addr.to_ne_bytes());
+                let prefix_len = prefix_len_from_netmask(genmask).unwrap_or(0);
+                let cidr = IpCidr::Ipv4(Ipv4Cidr::new(dst_addr, prefix_len));
 
-            info!("SIOCDELRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
-            let iface = iface_by_name(ifname)?;
-            iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
-            Ok(0)
+                let ifname = if !rt.rt_dev.is_null() {
+                    #[allow(unsafe_code)]
+                    unsafe { from_cstr(rt.rt_dev) }
+                } else {
+                    "eth0" // default to eth0 if not specified
+                };
+
+                info!("SIOCDELRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+                let iface = iface_by_name(ifname)?;
+                iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
+                Ok(0)
+            }
         }
 
         // SIOCGARP

@@ -46,6 +46,7 @@ pub fn init() {
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
 
+    let ip_addrs_clone = ip_addrs.clone();
     // 设置 主要 设置 iface
     let iface = InterfaceBuilder::new(loopback)
         .ip_addrs(ip_addrs)
@@ -57,6 +58,7 @@ pub fn init() {
         name,
         stats,
         routes: Arc::new(Mutex::new(vec![])),
+        ip_addrs: Arc::new(Mutex::new(ip_addrs_clone)),
     };
     // loopback_iface
     let dev = Device::Net(Arc::new(loopback_iface));

@@ -184,6 +184,13 @@ impl Socket for IcmpSocketState {
 
                 let mut icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(pkt.payload_mut());
                 icmp_pkt.fill_checksum(&IpAddress::Ipv6(src), &IpAddress::Ipv6(dst));
+                info!(
+                    "[icmp write] Filled ICMPv6 checksum: 0x{:04x}, src: {}, dst: {}, bytes: {:?}",
+                    icmp_pkt.checksum(),
+                    src,
+                    dst,
+                    &ip[40..]
+                );
             }
             if dst.is_loopback() {
                 if let Ok(dev) = crate::net::iface_by_name("loopback") {
@@ -326,7 +333,7 @@ impl FileLike for IcmpSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
-        handle_net_ioctl(request, arg1, arg2, arg3)
+        handle_net_ioctl(request, arg1, arg2, arg3, self.inner.ipv6)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
