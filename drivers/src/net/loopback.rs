@@ -146,9 +146,14 @@ impl NetScheme for LoopbackInterface {
     }
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(crate::net::timer_now_as_micros() as i64);
+        let Some(mut iface) = self.iface.try_lock() else {
+            return Ok(());
+        };
         let sockets = get_sockets();
-        let mut sockets = sockets.lock();
-        match self.iface.lock().poll(&mut sockets, timestamp) {
+        let Some(mut sockets) = sockets.try_lock() else {
+            return Ok(());
+        };
+        match iface.poll(&mut sockets, timestamp) {
             Ok(_) => Ok(()),
             Err(err) => {
                 debug!("poll got err {}", err);
