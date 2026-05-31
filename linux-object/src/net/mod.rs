@@ -759,6 +759,17 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
         }
         dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
         netdev_drain_rx(dev.as_ref());
+        if attempt + 1 < ARP_TRIES {
+            let deadline =
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1);
+            while kernel_hal::timer::timer_now() < deadline {
+                netdev_drain_rx(dev.as_ref());
+                if arp_cache::lookup(arp_target).is_some() {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
         if arp_cache::lookup(arp_target).is_some() {
             continue;
         }
