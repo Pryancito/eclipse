@@ -2286,6 +2286,75 @@ impl E1000eHw {
             .unwrap_or(false)
     }
 
+    /// Full L3 frame length for Ethernet (+ optional VLAN) + IPv6 (40-byte header + payload).
+    fn eth_ipv6_frame_length(data: &[u8]) -> Option<usize> {
+        Self::eth_ipv6_header_info(data).map(|(_, need)| need)
+    }
+
+    fn eth_ipv6_header_info(data: &[u8]) -> Option<(usize, usize)> {
+        if data.len() < 14 + 40 {
+            return None;
+        }
+        let mut l2 = 14usize;
+        let mut et = u16::from_be_bytes([data[12], data[13]]);
+        if et == 0x8100 {
+            if data.len() < 18 + 40 {
+                return None;
+            }
+            l2 = 18;
+            et = u16::from_be_bytes([data[16], data[17]]);
+        }
+        if et != 0x86dd || data.len() < l2 + 40 {
+            return None;
+        }
+        if (data[l2] >> 4) != 6 {
+            return None;
+        }
+        let payload_len = u16::from_be_bytes([data[l2 + 4], data[l2 + 5]]) as usize;
+        if payload_len > 9000 {
+            return None;
+        }
+        Some((l2, l2 + 40 + payload_len))
+    }
+
+    fn eth_ipv6_frame_complete(data: &[u8]) -> bool {
+        Self::eth_ipv6_frame_length(data)
+            .map(|need| data.len() >= need)
+            .unwrap_or(false)
+    }
+
+    fn trim_to_ip_frame(mut data: Vec<u8>) -> Vec<u8> {
+        if let Some(need) = Self::eth_ipv4_frame_length(&data) {
+            if data.len() > need {
+                data.truncate(need);
+            }
+        } else if let Some(need) = Self::eth_ipv6_frame_length(&data) {
+            if data.len() > need {
+                data.truncate(need);
+            }
+        }
+        data
+    }
+
+    /// Drop truncated L3 frames before they reach smoltcp / AF_PACKET / icmp_rx.
+    fn rx_frame_deliverable(data: &[u8]) -> bool {
+        if data.len() < 14 {
+            return false;
+        }
+        let mut et = u16::from_be_bytes([data[12], data[13]]);
+        if et == 0x8100 {
+            if data.len() < 18 {
+                return false;
+            }
+            et = u16::from_be_bytes([data[16], data[17]]);
+        }
+        match et {
+            0x0800 => Self::rx_ipv4_deliverable(data),
+            0x86dd => Self::eth_ipv6_frame_complete(data),
+            _ => true,
+        }
+    }
+
     /// True if `data` begins with a plausible Ethernet (+ optional VLAN) + IPv4 header.
     /// Continuation fragments of a split RX descriptor do not pass this test.
     fn is_eth_ipv4_header_start(data: &[u8]) -> bool {
@@ -2343,7 +2412,11 @@ impl E1000eHw {
         if !Self::is_bootp_udp(data, l2, ihl) {
             return true;
         }
-        Self::peek_dhcp_magic_cookie(data, l2, ihl)
+        if Self::peek_dhcp_magic_cookie(data, l2, ihl) {
+            return true;
+        }
+        // I219 may place the cookie away from the fixed BOOTP offset.
+        Self::scan_dhcp_magic_cookie_offset(data).is_some()
     }
 
     fn is_bootp_udp(peek: &[u8], l2: usize, ihl: usize) -> bool {
@@ -2375,13 +2448,8 @@ impl E1000eHw {
         Self::dhcp_cookie_valid_in_frame(data)
     }
 
-    fn trim_to_ipv4_frame(mut data: Vec<u8>) -> Vec<u8> {
-        if let Some(need) = Self::eth_ipv4_frame_length(&data) {
-            if data.len() > need {
-                data.truncate(need);
-            }
-        }
-        data
+    fn trim_to_ipv4_frame(data: Vec<u8>) -> Vec<u8> {
+        Self::trim_to_ip_frame(data)
     }
 
     fn peek_dhcp_magic_cookie(peek: &[u8], l2: usize, ihl: usize) -> bool {
@@ -2417,32 +2485,53 @@ impl E1000eHw {
         let inv = desc_len.max(512).min(BUF_SIZE);
         Self::invalidate_cpu_cache_for_read(buf_vaddr, inv);
         let peek = core::slice::from_raw_parts(buf_vaddr as *const u8, inv);
-        let (l2, ihl, frame_need) = {
-            if peek.len() < 34 {
+        if peek.len() < 34 {
+            return desc_len;
+        }
+        let mut l2 = 14usize;
+        let mut et = u16::from_be_bytes([peek[12], peek[13]]);
+        if et == 0x8100 {
+            if peek.len() < 38 {
                 return desc_len;
             }
-            let mut l2 = 14usize;
-            let mut et = u16::from_be_bytes([peek[12], peek[13]]);
-            if et == 0x8100 {
-                if peek.len() < 38 {
-                    return desc_len;
+            l2 = 18;
+            et = u16::from_be_bytes([peek[16], peek[17]]);
+        }
+        if et == 0x86dd {
+            if peek.len() < l2 + 40 || (peek[l2] >> 4) != 6 {
+                return desc_len;
+            }
+            let payload_len = u16::from_be_bytes([peek[l2 + 4], peek[l2 + 5]]) as usize;
+            if payload_len > 9000 {
+                return desc_len;
+            }
+            let frame_need = l2 + 40 + payload_len;
+            if frame_need > BUF_SIZE {
+                return desc_len;
+            }
+            if frame_need > desc_len {
+                Self::invalidate_cpu_cache_for_read(buf_vaddr, frame_need.min(BUF_SIZE));
+                if Self::eth_ipv6_frame_complete(core::slice::from_raw_parts(
+                    buf_vaddr as *const u8,
+                    frame_need.min(BUF_SIZE),
+                )) {
+                    return frame_need;
                 }
-                l2 = 18;
-                et = u16::from_be_bytes([peek[16], peek[17]]);
             }
-            if et != 0x0800 {
-                return desc_len;
-            }
-            let ihl = ((peek[l2] & 0x0f) as usize) * 4;
-            if ihl < 20 || peek.len() < l2 + ihl + 8 {
-                return desc_len;
-            }
-            let ip_tot = u16::from_be_bytes([peek[l2 + 2], peek[l2 + 3]]) as usize;
-            if ip_tot < ihl || ip_tot > 9000 {
-                return desc_len;
-            }
-            (l2, ihl, l2 + ip_tot)
-        };
+            return desc_len;
+        }
+        if et != 0x0800 {
+            return desc_len;
+        }
+        let ihl = ((peek[l2] & 0x0f) as usize) * 4;
+        if ihl < 20 || peek.len() < l2 + ihl + 8 {
+            return desc_len;
+        }
+        let ip_tot = u16::from_be_bytes([peek[l2 + 2], peek[l2 + 3]]) as usize;
+        if ip_tot < ihl || ip_tot > 9000 {
+            return desc_len;
+        }
+        let frame_need = l2 + ip_tot;
         if frame_need > BUF_SIZE {
             return desc_len;
         }
@@ -2930,7 +3019,7 @@ impl E1000eHw {
         self.arm_rx_unit_linux();
 
         // Sync MAC RAR/MTA/RCTL → PHY BM filters after RCTL.EN (Linux init_phy_wakeup path).
-        if self.is_i219_metal_rx_hacks() {
+        if self.is_pch_lpt_or_later() {
             let phy = self.active_phy_addr();
             self.pch_sync_phy_rx_path(phy);
         }
@@ -3065,8 +3154,8 @@ impl E1000eHw {
 
             self.configure_flow_control_after_link(speed, duplex_full);
 
-            // 7. Si el enlace viene de estar caído, armamos el anillo RX limpio de forma segura
-            if was_down {
+            // 7. Arm RX when link comes up or the ring was never posted (flap / partial init).
+            if was_down || !self.rx_link_armed {
                 self.enable_rx_after_link();
             }
         }
@@ -3086,24 +3175,27 @@ impl E1000eHw {
             return;
         }
 
+        if self.is_pch_lpt_or_later() {
+            self.pch_try_early_link();
+            if !self.link_bringup_pending {
+                return;
+            }
+        }
+
         let now = timer_now_as_micros();
         let elapsed_us = now.wrapping_sub(self.stage_start_us);
 
-        // Estado 4: Espera activa tras estabilización física del PHY.
-        // Damos 1.5 segundos para que la detección automática de velocidad de la MAC se sincronice.
+        // State 4: PHY link + autoneg done — bring up MAC/RX/TX immediately, then retry briefly.
         if self.link_bringup_stage == 4 {
-            if elapsed_us >= 1_500_000 {
-                if self.check_for_link_linux() {
-                    e1000e_vlog!("[e1000e] Bringup: Link resuelto y estable.\n");
-                    self.link_bringup_pending = false;
-                    self.link_bringup_stage = 0;
-                    self.link_bringup_attempts = 0;
-                } else {
-                    // Falso positivo. Volvemos al estado de detección.
-                    crate::klog_warn!("[e1000e] Bringup: El enlace se cayó antes de estabilizarse. Reintentando...\n");
-                    self.link_bringup_stage = 0;
-                    self.stage_start_us = now;
-                }
+            if self.check_for_link_linux() {
+                e1000e_vlog!("[e1000e] Bringup: Link resuelto y estable.\n");
+                self.link_bringup_pending = false;
+                self.link_bringup_stage = 0;
+                self.link_bringup_attempts = 0;
+            } else if elapsed_us >= 1_500_000 {
+                crate::klog_warn!("[e1000e] Bringup: El enlace se cayó antes de estabilizarse. Reintentando...\n");
+                self.link_bringup_stage = 0;
+                self.stage_start_us = now;
             }
             return;
         }
@@ -3115,13 +3207,19 @@ impl E1000eHw {
         let phy_link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
         let aneg_complete = (bmsr & BMSR_ANEG_COMPLETE) != 0;
 
-        // Si el PHY reporta enlace físico y AN resuelto, saltamos directamente al filtro de estabilización (Estado 4)
+        // If PHY reports link + autoneg, try full MAC bring-up now (don't wait 1.5 s idle).
         if phy_link_up && aneg_complete {
             let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
             e1000e_vlog!(
                 "[e1000e] Bringup: Link de capa 1 detectado (Reg26={:#x}, Stage {}). Pasando a estabilización.\n",
                 st2, self.link_bringup_stage
             );
+            if self.check_for_link_linux() {
+                self.link_bringup_pending = false;
+                self.link_bringup_stage = 0;
+                self.link_bringup_attempts = 0;
+                return;
+            }
             self.link_bringup_stage = 4;
             self.stage_start_us = now;
             return;
@@ -3683,8 +3781,8 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_MANC, manc);
         }
 
-        // Linux e1000_setup_rctl: enable RCTL before link; ring posted in enable_rx_after_link.
-        mmio_write(self.base, E1000E_RCTL, self.rctl_rx_bits());
+        // Program RCTL filters but leave RCTL.EN off until arm_rx_unit_linux() posts the ring.
+        mmio_write(self.base, E1000E_RCTL, self.rctl_rx_bits() & !RCTL_EN);
 
         // Disable VLAN filtering
         mmio_write(self.base, E1000E_VET, 0);
@@ -3712,8 +3810,39 @@ impl E1000eHw {
         self.rx_poll_budget = 32;
         unsafe {
             self.qemu_finish_link_if_up();
+            self.pch_try_early_link();
         }
         Ok(())
+    }
+
+    /// PCH/I219: if cable is already up at probe time, finish link/RX/TX without waiting for bringup ticks.
+    unsafe fn pch_try_early_link(&mut self) {
+        if self.device_id == 0x10d3 || !self.is_pch_lpt_or_later() {
+            return;
+        }
+        if !self.link_bringup_pending {
+            return;
+        }
+        let status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 {
+            return;
+        }
+        let phy = self.phy_addr;
+        let _ = self.mdic_read(phy, MII_BMSR);
+        let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
+        if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 || (bmsr & BMSR_ANEG_COMPLETE) == 0 {
+            return;
+        }
+        if self.check_for_link_linux() {
+            self.link_bringup_pending = false;
+            self.link_bringup_stage = 0;
+            self.link_bringup_attempts = 0;
+            crate::klog_info!(
+                "[e1000e] PCH early link: {} Mb/s {} duplex\n",
+                self.link_speed,
+                if self.link_duplex { "full" } else { "half" }
+            );
+        }
     }
 
     /// QEMU e1000 (0x10d3): trust STATUS.LU, skip multi-second PHY MDIO bringup.
@@ -3995,7 +4124,30 @@ impl E1000eHw {
                         );
                     }
                 }
+            } else if ethertype == 0x86dd && data.len() >= 14 + 40 {
+                let payload_len = u16::from_be_bytes([data[16], data[17]]) as usize;
+                let expected = 14 + 40 + payload_len;
+                if expected > data.len() {
+                    log::warn!(
+                        "[e1000e] RX TRUNCATED IPv6 slot={} desc_len={} frame={} payload_len={} (need {} B)",
+                        i,
+                        len,
+                        data.len(),
+                        payload_len,
+                        expected
+                    );
+                }
             }
+        }
+
+        if !Self::rx_frame_deliverable(&data) {
+            log::warn!(
+                "[e1000e] RX slot {} incomplete L3 frame ({} B) — discard",
+                i,
+                data.len()
+            );
+            recycle(self);
+            return None;
         }
 
         recycle(self);
@@ -4100,16 +4252,19 @@ impl E1000eHw {
             return Err(DeviceError::InvalidParam);
         }
         if !self.link_up {
-            if self.device_id == 0x10d3 {
-                let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+            unsafe {
+                let status = mmio_read(self.base, E1000E_STATUS);
                 if status & STATUS_LU != 0 {
-                    self.link_up = true;
-                    self.link_speed = Self::speed_mbps_from_status(status);
-                    self.link_duplex = status & STATUS_FD != 0;
-                } else {
-                    return Err(DeviceError::NotReady);
+                    if self.is_pch_lpt_or_later() {
+                        let _ = self.check_for_link_linux();
+                    } else {
+                        self.link_up = true;
+                        self.link_speed = Self::speed_mbps_from_status(status);
+                        self.link_duplex = status & STATUS_FD != 0;
+                    }
                 }
-            } else {
+            }
+            if !self.link_up {
                 return Err(DeviceError::NotReady);
             }
         }
@@ -4599,7 +4754,7 @@ impl NetScheme for E1000eInterface {
         self.driver.hw.lock().merged_stats()
     }
     fn get_mtu(&self) -> usize {
-        1400
+        1500
     }
 }
 
@@ -4644,7 +4799,7 @@ impl phy::Device<'_> for E1000eDriver {
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1414;
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(64);
         caps
     }

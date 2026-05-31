@@ -265,7 +265,7 @@ impl NetScheme for RTLxInterface {
         }
     }
     fn get_mtu(&self) -> usize {
-        1400
+        1500
     }
 }
 
@@ -278,7 +278,7 @@ impl<'a> Device<'a> for RTLxDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1414;
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(64);
         caps.medium = Medium::Ethernet;
         caps

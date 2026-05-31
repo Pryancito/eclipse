@@ -603,7 +603,7 @@ impl NetScheme for E1000Interface {
         self.stats.lock().clone()
     }
     fn get_mtu(&self) -> usize {
-        1400
+        1500
     }
 }
 
@@ -640,7 +640,7 @@ impl phy::Device<'_> for E1000Driver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1414;
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(64);
         caps
     }

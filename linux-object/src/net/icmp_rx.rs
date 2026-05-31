@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use kernel_hal::net::get_net_device;
 use lazy_static::lazy_static;
 use lock::Mutex;
-use smoltcp::wire::{IpAddress, IpCidr, IpProtocol, Ipv4Packet};
+use smoltcp::wire::{IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet};
 
 const RX_QUEUE_MAX: usize = 64;
 
@@ -64,10 +64,9 @@ pub fn deliver_from_frame(frame: &[u8]) {
     }
     if et == 0x0800 {
         let ip = &frame[l2..];
-        if ip.len() < 20 {
+        let Ok(pkt) = Ipv4Packet::new_checked(ip) else {
             return;
-        }
-        let pkt = Ipv4Packet::new_unchecked(ip);
+        };
         info!(
             "[icmp_rx] IPv4 packet: protocol={}, src={}, dst={}",
             pkt.protocol(),
@@ -107,13 +106,10 @@ pub fn deliver_from_frame(frame: &[u8]) {
         });
         info!("[icmp_rx] queued ICMPv4 Echo Reply!");
     } else if et == 0x86dd {
-        use smoltcp::wire::Ipv6Packet;
         let ip = &frame[l2..];
-        if ip.len() < 40 {
-            info!("[icmp_rx] et is IPv6 but ip len is too short: {}", ip.len());
+        let Ok(pkt) = Ipv6Packet::new_checked(ip) else {
             return;
-        }
-        let pkt = Ipv6Packet::new_unchecked(ip);
+        };
         info!(
             "[icmp_rx] IPv6 packet: next_header={}, src={}, dst={}",
             pkt.next_header(),
@@ -123,17 +119,17 @@ pub fn deliver_from_frame(frame: &[u8]) {
         if pkt.next_header() != IpProtocol::Icmpv6 {
             return;
         }
-        let icmp_bytes = pkt.payload();
-        let icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(icmp_bytes);
+        let Ok(icmp_pkt) = smoltcp::wire::Icmpv6Packet::new_checked(pkt.payload()) else {
+            return;
+        };
         let src = IpAddress::Ipv6(pkt.src_addr());
         let dst = IpAddress::Ipv6(pkt.dst_addr());
         let cs_ok = icmp_pkt.verify_checksum(&src, &dst);
         info!(
-            "[icmp_rx] ICMPv6 packet length: {}, checksum field: 0x{:04x}, calculated cs_ok: {}, bytes: {:?}",
-            icmp_bytes.len(),
+            "[icmp_rx] ICMPv6 packet length: {}, checksum field: 0x{:04x}, calculated cs_ok: {}",
+            pkt.payload().len(),
             icmp_pkt.checksum(),
-            cs_ok,
-            icmp_bytes
+            cs_ok
         );
         if !is_our_ip(dst) {
             info!("[icmp_rx] dst {} is not our IP", dst);
