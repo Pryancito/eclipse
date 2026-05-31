@@ -365,11 +365,12 @@ impl LinuxRootfs {
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
               if [ -x /bin/udhcpc ]; then\n\
                   echo \"Iniciando udhcpc (DHCPv4)...\r\n\"\n\
-                  /bin/udhcpc -i eth0 -b -q -s /usr/share/udhcpc/default.script >/dev/null 2>&1 &\n\
+                  /bin/udhcpc -i eth0 >/dev/null 2>&1 &\n\
               fi\n\
+              sleep 2\n\
               if [ -x /bin/udhcpc6 ]; then\n\
                   echo \"Iniciando udhcpc6 (DHCPv6)...\r\n\"\n\
-                  /bin/udhcpc6 -i eth0 -b -q -s /usr/share/udhcpc/default6.script >/dev/null 2>&1 &\n\
+                  /bin/udhcpc6 -i eth0 >/dev/null 2>&1 &\n\
               fi\n",
         )
         .unwrap();
