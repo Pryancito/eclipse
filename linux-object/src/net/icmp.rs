@@ -135,6 +135,17 @@ impl Socket for IcmpSocketState {
             // deferred poll job was scheduled (tight timing on QEMU).
             self.kick_rx();
 
+            // Re-check immediately after kick_rx so we don't miss a reply that
+            // arrived between drain_deferred_jobs and kick_rx: this is critical
+            // for NON_BLOCK callers (MSG_DONTWAIT) which would otherwise return
+            // EAGAIN even though the reply is already in the queue.
+            let remote = self.remote_ip();
+            if let Some((pkt, src)) = icmp_rx::pop_for(self.inner.ipv6, remote) {
+                let n = pkt.len().min(data.len());
+                data[..n].copy_from_slice(&pkt[..n]);
+                return (Ok(n), Endpoint::Ip(IpEndpoint::new(src.into(), 0)));
+            }
+
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
@@ -281,7 +292,7 @@ impl Socket for IcmpSocketState {
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         self.kick_rx();
-        let readable = icmp_rx::pending();
+        let readable = icmp_rx::pending_for(self.inner.ipv6);
         (readable, true, false)
     }
 }

@@ -186,3 +186,16 @@ pub fn pop_for(ipv6: bool, remote: Option<IpAddress>) -> Option<(Vec<u8>, IpAddr
 pub fn pending() -> bool {
     !RX_QUEUE.lock().is_empty()
 }
+
+/// Returns true if there is at least one queued reply matching the given address family.
+/// More precise than `pending()` — avoids spurious wakeups when replies from the
+/// opposite family (e.g. ICMPv6 while waiting for ICMPv4) are in the queue.
+pub fn pending_for(ipv6: bool) -> bool {
+    let q = RX_QUEUE.lock();
+    q.iter().any(|pkt| {
+        matches!(
+            (ipv6, pkt.src),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        )
+    })
+}
