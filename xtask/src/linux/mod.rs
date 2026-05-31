@@ -177,39 +177,93 @@ impl LinuxRootfs {
         let _ = fs::create_dir_all(dir.join("tmp"));
         let _ = fs::create_dir_all(dir.join("dev"));
 
-        // udhcpc default script — applies the DHCP-acquired address
+        // udhcpc / udhcpc6 scripts — apply leases via `ip` (no ifconfig/route)
         let udhcpc_dir = dir.join("usr/share/udhcpc");
         fs::create_dir_all(&udhcpc_dir).unwrap();
         let udhcpc_script = udhcpc_dir.join("default.script");
         fs::write(&udhcpc_script,
             b"#!/bin/sh\n\
-              # Minimal udhcpc script for Eclipse OS\n\
+              # udhcpc (DHCPv4) script for Eclipse OS\n\
+              RESOLV_CONF=/etc/resolv.conf\n\
+              mask_to_prefix() {\n\
+                case \"$1\" in\n\
+                  255.255.255.255) echo 32 ;;\n\
+                  255.255.255.254) echo 31 ;;\n\
+                  255.255.255.252) echo 30 ;;\n\
+                  255.255.255.248) echo 29 ;;\n\
+                  255.255.255.240) echo 28 ;;\n\
+                  255.255.255.224) echo 27 ;;\n\
+                  255.255.255.192) echo 26 ;;\n\
+                  255.255.255.128) echo 25 ;;\n\
+                  255.255.255.0)   echo 24 ;;\n\
+                  255.255.0.0)     echo 16 ;;\n\
+                  255.0.0.0)       echo 8 ;;\n\
+                  *)               echo 24 ;;\n\
+                esac\n\
+              }\n\
               case \"$1\" in\n\
                 deconfig)\n\
-                  ip addr flush dev $interface 2>/dev/null\n\
-                  ifconfig $interface 0.0.0.0 up 2>/dev/null\n\
+                  ip link set dev \"$interface\" up 2>/dev/null\n\
+                  ip -4 addr flush dev \"$interface\" 2>/dev/null\n\
+                  ip -4 route del default dev \"$interface\" 2>/dev/null\n\
                   ;;\n\
                 bound|renew)\n\
-                  ifconfig $interface $ip netmask ${subnet:-255.255.255.0} up 2>/dev/null\n\
+                  ip link set dev \"$interface\" up 2>/dev/null\n\
+                  prefix=$(mask_to_prefix \"${subnet:-255.255.255.0}\")\n\
+                  ip -4 addr flush dev \"$interface\" 2>/dev/null\n\
+                  ip -4 addr add \"$ip/$prefix\" dev \"$interface\" 2>/dev/null\n\
                   if [ -n \"$router\" ]; then\n\
                     for r in $router; do\n\
-                      route add default gw $r dev $interface 2>/dev/null\n\
+                      ip -4 route del default 2>/dev/null\n\
+                      ip -4 route add default via \"$r\" dev \"$interface\" 2>/dev/null\n\
+                      break\n\
                     done\n\
                   fi\n\
                   if [ -n \"$dns\" ]; then\n\
-                    echo -n > /etc/resolv.conf\n\
+                    : > \"$RESOLV_CONF\"\n\
                     for d in $dns; do\n\
-                      echo \"nameserver $d\" >> /etc/resolv.conf\n\
+                      echo \"nameserver $d\" >> \"$RESOLV_CONF\"\n\
                     done\n\
                   fi\n\
                   ;;\n\
+                leasefail)\n\
+                  ;;\n\
               esac\n"
         ).unwrap();
-        // Make the script executable
+        let udhcpc6_script = udhcpc_dir.join("default6.script");
+        fs::write(&udhcpc6_script,
+            b"#!/bin/sh\n\
+              # udhcpc6 (DHCPv6) script for Eclipse OS\n\
+              RESOLV_CONF=/etc/resolv.conf\n\
+              case \"$1\" in\n\
+                deconfig)\n\
+                  ip link set dev \"$interface\" up 2>/dev/null\n\
+                  ;;\n\
+                bound|renew)\n\
+                  ip link set dev \"$interface\" up 2>/dev/null\n\
+                  if [ -n \"$ipv6\" ]; then\n\
+                    ip -6 addr del \"$ipv6/128\" dev \"$interface\" 2>/dev/null\n\
+                    ip -6 addr add \"$ipv6/128\" dev \"$interface\" 2>/dev/null\n\
+                  fi\n\
+                  if [ -n \"$ipv6prefix\" ]; then\n\
+                    ip -6 addr add \"$ipv6prefix\" dev \"$interface\" 2>/dev/null\n\
+                  fi\n\
+                  if [ -n \"$dns\" ]; then\n\
+                    : > \"$RESOLV_CONF\"\n\
+                    for d in $dns; do\n\
+                      echo \"nameserver $d\" >> \"$RESOLV_CONF\"\n\
+                    done\n\
+                  fi\n\
+                  ;;\n\
+                leasefail)\n\
+                  ;;\n\
+              esac\n"
+        ).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&udhcpc_script, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&udhcpc6_script, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         // openssl wrapper to busybox ssl_client
@@ -309,9 +363,13 @@ impl LinuxRootfs {
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
-              if [ -f /bin/edhcpc ]; then\n\
-                  echo \"Iniciando cliente DHCP...\r\n\"\n\
-                  /bin/edhcpc -i eth0 >/dev/null 2>/dev/null &\n\
+              if [ -x /bin/udhcpc ]; then\n\
+                  echo \"Iniciando udhcpc (DHCPv4)...\r\n\"\n\
+                  /bin/udhcpc -i eth0 -b -q -s /usr/share/udhcpc/default.script >/dev/null 2>&1 &\n\
+              fi\n\
+              if [ -x /bin/udhcpc6 ]; then\n\
+                  echo \"Iniciando udhcpc6 (DHCPv6)...\r\n\"\n\
+                  /bin/udhcpc6 -i eth0 -b -q -s /usr/share/udhcpc/default6.script >/dev/null 2>&1 &\n\
               fi\n",
         )
         .unwrap();
@@ -422,7 +480,10 @@ impl LinuxRootfs {
                   s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/;\
                   s/.*CONFIG_FEATURE_WGET_OPENSSL.*/CONFIG_FEATURE_WGET_OPENSSL=n/;\
                   s/.*CONFIG_FEATURE_WGET_HTTPS.*/CONFIG_FEATURE_WGET_HTTPS=y/;\
-                  s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/")
+                  s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/;\
+                  s/.*CONFIG_FEATURE_IPV6.*/CONFIG_FEATURE_IPV6=y/;\
+                  s/.*CONFIG_UDHCPC6.*/CONFIG_UDHCPC6=y/;\
+                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/")
             .arg(".config")
             .invoke();
         Ext::new("sh")

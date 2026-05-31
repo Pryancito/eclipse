@@ -4574,7 +4574,7 @@ impl NetScheme for E1000eInterface {
         for cidr in iface.ip_addrs() {
             match cidr {
                 IpCidr::Ipv4(v4) => {
-                    if v4.prefix_len() > 0 {
+                    if v4.prefix_len() > 0 && v4.address().0[0] != 240 {
                         res.push(RouteInfo {
                             dst: IpCidr::Ipv4(v4.network()),
                             gateway: None,

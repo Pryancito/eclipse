@@ -7,7 +7,7 @@ pub mod socket_address;
 use crate::fs::{FileLike, PollEvents};
 use crate::error::{LxError, LxResult};
 use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
-use smoltcp::wire::{IpCidr, IpEndpoint, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
 pub use socket_address::*;
 use log::*;
 
@@ -33,12 +33,53 @@ pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);
     zcore_drivers::net::loopback::register_loopback_tx_callback(loopback_tx_handler);
     refresh_arp_local_macs();
+    for iface in get_net_device() {
+        ensure_ipv6_link_local(iface.as_ref());
+    }
 }
 
 pub fn refresh_arp_local_macs() {
     let macs: alloc::vec::Vec<_> = get_net_device().iter().map(|d| d.get_mac()).collect();
     arp_cache::refresh_local_macs(macs.clone());
     ndp_cache::refresh_local_macs(macs);
+}
+
+/// Derive the RFC 4862 link-local address (fe80::/64, EUI-64 IID) from a MAC.
+pub fn ipv6_link_local_from_mac(mac: &EthernetAddress) -> smoltcp::wire::Ipv6Address {
+    let b = mac.as_bytes();
+    smoltcp::wire::Ipv6Address::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from(b[0] ^ 2) << 8 | u16::from(b[1]),
+        u16::from(b[2]) << 8 | 0xff,
+        0xfe << 8 | u16::from(b[3]),
+        u16::from(b[4]) << 8 | u16::from(b[5]),
+    )
+}
+
+/// Ensure every Ethernet iface has a link-local IPv6 address (required by DHCPv6).
+pub fn ensure_ipv6_link_local(iface: &dyn zcore_drivers::scheme::NetScheme) {
+    if iface.get_ifname() == "loopback" {
+        return;
+    }
+    let expected = ipv6_link_local_from_mac(&iface.get_mac());
+    let has_ll = iface.get_ip_address().iter().any(|ip| {
+        matches!(
+            ip,
+            IpCidr::Ipv6(cidr) if cidr.address().is_link_local() || cidr.address() == expected
+        )
+    });
+    if !has_ll {
+        let ll = IpCidr::Ipv6(Ipv6Cidr::new(expected, 64));
+        let _ = iface.add_ip_address(ll);
+        info!(
+            "[net] ensured link-local {} on {}",
+            expected,
+            iface.get_ifname()
+        );
+    }
 }
 
 pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
@@ -313,6 +354,7 @@ pub const SIOCGIFMETRIC: usize = 0x891d;
 pub const SIOCGIFMTU: usize = 0x8921;
 pub const SIOCGIFHWADDR: usize = 0x8927;
 pub const SIOCGIFINDEX: usize = 0x8933;
+pub const SIOCGIFTXQLEN: usize = 0x8942;
 pub const SIOCGARP: usize = 0x8954;
 pub const ARPHRD_ETHER: u16 = 1;
 pub const ARPHRD_LOOPBACK: u16 = 772;
@@ -350,6 +392,7 @@ pub union IfReqUnion {
     pub ifindex: i32,
     pub ifmtu: i32,
     pub ifmetric: i32,
+    pub ifqlen: i32,
     pub flags: i16,
     pub ifru_pad: [u64; 3],
 }
@@ -1188,6 +1231,14 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
                     ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(mac.as_bytes());
                 }
             }
+            Ok(0)
+        }
+
+        SIOCGIFTXQLEN => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let _ = ifreq_name(&ifr.ifr_name)?;
+            ifr.ifr_ifru = IfReqUnion { ifqlen: 1000 };
             Ok(0)
         }
 

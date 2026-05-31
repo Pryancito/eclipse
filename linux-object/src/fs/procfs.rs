@@ -402,6 +402,7 @@ fn proc_net_if_inet6_content() -> String {
     let mut s = String::new();
     let ifaces = kernel_hal::net::get_net_device();
     for (idx, iface) in ifaces.iter().enumerate() {
+        crate::net::ensure_ipv6_link_local(iface.as_ref());
         let name = iface.get_ifname();
         let ifindex = idx + 1;
         for ip in iface.get_ip_address() {
@@ -414,7 +415,7 @@ fn proc_net_if_inet6_content() -> String {
                 for &byte in addr.as_bytes() {
                     let _ = write!(addr_hex, "{:02x}", byte);
                 }
-                let ifindex_hex = format!("{:02x}", ifindex);
+                let ifindex_hex = format!("{:08x}", ifindex);
                 let prefix_hex = format!("{:02x}", cidr.prefix_len());
                 let scope_hex = if addr.is_loopback() {
                     "10"

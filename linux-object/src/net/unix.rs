@@ -329,8 +329,8 @@ impl Socket for UnixSocketState {
         Ok(0)
     }
 
-    fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
-        Ok(0)
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
+        crate::net::handle_net_ioctl(request, arg1, arg2, arg3, false)
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
