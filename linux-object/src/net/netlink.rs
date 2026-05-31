@@ -180,11 +180,48 @@ impl Socket for NetlinkSocketState {
             }
             NetlinkMessageType::GetAddr => {
                 let ifaces = get_net_device();
+                // Byte pattern of the pre-DHCP placeholder IPv4 address.
+                let placeholder_v4: [u8; 4] = [240, 0, 0, 0];
                 for (i, iface) in ifaces.iter().enumerate() {
                     let ip_addrs = iface.get_ip_address();
-
-                    // for j in 0..ip_addrs.len() {
                     for ip in &ip_addrs {
+                        let ip_addr = ip.address();
+                        let ip_bytes = ip_addr.as_bytes();
+
+                        // Skip placeholder IPv4 240.0.0.0 entries (assigned before DHCP).
+                        if ip_bytes == placeholder_v4 {
+                            continue;
+                        }
+
+                        // Derive address family from byte width.
+                        let ifa_family: u8 = if ip_bytes.len() == 4 {
+                            let f: u16 = AddressFamily::Internet.into();
+                            f as u8
+                        } else {
+                            let f: u16 = AddressFamily::Internet6.into();
+                            f as u8
+                        };
+
+                        // Compute scope per RFC 2473 / rt_scope_t:
+                        //   RT_SCOPE_HOST=254  (loopback), RT_SCOPE_LINK=253 (link-local), 0 (global)
+                        let ifa_scope: u8 = if ip_bytes.len() == 16 {
+                            // IPv6 link-local: fe80::/10 (first byte 0xfe, second byte top-2-bits == 10).
+                            if ip_bytes[0] == 0xfe && (ip_bytes[1] & 0xc0) == 0x80 {
+                                253 // RT_SCOPE_LINK
+                            } else if ip_bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
+                                254 // RT_SCOPE_HOST (::1)
+                            } else {
+                                0 // RT_SCOPE_UNIVERSE
+                            }
+                        } else {
+                            // IPv4 loopback 127.x.x.x
+                            if ip_bytes[0] == 127 {
+                                254 // RT_SCOPE_HOST
+                            } else {
+                                0 // RT_SCOPE_UNIVERSE
+                            }
+                        };
+
                         let mut msg = Vec::new();
                         let new_header = NetlinkMessageHeader {
                             nlmsg_len: 0, // to be determined later
@@ -195,12 +232,11 @@ impl Socket for NetlinkSocketState {
                         };
                         msg.push_ext(new_header);
 
-                        let family: u16 = AddressFamily::Internet.into();
                         let if_addr = IfaceAddrMsg {
-                            ifa_family: family as u8,
+                            ifa_family,
                             ifa_prefixlen: ip.prefix_len(),
                             ifa_flags: 0,
-                            ifa_scope: 0,
+                            ifa_scope,
                             ifa_index: (i + 1) as u32, // must match GetLink ifi_index (1-based)
                         };
                         msg.align4();
@@ -208,17 +244,16 @@ impl Socket for NetlinkSocketState {
 
                         let mut attrs = Vec::new();
 
-                        let ip_addr = ip.address();
                         // IFA_LOCAL and IFA_ADDRESS are both used by userland.
                         push_rtattr_bytes(
                             &mut attrs,
                             IfAddrAttrTypes::Local.into(),
-                            ip_addr.as_bytes(),
+                            ip_bytes,
                         );
                         push_rtattr_bytes(
                             &mut attrs,
                             IfAddrAttrTypes::Address.into(),
-                            ip_addr.as_bytes(),
+                            ip_bytes,
                         );
 
                         // Label (interface name) with NUL terminator.
@@ -232,9 +267,9 @@ impl Socket for NetlinkSocketState {
                         );
 
                         // IPv4 broadcast if applicable.
-                        if ip_addr.as_bytes().len() == 4 {
+                        if ip_bytes.len() == 4 {
                             let bcast = ipv4_broadcast(
-                                smoltcp::wire::Ipv4Address::from_bytes(ip_addr.as_bytes()),
+                                smoltcp::wire::Ipv4Address::from_bytes(ip_bytes),
                                 ip.prefix_len(),
                             );
                             push_rtattr_bytes(
