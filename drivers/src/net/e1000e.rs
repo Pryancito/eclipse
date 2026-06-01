@@ -10,11 +10,9 @@
 //! IAME, no optional PCH tuning, short link-up wait. RX always uses extended
 //! descriptors (`RFCTL_EXTEN`) — I219/PCH ignore legacy layout on real silicon.
 //!
-//! Link speed/duplex come from IEEE 802.3 autoneg (PHY reg26 / BMSR). The driver
-//! only clears blocks (LPLU, GBE-disable), kicks autoneg at init if needed, and
-//! mirrors the negotiated rate into MAC CTRL/TIPG/TARC from PHY reg26 (and reg17
-//! when RESOLVED). ANAR∩LPA (MII HCD) is only logged — it is what both sides
-//! advertise, not the resolved link rate.
+//! Link speed/duplex follow Intel e1000e 3.8.7 (ich8lan.c / phy.c), as packaged in
+//! koljah-de/e1000e-dkms-debian: autoneg + ASDE on PCH, STATUS as primary speed,
+//! reg26/reg17 when ahead of STATUS, TIPG/EMI/PLL/TARC tuned after link-up.
 
 /// Minimal NIC profile for bare-metal bring-up (fewer moving parts).
 const E1000E_CONVENTIONAL: bool = false;
@@ -239,6 +237,11 @@ const I82577_PHY_CTRL_2: u32 = 18;
 const I82577_CFG_ASSERT_CRS_ON_TX: u16 = 1 << 15;
 const I82577_CFG_ENABLE_DOWNSHIFT: u16 = 3 << 10;
 const I82577_PHY_CTRL2_AUTO_MDI_MDIX: u16 = 0x0400;
+/// ich8lan.h `HV_PM_CTRL` — page 770 reg 17.
+const HV_PM_CTRL: u32 = (770 << 5) | 17;
+const HV_PM_CTRL_K1_CLK_REQ: u16 = 0x0200;
+/// Linux `PHY_AUTO_NEG_LIMIT` (100 ms steps).
+const PHY_AUTO_NEG_LIMIT: u16 = 50;
 const MANC_EN_MNG2HOST: u32 = 1 << 21;
 
 // CTRL bits
@@ -1395,6 +1398,59 @@ impl E1000eHw {
         (speed, duplex_full, src)
     }
 
+    /// Intel `e1000e_get_speed_and_duplex_copper` + I219 reg26/reg17 when ahead of STATUS.
+    unsafe fn resolve_link_speed_duplex_linux(
+        &self,
+        phy_addr: u8,
+        st2: u16,
+    ) -> (u32, bool, &'static str) {
+        let status = mmio_read(self.base, E1000E_STATUS);
+        let mut speed = Self::speed_mbps_from_status(status);
+        let mut duplex_full = status & STATUS_FD != 0;
+        let mut src = "STATUS";
+
+        if self.is_pch_lpt_or_later() && st2 & PHY_STATUS2_AUTONEG_DONE != 0 {
+            let reg26_spd = Self::speed_mbps_from_phy_st2(st2);
+            if reg26_spd > speed {
+                speed = reg26_spd;
+                duplex_full = Self::phy_resolve_speed_duplex_st2(st2)
+                    .map(|(_, d)| d != 0)
+                    .unwrap_or(duplex_full);
+                src = "reg26";
+            }
+            if let Some((cs, cs_fd)) = self.phy_cs17_resolved(phy_addr) {
+                if cs > speed {
+                    speed = cs;
+                    duplex_full = cs_fd;
+                    src = "reg17";
+                }
+            }
+        }
+
+        (speed, duplex_full, src)
+    }
+
+    /// Linux autoneg link-up: SLU+ASDE only — do not FRCSPD at 10/100 (locks I219 at 10M).
+    unsafe fn mac_apply_link_up_autoneg(&self) {
+        self.mac_setup_copper_link_linux();
+        self.mac_speed_sync_pulse();
+    }
+
+    /// Linux `e1000_wait_autoneg` — poll BMSR until ANEG complete or timeout.
+    unsafe fn phy_wait_autoneg_linux(&self, phy_addr: u8) -> bool {
+        let mut i = PHY_AUTO_NEG_LIMIT;
+        while i > 0 {
+            let _ = self.mdic_read(phy_addr, MII_BMSR);
+            let bmsr = self.mdic_read(phy_addr, MII_BMSR).unwrap_or(0);
+            if bmsr & BMSR_ANEG_COMPLETE != 0 {
+                return true;
+            }
+            Self::udelay(100_000);
+            i -= 1;
+        }
+        false
+    }
+
     /// Last resort when both PHY reg26 and MAC STATUS say 10M but MII HCD is higher.
     /// Retry full copper autoneg once; do not force 10-only advertisement.
     unsafe fn phy_accept_10m_degraded_mode(&mut self, phy_addr: u8) {
@@ -1814,6 +1870,12 @@ impl E1000eHw {
                 }
                 let _ = self.mdic_write_phy(phy_addr, pll_reg, phy_reg);
             }
+            if self.is_pch_spt_or_later() && speed == SPEED_1000 {
+                if let Some(mut pm) = self.mdic_read_phy(phy_addr, HV_PM_CTRL) {
+                    pm |= HV_PM_CTRL_K1_CLK_REQ;
+                    let _ = self.mdic_write_phy(phy_addr, HV_PM_CTRL, pm);
+                }
+            }
         }
     }
 
@@ -1845,46 +1907,22 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_CTRL);
     }
 
-    /// After link up: MAC/TIPG/TARC from resolved PHY status (reg26 / reg17 only).
+    /// After link up: STATUS/reg26 speed + TIPG/TARC (Intel check_for_copper_link_ich8lan).
     unsafe fn finish_copper_link_up(&self, phy_addr: u8, st2: u16) {
-        self.mac_setup_copper_link_linux();
+        let (phy_speed, duplex_full, src) = self.resolve_link_speed_duplex_linux(phy_addr, st2);
+        e1000e_vlog!(
+            "[e1000e] finish_copper_link_up reg26={:#x} -> {} Mb/s {} ({})",
+            st2,
+            phy_speed,
+            if duplex_full { "FD" } else { "HD" },
+            src
+        );
 
-        let status = mmio_read(self.base, E1000E_STATUS);
-        let status_speed = Self::speed_mbps_from_status(status);
-        let status_fd = status & STATUS_FD != 0;
-
-        let link_ok = self.is_pch_lpt_or_later()
-            && Self::phy_reg26_link_up(st2)
-            && st2 & PHY_STATUS2_AUTONEG_DONE != 0;
-
-        let (phy_speed, duplex_full) = if link_ok {
-            let reg26_spd = Self::speed_mbps_from_phy_st2(st2);
-            let (op_spd, op_fd, src) = self.phy_operational_speed(phy_addr, st2);
-            if op_spd != reg26_spd {
-                e1000e_vlog!(
-                    "[e1000e] reg26={:#x} says {} Mb/s; using {} Mb/s from {} (MII/autoneg)\n",
-                    st2,
-                    reg26_spd,
-                    op_spd,
-                    src
-                );
-                self.mac_sync_ctrl_speed_mbps(op_spd, op_fd);
-            } else {
-                let _ = self.mac_sync_ctrl_speed_from_st2(st2, op_fd);
-            }
-            self.mac_speed_sync_pulse();
-            if status_speed != op_spd {
-                e1000e_vlog!(
-                    "[e1000e] STATUS {} Mb/s, MAC @ {} Mb/s (reg26={:#x})\n",
-                    status_speed,
-                    op_spd,
-                    st2
-                );
-            }
-            (op_spd, op_fd)
+        if self.is_pch_lpt_or_later() {
+            self.mac_apply_link_up_autoneg();
         } else {
-            (status_speed, status_fd)
-        };
+            self.mac_sync_ctrl_speed_mbps(phy_speed, duplex_full);
+        }
 
         if self.is_pch_lpt_or_later() {
             self.program_link_tipg_emi_linux(phy_addr, phy_speed, duplex_full);
@@ -2118,6 +2156,7 @@ impl E1000eHw {
                     continue;
                 }
                 if self.phy_copper_autoneg_restart(phy_addr) {
+                    let _ = self.phy_wait_autoneg_linux(phy_addr);
                     return;
                 }
             }
@@ -3095,18 +3134,27 @@ impl E1000eHw {
             return false;
         }
 
-        // 2. El enlace físico está arriba. Resolvemos ground-truth leyendo el estado real del PHY.
-        let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
-        let (speed, duplex_full, src) = self.phy_operational_speed(phy, st2);
+        // Intel: do not treat link as negotiated until ANEG completes.
+        if is_pch && (bmsr & BMSR_ANEG_COMPLETE) == 0 {
+            return false;
+        }
 
-        // 3. Control de degradación crítica: Si el enlace se congela a 10M pero el HCD (Highest Common Denominator)
-        // de la línea soporta más, la Autonegociación colapsó o el cable tiene atenuación extrema.
+        // 2. Resolve speed: STATUS first (e1000e_get_speed_and_duplex_copper), then reg26/reg17.
+        let mut st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
+        let (mut speed, mut duplex_full, mut src) =
+            self.resolve_link_speed_duplex_linux(phy, st2);
+
+        // 3. If PHY/STATUS stuck at 10M but MII HCD is higher, wait for reg26 to settle.
         if speed == SPEED_10 && !self.link_10m_degraded {
             if let Some(hcd_speed) = self.phy_reg26_below_mii_hcd(phy, st2) {
                 if hcd_speed > SPEED_10 {
-                    // Evitamos martillar el hardware: entramos en modo degradado controlado y relanzamos AN
-                    self.phy_accept_10m_degraded_mode(phy);
-                    return false; 
+                    st2 = self.phy_wait_reg26_settled(phy, 3000);
+                    (speed, duplex_full, src) =
+                        self.resolve_link_speed_duplex_linux(phy, st2);
+                    if speed == SPEED_10 && hcd_speed > SPEED_10 {
+                        self.phy_accept_10m_degraded_mode(phy);
+                        return false;
+                    }
                 }
             }
         }
@@ -3125,8 +3173,12 @@ impl E1000eHw {
             self.link_speed = speed;
             self.link_duplex = duplex_full;
 
-            // 5. Forzar la sincronización del registro de la MAC con la velocidad resuelta por el PHY.
-            self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
+            // 5. MAC: autoneg path — ASDE, no FRCSPD at 10/100 (Intel ich8lan link-up).
+            if is_pch {
+                self.mac_apply_link_up_autoneg();
+            } else {
+                self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
+            }
 
             // 6. Aplicar parches específicos de silicio según la velocidad real negociada
             if is_pch {
@@ -4520,14 +4572,21 @@ impl NetScheme for E1000eInterface {
         e1000e_vlog!("{}: IPv4 address set to {}", self.name, cidr);
         let mut iface = self.iface.lock();
         iface.update_ip_addrs(|addrs| {
+            let mut set_primary = false;
             for slot in addrs.iter_mut() {
-                if let IpCidr::Ipv4(v4) = slot {
-                    *slot = IpCidr::Ipv4(cidr);
-                    return;
+                if let IpCidr::Ipv4(_) = slot {
+                    if !set_primary {
+                        *slot = IpCidr::Ipv4(cidr);
+                        set_primary = true;
+                    } else {
+                        *slot = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+                    }
                 }
             }
-            if let Some(slot) = addrs.iter_mut().next() {
-                *slot = IpCidr::Ipv4(cidr);
+            if !set_primary {
+                if let Some(slot) = addrs.iter_mut().next() {
+                    *slot = IpCidr::Ipv4(cidr);
+                }
             }
         });
         let addrs_vec = iface.ip_addrs().to_vec();
@@ -4562,7 +4621,7 @@ impl NetScheme for E1000eInterface {
         iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
+                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
                     return;
                 }
             }
@@ -4826,6 +4885,8 @@ impl phy::TxToken for E1000eTxToken {
     where
         F: FnOnce(&mut [u8]) -> SmolResult<R>,
     {
+        const MAX_TX_COPY: usize = 65536;
+        let len = len.min(MAX_TX_COPY);
         let mut buf = vec![0u8; len];
         // NOTE: do NOT call net_dispatch_packet here. The buffer is empty at this point
         // (smoltcp fills it via the closure below). Dispatching it as a received packet
@@ -4954,10 +5015,10 @@ pub fn init(
     );
 
     let ip_addrs = vec![
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64)),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
     let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];

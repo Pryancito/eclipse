@@ -117,9 +117,15 @@ impl ListenTable {
                 return;
             }
             if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
+                prune_stale_syn(&mut entry.syn_queue, sockets);
+                if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
+                    return;
+                }
+            }
+            if super::smoltcp_socket_count(sockets) >= super::MAX_SMOLTCIP_SOCKETS {
                 return;
             }
-            
+
             let rx_buffer = TcpSocketBuffer::new(vec![0; super::TCP_RECVBUF]);
             let tx_buffer = TcpSocketBuffer::new(vec![0; super::TCP_SENDBUF]);
             let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
@@ -129,6 +135,20 @@ impl ListenTable {
                 let handle = sockets.add(socket);
                 entry.syn_queue.push_back(handle);
             }
+        }
+    }
+}
+
+/// Drop half-open TCP sockets stuck in SynReceived (SYN flood / no accept).
+fn prune_stale_syn(queue: &mut VecDeque<SocketHandle>, sockets: &mut SocketSet<'_>) {
+    let mut i = 0;
+    while i < queue.len() {
+        let h = queue[i];
+        if sockets.get::<TcpSocket>(h).state() == TcpState::SynReceived {
+            sockets.remove(h);
+            queue.remove(i);
+        } else {
+            i += 1;
         }
     }
 }

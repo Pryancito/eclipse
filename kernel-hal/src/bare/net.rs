@@ -39,8 +39,6 @@ pub fn init() {
     let ip_addrs = vec![
         IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
         IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
     ];
     
     // Loopback does not require any default route/gateway
@@ -131,6 +129,8 @@ impl core::future::Future for NetRxOrTimeoutFuture {
     ) -> core::task::Poll<()> {
         // Second poll: woken by net data or timer → done.
         if self.registered {
+            let waker = cx.waker();
+            NET_RX_WAKERS.lock().retain(|w| !w.will_wake(waker));
             return core::task::Poll::Ready(());
         }
         if crate::timer::timer_now() >= self.deadline {

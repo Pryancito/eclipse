@@ -226,6 +226,18 @@ impl KObjectBase {
         }
     }
 
+    /// Create a kernel object with a fixed KoID (e.g. Linux PID 1 for init).
+    pub fn with_id(id: KoID, name: &str, signal: Signal) -> Self {
+        KObjectBase {
+            id,
+            inner: Mutex::new(KObjectBaseInner {
+                name: String::from(name),
+                signal,
+                ..Default::default()
+            }),
+        }
+    }
+
     /// Generate a new KoID.
     fn new_koid() -> KoID {
         static KOID: AtomicU64 = AtomicU64::new(1024);

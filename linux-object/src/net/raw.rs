@@ -30,7 +30,7 @@ struct RawSocketInner {
 
 impl RawSocketState {
     /// missing documentation
-    pub fn new(protocol: u8, ipv6: bool) -> Self {
+    pub fn new(protocol: u8, ipv6: bool) -> LxResult<Self> {
         let rx_buffer = RawSocketBuffer::new(
             vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
             vec![0; RAW_RECVBUF],
@@ -49,9 +49,9 @@ impl RawSocketState {
             rx_buffer,
             tx_buffer,
         );
-        let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
+        let handle = super::register_smoltcp_socket(socket)?;
 
-        RawSocketState {
+        Ok(RawSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(RawSocketInner {
                 handle,
@@ -60,7 +60,7 @@ impl RawSocketState {
                 remote: Mutex::new(None),
                 ipv6,
             }),
-        }
+        })
     }
 }
 
@@ -152,7 +152,7 @@ impl Socket for RawSocketState {
                 return Err(LxError::EINVAL);
             }
 
-            let len = data.len();
+            let len = data.len().min(super::MAX_KERNEL_VEC.saturating_sub(40));
             let mut buffer = vec![0u8; len + 40];
             let mut packet = Ipv6Packet::new_unchecked(&mut buffer);
             let ip_repr = Ipv6Repr {
@@ -191,7 +191,7 @@ impl Socket for RawSocketState {
                 return Err(LxError::EINVAL);
             }
 
-            let len = data.len();
+            let len = data.len().min(super::MAX_KERNEL_VEC.saturating_sub(20));
             let mut buffer = vec![0u8; len + 20];
             let mut packet = Ipv4Packet::new_unchecked(&mut buffer);
             packet.set_version(4);

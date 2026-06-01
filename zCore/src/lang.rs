@@ -1,6 +1,20 @@
 // Rust language features implementations
 
+use core::alloc::Layout;
 use core::panic::PanicInfo;
+
+#[alloc_error_handler]
+fn alloc_error(layout: Layout) -> ! {
+    let heap_used = crate::memory::heap_used();
+    let heap_total = crate::memory::heap_total();
+    crate::klog_err!(
+        "kernel OOM: alloc {} bytes failed (heap {} / {} KiB)\n",
+        layout.size(),
+        heap_used / 1024,
+        heap_total / 1024
+    );
+    panic!("memory allocation of {} bytes failed", layout.size());
+}
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

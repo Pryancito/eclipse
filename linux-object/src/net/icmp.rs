@@ -218,8 +218,14 @@ impl Socket for IcmpSocketState {
             let IpAddress::Ipv4(dst) = ip.addr else {
                 return Err(LxError::EINVAL);
             };
-            if !dst.is_unicast() {
+            if !dst.is_unicast() || is_ipv4_placeholder(dst) || dst.0[0] >= 240 {
                 return Err(LxError::EINVAL);
+            }
+
+            let icmp_payload = self.make_echo_request_payload(data);
+            if is_local_host_ipv4(dst) {
+                icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), icmp_payload);
+                return Ok(data.len());
             }
 
             let src = select_ipv4_for_dst(dst);
@@ -227,7 +233,6 @@ impl Socket for IcmpSocketState {
                 return Err(LxError::EINVAL);
             }
 
-            let icmp_payload = self.make_echo_request_payload(data);
             let ip_len = 20 + icmp_payload.len();
             let mut ip = vec![0u8; ip_len];
             {

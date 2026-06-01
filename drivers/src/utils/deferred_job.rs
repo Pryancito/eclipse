@@ -32,13 +32,20 @@ fn intr_on() {
 
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
+/// Cap queued IRQ work — unbounded growth looks like a kernel leak.
+const MAX_DEFERRED_JOBS: usize = 256;
+
 /// Enqueue a closure to be executed later outside of IRQ context.
 pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     let flag = intr_get();
     if flag {
         intr_off();
     }
-    JOBS.lock().push(Box::new(f));
+    let mut q = JOBS.lock();
+    if q.len() >= MAX_DEFERRED_JOBS {
+        return;
+    }
+    q.push(Box::new(f));
     if flag {
         intr_on();
     }

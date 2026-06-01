@@ -20,12 +20,12 @@ fn loopback_tx_handler(packet: &[u8]) {
     let version = packet.get(0).map(|b| b >> 4).unwrap_or(4);
     info!("[loopback tx] packet version={}, len={}", version, packet.len());
     let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
-    let mut eth_frame = alloc::vec![0u8; 14 + packet.len()];
-    eth_frame[0..6].copy_from_slice(&[0; 6]);
-    eth_frame[6..12].copy_from_slice(&[0; 6]);
+    const FRAME_CAP: usize = 2048;
+    let payload_len = packet.len().min(FRAME_CAP.saturating_sub(14));
+    let mut eth_frame = [0u8; FRAME_CAP];
     eth_frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
-    eth_frame[14..].copy_from_slice(packet);
-    packet::push_packet(&eth_frame);
+    eth_frame[14..14 + payload_len].copy_from_slice(&packet[..payload_len]);
+    packet::push_packet(&eth_frame[..14 + payload_len]);
 }
 
 /// Global initialization for the network stack.
@@ -306,9 +306,24 @@ pub const TCP_RECVBUF: usize = 64 * 1024;
 /// missing documentation
 pub const UDP_METADATA_BUF: usize = 256;
 /// missing documentation
-pub const UDP_SENDBUF: usize = 512 * 1024;
+pub const UDP_SENDBUF: usize = 64 * 1024;
 /// missing documentation
-pub const UDP_RECVBUF: usize = 512 * 1024;
+pub const UDP_RECVBUF: usize = 64 * 1024;
+
+/// Largest single kernel-heap `Vec` allocation (avoids multi‑MiB smoltcp/socket buffers).
+pub const MAX_KERNEL_VEC: usize = 4 * 1024 * 1024;
+
+/// Allocate a zeroed buffer on the kernel heap, capped and fallible.
+pub fn kernel_vec_zeroed(len: usize) -> crate::error::LxResult<alloc::vec::Vec<u8>> {
+    if len > MAX_KERNEL_VEC {
+        return Err(crate::error::LxError::ENOMEM);
+    }
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| crate::error::LxError::ENOMEM)?;
+    v.resize(len, 0);
+    Ok(v)
+}
 
 // ========RAW
 
@@ -604,10 +619,30 @@ numeric_enum! {
 
 use smoltcp::socket::SocketHandle;
 
+/// Maximum smoltcp sockets (each owns RX/TX buffers on the kernel heap).
+pub(super) const MAX_SMOLTCIP_SOCKETS: usize = 96;
+
+pub(super) fn smoltcp_socket_count(set: &smoltcp::socket::SocketSet<'_>) -> usize {
+    set.iter().count()
+}
+
+/// Register a socket in the global smoltcp set, or return `ENOMEM` if at cap.
+pub(super) fn register_smoltcp_socket<T>(socket: T) -> LxResult<GlobalSocketHandle>
+where
+    T: Into<smoltcp::socket::Socket<'static>>,
+{
+    let sockets_arc = get_sockets();
+    let mut sockets = sockets_arc.lock();
+    if smoltcp_socket_count(&sockets) >= MAX_SMOLTCIP_SOCKETS {
+        return Err(LxError::ENOMEM);
+    }
+    Ok(GlobalSocketHandle(sockets.add(socket)))
+}
+
 /// A wrapper for `SocketHandle`.
 /// Auto increase and decrease reference count on Clone and Drop.
 #[derive(Debug)]
-struct GlobalSocketHandle(SocketHandle);
+pub(super) struct GlobalSocketHandle(SocketHandle);
 
 impl Clone for GlobalSocketHandle {
     fn clone(&self) -> Self {
@@ -670,6 +705,33 @@ pub fn drain_net_poll(rounds: usize) {
     }
 }
 
+/// Pre-DHCP sentinel (Class E); must never be used for TX or ICMP.
+pub fn is_ipv4_placeholder(addr: smoltcp::wire::Ipv4Address) -> bool {
+    addr == smoltcp::wire::Ipv4Address::new(240, 0, 0, 0)
+}
+
+/// True when `dst` is configured on a local interface (excluding placeholders / Class E).
+pub fn is_local_host_ipv4(dst: smoltcp::wire::Ipv4Address) -> bool {
+    use smoltcp::wire::IpCidr;
+    if dst.is_loopback() || !dst.is_unicast() || dst.0[0] >= 240 {
+        return false;
+    }
+    get_net_device().iter().any(|dev| {
+        dev.get_ip_address().iter().any(|ip| {
+            match ip {
+                IpCidr::Ipv4(cidr) => {
+                    let addr = cidr.address();
+                    !addr.is_unspecified()
+                        && !is_ipv4_placeholder(addr)
+                        && cidr.prefix_len() > 0
+                        && addr == dst
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
 /// Pick a concrete IPv4 source for `dst` (skip 0.0.0.0/0 catch-all; prefer longest prefix).
 pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ipv4Address {
     use smoltcp::wire::{IpCidr, Ipv4Address};
@@ -678,7 +740,7 @@ pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ip
         for ip in iface.get_ip_address() {
             if let IpCidr::Ipv4(cidr) = ip {
                 let addr = cidr.address();
-                if addr.is_unspecified() || cidr.prefix_len() == 0 {
+                if addr.is_unspecified() || cidr.prefix_len() == 0 || is_ipv4_placeholder(addr) {
                     continue;
                 }
                 if cidr.contains_addr(&dst) {
@@ -696,7 +758,7 @@ pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ip
         for ip in iface.get_ip_address() {
             if let IpCidr::Ipv4(cidr) = ip {
                 let addr = cidr.address();
-                if !addr.is_unspecified() && cidr.prefix_len() > 0 {
+                if !addr.is_unspecified() && cidr.prefix_len() > 0 && !is_ipv4_placeholder(addr) {
                     return addr;
                 }
             }

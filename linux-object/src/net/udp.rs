@@ -39,11 +39,6 @@ pub struct UdpInner {
     ipv6: bool,
 }
 
-impl Default for UdpSocketState {
-    fn default() -> Self {
-        UdpSocketState::new(false)
-    }
-}
 
 // Moved to mod.rs as public constants
 
@@ -53,7 +48,7 @@ impl Default for UdpSocketState {
 
 impl UdpSocketState {
     /// missing documentation
-    pub fn new(ipv6: bool) -> Self {
+    pub fn new(ipv6: bool) -> LxResult<Self> {
         info!("udp new");
         let rx_buffer = UdpSocketBuffer::new(
             vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
@@ -64,9 +59,9 @@ impl UdpSocketState {
             vec![0; UDP_SENDBUF],
         );
         let socket = UdpSocket::new(rx_buffer, tx_buffer);
-        let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
+        let handle = super::register_smoltcp_socket(socket)?;
 
-        UdpSocketState {
+        Ok(UdpSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(Mutex::new(UdpInner {
                 handle,
@@ -74,7 +69,7 @@ impl UdpSocketState {
                 flags: OpenFlags::RDWR,
                 ipv6,
             })),
-        }
+        })
     }
 
     fn family_addr(ipv6: bool) -> IpAddress {

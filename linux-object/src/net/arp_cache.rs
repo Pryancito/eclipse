@@ -23,9 +23,21 @@ fn is_local_mac(mac: EthernetAddress) -> bool {
     LOCAL_MACS.lock().iter().any(|m| *m == mac)
 }
 
+/// Cap software ARP cache — every RX frame can learn a new entry.
+const CACHE_MAX: usize = 512;
+
 lazy_static! {
     static ref CACHE: Mutex<BTreeMap<Ipv4Address, EthernetAddress>> =
         Mutex::new(BTreeMap::new());
+}
+
+fn insert_bounded(map: &mut BTreeMap<Ipv4Address, EthernetAddress>, ip: Ipv4Address, mac: EthernetAddress) {
+    if map.len() >= CACHE_MAX && !map.contains_key(&ip) {
+        if let Some(old) = map.keys().next().copied() {
+            map.remove(&old);
+        }
+    }
+    map.insert(ip, mac);
 }
 
 /// Learn mappings from a complete Ethernet frame (called from `push_packet`).
@@ -53,7 +65,7 @@ pub fn learn_from_frame(frame: &[u8]) {
                 && !src.is_unspecified()
                 && !is_local_mac(src_mac)
             {
-                CACHE.lock().insert(src, src_mac);
+                insert_bounded(&mut *CACHE.lock(), src, src_mac);
             }
         }
         0x0806 => {
@@ -72,7 +84,11 @@ pub fn learn_from_frame(frame: &[u8]) {
                     if matches!(operation, ArpOperation::Request | ArpOperation::Reply)
                         && source_protocol_addr.is_unicast()
                     {
-                        CACHE.lock().insert(source_protocol_addr, source_hardware_addr);
+                        insert_bounded(
+                            &mut *CACHE.lock(),
+                            source_protocol_addr,
+                            source_hardware_addr,
+                        );
                     }
                 }
             }
@@ -99,7 +115,7 @@ pub fn clear() {
 
 pub fn insert(dst: Ipv4Address, mac: EthernetAddress) {
     if dst.is_unicast() {
-        CACHE.lock().insert(dst, mac);
+        insert_bounded(&mut *CACHE.lock(), dst, mac);
     }
 }
 

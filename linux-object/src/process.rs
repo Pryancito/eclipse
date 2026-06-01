@@ -78,7 +78,7 @@ impl Default for Credentials {
 impl ProcessExt for Process {
     fn create_linux(job: &Arc<Job>, rootfs: Arc<dyn FileSystem>) -> ZxResult<Arc<Self>> {
         let linux_proc = LinuxProcess::new(rootfs);
-        let proc = Process::create_with_ext(job, "root", linux_proc)?;
+        let proc = Process::create_init_with_ext(job, "root", linux_proc)?;
         let weak_proc = Arc::downgrade(&proc);
         proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
@@ -110,6 +110,7 @@ impl ProcessExt for Process {
             parent: Arc::downgrade(parent),
             inner: Mutex::new(LinuxProcessInner {
                 execute_path: linux_parent_inner.execute_path.clone(),
+                cmdline: linux_parent_inner.cmdline.clone(),
                 current_working_directory: linux_parent_inner.current_working_directory.clone(),
                 files: linux_parent_inner.files.clone(),
                 signal_actions: linux_parent_inner.signal_actions.clone(),
@@ -239,6 +240,8 @@ pub struct LinuxProcess {
 struct LinuxProcessInner {
     /// Execute path
     execute_path: String,
+    /// argv as seen by userland (`/proc/<pid>/cmdline`)
+    cmdline: Vec<String>,
     /// Current Working Directory
     ///
     /// Omit leading '/'.
@@ -916,6 +919,16 @@ impl LinuxProcess {
         self.inner.lock().execute_path = String::from(path);
     }
 
+    /// Set argv for `/proc/<pid>/cmdline`.
+    pub fn set_cmdline(&self, args: Vec<String>) {
+        self.inner.lock().cmdline = args;
+    }
+
+    /// Get argv.
+    pub fn cmdline(&self) -> Vec<String> {
+        self.inner.lock().cmdline.clone()
+    }
+
     /// Get the current program break (top of heap).
     pub fn brk(&self) -> usize {
         self.inner.lock().brk
@@ -1031,6 +1044,13 @@ pub fn check_signals() -> LxResult<()> {
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
         if let Ok(thread) = arc.downcast::<Thread>() {
             use crate::thread::ThreadExt;
+            use zircon_object::task::ThreadState;
+            if thread.state() == ThreadState::Dying {
+                return Err(LxError::EINTR);
+            }
+            if matches!(thread.proc().status(), Status::Exited(_)) {
+                return Err(LxError::EINTR);
+            }
             let linux_thread = thread.lock_linux();
             let pending = linux_thread.signals.mask_with(&linux_thread.signal_mask);
             if pending.is_not_empty() {

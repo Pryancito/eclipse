@@ -465,14 +465,21 @@ impl NetScheme for E1000Interface {
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
         let mut iface = self.iface.lock();
         iface.update_ip_addrs(|addrs| {
+            let mut set_primary = false;
             for slot in addrs.iter_mut() {
-                if let IpCidr::Ipv4(v4) = slot {
-                    *slot = IpCidr::Ipv4(cidr);
-                    return;
+                if let IpCidr::Ipv4(_) = slot {
+                    if !set_primary {
+                        *slot = IpCidr::Ipv4(cidr);
+                        set_primary = true;
+                    } else {
+                        *slot = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+                    }
                 }
             }
-            if let Some(slot) = addrs.iter_mut().next() {
-                *slot = IpCidr::Ipv4(cidr);
+            if !set_primary {
+                if let Some(slot) = addrs.iter_mut().next() {
+                    *slot = IpCidr::Ipv4(cidr);
+                }
             }
         });
         *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
@@ -506,7 +513,7 @@ impl NetScheme for E1000Interface {
         iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
+                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
                     return;
                 }
             }
@@ -716,10 +723,10 @@ pub fn init(
     );
 
     let ip_addrs = vec![
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64)),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
-        IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
     let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];

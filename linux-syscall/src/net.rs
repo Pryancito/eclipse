@@ -41,19 +41,19 @@ impl Syscall<'_> {
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
-                Arc::new(TcpSocketState::new(false))
+                Arc::new(TcpSocketState::new(false)?)
             }
             (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
-                Arc::new(TcpSocketState::new(true))
+                Arc::new(TcpSocketState::new(true)?)
             }
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
-                Arc::new(UdpSocketState::new(false))
+                Arc::new(UdpSocketState::new(false)?)
             }
             (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
-                Arc::new(UdpSocketState::new(true))
+                Arc::new(UdpSocketState::new(true)?)
             }
             // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
@@ -64,14 +64,14 @@ impl Syscall<'_> {
             }
             // Be tolerant for AF_INET/AF_INET6 datagram sockets.
             // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(false)),
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(true)),
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(false)?),
+            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(true)?),
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false))
+                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
             }
             (Domain::AF_INET6, SocketType::SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, true))
+                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, true)?)
             }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
@@ -81,7 +81,7 @@ impl Syscall<'_> {
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
             | (Domain::AF_PACKET, SocketType::SOCK_DGRAM, _) => {
-                PacketSocketState::new(socket_type, u16::from_be(protocol_num as u16))
+                PacketSocketState::new(socket_type, u16::from_be(protocol_num as u16))?
             }
             // AF_UNIX sockets
             (Domain::AF_UNIX, _, _) => UnixSocketState::new(),
@@ -315,7 +315,7 @@ impl Syscall<'_> {
             file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
         }
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
-        let cap_len = len.min(1024 * 1024);
+        let cap_len = len.min(super::SYSCALL_IO_MAX);
         let mut data = vec![0u8; cap_len];
         let socket = file_like.as_socket()?;
         let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
@@ -354,6 +354,9 @@ impl Syscall<'_> {
         let iov_ptr: UserInPtr<IoVecIn> = unsafe { core::mem::transmute(hdr.msg_iov) };
         let iovlen = hdr.msg_iovlen;
         let iovs = iov_ptr.read_iovecs(iovlen)?;
+        if iovs.total_len() > super::SYSCALL_IO_MAX {
+            return Err(LxError::EINVAL);
+        }
         let data = iovs.read_to_vec()?;
 
         let endpoint = if !hdr.msg_name.is_null() {
@@ -384,7 +387,7 @@ impl Syscall<'_> {
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
         let mut iovs = iov_ptr.read_iovecs(iovlen)?;
-        let total_len = iovs.total_len().min(1024 * 1024);
+        let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
         let mut data = vec![0u8; total_len];
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;

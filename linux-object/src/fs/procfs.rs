@@ -1,15 +1,130 @@
 //! Minimal procfs implementation for Linux userland compatibility.
 
-use alloc::{fmt::Write as _, string::String, sync::Arc};
+use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use kernel_hal::drivers;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
+use zircon_object::object::KernelObject;
+use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 
 use crate::fs::pseudo::Pseudo;
+use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
+
+const PROC_ROOT_STATIC: [&str; 7] = [
+    "net", "meminfo", "uptime", "mounts", "self", "stat", "loadavg",
+];
+
+fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
+    for id in job.process_ids() {
+        if let Some(proc) = job.find_process(id) {
+            if !matches!(proc.status(), Status::Exited(_)) {
+                out.push(proc);
+            }
+        }
+    }
+    for child_id in job.children_ids() {
+        if let Ok(child) = job.get_child(child_id) {
+            if let Ok(child_job) = child.downcast_arc::<Job>() {
+                collect_processes(&child_job, out);
+            }
+        }
+    }
+}
+
+fn all_processes() -> Vec<Arc<Process>> {
+    let mut out = Vec::new();
+    collect_processes(&ROOT_JOB, &mut out);
+    out
+}
+
+fn current_process_id() -> Option<u64> {
+    let arc = kernel_hal::thread::get_current_thread()?;
+    let thread = arc.downcast::<Thread>().ok()?;
+    Some(thread.proc().id() as u64)
+}
+
+fn sanitize_comm(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let mut s = String::new();
+    for c in base.chars().take(15) {
+        let ch = match c {
+            '(' | ')' | '\0' => '_',
+            _ => c,
+        };
+        s.push(ch);
+    }
+    if s.is_empty() {
+        s.push_str("process");
+    }
+    s
+}
+
+fn proc_state_char(status: Status) -> char {
+    match status {
+        Status::Running => 'R',
+        Status::Init => 'S',
+        Status::Exited(_) => 'Z',
+    }
+}
+
+fn proc_comm(proc: &Process) -> String {
+    let path = proc.linux().execute_path();
+    if !path.is_empty() {
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        return sanitize_comm(base);
+    }
+    sanitize_comm(&proc.name())
+}
+
+fn proc_ppid(proc: &Process) -> u64 {
+    proc.linux().parent().map(|p| p.id()).unwrap_or(0)
+}
+
+fn proc_pid_stat(proc: &Process) -> String {
+    let pid = proc.id();
+    let comm = proc_comm(proc);
+    let state = proc_state_char(proc.status());
+    let ppid = proc_ppid(proc);
+    format!(
+        "{} ({}) {} {} 0 0 0 0 0 4194560 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, comm, state, ppid
+    )
+}
+
+fn proc_pid_status(proc: &Process) -> String {
+    let pid = proc.id();
+    let name = proc_comm(proc);
+    let ppid = proc_ppid(proc);
+    let state = match proc.status() {
+        Status::Running => "R (running)",
+        Status::Init => "S (sleeping)",
+        Status::Exited(_) => "Z (zombie)",
+    };
+    format!(
+        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
+        name, state, pid, pid, ppid
+    )
+}
+
+fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
+    let args = proc.linux().cmdline();
+    if !args.is_empty() {
+        let mut out = Vec::new();
+        for arg in args {
+            out.extend_from_slice(arg.as_bytes());
+            out.push(0);
+        }
+        return out;
+    }
+    let path = proc.linux().execute_path();
+    let mut out = path.into_bytes();
+    out.push(0);
+    out
+}
 
 /// A minimal `procfs` with a few common files.
 pub struct ProcFS;
@@ -48,8 +163,16 @@ impl FileSystem for ProcFS {
 struct ProcRootINode;
 
 impl ProcRootINode {
-    fn entries() -> [&'static str; 4] {
-        ["net", "meminfo", "uptime", "mounts"]
+    fn entry_name(id: usize) -> Result<String> {
+        if id < PROC_ROOT_STATIC.len() {
+            return Ok(PROC_ROOT_STATIC[id].into());
+        }
+        let idx = id - PROC_ROOT_STATIC.len();
+        let procs = all_processes();
+        if idx >= procs.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(alloc::format!("{}", procs[idx].id()))
     }
 }
 
@@ -81,7 +204,7 @@ impl INode for ProcRootINode {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
-            mode: 0,
+            mode: 0o555,
             nlinks: 0,
             uid: 0,
             gid: 0,
@@ -112,6 +235,112 @@ impl INode for ProcRootINode {
             ))),
             "mounts" => Ok(Arc::new(Pseudo::new(
                 &proc_mounts_content(),
+                FileType::File,
+            ))),
+            "stat" => Ok(Arc::new(Pseudo::new(
+                &proc_stat_content(),
+                FileType::File,
+            ))),
+            "loadavg" => Ok(Arc::new(Pseudo::new(
+                &proc_loadavg_content(),
+                FileType::File,
+            ))),
+            "self" => {
+                let target = current_process_id()
+                    .map(|id| alloc::format!("{}", id))
+                    .unwrap_or_else(|| "1".into());
+                Ok(Arc::new(Pseudo::new(&target, FileType::SymLink)))
+            }
+            name => {
+                if let Ok(pid) = name.parse::<u64>() {
+                    if ROOT_JOB.find_process(pid as _).is_some() {
+                        return Ok(Arc::new(ProcPidDirINode { pid }));
+                    }
+                }
+                Err(FsError::EntryNotFound)
+            }
+        }
+    }
+
+    fn get_entry(&self, id: usize) -> Result<String> {
+        Self::entry_name(id)
+    }
+}
+
+/// `/proc/<pid>/` — `stat`, `cmdline`, `status` for BusyBox `ps`.
+struct ProcPidDirINode {
+    pid: u64,
+}
+
+impl ProcPidDirINode {
+    fn process(&self) -> Option<Arc<Process>> {
+        ROOT_JOB.find_process(self.pid as _)
+    }
+
+    fn entries() -> [&'static str; 5] {
+        [".", "..", "stat", "cmdline", "status"]
+    }
+}
+
+impl INode for ProcPidDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 0,
+            inode: 100 + self.pid as usize,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::Dir,
+            mode: 0o555,
+            nlinks: 2,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        let proc = self.process().ok_or(FsError::EntryNotFound)?;
+        match name {
+            "." => Ok(Arc::new(ProcPidDirINode { pid: self.pid })),
+            ".." => Ok(Arc::new(ProcRootINode)),
+            "stat" => Ok(Arc::new(Pseudo::new(
+                &proc_pid_stat(&proc),
+                FileType::File,
+            ))),
+            "cmdline" => Ok(Arc::new(Pseudo::new_bytes(
+                proc_pid_cmdline(&proc),
+                FileType::File,
+            ))),
+            "status" => Ok(Arc::new(Pseudo::new(
+                &proc_pid_status(&proc),
                 FileType::File,
             ))),
             _ => Err(FsError::EntryNotFound),
@@ -163,7 +392,7 @@ impl INode for ProcNetDirINode {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
-            mode: 0,
+            mode: 0o555,
             nlinks: 0,
             uid: 0,
             gid: 0,
@@ -248,7 +477,7 @@ impl INode for ProcNetDevINode {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::File,
-            mode: 0,
+            mode: 0o444,
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -346,6 +575,38 @@ fn proc_uptime_content() -> String {
     let uptime = now.as_secs_f64();
     // We don't currently track aggregated idle time; report 0.
     format!("{:.2} 0.00\n", uptime)
+}
+
+/// `/proc/stat` — aggregate CPU counters (BusyBox `top` reads this after chdir to `/proc`).
+fn proc_stat_content() -> String {
+    let procs = all_processes();
+    let running = procs
+        .iter()
+        .filter(|p| matches!(p.status(), Status::Running))
+        .count();
+    format!(
+        "cpu  0 0 0 1 0 0 0 0\n\
+         intr 0\n\
+         ctxt 0\n\
+         btime 0\n\
+         processes {}\n\
+         procs_running {}\n\
+         procs_blocked 0\n",
+        procs.len(),
+        running
+    )
+}
+
+/// `/proc/loadavg` — one-line load averages for `top` header.
+fn proc_loadavg_content() -> String {
+    let procs = all_processes();
+    let total = procs.len().max(1);
+    let running = procs
+        .iter()
+        .filter(|p| matches!(p.status(), Status::Running))
+        .count();
+    let last_pid = procs.last().map(|p| p.id()).unwrap_or(1);
+    format!("0.00 0.00 0.00 {}/{total} {last_pid}\n", running)
 }
 
 fn proc_meminfo_content() -> String {

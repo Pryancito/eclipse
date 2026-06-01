@@ -11,6 +11,8 @@ use super::*;
 use linux_object::signal::{Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
 use linux_object::thread::ThreadExt;
 use numeric_enum_macro::numeric_enum;
+use zircon_object::object::KernelObject;
+use zircon_object::task::ROOT_JOB;
 
 impl Syscall<'_> {
     /// Used to change the action taken by a process on receipt of a specific signal.
@@ -150,47 +152,43 @@ impl Syscall<'_> {
             p if p < -1 => SendTarget::EveryProcessInGroupByPID((-p) as KoID),
             _ => unimplemented!(),
         };
-        let parent = self.zircon_process().clone();
+        let caller = self.zircon_process().clone();
         let send_to_pid = |pid: KoID| -> SysResult {
-            match parent.job().get_child(pid as u64) {
-                Ok(obj) => {
-                    match signal {
-                        Signal::SIGKILL => {
-                            let current_pid = parent.id();
-                            if current_pid == (pid as u64) {
-                                parent.exit((128 + Signal::SIGKILL as i32) as i64);
-                            } else {
-                                let process: Arc<Process> = obj.downcast_arc().unwrap();
-                                process.exit((128 + Signal::SIGKILL as i32) as i64);
-                            }
-                        }
-                        sig => {
-                            let process: Arc<Process> = obj.downcast_arc().unwrap();
-                            let tids = process.thread_ids();
-                            for tid in tids {
-                                let thread = process.get_child(tid).unwrap();
-                                let thread: Arc<Thread> = thread.downcast_arc().unwrap();
-                                let mut thread_linux = thread.lock_linux();
-                                if thread_linux.signal_mask.contains(sig) {
-                                    continue;
-                                } else {
-                                    thread_linux.signals.insert(signal);
-                                    break;
-                                }
-                            }
-                        }
-                    };
-                    Ok(0)
+            let process = ROOT_JOB
+                .find_process(pid)
+                .ok_or(LxError::ESRCH)?;
+            match signal {
+                Signal::SIGKILL => {
+                    let retcode = (128 + Signal::SIGKILL as i32) as i64;
+                    if caller.id() == process.id() {
+                        caller.exit(retcode);
+                    } else {
+                        process.exit(retcode);
+                    }
                 }
-                Err(_) => Err(LxError::EINVAL),
-            }
+                sig => {
+                    let tids = process.thread_ids();
+                    for tid in tids {
+                        let thread = process.get_child(tid).unwrap();
+                        let thread: Arc<Thread> = thread.downcast_arc().unwrap();
+                        let mut thread_linux = thread.lock_linux();
+                        if thread_linux.signal_mask.contains(sig) {
+                            continue;
+                        } else {
+                            thread_linux.signals.insert(signal);
+                            break;
+                        }
+                    }
+                }
+            };
+            Ok(0)
         };
         match target {
             SendTarget::Pid(pid) => send_to_pid(pid),
             SendTarget::EveryProcessInGroup => {
                 // Minimal process-group support: without a real setpgid/pgid table,
                 // treat "current process group" as the current process ID.
-                send_to_pid(parent.id() as KoID)
+                send_to_pid(caller.id() as KoID)
             }
             SendTarget::EveryProcessInGroupByPID(pgid) => {
                 // Minimal process-group support: treat pgid as the leader's pid.

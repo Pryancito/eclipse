@@ -22,8 +22,19 @@ fn is_local_mac(mac: EthernetAddress) -> bool {
     LOCAL_MACS.lock().iter().any(|m| *m == mac)
 }
 
+const CACHE_MAX: usize = 512;
+
 lazy_static! {
     static ref CACHE: Mutex<BTreeMap<Ipv6Address, EthernetAddress>> = Mutex::new(BTreeMap::new());
+}
+
+fn insert_bounded(map: &mut BTreeMap<Ipv6Address, EthernetAddress>, ip: Ipv6Address, mac: EthernetAddress) {
+    if map.len() >= CACHE_MAX && !map.contains_key(&ip) {
+        if let Some(old) = map.keys().next().copied() {
+            map.remove(&old);
+        }
+    }
+    map.insert(ip, mac);
 }
 
 /// Learn mappings from a complete Ethernet frame (called from `push_packet`).
@@ -45,7 +56,7 @@ pub fn learn_from_frame(frame: &[u8]) {
     };
     let src_ip = ipv6.src_addr();
     if src_ip.is_unicast() && !src_ip.is_unspecified() {
-        CACHE.lock().insert(src_ip, src_mac);
+        insert_bounded(&mut *CACHE.lock(), src_ip, src_mac);
     }
 
     if ipv6.next_header() != smoltcp::wire::IpProtocol::Icmpv6 {
@@ -77,7 +88,11 @@ pub fn learn_from_frame(frame: &[u8]) {
             ..
         }) => {
             if target_addr.is_unicast() && !target_addr.is_unspecified() {
-                CACHE.lock().insert(target_addr, lladdr.unwrap_or(src_mac));
+                insert_bounded(
+                    &mut *CACHE.lock(),
+                    target_addr,
+                    lladdr.unwrap_or(src_mac),
+                );
             }
         }
         _ => {}

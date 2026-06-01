@@ -14,6 +14,10 @@ use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
 use zircon_object::{object::KernelObject, vm::USER_STACK_PAGES, ZxError, ZxResult};
 
+fn comm_from_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Create and run main Linux process
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
     info!("Run Linux process: args={:?}, envs={:?}", args, envs);
@@ -40,9 +44,11 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    let (entry, sp, initial_brk, execute_path) = loader.load(&proc.vmar(), &vmo, args, envs, path).unwrap();
+    let (entry, sp, initial_brk, execute_path) = loader.load(&proc.vmar(), &vmo, args.clone(), envs, path).unwrap();
     proc.linux().set_execute_path(&execute_path);
+    proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
+    proc.set_name(comm_from_path(&execute_path));
 
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
@@ -94,6 +100,9 @@ async fn run_user(thread: CurrentThread) {
         // handle trap/interrupt/syscall
         if let Err(err) = handle_user_trap(&thread, ctx).await {
             thread.exit_linux(err as i32);
+        }
+        if thread.state() == ThreadState::Dying {
+            break;
         }
     }
     kernel_hal::thread::set_current_thread(None);

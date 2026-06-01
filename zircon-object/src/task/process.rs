@@ -123,6 +123,37 @@ impl Process {
         Self::create_with_vmar(job, name, VmAddressRegion::new_root(), ext)
     }
 
+    /// Create the initial userspace process with KoID 1 (Linux `init` / PID 1).
+    pub fn create_init_with_ext(
+        job: &Arc<Job>,
+        name: &str,
+        ext: impl Any + Send + Sync,
+    ) -> ZxResult<Arc<Self>> {
+        Self::create_init_with_vmar(job, name, VmAddressRegion::new_root(), ext)
+    }
+
+    fn create_init_with_vmar(
+        job: &Arc<Job>,
+        name: &str,
+        vmar: Arc<VmAddressRegion>,
+        ext: impl Any + Send + Sync,
+    ) -> ZxResult<Arc<Self>> {
+        const INIT_PID: KoID = 1;
+        let proc = Arc::new(Process {
+            base: KObjectBase::with_id(INIT_PID, name, Signal::default()),
+            _counter: CountHelper::new(),
+            job: job.clone(),
+            policy: job.policy(),
+            vmar,
+            ext: Box::new(ext),
+            exceptionate: Exceptionate::new(ExceptionChannelType::Process),
+            debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
+            inner: Mutex::new(ProcessInner::default()),
+        });
+        job.add_process(proc.clone())?;
+        Ok(proc)
+    }
+
     /// Create a new process with extension info and vmar.
     pub fn create_with_vmar(
         job: &Arc<Job>,

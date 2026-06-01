@@ -364,7 +364,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 
     // mount ProcFS at /proc
     let proc = root.find(true, "proc").unwrap_or_else(|_| {
-        root.create("proc", FileType::Dir, 0o666)
+        root.create("proc", FileType::Dir, 0o755)
             .expect("failed to mkdir /proc")
     });
     proc.mount(Arc::new(ProcFS::new()))

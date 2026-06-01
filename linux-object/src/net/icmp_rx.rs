@@ -6,7 +6,12 @@ use alloc::vec::Vec;
 use kernel_hal::net::get_net_device;
 use lazy_static::lazy_static;
 use lock::Mutex;
-use smoltcp::wire::{IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet};
+use smoltcp::wire::{IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Packet};
+
+/// Pre-DHCP sentinel still present in older images; not a usable host address.
+pub fn is_ipv4_placeholder(addr: Ipv4Address) -> bool {
+    addr == Ipv4Address::new(240, 0, 0, 0)
+}
 
 const RX_QUEUE_MAX: usize = 64;
 
@@ -32,7 +37,10 @@ fn is_our_ip(addr: IpAddress) -> bool {
         for ip in dev.get_ip_address() {
             match (ip, addr) {
                 (IpCidr::Ipv4(cidr), IpAddress::Ipv4(a)) => {
-                    if cidr.prefix_len() > 0 && cidr.address() == a {
+                    if !is_ipv4_placeholder(cidr.address())
+                        && cidr.prefix_len() > 0
+                        && cidr.address() == a
+                    {
                         return true;
                     }
                 }
@@ -67,7 +75,7 @@ pub fn deliver_from_frame(frame: &[u8]) {
         let Ok(pkt) = Ipv4Packet::new_checked(ip) else {
             return;
         };
-        info!(
+        log::debug!(
             "[icmp_rx] IPv4 packet: protocol={}, src={}, dst={}",
             pkt.protocol(),
             pkt.src_addr(),
@@ -79,15 +87,15 @@ pub fn deliver_from_frame(frame: &[u8]) {
         let src = IpAddress::Ipv4(pkt.src_addr());
         let dst = IpAddress::Ipv4(pkt.dst_addr());
         if !is_our_ip(dst) {
-            info!("[icmp_rx] dst {} is not our IP", dst);
+            log::debug!("[icmp_rx] dst {} is not our IP", dst);
             return;
         }
         let payload = pkt.payload();
         if payload.is_empty() {
-            info!("[icmp_rx] payload is empty");
+            log::debug!("[icmp_rx] payload is empty");
             return;
         }
-        info!(
+        log::debug!(
             "[icmp_rx] ICMPv4 packet: type={}, code={}",
             payload[0],
             payload.get(1).unwrap_or(&0)
@@ -104,13 +112,13 @@ pub fn deliver_from_frame(frame: &[u8]) {
             src,
             data: payload.to_vec(),
         });
-        info!("[icmp_rx] queued ICMPv4 Echo Reply!");
+        log::debug!("[icmp_rx] queued ICMPv4 Echo Reply");
     } else if et == 0x86dd {
         let ip = &frame[l2..];
         let Ok(pkt) = Ipv6Packet::new_checked(ip) else {
             return;
         };
-        info!(
+        log::debug!(
             "[icmp_rx] IPv6 packet: next_header={}, src={}, dst={}",
             pkt.next_header(),
             pkt.src_addr(),
@@ -125,22 +133,22 @@ pub fn deliver_from_frame(frame: &[u8]) {
         let src = IpAddress::Ipv6(pkt.src_addr());
         let dst = IpAddress::Ipv6(pkt.dst_addr());
         let cs_ok = icmp_pkt.verify_checksum(&src, &dst);
-        info!(
+        log::debug!(
             "[icmp_rx] ICMPv6 packet length: {}, checksum field: 0x{:04x}, calculated cs_ok: {}",
             pkt.payload().len(),
             icmp_pkt.checksum(),
             cs_ok
         );
         if !is_our_ip(dst) {
-            info!("[icmp_rx] dst {} is not our IP", dst);
+            log::debug!("[icmp_rx] dst {} is not our IP", dst);
             return;
         }
         let payload = pkt.payload();
         if payload.is_empty() {
-            info!("[icmp_rx] payload is empty");
+            log::debug!("[icmp_rx] payload is empty");
             return;
         }
-        info!(
+        log::debug!(
             "[icmp_rx] ICMPv6 packet: type={}, code={}",
             payload[0],
             payload.get(1).unwrap_or(&0)
@@ -157,8 +165,27 @@ pub fn deliver_from_frame(frame: &[u8]) {
             src,
             data: payload.to_vec(),
         });
-        info!("[icmp_rx] queued ICMPv6 Echo Reply!");
+        log::debug!("[icmp_rx] queued ICMPv6 Echo Reply");
     }
+}
+
+/// Queue an ICMP echo reply locally (self-ping / loopback shortcut).
+pub fn queue_echo_reply(src: IpAddress, mut icmp: Vec<u8>) {
+    if icmp.is_empty() {
+        return;
+    }
+    let reply_type = match src {
+        IpAddress::Ipv6(_) => 129u8,
+        _ => 0u8,
+    };
+    if icmp[0] == 8 || icmp[0] == 128 {
+        icmp[0] = reply_type;
+    }
+    let mut q = RX_QUEUE.lock();
+    if q.len() >= RX_QUEUE_MAX {
+        q.pop_front();
+    }
+    q.push_back(IcmpRxPacket { src, data: icmp });
 }
 
 pub fn pop_for(ipv6: bool, remote: Option<IpAddress>) -> Option<(Vec<u8>, IpAddress)> {

@@ -99,6 +99,8 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
+        const MAX_TX_COPY: usize = 65536;
+        let len = len.min(MAX_TX_COPY);
         let mut buffer = alloc::vec![0u8; len];
         let result = f(&mut buffer);
 
@@ -201,7 +203,7 @@ impl NetScheme for LoopbackInterface {
         iface.update_ip_addrs(|addrs| {
             for slot in addrs.iter_mut() {
                 if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
+                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
                     return;
                 }
             }

@@ -16,88 +16,158 @@ use zircon_object::object::*;
 use lazy_static::lazy_static;
 use smoltcp::wire::{EthernetAddress, EthernetFrame};
 
+/// Per-socket RX queue depth (enough for DHCP bursts).
+const PACKET_QUEUE_MAX: usize = 16;
+/// Max concurrent AF_PACKET socket groups (each may queue PACKET_QUEUE_MAX frames).
+const MAX_PACKET_SOCKETS: usize = 12;
+/// Max Ethernet frame size we build on the stack for SOCK_DGRAM TX.
+const ETH_FRAME_MAX: usize = 1518;
+
+/// Shared RX frame storage — one heap copy per frame, refcounted across sockets.
+type PacketFrame = Arc<[u8]>;
+
 lazy_static! {
-    static ref PACKET_SOCKETS: Mutex<Vec<Weak<PacketSocketState>>> = Mutex::new(Vec::new());
+    static ref PACKET_SOCKETS: Mutex<Vec<Weak<PacketSocketInner>>> = Mutex::new(Vec::new());
+}
+
+fn purge_dead_sockets(sockets: &mut Vec<Weak<PacketSocketInner>>) {
+    sockets.retain(|w| w.strong_count() > 0);
+}
+
+fn unregister_inner(inner: &Arc<PacketSocketInner>) {
+    let inner_ptr = Arc::as_ptr(inner);
+    PACKET_SOCKETS.lock().retain(|weak| {
+        weak.upgrade()
+            .map(|arc| !core::ptr::eq(Arc::as_ptr(&arc), inner_ptr))
+            .unwrap_or(false)
+    });
+}
+
+fn register_fd(inner: &Arc<PacketSocketInner>, state: &Arc<PacketSocketState>) {
+    let mut fds = inner.fds.lock();
+    fds.push(Arc::downgrade(state));
+    fds.retain(|w| w.strong_count() > 0);
+}
+
+fn wake_readers(inner: &PacketSocketInner) {
+    let mut fds = inner.fds.lock();
+    fds.retain(|w| {
+        if let Some(s) = w.upgrade() {
+            s.base.signal_set(Signal::READABLE);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn frame_arc(packet: &[u8]) -> Option<PacketFrame> {
+    let n = packet.len().min(super::MAX_KERNEL_VEC);
+    if n == 0 {
+        return None;
+    }
+    Some(Arc::from(packet[..n].to_vec().into_boxed_slice()))
+}
+
+/// Snoop TCP SYN for the listen table without holding `PACKET_SOCKETS`.
+fn snoop_tcp_syn(packet: &[u8]) {
+    let Ok(frame) = EthernetFrame::new_checked(packet) else {
+        return;
+    };
+    let ethertype: u16 = frame.ethertype().into();
+    let (src_addr, dst_addr) = match ethertype {
+        0x0800 => {
+            let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(frame.payload()) else {
+                return;
+            };
+            if ipv4.protocol() != smoltcp::wire::IpProtocol::Tcp {
+                return;
+            }
+            let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()) else {
+                return;
+            };
+            if !tcp.syn() || tcp.ack() {
+                return;
+            }
+            use smoltcp::wire::{IpAddress, IpEndpoint};
+            (
+                IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr()), tcp.src_port()),
+                IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr()), tcp.dst_port()),
+            )
+        }
+        0x86dd => {
+            let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(frame.payload()) else {
+                return;
+            };
+            if ipv6.next_header() != smoltcp::wire::IpProtocol::Tcp {
+                return;
+            }
+            let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv6.payload()) else {
+                return;
+            };
+            if !tcp.syn() || tcp.ack() {
+                return;
+            }
+            use smoltcp::wire::{IpAddress, IpEndpoint};
+            (
+                IpEndpoint::new(IpAddress::Ipv6(ipv6.src_addr()), tcp.src_port()),
+                IpEndpoint::new(IpAddress::Ipv6(ipv6.dst_addr()), tcp.dst_port()),
+            )
+        }
+        _ => return,
+    };
+    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
+        crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
+    }
 }
 
 /// Dispatches a received packet to all registered AF_PACKET sockets.
+///
+/// Do not call `intr_on()`/`intr_off()` here: `lock::Mutex` already uses
+/// `push_off`/`pop_off` on a per-CPU `RefCell`. Re-enabling IRQs while a
+/// mutex guard is held breaks that nesting and panics with "RefCell already borrowed".
 pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
     crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
-    let flag = kernel_hal::interrupt::intr_get();
-    if flag { kernel_hal::interrupt::intr_off(); }
+    snoop_tcp_syn(packet);
+
     let mut sockets = PACKET_SOCKETS.lock();
     let mut to_remove = Vec::new();
+    let mut shared: Option<PacketFrame> = None;
+    let ethertype = EthernetFrame::new_checked(packet)
+        .ok()
+        .map(|f| u16::from(f.ethertype()));
 
     for (i, weak) in sockets.iter().enumerate() {
-        if let Some(state) = weak.upgrade() {
-            let protocol = *state.inner.protocol.lock();
-            // Try to parse Ethernet header to filter by protocol
-            if let Ok(frame) = EthernetFrame::new_checked(packet) {
-                let ethertype: u16 = frame.ethertype().into();
-                
-                // Snoop TCP SYN packets to populate listen_table
-                if ethertype == 0x0800 { // IPv4
-                    if let Ok(ipv4_packet) = smoltcp::wire::Ipv4Packet::new_checked(frame.payload()) {
-                        if ipv4_packet.protocol() == smoltcp::wire::IpProtocol::Tcp {
-                            if let Ok(tcp_packet) = smoltcp::wire::TcpPacket::new_checked(ipv4_packet.payload()) {
-                                let is_first = tcp_packet.syn() && !tcp_packet.ack();
-                                if is_first {
-                                    use smoltcp::wire::{IpAddress, IpEndpoint};
-                                    let src_addr = IpEndpoint::new(IpAddress::Ipv4(ipv4_packet.src_addr()), tcp_packet.src_port());
-                                    let dst_addr = IpEndpoint::new(IpAddress::Ipv4(ipv4_packet.dst_addr()), tcp_packet.dst_port());
-                                    
-                                    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
-                                    crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if ethertype == 0x86dd { // IPv6
-                    if let Ok(ipv6_packet) = smoltcp::wire::Ipv6Packet::new_checked(frame.payload()) {
-                        if ipv6_packet.next_header() == smoltcp::wire::IpProtocol::Tcp {
-                            if let Ok(tcp_packet) = smoltcp::wire::TcpPacket::new_checked(ipv6_packet.payload()) {
-                                let is_first = tcp_packet.syn() && !tcp_packet.ack();
-                                if is_first {
-                                    use smoltcp::wire::{IpAddress, IpEndpoint};
-                                    let src_addr = IpEndpoint::new(IpAddress::Ipv6(ipv6_packet.src_addr()), tcp_packet.src_port());
-                                    let dst_addr = IpEndpoint::new(IpAddress::Ipv6(ipv6_packet.dst_addr()), tcp_packet.dst_port());
-                                    
-                                    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
-                                        crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Filter by protocol if not ETH_P_ALL (0x0003 in host order)
-                if protocol != 0 && protocol != 0x0003 && protocol != ethertype {
+        if let Some(inner) = weak.upgrade() {
+            let protocol = *inner.protocol.lock();
+            if let Some(et) = ethertype {
+                if protocol != 0 && protocol != 0x0003 && protocol != et {
                     continue;
                 }
 
-                let mut queue = state.inner.packet_queue.lock();
-                // Limit queue size to avoid OOM by dropping the oldest packet when full
-                if queue.len() >= 1000 {
+                let mut queue = inner.packet_queue.lock();
+                if queue.len() >= PACKET_QUEUE_MAX {
                     queue.pop_front();
                 }
-                queue.push_back(packet.to_vec());
-                state.base.signal_set(Signal::READABLE);
+                if shared.is_none() {
+                    shared = frame_arc(packet);
+                }
+                if let Some(arc) = &shared {
+                    queue.push_back(Arc::clone(arc));
+                }
+                wake_readers(&inner);
             }
         } else {
             to_remove.push(i);
         }
     }
 
-    // Clean up dead weak pointers
     for i in to_remove.into_iter().rev() {
         sockets.swap_remove(i);
     }
-    
-    if flag { kernel_hal::interrupt::intr_on(); }
+    purge_dead_sockets(&mut sockets);
 }
 
 pub struct PacketSocketState {
@@ -111,26 +181,42 @@ struct PacketSocketInner {
     ifindex: Mutex<u32>,
     socket_type: SocketType,
     protocol: Mutex<u16>,
-    packet_queue: Mutex<VecDeque<Vec<u8>>>,
+    packet_queue: Mutex<VecDeque<PacketFrame>>,
+    /// All file descriptors sharing this queue (original + dup).
+    fds: Mutex<Vec<Weak<PacketSocketState>>>,
 }
 
 impl PacketSocketState {
-    pub fn new(socket_type: SocketType, protocol: u16) -> Arc<Self> {
+    pub fn new(socket_type: SocketType, protocol: u16) -> LxResult<Arc<Self>> {
+        let mut registry = PACKET_SOCKETS.lock();
+        purge_dead_sockets(&mut registry);
+        if registry.iter().filter(|w| w.strong_count() > 0).count() >= MAX_PACKET_SOCKETS {
+            return Err(LxError::ENOMEM);
+        }
+
+        let inner = Arc::new(PacketSocketInner {
+            flags: Mutex::new(OpenFlags::RDWR),
+            ifindex: Mutex::new(0),
+            socket_type,
+            protocol: Mutex::new(protocol),
+            packet_queue: Mutex::new(VecDeque::new()),
+            fds: Mutex::new(Vec::new()),
+        });
         let state = Arc::new(Self {
             base: KObjectBase::with_signal(Signal::WRITABLE),
-            inner: Arc::new(PacketSocketInner {
-                flags: Mutex::new(OpenFlags::RDWR),
-                ifindex: Mutex::new(0),
-                socket_type,
-                protocol: Mutex::new(protocol),
-                packet_queue: Mutex::new(VecDeque::new()),
-            }),
+            inner: inner.clone(),
         });
-        let flag = kernel_hal::interrupt::intr_get();
-        if flag { kernel_hal::interrupt::intr_off(); }
-        PACKET_SOCKETS.lock().push(Arc::downgrade(&state));
-        if flag { kernel_hal::interrupt::intr_on(); }
-        state
+        register_fd(&inner, &state);
+        registry.push(Arc::downgrade(&inner));
+        Ok(state)
+    }
+}
+
+impl Drop for PacketSocketState {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            unregister_inner(&self.inner);
+        }
     }
 }
 
@@ -221,8 +307,12 @@ impl Socket for PacketSocketState {
 
         if self.inner.socket_type == SocketType::SOCK_DGRAM {
             if let Some(Endpoint::LinkLevel(ll)) = sendto_endpoint {
-                let mut buf = vec![0u8; data.len() + 14];
-                let mut frame = EthernetFrame::new_unchecked(&mut buf);
+                if data.len() + 14 > ETH_FRAME_MAX {
+                    return Err(LxError::EINVAL);
+                }
+                let mut buf = [0u8; ETH_FRAME_MAX];
+                let frame_len = data.len() + 14;
+                let mut frame = EthernetFrame::new_unchecked(&mut buf[..frame_len]);
                 frame.set_dst_addr(EthernetAddress::from_bytes(&ll.addr[..6]));
                 frame.set_src_addr(dev.get_mac());
                 let protocol_raw = if ll.protocol != 0 {
@@ -234,7 +324,7 @@ impl Socket for PacketSocketState {
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut().copy_from_slice(data);
                 for _ in 0..16 {
-                    if dev.send(&buf).is_ok() {
+                    if dev.send(&buf[..frame_len]).is_ok() {
                         kernel_hal::deferred_job::drain_deferred_jobs();
                         return Ok(data.len());
                     }
@@ -245,7 +335,7 @@ impl Socket for PacketSocketState {
             // If no endpoint, we can't send SOCK_DGRAM (no destination MAC).
             return Err(LxError::EINVAL);
         }
-        
+
         // Do not call full poll_ifaces() here — edhcpc blocks inside send() while
         // waiting for DHCPOFFER; a heavy poll (link bringup + full RX drain) looks hung.
         for _ in 0..16 {
@@ -335,10 +425,13 @@ impl FileLike for PacketSocketState {
     }
 
     fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-        })
+        let inner = self.inner.clone();
+        let state = Arc::new(Self {
+            base: KObjectBase::with_signal(Signal::WRITABLE),
+            inner,
+        });
+        register_fd(&state.inner, &state);
+        state
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {

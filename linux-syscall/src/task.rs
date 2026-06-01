@@ -11,7 +11,12 @@ use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
+use zircon_object::object::KernelObject;
 use zircon_object::vm::USER_STACK_PAGES;
+
+fn comm_from_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
 
 /// Syscalls for process.
 ///
@@ -64,6 +69,10 @@ impl Syscall<'_> {
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
+        let path = new_proc.linux().execute_path();
+        if !path.is_empty() {
+            new_proc.set_name(comm_from_path(&path));
+        }
         let new_thread = Thread::create_linux(&new_proc)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
@@ -346,14 +355,17 @@ impl Syscall<'_> {
             stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
-        .load(&vmar, &vmo, args, envs, path_str)
+        .load(&vmar, &vmo, args.clone(), envs, path_str)
         .map_err(|e| {
             error!("execve: LinuxElfLoader::load failed: {:?}", e);
             e
         })?;
         proc.set_execute_path(&execute_path);
+        proc.set_cmdline(args);
         proc.set_brk(initial_brk);
         proc.apply_exec_metadata(&metadata);
+        self.zircon_process()
+            .set_name(comm_from_path(&execute_path));
 
         self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {

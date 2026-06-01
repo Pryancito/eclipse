@@ -34,7 +34,7 @@ impl Syscall<'_> {
             false
         };
 
-        let chunk_size = len.min(1024 * 1024);
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let mut buf = vec![0u8; chunk_size];
         let mut read_len = 0;
 
@@ -66,9 +66,15 @@ impl Syscall<'_> {
     /// - len – number of bytes to write
     pub fn sys_write(&self, fd: FileDesc, base: UserInPtr<u8>, len: usize) -> SysResult {
         info!("write: fd={:?}, base={:?}, len={:#x}", fd, base, len);
-        self.linux_process()
-            .get_file_like(fd)?
-            .write(base.as_slice(len)?)
+        let proc = self.linux_process();
+        let file_like = proc.get_file_like(fd)?;
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+        let mut written = 0usize;
+        while written < len {
+            let n = (len - written).min(chunk_size);
+            written += file_like.write(base.add(written).as_slice(n)?)?;
+        }
+        Ok(written)
     }
 
     /// read from or write to a file descriptor at a given offset
@@ -88,7 +94,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
 
-        let chunk_size = len.min(1024 * 1024);
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let mut buf = vec![0u8; chunk_size];
         let mut read_len = 0;
 
@@ -138,7 +144,7 @@ impl Syscall<'_> {
         let mut iovs = iov_ptr.read_iovecs(iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let total_len = iovs.total_len().min(1024 * 1024);
+        let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
         let mut buf = vec![0u8; total_len];
         let len = file_like.read(&mut buf).await?;
         iovs.write_from_buf(&buf[..len])?;
@@ -159,6 +165,9 @@ impl Syscall<'_> {
             fd, iov_ptr, iov_count
         );
         let iovs = iov_ptr.read_iovecs(iov_count)?;
+        if iovs.total_len() > super::SYSCALL_IO_MAX {
+            return Err(LxError::EINVAL);
+        }
         let buf = iovs.read_to_vec()?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;

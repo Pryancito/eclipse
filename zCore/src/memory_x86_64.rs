@@ -1,4 +1,11 @@
-//! Define physical frame allocation and dynamic memory allocation.
+//! Physical frame allocation and kernel heap on x86_64 bare metal.
+//!
+//! Two pools on purpose:
+//! - **Kernel heap** (`GlobalAlloc`): fixed BSS buddy pool for `Vec`/strings/smoltcp.
+//! - **Frame allocator** (bitmap): UEFI free RAM for DMA pages and process VM.
+//!
+//! Do not `transfer()` raw UEFI regions into the kernel heap at early boot: the buddy
+//! allocator touches those pages and can hang before the kernel reaches 60% progress.
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
@@ -7,16 +14,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lock::Mutex;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
-static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
-
-
+static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+static FRAMES_USED: AtomicUsize = AtomicUsize::new(0);
 
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
 const PAGE_BITS: usize = 12;
 const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64GiB
 
-/// Global physical frame allocator
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
 
 #[inline]
@@ -64,11 +69,11 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
             );
         }
     }
-    let (used, total) = stats();
+    let (frames_used, frames_total) = frame_stats();
     crate::klog_info!(
         "memory: frame allocator ready ({} MiB managed, {} KiB used)",
-        total / (1024 * 1024),
-        used / 1024
+        frames_total / (1024 * 1024),
+        frames_used / 1024
     );
 }
 
@@ -78,7 +83,7 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         .alloc_contiguous(frame_count, align_log2)
         .map(frame_idx_to_phys_addr);
     if ret.is_some() {
-        USED_MEMORY.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
+        FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
     }
     trace!(
         "frame_alloc_contiguous(): {ret:x?} ~ {end_ret:x?}, align_log2={align_log2}",
@@ -89,16 +94,29 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
 
 pub fn frame_dealloc(target: PhysAddr) {
     trace!("frame_dealloc(): {target:x}");
-    USED_MEMORY.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+    FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
     FRAME_ALLOCATOR
         .lock()
-        .dealloc(phys_addr_to_frame_idx(target))
+        .dealloc(phys_addr_to_frame_idx(target));
 }
 
+pub fn frame_stats() -> (usize, usize) {
+    (
+        FRAMES_USED.load(Ordering::Relaxed),
+        TOTAL_MEMORY.load(Ordering::Relaxed),
+    )
+}
+
+/// Combined usage for `/proc/meminfo` and diagnostics.
 pub fn stats() -> (usize, usize) {
-    let used = USED_MEMORY.load(Ordering::Relaxed);
-    let total = TOTAL_MEMORY.load(Ordering::Relaxed);
-    (used, total)
+    let heap_used = HEAP_USED.load(Ordering::Relaxed);
+    let frames_used = FRAMES_USED.load(Ordering::Relaxed);
+    (heap_used + frames_used, heap_total() + TOTAL_MEMORY.load(Ordering::Relaxed))
+}
+
+/// Kernel heap bytes currently allocated (diagnostics / OOM handler).
+pub fn heap_used() -> usize {
+    HEAP_USED.load(Ordering::Relaxed)
 }
 
 cfg_if! {
@@ -110,16 +128,17 @@ cfg_if! {
             ptr::NonNull,
         };
 
-        const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+        /// Kernel heap — separate from the physical frame pool.
+        const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
         const ORDER: usize = 32;
 
-        /// Global heap allocator
-        ///
-        /// Available after `memory::init()`.
         #[global_allocator]
         static HEAP_ALLOCATOR: LockedHeap<ORDER> = LockedHeap::<ORDER>::new();
 
-        /// Initialize the global heap allocator.
+        pub fn heap_total() -> usize {
+            KERNEL_HEAP_SIZE
+        }
+
         pub fn init() {
             const MACHINE_ALIGN: usize = core::mem::size_of::<usize>();
             const HEAP_BLOCK: usize = KERNEL_HEAP_SIZE / MACHINE_ALIGN;
@@ -140,7 +159,6 @@ cfg_if! {
         pub struct LockedHeap<const ORDER: usize>(Mutex<Heap<ORDER>>);
 
         impl<const ORDER: usize> LockedHeap<ORDER> {
-            /// Creates an empty heap
             pub const fn new() -> Self {
                 LockedHeap(Mutex::new(Heap::<ORDER>::new()))
             }
@@ -161,18 +179,22 @@ cfg_if! {
                     .alloc(layout)
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
-                        USED_MEMORY.fetch_add(layout.size(), Ordering::Relaxed);
+                        HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
                         allocation.as_ptr()
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                USED_MEMORY.fetch_sub(layout.size(), Ordering::Relaxed);
+                HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
                 self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
             }
         }
     } else {
         pub fn init() {}
+
+        pub fn heap_total() -> usize {
+            0
+        }
     }
 }
 
@@ -192,20 +214,18 @@ mod rvm_extern_fn {
 
     #[rvm::extern_fn(phys_to_virt)]
     fn rvm_phys_to_virt(paddr: usize) -> usize {
-        // 示意，这个常量已经没了
-        // pub const PHYSICAL_MEMORY_OFFSET: usize = KERNEL_OFFSET - PHYS_MEMORY_BASE;
         paddr + PHYSICAL_MEMORY_OFFSET
     }
 
     #[cfg(target_arch = "x86_64")]
     #[rvm::extern_fn(is_host_timer_interrupt)]
     fn rvm_is_host_timer_interrupt(vector: u8) -> bool {
-        vector == 32 // IRQ0 + Timer in kernel-hal-bare/src/arch/x86_64/interrupt.rs
+        vector == 32
     }
 
     #[cfg(target_arch = "x86_64")]
     #[rvm::extern_fn(is_host_serial_interrupt)]
     fn rvm_is_host_serial_interrupt(vector: u8) -> bool {
-        vector == 36 // IRQ0 + COM1 in kernel-hal-bare/src/arch/x86_64/interrupt.rs
+        vector == 36
     }
 }

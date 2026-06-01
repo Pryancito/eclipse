@@ -41,6 +41,11 @@ mod consts {
     // generated from syscall.h.in
     include!(concat!(env!("OUT_DIR"), "/consts.rs"));
 }
+/// Max kernel buffer for one read/write/recv/send syscall. Bare-metal zCore uses
+/// a fixed kernel heap; large transient allocations (e.g. 1 MiB recv buffers)
+/// exhaust or fragment it after long network sessions.
+pub(crate) const SYSCALL_IO_MAX: usize = 64 * 1024;
+
 mod file;
 mod ipc;
 mod misc;

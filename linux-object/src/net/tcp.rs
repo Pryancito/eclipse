@@ -46,21 +46,15 @@ pub struct TcpInner {
     ipv6: bool,
 }
 
-impl Default for TcpSocketState {
-    fn default() -> Self {
-        TcpSocketState::new(false)
-    }
-}
-
 impl TcpSocketState {
     /// missing documentation
-    pub fn new(ipv6: bool) -> Self {
+    pub fn new(ipv6: bool) -> LxResult<Self> {
         let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
         let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
         let socket = TcpSocket::new(rx_buffer, tx_buffer);
-        let handle = GlobalSocketHandle(get_sockets().lock().add(socket));
+        let handle = super::register_smoltcp_socket(socket)?;
 
-        TcpSocketState {
+        Ok(TcpSocketState {
             base: KObjectBase::new(),
             inner: Arc::new(Mutex::new(TcpInner {
                 handle,
@@ -69,7 +63,7 @@ impl TcpSocketState {
                 flags: OpenFlags::RDWR,
                 ipv6,
             })),
-        }
+        })
     }
 
     fn endpoint_matches_family(ipv6: bool, ep: &IpEndpoint) -> bool {
