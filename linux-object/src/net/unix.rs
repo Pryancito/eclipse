@@ -7,14 +7,14 @@ use crate::{
 use alloc::{
     boxed::Box,
     collections::VecDeque,
-    sync::{Arc, Weak},
     string::String,
+    sync::{Arc, Weak},
 };
 use async_trait::async_trait;
-use lock::Mutex;
-use zircon_object::object::*;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
+use lock::Mutex;
+use zircon_object::object::*;
 
 lazy_static! {
     static ref UNIX_SOCKETS: Mutex<HashMap<String, Weak<UnixSocketState>>> =
@@ -139,15 +139,6 @@ impl UnixSocketState {
             }
             map.remove(path);
         }
-
-        impl Drop for UnixSocketState {
-            fn drop(&mut self) {
-                let path = self.inner.lock().path.clone();
-                if !path.is_empty() {
-                    Self::unregister(path.as_str());
-                }
-            }
-        }
         None
     }
 
@@ -161,6 +152,15 @@ impl UnixSocketState {
         let mut inner = self.inner.lock();
         inner.accept_queue.push_back(peer);
         inner.eventbus.set(Event::READABLE);
+    }
+}
+
+impl Drop for UnixSocketState {
+    fn drop(&mut self) {
+        let path = self.inner.lock().path.clone();
+        if !path.is_empty() {
+            Self::unregister(path.as_str());
+        }
     }
 }
 
@@ -190,8 +190,8 @@ impl Socket for UnixSocketState {
             }
 
             // EOF: peer gone
-            let peer_gone = inner.peer_closed
-                || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
+            let peer_gone =
+                inner.peer_closed || inner.peer.as_ref().map_or(true, |w| w.strong_count() == 0);
             if peer_gone && inner.connected {
                 return (Ok(0), Endpoint::Unix(path));
             }
@@ -335,14 +335,20 @@ impl Socket for UnixSocketState {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let path = self.inner.lock().path.clone();
-        if !path.is_empty() { Some(Endpoint::Unix(path)) } else { None }
+        if !path.is_empty() {
+            Some(Endpoint::Unix(path))
+        } else {
+            None
+        }
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
         let inner = self.inner.lock();
-        inner.peer.as_ref()?.upgrade().map(|p| {
-            Endpoint::Unix(p.lock().path.clone())
-        })
+        inner
+            .peer
+            .as_ref()?
+            .upgrade()
+            .map(|p| Endpoint::Unix(p.lock().path.clone()))
     }
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
@@ -373,9 +379,15 @@ impl FileLike for UnixSocketState {
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         let mut inner = self.inner.lock();
-        inner.flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner.flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner.flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        inner
+            .flags
+            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
+        inner
+            .flags
+            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
+        inner
+            .flags
+            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
     }
 
