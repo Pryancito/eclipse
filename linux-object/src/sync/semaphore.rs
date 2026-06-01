@@ -69,29 +69,35 @@ impl Semaphore {
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SemaphoreFuture {
             inner: Arc<Mutex<SemaphoreInner>>,
+            subscribed: bool,
         }
 
         impl Future for SemaphoreFuture {
             type Output = Result<(), LxError>;
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                let mut inner = self.inner.lock();
-                if inner.removed {
-                    return Poll::Ready(Err(LxError::EIDRM));
-                } else if inner.count >= 1 {
-                    inner.count -= 1;
-                    if inner.count < 1 {
-                        inner.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                {
+                    let mut inner = self.inner.lock();
+                    if inner.removed {
+                        return Poll::Ready(Err(LxError::EIDRM));
                     }
-                    return Poll::Ready(Ok(()));
+                    if inner.count >= 1 {
+                        inner.count -= 1;
+                        if inner.count < 1 {
+                            inner.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
                 }
 
+                if self.subscribed {
+                    return Poll::Pending;
+                }
+                self.subscribed = true;
                 let waker = cx.waker().clone();
-                inner.eventbus.subscribe(Box::new({
-                    move |_| {
-                        waker.wake_by_ref();
-                        true
-                    }
+                self.inner.lock().eventbus.subscribe(Box::new(move |_| {
+                    waker.wake_by_ref();
+                    true
                 }));
 
                 Poll::Pending
@@ -100,6 +106,7 @@ impl Semaphore {
 
         let future = SemaphoreFuture {
             inner: self.lock.clone(),
+            subscribed: false,
         };
         future.await
     }

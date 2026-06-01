@@ -11,6 +11,8 @@ use core::{
 };
 use lock::Mutex;
 
+const MAX_EVENT_CALLBACKS: usize = 1024;
+
 bitflags! {
     #[derive(Default)]
     /// event bus Event flags
@@ -90,6 +92,10 @@ impl EventBus {
 
     /// push a EventHandler into the callback vector
     pub fn subscribe(&mut self, callback: EventHandler) {
+        if self.callbacks.len() >= MAX_EVENT_CALLBACKS {
+            trace!("EventBus: callback table full ({}), ignoring subscribe", MAX_EVENT_CALLBACKS);
+            return;
+        }
         self.callbacks.push(callback);
     }
 
@@ -101,7 +107,11 @@ impl EventBus {
 
 /// wait for a event async
 pub fn wait_for_event(bus: Arc<Mutex<EventBus>>, mask: Event) -> impl Future<Output = Event> {
-    EventBusFuture { bus, mask }
+    EventBusFuture {
+        bus,
+        mask,
+        subscribed: false,
+    }
 }
 
 /// EventBus future for async
@@ -109,25 +119,30 @@ pub fn wait_for_event(bus: Arc<Mutex<EventBus>>, mask: Event) -> impl Future<Out
 struct EventBusFuture {
     bus: Arc<Mutex<EventBus>>,
     mask: Event,
+    subscribed: bool,
 }
 
 impl Future for EventBusFuture {
     type Output = Event;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut lock = self.bus.lock();
-        if !(lock.event & self.mask).is_empty() {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        let mut lock = this.bus.lock();
+        if !(lock.event & this.mask).is_empty() {
             return Poll::Ready(lock.event);
         }
-        let waker = cx.waker().clone();
-        let mask = self.mask;
-        lock.subscribe(Box::new(move |s| {
-            if (s & mask).is_empty() {
-                return false;
-            }
-            waker.wake_by_ref();
-            true
-        }));
+        if !this.subscribed {
+            this.subscribed = true;
+            let waker = cx.waker().clone();
+            let mask = this.mask;
+            lock.subscribe(Box::new(move |s| {
+                if (s & mask).is_empty() {
+                    return false;
+                }
+                waker.wake_by_ref();
+                true
+            }));
+        }
         Poll::Pending
     }
 }
