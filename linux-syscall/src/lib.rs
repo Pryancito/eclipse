@@ -73,26 +73,8 @@ impl Syscall<'_> {
         if !linux_object::fs::stdio::ctrl_c_pending_take() {
             return Ok(0);
         }
-        use linux_object::signal::Signal;
-
-        // Best-effort: deliver SIGINT to foreground pgrp if the fd0 "tty" provides one.
-        let proc = self.linux_process();
-        if let Ok(file_like) = proc.get_file_like(0.into()) {
-            let mut pgid: i32 = 0;
-            let _ = file_like.ioctl(
-                linux_object::fs::ioctl::TIOCGPGRP,
-                &mut pgid as *mut i32 as usize,
-                0,
-                0,
-            );
-            if pgid != 0 {
-                let _ = self.sys_kill(-(pgid as isize), Signal::SIGINT as usize);
-                return Err(LxError::EINTR);
-            }
-        }
-
-        // Fallback: current process.
-        let _ = self.sys_kill(self.zircon_process().id() as isize, Signal::SIGINT as usize);
+        // Do not use sys_kill(-pgid): pgid==1 becomes kill(-1) ("every process") on Linux.
+        linux_object::process::deliver_sigint_to_foreground();
         Err(LxError::EINTR)
     }
 

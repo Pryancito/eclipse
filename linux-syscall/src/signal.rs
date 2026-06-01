@@ -195,7 +195,20 @@ impl Syscall<'_> {
                 // This matches the common shell behavior of setting fg_pgrp = child pid.
                 send_to_pid(pgid)
             }
-            SendTarget::EveryProcess => unimplemented!(),
+            SendTarget::EveryProcess => match signal {
+                Signal::SIGKILL => {
+                    for proc in linux_object::process::all_live_processes() {
+                        let retcode = (128 + Signal::SIGKILL as i32) as i64;
+                        if caller.id() == proc.id() {
+                            caller.exit(retcode);
+                        } else {
+                            proc.exit(retcode);
+                        }
+                    }
+                    Ok(0)
+                }
+                sig => linux_object::process::send_signal_to_all_processes(sig).map(|_| 0),
+            },
         }
     }
 

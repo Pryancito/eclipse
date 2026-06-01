@@ -1026,17 +1026,66 @@ impl LinuxProcessInner {
             .unwrap()
     }
 }
+/// Deliver SIGINT to the foreground terminal process group (job control).
+pub fn deliver_sigint_to_foreground() {
+    let pgid = crate::fs::stdio::get_foreground_pgrp();
+    if pgid > 0 {
+        let _ = send_signal_to_process(pgid as usize, LinuxSignal::SIGINT);
+        return;
+    }
+    if let Some(arc) = kernel_hal::thread::get_current_thread() {
+        if let Ok(thread) = arc.downcast::<Thread>() {
+            let _ = send_signal_to_process(thread.proc().id() as usize, LinuxSignal::SIGINT);
+        }
+    }
+}
+
 pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
     if crate::fs::stdio::ctrl_c_pending_take() {
-        if let Some(arc) = kernel_hal::thread::get_current_thread() {
-            if let Ok(thread) = arc.downcast::<Thread>() {
-                use crate::thread::ThreadExt;
-                thread.lock_linux().signals.insert(LinuxSignal::SIGINT);
-            }
-        }
+        deliver_sigint_to_foreground();
         return Err(LxError::EINTR);
     }
     check_signals()
+}
+
+fn collect_live_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
+    for id in job.process_ids() {
+        if let Some(proc) = job.find_process(id) {
+            if !matches!(proc.status(), Status::Exited(_)) {
+                out.push(proc);
+            }
+        }
+    }
+    for child_id in job.children_ids() {
+        if let Ok(child) = job.get_child(child_id) {
+            if let Ok(child_job) = child.downcast_arc::<Job>() {
+                collect_live_processes(&child_job, out);
+            }
+        }
+    }
+}
+
+/// All non-exited processes in the root job tree.
+pub fn all_live_processes() -> Vec<Arc<Process>> {
+    let mut processes = Vec::new();
+    collect_live_processes(&ROOT_JOB, &mut processes);
+    processes
+}
+
+/// Insert `signal` into one unmasked thread of each live process under `ROOT_JOB`.
+pub fn send_signal_to_all_processes(signal: LinuxSignal) -> LxResult<()> {
+    let processes = all_live_processes();
+    let mut any = false;
+    for proc in processes {
+        if send_signal_to_process(proc.id() as usize, signal).is_ok() {
+            any = true;
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err(LxError::ESRCH)
+    }
 }
 
 /// Check for pending signals and return EINTR if any.
