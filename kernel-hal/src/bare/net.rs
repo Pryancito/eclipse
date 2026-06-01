@@ -85,9 +85,22 @@ lazy_static! {
     static ref NET_RX_WAKERS: Mutex<Vec<Waker>> = Mutex::new(Vec::new());
 }
 
+/// Prevent unbounded registry growth if futures are cancelled or repeatedly re-register.
+const MAX_NET_RX_WAKERS: usize = 1024;
+
+fn register_waker_once(wakers: &mut Vec<Waker>, waker: &Waker) {
+    if wakers.iter().any(|w| w.will_wake(waker)) {
+        return;
+    }
+    if wakers.len() >= MAX_NET_RX_WAKERS {
+        wakers.remove(0);
+    }
+    wakers.push(waker.clone());
+}
+
 /// Register the current task's Waker to be notified when RX data arrives.
 pub fn register_net_rx_waker(waker: Waker) {
-    NET_RX_WAKERS.lock().push(waker);
+    register_waker_once(&mut NET_RX_WAKERS.lock(), &waker);
 }
 
 /// Wake every task waiting for RX data and clear the registry.
@@ -137,7 +150,7 @@ impl core::future::Future for NetRxOrTimeoutFuture {
             return core::task::Poll::Ready(());
         }
         // Register waker for immediate NIC notification.
-        NET_RX_WAKERS.lock().push(cx.waker().clone());
+        register_waker_once(&mut NET_RX_WAKERS.lock(), cx.waker());
         // Fallback timer so we don't hang if the NIC wake is missed.
         let waker = cx.waker().clone();
         let dl = self.deadline;

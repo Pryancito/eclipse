@@ -43,6 +43,9 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     }
     let mut q = JOBS.lock();
     if q.len() >= MAX_DEFERRED_JOBS {
+        if flag {
+            intr_on();
+        }
         return;
     }
     q.push(Box::new(f));
