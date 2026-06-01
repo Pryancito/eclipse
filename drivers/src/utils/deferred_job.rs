@@ -35,6 +35,14 @@ static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
 const MAX_DEFERRED_JOBS: usize = 256;
 
+/// Drop the oldest queued job without running it (IRQ must not execute arbitrary work).
+#[allow(unused_must_use)]
+fn evict_oldest_job(q: &mut Vec<Job>) {
+    if !q.is_empty() {
+        drop(q.remove(0));
+    }
+}
+
 /// Enqueue a closure to be executed later outside of IRQ context.
 pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     let flag = intr_get();
@@ -43,10 +51,7 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     }
     let mut q = JOBS.lock();
     if q.len() >= MAX_DEFERRED_JOBS {
-        if flag {
-            intr_on();
-        }
-        return;
+        evict_oldest_job(&mut q);
     }
     q.push(Box::new(f));
     if flag {

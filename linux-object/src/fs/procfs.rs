@@ -2,6 +2,7 @@
 
 use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use lazy_static::lazy_static;
 
 use kernel_hal::drivers;
 use rcore_fs::vfs::{
@@ -10,7 +11,6 @@ use rcore_fs::vfs::{
 use zircon_object::object::KernelObject;
 use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 
-use crate::fs::pseudo::Pseudo;
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
@@ -142,7 +142,7 @@ impl FileSystem for ProcFS {
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
-        Arc::new(ProcRootINode)
+        PROC_ROOT.clone()
     }
 
     fn info(&self) -> FsInfo {
@@ -222,35 +222,14 @@ impl INode for ProcRootINode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." => Ok(Arc::new(ProcRootINode)),
-            ".." => Ok(Arc::new(ProcRootINode)),
-            "net" => Ok(Arc::new(ProcNetDirINode)),
-            "meminfo" => Ok(Arc::new(Pseudo::new(
-                &proc_meminfo_content(),
-                FileType::File,
-            ))),
-            "uptime" => Ok(Arc::new(Pseudo::new(
-                &proc_uptime_content(),
-                FileType::File,
-            ))),
-            "mounts" => Ok(Arc::new(Pseudo::new(
-                &proc_mounts_content(),
-                FileType::File,
-            ))),
-            "stat" => Ok(Arc::new(Pseudo::new(
-                &proc_stat_content(),
-                FileType::File,
-            ))),
-            "loadavg" => Ok(Arc::new(Pseudo::new(
-                &proc_loadavg_content(),
-                FileType::File,
-            ))),
-            "self" => {
-                let target = current_process_id()
-                    .map(|id| alloc::format!("{}", id))
-                    .unwrap_or_else(|| "1".into());
-                Ok(Arc::new(Pseudo::new(&target, FileType::SymLink)))
-            }
+            "." | ".." => Ok(PROC_ROOT.clone()),
+            "net" => Ok(PROC_NET_DIR.clone()),
+            "meminfo" => Ok(PROC_MEMINFO.clone()),
+            "uptime" => Ok(PROC_UPTIME.clone()),
+            "mounts" => Ok(PROC_MOUNTS.clone()),
+            "stat" => Ok(PROC_STAT.clone()),
+            "loadavg" => Ok(PROC_LOADAVG.clone()),
+            "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
                     if ROOT_JOB.find_process(pid as _).is_some() {
@@ -327,22 +306,24 @@ impl INode for ProcPidDirINode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        let proc = self.process().ok_or(FsError::EntryNotFound)?;
+        if self.process().is_none() {
+            return Err(FsError::EntryNotFound);
+        }
         match name {
             "." => Ok(Arc::new(ProcPidDirINode { pid: self.pid })),
-            ".." => Ok(Arc::new(ProcRootINode)),
-            "stat" => Ok(Arc::new(Pseudo::new(
-                &proc_pid_stat(&proc),
-                FileType::File,
-            ))),
-            "cmdline" => Ok(Arc::new(Pseudo::new_bytes(
-                proc_pid_cmdline(&proc),
-                FileType::File,
-            ))),
-            "status" => Ok(Arc::new(Pseudo::new(
-                &proc_pid_status(&proc),
-                FileType::File,
-            ))),
+            ".." => Ok(PROC_ROOT.clone()),
+            "stat" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Stat,
+            })),
+            "cmdline" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Cmdline,
+            })),
+            "status" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Status,
+            })),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -410,21 +391,12 @@ impl INode for ProcNetDirINode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." => Ok(Arc::new(ProcNetDirINode)),
-            ".." => Ok(Arc::new(ProcRootINode)),
-            "dev" => Ok(Arc::new(ProcNetDevINode)),
-            "route" => Ok(Arc::new(Pseudo::new(
-                &proc_net_route_content(),
-                FileType::File,
-            ))),
-            "arp" => Ok(Arc::new(Pseudo::new(
-                &proc_net_arp_content(),
-                FileType::File,
-            ))),
-            "if_inet6" => Ok(Arc::new(Pseudo::new(
-                &proc_net_if_inet6_content(),
-                FileType::File,
-            ))),
+            "." => Ok(PROC_NET_DIR.clone()),
+            ".." => Ok(PROC_ROOT.clone()),
+            "dev" => Ok(PROC_NET_DEV.clone()),
+            "route" => Ok(PROC_NET_ROUTE.clone()),
+            "arp" => Ok(PROC_NET_ARP.clone()),
+            "if_inet6" => Ok(PROC_NET_IF_INET6.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -438,13 +410,78 @@ impl INode for ProcNetDirINode {
     }
 }
 
-/// `/proc/net/dev` — regenerated on every read so BusyBox `ifconfig` sees live counters.
-struct ProcNetDevINode;
+/// Proc file that regenerates text on each read (no snapshot in `find()`).
+struct ProcSeqINode {
+    inode: usize,
+    generate: fn() -> String,
+}
 
-impl INode for ProcNetDevINode {
+fn seq_read_at(generate: fn() -> String, offset: usize, buf: &mut [u8]) -> Result<usize> {
+    let content = generate();
+    let bytes = content.as_bytes();
+    if offset >= bytes.len() {
+        return Ok(0);
+    }
+    let len = (bytes.len() - offset).min(buf.len());
+    buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+    Ok(len)
+}
+
+impl INode for ProcSeqINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let content = proc_net_dev_content();
-        let bytes = content.as_bytes();
+        seq_read_at(self.generate, offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let size = (self.generate)().len();
+        Ok(Metadata {
+            dev: 0,
+            inode: self.inode,
+            size,
+            blk_size: 4096,
+            blocks: (size + 4095) / 4096,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o444,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+}
+
+/// `/proc/self` — target pid is resolved on read, not at `find()` time.
+struct ProcSelfSymINode;
+
+impl INode for ProcSelfSymINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let target = current_process_id()
+            .map(|id| alloc::format!("{}", id))
+            .unwrap_or_else(|| "1".into());
+        let bytes = target.as_bytes();
         if offset >= bytes.len() {
             return Ok(0);
         }
@@ -466,10 +503,90 @@ impl INode for ProcNetDevINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let size = proc_net_dev_content().len();
+        let target = current_process_id()
+            .map(|id| alloc::format!("{}", id))
+            .unwrap_or_else(|| "1".into());
         Ok(Metadata {
             dev: 0,
-            inode: 30,
+            inode: 12,
+            size: target.len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::SymLink,
+            mode: 0o777,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProcPidFileKind {
+    Stat,
+    Cmdline,
+    Status,
+}
+
+/// `/proc/<pid>/{stat,cmdline,status}` without snapshotting at lookup time.
+struct ProcPidFileINode {
+    pid: u64,
+    kind: ProcPidFileKind,
+}
+
+impl ProcPidFileINode {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let proc = ROOT_JOB
+            .find_process(self.pid as _)
+            .ok_or(FsError::EntryNotFound)?;
+        Ok(match self.kind {
+            ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
+            ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
+            ProcPidFileKind::Status => proc_pid_status(&proc).into_bytes(),
+        })
+    }
+}
+
+impl INode for ProcPidFileINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let bytes = self.bytes()?;
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let size = self.bytes()?.len();
+        Ok(Metadata {
+            dev: 0,
+            inode: 200 + self.pid as usize,
             size,
             blk_size: 4096,
             blocks: (size + 4095) / 4096,
@@ -699,4 +816,46 @@ fn proc_net_if_inet6_content() -> String {
         }
     }
     s
+}
+
+lazy_static! {
+    static ref PROC_ROOT: Arc<dyn INode> = Arc::new(ProcRootINode);
+    static ref PROC_NET_DIR: Arc<dyn INode> = Arc::new(ProcNetDirINode);
+    static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
+    static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 11,
+        generate: proc_meminfo_content,
+    });
+    static ref PROC_UPTIME: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 13,
+        generate: proc_uptime_content,
+    });
+    static ref PROC_MOUNTS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 14,
+        generate: proc_mounts_content,
+    });
+    static ref PROC_STAT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 15,
+        generate: proc_stat_content,
+    });
+    static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 16,
+        generate: proc_loadavg_content,
+    });
+    static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 30,
+        generate: proc_net_dev_content,
+    });
+    static ref PROC_NET_ROUTE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 31,
+        generate: proc_net_route_content,
+    });
+    static ref PROC_NET_ARP: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 32,
+        generate: proc_net_arp_content,
+    });
+    static ref PROC_NET_IF_INET6: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 33,
+        generate: proc_net_if_inet6_content,
+    });
 }

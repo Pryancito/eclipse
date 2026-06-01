@@ -21,6 +21,16 @@ use smoltcp::wire::IpCidr;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use zcore_drivers::scheme::RouteInfo;
 
+/// Bound queued netlink replies (unread sockets must not grow without limit).
+const NETLINK_RX_QUEUE_MAX: usize = 64;
+
+fn push_netlink_rx(queue: &mut Vec<Vec<u8>>, msg: Vec<u8>) {
+    if queue.len() >= NETLINK_RX_QUEUE_MAX {
+        queue.remove(0);
+    }
+    queue.push(msg);
+}
+
 // Needed by `impl_kobject!`
 #[allow(unused_imports)]
 use zircon_object::object::*;
@@ -192,7 +202,7 @@ impl Socket for NetlinkSocketState {
                     msg.align4();
                     msg.set_ext(0, msg.len() as u32);
 
-                    buffer.push(msg);
+                    push_netlink_rx(&mut buffer, msg);
                 }
             }
             NetlinkMessageType::GetAddr => {
@@ -315,7 +325,7 @@ impl Socket for NetlinkSocketState {
                         msg.align4();
                         msg.set_ext(0, msg.len() as u32);
 
-                        buffer.push(msg);
+                        push_netlink_rx(&mut buffer, msg);
                     }
                 }
             }
@@ -449,7 +459,7 @@ impl Socket for NetlinkSocketState {
                 msg.push_ext(err);
                 msg.align4();
                 msg.set_ext(0, msg.len() as u32);
-                buffer.push(msg);
+                push_netlink_rx(&mut buffer, msg);
             }
         }
         let is_dump = matches!(
@@ -470,7 +480,7 @@ impl Socket for NetlinkSocketState {
             msg.push_ext(0i32);
             msg.align4();
             msg.set_ext(0, msg.len() as u32);
-            buffer.push(msg);
+            push_netlink_rx(&mut buffer, msg);
             info!("[netlink] write: pushed DONE, buffer len now {}", buffer.len());
         }
         self.base.signal_set(Signal::READABLE);
@@ -984,7 +994,7 @@ fn push_route_dump_entry(
     msg.append(&mut attrs);
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
-    buffer.push(msg);
+    push_netlink_rx(buffer, msg);
 }
 
 /// Build a success ACK (NLMSG_ERROR with error=0) and push it onto `buffer`.
@@ -1015,7 +1025,7 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32) 
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
     info!("[netlink] push_ack: seq={}, len={}", req.nlmsg_seq, msg.len());
-    buffer.push(msg);
+    push_netlink_rx(buffer, msg);
 }
 
 fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::wire::Ipv4Address {

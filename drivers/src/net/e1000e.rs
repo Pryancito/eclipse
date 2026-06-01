@@ -3341,7 +3341,7 @@ impl E1000eHw {
         let mpc_delta = unsafe { mmio_read(self.base, E1000E_MPC) };
         if mpc_delta > 0 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
-            log::warn!(
+            log::debug!(
                 "[e1000e] MPC (Missed Packet Count) +{}! GPRC={} RDH={} RDT={} clean={}",
                 mpc_delta,
                 gprc,
@@ -3362,7 +3362,7 @@ impl E1000eHw {
         let gprc_delta = unsafe { mmio_read(self.base, E1000E_GPRC) };
         if gprc_delta > 0 {
             self.last_hw_rx_packets = self.last_hw_rx_packets.wrapping_add(gprc_delta);
-            log::warn!(
+            log::debug!(
                 "[e1000e] GPRC +{} (total {}) RDH={} RDT={} clean={}",
                 gprc_delta,
                 self.last_hw_rx_packets,
@@ -3380,7 +3380,7 @@ impl E1000eHw {
             }
             let wb = unsafe { read_volatile((desc_addr + 8) as *const u32) };
             if wb != 0 {
-                log::warn!(
+                log::trace!(
                     "[e1000e] RX slot {} WB={:#x} but not consumed (clean={})",
                     i,
                     wb,
@@ -4038,7 +4038,7 @@ impl E1000eHw {
         let desc_addr = unsafe { ring.add(i) as usize };
         let (staterr, len) = unsafe { self.desc_done(desc_addr)? };
         fence(Ordering::Acquire);
-        log::warn!("[e1000e] RX: slot={} staterr={:#x} len={} clean={} RDH={} RDT={}",
+        log::trace!("[e1000e] RX: slot={} staterr={:#x} len={} clean={} RDH={} RDT={}",
               i, staterr, len, self.rx_next_to_clean,
               unsafe { mmio_read(self.base, E1000E_RDH) },
               unsafe { mmio_read(self.base, E1000E_RDT) });
@@ -4058,7 +4058,7 @@ impl E1000eHw {
 
         if len == 0 || len > BUF_SIZE {
             // Descriptor is done but length is implausible — discard and recycle.
-            log::warn!(
+            log::debug!(
                 "[e1000e] RX slot {} bad len={} staterr={:#x} — discarding",
                 i, len, staterr
             );
@@ -4078,7 +4078,7 @@ impl E1000eHw {
         const RX_SG_MAX: usize = 9216;
         let data = if staterr & RXD_EXT_EOP == 0 {
             if Self::rx_ipv4_deliverable(&frag) {
-                log::warn!(
+                log::trace!(
                     "[e1000e] RX slot {} EOP=0 deliverable ({} B)",
                     i,
                     frag.len()
@@ -4087,14 +4087,14 @@ impl E1000eHw {
                 Self::trim_to_ipv4_frame(frag)
             } else if Self::is_eth_ipv4_header_start(&frag) {
                 if !self.rx_sg_buf.is_empty() {
-                    log::warn!(
+                    log::trace!(
                         "[e1000e] RX slot {} new frame start — drop partial ({} B)",
                         i,
                         self.rx_sg_buf.len()
                     );
                     self.rx_sg_buf.clear();
                 }
-                log::warn!(
+                log::trace!(
                     "[e1000e] RX slot {} fragment {} B EOP=0 — buffer head",
                     i,
                     frag.len()
@@ -4108,7 +4108,7 @@ impl E1000eHw {
                     recycle(self);
                     return None;
                 }
-                log::warn!(
+                log::trace!(
                     "[e1000e] RX slot {} continuation {} B EOP=0 — buffer",
                     i,
                     frag.len()
@@ -4122,7 +4122,7 @@ impl E1000eHw {
             }
         } else if !self.rx_sg_buf.is_empty() {
             if Self::is_eth_ipv4_header_start(&frag) {
-                log::warn!(
+                log::trace!(
                     "[e1000e] RX slot {} EOP=1 new frame — drop partial ({} B), deliver {} B",
                     i,
                     self.rx_sg_buf.len(),
@@ -4134,14 +4134,14 @@ impl E1000eHw {
                 let mut assembled = core::mem::take(&mut self.rx_sg_buf);
                 assembled.extend_from_slice(&frag);
                 if Self::rx_ipv4_deliverable(&assembled) {
-                    log::warn!(
+                    log::trace!(
                         "[e1000e] RX slot {} EOP: assembled {} B",
                         i,
                         assembled.len()
                     );
                     Self::trim_to_ipv4_frame(assembled)
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "[e1000e] RX slot {} assembled {} B still incomplete — discard",
                         i,
                         assembled.len()
@@ -4164,7 +4164,7 @@ impl E1000eHw {
                     let ip_tot_len = u16::from_be_bytes([b[16], b[17]]) as usize;
                     let expected = 14 + ip_tot_len;
                     if ip_tot_len >= ihl && expected > data.len() {
-                        log::warn!(
+                        log::trace!(
                             "[e1000e] RX TRUNCATED slot={} desc_len={} frame={} ip_tot_len={} (need {} B) RCTL={:#x} SRRCTL={:#x}",
                             i,
                             len,
@@ -4180,7 +4180,7 @@ impl E1000eHw {
                 let payload_len = u16::from_be_bytes([data[16], data[17]]) as usize;
                 let expected = 14 + 40 + payload_len;
                 if expected > data.len() {
-                    log::warn!(
+                    log::trace!(
                         "[e1000e] RX TRUNCATED IPv6 slot={} desc_len={} frame={} payload_len={} (need {} B)",
                         i,
                         len,
@@ -4193,7 +4193,7 @@ impl E1000eHw {
         }
 
         if !Self::rx_frame_deliverable(&data) {
-            log::warn!(
+            log::trace!(
                 "[e1000e] RX slot {} incomplete L3 frame ({} B) — discard",
                 i,
                 data.len()
@@ -4209,7 +4209,7 @@ impl E1000eHw {
         if self.stats.rx_packets == 1 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
             self.last_hw_rx_packets = self.last_hw_rx_packets.wrapping_add(gprc);
-            log::warn!(
+            log::info!(
                 "[e1000e] first RX frame {} bytes staterr={:#x} GPRC={} RDT={} RDH={}",
                 data.len(),
                 staterr,
@@ -4521,7 +4521,7 @@ impl Scheme for E1000eInterface {
         // because the first read already cleared all bits — causing us to
         // miss the RX event and never wake the polling loop.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
-        log::warn!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
+        log::trace!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
         if icr == 0 {
             if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
                 self.poll_pending

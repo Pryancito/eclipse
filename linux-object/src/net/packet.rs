@@ -133,6 +133,10 @@ pub fn push_packet(packet: &[u8]) {
     snoop_tcp_syn(packet);
 
     let mut sockets = PACKET_SOCKETS.lock();
+    if !sockets.iter().any(|w| w.strong_count() > 0) {
+        purge_dead_sockets(&mut sockets);
+        return;
+    }
     let mut to_remove = Vec::new();
     let mut shared: Option<PacketFrame> = None;
     let ethertype = EthernetFrame::new_checked(packet)

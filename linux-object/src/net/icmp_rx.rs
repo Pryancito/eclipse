@@ -75,31 +75,18 @@ pub fn deliver_from_frame(frame: &[u8]) {
         let Ok(pkt) = Ipv4Packet::new_checked(ip) else {
             return;
         };
-        log::debug!(
-            "[icmp_rx] IPv4 packet: protocol={}, src={}, dst={}",
-            pkt.protocol(),
-            pkt.src_addr(),
-            pkt.dst_addr()
-        );
         if pkt.protocol() != IpProtocol::Icmp {
             return;
         }
         let src = IpAddress::Ipv4(pkt.src_addr());
         let dst = IpAddress::Ipv4(pkt.dst_addr());
         if !is_our_ip(dst) {
-            log::debug!("[icmp_rx] dst {} is not our IP", dst);
             return;
         }
         let payload = pkt.payload();
         if payload.is_empty() {
-            log::debug!("[icmp_rx] payload is empty");
             return;
         }
-        log::debug!(
-            "[icmp_rx] ICMPv4 packet: type={}, code={}",
-            payload[0],
-            payload.get(1).unwrap_or(&0)
-        );
         if payload[0] != 0 {
             // 0 = Echo Reply
             return;
@@ -112,18 +99,11 @@ pub fn deliver_from_frame(frame: &[u8]) {
             src,
             data: payload.to_vec(),
         });
-        log::debug!("[icmp_rx] queued ICMPv4 Echo Reply");
     } else if et == 0x86dd {
         let ip = &frame[l2..];
         let Ok(pkt) = Ipv6Packet::new_checked(ip) else {
             return;
         };
-        log::debug!(
-            "[icmp_rx] IPv6 packet: next_header={}, src={}, dst={}",
-            pkt.next_header(),
-            pkt.src_addr(),
-            pkt.dst_addr()
-        );
         if pkt.next_header() != IpProtocol::Icmpv6 {
             return;
         }
@@ -132,27 +112,16 @@ pub fn deliver_from_frame(frame: &[u8]) {
         };
         let src = IpAddress::Ipv6(pkt.src_addr());
         let dst = IpAddress::Ipv6(pkt.dst_addr());
-        let cs_ok = icmp_pkt.verify_checksum(&src, &dst);
-        log::debug!(
-            "[icmp_rx] ICMPv6 packet length: {}, checksum field: 0x{:04x}, calculated cs_ok: {}",
-            pkt.payload().len(),
-            icmp_pkt.checksum(),
-            cs_ok
-        );
+        if !icmp_pkt.verify_checksum(&src, &dst) {
+            return;
+        }
         if !is_our_ip(dst) {
-            log::debug!("[icmp_rx] dst {} is not our IP", dst);
             return;
         }
         let payload = pkt.payload();
         if payload.is_empty() {
-            log::debug!("[icmp_rx] payload is empty");
             return;
         }
-        log::debug!(
-            "[icmp_rx] ICMPv6 packet: type={}, code={}",
-            payload[0],
-            payload.get(1).unwrap_or(&0)
-        );
         if payload[0] != 129 {
             // 129 = Echo Reply
             return;
@@ -165,7 +134,6 @@ pub fn deliver_from_frame(frame: &[u8]) {
             src,
             data: payload.to_vec(),
         });
-        log::debug!("[icmp_rx] queued ICMPv6 Echo Reply");
     }
 }
 
