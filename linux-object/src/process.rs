@@ -132,12 +132,19 @@ impl ProcessExt for Process {
         new_proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
                 parent.signal_set(Signal::SIGCHLD);
-                if let Some(proc) = weak_proc.upgrade() {
-                    let mut inner = proc.linux().inner.lock();
-                    inner.files.clear();
-                    inner.futexes.clear();
-                    inner.semaphores = Default::default();
-                    inner.shm_identifiers = Default::default();
+                if let Some(child) = weak_proc.upgrade() {
+                    let exit_code = match child.status() {
+                        Status::Exited(code) => code,
+                        _ => 0,
+                    };
+                    {
+                        let mut inner = child.linux().inner.lock();
+                        inner.files.clear();
+                        inner.futexes.clear();
+                        inner.semaphores = Default::default();
+                        inner.shm_identifiers = Default::default();
+                    }
+                    parent.linux().record_child_exit(child.id(), exit_code);
                 }
                 return true;
             }
@@ -155,14 +162,21 @@ impl ProcessExt for Process {
 /// - the child was stopped by a signal. TODO
 /// - the child was resumed by a signal. TODO
 pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxResult<ExitCode> {
-    let child = {
-        let inner = proc.linux().inner.lock();
-        inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
-    };
     loop {
+        {
+            let mut inner = proc.linux().inner.lock();
+            if let Some(code) = inner.reaped_children.remove(&pid) {
+                return Ok((code as i32) << 8);
+            }
+        }
+        let child = {
+            let inner = proc.linux().inner.lock();
+            inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
+        };
         if let Status::Exited(code) = child.status() {
             let mut inner = proc.linux().inner.lock();
             inner.children.remove(&pid);
+            inner.reaped_children.remove(&pid);
             return Ok((code as i32) << 8);
         }
         if nonblock {
@@ -175,6 +189,7 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
         if let Status::Exited(code) = child.status() {
             let mut inner = proc.linux().inner.lock();
             inner.children.remove(&pid);
+            inner.reaped_children.remove(&pid);
             return Ok((code as i32) << 8);
         }
         continue;
@@ -185,8 +200,12 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
 pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(KoID, ExitCode)> {
     loop {
         let mut inner = proc.linux().inner.lock();
-        if inner.children.is_empty() {
+        if inner.children.is_empty() && inner.reaped_children.is_empty() {
             return Err(LxError::ECHILD);
+        }
+        if let Some((pid, code)) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c)) {
+            inner.reaped_children.remove(&pid);
+            return Ok((pid, (code as i32) << 8));
         }
         let mut exited_pid = None;
         trace!("wait_child_any: checking {} children", inner.children.len());
@@ -201,6 +220,7 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         if let Some((pid, code)) = exited_pid {
             trace!("wait_child_any: reaping child {}", pid);
             inner.children.remove(&pid);
+            inner.reaped_children.remove(&pid);
             return Ok((pid, (code as i32) << 8));
         }
         if nonblock {
@@ -260,6 +280,8 @@ struct LinuxProcessInner {
     futexes: HashMap<VirtAddr, Arc<Futex>>,
     /// Child processes
     children: HashMap<KoID, Arc<Process>>,
+    /// Exit codes for children already detached (freed `Arc<Process>` at exit).
+    reaped_children: HashMap<KoID, i64>,
     /// Signal actions
     signal_actions: SignalActions,
     /// Program break (top of heap).
@@ -308,6 +330,13 @@ impl Default for RLimit {
 pub type ExitCode = i32;
 
 impl LinuxProcess {
+    /// Drop the live child handle and keep only the exit code for a future `wait`.
+    pub fn record_child_exit(&self, child_id: KoID, exit_code: i64) {
+        let mut inner = self.inner.lock();
+        inner.children.remove(&child_id);
+        inner.reaped_children.insert(child_id, exit_code);
+    }
+
     /// Create a new process.
     pub fn new(rootfs: Arc<dyn FileSystem>) -> Self {
         let stdin = File::new(

@@ -729,7 +729,7 @@ fn proc_loadavg_content() -> String {
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let free = total.saturating_sub(used);
-    let mut s = String::new();
+    let mut s = String::with_capacity(128);
     let _ = writeln!(s, "MemTotal:     {:>10} kB", total / 1024);
     let _ = writeln!(s, "MemFree:      {:>10} kB", free / 1024);
     let _ = writeln!(s, "MemAvailable: {:>10} kB", free / 1024);

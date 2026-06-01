@@ -181,6 +181,8 @@ pub struct KObjectBase {
     inner: Mutex<KObjectBaseInner>,
 }
 
+const MAX_SIGNAL_CALLBACKS: usize = 1024;
+
 /// The mutable part of `KObjectBase`.
 #[derive(Default)]
 struct KObjectBaseInner {
@@ -295,6 +297,9 @@ impl KObjectBase {
         // `add_signal_callback` (since lock is acquired inside it) and the callback is not triggered
         // in time.
         if !callback(inner.signal) {
+            if inner.signal_callbacks.len() >= MAX_SIGNAL_CALLBACKS {
+                return;
+            }
             inner.signal_callbacks.push(callback);
         }
     }

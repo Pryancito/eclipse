@@ -45,6 +45,10 @@ lazy_static! {
 }
 
 impl SemArray {
+    fn purge_stale_keys(map: &mut BTreeMap<u32, Weak<SemArray>>) {
+        map.retain(|_, weak| weak.strong_count() > 0);
+    }
+
     /// remove semaphores
     pub fn remove(&self) {
         let mut key2sem = KEY2SEM.write();
@@ -78,12 +82,18 @@ impl SemArray {
     /// If not exist, create a new one with `nsems` elements.
     pub fn get_or_create(mut key: u32, nsems: usize, flags: usize) -> Result<Arc<Self>, LxError> {
         let mut key2sem = KEY2SEM.write();
+        Self::purge_stale_keys(&mut key2sem);
         let flag = IpcGetFlag::from_bits_truncate(flags);
 
         if key == 0 {
             // IPC_PRIVATE
             // find an empty key slot
-            key = (1u32..).find(|i| key2sem.get(i).is_none()).unwrap();
+            key = (1u32..)
+                .find(|i| match key2sem.get(i) {
+                    None => true,
+                    Some(w) => w.strong_count() == 0,
+                })
+                .unwrap();
         } else {
             // check existence
             if let Some(weak_array) = key2sem.get(&key) {
