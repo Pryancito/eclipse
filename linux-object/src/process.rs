@@ -85,6 +85,7 @@ impl ProcessExt for Process {
                 if let Some(proc) = weak_proc.upgrade() {
                     let mut inner = proc.linux().inner.lock();
                     inner.files.clear();
+                    inner.futexes.clear();
                     inner.semaphores = Default::default();
                     inner.shm_identifiers = Default::default();
                 }
@@ -134,6 +135,7 @@ impl ProcessExt for Process {
                 if let Some(proc) = weak_proc.upgrade() {
                     let mut inner = proc.linux().inner.lock();
                     inner.files.clear();
+                    inner.futexes.clear();
                     inner.semaphores = Default::default();
                     inner.shm_identifiers = Default::default();
                 }
@@ -187,17 +189,17 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
             return Err(LxError::ECHILD);
         }
         let mut exited_pid = None;
-        warn!("wait_child_any: checking {} children", inner.children.len());
+        trace!("wait_child_any: checking {} children", inner.children.len());
         for (&pid, child) in inner.children.iter() {
             let status = child.status();
-            warn!("  child {}: status={:?}", pid, status);
+            trace!("  child {}: status={:?}", pid, status);
             if let Status::Exited(code) = status {
                 exited_pid = Some((pid, code));
                 break;
             }
         }
         if let Some((pid, code)) = exited_pid {
-            warn!("wait_child_any: reaping child {}", pid);
+            trace!("wait_child_any: reaping child {}", pid);
             inner.children.remove(&pid);
             return Ok((pid, (code as i32) << 8));
         }
@@ -216,12 +218,12 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         }
         drop(inner);
         if found_exited {
-            warn!("wait_child_any: found exited child after clear, continuing");
+            trace!("wait_child_any: found exited child after clear, continuing");
             continue;
         }
-        warn!("wait_child_any: waiting for SIGCHLD");
+        trace!("wait_child_any: waiting for SIGCHLD");
         proc_obj.wait_signal(Signal::SIGCHLD).await;
-        warn!("wait_child_any: woke up from SIGCHLD");
+        trace!("wait_child_any: woke up from SIGCHLD");
     }
 }
 

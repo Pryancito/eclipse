@@ -276,11 +276,19 @@ impl Process {
                 0
             }
         };
+        inner.futexes.clear();
+        drop(inner);
+
+        // Keep the exited process object around for wait/status, but release
+        // userspace mappings as soon as the last thread is gone.
+        let _ = self.vmar.clear();
+
         self.base.signal_set(Signal::PROCESS_TERMINATED);
         self.exceptionate.shutdown();
         self.debug_exceptionate.shutdown();
 
         self.job.remove_process(self.base.id);
+        let inner = self.inner.lock();
         // If we are critical to a job, we need to take action.
         if let Some((job, retcode_nonzero)) = &inner.critical_to_job {
             if !retcode_nonzero || retcode != 0 {

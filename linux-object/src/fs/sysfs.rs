@@ -480,7 +480,7 @@ impl INode for SysDevicesPciBusDirINode {
         Arc::new(SysFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        log::warn!("SysDevicesPciBusDirINode::find name={}", name);
+        log::trace!("SysDevicesPciBusDirINode::find name={}", name);
         if name == "." {
             return Ok(Arc::new(SysDevicesPciBusDirINode));
         }
@@ -489,7 +489,7 @@ impl INode for SysDevicesPciBusDirINode {
         }
         let devices = get_pci_devices();
         if let Some((idx, dev)) = devices.iter().enumerate().find(|(_, d)| d.name == name) {
-            log::warn!("SysDevicesPciBusDirINode::find name={} -> found", name);
+            log::trace!("SysDevicesPciBusDirINode::find name={} -> found", name);
             Ok(Arc::new(SysPciDevDirINode {
                 index: idx,
                 name: dev.name.clone(),
@@ -498,7 +498,7 @@ impl INode for SysDevicesPciBusDirINode {
                 class: dev.class.clone(),
             }))
         } else {
-            log::warn!("SysDevicesPciBusDirINode::find name={} -> EntryNotFound", name);
+            log::trace!("SysDevicesPciBusDirINode::find name={} -> EntryNotFound", name);
             Err(FsError::EntryNotFound)
         }
     }
@@ -537,7 +537,7 @@ impl INode for SysPciDevicesDirINode {
         Arc::new(SysFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        log::warn!("SysPciDevicesDirINode::find name={}", name);
+        log::trace!("SysPciDevicesDirINode::find name={}", name);
         if name == "." {
             return Ok(Arc::new(SysPciDevicesDirINode));
         }
@@ -547,10 +547,10 @@ impl INode for SysPciDevicesDirINode {
         let devices = get_pci_devices();
         if let Some(dev) = devices.iter().find(|d| d.name == name) {
             let target = format!("../../../devices/pci0000:00/{}", dev.name);
-            log::warn!("SysPciDevicesDirINode::find name={} -> target={}", name, target);
+            log::trace!("SysPciDevicesDirINode::find name={} -> target={}", name, target);
             Ok(Arc::new(Pseudo::new(&target, FileType::SymLink)))
         } else {
-            log::warn!("SysPciDevicesDirINode::find name={} -> EntryNotFound", name);
+            log::trace!("SysPciDevicesDirINode::find name={} -> EntryNotFound", name);
             Err(FsError::EntryNotFound)
         }
     }
@@ -595,7 +595,7 @@ impl INode for SysPciDevDirINode {
         Arc::new(SysFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        log::warn!("SysPciDevDirINode::find name={} self.name={}", name, self.name);
+        log::trace!("SysPciDevDirINode::find name={} self.name={}", name, self.name);
         match name {
             "." => Ok(Arc::new(SysPciDevDirINode {
                 index: self.index,
