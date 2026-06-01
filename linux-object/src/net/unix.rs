@@ -21,6 +21,12 @@ lazy_static! {
         Mutex::new(HashMap::new());
 }
 
+const MAX_UNIX_SOCKET_REGISTRY: usize = 1024;
+
+fn purge_dead_registry(map: &mut HashMap<String, Weak<UnixSocketState>>) {
+    map.retain(|_, weak| weak.strong_count() > 0);
+}
+
 /// Unix domain socket (AF_UNIX / AF_LOCAL) implementation.
 ///
 /// Supports the full AF_UNIX workflow (as used by many DHCP clients and daemons):
@@ -110,10 +116,14 @@ impl UnixSocketState {
     /// Register this socket under `path` so that connect() can find it.
     pub fn register(path: String, socket: Arc<Self>) -> LxResult<()> {
         let mut map = UNIX_SOCKETS.lock();
+        purge_dead_registry(&mut map);
         if let Some(w) = map.get(&path) {
             if w.upgrade().is_some() {
                 return Err(LxError::EADDRINUSE);
             }
+        }
+        if map.len() >= MAX_UNIX_SOCKET_REGISTRY {
+            return Err(LxError::ENOMEM);
         }
         map.insert(path, Arc::downgrade(&socket));
         Ok(())
@@ -122,11 +132,21 @@ impl UnixSocketState {
     /// Look up a registered socket by path.
     pub fn lookup(path: &String) -> Option<Arc<Self>> {
         let mut map = UNIX_SOCKETS.lock();
+        purge_dead_registry(&mut map);
         if let Some(w) = map.get(path) {
             if let Some(arc) = w.upgrade() {
                 return Some(arc);
             }
             map.remove(path);
+        }
+
+        impl Drop for UnixSocketState {
+            fn drop(&mut self) {
+                let path = self.inner.lock().path.clone();
+                if !path.is_empty() {
+                    Self::unregister(path.as_str());
+                }
+            }
         }
         None
     }

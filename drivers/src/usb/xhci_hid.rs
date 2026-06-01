@@ -124,13 +124,30 @@ impl InputScheme for LegacyUsbHid {
 
 static MSI_IRQ_HOST: Mutex<Option<Arc<dyn IrqScheme>>> = Mutex::new(None);
 static MSI_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
+const MAX_MSI_PENDING: usize = 256;
+
+fn enqueue_pending_msi(
+    pending: &mut Vec<(usize, Arc<dyn Scheme>)>,
+    vector: usize,
+    dev: &Arc<dyn Scheme>,
+) {
+    if pending.iter().any(|(v, d)| {
+        *v == vector && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(dev))
+    }) {
+        return;
+    }
+    if pending.len() >= MAX_MSI_PENDING {
+        pending.remove(0);
+    }
+    pending.push((vector, dev.clone()));
+}
 
 pub fn pci_set_irq_host(irq: Arc<dyn IrqScheme>) {
     *MSI_IRQ_HOST.lock() = Some(irq);
 }
 
 pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
-    MSI_PENDING.lock().push((vector, dev));
+    enqueue_pending_msi(&mut MSI_PENDING.lock(), vector, &dev);
 }
 
 static XHCI_WARNED_HALTED: AtomicBool = AtomicBool::new(false);
