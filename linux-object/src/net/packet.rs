@@ -339,9 +339,21 @@ impl Socket for PacketSocketState {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
-        crate::net::poll_ifaces();
-        let readable = !self.inner.packet_queue.lock().is_empty();
+        // Light NIC poll only — poll_ifaces() runs route/ARP sync + full link bringup
+        // and stalls udhcpc select() while waiting for DHCPOFFER.
         let ifindex = *self.inner.ifindex.lock();
+        if ifindex > 0 {
+            if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
+                let _ = net.poll();
+            }
+        } else {
+            for net in get_net_device().iter() {
+                if net.get_ifname() != "loopback" {
+                    let _ = net.poll();
+                }
+            }
+        }
+        let readable = !self.inner.packet_queue.lock().is_empty();
         let dev = if ifindex > 0 {
             crate::net::iface_by_linux_ifindex(ifindex).ok()
         } else {

@@ -216,6 +216,7 @@ impl LinuxRootfs {
                     for r in $router; do\n\
                       ip -4 route del default 2>/dev/null\n\
                       ip -4 route add default via \"$r\" dev \"$interface\" 2>/dev/null\n\
+                      route add default gw \"$r\" dev \"$interface\" 2>/dev/null\n\
                       break\n\
                     done\n\
                   fi\n\

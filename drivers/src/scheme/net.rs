@@ -62,5 +62,13 @@ pub trait NetScheme: Scheme {
     fn get_arp_content(&self) -> String {
         String::new()
     }
+    /// Import a resolved IPv4/IPv6 neighbor into smoltcp's cache (for TCP/UDP egress).
+    fn seed_neighbor(
+        &self,
+        _protocol: smoltcp::wire::IpAddress,
+        _hardware: EthernetAddress,
+    ) -> DeviceResult {
+        Ok(())
+    }
     fn poll(&self) -> DeviceResult;
 }

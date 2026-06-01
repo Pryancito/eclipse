@@ -57,10 +57,10 @@ impl Syscall<'_> {
             }
             // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
-                Arc::new(IcmpSocketState::new(false))
+                Arc::new(IcmpSocketState::new(false)?)
             }
             (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
-                Arc::new(IcmpSocketState::new(true))
+                Arc::new(IcmpSocketState::new(true)?)
             }
             // Be tolerant for AF_INET/AF_INET6 datagram sockets.
             // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.

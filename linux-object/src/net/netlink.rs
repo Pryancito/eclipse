@@ -333,6 +333,9 @@ impl Socket for NetlinkSocketState {
                 if let Some((ifindex, cidr)) = parse_ifaddr_cidr(data) {
                     if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifindex) {
                         let _ = iface.add_ip_address(cidr);
+                        if matches!(cidr, IpCidr::Ipv4(_)) {
+                            crate::net::prepare_ipv4_stack();
+                        }
                         info!(
                             "[netlink] NewAddr: set {} on {} (ifindex {})",
                             cidr,
@@ -369,6 +372,9 @@ impl Socket for NetlinkSocketState {
                         if let Some(iface) = iface {
                             let _ = iface.add_route(dst_cidr, Some(gw));
                         }
+                    }
+                    if matches!(dst_cidr, IpCidr::Ipv4(_)) {
+                        crate::net::prepare_ipv4_stack();
                     }
                     let _ = rtm;
                 }

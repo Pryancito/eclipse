@@ -1,86 +1,156 @@
+//! ICMP sockets (Linux `SOCK_DGRAM` + `IPPROTO_ICMP`) via smoltcp — same stack as TCP/UDP.
+
 use crate::{
     error::{LxError, LxResult},
     fs::{FileLike, OpenFlags, PollEvents, PollStatus},
     net::*,
 };
 use alloc::sync::Arc;
+use alloc::vec;
 use async_trait::async_trait;
 use lock::Mutex;
-use smoltcp::wire::IpAddress;
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::socket::{IcmpEndpoint, IcmpPacketMetadata, IcmpSocket, IcmpSocketBuffer};
+use smoltcp::wire::{
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, Ipv6Address,
+};
 
 #[allow(unused_imports)]
 use zircon_object::object::*;
 
+const ICMP_PACKET_META: usize = 64;
+
+fn icmp_checksum_caps() -> ChecksumCapabilities {
+    ChecksumCapabilities::default()
+}
+
 pub struct IcmpSocketState {
     base: KObjectBase,
-    inner: Arc<IcmpSocketInner>,
+    inner: Arc<Mutex<IcmpInner>>,
 }
 
 #[derive(Debug)]
-struct IcmpSocketInner {
-    flags: Mutex<OpenFlags>,
-    remote: Mutex<Option<Endpoint>>,
-    echo_seq: Mutex<u16>,
+struct IcmpInner {
+    handle: GlobalSocketHandle,
+    remote: Option<IpEndpoint>,
+    flags: OpenFlags,
+    echo_seq: u16,
     echo_id: u16,
     ipv6: bool,
 }
 
 impl IcmpSocketState {
-    /// missing documentation
-    pub fn new(ipv6: bool) -> Self {
-        IcmpSocketState {
+    pub fn new(ipv6: bool) -> LxResult<Self> {
+        let rx_buffer = IcmpSocketBuffer::new(
+            vec![IcmpPacketMetadata::EMPTY; ICMP_PACKET_META],
+            vec![0u8; ICMP_RECVBUF.min(64 * 1024)],
+        );
+        let tx_buffer = IcmpSocketBuffer::new(
+            vec![IcmpPacketMetadata::EMPTY; ICMP_PACKET_META],
+            vec![0u8; ICMP_SENDBUF.min(64 * 1024)],
+        );
+        let socket = IcmpSocket::new(rx_buffer, tx_buffer);
+        let handle = register_smoltcp_socket(socket)?;
+        Ok(Self {
             base: KObjectBase::new(),
-            inner: Arc::new(IcmpSocketInner {
-                flags: Mutex::new(OpenFlags::RDWR),
-                remote: Mutex::new(None),
-                echo_seq: Mutex::new(0),
+            inner: Arc::new(Mutex::new(IcmpInner {
+                handle,
+                remote: None,
+                flags: OpenFlags::RDWR,
+                echo_seq: 0,
                 echo_id: (kernel_hal::timer::timer_now().as_micros() as u16).wrapping_add(1),
                 ipv6,
-            }),
-        }
+            })),
+        })
     }
 
-    fn make_echo_request_payload(&self, data: &[u8]) -> alloc::vec::Vec<u8> {
-        let expect_type = if self.inner.ipv6 { 128 } else { 8 };
+    fn bind_ident(inner: &IcmpInner) -> LxResult<()> {
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        let mut sock = sets.get::<IcmpSocket>(inner.handle.0);
+        if sock.is_open() {
+            return Ok(());
+        }
+        sock.bind(IcmpEndpoint::Ident(inner.echo_id))
+            .map_err(|_| LxError::EINVAL)
+    }
+
+    /// Build ICMP echo request bytes (type 8/128 + id + seq + payload).
+    fn echo_request_bytes(inner: &mut IcmpInner, data: &[u8]) -> alloc::vec::Vec<u8> {
+        let expect_type = if inner.ipv6 { 128 } else { 8 };
         if data.len() >= 8 && data[0] == expect_type && data[1] == 0 {
             return data.to_vec();
         }
         let mut out = vec![0u8; 8 + data.len()];
         out[0] = expect_type;
         out[1] = 0;
-        out[4..6].copy_from_slice(&self.inner.echo_id.to_be_bytes());
-        let mut seq = self.inner.echo_seq.lock();
-        out[6..8].copy_from_slice(&seq.to_be_bytes());
-        *seq = seq.wrapping_add(1);
+        out[4..6].copy_from_slice(&inner.echo_id.to_be_bytes());
+        out[6..8].copy_from_slice(&inner.echo_seq.to_be_bytes());
+        inner.echo_seq = inner.echo_seq.wrapping_add(1);
         out[8..].copy_from_slice(data);
         out
     }
 
-    fn remote_ip(&self) -> Option<IpAddress> {
-        let Endpoint::Ip(ip) = self.inner.remote.lock().clone()? else {
-            return None;
-        };
-        Some(ip.addr)
-    }
+    fn send_echo(inner: &mut IcmpInner, dst: IpAddress, icmp_bytes: &[u8]) -> LxResult {
+        Self::bind_ident(inner)?;
+        let caps = icmp_checksum_caps();
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        let mut sock = sets.get::<IcmpSocket>(inner.handle.0);
 
-    fn kick_rx(&self) {
-        // Drain pending deferred poll jobs first so IRQ-triggered work runs.
-        kernel_hal::deferred_job::drain_deferred_jobs();
-
-        // Prefer the NIC that would receive packets from the connected remote.
-        if let Some(IpAddress::Ipv4(v4)) = self.remote_ip() {
-            if let Ok(dev) = netdev_for_ipv4(v4) {
-                netdev_drain_rx(dev.as_ref());
-                return;
+        match (inner.ipv6, dst) {
+            (false, IpAddress::Ipv4(dst_v4)) => {
+                if icmp_bytes.len() < 8 {
+                    return Err(LxError::EINVAL);
+                }
+                let ident = u16::from_be_bytes([icmp_bytes[4], icmp_bytes[5]]);
+                let seq_no = u16::from_be_bytes([icmp_bytes[6], icmp_bytes[7]]);
+                let echo_data = &icmp_bytes[8..];
+                let repr = Icmpv4Repr::EchoRequest {
+                    ident,
+                    seq_no,
+                    data: echo_data,
+                };
+                let buf = sock
+                    .send(repr.buffer_len(), IpAddress::Ipv4(dst_v4))
+                    .map_err(|_| LxError::ENOBUFS)?;
+                let mut pkt = Icmpv4Packet::new_unchecked(buf);
+                repr.emit(&mut pkt, &caps);
             }
-        }
-
-        // Fallback: drain all physical NICs directly.
-        for dev in kernel_hal::net::get_net_device().iter() {
-            if dev.get_ifname() != "loopback" {
-                netdev_drain_rx(dev.as_ref());
+            (true, IpAddress::Ipv6(dst_v6)) => {
+                if icmp_bytes.len() < 8 {
+                    return Err(LxError::EINVAL);
+                }
+                let src = select_ipv6_for_dst(dst_v6);
+                if src.is_unspecified() {
+                    return Err(LxError::EINVAL);
+                }
+                let ident = u16::from_be_bytes([icmp_bytes[4], icmp_bytes[5]]);
+                let seq_no = u16::from_be_bytes([icmp_bytes[6], icmp_bytes[7]]);
+                let echo_data = &icmp_bytes[8..];
+                let repr = Icmpv6Repr::EchoRequest {
+                    ident,
+                    seq_no,
+                    data: echo_data,
+                };
+                let buf = sock
+                    .send(repr.buffer_len(), IpAddress::Ipv6(dst_v6))
+                    .map_err(|_| LxError::ENOBUFS)?;
+                let mut pkt = Icmpv6Packet::new_unchecked(buf);
+                repr.emit(
+                    &IpAddress::Ipv6(src),
+                    &IpAddress::Ipv6(dst_v6),
+                    &mut pkt,
+                    &caps,
+                );
             }
+            _ => return Err(LxError::EINVAL),
         }
+        drop(sock);
+        drop(sets);
+        prepare_ipv4_stack();
+        flush_socket_egress();
+        Ok(())
     }
 }
 
@@ -88,33 +158,40 @@ impl IcmpSocketState {
 impl Socket for IcmpSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
-            let remote = self.remote_ip();
-            if let Some((pkt, src)) = icmp_rx::pop_for(self.inner.ipv6, remote) {
+            let (ipv6, remote, non_block) = {
+                let inner = self.inner.lock();
+                (
+                    inner.ipv6,
+                    inner.remote.map(|e| e.addr),
+                    inner.flags.contains(OpenFlags::NON_BLOCK),
+                )
+            };
+            if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
                 let n = pkt.len().min(data.len());
                 data[..n].copy_from_slice(&pkt[..n]);
-                return (Ok(n), Endpoint::Ip(IpEndpoint::new(src.into(), 0)));
+                return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
             }
 
-            // Drain deferred jobs first: the NIC IRQ handler pushes a deferred
-            // poll() job that routes incoming frames through smoltcp and then
-            // calls push_packet -> deliver_from_frame. Without draining here,
-            // the ICMP echo reply sits in the deferred queue forever.
-            kernel_hal::deferred_job::drain_deferred_jobs();
-
-            // Direct RX drain bypasses smoltcp and calls push_packet/deliver_from_frame
-            // immediately — covers the case where the reply arrived before the
-            // deferred poll job was scheduled (tight timing on QEMU).
-            self.kick_rx();
-
-            // Re-check immediately after kick_rx so we don't miss a reply that
-            // arrived between drain_deferred_jobs and kick_rx: this is critical
-            // for NON_BLOCK callers (MSG_DONTWAIT) which would otherwise return
-            // EAGAIN even though the reply is already in the queue.
-            let remote = self.remote_ip();
-            if let Some((pkt, src)) = icmp_rx::pop_for(self.inner.ipv6, remote) {
-                let n = pkt.len().min(data.len());
-                data[..n].copy_from_slice(&pkt[..n]);
-                return (Ok(n), Endpoint::Ip(IpEndpoint::new(src.into(), 0)));
+            let handle = self.inner.lock().handle.0;
+            let copied = {
+                let sets = get_sockets();
+                let mut sets = sets.lock();
+                let mut sock = sets.get::<IcmpSocket>(handle);
+                sock.recv_slice(data)
+            };
+            match copied {
+                Ok((n, src)) => {
+                    return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
+                }
+                Err(smoltcp::Error::Exhausted) => {
+                    poll_ifaces();
+                    if non_block {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                }
+                Err(_) => {
+                    return (Err(LxError::EIO), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                }
             }
 
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
@@ -124,9 +201,6 @@ impl Socket for IcmpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
 
-            if self.inner.flags.lock().contains(OpenFlags::NON_BLOCK) {
-                return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
             kernel_hal::thread::sleep_until(
                 kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
             )
@@ -137,53 +211,30 @@ impl Socket for IcmpSocketState {
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         let endpoint = match sendto_endpoint {
             Some(ep) => Some(ep),
-            None => self.inner.remote.lock().clone(),
+            None => {
+                let inner = self.inner.lock();
+                inner.remote.map(|e| Endpoint::Ip(e))
+            }
         };
         let Endpoint::Ip(ip) = endpoint.ok_or(LxError::ENOTCONN)? else {
             return Err(LxError::EINVAL);
         };
-        if self.inner.ipv6 {
+
+        let mut inner = self.inner.lock();
+        if inner.ipv6 {
             let IpAddress::Ipv6(dst) = ip.addr else {
                 return Err(LxError::EINVAL);
             };
-            let src = select_ipv6_for_dst(dst);
-            if src.is_unspecified() {
+            if !dst.is_unicast() {
                 return Err(LxError::EINVAL);
             }
-
-            let icmp_payload = self.make_echo_request_payload(data);
-            let ip_len = 40 + icmp_payload.len();
-            let mut ip = vec![0u8; ip_len];
-            {
-                let mut pkt = smoltcp::wire::Ipv6Packet::new_unchecked(&mut ip);
-                pkt.set_version(6);
-                pkt.set_payload_len(icmp_payload.len() as u16);
-                pkt.set_next_header(smoltcp::wire::IpProtocol::Icmpv6);
-                pkt.set_src_addr(src);
-                pkt.set_dst_addr(dst);
-                pkt.set_hop_limit(64);
-                pkt.payload_mut().copy_from_slice(&icmp_payload);
-
-                let mut icmp_pkt = smoltcp::wire::Icmpv6Packet::new_unchecked(pkt.payload_mut());
-                icmp_pkt.fill_checksum(&IpAddress::Ipv6(src), &IpAddress::Ipv6(dst));
-                info!(
-                    "[icmp write] Filled ICMPv6 checksum: 0x{:04x}, src: {}, dst: {}, bytes: {:?}",
-                    icmp_pkt.checksum(),
-                    src,
-                    dst,
-                    &ip[40..]
-                );
+            if is_local_host_ipv6(dst) {
+                let icmp = Self::echo_request_bytes(&mut inner, data);
+                icmp_rx::queue_echo_reply(IpAddress::Ipv6(dst), icmp);
+                return Ok(data.len());
             }
-            if dst.is_loopback() {
-                if let Ok(dev) = crate::net::iface_by_name("loopback") {
-                    dev.send(&ip).map_err(|_| LxError::EIO)?;
-                    crate::net::poll_ifaces();
-                    self.kick_rx();
-                    return Ok(data.len());
-                }
-            }
-            send_ip6_ethernet(&ip)?;
-            self.kick_rx();
+            let icmp = Self::echo_request_bytes(&mut inner, data);
+            Self::send_echo(&mut inner, IpAddress::Ipv6(dst), &icmp)?;
             Ok(data.len())
         } else {
             let IpAddress::Ipv4(dst) = ip.addr else {
@@ -192,44 +243,13 @@ impl Socket for IcmpSocketState {
             if !dst.is_unicast() || is_ipv4_placeholder(dst) || dst.0[0] >= 240 {
                 return Err(LxError::EINVAL);
             }
-
-            let icmp_payload = self.make_echo_request_payload(data);
-            if is_local_host_ipv4(dst) {
-                icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), icmp_payload);
+            if dst.is_loopback() || is_local_host_ipv4(dst) {
+                let icmp = Self::echo_request_bytes(&mut inner, data);
+                icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), icmp);
                 return Ok(data.len());
             }
-
-            let src = select_ipv4_for_dst(dst);
-            if src.is_unspecified() {
-                return Err(LxError::EINVAL);
-            }
-
-            let ip_len = 20 + icmp_payload.len();
-            let mut ip = vec![0u8; ip_len];
-            {
-                let mut pkt = smoltcp::wire::Ipv4Packet::new_unchecked(&mut ip);
-                pkt.set_version(4);
-                pkt.set_header_len(20);
-                pkt.set_total_len(ip_len as u16);
-                pkt.set_protocol(smoltcp::wire::IpProtocol::Icmp);
-                pkt.set_src_addr(src);
-                pkt.set_dst_addr(dst);
-                pkt.set_hop_limit(64);
-                pkt.payload_mut().copy_from_slice(&icmp_payload);
-                let mut icmp_pkt = smoltcp::wire::Icmpv4Packet::new_unchecked(pkt.payload_mut());
-                icmp_pkt.fill_checksum();
-                pkt.fill_checksum();
-            }
-            if dst.is_loopback() {
-                if let Ok(dev) = crate::net::iface_by_name("loopback") {
-                    dev.send(&ip).map_err(|_| LxError::EIO)?;
-                    crate::net::poll_ifaces();
-                    self.kick_rx();
-                    return Ok(data.len());
-                }
-            }
-            send_ip_ethernet(&ip)?;
-            self.kick_rx();
+            let icmp = Self::echo_request_bytes(&mut inner, data);
+            Self::send_echo(&mut inner, IpAddress::Ipv4(dst), &icmp)?;
             Ok(data.len())
         }
     }
@@ -239,17 +259,21 @@ impl Socket for IcmpSocketState {
             return Err(LxError::EINVAL);
         };
         let family_ok = matches!(
-            (self.inner.ipv6, ip.addr),
+            (self.inner.lock().ipv6, ip.addr),
             (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
         );
         if !family_ok {
             return Err(LxError::EINVAL);
         }
-        *self.inner.remote.lock() = Some(Endpoint::Ip(ip));
+        let mut inner = self.inner.lock();
+        inner.remote = Some(ip);
+        Self::bind_ident(&inner)?;
         Ok(0)
     }
 
     fn bind(&self, _endpoint: Endpoint) -> SysResult {
+        let inner = self.inner.lock();
+        Self::bind_ident(&inner)?;
         Ok(0)
     }
 
@@ -267,10 +291,28 @@ impl Socket for IcmpSocketState {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
-        self.kick_rx();
-        let readable = icmp_rx::pending_for(self.inner.ipv6);
+        poll_ifaces();
+        let inner = self.inner.lock();
+        let readable = {
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            let sock = sets.get::<IcmpSocket>(inner.handle.0);
+            sock.can_recv() || icmp_rx::pending_for(inner.ipv6)
+        };
         (readable, true, false)
     }
+}
+
+fn is_local_host_ipv6(dst: Ipv6Address) -> bool {
+    use smoltcp::wire::IpCidr;
+    get_net_device().iter().any(|dev| {
+        dev.get_ip_address().iter().any(|ip| match ip {
+            IpCidr::Ipv6(cidr) => {
+                cidr.prefix_len() > 0 && cidr.address() == dst
+            }
+            _ => false,
+        })
+    })
 }
 
 zircon_object::impl_kobject!(IcmpSocketState);
@@ -278,14 +320,14 @@ zircon_object::impl_kobject!(IcmpSocketState);
 #[async_trait]
 impl FileLike for IcmpSocketState {
     fn flags(&self) -> OpenFlags {
-        *self.inner.flags.lock()
+        self.inner.lock().flags
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut flags = self.inner.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        let mut inner = self.inner.lock();
+        inner.flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
+        inner.flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
+        inner.flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
     }
 
@@ -297,6 +339,16 @@ impl FileLike for IcmpSocketState {
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
+        let inner = self.inner.lock();
+        if icmp_rx::pending_for(inner.ipv6) {
+            let remote = inner.remote.map(|e| e.addr);
+            if let Some((pkt, _src)) = icmp_rx::pop_for(inner.ipv6, remote) {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                return Ok(n);
+            }
+        }
+        drop(inner);
         Socket::read(self, buf).await.0
     }
 
@@ -320,7 +372,7 @@ impl FileLike for IcmpSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
-        handle_net_ioctl(request, arg1, arg2, arg3, self.inner.ipv6)
+        handle_net_ioctl(request, arg1, arg2, arg3, self.inner.lock().ipv6)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

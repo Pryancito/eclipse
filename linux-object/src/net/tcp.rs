@@ -274,6 +274,7 @@ impl Socket for TcpSocketState {
                     poll_ifaces();
                 }
                 Ok(size) => {
+                    flush_socket_egress();
                     return Ok(size);
                 }
                 Err(err) => {
@@ -301,6 +302,7 @@ impl Socket for TcpSocketState {
             // so we have up to 6000 tries before giving up — plenty of time for
             // a real internet round-trip through QEMU slirp.
             let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+            prepare_ipv4_stack();
             loop {
                 // Transmit pending packets (SYN, ACK, etc.)
                 poll_ifaces();

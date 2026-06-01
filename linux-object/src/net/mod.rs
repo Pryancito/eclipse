@@ -110,7 +110,12 @@ pub fn netdev_for_ipv4(dst: smoltcp::wire::Ipv4Address) -> LxResult<Arc<dyn zcor
         }
         for ip in iface.get_ip_address() {
             if let IpCidr::Ipv4(cidr) = ip {
-                if cidr.prefix_len() == 0 || cidr.address().is_unspecified() {
+                let addr = cidr.address();
+                if cidr.prefix_len() == 0
+                    || addr.is_unspecified()
+                    || is_ipv4_placeholder(addr)
+                    || addr.0[0] >= 240
+                {
                     continue;
                 }
                 if cidr.contains_addr(&dst) {
@@ -185,13 +190,17 @@ pub fn netdev_for_ipv6(dst: smoltcp::wire::Ipv6Address) -> LxResult<Arc<dyn zcor
 }
 
 pub fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
-    iface
-        .get_ip_address()
-        .into_iter()
-        .find_map(|cidr| match cidr {
-            IpCidr::Ipv4(cidr) => Some(cidr),
-            _ => None,
-        })
+    iface.get_ip_address().into_iter().find_map(|cidr| match cidr {
+        IpCidr::Ipv4(cidr) => {
+            let addr = cidr.address();
+            if addr.is_unspecified() || cidr.prefix_len() == 0 || is_ipv4_placeholder(addr) {
+                None
+            } else {
+                Some(cidr)
+            }
+        }
+        _ => None,
+    })
 }
 
 pub fn ipv4_sockaddr(addr: Ipv4Address) -> SockAddrIn {
@@ -666,6 +675,51 @@ impl Drop for GlobalSocketHandle {
 
 use kernel_hal::net::get_net_device;
 
+/// True once DHCP (or static config) assigned a real host IPv4 — not placeholder/0.0.0.0.
+pub fn has_usable_ipv4() -> bool {
+    use smoltcp::wire::IpCidr;
+    get_net_device().iter().any(|dev| {
+        dev.get_ip_address().iter().any(|ip| match ip {
+            IpCidr::Ipv4(cidr) => {
+                let addr = cidr.address();
+                cidr.prefix_len() > 0
+                    && !addr.is_unspecified()
+                    && !is_ipv4_placeholder(addr)
+                    && addr.0[0] < 240
+            }
+            _ => false,
+        })
+    })
+}
+
+/// Resolve the IPv4 default gateway from routes or `.1` on the host subnet.
+pub fn ipv4_default_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smoltcp::wire::Ipv4Address> {
+    ipv4_gateway_from_routes(&dev.get_routes())
+        .filter(|gw| !gw.is_unspecified())
+        .or_else(|| infer_ipv4_gateway(dev))
+}
+
+/// Ensure smoltcp has a default route (ICMP/TCP/UDP share this stack).
+pub fn prepare_ipv4_stack() {
+    if !has_usable_ipv4() {
+        return;
+    }
+    for dev in get_net_device().iter() {
+        if dev.get_ifname() != "loopback" {
+            ensure_ipv4_default_route(dev.as_ref());
+        }
+    }
+}
+
+/// Poll smoltcp then pull any remaining RX into `push_packet` / `icmp_rx`.
+pub fn drain_ipv4_nic(dev: &dyn zcore_drivers::scheme::NetScheme, rounds: usize) {
+    for _ in 0..rounds {
+        kernel_hal::deferred_job::drain_deferred_jobs();
+        poll_netdev(dev);
+        netdev_drain_rx(dev);
+    }
+}
+
 /// miss doc
 pub fn poll_ifaces() {
     for iface in get_net_device().iter() {
@@ -675,6 +729,9 @@ pub fn poll_ifaces() {
                 warn!("error : {:?}", e)
             }
         }
+    }
+    if has_usable_ipv4() {
+        prepare_ipv4_stack();
     }
     if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
         sockets.prune();
@@ -702,6 +759,9 @@ pub fn netdev_drain_rx(dev: &dyn zcore_drivers::scheme::NetScheme) {
 
 /// Drive smoltcp until ARP/TX/RX make progress (needed after raw/icmp sends).
 pub fn drain_net_poll(rounds: usize) {
+    if has_usable_ipv4() {
+        prepare_ipv4_stack();
+    }
     for _ in 0..rounds {
         poll_ifaces();
         kernel_hal::deferred_job::drain_deferred_jobs();
@@ -775,22 +835,37 @@ pub fn flush_socket_egress() {
     drain_net_poll(128);
 }
 
+fn is_ipv4_on_link(dev: &dyn zcore_drivers::scheme::NetScheme, dst: smoltcp::wire::Ipv4Address) -> bool {
+    use smoltcp::wire::IpCidr;
+    dev.get_ip_address().iter().any(|cidr| match cidr {
+        IpCidr::Ipv4(v4) => {
+            let addr = v4.address();
+            v4.prefix_len() > 0
+                && !addr.is_unspecified()
+                && !is_ipv4_placeholder(addr)
+                && v4.contains_addr(&dst)
+        }
+        _ => false,
+    })
+}
+
 fn resolve_ipv4_next_hop(
     dev: &dyn zcore_drivers::scheme::NetScheme,
     dst: smoltcp::wire::Ipv4Address,
 ) -> smoltcp::wire::Ipv4Address {
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
-    let on_link = dev.get_ip_address().iter().any(|cidr| match cidr {
-        IpCidr::Ipv4(v4) => {
-            v4.prefix_len() > 0 && !v4.address().is_unspecified() && v4.contains_addr(&dst)
-        }
-        _ => false,
-    });
-    if on_link {
+    // Same subnet (e.g. 192.168.1.1): ARP the host directly — this is why router ping works.
+    if is_ipv4_on_link(dev, dst) {
         return dst;
     }
 
+    // Off-subnet (8.8.8.8, 172.x): never ARP the remote IP; always use the default gateway.
+    if let Some(gw) = ipv4_default_gateway(dev) {
+        return gw;
+    }
+
+    // Fallback: longest-prefix match with sane gateway on default routes.
     let mut best: Option<(u8, Ipv4Address)> = None;
     for route in dev.get_routes() {
         let (prefix, matched) = match route.dst {
@@ -800,8 +875,9 @@ fn resolve_ipv4_next_hop(
         if !matched {
             continue;
         }
-        let next_hop = match route.gateway {
-            Some(IpAddress::Ipv4(gw)) => gw,
+        let next_hop = match (prefix, route.gateway) {
+            (_, Some(IpAddress::Ipv4(gw))) if !gw.is_unspecified() => gw,
+            (0, _) => infer_ipv4_gateway(dev).unwrap_or(dst),
             _ => dst,
         };
         if best.map_or(true, |(p, _)| prefix > p) {
@@ -809,7 +885,66 @@ fn resolve_ipv4_next_hop(
         }
     }
 
-    best.map_or(dst, |(_, hop)| hop)
+    let hop = best.map_or(dst, |(_, hop)| hop);
+    if hop == dst {
+        if let Some(gw) = infer_ipv4_gateway(dev) {
+            return gw;
+        }
+    }
+    hop
+}
+
+/// Guess the default gateway (.1 on the host subnet) when DHCP/`ip route` did not install one.
+fn infer_ipv4_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smoltcp::wire::Ipv4Address> {
+    use smoltcp::wire::{IpCidr, Ipv4Address};
+    for ip in dev.get_ip_address() {
+        if let IpCidr::Ipv4(cidr) = ip {
+            let addr = cidr.address();
+            if addr.is_unspecified() || cidr.prefix_len() < 8 || is_ipv4_placeholder(addr) {
+                continue;
+            }
+            let o = addr.0;
+            return Some(Ipv4Address::new(o[0], o[1], o[2], 1));
+        }
+    }
+    None
+}
+
+fn ipv4_gateway_from_routes(routes: &[zcore_drivers::scheme::RouteInfo]) -> Option<smoltcp::wire::Ipv4Address> {
+    use smoltcp::wire::{IpAddress, IpCidr};
+    routes.iter().find_map(|route| match (route.dst, route.gateway) {
+        (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gw)))
+            if cidr.prefix_len() == 0 && !gw.is_unspecified() =>
+        {
+            Some(gw)
+        }
+        _ => None,
+    })
+}
+
+/// Install `0.0.0.0/0` via DHCP gateway or inferred `.1` on the host subnet.
+pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+    let Some(gw) = ipv4_default_gateway(iface) else {
+        return;
+    };
+    let default = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+    if iface
+        .add_route(default, Some(IpAddress::Ipv4(gw)))
+        .is_ok()
+    {
+        info!(
+            "[net] inferred default IPv4 route via {} on {}",
+            gw,
+            iface.get_ifname()
+        );
+    } else {
+        warn!(
+            "[net] failed to add default IPv4 route via {} on {}",
+            gw,
+            iface.get_ifname()
+        );
+    }
 }
 
 /// Send a complete IPv4 datagram on the wire (same path as DHCP `PacketSocket`).
@@ -832,7 +967,15 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
     }
 
     let dev = netdev_for_ipv4(dst)?;
+    if has_usable_ipv4() {
+        prepare_ipv4_stack();
+    } else {
+        ensure_ipv4_default_route(dev.as_ref());
+    }
     let arp_target = resolve_ipv4_next_hop(dev.as_ref(), dst);
+    if arp_target.is_unspecified() || !arp_target.is_unicast() {
+        return Err(LxError::EINVAL);
+    }
     let our_mac_eth = dev.get_mac();
 
     const ARP_TRIES: usize = 4;
@@ -845,7 +988,7 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
             eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
             eth.payload_mut().copy_from_slice(ip);
             dev.send(&frame).map_err(|_| LxError::EIO)?;
-            netdev_drain_rx(dev.as_ref());
+            drain_ipv4_nic(dev.as_ref(), 4);
             return Ok(());
         }
 
@@ -866,12 +1009,12 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
             repr.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
         }
         dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
-        netdev_drain_rx(dev.as_ref());
+        drain_ipv4_nic(dev.as_ref(), 4);
         if attempt + 1 < ARP_TRIES {
             let deadline =
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1);
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(25);
             while kernel_hal::timer::timer_now() < deadline {
-                netdev_drain_rx(dev.as_ref());
+                drain_ipv4_nic(dev.as_ref(), 2);
                 if arp_cache::lookup(arp_target).is_some() {
                     break;
                 }
@@ -1015,7 +1158,7 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
             eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
             eth.payload_mut().copy_from_slice(ip);
             dev.send(&frame).map_err(|_| LxError::EIO)?;
-            netdev_drain_rx(dev.as_ref());
+            poll_netdev(dev.as_ref());
             return Ok(());
         }
 
@@ -1065,7 +1208,7 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
         }
 
         dev.send(&ns_buf).map_err(|_| LxError::EIO)?;
-        netdev_drain_rx(dev.as_ref());
+        poll_netdev(dev.as_ref());
         if ndp_cache::lookup(ndp_target).is_some() {
             continue;
         }
@@ -1228,6 +1371,7 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             iface
                 .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                 .map_err(|_| LxError::EINVAL)?;
+            prepare_ipv4_stack();
             Ok(0)
         }
 
@@ -1277,6 +1421,7 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             iface
                 .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                 .map_err(|_| LxError::EINVAL)?;
+            prepare_ipv4_stack();
             Ok(0)
         }
 

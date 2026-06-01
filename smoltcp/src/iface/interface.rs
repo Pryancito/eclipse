@@ -568,6 +568,19 @@ where
         &mut self.inner.routes
     }
 
+    /// Pre-seed the Ethernet neighbor cache (used to import the software ARP table).
+    #[cfg(feature = "medium-ethernet")]
+    pub fn seed_neighbor(
+        &mut self,
+        protocol_addr: IpAddress,
+        hardware_addr: EthernetAddress,
+        timestamp: Instant,
+    ) {
+        if let Some(cache) = self.inner.neighbor_cache.as_mut() {
+            cache.fill(protocol_addr, hardware_addr, timestamp);
+        }
+    }
+
     /// Transmit packets queued in the given sockets, and receive packets queued
     /// in the device.
     ///
@@ -1813,7 +1826,12 @@ impl<'a> InterfaceInner<'a> {
     }
 
     fn in_same_network(&self, addr: &IpAddress) -> bool {
-        self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
+        self.ip_addrs.iter().any(|cidr| {
+            cidr.prefix_len() > 0
+                && cidr.address().is_unicast()
+                && !cidr.address().is_unspecified()
+                && cidr.contains_addr(addr)
+        })
     }
 
     fn route(&self, addr: &IpAddress, timestamp: Instant) -> Result<IpAddress> {

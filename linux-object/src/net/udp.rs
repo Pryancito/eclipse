@@ -209,7 +209,7 @@ impl Socket for UdpSocketState {
 
         drop(socket);
         drop(sets);
-        poll_ifaces();
+        flush_socket_egress();
 
         match _len {
             Ok(()) => Ok(data.len()),
