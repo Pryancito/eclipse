@@ -11,6 +11,7 @@ extern "C" {
     fn drivers_dma_alloc(pages: usize) -> usize;
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: usize) -> usize;
+    fn drivers_dma_mark_uncached(paddr: usize, pages: usize) -> i32;
 }
 
 /// A contiguous, page-aligned DMA memory region.
@@ -64,6 +65,14 @@ impl DmaRegion {
     #[inline]
     pub fn as_ptr<T>(&self) -> *mut T {
         self.virt as *mut T
+    }
+
+    /// Map this region uncacheable in the kernel page tables (bare-metal NIC DMA).
+    pub fn mark_uncached(&self) -> bool {
+        if self.phys == 0 {
+            return false;
+        }
+        unsafe { drivers_dma_mark_uncached(self.phys, self.pages) == 0 }
     }
 }
 

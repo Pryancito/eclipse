@@ -268,6 +268,44 @@ mod drivers_ffi {
         0
     }
 
+    /// Remap contiguous DMA pages as uncacheable (UC) in the kernel page tables.
+    /// Descriptor rings and NIC DMA buffers on bare metal must not use WB without snooping.
+    #[no_mangle]
+    extern "C" fn drivers_dma_mark_uncached(paddr: PhysAddr, pages: usize) -> i32 {
+        use crate::hal_fn::vm::flush_tlb;
+        use crate::vm::{GenericPageTable, PageTable};
+        use crate::{CachePolicy, MMUFlags, PAGE_SIZE};
+
+        if paddr == 0 || pages == 0 {
+            return -1;
+        }
+        let vaddr = paddr + KCONFIG.phys_to_virt_offset;
+        let flags = MMUFlags::READ
+            | MMUFlags::WRITE
+            | MMUFlags::from_bits_truncate(CachePolicy::Uncached as usize);
+        let mut pt = PageTable::from_current();
+        for i in 0..pages {
+            let va = vaddr + i * PAGE_SIZE;
+            match pt.query(va) {
+                Ok((pa, _, _)) => {
+                    if let Err(e) = pt.update(va, Some(pa), Some(flags)) {
+                        trace!("drivers_dma_mark_uncached: update {:#x} failed {:?}", va, e);
+                        return -1;
+                    }
+                }
+                Err(_) => {
+                    if let Err(e) = pt.map_cont(va, PAGE_SIZE, paddr + i * PAGE_SIZE, flags) {
+                        trace!("drivers_dma_mark_uncached: map {:#x} failed {:?}", va, e);
+                        return -1;
+                    }
+                }
+            }
+        }
+        flush_tlb(None);
+        core::mem::forget(pt);
+        0
+    }
+
     #[no_mangle]
     extern "C" fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr {
         paddr + KCONFIG.phys_to_virt_offset

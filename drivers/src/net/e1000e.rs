@@ -447,6 +447,8 @@ const TX_CMD_IFCS: u8 = 1 << 1;
 const TX_CMD_RS: u8 = 1 << 3;
 
 const NUM_RX: usize = 256;
+/// Leave a descriptor cushion at RX bring-up (RDH==RDT means empty; I219 races on full ring).
+const RX_BOOT_POST_MAX: usize = NUM_RX - 2;
 const NUM_TX: usize = 256;
 const BUF_SIZE: usize = 2048 + 128;
 /// Linux `E1000_RX_BUFFER_WRITE` — batch RDT doorbell every N descriptors.
@@ -570,6 +572,8 @@ pub struct E1000eHw {
     rx_sg_buf: Vec<u8>,
     /// SRRCTL at 0x280C does not read back on some steppings (e.g. 15b8); use RCTL only.
     srrctl_absent: bool,
+    /// RX/TX rings mapped UC — skip clflush on descriptor WB paths.
+    dma_uncached: bool,
 }
 
 impl E1000eHw {
@@ -684,11 +688,35 @@ impl E1000eHw {
         self.is_pch_lpt_or_later()
     }
 
-    /// Returns true for all bare-metal / real hardware devices that require CPU cache invalidation.
-    /// QEMU uses device ID 0x10d3, and virtual environments have coherent DMA.
-    /// Discrete cards and integrated chips on bare metal all run under WB cache mapping.
+    /// Returns true for bare-metal devices (not QEMU 82574 coherent DMA).
     fn rx_needs_cache_invalidation(&self) -> bool {
         self.device_id != 0x10d3
+    }
+
+    /// Returns true when CPU cache maintenance is required before reading NIC write-back.
+    fn rx_needs_cache_flush(&self) -> bool {
+        self.rx_needs_cache_invalidation() && !self.dma_uncached
+    }
+
+    /// Mark descriptor rings and DMA buffers uncacheable on bare metal.
+    fn setup_dma_uncached(&mut self) {
+        if !self.rx_needs_cache_invalidation() {
+            self.dma_uncached = false;
+            return;
+        }
+        let mut ok = self.rx_ring.mark_uncached() && self.tx_ring.mark_uncached();
+        for b in &self.rx_bufs {
+            ok &= b.mark_uncached();
+        }
+        for b in &self.tx_bufs {
+            ok &= b.mark_uncached();
+        }
+        self.dma_uncached = ok;
+        if ok {
+            crate::klog_info!("[e1000e] DMA rings/buffers mapped uncacheable\n");
+        } else {
+            crate::klog_warn!("[e1000e] UC DMA remap failed — using clflush fallback\n");
+        }
     }
 
     /// Returns true for PCH-SPT (I219) and later silicon.
@@ -905,9 +933,7 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_FEXTNVM11); // flush posted write
     }
 
-    /// Push CPU-written DMA data to RAM for the device (WB cache).
-    /// Use only on CPU→device paths (TX buffers, descriptor recycle). Never call
-    /// before reading device write-back (RX descriptor DD, RX payload, TX DD).
+    /// Push CPU-written DMA data to RAM for the device (WB cache fallback only).
     unsafe fn dma_wbinv_range(vaddr: usize, len: usize) {
         if len == 0 {
             return;
@@ -922,16 +948,14 @@ impl E1000eHw {
         fence(Ordering::SeqCst);
     }
 
-    /// Serialize CPU reads after device DMA (WB memory). Do not CLFLUSH here:
-    /// flushing can write back stale CPU cache over device-written descriptor WB.
+    /// Device → CPU ordering fence before reading NIC write-back fields.
     #[inline]
     unsafe fn dma_rmb_after_device() {
         core::arch::x86_64::_mm_lfence();
         fence(Ordering::Acquire);
     }
 
-    /// Drop cached copies so the next read sees device write-back (WB DMA memory).
-    /// Only call after `dma_wbinv_range` pushed CPU writes and before reading HW-owned fields.
+    /// Drop stale CPU cache lines before reading device write-back (WB mapping only).
     unsafe fn invalidate_cpu_cache_for_read(vaddr: usize, len: usize) {
         if len == 0 {
             return;
@@ -946,6 +970,38 @@ impl E1000eHw {
         fence(Ordering::SeqCst);
     }
 
+    /// Single 64-bit load of the RX write-back region (+8 staterr, +12 length).
+    #[inline]
+    unsafe fn read_rx_wb_u64(desc_addr: usize) -> u64 {
+        read_volatile((desc_addr + 8) as *const u64)
+    }
+
+    /// Parse extended RX write-back from one atomic u64 load (after fence / invalidate).
+    #[inline]
+    unsafe fn parse_rx_wb_ext(desc_addr: usize) -> Option<(u32, usize)> {
+        Self::dma_rmb_after_device();
+        let wb = Self::read_rx_wb_u64(desc_addr);
+        let staterr = wb as u32;
+        if staterr & RXD_EXT_DD == 0 {
+            return None;
+        }
+        let len = (wb >> 32) as u16 as usize;
+        Some((staterr, len))
+    }
+
+    /// Legacy RX write-back: len @ +8, DD status @ +12 — one u64 covers both.
+    #[inline]
+    unsafe fn parse_rx_wb_legacy(desc_addr: usize) -> Option<(u32, usize)> {
+        Self::dma_rmb_after_device();
+        let wb = Self::read_rx_wb_u64(desc_addr);
+        let len = wb as u16 as usize;
+        let status = (wb >> 32) as u8;
+        if status & 0x01 == 0 {
+            return None;
+        }
+        Some((status as u32, len))
+    }
+
     /// Read a range the device wrote into WB memory.
     unsafe fn dma_copy_in(dst: &mut Vec<u8>, vaddr: usize, len: usize) {
         dst.clear();
@@ -955,10 +1011,10 @@ impl E1000eHw {
         }
     }
 
-    /// RX payload after device DMA — cache invalidate only on I219 metal (not QEMU).
+    /// RX payload after device DMA — invalidate only when rings stay WB-mapped.
     unsafe fn dma_copy_in_rx_buffer(&self, dst: &mut Vec<u8>, vaddr: usize, len: usize) {
         Self::dma_rmb_after_device();
-        if self.rx_needs_cache_invalidation() {
+        if self.rx_needs_cache_flush() {
             Self::invalidate_cpu_cache_for_read(vaddr, len);
         }
         Self::dma_copy_in(dst, vaddr, len);
@@ -1974,17 +2030,13 @@ impl E1000eHw {
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
             // Invalidate the cache for the packet buffer on physical hardware before the hardware writes to it.
-            if self.rx_needs_cache_invalidation() {
+            if self.rx_needs_cache_flush() {
                 Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
             }
 
-            // CRITICAL: For physical hardware with Write-Back cached memory, we
-            // MUST flush the modified descriptor to physical RAM. Otherwise the
-            // NIC DMA engine reads stale descriptor addresses or old status bits.
-            // Note: 4 descriptors share each 64-byte cache line; clflush evicts
-            // all 4 at once. This is safe because we write ALL descriptors
-            // before issuing the single RDT doorbell, so there is no race.
-            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+            if self.rx_needs_cache_flush() {
+                core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+            }
 
             posted += 1;
             i = (i + 1) % NUM_RX;
@@ -2071,9 +2123,8 @@ impl E1000eHw {
         // in silicon before we advance the RDT doorbell below.
         let _ = mmio_read(self.base, E1000E_RCTL);
 
-        // Step 8: NOW advance RDT. The engine is running and will see RDH (0) ≠ RDT
-        // immediately and begin DMA. This is the Intel-mandated order.
-        let n = self.rx_desc_unused();
+        // Step 8: Post buffers conservatively — never doorbell RDT to NUM_RX-1 on first arm.
+        let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
         self.alloc_rx_buffers(n);
 
         self.kick_rx_writeback();
@@ -3943,15 +3994,15 @@ impl E1000eHw {
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
             // Invalidate the cache for the packet buffer on physical hardware.
-            if self.rx_needs_cache_invalidation() {
+            if self.rx_needs_cache_flush() {
                 Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+                core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
             }
-
-            // Evict and write back cache lines to physical RAM.
-            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
-        core::arch::x86_64::_mm_sfence();
-        fence(Ordering::SeqCst);
+        if self.rx_needs_cache_flush() {
+            core::arch::x86_64::_mm_sfence();
+            fence(Ordering::SeqCst);
+        }
     }
 
 
@@ -3996,33 +4047,14 @@ impl E1000eHw {
     /// the NIC had already written DD=1.  QEMU is coherent and does not expose
     /// this bug; real silicon does.
     unsafe fn desc_done(&self, desc_addr: usize) -> Option<(u32, usize)> {
-        let read_wb = || {
-            // lfence: all preceding loads complete before we read the WB region.
-            Self::dma_rmb_after_device();
-            if self.use_extended_descriptors {
-                let staterr = read_volatile((desc_addr + 8) as *const u32);
-                if staterr & RXD_EXT_DD != 0 {
-                    let len = read_volatile((desc_addr + 12) as *const u16) as usize;
-                    return Some((staterr, len));
-                }
-            } else {
-                let status = read_volatile((desc_addr + 12) as *const u8);
-                if status & 0x01 != 0 { // DD
-                    let len = read_volatile((desc_addr + 8) as *const u16) as usize;
-                    let staterr = status as u32;
-                    return Some((staterr, len));
-                }
-            }
-            None
-        };
-        // Bare-metal: invalidate CPU cache FIRST so the subsequent read
-        // fetches from physical RAM (where the NIC's DMA write-back landed).
-        if self.rx_needs_cache_invalidation() {
-            Self::invalidate_cpu_cache_for_read(desc_addr, core::mem::size_of::<RxDesc>());
-            return read_wb();
+        if self.rx_needs_cache_flush() {
+            Self::invalidate_cpu_cache_for_read(desc_addr, 16);
         }
-        // QEMU / other silicon: coherent DMA — plain volatile read is fine.
-        read_wb()
+        if self.use_extended_descriptors {
+            unsafe { Self::parse_rx_wb_ext(desc_addr) }
+        } else {
+            unsafe { Self::parse_rx_wb_legacy(desc_addr) }
+        }
     }
 
     /// Nudge the MAC to write back completed RX descriptors (Linux RDTR_FPD path).
@@ -4348,40 +4380,30 @@ impl E1000eHw {
         unsafe {
             write_volatile(&mut desc.addr, self.tx_bufs[idx].paddr() as u64);
             write_volatile(&mut desc.len, data.len() as u16);
-            // Linux e1000_tx_desc: zero cso/css/special unless offload is used.
             write_volatile(&mut desc.cso, 0);
             write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
             write_volatile(&mut desc.status, 0);
             write_volatile(&mut desc.css, 0);
             write_volatile(&mut desc.special, 0);
         }
+        compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
-        // CPU → device: push data and descriptor to physical RAM before ringing TDT.
-        // _mm_clflush writes dirty WB cache lines back and invalidates them.
-        // _mm_sfence is required on top of clflush to drain write-combining (WC)
-        // buffers — on real hardware DMA memory may be mapped WC, in which case
-        // clflush alone does NOT flush WC stores. QEMU doesn't simulate WC so this
-        // difference explains why TX works in QEMU but silently fails on I219-V.
-        //
-        // 16-byte descriptors: 4 per 64-byte cache line. clflush flushes the
-        // whole line, but since all TX slots are initialized before TDT rings,
-        // there is no race between CPU and NIC on adjacent descriptors.
-        unsafe {
-            Self::dma_wbinv_range(self.tx_bufs[idx].vaddr(), data.len());
-            Self::dma_wbinv_range(desc as *const TxDesc as usize, core::mem::size_of::<TxDesc>());
-            // Store fence: all stores (including WC) visible before TDT doorbell.
-            core::arch::x86_64::_mm_sfence();
+        if self.rx_needs_cache_flush() {
+            unsafe {
+                Self::dma_wbinv_range(self.tx_bufs[idx].vaddr(), data.len());
+                Self::dma_wbinv_range(desc as *const TxDesc as usize, core::mem::size_of::<TxDesc>());
+                core::arch::x86_64::_mm_sfence();
+            }
+        } else {
+            compiler_fence(Ordering::SeqCst);
         }
 
         self.tx_tail = (idx + 1) % NUM_TX;
-        // compiler_fence(SeqCst) prevents LLVM from reordering the tx_tail store
-        // or any earlier Rust-visible writes past the MMIO doorbell write.
-        // The hardware ordering is already covered by _mm_sfence / _mm_clflush above.
         compiler_fence(Ordering::SeqCst);
         unsafe {
             mmio_write(self.base, E1000E_TDT, self.tx_tail as u32);
-            let _ = mmio_read(self.base, E1000E_TDT); // flush posted MMIO write
+            let _ = mmio_read(self.base, E1000E_TDT);
         }
 
         // Espera segura para bare-metal (Solo para asegurar el reporte en logs iniciales)
@@ -4389,7 +4411,7 @@ impl E1000eHw {
         for _ in 0..1000 {
             unsafe {
                 Self::dma_rmb_after_device();
-                if self.is_pch_lpt_or_later() {
+                if self.rx_needs_cache_flush() {
                     Self::invalidate_cpu_cache_for_read(
                         ring.add(idx) as usize,
                         core::mem::size_of::<TxDesc>(),
@@ -4515,26 +4537,13 @@ impl Scheme for E1000eInterface {
             return;
         }
 
-        // ICR is Read-to-Clear: reading it both acknowledges the interrupt at
-        // the hardware level and tells us what triggered it. We must do this
-        // exactly ONCE per IRQ entry. A second read would always return 0
-        // because the first read already cleared all bits — causing us to
-        // miss the RX event and never wake the polling loop.
+        // ICR is read-to-clear; with CTRL_EXT.IAME a read auto-masks IMS even when icr==0
+        // (shared/ spurious IRQ). Always re-arm IMS on every exit path.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         log::trace!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
+
         if icr == 0 {
-            if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
-                self.poll_pending
-                    .store(true, core::sync::atomic::Ordering::SeqCst);
-                let poll_pending = self.poll_pending.clone();
-                let self_clone = self.clone();
-                crate::utils::deferred_job::push_deferred_job(move || {
-                    let _ = self_clone.poll();
-                    poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
-                });
-            } else {
-                self.ims_rearm();
-            }
+            self.ims_rearm();
             return;
         }
 
@@ -4552,9 +4561,9 @@ impl Scheme for E1000eInterface {
                 let _ = self_clone.poll();
                 poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
             });
-        } else {
-            self.ims_rearm();
         }
+
+        self.ims_rearm();
     }
 }
 
@@ -4974,7 +4983,10 @@ pub fn init(
         use_extended_descriptors: true,
         rx_sg_buf: Vec::new(),
         srrctl_absent: false,
+        dma_uncached: false,
     };
+
+    hw.setup_dma_uncached();
 
     unsafe {
         hw.reset_and_init()?;
