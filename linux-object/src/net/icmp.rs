@@ -64,10 +64,23 @@ impl IcmpSocketState {
     }
 
     fn kick_rx(&self) {
-        // `poll_ifaces` already drives smoltcp RX and dispatches packet taps.
-        // Calling `netdev_drain_rx` here reads the NIC again and duplicates RX
-        // delivery, which grows AF_PACKET/ICMP queues under background traffic.
-        crate::net::poll_ifaces();
+        // Drain pending deferred poll jobs first so IRQ-triggered work runs.
+        kernel_hal::deferred_job::drain_deferred_jobs();
+
+        // Prefer the NIC that would receive packets from the connected remote.
+        if let Some(IpAddress::Ipv4(v4)) = self.remote_ip() {
+            if let Ok(dev) = netdev_for_ipv4(v4) {
+                netdev_drain_rx(dev.as_ref());
+                return;
+            }
+        }
+
+        // Fallback: drain all physical NICs directly.
+        for dev in kernel_hal::net::get_net_device().iter() {
+            if dev.get_ifname() != "loopback" {
+                netdev_drain_rx(dev.as_ref());
+            }
+        }
     }
 }
 
