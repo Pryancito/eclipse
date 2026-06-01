@@ -4079,7 +4079,9 @@ impl E1000eHw {
         let recycle = |hw: &mut Self| {
             unsafe {
                 write_volatile((desc_addr + 8) as *mut u64, 0);
-                Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
+                if hw.rx_needs_cache_flush() {
+                    Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
+                }
             }
             hw.rx_next_to_clean = (i + 1) % NUM_RX;
             let unused = hw.rx_desc_unused();
