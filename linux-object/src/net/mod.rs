@@ -720,6 +720,30 @@ pub fn drain_ipv4_nic(dev: &dyn zcore_drivers::scheme::NetScheme, rounds: usize)
     }
 }
 
+/// Import software ARP/NDP learnings into smoltcp's neighbor cache (TCP/UDP egress).
+pub fn sync_neighbor_cache_into_smoltcp() {
+    use smoltcp::wire::IpAddress;
+    for dev in get_net_device().iter() {
+        for (ip, mac) in arp_cache::get_entries() {
+            let _ = dev.seed_neighbor(IpAddress::Ipv4(ip), mac);
+        }
+        for (ip, mac) in ndp_cache::get_entries() {
+            let _ = dev.seed_neighbor(IpAddress::Ipv6(ip), mac);
+        }
+    }
+}
+
+/// Local UDP bind address for a query toward `dst` (port 0 → ephemeral on send).
+pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
+    use smoltcp::wire::IpAddress;
+    let addr = match dst {
+        IpAddress::Ipv4(d) => IpAddress::Ipv4(select_ipv4_for_dst(d)),
+        IpAddress::Ipv6(d) => IpAddress::Ipv6(select_ipv6_for_dst(d)),
+        other => other,
+    };
+    IpEndpoint::new(addr, 0)
+}
+
 /// miss doc
 pub fn poll_ifaces() {
     for iface in get_net_device().iter() {
@@ -730,6 +754,7 @@ pub fn poll_ifaces() {
             }
         }
     }
+    sync_neighbor_cache_into_smoltcp();
     if has_usable_ipv4() {
         prepare_ipv4_stack();
     }

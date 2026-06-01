@@ -110,3 +110,7 @@ pub fn lookup(dst: Ipv6Address) -> Option<EthernetAddress> {
 pub fn clear() {
     CACHE.lock().clear();
 }
+
+pub fn get_entries() -> alloc::vec::Vec<(Ipv6Address, EthernetAddress)> {
+    CACHE.lock().iter().map(|(&ip, &mac)| (ip, mac)).collect()
+}

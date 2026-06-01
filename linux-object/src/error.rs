@@ -115,6 +115,8 @@ pub enum LxError {
     ETIMEDOUT = 110,
     /// Connection refused
     ECONNREFUSED = 111,
+    /// Operation now in progress (non-blocking connect)
+    EINPROGRESS = 115,
     /// Address already in use
     EADDRINUSE = 98,
 }
@@ -173,6 +175,7 @@ impl fmt::Display for LxError {
             EISCONN => "Transport endpoint is already connected",
             ENOTCONN => "Transport endpoint is not connected",
             ECONNREFUSED => "Connection refused",
+            EINPROGRESS => "Operation in progress",
             EADDRINUSE => "Address already in use",
             _ => "Unknown error",
         };

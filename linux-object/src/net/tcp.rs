@@ -286,69 +286,84 @@ impl Socket for TcpSocketState {
     }
     /// connect
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
-        let inner = self.inner.lock();
-        #[allow(warnings)]
-        if let Endpoint::Ip(ip) = endpoint {
-            if !Self::endpoint_matches_family(inner.ipv6, &ip) {
-                return Err(LxError::EINVAL);
-            }
-            get_sockets()
-                .lock()
-                .get::<TcpSocket>(inner.handle.0)
-                .connect(ip, get_ephemeral_port())
-                .map_err(|_| LxError::ENOBUFS)?;
-
-            // Use a 30-second wall-clock deadline. Each iteration sleeps 5ms,
-            // so we have up to 6000 tries before giving up — plenty of time for
-            // a real internet round-trip through QEMU slirp.
-            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
-            prepare_ipv4_stack();
-            loop {
-                // Transmit pending packets (SYN, ACK, etc.)
-                poll_ifaces();
-                kernel_hal::deferred_job::drain_deferred_jobs();
-
-                match get_sockets()
-                    .lock()
-                    .get::<TcpSocket>(inner.handle.0)
-                    .state()
-                {
-                    TcpState::SynSent | TcpState::SynReceived => {
-                        // still connecting — keep waiting
-                    }
-                    TcpState::Established => {
-                        return Ok(0);
-                    }
-                    // Terminal failure states: RST received or connection refused
-                    TcpState::Closed | TcpState::TimeWait => {
-                        // Only give up if a meaningful amount of time has passed
-                        // (the socket starts in Closed before SYN is sent, so we
-                        // must not fail immediately on the very first iteration).
-                        if kernel_hal::timer::timer_now() >= deadline {
-                            warn!("connect: timed out after 30s");
-                            return Err(LxError::ETIMEDOUT);
-                        }
-                        // Short initial delay then continue; the SYN may not have
-                        // been transmitted yet.
-                    }
-                    _ => {
-                        warn!("connect: unexpected state, retrying");
-                    }
-                }
-
-                thread::sleep_until(
-                    kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
-                )
-                .await;
-
-                if kernel_hal::timer::timer_now() >= deadline {
-                    warn!("connect: timed out after 30s");
-                    return Err(LxError::ETIMEDOUT);
-                }
-            }
-        } else {
+        let (handle, ipv6, non_block) = {
+            let inner = self.inner.lock();
+            (
+                inner.handle.0,
+                inner.ipv6,
+                inner.flags.contains(OpenFlags::NON_BLOCK),
+            )
+        };
+        let Endpoint::Ip(ip) = endpoint else {
             error!("connect: bad endpoint");
-            Err(LxError::EINVAL)
+            return Err(LxError::EINVAL);
+        };
+        if !Self::endpoint_matches_family(ipv6, &ip) {
+            return Err(LxError::EINVAL);
+        }
+
+        {
+            let sockets = get_sockets();
+            let mut sets = sockets.lock();
+            let socket = sets.get::<TcpSocket>(handle);
+            if socket.is_active() {
+                return Err(LxError::EISCONN);
+            }
+        }
+
+        get_sockets()
+            .lock()
+            .get::<TcpSocket>(handle)
+            .connect(ip, get_ephemeral_port())
+            .map_err(|_| LxError::ENOBUFS)?;
+
+        prepare_ipv4_stack();
+        drain_net_poll(8);
+
+        let state = get_sockets().lock().get::<TcpSocket>(handle).state();
+        if matches!(state, TcpState::Established) {
+            flush_socket_egress();
+            return Ok(0);
+        }
+        if non_block {
+            if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
+                return Err(LxError::EINPROGRESS);
+            }
+            if matches!(state, TcpState::Closed | TcpState::TimeWait) {
+                return Err(LxError::ECONNREFUSED);
+            }
+        }
+
+        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        let mut polls = 0u32;
+        loop {
+            drain_net_poll(4);
+            kernel_hal::deferred_job::drain_deferred_jobs();
+
+            match get_sockets().lock().get::<TcpSocket>(handle).state() {
+                TcpState::SynSent | TcpState::SynReceived => {}
+                TcpState::Established => {
+                    flush_socket_egress();
+                    return Ok(0);
+                }
+                TcpState::Closed | TcpState::TimeWait => {
+                    if polls > 4 && kernel_hal::timer::timer_now() >= deadline {
+                        warn!("connect: timed out after 30s (state={:?})", state);
+                        return Err(LxError::ETIMEDOUT);
+                    }
+                }
+                other => {
+                    warn!("connect: unexpected state {:?}, retrying", other);
+                }
+            }
+            polls = polls.saturating_add(1);
+
+            if kernel_hal::timer::timer_now() >= deadline {
+                warn!("connect: timed out after 30s");
+                return Err(LxError::ETIMEDOUT);
+            }
+
+            thread::yield_now().await;
         }
     }
     /// wait for some event on a file descriptor

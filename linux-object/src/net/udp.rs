@@ -94,11 +94,14 @@ impl Socket for UdpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         info!("udp read");
-        let inner = self.inner.lock();
+        let (handle, non_block) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.flags.contains(OpenFlags::NON_BLOCK))
+        };
         loop {
             let sets = get_sockets();
             let mut sets = sets.lock();
-            let mut socket = sets.get::<UdpSocket>(inner.handle.0);
+            let mut socket = sets.get::<UdpSocket>(handle);
             let copied_len = socket.recv_slice(data);
             drop(socket);
             drop(sets);
@@ -106,9 +109,9 @@ impl Socket for UdpSocketState {
             match copied_len {
                 Ok((size, endpoint)) => return (Ok(size), Endpoint::Ip(endpoint)),
                 Err(smoltcp::Error::Exhausted) => {
-                    poll_ifaces();
+                    drain_net_poll(4);
                     // The receive buffer is empty. Try again later...
-                    if inner.flags.contains(OpenFlags::NON_BLOCK) {
+                    if non_block {
                         debug!("NON_BLOCK: Try again later...");
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     } else {
@@ -127,18 +130,18 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
-            )
-            .await;
+            thread::yield_now().await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let inner = self.inner.lock();
+        let (handle, non_block) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.flags.contains(OpenFlags::NON_BLOCK))
+        };
         loop {
             let sets = get_sockets();
             let mut sets = sets.lock();
-            let mut socket = sets.get::<UdpSocket>(inner.handle.0);
+            let mut socket = sets.get::<UdpSocket>(handle);
             // peek_slice returns &IpEndpoint which borrows `socket`.
             // Dereference (copy) it immediately so the borrow ends inside
             // this block, allowing drop(socket) below.
@@ -150,8 +153,8 @@ impl Socket for UdpSocketState {
             match copied_len {
                 Ok((size, endpoint)) => return (Ok(size), Endpoint::Ip(endpoint)),
                 Err(smoltcp::Error::Exhausted) => {
-                    poll_ifaces();
-                    if inner.flags.contains(OpenFlags::NON_BLOCK) {
+                    drain_net_poll(4);
+                    if non_block {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                 }
@@ -167,10 +170,7 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
-            )
-            .await;
+            thread::yield_now().await;
         }
     }
     /// write from buffer

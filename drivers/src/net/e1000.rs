@@ -414,6 +414,18 @@ impl NetScheme for E1000Interface {
         self.ip_addrs.lock().clone()
     }
 
+    fn seed_neighbor(
+        &self,
+        protocol: smoltcp::wire::IpAddress,
+        hardware: smoltcp::wire::EthernetAddress,
+    ) -> DeviceResult {
+        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
+        self.iface
+            .lock()
+            .seed_neighbor(protocol, hardware, timestamp);
+        Ok(())
+    }
+
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
