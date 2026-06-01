@@ -14,6 +14,7 @@ pub fn is_ipv4_placeholder(addr: Ipv4Address) -> bool {
 }
 
 const RX_QUEUE_MAX: usize = 64;
+const MAX_ICMP_PAYLOAD: usize = 1280;
 
 struct IcmpRxPacket {
     src: IpAddress,
@@ -97,7 +98,7 @@ pub fn deliver_from_frame(frame: &[u8]) {
         }
         q.push_back(IcmpRxPacket {
             src,
-            data: payload.to_vec(),
+            data: payload[..payload.len().min(MAX_ICMP_PAYLOAD)].to_vec(),
         });
     } else if et == 0x86dd {
         let ip = &frame[l2..];
@@ -132,7 +133,7 @@ pub fn deliver_from_frame(frame: &[u8]) {
         }
         q.push_back(IcmpRxPacket {
             src,
-            data: payload.to_vec(),
+            data: payload[..payload.len().min(MAX_ICMP_PAYLOAD)].to_vec(),
         });
     }
 }

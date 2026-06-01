@@ -61,64 +61,16 @@ fn wake_readers(inner: &PacketSocketInner) {
     });
 }
 
+const MAX_FRAME_COPY: usize = 1518;
+
 fn frame_arc(packet: &[u8]) -> Option<PacketFrame> {
-    let n = packet.len().min(super::MAX_KERNEL_VEC);
+    let n = packet.len().min(MAX_FRAME_COPY);
     if n == 0 {
         return None;
     }
-    Some(Arc::from(packet[..n].to_vec().into_boxed_slice()))
-}
-
-/// Snoop TCP SYN for the listen table without holding `PACKET_SOCKETS`.
-fn snoop_tcp_syn(packet: &[u8]) {
-    let Ok(frame) = EthernetFrame::new_checked(packet) else {
-        return;
-    };
-    let ethertype: u16 = frame.ethertype().into();
-    let (src_addr, dst_addr) = match ethertype {
-        0x0800 => {
-            let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(frame.payload()) else {
-                return;
-            };
-            if ipv4.protocol() != smoltcp::wire::IpProtocol::Tcp {
-                return;
-            }
-            let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv4.payload()) else {
-                return;
-            };
-            if !tcp.syn() || tcp.ack() {
-                return;
-            }
-            use smoltcp::wire::{IpAddress, IpEndpoint};
-            (
-                IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr()), tcp.src_port()),
-                IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr()), tcp.dst_port()),
-            )
-        }
-        0x86dd => {
-            let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(frame.payload()) else {
-                return;
-            };
-            if ipv6.next_header() != smoltcp::wire::IpProtocol::Tcp {
-                return;
-            }
-            let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(ipv6.payload()) else {
-                return;
-            };
-            if !tcp.syn() || tcp.ack() {
-                return;
-            }
-            use smoltcp::wire::{IpAddress, IpEndpoint};
-            (
-                IpEndpoint::new(IpAddress::Ipv6(ipv6.src_addr()), tcp.src_port()),
-                IpEndpoint::new(IpAddress::Ipv6(ipv6.dst_addr()), tcp.dst_port()),
-            )
-        }
-        _ => return,
-    };
-    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
-        crate::net::LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, &mut sockets);
-    }
+    let mut buf = Vec::with_capacity(n);
+    buf.extend_from_slice(&packet[..n]);
+    Some(Arc::from(buf.into_boxed_slice()))
 }
 
 /// Dispatches a received packet to all registered AF_PACKET sockets.
@@ -130,7 +82,6 @@ pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
     crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
-    snoop_tcp_syn(packet);
 
     let mut sockets = PACKET_SOCKETS.lock();
     if !sockets.iter().any(|w| w.strong_count() > 0) {

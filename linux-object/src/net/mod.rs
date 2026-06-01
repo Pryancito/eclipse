@@ -676,6 +676,9 @@ pub fn poll_ifaces() {
             }
         }
     }
+    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
+        sockets.prune();
+    }
 }
 
 /// Poll a single NIC once (smoltcp path — can hold the global socket set lock).
@@ -842,7 +845,7 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
             eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
             eth.payload_mut().copy_from_slice(ip);
             dev.send(&frame).map_err(|_| LxError::EIO)?;
-            netdev_drain_rx(dev.as_ref());
+            poll_ifaces();
             return Ok(());
         }
 
@@ -863,12 +866,12 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
             repr.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
         }
         dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
-        netdev_drain_rx(dev.as_ref());
+        poll_ifaces();
         if attempt + 1 < ARP_TRIES {
             let deadline =
                 kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1);
             while kernel_hal::timer::timer_now() < deadline {
-                netdev_drain_rx(dev.as_ref());
+                poll_ifaces();
                 if arp_cache::lookup(arp_target).is_some() {
                     break;
                 }
@@ -1012,7 +1015,7 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
             eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
             eth.payload_mut().copy_from_slice(ip);
             dev.send(&frame).map_err(|_| LxError::EIO)?;
-            netdev_drain_rx(dev.as_ref());
+            poll_ifaces();
             return Ok(());
         }
 
@@ -1062,7 +1065,7 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
         }
 
         dev.send(&ns_buf).map_err(|_| LxError::EIO)?;
-        netdev_drain_rx(dev.as_ref());
+        poll_ifaces();
         if ndp_cache::lookup(ndp_target).is_some() {
             continue;
         }

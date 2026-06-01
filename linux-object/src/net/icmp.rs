@@ -6,7 +6,7 @@ use crate::{
 use alloc::sync::Arc;
 use async_trait::async_trait;
 use lock::Mutex;
-use smoltcp::wire::{IpAddress, Ipv4Address};
+use smoltcp::wire::IpAddress;
 
 #[allow(unused_imports)]
 use zircon_object::object::*;
@@ -56,16 +56,6 @@ impl IcmpSocketState {
         out
     }
 
-    fn remote_ipv4(&self) -> Option<Ipv4Address> {
-        let Endpoint::Ip(ip) = self.inner.remote.lock().clone()? else {
-            return None;
-        };
-        match ip.addr {
-            IpAddress::Ipv4(v4) => Some(v4),
-            _ => None,
-        }
-    }
-
     fn remote_ip(&self) -> Option<IpAddress> {
         let Endpoint::Ip(ip) = self.inner.remote.lock().clone()? else {
             return None;
@@ -74,42 +64,10 @@ impl IcmpSocketState {
     }
 
     fn kick_rx(&self) {
-        // If we have a known remote, drain only that interface's RX ring.
-        // Otherwise drain all non-loopback interfaces so we don't miss the
-        // ICMP reply when ping uses sendto() without a prior connect().
-        if self.inner.ipv6 {
-            if let Some(Endpoint::Ip(ip)) = self.inner.remote.lock().clone() {
-                if let IpAddress::Ipv6(dst) = ip.addr {
-                    if dst.is_loopback() {
-                        crate::net::poll_ifaces();
-                        return;
-                    }
-                    if let Ok(dev) = netdev_for_ipv6(dst) {
-                        netdev_drain_rx(dev.as_ref());
-                        return;
-                    }
-                }
-            }
-        } else {
-            if let Some(dst) = self.remote_ipv4() {
-                if dst.is_loopback() {
-                    crate::net::poll_ifaces();
-                    return;
-                }
-                if let Ok(dev) = netdev_for_ipv4(dst) {
-                    netdev_drain_rx(dev.as_ref());
-                    return;
-                }
-            }
-        }
-        // Fallback: drain all non-loopback devices.
-        for dev in kernel_hal::net::get_net_device().iter() {
-            if dev.get_ifname() != "loopback" {
-                netdev_drain_rx(dev.as_ref());
-            } else {
-                crate::net::poll_ifaces();
-            }
-        }
+        // `poll_ifaces` already drives smoltcp RX and dispatches packet taps.
+        // Calling `netdev_drain_rx` here reads the NIC again and duplicates RX
+        // delivery, which grows AF_PACKET/ICMP queues under background traffic.
+        crate::net::poll_ifaces();
     }
 }
 

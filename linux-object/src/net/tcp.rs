@@ -378,11 +378,7 @@ impl Socket for TcpSocketState {
         let socket = sets.get::<TcpSocket>(inner.handle.0);
 
         if inner.is_listening {
-            if let Some(ep) = inner.local_endpoint {
-                if let Ok(true) = crate::net::LISTEN_TABLE.can_accept(ep.port) {
-                    read = true;
-                }
-            }
+            read = matches!(socket.state(), TcpState::Established);
         } else if !socket.is_open() {
             error = true;
             read = true;
@@ -436,6 +432,16 @@ impl Socket for TcpSocketState {
         let local_endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
         info!("socket listening on {:?}", local_endpoint);
 
+        if !crate::net::LISTEN_TABLE.can_listen(local_endpoint.port) {
+            return Err(LxError::EADDRINUSE);
+        }
+
+        get_sockets()
+            .lock()
+            .get::<TcpSocket>(inner.handle.0)
+            .listen(local_endpoint)
+            .map_err(|_| LxError::ENOBUFS)?;
+
         crate::net::LISTEN_TABLE.listen(local_endpoint)?;
         inner.is_listening = true;
         Ok(0)
@@ -459,19 +465,60 @@ impl Socket for TcpSocketState {
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        let inner = self.inner.lock();
-        let endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
-        let non_block = inner.flags.contains(OpenFlags::NON_BLOCK);
-        let is_ipv6 = inner.ipv6;
-        drop(inner);
+        let (endpoint, non_block, is_ipv6) = {
+            let inner = self.inner.lock();
+            (
+                inner.local_endpoint.ok_or(LxError::EINVAL)?,
+                inner.flags.contains(OpenFlags::NON_BLOCK),
+                inner.ipv6,
+            )
+        };
 
         loop {
-            if let Ok((handle, (local, remote))) = crate::net::LISTEN_TABLE.accept(endpoint.port) {
-                let new_handle = GlobalSocketHandle(handle);
+            poll_ifaces();
+            kernel_hal::deferred_job::drain_deferred_jobs();
+
+            let established = {
+                let handle = self.inner.lock().handle.0;
+                let sockets = get_sockets();
+                let mut sockets = sockets.lock();
+                let socket = sockets.get::<TcpSocket>(handle);
+                matches!(socket.state(), TcpState::Established)
+            };
+
+            if established {
+                let listen_handle = self.inner.lock().handle.0;
+                let (local, remote) = {
+                    let sockets = get_sockets();
+                    let mut sockets = sockets.lock();
+                    let socket = sockets.get::<TcpSocket>(listen_handle);
+                    (socket.local_endpoint(), socket.remote_endpoint())
+                };
+
+                let rx_buffer =
+                    TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_RECVBUF)?);
+                let tx_buffer =
+                    TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_SENDBUF)?);
+                let mut new_listen = TcpSocket::new(rx_buffer, tx_buffer);
+                new_listen
+                    .listen(endpoint)
+                    .map_err(|_| LxError::ENOBUFS)?;
+
+                let new_listen_handle = {
+                    let sockets = get_sockets();
+                    let mut sockets = sockets.lock();
+                    sockets.add(new_listen)
+                };
+
+                let child_handle = {
+                    let mut inner = self.inner.lock();
+                    core::mem::replace(&mut inner.handle, GlobalSocketHandle(new_listen_handle))
+                };
+
                 let new_socket = Arc::new(TcpSocketState {
                     base: KObjectBase::new(),
                     inner: Arc::new(Mutex::new(TcpInner {
-                        handle: new_handle,
+                        handle: child_handle,
                         local_endpoint: Some(local),
                         is_listening: false,
                         flags: OpenFlags::RDWR,
@@ -483,8 +530,6 @@ impl Socket for TcpSocketState {
                 if non_block {
                     return Err(LxError::EAGAIN);
                 }
-                poll_ifaces();
-                kernel_hal::deferred_job::drain_deferred_jobs();
                 thread::sleep_until(
                     kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
                 )
