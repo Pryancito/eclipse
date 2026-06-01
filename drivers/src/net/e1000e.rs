@@ -449,6 +449,14 @@ const TX_CMD_RS: u8 = 1 << 3;
 const NUM_RX: usize = 256;
 /// Leave a descriptor cushion at RX bring-up (RDH==RDT means empty; I219 races on full ring).
 const RX_BOOT_POST_MAX: usize = NUM_RX - 2;
+/// Microseconds to wait after RCTL.EN=0 before rewriting the RX descriptor ring.
+const RX_DMA_DRAIN_US: u32 = 100;
+/// Max PCIe write-back settle attempts when DD is set but length is not yet valid.
+const RX_DESC_WB_SETTLE_TRIES: u32 = 12;
+const RX_DESC_WB_SETTLE_US: u32 = 2;
+/// Scatter-gather reassembly limits (non-EOP fragments without EOP=1).
+const RX_SG_MAX_BYTES: usize = 9216;
+const RX_SG_MAX_FRAGS: u8 = 24;
 const NUM_TX: usize = 256;
 const BUF_SIZE: usize = 2048 + 128;
 /// Linux `E1000_RX_BUFFER_WRITE` — batch RDT doorbell every N descriptors.
@@ -570,6 +578,8 @@ pub struct E1000eHw {
     /// Fragments with EOP=0 are appended here; the final EOP=1 fragment delivers
     /// the assembled frame. Reset to empty after delivery or on error.
     rx_sg_buf: Vec<u8>,
+    /// Non-EOP fragments buffered without a completed frame yet.
+    rx_sg_frag_count: u8,
     /// SRRCTL at 0x280C does not read back on some steppings (e.g. 15b8); use RCTL only.
     srrctl_absent: bool,
     /// RX/TX rings mapped UC — skip clflush on descriptor WB paths.
@@ -1018,6 +1028,40 @@ impl E1000eHw {
             Self::invalidate_cpu_cache_for_read(vaddr, len);
         }
         Self::dma_copy_in(dst, vaddr, len);
+    }
+
+    unsafe fn wait_rx_dma_quiescent(&self) {
+        Self::udelay(RX_DMA_DRAIN_US as u64);
+        for _ in 0..10 {
+            let rdh = mmio_read(self.base, E1000E_RDH);
+            let rdt = mmio_read(self.base, E1000E_RDT);
+            if rdh == rdt {
+                break;
+            }
+            Self::udelay(10);
+        }
+    }
+
+    fn rx_sg_reset(&mut self) {
+        self.rx_sg_buf.clear();
+        self.rx_sg_frag_count = 0;
+    }
+
+    fn rx_sg_append(&mut self, frag: &[u8]) -> bool {
+        if self.rx_sg_frag_count >= RX_SG_MAX_FRAGS
+            || self.rx_sg_buf.len().saturating_add(frag.len()) > RX_SG_MAX_BYTES
+        {
+            log::warn!(
+                "[e1000e] RX SG overflow ({} frags, {} B) — reset",
+                self.rx_sg_frag_count,
+                self.rx_sg_buf.len()
+            );
+            self.rx_sg_reset();
+            return false;
+        }
+        self.rx_sg_frag_count = self.rx_sg_frag_count.saturating_add(1);
+        self.rx_sg_buf.extend_from_slice(frag);
+        true
     }
 
     unsafe fn stop_rx_tx_engines(&self) {
@@ -2073,10 +2117,12 @@ impl E1000eHw {
     ///      internal shadow pointer from the MMIO-visible value, causing the chip to
     ///      wake up in an undefined state ("no valid descriptors" or instant overflow).
     unsafe fn arm_rx_unit_linux(&mut self) {
-        // Step 1: Ensure RX engine is disabled.
+        // Step 1: Ensure RX engine is disabled; drain in-flight PCIe DMA before touching rings.
         let rctl = mmio_read(self.base, E1000E_RCTL);
         mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
         let _ = mmio_read(self.base, E1000E_RCTL);
+        self.wait_rx_dma_quiescent();
+        self.rx_sg_reset();
 
         // Step 2: Reset indices.
         self.rx_next_to_clean = 0;
@@ -4047,14 +4093,39 @@ impl E1000eHw {
     /// the NIC had already written DD=1.  QEMU is coherent and does not expose
     /// this bug; real silicon does.
     unsafe fn desc_done(&self, desc_addr: usize) -> Option<(u32, usize)> {
-        if self.rx_needs_cache_flush() {
-            Self::invalidate_cpu_cache_for_read(desc_addr, 16);
+        for attempt in 0..RX_DESC_WB_SETTLE_TRIES {
+            if self.rx_needs_cache_flush() {
+                Self::invalidate_cpu_cache_for_read(desc_addr, 16);
+                core::arch::x86_64::_mm_mfence();
+            }
+            let parsed = if self.use_extended_descriptors {
+                Self::parse_rx_wb_ext(desc_addr)
+            } else {
+                Self::parse_rx_wb_legacy(desc_addr)
+            };
+            match parsed {
+                None => return None,
+                Some((staterr, len)) if len > 0 && len <= BUF_SIZE => return Some((staterr, len)),
+                Some((staterr, len)) if attempt + 1 < RX_DESC_WB_SETTLE_TRIES => {
+                    log::trace!(
+                        "[e1000e] desc_done WB settling staterr={:#x} len={} try={}",
+                        staterr,
+                        len,
+                        attempt + 1
+                    );
+                    Self::udelay(RX_DESC_WB_SETTLE_US as u64);
+                }
+                Some((staterr, len)) => {
+                    log::trace!(
+                        "[e1000e] desc_done unstable WB staterr={:#x} len={} — skip slot",
+                        staterr,
+                        len
+                    );
+                    return None;
+                }
+            }
         }
-        if self.use_extended_descriptors {
-            unsafe { Self::parse_rx_wb_ext(desc_addr) }
-        } else {
-            unsafe { Self::parse_rx_wb_legacy(desc_addr) }
-        }
+        None
     }
 
     /// Nudge the MAC to write back completed RX descriptors (Linux RDTR_FPD path).
@@ -4096,7 +4167,7 @@ impl E1000eHw {
                 "[e1000e] RX slot {} bad len={} staterr={:#x} — discarding",
                 i, len, staterr
             );
-            self.rx_sg_buf.clear();
+            self.rx_sg_reset();
             recycle(self);
             return None;
         }
@@ -4109,7 +4180,6 @@ impl E1000eHw {
 
         // Unified split-RX (QEMU + bare metal): buffer only real continuations, never glue
         // a new Ethernet header onto a stale partial (the old 60+381 B DHCP bug).
-        const RX_SG_MAX: usize = 9216;
         let data = if staterr & RXD_EXT_EOP == 0 {
             if Self::rx_ipv4_deliverable(&frag) {
                 log::trace!(
@@ -4117,7 +4187,7 @@ impl E1000eHw {
                     i,
                     frag.len()
                 );
-                self.rx_sg_buf.clear();
+                self.rx_sg_reset();
                 Self::trim_to_ipv4_frame(frag)
             } else if Self::is_eth_ipv4_header_start(&frag) {
                 if !self.rx_sg_buf.is_empty() {
@@ -4126,28 +4196,29 @@ impl E1000eHw {
                         i,
                         self.rx_sg_buf.len()
                     );
-                    self.rx_sg_buf.clear();
+                    self.rx_sg_reset();
                 }
                 log::trace!(
                     "[e1000e] RX slot {} fragment {} B EOP=0 — buffer head",
                     i,
                     frag.len()
                 );
-                self.rx_sg_buf.extend_from_slice(&frag);
-                recycle(self);
-                return None;
-            } else if !self.rx_sg_buf.is_empty() {
-                if self.rx_sg_buf.len() + frag.len() > RX_SG_MAX {
-                    self.rx_sg_buf.clear();
+                if !self.rx_sg_append(&frag) {
                     recycle(self);
                     return None;
                 }
+                recycle(self);
+                return None;
+            } else if !self.rx_sg_buf.is_empty() {
                 log::trace!(
                     "[e1000e] RX slot {} continuation {} B EOP=0 — buffer",
                     i,
                     frag.len()
                 );
-                self.rx_sg_buf.extend_from_slice(&frag);
+                if !self.rx_sg_append(&frag) {
+                    recycle(self);
+                    return None;
+                }
                 recycle(self);
                 return None;
             } else {
@@ -4162,10 +4233,11 @@ impl E1000eHw {
                     self.rx_sg_buf.len(),
                     frag.len()
                 );
-                self.rx_sg_buf.clear();
+                self.rx_sg_reset();
                 Self::trim_to_ipv4_frame(frag)
             } else {
                 let mut assembled = core::mem::take(&mut self.rx_sg_buf);
+                self.rx_sg_frag_count = 0;
                 assembled.extend_from_slice(&frag);
                 if Self::rx_ipv4_deliverable(&assembled) {
                     log::trace!(
@@ -4408,38 +4480,35 @@ impl E1000eHw {
             let _ = mmio_read(self.base, E1000E_TDT);
         }
 
-        // Espera segura para bare-metal (Solo para asegurar el reporte en logs iniciales)
-        let mut tx_dd = false;
-        for _ in 0..1000 {
-            unsafe {
-                Self::dma_rmb_after_device();
-                if self.rx_needs_cache_flush() {
-                    Self::invalidate_cpu_cache_for_read(
-                        ring.add(idx) as usize,
-                        core::mem::size_of::<TxDesc>(),
-                    );
-                }
-                
-                // Comprobación segura del bit DD en el campo status descriptor de transmisión convencional
-                let status = read_volatile(&(*ring.add(idx)).status);
-                if status & 0x01 != 0 {
-                    tx_dd = true;
-                    break;
-                }
-            }
-            Self::udelay(10);
-        }
-
-        // LOGS e incremento de estadísticas básicas
+        // Hot path: TX completion is driven by TXDW interrupt / later poll — do not spin here.
         if first_tx {
-            crate::klog_info!("[e1000e] first TX {} ({} bytes) enviado.\n", info, data.len());
-        }
-
-        // COMPORTAMIENTO CORRECTO:
-        // No dispares un reset si tx_dd es falso. El DMA procesará el paquete asíncronamente.
-        // Solo retorna Ok(()) indicando que el paquete se encoló con éxito en el hardware.
-        if !tx_dd && self.stats.tx_packets <= 5 {
-            e1000e_vlog!("[e1000e] TX descriptor {} procesándose asíncronamente por el hardware\n", idx);
+            let mut tx_dd = false;
+            for _ in 0..100 {
+                unsafe {
+                    Self::dma_rmb_after_device();
+                    if self.rx_needs_cache_flush() {
+                        Self::invalidate_cpu_cache_for_read(
+                            ring.add(idx) as usize,
+                            core::mem::size_of::<TxDesc>(),
+                        );
+                    }
+                    let status = read_volatile(&(*ring.add(idx)).status);
+                    if status & 0x01 != 0 {
+                        tx_dd = true;
+                        break;
+                    }
+                }
+                Self::udelay(20);
+            }
+            if tx_dd {
+                crate::klog_info!("[e1000e] first TX {} ({} bytes) DD ok\n", info, data.len());
+            } else {
+                e1000e_vlog!(
+                    "[e1000e] first TX {} ({} bytes) queued — DD pending (async TXDW)\n",
+                    info,
+                    data.len()
+                );
+            }
         }
 
         Ok(())
@@ -4984,6 +5053,7 @@ pub fn init(
         stage_start_us: 0,
         use_extended_descriptors: true,
         rx_sg_buf: Vec::new(),
+        rx_sg_frag_count: 0,
         srrctl_absent: false,
         dma_uncached: false,
     };
