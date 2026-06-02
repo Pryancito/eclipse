@@ -3776,7 +3776,7 @@ impl E1000eHw {
 
 
     unsafe fn resolve_link_speed_duplex(&self) -> (u32, bool) {
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
         let (speed, duplex_full, _src) = self.phy_operational_speed(phy, st2);
         (speed, duplex_full)
@@ -3807,7 +3807,15 @@ impl E1000eHw {
     /// Resuelve de forma segura el enlace físico y evita bucles infinitos de AN.
     unsafe fn check_for_link_linux(&mut self) -> bool {
         let is_pch = self.is_pch_lpt_or_later();
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
+        if phy != self.phy_addr {
+            crate::klog_info!(
+                "[e1000e] runtime PHY switch {} -> {}\n",
+                self.phy_addr,
+                phy
+            );
+            self.phy_addr = phy;
+        }
 
         // 1. Leer BMSR dos veces para limpiar el bit pegajoso de "Latch-Low".
         let _ = self.mdic_read(phy, MII_BMSR);
@@ -3952,7 +3960,7 @@ impl E1000eHw {
         }
 
         // Lectura de control del PHY antes de evaluar timeouts de estados
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         let phy_link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
@@ -4609,7 +4617,7 @@ impl E1000eHw {
         if status & STATUS_LU == 0 {
             return;
         }
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 || (bmsr & BMSR_ANEG_COMPLETE) == 0 {
