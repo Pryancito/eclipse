@@ -63,6 +63,52 @@ fn wake_readers(inner: &PacketSocketInner) {
 
 const MAX_FRAME_COPY: usize = 1518;
 
+/// Bytes of L2 header (14, or 18 with 802.1Q) and EtherType.
+fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let et = u16::from_be_bytes([frame[12], frame[13]]);
+    if et == 0x8100 {
+        if frame.len() < 18 {
+            return None;
+        }
+        Some((18, u16::from_be_bytes([frame[16], frame[17]])))
+    } else {
+        Some((14, et))
+    }
+}
+
+/// SOCK_DGRAM AF_PACKET delivers a bare IPv4 datagram. udhcpc's get_raw_packet()
+/// requires `read_len - iphdr_len == udp.len` exactly — IP padding after the UDP
+/// segment must not be included (Linux trims to the UDP length for this path).
+fn ipv4_datagram_from_eth_frame(frame: &[u8]) -> Option<&[u8]> {
+    let (l2, et) = eth_l2_header_len(frame)?;
+    if et != 0x0800 || frame.len() < l2 + 20 {
+        return None;
+    }
+    let ihl = ((frame[l2] & 0x0f) as usize) * 4;
+    if ihl < 20 || frame.len() < l2 + ihl {
+        return None;
+    }
+    let ip_tot = u16::from_be_bytes([frame[l2 + 2], frame[l2 + 3]]) as usize;
+    if ip_tot < ihl || l2 + ip_tot > frame.len() {
+        return None;
+    }
+    let mut end = l2 + ip_tot;
+    if frame[l2 + 9] == 17 && frame.len() >= l2 + ihl + 8 {
+        let udp_len = u16::from_be_bytes([frame[l2 + ihl + 4], frame[l2 + ihl + 5]]) as usize;
+        if (8..=ip_tot.saturating_sub(ihl)).contains(&udp_len) {
+            end = l2 + ihl + udp_len;
+        }
+    }
+    Some(&frame[l2..end])
+}
+
+fn frame_ethertype(packet: &[u8]) -> Option<u16> {
+    eth_l2_header_len(packet).map(|(_, et)| et)
+}
+
 fn frame_arc(packet: &[u8]) -> Option<PacketFrame> {
     let n = packet.len().min(MAX_FRAME_COPY);
     if n == 0 {
@@ -90,9 +136,7 @@ pub fn push_packet(packet: &[u8]) {
     }
     let mut to_remove = Vec::new();
     let mut shared: Option<PacketFrame> = None;
-    let ethertype = EthernetFrame::new_checked(packet)
-        .ok()
-        .map(|f| u16::from(f.ethertype()));
+    let ethertype = frame_ethertype(packet);
 
     for (i, weak) in sockets.iter().enumerate() {
         if let Some(inner) = weak.upgrade() {
@@ -210,23 +254,28 @@ impl Socket for PacketSocketState {
             let pkt = self.inner.packet_queue.lock().pop_front();
             if let Some(internal_buf) = pkt {
                 let n = internal_buf.len();
-                let mut start = 0;
-                // Try to parse Ethernet header to extract source MAC
-                if let Ok(frame) = EthernetFrame::new_checked(&internal_buf[..n]) {
-                    let ethertype: u16 = frame.ethertype().into();
-                    // Filters are already applied in push_packet, but we can double check or extract info
+                if let Some((_, et)) = eth_l2_header_len(&internal_buf[..n]) {
                     if let Endpoint::LinkLevel(ref mut ll) = endpoint {
-                        ll.addr[..6].copy_from_slice(frame.src_addr().as_bytes());
+                        ll.addr[..6].copy_from_slice(&internal_buf[6..12]);
                         ll.halen = 6;
-                        ll.protocol = ethertype;
-                    }
-                    if self.inner.socket_type == SocketType::SOCK_DGRAM {
-                        start = EthernetFrame::<&[u8]>::header_len();
+                        ll.protocol = et;
                     }
                 }
-                let actual_len = n - start;
+                let payload = if self.inner.socket_type == SocketType::SOCK_DGRAM {
+                    ipv4_datagram_from_eth_frame(&internal_buf[..n])
+                        .unwrap_or_else(|| {
+                            if n > 14 {
+                                &internal_buf[14..n]
+                            } else {
+                                &internal_buf[..0]
+                            }
+                        })
+                } else {
+                    &internal_buf[..n]
+                };
+                let actual_len = payload.len();
                 let copy_len = actual_len.min(data.len());
-                data[..copy_len].copy_from_slice(&internal_buf[start..start + copy_len]);
+                data[..copy_len].copy_from_slice(&payload[..copy_len]);
 
                 if self.inner.packet_queue.lock().is_empty() {
                     self.base.signal_clear(Signal::READABLE);

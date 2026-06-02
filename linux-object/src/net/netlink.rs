@@ -333,15 +333,18 @@ impl Socket for NetlinkSocketState {
                 if let Some((ifindex, cidr)) = parse_ifaddr_cidr(data) {
                     if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifindex) {
                         let _ = iface.add_ip_address(cidr);
-                        if matches!(cidr, IpCidr::Ipv4(_)) {
+                        if let IpCidr::Ipv4(v4) = cidr {
+                            let _ = iface.set_ipv4_address(v4);
                             crate::net::prepare_ipv4_stack();
                         }
-                        info!(
-                            "[netlink] NewAddr: set {} on {} (ifindex {})",
+                        log::warn!(
+                            "[netlink] NewAddr {} on {} ifindex={}",
                             cidr,
                             iface.get_ifname(),
                             ifindex
                         );
+                    } else {
+                        log::warn!("[netlink] NewAddr: unknown ifindex {}", ifindex);
                     }
                 }
                 push_ack(&mut buffer, header, reply_pid);

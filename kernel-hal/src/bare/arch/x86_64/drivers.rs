@@ -137,6 +137,7 @@ pub(super) fn init() -> DeviceResult {
 
         boot_progress(84);
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
+        zcore_drivers::utils::deferred_job::drain_deferred_jobs();
         boot_progress(87);
         for d in pci_devs.into_iter() {
             drivers::add_device(d);

@@ -1188,15 +1188,23 @@ impl<'a> InterfaceInner<'a> {
         ipv4_packet: &Ipv4Packet<&'frame T>,
     ) -> Result<Option<IpPacket<'frame>>> {
         let ipv4_repr = Ipv4Repr::parse(ipv4_packet, &cx.caps.checksum)?;
+        let ip_payload = ipv4_packet.payload();
 
         if !self.is_unicast_v4(ipv4_repr.src_addr) {
-            // Discard packets with non-unicast source addresses.
-            net_debug!("non-unicast source address");
-            return Err(Error::Malformed);
+            // BOOTP servers may still use 0.0.0.0 before address assignment.
+            const BOOTPS: u16 = 67;
+            const BOOTPC: u16 = 68;
+            let allow_dhcp_reply = ipv4_repr.protocol == IpProtocol::Udp
+                && UdpPacket::new_checked(ip_payload)
+                    .map(|p| p.src_port() == BOOTPS && p.dst_port() == BOOTPC)
+                    .unwrap_or(false);
+            if !allow_dhcp_reply {
+                net_debug!("non-unicast source address");
+                return Err(Error::Malformed);
+            }
         }
 
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
-        let ip_payload = ipv4_packet.payload();
 
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = self.raw_socket_filter(cx, sockets, &ip_repr, ip_payload);
@@ -1226,6 +1234,26 @@ impl<'a> InterfaceInner<'a> {
                             // The packet is malformed, or the socket buffer is full.
                             Err(e) => return Err(e),
                         }
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "socket-udp")]
+        {
+            // Deliver inbound BOOTP/DHCP to UDP :68 even when yiaddr is not yet configured
+            // on the interface (smoltcp would otherwise drop unicast-to-yiaddr OFFERs).
+            const BOOTPC: u16 = 68;
+            if ipv4_repr.protocol == IpProtocol::Udp {
+                if let Ok(udp_packet) = UdpPacket::new_checked(ip_payload) {
+                    if udp_packet.dst_port() == BOOTPC {
+                        return self.process_udp(
+                            cx,
+                            sockets,
+                            ip_repr,
+                            handled_by_raw_socket,
+                            ip_payload,
+                        );
                     }
                 }
             }

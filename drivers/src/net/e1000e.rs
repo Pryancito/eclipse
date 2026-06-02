@@ -20,7 +20,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-mac-reset";
+const E1000E_DRIVER_TAG: &str = "e1000e-rx-late-link";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -389,8 +389,10 @@ const MDIC_OP_READ: u32 = 0x0800_0000;
 const MDIC_OP_WRITE: u32 = 0x0400_0000;
 const MDIC_READY: u32 = 0x1000_0000;
 const MDIC_ERROR: u32 = 0x4000_0000;
-/// MDIC poll budget (working metal commit used 400 × 50µs).
+/// MDIC poll budget at runtime (400 × 50µs ≈ 20 ms).
 const MDIC_POLL_TRIES: u32 = 400;
+/// MDIC budget during PCI probe / deferred PHY init (must not block boot at 84%).
+const MDIC_INIT_TRIES: u32 = 48;
 /// Fast MDIO probe during PHY discovery (avoid 100 ms × 31 addresses).
 const MDIC_PROBE_TRIES: u32 = 128;
 const FWSM_FW_VALID: u32 = 0x8000;
@@ -588,6 +590,8 @@ pub struct E1000eHw {
     rx_diag_counter: u32,
     /// Cap frames delivered per `poll()` so AF_PACKET `send()` does not drain the whole ring.
     rx_poll_budget: u8,
+    /// PHY workarounds (ULP/MDIO/LANPHYPC) deferred past PCI scan (boot progress 84%).
+    phy_init_pending: bool,
     /// Full PHY/link tuning deferred to `poll()` so PCI probe does not block the shell.
     link_bringup_pending: bool,
     link_bringup_attempts: u8,
@@ -938,7 +942,7 @@ impl E1000eHw {
             [1u8, 2, self.phy_addr]
         };
         for pa in scan {
-            if let Some(id1) = self.mdic_read(pa, MII_PHYSID1) {
+            if let Some(id1) = self.mdic_read_init(pa, MII_PHYSID1) {
                 if id1 != 0 && id1 != 0xFFFF {
                     crate::klog_info!("[e1000e] detected PHY at address {} (ID1={:#x})\n", pa, id1);
                     self.phy_addr = pa;
@@ -947,7 +951,7 @@ impl E1000eHw {
             }
         }
         for pa in scan {
-            if let Some(bmsr) = self.mdic_read(pa, MII_BMSR) {
+            if let Some(bmsr) = self.mdic_read_init(pa, MII_BMSR) {
                 if bmsr != 0 && bmsr != 0xFFFF {
                     crate::klog_info!(
                         "[e1000e] detected PHY at address {} via BMSR ({:#x})\n",
@@ -961,7 +965,7 @@ impl E1000eHw {
         }
         if !self.is_pch_lpt_or_later() {
             for pa in 3u8..=31 {
-                if let Some(id1) = self.mdic_read(pa, MII_PHYSID1) {
+                if let Some(id1) = self.mdic_read_init(pa, MII_PHYSID1) {
                     if id1 != 0 && id1 != 0xFFFF {
                         crate::klog_info!(
                             "[e1000e] detected PHY at address {} (ID1={:#x})\n",
@@ -1078,14 +1082,14 @@ impl E1000eHw {
         let mut phy_id: u32 = 0;
         let mut phy_reg2: u16 = 0;
         for _ in 0..2 {
-            let Some(id1) = self.mdic_read_swheld(phy_addr, MII_PHYSID1, MDIC_POLL_TRIES) else {
+            let Some(id1) = self.mdic_read_swheld(phy_addr, MII_PHYSID1, MDIC_INIT_TRIES) else {
                 continue;
             };
             if id1 == 0 || id1 == 0xFFFF {
                 continue;
             }
             phy_id = (id1 as u32) << 16;
-            let Some(id2) = self.mdic_read_swheld(phy_addr, MII_PHYSID2, MDIC_POLL_TRIES) else {
+            let Some(id2) = self.mdic_read_swheld(phy_addr, MII_PHYSID2, MDIC_INIT_TRIES) else {
                 phy_id = 0;
                 continue;
             };
@@ -1209,7 +1213,7 @@ impl E1000eHw {
         fextnvm7 &= !FEXTNVM7_DISABLE_SMB_PERST;
         mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
 
-        match self.mdic_read_swheld(phy_addr, MII_BMSR, MDIC_POLL_TRIES) {
+        match self.mdic_read_swheld(phy_addr, MII_BMSR, MDIC_INIT_TRIES) {
             Some(bmsr) => {
                 crate::klog_info!("[e1000e] ULP software: PHY BMSR={:#x}\n", bmsr);
                 ok
@@ -1347,6 +1351,436 @@ impl E1000eHw {
         }
     }
 
+    /// Quiesce DMA before reset (Linux `e1000_reset_hw_ich8lan` preamble).
+    unsafe fn quiesce_dma_before_reset(&mut self) {
+        if self.is_pch_spt_or_later() {
+            let mut rxdctl = mmio_read(self.base, E1000E_RXDCTL);
+            rxdctl &= !RXDCTL_QUEUE_ENABLE;
+            mmio_write(self.base, E1000E_RXDCTL, rxdctl);
+            let _ = mmio_read(self.base, E1000E_RXDCTL);
+
+            let mut txdctl = mmio_read(self.base, E1000E_TXDCTL);
+            txdctl &= !TXDCTL_QUEUE_ENABLE;
+            mmio_write(self.base, E1000E_TXDCTL, txdctl);
+            let _ = mmio_read(self.base, E1000E_TXDCTL);
+            Self::udelay(2_000);
+        }
+
+        self.stop_rx_tx_engines();
+        self.rx_next_to_clean = 0;
+        self.rx_next_to_use = 0;
+        mmio_write(self.base, E1000E_RDH, 0);
+        let _ = mmio_read(self.base, E1000E_RDH);
+        mmio_write(self.base, E1000E_RDT, 0);
+        let _ = mmio_read(self.base, E1000E_RDT);
+        self.flush_desc_rings();
+    }
+
+    /// Linux `e1000_reset_hw_ich8lan` — global MAC reset (+ PHY_RST when ME allows).
+    unsafe fn reset_hw_ich8lan_linux(&mut self, with_phy_rst: bool) {
+        crate::klog_warn!("[e1000e] reset_hw_ich8lan (phy_rst={})\n", with_phy_rst);
+
+        mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
+        mmio_write(self.base, E1000E_RCTL, 0);
+        mmio_write(self.base, E1000E_TCTL, TCTL_PSP);
+        let _ = mmio_read(self.base, E1000E_TCTL);
+        Self::udelay(10_000);
+
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
+        let mut gio_wait = 500u32;
+        while gio_wait > 0 {
+            if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
+                break;
+            }
+            Self::udelay(100);
+            gio_wait -= 1;
+        }
+
+        ctrl = mmio_read(self.base, E1000E_CTRL);
+        let phy_rst = with_phy_rst
+            && self.is_pch_lpt_or_later()
+            && !self.pch_phy_reset_blocked();
+        if phy_rst {
+            ctrl |= CTRL_PHY_RST;
+        }
+
+        let swflag_ok = if self.is_pch_lpt_or_later() {
+            self.pch_swflag_acquire()
+        } else {
+            true
+        };
+
+        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
+        Self::udelay(20_000);
+
+        let mut rst_wait = 1_000u32;
+        while rst_wait > 0 {
+            if mmio_read(self.base, E1000E_CTRL) & CTRL_RST == 0 {
+                break;
+            }
+            Self::udelay(100);
+            rst_wait -= 1;
+        }
+
+        if swflag_ok && self.is_pch_lpt_or_later() {
+            self.pch_swflag_release();
+        }
+
+        if phy_rst {
+            self.pch_phy_reset_complete();
+            Self::udelay(10_000);
+            self.pch_clear_status_phyra_if_set();
+        }
+
+        mmio_write(self.base, E1000E_WUC, 0);
+        mmio_write(self.base, E1000E_WUFC, 0);
+        mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
+
+        mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
+        let _ = mmio_read(self.base, E1000E_ICR);
+
+        let kabgtxd = mmio_read(self.base, E1000E_KABGTXD);
+        mmio_write(self.base, E1000E_KABGTXD, kabgtxd | KABGTXD_BGSQLBIAS);
+
+        if self.is_pch_lpt_or_later() {
+            let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+            ctrl_ext &= !CTRL_EXT_DPG_EN;
+            mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+        }
+
+        ctrl = mmio_read(self.base, E1000E_CTRL);
+        mmio_write(
+            self.base,
+            E1000E_CTRL,
+            ctrl & !CTRL_GIO_MASTER_DISABLE,
+        );
+        let _ = mmio_read(self.base, E1000E_CTRL);
+    }
+
+    /// Linux `e1000_setup_link_ich8lan` + `e1000_setup_copper_link_pch_lpt` (flow + copper).
+    unsafe fn setup_link_ich8lan_linux(&self) {
+        if self.pch_phy_reset_blocked() {
+            return;
+        }
+        if self.is_pch_lpt_or_later() {
+            mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
+            mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
+        }
+        self.mac_setup_copper_link_linux();
+        self.phy_setup_82577_copper(self.active_phy_addr());
+    }
+
+    /// Linux `e1000_init_hw_ich8lan` subset after reset.
+    unsafe fn init_hw_ich8lan_linux(&mut self) {
+        self.read_mac_from_hw();
+        if self.is_valid_mac() {
+            let mac_low =
+                u32::from_le_bytes([self.mac[0], self.mac[1], self.mac[2], self.mac[3]]);
+            let mac_high = u32::from_le_bytes([self.mac[4], self.mac[5], 0, 0]);
+            mmio_write(self.base, E1000E_RAL0, mac_low);
+            mmio_write(self.base, E1000E_RAH0, mac_high | 0x8000_0000);
+        }
+
+        if self.is_pch_lpt_or_later() {
+            self.pch_disable_lplu_gbe();
+            self.pch_disable_k1();
+            let phy_addr = self.active_phy_addr();
+            let pll_reg = Self::phy_reg_paged(772, 28);
+            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, pll_reg) {
+                phy_reg &= !I217_PLL_CLOCK_GATE_MASK;
+                phy_reg |= 0xFA;
+                let _ = self.mdic_write_phy(phy_addr, pll_reg, phy_reg);
+            }
+            self.pch_setup_kmrn_copper_link();
+            self.setup_link_ich8lan_linux();
+        } else {
+            self.mac_setup_copper_link_linux();
+        }
+
+        let status = mmio_read(self.base, E1000E_STATUS);
+        crate::klog_warn!(
+            "[e1000e] init_hw_ich8lan STATUS={:#x} link={}\n",
+            status,
+            status & STATUS_LU != 0
+        );
+    }
+
+    /// Reprogram MAC datapath + DMA rings after `reset_hw_ich8lan_linux`.
+    /// Probe-time ring setup is invalidated by CTRL_RST; Linux re-runs configure_tx/rx on open.
+    unsafe fn reapply_datapath_after_mac_reset(&mut self) {
+        crate::klog_warn!("[e1000e] reapply datapath after MAC reset\n");
+
+        for i in 1usize..16 {
+            mmio_write(self.base, E1000E_RAL0 + i * 2, 0);
+            mmio_write(self.base, E1000E_RAL0 + i * 2 + 1, 0);
+        }
+
+        let ctrl = mmio_read(self.base, E1000E_CTRL);
+        mmio_write(
+            self.base,
+            E1000E_CTRL,
+            (ctrl | CTRL_SLU | CTRL_ASDE | CTRL_FD)
+                & !(CTRL_TFCE | CTRL_RFCE | CTRL_VME | CTRL_GIO_MASTER_DISABLE),
+        );
+
+        let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        ctrl_ext |= 1 << 22;
+        ctrl_ext |= 1 << 31;
+        ctrl_ext |= 1 << 28;
+        if self.is_pch_lpt_or_later() {
+            ctrl_ext &= !CTRL_EXT_PHYPDEN;
+        }
+        ctrl_ext |= CTRL_EXT_RO_DIS;
+        ctrl_ext &= !CTRL_EXT_DPG_EN;
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+
+        if self.is_pch_lpt_or_later() {
+            mmio_write(self.base, E1000E_PBA, 0x0012001A);
+            self.pch_apply_silicon_workarounds();
+        } else {
+            mmio_write(self.base, E1000E_PBA, 0x00100030);
+        }
+
+        if !E1000E_CONVENTIONAL && self.is_pch_lpt_or_later() {
+            mmio_write(self.base, E1000E_CRC_OFFSET, 0x65656565);
+            let kabgtxd = mmio_read(self.base, E1000E_KABGTXD);
+            mmio_write(self.base, E1000E_KABGTXD, kabgtxd | KABGTXD_BGSQLBIAS);
+
+            let mut fextnvm6 = mmio_read(self.base, E1000E_FEXTNVM6);
+            fextnvm6 |= FEXTNVM6_K1_OFF_EN | FEXTNVM6_DIS_ELDW;
+            mmio_write(self.base, E1000E_FEXTNVM6, fextnvm6);
+
+            let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
+            kmrn &= !KMRNCTRLSTA_K1_ENABLE;
+            self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
+
+            let mut fextnvm11 = mmio_read(self.base, E1000E_FEXTNVM11);
+            fextnvm11 |= FEXTNVM11_DISABLE_L1_2;
+            mmio_write(self.base, E1000E_FEXTNVM11, fextnvm11);
+
+            let mut fextnvm4 = mmio_read(self.base, E1000E_FEXTNVM4);
+            fextnvm4 &= !FEXTNVM4_BEACON_DURATION_MASK;
+            fextnvm4 |= FEXTNVM4_BEACON_DURATION_8USEC;
+            mmio_write(self.base, E1000E_FEXTNVM4, fextnvm4);
+
+            let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
+            fextnvm7 |= FEXTNVM7_SIDE_CLK_UNGATE
+                | FEXTNVM7_DISABLE_SMB_PERST
+                | FEXTNVM7_NEED_DESCR_RING_FLUSH;
+            mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
+
+            let mut fextnvm9 = mmio_read(self.base, E1000E_FEXTNVM9);
+            fextnvm9 |= FEXTNVM9_IOSFSB_CLKGATE_DIS | FEXTNVM9_IOSFSB_CLKREQ_DIS;
+            mmio_write(self.base, E1000E_FEXTNVM9, fextnvm9);
+
+            if matches!(self.device_id, 0x156f..=0x1570 | 0x15b7..=0x15be) {
+                let iosfpc = mmio_read(self.base, E1000E_IOSFPC);
+                mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x00010000);
+            }
+        }
+
+        if !E1000E_CONVENTIONAL {
+            let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
+            tarc0 |= (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27);
+            mmio_write(self.base, E1000E_TARC0, tarc0);
+
+            let mut tarc1 = mmio_read(self.base, E1000E_TARC1);
+            tarc1 |= (1 << 24) | (1 << 26) | (1 << 30) | (1 << 28);
+            mmio_write(self.base, E1000E_TARC1, tarc1);
+        }
+
+        for i in 0..E1000E_MTA_LEN {
+            mmio_write(self.base, E1000E_MTA_BASE + i, 0);
+        }
+
+        let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
+        let tx_ring = self.tx_ring.as_ptr::<TxDesc>();
+        core::ptr::write_bytes(rx_ring, 0, NUM_RX);
+        core::ptr::write_bytes(tx_ring, 0, NUM_TX);
+        for i in 0..NUM_RX {
+            let desc = &mut *rx_ring.add(i);
+            desc.addr = self.rx_buf_paddr(i);
+            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+        }
+        core::arch::x86_64::_mm_sfence();
+        fence(Ordering::SeqCst);
+
+        let tx_ring_pa = self.tx_ring.paddr();
+        mmio_write(self.base, E1000E_TDBAL, tx_ring_pa as u32);
+        mmio_write(self.base, E1000E_TDBAH, (tx_ring_pa >> 32) as u32);
+        mmio_write(self.base, E1000E_TDLEN, (NUM_TX * size_of::<TxDesc>()) as u32);
+        self.tx_tail = 0;
+        mmio_write(self.base, E1000E_TDH, 0);
+        mmio_write(self.base, E1000E_TDT, 0);
+        mmio_write(self.base, E1000E_TIPG, 8 | (8 << 10) | (12 << 20));
+        mmio_write(self.base, E1000E_TIDV, 0);
+        mmio_write(self.base, E1000E_TADV, 0);
+
+        if self.is_pch_lpt_or_later() {
+            let txdctl = self.program_txdctl_linux();
+            mmio_write(self.base, E1000E_TXDCTL, txdctl);
+        } else {
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL,
+                TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB,
+            );
+        }
+        if self.is_pch_spt_or_later() {
+            let txdctl = mmio_read(self.base, E1000E_TXDCTL);
+            mmio_write(self.base, E1000E_TXDCTL, txdctl | TXDCTL_QUEUE_ENABLE);
+            let mut txq_wait = 100;
+            while txq_wait > 0 && mmio_read(self.base, E1000E_TXDCTL) & TXDCTL_QUEUE_ENABLE == 0 {
+                Self::udelay(100);
+                txq_wait -= 1;
+            }
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL1,
+                mmio_read(self.base, E1000E_TXDCTL),
+            );
+        }
+        {
+            let mut tctl = mmio_read(self.base, E1000E_TCTL);
+            if self.is_pch_spt_or_later() {
+                tctl &= !(0xFF0u32 | 0x003FF000u32 | TCTL_EN);
+                tctl |= TCTL_PSP | TCTL_RTLC | TCTL_CT_LINUX | TCTL_COLD_LINUX;
+            } else if E1000E_CONVENTIONAL {
+                tctl |= TCTL_EN | TCTL_PSP;
+            } else {
+                tctl &= !(0xFF0u32 | 0x003FF000u32);
+                tctl |= TCTL_EN | TCTL_PSP | TCTL_RTLC | TCTL_CT_LINUX | TCTL_COLD_LINUX;
+            }
+            mmio_write(self.base, E1000E_TCTL, tctl);
+            let _ = mmio_read(self.base, E1000E_TCTL);
+        }
+
+        mmio_write(self.base, E1000E_RDTR, 0);
+        mmio_write(self.base, E1000E_RADV, 0);
+        mmio_write(self.base, E1000E_ITR, 0);
+        {
+            let mut ce = mmio_read(self.base, E1000E_CTRL_EXT);
+            ce |= CTRL_EXT_IAME;
+            mmio_write(self.base, E1000E_IAM, 0xFFFF_FFFF);
+            mmio_write(self.base, E1000E_CTRL_EXT, ce);
+            let _ = mmio_read(self.base, E1000E_CTRL_EXT);
+        }
+
+        let rx_ring_pa = self.rx_ring.paddr();
+        mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
+        mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
+        mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
+        self.rx_next_to_clean = 0;
+        self.rx_next_to_use = 0;
+        mmio_write(self.base, E1000E_RDH, 0);
+        let _ = mmio_read(self.base, E1000E_RDH);
+
+        mmio_write(self.base, E1000E_RXCSUM, 0);
+        {
+            let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
+            rfctl |= RFCTL_EXTEN | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
+            mmio_write(self.base, E1000E_RFCTL, rfctl);
+            let rfctl_rd = mmio_read(self.base, E1000E_RFCTL);
+            self.use_extended_descriptors = (rfctl_rd & RFCTL_EXTEN) != 0;
+        }
+        mmio_write(self.base, E1000E_MRQC, 0);
+        mmio_write(self.base, E1000E_VET, 0);
+        self.program_srrctl_rx_queue0();
+
+        if self.is_pch_lpt_or_later() {
+            mmio_write(self.base, E1000E_FCTTV, 0xFFFF);
+            mmio_write(self.base, E1000E_FCRTV, 0xFFFF);
+            mmio_write(self.base, E1000E_FCRTL, 0x05048);
+            mmio_write(self.base, E1000E_FCRTH, 0x05C20);
+        }
+
+        mmio_write(self.base, E1000E_RCTL, self.rctl_rx_bits() & !RCTL_EN);
+        mmio_write(self.base, E1000E_VET, 0);
+        for i in 0..128 {
+            mmio_write(self.base, E1000E_VFTA_BASE + i, 0);
+        }
+        let rctl_v = mmio_read(self.base, E1000E_RCTL);
+        mmio_write(self.base, E1000E_RCTL, rctl_v & !RCTL_VFE);
+
+        mmio_write(self.base, 0x0E30 / 4, 0);
+        let _ = mmio_read(self.base, E1000E_ICR);
+        mmio_write(self.base, E1000E_IMS, IMS_REARM_LINUX);
+
+        crate::klog_warn!(
+            "[e1000e] datapath reprogrammed RDBAL={:#x} TDBAL={:#x} RCTL={:#x} TCTL={:#x}\n",
+            mmio_read(self.base, E1000E_RDBAL),
+            mmio_read(self.base, E1000E_TDBAL),
+            mmio_read(self.base, E1000E_RCTL),
+            mmio_read(self.base, E1000E_TCTL)
+        );
+    }
+
+    /// Arm RX when STATUS.LU is set but the ring was never posted (common on QEMU
+    /// when link comes up after probe, or when send() sets link_up without RX).
+    unsafe fn ensure_rx_armed_if_link_up(&mut self) {
+        if self.rx_link_armed {
+            return;
+        }
+        let status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 {
+            return;
+        }
+        if self.device_id == 0x10d3 {
+            if !self.link_up {
+                self.link_up = true;
+                self.link_speed = Self::speed_mbps_from_status(status);
+                self.link_duplex = status & STATUS_FD != 0;
+                self.config_collision_dist_linux();
+            }
+            self.link_bringup_pending = false;
+            self.enable_rx_after_link();
+            crate::klog_warn!(
+                "[e1000e] ensure_rx: QEMU link up @ {} Mb/s RX armed={}\n",
+                self.link_speed,
+                self.rx_link_armed
+            );
+            return;
+        }
+        if self.is_pch_lpt_or_later() {
+            let _ = self.check_for_link_linux();
+        }
+    }
+
+    /// Heavy PHY/MDIO path — runs from deferred_job after PCI scan (not at boot 84%).
+    /// Order mirrors Linux probe: init_phy_workarounds → reset_hw → init_hw → rings.
+    unsafe fn finish_deferred_phy_init(&mut self) {
+        if !self.phy_init_pending {
+            return;
+        }
+        self.phy_init_pending = false;
+        crate::klog_warn!("[e1000e] deferred linux init (tag={})\n", E1000E_DRIVER_TAG);
+
+        if self.is_pch_lpt_or_later() {
+            self.pch_init_phy_workarounds();
+            self.detect_phy_addr();
+        }
+
+        self.reset_hw_ich8lan_linux(self.is_pch_lpt_or_later());
+        self.init_hw_ich8lan_linux();
+        self.reapply_datapath_after_mac_reset();
+
+        self.link_bringup_pending = true;
+        self.link_bringup_stage = 0;
+        self.stage_start_us = timer_now_as_micros();
+        self.link_bringup_attempts = 0;
+        self.get_link_status = true;
+        self.link_up = false;
+        self.link_speed = 0;
+        self.link_duplex = false;
+        self.rx_link_armed = false;
+        self.pch_try_early_link();
+        if self.link_up && !self.rx_link_armed {
+            crate::klog_warn!("[e1000e] deferred: forcing RX arm after early link\n");
+            self.enable_rx_after_link();
+        }
+    }
+
     /// Abort a stuck MDIC transaction (READY never set — common after BIOS/ME handoff).
     unsafe fn mdic_clear_stuck(&self, log: bool) {
         let mdic = mmio_read(self.base, E1000E_MDIC);
@@ -1472,6 +1906,20 @@ impl E1000eHw {
         fence(Ordering::Acquire);
     }
 
+    /// Descriptor WB on WB pages: double clflush + PCIe write-post settle (SKX+ / NUMA).
+    unsafe fn invalidate_desc_wb_pcie_settle(desc_addr: usize) {
+        core::arch::x86_64::_mm_mfence();
+        Self::clflush_range(desc_addr, 16);
+        core::arch::x86_64::_mm_mfence();
+        for _ in 0..CLFLUSH_PCIE_SETTLE_SPINS {
+            core::hint::spin_loop();
+        }
+        Self::clflush_range(desc_addr, 16);
+        core::arch::x86_64::_mm_mfence();
+        core::arch::x86_64::_mm_lfence();
+        fence(Ordering::Acquire);
+    }
+
     /// Single 64-bit load of the RX write-back region (+8 staterr, +12 length).
     /// lfence immediately before read_volatile drains load buffers after clflush.
     #[inline]
@@ -1483,7 +1931,7 @@ impl E1000eHw {
     /// Invalidate descriptor WB, fence load buffers, then read — no speculative window.
     unsafe fn read_rx_wb_after_sync(&self, desc_addr: usize) -> u64 {
         if self.rx_needs_cache_flush() {
-            Self::invalidate_cpu_cache_for_read(desc_addr, 16);
+            Self::invalidate_desc_wb_pcie_settle(desc_addr);
         } else if !self.dma_uncached {
             core::arch::x86_64::_mm_mfence();
             core::arch::x86_64::_mm_lfence();
@@ -1786,18 +2234,26 @@ impl E1000eHw {
         res
     }
 
-    unsafe fn mdic_read(&self, phy_addr: u8, reg: u32) -> Option<u16> {
+    unsafe fn mdic_read_with_tries(&self, phy_addr: u8, reg: u32, tries: u32) -> Option<u16> {
         let is_pch = self.is_pch_lpt_or_later();
         if is_pch && !self.pch_swflag_acquire() {
             return None;
         }
 
-        let res = self.mdic_read_swheld(phy_addr, reg, MDIC_POLL_TRIES);
+        let res = self.mdic_read_swheld(phy_addr, reg, tries);
 
         if is_pch {
             self.pch_swflag_release();
         }
         res
+    }
+
+    unsafe fn mdic_read(&self, phy_addr: u8, reg: u32) -> Option<u16> {
+        self.mdic_read_with_tries(phy_addr, reg, MDIC_POLL_TRIES)
+    }
+
+    unsafe fn mdic_read_init(&self, phy_addr: u8, reg: u32) -> Option<u16> {
+        self.mdic_read_with_tries(phy_addr, reg, MDIC_INIT_TRIES)
     }
 
     unsafe fn mdic_read_phy_swheld(&self, phy_addr: u8, offset: u32) -> Option<u16> {
@@ -2700,18 +3156,27 @@ impl E1000eHw {
     /// Correct silicon initialization sequence (Intel-mandated order):
     ///   1. Ensure the RX engine is disabled (RCTL.EN = 0) so the hardware is quiet.
     ///   2. Reset software descriptor indices (rx_next_to_clean/use = 0).
-    ///   3. Write RDH = 0 and RDT = 0 while RCTL.EN is clear.
+    ///   3. Write RDH = 0 while RCTL.EN is clear (do not write RDT until step 8).
     ///   4. Re-post descriptors into the ring (reinit_rx_ring) — flushes via clflush
     ///      so physical RAM already contains valid buffer addresses and zero WB fields.
     ///   5. Configure RXDCTL burst parameters (no QUEUE_ENABLE yet).
     ///   6. Enable RXDCTL.QUEUE_ENABLE (PCH-SPT/later) and wait for it to latch.
-    ///   7. Enable RCTL.EN — the DMA engine is now fully armed.
-    ///   8. ONLY THEN advance RDT via alloc_rx_buffers. The shadow register inside
-    ///      the silicon only latches the doorbell correctly once RCTL.EN + QUEUE_ENABLE
-    ///      are both set. Writing RDT while the engine is off desynchronises the
-    ///      internal shadow pointer from the MMIO-visible value, causing the chip to
-    ///      wake up in an undefined state ("no valid descriptors" or instant overflow).
+    ///   7. Enable RCTL.EN and read back until the bit latches.
+    ///   8. First RDT doorbell via alloc_rx_buffers (never while RCTL.EN == 0).
     unsafe fn arm_rx_unit_linux(&mut self) {
+        // Step 0: Ensure ring base registers survived any MAC reset (CTRL_RST clears them).
+        let rdbal = mmio_read(self.base, E1000E_RDBAL);
+        if rdbal == 0 {
+            let rx_ring_pa = self.rx_ring.paddr();
+            mmio_write(self.base, E1000E_RDBAL, rx_ring_pa as u32);
+            mmio_write(self.base, E1000E_RDBAH, (rx_ring_pa >> 32) as u32);
+            mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
+            crate::klog_warn!(
+                "[e1000e] arm_rx: restored RDBAL={:#x}\n",
+                mmio_read(self.base, E1000E_RDBAL)
+            );
+        }
+
         // Step 1: Ensure RX engine is disabled; drain in-flight PCIe DMA before touching rings.
         let rctl = mmio_read(self.base, E1000E_RCTL);
         mmio_write(self.base, E1000E_RCTL, rctl & !RCTL_EN);
@@ -2724,13 +3189,10 @@ impl E1000eHw {
         self.rx_next_to_clean = 0;
         self.rx_next_to_use = 0;
 
-        // Step 3: Write RDH=0, RDT=0 while DMA engine is completely disabled.
-        // Do NOT write a non-zero RDT here — doing so while RCTL.EN=0 desynchronises
-        // the NIC's internal shadow register from the MMIO-visible value.
+        // Step 3: RDH=0 only while the engine is off. Do not touch RDT until RCTL.EN
+        // has latched — writing RDT with EN=0 desyncs the internal shadow pointer.
         mmio_write(self.base, E1000E_RDH, 0);
         let _ = mmio_read(self.base, E1000E_RDH);
-        mmio_write(self.base, E1000E_RDT, 0);
-        let _ = mmio_read(self.base, E1000E_RDT);
 
         // Step 4: Re-initialize and flush descriptors to RAM.
         // reinit_rx_ring writes buffer addresses + zeroes the WB fields for every
@@ -2758,14 +3220,19 @@ impl E1000eHw {
             }
         }
 
-        // Step 7: Enable RX engine (RCTL.EN). The MAC is now running.
+        // Step 7: Enable RX engine (RCTL.EN). Read back before the first RDT doorbell.
         let rctl = self.rctl_rx_bits() | RCTL_EN;
         mmio_write(self.base, E1000E_RCTL, rctl);
-        // Read back to flush the posted write and confirm the bit has latched
-        // in silicon before we advance the RDT doorbell below.
-        let _ = mmio_read(self.base, E1000E_RCTL);
+        let rctl_rb = mmio_read(self.base, E1000E_RCTL);
+        if rctl_rb & RCTL_EN == 0 {
+            crate::klog_warn!(
+                "[e1000e] RCTL.EN did not latch ({:#x}) — deferring RDT doorbell\n",
+                rctl_rb
+            );
+            return;
+        }
 
-        // Step 8: Post buffers conservatively — never doorbell RDT to NUM_RX-1 on first arm.
+        // Step 8: First RDT write only after RCTL.EN is verified (alloc_rx_buffers doorbell).
         let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
         unsafe { self.alloc_rx_buffers(n, true) };
 
@@ -3693,7 +4160,7 @@ impl E1000eHw {
         // Linux netdev: clear TARC speed-mode at 10/100M before TCTL_EN (I219 TX errata).
         let phy = self.active_phy_addr();
         let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
-        self.program_tarc_for_speed(Self::speed_mbps_from_phy_st2(st2));
+        self.program_tarc_with_tctl_gate(Self::speed_mbps_from_phy_st2(st2));
         self.config_collision_dist_linux();
 
         tctl = mmio_read(self.base, E1000E_TCTL);
@@ -4071,28 +4538,16 @@ impl E1000eHw {
         let mpc_delta = unsafe { mmio_read(self.base, E1000E_MPC) };
         if mpc_delta > 0 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
-            if gprc == 0 {
-                warn!(
-                    "[e1000e] MPC +{} but GPRC=0 — CPU cache/RDT race or IMS mute; \
-                     RDH={} RDT={} clean={} post={} uc={}",
-                    mpc_delta,
-                    unsafe { mmio_read(self.base, E1000E_RDH) },
-                    unsafe { mmio_read(self.base, E1000E_RDT) },
-                    self.rx_next_to_clean,
-                    self.rx_post_since_doorbell,
-                    self.dma_uncached
-                );
-            } else {
-                warn!(
-                    "[e1000e] MPC +{} — ring underrun; GPRC={} RDH={} RDT={} clean={} uc={}",
-                    mpc_delta,
-                    gprc,
-                    unsafe { mmio_read(self.base, E1000E_RDH) },
-                    unsafe { mmio_read(self.base, E1000E_RDT) },
-                    self.rx_next_to_clean,
-                    self.dma_uncached
-                );
-            }
+            crate::klog_warn!(
+                "[e1000e] MPC +{} GPRC_snap={} RDH={} RDT={} clean={} post={} uc={}\n",
+                mpc_delta,
+                gprc,
+                unsafe { mmio_read(self.base, E1000E_RDH) },
+                unsafe { mmio_read(self.base, E1000E_RDT) },
+                self.rx_next_to_clean,
+                self.rx_post_since_doorbell,
+                self.dma_uncached
+            );
         }
 
         if !E1000E_LOG_VERBOSE {
@@ -4146,63 +4601,18 @@ impl E1000eHw {
         self.read_mac_from_hw();
         let mut mac_found = self.is_valid_mac();
 
-        self.flush_desc_rings();
-
-        // Ordered shutdown before CTRL_RST (mandatory on I219 after UEFI handoff).
-        if self.is_pch_spt_or_later() {
-            let mut rxdctl = mmio_read(self.base, E1000E_RXDCTL);
-            rxdctl &= !RXDCTL_QUEUE_ENABLE;
-            mmio_write(self.base, E1000E_RXDCTL, rxdctl);
-            let _ = mmio_read(self.base, E1000E_RXDCTL);
-
-            let mut txdctl = mmio_read(self.base, E1000E_TXDCTL);
-            txdctl &= !TXDCTL_QUEUE_ENABLE;
-            mmio_write(self.base, E1000E_TXDCTL, txdctl);
-            let _ = mmio_read(self.base, E1000E_TXDCTL);
-            Self::udelay(2_000);
-        }
-
-        self.stop_rx_tx_engines();
-        self.rx_next_to_clean = 0;
-        self.rx_next_to_use = 0;
-        mmio_write(self.base, E1000E_RDH, 0);
-        let _ = mmio_read(self.base, E1000E_RDH);
-        mmio_write(self.base, E1000E_RDT, 0);
-        let _ = mmio_read(self.base, E1000E_RDT);
+        self.phy_init_pending = self.is_pch_lpt_or_later();
+        self.quiesce_dma_before_reset();
 
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
 
-        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
-        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
-        let mut master_wait = 500u32;
-        while master_wait > 0 {
-            if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
-                break;
-            }
-            Self::udelay(100);
-            master_wait -= 1;
+        if self.phy_init_pending {
+            crate::klog_info!("[e1000e] PCH probe: defer reset_hw to linux init path\n");
+            self.pch_clear_status_phyra_if_set();
+        } else {
+            self.reset_hw_ich8lan_linux(false);
         }
-        if master_wait == 0 {
-            crate::klog_warn!("[e1000e] GIO master still active before CTRL_RST\n");
-        }
-
-        ctrl = mmio_read(self.base, E1000E_CTRL);
-        mmio_write(self.base, E1000E_CTRL, ctrl | CTRL_RST);
-
-        let mut rst_wait = 1_000u32;
-        while rst_wait > 0 {
-            if mmio_read(self.base, E1000E_CTRL) & CTRL_RST == 0 {
-                break;
-            }
-            Self::udelay(100);
-            rst_wait -= 1;
-        }
-        Self::udelay(20_000);
-
-        mmio_write(self.base, E1000E_WUC, 0);
-        mmio_write(self.base, E1000E_WUFC, 0);
-        mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
 
         let mut ready = false;
         let mut status_poll_tries = (STATUS_POLL_US / 1_000).max(1);
@@ -4225,13 +4635,9 @@ impl E1000eHw {
 
         let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | (1 << 28));
-        self.pch_clear_status_phyra_if_set();
-
-        if self.is_pch_lpt_or_later() {
-            self.pch_init_phy_workarounds();
+        if !self.phy_init_pending {
+            self.pch_clear_status_phyra_if_set();
         }
-
-        self.detect_phy_addr();
 
         // 4. Linux Workarounds for I219-V (SPT)
         // NOTE: The is_pch_lpt_or_later() block below (step 6) already applies
@@ -4321,19 +4727,19 @@ impl E1000eHw {
         }
 
         // PCH workarounds required on real I219 even in conventional profile (Linux ich8lan).
-        if self.is_pch_lpt_or_later() {
+        if self.is_pch_lpt_or_later() && !self.phy_init_pending {
             self.pch_apply_silicon_workarounds();
             self.pch_disable_lplu_gbe();
-
-            // Force K1 disabled and lock PLL clock gating to GbE active from the first millisecond of bring-up
             self.pch_disable_k1();
             let phy_addr = self.active_phy_addr();
             let pll_reg = Self::phy_reg_paged(772, 28);
             if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, pll_reg) {
                 phy_reg &= !I217_PLL_CLOCK_GATE_MASK;
-                phy_reg |= 0xFA; // Force GbE clock active
+                phy_reg |= 0xFA;
                 let _ = self.mdic_write_phy(phy_addr, pll_reg, phy_reg);
             }
+        } else if self.is_pch_lpt_or_later() {
+            self.pch_apply_silicon_workarounds();
         }
 
         if !E1000E_CONVENTIONAL && self.is_pch_lpt_or_later() {
@@ -4492,8 +4898,7 @@ impl E1000eHw {
         self.rx_next_to_use = 0;
         mmio_write(self.base, E1000E_RDH, 0);
         let _ = mmio_read(self.base, E1000E_RDH);
-        mmio_write(self.base, E1000E_RDT, 0);
-        let _ = mmio_read(self.base, E1000E_RDT);
+        // RDT is not written here; arm_rx_unit_linux doorbells after RCTL.EN.
 
         mmio_write(self.base, E1000E_RXCSUM, 0);
         // Linux e1000_setup_rctl: EXTEN on all e1000e (required on I219 real HW).
@@ -4527,7 +4932,7 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_FCRTH, 0x05C20);
         }
 
-        if self.is_pch_lpt_or_later() {
+        if self.is_pch_lpt_or_later() && !self.phy_init_pending {
             self.pch_setup_kmrn_copper_link();
         }
 
@@ -4547,7 +4952,9 @@ impl E1000eHw {
         let rctl_v = mmio_read(self.base, E1000E_RCTL);
         mmio_write(self.base, E1000E_RCTL, rctl_v & !RCTL_VFE);
 
-        self.mac_setup_copper_link_linux();
+        if !self.phy_init_pending {
+            self.mac_setup_copper_link_linux();
+        }
 
         // Disable EEE
         mmio_write(self.base, 0x0E30 / 4, 0);
@@ -4555,20 +4962,28 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_ICR);
         mmio_write(self.base, E1000E_IMS, IMS_REARM_LINUX);
 
-        // 13. Link — do not block boot on multi-second PHY settle (BusyBox shell).
-        self.link_bringup_pending = true;
-        self.link_bringup_stage = 0;
-        self.stage_start_us = timer_now_as_micros();
-        self.link_bringup_attempts = 0;
-        self.get_link_status = true;
-        self.link_up = false;
-        self.link_speed = 0;
-        self.link_duplex = false;
-        self.rx_poll_budget = 32;
-        self.rx_link_armed = false;
-        unsafe {
-            self.qemu_finish_link_if_up();
-            self.pch_try_early_link();
+        // 13. Link — PHY MDIO tuning deferred when phy_init_pending.
+        if !self.phy_init_pending {
+            self.link_bringup_pending = true;
+            self.link_bringup_stage = 0;
+            self.stage_start_us = timer_now_as_micros();
+            self.link_bringup_attempts = 0;
+            self.get_link_status = true;
+            self.link_up = false;
+            self.link_speed = 0;
+            self.link_duplex = false;
+            self.rx_poll_budget = 32;
+            self.rx_link_armed = false;
+            unsafe {
+                self.qemu_finish_link_if_up();
+                self.pch_try_early_link();
+            }
+        } else {
+            self.link_bringup_pending = false;
+            self.get_link_status = true;
+            self.link_up = false;
+            self.rx_poll_budget = 32;
+            self.rx_link_armed = false;
         }
         Ok(())
     }
@@ -4593,8 +5008,8 @@ impl E1000eHw {
         if !self.rx_link_armed {
             self.enable_rx_after_link();
         }
-        crate::klog_info!(
-            "[e1000e] QEMU fast link: {} Mb/s {} duplex\n",
+        crate::klog_warn!(
+            "[e1000e] QEMU fast link: {} Mb/s {} duplex RX armed\n",
             self.link_speed,
             if self.link_duplex { "full" } else { "half" }
         );
@@ -4920,7 +5335,7 @@ impl E1000eHw {
         if self.stats.rx_packets == 1 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
             self.last_hw_rx_packets = self.last_hw_rx_packets.wrapping_add(gprc);
-            log::info!(
+            warn!(
                 "[e1000e] first RX frame {} bytes staterr={:#x} GPRC={} RDT={} RDH={}",
                 data.len(),
                 staterr,
@@ -4933,6 +5348,9 @@ impl E1000eHw {
     }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
+        if !self.rx_link_armed {
+            unsafe { self.ensure_rx_armed_if_link_up() };
+        }
         if self.rx_poll_budget == 0 {
             return None;
         }
@@ -5027,6 +5445,9 @@ impl E1000eHw {
                         self.link_up = true;
                         self.link_speed = Self::speed_mbps_from_status(status);
                         self.link_duplex = status & STATUS_FD != 0;
+                        if !self.rx_link_armed {
+                            self.ensure_rx_armed_if_link_up();
+                        }
                     }
                 }
             }
@@ -5156,6 +5577,20 @@ impl E1000eInterface {
             }
             unsafe { hw.deferred_link_bringup_tick() };
         }
+    }
+
+    /// Run PHY workarounds after PCI scan so boot progress is not stuck at 84%.
+    pub fn schedule_deferred_phy_init(&self) {
+        let me = self.clone();
+        crate::utils::deferred_job::push_deferred_job(move || {
+            let mut hw = me.driver.hw.lock();
+            if hw.phy_init_pending {
+                unsafe { hw.finish_deferred_phy_init() };
+            }
+            if hw.link_bringup_pending {
+                me.schedule_link_bringup_poll();
+            }
+        });
     }
 
     /// Queue background link recovery (idle loop / deferred_job drain).
@@ -5352,6 +5787,10 @@ impl NetScheme for E1000eInterface {
         }
 
         self.run_link_bringup_slices(1);
+        {
+            let mut hw = self.driver.hw.lock();
+            unsafe { hw.ensure_rx_armed_if_link_up() };
+        }
         if self.driver.hw.lock().link_bringup_pending {
             self.schedule_link_bringup_poll();
         }
@@ -5639,6 +6078,7 @@ pub fn init(
         last_hw_rx_packets: 0,
         rx_diag_counter: 0,
         rx_poll_budget: 32,
+        phy_init_pending: false,
         link_bringup_pending: false,
         link_bringup_attempts: 0,
         link_bringup_stage: 0,
@@ -5673,8 +6113,8 @@ pub fn init(
     } else {
         "down"
     };
-    crate::klog_info!(
-        "e1000e: {} {:#x}:{:#x} {} tag={} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+    crate::klog_warn!(
+        "e1000e: {} {:#x}:{:#x} {} tag={} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rx_armed={}\n",
         name,
         pci.id.vendor_id,
         pci.id.device_id,
@@ -5685,7 +6125,8 @@ pub fn init(
         mac_bytes[2],
         mac_bytes[3],
         mac_bytes[4],
-        mac_bytes[5]
+        mac_bytes[5],
+        hw.rx_link_armed
     );
     let hw_arc = Arc::new(Mutex::new(hw));
     let driver = E1000eDriver { hw: hw_arc.clone() };
@@ -5810,7 +6251,11 @@ impl PciDriver for E1000eDriverPci {
         let vector = irq.map(|idx| idx + 32).unwrap_or(0);
         let iface = init(name, dev, vector, vaddr, 0)?;
         let iface_arc = Arc::new(iface);
-        if iface_arc.driver.hw.lock().link_bringup_pending {
+        let needs_phy = iface_arc.driver.hw.lock().phy_init_pending;
+        let needs_link = iface_arc.driver.hw.lock().link_bringup_pending;
+        if needs_phy {
+            iface_arc.schedule_deferred_phy_init();
+        } else if needs_link {
             iface_arc.schedule_link_bringup_poll();
         }
         if vector != 0 {
