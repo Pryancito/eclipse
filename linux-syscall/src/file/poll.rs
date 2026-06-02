@@ -65,7 +65,11 @@ impl Syscall<'_> {
                     .polls
                     .iter()
                     .any(|p| linux_object::net::fd_is_socket(p.fd));
-                linux_object::net::io_wait_tick(watch_net);
+                let watch_interactive = self
+                    .polls
+                    .iter()
+                    .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
 
@@ -247,7 +251,13 @@ impl Syscall<'_> {
                             || self.write_fds.contains(FileDesc::from(fd))
                             || self.err_fds.contains(FileDesc::from(fd)))
                 });
-                linux_object::net::io_wait_tick(watch_net);
+                let watch_interactive = (0..self.nfds).any(|fd| {
+                    linux_object::net::fd_is_interactive(FileDesc::from(fd))
+                        && (self.read_fds.contains(FileDesc::from(fd))
+                            || self.write_fds.contains(FileDesc::from(fd))
+                            || self.err_fds.contains(FileDesc::from(fd)))
+                });
+                linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;

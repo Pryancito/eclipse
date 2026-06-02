@@ -119,7 +119,10 @@ impl Epoll {
             let watch_net = interest_list
                 .keys()
                 .any(|fd| crate::net::fd_is_socket(*fd));
-            crate::net::io_wait_tick(watch_net);
+            let watch_interactive = interest_list
+                .keys()
+                .any(|fd| crate::net::fd_is_interactive(*fd));
+            crate::net::io_wait_tick(watch_net, watch_interactive);
             let mut events = Vec::new();
             for (fd, event) in interest_list {
                 if let Ok(file) = process.get_file_like(fd) {

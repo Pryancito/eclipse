@@ -20,7 +20,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-link-relax";
+const E1000E_DRIVER_TAG: &str = "e1000e-rx-doorbell";
 /// Retry AMT open if SWFLAG/MDIO still blocked (CSME can take seconds after DRV_LOAD).
 const E1000E_AMT_OPEN_RETRY_US: u64 = 30_000_000;
 /// Per deferred job: wait at most this long for SWFLAG (chunked — PS/2/USB stay responsive).
@@ -1943,9 +1943,31 @@ impl E1000eHw {
             return;
         }
         if self.is_pch_lpt_or_later() {
-            // Never MDIO/SWFLAG from poll — watchdog or LSC only (Linux model).
+            if self.try_rx_arm_pending_amt(status) {
+                return;
+            }
             let _ = self.apply_link_from_status(status);
         }
+    }
+
+    /// I219+AMT: do not wait for `nic_open_done` / SWFLAG open — arm RX from STATUS.LU.
+    unsafe fn try_rx_arm_pending_amt(&mut self, status: u32) -> bool {
+        if self.rx_link_armed || !self.has_amt() || self.nic_open_done {
+            return false;
+        }
+        if status & STATUS_LU == 0 {
+            return false;
+        }
+        crate::klog_warn!(
+            "[e1000e] AMT open pending — arm RX from STATUS (LU=1 open_done={})\n",
+            self.nic_open_done
+        );
+        let _ = self.apply_link_from_status(status);
+        if !self.rx_link_armed {
+            self.link_up = true;
+            self.enable_rx_after_link();
+        }
+        self.rx_link_armed
     }
 
     #[inline]
@@ -2889,24 +2911,34 @@ impl E1000eHw {
             && Self::phy_resolve_speed_duplex_st2(st2).is_some()
     }
 
-    /// Copper L1 ready — do not require BMSR ANEG alone (I219 often has STATUS.LU first).
+    /// Copper L1 ready — on PCH trust STATUS.LU first (BMSR often lags I219).
     #[inline]
     unsafe fn phy_copper_ready_for_link_up(&self, bmsr: u16, status: u32, st2: u16) -> bool {
+        if self.is_pch_lpt_or_later() && status & STATUS_LU != 0 {
+            return true;
+        }
         if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 {
-            return false;
+            return self.mdio_unavailable() && status & STATUS_LU != 0;
         }
         if (bmsr & BMSR_ANEG_COMPLETE) != 0 {
             return true;
         }
-        if self.is_pch_lpt_or_later() {
-            if status & STATUS_LU != 0 {
-                return true;
-            }
-            if Self::phy_reg26_speed_resolved(st2) {
-                return true;
-            }
+        if Self::phy_reg26_speed_resolved(st2) {
+            return true;
         }
         self.mdio_unavailable() && status & STATUS_LU != 0
+    }
+
+    /// STATUS.LU cleared — cable out or partner down.
+    unsafe fn pch_note_status_link_down(&mut self) {
+        if !self.link_up {
+            return;
+        }
+        crate::klog_warn!("[e1000e] link down (STATUS.LU clear)\n");
+        self.link_up = false;
+        self.link_speed = 0;
+        self.link_duplex = false;
+        self.rx_link_armed = false;
     }
 
     /// Decode reg26 / `HV_M_STATUS` for logs (I219 PHY status).
@@ -3733,6 +3765,8 @@ impl E1000eHw {
             write_volatile(core::ptr::addr_of_mut!((*desc_ptr).addr), self.rx_buf_paddr(i));
             Self::clear_rx_desc_wb(desc_ptr);
         }
+        // Descriptor clflush is batched in rx_doorbell_if_needed (full cache lines only).
+        // Per-descriptor clflush here corrupts adjacent descriptors on the same 64 B line.
         if self.rx_needs_cache_flush() {
             Self::invalidate_cpu_cache_for_read(self.rx_buf_vaddr(i), BUF_SIZE);
         }
@@ -3799,7 +3833,8 @@ impl E1000eHw {
     ///   7. Enable RXDCTL.QUEUE_ENABLE (PCH-SPT/later) and wait for it to latch.
     ///   8. Post buffers and doorbell RDT while RCTL.EN is still clear (ring not empty).
     ///   9. Enable RCTL.EN last — I219 PCH ignores post-EN RDT if EN latched on empty ring.
-    unsafe fn arm_rx_unit_linux(&mut self) {
+    /// Returns false if the ring was not posted or RCTL.EN did not latch (do not set rx_link_armed).
+    unsafe fn arm_rx_unit_linux(&mut self) -> bool {
         // Step 0: Ensure ring base registers survived any MAC reset (CTRL_RST clears them).
         let rdbal = mmio_read(self.base, E1000E_RDBAL);
         if rdbal == 0 {
@@ -3860,18 +3895,37 @@ impl E1000eHw {
 
         // Step 8: Post buffers + RDT doorbell with RX engine still off (non-empty ring).
         let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
-        unsafe { self.alloc_rx_buffers(n, true) };
+        if n == 0 {
+            crate::klog_warn!("[e1000e] arm_rx: no free RX descriptors\n");
+            return false;
+        }
+        self.alloc_rx_buffers(n, true);
+
+        let rdh = mmio_read(self.base, E1000E_RDH);
+        let rdt = mmio_read(self.base, E1000E_RDT);
+        if rdh == rdt {
+            crate::klog_warn!(
+                "[e1000e] arm_rx: empty ring RDH=RDT={} after posting {} buffers (uc={})\n",
+                rdh,
+                n,
+                self.dma_uncached
+            );
+            return false;
+        }
 
         // Step 9: Enable RX engine after the shadow tail sees posted descriptors.
         let rctl = self.rctl_rx_bits() | RCTL_EN;
+        if rctl & RCTL_BAM == 0 {
+            crate::klog_warn!("[e1000e] arm_rx: RCTL.BAM clear — DHCP/broadcast would fail\n");
+        }
         mmio_write(self.base, E1000E_RCTL, rctl);
         let rctl_rb = mmio_read(self.base, E1000E_RCTL);
         if rctl_rb & RCTL_EN == 0 {
-            e1000e_wlog!(
-                "[e1000e] RCTL.EN did not latch ({:#x}) — RX may stay down\n",
+            crate::klog_warn!(
+                "[e1000e] RCTL.EN did not latch ({:#x}) — RX down\n",
                 rctl_rb
             );
-            return;
+            return false;
         }
 
         self.kick_rx_writeback();
@@ -3884,6 +3938,7 @@ impl E1000eHw {
             mmio_read(self.base, E1000E_RDT),
             mmio_read(self.base, E1000E_RDH)
         );
+        true
     }
 
 
@@ -4316,11 +4371,11 @@ impl E1000eHw {
     /// Also extend when desc_len already matches ip_tot but the DHCP magic cookie is missing
     /// (stale tail / false length in WB).
     unsafe fn recover_rx_copy_len(&self, buf_vaddr: usize, desc_len: usize) -> usize {
-        if !self.rx_needs_cache_invalidation() {
-            return desc_len;
-        }
+        let needs_inv = self.rx_needs_cache_invalidation();
         let inv = desc_len.max(512).min(BUF_SIZE);
-        Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, inv);
+        if needs_inv {
+            Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, inv);
+        }
         let peek = core::slice::from_raw_parts(buf_vaddr as *const u8, inv);
         if peek.len() < 34 {
             return desc_len;
@@ -4347,7 +4402,9 @@ impl E1000eHw {
                 return desc_len;
             }
             if frame_need > desc_len {
-                Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, frame_need.min(BUF_SIZE));
+                if needs_inv {
+                    Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, frame_need.min(BUF_SIZE));
+                }
                 if Self::eth_ipv6_frame_complete(core::slice::from_raw_parts(
                     buf_vaddr as *const u8,
                     frame_need.min(BUF_SIZE),
@@ -4386,7 +4443,9 @@ impl E1000eHw {
                     frame_need
                 );
             } else {
-                Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, BUF_SIZE);
+                if needs_inv {
+                    Self::invalidate_rx_frame_buffer_for_cpu(buf_vaddr, BUF_SIZE);
+                }
                 let full = core::slice::from_raw_parts(buf_vaddr as *const u8, BUF_SIZE);
                 if is_bootp && Self::peek_dhcp_magic_cookie(full, l2, ihl) {
                     copy_len = frame_need;
@@ -4621,8 +4680,19 @@ impl E1000eHw {
     unsafe fn verify_rx_engine(&self) {
         let rctl = mmio_read(self.base, E1000E_RCTL);
         let rxdctl = mmio_read(self.base, E1000E_RXDCTL);
+        let rdh = mmio_read(self.base, E1000E_RDH);
+        let rdt = mmio_read(self.base, E1000E_RDT);
         if rctl & RCTL_EN == 0 {
             e1000e_wlog!("[e1000e] RX engine: RCTL.EN clear (RCTL={:#x})\n", rctl);
+        }
+        if rctl & RCTL_BAM == 0 {
+            e1000e_wlog!("[e1000e] RX engine: RCTL.BAM clear — no broadcast/DHCP\n");
+        }
+        if rdh == rdt && rctl & RCTL_EN != 0 {
+            e1000e_wlog!(
+                "[e1000e] RX engine: RDH==RDT={} with RCTL.EN — DMA paused\n",
+                rdh
+            );
         }
         if self.is_pch_spt_or_later() && rxdctl & RXDCTL_QUEUE_ENABLE == 0 {
             e1000e_wlog!("[e1000e] RX engine: RXDCTL.QUEUE_ENABLE clear ({:#x})\n", rxdctl);
@@ -4902,9 +4972,24 @@ impl E1000eHw {
 
         self.hw_roc_gprc_last = 0;
         self.hw_roc_mpc_last = 0;
-        self.rx_link_armed = true;
-        self.log_rx_path_regs("RX armed");
-        self.log_post_link_counters("post-RX-arm");
+        let rctl = mmio_read(self.base, E1000E_RCTL);
+        let rdh = mmio_read(self.base, E1000E_RDH);
+        let rdt = mmio_read(self.base, E1000E_RDT);
+        let armed = (rctl & RCTL_EN != 0) && rdh != rdt;
+        self.rx_link_armed = armed;
+        if armed {
+            self.log_rx_path_regs("RX armed");
+            self.log_post_link_counters("post-RX-arm");
+        } else {
+            crate::klog_warn!(
+                "[e1000e] RX arm incomplete RCTL={:#x} RDH={} RDT={} BAM={} uc={}\n",
+                rctl,
+                rdh,
+                rdt,
+                rctl & RCTL_BAM != 0,
+                self.dma_uncached
+            );
+        }
     }
 
 
@@ -5187,10 +5272,19 @@ impl E1000eHw {
         let now = timer_now_as_micros();
         self.link_watchdog_next_us = now.saturating_add(E1000E_WATCHDOG_PERIOD_US);
 
+        let status = mmio_read(self.base, E1000E_STATUS);
+        if status & STATUS_LU == 0 {
+            self.pch_note_status_link_down();
+        } else if self.has_amt() && !self.nic_open_done {
+            let _ = self.try_rx_arm_pending_amt(status);
+        }
+
         if self.is_pch_lpt_or_later() {
             self.pch_try_early_link();
         }
 
+        // Linux watchdog always re-checks PHY; do not stick with get_link_status=false after one pass.
+        self.get_link_status = true;
         let _ = self.e1000e_has_link();
 
         if self.link_up && !self.rx_link_armed {
@@ -6500,6 +6594,29 @@ impl NetScheme for E1000eInterface {
         Ok(())
     }
     
+    fn refresh_link(&self) -> DeviceResult {
+        let status = unsafe { mmio_read(self.base, E1000E_STATUS) };
+        crate::klog_warn!(
+            "[e1000e] admin refresh {} STATUS={:#x} LU={} tag={}\n",
+            self.name,
+            status,
+            status & STATUS_LU != 0,
+            E1000E_DRIVER_TAG
+        );
+        {
+            let mut hw = self.driver.hw.lock();
+            hw.get_link_status = true;
+        }
+        self.schedule_amt_open();
+        self.schedule_watchdog(true);
+        Ok(())
+    }
+
+    fn link_carrier_up(&self) -> bool {
+        let hw = self.driver.hw.lock();
+        hw.link_up || unsafe { mmio_read(self.base, E1000E_STATUS) & STATUS_LU != 0 }
+    }
+
     fn poll(&self) -> DeviceResult {
         if self.driver.hw.lock().phy_init_pending {
             self.schedule_deferred_phy_init();

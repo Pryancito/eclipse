@@ -71,4 +71,12 @@ pub trait NetScheme: Scheme {
         Ok(())
     }
     fn poll(&self) -> DeviceResult;
+    /// SIOCSIFFLAGS / admin up — drivers may re-probe link (default no-op).
+    fn refresh_link(&self) -> DeviceResult {
+        Ok(())
+    }
+    /// Physical carrier up (for SIOCGIFFLAGS IFF_LOWER_UP / RUNNING).
+    fn link_carrier_up(&self) -> bool {
+        true
+    }
 }

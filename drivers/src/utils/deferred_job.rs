@@ -66,6 +66,13 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
 /// Should be called from a non-atomic context (e.g. the kernel idle loop or a
 /// timer tick handler).
 pub fn drain_deferred_jobs() {
+    drain_deferred_jobs_max(MAX_JOBS_PER_DRAIN);
+}
+
+/// Run at most `max` deferred jobs (requeue the rest). Use before NIC poll when
+/// stdin/HID must stay responsive.
+pub fn drain_deferred_jobs_max(max: usize) {
+    let cap = max.max(1).min(MAX_DEFERRED_JOBS);
     let flag = intr_get();
     if flag {
         intr_off();
@@ -77,7 +84,7 @@ pub fn drain_deferred_jobs() {
     if flag {
         intr_on();
     }
-    let run = jobs.len().min(MAX_JOBS_PER_DRAIN);
+    let run = jobs.len().min(cap);
     for job in jobs.drain(..run) {
         job();
     }

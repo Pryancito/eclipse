@@ -749,6 +749,8 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
 const NET_POLL_MIN_INTERVAL_US: u64 = 32_000;
 /// Deferred IRQ drain when epoll/poll is not waiting on sockets.
 const DEFERRED_IDLE_INTERVAL_US: u64 = 20_000;
+/// Max NIC deferred jobs per I/O wait tick when sockets are watched (HID first).
+const DEFERRED_NET_JOBS_PER_TICK: usize = 1;
 
 static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
 static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
@@ -757,6 +759,13 @@ static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
 #[inline]
 pub fn fd_is_socket(fd: FileDesc) -> bool {
     usize::from(fd) >= SOCKET_FD
+}
+
+/// True for stdin, TTY, `/dev/input/*`, etc. (prioritize HID over NIC in wait loops).
+#[inline]
+pub fn fd_is_interactive(fd: FileDesc) -> bool {
+    let raw: i32 = fd.into();
+    (raw as usize) < SOCKET_FD && raw >= 0
 }
 
 #[inline]
@@ -782,17 +791,28 @@ pub fn poll_ifaces_throttled() {
     poll_ifaces();
 }
 
-/// One tick of an I/O wait loop: avoid full NIC poll when only stdin/TTY is watched.
-pub fn io_wait_tick(watch_net: bool) {
+/// One tick of an I/O wait loop: HID/USB first, then throttled NIC / deferred work.
+///
+/// When `watch_interactive` and not `watch_net`, skips [`poll_ifaces`] so shell/TTY
+/// loops are not blocked by smoltcp/NIC work.
+pub fn io_wait_tick(watch_net: bool, watch_interactive: bool) {
+    kernel_hal::input_poll::poll_input_devices();
     if watch_net {
-        kernel_hal::deferred_job::drain_deferred_jobs();
+        kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
         poll_ifaces_throttled();
+    } else if watch_interactive {
+        let now = mono_us();
+        let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
+            LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
+            kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
+        }
     } else {
         let now = mono_us();
         let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
         if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
             LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
-            kernel_hal::deferred_job::drain_deferred_jobs();
+            kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
         }
     }
 }
@@ -1405,13 +1425,17 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let flags = if ifname == "loopback" {
+            let mut flags = if ifname == "loopback" {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
             } else {
-                // IFF_LOWER_UP signals that the physical link is up.
-                // udhcpc and ifconfig check this before attempting DHCP.
-                IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST | IFF_LOWER_UP
+                IFF_UP | IFF_BROADCAST | IFF_MULTICAST
             };
+            if ifname != "loopback" {
+                let iface = iface_by_name(ifname)?;
+                if iface.link_carrier_up() {
+                    flags |= IFF_RUNNING | IFF_LOWER_UP;
+                }
+            }
             ifr.ifr_ifru = IfReqUnion {
                 flags: flags as i16,
             };
@@ -1419,7 +1443,23 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
         }
 
         SIOCSIFFLAGS => {
-            // Ignore for now, just return success
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &*(arg1 as *const IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            #[allow(unsafe_code)]
+            let new_flags = unsafe { ifr.ifr_ifru.flags } as u32;
+            warn!(
+                "SIOCSIFFLAGS: {} flags={:#x} (admin {})",
+                ifname,
+                new_flags,
+                if new_flags & IFF_UP != 0 {
+                    "up"
+                } else {
+                    "down"
+                }
+            );
+            let iface = iface_by_name(ifname)?;
+            let _ = iface.refresh_link();
             Ok(0)
         }
 

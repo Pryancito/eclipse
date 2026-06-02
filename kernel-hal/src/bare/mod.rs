@@ -15,6 +15,7 @@ cfg_if! {
 }
 
 pub mod boot;
+pub mod input_poll;
 pub mod mem;
 pub mod net;
 pub mod thread;
