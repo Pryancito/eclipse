@@ -115,10 +115,12 @@ impl Epoll {
             if let Err(e) = crate::process::check_signals() {
                 return Err(e);
             }
-            kernel_hal::deferred_job::drain_deferred_jobs();
-            crate::net::poll_ifaces();
-            let mut events = Vec::new();
             let interest_list = self.inner.lock().interest_list.clone();
+            let watch_net = interest_list
+                .keys()
+                .any(|fd| crate::net::fd_is_socket(*fd));
+            crate::net::io_wait_tick(watch_net);
+            let mut events = Vec::new();
             for (fd, event) in interest_list {
                 if let Ok(file) = process.get_file_like(fd) {
                     let interest = PollEvents::from_bits_truncate(event.events as u16);

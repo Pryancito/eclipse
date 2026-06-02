@@ -4,7 +4,8 @@
 /// missing documentation
 #[macro_use]
 pub mod socket_address;
-use crate::fs::{FileLike, PollEvents};
+use crate::fs::{FileDesc, FileLike, PollEvents};
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{LxError, LxResult};
 use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
 use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
@@ -742,6 +743,58 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
         other => other,
     };
     IpEndpoint::new(addr, 0)
+}
+
+/// Min interval between full [`poll_ifaces`] (~125 Hz cap — keeps PS/2 IRQ responsive).
+const NET_POLL_MIN_INTERVAL_US: u64 = 8_000;
+/// Deferred IRQ drain when epoll/poll is not waiting on sockets.
+const DEFERRED_IDLE_INTERVAL_US: u64 = 20_000;
+
+static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
+static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
+
+/// True for socket / packet / netlink fds (see [`SOCKET_FD`]).
+#[inline]
+pub fn fd_is_socket(fd: FileDesc) -> bool {
+    usize::from(fd) >= SOCKET_FD
+}
+
+#[inline]
+fn mono_us() -> u64 {
+    kernel_hal::timer::timer_now().as_micros() as u64
+}
+
+fn net_poll_interval_elapsed() -> bool {
+    let now = mono_us();
+    let last = LAST_NET_POLL_US.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < NET_POLL_MIN_INTERVAL_US {
+        return false;
+    }
+    LAST_NET_POLL_US.store(now, Ordering::Relaxed);
+    true
+}
+
+/// Throttled NIC poll for multiplex wait loops (epoll/poll/select).
+pub fn poll_ifaces_throttled() {
+    if !net_poll_interval_elapsed() {
+        return;
+    }
+    poll_ifaces();
+}
+
+/// One tick of an I/O wait loop: avoid full NIC poll when only stdin/TTY is watched.
+pub fn io_wait_tick(watch_net: bool) {
+    if watch_net {
+        kernel_hal::deferred_job::drain_deferred_jobs();
+        poll_ifaces_throttled();
+    } else {
+        let now = mono_us();
+        let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
+            LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
+            kernel_hal::deferred_job::drain_deferred_jobs();
+        }
+    }
 }
 
 /// miss doc

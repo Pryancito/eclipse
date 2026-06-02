@@ -57,8 +57,11 @@ impl Syscall<'_> {
                 if let Err(e) = linux_object::process::check_signals() {
                     return Poll::Ready(Err(e));
                 }
-                kernel_hal::deferred_job::drain_deferred_jobs();
-                linux_object::net::poll_ifaces();
+                let watch_net = self
+                    .polls
+                    .iter()
+                    .any(|p| linux_object::net::fd_is_socket(p.fd));
+                linux_object::net::io_wait_tick(watch_net);
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
 
@@ -221,6 +224,7 @@ impl Syscall<'_> {
             read_fds: &'a mut FdSet,
             write_fds: &'a mut FdSet,
             err_fds: &'a mut FdSet,
+            nfds: usize,
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
@@ -233,8 +237,13 @@ impl Syscall<'_> {
                 if let Err(e) = linux_object::process::check_signals() {
                     return Poll::Ready(Err(e));
                 }
-                kernel_hal::deferred_job::drain_deferred_jobs();
-                linux_object::net::poll_ifaces();
+                let watch_net = (0..self.nfds).any(|fd| {
+                    fd >= linux_object::net::SOCKET_FD
+                        && (self.read_fds.contains(FileDesc::from(fd))
+                            || self.write_fds.contains(FileDesc::from(fd))
+                            || self.err_fds.contains(FileDesc::from(fd)))
+                });
+                linux_object::net::io_wait_tick(watch_net);
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;
@@ -295,6 +304,7 @@ impl Syscall<'_> {
             read_fds: &mut read_fds,
             write_fds: &mut write_fds,
             err_fds: &mut err_fds,
+            nfds,
             timeout_msecs,
             begin_time,
             syscall: self,
@@ -340,7 +350,7 @@ impl Syscall<'_> {
         timeout: isize,
         _sigmask: usize,
     ) -> SysResult {
-        info!("epoll_pwait: epfd={:?}, maxevents={}, timeout={}", epfd, maxevents, timeout);
+        log::trace!("epoll_pwait: epfd={:?}, maxevents={}, timeout={}", epfd, maxevents, timeout);
         let proc = self.linux_process();
         let epoll_file = proc.get_file_like(epfd)?;
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;

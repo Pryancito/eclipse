@@ -20,7 +20,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-status-fallback";
+const E1000E_DRIVER_TAG: &str = "e1000e-rx-wb-fix";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -1966,7 +1966,7 @@ impl E1000eHw {
         read_volatile((desc_addr + 8) as *const u64)
     }
 
-    /// Invalidate descriptor WB, fence load buffers, then read — no speculative window.
+    /// First read after posting: invalidate stale WB cache lines (I219 real silicon).
     unsafe fn read_rx_wb_after_sync(&self, desc_addr: usize) -> u64 {
         if self.rx_needs_cache_flush() {
             Self::invalidate_desc_wb_pcie_settle(desc_addr);
@@ -1976,6 +1976,19 @@ impl E1000eHw {
             fence(Ordering::Acquire);
         } else {
             Self::dma_rmb_after_device();
+        }
+        Self::read_rx_wb_u64(desc_addr)
+    }
+
+    /// Retry reads: no clflush (NIC may be writing WB); lfence before load drains speculation.
+    #[inline]
+    unsafe fn read_rx_wb_retry(&self, desc_addr: usize) -> u64 {
+        if self.dma_uncached {
+            Self::dma_rmb_after_device();
+        } else {
+            core::arch::x86_64::_mm_mfence();
+            core::arch::x86_64::_mm_lfence();
+            fence(Ordering::Acquire);
         }
         Self::read_rx_wb_u64(desc_addr)
     }
@@ -2950,6 +2963,18 @@ impl E1000eHw {
             speed_mbps,
             if verify & TARC0_SPEED_MODE != 0 { "on" } else { "off" }
         );
+    }
+
+    /// I219 TX errata: TARC0_SPEED_MODE + K1 off at 10/100M before any post-link TX.
+    unsafe fn configure_link_tx_path(&self, speed_mbps: u32) {
+        if self.is_pch_lpt_or_later() && speed_mbps < SPEED_1000 {
+            self.pch_disable_k1();
+        }
+        if self.is_pch_spt_or_later() {
+            self.program_tarc_with_tctl_gate(speed_mbps);
+        } else {
+            self.program_tarc_for_speed(speed_mbps);
+        }
     }
 
     /// Linux netdev link-up: program TARC while TCTL is off, then re-enable TCTL.
@@ -4362,11 +4387,8 @@ impl E1000eHw {
                         self.pch_spt_ptr_gap_workaround(phy, speed);
                     }
                 }
-                self.program_tarc_with_tctl_gate(speed);
+                self.configure_link_tx_path(speed);
                 self.config_collision_dist_linux();
-                if speed < SPEED_1000 {
-                    self.pch_disable_k1();
-                }
             } else {
                 self.config_collision_dist_linux();
             }
@@ -4486,16 +4508,9 @@ impl E1000eHw {
                 self.program_link_tipg_emi_linux(phy, speed, duplex_full);
                 self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
                 
-                // Errata Intel crucial: El bit TARC0_SPEED_MODE debe apagarse a 10/100M, 
-                // de lo contrario el motor de transmisión se congela (TX DMA lockup).
-                self.program_tarc_with_tctl_gate(speed);
+                self.configure_link_tx_path(speed);
                 self.config_collision_dist_linux();
 
-                // Deshabilitar K1 (Power Management) a 10/100M para evitar oscilaciones cíclicas del enlace.
-                if speed < SPEED_1000 {
-                    self.pch_disable_k1();
-                }
-                
                 self.phy_setup_82577_copper(phy);
 
                 if self.is_pch_spt_or_later() {
@@ -5260,14 +5275,26 @@ impl E1000eHw {
     /// this bug; real silicon does.
     unsafe fn desc_done(&self, desc_addr: usize) -> Option<(u32, usize)> {
         for attempt in 0..RX_DESC_WB_SETTLE_TRIES {
-            let wb = unsafe { self.read_rx_wb_after_sync(desc_addr) };
+            let wb = unsafe {
+                if attempt == 0 {
+                    self.read_rx_wb_after_sync(desc_addr)
+                } else {
+                    self.read_rx_wb_retry(desc_addr)
+                }
+            };
             let parsed = if self.use_extended_descriptors {
                 Self::parse_rx_wb_ext_u64(wb)
             } else {
                 Self::parse_rx_wb_legacy_u64(wb)
             };
             match parsed {
-                None => return None,
+                None => {
+                    if attempt + 1 < RX_DESC_WB_SETTLE_TRIES {
+                        Self::udelay(RX_DESC_WB_SETTLE_US as u64);
+                        continue;
+                    }
+                    return None;
+                }
                 Some((staterr, len)) if len > 0 && len <= BUF_SIZE => return Some((staterr, len)),
                 Some((staterr, len)) if attempt + 1 < RX_DESC_WB_SETTLE_TRIES => {
                     log::trace!(
@@ -5291,6 +5318,16 @@ impl E1000eHw {
         None
     }
 
+    /// Return descriptor to hardware only after payload is copied out of the DMA buffer.
+    unsafe fn recycle_rx_descriptor(&mut self, i: usize, desc_addr: usize) {
+        write_volatile((desc_addr + 8) as *mut u64, 0);
+        if self.rx_needs_cache_flush() {
+            Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
+        }
+        self.rx_next_to_clean = (i + 1) % NUM_RX;
+        self.alloc_rx_buffers(1, false);
+    }
+
     /// Nudge the MAC to write back completed RX descriptors (Linux RDTR_FPD path).
     unsafe fn kick_rx_writeback(&self) {
         mmio_write(self.base, E1000E_RDTR, RDTR_FPD);
@@ -5309,20 +5346,6 @@ impl E1000eHw {
               unsafe { mmio_read(self.base, E1000E_RDH) },
               unsafe { mmio_read(self.base, E1000E_RDT) });
 
-        // Recycle descriptor regardless of EOP/error status.
-        let recycle = |hw: &mut Self| {
-            unsafe {
-                write_volatile((desc_addr + 8) as *mut u64, 0);
-                if hw.rx_needs_cache_flush() {
-                    Self::dma_wbinv_range(desc_addr, core::mem::size_of::<RxDesc>());
-                }
-            }
-            hw.rx_next_to_clean = (i + 1) % NUM_RX;
-            unsafe {
-                hw.alloc_rx_buffers(1, false);
-            }
-        };
-
         if len == 0 || len > BUF_SIZE {
             // Descriptor is done but length is implausible — discard and recycle.
             log::debug!(
@@ -5330,7 +5353,7 @@ impl E1000eHw {
                 i, len, staterr
             );
             self.rx_sg_reset();
-            recycle(self);
+            unsafe { self.recycle_rx_descriptor(i, desc_addr) };
             return None;
         }
 
@@ -5366,10 +5389,10 @@ impl E1000eHw {
                     frag.len()
                 );
                 if !self.rx_sg_append(&frag) {
-                    recycle(self);
+                    unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                     return None;
                 }
-                recycle(self);
+                unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                 return None;
             } else if !self.rx_sg_buf.is_empty() {
                 log::trace!(
@@ -5378,13 +5401,13 @@ impl E1000eHw {
                     frag.len()
                 );
                 if !self.rx_sg_append(&frag) {
-                    recycle(self);
+                    unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                     return None;
                 }
-                recycle(self);
+                unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                 return None;
             } else {
-                recycle(self);
+                unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                 return None;
             }
         } else if !self.rx_sg_buf.is_empty() {
@@ -5414,7 +5437,7 @@ impl E1000eHw {
                         i,
                         assembled.len()
                     );
-                    recycle(self);
+                    unsafe { self.recycle_rx_descriptor(i, desc_addr) };
                     return None;
                 }
             }
@@ -5466,11 +5489,11 @@ impl E1000eHw {
                 i,
                 data.len()
             );
-            recycle(self);
+            unsafe { self.recycle_rx_descriptor(i, desc_addr) };
             return None;
         }
 
-        recycle(self);
+        unsafe { self.recycle_rx_descriptor(i, desc_addr) };
 
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += data.len() as u64;

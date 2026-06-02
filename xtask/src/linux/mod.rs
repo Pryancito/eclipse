@@ -115,6 +115,7 @@ impl LinuxRootfs {
             Self::write_resolv_conf(&etc);
         }
         Self::write_profile(&etc);
+        Self::write_eclipse_net_dhcp(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -364,17 +365,84 @@ impl LinuxRootfs {
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
-              if [ -x /bin/udhcpc ]; then\n\
-                  echo \"Iniciando udhcpc (DHCPv4)...\r\n\"\n\
-                  /bin/udhcpc -i eth0 >/dev/null 2>&1 &\n\
-              fi\n\
-              sleep 2\n\
-              if [ -x /bin/udhcpc6 ]; then\n\
-                  echo \"Iniciando udhcpc6 (DHCPv6)...\r\n\"\n\
-                  /bin/udhcpc6 -i eth0 >/dev/null 2>&1 &\n\
+              if [ -x /usr/sbin/eclipse-net-dhcp.sh ]; then\n\
+                  /usr/sbin/eclipse-net-dhcp.sh &\n\
               fi\n",
         )
         .unwrap();
+    }
+
+    /// DHCPv4/v6 solo si hay NIC real (no solo loopback) y el stack expone IPv4/IPv6.
+    fn write_eclipse_net_dhcp(root: &Path) {
+        let sbin = root.join("usr/sbin");
+        fs::create_dir_all(&sbin).unwrap();
+        let script = sbin.join("eclipse-net-dhcp.sh");
+        fs::write(
+            &script,
+            br#"#!/bin/sh
+# Eclipse OS: arranque condicional de udhcpc / udhcpc6
+# - NIC: primera interfaz distinta de lo en /proc/net/dev
+# - IPv4: existe la NIC y /bin/udhcpc
+# - IPv6: la NIC aparece en /proc/net/if_inet6 (link-local u otra)
+
+eclipse_first_netdev() {
+    [ -r /proc/net/dev ] || return 1
+    eth=$(awk 'NR>2 {
+        n=$1; gsub(/:/,"",n)
+        if (n != "lo" && n ~ /^eth/) { print n; exit }
+    }' /proc/net/dev 2>/dev/null)
+    if [ -n "$eth" ]; then
+        echo "$eth"
+        return 0
+    fi
+    awk 'NR>2 {
+        n=$1; gsub(/:/,"",n)
+        if (n != "lo") { print n; exit }
+    }' /proc/net/dev 2>/dev/null
+}
+
+eclipse_ipv6_possible() {
+    iface="$1"
+    [ -n "$iface" ] || return 1
+    [ -r /proc/net/if_inet6 ] || return 1
+    # Esperar a que el kernel publique fe80::/64 (init IPv6 en Eclipse).
+    i=0
+    while [ "$i" -lt 25 ]; do
+        if grep -qw "$iface" /proc/net/if_inet6 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
+IFACE=$(eclipse_first_netdev)
+if [ -z "$IFACE" ]; then
+    exit 0
+fi
+
+echo "eclipse-net: interfaz $IFACE detectada"
+
+if [ -x /bin/udhcpc ]; then
+    echo "Iniciando udhcpc (DHCPv4) en $IFACE..."
+    /bin/udhcpc -i "$IFACE" -q -b >/dev/null 2>&1
+fi
+
+if [ -x /bin/udhcpc6 ] && eclipse_ipv6_possible "$IFACE"; then
+    echo "Iniciando udhcpc6 (DHCPv6) en $IFACE..."
+    /bin/udhcpc6 -i "$IFACE" -q -b >/dev/null 2>&1
+elif [ -x /bin/udhcpc6 ]; then
+    echo "eclipse-net: IPv6 no disponible en $IFACE (sin entrada en /proc/net/if_inet6)"
+fi
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     const CA_PEM_URL: &str = "https://curl.se/ca/cacert.pem";
