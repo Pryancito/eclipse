@@ -20,7 +20,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rx-late-link";
+const E1000E_DRIVER_TAG: &str = "e1000e-status-fallback";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -37,7 +37,12 @@ const TARC0_CB_MULTIQ_2_REQ: u32 = 0x2000_0000;
 const TARC0_SPEED_MODE: u32 = 1 << 21;
 
 /// PHY work per background job — keep small so USB/HID are not starved.
-const LINK_BRINGUP_SLICES_PER_JOB: u32 = 2;
+const LINK_BRINGUP_SLICES_PER_JOB: u32 = 8;
+/// Async bringup stage timeouts (must sum to well under multi-second hangs).
+const BRINGUP_STAGE1_TIMEOUT_US: u64 = 800_000;
+const BRINGUP_STAGE2_TIMEOUT_US: u64 = 400_000;
+const BRINGUP_STAGE3_TIMEOUT_US: u64 = 800_000;
+const BRINGUP_STAGE4_TIMEOUT_US: u64 = 400_000;
 
 /// Max PHY polling per `poll()` — avoids holding `hw` lock for seconds (deadlocks
 /// NIC IRQ on single-CPU and starves USB/HID when `poll_ifaces` runs from epoll).
@@ -592,6 +597,8 @@ pub struct E1000eHw {
     rx_poll_budget: u8,
     /// PHY workarounds (ULP/MDIO/LANPHYPC) deferred past PCI scan (boot progress 84%).
     phy_init_pending: bool,
+    /// Chunk index for [`E1000eHw::deferred_init_step`] (0..=2 while pending).
+    deferred_init_step: u8,
     /// Full PHY/link tuning deferred to `poll()` so PCI probe does not block the shell.
     link_bringup_pending: bool,
     link_bringup_attempts: u8,
@@ -627,6 +634,8 @@ pub struct E1000eHw {
     srrctl_absent: bool,
     /// RX/TX rings mapped UC — skip clflush on descriptor WB paths.
     dma_uncached: bool,
+    /// MDIO/SWFLAG unavailable — trust STATUS.LU for link (common on I219 after ULP).
+    mdio_degraded: bool,
 }
 
 impl E1000eHw {
@@ -1133,14 +1142,22 @@ impl E1000eHw {
         self.mdic_clear_stuck(false);
     }
 
-    /// After LANPHYPC: SWFLAG + ungate MDIO (BIOS often leaves GATE_PHY_CFG set).
+    /// After LANPHYPC: ungate MDIO bus (works even when SWFLAG is temporarily busy).
     unsafe fn pch_mdio_prepare_after_power(&self) {
-        if !self.pch_swflag_acquire() {
-            crate::klog_warn!("[e1000e] MDIO prep: SWFLAG unavailable\n");
-            return;
+        let mut ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+        if ext & EXTCNF_CTRL_GATE_PHY_CFG != 0 {
+            ext &= !EXTCNF_CTRL_GATE_PHY_CFG;
+            mmio_write(self.base, E1000E_EXTCNF_CTRL, ext);
+            let _ = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+            Self::udelay(1_000);
         }
-        self.pch_mdio_unlock_swheld();
-        self.pch_swflag_release();
+        self.mdic_clear_stuck(true);
+        if self.pch_swflag_acquire() {
+            self.pch_mdio_unlock_swheld();
+            self.pch_swflag_release();
+        } else {
+            crate::klog_warn!("[e1000e] MDIO prep: SWFLAG unavailable (STATUS fallback may apply)\n");
+        }
     }
 
     unsafe fn pch_try_h2me_ulp_clear(&self) -> bool {
@@ -1747,37 +1764,58 @@ impl E1000eHw {
         }
     }
 
-    /// Heavy PHY/MDIO path — runs from deferred_job after PCI scan (not at boot 84%).
-    /// Order mirrors Linux probe: init_phy_workarounds → reset_hw → init_hw → rings.
-    unsafe fn finish_deferred_phy_init(&mut self) {
+    /// One chunk of deferred PCH init — returns `true` when another job is needed.
+    /// Never blocks boot: each step is a separate deferred_job.
+    unsafe fn deferred_init_step(&mut self) -> bool {
         if !self.phy_init_pending {
-            return;
+            return false;
         }
-        self.phy_init_pending = false;
-        crate::klog_warn!("[e1000e] deferred linux init (tag={})\n", E1000E_DRIVER_TAG);
-
-        if self.is_pch_lpt_or_later() {
-            self.pch_init_phy_workarounds();
-            self.detect_phy_addr();
-        }
-
-        self.reset_hw_ich8lan_linux(self.is_pch_lpt_or_later());
-        self.init_hw_ich8lan_linux();
-        self.reapply_datapath_after_mac_reset();
-
-        self.link_bringup_pending = true;
-        self.link_bringup_stage = 0;
-        self.stage_start_us = timer_now_as_micros();
-        self.link_bringup_attempts = 0;
-        self.get_link_status = true;
-        self.link_up = false;
-        self.link_speed = 0;
-        self.link_duplex = false;
-        self.rx_link_armed = false;
-        self.pch_try_early_link();
-        if self.link_up && !self.rx_link_armed {
-            crate::klog_warn!("[e1000e] deferred: forcing RX arm after early link\n");
-            self.enable_rx_after_link();
+        match self.deferred_init_step {
+            0 => {
+                crate::klog_warn!(
+                    "[e1000e] deferred init 1/3: PHY workarounds (tag={})\n",
+                    E1000E_DRIVER_TAG
+                );
+                if self.is_pch_lpt_or_later() {
+                    self.pch_init_phy_workarounds();
+                    self.detect_phy_addr();
+                }
+                self.deferred_init_step = 1;
+                true
+            }
+            1 => {
+                crate::klog_warn!("[e1000e] deferred init 2/3: MAC reset + datapath\n");
+                self.reset_hw_ich8lan_linux(self.is_pch_lpt_or_later());
+                self.init_hw_ich8lan_linux();
+                self.reapply_datapath_after_mac_reset();
+                self.pch_mdio_prepare_after_power();
+                self.deferred_init_step = 2;
+                true
+            }
+            2 => {
+                crate::klog_warn!("[e1000e] deferred init 3/3: link bringup\n");
+                self.phy_init_pending = false;
+                self.pch_mdio_prepare_after_power();
+                self.link_bringup_pending = true;
+                self.link_bringup_stage = 0;
+                self.stage_start_us = timer_now_as_micros();
+                self.link_bringup_attempts = 0;
+                self.get_link_status = true;
+                self.link_up = false;
+                self.link_speed = 0;
+                self.link_duplex = false;
+                self.rx_link_armed = false;
+                self.pch_try_early_link();
+                if self.link_up && !self.rx_link_armed {
+                    crate::klog_warn!("[e1000e] deferred: RX arm after early link\n");
+                    self.enable_rx_after_link();
+                }
+                false
+            }
+            _ => {
+                self.phy_init_pending = false;
+                false
+            }
         }
     }
 
@@ -2043,8 +2081,8 @@ impl E1000eHw {
 
     /// Linux `e1000_acquire_swflag_ich8lan`: wait for FW, then claim SWFLAG.
     unsafe fn pch_swflag_acquire(&self) -> bool {
-        for attempt in 0..2 {
-            for _ in 0..1000 {
+        for attempt in 0..5 {
+            for _ in 0..2000 {
                 let v = mmio_read(self.base, E1000E_EXTCNF_CTRL);
                 if v & EXTCNF_CTRL_SWFLAG == 0 {
                     break;
@@ -2053,13 +2091,14 @@ impl E1000eHw {
             }
             let mut v = mmio_read(self.base, E1000E_EXTCNF_CTRL);
             if v & EXTCNF_CTRL_SWFLAG != 0 {
-                if attempt == 0 {
+                if attempt < 4 {
                     crate::klog_warn!(
-                        "[e1000e] EXTCNF SWFLAG busy ({:#x}) — force release\n",
-                        v
+                        "[e1000e] EXTCNF SWFLAG busy ({:#x}) — force release (try {})\n",
+                        v,
+                        attempt + 1
                     );
                     self.pch_swflag_force_release();
-                    Self::udelay(1_000);
+                    Self::udelay(2_000);
                     continue;
                 }
                 crate::klog_warn!(
@@ -2070,7 +2109,7 @@ impl E1000eHw {
             }
             v |= EXTCNF_CTRL_SWFLAG;
             mmio_write(self.base, E1000E_EXTCNF_CTRL, v);
-            for _ in 0..200 {
+            for _ in 0..500 {
                 let r = mmio_read(self.base, E1000E_EXTCNF_CTRL);
                 if r & EXTCNF_CTRL_SWFLAG != 0 {
                     return true;
@@ -4278,6 +4317,70 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_FCRTH, 0);
     }
 
+    /// Bring MAC/RX up from STATUS when MDIO is silent (I219 ULP/SWFLAG handoff).
+    unsafe fn apply_link_from_status(&mut self, status: u32) -> bool {
+        if status & STATUS_LU == 0 {
+            return false;
+        }
+        let is_pch = self.is_pch_lpt_or_later();
+        let phy = self.active_phy_addr();
+        let (speed, duplex_full, src) = self.resolve_link_speed_duplex_linux(phy, 0);
+
+        if !self.link_up || self.link_speed != speed || self.link_duplex != duplex_full {
+            let was_down = !self.link_up;
+            if self.mdio_degraded {
+                crate::klog_warn!(
+                    "[e1000e] Link is Up @ {} Mbps {} Duplex (STATUS fallback — MDIO silent)\n",
+                    speed,
+                    if duplex_full { "Full" } else { "Half" }
+                );
+            } else {
+                crate::klog_info!(
+                    "[e1000e] Link is Up @ {} Mbps {} Duplex (Validated via {})\n",
+                    speed,
+                    if duplex_full { "Full" } else { "Half" },
+                    src
+                );
+            }
+
+            self.link_up = true;
+            self.link_speed = speed;
+            self.link_duplex = duplex_full;
+
+            if is_pch {
+                self.mac_apply_link_up_autoneg();
+            } else {
+                self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
+            }
+
+            if is_pch {
+                if !self.mdio_degraded {
+                    self.program_link_tipg_emi_linux(phy, speed, duplex_full);
+                    self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
+                    self.phy_setup_82577_copper(phy);
+                    if self.is_pch_spt_or_later() {
+                        self.pch_spt_ptr_gap_workaround(phy, speed);
+                    }
+                }
+                self.program_tarc_with_tctl_gate(speed);
+                self.config_collision_dist_linux();
+                if speed < SPEED_1000 {
+                    self.pch_disable_k1();
+                }
+            } else {
+                self.config_collision_dist_linux();
+            }
+
+            self.configure_flow_control_after_link(speed, duplex_full);
+
+            if was_down || !self.rx_link_armed {
+                self.enable_rx_after_link();
+            }
+        }
+
+        true
+    }
+
     /// Versión optimizada basada en el watchdog in-tree de Linux:
     /// Resuelve de forma segura el enlace físico y evita bucles infinitos de AN.
     unsafe fn check_for_link_linux(&mut self) -> bool {
@@ -4292,12 +4395,21 @@ impl E1000eHw {
             self.phy_addr = phy;
         }
 
+        let status = mmio_read(self.base, E1000E_STATUS);
+        if is_pch && status & STATUS_LU != 0 && self.mdio_degraded {
+            return self.apply_link_from_status(status);
+        }
+
         // 1. Leer BMSR dos veces para limpiar el bit pegajoso de "Latch-Low".
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
-        
-        // Manejo de cable desconectado o hardware ausente
+
+        // MDIO silent but MAC reports carrier — common on I219 when SWFLAG/ULP blocks MDIO.
         if bmsr == 0 || bmsr == 0xFFFF {
+            if is_pch && status & STATUS_LU != 0 {
+                self.mdio_degraded = true;
+                return self.apply_link_from_status(status);
+            }
             if self.link_up {
                 crate::klog_warn!("[e1000e] Link is Down (PHY read failure or detached)\n");
                 self.link_up = false;
@@ -4307,6 +4419,8 @@ impl E1000eHw {
             }
             return false;
         }
+
+        self.mdio_degraded = false;
 
         let link_up = (bmsr & 0x0004) != 0;
 
@@ -4431,7 +4545,7 @@ impl E1000eHw {
                 self.link_bringup_pending = false;
                 self.link_bringup_stage = 0;
                 self.link_bringup_attempts = 0;
-            } else if elapsed_us >= 1_500_000 {
+            } else if elapsed_us >= BRINGUP_STAGE4_TIMEOUT_US {
                 crate::klog_warn!("[e1000e] Bringup: El enlace se cayó antes de estabilizarse. Reintentando...\n");
                 self.link_bringup_stage = 0;
                 self.stage_start_us = now;
@@ -4466,6 +4580,15 @@ impl E1000eHw {
 
         // Si excedemos el número máximo de intentos duros sin portadora, apagamos la bandera para no saturar el kernel
         if self.link_bringup_stage == 0 && self.link_bringup_attempts >= 3 {
+            let status = mmio_read(self.base, E1000E_STATUS);
+            if status & STATUS_LU != 0 {
+                self.mdio_degraded = true;
+                if self.apply_link_from_status(status) {
+                    self.link_bringup_pending = false;
+                    self.link_bringup_stage = 0;
+                    return;
+                }
+            }
             self.link_bringup_pending = false;
             self.link_bringup_stage = 0;
             self.link_up = false;
@@ -4487,9 +4610,9 @@ impl E1000eHw {
                 self.stage_start_us = now;
             }
             1 => {
-                // Timeout del Estado 1 (4 segundos esperando portadora inicial con configuraciones base)
-                if elapsed_us >= 4_000_000 {
-                    e1000e_vlog!("[e1000e] Bringup PCH: Timeout en Stage 1 (4s). Forzando sincronización de registros MAC/PHY.\n");
+                // Timeout del Estado 1 — espera portadora inicial con configuraciones base.
+                if elapsed_us >= BRINGUP_STAGE1_TIMEOUT_US {
+                    e1000e_vlog!("[e1000e] Bringup PCH: Timeout en Stage 1. Forzando sincronización MAC/PHY.\n");
                     self.mac_setup_copper_link_linux();
                     self.pch_kick_autoneg_mdio();
                     self.link_bringup_stage = 2;
@@ -4497,13 +4620,18 @@ impl E1000eHw {
                 }
             }
             2 => {
-                // Timeout del Estado 2 (2 segundos adicionales). Reset eléctrico vía PHY_RST.
-                // No llamamos toggle_lanphypc() extra ni pch_prepare_mdio_bus() completo:
-                //   - pch_issue_phy_reset() ya espera LAN_INIT_DONE y descompuerta el PHY.
-                //   - detect_phy_addr() llama toggle_lanphypc() internamente si MDIO sigue mudo.
-                // Llamar pch_prepare_mdio_bus() aquí causa doble toggle y re-espera inútil
-                // de LAN_INIT_DONE (ya fue limpiado por pch_phy_reset_complete).
-                if elapsed_us >= 2_000_000 {
+                // Timeout del Estado 2 — reset eléctrico vía PHY_RST (skip if STATUS up + MDIO dead).
+                if elapsed_us >= BRINGUP_STAGE2_TIMEOUT_US {
+                    let status = mmio_read(self.base, E1000E_STATUS);
+                    if status & STATUS_LU != 0 {
+                        self.mdio_degraded = true;
+                        if self.apply_link_from_status(status) {
+                            self.link_bringup_pending = false;
+                            self.link_bringup_stage = 0;
+                            self.link_bringup_attempts = 0;
+                            return;
+                        }
+                    }
                     crate::klog_warn!(
                         "[e1000e] Bringup PCH: Timeout en Stage 2. PHY_RST.\n"
                     );
@@ -4518,8 +4646,8 @@ impl E1000eHw {
                 }
             }
             3 => {
-                // Timeout del Estado 3 (4 segundos esperando estabilización tras el reset eléctrico). Si falla, reinicia el ciclo completo.
-                if elapsed_us >= 4_000_000 {
+                // Timeout del Estado 3 — estabilización tras reset eléctrico; reinicia ciclo si falla.
+                if elapsed_us >= BRINGUP_STAGE3_TIMEOUT_US {
                     e1000e_vlog!("[e1000e] Bringup PCH: Reset de hardware sin respuesta. Reiniciando secuencia...\n");
                     self.link_bringup_stage = 0;
                     self.stage_start_us = now;
@@ -5030,7 +5158,21 @@ impl E1000eHw {
         let phy = self.active_phy_addr();
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
-        if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 || (bmsr & BMSR_ANEG_COMPLETE) == 0 {
+        if bmsr == 0 || bmsr == 0xFFFF {
+            self.mdio_degraded = true;
+            if self.apply_link_from_status(status) {
+                self.link_bringup_pending = false;
+                self.link_bringup_stage = 0;
+                self.link_bringup_attempts = 0;
+                crate::klog_warn!(
+                    "[e1000e] PCH early link (STATUS): {} Mb/s {} duplex\n",
+                    self.link_speed,
+                    if self.link_duplex { "full" } else { "half" }
+                );
+            }
+            return;
+        }
+        if (bmsr & 0x0004) == 0 || (bmsr & BMSR_ANEG_COMPLETE) == 0 {
             return;
         }
         if self.check_for_link_linux() {
@@ -5579,15 +5721,24 @@ impl E1000eInterface {
         }
     }
 
-    /// Run PHY workarounds after PCI scan so boot progress is not stuck at 84%.
+    /// Queue the next chunk of PCH PHY/MAC init (background — never at boot 84%/87%).
     pub fn schedule_deferred_phy_init(&self) {
+        if !self.driver.hw.lock().phy_init_pending {
+            return;
+        }
         let me = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            let mut hw = me.driver.hw.lock();
-            if hw.phy_init_pending {
-                unsafe { hw.finish_deferred_phy_init() };
-            }
-            if hw.link_bringup_pending {
+            let more = {
+                let mut hw = me.driver.hw.lock();
+                if hw.phy_init_pending {
+                    unsafe { hw.deferred_init_step() }
+                } else {
+                    false
+                }
+            };
+            if more {
+                me.schedule_deferred_phy_init();
+            } else if me.driver.hw.lock().link_bringup_pending {
                 me.schedule_link_bringup_poll();
             }
         });
@@ -5753,6 +5904,9 @@ impl NetScheme for E1000eInterface {
     }
     
     fn poll(&self) -> DeviceResult {
+        if self.driver.hw.lock().phy_init_pending {
+            self.schedule_deferred_phy_init();
+        }
         let ts = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
 
@@ -6079,6 +6233,7 @@ pub fn init(
         rx_diag_counter: 0,
         rx_poll_budget: 32,
         phy_init_pending: false,
+        deferred_init_step: 0,
         link_bringup_pending: false,
         link_bringup_attempts: 0,
         link_bringup_stage: 0,
@@ -6096,6 +6251,7 @@ pub fn init(
         rx_post_since_doorbell: 0,
         srrctl_absent: false,
         dma_uncached: false,
+        mdio_degraded: false,
     };
 
     hw.setup_dma_uncached();

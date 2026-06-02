@@ -137,7 +137,8 @@ pub(super) fn init() -> DeviceResult {
 
         boot_progress(84);
         let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
-        zcore_drivers::utils::deferred_job::drain_deferred_jobs();
+        // Do NOT drain deferred jobs here — e1000e PHY/MAC init runs in the idle
+        // loop / NIC poll path so boot progress is not blocked at 84% or 87%.
         boot_progress(87);
         for d in pci_devs.into_iter() {
             drivers::add_device(d);
