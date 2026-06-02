@@ -19,7 +19,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250519-rx-icmp-gw";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-hardening";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -484,6 +484,7 @@ struct RxDesc {
     addr:     u64,  // buffer physical address (written by driver)
     reserved: u64,  // written back by HW: staterr[31:0] @ +8, length[47:32] @ +12
 }
+const _RX_DESC_SIZE_OK: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
 // Extended RX write-back layout (RFCTL_EXTEN=1, I219 default):
 //   +0  addr     (driver → HW)
@@ -503,6 +504,10 @@ struct TxDesc {
     css:     u8,
     special: u16,
 }
+const _TX_DESC_SIZE_OK: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+
+/// Intel placeholder MAC when NVM/RAL reads fail — link may still work but filters are wrong.
+const E1000E_PLACEHOLDER_MAC: [u8; 6] = [0x00, 0x0E, 0x10, 0x00, 0x0E, 0x00];
 
 // ---------------------------------------------------------------------------
 // DMA allocation helpers (thin wrappers over the kernel C FFI)
@@ -595,24 +600,42 @@ impl E1000eHw {
     // Kumeran (KMRN) register access (ICH8/PCH specific)
     // -----------------------------------------------------------------------
 
-    /// Busy-wait for `us` microseconds using the driver timer.
-    /// `timer_now_as_micros` is imported from `super` (drivers/src/net/mod.rs).
+    /// Busy-wait for `us` microseconds — timer when calibrated, spin budget when not.
+    /// On bare metal the APIC/HPET may not tick during early PCI probe; a pure
+    /// timer loop then exits in microseconds (10M spins ≈ 2 ms @ 4.5 GHz) and
+    /// breaks MDIO/PHY timing. Require `us * SPINS_PER_US` iterations as a floor.
     fn udelay(us: u64) {
+        if us == 0 {
+            return;
+        }
+        const SPINS_PER_US: u64 = 400;
+        const MAX_SPINS: u64 = 400_000_000;
+        let min_spins = us.saturating_mul(SPINS_PER_US);
         let t0 = timer_now_as_micros();
-        // Hard spin guard: at most ~10M iterations (~10ms at 1GHz) regardless of
-        // the requested delay. This prevents infinite loops on bare-metal when the
-        // TSC-based timer hasn't started yet, without burning seconds of CPU time.
-        // The guard activates only when the timer is genuinely broken; otherwise
-        // the timer-based condition fires first and we exit normally.
-        const MAX_SPINS: u64 = 10_000_000;
         let mut spins = 0u64;
-        while timer_now_as_micros().wrapping_sub(t0) < us {
+        loop {
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);
+            let elapsed = timer_now_as_micros().wrapping_sub(t0);
+            if elapsed >= us {
+                break;
+            }
+            if spins >= min_spins {
+                if elapsed == 0 && us > 100 {
+                    log::trace!(
+                        "[e1000e] udelay({}us) via spin floor (timer stuck at {})",
+                        us,
+                        t0
+                    );
+                }
+                break;
+            }
             if spins >= MAX_SPINS {
                 warn!(
-                    "[e1000e] udelay fallback hit ({}us, timer did not advance fast enough)",
-                    us
+                    "[e1000e] udelay cap hit ({}us, {} spins, elapsed {}us)",
+                    us,
+                    spins,
+                    elapsed
                 );
                 break;
             }
@@ -690,6 +713,78 @@ impl E1000eHw {
         !all_zeros && !all_fs
     }
 
+    fn is_placeholder_mac(&self) -> bool {
+        self.mac == E1000E_PLACEHOLDER_MAC
+    }
+
+    fn warn_mac_diagnostic(&self) {
+        if self.is_placeholder_mac() {
+            crate::klog_warn!(
+                "[e1000e] MAC is {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — NVM/RAL read failed; \
+                 check ULP/ME timeout and mdic timing\n",
+                self.mac[0],
+                self.mac[1],
+                self.mac[2],
+                self.mac[3],
+                self.mac[4],
+                self.mac[5]
+            );
+        }
+    }
+
+    /// Verify descriptor stride and ring geometry before programming RDLEN/TDLEN.
+    fn validate_dma_ring_layout(&self) -> bool {
+        const DESC_BYTES: usize = 16;
+        if size_of::<RxDesc>() != DESC_BYTES || size_of::<TxDesc>() != DESC_BYTES {
+            crate::klog_err!(
+                "[e1000e] descriptor size mismatch Rx={} Tx={} (expected {})\n",
+                size_of::<RxDesc>(),
+                size_of::<TxDesc>(),
+                DESC_BYTES
+            );
+            return false;
+        }
+
+        let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
+        let rx_base_v = rx_ring as usize;
+        let rx_base_p = self.rx_ring.paddr();
+        if (rx_base_v | rx_base_p) & (DESC_BYTES - 1) != 0 {
+            crate::klog_warn!(
+                "[e1000e] RX ring base v={:#x} p={:#x} not 16-byte aligned\n",
+                rx_base_v,
+                rx_base_p
+            );
+        }
+
+        for i in 1..NUM_RX {
+            let prev = unsafe { rx_ring.add(i - 1) as usize };
+            let curr = unsafe { rx_ring.add(i) as usize };
+            if curr - prev != DESC_BYTES {
+                crate::klog_err!(
+                    "[e1000e] RX ring stride {} != {} at slot {} — RDLEN would corrupt DMA\n",
+                    curr - prev,
+                    DESC_BYTES,
+                    i
+                );
+                return false;
+            }
+        }
+
+        let rdlen = (NUM_RX * DESC_BYTES) as u32;
+        let tdlen = (NUM_TX * DESC_BYTES) as u32;
+        crate::klog_info!(
+            "[e1000e] DMA layout: NUM_RX={} RDLEN={} rx_paddr={:#x} NUM_TX={} TDLEN={} tx_paddr={:#x} uc={}\n",
+            NUM_RX,
+            rdlen,
+            rx_base_p,
+            NUM_TX,
+            tdlen,
+            self.tx_ring.paddr(),
+            self.dma_uncached
+        );
+        true
+    }
+
     /// Returns true for PCH-LPT (I217/I218) and later integrated NICs.
     fn is_pch_lpt_or_later(&self) -> bool {
         self.is_pch_spt_or_later() || matches!(self.device_id,
@@ -729,8 +824,9 @@ impl E1000eHw {
         if ok {
             crate::klog_info!("[e1000e] DMA rings/buffers mapped uncacheable\n");
         } else {
-            crate::klog_warn!("[e1000e] UC DMA remap failed — using clflush fallback\n");
+            crate::klog_warn!("[e1000e] UC DMA remap failed — using clflush+lfence fallback\n");
         }
+        let _ = self.validate_dma_ring_layout();
     }
 
     /// Returns true for PCH-SPT (I219) and later silicon.
@@ -820,6 +916,64 @@ impl E1000eHw {
         Self::udelay(50_000); // 50 ms, matches Linux e1000_toggle_lanphypc_via_cmdc
     }
 
+    unsafe fn disable_ulp_software(&self) {
+        self.toggle_lanphypc();
+
+        let phy_addr = self.active_phy_addr();
+        let cv_smb_ctrl = Self::phy_reg_paged(769, 23);
+        if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, cv_smb_ctrl) {
+            phy_reg &= !0x0001; // Clear CV_SMB_CTRL_FORCE_SMBUS
+            self.mdic_write_phy(phy_addr, cv_smb_ctrl, phy_reg);
+        } else {
+            // MAC might be in PCIe mode. Force to SMBus mode in MAC:
+            let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+            ctrl_ext |= 0x00000800; // E1000_CTRL_EXT_FORCE_SMBUS (bit 11)
+            mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+            Self::udelay(50_000); // 50 ms
+
+            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, cv_smb_ctrl) {
+                phy_reg &= !0x0001;
+                self.mdic_write_phy(phy_addr, cv_smb_ctrl, phy_reg);
+            }
+        }
+
+        // Unforce SMBus mode in MAC
+        let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        ctrl_ext &= !0x00000800; // Clear E1000_CTRL_EXT_FORCE_SMBUS
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+
+        // Re-Enable K1 in PHY:
+        let hv_pm_ctrl = Self::phy_reg_paged(770, 17);
+        if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, hv_pm_ctrl) {
+            phy_reg |= 0x4000; // Set HV_PM_CTRL_K1_ENABLE
+            self.mdic_write_phy(phy_addr, hv_pm_ctrl, phy_reg);
+        }
+
+        // Clear ULP enabled configuration
+        let i218_ulp_config1 = Self::phy_reg_paged(779, 16);
+        if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, i218_ulp_config1) {
+            phy_reg &= !0x1D74;
+            self.mdic_write_phy(phy_addr, i218_ulp_config1, phy_reg);
+
+            // Commit ULP changes by starting auto ULP configuration:
+            phy_reg |= 0x0001; // I218_ULP_CONFIG1_START
+            self.mdic_write_phy(phy_addr, i218_ulp_config1, phy_reg);
+        }
+
+        // Clear Disable SMBus Release on PERST# in MAC:
+        let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
+        fextnvm7 &= !FEXTNVM7_DISABLE_SMB_PERST;
+        mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
+
+        // Soft reset the PHY
+        if let Some(bmcr) = self.mdic_read(phy_addr, MII_BMCR) {
+            self.mdic_write(phy_addr, MII_BMCR, bmcr | 0x8000); // Set BMCR_RESET
+            Self::udelay(50_000);
+        }
+
+        crate::klog_info!("[e1000e] ULP disabled via software path (toggle_lanphypc)\n");
+    }
+
     unsafe fn disable_ulp(&self) {
         if !self.is_pch_lpt_or_later() {
             return;
@@ -836,14 +990,18 @@ impl E1000eHw {
 
             // Poll up to 2.5 seconds (250 ticks of 10ms) for ME to clear ULP_CFG_DONE (FWSM bit 10, 0x400)
             let mut i = 0;
+            let mut me_ok = false;
             while (mmio_read(self.base, E1000E_FWSM) & 0x0400) != 0 {
                 if i >= 250 {
-                    crate::klog_warn!("[e1000e] ULP config done timeout (2.5s) waiting for ME!\n");
+                    crate::klog_warn!(
+                        "[e1000e] ULP ME timeout (2.5s) — ME may be locked; running software ULP path\n"
+                    );
                     break;
                 }
                 i += 1;
                 Self::udelay(10_000);
             }
+            me_ok = i < 250;
 
             // Clear ENFORCE_SETTINGS
             let mut h2me = mmio_read(self.base, E1000E_H2ME);
@@ -851,64 +1009,14 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_H2ME, h2me);
             let _ = mmio_read(self.base, E1000E_H2ME);
 
-            crate::klog_info!("[e1000e] ULP disabled via Intel ME in {} ms\n", i * 10);
+            if me_ok {
+                crate::klog_info!("[e1000e] ULP disabled via Intel ME in {} ms\n", i * 10);
+            } else {
+                self.disable_ulp_software();
+            }
         } else {
             // No ME firmware active: software ULP disable path
-            self.toggle_lanphypc();
-
-            let phy_addr = self.active_phy_addr();
-            let cv_smb_ctrl = Self::phy_reg_paged(769, 23);
-            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, cv_smb_ctrl) {
-                phy_reg &= !0x0001; // Clear CV_SMB_CTRL_FORCE_SMBUS
-                self.mdic_write_phy(phy_addr, cv_smb_ctrl, phy_reg);
-            } else {
-                // MAC might be in PCIe mode. Force to SMBus mode in MAC:
-                let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
-                ctrl_ext |= 0x00000800; // E1000_CTRL_EXT_FORCE_SMBUS (bit 11)
-                mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
-                Self::udelay(50_000); // 50 ms
-
-                if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, cv_smb_ctrl) {
-                    phy_reg &= !0x0001;
-                    self.mdic_write_phy(phy_addr, cv_smb_ctrl, phy_reg);
-                }
-            }
-
-            // Unforce SMBus mode in MAC
-            let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
-            ctrl_ext &= !0x00000800; // Clear E1000_CTRL_EXT_FORCE_SMBUS
-            mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
-
-            // Re-Enable K1 in PHY:
-            let hv_pm_ctrl = Self::phy_reg_paged(770, 17);
-            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, hv_pm_ctrl) {
-                phy_reg |= 0x4000; // Set HV_PM_CTRL_K1_ENABLE
-                self.mdic_write_phy(phy_addr, hv_pm_ctrl, phy_reg);
-            }
-
-            // Clear ULP enabled configuration
-            let i218_ulp_config1 = Self::phy_reg_paged(779, 16);
-            if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, i218_ulp_config1) {
-                phy_reg &= !0x1D74;
-                self.mdic_write_phy(phy_addr, i218_ulp_config1, phy_reg);
-
-                // Commit ULP changes by starting auto ULP configuration:
-                phy_reg |= 0x0001; // I218_ULP_CONFIG1_START
-                self.mdic_write_phy(phy_addr, i218_ulp_config1, phy_reg);
-            }
-
-            // Clear Disable SMBus Release on PERST# in MAC:
-            let mut fextnvm7 = mmio_read(self.base, E1000E_FEXTNVM7);
-            fextnvm7 &= !FEXTNVM7_DISABLE_SMB_PERST;
-            mmio_write(self.base, E1000E_FEXTNVM7, fextnvm7);
-
-            // Soft reset the PHY
-            if let Some(bmcr) = self.mdic_read(phy_addr, MII_BMCR) {
-                self.mdic_write(phy_addr, MII_BMCR, bmcr | 0x8000); // Set BMCR_RESET
-                Self::udelay(50_000);
-            }
-
-            crate::klog_info!("[e1000e] ULP disabled via software fallback path\n");
+            self.disable_ulp_software();
         }
     }
 
@@ -959,6 +1067,7 @@ impl E1000eHw {
             p += 64;
         }
         core::arch::x86_64::_mm_mfence();
+        core::arch::x86_64::_mm_lfence();
         fence(Ordering::SeqCst);
     }
 
@@ -974,6 +1083,7 @@ impl E1000eHw {
         if len == 0 {
             return;
         }
+        core::arch::x86_64::_mm_mfence();
         let mut p = vaddr & !63;
         let end = vaddr.saturating_add(len);
         while p < end {
@@ -981,6 +1091,7 @@ impl E1000eHw {
             p += 64;
         }
         core::arch::x86_64::_mm_mfence();
+        core::arch::x86_64::_mm_lfence();
         fence(Ordering::SeqCst);
     }
 
@@ -3478,13 +3589,15 @@ impl E1000eHw {
         let mpc_delta = unsafe { mmio_read(self.base, E1000E_MPC) };
         if mpc_delta > 0 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
-            log::debug!(
-                "[e1000e] MPC (Missed Packet Count) +{}! GPRC={} RDH={} RDT={} clean={}",
+            warn!(
+                "[e1000e] MPC (Missed Packet Count) +{} — ring underrun or multicast storm; \
+                 GPRC={} RDH={} RDT={} clean={} uc={}",
                 mpc_delta,
                 gprc,
                 unsafe { mmio_read(self.base, E1000E_RDH) },
                 unsafe { mmio_read(self.base, E1000E_RDT) },
-                self.rx_next_to_clean
+                self.rx_next_to_clean,
+                self.dma_uncached
             );
         }
 
@@ -3710,9 +3823,10 @@ impl E1000eHw {
             mac_found = self.is_valid_mac();
         }
         if !mac_found {
-            self.mac = [0x00, 0x0E, 0x10, 0x00, 0x0E, 0x00];
+            self.mac = E1000E_PLACEHOLDER_MAC;
             warn!("[e1000e] using fallback MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]);
+            self.warn_mac_diagnostic();
         }
 
         // 5b. Write the resolved MAC into RAL0/RAH0 with AV bit.
@@ -3825,10 +3939,11 @@ impl E1000eHw {
         // No second write needed; keeping the block for reference only.
         let _ = mac_found; // suppress unused-variable warning
 
-        // 8. Initialize MTA (fill with 0xFFFF_FFFF on real silicon to bypass multicast filtering issues, clear to 0 on QEMU)
-        let mta_val = if self.is_i219_metal_rx_hacks() { 0xFFFF_FFFF } else { 0 };
+        // 8. Initialize MTA — Linux clears to 0 (hash-based multicast filter disabled).
+        // Do not fill 0xFFFF_FFFF on I219: it accepts all multicast and floods the 256-slot
+        // RX ring under real LAN noise (mDNS/SSDP), driving MPC up and starving DHCP/TCP.
         for i in 0..E1000E_MTA_LEN {
-            mmio_write(self.base, E1000E_MTA_BASE + i, mta_val);
+            mmio_write(self.base, E1000E_MTA_BASE + i, 0);
         }
 
         // 9. Initialize Rings
@@ -4136,7 +4251,6 @@ impl E1000eHw {
         for attempt in 0..RX_DESC_WB_SETTLE_TRIES {
             if self.rx_needs_cache_flush() {
                 Self::invalidate_cpu_cache_for_read(desc_addr, 16);
-                core::arch::x86_64::_mm_mfence();
             }
             let parsed = if self.use_extended_descriptors {
                 Self::parse_rx_wb_ext(desc_addr)
@@ -5099,6 +5213,7 @@ pub fn init(
     unsafe {
         hw.reset_and_init()?;
     }
+    hw.warn_mac_diagnostic();
 
     let mac_bytes = hw.mac;
     let link_note = if hw.link_bringup_pending {
