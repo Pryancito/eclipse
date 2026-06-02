@@ -19,7 +19,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-dma-tsc";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-irq-lfence";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -194,6 +194,18 @@ const RXD_EXT_DD: u32 = 0x01;
 const RXD_EXT_EOP: u32 = 0x02;
 /// Linux `E1000_CTRL_EXT_IAME` — reading ICR masks until IMS is written again.
 const CTRL_EXT_IAME: u32 = 1 << 27;
+/// ICR cause bits (Intel 8257x / e1000e).
+const ICR_TXDW: u32 = 1 << 0;
+const ICR_LSC: u32 = 1 << 2;
+const ICR_RXDMT0: u32 = 1 << 4;
+const ICR_RXT0: u32 = 1 << 7;
+const ICR_RX_ANY: u32 = ICR_RXT0 | ICR_RXDMT0;
+/// Hold LANPHYPC low long enough for PHY rail discharge on warm/cold boot.
+const LANPHYPC_POWERDOWN_HOLD_US: u64 = 10_000;
+/// Analog PHY settle after releasing LANPHYPC (some boards need >50 ms).
+const LANPHYPC_POWERUP_SETTLE_US: u64 = 100_000;
+/// Minimum DMA base alignment for descriptor rings (Intel hardware requirement).
+const DMA_DESC_ALIGN: usize = 16;
 /// Linux `e1000_irq_enable` (PCH): `IMS_ENABLE_MASK | E1000_IMS_ECCER`.
 const IMS_REARM_LINUX: u32 = (1 << 0)   // TXDW
     | (1 << 2)   // LSC
@@ -797,12 +809,27 @@ impl E1000eHw {
         let rx_ring = self.rx_ring.as_ptr::<RxDesc>();
         let rx_base_v = rx_ring as usize;
         let rx_base_p = self.rx_ring.paddr();
-        if (rx_base_v | rx_base_p) & (DESC_BYTES - 1) != 0 {
-            crate::klog_warn!(
-                "[e1000e] RX ring base v={:#x} p={:#x} not 16-byte aligned\n",
+        if (rx_base_v | rx_base_p) & (DMA_DESC_ALIGN - 1) != 0 {
+            crate::klog_err!(
+                "[e1000e] RX ring base v={:#x} p={:#x} not {}-byte aligned\n",
                 rx_base_v,
-                rx_base_p
+                rx_base_p,
+                DMA_DESC_ALIGN
             );
+            return false;
+        }
+
+        let tx_ring = self.tx_ring.as_ptr::<TxDesc>();
+        let tx_base_v = tx_ring as usize;
+        let tx_base_p = self.tx_ring.paddr();
+        if (tx_base_v | tx_base_p) & (DMA_DESC_ALIGN - 1) != 0 {
+            crate::klog_err!(
+                "[e1000e] TX ring base v={:#x} p={:#x} not {}-byte aligned\n",
+                tx_base_v,
+                tx_base_p,
+                DMA_DESC_ALIGN
+            );
+            return false;
         }
 
         for i in 1..NUM_RX {
@@ -910,13 +937,28 @@ impl E1000eHw {
 
     /// Discover the responding PHY address via MDIO reads.
     unsafe fn detect_phy_addr(&mut self) {
+        if self.try_detect_phy_addr() {
+            return;
+        }
+        if self.is_pch_lpt_or_later() {
+            crate::klog_warn!("[e1000e] MDIO silent during PHY detect — LANPHYPC power cycle\n");
+            self.toggle_lanphypc();
+            if self.try_detect_phy_addr() {
+                return;
+            }
+        }
+        crate::klog_warn!("[e1000e] no PHY detected, falling back to address 1\n");
+        self.phy_addr = 1;
+    }
+
+    unsafe fn try_detect_phy_addr(&mut self) -> bool {
         // Standard PHY discovery: read MII_PHYSID1 on addresses 1..=31
         for pa in 1u8..=31 {
-            if let Some(id1) = self.mdic_read(pa, 2) { // 2 is MII_PHYSID1
+            if let Some(id1) = self.mdic_read(pa, 2) {
                 if id1 != 0 && id1 != 0xFFFF {
                     crate::klog_info!("[e1000e] detected PHY at address {} (ID1={:#x})\n", pa, id1);
                     self.phy_addr = pa;
-                    return;
+                    return true;
                 }
             }
         }
@@ -924,16 +966,30 @@ impl E1000eHw {
         for pa in 1u8..=31 {
             if let Some(bmsr) = self.mdic_read(pa, MII_BMSR) {
                 if bmsr != 0 && bmsr != 0xFFFF {
-                    crate::klog_info!("[e1000e] detected PHY at address {} via BMSR ({:#x})\n", pa, bmsr);
+                    crate::klog_info!(
+                        "[e1000e] detected PHY at address {} via BMSR ({:#x})\n",
+                        pa,
+                        bmsr
+                    );
                     self.phy_addr = pa;
-                    return;
+                    return true;
                 }
             }
         }
-        crate::klog_warn!("[e1000e] no PHY detected, falling back to address 1\n");
-        self.phy_addr = 1;
+        false
     }
 
+    /// Poll until MDIO responds after a LANPHYPC transition.
+    unsafe fn wait_phy_mdio_ready(&self, phy_addr: u8, budget_us: u64) -> bool {
+        let t0 = timer_now_as_micros();
+        while timer_now_as_micros().wrapping_sub(t0) < budget_us {
+            if self.mdic_read(phy_addr, MII_BMSR).is_some() {
+                return true;
+            }
+            Self::udelay(1_000);
+        }
+        false
+    }
 
     // -----------------------------------------------------------------------
     // Read MAC address from NVM (3 words at offsets 0, 1, 2)
@@ -970,7 +1026,7 @@ impl E1000eHw {
         ctrl &= !CTRL_LANPHYPC_VALUE;
         mmio_write(self.base, E1000E_CTRL, ctrl);
         let _ = mmio_read(self.base, E1000E_CTRL); // flush posted write
-        Self::udelay(20);
+        Self::udelay(LANPHYPC_POWERDOWN_HOLD_US);
 
         // Phase 2: deassert OVERRIDE (release LANPHYPC back to hardware control).
         // Re-read CTRL here so we don't accidentally clear bits that were set
@@ -979,8 +1035,15 @@ impl E1000eHw {
         ctrl &= !CTRL_LANPHYPC_OVERRIDE;
         mmio_write(self.base, E1000E_CTRL, ctrl);
         let _ = mmio_read(self.base, E1000E_CTRL); // flush
-        // Give the PHY time to power up after LANPHYPC deassert
-        Self::udelay(50_000); // 50 ms, matches Linux e1000_toggle_lanphypc_via_cmdc
+        Self::udelay(LANPHYPC_POWERUP_SETTLE_US);
+
+        let phy_addr = self.active_phy_addr();
+        if !self.wait_phy_mdio_ready(phy_addr, 200_000) {
+            crate::klog_warn!(
+                "[e1000e] LANPHYPC: MDIO still silent after {} ms settle\n",
+                LANPHYPC_POWERUP_SETTLE_US / 1000
+            );
+        }
     }
 
     unsafe fn disable_ulp_software(&self) {
@@ -990,9 +1053,12 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
         let _ = mmio_read(self.base, E1000E_CTRL_EXT);
 
-        self.toggle_lanphypc();
-
         let phy_addr = self.active_phy_addr();
+        if self.mdic_read(phy_addr, MII_BMSR).is_none() {
+            self.toggle_lanphypc();
+        } else {
+            crate::klog_info!("[e1000e] ULP: MDIO alive — skipping initial LANPHYPC pulse\n");
+        }
         let cv_smb_ctrl = Self::phy_reg_paged(769, 23);
         if let Some(mut phy_reg) = self.mdic_read_phy(phy_addr, cv_smb_ctrl) {
             phy_reg &= !0x0001; // Clear CV_SMB_CTRL_FORCE_SMBUS
@@ -1180,8 +1246,10 @@ impl E1000eHw {
     }
 
     /// Single 64-bit load of the RX write-back region (+8 staterr, +12 length).
+    /// lfence immediately before read_volatile drains load buffers after clflush.
     #[inline]
     unsafe fn read_rx_wb_u64(desc_addr: usize) -> u64 {
+        core::arch::x86_64::_mm_lfence();
         read_volatile((desc_addr + 8) as *const u64)
     }
 
@@ -1189,10 +1257,12 @@ impl E1000eHw {
     unsafe fn read_rx_wb_after_sync(&self, desc_addr: usize) -> u64 {
         if self.rx_needs_cache_flush() {
             Self::invalidate_cpu_cache_for_read(desc_addr, 16);
-        } else {
+        } else if !self.dma_uncached {
             core::arch::x86_64::_mm_mfence();
             core::arch::x86_64::_mm_lfence();
             fence(Ordering::Acquire);
+        } else {
+            Self::dma_rmb_after_device();
         }
         Self::read_rx_wb_u64(desc_addr)
     }
@@ -1222,6 +1292,7 @@ impl E1000eHw {
     unsafe fn dma_copy_in(dst: &mut Vec<u8>, vaddr: usize, len: usize) {
         dst.clear();
         dst.reserve(len);
+        core::arch::x86_64::_mm_lfence();
         for i in 0..len {
             dst.push(core::ptr::read_volatile((vaddr + i) as *const u8));
         }
@@ -3681,16 +3752,28 @@ impl E1000eHw {
         let mpc_delta = unsafe { mmio_read(self.base, E1000E_MPC) };
         if mpc_delta > 0 {
             let gprc = unsafe { mmio_read(self.base, E1000E_GPRC) };
-            warn!(
-                "[e1000e] MPC (Missed Packet Count) +{} — ring underrun or multicast storm; \
-                 GPRC={} RDH={} RDT={} clean={} uc={}",
-                mpc_delta,
-                gprc,
-                unsafe { mmio_read(self.base, E1000E_RDH) },
-                unsafe { mmio_read(self.base, E1000E_RDT) },
-                self.rx_next_to_clean,
-                self.dma_uncached
-            );
+            if gprc == 0 {
+                warn!(
+                    "[e1000e] MPC +{} but GPRC=0 — CPU cache/RDT race or IMS mute; \
+                     RDH={} RDT={} clean={} post={} uc={}",
+                    mpc_delta,
+                    unsafe { mmio_read(self.base, E1000E_RDH) },
+                    unsafe { mmio_read(self.base, E1000E_RDT) },
+                    self.rx_next_to_clean,
+                    self.rx_post_since_doorbell,
+                    self.dma_uncached
+                );
+            } else {
+                warn!(
+                    "[e1000e] MPC +{} — ring underrun; GPRC={} RDH={} RDT={} clean={} uc={}",
+                    mpc_delta,
+                    gprc,
+                    unsafe { mmio_read(self.base, E1000E_RDH) },
+                    unsafe { mmio_read(self.base, E1000E_RDT) },
+                    self.rx_next_to_clean,
+                    self.dma_uncached
+                );
+            }
         }
 
         if !E1000E_LOG_VERBOSE {
@@ -4831,8 +4914,10 @@ impl E1000eInterface {
 
     fn ims_rearm(&self) {
         unsafe {
+            compiler_fence(Ordering::SeqCst);
             mmio_write(self.base, E1000E_IMS, IMS_REARM_LINUX);
             let _ = mmio_read(self.base, E1000E_IMS);
+            fence(Ordering::SeqCst);
         }
     }
 }
@@ -4848,31 +4933,33 @@ impl Scheme for E1000eInterface {
         }
 
         // ICR is read-to-clear; with CTRL_EXT.IAME a read auto-masks IMS even when icr==0
-        // (shared/ spurious IRQ). Always re-arm IMS on every exit path.
+        // (shared/spurious IRQ). Re-arm IMS immediately to shrink the interrupt mute window.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         log::trace!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
+        self.ims_rearm();
 
         if icr == 0 {
-            self.ims_rearm();
             return;
         }
 
-        if icr & (1 << 2) != 0 {
+        if icr & ICR_LSC != 0 {
             if let Some(mut hw) = self.driver.hw.try_lock() {
                 hw.get_link_status = true;
             }
         }
 
-        if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
-            self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+        let needs_poll = icr & (ICR_RX_ANY | ICR_TXDW) != 0;
+        if needs_poll && !self.poll_pending.load(Ordering::Acquire) {
+            self.poll_pending.store(true, Ordering::SeqCst);
             let poll_pending = self.poll_pending.clone();
             let self_clone = self.clone();
             crate::utils::deferred_job::push_deferred_job(move || {
                 let _ = self_clone.poll();
-                poll_pending.store(false, core::sync::atomic::Ordering::SeqCst);
+                poll_pending.store(false, Ordering::SeqCst);
             });
         }
 
+        // Belt-and-suspenders: TXDW/RXT0 may assert while deferred poll is still queued.
         self.ims_rearm();
     }
 }
@@ -5244,22 +5331,30 @@ pub fn init(
         name, vaddr, irq
     );
 
-    // Allocate DMA rings
+    // Allocate DMA rings (page-aligned contiguous frames → also 16-byte aligned bases).
     let rx_ring = DmaRegion::alloc(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
     let tx_ring = DmaRegion::alloc(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
 
     let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
     let tx_buf_pool = DmaRegion::alloc(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    assert_eq!(
-        rx_buf_pool.paddr() % 64,
-        0,
-        "e1000e: RX buffer pool base must be 64-byte aligned"
-    );
-    assert_eq!(
-        tx_buf_pool.paddr() % 64,
-        0,
-        "e1000e: TX buffer pool base must be 64-byte aligned"
-    );
+
+    for (name, region, align) in [
+        ("rx_ring", &rx_ring, DMA_DESC_ALIGN),
+        ("tx_ring", &tx_ring, DMA_DESC_ALIGN),
+        ("rx_buf_pool", &rx_buf_pool, 64),
+        ("tx_buf_pool", &tx_buf_pool, 64),
+    ] {
+        if region.vaddr() % align != 0 || region.paddr() % align != 0 {
+            crate::klog_err!(
+                "[e1000e] {} DMA misaligned v={:#x} p={:#x} (need {} B)\n",
+                name,
+                region.vaddr(),
+                region.paddr(),
+                align
+            );
+            return Err(DeviceError::DmaError);
+        }
+    }
 
     let mut hw = E1000eHw {
         base: vaddr,
