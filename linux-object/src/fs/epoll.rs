@@ -161,7 +161,7 @@ impl Epoll {
             }
 
             kernel_hal::thread::sleep_until(
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1),
             )
             .await;
         }

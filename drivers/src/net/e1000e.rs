@@ -902,6 +902,16 @@ impl E1000eHw {
         self.dma_uncached = ok;
         if ok {
             crate::klog_info!("[e1000e] DMA rings/pools mapped and verified uncacheable (PAT UC)\n");
+            // We may have touched these pages while they were still WB-mapped.
+            // Purge any stale cache lines once so UC reads observe device DMA.
+            unsafe {
+                Self::clflush_range(self.rx_ring.vaddr(), self.rx_ring.byte_len());
+                Self::clflush_range(self.tx_ring.vaddr(), self.tx_ring.byte_len());
+                Self::clflush_range(self.rx_buf_pool.vaddr(), self.rx_buf_pool.byte_len());
+                Self::clflush_range(self.tx_buf_pool.vaddr(), self.tx_buf_pool.byte_len());
+                core::arch::x86_64::_mm_mfence();
+                core::arch::x86_64::_mm_lfence();
+            }
         } else {
             crate::klog_warn!(
                 "[e1000e] UC DMA incomplete — RX/TX will use clflush+mfence+lfence on WB pages\n"
@@ -3277,14 +3287,17 @@ impl E1000eHw {
         // touched here — the engine is still off.
         self.reinit_rx_ring();
 
-        // Step 5: Configure RXDCTL parameters (DMA burst) without enabling the queue yet.
+        // Step 5: Program SRRCTL while RX is still disabled.
+        self.program_srrctl_rx_queue0();
+
+        // Step 6: Configure RXDCTL parameters (DMA burst) without enabling the queue yet.
         let mut rxdctl = mmio_read(self.base, E1000E_RXDCTL);
         rxdctl &= 0xFFFF_C000;
         rxdctl |= RXDCTL_DMA_BURST;
         mmio_write(self.base, E1000E_RXDCTL, rxdctl);
         let _ = mmio_read(self.base, E1000E_RXDCTL);
 
-        // Step 6: Enable RXDCTL.QUEUE_ENABLE (PCH-SPT or later) and wait for it to latch
+        // Step 7: Enable RXDCTL.QUEUE_ENABLE (PCH-SPT or later) and wait for it to latch
         // BEFORE raising RCTL.EN, so the DMA queue is fully enabled when EN fires.
         if self.is_pch_spt_or_later() {
             let mut rxd = mmio_read(self.base, E1000E_RXDCTL);
@@ -3297,7 +3310,7 @@ impl E1000eHw {
             }
         }
 
-        // Step 7: Enable RX engine (RCTL.EN). Read back before the first RDT doorbell.
+        // Step 8: Enable RX engine (RCTL.EN). Read back before the first RDT doorbell.
         let rctl = self.rctl_rx_bits() | RCTL_EN;
         mmio_write(self.base, E1000E_RCTL, rctl);
         let rctl_rb = mmio_read(self.base, E1000E_RCTL);
@@ -3309,7 +3322,7 @@ impl E1000eHw {
             return;
         }
 
-        // Step 8: First RDT write only after RCTL.EN is verified (alloc_rx_buffers doorbell).
+        // Step 9: First RDT write only after RCTL.EN is verified (alloc_rx_buffers doorbell).
         let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
         // En hardware real (I219/PCH) algunos equipos son sensibles a un único "salto"
         // grande de RDT tras reset. Publicamos en chunks pequeños para que el hardware
@@ -3500,15 +3513,12 @@ impl E1000eHw {
         if self.srrctl_absent {
             return;
         }
-        let rctl_saved = mmio_read(self.base, E1000E_RCTL);
-        mmio_write(self.base, E1000E_RCTL, rctl_saved & !RCTL_EN);
-        for _ in 0..200 {
-            if mmio_read(self.base, E1000E_RCTL) & RCTL_EN == 0 {
-                break;
-            }
-            Self::udelay(10);
+        // SRRCTL programming must not tear down an already-enabled RX queue.
+        // Callers should keep RX disabled (RCTL.EN=0) while touching SRRCTL.
+        if mmio_read(self.base, E1000E_RCTL) & RCTL_EN != 0 {
+            crate::klog_warn!("[e1000e] SRRCTL write skipped: RCTL.EN=1\n");
+            return;
         }
-        let _ = mmio_read(self.base, E1000E_RCTL);
 
         let mut v = mmio_read(self.base, E1000E_SRRCTL);
         v &= !SRRCTL_DESCTYPE_MASK;

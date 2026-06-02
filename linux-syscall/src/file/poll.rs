@@ -26,6 +26,10 @@ fn schedule_poll_wakeup(cx: &mut Context, after: Duration) {
     timer::timer_set(deadline, Box::new(move |_| waker.wake_by_ref()));
 }
 
+/// Wakeup granularity for select/poll/epoll loops.
+/// Smaller values improve interactive input (PS/2/USB HID) responsiveness.
+const IO_WAIT_TICK: Duration = Duration::from_millis(1);
+
 impl Syscall<'_> {
     /// Wait for some event on a file descriptor
     pub async fn sys_poll(
@@ -125,11 +129,11 @@ impl Syscall<'_> {
                             return Poll::Ready(Ok(0));
                         }
                         let remaining = deadline.saturating_sub(mono_now());
-                        let wake_in = remaining.min(Duration::from_millis(10));
+                        let wake_in = remaining.min(IO_WAIT_TICK);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
-                        schedule_poll_wakeup(cx, Duration::from_millis(10));
+                        schedule_poll_wakeup(cx, IO_WAIT_TICK);
                     }
                     _ => {
                         info!("No waker. timeout: {:?}", self.timeout_msecs);
@@ -289,11 +293,11 @@ impl Syscall<'_> {
                             return Poll::Ready(Ok(0));
                         }
                         let remaining = deadline.saturating_sub(mono_now());
-                        let wake_in = remaining.min(Duration::from_millis(10));
+                        let wake_in = remaining.min(IO_WAIT_TICK);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
-                        schedule_poll_wakeup(cx, Duration::from_millis(10));
+                        schedule_poll_wakeup(cx, IO_WAIT_TICK);
                     }
                     _ => {}
                 }
