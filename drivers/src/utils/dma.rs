@@ -43,6 +43,10 @@ impl DmaRegion {
         if phys == 0 {
             return None;
         }
+        if phys & (PAGE_SIZE - 1) != 0 {
+            unsafe { drivers_dma_dealloc(phys, pages) };
+            return None;
+        }
         let virt = unsafe { drivers_phys_to_virt(phys) };
         if zero {
             unsafe { core::ptr::write_bytes(virt as *mut u8, 0, pages * PAGE_SIZE) };

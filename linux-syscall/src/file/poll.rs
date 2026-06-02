@@ -106,7 +106,7 @@ impl Syscall<'_> {
                             events += 1;
                         }
                     } else if <FileDesc as Into<i32>>::into(poll.fd) < 0 {
-                        warn!("A negative fd: {:?}", poll.fd);
+                        // POSIX poll(2): negative fds are ignored (udhcpc6 leaves -1 in the set).
                         poll.revents = PE::empty();
                     } else {
                         warn!("can not find filelike object from fd: {:?}", poll.fd);

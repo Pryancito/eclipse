@@ -745,8 +745,8 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
     IpEndpoint::new(addr, 0)
 }
 
-/// Min interval between full [`poll_ifaces`] (~125 Hz cap — keeps PS/2 IRQ responsive).
-const NET_POLL_MIN_INTERVAL_US: u64 = 8_000;
+/// Min interval between full [`poll_ifaces`] (~62 Hz cap — keeps PS/2 IRQ responsive).
+const NET_POLL_MIN_INTERVAL_US: u64 = 32_000;
 /// Deferred IRQ drain when epoll/poll is not waiting on sockets.
 const DEFERRED_IDLE_INTERVAL_US: u64 = 20_000;
 

@@ -34,6 +34,8 @@ static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
 const MAX_DEFERRED_JOBS: usize = 256;
+/// Run at most this many deferred jobs per drain (long NIC init must not starve PS/2/USB).
+const MAX_JOBS_PER_DRAIN: usize = 2;
 
 /// Drop the oldest queued job without running it (IRQ must not execute arbitrary work).
 #[allow(unused_must_use)]
@@ -68,14 +70,21 @@ pub fn drain_deferred_jobs() {
     if flag {
         intr_off();
     }
-    let jobs: Vec<Job> = {
+    let mut jobs: Vec<Job> = {
         let mut q = JOBS.lock();
         core::mem::take(&mut *q)
     };
     if flag {
         intr_on();
     }
-    for job in jobs {
+    let run = jobs.len().min(MAX_JOBS_PER_DRAIN);
+    for job in jobs.drain(..run) {
         job();
+    }
+    if !jobs.is_empty() {
+        let mut q = JOBS.lock();
+        for job in jobs.into_iter().rev() {
+            q.insert(0, job);
+        }
     }
 }
