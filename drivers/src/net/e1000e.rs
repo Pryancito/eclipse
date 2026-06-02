@@ -6105,6 +6105,7 @@ impl E1000eHw {
                 let status = mmio_read(self.base, E1000E_STATUS);
                 if status & STATUS_LU != 0 {
                     if self.is_pch_lpt_or_later() {
+                        self.get_link_status = true;
                         let _ = self.check_for_link_linux(0);
                     } else {
                         self.link_up = true;
