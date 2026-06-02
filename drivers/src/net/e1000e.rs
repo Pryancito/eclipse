@@ -1475,6 +1475,17 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_CTRL);
     }
 
+    /// CTRL_RST (reset_hw_ich8lan) puede dejar deshabilitado el Bus Master y/o
+    /// Memory Space en el registro PCI Command en algunos equipos reales.
+    /// Tras reset, reaseguramos esos bits antes de reprogramar datapath/DMA.
+    unsafe fn restore_pci_command_bus_master(&self) {
+        let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, 0x04);
+        cmd |= 0x0004; // Bus Master
+        cmd |= 0x0002; // Memory Space
+        PCI_ACCESS.write16(&PortOpsImpl, self.pci_loc, 0x04, cmd);
+        let _ = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, 0x04);
+    }
+
     /// Linux `e1000_setup_link_ich8lan` + `e1000_setup_copper_link_pch_lpt` (flow + copper).
     unsafe fn setup_link_ich8lan_linux(&self) {
         if self.pch_phy_reset_blocked() {
@@ -1786,6 +1797,8 @@ impl E1000eHw {
             1 => {
                 crate::klog_warn!("[e1000e] deferred init 2/3: MAC reset + datapath\n");
                 self.reset_hw_ich8lan_linux(self.is_pch_lpt_or_later());
+                // CTRL_RST puede romper DMA al dejar Bus Master PCI apagado.
+                unsafe { self.restore_pci_command_bus_master() };
                 self.init_hw_ich8lan_linux();
                 self.reapply_datapath_after_mac_reset();
                 self.pch_mdio_prepare_after_power();
@@ -3298,7 +3311,15 @@ impl E1000eHw {
 
         // Step 8: First RDT write only after RCTL.EN is verified (alloc_rx_buffers doorbell).
         let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
-        unsafe { self.alloc_rx_buffers(n, true) };
+        // En hardware real (I219/PCH) algunos equipos son sensibles a un único "salto"
+        // grande de RDT tras reset. Publicamos en chunks pequeños para que el hardware
+        // vea el anillo avanzar de forma gradual (múltiples doorbells post-RCTL.EN).
+        let mut remaining = n;
+        while remaining > 0 {
+            let chunk = remaining.min(RX_BUFFER_WRITE);
+            unsafe { self.alloc_rx_buffers(chunk, true) };
+            remaining -= chunk;
+        }
 
         self.kick_rx_writeback();
         self.verify_rx_engine();
