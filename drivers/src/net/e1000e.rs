@@ -461,6 +461,8 @@ const NUM_TX: usize = 256;
 const BUF_SIZE: usize = 2048 + 128;
 /// Linux `E1000_RX_BUFFER_WRITE` — batch RDT doorbell every N descriptors.
 const RX_BUFFER_WRITE: usize = 16;
+/// Max RX slots consumed per `receive()` call while assembling SG (EOP=0) fragments.
+const RX_SG_SLOTS_PER_CALL: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Descriptor layouts (§3.2.3 / §3.3.3 of 82574 datasheet)
@@ -580,6 +582,8 @@ pub struct E1000eHw {
     rx_sg_buf: Vec<u8>,
     /// Non-EOP fragments buffered without a completed frame yet.
     rx_sg_frag_count: u8,
+    /// Descriptors posted in RAM since the last E1000E_RDT doorbell (batched refill).
+    rx_post_since_doorbell: u16,
     /// SRRCTL at 0x280C does not read back on some steppings (e.g. 15b8); use RCTL only.
     srrctl_absent: bool,
     /// RX/TX rings mapped UC — skip clflush on descriptor WB paths.
@@ -1030,7 +1034,23 @@ impl E1000eHw {
         Self::dma_copy_in(dst, vaddr, len);
     }
 
-    unsafe fn wait_rx_dma_quiescent(&self) {
+    unsafe fn wait_rx_dma_quiescent(&mut self) {
+        if self.is_pch_spt_or_later() {
+            let mut rxd = mmio_read(self.base, E1000E_RXDCTL);
+            if rxd & RXDCTL_QUEUE_ENABLE != 0 {
+                rxd &= !RXDCTL_QUEUE_ENABLE;
+                mmio_write(self.base, E1000E_RXDCTL, rxd);
+                let _ = mmio_read(self.base, E1000E_RXDCTL);
+                for _ in 0..50 {
+                    if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE == 0 {
+                        break;
+                    }
+                    Self::udelay(10);
+                }
+            }
+        }
+        // Mandatory on real silicon — do not touch descriptor RAM before this elapses.
+        Self::udelay(10);
         Self::udelay(RX_DMA_DRAIN_US as u64);
         for _ in 0..10 {
             let rdh = mmio_read(self.base, E1000E_RDH);
@@ -2060,44 +2080,63 @@ impl E1000eHw {
         }
     }
 
-    /// Linux `e1000_alloc_rx_buffers` — post buffers and advance RDT (not on clean).
-    unsafe fn alloc_rx_buffers(&mut self, count: usize) {
+    /// Linux `e1000_alloc_rx_buffers` — post `count` descriptors; RDT doorbell is batched.
+    unsafe fn post_one_rx_buffer(&mut self) -> bool {
+        if self.rx_desc_unused() == 0 {
+            return false;
+        }
+        let ring = self.rx_ring.as_ptr::<RxDesc>();
+        let i = self.rx_next_to_use;
+        let desc = &mut *ring.add(i);
+        write_volatile(&mut desc.addr, self.rx_bufs[i].paddr() as u64);
+        write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
+        if self.rx_needs_cache_flush() {
+            Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+            core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
+        }
+        self.rx_next_to_use = (i + 1) % NUM_RX;
+        self.rx_post_since_doorbell = self.rx_post_since_doorbell.saturating_add(1);
+        true
+    }
+
+    /// Ring the RDT doorbell when enough descriptors are posted or the ring is low.
+    unsafe fn rx_doorbell_if_needed(&mut self, force: bool) {
+        if self.rx_post_since_doorbell == 0 {
+            return;
+        }
+        let unused = self.rx_desc_unused();
+        let critical = unused <= RX_BUFFER_WRITE;
+        if !force
+            && self.rx_post_since_doorbell < RX_BUFFER_WRITE as u16
+            && !critical
+        {
+            return;
+        }
+        let i = self.rx_next_to_use;
+        let last = if i == 0 { NUM_RX - 1 } else { i - 1 };
+        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        mmio_write(self.base, E1000E_RDT, last as u32);
+        let _ = mmio_read(self.base, E1000E_RDT);
+        self.rx_post_since_doorbell = 0;
+    }
+
+    unsafe fn flush_rx_post_queue(&mut self) {
+        self.rx_doorbell_if_needed(true);
+    }
+
+    unsafe fn alloc_rx_buffers(&mut self, count: usize, force_doorbell: bool) {
         if count == 0 {
             return;
         }
-        let ring = self.rx_ring.as_ptr::<RxDesc>();
-        let mut i = self.rx_next_to_use;
         let mut posted = 0usize;
         while posted < count {
-            let desc = &mut *ring.add(i);
-            write_volatile(&mut desc.addr, self.rx_bufs[i].paddr() as u64);
-            write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
-
-            // Invalidate the cache for the packet buffer on physical hardware before the hardware writes to it.
-            if self.rx_needs_cache_flush() {
-                Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+            if !self.post_one_rx_buffer() {
+                break;
             }
-
-            if self.rx_needs_cache_flush() {
-                core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
-            }
-
             posted += 1;
-            i = (i + 1) % NUM_RX;
         }
-        self.rx_next_to_use = i;
-        // Linux jumbo alloc path: always doorbell the last posted index.
-        // compiler_fence(SeqCst) prevents LLVM from moving Rust state updates
-        // (rx_next_to_use, descriptor writes) *after* the MMIO store to RDT.
-        // The hardware-level ordering is already guaranteed by the preceding
-        // _mm_clflush + mfence inside invalidate_cpu_cache_for_read / dma_wbinv_range.
-        if posted > 0 {
-            let last = if i == 0 { NUM_RX - 1 } else { i - 1 };
-            compiler_fence(Ordering::SeqCst);
-            fence(Ordering::SeqCst);
-            mmio_write(self.base, E1000E_RDT, last as u32);
-            let _ = mmio_read(self.base, E1000E_RDT);
-        }
+        self.rx_doorbell_if_needed(force_doorbell);
     }
 
     /// Linux `e1000_configure_rx` final step: RCTL with EN already set in setup_rctl.
@@ -2123,6 +2162,7 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_RCTL);
         self.wait_rx_dma_quiescent();
         self.rx_sg_reset();
+        self.rx_post_since_doorbell = 0;
 
         // Step 2: Reset indices.
         self.rx_next_to_clean = 0;
@@ -2171,7 +2211,7 @@ impl E1000eHw {
 
         // Step 8: Post buffers conservatively — never doorbell RDT to NUM_RX-1 on first arm.
         let n = self.rx_desc_unused().min(RX_BOOT_POST_MAX);
-        self.alloc_rx_buffers(n);
+        unsafe { self.alloc_rx_buffers(n, true) };
 
         self.kick_rx_writeback();
         self.verify_rx_engine();
@@ -4155,9 +4195,8 @@ impl E1000eHw {
                 }
             }
             hw.rx_next_to_clean = (i + 1) % NUM_RX;
-            let unused = hw.rx_desc_unused();
-            if unused > 0 {
-                unsafe { hw.alloc_rx_buffers(unused) };
+            unsafe {
+                hw.alloc_rx_buffers(1, false);
             }
         };
 
@@ -4335,28 +4374,31 @@ impl E1000eHw {
             unsafe { self.kick_rx_writeback() };
         }
 
-        // Loop to collect all SG fragments into rx_sg_buf before returning.
-        // A non-EOP descriptor (EOP=0) consumes the slot, appends to rx_sg_buf,
-        // and returns None. We immediately try the next slot so the assembled
-        // frame is delivered in this single call rather than spread across poll ticks.
-        // Guard against a run-away loop (ring wrap or EOP never set by HW).
+        // Loop to collect SG fragments; cap work per call so a stuck EOP=0 storm
+        // cannot burn the whole ring and starve the scheduler.
         let max_frags = NUM_RX;
+        let mut sg_slots = RX_SG_SLOTS_PER_CALL;
         for _ in 0..max_frags {
             let i = self.rx_next_to_clean;
             if let Some(frame) = self.receive_slot(i) {
                 self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
+                unsafe { self.flush_rx_post_queue() };
                 return Some(frame);
             }
-            // receive_slot returned None either because:
-            //  (a) no descriptor was DD yet (desc_done returned None), or
-            //  (b) a non-EOP fragment was buffered into rx_sg_buf.
-            // Distinguish: if rx_sg_buf is non-empty we may have more fragments;
-            // keep looping. If rx_sg_buf is empty, nothing is ready — stop.
             if self.rx_sg_buf.is_empty() {
                 break;
             }
-            // SG fragment was buffered; the ring index advanced — try the next slot.
+            sg_slots = sg_slots.saturating_sub(1);
+            self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
+            if sg_slots == 0 {
+                log::trace!(
+                    "[e1000e] RX SG budget exhausted ({} B partial) — resume next poll",
+                    self.rx_sg_buf.len()
+                );
+                break;
+            }
         }
+        unsafe { self.flush_rx_post_queue() };
         None
     }
 
@@ -4429,13 +4471,6 @@ impl E1000eHw {
         if !unsafe { self.ensure_tx_engine_ready() } {
             crate::klog_warn!("[e1000e] send: TX engine not ready (TCTL/TXDCTL/GIO) despite link up\n");
             return Err(DeviceError::NotReady);
-        }
-        if self.stats.tx_packets == 0 && self.is_pch_lpt_or_later() {
-            unsafe {
-                let phy = self.active_phy_addr();
-                let _ = self.resync_mac_if_phy_changed(phy);
-                self.restart_tx_datapath_linux();
-            }
         }
 
         let ring = self.tx_ring.as_ptr::<TxDesc>();
@@ -5054,6 +5089,7 @@ pub fn init(
         use_extended_descriptors: true,
         rx_sg_buf: Vec::new(),
         rx_sg_frag_count: 0,
+        rx_post_since_doorbell: 0,
         srrctl_absent: false,
         dma_uncached: false,
     };
