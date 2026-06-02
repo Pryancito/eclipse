@@ -12,6 +12,7 @@ extern "C" {
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: usize) -> usize;
     fn drivers_dma_mark_uncached(paddr: usize, pages: usize) -> i32;
+    fn drivers_dma_verify_uncached(paddr: usize, pages: usize) -> i32;
 }
 
 /// A contiguous, page-aligned DMA memory region.
@@ -61,6 +62,12 @@ impl DmaRegion {
         self.phys
     }
 
+    /// Size of the allocation in bytes (always page-rounded up).
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.pages * PAGE_SIZE
+    }
+
     /// Return a raw pointer to the start of the region cast to `*mut T`.
     #[inline]
     pub fn as_ptr<T>(&self) -> *mut T {
@@ -73,6 +80,14 @@ impl DmaRegion {
             return false;
         }
         unsafe { drivers_dma_mark_uncached(self.phys, self.pages) == 0 }
+    }
+
+    /// Returns true when every page in the region is mapped UC/UC- in the PTEs.
+    pub fn verify_uncached(&self) -> bool {
+        if self.phys == 0 {
+            return false;
+        }
+        unsafe { drivers_dma_verify_uncached(self.phys, self.pages) == 0 }
     }
 }
 

@@ -306,6 +306,33 @@ mod drivers_ffi {
         0
     }
 
+    /// Verify contiguous DMA pages are mapped uncacheable (PAT/PCD/PWT set in PTE).
+    #[no_mangle]
+    extern "C" fn drivers_dma_verify_uncached(paddr: PhysAddr, pages: usize) -> i32 {
+        use crate::vm::{GenericPageTable, PageTable};
+        use crate::{CachePolicy, PAGE_SIZE};
+
+        if paddr == 0 || pages == 0 {
+            return -1;
+        }
+        let vaddr = paddr + KCONFIG.phys_to_virt_offset;
+        let pt = PageTable::from_current();
+        for i in 0..pages {
+            let va = vaddr + i * PAGE_SIZE;
+            let Ok((_, flags, _)) = pt.query(va) else {
+                return -1;
+            };
+            let policy = flags.bits() & 3;
+            if policy != CachePolicy::Uncached as usize
+                && policy != CachePolicy::UncachedDevice as usize
+            {
+                return -1;
+            }
+        }
+        core::mem::forget(pt);
+        0
+    }
+
     #[no_mangle]
     extern "C" fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr {
         paddr + KCONFIG.phys_to_virt_offset

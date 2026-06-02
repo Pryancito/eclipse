@@ -19,7 +19,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-hardening";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-dma-tsc";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -461,6 +461,10 @@ const NUM_TX: usize = 256;
 const BUF_SIZE: usize = 2048 + 128;
 /// Linux `E1000_RX_BUFFER_WRITE` — batch RDT doorbell every N descriptors.
 const RX_BUFFER_WRITE: usize = 16;
+/// Conservative TSC cycle budget per requested microsecond (safe through ~6 GHz turbo).
+const UDELAY_TSC_PER_US: u64 = 7000;
+/// Spin-loop floor per microsecond when the APIC/HPET timer is stuck.
+const UDELAY_SPINS_PER_US: u64 = 3500;
 /// Max RX slots consumed per `receive()` call while assembling SG (EOP=0) fragments.
 const RX_SG_SLOTS_PER_CALL: u8 = 8;
 
@@ -542,14 +546,16 @@ pub struct E1000eHw {
     mac: [u8; 6],
 
     rx_ring: DmaRegion,
-    rx_bufs: Vec<DmaRegion>,
+    /// Single contiguous DMA block for all RX packet buffers (NUM_RX × BUF_SIZE).
+    rx_buf_pool: DmaRegion,
     /// Linux `next_to_clean` — next descriptor to check for DD.
     rx_next_to_clean: usize,
     /// Linux `next_to_use` — next descriptor to post to hardware via RDT.
     rx_next_to_use: usize,
 
     tx_ring: DmaRegion,
-    tx_bufs: Vec<DmaRegion>,
+    /// Single contiguous DMA block for all TX packet buffers (NUM_TX × BUF_SIZE).
+    tx_buf_pool: DmaRegion,
     tx_tail: usize,
     phy_addr: u8,
     pub stats: NetStats,
@@ -600,17 +606,17 @@ impl E1000eHw {
     // Kumeran (KMRN) register access (ICH8/PCH specific)
     // -----------------------------------------------------------------------
 
-    /// Busy-wait for `us` microseconds — timer when calibrated, spin budget when not.
-    /// On bare metal the APIC/HPET may not tick during early PCI probe; a pure
-    /// timer loop then exits in microseconds (10M spins ≈ 2 ms @ 4.5 GHz) and
-    /// breaks MDIO/PHY timing. Require `us * SPINS_PER_US` iterations as a floor.
+    /// Busy-wait for `us` microseconds — APIC timer when live, TSC+spin floor otherwise.
     fn udelay(us: u64) {
         if us == 0 {
             return;
         }
-        const SPINS_PER_US: u64 = 400;
-        const MAX_SPINS: u64 = 400_000_000;
-        let min_spins = us.saturating_mul(SPINS_PER_US);
+        const MAX_SPINS: u64 = 800_000_000;
+        let min_spins = us.saturating_mul(UDELAY_SPINS_PER_US);
+        #[cfg(target_arch = "x86_64")]
+        let tsc_start = unsafe { core::arch::x86_64::_rdtsc() };
+        #[cfg(target_arch = "x86_64")]
+        let tsc_budget = us.saturating_mul(UDELAY_TSC_PER_US);
         let t0 = timer_now_as_micros();
         let mut spins = 0u64;
         loop {
@@ -620,14 +626,22 @@ impl E1000eHw {
             if elapsed >= us {
                 break;
             }
-            if spins >= min_spins {
-                if elapsed == 0 && us > 100 {
-                    log::trace!(
-                        "[e1000e] udelay({}us) via spin floor (timer stuck at {})",
-                        us,
-                        t0
-                    );
+            #[cfg(target_arch = "x86_64")]
+            {
+                let tsc_elapsed = unsafe { core::arch::x86_64::_rdtsc().wrapping_sub(tsc_start) };
+                if tsc_elapsed >= tsc_budget && spins >= min_spins {
+                    if elapsed == 0 && us > 10 {
+                        log::trace!(
+                            "[e1000e] udelay({}us) via TSC floor ({} cycles, timer stuck)",
+                            us,
+                            tsc_elapsed
+                        );
+                    }
+                    break;
                 }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            if spins >= min_spins {
                 break;
             }
             if spins >= MAX_SPINS {
@@ -640,6 +654,41 @@ impl E1000eHw {
                 break;
             }
         }
+    }
+
+    #[inline]
+    fn rx_buf_paddr(&self, i: usize) -> u64 {
+        (self.rx_buf_pool.paddr() + i * BUF_SIZE) as u64
+    }
+
+    #[inline]
+    fn rx_buf_vaddr(&self, i: usize) -> usize {
+        self.rx_buf_pool.vaddr() + i * BUF_SIZE
+    }
+
+    #[inline]
+    fn tx_buf_paddr(&self, i: usize) -> u64 {
+        (self.tx_buf_pool.paddr() + i * BUF_SIZE) as u64
+    }
+
+    #[inline]
+    fn tx_buf_vaddr(&self, i: usize) -> usize {
+        self.tx_buf_pool.vaddr() + i * BUF_SIZE
+    }
+
+    fn mark_dma_region_uncached(region: &DmaRegion, label: &str) -> bool {
+        if !region.mark_uncached() {
+            crate::klog_warn!("[e1000e] {}: mark_uncached() failed (PAT remap rejected)\n", label);
+            return false;
+        }
+        if !region.verify_uncached() {
+            crate::klog_warn!(
+                "[e1000e] {}: PTE verify failed — page still WB (PAT/MTRR not applied)\n",
+                label
+            );
+            return false;
+        }
+        true
     }
 
     unsafe fn kmrn_read(&self, offset: u16) -> u16 {
@@ -772,11 +821,30 @@ impl E1000eHw {
 
         let rdlen = (NUM_RX * DESC_BYTES) as u32;
         let tdlen = (NUM_TX * DESC_BYTES) as u32;
+        for i in 1..NUM_RX {
+            if self.rx_buf_paddr(i) != self.rx_buf_paddr(i - 1) + BUF_SIZE as u64 {
+                crate::klog_err!(
+                    "[e1000e] RX buf pool not contiguous at slot {} — DMA aliasing risk\n",
+                    i
+                );
+                return false;
+            }
+            if self.rx_buf_paddr(i) & 63 != 0 {
+                crate::klog_warn!(
+                    "[e1000e] RX buf slot {} paddr {:#x} not 64-byte aligned\n",
+                    i,
+                    self.rx_buf_paddr(i)
+                );
+            }
+        }
         crate::klog_info!(
-            "[e1000e] DMA layout: NUM_RX={} RDLEN={} rx_paddr={:#x} NUM_TX={} TDLEN={} tx_paddr={:#x} uc={}\n",
+            "[e1000e] DMA layout: NUM_RX={} RDLEN={} rx_paddr={:#x} rx_pool={:#x}+{} \
+             NUM_TX={} TDLEN={} tx_paddr={:#x} uc={}\n",
             NUM_RX,
             rdlen,
             rx_base_p,
+            self.rx_buf_pool.paddr(),
+            self.rx_buf_pool.byte_len(),
             NUM_TX,
             tdlen,
             self.tx_ring.paddr(),
@@ -807,24 +875,23 @@ impl E1000eHw {
         self.rx_needs_cache_invalidation() && !self.dma_uncached
     }
 
-    /// Mark descriptor rings and DMA buffers uncacheable on bare metal.
+    /// Mark descriptor rings and packet pools uncacheable; verify PTE cache bits on bare metal.
     fn setup_dma_uncached(&mut self) {
         if !self.rx_needs_cache_invalidation() {
             self.dma_uncached = false;
             return;
         }
-        let mut ok = self.rx_ring.mark_uncached() && self.tx_ring.mark_uncached();
-        for b in &self.rx_bufs {
-            ok &= b.mark_uncached();
-        }
-        for b in &self.tx_bufs {
-            ok &= b.mark_uncached();
-        }
+        let ok = Self::mark_dma_region_uncached(&self.rx_ring, "rx_ring")
+            & Self::mark_dma_region_uncached(&self.tx_ring, "tx_ring")
+            & Self::mark_dma_region_uncached(&self.rx_buf_pool, "rx_buf_pool")
+            & Self::mark_dma_region_uncached(&self.tx_buf_pool, "tx_buf_pool");
         self.dma_uncached = ok;
         if ok {
-            crate::klog_info!("[e1000e] DMA rings/buffers mapped uncacheable\n");
+            crate::klog_info!("[e1000e] DMA rings/pools mapped and verified uncacheable (PAT UC)\n");
         } else {
-            crate::klog_warn!("[e1000e] UC DMA remap failed — using clflush+lfence fallback\n");
+            crate::klog_warn!(
+                "[e1000e] UC DMA incomplete — RX/TX will use clflush+mfence+lfence on WB pages\n"
+            );
         }
         let _ = self.validate_dma_ring_layout();
     }
@@ -917,6 +984,12 @@ impl E1000eHw {
     }
 
     unsafe fn disable_ulp_software(&self) {
+        // Release PHY power-down before any MDIO paged access.
+        let mut ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        ctrl_ext &= !CTRL_EXT_PHYPDEN;
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+        let _ = mmio_read(self.base, E1000E_CTRL_EXT);
+
         self.toggle_lanphypc();
 
         let phy_addr = self.active_phy_addr();
@@ -971,7 +1044,18 @@ impl E1000eHw {
             Self::udelay(50_000);
         }
 
-        crate::klog_info!("[e1000e] ULP disabled via software path (toggle_lanphypc)\n");
+        // If ME left MDIO dead, pulse LANPHYPC again (common after warm boot / Windows).
+        if self.mdic_read(phy_addr, MII_BMSR).is_none() {
+            crate::klog_warn!("[e1000e] ULP software: MDIO silent — retry toggle_lanphypc\n");
+            self.toggle_lanphypc();
+        }
+
+        match self.mdic_read(phy_addr, MII_BMSR) {
+            Some(bmsr) => crate::klog_info!("[e1000e] ULP software: PHY BMSR={:#x}\n", bmsr),
+            None => crate::klog_warn!(
+                "[e1000e] ULP software: PHY still not responding — check cable LEDs / ME lock\n"
+            ),
+        }
     }
 
     unsafe fn disable_ulp(&self) {
@@ -1101,11 +1185,20 @@ impl E1000eHw {
         read_volatile((desc_addr + 8) as *const u64)
     }
 
-    /// Parse extended RX write-back from one atomic u64 load (after fence / invalidate).
+    /// Invalidate descriptor WB, fence load buffers, then read — no speculative window.
+    unsafe fn read_rx_wb_after_sync(&self, desc_addr: usize) -> u64 {
+        if self.rx_needs_cache_flush() {
+            Self::invalidate_cpu_cache_for_read(desc_addr, 16);
+        } else {
+            core::arch::x86_64::_mm_mfence();
+            core::arch::x86_64::_mm_lfence();
+            fence(Ordering::Acquire);
+        }
+        Self::read_rx_wb_u64(desc_addr)
+    }
+
     #[inline]
-    unsafe fn parse_rx_wb_ext(desc_addr: usize) -> Option<(u32, usize)> {
-        Self::dma_rmb_after_device();
-        let wb = Self::read_rx_wb_u64(desc_addr);
+    unsafe fn parse_rx_wb_ext_u64(wb: u64) -> Option<(u32, usize)> {
         let staterr = wb as u32;
         if staterr & RXD_EXT_DD == 0 {
             return None;
@@ -1116,9 +1209,7 @@ impl E1000eHw {
 
     /// Legacy RX write-back: len @ +8, DD status @ +12 — one u64 covers both.
     #[inline]
-    unsafe fn parse_rx_wb_legacy(desc_addr: usize) -> Option<(u32, usize)> {
-        Self::dma_rmb_after_device();
-        let wb = Self::read_rx_wb_u64(desc_addr);
+    unsafe fn parse_rx_wb_legacy_u64(wb: u64) -> Option<(u32, usize)> {
         let len = wb as u16 as usize;
         let status = (wb >> 32) as u8;
         if status & 0x01 == 0 {
@@ -1138,9 +1229,10 @@ impl E1000eHw {
 
     /// RX payload after device DMA — invalidate only when rings stay WB-mapped.
     unsafe fn dma_copy_in_rx_buffer(&self, dst: &mut Vec<u8>, vaddr: usize, len: usize) {
-        Self::dma_rmb_after_device();
         if self.rx_needs_cache_flush() {
             Self::invalidate_cpu_cache_for_read(vaddr, len);
+        } else {
+            Self::dma_rmb_after_device();
         }
         Self::dma_copy_in(dst, vaddr, len);
     }
@@ -2199,10 +2291,10 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let i = self.rx_next_to_use;
         let desc = &mut *ring.add(i);
-        write_volatile(&mut desc.addr, self.rx_bufs[i].paddr() as u64);
+        write_volatile(&mut desc.addr, self.rx_buf_paddr(i));
         write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
         if self.rx_needs_cache_flush() {
-            Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+            Self::invalidate_cpu_cache_for_read(self.rx_buf_vaddr(i), BUF_SIZE);
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
         self.rx_next_to_use = (i + 1) % NUM_RX;
@@ -3953,7 +4045,7 @@ impl E1000eHw {
         core::ptr::write_bytes(tx_ring, 0, NUM_TX);
         for i in 0..NUM_RX {
             let desc = &mut *rx_ring.add(i);
-            desc.addr = self.rx_bufs[i].paddr() as u64;
+            desc.addr = self.rx_buf_paddr(i);
             core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
         }
         core::arch::x86_64::_mm_sfence();
@@ -4190,13 +4282,13 @@ impl E1000eHw {
         for i in 0..NUM_RX {
             let desc = &mut *ring.add(i);
             // Write buffer address (CPU→HW field).
-            write_volatile(&mut desc.addr, self.rx_bufs[i].paddr() as u64);
+            write_volatile(&mut desc.addr, self.rx_buf_paddr(i));
             // Zero the WB region (HW→CPU field) so old DD bits don't linger.
             write_volatile((desc as *mut RxDesc as usize + 8) as *mut u64, 0);
 
             // Invalidate the cache for the packet buffer on physical hardware.
             if self.rx_needs_cache_flush() {
-                Self::invalidate_cpu_cache_for_read(self.rx_bufs[i].vaddr(), BUF_SIZE);
+                Self::invalidate_cpu_cache_for_read(self.rx_buf_vaddr(i), BUF_SIZE);
                 core::arch::x86_64::_mm_clflush(desc as *const RxDesc as *const u8);
             }
         }
@@ -4249,13 +4341,11 @@ impl E1000eHw {
     /// this bug; real silicon does.
     unsafe fn desc_done(&self, desc_addr: usize) -> Option<(u32, usize)> {
         for attempt in 0..RX_DESC_WB_SETTLE_TRIES {
-            if self.rx_needs_cache_flush() {
-                Self::invalidate_cpu_cache_for_read(desc_addr, 16);
-            }
+            let wb = unsafe { self.read_rx_wb_after_sync(desc_addr) };
             let parsed = if self.use_extended_descriptors {
-                Self::parse_rx_wb_ext(desc_addr)
+                Self::parse_rx_wb_ext_u64(wb)
             } else {
-                Self::parse_rx_wb_legacy(desc_addr)
+                Self::parse_rx_wb_legacy_u64(wb)
             };
             match parsed {
                 None => return None,
@@ -4326,7 +4416,7 @@ impl E1000eHw {
         }
 
         // Copy this fragment out of the DMA buffer before recycling the descriptor.
-        let buf_vaddr = self.rx_bufs[i].vaddr();
+        let buf_vaddr = self.rx_buf_vaddr(i);
         let copy_len = unsafe { self.recover_rx_copy_len(buf_vaddr, len) };
         let mut frag = Vec::new();
         unsafe { self.dma_copy_in_rx_buffer(&mut frag, buf_vaddr, copy_len) };
@@ -4592,7 +4682,7 @@ impl E1000eHw {
         let desc = unsafe { &mut *ring.add(idx) };
 
         let buf =
-            unsafe { core::slice::from_raw_parts_mut(self.tx_bufs[idx].vaddr() as *mut u8, data.len()) };
+            unsafe { core::slice::from_raw_parts_mut(self.tx_buf_vaddr(idx) as *mut u8, data.len()) };
         buf.copy_from_slice(data);
 
 
@@ -4601,7 +4691,7 @@ impl E1000eHw {
         self.stats.tx_bytes += data.len() as u64;
 
         unsafe {
-            write_volatile(&mut desc.addr, self.tx_bufs[idx].paddr() as u64);
+            write_volatile(&mut desc.addr, self.tx_buf_paddr(idx));
             write_volatile(&mut desc.len, data.len() as u16);
             write_volatile(&mut desc.cso, 0);
             write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
@@ -4614,7 +4704,7 @@ impl E1000eHw {
 
         if self.rx_needs_cache_flush() {
             unsafe {
-                Self::dma_wbinv_range(self.tx_bufs[idx].vaddr(), data.len());
+                Self::dma_wbinv_range(self.tx_buf_vaddr(idx), data.len());
                 Self::dma_wbinv_range(desc as *const TxDesc as usize, core::mem::size_of::<TxDesc>());
                 core::arch::x86_64::_mm_sfence();
             }
@@ -5158,19 +5248,18 @@ pub fn init(
     let rx_ring = DmaRegion::alloc(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
     let tx_ring = DmaRegion::alloc(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
 
-    let mut rx_bufs = Vec::with_capacity(NUM_RX);
-    let mut tx_bufs = Vec::with_capacity(NUM_TX);
-
-    for _ in 0..NUM_RX {
-        let buf = DmaRegion::alloc_uninit(BUF_SIZE).ok_or(DeviceError::DmaError)?;
-        assert_eq!(buf.paddr() % 64, 0, "e1000e: RX Buffer physical address must be 64-byte aligned!");
-        rx_bufs.push(buf);
-    }
-    for _ in 0..NUM_TX {
-        let buf = DmaRegion::alloc(BUF_SIZE).ok_or(DeviceError::DmaError)?;
-        assert_eq!(buf.paddr() % 64, 0, "e1000e: TX Buffer physical address must be 64-byte aligned!");
-        tx_bufs.push(buf);
-    }
+    let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let tx_buf_pool = DmaRegion::alloc(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    assert_eq!(
+        rx_buf_pool.paddr() % 64,
+        0,
+        "e1000e: RX buffer pool base must be 64-byte aligned"
+    );
+    assert_eq!(
+        tx_buf_pool.paddr() % 64,
+        0,
+        "e1000e: TX buffer pool base must be 64-byte aligned"
+    );
 
     let mut hw = E1000eHw {
         base: vaddr,
@@ -5178,11 +5267,11 @@ pub fn init(
         device_id: pci.id.device_id,
         mac: [0u8; 6], // Read from hardware during reset
         rx_ring,
-        rx_bufs,
+        rx_buf_pool,
         rx_next_to_clean: 0,
         rx_next_to_use: 0,
         tx_ring,
-        tx_bufs,
+        tx_buf_pool,
         tx_tail: 0,
         phy_addr: 1, // Default to 1, updated during probe
         stats: NetStats::default(),
