@@ -1193,7 +1193,15 @@ impl E1000eHw {
 
         if let Some(bmcr) = self.mdic_read_swheld(phy_addr, MII_BMCR, MDIC_POLL_TRIES) {
             let _ = self.mdic_write_swheld(phy_addr, MII_BMCR, bmcr | 0x8000, MDIC_POLL_TRIES);
-            Self::udelay(50_000);
+            // Poll until BMCR bit 15 (software reset) self-clears; I219 can take >50 ms.
+            for _ in 0..50 {
+                Self::udelay(10_000);
+                match self.mdic_read_swheld(phy_addr, MII_BMCR, MDIC_POLL_TRIES) {
+                    Some(c) if c & 0x8000 == 0 => break,
+                    None => break,
+                    _ => {}
+                }
+            }
         }
 
         match self.mdic_read_swheld(phy_addr, MII_BMSR, MDIC_POLL_TRIES) {
@@ -3776,7 +3784,7 @@ impl E1000eHw {
 
 
     unsafe fn resolve_link_speed_duplex(&self) -> (u32, bool) {
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
         let (speed, duplex_full, _src) = self.phy_operational_speed(phy, st2);
         (speed, duplex_full)
@@ -3807,7 +3815,15 @@ impl E1000eHw {
     /// Resuelve de forma segura el enlace físico y evita bucles infinitos de AN.
     unsafe fn check_for_link_linux(&mut self) -> bool {
         let is_pch = self.is_pch_lpt_or_later();
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
+        if phy != self.phy_addr {
+            crate::klog_info!(
+                "[e1000e] runtime PHY switch {} -> {}\n",
+                self.phy_addr,
+                phy
+            );
+            self.phy_addr = phy;
+        }
 
         // 1. Leer BMSR dos veces para limpiar el bit pegajoso de "Latch-Low".
         let _ = self.mdic_read(phy, MII_BMSR);
@@ -3952,7 +3968,7 @@ impl E1000eHw {
         }
 
         // Lectura de control del PHY antes de evaluar timeouts de estados
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         let phy_link_up = bmsr != 0 && bmsr != 0xFFFF && (bmsr & 0x0004) != 0;
@@ -4009,15 +4025,21 @@ impl E1000eHw {
                 }
             }
             2 => {
-                // Timeout del Estado 2 (2 segundos adicionales). Si sigue colapsado, disparamos un reset eléctrico del PHY vía LANPHYPC.
+                // Timeout del Estado 2 (2 segundos adicionales). Reset eléctrico vía PHY_RST.
+                // No llamamos toggle_lanphypc() extra ni pch_prepare_mdio_bus() completo:
+                //   - pch_issue_phy_reset() ya espera LAN_INIT_DONE y descompuerta el PHY.
+                //   - detect_phy_addr() llama toggle_lanphypc() internamente si MDIO sigue mudo.
+                // Llamar pch_prepare_mdio_bus() aquí causa doble toggle y re-espera inútil
+                // de LAN_INIT_DONE (ya fue limpiado por pch_phy_reset_complete).
                 if elapsed_us >= 2_000_000 {
                     crate::klog_warn!(
-                        "[e1000e] Bringup PCH: Timeout en Stage 2. PHY_RST + LANPHYPC.\n"
+                        "[e1000e] Bringup PCH: Timeout en Stage 2. PHY_RST.\n"
                     );
                     self.pch_issue_phy_reset();
-                    self.toggle_lanphypc();
-                    self.pch_prepare_mdio_bus();
+                    self.mdic_clear_stuck(true);
+                    self.detect_phy_addr();
                     self.pch_disable_lplu_gbe();
+                    self.mac_setup_copper_link_linux();
                     self.pch_kick_autoneg_mdio();
                     self.link_bringup_stage = 3;
                     self.stage_start_us = now;
@@ -4609,7 +4631,7 @@ impl E1000eHw {
         if status & STATUS_LU == 0 {
             return;
         }
-        let phy = self.phy_addr;
+        let phy = self.active_phy_addr();
         let _ = self.mdic_read(phy, MII_BMSR);
         let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
         if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 || (bmsr & BMSR_ANEG_COMPLETE) == 0 {
