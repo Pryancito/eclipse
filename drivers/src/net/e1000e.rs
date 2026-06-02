@@ -19,7 +19,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-irq-lfence";
+const E1000E_DRIVER_TAG: &str = "e1000e-rev-20250601-metal-irq-atomic";
 
 /// Optional `klog_info!` — compiled out when [`E1000E_LOG_VERBOSE`] is false.
 macro_rules! e1000e_vlog {
@@ -204,6 +204,8 @@ const ICR_RX_ANY: u32 = ICR_RXT0 | ICR_RXDMT0;
 const LANPHYPC_POWERDOWN_HOLD_US: u64 = 10_000;
 /// Analog PHY settle after releasing LANPHYPC (some boards need >50 ms).
 const LANPHYPC_POWERUP_SETTLE_US: u64 = 100_000;
+/// Spin iterations between clflush passes (PCIe WB settle on SKX+ / NUMA).
+const CLFLUSH_PCIE_SETTLE_SPINS: u32 = 64;
 /// Minimum DMA base alignment for descriptor rings (Intel hardware requirement).
 const DMA_DESC_ALIGN: usize = 16;
 /// Linux `e1000_irq_enable` (PCH): `IMS_ENABLE_MASK | E1000_IMS_ECCER`.
@@ -1228,18 +1230,33 @@ impl E1000eHw {
         fence(Ordering::Acquire);
     }
 
-    /// Drop stale CPU cache lines before reading device write-back (WB mapping only).
-    unsafe fn invalidate_cpu_cache_for_read(vaddr: usize, len: usize) {
+    /// Flush cache lines covering `[vaddr, vaddr+len)` (64-byte stride).
+    unsafe fn clflush_range(vaddr: usize, len: usize) {
         if len == 0 {
             return;
         }
-        core::arch::x86_64::_mm_mfence();
         let mut p = vaddr & !63;
         let end = vaddr.saturating_add(len);
         while p < end {
             core::arch::x86_64::_mm_clflush(p as *const u8);
             p += 64;
         }
+    }
+
+    /// Drop stale CPU cache lines before reading device write-back (WB mapping only).
+    /// clflush is asynchronous w.r.t. PCIe; on SKX+ / NUMA a single pass may refetch
+    /// a stale line before the NIC WB reaches RAM — double-flush with mfence between.
+    unsafe fn invalidate_cpu_cache_for_read(vaddr: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        core::arch::x86_64::_mm_mfence();
+        Self::clflush_range(vaddr, len);
+        core::arch::x86_64::_mm_mfence();
+        for _ in 0..CLFLUSH_PCIE_SETTLE_SPINS {
+            core::hint::spin_loop();
+        }
+        Self::clflush_range(vaddr, len);
         core::arch::x86_64::_mm_mfence();
         core::arch::x86_64::_mm_lfence();
         fence(Ordering::SeqCst);
@@ -4932,13 +4949,13 @@ impl Scheme for E1000eInterface {
             return;
         }
 
-        // ICR is read-to-clear; with CTRL_EXT.IAME a read auto-masks IMS even when icr==0
-        // (shared/spurious IRQ). Re-arm IMS immediately to shrink the interrupt mute window.
+        // ICR is read-to-clear; with CTRL_EXT.IAME the read auto-masks IMS.
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         log::trace!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
-        self.ims_rearm();
 
         if icr == 0 {
+            // Spurious/shared IRQ — re-arm only after ICR consumed (no early IMS write).
+            self.ims_rearm();
             return;
         }
 
@@ -4949,17 +4966,18 @@ impl Scheme for E1000eInterface {
         }
 
         let needs_poll = icr & (ICR_RX_ANY | ICR_TXDW) != 0;
-        if needs_poll && !self.poll_pending.load(Ordering::Acquire) {
-            self.poll_pending.store(true, Ordering::SeqCst);
+        // swap(true): returns previous value; enter only when no poll job was already queued.
+        if needs_poll && !self.poll_pending.swap(true, Ordering::AcqRel) {
             let poll_pending = self.poll_pending.clone();
             let self_clone = self.clone();
             crate::utils::deferred_job::push_deferred_job(move || {
                 let _ = self_clone.poll();
-                poll_pending.store(false, Ordering::SeqCst);
+                poll_pending.store(false, Ordering::Release);
             });
         }
 
-        // Belt-and-suspenders: TXDW/RXT0 may assert while deferred poll is still queued.
+        // Linux order: consume ICR, queue NAPI/poll work, then e1000_irq_enable (IMS).
+        // Early IMS re-arm before deferred work can lose MSI events on non-reentrant APIC paths.
         self.ims_rearm();
     }
 }
