@@ -5828,6 +5828,18 @@ impl E1000eInterface {
             fence(Ordering::SeqCst);
         }
     }
+
+    fn queue_deferred_poll(&self) {
+        if self.poll_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let poll_pending = self.poll_pending.clone();
+        let self_clone = self.clone();
+        crate::utils::deferred_job::push_deferred_job(move || {
+            let _ = self_clone.poll();
+            poll_pending.store(false, Ordering::Release);
+        });
+    }
 }
 
 impl Scheme for E1000eInterface {
@@ -5845,7 +5857,10 @@ impl Scheme for E1000eInterface {
         log::trace!("[e1000e] handle_irq: irq={}, icr={:#x}", irq, icr);
 
         if icr == 0 {
-            // Spurious/shared IRQ — re-arm only after ICR consumed (no early IMS write).
+            if let Some(mut hw) = self.driver.hw.try_lock() {
+                hw.get_link_status = true;
+            }
+            self.queue_deferred_poll();
             self.ims_rearm();
             return;
         }
@@ -5856,15 +5871,9 @@ impl Scheme for E1000eInterface {
             }
         }
 
-        let needs_poll = icr & (ICR_RX_ANY | ICR_TXDW) != 0;
-        // swap(true): returns previous value; enter only when no poll job was already queued.
-        if needs_poll && !self.poll_pending.swap(true, Ordering::AcqRel) {
-            let poll_pending = self.poll_pending.clone();
-            let self_clone = self.clone();
-            crate::utils::deferred_job::push_deferred_job(move || {
-                let _ = self_clone.poll();
-                poll_pending.store(false, Ordering::Release);
-            });
+        let needs_poll = icr & (ICR_RX_ANY | ICR_TXDW | ICR_LSC) != 0;
+        if needs_poll {
+            self.queue_deferred_poll();
         }
 
         // Linux order: consume ICR, queue NAPI/poll work, then e1000_irq_enable (IMS).
