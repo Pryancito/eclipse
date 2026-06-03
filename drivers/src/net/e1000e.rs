@@ -1,11 +1,19 @@
 //! Intel e1000e NIC driver (82574L / 82579 / I217 / I218 / I219 family)
 //!
-//! Register semantics and hot paths are aligned with the in-tree Linux driver
-//! in this repo (`e1000e/*.c`, especially `netdev.c` ring setup, `hw.h` RX
-//! extended descriptors, and `defines.h` interrupt masks). A full line-by-line
-//! port of all MAC/PHY/NVM paths is not the goal; behaviour-critical pieces are
-//! behaviour-critical pieces are matched for PCH/discrete Intel NICs on real
-//! hardware (QEMU uses the same driver paths — no emulated shortcuts).
+//! Reference drivers (behaviour checklist, not a line-by-line port):
+//! - **Linux** `drivers/net/ethernet/intel/e1000e/` — `netdev.c` (open/NAPI/RX),
+//!   `ich8lan.c` (PCH/AMT/I219), `defines.h` (interrupt masks).
+//! - **FreeBSD** `if_em.c` / `em_rxtx.c` — `bus_dmamap_sync(POSTREAD|PREWRITE)`,
+//!   filter + taskqueue instead of NAPI.
+//!
+//! Eclipse mapping:
+//! | Concern        | Linux                         | FreeBSD              | Eclipse                    |
+//! |----------------|-------------------------------|----------------------|----------------------------|
+//! | DMA alloc      | `dma_alloc_coherent`          | `BUS_DMA_COHERENT`   | [`DmaRegion::map_coherent`] |
+//! | CPU→device     | `dma_sync_single_for_device`  | `BUS_DMASYNC_PREWRITE` | [`DmaSyncDir::ToDevice`]   |
+//! | device→CPU     | `dma_sync_single_for_cpu`     | `BUS_DMASYNC_POSTREAD` | [`DmaSyncDir::FromDevice`] |
+//! | RX poll budget | NAPI `budget`                 | if_em filter         | Pulse + `rx_poll_budget`   |
+//! | AMT open       | `e1000e_open` chunked         | em attach/open       | `schedule_amt_open`        |
 //!
 //! Set [`E1000E_CONVENTIONAL`] for a minimal profile: no checksum offload, no
 //! no IAME auto-mask, no optional PCH tuning, short link-up wait. RX always uses extended
@@ -20,7 +28,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rx-silicon";
+const E1000E_DRIVER_TAG: &str = "e1000e-rx-real-hw";
 /// Retry AMT open if SWFLAG/MDIO still blocked (CSME can take seconds after DRV_LOAD).
 const E1000E_AMT_OPEN_RETRY_US: u64 = 30_000_000;
 /// Per deferred job: wait at most this long for SWFLAG (chunked — PS/2/USB stay responsive).
@@ -108,6 +116,7 @@ use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use crate::utils::dma::DmaRegion;
+use crate::utils::dma_sync::{dma_sync_region, dma_sync_rx_desc_span, dma_sync_wb_from_device, DmaSyncDir};
 use pci::{PCIDevice, BAR, Location};
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
 use lock::Mutex;
@@ -704,6 +713,8 @@ pub struct E1000eHw {
     srrctl_absent: bool,
     /// RX/TX rings mapped UC — skip clflush on descriptor WB paths.
     dma_uncached: bool,
+    /// Last cache line (idx/4) synced for DD read on WB fallback; 0xFF = none.
+    rx_wb_sync_line: u8,
     /// MDIO/SWFLAG unavailable — trust STATUS.LU for link (common on I219 after ULP).
     mdio_degraded: bool,
     /// MDIO returned a valid PHY ID/BMSR during detect.
@@ -997,28 +1008,29 @@ impl E1000eHw {
         !self.dma_uncached
     }
 
-    /// Mark descriptor rings and packet pools uncacheable; verify PTE cache bits.
+    /// Mark descriptor rings and packet pools uncacheable (Linux `dma_alloc_coherent` fallback).
     fn setup_dma_uncached(&mut self) {
-        let ok = Self::mark_dma_region_uncached(&self.rx_ring, "rx_ring")
-            & Self::mark_dma_region_uncached(&self.tx_ring, "tx_ring")
-            & Self::mark_dma_region_uncached(&self.rx_buf_pool, "rx_buf_pool")
-            & Self::mark_dma_region_uncached(&self.tx_buf_pool, "tx_buf_pool");
+        let ok = E1000eHw::mark_dma_region_uncached(&self.rx_ring, "rx_ring")
+            & E1000eHw::mark_dma_region_uncached(&self.tx_ring, "tx_ring")
+            & E1000eHw::mark_dma_region_uncached(&self.rx_buf_pool, "rx_buf_pool")
+            & E1000eHw::mark_dma_region_uncached(&self.tx_buf_pool, "tx_buf_pool");
         self.dma_uncached = ok;
         if ok {
             e1000e_vlog!("[e1000e] DMA rings/pools mapped and verified uncacheable (PAT UC)\n");
-            // We may have touched these pages while they were still WB-mapped.
-            // Purge any stale cache lines once so UC reads observe device DMA.
             unsafe {
-                Self::clflush_range(self.rx_ring.vaddr(), self.rx_ring.byte_len());
-                Self::clflush_range(self.tx_ring.vaddr(), self.tx_ring.byte_len());
-                Self::clflush_range(self.rx_buf_pool.vaddr(), self.rx_buf_pool.byte_len());
-                Self::clflush_range(self.tx_buf_pool.vaddr(), self.tx_buf_pool.byte_len());
-                core::arch::x86_64::_mm_mfence();
-                core::arch::x86_64::_mm_lfence();
+                for (region, len) in [
+                    (&self.rx_ring, self.rx_ring.byte_len()),
+                    (&self.tx_ring, self.tx_ring.byte_len()),
+                    (&self.rx_buf_pool, self.rx_buf_pool.byte_len()),
+                    (&self.tx_buf_pool, self.tx_buf_pool.byte_len()),
+                ] {
+                    dma_sync_region(region, false, 0, len, DmaSyncDir::ToDevice);
+                }
             }
         } else {
-            e1000e_wlog!(
-                "[e1000e] UC DMA incomplete — RX/TX will use clflush+mfence+lfence on WB pages\n"
+            crate::klog_warn!(
+                "[e1000e] UC DMA incomplete — RX uses line-batch sync on WB pages (tag={})\n",
+                E1000E_DRIVER_TAG
             );
         }
         let _ = self.validate_dma_ring_layout();
@@ -1636,6 +1648,8 @@ impl E1000eHw {
             self.pch_clear_status_phyra_if_set();
         }
 
+        self.invalidate_rx_sw_state();
+
         mmio_write(self.base, E1000E_WUC, 0);
         mmio_write(self.base, E1000E_WUFC, 0);
         mmio_write(self.base, E1000E_WUS, 0xFFFF_FFFF);
@@ -1726,6 +1740,7 @@ impl E1000eHw {
     /// Probe-time ring setup is invalidated by CTRL_RST; Linux re-runs configure_tx/rx on open.
     unsafe fn reapply_datapath_after_mac_reset(&mut self) {
         e1000e_wlog!("[e1000e] reapply datapath after MAC reset\n");
+        self.invalidate_rx_sw_state();
         self.restore_pci_command_bus_master();
         Self::udelay(50);
 
@@ -1959,9 +1974,18 @@ impl E1000eHw {
         }
     }
 
-    /// I219+AMT: do not wait for `nic_open_done` / SWFLAG open — arm RX from STATUS.LU.
+    fn invalidate_rx_sw_state(&mut self) {
+        self.rx_link_armed = false;
+        self.rx_next_to_clean = 0;
+        self.rx_next_to_use = 0;
+        self.rx_post_since_doorbell = 0;
+        self.invalidate_rx_desc_wb_sync();
+        self.rx_sg_reset();
+    }
+
+    /// I219+AMT: arm RX from STATUS.LU only when AMT open is not resetting the MAC.
     unsafe fn try_rx_arm_pending_amt(&mut self, status: u32) -> bool {
-        if self.rx_link_armed || !self.has_amt() || self.nic_open_done {
+        if self.rx_link_armed || !self.has_amt() || self.nic_open_done || self.amt_open_active.get() {
             return false;
         }
         if status & STATUS_LU == 0 {
@@ -2195,46 +2219,53 @@ impl E1000eHw {
 
     /// Drop stale CPU cache lines before reading device write-back (WB mapping only).
     unsafe fn invalidate_cpu_cache_for_read(vaddr: usize, len: usize) {
-        if len == 0 {
-            return;
-        }
-        core::arch::x86_64::_mm_mfence();
-        Self::clflush_range(vaddr, len);
-        core::arch::x86_64::_mm_sfence();
-        core::arch::x86_64::_mm_lfence();
-        fence(Ordering::Acquire);
+        dma_sync_wb_from_device(vaddr, len);
     }
 
-    /// Flush full cache lines covering `count` RX descriptors from `start_idx`.
+    /// FreeBSD `BUS_DMASYNC_PREWRITE` / Linux `dma_sync_for_device` on RX ring span.
     unsafe fn flush_rx_ring_descriptor_span(&self, start_idx: usize, count: usize) {
-        if count == 0 || !self.rx_needs_cache_flush() {
-            return;
-        }
-        let ring_vaddr = self.rx_ring.vaddr();
-        let byte_off = start_idx * size_of::<RxDesc>();
-        let span_end = byte_off + count * size_of::<RxDesc>();
-        let line_start = (ring_vaddr + byte_off) & !(CACHE_LINE_SIZE - 1);
-        let line_end = (ring_vaddr + span_end + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-        if line_end > line_start {
-            Self::clflush_range(line_start, line_end - line_start);
-            Self::store_fence_before_device_mmio();
-        }
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.dma_uncached,
+            start_idx,
+            count,
+            size_of::<RxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
     }
 
-    /// Descriptor WB on WB pages: invalidate the 64-byte line holding this descriptor.
-    unsafe fn invalidate_desc_wb_pcie_settle(desc_ptr: *const RxDesc) {
-        if desc_ptr.is_null() {
+    /// Descriptor WB on WB pages: never clflush a single 16 B descriptor — 4 share a line.
+    /// Sync the whole 64 B line once per clean sweep (see [`Self::prepare_rx_desc_wb_read`]).
+    const RX_WB_SYNC_NONE: u8 = 0xFF;
+
+    /// Before reading DD/length: UC needs only a fence; WB syncs one cache line at a time.
+    unsafe fn prepare_rx_desc_wb_read(&mut self, desc_idx: usize) {
+        if self.dma_uncached {
+            core::arch::x86_64::_mm_mfence();
             return;
         }
-        core::arch::x86_64::_mm_mfence();
-        let line = desc_ptr as usize & !(CACHE_LINE_SIZE - 1);
-        Self::clflush_range(line, CACHE_LINE_SIZE);
-        core::arch::x86_64::_mm_sfence();
-        core::arch::x86_64::_mm_lfence();
-        fence(Ordering::Acquire);
+        let line = (desc_idx / RX_DESCS_PER_CACHE_LINE) as u8;
+        if self.rx_wb_sync_line == line {
+            core::arch::x86_64::_mm_mfence();
+            return;
+        }
+        self.rx_wb_sync_line = line;
+        let line_start = desc_idx - (desc_idx % RX_DESCS_PER_CACHE_LINE);
+        // device→CPU only: ToDevice here clflushes stale CPU lines over NIC write-back on WB pages.
+        let byte_off = line_start * size_of::<RxDesc>();
+        dma_sync_region(
+            &self.rx_ring,
+            self.dma_uncached,
+            byte_off,
+            CACHE_LINE_SIZE,
+            DmaSyncDir::FromDevice,
+        );
     }
 
-    /// Single 64-bit load of the RX write-back region (staterr + length in `reserved`).
+    #[inline]
+    fn invalidate_rx_desc_wb_sync(&mut self) {
+        self.rx_wb_sync_line = Self::RX_WB_SYNC_NONE;
+    }
     ///
     /// `lfence` must precede the load — not after — or Skylake+ may return speculative zeros.
     #[inline]
@@ -2255,26 +2286,7 @@ impl E1000eHw {
         Self::invalidate_cpu_cache_for_read(buf_vaddr, len);
     }
 
-    /// First read after posting: invalidate stale WB cache lines (I219 real silicon).
-    unsafe fn read_rx_wb_after_sync(&self, desc_ptr: *const RxDesc) -> u64 {
-        if self.rx_needs_cache_flush() {
-            Self::invalidate_desc_wb_pcie_settle(desc_ptr);
-        } else if !self.dma_uncached {
-            core::arch::x86_64::_mm_mfence();
-        }
-        Self::read_rx_wb_u64(desc_ptr)
-    }
-
-    /// Retry reads: no clflush (NIC may be writing WB).
-    #[inline]
-    unsafe fn read_rx_wb_retry(&self, desc_ptr: *const RxDesc) -> u64 {
-        if !self.dma_uncached {
-            core::arch::x86_64::_mm_mfence();
-        }
-        Self::read_rx_wb_u64(desc_ptr)
-    }
-
-    /// PHY deferred path finished and PCI bus master enabled for DMA.
+    /// Single 64-bit load of the RX write-back region (staterr + length in `reserved`).
     fn dma_path_ready(&self) -> bool {
         if self.phy_init_pending {
             return false;
@@ -2526,9 +2538,7 @@ impl E1000eHw {
                     self.mac_setup_copper_link_linux();
                 }
                 self.pch_try_early_link();
-                if self.link_up && !self.rx_link_armed {
-                    self.enable_rx_after_link();
-                }
+                unsafe { self.ensure_rx_armed_if_link_up() };
                 self.amt_open_active.set(false);
                 self.amt_open_phase = AMT_OPEN_IDLE;
 
@@ -3774,11 +3784,7 @@ impl E1000eHw {
             write_volatile(core::ptr::addr_of_mut!((*desc_ptr).addr), self.rx_buf_paddr(i));
             Self::clear_rx_desc_wb(desc_ptr);
         }
-        // Descriptor clflush is batched in rx_doorbell_if_needed (full cache lines only).
-        // Per-descriptor clflush here corrupts adjacent descriptors on the same 64 B line.
-        if self.rx_needs_cache_flush() {
-            Self::invalidate_cpu_cache_for_read(self.rx_buf_vaddr(i), BUF_SIZE);
-        }
+        // Buffer sync on post is unnecessary for UC; descriptor flush is batched at RDT doorbell.
         self.rx_next_to_use = (i + 1) % NUM_RX;
         self.rx_post_since_doorbell = self.rx_post_since_doorbell.saturating_add(1);
         true
@@ -3864,6 +3870,7 @@ impl E1000eHw {
         self.wait_rx_dma_quiescent();
         self.rx_sg_reset();
         self.rx_post_since_doorbell = 0;
+        self.invalidate_rx_desc_wb_sync();
 
         // Step 2: Reset indices.
         self.rx_next_to_clean = 0;
@@ -4988,7 +4995,7 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_FCRTH, 0);
         }
 
-        self.arm_rx_unit_linux();
+        let arm_ok = self.arm_rx_unit_linux();
 
         // Sync MAC RAR/MTA/RCTL → PHY BM filters after RCTL.EN (Linux init_phy_wakeup path).
         if self.is_pch_lpt_or_later() {
@@ -4999,21 +5006,39 @@ impl E1000eHw {
         self.hw_roc_gprc_last = 0;
         self.hw_roc_mpc_last = 0;
         let rctl = mmio_read(self.base, E1000E_RCTL);
+        let rxdctl = mmio_read(self.base, E1000E_RXDCTL);
         let rdh = mmio_read(self.base, E1000E_RDH);
         let rdt = mmio_read(self.base, E1000E_RDT);
-        let armed = (rctl & RCTL_EN != 0) && rdh != rdt;
+        let ctrl = mmio_read(self.base, E1000E_CTRL);
+        let armed = arm_ok && (rctl & RCTL_EN != 0) && rdh != rdt;
         self.rx_link_armed = armed;
         if armed {
+            crate::klog_warn!(
+                "[e1000e] RX armed: RCTL={:#x} RXDCTL={:#x} RDH={} RDT={} clean={} use={} BAM={} uc={} CTRL={:#x} tag={}\n",
+                rctl,
+                rxdctl,
+                rdh,
+                rdt,
+                self.rx_next_to_clean,
+                self.rx_next_to_use,
+                rctl & RCTL_BAM != 0,
+                self.dma_uncached,
+                ctrl,
+                E1000E_DRIVER_TAG
+            );
             self.log_rx_path_regs("RX armed");
             self.log_post_link_counters("post-RX-arm");
         } else {
             crate::klog_warn!(
-                "[e1000e] RX arm incomplete RCTL={:#x} RDH={} RDT={} BAM={} uc={}\n",
+                "[e1000e] RX arm FAILED: RCTL={:#x} RXDCTL={:#x} RDH={} RDT={} BAM={} uc={} CTRL={:#x} tag={}\n",
                 rctl,
+                rxdctl,
                 rdh,
                 rdt,
                 rctl & RCTL_BAM != 0,
-                self.dma_uncached
+                self.dma_uncached,
+                ctrl,
+                E1000E_DRIVER_TAG
             );
         }
     }
@@ -5086,6 +5111,9 @@ impl E1000eHw {
 
             if is_pch {
                 self.mac_apply_link_up_autoneg();
+                if !self.mdio_unavailable() {
+                    let _ = self.mac_lock_ctrl_from_st2(st2);
+                }
             } else {
                 self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
             }
@@ -5235,9 +5263,12 @@ impl E1000eHw {
             self.link_speed = speed;
             self.link_duplex = duplex_full;
 
-            // 5. MAC: autoneg path — ASDE, no FRCSPD at 10/100 (Intel ich8lan link-up).
+            // 5. MAC: autoneg path — ASDE, then lock CTRL to PHY when reg26 is settled.
             if is_pch {
                 self.mac_apply_link_up_autoneg();
+                if !self.mdio_unavailable() {
+                    let _ = self.mac_lock_ctrl_from_st2(st2);
+                }
             } else {
                 self.mac_sync_ctrl_speed_mbps(speed, duplex_full);
             }
@@ -5380,16 +5411,14 @@ impl E1000eHw {
             let i = self.rx_next_to_clean;
             let ring = self.rx_ring.as_ptr::<RxDesc>();
             let desc_ptr = unsafe { ring.add(i) };
-            unsafe {
-                Self::invalidate_desc_wb_pcie_settle(desc_ptr);
-            }
             let wb = unsafe { read_volatile(core::ptr::addr_of!((*desc_ptr).reserved)) as u32 };
             if wb != 0 {
                 log::trace!(
-                    "[e1000e] RX slot {} WB={:#x} but not consumed (clean={})",
+                    "[e1000e] RX slot {} WB={:#x} but not consumed (clean={} uc={})",
                     i,
                     wb,
-                    self.rx_next_to_clean
+                    self.rx_next_to_clean,
+                    self.dma_uncached
                 );
             }
         }
@@ -5841,9 +5870,6 @@ impl E1000eHw {
                 let desc_ptr = ring.add(idx);
                 write_volatile(core::ptr::addr_of_mut!((*desc_ptr).addr), self.rx_buf_paddr(idx));
                 Self::clear_rx_desc_wb(desc_ptr);
-                if self.rx_needs_cache_flush() {
-                    Self::invalidate_cpu_cache_for_read(self.rx_buf_vaddr(idx), BUF_SIZE);
-                }
             }
             self.flush_rx_ring_descriptor_span(i, chunk);
             i += chunk;
@@ -5891,22 +5917,19 @@ impl E1000eHw {
     ///   +8  u32 staterr  (DD=bit0, EOP=bit1)
     ///   +12 u16 length
     ///
-    /// CRITICAL: On I219 bare-metal the descriptor region is Write-Back cached.
-    /// The NIC writes via DMA into physical RAM; the CPU may still hold stale zeros.
-    /// Before the first WB read use clflushopt + sfence (see read_rx_wb_after_sync).
-    /// QEMU is fully coherent and does not expose this; Skylake+ real silicon does.
-    unsafe fn desc_done(&self, desc_ptr: *const RxDesc) -> Option<(u32, usize)> {
+    /// CRITICAL: On WB-mapped DMA, never clflush a single 16 B descriptor in the hot path
+    /// (4 descriptors share one 64 B line). Use [`Self::prepare_rx_desc_wb_read`] instead.
+    unsafe fn desc_done(&mut self, desc_ptr: *const RxDesc) -> Option<(u32, usize)> {
         if desc_ptr.is_null() {
             return None;
         }
+        let desc_idx = (desc_ptr as usize - self.rx_ring.vaddr()) / size_of::<RxDesc>();
         for attempt in 0..RX_DESC_WB_SETTLE_TRIES {
-            let wb = unsafe {
-                if attempt == 0 {
-                    self.read_rx_wb_after_sync(desc_ptr)
-                } else {
-                    self.read_rx_wb_retry(desc_ptr)
-                }
-            };
+            if attempt > 0 {
+                self.invalidate_rx_desc_wb_sync();
+            }
+            self.prepare_rx_desc_wb_read(desc_idx);
+            let wb = Self::read_rx_wb_u64(desc_ptr);
             let parsed = if self.use_extended_descriptors {
                 Self::parse_rx_wb_ext_u64(wb)
             } else {
@@ -5967,7 +5990,66 @@ impl E1000eHw {
     fn receive_slot(&mut self, i: usize) -> Option<Vec<u8>> {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
-        let (staterr, len) = unsafe { self.desc_done(desc_ptr)? };
+        let (staterr, len) = match unsafe { self.desc_done(desc_ptr) } {
+            Some(v) => v,
+            None => {
+                self.invalidate_rx_desc_wb_sync();
+                if let Some(v) = unsafe { self.desc_done(desc_ptr) } {
+                    v
+                } else {
+                let wb = unsafe {
+                    self.prepare_rx_desc_wb_read(i);
+                    Self::read_rx_wb_u64(desc_ptr)
+                };
+                let parsed = unsafe {
+                    if self.use_extended_descriptors {
+                        Self::parse_rx_wb_ext_u64(wb)
+                    } else {
+                        Self::parse_rx_wb_legacy_u64(wb)
+                    }
+                };
+                match parsed {
+                    Some((staterr, len)) if len > 0 && len <= BUF_SIZE => {
+                        log::trace!(
+                            "[e1000e] RX slot {} late WB settle staterr={:#x} len={}",
+                            i,
+                            staterr,
+                            len
+                        );
+                        (staterr, len)
+                    }
+                    Some((staterr, len)) => {
+                        log::debug!(
+                            "[e1000e] RX slot {} forcing recycle after unstable WB staterr={:#x} len={} clean={} RDH={} RDT={}",
+                            i,
+                            staterr,
+                            len,
+                            self.rx_next_to_clean,
+                            unsafe { mmio_read(self.base, E1000E_RDH) },
+                            unsafe { mmio_read(self.base, E1000E_RDT) }
+                        );
+                        self.rx_sg_reset();
+                        unsafe { self.recycle_rx_descriptor(i) };
+                        return None;
+                    }
+                    None if wb != 0 => {
+                        log::debug!(
+                            "[e1000e] RX slot {} forcing recycle on non-zero WB={:#x} clean={} RDH={} RDT={}",
+                            i,
+                            wb,
+                            self.rx_next_to_clean,
+                            unsafe { mmio_read(self.base, E1000E_RDH) },
+                            unsafe { mmio_read(self.base, E1000E_RDT) }
+                        );
+                        self.rx_sg_reset();
+                        unsafe { self.recycle_rx_descriptor(i) };
+                        return None;
+                    }
+                    None => return None,
+                }
+                }
+            }
+        };
         fence(Ordering::Acquire);
         log::trace!("[e1000e] RX: slot={} staterr={:#x} len={} clean={} RDH={} RDT={}",
               i, staterr, len, self.rx_next_to_clean,
@@ -6443,8 +6525,16 @@ impl E1000eInterface {
         }
         let me = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            me.watchdog_job_scheduled
-                .store(false, Ordering::Release);
+            // RAII guard: clear flag on eviction (job dropped without running)
+            // so future watchdog calls can reschedule.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ClearOnDrop(Arc::clone(&me.watchdog_job_scheduled));
+            me.watchdog_job_scheduled.store(false, Ordering::Release);
             {
                 let mut hw = me.driver.hw.lock();
                 unsafe { hw.watchdog_tick() };
@@ -6491,8 +6581,19 @@ impl E1000eInterface {
         let poll_pending = self.poll_pending.clone();
         let self_clone = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            let _ = self_clone.poll();
+            // Clear *before* polling so that any IRQ firing during poll() can
+            // immediately re-queue a new deferred poll instead of being silently
+            // dropped.  The RAII guard clears again on drop so that eviction
+            // (job dropped without running) also releases the flag.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ClearOnDrop(Arc::clone(&poll_pending));
             poll_pending.store(false, Ordering::Release);
+            let _ = self_clone.poll();
         });
     }
 }
@@ -6686,6 +6787,12 @@ impl NetScheme for E1000eInterface {
         {
             let mut sockets = sockets.lock();
             let _ = self.iface.lock().poll(&mut sockets, ts);
+        }
+        // If the budget was exhausted (32 frames consumed without emptying the ring),
+        // there may be more frames waiting.  Queue another deferred poll so the ring
+        // drains without waiting for the next IRQ or periodic poll_ifaces() tick.
+        if self.driver.hw.lock().rx_poll_budget == 0 {
+            self.queue_deferred_poll();
         }
         super::wake_net_rx_waiters();
         // IMS is re-armed from handle_irq only — writing IMS every poll starves USB/HID.
@@ -6911,12 +7018,17 @@ pub fn init(
         name, vaddr, irq
     );
 
-    // Allocate DMA rings (page-aligned contiguous frames → also 16-byte aligned bases).
-    let rx_ring = DmaRegion::alloc(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
-    let tx_ring = DmaRegion::alloc(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
+    // Allocate DMA rings — map UC at alloc time (Linux dma_alloc_coherent).
+    let (rx_ring, rx_uc) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
+    let (tx_ring, tx_uc) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
 
-    let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    let tx_buf_pool = DmaRegion::alloc(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let (rx_buf_pool, rx_pool_uc) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let (tx_buf_pool, tx_pool_uc) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let probe_dma_coherent = rx_uc && tx_uc && rx_pool_uc && tx_pool_uc;
 
     for (name, region, align, max_span, ring_single_page) in [
         ("rx_ring", &rx_ring, DMA_DESC_ALIGN, DMA_RING_BYTES, true),
@@ -7011,6 +7123,7 @@ pub fn init(
         rx_post_since_doorbell: 0,
         srrctl_absent: false,
         dma_uncached: false,
+        rx_wb_sync_line: 0xFF,
         mdio_degraded: false,
         phy_mdio_responding: false,
         phy_detect_fail_logged: false,
@@ -7023,7 +7136,16 @@ pub fn init(
         amt_open_sw_chunks: 0,
     };
 
-    hw.setup_dma_uncached();
+    if probe_dma_coherent {
+        hw.dma_uncached = true;
+        crate::klog_warn!(
+            "[e1000e] DMA coherent at alloc (PAT UC, tag={})\n",
+            E1000E_DRIVER_TAG
+        );
+        let _ = hw.validate_dma_ring_layout();
+    } else {
+        hw.setup_dma_uncached();
+    }
 
     unsafe {
         hw.reset_and_init()?;

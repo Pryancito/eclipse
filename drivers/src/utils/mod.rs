@@ -10,6 +10,7 @@ mod graphic_console;
 
 pub mod devicetree;
 pub mod dma;
+pub mod dma_sync;
 
 pub(super) use id_allocator::IdAllocator;
 pub(super) use irq_manager::IrqManager;

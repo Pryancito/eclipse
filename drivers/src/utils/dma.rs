@@ -86,6 +86,28 @@ impl DmaRegion {
         unsafe { drivers_dma_mark_uncached(self.phys, self.pages) == 0 }
     }
 
+    /// Linux `dma_alloc_coherent` / FreeBSD `BUS_DMA_COHERENT`: map UC at alloc time.
+    pub fn map_coherent(&self) -> bool {
+        self.mark_uncached() && self.verify_uncached()
+    }
+
+    /// Allocate and map UC immediately (preferred for NIC rings — no WB fallback).
+    pub fn alloc_coherent(len: usize) -> Option<Self> {
+        let region = Self::alloc(len)?;
+        if region.map_coherent() {
+            Some(region)
+        } else {
+            None
+        }
+    }
+
+    /// Like [`Self::alloc_uninit`] but returns `(region, coherent)` even if PAT remap fails.
+    pub fn alloc_uninit_try_coherent(len: usize) -> Option<(Self, bool)> {
+        let region = Self::alloc_uninit(len)?;
+        let coherent = region.map_coherent();
+        Some((region, coherent))
+    }
+
     /// Returns true when every page in the region is mapped UC/UC- in the PTEs.
     pub fn verify_uncached(&self) -> bool {
         if self.phys == 0 {
