@@ -6520,6 +6520,7 @@ impl Scheme for E1000eInterface {
             if let Some(mut hw) = self.driver.hw.try_lock() {
                 hw.get_link_status = true;
             }
+            self.queue_deferred_poll();
             self.ims_rearm();
             return;
         }
