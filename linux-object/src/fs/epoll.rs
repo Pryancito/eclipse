@@ -163,10 +163,8 @@ impl Epoll {
                 }
             }
 
-            kernel_hal::thread::sleep_until(
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1),
-            )
-            .await;
+            crate::net::wait::IoMultiplexWait::new(timeout_msecs, watch_net, watch_interactive)
+                .await;
         }
     }
 }

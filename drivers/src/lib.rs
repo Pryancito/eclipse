@@ -31,6 +31,7 @@ pub mod irq;
 pub mod net;
 pub mod nvme;
 pub mod prelude;
+pub mod pulse;
 pub mod scheme;
 pub mod uart;
 pub mod utils;

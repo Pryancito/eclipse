@@ -262,7 +262,7 @@ impl Socket for UdpSocketState {
         if (events.contains(PollEvents::IN) && !recv_state)
             || (events.contains(PollEvents::OUT) && !send_state)
         {
-            poll_ifaces();
+            crate::net::pulse_drain_net();
         }
 
         let (mut input, mut output, mut err) = (false, false, false);
@@ -301,7 +301,7 @@ impl Socket for UdpSocketState {
                 Ok(()) => {
                     drop(socket);
                     drop(set);
-                    poll_ifaces();
+                    crate::net::pulse_drain_net_urgent();
                     Ok(0)
                 }
                 Err(_) => Err(LxError::EINVAL),

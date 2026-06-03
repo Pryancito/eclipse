@@ -5,6 +5,7 @@ use crate::{sync::Event, sync::EventBus};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
@@ -48,6 +49,43 @@ pub fn ctrl_c_pending_take() -> bool {
 #[allow(dead_code)]
 pub fn ctrl_c_pending_set() {
     CTRL_C_PENDING.store(true, Ordering::SeqCst);
+    wake_tty_intr_waiters();
+}
+
+/// Non-consuming check for multiplex wait loops.
+pub fn ctrl_c_pending_peek() -> bool {
+    CTRL_C_PENDING.load(Ordering::SeqCst)
+}
+
+lazy_static! {
+    static ref TTY_INTR_WAKERS: Mutex<Vec<core::task::Waker>> = Mutex::new(Vec::new());
+}
+
+const MAX_TTY_INTR_WAKERS: usize = 64;
+
+fn register_tty_waker_once(wakers: &mut Vec<core::task::Waker>, waker: &core::task::Waker) {
+    if wakers.iter().any(|w| w.will_wake(waker)) {
+        return;
+    }
+    if wakers.len() >= MAX_TTY_INTR_WAKERS {
+        wakers.remove(0);
+    }
+    wakers.push(waker.clone());
+}
+
+fn wake_tty_intr_waiters() {
+    let wakers: Vec<core::task::Waker> = core::mem::take(&mut *TTY_INTR_WAKERS.lock());
+    for w in wakers {
+        w.wake();
+    }
+}
+
+pub fn register_tty_intr_waker(waker: core::task::Waker) {
+    register_tty_waker_once(&mut *TTY_INTR_WAKERS.lock(), &waker);
+}
+
+pub fn retain_tty_intr_waker(waker: &core::task::Waker) {
+    TTY_INTR_WAKERS.lock().retain(|w| w.will_wake(waker));
 }
 
 lazy_static! {

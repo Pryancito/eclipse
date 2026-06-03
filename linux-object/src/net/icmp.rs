@@ -184,7 +184,7 @@ impl Socket for IcmpSocketState {
                     return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                 }
                 Err(smoltcp::Error::Exhausted) => {
-                    poll_ifaces();
+                    crate::net::pulse_drain_net();
                     if non_block {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
@@ -201,10 +201,7 @@ impl Socket for IcmpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
 
-            kernel_hal::thread::sleep_until(
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
-            )
-            .await;
+            crate::net::wait::NetOrTtyWait::new_after_ms(10).await;
         }
     }
 
@@ -291,7 +288,7 @@ impl Socket for IcmpSocketState {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
-        poll_ifaces();
+        crate::net::pulse_drain_net();
         let inner = self.inner.lock();
         let readable = {
             let sets = get_sockets();

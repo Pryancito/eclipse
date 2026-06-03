@@ -23,6 +23,7 @@ mod macros;
 
 mod common;
 pub mod config;
+pub mod pulse;
 mod hal_fn;
 mod kernel_handler;
 mod utils;

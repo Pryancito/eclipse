@@ -383,10 +383,14 @@ mod drivers_ffi {
         }
     }
 
-    /// Wake all tasks blocked in TcpSocket::read waiting for RX data.
-    /// Called by the NIC driver (e1000e) after iface.poll() processes packets.
+    /// Wake RX waiters and Pulse NET_RX (NIC deferred poll is scheduled separately).
     #[no_mangle]
     extern "C" fn drivers_wake_net_rx_waiters() {
-        crate::net::wake_net_rx_waiters();
+        crate::pulse::pulse_signal(crate::pulse::PULSE_NET_RX);
+    }
+
+    #[no_mangle]
+    extern "C" fn drivers_pulse_signal(bits: u32) {
+        crate::pulse::pulse_signal(bits);
     }
 }

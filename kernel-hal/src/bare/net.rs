@@ -103,13 +103,22 @@ pub fn register_net_rx_waker(waker: Waker) {
     register_waker_once(&mut NET_RX_WAKERS.lock(), &waker);
 }
 
-/// Wake every task waiting for RX data and clear the registry.
-/// Called by the NIC driver after `iface.poll()` processes incoming packets.
+/// After an IRQ-driven wake: keep the waker for the next sleep cycle.
+pub fn retain_net_rx_waker(waker: &Waker) {
+    NET_RX_WAKERS.lock().retain(|w| w.will_wake(waker));
+}
+
+/// Wake tasks registered for TCP/UDP RX.
 pub fn wake_net_rx_waiters() {
     let wakers: Vec<Waker> = core::mem::take(&mut *NET_RX_WAKERS.lock());
     for w in wakers {
         w.wake();
     }
+}
+
+/// Used by [`crate::pulse::pulse_signal`] — does not re-enter Pulse.
+pub(crate) fn wake_net_rx_waiters_inner() {
+    wake_net_rx_waiters();
 }
 
 /// Future that resolves when either:

@@ -1,7 +1,4 @@
-//! Input device poll hook for interactive I/O wait loops (poll/epoll/select).
-
-/// Drain USB HID transfer rings before network / deferred NIC work.
-/// PS/2 keyboard and mouse remain IRQ-driven; xHCI needs periodic backup poll.
+//! Input device poll hook — only used when Eclipse Pulse requests HID tier-C backup.
 pub fn poll_input_devices() {
     #[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
     {

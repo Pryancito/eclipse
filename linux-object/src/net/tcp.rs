@@ -93,7 +93,7 @@ impl Socket for TcpSocketState {
             // Drive the NIC FIRST so any deferred RX is in the socket before
             // recv_slice is called.
             kernel_hal::deferred_job::drain_deferred_jobs();
-            poll_ifaces();
+            crate::net::pulse_drain_net();
 
             let sets = get_sockets();
             let mut sets = sets.lock();
@@ -146,7 +146,7 @@ impl Socket for TcpSocketState {
                     // sending more than one receive-window (TLS handshakes and
                     // large downloads exceed the 64 KiB window) can stall
                     // waiting for the window to reopen.
-                    poll_ifaces();
+                    crate::net::pulse_drain_net_urgent();
                     let endpoint = get_sockets()
                         .lock()
                         .get::<TcpSocket>(handle)
@@ -184,7 +184,7 @@ impl Socket for TcpSocketState {
         };
         loop {
             kernel_hal::deferred_job::drain_deferred_jobs();
-            poll_ifaces();
+            crate::net::pulse_drain_net();
 
             let sets = get_sockets();
             let mut sets = sets.lock();
@@ -257,7 +257,7 @@ impl Socket for TcpSocketState {
                 let mut socket = sets.get::<TcpSocket>(handle);
                 socket.send_slice(data)
             };
-            poll_ifaces();
+            crate::net::pulse_drain_net();
 
             match copied_len {
                 Ok(0) => {
@@ -271,7 +271,7 @@ impl Socket for TcpSocketState {
                     // Synchronous trait: drain ACKs so the peer's window frees
                     // up TX buffer space before retrying.
                     kernel_hal::deferred_job::drain_deferred_jobs();
-                    poll_ifaces();
+                    crate::net::pulse_drain_net_urgent();
                 }
                 Ok(size) => {
                     flush_socket_egress();
@@ -385,7 +385,7 @@ impl Socket for TcpSocketState {
         if (events.contains(PollEvents::IN) && !recv_state)
             || (events.contains(PollEvents::OUT) && !send_state)
         {
-            poll_ifaces();
+            crate::net::pulse_drain_net();
         }
 
         let (mut read, mut write, mut error) = (false, false, false);
@@ -492,7 +492,7 @@ impl Socket for TcpSocketState {
         };
 
         loop {
-            poll_ifaces();
+            crate::net::pulse_drain_net();
             kernel_hal::deferred_job::drain_deferred_jobs();
 
             let established = {

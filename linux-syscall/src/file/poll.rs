@@ -26,9 +26,18 @@ fn schedule_poll_wakeup(cx: &mut Context, after: Duration) {
     timer::timer_set(deadline, Box::new(move |_| waker.wake_by_ref()));
 }
 
-/// Wakeup granularity for select/poll/epoll loops.
-/// Smaller values improve interactive input (PS/2/USB HID) responsiveness.
-const IO_WAIT_TICK: Duration = Duration::from_millis(1);
+/// Wakeup granularity for select/poll/epoll (tier-C; IRQ wakes via Pulse earlier).
+const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::PULSE_IO_WAIT_TICK_MS);
+
+fn arm_io_wait(cx: &mut Context, watch_net: bool, watch_interactive: bool, io_armed: &mut bool) {
+    if *io_armed {
+        linux_object::net::retain_io_wait_wakers(cx.waker(), watch_net, watch_interactive);
+        *io_armed = false;
+        return;
+    }
+    linux_object::net::register_io_wait_wakers(cx.waker(), watch_net, watch_interactive);
+    *io_armed = true;
+}
 
 impl Syscall<'_> {
     /// Wait for some event on a file descriptor
@@ -52,6 +61,7 @@ impl Syscall<'_> {
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
+            io_armed: bool,
         }
         impl<'a> Future for PollFuture<'a> {
             type Output = SysResult;
@@ -69,6 +79,9 @@ impl Syscall<'_> {
                     .polls
                     .iter()
                     .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                if self.io_armed {
+                    arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
+                }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = self.syscall.linux_process();
                 let mut events = 0;
@@ -134,9 +147,11 @@ impl Syscall<'_> {
                         }
                         let remaining = deadline.saturating_sub(mono_now());
                         let wake_in = remaining.min(IO_WAIT_TICK);
+                        arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
+                        arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, IO_WAIT_TICK);
                     }
                     _ => {
@@ -153,6 +168,7 @@ impl Syscall<'_> {
             timeout_msecs,
             begin_time,
             syscall: self,
+            io_armed: false,
         };
         let result = future.await;
         ufds.write_array(&polls)?;
@@ -236,6 +252,7 @@ impl Syscall<'_> {
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
+            io_armed: bool,
         }
 
         impl<'a> Future for SelectFuture<'a> {
@@ -257,6 +274,9 @@ impl Syscall<'_> {
                             || self.write_fds.contains(FileDesc::from(fd))
                             || self.err_fds.contains(FileDesc::from(fd)))
                 });
+                if self.io_armed {
+                    arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
+                }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let files = self.syscall.linux_process().get_files()?;
 
@@ -304,9 +324,11 @@ impl Syscall<'_> {
                         }
                         let remaining = deadline.saturating_sub(mono_now());
                         let wake_in = remaining.min(IO_WAIT_TICK);
+                        arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
+                        arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, IO_WAIT_TICK);
                     }
                     _ => {}
@@ -322,6 +344,7 @@ impl Syscall<'_> {
             timeout_msecs,
             begin_time,
             syscall: self,
+            io_armed: false,
         };
         future.await
     }

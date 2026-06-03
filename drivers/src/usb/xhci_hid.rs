@@ -2410,6 +2410,7 @@ impl Scheme for XhciUsbHid {
         if let Some(ref mut xi) = *g {
             xi.mmio.ack_host_interrupt();
             xi.process_irq_events(Some(&self.listener));
+            crate::pulse::pulse_signal(crate::pulse::PULSE_HID);
         }
     }
 }

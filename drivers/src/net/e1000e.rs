@@ -6520,6 +6520,8 @@ impl Scheme for E1000eInterface {
             if let Some(mut hw) = self.driver.hw.try_lock() {
                 hw.get_link_status = true;
             }
+            crate::pulse::pulse_signal(crate::pulse::PULSE_NET_RX);
+            self.queue_deferred_poll();
             self.ims_rearm();
             return;
         }
@@ -6528,11 +6530,15 @@ impl Scheme for E1000eInterface {
             if let Some(mut hw) = self.driver.hw.try_lock() {
                 hw.get_link_status = true;
             }
+            crate::pulse::pulse_signal(crate::pulse::PULSE_LINK);
             self.schedule_watchdog(true);
         }
 
         let needs_poll = icr & (ICR_RX_ANY | ICR_TXDW | ICR_LSC) != 0;
         if needs_poll {
+            if icr & ICR_RX_ANY != 0 {
+                crate::pulse::pulse_signal(crate::pulse::PULSE_NET_RX);
+            }
             self.queue_deferred_poll();
         }
 

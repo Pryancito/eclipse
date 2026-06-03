@@ -1,4 +1,4 @@
-//! Wait for NIC RX, a tty interrupt (Ctrl+C), or a timeout.
+//! Futures for Eclipse Pulse–aware I/O waits (NIC, HID, TTY).
 
 use alloc::boxed::Box;
 use core::future::Future;
@@ -6,7 +6,12 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
-/// Resolves when any of: pending Ctrl+C, `wake_net_rx_waiters()`, or deadline.
+use super::{register_io_wait_wakers, retain_io_wait_wakers};
+
+/// Tier-C fallback when no IRQ wakes a multiplex wait (poll/epoll/select).
+pub const PULSE_IO_WAIT_TICK_MS: u64 = 4;
+
+/// Resolves when Ctrl+C is pending, NET RX wakers fire, Pulse signals, or deadline.
 pub struct NetOrTtyWait {
     deadline: Duration,
     armed: bool,
@@ -32,14 +37,72 @@ impl Future for NetOrTtyWait {
             return Poll::Ready(());
         }
         if self.armed {
-            kernel_hal::net::retain_net_rx_waker(cx.waker());
+            retain_io_wait_wakers(cx.waker(), true, true);
             return Poll::Ready(());
         }
-        crate::fs::stdio::register_tty_intr_waker(cx.waker().clone());
-        kernel_hal::net::register_net_rx_waker(cx.waker().clone());
+        register_io_wait_wakers(cx.waker(), true, true);
         let waker = cx.waker().clone();
         let dl = self.deadline;
         kernel_hal::timer::timer_set(dl, Box::new(move |_| waker.wake_by_ref()));
+        self.armed = true;
+        Poll::Pending
+    }
+}
+
+/// One sleep cycle in epoll/poll: wake on Pulse/NET/TTY IRQ or tier-C timer.
+pub struct IoMultiplexWait {
+    deadline: Option<Duration>,
+    watch_net: bool,
+    watch_hid: bool,
+    armed: bool,
+}
+
+impl IoMultiplexWait {
+    pub fn new(timeout_msecs: isize, watch_net: bool, watch_hid: bool) -> Self {
+        let deadline = if timeout_msecs >= 0 {
+            Some(
+                kernel_hal::timer::timer_now()
+                    + Duration::from_millis(timeout_msecs as u64),
+            )
+        } else {
+            None
+        };
+        Self {
+            deadline,
+            watch_net,
+            watch_hid,
+            armed: false,
+        }
+    }
+}
+
+impl Future for IoMultiplexWait {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(dl) = self.deadline {
+            if kernel_hal::timer::timer_now() >= dl {
+                return Poll::Ready(());
+            }
+        }
+        if self.armed {
+            retain_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+            return Poll::Ready(());
+        }
+        register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+        let waker = cx.waker().clone();
+        let wake_at = if let Some(dl) = self.deadline {
+            let tick = Duration::from_millis(PULSE_IO_WAIT_TICK_MS);
+            let now = kernel_hal::timer::timer_now();
+            if now + tick < dl {
+                now + tick
+            } else {
+                dl
+            }
+        } else {
+            kernel_hal::timer::timer_now() + Duration::from_millis(PULSE_IO_WAIT_TICK_MS)
+        };
+        kernel_hal::timer::timer_set(wake_at, Box::new(move |_| waker.wake_by_ref()));
         self.armed = true;
         Poll::Pending
     }
