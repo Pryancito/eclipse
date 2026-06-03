@@ -20,7 +20,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rx-doorbell";
+const E1000E_DRIVER_TAG: &str = "e1000e-rx-silicon";
 /// Retry AMT open if SWFLAG/MDIO still blocked (CSME can take seconds after DRV_LOAD).
 const E1000E_AMT_OPEN_RETRY_US: u64 = 30_000_000;
 /// Per deferred job: wait at most this long for SWFLAG (chunked — PS/2/USB stay responsive).
@@ -624,6 +624,15 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
 unsafe fn mmio_write_flush(base: usize, reg: usize, val: u32) {
     mmio_write(base, reg, val);
     let _ = mmio_read(base, reg);
+}
+
+/// Drain PCIe posted-write buffers before enabling RCTL.EN (RDT must be visible first).
+#[inline(always)]
+unsafe fn mmio_pcie_posted_flush(base: usize) {
+    let _ = mmio_read(base, E1000E_RDT);
+    let _ = mmio_read(base, E1000E_STATUS);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    fence(Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -3901,6 +3910,8 @@ impl E1000eHw {
         }
         self.alloc_rx_buffers(n, true);
 
+        // RDT doorbell uses posted writes; flush before RCTL.EN so silicon never sees RDH==RDT.
+        mmio_pcie_posted_flush(self.base);
         let rdh = mmio_read(self.base, E1000E_RDH);
         let rdt = mmio_read(self.base, E1000E_RDT);
         if rdh == rdt {
@@ -3913,12 +3924,12 @@ impl E1000eHw {
             return false;
         }
 
-        // Step 9: Enable RX engine after the shadow tail sees posted descriptors.
+        // Step 9: Enable RX engine after hardware has observed a non-empty ring.
         let rctl = self.rctl_rx_bits() | RCTL_EN;
         if rctl & RCTL_BAM == 0 {
             crate::klog_warn!("[e1000e] arm_rx: RCTL.BAM clear — DHCP/broadcast would fail\n");
         }
-        mmio_write(self.base, E1000E_RCTL, rctl);
+        mmio_write_flush(self.base, E1000E_RCTL, rctl);
         let rctl_rb = mmio_read(self.base, E1000E_RCTL);
         if rctl_rb & RCTL_EN == 0 {
             crate::klog_warn!(
@@ -4228,7 +4239,7 @@ impl E1000eHw {
         data
     }
 
-    /// Drop truncated L3 frames before they reach smoltcp / AF_PACKET / icmp_rx.
+    /// Drop obviously broken L2/L3 frames; tolerate I219 short descriptor WB lengths.
     fn rx_frame_deliverable(data: &[u8]) -> bool {
         if data.len() < 14 {
             return false;
@@ -4242,7 +4253,7 @@ impl E1000eHw {
         }
         match et {
             0x0800 => Self::rx_ipv4_deliverable(data),
-            0x86dd => Self::eth_ipv6_frame_complete(data),
+            0x86dd => Self::rx_ipv6_deliverable(data),
             _ => true,
         }
     }
@@ -4325,19 +4336,34 @@ impl E1000eHw {
         (sport == 67 && dport == 68) || (sport == 68 && dport == 67)
     }
 
-    /// Do not deliver a frame that only satisfies ip_tot while the DHCP cookie is still fill bytes.
+    /// Do not require ip_tot_len bytes when the DMA buffer already holds a valid L3 header
+    /// (I219 often under-reports length in the descriptor write-back).
     fn rx_ipv4_deliverable(data: &[u8]) -> bool {
-        if !Self::eth_ipv4_frame_complete(data) {
+        let Some((l2, ihl, frame_need, is_dhcp)) = Self::eth_ipv4_header_info(data) else {
+            return data.len() >= 14 + 20 && (data[14] >> 4) == 4;
+        };
+        if data.len() < l2 + ihl {
             return false;
         }
-        let Some((l2, _, _, _)) = Self::eth_ipv4_header_info(data) else {
-            return false;
-        };
-        // ICMP/ARP/etc. must reach smoltcp (ping to 10.0.2.2); cookie gate is DHCP-only.
-        if data[l2 + 9] != 17 {
+        if data[l2 + 9] == 17 {
+            if is_dhcp {
+                return Self::dhcp_cookie_valid_in_frame(data)
+                    || Self::scan_dhcp_magic_cookie_offset(data).is_some()
+                    || data.len() >= l2 + ihl + 28;
+            }
             return true;
         }
-        Self::dhcp_cookie_valid_in_frame(data)
+        if data.len() >= frame_need {
+            return true;
+        }
+        data.len() >= l2 + ihl + 4
+    }
+
+    fn rx_ipv6_deliverable(data: &[u8]) -> bool {
+        let Some((l2, _)) = Self::eth_ipv6_header_info(data) else {
+            return false;
+        };
+        data.len() >= l2 + 40 && (data[l2] >> 4) == 6
     }
 
     fn trim_to_ipv4_frame(data: Vec<u8>) -> Vec<u8> {
@@ -5275,15 +5301,21 @@ impl E1000eHw {
         let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU == 0 {
             self.pch_note_status_link_down();
-        } else if self.has_amt() && !self.nic_open_done {
+        } else if self.has_amt() && !self.nic_open_done && !self.rx_link_armed {
             let _ = self.try_rx_arm_pending_amt(status);
+        }
+
+        if self.link_up {
+            if !self.rx_link_armed {
+                self.enable_rx_after_link();
+            }
+            return;
         }
 
         if self.is_pch_lpt_or_later() {
             self.pch_try_early_link();
         }
 
-        // Linux watchdog always re-checks PHY; do not stick with get_link_status=false after one pass.
         self.get_link_status = true;
         let _ = self.e1000e_has_link();
 
