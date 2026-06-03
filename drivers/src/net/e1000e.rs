@@ -2265,11 +2265,14 @@ impl E1000eHw {
         Self::read_rx_wb_u64(desc_ptr)
     }
 
-    /// Retry reads: no clflush (NIC may be writing WB).
+    /// Retry reads: for cached DMA use full cache invalidation so the CPU sees
+    /// any NIC write-back that landed in DRAM after the previous attempt's clflush.
+    /// mfence alone is insufficient for cached (WB-mapped) DMA — it only orders
+    /// CPU stores/loads but does not evict stale lines that the NIC wrote to RAM.
     #[inline]
     unsafe fn read_rx_wb_retry(&self, desc_ptr: *const RxDesc) -> u64 {
         if !self.dma_uncached {
-            core::arch::x86_64::_mm_mfence();
+            Self::invalidate_desc_wb_pcie_settle(desc_ptr);
         }
         Self::read_rx_wb_u64(desc_ptr)
     }
@@ -6497,8 +6500,16 @@ impl E1000eInterface {
         }
         let me = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            me.watchdog_job_scheduled
-                .store(false, Ordering::Release);
+            // RAII guard: clear flag on eviction (job dropped without running)
+            // so future watchdog calls can reschedule.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ClearOnDrop(Arc::clone(&me.watchdog_job_scheduled));
+            me.watchdog_job_scheduled.store(false, Ordering::Release);
             {
                 let mut hw = me.driver.hw.lock();
                 unsafe { hw.watchdog_tick() };
@@ -6545,8 +6556,19 @@ impl E1000eInterface {
         let poll_pending = self.poll_pending.clone();
         let self_clone = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            let _ = self_clone.poll();
+            // Clear *before* polling so that any IRQ firing during poll() can
+            // immediately re-queue a new deferred poll instead of being silently
+            // dropped.  The RAII guard clears again on drop so that eviction
+            // (job dropped without running) also releases the flag.
+            struct ClearOnDrop(Arc<AtomicBool>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ClearOnDrop(Arc::clone(&poll_pending));
             poll_pending.store(false, Ordering::Release);
+            let _ = self_clone.poll();
         });
     }
 }
@@ -6735,6 +6757,12 @@ impl NetScheme for E1000eInterface {
         {
             let mut sockets = sockets.lock();
             let _ = self.iface.lock().poll(&mut sockets, ts);
+        }
+        // If the budget was exhausted (32 frames consumed without emptying the ring),
+        // there may be more frames waiting.  Queue another deferred poll so the ring
+        // drains without waiting for the next IRQ or periodic poll_ifaces() tick.
+        if self.driver.hw.lock().rx_poll_budget == 0 {
+            self.queue_deferred_poll();
         }
         super::wake_net_rx_waiters();
         // IMS is re-armed from handle_irq only — writing IMS every poll starves USB/HID.
