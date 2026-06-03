@@ -5,6 +5,7 @@ mod mock_mem;
 pub mod boot;
 pub mod config;
 pub mod cpu;
+pub mod input_poll;
 pub mod interrupt;
 pub mod mem;
 pub mod net;
