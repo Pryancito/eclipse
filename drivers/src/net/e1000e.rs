@@ -63,6 +63,8 @@ const TARC0_SPEED_MODE: u32 = 1 << 21;
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 /// Linux `mod_timer(..., jiffies + 1)` after LSC — quick follow-up check.
 const E1000E_WATCHDOG_FAST_US: u64 = 10_000;
+/// Minimum spacing between deferred poll jobs to avoid IRQ-driven CPU monopolization.
+const E1000E_DEFERRED_POLL_MIN_US: u64 = 2_000;
 /// Min spacing between full PHY recovery attempts when MDIO stays silent.
 const E1000E_PHY_RECOVERY_INTERVAL_US: u64 = 60_000_000;
 /// After SWFLAG acquire fails, skip MDIO (Linux returns -E1000_ERR_CONFIG; no tight retry loop).
@@ -686,6 +688,8 @@ pub struct E1000eHw {
     link_duplex: bool,
     /// Linux watchdog: next [`E1000eHw::watchdog_tick`] (2 Hz default).
     link_watchdog_next_us: u64,
+    /// Earliest timestamp when scheduling another deferred poll is allowed.
+    deferred_poll_next_us: u64,
     /// Last [`pch_recover_phy_mdio`] attempt when MDIO silent and link down.
     last_phy_recovery_us: u64,
     /// Start of current bring-up stage in microseconds.
@@ -5767,7 +5771,7 @@ impl E1000eHw {
         self.link_up = false;
         self.link_speed = 0;
         self.link_duplex = false;
-        self.rx_poll_budget = 32;
+        self.rx_poll_budget = 16;
         self.rx_link_armed = false;
         let now = timer_now_as_micros();
         self.link_watchdog_next_us = now;
@@ -6485,6 +6489,14 @@ impl E1000eInterface {
     }
 
     fn queue_deferred_poll(&self) {
+        let now = timer_now_as_micros();
+        {
+            let mut hw = self.driver.hw.lock();
+            if now < hw.deferred_poll_next_us {
+                return;
+            }
+            hw.deferred_poll_next_us = now.saturating_add(E1000E_DEFERRED_POLL_MIN_US);
+        }
         if self.poll_pending.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -6675,7 +6687,7 @@ impl NetScheme for E1000eInterface {
         // RX/TX: smoltcp (ping/ARP) + AF_PACKET dispatch in RxToken::consume.
         {
             let mut hw = self.driver.hw.lock();
-            hw.rx_poll_budget = 32;
+            hw.rx_poll_budget = 16;
         }
         {
             let mut sockets = sockets.lock();
@@ -6987,7 +6999,7 @@ pub fn init(
         hw_roc_gprc_last: 0,
         hw_roc_mpc_last: 0,
         rx_diag_counter: 0,
-        rx_poll_budget: 32,
+        rx_poll_budget: 16,
         phy_init_pending: false,
         deferred_init_step: 0,
         rx_link_armed: false,
@@ -6997,6 +7009,7 @@ pub fn init(
         link_speed: 0,
         link_duplex: false,
         link_watchdog_next_us: 0,
+        deferred_poll_next_us: 0,
         last_phy_recovery_us: 0,
         stage_start_us: 0,
         use_extended_descriptors: true,
