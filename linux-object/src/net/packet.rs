@@ -236,7 +236,6 @@ impl Socket for PacketSocketState {
             {
                 let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
                     let _ = net.poll();
-                    let _ = net.poll();
                 };
                 if ifindex > 0 {
                     if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {

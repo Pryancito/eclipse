@@ -94,7 +94,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, Ordering};
 
 use smoltcp::iface::*;
 use smoltcp::phy::{self, DeviceCapabilities, Checksum};
@@ -6344,6 +6344,7 @@ pub struct E1000eInterface {
     pub irq: usize,
     pub base: usize,
     pub poll_pending: Arc<AtomicBool>,
+    pub poll_last_queued_us: Arc<AtomicU64>,
     pub link_up_seen: Arc<AtomicBool>,
     /// Avoid queueing multiple watchdog jobs at once (Linux `watchdog_task` workqueue).
     watchdog_job_scheduled: Arc<AtomicBool>,
@@ -6456,6 +6457,15 @@ impl E1000eInterface {
         if self.poll_pending.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Coalesce IRQ bursts so NIC work doesn't monopolize CPU and starve USB/HID service.
+        const DEFERRED_POLL_MIN_INTERVAL_US: u64 = 2_000;
+        let now = timer_now_as_micros();
+        let last = self.poll_last_queued_us.load(Ordering::Acquire);
+        if now.wrapping_sub(last) < DEFERRED_POLL_MIN_INTERVAL_US {
+            self.poll_pending.store(false, Ordering::Release);
+            return;
+        }
+        self.poll_last_queued_us.store(now, Ordering::Release);
         let poll_pending = self.poll_pending.clone();
         let self_clone = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
@@ -6643,7 +6653,7 @@ impl NetScheme for E1000eInterface {
         // RX/TX: smoltcp (ping/ARP) + AF_PACKET dispatch in RxToken::consume.
         {
             let mut hw = self.driver.hw.lock();
-            hw.rx_poll_budget = 32;
+            hw.rx_poll_budget = 16;
         }
         {
             let mut sockets = sockets.lock();
@@ -7068,6 +7078,7 @@ pub fn init(
         irq,
         base: vaddr,
         poll_pending: Arc::new(AtomicBool::new(false)),
+        poll_last_queued_us: Arc::new(AtomicU64::new(0)),
         link_up_seen,
         watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
         amt_open_job_scheduled: Arc::new(AtomicBool::new(false)),
