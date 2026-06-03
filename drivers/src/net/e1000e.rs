@@ -5967,7 +5967,61 @@ impl E1000eHw {
     fn receive_slot(&mut self, i: usize) -> Option<Vec<u8>> {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
-        let (staterr, len) = unsafe { self.desc_done(desc_ptr)? };
+        let (staterr, len) = match unsafe { self.desc_done(desc_ptr) } {
+            Some(v) => v,
+            None => {
+                // Prevent RX head lock on real hardware: if the slot looks write-backed
+                // but descriptor metadata remains unstable/invalid, recycle this slot so
+                // rx_next_to_clean can progress on the next poll.
+                let wb = unsafe { self.read_rx_wb_retry(desc_ptr) };
+                let parsed = unsafe {
+                    if self.use_extended_descriptors {
+                        Self::parse_rx_wb_ext_u64(wb)
+                    } else {
+                        Self::parse_rx_wb_legacy_u64(wb)
+                    }
+                };
+                match parsed {
+                    Some((staterr, len)) if len > 0 && len <= BUF_SIZE => {
+                        log::trace!(
+                            "[e1000e] RX slot {} late WB settle staterr={:#x} len={}",
+                            i,
+                            staterr,
+                            len
+                        );
+                        (staterr, len)
+                    }
+                    Some((staterr, len)) => {
+                        log::debug!(
+                            "[e1000e] RX slot {} forcing recycle after unstable WB staterr={:#x} len={} clean={} RDH={} RDT={}",
+                            i,
+                            staterr,
+                            len,
+                            self.rx_next_to_clean,
+                            unsafe { mmio_read(self.base, E1000E_RDH) },
+                            unsafe { mmio_read(self.base, E1000E_RDT) }
+                        );
+                        self.rx_sg_reset();
+                        unsafe { self.recycle_rx_descriptor(i) };
+                        return None;
+                    }
+                    None if wb != 0 => {
+                        log::debug!(
+                            "[e1000e] RX slot {} forcing recycle on non-zero WB={:#x} clean={} RDH={} RDT={}",
+                            i,
+                            wb,
+                            self.rx_next_to_clean,
+                            unsafe { mmio_read(self.base, E1000E_RDH) },
+                            unsafe { mmio_read(self.base, E1000E_RDT) }
+                        );
+                        self.rx_sg_reset();
+                        unsafe { self.recycle_rx_descriptor(i) };
+                        return None;
+                    }
+                    None => return None,
+                }
+            }
+        };
         fence(Ordering::Acquire);
         log::trace!("[e1000e] RX: slot={} staterr={:#x} len={} clean={} RDH={} RDT={}",
               i, staterr, len, self.rx_next_to_clean,
