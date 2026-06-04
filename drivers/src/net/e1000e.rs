@@ -28,7 +28,7 @@ const E1000E_CONVENTIONAL: bool = false;
 /// PHY/register bring-up traces (link stages, GPRC polls, BM sync). Keep false for quiet dmesg.
 const E1000E_LOG_VERBOSE: bool = false;
 /// Bump when changing init/RX paths — grep dmesg for this tag to verify the ISO.
-const E1000E_DRIVER_TAG: &str = "e1000e-rx-real-hw";
+const E1000E_DRIVER_TAG: &str = "e1000e-osdev-rx";
 /// Retry AMT open if SWFLAG/MDIO still blocked (CSME can take seconds after DRV_LOAD).
 const E1000E_AMT_OPEN_RETRY_US: u64 = 30_000_000;
 /// Per deferred job: wait at most this long for SWFLAG (chunked — PS/2/USB stay responsive).
@@ -84,7 +84,7 @@ const SWFLAG_VERIFY_SET_INIT_MS: u32 = 1000;
 /// Linux ME ULP_CFG_DONE poll: up to 2.5 s (`usleep_range(10000)` × 250).
 const ME_ULP_CFG_DONE_MAX_ROUNDS: u32 = 250;
 /// reg26 settle when `get_link_status` forces a PHY read (not on every poll).
-const E1000E_LINK_CHECK_REG26_MS: u32 = 200;
+const E1000E_LINK_CHECK_REG26_MS: u32 = 500;
 #[inline]
 const fn e1000e_profile() -> &'static str {
     if E1000E_CONVENTIONAL {
@@ -378,6 +378,7 @@ const RDTR_FPD: u32 = 1 << 31;
 const BM_WUC_PAGE: u32 = 800;
 const BM_PORT_CTRL_PAGE: u32 = 769;
 const BM_WUC_ENABLE_REG: u32 = 17;
+const BM_PORT_GEN_CFG: u32 = 27;
 const BM_WUC_ENABLE_BIT: u16 = 1 << 2;
 const BM_WUC_HOST_WU_BIT: u16 = 1 << 4;
 const BM_WUC_ME_WU_BIT: u16 = 1 << 5;
@@ -675,6 +676,8 @@ pub struct E1000eHw {
     hw_roc_gprc_last: u32,
     hw_roc_mpc_last: u32,
     rx_diag_counter: u32,
+    /// Watchdog ticks with link up but GPRC still zero — triggers RX re-arm.
+    rx_stall_watchdogs: u8,
     /// Cap frames delivered per `poll()` so AF_PACKET `send()` does not drain the whole ring.
     rx_poll_budget: u8,
     /// PHY workarounds (ULP/MDIO/LANPHYPC) deferred past PCI scan (boot progress 84%).
@@ -1734,6 +1737,9 @@ impl E1000eHw {
             status,
             status & STATUS_LU != 0
         );
+        if self.is_pch_lpt_or_later() {
+            self.pch_clear_bm_port_gen_host_wu();
+        }
     }
 
     /// Reprogram MAC datapath + DMA rings after `reset_hw_ich8lan_linux`.
@@ -2922,20 +2928,75 @@ impl E1000eHw {
             .unwrap_or(false)
     }
 
-    /// reg26 reports link + one-hot speed (I219 may never set AUTONEG_DONE in reg26).
+    /// reg26 reports link + settled speed. 100/1000 one-hot bits are definitive on I219;
+    /// 10M (speed bits clear) needs AUTONEG_DONE — otherwise autoneg is still ramping to 1G.
     fn phy_reg26_speed_resolved(st2: u16) -> bool {
-        st2 != 0
-            && st2 != 0xFFFF
-            && st2 & PHY_STATUS2_LINK_UP != 0
-            && Self::phy_resolve_speed_duplex_st2(st2).is_some()
-    }
-
-    /// Copper L1 ready — on PCH trust STATUS.LU first (BMSR often lags I219).
-    #[inline]
-    unsafe fn phy_copper_ready_for_link_up(&self, bmsr: u16, status: u32, st2: u16) -> bool {
-        if self.is_pch_lpt_or_later() && status & STATUS_LU != 0 {
+        if st2 == 0 || st2 == 0xFFFF || st2 & PHY_STATUS2_LINK_UP == 0 {
+            return false;
+        }
+        let bits = st2 & PHY_STATUS2_SPEED_MASK;
+        if bits == PHY_STATUS2_SPEED_1000 || bits == PHY_STATUS2_SPEED_100 {
             return true;
         }
+        if bits == 0 {
+            return false;
+        }
+        false
+    }
+
+    /// Highest common speed from current autoneg registers.
+    unsafe fn phy_mii_hcd_speed(&self, phy_addr: u8) -> u32 {
+        let anar = self.mdic_read(phy_addr, MII_ADVERTISE).unwrap_or(0);
+        let lpa = self.mdic_read(phy_addr, MII_LPA).unwrap_or(0);
+        let stat1000 = self.mdic_read(phy_addr, MII_STAT1000).unwrap_or(0);
+        let ctrl1000 = self.mdic_read(phy_addr, MII_CTRL1000).unwrap_or(0);
+        Self::phy_mii_hcd_speed_mbps(anar, lpa, stat1000, ctrl1000)
+    }
+
+    /// On I219 + GbE partner, do not bring link up at 10/100M — locks MAC before reg26 reaches 1G.
+    unsafe fn pch_defer_link_until_gig_ready(
+        &mut self,
+        phy: u8,
+        speed: u32,
+        st2: u16,
+    ) -> bool {
+        if !self.is_pch_lpt_or_later()
+            || self.device_id == 0x10d3
+            || self.link_10m_degraded
+            || self.mdio_unavailable()
+            || speed >= SPEED_1000
+            || self.link_up
+        {
+            return false;
+        }
+        let hcd = self.phy_mii_hcd_speed(phy);
+        if hcd < SPEED_1000 {
+            return false;
+        }
+        e1000e_vlog!(
+            "[e1000e] link deferred: {} Mb/s reg26={:#x} ({}) MII_HCD={} Mb/s — wait 1G (tag={})\n",
+            speed,
+            st2,
+            Self::hv_m_status_label(st2),
+            hcd,
+            E1000E_DRIVER_TAG
+        );
+        if !self.link_up {
+            crate::klog_warn!(
+                "[e1000e] waiting for 1G: reg26={:#x} ({}) MII_HCD={} Mb/s (tag={})\n",
+                st2,
+                Self::hv_m_status_label(st2),
+                hcd,
+                E1000E_DRIVER_TAG
+            );
+        }
+        self.get_link_status = true;
+        true
+    }
+
+    /// Copper L1 ready — wait for BMSR ANEG or settled reg26 (Linux ~29 s to 1G on I219).
+    #[inline]
+    unsafe fn phy_copper_ready_for_link_up(&self, bmsr: u16, status: u32, st2: u16) -> bool {
         if bmsr == 0 || bmsr == 0xFFFF || (bmsr & 0x0004) == 0 {
             return self.mdio_unavailable() && status & STATUS_LU != 0;
         }
@@ -3772,6 +3833,22 @@ impl E1000eHw {
         }
     }
 
+    /// OSDev I219 guide: repost the cleaned slot and doorbell RDT to that index
+    /// (not `next_to_use` — descriptor *i* always maps to buffer *i*).
+    unsafe fn repost_rx_slot(&mut self, idx: usize) {
+        let ring = self.rx_ring.as_ptr::<RxDesc>();
+        let desc_ptr = ring.add(idx);
+        write_volatile(
+            core::ptr::addr_of_mut!((*desc_ptr).addr),
+            self.rx_buf_paddr(idx),
+        );
+        Self::clear_rx_desc_wb(desc_ptr);
+        self.flush_rx_ring_descriptor_span(idx, 1);
+        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        mmio_write_flush(self.base, E1000E_RDT, idx as u32);
+    }
+
     /// Linux `e1000_alloc_rx_buffers` — post `count` descriptors; RDT doorbell is batched.
     unsafe fn post_one_rx_buffer(&mut self) -> bool {
         if self.rx_desc_unused() == 0 {
@@ -4109,14 +4186,14 @@ impl E1000eHw {
     }
 
     /// Linux `e1000_setup_rctl` for 2 KB buffers + `RFCTL_EXTEN` extended descriptors.
+    /// OSDev guide: program RCTL filters first; RCTL.EN is set separately in `arm_rx_unit_linux`.
     unsafe fn rctl_rx_bits(&self) -> u32 {
         let mut rctl = mmio_read(self.base, E1000E_RCTL);
         rctl &= !(RCTL_MO_MASK | 0xC0); // MO + loopback mode → LBM_NO
-        rctl |= RCTL_EN | RCTL_BAM | RCTL_SECRC;
-        // Standard MTU: LPE on (enabling long packet support to avoid packet drops with 802.1Q tags or extra padding)
-        rctl &= !(RCTL_SBP | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK);
+        rctl |= RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC;
+        // OSDev: clear SBP; SZ_2048 + SECRC + BAM
+        rctl &= !(RCTL_SBP | RCTL_DTYP_PS | RCTL_BSEX | RCTL_RX_SZ_MASK | RCTL_EN);
         rctl |= RCTL_SZ_2048 | RCTL_LPE;
-        rctl &= !(RCTL_UPE | RCTL_MPE);
         rctl
     }
 
@@ -4579,32 +4656,119 @@ impl E1000eHw {
             page_port,
             MDIC_POLL_TRIES,
         );
-        let _ = self.mdic_write_swheld(BM_PHY_MDIO_ADDR, BM_WUC_ENABLE_REG, saved, MDIC_POLL_TRIES);
+        // Linux disable_phy_wakeup_reg_access_bm: restore original 769.17 — do NOT
+        // leave BM_WUC_ENABLE set; that keeps the PHY BM filter active and GPRC at 0.
+        let restore = saved & !(BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT);
+        let _ = self.mdic_write_swheld(BM_PHY_MDIO_ADDR, BM_WUC_ENABLE_REG, restore, MDIC_POLL_TRIES);
+        self.pch_swflag_release();
+    }
+
+    /// Linux `e1000_init_hw_ich8lan`: clear BM_PORT_GEN_CFG HOST_WU after reset.
+    unsafe fn pch_clear_bm_port_gen_host_wu(&self) {
+        if !self.is_pch_lpt_or_later() || !self.pch_swflag_acquire() {
+            return;
+        }
+        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        if !self.mdic_write_swheld(
+            BM_PHY_MDIO_ADDR,
+            IGP_PHY_PAGE_SELECT,
+            page_port,
+            MDIC_POLL_TRIES,
+        ) {
+            self.pch_swflag_release();
+            return;
+        }
+        if let Some(reg) =
+            self.mdic_read_swheld(BM_PHY_MDIO_ADDR, BM_PORT_GEN_CFG, MDIC_POLL_TRIES)
+        {
+            let cleared = reg & !BM_WUC_HOST_WU_BIT;
+            if cleared != reg {
+                let _ = self.mdic_write_swheld(
+                    BM_PHY_MDIO_ADDR,
+                    BM_PORT_GEN_CFG,
+                    cleared,
+                    MDIC_POLL_TRIES,
+                );
+                e1000e_vlog!(
+                    "[e1000e] BM_PORT_GEN_CFG HOST_WU cleared ({:#x} -> {:#x})\n",
+                    reg,
+                    cleared
+                );
+            }
+        }
+        self.pch_swflag_release();
+    }
+
+    /// Ensure RAL0/RAH0 carry our MAC with AV before copying filters to BM page-800.
+    unsafe fn ensure_mac_rar0_valid(&self) {
+        if !self.is_valid_mac() {
+            return;
+        }
+        let rah = mmio_read(self.base, E1000E_RAH0);
+        if rah & RAH_AV != 0 {
+            return;
+        }
+        let mac_low = u32::from_le_bytes([self.mac[0], self.mac[1], self.mac[2], self.mac[3]]);
+        let mac_high = u32::from_le_bytes([self.mac[4], self.mac[5], 0, 0]);
+        mmio_write(self.base, E1000E_RAL0, mac_low);
+        mmio_write(self.base, E1000E_RAH0, mac_high | RAH_AV);
+        let _ = mmio_read(self.base, E1000E_RAH0);
+        crate::klog_warn!(
+            "[e1000e] RAH0 AV restored {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (tag={})\n",
+            self.mac[0],
+            self.mac[1],
+            self.mac[2],
+            self.mac[3],
+            self.mac[4],
+            self.mac[5],
+            E1000E_DRIVER_TAG
+        );
+    }
+
+    /// Linux `disable_phy_wakeup_reg_access_bm`: ensure BM WUC page access is off for host RX.
+    unsafe fn pch_ensure_bm_wuc_disabled(&self) {
+        if !self.is_pch_lpt_or_later() || !self.pch_swflag_acquire() {
+            return;
+        }
+        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        if !self.mdic_write_swheld(
+            BM_PHY_MDIO_ADDR,
+            IGP_PHY_PAGE_SELECT,
+            page_port,
+            MDIC_POLL_TRIES,
+        ) {
+            self.pch_swflag_release();
+            return;
+        }
+        if let Some(reg) =
+            self.mdic_read_swheld(BM_PHY_MDIO_ADDR, BM_WUC_ENABLE_REG, MDIC_POLL_TRIES)
+        {
+            let cleared = reg & !(BM_WUC_ENABLE_BIT | BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT);
+            if cleared != reg {
+                let _ = self.mdic_write_swheld(
+                    BM_PHY_MDIO_ADDR,
+                    BM_WUC_ENABLE_REG,
+                    cleared,
+                    MDIC_POLL_TRIES,
+                );
+                e1000e_vlog!(
+                    "[e1000e] BM_WUC_ENABLE cleared ({:#x} -> {:#x})\n",
+                    reg,
+                    cleared
+                );
+            }
+        }
         self.pch_swflag_release();
     }
 
     /// Linux `e1000_copy_rx_addrs_to_phy_ich8lan` + `e1000_init_phy_wakeup` BM path.
+    /// Linux does not set PHY_CTRL GBE_DISABLE here — doing so drops a 1G link.
     unsafe fn pch_sync_phy_rx_path(&self, link_phy: u8) {
         if !self.is_pch_lpt_or_later() {
             return;
         }
-        // Linux: reliable BM page-800 MDIO on PCH when gigabit path is gated off briefly.
-        let phy_ctrl_saved = if self.is_pch_lpt_or_later() {
-            let s = mmio_read(self.base, E1000E_PHY_CTRL);
-            mmio_write(
-                self.base,
-                E1000E_PHY_CTRL,
-                s | PHY_CTRL_GBE_DISABLE | PHY_CTRL_NOND0A_GBE_DISABLE,
-            );
-            let _ = mmio_read(self.base, E1000E_PHY_CTRL);
-            Some(s)
-        } else {
-            None
-        };
+        self.ensure_mac_rar0_valid();
         let Some(saved) = self.pch_bm_wuc_access_begin() else {
-            if let Some(s) = phy_ctrl_saved {
-                mmio_write(self.base, E1000E_PHY_CTRL, s);
-            }
             crate::klog_warn!(
                 "[e1000e] BM PHY filter sync skipped (no MDIO) — enabling UPE/MPE/BAM on MAC\n"
             );
@@ -4663,19 +4827,36 @@ impl E1000eHw {
         if ctrl & CTRL_RFCE != 0 {
             bm_rctl |= BM_RCTL_RFCE;
         }
+        // Match MAC promisc filters used during bringup (BM only active while WUC enable set).
+        bm_rctl |= BM_RCTL_BAM | BM_RCTL_UPE | BM_RCTL_MPE;
         let ok_rctl = self.pch_bm_wuc_reg_write(0, bm_rctl);
 
+        let mac_ral = mmio_read(self.base, E1000E_RAL0);
+        let mac_rah = mmio_read(self.base, E1000E_RAL0 + 1);
+        let bm_ral_lo = self.pch_bm_wuc_reg_read(16).unwrap_or(0);
+        let bm_ral_hi = self.pch_bm_wuc_reg_read(17).unwrap_or(0);
+        let bm_rah_lo = self.pch_bm_wuc_reg_read(18).unwrap_or(0);
+        let bm_rah_av = self.pch_bm_wuc_reg_read(19).unwrap_or(0);
+        let bm_rar_ok = ok_rar
+            && bm_ral_lo == (mac_ral as u16)
+            && bm_ral_hi == ((mac_ral >> 16) as u16)
+            && bm_rah_lo == (mac_rah as u16)
+            && bm_rah_av & 0x8000 != 0;
+
         self.pch_bm_wuc_access_end(saved);
-        if let Some(s) = phy_ctrl_saved {
-            mmio_write(self.base, E1000E_PHY_CTRL, s);
-            let _ = mmio_read(self.base, E1000E_PHY_CTRL);
-        }
 
-        if self.is_pch_lpt_or_later() {
-            mmio_write(self.base, E1000E_WUC, WUC_PHY_WAKE | WUC_PME_STATUS);
-        }
-
-        if ok_rar && ok_mta && ok_rctl {
+        if ok_rar && ok_mta && ok_rctl && bm_rar_ok {
+            crate::klog_warn!(
+                "[e1000e] BM page-800 sync OK BM_RCTL={:#x} BAM={} RAR0={:04x}{:04x}/{:04x}{:04x} AV={} (tag={})\n",
+                bm_rctl,
+                bm_rctl & BM_RCTL_BAM != 0,
+                mac_ral as u16,
+                (mac_ral >> 16) as u16,
+                bm_ral_lo,
+                bm_ral_hi,
+                bm_rah_av & 0x8000 != 0,
+                E1000E_DRIVER_TAG
+            );
             e1000e_vlog!(
                 "[e1000e] BM page-800 full sync ({} RAR, {} MTA, PHY{} link PHY{}, BM_RCTL={:#x})\n",
                 PCH_LPT_RAR_ENTRIES,
@@ -4685,11 +4866,20 @@ impl E1000eHw {
                 bm_rctl
             );
         } else {
-            e1000e_wlog!(
-                "[e1000e] BM page-800 partial sync (rar={} mta={} rctl={}) — UPE/MPE/BAM on MAC\n",
+            crate::klog_warn!(
+                "[e1000e] BM page-800 verify fail (rar={} mta={} rctl={} bm_rar={}) — UPE/MPE/BAM on MAC (tag={})\n",
                 ok_rar,
                 ok_mta,
-                ok_rctl
+                ok_rctl,
+                bm_rar_ok,
+                E1000E_DRIVER_TAG
+            );
+            e1000e_wlog!(
+                "[e1000e] BM page-800 partial sync (rar={} mta={} rctl={} bm_rar={}) — UPE/MPE/BAM on MAC\n",
+                ok_rar,
+                ok_mta,
+                ok_rctl,
+                bm_rar_ok
             );
             let mut rctl = mmio_read(self.base, E1000E_RCTL);
             rctl |= RCTL_UPE | RCTL_MPE | RCTL_BAM;
@@ -4949,13 +5139,75 @@ impl E1000eHw {
         );
     }
 
+    /// Wait for settled reg26, lock MAC CTRL and PHY TIPG/EMI to that speed.
+    /// I219 often reports 10M then ramps to 100/1000 within ms — arming RX with stale
+    /// 10M tuning while CTRL was resynced to 100M leaves GPRC at zero.
+    unsafe fn pch_commit_operational_link_speed(&mut self) -> u16 {
+        let phy = self.active_phy_addr();
+        let mut st2 = if self.phy_mdio_responding {
+            self.phy_wait_reg26_settled(phy, 1000)
+        } else {
+            self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0)
+        };
+        if self.phy_mdio_responding && st2 & PHY_STATUS2_AUTONEG_DONE == 0 {
+            let st2_retry = self.phy_wait_reg26_settled(phy, 500);
+            if st2_retry & PHY_STATUS2_AUTONEG_DONE != 0 {
+                st2 = st2_retry;
+                e1000e_vlog!("[e1000e] reg26 ANEG done after extra wait ({:#x})\n", st2);
+            }
+        }
+        let (speed, duplex_full, src) = self.resolve_link_speed_duplex_linux(phy, st2);
+        if self.link_speed != speed || self.link_duplex != duplex_full {
+            crate::klog_warn!(
+                "[e1000e] link reconcile: {}→{} Mb/s {} reg26={:#x} ({}) tag={}\n",
+                self.link_speed,
+                speed,
+                if duplex_full { "FD" } else { "HD" },
+                st2,
+                src,
+                E1000E_DRIVER_TAG
+            );
+        }
+        self.link_speed = speed;
+        self.link_duplex = duplex_full;
+        if !self.mdio_unavailable() {
+            let _ = self.mac_lock_ctrl_from_st2(st2);
+            self.program_link_tipg_emi_linux(phy, speed, duplex_full);
+            self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
+            self.phy_setup_82577_copper(phy);
+            if self.is_pch_spt_or_later() {
+                self.pch_spt_ptr_gap_workaround(phy, speed);
+            }
+            self.configure_link_tx_path(speed);
+            self.config_collision_dist_linux();
+        }
+        st2
+    }
+
     /// Arm RX rings and enable RCTL — call only when link is up and configured.
     unsafe fn enable_rx_after_link(&mut self) {
-        if self.is_pch_lpt_or_later() {
-            let phy = self.active_phy_addr();
-            let _ = self.resync_mac_if_phy_changed(phy);
+        self.enable_rx_after_link_setup(true);
+    }
+
+    /// Re-post RX ring only (no PHY/BM reprogram) — used by GPRC stall recovery.
+    unsafe fn enable_rx_rearm_only(&mut self) {
+        self.enable_rx_after_link_setup(false);
+    }
+
+    unsafe fn enable_rx_after_link_setup(&mut self, full_link_setup: bool) {
+        if full_link_setup && self.is_pch_lpt_or_later() {
+            self.pch_clear_bm_port_gen_host_wu();
+            self.pch_ensure_bm_wuc_disabled();
+            let _st2 = self.pch_commit_operational_link_speed();
+            self.pch_post_link_phy_tune();
             self.restart_tx_datapath_linux();
+            let phy = self.active_phy_addr();
+            self.pch_sync_phy_rx_path(phy);
+        } else if self.is_pch_lpt_or_later() {
+            self.pch_ensure_bm_wuc_disabled();
         }
+
+        self.ensure_gio_master();
 
         let status = mmio_read(self.base, E1000E_STATUS);
         let status_spd = Self::speed_mbps_from_status(status);
@@ -4997,10 +5249,16 @@ impl E1000eHw {
 
         let arm_ok = self.arm_rx_unit_linux();
 
-        // Sync MAC RAR/MTA/RCTL → PHY BM filters after RCTL.EN (Linux init_phy_wakeup path).
         if self.is_pch_lpt_or_later() {
-            let phy = self.active_phy_addr();
-            self.pch_sync_phy_rx_path(phy);
+            let rctl_post = mmio_read(self.base, E1000E_RCTL);
+            if rctl_post & (RCTL_UPE | RCTL_MPE | RCTL_BAM) != (RCTL_UPE | RCTL_MPE | RCTL_BAM) {
+                mmio_write(
+                    self.base,
+                    E1000E_RCTL,
+                    rctl_post | RCTL_UPE | RCTL_MPE | RCTL_BAM,
+                );
+                let _ = mmio_read(self.base, E1000E_RCTL);
+            }
         }
 
         self.hw_roc_gprc_last = 0;
@@ -5014,15 +5272,17 @@ impl E1000eHw {
         self.rx_link_armed = armed;
         if armed {
             crate::klog_warn!(
-                "[e1000e] RX armed: RCTL={:#x} RXDCTL={:#x} RDH={} RDT={} clean={} use={} BAM={} uc={} CTRL={:#x} tag={}\n",
+                "[e1000e] RX armed: {} Mb/s RCTL={:#x} RXDCTL={:#x} RDH={} RDT={} reg26={:#x} CTRL={:#x} tag={}\n",
+                self.link_speed,
                 rctl,
                 rxdctl,
                 rdh,
                 rdt,
-                self.rx_next_to_clean,
-                self.rx_next_to_use,
-                rctl & RCTL_BAM != 0,
-                self.dma_uncached,
+                if self.is_pch_lpt_or_later() {
+                    self.mdic_read(self.active_phy_addr(), MII_PHY_STATUS_2).unwrap_or(0)
+                } else {
+                    0
+                },
                 ctrl,
                 E1000E_DRIVER_TAG
             );
@@ -5078,8 +5338,21 @@ impl E1000eHw {
         let is_pch = self.is_pch_lpt_or_later();
         let phy = self.active_phy_addr();
         let st2 = self.mdic_read(phy, MII_PHY_STATUS_2).unwrap_or(0);
-        let use_status_sane = self.mdio_unavailable()
-            || (status & STATUS_LU != 0 && !Self::phy_reg26_speed_resolved(st2));
+        if is_pch && !self.mdio_unavailable() && !Self::phy_reg26_speed_resolved(st2) {
+            let _ = self.mdic_read(phy, MII_BMSR);
+            let bmsr = self.mdic_read(phy, MII_BMSR).unwrap_or(0);
+            if bmsr & BMSR_ANEG_COMPLETE == 0 {
+                e1000e_vlog!(
+                    "[e1000e] link deferred: STATUS={:#x} reg26={:#x} BMSR={:#x} (autoneg pending)\n",
+                    status,
+                    st2,
+                    bmsr
+                );
+                self.get_link_status = true;
+                return false;
+            }
+        }
+        let use_status_sane = self.mdio_unavailable();
         let (speed, duplex_full, src) = if use_status_sane {
             let Some((spd, dpx)) = Self::speed_duplex_from_status_sane(status) else {
                 return false;
@@ -5094,6 +5367,10 @@ impl E1000eHw {
             let (spd, dpx, s) = self.resolve_link_speed_duplex_linux(phy, st2);
             (spd, dpx, s)
         };
+
+        if is_pch && self.pch_defer_link_until_gig_ready(phy, speed, st2) {
+            return false;
+        }
 
         if !self.link_up || self.link_speed != speed || self.link_duplex != duplex_full {
             let _was_down = !self.link_up;
@@ -5111,7 +5388,7 @@ impl E1000eHw {
 
             if is_pch {
                 self.mac_apply_link_up_autoneg();
-                if !self.mdio_unavailable() {
+                if !self.mdio_unavailable() && speed >= SPEED_1000 {
                     let _ = self.mac_lock_ctrl_from_st2(st2);
                 }
             } else {
@@ -5119,9 +5396,9 @@ impl E1000eHw {
             }
 
             if is_pch {
+                self.program_link_tipg_emi_linux(phy, speed, duplex_full);
+                self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
                 if !self.mdio_unavailable() {
-                    self.program_link_tipg_emi_linux(phy, speed, duplex_full);
-                    self.pch_kmrn_half_duplex_preamble(phy, duplex_full);
                     self.phy_setup_82577_copper(phy);
                     if self.is_pch_spt_or_later() {
                         self.pch_spt_ptr_gap_workaround(phy, speed);
@@ -5193,6 +5470,14 @@ impl E1000eHw {
         let link_up = (bmsr & 0x0004) != 0;
 
         if !link_up {
+            if is_pch && self.link_up && status & STATUS_LU != 0 {
+                e1000e_vlog!(
+                    "[e1000e] BMSR link clear but STATUS.LU set — keep link (tag={})\n",
+                    E1000E_DRIVER_TAG
+                );
+                self.get_link_status = true;
+                return true;
+            }
             if self.link_up {
                 crate::klog_warn!("[e1000e] link down\n");
                 self.link_up = false;
@@ -5219,9 +5504,6 @@ impl E1000eHw {
                 || Self::phy_reg26_speed_resolved(st2);
         }
         if is_pch && self.phy_mdio_responding && !reg26_ready {
-            if status & STATUS_LU != 0 && (bmsr & 0x0004) != 0 {
-                return self.apply_link_from_status(status);
-            }
             e1000e_vlog!(
                 "[e1000e] link deferred: BMSR={:#x} STATUS={:#x} reg26={:#x} ({})\n",
                 bmsr,
@@ -5251,7 +5533,25 @@ impl E1000eHw {
         }
 
         // 4. Si el enlace ha cambiado o acaba de levantarse:
+        if is_pch && self.phy_mdio_responding && speed < SPEED_1000 {
+            st2 = self.phy_wait_reg26_settled(phy, reg26_wait_ms.max(2000));
+            (speed, duplex_full, src) = self.resolve_link_speed_duplex_linux(phy, st2);
+            if !self.link_up && speed < SPEED_1000 && bmsr & BMSR_ANEG_COMPLETE == 0 {
+                self.get_link_status = true;
+                return false;
+            }
+        }
+
+        if is_pch && self.pch_defer_link_until_gig_ready(phy, speed, st2) {
+            return false;
+        }
+
         if !self.link_up || self.link_speed != speed || self.link_duplex != duplex_full {
+            if speed == SPEED_1000 && duplex_full {
+                crate::klog_warn!(
+                    "[e1000e] NIC Link is Up 1000 Mbps Full Duplex, Flow Control: None\n"
+                );
+            }
             crate::klog_warn!(
                 "[e1000e] link up: {} Mb/s {} duplex ({})\n",
                 speed,
@@ -5266,7 +5566,7 @@ impl E1000eHw {
             // 5. MAC: autoneg path — ASDE, then lock CTRL to PHY when reg26 is settled.
             if is_pch {
                 self.mac_apply_link_up_autoneg();
-                if !self.mdio_unavailable() {
+                if !self.mdio_unavailable() && speed >= SPEED_1000 {
                     let _ = self.mac_lock_ctrl_from_st2(st2);
                 }
             } else {
@@ -5281,10 +5581,12 @@ impl E1000eHw {
                 self.configure_link_tx_path(speed);
                 self.config_collision_dist_linux();
 
-                self.phy_setup_82577_copper(phy);
+                if !self.mdio_unavailable() {
+                    self.phy_setup_82577_copper(phy);
 
-                if self.is_pch_spt_or_later() {
-                    self.pch_spt_ptr_gap_workaround(phy, speed);
+                    if self.is_pch_spt_or_later() {
+                        self.pch_spt_ptr_gap_workaround(phy, speed);
+                    }
                 }
             } else {
                 self.config_collision_dist_linux();
@@ -5337,8 +5639,33 @@ impl E1000eHw {
         }
 
         if self.link_up {
+            if self.is_pch_lpt_or_later()
+                && self.device_id != 0x10d3
+                && self.phy_mdio_responding
+                && self.link_speed < SPEED_1000
+            {
+                self.get_link_status = true;
+                let _ = self.check_for_link_linux(E1000E_LINK_CHECK_REG26_MS.max(1500));
+            }
             if !self.rx_link_armed {
-                self.enable_rx_after_link();
+                unsafe { self.enable_rx_after_link() };
+            } else {
+                unsafe {
+                    self.refresh_hw_stats_roc();
+                }
+                if self.hw_roc_gprc_acc == 0 && self.stats.rx_packets == 0 {
+                    self.rx_stall_watchdogs = self.rx_stall_watchdogs.saturating_add(1);
+                    if self.rx_stall_watchdogs >= 4 {
+                        self.rx_stall_watchdogs = 0;
+                        crate::klog_warn!(
+                            "[e1000e] GPRC still 0 after link — re-arm RX ring (tag={})\n",
+                            E1000E_DRIVER_TAG
+                        );
+                        unsafe { self.enable_rx_rearm_only() };
+                    }
+                } else {
+                    self.rx_stall_watchdogs = 0;
+                }
             }
             return;
         }
@@ -5460,6 +5787,12 @@ impl E1000eHw {
             );
             self.pch_clear_status_phyra_if_set();
             self.amt_open_reset_state();
+            self.pch_mdio_prepare_after_power();
+            self.detect_phy_addr();
+            if self.phy_mdio_responding {
+                self.pch_kick_autoneg_mdio();
+                self.get_link_status = true;
+            }
         } else {
             self.reset_hw_ich8lan_linux(false);
             self.restore_pci_command_bus_master();
@@ -5966,17 +6299,10 @@ impl E1000eHw {
         None
     }
 
-    /// Return descriptor to hardware only after payload is copied out of the DMA buffer.
+    /// Return descriptor to hardware after the frame is copied (OSDev: `RDT = old_cur`).
     unsafe fn recycle_rx_descriptor(&mut self, i: usize) {
-        let ring = self.rx_ring.as_ptr::<RxDesc>();
-        let desc_ptr = ring.add(i);
-        Self::clear_rx_desc_wb(desc_ptr);
+        self.repost_rx_slot(i);
         self.rx_next_to_clean = (i + 1) % NUM_RX;
-        if self.rx_next_to_clean % RX_DESCS_PER_CACHE_LINE == 0 {
-            let start = self.rx_next_to_clean.wrapping_sub(RX_DESCS_PER_CACHE_LINE) % NUM_RX;
-            self.flush_rx_ring_descriptor_span(start, RX_DESCS_PER_CACHE_LINE);
-        }
-        self.alloc_rx_buffers(1, false);
     }
 
     /// Nudge the MAC to write back completed RX descriptors (Linux RDTR_FPD path).
@@ -7105,6 +7431,7 @@ pub fn init(
         hw_roc_gprc_last: 0,
         hw_roc_mpc_last: 0,
         rx_diag_counter: 0,
+        rx_stall_watchdogs: 0,
         rx_poll_budget: 32,
         phy_init_pending: false,
         deferred_init_step: 0,
