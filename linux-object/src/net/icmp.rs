@@ -166,6 +166,8 @@ impl Socket for IcmpSocketState {
                     inner.flags.contains(OpenFlags::NON_BLOCK),
                 )
             };
+
+            drain_all_nic_rx();
             if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
                 let n = pkt.len().min(data.len());
                 data[..n].copy_from_slice(&pkt[..n]);
@@ -184,7 +186,13 @@ impl Socket for IcmpSocketState {
                     return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                 }
                 Err(smoltcp::Error::Exhausted) => {
-                    crate::net::pulse_drain_net();
+                    pulse_drain_net_urgent();
+                    drain_all_nic_rx();
+                    if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
+                        let n = pkt.len().min(data.len());
+                        data[..n].copy_from_slice(&pkt[..n]);
+                        return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
+                    }
                     if non_block {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
@@ -201,7 +209,7 @@ impl Socket for IcmpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
 
-            crate::net::wait::NetOrTtyWait::new_after_ms(10).await;
+            kernel_hal::net::NetRxOrTimeoutFuture::new(25).await;
         }
     }
 

@@ -73,6 +73,42 @@ impl Socket for RawSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
+            let remote = self.inner.remote.lock().as_ref().and_then(|ep| match ep {
+                Endpoint::Ip(ip) => Some(ip.addr),
+                _ => None,
+            });
+            if !self.inner.ipv6 {
+                let proto = {
+                    let net_sockets = get_sockets();
+                    let mut sockets = net_sockets.lock();
+                    let proto = sockets.get::<RawSocket>(self.inner.handle.0).ip_protocol();
+                    proto
+                };
+                if proto == IpProtocol::Icmp {
+                    if let Some((n, src)) = super::icmp_rx::pop_ipv4_raw_reply(remote, data) {
+                        return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
+                    }
+                    // RxToken also enqueues the same frame on smoltcp RawSocket; drop it
+                    // so BusyBox ping does not report (DUP!) with a second TTL.
+                    {
+                        let net_sockets = get_sockets();
+                        let mut sockets = net_sockets.lock();
+                        let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
+                        if socket.can_recv() {
+                            let _ = socket.recv_slice(data);
+                        }
+                    }
+                    let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
+                    if non_block {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                    kernel_hal::thread::sleep_until(
+                        kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
+                    )
+                    .await;
+                    continue;
+                }
+            }
             let net_sockets = get_sockets();
             let mut sockets = net_sockets.lock();
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
@@ -143,6 +179,18 @@ impl Socket for RawSocketState {
         let Endpoint::Ip(ip) = endpoint.ok_or(LxError::ENOTCONN)? else {
             return Err(LxError::EINVAL);
         };
+        if !*self.inner.header_included.lock()
+            && !self.inner.ipv6
+            && socket.ip_protocol() == IpProtocol::Icmp
+        {
+            let IpAddress::Ipv4(dst) = ip.addr else {
+                return Err(LxError::EINVAL);
+            };
+            if dst.is_loopback() || is_local_host_ipv4(dst) {
+                super::icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), data.to_vec());
+                return Ok(data.len());
+            }
+        }
         if self.inner.ipv6 {
             let IpAddress::Ipv6(dst) = ip.addr else {
                 return Err(LxError::EINVAL);
@@ -281,7 +329,11 @@ impl Socket for RawSocketState {
         let s = get_sockets();
         let mut s = s.lock();
         let socket = s.get::<RawSocket>(self.inner.handle.0);
-        (socket.can_recv(), socket.can_send(), false)
+        let readable = socket.can_recv()
+            || (!self.inner.ipv6
+                && socket.ip_protocol() == IpProtocol::Icmp
+                && super::icmp_rx::pending_for(false));
+        (readable, socket.can_send(), false)
     }
 }
 

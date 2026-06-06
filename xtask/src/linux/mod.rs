@@ -424,14 +424,24 @@ fi
 
 echo "eclipse-net: interfaz $IFACE detectada"
 
+# Esperar init e1000e (deferred o probe sincrono en HEAD).
+i=0
+while [ "$i" -lt 50 ]; do
+    if dmesg 2>/dev/null | grep -qE 'e1000e.*(hardware ready|link=.*tag=)'; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+
 if [ -x /bin/udhcpc ]; then
     echo "Iniciando udhcpc (DHCPv4) en $IFACE..."
-    /bin/udhcpc -i "$IFACE" -q -b >/dev/null 2>&1
+    udhcpc -i "$IFACE" -q -b -n -t 5 -T 3 >/dev/null 2>&1 &
 fi
 
 if [ -x /bin/udhcpc6 ] && eclipse_ipv6_possible "$IFACE"; then
     echo "Iniciando udhcpc6 (DHCPv6) en $IFACE..."
-    /bin/udhcpc6 -i "$IFACE" -q -b >/dev/null 2>&1
+    /bin/udhcpc6 -i "$IFACE" -q -b >/dev/null 2>&1 &
 elif [ -x /bin/udhcpc6 ]; then
     echo "eclipse-net: IPv6 no disponible en $IFACE (sin entrada en /proc/net/if_inet6)"
 fi

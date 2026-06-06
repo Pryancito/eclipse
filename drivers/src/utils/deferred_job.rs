@@ -51,11 +51,13 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     if flag {
         intr_off();
     }
-    let mut q = JOBS.lock();
-    if q.len() >= MAX_DEFERRED_JOBS {
-        evict_oldest_job(&mut q);
+    {
+        let mut q = JOBS.lock();
+        if q.len() >= MAX_DEFERRED_JOBS {
+            evict_oldest_job(&mut q);
+        }
+        q.push(Box::new(f));
     }
-    q.push(Box::new(f));
     if flag {
         intr_on();
     }

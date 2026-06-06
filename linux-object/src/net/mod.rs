@@ -834,8 +834,15 @@ pub fn retain_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_i
 /// One tick of an I/O wait loop (Eclipse Pulse): IRQ-first, tier-C backup, `hlt` when idle.
 pub fn io_wait_tick(watch_net: bool, watch_interactive: bool) {
     let work = kernel_hal::pulse::pulse_io_tick(watch_net, watch_interactive);
-    if work.run_hid_backup {
+    if work.run_hid_backup || watch_interactive {
         kernel_hal::input_poll::poll_input_devices();
+    }
+    // Keyboard-only waits: skip heavy NIC poll unless RX/LINK IRQ fired.
+    if watch_interactive && !watch_net && !work.run_net_poll_now {
+        if work.run_net_deferred {
+            kernel_hal::deferred_job::drain_deferred_jobs_max(1);
+        }
+        return;
     }
     if work.run_net_deferred {
         kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
@@ -871,6 +878,16 @@ pub fn poll_netdev(dev: &dyn zcore_drivers::scheme::NetScheme) {
     kernel_hal::deferred_job::drain_deferred_jobs();
     let _ = dev.poll();
     kernel_hal::deferred_job::drain_deferred_jobs();
+}
+
+/// Pull RX from every non-loopback NIC into `push_packet` / `icmp_rx` (no throttle).
+pub fn drain_all_nic_rx() {
+    kernel_hal::deferred_job::drain_deferred_jobs();
+    for dev in get_net_device().iter() {
+        if dev.get_ifname() != "loopback" {
+            netdev_drain_rx(dev.as_ref());
+        }
+    }
 }
 
 /// Pull RX frames from the NIC and feed `push_packet` / `icmp_rx` without smoltcp.
@@ -1026,7 +1043,7 @@ fn resolve_ipv4_next_hop(
     hop
 }
 
-/// Guess the default gateway (.1 on the host subnet) when DHCP/`ip route` did not install one.
+/// Guess the default gateway when DHCP/`ip route` did not install one.
 fn infer_ipv4_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smoltcp::wire::Ipv4Address> {
     use smoltcp::wire::{IpCidr, Ipv4Address};
     for ip in dev.get_ip_address() {
@@ -1036,7 +1053,19 @@ fn infer_ipv4_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smol
                 continue;
             }
             let o = addr.0;
-            return Some(Ipv4Address::new(o[0], o[1], o[2], 1));
+            // QEMU user networking (slirp): gateway is 10.0.2.2, not .1.
+            if o[0] == 10 && o[1] == 0 && o[2] == 2 {
+                return Some(Ipv4Address::new(10, 0, 2, 2));
+            }
+            let gw1 = Ipv4Address::new(o[0], o[1], o[2], 1);
+            let gw2 = Ipv4Address::new(o[0], o[1], o[2], 2);
+            if arp_cache::lookup(gw2).is_some() {
+                return Some(gw2);
+            }
+            if arp_cache::lookup(gw1).is_some() {
+                return Some(gw1);
+            }
+            return Some(gw1);
         }
     }
     None
@@ -1054,12 +1083,15 @@ fn ipv4_gateway_from_routes(routes: &[zcore_drivers::scheme::RouteInfo]) -> Opti
     })
 }
 
-/// Install `0.0.0.0/0` via DHCP gateway or inferred `.1` on the host subnet.
+/// Install `0.0.0.0/0` via DHCP gateway or inferred gateway on the host subnet.
 pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
     let Some(gw) = ipv4_default_gateway(iface) else {
         return;
     };
+    if ipv4_gateway_from_routes(&iface.get_routes()) == Some(gw) {
+        return;
+    }
     let default = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
     if iface
         .add_route(default, Some(IpAddress::Ipv4(gw)))
@@ -1492,8 +1524,7 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
                     "down"
                 }
             );
-            let iface = iface_by_name(ifname)?;
-            let _ = iface.refresh_link();
+            // IFF_UP is software state — do not reset I219 PHY/RX on every `ifconfig up`.
             Ok(0)
         }
 

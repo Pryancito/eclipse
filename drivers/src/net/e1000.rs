@@ -539,6 +539,7 @@ impl NetScheme for E1000Interface {
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
                 if cidr.prefix_len() == 0 {
+                    let _ = iface.routes_mut().remove_default_ipv4_route();
                     iface
                         .routes_mut()
                         .add_default_ipv4_route(gw)
@@ -553,6 +554,7 @@ impl NetScheme for E1000Interface {
             }
             Some(IpAddress::Ipv6(gw)) => {
                 if cidr.prefix_len() == 0 {
+                    let _ = iface.routes_mut().remove_default_ipv6_route();
                     iface
                         .routes_mut()
                         .add_default_ipv6_route(gw)
@@ -740,10 +742,8 @@ pub fn init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    let default_v4_gw = Ipv4Address::new(0, 0, 0, 0);
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
-    let mut routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
-    routes.add_default_ipv4_route(default_v4_gw).unwrap();
+    let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
     let neighbor_cache = NeighborCache::new(BTreeMap::new());
 
     let iface = InterfaceBuilder::new(net_driver.clone())
@@ -762,10 +762,7 @@ pub fn init(
         base: header,
         poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         stats,
-        routes: Arc::new(Mutex::new(vec![RouteInfo {
-            dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-            gateway: Some(IpAddress::Ipv4(default_v4_gw)),
-        }])),
+        routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
     };
 

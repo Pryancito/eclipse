@@ -144,6 +144,11 @@ pub(super) fn init() -> DeviceResult {
             drivers::add_device(d);
         }
 
+        // Finish deferred NIC work without starving HID at login.
+        for _ in 0..2 {
+            zcore_drivers::utils::deferred_job::drain_deferred_jobs_max(1);
+        }
+
         // Finish MSI registrations for USB
         #[cfg(feature = "xhci-usb-hid")]
         {

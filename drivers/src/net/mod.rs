@@ -7,6 +7,7 @@ use smoltcp::socket::SocketSet;
 
 pub mod e1000;
 pub mod e1000e;
+mod e1000e_pch;
 // pub mod ixgbe;
 pub mod loopback;
 pub use isomorphic_drivers::provider::Provider;
