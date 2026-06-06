@@ -68,6 +68,16 @@ impl NetlinkSocketState {
     }
 }
 
+/// `nlmsg_pid` echoed in dump replies must match what userland put in the request
+/// (fastfetch/musl filter on this field; falls back to process pid if getsockname fails).
+fn reply_nl_pid(req: &NetlinkMessageHeader, local_port: u32) -> u32 {
+    if req.nlmsg_pid != 0 {
+        req.nlmsg_pid
+    } else {
+        local_port
+    }
+}
+
 
 
 #[async_trait]
@@ -95,7 +105,10 @@ impl Socket for NetlinkSocketState {
                     if n != 0 {
                         data[..n].copy_from_slice(&msg[..n]);
                     }
-                    info!("[netlink] read hex: {:?}", &msg[..n]);
+                    if n < msg.len() {
+                        self.data.lock().insert(0, msg[n..].to_vec());
+                    }
+                    info!("[netlink] read hex: {:?}", &msg[..n.min(msg.len())]);
                     return (Ok(n), endpoint);
                 }
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
@@ -118,7 +131,8 @@ impl Socket for NetlinkSocketState {
         }
         let message_type = NetlinkMessageType::from(header.nlmsg_type);
         info!("Netlink write: message_type={:?}, len={}, seq={}, hex: {:?}", message_type, header.nlmsg_len, header.nlmsg_seq, data);
-        let reply_pid = self.local_port_id();
+        let local_port = self.local_port_id();
+        let reply_pid = reply_nl_pid(header, local_port);
         let mut buffer = self.data.lock();
         buffer.clear();
         match message_type {

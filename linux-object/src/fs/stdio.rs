@@ -375,6 +375,51 @@ impl Stdin {
     pub fn can_read(&self) -> bool {
         self.buf.lock().len() > 0
     }
+
+    /// Push raw bytes into stdin without echo (TTY query responses for userland).
+    pub fn push_bytes(&self, bytes: &[u8]) {
+        let mut buf = self.buf.lock();
+        for &b in bytes {
+            buf.push_back(b as char);
+        }
+        self.data_ready.store(true, Ordering::Release);
+        if let Some(mut eb) = self.eventbus.try_lock() {
+            self.data_ready.store(false, Ordering::Relaxed);
+            eb.set(Event::READABLE);
+        }
+    }
+}
+
+/// fastfetch and other tools send DSR queries to the terminal; serial consoles
+/// do not answer, so inject a minimal response into stdin.
+fn tty_handle_outgoing(data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let mut need_cpr = false;
+    let mut need_status = false;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            if i + 3 < data.len() && data[i + 2] == b'6' && data[i + 3] == b'n' {
+                need_cpr = true;
+                i += 4;
+                continue;
+            }
+            if i + 3 < data.len() && data[i + 2] == b'5' && data[i + 3] == b'n' {
+                need_status = true;
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if need_cpr {
+        STDIN.push_bytes(b"\x1b[1;1R");
+    }
+    if need_status {
+        STDIN.push_bytes(b"\x1b[0n");
+    }
 }
 
 /// Stdout struct, empty now
@@ -392,6 +437,7 @@ impl INode for Stdin {
         }
     }
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        tty_handle_outgoing(buf);
         let s = unsafe { core::str::from_utf8_unchecked(buf) };
         kernel_hal::console::console_write_str(s);
         Ok(buf.len())
@@ -532,6 +578,7 @@ impl INode for Stdout {
         unimplemented!()
     }
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        tty_handle_outgoing(buf);
         // we do not care the utf-8 things, we just want to print it!
         let s = unsafe { core::str::from_utf8_unchecked(buf) };
         kernel_hal::console::console_write_str(s);

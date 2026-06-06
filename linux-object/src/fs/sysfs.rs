@@ -4,6 +4,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use kernel_hal::drivers;
+use kernel_hal::net::get_net_device;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -161,8 +162,8 @@ impl INode for SysRootINode {
 struct SysClassINode;
 
 impl SysClassINode {
-    fn entries() -> [&'static str; 1] {
-        ["block"]
+    fn entries() -> [&'static str; 4] {
+        ["block", "drm", "net", "power_supply"]
     }
 }
 
@@ -200,6 +201,9 @@ impl INode for SysClassINode {
             "." => Ok(Arc::new(SysClassINode)),
             ".." => Ok(Arc::new(SysRootINode)),
             "block" => Ok(Arc::new(SysBlockDirINode)),
+            "drm" => Ok(Arc::new(SysClassDrmDirINode)),
+            "net" => Ok(Arc::new(SysClassNetDirINode)),
+            "power_supply" => Ok(Arc::new(SysClassPowerSupplyDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -633,11 +637,15 @@ impl INode for SysPciDevDirINode {
 
                 Ok(Arc::new(Pseudo::new_bytes(cfg.to_vec(), FileType::File)))
             }
+            "modalias" => Ok(Arc::new(Pseudo::new(
+                &pci_modalias(&self.vendor, &self.device, &self.class),
+                FileType::File,
+            ))),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = ["vendor", "device", "class", "config", "uevent"];
+        let entries = ["vendor", "device", "class", "config", "uevent", "modalias"];
         if id >= entries.len() {
             return Err(FsError::EntryNotFound);
         }
@@ -650,6 +658,350 @@ struct PciDevInfo {
     vendor: String,
     device: String,
     class: String,
+}
+
+fn pci_modalias(vendor: &str, device: &str, class: &str) -> String {
+    let v = u32::from_str_radix(vendor.trim_start_matches("0x"), 16).unwrap_or(0);
+    let d = u32::from_str_radix(device.trim_start_matches("0x"), 16).unwrap_or(0);
+    let c = class.trim_start_matches("0x");
+    let (bc, sc, pi) = if c.len() >= 6 {
+        (&c[0..2], &c[2..4], &c[4..6])
+    } else {
+        ("00", "00", "00")
+    };
+    format!(
+        "pci:v{v:08x}d{d:08x}sv00000000sd00000000bc{bc}sc{sc}i{pi}\n",
+        v = v,
+        d = d,
+        bc = bc,
+        sc = sc,
+        pi = pi
+    )
+}
+
+fn display_pci_index() -> Option<usize> {
+    let devs = get_pci_devices();
+    devs.iter()
+        .position(|d| d.class.starts_with("0x03"))
+        .or_else(|| (!devs.is_empty()).then_some(0))
+}
+
+fn list_net_ifnames() -> Vec<String> {
+    let ifaces = get_net_device();
+    if ifaces.is_empty() {
+        vec!["lo".into()]
+    } else {
+        ifaces.iter().map(|i| i.get_ifname()).collect()
+    }
+}
+
+struct SysClassDrmDirINode;
+
+impl INode for SysClassDrmDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(21))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassDrmDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            "card0" => display_pci_index()
+                .map(|idx| Arc::new(SysDrmCardINode { pci_index: idx }) as Arc<dyn INode>)
+                .ok_or(FsError::EntryNotFound),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        if id == 0 && display_pci_index().is_some() {
+            Ok("card0".into())
+        } else {
+            Err(FsError::EntryNotFound)
+        }
+    }
+}
+
+struct SysDrmCardINode {
+    pci_index: usize,
+}
+
+impl SysDrmCardINode {
+    fn entries() -> [&'static str; 1] {
+        ["device"]
+    }
+}
+
+impl INode for SysDrmCardINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(22))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysDrmCardINode {
+                pci_index: self.pci_index,
+            })),
+            ".." => Ok(Arc::new(SysClassDrmDirINode)),
+            "device" => Ok(Arc::new(SysDrmCardDeviceINode {
+                pci_index: self.pci_index,
+            })),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysDrmCardDeviceINode {
+    pci_index: usize,
+}
+
+impl INode for SysDrmCardDeviceINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(23))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        let devs = get_pci_devices();
+        let pci = devs.get(self.pci_index).ok_or(FsError::EntryNotFound)?;
+        match name {
+            "." => Ok(Arc::new(SysDrmCardDeviceINode {
+                pci_index: self.pci_index,
+            })),
+            ".." => Ok(Arc::new(SysDrmCardINode {
+                pci_index: self.pci_index,
+            })),
+            "modalias" => Ok(Arc::new(Pseudo::new(
+                &pci_modalias(&pci.vendor, &pci.device, &pci.class),
+                FileType::File,
+            ))),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        if id == 0 {
+            Ok("modalias".into())
+        } else {
+            Err(FsError::EntryNotFound)
+        }
+    }
+}
+
+struct SysClassNetDirINode;
+
+impl INode for SysClassNetDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(24))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassNetDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            name => {
+                if list_net_ifnames().iter().any(|n| n.as_str() == name) {
+                    Ok(Arc::new(SysNetIfaceINode {
+                        name: name.into(),
+                    }))
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
+            }
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let names = list_net_ifnames();
+        if id >= names.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(names[id].clone())
+    }
+}
+
+struct SysNetIfaceINode {
+    name: String,
+}
+
+impl SysNetIfaceINode {
+    fn entries() -> [&'static str; 3] {
+        ["address", "operstate", "carrier"]
+    }
+}
+
+impl INode for SysNetIfaceINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(25))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysNetIfaceINode {
+                name: self.name.clone(),
+            })),
+            ".." => Ok(Arc::new(SysClassNetDirINode)),
+            "operstate" => {
+                let state = if self.name == "lo" || self.name == "loopback" {
+                    "unknown"
+                } else {
+                    "up"
+                };
+                Ok(Arc::new(Pseudo::new(&format!("{}\n", state), FileType::File)))
+            }
+            "carrier" => Ok(Arc::new(Pseudo::new("1\n", FileType::File))),
+            "address" => {
+                let mac = get_net_device()
+                    .iter()
+                    .find(|i| i.get_ifname() == self.name)
+                    .map(|i| i.get_mac())
+                    .unwrap_or_default();
+                let bytes = mac.as_bytes();
+                let content = format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                );
+                Ok(Arc::new(Pseudo::new(&content, FileType::File)))
+            }
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysClassPowerSupplyDirINode;
+
+impl INode for SysClassPowerSupplyDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(26))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." | ".." => Ok(Arc::new(SysClassPowerSupplyDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, _id: usize) -> Result<String> {
+        Err(FsError::EntryNotFound)
+    }
 }
 
 fn get_pci_devices() -> Vec<PciDevInfo> {

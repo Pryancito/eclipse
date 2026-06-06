@@ -14,9 +14,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 8] = [
+const PROC_ROOT_STATIC: [&str; 10] = [
     "net",
     "meminfo",
+    "cpuinfo",
+    "swaps",
     "uptime",
     "mounts",
     "self",
@@ -232,6 +234,8 @@ impl INode for ProcRootINode {
             "." | ".." => Ok(PROC_ROOT.clone()),
             "net" => Ok(PROC_NET_DIR.clone()),
             "meminfo" => Ok(PROC_MEMINFO.clone()),
+            "cpuinfo" => Ok(PROC_CPUINFO.clone()),
+            "swaps" => Ok(PROC_SWAPS.clone()),
             "uptime" => Ok(PROC_UPTIME.clone()),
             "mounts" => Ok(PROC_MOUNTS.clone()),
             "stat" => Ok(PROC_STAT.clone()),
@@ -746,6 +750,23 @@ fn proc_meminfo_content() -> String {
     s
 }
 
+/// Minimal `/proc/cpuinfo` for fastfetch CPU detection on x86_64.
+fn proc_cpuinfo_content() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Eclipse Virtual CPU\nstepping\t: 0\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncore id\t\t: 0\ncpu cores\t: 1\n".into()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        "processor\t: 0\nmodel name\t: Eclipse CPU\ncpu cores\t: 1\n".into()
+    }
+}
+
+/// Empty swap table (header only) — fastfetch falls back to meminfo for swap stats.
+fn proc_swaps_content() -> String {
+    "Filename\t\tType\t\tSize\t\tUsed\t\tPriority\n".into()
+}
+
 fn proc_mounts_content() -> String {
     super::proc_mounts_content()
 }
@@ -841,6 +862,14 @@ lazy_static! {
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 11,
         generate: proc_meminfo_content,
+    });
+    static ref PROC_CPUINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 12,
+        generate: proc_cpuinfo_content,
+    });
+    static ref PROC_SWAPS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 18,
+        generate: proc_swaps_content,
     });
     static ref PROC_UPTIME: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 13,
