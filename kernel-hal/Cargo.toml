@@ -94,3 +94,4 @@ uefi = "0.26"
 raw-cpuid = "9.0"
 x86-smpboot = { git = "https://github.com/rcore-os/x86-smpboot", rev = "1069df3" }
 x2apic = "0.4"
+acpi = "4.1"

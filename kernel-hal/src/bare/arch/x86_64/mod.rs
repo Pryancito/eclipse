@@ -1,6 +1,7 @@
 mod drivers;
 #[cfg(feature = "graphic")]
 mod early_fb_console;
+mod smp;
 mod trap;
 
 pub mod config;
@@ -63,6 +64,7 @@ pub fn primary_init() {
         // enable global page
         Cr4::update(|f| f.insert(Cr4Flags::PAGE_GLOBAL));
     }
+    smp::start_application_processors();
 }
 
 pub fn timer_init() {
@@ -71,4 +73,5 @@ pub fn timer_init() {
 
 pub fn secondary_init() {
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
+    smp::ap_signal_online();
 }

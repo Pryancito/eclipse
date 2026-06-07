@@ -115,8 +115,10 @@ const CTRL_RST:     u32 = 1 << 26;
 const CTRL_PHY_RST: u32 = 1 << 31;
 
 // STATUS register bits
-const STATUS_LU:    u32 = 1 << 1;
-const STATUS_FD:    u32 = 1 << 0;
+const STATUS_LU:       u32 = 1 << 1;
+const STATUS_FD:       u32 = 1 << 0;
+const STATUS_SPEED_SHIFT: u32 = 6;
+const STATUS_SPEED_MASK:  u32 = 0x3 << STATUS_SPEED_SHIFT; // bits [7:6]: 00=10 01=100 10/11=1000
 
 // CTRL_EXT bits
 const CTRL_EXT_RO_DIS:   u32 = 1 << 17; // PCIe Relaxed Ordering Disable
@@ -175,7 +177,19 @@ const TCTL_COLD_LINUX: u32 = 63 << 12;
 const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const TXDCTL_FULL_TX_DESC_WB: u32 = 0x0101_0000;
-const TXDCTL_DMA_BURST: u32 = (1 << 22) | (1 << 8) | 1; // wthresh=1, pthresh=1, hthresh=1
+// wthresh=4 pthresh=8 hthresh=2 — Linux e1000e defaults for burst throughput
+const TXDCTL_DMA_BURST: u32 = (4 << 16) | (2 << 8) | 8;
+
+// Interrupt throttling (ITR) — units of 256 ns.
+// 200 → 200×256 ns = 51.2 µs ≈ 19 500 interrupts/sec.
+// Eliminates per-packet interrupt storms without adding perceptible latency.
+const ITR_DEFAULT: u32 = 200;
+
+// RX interrupt coalescing timers — units of 1.024 µs.
+// RDTR: wait this long after a packet for more packets before interrupting.
+// RADV: absolute maximum delay before an RX interrupt fires.
+const RDTR_DEFAULT: u32 = 64;   //  64 × 1.024 µs ≈  65 µs
+const RADV_DEFAULT: u32 = 128;  // 128 × 1.024 µs ≈ 131 µs
 
 // RFCTL bits
 const RFCTL_EXTEN:    u32 = 1 << 15;
@@ -1005,10 +1019,10 @@ impl E1000eHw {
     }
 
     unsafe fn init_rx(&mut self) {
-        // Timers off
-        mmio_write(self.base, E1000E_RDTR, 0);
-        mmio_write(self.base, E1000E_RADV, 0);
-        mmio_write(self.base, E1000E_ITR,  0);
+        // Interrupt coalescing: throttle to ~20k int/sec and coalesce RX bursts.
+        mmio_write(self.base, E1000E_ITR,  ITR_DEFAULT);
+        mmio_write(self.base, E1000E_RDTR, RDTR_DEFAULT);
+        mmio_write(self.base, E1000E_RADV, RADV_DEFAULT);
 
         // Program RX ring base, length, head
         let rx_pa = self.rx_ring.paddr();
@@ -1210,7 +1224,34 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
-    // Watchdog — simple link check
+    // Link speed helper
+    // -----------------------------------------------------------------------
+
+    fn speed_from_status(status: u32) -> u32 {
+        match (status & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT {
+            0 => 10,
+            1 => 100,
+            _ => 1000,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // K1 workaround: disable K1 at 100 Mb/s (it causes MAC-PHY sync issues
+    // at that speed on PCH). Called from the watchdog after link comes up.
+    // Port of Linux e1000_k1_workaround_lpt_lp.
+    // -----------------------------------------------------------------------
+
+    unsafe fn k1_workaround(&self, status: u32) {
+        if !self.is_pch() { return; }
+        let speed = Self::speed_from_status(status);
+        let fd    = status & STATUS_FD != 0;
+        // Disable K1 at 100 Mb/s or half-duplex; enable at 1000 Mb/s.
+        let enable_k1 = speed == 1000 && fd;
+        self.configure_k1(enable_k1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Watchdog — link check + speed log + K1 workaround
     // -----------------------------------------------------------------------
 
     /// Returns `true` when carrier state changed (for Eclipse Pulse `PULSE_LINK`).
@@ -1223,19 +1264,27 @@ impl E1000eHw {
             link_changed = true;
             self.link_up = link;
             if link {
-                crate::klog_warn!("[e1000e] link UP STATUS={:#010x}\n", status);
+                let speed = Self::speed_from_status(status);
+                let duplex = if status & STATUS_FD != 0 { "full" } else { "half" };
+                crate::klog_warn!(
+                    "[e1000e] link UP {} Mb/s {} duplex STATUS={:#010x}\n",
+                    speed, duplex, status
+                );
+                // Apply K1 workaround now that we know the negotiated speed.
+                self.k1_workaround(status);
             } else {
                 crate::klog_warn!("[e1000e] link DOWN\n");
             }
         }
 
-        // Log GPRC/MPC periodically to diagnose RX issues.
-        // GPRC>0 means the MAC received frames. MPC>0 means frames arrived but
-        // were dropped (no free descriptors or DMA ring not armed).
+        // GPRC/MPC are clear-on-read — accumulate in stats.
         let gprc = mmio_read(self.base, E1000E_GPRC);
         let mpc  = mmio_read(self.base, E1000E_MPC);
-        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
-            link, gprc, mpc, self.stats.rx_packets);
+        self.stats.rx_packets += gprc as u64;
+        if gprc > 0 || mpc > 0 {
+            crate::klog_warn!("[e1000e] watchdog: link={} speed={} GPRC={} MPC={}\n",
+                link, Self::speed_from_status(status), gprc, mpc);
+        }
         link_changed
     }
 

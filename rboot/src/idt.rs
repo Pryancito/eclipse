@@ -67,4 +67,3 @@ fn paint_fault_marker(tag: u32, code: u32) {
     progress::bar_raw(fb, stride, sw, sh, 99);
     progress::fault_block_raw(fb, stride, sw, sh, tag, code);
 }
-

@@ -1,8 +1,8 @@
 //! This file is modified from 'page_table.rs' in 'rust-osdev/bootloader'
 
 use x86_64::structures::paging::{mapper::*, *};
-use x86_64::{PhysAddr, VirtAddr, align_up};
-use xmas_elf::{ElfFile, program};
+use x86_64::{align_up, PhysAddr, VirtAddr};
+use xmas_elf::{program, ElfFile};
 
 pub fn map_elf(
     elf: &ElfFile,
@@ -177,7 +177,11 @@ pub fn map_physical_memory(
                 .map_to(page, frame, flags, frame_allocator)
                 .map(|flush| flush.flush())
                 .or_else(|e| match e {
-                    MapToError::PageAlreadyMapped(_) if page_table.translate_page(page).ok() == Some(frame) => Ok(()),
+                    MapToError::PageAlreadyMapped(_)
+                        if page_table.translate_page(page).ok() == Some(frame) =>
+                    {
+                        Ok(())
+                    }
                     other => Err(other),
                 })
                 .expect("failed to map physical memory");

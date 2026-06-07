@@ -9,8 +9,7 @@ pub const LOGO_WIDTH: usize = 800;
 pub const LOGO_HEIGHT: usize = 250;
 
 // NOTE: absolute path per request. Consider vendoring into `rboot/src/` later.
-const LOGO_DATA: &[u8] =
-    include_bytes!("logo.raw");
+const LOGO_DATA: &[u8] = include_bytes!("logo.raw");
 
 pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     let (sw, sh) = mode.resolution();
@@ -71,4 +70,3 @@ pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
         }
     }
 }
-
