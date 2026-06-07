@@ -110,9 +110,5 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             "\nCPU EXCEPTION on CPU{}: Syscall trap in kernel context at RIP={:#x}\n{:#x?}",
             super::cpu::cpu_id(), tf.rip, tf
         ),
-        other => panic!(
-            "\nCPU EXCEPTION on CPU{}: Unhandled {:x?} at RIP={:#x}\n{:#x?}",
-            super::cpu::cpu_id(), other, tf.rip, tf
-        ),
     }
 }
