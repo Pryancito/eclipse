@@ -34,10 +34,10 @@ use x86_64::{PhysAddr, VirtAddr};
 use xmas_elf::ElfFile;
 
 mod config;
-mod page_table;
-mod logo;
-mod progress;
 mod idt;
+mod logo;
+mod page_table;
+mod progress;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
 
@@ -62,7 +62,10 @@ fn has_cmdline_flag(cmdline: &str, key: &str) -> bool {
         let k = it.next().unwrap_or("").trim();
         let v = it.next().unwrap_or("").trim();
         if k.eq_ignore_ascii_case(key) {
-            return v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+            return v.is_empty()
+                || v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on");
         }
     }
     false
@@ -126,7 +129,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         ElfFile::new(buf).expect("failed to parse ELF")
     };
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 15);
-    debug!("kernel elf loaded: entry={:#x}", elf.header.pt2.entry_point());
+    debug!(
+        "kernel elf loaded: entry={:#x}",
+        elf.header.pt2.entry_point()
+    );
     unsafe {
         ENTRY = elf.header.pt2.entry_point() as usize;
     }
@@ -134,7 +140,11 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     let (initramfs_addr, initramfs_size) = if let Some(path) = config.initramfs {
         let mut file = open_file(bs, path);
         let buf = load_file(bs, &mut file);
-        debug!("initramfs loaded: addr={:#x} size={:#x}", buf.as_ptr() as u64, buf.len());
+        debug!(
+            "initramfs loaded: addr={:#x} size={:#x}",
+            buf.as_ptr() as u64,
+            buf.len()
+        );
         (buf.as_ptr() as u64, buf.len() as u64)
     } else {
         (0, 0)
@@ -147,8 +157,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         let mmap = st
             .boot_services()
             .memory_map(mmap_storage)
-            .expect("failed to get memory map")
-            ;
+            .expect("failed to get memory map");
         mmap.entries()
             .map(|m| m.phys_start + m.page_count * 0x1000)
             .max()

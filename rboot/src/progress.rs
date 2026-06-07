@@ -2,8 +2,8 @@
 //!
 //! Minimal, no_std-friendly: draws a centered progress bar directly into GOP fb.
 
-use uefi::proto::console::gop::{ModeInfo, PixelFormat};
 use core::sync::atomic::{AtomicBool, Ordering};
+use uefi::proto::console::gop::{ModeInfo, PixelFormat};
 
 // 8x8 font for ASCII 0x20..0x7F (same data format as kernel-hal).
 const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
@@ -114,8 +114,21 @@ fn fill_rect(
     }
 }
 
-fn stroke_rect(fb: *mut u32, stride: usize, sw: usize, sh: usize, x: usize, y: usize, w: usize, h: usize, t: usize, pixel: u32) {
-    if w == 0 || h == 0 || t == 0 { return; }
+fn stroke_rect(
+    fb: *mut u32,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    t: usize,
+    pixel: u32,
+) {
+    if w == 0 || h == 0 || t == 0 {
+        return;
+    }
     fill_rect(fb, stride, sw, sh, x, y, w, t, pixel);
     if h > t {
         fill_rect(fb, stride, sw, sh, x, y + h - t, w, t, pixel);
@@ -154,7 +167,9 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
     // Position below the centered logo.
     // The logo is centered: its bottom is sh/2 + LOGO_HEIGHT/2.
     // We add 35px padding.
-    let y = (sh / 2).saturating_add(crate::logo::LOGO_HEIGHT / 2).saturating_add(35);
+    let y = (sh / 2)
+        .saturating_add(crate::logo::LOGO_HEIGHT / 2)
+        .saturating_add(35);
 
     // Border (black) and inner content (black fill / white remainder).
     let white = pixel_white(fmt);
@@ -176,7 +191,17 @@ pub fn bar(mode: ModeInfo, fb_addr: u64, progress: u32) {
         fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, black);
     }
     if fill_w < bar_w {
-        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, white);
+        fill_rect(
+            fb,
+            stride,
+            sw,
+            sh,
+            x + fill_w,
+            y,
+            bar_w - fill_w,
+            bar_h,
+            white,
+        );
     }
 
     // Fixed-width percentage text (4 chars: "100%" or "  7%"/" 42%").
@@ -207,7 +232,9 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
     let bar_h: usize = 20;
     let x = sw.saturating_sub(bar_w) / 2;
     // Same offset as bar()
-    let y = (sh / 2).saturating_add(crate::logo::LOGO_HEIGHT / 2).saturating_add(35);
+    let y = (sh / 2)
+        .saturating_add(crate::logo::LOGO_HEIGHT / 2)
+        .saturating_add(35);
     let white: u32 = 0x00FF_FFFF;
     let black: u32 = 0x0000_0000;
 
@@ -228,7 +255,17 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
         fill_rect(fb, stride, sw, sh, x, y, fill_w, bar_h, black);
     }
     if fill_w < bar_w {
-        fill_rect(fb, stride, sw, sh, x + fill_w, y, bar_w - fill_w, bar_h, white);
+        fill_rect(
+            fb,
+            stride,
+            sw,
+            sh,
+            x + fill_w,
+            y,
+            bar_w - fill_w,
+            bar_h,
+            white,
+        );
     }
 
     // Percentage text (fixed width).
@@ -288,4 +325,3 @@ pub fn fault_block_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, tag: u
         }
     }
 }
-
