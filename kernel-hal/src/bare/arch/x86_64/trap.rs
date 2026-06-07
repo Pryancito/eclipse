@@ -42,6 +42,37 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // `executor::handle_timeout()` here: it context-switches from IRQ
             // context and abandons the trap frame → triple fault (QEMU/VBox).
         }
+        TrapReason::GernelFault(vec) => {
+            // x86 CPU exception — translate the vector to a readable name so
+            // the panic message is immediately actionable without a debugger.
+            let name = match vec {
+                0  => "Divide Error (#DE)",
+                1  => "Debug (#DB)",
+                2  => "NMI",
+                3  => "Breakpoint (#BP)",
+                4  => "Overflow (#OF)",
+                5  => "Bound Range Exceeded (#BR)",
+                6  => "Invalid Opcode (#UD)",
+                7  => "Device Not Available / No Math Coprocessor (#NM)",
+                8  => "Double Fault (#DF)",
+                9  => "Coprocessor Segment Overrun",
+                10 => "Invalid TSS (#TS)",
+                11 => "Segment Not Present (#NP)",
+                12 => "Stack Segment Fault (#SS)",
+                13 => "General Protection Fault (#GP)",
+                14 => "Page Fault (#PF via GernelFault — should not happen)",
+                16 => "x87 FPU Floating-Point Error (#MF)",
+                17 => "Alignment Check (#AC)",
+                18 => "Machine Check (#MC)",
+                19 => "SIMD Floating-Point Exception (#XF)",
+                _  => "Unknown CPU exception",
+            };
+            panic!(
+                "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
+                 error_code={:#x}\n{:#x?}",
+                super::cpu::cpu_id(), name, vec, tf.error_code, tf
+            );
+        }
         other => panic!("Unhandled trap {:x?} {:#x?}", other, tf),
     }
 }
