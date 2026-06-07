@@ -560,8 +560,10 @@ impl E1000eHw {
             Self::udelay(1_000);
         }
 
-        // 11. PHY soft reset — clears any BM WUC / WUL filters left by firmware
-        self.phy_soft_reset();
+        // 11. Skip PHY soft reset — BMCR reset disrupts auto-negotiation (3-5 s) and may
+        //     reload LPLU from NVM, permanently keeping the link down. The MAC-level
+        //     CTRL_RST + PHY_CTRL LPLU clear is sufficient; the OSDev i219-V guide
+        //     confirms this works without any PHY soft reset on real hardware.
 
         // 12. CTRL: SLU + ASDE, clear force-speed/duplex
         {
