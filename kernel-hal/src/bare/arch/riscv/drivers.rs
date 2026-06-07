@@ -117,7 +117,7 @@ pub(super) fn init() -> DeviceResult {
 
 pub(super) fn intc_init() -> DeviceResult {
     let irq = drivers::all_irq()
-        .find(format!("riscv-intc-cpu{}", crate::cpu::cpu_id()).as_str())
+        .find(format!("riscv-intc-cpu{}", super::cpu::raw_hart_id()).as_str())
         .expect("IRQ device 'riscv-intc' not initialized!");
     // register soft interrupts handler
     irq.register_handler(

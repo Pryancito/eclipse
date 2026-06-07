@@ -3,13 +3,34 @@ use core::cell::{RefCell, RefMut};
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", any(target_arch = "riscv32", target_arch = "riscv64")))] {
         mod interrupts {
+            use core::sync::atomic::{AtomicU8, Ordering};
             use riscv::register::sstatus;
-            pub(crate) fn cpu_id() -> u8 {
-                let mut cpu_id;
+
+            /// Maps a hardware hart id (in `tp`, possibly sparse — e.g. boards that
+            /// reserve hart 0) to a dense logical CPU id (0..NCPU). Populated by the
+            /// HAL during SMP bring-up via [`set_logical_cpu_id`]; reads 0 until then
+            /// (correct, since only the boot hart = logical 0 runs that early).
+            static HARTID_TO_LOGICAL: [AtomicU8; 256] = {
+                const ZERO: AtomicU8 = AtomicU8::new(0);
+                [ZERO; 256]
+            };
+
+            /// Raw hart id of the current CPU (kernel convention: stored in `tp`).
+            fn raw_hart_id() -> u8 {
+                let hart_id: usize;
                 unsafe {
-                    core::arch::asm!("mv {0}, tp", out(reg) cpu_id);
+                    core::arch::asm!("mv {0}, tp", out(reg) hart_id);
                 }
-                cpu_id
+                hart_id as u8
+            }
+
+            /// Register the logical id assigned to a given hart id.
+            pub fn set_logical_cpu_id(hart_id: u8, logical_id: u8) {
+                HARTID_TO_LOGICAL[hart_id as usize].store(logical_id, Ordering::Release);
+            }
+
+            pub(crate) fn cpu_id() -> u8 {
+                HARTID_TO_LOGICAL[raw_hart_id() as usize].load(Ordering::Acquire)
             }
             pub(crate) fn intr_on() {
                 unsafe { sstatus::set_sie() };
@@ -68,9 +89,13 @@ cfg_if::cfg_if! {
     } else if #[cfg(all(target_os = "none", target_arch = "aarch64"))] {
         mod interrupts {
             pub(crate) fn cpu_id() -> u8 {
-                use cortex_a::registers::MPIDR_EL1;
-                use tock_registers::interfaces::Readable;
-                (MPIDR_EL1.get() & 0xf) as u8
+                // Dense logical id, written to TPIDR_EL1 by the kernel per CPU.
+                // MPIDR affinity is sparse across clusters (Aff0 repeats), so it
+                // can't index per-CPU arrays; TPIDR_EL1 holds the logical id
+                // directly (0 on the boot CPU until secondaries are brought up).
+                let id: u64;
+                unsafe { core::arch::asm!("mrs {0}, tpidr_el1", out(reg) id) };
+                id as u8
             }
             pub(crate) fn intr_on() {
                 unsafe {
@@ -113,13 +138,22 @@ pub fn current_cpu_id() -> u8 {
     cpu_id()
 }
 
-/// Register the dense logical id assigned to a hardware Local APIC ID.
+/// Register the dense logical id assigned to a hardware CPU id (Local APIC ID on
+/// x86, hart id on riscv).
 ///
 /// Must be called once per CPU (including the BSP) before that CPU executes any
 /// code that takes a lock, so that `cpu_id()` never returns a stale/colliding id.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-pub fn set_logical_cpu_id(apic_id: u8, logical_id: u8) {
-    interrupts::set_logical_cpu_id(apic_id, logical_id)
+#[cfg(all(
+    target_os = "none",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "riscv64"
+    )
+))]
+pub fn set_logical_cpu_id(hw_id: u8, logical_id: u8) {
+    interrupts::set_logical_cpu_id(hw_id, logical_id)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -153,7 +187,9 @@ impl<T> SafeRefCell<T> {
 #[allow(clippy::declare_interior_mutable_const)]
 const DEFAULT_CPU: SafeRefCell<Cpu> = SafeRefCell::new(Cpu::new());
 
-const MAX_CORE_NUM: usize = 16;
+// Debe ser >= al MAX_CORE_NUM del kernel (kernel-hal::config), que comparte el
+// mismo espacio de id lógico denso usado para indexar este array.
+const MAX_CORE_NUM: usize = 64;
 
 static CPUS: [SafeRefCell<Cpu>; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 

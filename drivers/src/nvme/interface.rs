@@ -87,6 +87,10 @@ fn clflush_range(vaddr: usize, len: usize) {
             _mm_mfence();
         }
     }
+    // Non-x86 cache maintenance for non-coherent DMA is a TODO; rely on coherent
+    // mappings for now.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (vaddr, len);
 }
 
 impl NvmeInterface {

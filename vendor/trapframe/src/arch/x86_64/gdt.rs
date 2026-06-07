@@ -16,15 +16,66 @@ type TSS = x86_64::structures::tss::TaskStateSegment;
 #[cfg(feature = "ioport_bitmap")]
 type TSS = super::ioport::TSSWithPortBitmap;
 
+/// The region pointed to by `GSBASE` on each CPU.
+///
+/// `GSBASE` (and the TSS descriptor) point at the `tss` field, which therefore
+/// MUST stay first: the syscall/trap entry stubs read `gs:4` / `gs:12` as
+/// offsets *into the TSS*. The trailing `cpu_local` word is appended storage for
+/// a kernel per-CPU pointer (à la Redox's ProcessorControlRegion), read/written
+/// via `gs:[offset_of!(.., cpu_local)]`. Reads through GSBASE are not bounded by
+/// the TSS segment limit, so the extra word is always reachable.
+#[repr(C)]
+struct CpuLocalRegion {
+    tss: TSS,
+    cpu_local: usize,
+}
+
+/// Read the kernel per-CPU pointer stored in this CPU's GS region.
+///
+/// Returns 0 if [`init`] has not run yet on this CPU.
+#[inline]
+pub fn read_cpu_local() -> usize {
+    let ret: usize;
+    unsafe {
+        asm!(
+            "mov {ret}, gs:[{off}]",
+            ret = out(reg) ret,
+            off = const core::mem::offset_of!(CpuLocalRegion, cpu_local),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    ret
+}
+
+/// Store a kernel per-CPU pointer in this CPU's GS region.
+///
+/// # Safety
+///
+/// `GSBASE` must point to a [`CpuLocalRegion`], i.e. [`init`] must have run on
+/// the current CPU.
+#[inline]
+pub unsafe fn write_cpu_local(val: usize) {
+    asm!(
+        "mov gs:[{off}], {val}",
+        val = in(reg) val,
+        off = const core::mem::offset_of!(CpuLocalRegion, cpu_local),
+        options(nostack, preserves_flags),
+    );
+}
+
 /// Init TSS & GDT.
 pub fn init() {
     // allocate stack for trap from user
     // set the stack top to TSS
     // so that when trap from ring3 to ring0, CPU can switch stack correctly
-    let mut tss = Box::new(TSS::new());
+    let mut region = Box::new(CpuLocalRegion {
+        tss: TSS::new(),
+        cpu_local: 0,
+    });
     let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
-    tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
-    let tss: &'static _ = Box::leak(tss);
+    region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
+    let region: &'static CpuLocalRegion = Box::leak(region);
+    let tss: &'static TSS = &region.tss;
     let (tss0, tss1) = match Descriptor::tss_segment(tss) {
         Descriptor::SystemSegment(tss0, tss1) => (tss0, tss1),
         _ => unreachable!(),

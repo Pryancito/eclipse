@@ -17,9 +17,11 @@ use crate::{mem::phys_to_virt, CachePolicy, MMUFlags, KCONFIG};
 
 const PAGE_SIZE: usize = 4096;
 
-// Per-AP stacks: 256 KB each, up to 7 APs
+// Per-AP stacks: 256 KB each, allocated from the kernel heap on demand.
 const STACK_SIZE: usize = 256 * 1024;
-const MAX_APS: usize = 7;
+// At most MAX_CORE_NUM logical CPUs total; the BSP is logical 0, so up to
+// MAX_CORE_NUM - 1 application processors.
+const MAX_APS: usize = crate::config::MAX_CORE_NUM - 1;
 
 // Trampoline lives at physical 0x6000; SIPI vector = 6
 const TRAMPOLINE_PADDR: usize = 0x6000;
@@ -126,10 +128,17 @@ extern "C" {
 
 // ─── AP stacks ───────────────────────────────────────────────────────────────
 
-#[repr(align(4096))]
-struct ApStack([u8; STACK_SIZE]);
-
-static mut AP_STACKS: [ApStack; MAX_APS] = [const { ApStack([0u8; STACK_SIZE]) }; MAX_APS];
+/// Allocate a zeroed, page-aligned AP stack from the kernel heap and return its
+/// top address. Leaked intentionally: AP stacks live for the lifetime of the CPU.
+fn alloc_ap_stack() -> Option<usize> {
+    use alloc::alloc::{alloc_zeroed, Layout};
+    let layout = Layout::from_size_align(STACK_SIZE, PAGE_SIZE).unwrap();
+    let base = unsafe { alloc_zeroed(layout) };
+    if base.is_null() {
+        return None;
+    }
+    Some(base as usize + STACK_SIZE)
+}
 
 /// Number of APs that have signalled they are running.
 pub static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -285,7 +294,13 @@ pub fn start_application_processors() {
         // very first lock it takes resolves to the right per-CPU slot.
         let logical = register_cpu(lapic_id as u8);
 
-        let stack_top = unsafe { AP_STACKS[idx].0.as_ptr().add(STACK_SIZE) as usize };
+        let stack_top = match alloc_ap_stack() {
+            Some(top) => top,
+            None => {
+                crate::klog_warn!("[smp] failed to allocate stack for LAPIC {}", lapic_id);
+                break;
+            }
+        };
         unsafe { (phys_to_virt(SLOT_STACK) as *mut usize).write_volatile(stack_top) };
 
         crate::klog_info!(

@@ -19,7 +19,7 @@ hal_fn_impl! {
         fn handle_irq(cause: usize) {
             trace!("Handle irq cause: {}", cause);
             let irq = crate::drivers::all_irq()
-                .find(alloc::format!("riscv-intc-cpu{}", crate::cpu::cpu_id()).as_str())
+                .find(alloc::format!("riscv-intc-cpu{}", super::cpu::raw_hart_id()).as_str())
                 .expect("IRQ device 'riscv-intc' not initialized!");
             irq.handle_irq(cause)
         }
@@ -45,7 +45,8 @@ hal_fn_impl! {
                 let entry = queue.entry_at(idx);
                 *entry = reason;
                 queue.commit_entry(idx);
-                let mask:usize = 1 << cpuid;
+                // `cpuid` is a dense logical id (queue index); SBI needs a hart mask.
+                let mask: usize = 1 << super::cpu::logical_to_hart(cpuid);
                 sbi_rt::legacy::send_ipi(&mask as *const usize as usize);
                 return Ok(());
             }

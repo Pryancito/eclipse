@@ -85,7 +85,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
 }
 
-#[cfg(not(any(feature = "libos", target_arch = "aarch64")))]
+#[cfg(not(feature = "libos"))]
 fn secondary_main() -> ! {
     while !STARTED.load(Ordering::SeqCst) {
         core::hint::spin_loop();

@@ -25,6 +25,7 @@ loopback = ["zcore-drivers/loopback", "no-pci"]
 # Enable graphical output
 graphic = ["zcore-drivers/graphic"]
 board-c910light = []
+board-fu740 = []
 link-user-img = []
 # Enable extra page table falgs for T-Head CPU with MAEE on
 thead-maee = []
