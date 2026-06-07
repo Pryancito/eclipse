@@ -691,16 +691,19 @@ impl E1000eHw {
         // Disable checksum offload
         mmio_write(self.base, E1000E_RXCSUM, 0);
 
-        // RFCTL: enable extended write-back descriptors (required for I219)
+        // RFCTL: use legacy write-back (no RFCTL_EXTEN) — matches OSDev i219-V guide.
+        // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
+        // confirmed to work on real i219-V hardware without RFCTL_EXTEN.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
-        rfctl |= RFCTL_EXTEN | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
+        rfctl &= !RFCTL_EXTEN;  // legacy mode: status at +12 u8, length at +8 u16
+        rfctl |= RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
         let _ = mmio_read(self.base, E1000E_RFCTL);
 
         // No multiqueue
         mmio_write(self.base, E1000E_MRQC, 0);
 
-        // SRRCTL: 2 KB buffer size, extended descriptor type
+        // SRRCTL: 2 KB buffer size
         mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31)); // 2 KB, Drop_En
 
         // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN
@@ -745,13 +748,15 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
 
-        // Read extended WB staterr (u32 at offset +8) and length (u16 at offset +12)
+        // Legacy descriptor write-back layout (no RFCTL_EXTEN):
+        //   +8  u16  length
+        //   +12 u8   status  (DD=bit0, EOP=bit1)
         compiler_fence(Ordering::SeqCst);
-        let staterr = unsafe { read_volatile((desc_ptr as usize + 8) as *const u32) };
-        if staterr & RXD_EXT_DD == 0 {
+        let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
+        if status == 0 {
             return None;
         }
-        let len = unsafe { read_volatile((desc_ptr as usize + 12) as *const u16) } as usize;
+        let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
 
         self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
@@ -780,12 +785,13 @@ impl E1000eHw {
     unsafe fn recycle_rx_slot(&self, i: usize) {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = ring.add(i);
-        // Clear write-back area and re-post buffer address
-        write_volatile(&mut (*desc_ptr).reserved, 0);
+        // Clear the status byte (legacy WB: status at +12) so hardware can reuse slot.
+        // Re-post buffer address (addr at +0).
+        write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
         compiler_fence(Ordering::SeqCst);
-        // Advance RDT to include this slot
+        // Advance RDT to this slot (give it back to hardware)
         mmio_write(self.base, E1000E_RDT, i as u32);
     }
 
