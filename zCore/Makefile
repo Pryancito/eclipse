@@ -203,7 +203,14 @@ endif
 qemu_opts += \
 	-netdev user,id=net1 \
 	-device e1000e,netdev=net1 \
-	-object filter-dump,id=f1,netdev=net1,file=dump.pcap -no-reboot
+	-no-reboot
+
+# Capture packets to dump.pcap only when explicitly requested (PCAP=on).
+# The filter-dump hook adds a synchronous disk write per packet and can
+# reduce bulk-download throughput by an order of magnitude.
+ifeq ($(PCAP), on)
+  qemu_opts += -object filter-dump,id=f1,netdev=net1,file=dump.pcap
+endif
 
 ifeq ($(DISK), on)
   ifeq ($(ARCH), x86_64)

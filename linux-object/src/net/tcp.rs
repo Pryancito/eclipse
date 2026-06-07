@@ -51,7 +51,12 @@ impl TcpSocketState {
     pub fn new(ipv6: bool) -> LxResult<Self> {
         let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
         let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+        // Disable delayed ACKs: with the default 10 ms delay, every burst of data
+        // stalls for up to 10-42 ms waiting for the poll throttle before the ACK
+        // goes out. For bulk downloads (apk update, package fetches) this compounds
+        // across every window and can turn a few-second transfer into minutes.
+        socket.set_ack_delay(None);
         let handle = super::register_smoltcp_socket(socket)?;
 
         Ok(TcpSocketState {
