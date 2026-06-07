@@ -25,8 +25,10 @@ fn panic(info: &PanicInfo) -> ! {
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
 
+    // Use spin variant: interrupts are already off above, and try_lock silently
+    // discards output if another CPU holds the lock — unacceptable in panic context.
     if let Some(loc) = info.location() {
-        kernel_hal::console::serial_write_fmt(format_args!(
+        kernel_hal::console::serial_write_fmt_spin(format_args!(
             "\n\npanic cpu={} at {}:{}:{}\n",
             kernel_hal::cpu::cpu_id(),
             loc.file(),
@@ -34,14 +36,14 @@ fn panic(info: &PanicInfo) -> ! {
             loc.column(),
         ));
     } else {
-        kernel_hal::console::serial_write_fmt(format_args!(
+        kernel_hal::console::serial_write_fmt_spin(format_args!(
             "\n\npanic cpu={}\n",
             kernel_hal::cpu::cpu_id(),
         ));
     }
-    if let Some(msg) = info.message().as_str() {
-        kernel_hal::console::serial_write_fmt(format_args!("{}\n", msg));
-    }
+    // `as_str()` returns None for any panic! with format arguments — use
+    // Display on the Arguments directly so the message is always printed.
+    kernel_hal::console::serial_write_fmt_spin(format_args!("{}\n", info.message()));
 
     if cfg!(feature = "baremetal-test") {
         kernel_hal::cpu::reset();
