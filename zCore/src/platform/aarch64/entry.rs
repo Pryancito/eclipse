@@ -24,6 +24,7 @@ extern "C" fn rust_main(boot_info: &'static Aarch64BootInfo) -> ! {
         uart_base: boot_info.uart_base,
         gic_base: boot_info.gic_base,
         phys_to_virt_offset: boot_info.offset,
+        ap_fn: crate::secondary_main,
     };
     save_offset(boot_info.offset);
     crate::primary_main(config);
