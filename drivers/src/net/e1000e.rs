@@ -1213,11 +1213,14 @@ impl E1000eHw {
     // Watchdog — simple link check
     // -----------------------------------------------------------------------
 
-    pub unsafe fn watchdog_tick(&mut self) {
+    /// Returns `true` when carrier state changed (for Eclipse Pulse `PULSE_LINK`).
+    pub unsafe fn watchdog_tick(&mut self) -> bool {
         let status = mmio_read(self.base, E1000E_STATUS);
         let link = status & STATUS_LU != 0;
+        let mut link_changed = false;
 
         if link != self.link_up {
+            link_changed = true;
             self.link_up = link;
             if link {
                 crate::klog_warn!("[e1000e] link UP STATUS={:#010x}\n", status);
@@ -1264,6 +1267,13 @@ pub struct E1000eInterface {
 }
 
 impl E1000eInterface {
+    /// Notify Eclipse Pulse from thread/deferred context (never from raw IRQ).
+    fn pulse(&self, bits: u32) {
+        if bits != 0 {
+            crate::pulse::pulse_signal(bits);
+        }
+    }
+
     pub fn schedule_watchdog(&self, fast: bool) {
         let now = timer_now_as_micros();
         {
@@ -1286,9 +1296,14 @@ impl E1000eInterface {
             impl Drop for Guard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
             let _g = Guard(Arc::clone(&me.watchdog_job_scheduled));
             me.watchdog_job_scheduled.store(false, Ordering::Release);
-            {
+            let (link_changed, link_up) = {
                 let mut hw = me.driver.hw.lock();
-                unsafe { hw.watchdog_tick(); }
+                let changed = unsafe { hw.watchdog_tick() };
+                (changed, hw.link_up)
+            };
+            if link_changed {
+                me.link_up_seen.store(link_up, Ordering::Release);
+                me.pulse(crate::pulse::PULSE_LINK);
             }
             me.schedule_watchdog(false);
         });
@@ -1304,41 +1319,136 @@ impl E1000eInterface {
     }
 
     fn queue_deferred_poll(&self) {
-        if self.poll_pending.swap(true, Ordering::AcqRel) { return; }
+        if self.poll_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let poll_pending = self.poll_pending.clone();
         let me = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
-            struct Guard(Arc<AtomicBool>);
-            impl Drop for Guard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
-            let _g = Guard(Arc::clone(&poll_pending));
-            poll_pending.store(false, Ordering::Release);
-            let _ = me.poll();
+            let _ = me.poll_with_irq_hint(0);
+            poll_pending.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
+    fn poll_with_irq_hint(&self, irq_icr: u32) -> DeviceResult {
+        use crate::pulse::{PULSE_LINK, PULSE_NET_RX};
+
+        let now = timer_now_as_micros();
+        let due = self.driver.hw.lock().link_watchdog_next_us <= now;
+        if due {
+            self.schedule_watchdog(false);
+        }
+
+        let mut pulse = 0u32;
+        if irq_icr & ICR_LSC != 0 {
+            pulse |= PULSE_LINK;
+        }
+        if irq_icr & ICR_RX_ANY != 0 {
+            pulse |= PULSE_NET_RX;
+        }
+
+        let ts = Instant::from_micros(now as i64);
+        unsafe { self.driver.hw.lock().ensure_rx_armed_if_link_up(); }
+        {
+            let mut hw = self.driver.hw.lock();
+            hw.rx_poll_budget = 32;
+        }
+
+        // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
+        let intr_was_on = super::intr_get();
+        if intr_was_on {
+            super::intr_off();
+        }
+        let sockets = get_sockets();
+        {
+            let mut sockets = sockets.lock();
+            match self.iface.lock().poll(&mut sockets, ts) {
+                Ok(true) => pulse |= PULSE_NET_RX,
+                Ok(false) => {}
+                Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
+            }
+        }
+        if intr_was_on {
+            super::intr_on();
+        }
+
+        let mut hw_rx = 0u32;
+        {
+            let mut hw = self.driver.hw.lock();
+            for _ in 0..32 {
+                if hw.rx_poll_budget == 0 {
+                    hw.rx_poll_budget = 32;
+                }
+                match hw.receive() {
+                    Some(pkt) => {
+                        hw_rx += 1;
+                        drop(hw);
+                        super::net_dispatch_packet(&pkt);
+                        hw = self.driver.hw.lock();
+                    }
+                    None => break,
+                }
+            }
+        }
+        if hw_rx > 0 {
+            pulse |= PULSE_NET_RX;
+        }
+        if self.driver.hw.lock().rx_poll_budget == 0 {
+            self.queue_deferred_poll();
+        }
+        if self.driver.hw.lock().rx_poll_budget < 32 {
+            self.ims_rearm();
+        }
+
+        self.pulse(pulse);
+        if pulse & PULSE_NET_RX != 0 {
+            super::wake_net_rx_waiters();
+        }
+        Ok(())
     }
 }
 
 impl Scheme for E1000eInterface {
     fn name(&self) -> &str { "e1000e" }
 
+    /// Minimal IRQ top-half (same as [`e1000::E1000Interface`]): read ICR, mask IMS,
+    /// queue one deferred poll. Pulse is signaled from [`E1000eInterface::poll_with_irq_hint`]
+    /// in thread context — never here (avoids `RefCell already borrowed`).
     fn handle_irq(&self, irq: usize) {
-        if irq != self.irq { return; }
+        if irq != self.irq {
+            return;
+        }
 
+        let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
+        if icr == 0 {
+            if !self.poll_pending.load(Ordering::SeqCst) {
+                self.ims_rearm();
+            }
+            return;
+        }
+
+        if self.poll_pending.load(Ordering::SeqCst) {
+            self.ims_rearm();
+            return;
+        }
+
+        self.poll_pending.store(true, Ordering::SeqCst);
         unsafe {
             mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
             let _ = mmio_read(self.base, E1000E_IMC);
             fence(Ordering::SeqCst);
         }
-        let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
 
-        if icr & ICR_LSC != 0 {
-            self.schedule_watchdog(true);
-            crate::pulse::pulse_signal(crate::pulse::PULSE_LINK);
-        }
-        if icr & ICR_RX_ANY != 0 {
-            crate::pulse::pulse_signal(crate::pulse::PULSE_NET_RX);
-        }
-        self.queue_deferred_poll();
-        self.ims_rearm();
+        let poll_pending = self.poll_pending.clone();
+        let me = self.clone();
+        crate::utils::deferred_job::push_deferred_job(move || {
+            if icr & ICR_LSC != 0 {
+                me.schedule_watchdog(true);
+            }
+            let _ = me.poll_with_irq_hint(icr);
+            poll_pending.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -1428,31 +1538,7 @@ impl NetScheme for E1000eInterface {
             || unsafe { mmio_read(self.base, E1000E_STATUS) & STATUS_LU != 0 }
     }
     fn poll(&self) -> DeviceResult {
-        let now = timer_now_as_micros();
-        let due = self.driver.hw.lock().link_watchdog_next_us <= now;
-        if due {
-            self.schedule_watchdog(false);
-        }
-
-        let ts = Instant::from_micros(now as i64);
-        let sockets = get_sockets();
-        unsafe { self.driver.hw.lock().ensure_rx_armed_if_link_up(); }
-        {
-            let mut hw = self.driver.hw.lock();
-            hw.rx_poll_budget = 32;
-        }
-        {
-            let mut sockets = sockets.lock();
-            let _ = self.iface.lock().poll(&mut sockets, ts);
-        }
-        if self.driver.hw.lock().rx_poll_budget == 0 {
-            self.queue_deferred_poll();
-        }
-        if self.driver.hw.lock().rx_poll_budget < 32 {
-            self.ims_rearm();
-        }
-        super::wake_net_rx_waiters();
-        Ok(())
+        self.poll_with_irq_hint(0)
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         if let Some(pkt) = self.driver.hw.lock().receive() {

@@ -156,6 +156,7 @@ pub fn push_packet(packet: &[u8]) {
                 if let Some(arc) = &shared {
                     queue.push_back(Arc::clone(arc));
                 }
+                drop(queue);
                 wake_readers(&inner);
             }
         } else {
