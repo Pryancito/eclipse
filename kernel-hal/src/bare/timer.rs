@@ -38,14 +38,10 @@ hal_fn_impl! {
 
         fn timer_set(deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send + Sync>) {
             debug!("Set timer at: {:?}", deadline);
-            let enable = crate::interrupt::intr_get();
-            if enable {
-                crate::interrupt::intr_off();
-            }
+            // Mutex::lock() uses push_off/pop_off which already handles interrupt
+            // disabling. Manual intr_off/on here would bypass the noff accounting
+            // and cause "RefCell already borrowed" panics under SMP.
             NAIVE_TIMER.lock().add(deadline, callback);
-            if enable {
-                crate::interrupt::intr_on();
-            }
         }
 
         fn timer_tick() {

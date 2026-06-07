@@ -37,23 +37,14 @@ fn enqueue_pending_msi(
 }
 
 pub fn pci_set_irq_host(irq: Arc<dyn IrqScheme>) {
-    let flag = intr_get();
-    if flag { intr_off(); }
     *MSI_IRQ_HOST.lock() = Some(irq);
-    if flag { intr_on(); }
 }
 
 pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
-    let flag = intr_get();
-    if flag { intr_off(); }
     enqueue_pending_msi(&mut MSI_PENDING.lock(), vector, &dev);
-    if flag { intr_on(); }
 }
 
 pub fn pci_finish_msi_registrations() -> DeviceResult {
-    let flag = intr_get();
-    if flag { intr_off(); }
-    
     let host = MSI_IRQ_HOST.lock().clone();
     if let Some(host) = host {
         let mut q = MSI_PENDING.lock();
@@ -71,8 +62,6 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
             }
         }
     }
-    
-    if flag { intr_on(); }
     Ok(())
 }
 
@@ -174,10 +163,10 @@ lazy_static::lazy_static! {
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {
-    let flag = intr_get();
-    if flag { intr_off(); }
+    // Mutex::lock() uses push_off/pop_off which handles interrupt disabling.
+    // Manual intr_off/on here bypasses noff accounting and causes
+    // "RefCell already borrowed" panics under SMP.
     *PACKET_CALLBACK.lock() = Some(callback);
-    if flag { intr_on(); }
 }
 
 /// Dispatches a received packet to the registered callback.

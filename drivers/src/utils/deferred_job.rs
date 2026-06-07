@@ -12,24 +12,6 @@ use lock::Mutex;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-extern "C" {
-    fn drivers_intr_on();
-    fn drivers_intr_off();
-    fn drivers_intr_get() -> bool;
-}
-
-fn intr_get() -> bool {
-    unsafe { drivers_intr_get() }
-}
-
-fn intr_off() {
-    unsafe { drivers_intr_off() }
-}
-
-fn intr_on() {
-    unsafe { drivers_intr_on() }
-}
-
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
@@ -47,20 +29,14 @@ fn evict_oldest_job(q: &mut Vec<Job>) {
 
 /// Enqueue a closure to be executed later outside of IRQ context.
 pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
-    let flag = intr_get();
-    if flag {
-        intr_off();
+    // Mutex::lock() uses push_off/pop_off which already handles interrupt
+    // disabling. Manual intr_off/on here bypasses the noff accounting and
+    // causes "RefCell already borrowed" panics under SMP.
+    let mut q = JOBS.lock();
+    if q.len() >= MAX_DEFERRED_JOBS {
+        evict_oldest_job(&mut q);
     }
-    {
-        let mut q = JOBS.lock();
-        if q.len() >= MAX_DEFERRED_JOBS {
-            evict_oldest_job(&mut q);
-        }
-        q.push(Box::new(f));
-    }
-    if flag {
-        intr_on();
-    }
+    q.push(Box::new(f));
 }
 
 /// Execute all currently queued deferred jobs.
@@ -75,17 +51,13 @@ pub fn drain_deferred_jobs() {
 /// stdin/HID must stay responsive.
 pub fn drain_deferred_jobs_max(max: usize) {
     let cap = max.max(1).min(MAX_DEFERRED_JOBS);
-    let flag = intr_get();
-    if flag {
-        intr_off();
-    }
+    // Mutex::lock() uses push_off/pop_off which handles interrupt
+    // disabling. Manual intr_off/on here bypasses noff accounting and
+    // causes "RefCell already borrowed" panics under SMP.
     let mut jobs: Vec<Job> = {
         let mut q = JOBS.lock();
         core::mem::take(&mut *q)
     };
-    if flag {
-        intr_on();
-    }
     let run = jobs.len().min(cap);
     for job in jobs.drain(..run) {
         job();
