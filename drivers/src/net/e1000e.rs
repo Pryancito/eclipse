@@ -328,7 +328,7 @@ const CTRL_ILOS: u32 = 1 << 7; // Invert Loss of Signal
 
 
 // CTRL_EXT bits
-const CTRL_EXT_RO_DIS: u32 = 1 << 2; // Relaxation Order Disable
+const CTRL_EXT_RO_DIS: u32 = 1 << 17; // Relaxation Order Disable (Linux: E1000_CTRL_EXT_RO_DIS = 0x00020000)
 const CTRL_EXT_PHYPDEN: u32 = 1 << 20; // PHY Power Down Enable
 const CTRL_EXT_DPG_EN: u32 = 1 << 3; // Dynamic Power Gating Enable
 const CTRL_EXT_SPD_BYPS: u32 = 1 << 15; // Speed-select bypass (Linux k1/speed pulse)
