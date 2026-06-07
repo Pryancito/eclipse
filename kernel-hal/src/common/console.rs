@@ -167,6 +167,14 @@ pub fn serial_write_fmt(fmt: Arguments) {
     }
 }
 
+/// Writes formatted data into the serial, spinning until the lock is free.
+///
+/// Use in panic/abort context where dropping output silently is unacceptable.
+/// Caller must ensure interrupts are disabled to avoid deadlock on the same CPU.
+pub fn serial_write_fmt_spin(fmt: Arguments) {
+    let _ = SERIAL_WRITER.lock().write_fmt(fmt);
+}
+
 /// Writes a string slice into the serial through sbi call.
 pub fn debug_write_str(s: &str) {
     if let Some(mut w) = DEBUG_WRITER.try_lock() {

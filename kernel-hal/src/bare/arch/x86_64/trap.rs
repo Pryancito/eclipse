@@ -98,6 +98,21 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 super::cpu::cpu_id(), name, vec, tf.error_code, tf
             );
         }
-        other => panic!("Unhandled trap {:x?} {:#x?}", other, tf),
+        TrapReason::UndefinedInstruction => panic!(
+            "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={:#x}\n{:#x?}",
+            super::cpu::cpu_id(), tf.rip, tf
+        ),
+        TrapReason::UnalignedAccess => panic!(
+            "\nCPU EXCEPTION on CPU{}: Alignment Check (#AC) at RIP={:#x}\n{:#x?}",
+            super::cpu::cpu_id(), tf.rip, tf
+        ),
+        TrapReason::Syscall => panic!(
+            "\nCPU EXCEPTION on CPU{}: Syscall trap in kernel context at RIP={:#x}\n{:#x?}",
+            super::cpu::cpu_id(), tf.rip, tf
+        ),
+        other => panic!(
+            "\nCPU EXCEPTION on CPU{}: Unhandled {:x?} at RIP={:#x}\n{:#x?}",
+            super::cpu::cpu_id(), other, tf.rip, tf
+        ),
     }
 }
