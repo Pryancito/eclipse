@@ -37,9 +37,39 @@ pub use trap::TrapFrame;
 /// [TSS]: https://wiki.osdev.org/Task_State_Segment
 /// [`syscall`]: https://www.felixcloutier.com/x86/syscall
 ///
+/// Enable x87 + SSE on this CPU.
+///
+/// The BSP inherits a usable FPU state from the firmware; APs arrive from the
+/// INIT/SIPI trampoline with CR0.TS set, so the first SSE instruction in Rust
+/// kernel code raises #NM → unhandled trap in `trap_handler`.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+fn init_fpu() {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+
+    unsafe {
+        Cr4::update(|cr4| {
+            cr4.insert(Cr4Flags::OSFXSR);
+            cr4.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
+        });
+        Cr0::update(|cr0| {
+            cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
+            cr0.remove(Cr0Flags::TASK_SWITCHED);
+        });
+        core::arch::asm!("fninit", options(nostack, preserves_flags));
+        const MXCSR_DEFAULT: u32 = 0x1F80;
+        let mxcsr = MXCSR_DEFAULT;
+        core::arch::asm!(
+            "ldmxcsr [{mxcsr}]",
+            mxcsr = in(reg) &mxcsr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub unsafe fn init() {
     x86_64::instructions::interrupts::disable();
+    init_fpu();
     gdt::init();
     idt::init();
     syscall::init();
@@ -48,6 +78,7 @@ pub unsafe fn init() {
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub unsafe fn init_ap() {
     x86_64::instructions::interrupts::disable();
+    init_fpu();
     gdt::init_ap();
     // Load the shared IDT on this AP.  Each CPU's IDTR is a private register;
     // without this call the AP's IDTR is at its reset-default (base = 0),
