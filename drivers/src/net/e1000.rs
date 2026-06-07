@@ -428,18 +428,28 @@ impl NetScheme for E1000Interface {
 
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
+        let intr_was_on = super::intr_get();
+        if intr_was_on {
+            super::intr_off();
+        }
         let sockets = get_sockets();
-        let mut sockets = sockets.lock();
-        let res = match self.iface.lock().poll(&mut sockets, timestamp) {
-            Ok(p) => {
-                trace!("e1000 NetScheme poll: {:?}", p);
-                Ok(())
-            }
-            Err(err) => {
-                warn!("poll got err {}", err);
-                Err(DeviceError::IoError)
+        let res = {
+            let mut sockets = sockets.lock();
+            match self.iface.lock().poll(&mut sockets, timestamp) {
+                Ok(p) => {
+                    trace!("e1000 NetScheme poll: {:?}", p);
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("poll got err {}", err);
+                    Err(DeviceError::IoError)
+                }
             }
         };
+        super::net_flush_deferred_packets();
+        if intr_was_on {
+            super::intr_on();
+        }
         self.ims_rearm();
         res
     }
@@ -677,8 +687,8 @@ impl phy::RxToken for E1000RxToken {
         stats.rx_bytes += self.data.len() as u64;
         drop(stats);
 
-        // Dispatch to global packet tapping (AF_PACKET sockets)
-        super::net_dispatch_packet(&self.data);
+        // Dispatch to global packet tapping (AF_PACKET sockets) after smoltcp unlocks SOCKETS.
+        super::net_defer_packet(&self.data);
         f(&mut self.data)
     }
 }

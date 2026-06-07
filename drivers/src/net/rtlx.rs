@@ -309,7 +309,7 @@ impl phy::RxToken for RTLxRxToken {
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
         // Dispatch to global packet tapping (AF_PACKET sockets)
-        super::net_dispatch_packet(&self.0);
+        super::net_defer_packet(&self.0);
         f(&mut self.0)
     }
 }

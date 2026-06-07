@@ -1429,13 +1429,15 @@ impl E1000eInterface {
                 match hw.receive() {
                     Some(pkt) => {
                         hw_rx += 1;
-                        drop(hw);
-                        super::net_dispatch_packet(&pkt);
-                        hw = self.driver.hw.lock();
+                        super::net_defer_packet(&pkt);
                     }
                     None => break,
                 }
             }
+        }
+        super::net_flush_deferred_packets();
+        if intr_was_on {
+            super::intr_on();
         }
         if hw_rx > 0 {
             pulse |= PULSE_NET_RX;
@@ -1448,9 +1450,6 @@ impl E1000eInterface {
         }
 
         self.pulse(pulse);
-        if pulse & PULSE_NET_RX != 0 {
-            super::wake_net_rx_waiters();
-        }
         Ok(())
     }
 }
@@ -1693,7 +1692,8 @@ impl phy::RxToken for E1000eRxToken {
     fn consume<R, F>(self, _ts: Instant, f: F) -> SmolResult<R>
     where F: FnOnce(&mut [u8]) -> SmolResult<R> {
         let mut data = self.data;
-        super::net_dispatch_packet(&data);
+        // Defer AF_PACKET tap until smoltcp releases SOCKETS (see net_flush_deferred_packets).
+        super::net_defer_packet(&data);
         f(&mut data)
     }
 }

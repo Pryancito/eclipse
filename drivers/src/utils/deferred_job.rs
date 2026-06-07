@@ -28,6 +28,9 @@ fn evict_oldest_job(q: &mut Vec<Job>) {
 }
 
 /// Enqueue a closure to be executed later outside of IRQ context.
+///
+/// Do not wrap with manual `intr_on`/`intr_off` — `lock::Mutex` already uses
+/// `push_off`/`pop_off`; re-enabling IRQs before the guard drops panics in `mycpu()`.
 pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     // Mutex::lock() uses push_off/pop_off which already handles interrupt
     // disabling. Manual intr_off/on here bypasses the noff accounting and

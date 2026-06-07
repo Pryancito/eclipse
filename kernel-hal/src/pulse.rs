@@ -90,6 +90,7 @@ cfg_if! {
             static ref LAST_NET_FALLBACK_US: AtomicU64 = AtomicU64::new(0);
             static ref LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
             static ref STATS: Mutex<PulseStats> = Mutex::new(PulseStats::default());
+            static ref SIGNAL_COUNT: AtomicU64 = AtomicU64::new(0);
         }
 
         const MAX_PULSE_WAKERS: usize = 256;
@@ -121,13 +122,13 @@ cfg_if! {
             f(&mut *STATS.lock());
         }
 
-        /// Called from IRQ context (via `drivers_pulse_signal`); safe with atomics only.
+        /// Called from IRQ or thread context; must not take mutexes before waking waiters.
         pub fn pulse_signal(bits: u32) {
             if bits == 0 {
                 return;
             }
             PENDING.fetch_or(bits, Ordering::Release);
-            bump_stat(|s| s.signals += 1);
+            SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
             if bits & PULSE_NET_RX != 0 {
                 crate::net::wake_net_rx_waiters_inner();
             }
@@ -165,7 +166,9 @@ cfg_if! {
         }
 
         pub fn pulse_stats() -> PulseStats {
-            *STATS.lock()
+            let mut stats = *STATS.lock();
+            stats.signals = SIGNAL_COUNT.load(Ordering::Relaxed);
+            stats
         }
 
         pub fn pulse_io_tick(watch_net: bool, watch_hid: bool) -> PulseWork {
