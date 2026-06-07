@@ -22,6 +22,8 @@ hal_fn_impl! {
         fn primary_init() {
             crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
             unsafe { trapframe::init() };
+            // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
+            super::percpu::register();
             super::arch::primary_init();
         }
 
@@ -29,6 +31,7 @@ hal_fn_impl! {
             // info!("Secondary CPU {} init...", crate::cpu::cpu_id());
             // we can't print anything here, see reason: zcore/main.rs::secondary_main()
             unsafe { trapframe::init() };
+            super::percpu::register();
             super::arch::secondary_init();
             // now can print
         }

@@ -18,6 +18,7 @@ pub mod boot;
 pub mod input_poll;
 pub mod mem;
 pub mod net;
+pub mod percpu;
 pub mod thread;
 pub mod timer;
 
