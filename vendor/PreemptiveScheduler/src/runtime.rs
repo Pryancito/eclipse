@@ -113,12 +113,23 @@ unsafe impl Sync for ExecutorRuntime {}
 
 // TODO: more elegent?
 lazy_static! {
-    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime>; 5] = [
+    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime>; 16] = [
         Mutex::new(ExecutorRuntime::new(0)),
         Mutex::new(ExecutorRuntime::new(1)),
         Mutex::new(ExecutorRuntime::new(2)),
         Mutex::new(ExecutorRuntime::new(3)),
-        Mutex::new(ExecutorRuntime::new(4))
+        Mutex::new(ExecutorRuntime::new(4)),
+        Mutex::new(ExecutorRuntime::new(5)),
+        Mutex::new(ExecutorRuntime::new(6)),
+        Mutex::new(ExecutorRuntime::new(7)),
+        Mutex::new(ExecutorRuntime::new(8)),
+        Mutex::new(ExecutorRuntime::new(9)),
+        Mutex::new(ExecutorRuntime::new(10)),
+        Mutex::new(ExecutorRuntime::new(11)),
+        Mutex::new(ExecutorRuntime::new(12)),
+        Mutex::new(ExecutorRuntime::new(13)),
+        Mutex::new(ExecutorRuntime::new(14)),
+        Mutex::new(ExecutorRuntime::new(15))
     ];
 }
 

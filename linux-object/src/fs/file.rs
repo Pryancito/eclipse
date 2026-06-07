@@ -113,34 +113,6 @@ pub struct File {
 impl_kobject!(File);
 
 impl FileInner {
-    /// read from file
-    async fn read(&mut self, buf: &mut [u8]) -> LxResult<usize> {
-        let len = self.read_at(self.offset, buf).await?;
-        self.offset += len as u64;
-        Ok(len)
-    }
-
-    /// read from file at given offset
-    async fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        if !self.flags.readable() {
-            return Err(LxError::EBADF);
-        }
-        if !self.flags.non_block() {
-            // block
-            loop {
-                match self.inode.read_at(offset as usize, buf) {
-                    Ok(read_len) => return Ok(read_len),
-                    Err(FsError::Again) => {
-                        self.inode.async_poll().await?;
-                    }
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        }
-        let len = self.inode.read_at(offset as usize, buf)?;
-        Ok(len)
-    }
-
     /// write to file
     fn write(&mut self, buf: &[u8]) -> LxResult<usize> {
         let offset = if self.flags.is_append() {
@@ -266,7 +238,33 @@ impl FileLike for File {
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
-        self.inner.write().read(buf).await
+        let (offset, flags, inode) = {
+            let inner = self.inner.read();
+            (inner.offset, inner.flags, inner.inode.clone())
+        };
+
+        if !flags.readable() {
+            return Err(LxError::EBADF);
+        }
+
+        let len = if !flags.non_block() {
+            // block
+            loop {
+                match inode.read_at(offset as usize, buf) {
+                    Ok(read_len) => break read_len,
+                    Err(FsError::Again) => {
+                        inode.async_poll().await?;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        } else {
+            inode.read_at(offset as usize, buf)?
+        };
+
+        let mut inner = self.inner.write();
+        inner.offset += len as u64;
+        Ok(len)
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {
@@ -274,7 +272,29 @@ impl FileLike for File {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.inner.write().read_at(offset, buf).await
+        let (flags, inode) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone())
+        };
+
+        if !flags.readable() {
+            return Err(LxError::EBADF);
+        }
+
+        if !flags.non_block() {
+            // block
+            loop {
+                match inode.read_at(offset as usize, buf) {
+                    Ok(read_len) => return Ok(read_len),
+                    Err(FsError::Again) => {
+                        inode.async_poll().await?;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        let len = inode.read_at(offset as usize, buf)?;
+        Ok(len)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
@@ -286,7 +306,8 @@ impl FileLike for File {
     }
 
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
-        Ok(self.inner.read().inode.async_poll().await?)
+        let inode = self.inner.read().inode.clone();
+        Ok(inode.async_poll().await?)
     }
 
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {

@@ -579,13 +579,14 @@ impl VMObjectPagedInner {
                                 par_frame.swap(&mut new_frame);
                             }
                             let sibling = parent.type_.get_tag_and_other(&self.self_ref).1;
-                            let arc_sibling = sibling.upgrade().unwrap();
-                            let sibling_inner = arc_sibling.inner.borrow();
-                            sibling_inner.range_change(
-                                parent_idx * PAGE_SIZE,
-                                (parent_idx + 1) * PAGE_SIZE,
-                                RangeChangeOp::Unmap,
-                            )
+                            if let Some(arc_sibling) = sibling.upgrade() {
+                                let sibling_inner = arc_sibling.inner.borrow();
+                                sibling_inner.range_change(
+                                    parent_idx * PAGE_SIZE,
+                                    (parent_idx + 1) * PAGE_SIZE,
+                                    RangeChangeOp::Unmap,
+                                );
+                            }
                         } else {
                             need_unmap = need_unmap || unmap;
                         }
@@ -598,23 +599,26 @@ impl VMObjectPagedInner {
         // now the page must hit on this VMO
         let (child_tag, other_child) = self.type_.get_tag_and_other(child);
         if self.type_.is_hidden() {
-            let arc_other = other_child.upgrade().unwrap();
-            let other_inner = arc_other.inner.borrow();
-            let in_range = {
-                let start = other_inner.parent_offset / PAGE_SIZE;
-                let end = other_inner.parent_limit / PAGE_SIZE;
-                page_idx >= start && page_idx < end
-            };
-            if !in_range {
-                let frame = self.frames.remove(&page_idx).unwrap().take();
-                return Ok(CommitResult::CopyOnWrite(frame, need_unmap));
-            } else if need_unmap {
-                other_inner.range_change(
-                    page_idx * PAGE_SIZE,
-                    (1 + page_idx) * PAGE_SIZE,
-                    RangeChangeOp::Unmap,
-                )
+            if let Some(arc_other) = other_child.upgrade() {
+                let other_inner = arc_other.inner.borrow();
+                let in_range = {
+                    let start = other_inner.parent_offset / PAGE_SIZE;
+                    let end = other_inner.parent_limit / PAGE_SIZE;
+                    page_idx >= start && page_idx < end
+                };
+                if !in_range {
+                    let frame = self.frames.remove(&page_idx).unwrap().take();
+                    return Ok(CommitResult::CopyOnWrite(frame, need_unmap));
+                } else if need_unmap {
+                    other_inner.range_change(
+                        page_idx * PAGE_SIZE,
+                        (1 + page_idx) * PAGE_SIZE,
+                        RangeChangeOp::Unmap,
+                    );
+                }
             }
+            // Sibling VMO already dropped (fork/COW tree reshaped): skip hidden
+            // sibling bookkeeping and fall through to the leaf commit path below.
         }
         if need_unmap {
             for map in self.mappings.iter() {
@@ -658,8 +662,9 @@ impl VMObjectPagedInner {
         }
         if let VMOType::Hidden { left, right, .. } = &self.type_ {
             for child in &[left, right] {
-                let child = child.upgrade().unwrap();
-                child.inner.borrow().range_change(start, end, op);
+                if let Some(child) = child.upgrade() {
+                    child.inner.borrow().range_change(start, end, op);
+                }
             }
         }
     }
@@ -725,7 +730,9 @@ impl VMObjectPagedInner {
             return;
         }
         let (tag, other_child) = self.type_.get_tag_and_other(child);
-        let arc_child = other_child.upgrade().unwrap();
+        let Some(arc_child) = other_child.upgrade() else {
+            return;
+        };
         let mut child = arc_child.inner.borrow_mut();
         let start = child.parent_offset / PAGE_SIZE;
         let end = child.parent_limit / PAGE_SIZE;
@@ -847,7 +854,19 @@ impl VMObjectPagedInner {
         new_range: Option<(usize, usize)>,
     ) {
         let (tag, other) = self.type_.get_tag_and_other(old);
-        let arc_other_child = other.upgrade().unwrap();
+        let Some(arc_other_child) = other.upgrade() else {
+            match &mut self.type_ {
+                VMOType::Hidden { left, right, .. } => {
+                    if left.ptr_eq(old) {
+                        *left = new;
+                    } else if right.ptr_eq(old) {
+                        *right = new;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        };
         let mut other_child = arc_other_child.inner.borrow_mut();
         let mut unwanted = VecDeque::<usize>::new();
         if let Some((new_start, new_end)) = new_range {
@@ -899,7 +918,10 @@ impl VMObjectPagedInner {
                 let mut parent_inner = parent.inner.borrow_mut();
                 if parent_inner.owner == old_id {
                     let (_, other) = parent_inner.type_.get_tag_and_other(&child);
-                    let new_owner = other.upgrade().unwrap().inner.borrow().owner;
+                    let Some(arc) = other.upgrade() else {
+                        break;
+                    };
+                    let new_owner = arc.inner.borrow().owner;
                     child = parent_inner.self_ref.clone();
                     assert_ne!(new_owner, skip_owner);
                     parent_inner.owner = new_owner;
@@ -946,7 +968,9 @@ impl VMObjectPagedInner {
         while let Some(parent) = option_parent {
             let mut parent_inner = parent.inner.borrow_mut();
             let (tag, other) = parent_inner.type_.get_tag_and_other(&child);
-            let arc_other = other.upgrade().unwrap();
+            let Some(arc_other) = other.upgrade() else {
+                break;
+            };
             let mut other_inner = arc_other.inner.borrow_mut();
             let start = other_inner.parent_offset / PAGE_SIZE;
             let end = other_inner.parent_limit / PAGE_SIZE;
