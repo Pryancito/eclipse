@@ -1405,11 +1405,10 @@ impl E1000eInterface {
             hw.rx_poll_budget = 32;
         }
 
-        // Keep IRQs off for the whole smoltcp + AF_PACKET flush + HW drain critical section.
-        let intr_was_on = super::intr_get();
-        if intr_was_on {
-            super::intr_off();
-        }
+        // SOCKETS + iface locks already disable interrupts for the critical
+        // section via kernel-sync push_off/pop_off. Manual intr_off/on here
+        // desyncs the noff accounting and panics ("pop_off" / "RefCell already
+        // borrowed") under SMP.
         let sockets = get_sockets();
         {
             let mut sockets = sockets.lock();
