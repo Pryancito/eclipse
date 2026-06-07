@@ -3,13 +3,34 @@ use core::cell::{RefCell, RefMut};
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", any(target_arch = "riscv32", target_arch = "riscv64")))] {
         mod interrupts {
+            use core::sync::atomic::{AtomicU8, Ordering};
             use riscv::register::sstatus;
-            pub(crate) fn cpu_id() -> u8 {
-                let mut cpu_id;
+
+            /// Maps a hardware hart id (in `tp`, possibly sparse — e.g. boards that
+            /// reserve hart 0) to a dense logical CPU id (0..NCPU). Populated by the
+            /// HAL during SMP bring-up via [`set_logical_cpu_id`]; reads 0 until then
+            /// (correct, since only the boot hart = logical 0 runs that early).
+            static HARTID_TO_LOGICAL: [AtomicU8; 256] = {
+                const ZERO: AtomicU8 = AtomicU8::new(0);
+                [ZERO; 256]
+            };
+
+            /// Raw hart id of the current CPU (kernel convention: stored in `tp`).
+            fn raw_hart_id() -> u8 {
+                let hart_id: usize;
                 unsafe {
-                    core::arch::asm!("mv {0}, tp", out(reg) cpu_id);
+                    core::arch::asm!("mv {0}, tp", out(reg) hart_id);
                 }
-                cpu_id
+                hart_id as u8
+            }
+
+            /// Register the logical id assigned to a given hart id.
+            pub fn set_logical_cpu_id(hart_id: u8, logical_id: u8) {
+                HARTID_TO_LOGICAL[hart_id as usize].store(logical_id, Ordering::Release);
+            }
+
+            pub(crate) fn cpu_id() -> u8 {
+                HARTID_TO_LOGICAL[raw_hart_id() as usize].load(Ordering::Acquire)
             }
             pub(crate) fn intr_on() {
                 unsafe { sstatus::set_sie() };
@@ -113,13 +134,22 @@ pub fn current_cpu_id() -> u8 {
     cpu_id()
 }
 
-/// Register the dense logical id assigned to a hardware Local APIC ID.
+/// Register the dense logical id assigned to a hardware CPU id (Local APIC ID on
+/// x86, hart id on riscv).
 ///
 /// Must be called once per CPU (including the BSP) before that CPU executes any
 /// code that takes a lock, so that `cpu_id()` never returns a stale/colliding id.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-pub fn set_logical_cpu_id(apic_id: u8, logical_id: u8) {
-    interrupts::set_logical_cpu_id(apic_id, logical_id)
+#[cfg(all(
+    target_os = "none",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "riscv64"
+    )
+))]
+pub fn set_logical_cpu_id(hw_id: u8, logical_id: u8) {
+    interrupts::set_logical_cpu_id(hw_id, logical_id)
 }
 
 #[derive(Debug, Default, Clone, Copy)]

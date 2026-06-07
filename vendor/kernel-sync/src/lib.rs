@@ -5,7 +5,12 @@ cfg_if::cfg_if! {
         extern crate alloc;
         mod interrupt;
         pub use interrupt::current_cpu_id;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv32",
+            target_arch = "riscv64"
+        ))]
         pub use interrupt::set_logical_cpu_id;
         pub mod mcslock;
         pub mod rwlock;
@@ -16,7 +21,12 @@ cfg_if::cfg_if! {
         extern crate alloc;
         mod interrupt;
         pub use interrupt::current_cpu_id;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv32",
+            target_arch = "riscv64"
+        ))]
         pub use interrupt::set_logical_cpu_id;
         pub mod mcslock;
         pub mod rwlock;

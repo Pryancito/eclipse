@@ -90,6 +90,12 @@ pub fn current() -> &'static PercpuBlock {
 /// Call once per CPU, after `trapframe::init()` (which sets up the GS region on
 /// x86_64) and after the CPU's logical id is known.
 pub fn register() {
+    // Establish this CPU's hardware-id -> logical-id mapping where the arch needs
+    // to self-assign (riscv). On x86_64 the mapping is set during SMP enumeration.
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::cpu::register_logical_id();
+    }
     let id = crate::cpu::cpu_id() as usize;
     if let Some(block) = PERCPU.get(id) {
         block.cpu_id.store(id as u32, Ordering::Relaxed);
