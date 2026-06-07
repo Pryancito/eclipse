@@ -755,15 +755,17 @@ impl E1000eHw {
         //   +12 u8   status  (DD=bit0, EOP=bit1)
         compiler_fence(Ordering::SeqCst);
         let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
-        if status == 0 {
+        if status & 1 == 0 {
+            // DD (Descriptor Done) not set — hardware hasn't written back yet
             return None;
         }
+
         let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
 
         self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
-        if len == 0 || len > BUF_SIZE {
-            // Bad descriptor; recycle and skip
+        // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
+        if status & 2 == 0 || len == 0 || len > BUF_SIZE {
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             return None;
@@ -792,7 +794,9 @@ impl E1000eHw {
         write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-        compiler_fence(Ordering::SeqCst);
+        // Full memory barrier: ensure the DMA engine sees the updated descriptor
+        // before we ring the doorbell.
+        fence(Ordering::SeqCst);
         // Advance RDT to this slot (give it back to hardware)
         mmio_write(self.base, E1000E_RDT, i as u32);
     }
@@ -885,12 +889,13 @@ impl E1000eHw {
             }
         }
 
-        // Log GPRC periodically to help diagnose RX issues
+        // Log GPRC/MPC periodically to diagnose RX issues.
+        // GPRC>0 means the MAC received frames. MPC>0 means frames arrived but
+        // were dropped (no free descriptors or DMA ring not armed).
         let gprc = mmio_read(self.base, E1000E_GPRC);
-        if gprc > 0 {
-            crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} rx_pkt={}\n",
-                link, gprc, self.stats.rx_packets);
-        }
+        let mpc  = mmio_read(self.base, E1000E_MPC);
+        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
+            link, gprc, mpc, self.stats.rx_packets);
     }
 
     fn merged_stats(&self) -> NetStats {
