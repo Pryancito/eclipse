@@ -34,6 +34,8 @@
 #define UPD_ROOT_MNT    "/tmp/eclipse-upd-root"
 #define EFI_IMAGE_GZ    "/boot/efi.img.gz"
 
+#define INST_ROOT_MNT   "/tmp/eclipse-inst-root"
+
 #define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 #define GPT_LINUX_TYPE "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
 
@@ -407,6 +409,8 @@ static int shell_mount(const char *source, const char *target, const char *fstyp
 static int shell_umount(const char *target, int dry_run);
 static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run);
 static int run_upgrade(const char *disk_path, int dry_run);
+static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
+                               int part_count, enum layout_mode layout, int dry_run);
 static void close_log_file(void);
 
 static void close_log_file(void) {
@@ -2091,6 +2095,84 @@ static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int 
     return 0;
 }
 
+static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
+                               int part_count, enum layout_mode layout, int dry_run) {
+    char efi_dev[160], root_dev[160], home_dev[160], swap_dev[160];
+    char fstab_path[256];
+    char cmd[512];
+    int rc = 0;
+    (void)parts;
+
+    /* EFI = part 1, ROOT = part 2, HOME = part 3, SWAP = part 4 */
+    if (partition_dev_path(disk_path, 1, efi_dev,  sizeof(efi_dev))  != 0 ||
+        partition_dev_path(disk_path, 2, root_dev, sizeof(root_dev)) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de las particiones." COLOR_RESET);
+        return -1;
+    }
+
+    if (layout == LAYOUT_ADVANCED && part_count >= 4) {
+        if (partition_dev_path(disk_path, 3, home_dev, sizeof(home_dev)) != 0 ||
+            partition_dev_path(disk_path, 4, swap_dev, sizeof(swap_dev)) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de HOME/SWAP." COLOR_RESET);
+            return -1;
+        }
+
+        log(COLOR_GREEN "[4/5] Formateando partición HOME (ext2)..." COLOR_RESET);
+        snprintf(cmd, sizeof(cmd), "sh -c \"mke2fs -t ext2 -L HOME '%s'\"", home_dev);
+        if (run_command_logged(cmd, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo formatear HOME." COLOR_RESET);
+            return -1;
+        }
+
+        log(COLOR_GREEN "[5/5] Inicializando partición SWAP..." COLOR_RESET);
+        snprintf(cmd, sizeof(cmd), "sh -c \"mkswap -L SWAP '%s'\"", swap_dev);
+        if (run_command_logged(cmd, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo inicializar SWAP." COLOR_RESET);
+            return -1;
+        }
+    }
+
+    log(COLOR_GREEN "Montando ROOT para escribir /etc/fstab..." COLOR_RESET);
+    shell_mkdir_p(INST_ROOT_MNT, dry_run);
+
+    if (shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar ROOT en %s." COLOR_RESET, INST_ROOT_MNT);
+        return -1;
+    }
+
+    snprintf(fstab_path, sizeof(fstab_path), "%s/etc/fstab", INST_ROOT_MNT);
+
+    if (!dry_run) {
+        shell_mkdir_p(INST_ROOT_MNT "/etc", dry_run);
+        FILE *f = fopen(fstab_path, "w");
+        if (f == NULL) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear %s (%s)." COLOR_RESET,
+                fstab_path, strerror(errno));
+            shell_umount(INST_ROOT_MNT, dry_run);
+            return -1;
+        }
+        fprintf(f, "# /etc/fstab - generado por install-eclipse\n");
+        fprintf(f, "# <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n");
+        fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
+                root_dev, "/",     "ext2", "defaults",           1);
+        fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
+                efi_dev,  "/boot/efi", "vfat", "defaults,noatime", 0);
+        if (layout == LAYOUT_ADVANCED && part_count >= 4) {
+            fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
+                    home_dev, "/home", "ext2", "defaults",        0);
+            fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
+                    swap_dev, "none",  "swap", "sw",              0);
+        }
+        fclose(f);
+        log(COLOR_GREEN "fstab escrito en %s." COLOR_RESET, fstab_path);
+    } else {
+        log("[dry-run] Se escribiría fstab en %s", fstab_path);
+    }
+
+    shell_umount(INST_ROOT_MNT, dry_run);
+    return rc;
+}
+
 static int run_upgrade(const char *disk_path, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
@@ -2360,7 +2442,11 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        log(COLOR_GREEN "[2/3] Escribiendo partición EFI..." COLOR_RESET);
+        int total_steps = (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3;
+        (void)total_steps;
+
+        log(COLOR_GREEN "[2/%d] Escribiendo partición EFI..." COLOR_RESET,
+            (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3);
         if (write_partition_image_with_retry(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
             return 1;
         }
@@ -2368,7 +2454,8 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        log(COLOR_GREEN "[3/3] Escribiendo partición ROOT..." COLOR_RESET);
+        log(COLOR_GREEN "[3/%d] Escribiendo partición ROOT..." COLOR_RESET,
+            (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3);
         if (write_partition_image_with_retry(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
             return 1;
         }
@@ -2376,8 +2463,8 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if (cfg.layout == LAYOUT_ADVANCED) {
-            log(COLOR_GREEN "Información: las particiones HOME y SWAP fueron creadas sin sobrescribir contenido adicional." COLOR_RESET);
+        if (write_fstab_to_root(cfg.disk_path, parts, part_count, cfg.layout, cfg.dry_run) != 0) {
+            return 1;
         }
     } else {
         if (run_upgrade(cfg.disk_path, cfg.dry_run) != 0) {
