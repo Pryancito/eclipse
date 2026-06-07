@@ -150,6 +150,7 @@ const PCI_BASE: usize = 0xbbe00000;
 #[cfg(target_arch = "riscv64")]
 const PCI_BASE: usize = 0x30000000;
 #[cfg(target_arch = "riscv64")]
+#[allow(dead_code)]
 const E1000_BASE: usize = 0x40000000;
 // riscv64 Qemu
 
