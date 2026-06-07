@@ -18,6 +18,13 @@ fn alloc_error(layout: Layout) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Disable interrupts immediately. With panic-strategy=abort, local variables
+    // in the panicking function (e.g. kernel-sync's RefMut borrow guard in
+    // pop_off) are never dropped. If a timer IRQ fires while the panic handler
+    // is running, push_off/pop_off will call borrow_mut() on an already-borrowed
+    // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
+    kernel_hal::interrupt::intr_off();
+
     println!("\n\npanic cpu={}\n{}", kernel_hal::cpu::cpu_id(), info);
     error!("\n\n{info}");
 
