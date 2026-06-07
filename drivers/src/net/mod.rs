@@ -159,7 +159,12 @@ lazy_static::lazy_static! {
     Arc::new(Mutex::new(SocketSet::new(vec![])));
 
     static ref PACKET_CALLBACK: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
+
+    /// AF_PACKET taps queued during smoltcp `poll` (SOCKETS held) and flushed after.
+    static ref DEFERRED_PACKETS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 }
+
+const DEFERRED_PACKET_MAX: usize = 32;
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {
@@ -178,6 +183,26 @@ pub fn net_dispatch_packet(data: &[u8]) {
     let callback = *PACKET_CALLBACK.lock();
     if let Some(cb) = callback {
         cb(data);
+    }
+}
+
+/// Queue a frame for AF_PACKET while smoltcp holds `SOCKETS` (see [`net_flush_deferred_packets`]).
+pub fn net_defer_packet(data: &[u8]) {
+    let mut q = DEFERRED_PACKETS.lock();
+    if q.len() >= DEFERRED_PACKET_MAX {
+        q.remove(0);
+    }
+    q.push(data.to_vec());
+}
+
+/// Flush frames queued by [`net_defer_packet`]; call only after releasing smoltcp locks.
+pub fn net_flush_deferred_packets() {
+    let batch: Vec<Vec<u8>> = {
+        let mut q = DEFERRED_PACKETS.lock();
+        core::mem::take(&mut *q)
+    };
+    for pkt in batch {
+        net_dispatch_packet(&pkt);
     }
 }
 

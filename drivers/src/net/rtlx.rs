@@ -233,11 +233,8 @@ impl NetScheme for RTLxInterface {
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
         let result = self.iface.lock().poll(&mut sockets, timestamp);
-        // Explicitly release the SOCKETS guard here, before re-enabling
-        // interrupts.  Without this drop the guard would live until the end
-        // of the function (after intr_on), which would re-introduce the
-        // deadlock we are fixing.
         drop(sockets);
+        super::net_flush_deferred_packets();
         if intr_was_on {
             super::intr_on();
         }
@@ -316,7 +313,7 @@ impl phy::RxToken for RTLxRxToken {
         F: FnOnce(&mut [u8]) -> Result<R>,
     {
         // Dispatch to global packet tapping (AF_PACKET sockets)
-        super::net_dispatch_packet(&self.0);
+        super::net_defer_packet(&self.0);
         f(&mut self.0)
     }
 }
