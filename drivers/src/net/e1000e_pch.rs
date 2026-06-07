@@ -31,6 +31,8 @@ const E1000_FEXTNVM7: usize = 0x01018 / 4;
 const E1000_RFCTL: usize = 0x5008 / 4;
 const E1000_FWSM: usize = 0x05B54 / 4;
 const E1000_H2ME: usize = 0x05B50 / 4;
+/// MAC-side PHY power control: LPLU / GbE-disable bits (Linux E1000_PHY_CTRL).
+const E1000_PHY_CTRL: usize = 0x00F10 / 4;
 
 const CTRL_SLU: u32 = 1 << 6;
 const CTRL_ASDE: u32 = 1 << 5;
@@ -42,12 +44,15 @@ const CTRL_LANPHYPC_VALUE: u32 = 0x0002_0000;
 const STATUS_LU: u32 = 1 << 1;
 const STATUS_PHYRA: u32 = 1 << 10;
 const STATUS_LAN_INIT_DONE: u32 = 1 << 9;
+/// STATUS bits [7:6]: 00=10M 01=100M 10=1G
+const STATUS_SPEED_MASK: u32 = 3 << 6;
+const STATUS_SPEED_1000: u32 = 2 << 6;
 
 const CTRL_EXT_DRV_LOAD: u32 = 0x1000_0000;
 const CTRL_EXT_FORCE_SMBUS: u32 = 0x0000_0800;
 const CTRL_EXT_PHYPDEN: u32 = 1 << 20;
-const CTRL_EXT_RO_DIS: u32 = 1 << 2;
-const CTRL_EXT_LPCD: u32 = 1 << 2;
+const CTRL_EXT_RO_DIS: u32 = 1 << 17; // Relaxation Order Disable (Linux: E1000_CTRL_EXT_RO_DIS = 0x00020000)
+const CTRL_EXT_LPCD: u32 = 1 << 2; // Link Partner Connection Detection
 
 const EXTCNF_CTRL_SWFLAG: u32 = 0x20;
 const EXTCNF_CTRL_GATE_PHY_CFG: u32 = 0x80;
@@ -66,6 +71,12 @@ const FEXTNVM7_DISABLE_SMB_PERST: u32 = 1 << 5;
 
 const RFCTL_NFSW_DIS: u32 = 1 << 6;
 const RFCTL_NFSR_DIS: u32 = 1 << 7;
+
+/// MAC-side LPLU/GbE-disable bits in E1000_PHY_CTRL (Linux ich8lan.c).
+const PHY_CTRL_D0A_LPLU: u32 = 1 << 1;
+const PHY_CTRL_NOND0A_LPLU: u32 = 1 << 2;
+const PHY_CTRL_NOND0A_GBE_DISABLE: u32 = 1 << 3;
+const PHY_CTRL_GBE_DISABLE: u32 = 1 << 6;
 
 const MDIC_REG_SHIFT: u32 = 16;
 const MDIC_PHY_SHIFT: u32 = 21;
@@ -298,6 +309,27 @@ impl PchCtx {
         }
     }
 
+    /// Linux `set_d0_lplu_state_ich8lan(false)` — clear MAC-side LPLU and GbE-disable.
+    /// Must be called after any PHY reset so the PHY advertises all speeds including 1G.
+    /// Without this, I219 may only advertise 10M (LPLU default after power-up/reset).
+    unsafe fn clear_lplu_mac(&self) {
+        let mut phy_ctrl = mmio_read(self.base, E1000_PHY_CTRL);
+        let before = phy_ctrl;
+        phy_ctrl &= !(PHY_CTRL_D0A_LPLU
+            | PHY_CTRL_NOND0A_LPLU
+            | PHY_CTRL_GBE_DISABLE
+            | PHY_CTRL_NOND0A_GBE_DISABLE);
+        if phy_ctrl != before {
+            mmio_write(self.base, E1000_PHY_CTRL, phy_ctrl);
+            let _ = mmio_read(self.base, E1000_PHY_CTRL);
+            crate::klog_warn!(
+                "[e1000e] PCH: cleared LPLU/GBE-dis PHY_CTRL {:#x}->{:#x}\n",
+                before,
+                phy_ctrl
+            );
+        }
+    }
+
     unsafe fn disable_ulp_me(&self) -> bool {
         let fwsm = mmio_read(self.base, E1000_FWSM);
         if fwsm & FWSM_FW_VALID == 0 {
@@ -473,15 +505,25 @@ impl PchCtx {
         }
     }
 
-    unsafe fn wait_status_link(&self, budget_us: u64) -> bool {
+    /// Wait for STATUS.LU, preferring 1G: continues polling even if 10/100M link appears,
+    /// giving the autoneg master/slave resolution time to reach 1G before we commit.
+    /// Returns true if any link came up within budget_us.
+    unsafe fn wait_status_link_prefer_gig(&self, budget_us: u64) -> bool {
         let t0 = timer_now_as_micros();
+        let mut got_link = false;
         while timer_now_as_micros().wrapping_sub(t0) < budget_us {
-            if mmio_read(self.base, E1000_STATUS) & STATUS_LU != 0 {
-                return true;
+            let status = mmio_read(self.base, E1000_STATUS);
+            if status & STATUS_LU != 0 {
+                got_link = true;
+                if (status & STATUS_SPEED_MASK) == STATUS_SPEED_1000 {
+                    // 1G achieved — stop waiting
+                    return true;
+                }
+                // Link at 10/100M: keep polling; 1G master/slave may still be resolving
             }
             Self::udelay(50_000);
         }
-        false
+        got_link
     }
 
     unsafe fn restore_pci_bus_master(&self) {
@@ -510,12 +552,17 @@ impl PchCtx {
         self.setup_copper_mac();
         self.apply_spt_workarounds();
 
+        // Clear MAC-side LPLU/GbE-disable AFTER any PHY reset so the PHY
+        // re-advertises all speeds. Without this, I219 defaults to LPLU (10M only).
+        self.clear_lplu_mac();
+
         let mut linked = false;
         for phy in [2u8, 1u8] {
             if self.restart_autoneg(phy) {
                 self.phy_addr = phy;
                 self.wait_autoneg(phy);
-                linked = self.wait_status_link(3_000_000);
+                // Use 1G-preferring wait: keeps polling even if 10M link appears first
+                linked = self.wait_status_link_prefer_gig(3_000_000);
                 if linked {
                     break;
                 }
