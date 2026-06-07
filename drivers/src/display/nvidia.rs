@@ -647,9 +647,11 @@ impl PciDriver for NvidiaGpuDriverPci {
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, _irq: Option<usize>) -> DeviceResult<Device> {
+        #[cfg(target_arch = "x86_64")]
         use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS};
         use crate::bus::phys_to_virt;
         use crate::bus::PAGE_SIZE;
+        #[cfg(target_arch = "x86_64")]
         const BAR0: u16 = 0x10;
 
         #[cfg(target_arch = "x86_64")]

@@ -33,9 +33,7 @@ pub fn dma_sync_region(
         return;
     }
     if coherent {
-        unsafe {
-            core::arch::x86_64::_mm_mfence();
-        }
+        fence(Ordering::SeqCst);
         return;
     }
     let vaddr = region.vaddr() + byte_off;
@@ -65,11 +63,7 @@ pub fn dma_sync_wb_to_device(vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
-    unsafe {
-        core::arch::x86_64::_mm_mfence();
-        clflush_span(vaddr, len);
-        core::arch::x86_64::_mm_sfence();
-    }
+    clflush_span(vaddr, len);
     fence(Ordering::Release);
 }
 
@@ -78,21 +72,30 @@ pub fn dma_sync_wb_from_device(vaddr: usize, len: usize) {
     if len == 0 {
         return;
     }
-    unsafe {
-        core::arch::x86_64::_mm_mfence();
-        clflush_span(vaddr, len);
-        core::arch::x86_64::_mm_lfence();
-    }
+    clflush_span(vaddr, len);
     fence(Ordering::Acquire);
 }
 
+/// Write back / invalidate the cache lines covering `[vaddr, vaddr+len)`.
+///
+/// On x86_64 this is `mfence; clflush…; sfence`. Other architectures use only a
+/// fence here; their non-coherent DMA support (e.g. aarch64 `DC CVAC/CIVAC`,
+/// riscv `CMO`) is a TODO — for now they rely on coherent (UC) DMA mappings.
 fn clflush_span(vaddr: usize, len: usize) {
-    let mut p = vaddr & !(64 - 1);
-    let end = vaddr.saturating_add(len);
-    while p < end {
-        unsafe {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_mfence();
+        let mut p = vaddr & !(64 - 1);
+        let end = vaddr.saturating_add(len);
+        while p < end {
             core::arch::x86_64::_mm_clflush(p as *const u8);
+            p += 64;
         }
-        p += 64;
+        core::arch::x86_64::_mm_sfence();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (vaddr, len);
+        fence(Ordering::SeqCst);
     }
 }

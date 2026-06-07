@@ -37,7 +37,8 @@ const PAGE_BITS: usize = 12;
 /// | qemu,virt SMP 1 |  16 KiB
 /// | qemu,virt SMP 4 |  32 KiB
 /// | allwinner,nezha | 256 KiB
-static mut MEMORY: [u8; 2 * 1024 * 1024] = [0u8; 2 * 1024 * 1024];
+const MEMORY_SIZE: usize = 2 * 1024 * 1024;
+static mut MEMORY: [u8; MEMORY_SIZE] = [0u8; MEMORY_SIZE];
 
 unsafe impl GlobalAlloc for LockedHeap {
     #[inline]
@@ -62,12 +63,18 @@ unsafe impl GlobalAlloc for LockedHeap {
 /// 初始化分配器，并将一个小的内存块注册到分配器中，用于启动需要的动态内存。
 pub fn init() {
     unsafe {
-        log::info!("MEMORY = {:#?}", MEMORY.as_ptr_range());
+        // Use a raw pointer to the static (no `&`/`&mut` to a `static mut`).
+        let base = core::ptr::addr_of_mut!(MEMORY) as *mut u8;
+        log::info!(
+            "MEMORY = {:#x}..{:#x}",
+            base as usize,
+            base as usize + MEMORY_SIZE
+        );
         let mut heap = HEAP.0.lock();
-        let ptr = NonNull::new(MEMORY.as_mut_ptr()).unwrap();
+        let ptr = NonNull::new(base).unwrap();
         heap.init(core::mem::size_of::<usize>().trailing_zeros() as _, ptr);
-        heap.transfer(ptr, MEMORY.len());
-        TOTAL_MEMORY.fetch_add(MEMORY.len(), Ordering::Relaxed);
+        heap.transfer(ptr, MEMORY_SIZE);
+        TOTAL_MEMORY.fetch_add(MEMORY_SIZE, Ordering::Relaxed);
     }
 }
 
@@ -113,4 +120,14 @@ pub fn stats() -> (usize, usize) {
         USED_MEMORY.load(Ordering::Relaxed),
         TOTAL_MEMORY.load(Ordering::Relaxed),
     )
+}
+
+/// Bytes of heap currently in use (mirrors `memory_x86_64::heap_used`).
+pub fn heap_used() -> usize {
+    USED_MEMORY.load(Ordering::Relaxed)
+}
+
+/// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
+pub fn heap_total() -> usize {
+    TOTAL_MEMORY.load(Ordering::Relaxed)
 }

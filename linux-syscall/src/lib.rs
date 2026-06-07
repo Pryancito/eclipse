@@ -224,6 +224,9 @@ impl Syscall<'_> {
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
+            // `alarm` only exists in the x86_64 syscall table; the generic ABI
+            // (aarch64/riscv64) omits it in favour of setitimer/timer_*.
+            #[cfg(target_arch = "x86_64")]
             Sys::ALARM => self.sys_alarm(a0),
             Sys::GETTIMEOFDAY => self.sys_gettimeofday(a0.into(), a1.into()),
             Sys::SETTIMEOFDAY => self.sys_settimeofday(a0.into(), a1.into()),

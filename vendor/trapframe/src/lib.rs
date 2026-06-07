@@ -1,6 +1,10 @@
 #![no_std]
 #![deny(warnings)]
 #![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
+#![cfg_attr(
+    any(target_arch = "mips", target_arch = "riscv32", target_arch = "riscv64"),
+    feature(linkage)
+)]
 
 extern crate alloc;
 
