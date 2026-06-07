@@ -222,25 +222,18 @@ impl NetScheme for RTLxInterface {
         // On real hardware the NIC fires a hardware interrupt as soon as a
         // frame lands in the DMA ring.  If that interrupt is delivered while
         // this thread already holds SOCKETS, handle_irq() will try to acquire
-        // the same lock and spin forever, dead-locking the single-CPU system.
-        // Keeping interrupts off for the duration of iface.poll() avoids the
-        // race; any pending NIC interrupt fires safely after we release the
-        // locks and re-enable interrupts.
-        let intr_was_on = super::intr_get();
-        if intr_was_on {
-            super::intr_off();
-        }
+        // the same lock and spin forever, dead-locking the system.
+        // The kernel-sync Mutex already keeps interrupts off for the duration
+        // of the locked critical section (push_off/pop_off), so the NIC IRQ
+        // cannot reenter while SOCKETS is held. Manual intr_off/on here would
+        // desync the noff accounting and panic ("pop_off" / "RefCell already
+        // borrowed") under SMP, so we rely on the Mutex alone.
         let sockets = get_sockets();
         let mut sockets = sockets.lock();
         let result = self.iface.lock().poll(&mut sockets, timestamp);
-        // Explicitly release the SOCKETS guard here, before re-enabling
-        // interrupts.  Without this drop the guard would live until the end
-        // of the function (after intr_on), which would re-introduce the
-        // deadlock we are fixing.
+        // Release the SOCKETS guard promptly so interrupts (disabled by the
+        // lock) are re-enabled as soon as the critical section ends.
         drop(sockets);
-        if intr_was_on {
-            super::intr_on();
-        }
         match result {
             Ok(b) => {
                 debug!("nic poll, is changed ?: {}", b);

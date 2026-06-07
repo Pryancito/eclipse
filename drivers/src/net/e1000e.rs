@@ -1405,11 +1405,10 @@ impl E1000eInterface {
             hw.rx_poll_budget = 32;
         }
 
-        // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
-        let intr_was_on = super::intr_get();
-        if intr_was_on {
-            super::intr_off();
-        }
+        // SOCKETS + iface locks already disable interrupts for the critical
+        // section via kernel-sync push_off/pop_off. Manual intr_off/on here
+        // desyncs the noff accounting and panics ("pop_off" / "RefCell already
+        // borrowed") under SMP.
         let sockets = get_sockets();
         {
             let mut sockets = sockets.lock();
@@ -1418,9 +1417,6 @@ impl E1000eInterface {
                 Ok(false) => {}
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
-        }
-        if intr_was_on {
-            super::intr_on();
         }
 
         let mut hw_rx = 0u32;
