@@ -231,6 +231,22 @@ const ULP_CONFIG1_WOL_HOST:          u16 = 0x0040;
 const ULP_CONFIG1_RESET_TO_SMBUS:    u16 = 0x0100;
 const ULP_CONFIG1_DISABLE_SMB_PERST: u16 = 0x1000;
 
+// GIO master disable (quiesce DMA before CTRL_RST)
+const CTRL_GIO_MASTER_DISABLE:  u32 = 0x0000_0004; // CTRL bit 2
+const STATUS_GIO_MASTER_ENABLE: u32 = 0x0008_0000; // STATUS bit 19
+const MASTER_DISABLE_TIMEOUT:   u32 = 800;
+
+// Kumeran (KMRN) register access + K1 config
+const E1000E_KMRNCTRLSTA:      usize = 0x0034 / 4;
+const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
+const KMRNCTRLSTA_OFFSET:       u32 = 0x001F_0000;
+const KMRNCTRLSTA_REN:          u32 = 0x0020_0000;
+const KMRNCTRLSTA_K1_CONFIG:    u32 = 0x7;
+const KMRNCTRLSTA_K1_ENABLE:    u16 = 0x0002;
+const CTRL_EXT_SPD_BYPS: u32 = 0x0000_8000;
+const CTRL_SPD_1000:     u32 = 0x0000_0200;
+const CTRL_SPD_100:      u32 = 0x0000_0100;
+
 // Extended RX write-back layout (RFCTL_EXTEN=1):
 //   +0:  addr u64 (driver writes)
 //   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
@@ -567,6 +583,73 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // GIO master disable — quiesce in-flight DMA before CTRL_RST so the reset
+    // doesn't fire while the device is mastering the bus (port of
+    // e1000e_disable_pcie_master). Returns false if requests stay pending.
+    // -----------------------------------------------------------------------
+
+    unsafe fn disable_pcie_master(&self) -> bool {
+        let ctrl = mmio_read(self.base, E1000E_CTRL) | CTRL_GIO_MASTER_DISABLE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        for _ in 0..MASTER_DISABLE_TIMEOUT {
+            if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
+                return true;
+            }
+            Self::udelay(100);
+        }
+        false
+    }
+
+    // -----------------------------------------------------------------------
+    // Kumeran (KMRN) register access and K1 power-state config
+    // (port of e1000_configure_k1_ich8lan). Caller need not hold the semaphore;
+    // configure_k1 takes it internally.
+    // -----------------------------------------------------------------------
+
+    unsafe fn kmrn_read(&self, offset: u32) -> u16 {
+        let cmd = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | KMRNCTRLSTA_REN;
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(2);
+        mmio_read(self.base, E1000E_KMRNCTRLSTA) as u16
+    }
+
+    unsafe fn kmrn_write(&self, offset: u32, data: u16) {
+        let cmd = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | data as u32;
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(2);
+    }
+
+    unsafe fn configure_k1(&self, enable: bool) {
+        if !self.is_pch() { return; }
+        if !self.acquire_swflag() {
+            crate::klog_warn!("[e1000e] configure_k1: SW/FW semaphore busy\n");
+            return;
+        }
+        let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
+        if enable { kmrn |= KMRNCTRLSTA_K1_ENABLE; } else { kmrn &= !KMRNCTRLSTA_K1_ENABLE; }
+        self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
+        Self::udelay(30);
+
+        let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        let ctrl_reg = mmio_read(self.base, E1000E_CTRL);
+        let mut reg = ctrl_reg & !(CTRL_SPD_1000 | CTRL_SPD_100);
+        reg |= CTRL_FRCSPD | CTRL_FRCDPX;
+        mmio_write(self.base, E1000E_CTRL, reg);
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | CTRL_EXT_SPD_BYPS);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(30);
+        // Restore CTRL / CTRL_EXT to the pre-K1 values (preserves our SLU+ASDE).
+        mmio_write(self.base, E1000E_CTRL, ctrl_reg);
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(30);
+
+        self.release_swflag();
+    }
+
+    // -----------------------------------------------------------------------
     // PHY soft reset — clears all PHY registers to power-on defaults
     // (including any BM WUC filters left by firmware)
     // -----------------------------------------------------------------------
@@ -681,6 +764,11 @@ impl E1000eHw {
         //     No-op on QEMU/discrete parts (no ME firmware, not PCH-SPT).
         self.disable_ulp(true);
 
+        // 4.7 Quiesce in-flight DMA before resetting (GIO master disable).
+        if !self.disable_pcie_master() {
+            crate::klog_warn!("[e1000e] GIO master requests still pending before reset\n");
+        }
+
         // 5. MAC reset (CTRL_RST)
         {
             let ctrl = mmio_read(self.base, E1000E_CTRL);
@@ -748,6 +836,10 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_CTRL, ctrl);
             let _ = mmio_read(self.base, E1000E_CTRL);
         }
+
+        // 12.5 Configure K1 (Kumeran power state) to a known-good enabled state.
+        //      Runs the FRCSPD/SPD_BYPS dance from Linux and restores CTRL.
+        self.configure_k1(true);
 
         // 13. Read MAC address
         self.read_mac_from_hw();
