@@ -1436,9 +1436,6 @@ impl E1000eInterface {
             }
         }
         super::net_flush_deferred_packets();
-        if intr_was_on {
-            super::intr_on();
-        }
         if hw_rx > 0 {
             pulse |= PULSE_NET_RX;
         }

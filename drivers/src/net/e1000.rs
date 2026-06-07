@@ -428,10 +428,9 @@ impl NetScheme for E1000Interface {
 
     fn poll(&self) -> DeviceResult {
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        let intr_was_on = super::intr_get();
-        if intr_was_on {
-            super::intr_off();
-        }
+        // Mutex::lock() uses push_off/pop_off which already disables interrupts
+        // for the duration of the critical section. Manual intr_off/on bypasses
+        // the noff accounting and panics ("RefCell already borrowed") under SMP.
         let sockets = get_sockets();
         let res = {
             let mut sockets = sockets.lock();
@@ -447,9 +446,6 @@ impl NetScheme for E1000Interface {
             }
         };
         super::net_flush_deferred_packets();
-        if intr_was_on {
-            super::intr_on();
-        }
         self.ims_rearm();
         res
     }
