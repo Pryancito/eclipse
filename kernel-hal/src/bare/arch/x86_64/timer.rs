@@ -1,4 +1,5 @@
 use core::time::Duration;
+use spin::Once;
 use x86_64::instructions::port::Port;
 
 pub fn timer_now() -> Duration {
@@ -6,10 +7,14 @@ pub fn timer_now() -> Duration {
     Duration::from_nanos(cycle * 1000 / super::cpu::cpu_frequency() as u64)
 }
 
+static WALL_CLOCK_INIT: Once = Once::new();
+
 pub fn init() {
     let irq = crate::drivers::all_irq().first_unwrap();
     irq.apic_timer_enable();
-    init_wall_clock_from_rtc();
+    // RTC I/O ports (0x70/0x71) are not per-CPU — only the first caller reads
+    // them to avoid concurrent port access corrupting the read under SMP.
+    WALL_CLOCK_INIT.call_once(init_wall_clock_from_rtc);
 }
 
 // ---------------------------------------------------------------------------
