@@ -175,7 +175,11 @@ const TCTL_COLD_LINUX: u32 = 63 << 12;
 const TXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const RXDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 const TXDCTL_FULL_TX_DESC_WB: u32 = 0x0101_0000;
-const TXDCTL_DMA_BURST: u32 = (1 << 22) | (1 << 8) | 1; // wthresh=1, pthresh=1, hthresh=1
+// wthresh=4 (batch write-backs every 4 tx descs), hthresh=1, pthresh=8 (aggressive prefetch)
+const TXDCTL_DMA_BURST: u32 = (4 << 16) | (1 << 8) | 8;
+// RXDCTL descriptor thresholds: pthresh=8, hthresh=8, wthresh=4
+// Applied to all variants (separate from QUEUE_ENABLE which is PCH-SPT only).
+const RXDCTL_THRESH: u32 = (4 << 16) | (8 << 8) | 8;
 
 // RFCTL bits
 const RFCTL_EXTEN:    u32 = 1 << 15;
@@ -341,6 +345,13 @@ pub struct E1000eHw {
     pub stats: NetStats,
 
     rx_poll_budget: u8,
+    /// True when recycle_rx_slot has run since the last flush_rdt_if_dirty().
+    /// Lets us batch all RDT doorbell writes into one MMIO write per poll burst
+    /// instead of one per packet (up to 32× fewer PCIe writes on a full burst).
+    rx_rdt_dirty: bool,
+    /// Cached value of TDH (TX head pointer). Avoids an MMIO read on every
+    /// can_send() call — only re-read from hardware when the ring appears full.
+    tx_head_cache: usize,
     link_up: bool,
     link_watchdog_next_us: u64,
 }
@@ -1062,6 +1073,15 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
         let _ = mmio_read(self.base, E1000E_RDT); // flush
 
+        // RXDCTL: set descriptor prefetch/write-back thresholds for both PCH and
+        // non-PCH variants. For PCH-SPT we preserve the QUEUE_ENABLE bit that
+        // was latched above; for other parts it is always 0.
+        {
+            let qen = mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE;
+            mmio_write(self.base, E1000E_RXDCTL, qen | RXDCTL_THRESH);
+            let _ = mmio_read(self.base, E1000E_RXDCTL);
+        }
+
         // Small settle before enabling RCTL
         Self::udelay(1_000);
 
@@ -1123,7 +1143,7 @@ impl E1000eHw {
         Some(packet)
     }
 
-    unsafe fn recycle_rx_slot(&self, i: usize) {
+    unsafe fn recycle_rx_slot(&mut self, i: usize) {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = ring.add(i);
         // Clear the status byte (legacy WB: status at +12) so hardware can reuse slot.
@@ -1131,20 +1151,43 @@ impl E1000eHw {
         write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-        // Full memory barrier: ensure the DMA engine sees the updated descriptor
-        // before we ring the doorbell.
         fence(Ordering::SeqCst);
-        // Advance RDT to this slot (give it back to hardware)
-        mmio_write(self.base, E1000E_RDT, i as u32);
+        // Do NOT write RDT here — deferred to flush_rdt_if_dirty() so that a
+        // burst of N packets produces exactly ONE doorbell write instead of N.
+        self.rx_rdt_dirty = true;
+    }
+
+    /// Ring the RX doorbell once for the entire burst just processed.
+    /// Must be called after every receive() loop that may have recycled slots.
+    fn flush_rdt_if_dirty(&mut self) {
+        if !self.rx_rdt_dirty { return; }
+        // rx_next_to_clean points to the next un-processed slot, so the last
+        // recycled slot is one before it (wrapping).
+        let last = (self.rx_next_to_clean + NUM_RX - 1) % NUM_RX;
+        unsafe { mmio_write(self.base, E1000E_RDT, last as u32); }
+        self.rx_rdt_dirty = false;
     }
 
     // -----------------------------------------------------------------------
     // TX data path
     // -----------------------------------------------------------------------
 
-    fn tx_slots_free(&self) -> usize {
-        let head = unsafe { mmio_read(self.base, E1000E_TDH) as usize };
+    fn tx_slots_free(&mut self) -> usize {
         let tail = self.tx_tail;
+        let head = self.tx_head_cache;
+        let free = if tail >= head {
+            NUM_TX.saturating_sub(tail - head).saturating_sub(1)
+        } else {
+            head.saturating_sub(tail).saturating_sub(1)
+        };
+        if free > 0 {
+            return free;
+        }
+        // Ring appears full — re-read TDH from hardware to get the real head.
+        // This is the only MMIO read in the TX fast path; with a large ring it
+        // happens rarely (only when we've actually exhausted all descriptors).
+        self.tx_head_cache = unsafe { mmio_read(self.base, E1000E_TDH) as usize };
+        let head = self.tx_head_cache;
         if tail >= head {
             NUM_TX.saturating_sub(tail - head).saturating_sub(1)
         } else {
@@ -1152,7 +1195,7 @@ impl E1000eHw {
         }
     }
 
-    fn can_send(&self) -> bool {
+    fn can_send(&mut self) -> bool {
         self.tx_slots_free() > 0
     }
 
@@ -1366,6 +1409,8 @@ impl E1000eInterface {
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
         }
+        // Flush any RDT doorbell writes deferred by the smoltcp Device receive path.
+        self.driver.hw.lock().flush_rdt_if_dirty();
         super::net_flush_deferred_packets();
 
         let mut hw_rx = 0u32;
@@ -1383,6 +1428,8 @@ impl E1000eInterface {
                     None => break,
                 }
             }
+            // One doorbell write for the whole burst (was one per packet before).
+            hw.flush_rdt_if_dirty();
         }
         super::net_flush_deferred_packets();
         if hw_rx > 0 {
@@ -1549,7 +1596,7 @@ impl NetScheme for E1000eInterface {
         Ok(data.len())
     }
     fn can_recv(&self) -> bool { true }
-    fn can_send(&self) -> bool { self.driver.hw.lock().can_send() }
+    fn can_send(&self) -> bool { self.driver.hw.lock().can_send() }  // lock gives &mut
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
         let mut iface = self.iface.lock();
         match gateway {
@@ -1726,6 +1773,8 @@ pub fn init(
         tx_tail: 0,
         stats: NetStats::default(),
         rx_poll_budget: 32,
+        rx_rdt_dirty: false,
+        tx_head_cache: 0,
         link_up: false,
         link_watchdog_next_us: 0,
     };
