@@ -75,6 +75,9 @@ hal_fn_impl! {
         }
 
         fn send_ipi(cpuid: usize, reason: usize) -> HalResult {
+            // `cpuid` is a dense logical CPU id: it indexes the per-CPU IPI queue
+            // directly, but the LAPIC needs the *hardware* APIC ID, so translate
+            // through the topology map before delivering the interrupt.
             trace!("ipi [{}] => [{}]: {:x}", super::cpu::cpu_id(), cpuid, reason);
             let queue = crate::common::ipi::ipi_queue(cpuid);
             if let Some(idx) = queue.alloc_entry() {
@@ -83,7 +86,8 @@ hal_fn_impl! {
             }
             // X86_INT_LOCAL_APIC_BASE + 3 = 0xf3, our IPI vector
             const IPI_VECTOR: u8 = 0xf3;
-            zcore_drivers::irq::x86::Apic::send_ipi_to(IPI_VECTOR, cpuid as u32);
+            let apic_id = super::smp::logical_to_apic(cpuid);
+            zcore_drivers::irq::x86::Apic::send_ipi_to(IPI_VECTOR, apic_id);
             Ok(())
         }
 

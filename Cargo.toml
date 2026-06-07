@@ -36,3 +36,8 @@ time-core = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
 
 [patch."https://github.com/smoltcp-rs/smoltcp"]
 smoltcp = { path = "./smoltcp" }
+
+# kernel-sync (`lock`) vendorizado en vendor/kernel-sync: añade el mapeo
+# APIC ID -> id lógico denso para que los arrays per-CPU no se desborden bajo SMP.
+[patch."https://github.com/DeathWish5/kernel-sync"]
+lock = { path = "vendor/kernel-sync" }
