@@ -81,6 +81,9 @@ async fn run_user(thread: CurrentThread) {
         if let Some((signal, sigmask)) = thread.inner().lock_linux().handle_signal() {
             ctx = handle_signal(&thread, ctx, signal, sigmask);
         }
+        if thread.state() == ThreadState::Dying {
+            break;
+        }
 
         // run
         trace!("go to user: tid = {} pc = {:x} sp = {:x}",
