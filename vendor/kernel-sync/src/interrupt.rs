@@ -187,7 +187,9 @@ impl<T> SafeRefCell<T> {
 #[allow(clippy::declare_interior_mutable_const)]
 const DEFAULT_CPU: SafeRefCell<Cpu> = SafeRefCell::new(Cpu::new());
 
-const MAX_CORE_NUM: usize = 16;
+// Debe ser >= al MAX_CORE_NUM del kernel (kernel-hal::config), que comparte el
+// mismo espacio de id lógico denso usado para indexar este array.
+const MAX_CORE_NUM: usize = 64;
 
 static CPUS: [SafeRefCell<Cpu>; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 
