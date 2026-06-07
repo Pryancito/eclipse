@@ -183,14 +183,13 @@ pub fn set_packet_callback(callback: fn(&[u8])) {
 /// Dispatches a received packet to the registered callback.
 pub fn net_dispatch_packet(data: &[u8]) {
     // Hot path for AF_PACKET / edhcpc — keep quiet (was warn! per packet).
-    let flag = intr_get();
-    if flag { intr_off(); }
-    
-    if let Some(callback) = PACKET_CALLBACK.lock().as_ref() {
-        callback(data);
+    // Copy the fn pointer and drop the mutex before invoking — `push_packet` locks
+    // more mutexes; holding PACKET_CALLBACK across the call nests push_off/pop_off
+    // badly with manual intr_on/intr_off and panics with "RefCell already borrowed".
+    let callback = *PACKET_CALLBACK.lock();
+    if let Some(cb) = callback {
+        cb(data);
     }
-    
-    if flag { intr_on(); }
 }
 
 // 注意！这个容易出现死锁
