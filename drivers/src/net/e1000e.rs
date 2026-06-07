@@ -191,6 +191,71 @@ const TARC0_SPEED_MODE: u32 = 1 << 21;
 // FWSM
 const FWSM_FW_VALID: u32 = 1 << 14;
 
+// ULP (Ultra Low Power) disable — i219/PCH-SPT only. On real hardware the ME
+// firmware often leaves the PHY in ULP, so STATUS.LU never asserts. QEMU has no
+// ME, which is why this is only needed on real hardware.
+const ICH_FWSM_FW_VALID:          u32 = 0x0000_8000;
+const FWSM_ULP_CFG_DONE:          u32 = 0x0000_0400;
+const H2ME_ULP:                   u32 = 0x0000_0800;
+const H2ME_ENFORCE_SETTINGS:      u32 = 0x0000_1000;
+const FEXTNVM7_DISABLE_SMB_PERST: u32 = 0x0000_0020;
+const CTRL_EXT_FORCE_SMBUS:       u32 = 0x0000_0800; // CTRL_EXT bit 11
+
+// SW/FW semaphore (EXTCNF_CTRL)
+const EXTCNF_CTRL_SWFLAG: u32 = 0x0000_0020; // bit 5
+
+// HV PHY paged-register access: value at page-select reg = page << PHY_PAGE_SHIFT,
+// then access (reg & MAX_PHY_REG_ADDRESS) via MDIC.
+const PHY_PAGE_SHIFT:       u32 = 5;
+const PHY_PAGE_SELECT_REG:  u32 = 0x1F; // IGP01E1000_PHY_PAGE_SELECT
+const MAX_PHY_REG_ADDRESS:  u32 = 0x1F;
+const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0F;
+const HV_PHY_ADDR:          u8  = 1;    // pages >= 768 live at PHY addr 1
+
+// CV_SMB_CTRL = PHY_REG(769, 23)
+const CV_SMB_CTRL_PAGE: u32 = 769;
+const CV_SMB_CTRL_REG:  u32 = 23;
+const CV_SMB_CTRL_FORCE_SMBUS: u16 = 0x0001;
+// HV_PM_CTRL = PHY_REG(770, 17)
+const HV_PM_CTRL_PAGE: u32 = 770;
+const HV_PM_CTRL_REG:  u32 = 17;
+const HV_PM_CTRL_K1_ENABLE: u16 = 0x4000;
+// I218_ULP_CONFIG1 = PHY_REG(779, 16)
+const ULP_CONFIG1_PAGE: u32 = 779;
+const ULP_CONFIG1_REG:  u32 = 16;
+const ULP_CONFIG1_START:             u16 = 0x0001;
+const ULP_CONFIG1_IND:               u16 = 0x0004;
+const ULP_CONFIG1_STICKY_ULP:        u16 = 0x0010;
+const ULP_CONFIG1_INBAND_EXIT:       u16 = 0x0020;
+const ULP_CONFIG1_WOL_HOST:          u16 = 0x0040;
+const ULP_CONFIG1_RESET_TO_SMBUS:    u16 = 0x0100;
+const ULP_CONFIG1_DISABLE_SMB_PERST: u16 = 0x1000;
+
+// GIO master disable (quiesce DMA before CTRL_RST)
+const CTRL_GIO_MASTER_DISABLE:  u32 = 0x0000_0004; // CTRL bit 2
+const STATUS_GIO_MASTER_ENABLE: u32 = 0x0008_0000; // STATUS bit 19
+const MASTER_DISABLE_TIMEOUT:   u32 = 800;
+
+// Kumeran (KMRN) register access + K1 config
+const E1000E_KMRNCTRLSTA:      usize = 0x0034 / 4;
+const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
+const KMRNCTRLSTA_OFFSET:       u32 = 0x001F_0000;
+const KMRNCTRLSTA_REN:          u32 = 0x0020_0000;
+const KMRNCTRLSTA_K1_CONFIG:    u32 = 0x7;
+const KMRNCTRLSTA_K1_ENABLE:    u16 = 0x0002;
+const CTRL_EXT_SPD_BYPS: u32 = 0x0000_8000;
+const CTRL_SPD_1000:     u32 = 0x0000_0200;
+const CTRL_SPD_100:      u32 = 0x0000_0100;
+
+// LANPHYPC toggle — re-powers the PHY after it leaves ULP
+const CTRL_LANPHYPC_OVERRIDE: u32 = 0x0001_0000; // CTRL bit 16
+const CTRL_LANPHYPC_VALUE:    u32 = 0x0002_0000; // CTRL bit 17
+const CTRL_EXT_LPCD:          u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
+
+// MII BMCR (PHY register 0) — IEEE standard autoneg bits
+const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
+const MII_CR_AUTO_NEG_EN:      u16 = 0x1000;
+
 // Extended RX write-back layout (RFCTL_EXTEN=1):
 //   +0:  addr u64 (driver writes)
 //   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
@@ -397,6 +462,256 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // SW/FW semaphore (EXTCNF_CTRL.SWFLAG) — required before touching the PHY
+    // on PCH parts while the ME firmware is active.
+    // -----------------------------------------------------------------------
+
+    unsafe fn acquire_swflag(&self) -> bool {
+        let mut ext;
+        let mut timeout = 100u32;
+        loop {
+            ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+            if ext & EXTCNF_CTRL_SWFLAG == 0 { break; }
+            if timeout == 0 { return false; }
+            Self::udelay(1_000);
+            timeout -= 1;
+        }
+        ext |= EXTCNF_CTRL_SWFLAG;
+        mmio_write(self.base, E1000E_EXTCNF_CTRL, ext);
+        let mut timeout = 1_000u32;
+        loop {
+            ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
+            if ext & EXTCNF_CTRL_SWFLAG != 0 { return true; }
+            if timeout == 0 {
+                ext &= !EXTCNF_CTRL_SWFLAG;
+                mmio_write(self.base, E1000E_EXTCNF_CTRL, ext);
+                return false;
+            }
+            Self::udelay(1_000);
+            timeout -= 1;
+        }
+    }
+
+    unsafe fn release_swflag(&self) {
+        let ext = mmio_read(self.base, E1000E_EXTCNF_CTRL) & !EXTCNF_CTRL_SWFLAG;
+        mmio_write(self.base, E1000E_EXTCNF_CTRL, ext);
+    }
+
+    // -----------------------------------------------------------------------
+    // HV PHY paged register access (used only in the SW disable-ULP path).
+    // Caller must hold the SW/FW semaphore.
+    // -----------------------------------------------------------------------
+
+    unsafe fn phy_read_hv(&self, page: u32, reg: u32) -> Option<u16> {
+        if reg > MAX_PHY_MULTI_PAGE_REG
+            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, (page << PHY_PAGE_SHIFT) as u16)
+        {
+            return None;
+        }
+        self.mdic_read(HV_PHY_ADDR, reg & MAX_PHY_REG_ADDRESS)
+    }
+
+    unsafe fn phy_write_hv(&self, page: u32, reg: u32, val: u16) -> bool {
+        if reg > MAX_PHY_MULTI_PAGE_REG
+            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, (page << PHY_PAGE_SHIFT) as u16)
+        {
+            return false;
+        }
+        self.mdic_write(HV_PHY_ADDR, reg & MAX_PHY_REG_ADDRESS, val)
+    }
+
+    // -----------------------------------------------------------------------
+    // Disable ULP — port of Linux e1000_disable_ulp_lpt_lp().
+    // On real i219 with active ME firmware the FW-handshake path runs (MMIO
+    // only, no PHY access). The SW path is the fallback when no FW is present.
+    // -----------------------------------------------------------------------
+
+    unsafe fn disable_ulp(&self, force: bool) {
+        if !self.is_pch_spt_or_later() { return; }
+
+        let fwsm = mmio_read(self.base, E1000E_FWSM);
+        if fwsm & ICH_FWSM_FW_VALID != 0 {
+            // Firmware handshake path — ask the ME to un-configure ULP.
+            if force {
+                let mut h2me = mmio_read(self.base, E1000E_H2ME);
+                h2me &= !H2ME_ULP;
+                h2me |= H2ME_ENFORCE_SETTINGS;
+                mmio_write(self.base, E1000E_H2ME, h2me);
+            }
+            // Poll up to ~400 ms for ME to clear ULP_CFG_DONE.
+            let mut cleared = false;
+            for _ in 0..40u32 {
+                if mmio_read(self.base, E1000E_FWSM) & FWSM_ULP_CFG_DONE == 0 {
+                    cleared = true;
+                    break;
+                }
+                Self::udelay(10_000);
+            }
+            let mut h2me = mmio_read(self.base, E1000E_H2ME);
+            if force { h2me &= !H2ME_ENFORCE_SETTINGS; } else { h2me &= !H2ME_ULP; }
+            mmio_write(self.base, E1000E_H2ME, h2me);
+            crate::klog_warn!("[e1000e] disable_ulp FW-path cfg_done_cleared={}\n", cleared);
+            return;
+        }
+
+        // Software path — drive the PHY directly (no ME firmware present).
+        if !self.acquire_swflag() {
+            crate::klog_warn!("[e1000e] disable_ulp: SW/FW semaphore busy\n");
+            return;
+        }
+        // Clear FORCE_SMBUS in the PHY.
+        if let Some(mut p) = self.phy_read_hv(CV_SMB_CTRL_PAGE, CV_SMB_CTRL_REG) {
+            p &= !CV_SMB_CTRL_FORCE_SMBUS;
+            let _ = self.phy_write_hv(CV_SMB_CTRL_PAGE, CV_SMB_CTRL_REG, p);
+        }
+        // Unforce SMBus at the MAC.
+        let ext = mmio_read(self.base, E1000E_CTRL_EXT) & !CTRL_EXT_FORCE_SMBUS;
+        mmio_write(self.base, E1000E_CTRL_EXT, ext);
+        // Re-enable K1 (ME disables it when entering ULP).
+        if let Some(mut p) = self.phy_read_hv(HV_PM_CTRL_PAGE, HV_PM_CTRL_REG) {
+            p |= HV_PM_CTRL_K1_ENABLE;
+            let _ = self.phy_write_hv(HV_PM_CTRL_PAGE, HV_PM_CTRL_REG, p);
+        }
+        // Clear the ULP configuration and commit (START).
+        if let Some(mut p) = self.phy_read_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG) {
+            p &= !(ULP_CONFIG1_IND
+                 | ULP_CONFIG1_STICKY_ULP
+                 | ULP_CONFIG1_RESET_TO_SMBUS
+                 | ULP_CONFIG1_WOL_HOST
+                 | ULP_CONFIG1_INBAND_EXIT
+                 | ULP_CONFIG1_DISABLE_SMB_PERST);
+            let _ = self.phy_write_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG, p);
+            p |= ULP_CONFIG1_START;
+            let _ = self.phy_write_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG, p);
+        }
+        // Clear FEXTNVM7.DISABLE_SMB_PERST.
+        let f7 = mmio_read(self.base, E1000E_FEXTNVM7) & !FEXTNVM7_DISABLE_SMB_PERST;
+        mmio_write(self.base, E1000E_FEXTNVM7, f7);
+        self.release_swflag();
+        crate::klog_warn!("[e1000e] disable_ulp SW-path done\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // GIO master disable — quiesce in-flight DMA before CTRL_RST so the reset
+    // doesn't fire while the device is mastering the bus (port of
+    // e1000e_disable_pcie_master). Returns false if requests stay pending.
+    // -----------------------------------------------------------------------
+
+    unsafe fn disable_pcie_master(&self) -> bool {
+        let ctrl = mmio_read(self.base, E1000E_CTRL) | CTRL_GIO_MASTER_DISABLE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        for _ in 0..MASTER_DISABLE_TIMEOUT {
+            if mmio_read(self.base, E1000E_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
+                return true;
+            }
+            Self::udelay(100);
+        }
+        false
+    }
+
+    // -----------------------------------------------------------------------
+    // Kumeran (KMRN) register access and K1 power-state config
+    // (port of e1000_configure_k1_ich8lan). Caller need not hold the semaphore;
+    // configure_k1 takes it internally.
+    // -----------------------------------------------------------------------
+
+    unsafe fn kmrn_read(&self, offset: u32) -> u16 {
+        let cmd = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | KMRNCTRLSTA_REN;
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(2);
+        mmio_read(self.base, E1000E_KMRNCTRLSTA) as u16
+    }
+
+    unsafe fn kmrn_write(&self, offset: u32, data: u16) {
+        let cmd = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | data as u32;
+        mmio_write(self.base, E1000E_KMRNCTRLSTA, cmd);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(2);
+    }
+
+    unsafe fn configure_k1(&self, enable: bool) {
+        if !self.is_pch() { return; }
+        if !self.acquire_swflag() {
+            crate::klog_warn!("[e1000e] configure_k1: SW/FW semaphore busy\n");
+            return;
+        }
+        let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
+        if enable { kmrn |= KMRNCTRLSTA_K1_ENABLE; } else { kmrn &= !KMRNCTRLSTA_K1_ENABLE; }
+        self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
+        Self::udelay(30);
+
+        let ctrl_ext = mmio_read(self.base, E1000E_CTRL_EXT);
+        let ctrl_reg = mmio_read(self.base, E1000E_CTRL);
+        let mut reg = ctrl_reg & !(CTRL_SPD_1000 | CTRL_SPD_100);
+        reg |= CTRL_FRCSPD | CTRL_FRCDPX;
+        mmio_write(self.base, E1000E_CTRL, reg);
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext | CTRL_EXT_SPD_BYPS);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(30);
+        // Restore CTRL / CTRL_EXT to the pre-K1 values (preserves our SLU+ASDE).
+        mmio_write(self.base, E1000E_CTRL, ctrl_reg);
+        mmio_write(self.base, E1000E_CTRL_EXT, ctrl_ext);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(30);
+
+        self.release_swflag();
+    }
+
+    // -----------------------------------------------------------------------
+    // LANPHYPC toggle — force the PHY to re-run its power-up/config sequence
+    // after leaving ULP (port of e1000_toggle_lanphypc_pch_lpt). MMIO only.
+    // -----------------------------------------------------------------------
+
+    unsafe fn toggle_lanphypc(&self) {
+        if !self.is_pch() { return; }
+        // Toggle LANPHYPC value bit with override asserted, then deasserted.
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        ctrl |= CTRL_LANPHYPC_OVERRIDE;
+        ctrl &= !CTRL_LANPHYPC_VALUE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(20);
+        ctrl &= !CTRL_LANPHYPC_OVERRIDE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+
+        if self.is_pch_spt_or_later() {
+            // PCH-LPT+: wait for the PHY config-done indication (LPCD), ~120 ms max.
+            let mut count = 20u16;
+            loop {
+                Self::udelay(6_000);
+                if mmio_read(self.base, E1000E_CTRL_EXT) & CTRL_EXT_LPCD != 0 { break; }
+                if count == 0 { break; }
+                count -= 1;
+            }
+            Self::udelay(30_000);
+        } else {
+            Self::udelay(50_000);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Restart auto-negotiation via the PHY BMCR (register 0). Tries both
+    // possible PHY addresses and protects the access with the SW/FW semaphore.
+    // -----------------------------------------------------------------------
+
+    unsafe fn restart_autoneg(&self) {
+        if !self.acquire_swflag() { return; }
+        for phy_addr in [1u8, 2u8] {
+            if let Some(bmcr) = self.mdic_read(phy_addr, 0) {
+                if bmcr == 0xFFFF { continue; }
+                let v = bmcr | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG;
+                if self.mdic_write(phy_addr, 0, v) {
+                    crate::klog_warn!("[e1000e] restart autoneg on phy_addr={}\n", phy_addr);
+                    break;
+                }
+            }
+        }
+        self.release_swflag();
+    }
+
+    // -----------------------------------------------------------------------
     // PHY soft reset — clears all PHY registers to power-on defaults
     // (including any BM WUC filters left by firmware)
     // -----------------------------------------------------------------------
@@ -506,6 +821,20 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_WUC,  0);
         mmio_write(self.base, E1000E_WUFC, 0);
 
+        // 4.5 Disable ULP (i219 real hardware): bring the PHY out of Ultra Low
+        //     Power mode so auto-negotiation can run and STATUS.LU can assert.
+        //     No-op on QEMU/discrete parts (no ME firmware, not PCH-SPT).
+        self.disable_ulp(true);
+
+        // 4.6 Toggle LANPHYPC so the PHY re-runs its power-up/config sequence
+        //     now that it is out of ULP.
+        self.toggle_lanphypc();
+
+        // 4.7 Quiesce in-flight DMA before resetting (GIO master disable).
+        if !self.disable_pcie_master() {
+            crate::klog_warn!("[e1000e] GIO master requests still pending before reset\n");
+        }
+
         // 5. MAC reset (CTRL_RST)
         {
             let ctrl = mmio_read(self.base, E1000E_CTRL);
@@ -573,6 +902,14 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_CTRL, ctrl);
             let _ = mmio_read(self.base, E1000E_CTRL);
         }
+
+        // 12.5 Configure K1 (Kumeran power state) to a known-good enabled state.
+        //      Runs the FRCSPD/SPD_BYPS dance from Linux and restores CTRL.
+        self.configure_k1(true);
+
+        // 12.7 Kick off auto-negotiation explicitly via the PHY BMCR, in case
+        //      SLU+ASDE alone didn't restart it after the ULP/LANPHYPC dance.
+        self.restart_autoneg();
 
         // 13. Read MAC address
         self.read_mac_from_hw();
@@ -755,15 +1092,17 @@ impl E1000eHw {
         //   +12 u8   status  (DD=bit0, EOP=bit1)
         compiler_fence(Ordering::SeqCst);
         let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
-        if status == 0 {
+        if status & 1 == 0 {
+            // DD (Descriptor Done) not set — hardware hasn't written back yet
             return None;
         }
+
         let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
 
         self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
-        if len == 0 || len > BUF_SIZE {
-            // Bad descriptor; recycle and skip
+        // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
+        if status & 2 == 0 || len == 0 || len > BUF_SIZE {
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             return None;
@@ -792,7 +1131,9 @@ impl E1000eHw {
         write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-        compiler_fence(Ordering::SeqCst);
+        // Full memory barrier: ensure the DMA engine sees the updated descriptor
+        // before we ring the doorbell.
+        fence(Ordering::SeqCst);
         // Advance RDT to this slot (give it back to hardware)
         mmio_write(self.base, E1000E_RDT, i as u32);
     }
@@ -888,13 +1229,13 @@ impl E1000eHw {
             }
         }
 
-        // Log GPRC periodically to help diagnose RX issues
+        // Log GPRC/MPC periodically to diagnose RX issues.
+        // GPRC>0 means the MAC received frames. MPC>0 means frames arrived but
+        // were dropped (no free descriptors or DMA ring not armed).
         let gprc = mmio_read(self.base, E1000E_GPRC);
-        if gprc > 0 {
-            crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} rx_pkt={}\n",
-                link, gprc, self.stats.rx_packets);
-        }
-        link_changed
+        let mpc  = mmio_read(self.base, E1000E_MPC);
+        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
+            link, gprc, mpc, self.stats.rx_packets);
     }
 
     fn merged_stats(&self) -> NetStats {
