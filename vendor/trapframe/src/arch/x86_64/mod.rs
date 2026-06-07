@@ -49,6 +49,12 @@ pub unsafe fn init() {
 pub unsafe fn init_ap() {
     x86_64::instructions::interrupts::disable();
     gdt::init_ap();
+    // Load the shared IDT on this AP.  Each CPU's IDTR is a private register;
+    // without this call the AP's IDTR is at its reset-default (base = 0),
+    // causing any interrupt or exception to immediately triple-fault.
+    idt::init_ap();
+    // Configure syscall MSRs (EFER::SCE, LSTAR, SFMASK) — all per-CPU.
+    syscall::init();
 }
 
 /// User space context
