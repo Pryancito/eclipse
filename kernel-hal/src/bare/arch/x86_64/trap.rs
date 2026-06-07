@@ -20,6 +20,31 @@ fn breakpoint() {
     panic!("\nEXCEPTION: Breakpoint");
 }
 
+#[cfg(target_arch = "x86_64")]
+fn kernel_trap_name(trap_num: usize) -> &'static str {
+    match trap_num {
+        0x0 => "#DE divide error",
+        0x1 => "#DB debug",
+        0x3 => "#BP breakpoint",
+        0x4 => "#OF overflow",
+        0x5 => "#BR bound range",
+        0x6 => "#UD invalid opcode",
+        0x7 => "#NM device not available (FPU/SSE?)",
+        0x8 => "#DF double fault",
+        0x9 => "#MC coprocessor segment overrun",
+        0xa => "#TS invalid TSS",
+        0xb => "#NP segment not present",
+        0xc => "#SS stack fault",
+        0xd => "#GP general protection",
+        0xe => "#PF page fault",
+        0x10 => "#MF x87 FP exception",
+        0x11 => "#AC alignment check",
+        0x13 => "#XF SIMD FP exception",
+        0x100 => "syscall",
+        _ => "unknown",
+    }
+}
+
 pub(super) fn super_timer() {
     crate::timer::timer_tick();
 }
