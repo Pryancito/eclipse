@@ -1236,6 +1236,7 @@ impl E1000eHw {
         let mpc  = mmio_read(self.base, E1000E_MPC);
         crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
             link, gprc, mpc, self.stats.rx_packets);
+        link_changed
     }
 
     fn merged_stats(&self) -> NetStats {
