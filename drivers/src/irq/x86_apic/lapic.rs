@@ -67,6 +67,18 @@ impl LocalApic {
         unsafe { (self.inner.id() >> 24) as u8 }
     }
 
+    pub fn send_init_ipi(&mut self, dest: u32) {
+        unsafe { self.inner.send_init_ipi(dest) }
+    }
+
+    pub fn send_sipi(&mut self, vector: u8, dest: u32) {
+        unsafe { self.inner.send_sipi(vector, dest) }
+    }
+
+    pub fn send_ipi_to(&mut self, vector: u8, dest: u32) {
+        unsafe { self.inner.send_ipi(vector, dest) }
+    }
+
     pub fn eoi(&mut self) {
         unsafe { self.inner.end_of_interrupt() }
     }

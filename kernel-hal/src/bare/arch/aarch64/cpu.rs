@@ -6,7 +6,8 @@ use tock_registers::interfaces::Readable;
 hal_fn_impl! {
     impl mod crate::hal_fn::cpu {
         fn cpu_id() -> u8 {
-            let id = MPIDR_EL1.get() & 0x3;
+            // Use Aff0 (bits 7:0) of MPIDR_EL1 as CPU ID — supports up to 8 CPUs.
+            let id = MPIDR_EL1.get() & 0xFF;
             id as u8
         }
 

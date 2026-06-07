@@ -48,6 +48,24 @@ impl Apic {
         }
     }
 
+    pub fn send_init_ipi(dest: u32) {
+        if LocalApic::is_initialized() {
+            Self::local_apic().send_init_ipi(dest);
+        }
+    }
+
+    pub fn send_sipi(vector: u8, dest: u32) {
+        if LocalApic::is_initialized() {
+            Self::local_apic().send_sipi(vector, dest);
+        }
+    }
+
+    pub fn send_ipi_to(vector: u8, dest: u32) {
+        if LocalApic::is_initialized() {
+            Self::local_apic().send_ipi_to(vector, dest);
+        }
+    }
+
     pub fn init_local_apic_bsp(phys_to_virt: Phys2VirtFn) {
         unsafe { LocalApic::init_bsp(phys_to_virt) }
     }

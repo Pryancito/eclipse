@@ -15,7 +15,7 @@
     ]
   },
   "disable-redzone": true,
-  "code-model": "large",
+  "code-model": "kernel",
   "features": "-mmx,+sse2",
   "panic-strategy": "abort"
 }

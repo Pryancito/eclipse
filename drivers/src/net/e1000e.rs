@@ -1285,6 +1285,7 @@ impl E1000eHw {
             crate::klog_warn!("[e1000e] watchdog: link={} speed={} GPRC={} MPC={}\n",
                 link, Self::speed_from_status(status), gprc, mpc);
         }
+        link_changed
     }
 
     fn merged_stats(&self) -> NetStats {

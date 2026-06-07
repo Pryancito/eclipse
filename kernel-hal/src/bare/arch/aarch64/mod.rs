@@ -38,7 +38,8 @@ pub fn primary_init() {
 }
 
 pub fn secondary_init() {
-    unimplemented!()
+    // Re-enable interrupts on this AP; GIC SGI are always-on.
+    interrupt::intr_on();
 }
 
 pub const fn timer_interrupt_vector() -> usize {

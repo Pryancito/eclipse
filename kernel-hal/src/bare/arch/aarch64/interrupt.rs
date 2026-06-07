@@ -39,11 +39,25 @@ hal_fn_impl! {
 
         fn send_ipi(cpuid: usize, reason: usize) -> HalResult {
             trace!("ipi [{}] => [{}]: {:x}", super::cpu::cpu_id(), cpuid, reason);
-            panic!("send_ipi unsupported for aarch64");
+            // Push reason into per-CPU IPI queue
+            let queue = crate::common::ipi::ipi_queue(cpuid);
+            if let Some(idx) = queue.alloc_entry() {
+                *queue.entry_at(idx) = reason;
+                queue.commit_entry(idx);
+            }
+            // Send GIC SGI #0 to the target CPU (GICv2 GICD_SGIR)
+            // GICD_SGIR: [25:24]=TargetListFilter=0b00 (use list), [23:16]=CPUTargetList, [3:0]=SGIINTID
+            let gic_base = crate::hal_fn::mem::phys_to_virt(crate::KCONFIG.gic_base);
+            const GICD_SGIR: usize = 0x0F00;
+            let val: u32 = ((1u32 << (cpuid & 7)) << 16) | 0; // SGI 0
+            unsafe {
+                core::ptr::write_volatile((gic_base + GICD_SGIR) as *mut u32, val);
+            }
+            Ok(())
         }
 
         fn ipi_reason() -> Vec<usize> {
-            panic!("ipi_reason unsupported for aarch64");
+            crate::common::ipi::ipi_reason()
         }
     }
 }
