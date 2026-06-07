@@ -5,10 +5,13 @@ use raw_cpuid::CpuId;
 hal_fn_impl! {
     impl mod crate::hal_fn::cpu {
         fn cpu_id() -> u8 {
-            CpuId::new()
-                .get_feature_info()
-                .unwrap()
-                .initial_local_apic_id() as u8
+            // Dense logical CPU id (0..NCPU), resolved from the sparse Local APIC
+            // ID through the table populated during SMP bring-up (see `smp.rs`).
+            // The raw APIC ID must NOT be used to index per-CPU arrays: it is not
+            // contiguous and can exceed the CPU count, causing out-of-bounds
+            // panics. `lock` owns the apic->logical map so the kernel and the lock
+            // crate agree on a single id space.
+            lock::current_cpu_id()
         }
 
         fn cpu_frequency() -> u16 {

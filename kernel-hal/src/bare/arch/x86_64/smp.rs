@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping};
 use x86::controlregs::cr3;
@@ -134,6 +134,55 @@ static mut AP_STACKS: [ApStack; MAX_APS] = [const { ApStack([0u8; STACK_SIZE]) }
 /// Number of APs that have signalled they are running.
 pub static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// ─── CPU topology: dense logical id  <->  Local APIC ID ─────────────────────────
+//
+// Local APIC IDs are sparse (cores/threads/sockets leave gaps), so they cannot be
+// used directly to index per-CPU arrays. We assign each online CPU a dense logical
+// id (0..NCPU, BSP = 0). The forward map (apic -> logical) lives in `lock` so the
+// lock crate and the kernel share one id space; here we keep the reverse map
+// (logical -> apic) needed to direct IPIs to the right hardware APIC.
+
+/// logical id -> Local APIC ID. Index 0 is the BSP.
+static LOGICAL_TO_APIC: [AtomicU8; crate::config::MAX_CORE_NUM] = {
+    const ZERO: AtomicU8 = AtomicU8::new(0);
+    [ZERO; crate::config::MAX_CORE_NUM]
+};
+
+/// Number of logical ids assigned so far (next id to hand out).
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Raw initial Local APIC ID of the calling CPU.
+fn raw_apic_id() -> u8 {
+    raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .unwrap()
+        .initial_local_apic_id() as u8
+}
+
+/// Assign the next dense logical id to `apic_id`, wiring up both the forward map
+/// (apic -> logical, owned by `lock`) and the reverse map (logical -> apic).
+/// Returns the assigned logical id. Must run before the target CPU executes any
+/// lock-taking code.
+fn register_cpu(apic_id: u8) -> usize {
+    let logical = CPU_COUNT.fetch_add(1, Ordering::AcqRel);
+    assert!(
+        logical < crate::config::MAX_CORE_NUM,
+        "[smp] more online CPUs than MAX_CORE_NUM={}",
+        crate::config::MAX_CORE_NUM
+    );
+    LOGICAL_TO_APIC[logical].store(apic_id, Ordering::Release);
+    lock::set_logical_cpu_id(apic_id, logical as u8);
+    logical
+}
+
+/// Translate a dense logical CPU id back to its Local APIC ID (for IPI delivery).
+pub(super) fn logical_to_apic(logical: usize) -> u32 {
+    LOGICAL_TO_APIC
+        .get(logical)
+        .map(|a| a.load(Ordering::Acquire) as u32)
+        .unwrap_or(0)
+}
+
 // ─── ACPI handler ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -162,12 +211,16 @@ impl AcpiHandler for AcpiMap {
 // ─── Timing ──────────────────────────────────────────────────────────────────
 
 fn delay_us(us: u64) {
+    // TSC ticks per microsecond ≈ CPU base frequency in MHz. The previous code
+    // hard-coded 1 GHz (1000 ticks/µs); on a real 3–4 GHz CPU that made every
+    // delay 3–4× too short, so the INIT→SIPI gap and the AP-online wait could
+    // expire before the AP was ready, intermittently losing APs. `cpu_frequency()`
+    // reports at least 4000 MHz, so we err on the side of waiting slightly longer
+    // (always safe) rather than too short.
+    let ticks_per_us = crate::cpu::cpu_frequency() as u64;
+    let ticks = us.saturating_mul(ticks_per_us);
     let start = unsafe { core::arch::x86_64::_rdtsc() };
-    // Conservative 1 GHz assumption; actual delay will be shorter on faster CPUs.
-    let ticks = us.saturating_mul(1_000); // 1 GHz = 1000 ticks/µs
-    let end = start.wrapping_add(ticks);
     while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < ticks {
-        let _ = end; // use binding
         core::hint::spin_loop();
     }
 }
@@ -176,6 +229,10 @@ fn delay_us(us: u64) {
 
 /// Start all APs found in the ACPI MADT.  Called once from BSP `primary_init()`.
 pub fn start_application_processors() {
+    // The BSP is always logical CPU 0. Register it before anything else so its
+    // apic->logical mapping is in place even on a uniprocessor (early-return) path.
+    register_cpu(raw_apic_id());
+
     let acpi_rsdp = KCONFIG.acpi_rsdp as usize;
     if acpi_rsdp == 0 {
         crate::klog_warn!("[smp] No ACPI RSDP — skipping AP startup");
@@ -224,10 +281,19 @@ pub fn start_application_processors() {
             break;
         }
 
+        // Assign this AP its dense logical id *before* it starts running, so the
+        // very first lock it takes resolves to the right per-CPU slot.
+        let logical = register_cpu(lapic_id as u8);
+
         let stack_top = unsafe { AP_STACKS[idx].0.as_ptr().add(STACK_SIZE) as usize };
         unsafe { (phys_to_virt(SLOT_STACK) as *mut usize).write_volatile(stack_top) };
 
-        crate::klog_info!("[smp] Starting AP LAPIC {} stack={:#x}", lapic_id, stack_top);
+        crate::klog_info!(
+            "[smp] Starting AP LAPIC {} (logical CPU {}) stack={:#x}",
+            lapic_id,
+            logical,
+            stack_top
+        );
 
         // INIT IPI → wait 10 ms → SIPI × 2
         zcore_drivers::irq::x86::Apic::send_init_ipi(lapic_id);
