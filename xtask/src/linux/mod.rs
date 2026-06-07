@@ -216,7 +216,6 @@ impl LinuxRootfs {
                     for r in $router; do\n\
                       ip -4 route del default 2>/dev/null\n\
                       ip -4 route add default via \"$r\" dev \"$interface\" 2>/dev/null\n\
-                      route add default gw \"$r\" dev \"$interface\" 2>/dev/null\n\
                       break\n\
                     done\n\
                   fi\n\
@@ -227,9 +226,10 @@ impl LinuxRootfs {
                     done\n\
                   fi\n\
                   ;;\n\
-                leasefail)\n\
+                leasefail|nak)\n\
                   ;;\n\
-              esac\n"
+              esac\n\
+              exit 0\n"
         ).unwrap();
         let udhcpc6_script = udhcpc_dir.join("default6.script");
         fs::write(&udhcpc6_script,
@@ -256,9 +256,10 @@ impl LinuxRootfs {
                     done\n\
                   fi\n\
                   ;;\n\
-                leasefail)\n\
+                leasefail|nak)\n\
                   ;;\n\
-              esac\n"
+              esac\n\
+              exit 0\n"
         ).unwrap();
         #[cfg(unix)]
         {
