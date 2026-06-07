@@ -245,6 +245,35 @@ pub fn init_ap() {
             limit: gdt.len() as u16 * 8 - 1,
             base: VirtAddr::new(gdt.as_ptr() as _),
         });
+
+        // The AP entered via the trampoline with CS=0x8 (mini-GDT code segment).
+        // After lgdt() the mini-GDT is no longer the active GDT, so CS=0x8 now
+        // points at BSP's GDT[1] (a UEFI firmware descriptor, typically a 32-bit
+        // code or data segment).  Any interrupt that fires before a far branch
+        // will save CS=0x8 to the stack; on iretq the CPU reloads CS=0x8 from
+        // the new GDT and faults with #GP error_code=0x8.  Fix: far-return to
+        // immediately reload CS with KCODE64.
+        //
+        // BSP's init() appended [tss0, tss1, KCODE64, KDATA64, UCODE32, UDATA32,
+        // UCODE64], so KCODE64 is at GDT index (original_count + 2).
+        // entry_count = BSP_GDT_COUNT = original_count + 7, so
+        // KCODE64 index = entry_count - 5.
+        let kcode64_idx = entry_count as u16 - 5;
+        let kcode64_sel = SegmentSelector::new(kcode64_idx, PrivilegeLevel::Ring0).0 as u64;
+        asm!(
+            // Push new CS, then the return address, then 64-bit far return.
+            // 0x48 0xcb = REX.W RETF — the 64-bit far return (lretq).
+            // This atomically reloads CS with kcode64_sel and continues at "2:".
+            "pushq {sel}",
+            "leaq 2f(%rip), {tmp}",
+            "pushq {tmp}",
+            ".byte 0x48, 0xcb",
+            "2:",
+            sel = in(reg) kcode64_sel,
+            tmp = lateout(reg) _,
+            options(att_syntax),
+        );
+
         load_tss(SegmentSelector::new(
             entry_count as u16,
             PrivilegeLevel::Ring0,

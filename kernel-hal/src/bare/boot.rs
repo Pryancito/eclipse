@@ -29,14 +29,16 @@ hal_fn_impl! {
         }
 
         fn secondary_init() {
-            // info!("Secondary CPU {} init...", crate::cpu::cpu_id());
-            // we can't print anything here, see reason: zcore/main.rs::secondary_main()
             #[cfg(target_arch = "x86_64")]
             {
                 let logical = super::arch::ap_trampoline_logical_id();
+                crate::console::serial_write_fmt_spin(format_args!(
+                    "[smp] AP logical={} trapframe::init_ap\n", logical));
                 lock::with_ap_boot_logical(logical, || unsafe {
                     trapframe::init_ap();
                 });
+                crate::console::serial_write_fmt_spin(format_args!(
+                    "[smp] AP logical={} init_ap done\n", logical));
                 unsafe {
                     trapframe::write_logical_cpu_id(logical);
                 }
@@ -48,7 +50,6 @@ hal_fn_impl! {
             }
             super::percpu::register();
             super::arch::secondary_init();
-            // now can print
         }
     }
 }
