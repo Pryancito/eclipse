@@ -89,9 +89,13 @@ cfg_if::cfg_if! {
     } else if #[cfg(all(target_os = "none", target_arch = "aarch64"))] {
         mod interrupts {
             pub(crate) fn cpu_id() -> u8 {
-                use cortex_a::registers::MPIDR_EL1;
-                use tock_registers::interfaces::Readable;
-                (MPIDR_EL1.get() & 0xf) as u8
+                // Dense logical id, written to TPIDR_EL1 by the kernel per CPU.
+                // MPIDR affinity is sparse across clusters (Aff0 repeats), so it
+                // can't index per-CPU arrays; TPIDR_EL1 holds the logical id
+                // directly (0 on the boot CPU until secondaries are brought up).
+                let id: u64;
+                unsafe { core::arch::asm!("mrs {0}, tpidr_el1", out(reg) id) };
+                id as u8
             }
             pub(crate) fn intr_on() {
                 unsafe {

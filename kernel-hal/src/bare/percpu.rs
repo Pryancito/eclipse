@@ -92,7 +92,7 @@ pub fn current() -> &'static PercpuBlock {
 pub fn register() {
     // Establish this CPU's hardware-id -> logical-id mapping where the arch needs
     // to self-assign (riscv). On x86_64 the mapping is set during SMP enumeration.
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
         crate::cpu::register_logical_id();
     }

@@ -11,6 +11,7 @@ unsafe extern "C" fn _start() -> ! {
         "
         adrp    x19, boot_stack_top
         mov     sp, x19
+        msr     tpidr_el1, xzr   // logical CPU id = 0 for the boot CPU
         b rust_main",
     )
 }
