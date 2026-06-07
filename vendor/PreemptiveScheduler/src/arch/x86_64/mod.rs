@@ -13,10 +13,8 @@ extern "C" {
 }
 
 pub(crate) fn cpu_id() -> u8 {
-    raw_cpuid::CpuId::new()
-        .get_feature_info()
-        .unwrap()
-        .initial_local_apic_id() as u8
+    // Dense logical id (0..NCPU), not the sparse Local APIC id — see `lock`.
+    lock::current_cpu_id()
 }
 
 // pub(crate) fn pg_base_addr() -> usize {

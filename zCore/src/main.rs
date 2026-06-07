@@ -87,10 +87,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
 
 #[cfg(not(feature = "libos"))]
 fn secondary_main() -> ! {
+    // Bring up this AP (trapframe/GS/LAPIC) before STARTED so the BSP can wait
+    // for AP_ONLINE during SMP init. cpu_id() uses the trampoline logical id
+    // until GS is configured (APIC id from CPUID is wrong on many APs).
+    kernel_hal::secondary_init();
     while !STARTED.load(Ordering::SeqCst) {
         core::hint::spin_loop();
     }
-    kernel_hal::secondary_init();
     klog_info!("Eclipse: CPU {} online", kernel_hal::cpu::cpu_id());
     #[cfg(feature = "mock-disk")]
     {

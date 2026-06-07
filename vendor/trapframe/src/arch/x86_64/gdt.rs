@@ -28,6 +28,10 @@ type TSS = super::ioport::TSSWithPortBitmap;
 struct CpuLocalRegion {
     tss: TSS,
     cpu_local: usize,
+    /// Dense logical CPU id (0..NCPU), valid once [`write_logical_cpu_id`] runs.
+    logical_cpu_id: u8,
+    logical_cpu_valid: u8,
+    _pad: [u8; 6],
 }
 
 /// Read the kernel per-CPU pointer stored in this CPU's GS region.
@@ -63,6 +67,57 @@ pub unsafe fn write_cpu_local(val: usize) {
     );
 }
 
+/// Whether this CPU's dense logical id has been stored in the GS region.
+#[inline]
+pub fn logical_cpu_id_valid() -> bool {
+    let valid: u8;
+    unsafe {
+        asm!(
+            "mov {valid}, gs:[{off}]",
+            valid = out(reg_byte) valid,
+            off = const core::mem::offset_of!(CpuLocalRegion, logical_cpu_valid),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    valid != 0
+}
+
+/// Read the dense logical CPU id from the GS region.
+///
+/// # Panics
+///
+/// If [`logical_cpu_id_valid`] is false.
+#[inline]
+pub fn read_logical_cpu_id() -> u8 {
+    let id: u8;
+    unsafe {
+        asm!(
+            "mov {id}, gs:[{off}]",
+            id = out(reg_byte) id,
+            off = const core::mem::offset_of!(CpuLocalRegion, logical_cpu_id),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    id
+}
+
+/// Store the dense logical CPU id for this CPU in the GS region.
+///
+/// # Safety
+///
+/// [`init`] must have run on the current CPU.
+#[inline]
+pub unsafe fn write_logical_cpu_id(id: u8) {
+    asm!(
+        "mov gs:[{id_off}], {id}",
+        "mov byte ptr gs:[{valid_off}], 1",
+        id = in(reg_byte) id,
+        id_off = const core::mem::offset_of!(CpuLocalRegion, logical_cpu_id),
+        valid_off = const core::mem::offset_of!(CpuLocalRegion, logical_cpu_valid),
+        options(nostack, preserves_flags),
+    );
+}
+
 /// Init TSS & GDT.
 pub fn init() {
     // allocate stack for trap from user
@@ -71,6 +126,9 @@ pub fn init() {
     let mut region = Box::new(CpuLocalRegion {
         tss: TSS::new(),
         cpu_local: 0,
+        logical_cpu_id: 0,
+        logical_cpu_valid: 0,
+        _pad: [0; 6],
     });
     let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
@@ -119,6 +177,60 @@ pub fn init() {
             SegmentSelector::new(entry_count as u16 + 2, PrivilegeLevel::Ring0).0,
         );
     }
+}
+
+/// Per-CPU setup for application processors (BSP must call [`init`] once first).
+///
+/// Adds this CPU's TSS to the global GDT and points `GSBASE` at its
+/// [`CpuLocalRegion`]. Does not touch IDT or syscall MSRs (already configured on BSP).
+pub fn init_ap() {
+    let mut region = Box::new(CpuLocalRegion {
+        tss: TSS::new(),
+        cpu_local: 0,
+        logical_cpu_id: 0,
+        logical_cpu_valid: 0,
+        _pad: [0; 6],
+    });
+    let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
+    region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
+    let region: &'static CpuLocalRegion = Box::leak(region);
+    let tss: &'static TSS = &region.tss;
+    let (tss0, tss1) = match Descriptor::tss_segment(tss) {
+        Descriptor::SystemSegment(tss0, tss1) => (tss0, tss1),
+        _ => unreachable!(),
+    };
+    #[cfg(feature = "ioport_bitmap")]
+    let tss0 = (tss0 & !0xFFFF) | (size_of::<TSS>() as u64);
+
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static GDT_EXTEND_LOCK: AtomicBool = AtomicBool::new(false);
+    while GDT_EXTEND_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
+    unsafe {
+        let gdtp = sgdt();
+        let entry_count = (gdtp.limit + 1) as usize / size_of::<u64>();
+        let old_gdt = core::slice::from_raw_parts(gdtp.base.as_ptr::<u64>(), entry_count);
+        let mut gdt = Vec::from(old_gdt);
+        gdt.extend([tss0, tss1].iter());
+        let gdt = Vec::leak(gdt);
+        lgdt(&DescriptorTablePointer {
+            limit: gdt.len() as u16 * 8 - 1,
+            base: VirtAddr::new(gdt.as_ptr() as _),
+        });
+        load_tss(SegmentSelector::new(
+            entry_count as u16,
+            PrivilegeLevel::Ring0,
+        ));
+        #[allow(const_item_mutation)]
+        GsBase::MSR.write(tss as *const _ as u64);
+    }
+
+    GDT_EXTEND_LOCK.store(false, Ordering::Release);
 }
 
 /// Get current GDT register

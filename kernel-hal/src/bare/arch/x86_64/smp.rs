@@ -28,6 +28,7 @@ const TRAMPOLINE_PADDR: usize = 0x6000;
 const SIPI_VECTOR: u8 = 6;
 
 // Data slots in the trampoline page (physical addresses):
+const SLOT_LOGICAL: usize = 0x6FD8; // u8: dense logical CPU id for the starting AP
 const SLOT_STACK: usize = 0x6FE8; // usize: AP initial RSP
 const SLOT_ENTRY: usize = 0x6FF0; // usize: 64-bit entry function
 const SLOT_CR3: usize = 0x6FF8; // u32:   BSP CR3 (PML4 physical)
@@ -160,12 +161,9 @@ static LOGICAL_TO_APIC: [AtomicU8; crate::config::MAX_CORE_NUM] = {
 /// Number of logical ids assigned so far (next id to hand out).
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Raw initial Local APIC ID of the calling CPU.
+/// Raw Local APIC ID of the calling CPU (MMIO when mapped, else CPUID).
 fn raw_apic_id() -> u8 {
-    raw_cpuid::CpuId::new()
-        .get_feature_info()
-        .unwrap()
-        .initial_local_apic_id() as u8
+    lock::hardware_apic_id()
 }
 
 /// Assign the next dense logical id to `apic_id`, wiring up both the forward map
@@ -302,6 +300,9 @@ pub fn start_application_processors() {
             }
         };
         unsafe { (phys_to_virt(SLOT_STACK) as *mut usize).write_volatile(stack_top) };
+        unsafe {
+            (phys_to_virt(SLOT_LOGICAL) as *mut u8).write_volatile(logical as u8);
+        }
 
         crate::klog_info!(
             "[smp] Starting AP LAPIC {} (logical CPU {}) stack={:#x}",
@@ -335,6 +336,11 @@ pub fn start_application_processors() {
 /// Called by each AP from `secondary_init()` to announce it is running.
 pub fn ap_signal_online() {
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);
+}
+
+/// Dense logical CPU id written by the BSP for the AP currently being started.
+pub fn ap_trampoline_logical_id() -> u8 {
+    unsafe { (phys_to_virt(SLOT_LOGICAL) as *const u8).read_volatile() }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

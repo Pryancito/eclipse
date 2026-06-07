@@ -15,7 +15,8 @@ extern "C" {
 }
 
 pub(crate) fn cpu_id() -> u8 {
-    (MPIDR_EL1.get() & 0xf) as u8
+    // Dense logical id in TPIDR_EL1 (not sparse MPIDR Aff0).
+    lock::current_cpu_id()
 }
 
 pub(crate) fn pg_base_addr() -> usize {

@@ -13,9 +13,10 @@ ticket = ["spin/use_ticket_mutex"]
 cfg-if = "1.0.0"
 
 # Bare-metal mode on x86_64
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "10.2.0"
 x86_64 = "0.14.6"
+trapframe = { path = "../trapframe" }
 
 # Bare-metal mode on riscv64
 [target.'cfg(target_arch = "riscv64")'.dependencies]

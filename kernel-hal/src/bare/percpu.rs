@@ -99,6 +99,10 @@ pub fn register() {
     let id = crate::cpu::cpu_id() as usize;
     if let Some(block) = PERCPU.get(id) {
         block.cpu_id.store(id as u32, Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            trapframe::write_logical_cpu_id(id as u8);
+        }
         set_arch_percpu_ptr(block);
     }
 }

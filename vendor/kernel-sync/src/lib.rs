@@ -12,6 +12,8 @@ cfg_if::cfg_if! {
             target_arch = "riscv64"
         ))]
         pub use interrupt::set_logical_cpu_id;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        pub use interrupt::{hardware_apic_id, set_phys_virt_offset, with_ap_boot_logical};
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
@@ -28,6 +30,8 @@ cfg_if::cfg_if! {
             target_arch = "riscv64"
         ))]
         pub use interrupt::set_logical_cpu_id;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        pub use interrupt::{hardware_apic_id, set_phys_virt_offset, with_ap_boot_logical};
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};

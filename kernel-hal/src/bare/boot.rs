@@ -13,6 +13,7 @@ hal_fn_impl! {
         }
 
         fn primary_init_early(cfg: KernelConfig, handler: &'static impl KernelHandler) {
+            lock::set_phys_virt_offset(cfg.phys_to_virt_offset as u64);
             KCONFIG.init_once_by(cfg);
             KHANDLER.init_once_by(handler);
             crate::klog_info!("Eclipse: primary CPU {} init early", crate::cpu::cpu_id());
@@ -30,7 +31,21 @@ hal_fn_impl! {
         fn secondary_init() {
             // info!("Secondary CPU {} init...", crate::cpu::cpu_id());
             // we can't print anything here, see reason: zcore/main.rs::secondary_main()
-            unsafe { trapframe::init() };
+            #[cfg(target_arch = "x86_64")]
+            {
+                let logical = super::arch::ap_trampoline_logical_id();
+                lock::with_ap_boot_logical(logical, || unsafe {
+                    trapframe::init_ap();
+                });
+                unsafe {
+                    trapframe::write_logical_cpu_id(logical);
+                }
+                lock::set_logical_cpu_id(lock::hardware_apic_id(), logical);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe {
+                trapframe::init();
+            }
             super::percpu::register();
             super::arch::secondary_init();
             // now can print

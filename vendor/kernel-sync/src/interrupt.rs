@@ -1,4 +1,4 @@
-use core::cell::{RefCell, RefMut};
+use core::cell::UnsafeCell;
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", any(target_arch = "riscv32", target_arch = "riscv64")))] {
@@ -44,7 +44,7 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))] {
         mod interrupts {
-            use core::sync::atomic::{AtomicU8, Ordering};
+            use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
             use x86_64::instructions::interrupts;
 
             /// Maps a hardware Local APIC ID (sparse, 0..=255) to a dense logical
@@ -59,12 +59,41 @@ cfg_if::cfg_if! {
                 [ZERO; 256]
             };
 
-            /// Raw initial Local APIC ID of the current CPU.
-            fn raw_apic_id() -> u8 {
-                raw_cpuid::CpuId::new()
-                    .get_feature_info()
-                    .unwrap()
-                    .initial_local_apic_id() as u8
+            /// `phys + offset` virtual mapping for the LAPIC MMIO page (set by HAL at boot).
+            static PHYS_VIRT_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+            /// Register the kernel's phys→virt linear map offset (from UEFI/boot config).
+            pub fn set_phys_virt_offset(offset: u64) {
+                PHYS_VIRT_OFFSET.store(offset, Ordering::Release);
+            }
+
+            /// Read Local APIC ID from the MMIO register (reliable on APs).
+            fn read_lapic_id_mmio() -> Option<u8> {
+                use x86_64::registers::model_specific::Msr;
+                const IA32_APIC_BASE: u32 = 0x1B;
+                const IA32_APIC_BASE_ENABLE: u64 = 1 << 11;
+                let offset = PHYS_VIRT_OFFSET.load(Ordering::Acquire);
+                if offset == 0 {
+                    return None;
+                }
+                let base = unsafe { Msr::new(IA32_APIC_BASE).read() };
+                if base & IA32_APIC_BASE_ENABLE == 0 {
+                    return None;
+                }
+                let page_phys = (base & 0xFFFF_F000) as u64;
+                let id_ptr = (page_phys.wrapping_add(offset) + 0x20) as *const u32;
+                let id_reg = unsafe { core::ptr::read_volatile(id_ptr) };
+                Some((id_reg >> 24) as u8)
+            }
+
+            /// Raw Local APIC ID of the current CPU (hardware id, may be sparse).
+            pub(super) fn raw_apic_id() -> u8 {
+                read_lapic_id_mmio().unwrap_or_else(|| {
+                    raw_cpuid::CpuId::new()
+                        .get_feature_info()
+                        .unwrap()
+                        .initial_local_apic_id() as u8
+                })
             }
 
             /// Register the logical id assigned to a given Local APIC ID. Called once
@@ -73,7 +102,27 @@ cfg_if::cfg_if! {
                 APIC_TO_LOGICAL[apic_id as usize].store(logical_id, Ordering::Release);
             }
 
+            /// Dense logical id override while an AP runs [`init_ap`] (GS not ready yet).
+            static AP_BOOT_LOGICAL: AtomicU8 = AtomicU8::new(u8::MAX);
+
+            pub fn with_ap_boot_logical<R>(logical: u8, f: impl FnOnce() -> R) -> R {
+                AP_BOOT_LOGICAL.store(logical, Ordering::Release);
+                let ret = f();
+                AP_BOOT_LOGICAL.store(u8::MAX, Ordering::Release);
+                ret
+            }
+
             pub(crate) fn cpu_id() -> u8 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if trapframe::logical_cpu_id_valid() {
+                        return trapframe::read_logical_cpu_id();
+                    }
+                }
+                let boot = AP_BOOT_LOGICAL.load(Ordering::Acquire);
+                if boot != u8::MAX {
+                    return boot;
+                }
                 APIC_TO_LOGICAL[raw_apic_id() as usize].load(Ordering::Acquire)
             }
             pub(crate) fn intr_on() {
@@ -138,6 +187,15 @@ pub fn current_cpu_id() -> u8 {
     cpu_id()
 }
 
+/// Raw hardware Local APIC ID (x86). Sparse; use [`current_cpu_id`] to index arrays.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub fn hardware_apic_id() -> u8 {
+    interrupts::raw_apic_id()
+}
+
 /// Register the dense logical id assigned to a hardware CPU id (Local APIC ID on
 /// x86, hart id on riscv).
 ///
@@ -156,6 +214,24 @@ pub fn set_logical_cpu_id(hw_id: u8, logical_id: u8) {
     interrupts::set_logical_cpu_id(hw_id, logical_id)
 }
 
+/// Register phys→virt linear map offset for LAPIC MMIO reads on x86.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub fn set_phys_virt_offset(offset: u64) {
+    interrupts::set_phys_virt_offset(offset)
+}
+
+/// Run `f` while [`cpu_id`] returns `logical` (AP [`init_ap`] before GS is ready).
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub fn with_ap_boot_logical<R>(logical: u8, f: impl FnOnce() -> R) -> R {
+    interrupts::with_ap_boot_logical(logical, f)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(align(64))]
 pub struct Cpu {
@@ -172,29 +248,38 @@ impl Cpu {
     }
 }
 
-pub struct SafeRefCell<T>(RefCell<T>);
+pub struct CpuStorage(UnsafeCell<Cpu>);
 
-// #Safety: Only the corresponding cpu will access it.
-unsafe impl<Cpu> Sync for SafeRefCell<Cpu> {}
+// SAFETY: each CPU only ever accesses CPUS[cpu_id()]; wrong ids are fixed at AP boot.
+unsafe impl Sync for CpuStorage {}
 
-impl<T> SafeRefCell<T> {
-    const fn new(t: T) -> Self {
-        Self(RefCell::new(t))
+impl CpuStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(Cpu::new()))
+    }
+
+    #[inline]
+    fn get(&self) -> &mut Cpu {
+        // SAFETY: caller ensures this slot is owned by the current CPU.
+        unsafe { &mut *self.0.get() }
     }
 }
 
 // Avoid hard code
 #[allow(clippy::declare_interior_mutable_const)]
-const DEFAULT_CPU: SafeRefCell<Cpu> = SafeRefCell::new(Cpu::new());
+const DEFAULT_CPU: CpuStorage = CpuStorage::new();
 
 // Debe ser >= al MAX_CORE_NUM del kernel (kernel-hal::config), que comparte el
 // mismo espacio de id lógico denso usado para indexar este array.
 const MAX_CORE_NUM: usize = 64;
 
-static CPUS: [SafeRefCell<Cpu>; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
+static CPUS: [CpuStorage; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 
-pub fn mycpu() -> RefMut<'static, Cpu> {
-    CPUS[cpu_id() as usize].0.borrow_mut()
+#[inline]
+pub fn mycpu() -> &'static mut Cpu {
+    let id = cpu_id() as usize;
+    assert!(id < MAX_CORE_NUM, "cpu_id {} >= MAX_CORE_NUM", id);
+    CPUS[id].get()
 }
 
 // push_off/pop_off are like intr_off()/intr_on() except that they are matched:

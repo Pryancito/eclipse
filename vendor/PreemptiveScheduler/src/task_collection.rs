@@ -71,12 +71,8 @@ impl Task {
         //     return Poll::Ready(());
         // }
         let mut f = self.future.lock();
-        if self.inner.lock().intr_enable {
-            crate::arch::intr_on();
-        }
         let ret = f.as_mut().poll(cx);
         self.inner.lock().intr_enable = crate::arch::intr_get();
-        crate::arch::intr_off();
         ret
     }
 

@@ -15,7 +15,7 @@ mod trap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fncall::syscall_fn_entry;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
-pub use gdt::{read_cpu_local, write_cpu_local};
+pub use gdt::{logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id, write_cpu_local, write_logical_cpu_id};
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use trap::TrapFrame;
 
@@ -43,6 +43,12 @@ pub unsafe fn init() {
     gdt::init();
     idt::init();
     syscall::init();
+}
+
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub unsafe fn init_ap() {
+    x86_64::instructions::interrupts::disable();
+    gdt::init_ap();
 }
 
 /// User space context

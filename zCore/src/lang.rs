@@ -25,8 +25,23 @@ fn panic(info: &PanicInfo) -> ! {
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
 
-    println!("\n\npanic cpu={}\n{}", kernel_hal::cpu::cpu_id(), info);
-    error!("\n\n{info}");
+    if let Some(loc) = info.location() {
+        kernel_hal::console::serial_write_fmt(format_args!(
+            "\n\npanic cpu={} at {}:{}:{}\n",
+            kernel_hal::cpu::cpu_id(),
+            loc.file(),
+            loc.line(),
+            loc.column(),
+        ));
+    } else {
+        kernel_hal::console::serial_write_fmt(format_args!(
+            "\n\npanic cpu={}\n",
+            kernel_hal::cpu::cpu_id(),
+        ));
+    }
+    if let Some(msg) = info.message().as_str() {
+        kernel_hal::console::serial_write_fmt(format_args!("{}\n", msg));
+    }
 
     if cfg!(feature = "baremetal-test") {
         kernel_hal::cpu::reset();

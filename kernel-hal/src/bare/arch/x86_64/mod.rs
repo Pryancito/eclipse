@@ -75,3 +75,8 @@ pub fn secondary_init() {
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
     smp::ap_signal_online();
 }
+
+/// Dense logical CPU id for the AP currently starting (trampoline slot).
+pub fn ap_trampoline_logical_id() -> u8 {
+    smp::ap_trampoline_logical_id()
+}

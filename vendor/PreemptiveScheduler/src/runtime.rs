@@ -14,6 +14,9 @@ use core::{future::Future, pin::Pin};
 use lazy_static::*;
 use spin::{Mutex, MutexGuard};
 
+/// Must match `kernel_hal::config::MAX_CORE_NUM` and `lock`'s per-CPU array size.
+const MAX_CORE_NUM: usize = 64;
+
 pub struct ExecutorRuntime {
     // runtime only run on this cpu
     cpu_id: u8,
@@ -113,24 +116,8 @@ unsafe impl Sync for ExecutorRuntime {}
 
 // TODO: more elegent?
 lazy_static! {
-    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime>; 16] = [
-        Mutex::new(ExecutorRuntime::new(0)),
-        Mutex::new(ExecutorRuntime::new(1)),
-        Mutex::new(ExecutorRuntime::new(2)),
-        Mutex::new(ExecutorRuntime::new(3)),
-        Mutex::new(ExecutorRuntime::new(4)),
-        Mutex::new(ExecutorRuntime::new(5)),
-        Mutex::new(ExecutorRuntime::new(6)),
-        Mutex::new(ExecutorRuntime::new(7)),
-        Mutex::new(ExecutorRuntime::new(8)),
-        Mutex::new(ExecutorRuntime::new(9)),
-        Mutex::new(ExecutorRuntime::new(10)),
-        Mutex::new(ExecutorRuntime::new(11)),
-        Mutex::new(ExecutorRuntime::new(12)),
-        Mutex::new(ExecutorRuntime::new(13)),
-        Mutex::new(ExecutorRuntime::new(14)),
-        Mutex::new(ExecutorRuntime::new(15))
-    ];
+    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime>; MAX_CORE_NUM] =
+        core::array::from_fn(|i| Mutex::new(ExecutorRuntime::new(i as u8)));
 }
 
 // obtain a task from other cpu.
@@ -218,6 +205,12 @@ pub fn spawn_task(
     debug!("try to spawn {:?} {:?}", priority, cpu_id);
     let priority = priority.unwrap_or(DEFAULT_PRIORITY);
     let runtime = if let Some(cpu_id) = cpu_id {
+        assert!(
+            cpu_id < MAX_CORE_NUM,
+            "spawn_task: cpu_id {} out of range (MAX_CORE_NUM={})",
+            cpu_id,
+            MAX_CORE_NUM
+        );
         &GLOBAL_RUNTIME[cpu_id]
     } else {
         GLOBAL_RUNTIME
@@ -273,7 +266,14 @@ pub(crate) fn switch(from_ctx: usize, to_ctx: usize) {
 
 /// return runtime `MutexGuard` of current cpu.
 pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
-    GLOBAL_RUNTIME[crate::arch::cpu_id() as usize].lock()
+    let id = crate::arch::cpu_id() as usize;
+    assert!(
+        id < MAX_CORE_NUM,
+        "cpu_id {} out of range (MAX_CORE_NUM={})",
+        id,
+        MAX_CORE_NUM
+    );
+    GLOBAL_RUNTIME[id].lock()
 }
 
 #[allow(dead_code)]

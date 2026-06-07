@@ -37,17 +37,10 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),
         TrapReason::Interrupt(vector) => {
             crate::interrupt::handle_irq(vector);
-            if vector == X86_INT_APIC_TIMER {
-                // Only preempt if the interrupted code had IF=1 (not inside a
-                // kernel-sync critical section). When noff>0 the scheduler
-                // disables IF, so IF=0 in the saved RFLAGS means we hit a lock
-                // holder — context-switching away would leave noff>0 on the CPU
-                // and the new executor would inherit it, triggering pop_off panics.
-                const RFLAGS_IF: usize = 1 << 9;
-                if tf.rflags & RFLAGS_IF != 0 {
-                    executor::handle_timeout();
-                }
-            }
+            // Timer preemption is handled in the thread trap path (e.g.
+            // `loader/src/linux.rs` calls `yield_now` on TIMER). Never call
+            // `executor::handle_timeout()` here: it context-switches from IRQ
+            // context and abandons the trap frame → triple fault (QEMU/VBox).
         }
         other => panic!("Unhandled trap {:x?} {:#x?}", other, tf),
     }

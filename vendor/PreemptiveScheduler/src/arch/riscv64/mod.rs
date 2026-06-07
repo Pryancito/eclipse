@@ -13,11 +13,8 @@ extern "C" {
 }
 
 pub(crate) fn cpu_id() -> u8 {
-    let mut cpu_id;
-    unsafe {
-        asm!("mv {0}, tp", out(reg) cpu_id, options(nomem, nostack));
-    }
-    cpu_id
+    // Dense logical id via hart-id table populated during SMP bring-up.
+    lock::current_cpu_id()
 }
 
 pub(crate) fn pg_base_addr() -> usize {
