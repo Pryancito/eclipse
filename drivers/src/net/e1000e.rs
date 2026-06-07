@@ -247,6 +247,15 @@ const CTRL_EXT_SPD_BYPS: u32 = 0x0000_8000;
 const CTRL_SPD_1000:     u32 = 0x0000_0200;
 const CTRL_SPD_100:      u32 = 0x0000_0100;
 
+// LANPHYPC toggle — re-powers the PHY after it leaves ULP
+const CTRL_LANPHYPC_OVERRIDE: u32 = 0x0001_0000; // CTRL bit 16
+const CTRL_LANPHYPC_VALUE:    u32 = 0x0002_0000; // CTRL bit 17
+const CTRL_EXT_LPCD:          u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
+
+// MII BMCR (PHY register 0) — IEEE standard autoneg bits
+const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
+const MII_CR_AUTO_NEG_EN:      u16 = 0x1000;
+
 // Extended RX write-back layout (RFCTL_EXTEN=1):
 //   +0:  addr u64 (driver writes)
 //   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
@@ -650,6 +659,59 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // LANPHYPC toggle — force the PHY to re-run its power-up/config sequence
+    // after leaving ULP (port of e1000_toggle_lanphypc_pch_lpt). MMIO only.
+    // -----------------------------------------------------------------------
+
+    unsafe fn toggle_lanphypc(&self) {
+        if !self.is_pch() { return; }
+        // Toggle LANPHYPC value bit with override asserted, then deasserted.
+        let mut ctrl = mmio_read(self.base, E1000E_CTRL);
+        ctrl |= CTRL_LANPHYPC_OVERRIDE;
+        ctrl &= !CTRL_LANPHYPC_VALUE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        Self::udelay(20);
+        ctrl &= !CTRL_LANPHYPC_OVERRIDE;
+        mmio_write(self.base, E1000E_CTRL, ctrl);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+
+        if self.is_pch_spt_or_later() {
+            // PCH-LPT+: wait for the PHY config-done indication (LPCD), ~120 ms max.
+            let mut count = 20u16;
+            loop {
+                Self::udelay(6_000);
+                if mmio_read(self.base, E1000E_CTRL_EXT) & CTRL_EXT_LPCD != 0 { break; }
+                if count == 0 { break; }
+                count -= 1;
+            }
+            Self::udelay(30_000);
+        } else {
+            Self::udelay(50_000);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Restart auto-negotiation via the PHY BMCR (register 0). Tries both
+    // possible PHY addresses and protects the access with the SW/FW semaphore.
+    // -----------------------------------------------------------------------
+
+    unsafe fn restart_autoneg(&self) {
+        if !self.acquire_swflag() { return; }
+        for phy_addr in [1u8, 2u8] {
+            if let Some(bmcr) = self.mdic_read(phy_addr, 0) {
+                if bmcr == 0xFFFF { continue; }
+                let v = bmcr | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG;
+                if self.mdic_write(phy_addr, 0, v) {
+                    crate::klog_warn!("[e1000e] restart autoneg on phy_addr={}\n", phy_addr);
+                    break;
+                }
+            }
+        }
+        self.release_swflag();
+    }
+
+    // -----------------------------------------------------------------------
     // PHY soft reset — clears all PHY registers to power-on defaults
     // (including any BM WUC filters left by firmware)
     // -----------------------------------------------------------------------
@@ -764,6 +826,10 @@ impl E1000eHw {
         //     No-op on QEMU/discrete parts (no ME firmware, not PCH-SPT).
         self.disable_ulp(true);
 
+        // 4.6 Toggle LANPHYPC so the PHY re-runs its power-up/config sequence
+        //     now that it is out of ULP.
+        self.toggle_lanphypc();
+
         // 4.7 Quiesce in-flight DMA before resetting (GIO master disable).
         if !self.disable_pcie_master() {
             crate::klog_warn!("[e1000e] GIO master requests still pending before reset\n");
@@ -840,6 +906,10 @@ impl E1000eHw {
         // 12.5 Configure K1 (Kumeran power state) to a known-good enabled state.
         //      Runs the FRCSPD/SPD_BYPS dance from Linux and restores CTRL.
         self.configure_k1(true);
+
+        // 12.7 Kick off auto-negotiation explicitly via the PHY BMCR, in case
+        //      SLU+ASDE alone didn't restart it after the ULP/LANPHYPC dance.
+        self.restart_autoneg();
 
         // 13. Read MAC address
         self.read_mac_from_hw();
