@@ -4,12 +4,24 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::instructions::tables::{lgdt, load_tss};
 use x86_64::registers::model_specific::{GsBase, Star};
 use x86_64::structures::gdt::{Descriptor, SegmentSelector};
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PrivilegeLevel, VirtAddr};
+
+/// Base address and entry count of the GDT created by the BSP's [`init`].
+/// APs read this instead of their own `sgdt()` (which points at the trampoline's
+/// 3-entry mini-GDT and is therefore missing all user-space segments).
+static BSP_GDT_BASE: AtomicU64 = AtomicU64::new(0);
+static BSP_GDT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The `STAR` MSR value written by the BSP.  `STAR` is a per-CPU MSR, so each
+/// AP must write it independently with the same value.
+/// Packed as `(u_cs_raw << 16) | k_cs_raw` into a single AtomicU32.
+static BSP_STAR: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(not(feature = "ioport_bitmap"))]
 type TSS = x86_64::structures::tss::TaskStateSegment;
@@ -172,17 +184,26 @@ pub fn init() {
         #[allow(const_item_mutation)]
         GsBase::MSR.write(tss as *const _ as u64);
 
-        Star::write_raw(
-            SegmentSelector::new(entry_count as u16 + 4, PrivilegeLevel::Ring3).0,
-            SegmentSelector::new(entry_count as u16 + 2, PrivilegeLevel::Ring0).0,
-        );
+        let star_k_cs = SegmentSelector::new(entry_count as u16 + 2, PrivilegeLevel::Ring0).0;
+        let star_u_cs = SegmentSelector::new(entry_count as u16 + 4, PrivilegeLevel::Ring3).0;
+        Star::write_raw(star_u_cs, star_k_cs);
+
+        // Persist the BSP GDT info for APs.  APs cannot use their own sgdt()
+        // after the trampoline because it points at a 3-entry mini-GDT that
+        // lacks KCODE64/UCODE64/UDATA32 etc.  They must extend THIS GDT.
+        BSP_GDT_BASE.store(gdt.as_ptr() as u64, Ordering::Release);
+        BSP_GDT_COUNT.store(gdt.len(), Ordering::Release);
+        // Pack STAR fields so APs can replicate the write.
+        BSP_STAR.store(((star_u_cs as u32) << 16) | star_k_cs as u32, Ordering::Release);
     }
 }
 
-/// Per-CPU setup for application processors (BSP must call [`init`] once first).
+/// Per-CPU GDT/TSS/GSBASE setup for application processors.
 ///
-/// Adds this CPU's TSS to the global GDT and points `GSBASE` at its
-/// [`CpuLocalRegion`]. Does not touch IDT or syscall MSRs (already configured on BSP).
+/// The BSP must call [`init`] first.  Extends the BSP's GDT with this AP's
+/// TSS entry, loads it, and points `GSBASE` at the AP's [`CpuLocalRegion`].
+/// Also replicates the `STAR` MSR (segment selectors for syscall/sysret),
+/// which is a per-CPU register that the BSP set during [`init`].
 pub fn init_ap() {
     let mut region = Box::new(CpuLocalRegion {
         tss: TSS::new(),
@@ -202,7 +223,6 @@ pub fn init_ap() {
     #[cfg(feature = "ioport_bitmap")]
     let tss0 = (tss0 & !0xFFFF) | (size_of::<TSS>() as u64);
 
-    use core::sync::atomic::{AtomicBool, Ordering};
     static GDT_EXTEND_LOCK: AtomicBool = AtomicBool::new(false);
     while GDT_EXTEND_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -212,9 +232,12 @@ pub fn init_ap() {
     }
 
     unsafe {
-        let gdtp = sgdt();
-        let entry_count = (gdtp.limit + 1) as usize / size_of::<u64>();
-        let old_gdt = core::slice::from_raw_parts(gdtp.base.as_ptr::<u64>(), entry_count);
+        // Read the BSP's full GDT (not sgdt() which would give the AP's own
+        // 3-entry trampoline GDT, missing all user-space segment descriptors).
+        let base = BSP_GDT_BASE.load(Ordering::Acquire);
+        let entry_count = BSP_GDT_COUNT.load(Ordering::Acquire);
+        assert!(base != 0, "BSP GDT not initialized before AP init_ap");
+        let old_gdt = core::slice::from_raw_parts(base as *const u64, entry_count);
         let mut gdt = Vec::from(old_gdt);
         gdt.extend([tss0, tss1].iter());
         let gdt = Vec::leak(gdt);
@@ -228,6 +251,12 @@ pub fn init_ap() {
         ));
         #[allow(const_item_mutation)]
         GsBase::MSR.write(tss as *const _ as u64);
+
+        // Replicate the STAR MSR (per-CPU) that the BSP set during init().
+        let packed = BSP_STAR.load(Ordering::Acquire);
+        let star_k_cs = (packed & 0xFFFF) as u16;
+        let star_u_cs = (packed >> 16) as u16;
+        Star::write_raw(star_u_cs, star_k_cs);
     }
 
     GDT_EXTEND_LOCK.store(false, Ordering::Release);
