@@ -333,6 +333,7 @@ const CTRL_EXT_PHYPDEN: u32 = 1 << 20; // PHY Power Down Enable
 const CTRL_EXT_DPG_EN: u32 = 1 << 3; // Dynamic Power Gating Enable
 const CTRL_EXT_SPD_BYPS: u32 = 1 << 15; // Speed-select bypass (Linux k1/speed pulse)
 const IGP_PHY_PAGE_SELECT: u32 = 31;
+const BM_PHY_PAGE_SELECT: u32 = 22; // BM/HV PHY (I217/I219) uses reg 22, not 31
 const IGP_PAGE_SHIFT: u32 = 5;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0xF;
 const PHY_REG_770_19: u32 = (770 << 5) | 19; // IGP3_KMRN_DIAG — link stall fix
@@ -2903,6 +2904,27 @@ impl E1000eHw {
         self.mdic_write(phy_addr, offset & 0x1F, val)
     }
 
+    /// BM/HV PHY paged read (I217/I219) — page select via reg 22, not reg 31.
+    unsafe fn mdic_read_bm_phy(&self, phy_addr: u8, offset: u32) -> Option<u16> {
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            let page = (offset >> IGP_PAGE_SHIFT) as u16;
+            if !self.mdic_write(phy_addr, BM_PHY_PAGE_SELECT, page) {
+                return None;
+            }
+        }
+        self.mdic_read(phy_addr, offset & 0x1F)
+    }
+
+    unsafe fn mdic_write_bm_phy(&self, phy_addr: u8, offset: u32, val: u16) -> bool {
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            let page = (offset >> IGP_PAGE_SHIFT) as u16;
+            if !self.mdic_write(phy_addr, BM_PHY_PAGE_SELECT, page) {
+                return false;
+            }
+        }
+        self.mdic_write(phy_addr, offset & 0x1F, val)
+    }
+
     unsafe fn mdic_write(&self, phy_addr: u8, reg: u32, val: u16) -> bool {
         let is_pch = self.is_pch_lpt_or_later();
         if is_pch {
@@ -3331,13 +3353,35 @@ impl E1000eHw {
     }
 
     /// Linux `e1000_wait_autoneg` — poll BMSR until ANEG complete or timeout.
+    /// Extra guard: if we advertise 1G and LP also supports 1G, wait past the first
+    /// ANEG_COMPLETE (which can fire at 10M before 1G master/slave resolution finishes).
     unsafe fn phy_wait_autoneg_linux(&self, phy_addr: u8) -> bool {
+        // Check once whether both sides want 1G so we know whether to guard against early 10M completion.
+        let ctrl1000 = self.mdic_read(phy_addr, MII_CTRL1000).unwrap_or(0);
+        let stat1000 = self.mdic_read(phy_addr, MII_STAT1000).unwrap_or(0);
+        let both_want_1g = (ctrl1000 & ADVERTISE_1000FULL != 0)
+            && (stat1000 & STAT1000_LP_1000FULL != 0);
+
         let mut i = PHY_AUTO_NEG_LIMIT;
+        let mut aneg_complete_count = 0u32;
         while i > 0 {
             let _ = self.mdic_read(phy_addr, MII_BMSR);
             let bmsr = self.mdic_read(phy_addr, MII_BMSR).unwrap_or(0);
             if bmsr & BMSR_ANEG_COMPLETE != 0 {
-                return true;
+                if !both_want_1g {
+                    return true;
+                }
+                // Both sides want 1G: BMSR_ANEG_COMPLETE can fire early at 10M before
+                // 1G master/slave resolution. Read STAT1000 to confirm 1G resolved.
+                let st1000 = self.mdic_read(phy_addr, MII_STAT1000).unwrap_or(0);
+                if st1000 & STAT1000_LP_1000FULL != 0 {
+                    return true; // 1G resolved
+                }
+                aneg_complete_count += 1;
+                if aneg_complete_count >= 3 {
+                    // Gave up waiting for 1G — accept whatever aneg resolved.
+                    return true;
+                }
             }
             Self::udelay(100_000);
             i -= 1;
@@ -3684,8 +3728,9 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_PHY_CTRL, phy_ctrl);
             let _ = mmio_read(self.base, E1000E_PHY_CTRL);
         }
+        // OEM bits are on page 768 reg 25 — must use BM PHY page select (reg 22), not IGP (reg 31).
         for phy_addr in [self.phy_addr, 1u8, 2u8] {
-            let Some(mut oem) = self.mdic_read_phy(phy_addr, HV_OEM_BITS_PHY) else {
+            let Some(mut oem) = self.mdic_read_bm_phy(phy_addr, HV_OEM_BITS_PHY) else {
                 continue;
             };
             if oem == 0 || oem == 0xFFFF {
@@ -3695,7 +3740,7 @@ impl E1000eHw {
             oem &= !(HV_OEM_BITS_LPLU | HV_OEM_BITS_GBE_DIS);
             if oem != prev {
                 oem |= HV_OEM_BITS_RESTART_AN;
-                let _ = self.mdic_write_phy(phy_addr, HV_OEM_BITS_PHY, oem);
+                let _ = self.mdic_write_bm_phy(phy_addr, HV_OEM_BITS_PHY, oem);
             }
         }
         if phy_ctrl_before
@@ -5861,27 +5906,49 @@ impl E1000eHw {
                 }
                 if self.hw_roc_gprc_acc == 0 && self.stats.rx_packets == 0 {
                     self.rx_stall_watchdogs = self.rx_stall_watchdogs.saturating_add(1);
-                    if self.rx_stall_watchdogs >= 4 {
+                    if self.link_speed <= SPEED_100 && !self.link_10m_degraded
+                        && self.rx_stall_watchdogs >= 4
+                    {
+                        // Low speed, non-degraded: reconcile link then re-arm.
                         self.rx_stall_watchdogs = 0;
-                        if self.link_speed <= SPEED_100 && !self.link_10m_degraded {
-                            crate::klog_warn!(
-                                "[e1000e] GPRC still 0 at {} Mb/s — reconcile link speed + re-arm RX (tag={})\n",
-                                self.link_speed,
-                                E1000E_DRIVER_TAG
-                            );
-                            self.get_link_status = true;
-                            let prev_speed = self.link_speed;
-                            let _ = self.check_for_link_linux(E1000E_LINK_CHECK_REG26_MS);
-                            if self.link_speed == prev_speed {
-                                unsafe { self.enable_rx_after_link() };
-                            }
-                        } else {
-                            crate::klog_warn!(
-                                "[e1000e] GPRC still 0 after link — re-arm RX ring (tag={})\n",
-                                E1000E_DRIVER_TAG
-                            );
-                            unsafe { self.enable_rx_rearm_only() };
+                        crate::klog_warn!(
+                            "[e1000e] GPRC still 0 at {} Mb/s — reconcile link speed + re-arm RX (tag={})\n",
+                            self.link_speed,
+                            E1000E_DRIVER_TAG
+                        );
+                        self.get_link_status = true;
+                        let prev_speed = self.link_speed;
+                        let _ = self.check_for_link_linux(E1000E_LINK_CHECK_REG26_MS);
+                        if self.link_speed == prev_speed {
+                            unsafe { self.enable_rx_after_link() };
                         }
+                    } else if self.rx_stall_watchdogs >= 30 {
+                        // ~60 s with GPRC=0 (degraded or 1G): full autoneg retry.
+                        // Clears link_10m_degraded so the next check_for_link can
+                        // re-evaluate speed and use the 1G-preferring path.
+                        self.rx_stall_watchdogs = 0;
+                        self.link_10m_degraded = false;
+                        self.link_up = false;
+                        self.rx_link_armed = false;
+                        self.get_link_status = true;
+                        crate::klog_warn!(
+                            "[e1000e] GPRC=0 for ~60 s — full autoneg retry (tag={})\n",
+                            E1000E_DRIVER_TAG
+                        );
+                        unsafe {
+                            self.pch_disable_lplu_gbe();
+                            self.mac_setup_copper_link_linux();
+                            if self.phy_mdio_responding {
+                                self.pch_kick_autoneg_mdio();
+                            }
+                        }
+                    } else if self.rx_stall_watchdogs % 4 == 0 {
+                        // Every ~8 s: re-arm RX while waiting for full retry threshold.
+                        crate::klog_warn!(
+                            "[e1000e] GPRC still 0 after link — re-arm RX ring (tag={})\n",
+                            E1000E_DRIVER_TAG
+                        );
+                        unsafe { self.enable_rx_rearm_only() };
                     }
                 } else {
                     self.rx_stall_watchdogs = 0;
