@@ -4811,11 +4811,11 @@ impl E1000eHw {
         if !self.pch_swflag_acquire() {
             return None;
         }
-        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        // BM_PORT_CTRL_PAGE (769) is a normal BM PHY page — select via reg 22, not reg 31.
         if !self.mdic_write_swheld(
             BM_PHY_MDIO_ADDR,
-            IGP_PHY_PAGE_SELECT,
-            page_port,
+            BM_PHY_PAGE_SELECT,
+            BM_PORT_CTRL_PAGE as u16,
             MDIC_POLL_TRIES,
         ) {
             self.pch_swflag_release();
@@ -4833,11 +4833,12 @@ impl E1000eHw {
             self.pch_swflag_release();
             return None;
         }
-        // Linux: select BM_WUC_PAGE (800) for host wakeup register access.
+        // WUC_PAGE (800) indirect register access uses reg 31 (IGP-style extended page).
         let wuc_page = (BM_WUC_PAGE << IGP_PAGE_SHIFT) as u16;
         if !self.mdic_write_swheld(BM_PHY_MDIO_ADDR, IGP_PHY_PAGE_SELECT, wuc_page, MDIC_POLL_TRIES)
         {
             let restore = saved & !(BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT | BM_WUC_ENABLE_BIT);
+            // Restore uses reg 22 since we're writing to page 769 reg 17.
             let _ = self.mdic_write_swheld(
                 BM_PHY_MDIO_ADDR,
                 BM_WUC_ENABLE_REG,
@@ -4851,11 +4852,11 @@ impl E1000eHw {
     }
 
     unsafe fn pch_bm_wuc_access_end(&self, saved: u16) {
-        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        // Re-select page 769 via reg 22 to write back BM_WUC_ENABLE_REG.
         let _ = self.mdic_write_swheld(
             BM_PHY_MDIO_ADDR,
-            IGP_PHY_PAGE_SELECT,
-            page_port,
+            BM_PHY_PAGE_SELECT,
+            BM_PORT_CTRL_PAGE as u16,
             MDIC_POLL_TRIES,
         );
         // Never leave BM_WUC_ENABLE set after BM page-800 sync — firmware often has it
@@ -4870,11 +4871,11 @@ impl E1000eHw {
         if !self.is_pch_lpt_or_later() || !self.pch_swflag_acquire() {
             return;
         }
-        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        // BM_PORT_CTRL_PAGE (769) is a normal BM PHY page — select via reg 22.
         if !self.mdic_write_swheld(
             BM_PHY_MDIO_ADDR,
-            IGP_PHY_PAGE_SELECT,
-            page_port,
+            BM_PHY_PAGE_SELECT,
+            BM_PORT_CTRL_PAGE as u16,
             MDIC_POLL_TRIES,
         ) {
             self.pch_swflag_release();
@@ -4932,11 +4933,11 @@ impl E1000eHw {
         if !self.is_pch_lpt_or_later() || !self.pch_swflag_acquire() {
             return;
         }
-        let page_port = (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16;
+        // BM_PORT_CTRL_PAGE (769) is a normal BM PHY page — select via reg 22.
         if !self.mdic_write_swheld(
             BM_PHY_MDIO_ADDR,
-            IGP_PHY_PAGE_SELECT,
-            page_port,
+            BM_PHY_PAGE_SELECT,
+            BM_PORT_CTRL_PAGE as u16,
             MDIC_POLL_TRIES,
         ) {
             self.pch_swflag_release();
