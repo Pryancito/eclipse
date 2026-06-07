@@ -4,7 +4,12 @@ ARCH ?= x86_64
 PLATFORM ?= qemu
 MODE ?= release
 LOG ?= warn
+ifeq ($(ARCH), x86_64)
+# Alpine SFS rootfs from `cargo xtask image` needs the linux loader, not userboot/zircon.
+LINUX ?= 1
+else
 LINUX ?=
+endif
 MOCK ?=
 LIBOS ?=
 TEST ?=

@@ -237,7 +237,14 @@ impl From<Endpoint> for SockAddr {
             addr_un.sun_path[..len].copy_from_slice(&bytes[..len]);
             SockAddr { addr_un }
         } else {
-            unimplemented!("not match");
+            // Fallback: return an unspecified address instead of panicking.
+            warn!("[socket_address] From<Endpoint>: unrecognised endpoint variant, returning UNSPECIFIED");
+            SockAddr {
+                addr_ph: SockAddrPlaceholder {
+                    family: 0,
+                    data: [0; 14],
+                },
+            }
         }
     }
 }

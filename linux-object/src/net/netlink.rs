@@ -510,9 +510,13 @@ impl Socket for NetlinkSocketState {
         Ok(data.len())
     }
 
-    /// connect
+    /// connect (netlink sockets do not support connect)
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        unimplemented!()
+        // Netlink sockets do not support connect(2). Returning ENOTSUP is
+        // correct for SOCK_RAW/SOCK_DGRAM netlink; prevents panic on `ip`
+        // tool usage inside udhcpc default.script.
+        warn!("[netlink] connect: not supported on netlink sockets");
+        Err(LxError::EINVAL)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -528,15 +532,19 @@ impl Socket for NetlinkSocketState {
     }
 
     fn listen(&self) -> SysResult {
-        unimplemented!()
+        warn!("[netlink] listen: not supported on netlink sockets");
+        Err(LxError::EINVAL)
     }
 
     fn shutdown(&self, _howto: usize) -> SysResult {
-        unimplemented!()
+        // Accept shutdown silently — some userland code calls shutdown() before
+        // close() even on netlink sockets. Return success to avoid EINVAL noise.
+        Ok(0)
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        unimplemented!()
+        warn!("[netlink] accept: not supported on netlink sockets");
+        Err(LxError::EINVAL)
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
@@ -553,7 +561,8 @@ impl Socket for NetlinkSocketState {
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
-        unimplemented!()
+        // Netlink sockets are connectionless; no remote endpoint.
+        None
     }
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
@@ -600,7 +609,8 @@ impl FileLike for NetlinkSocketState {
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        unimplemented!()
+        // Sockets do not support positioned reads.
+        Err(LxError::ESPIPE)
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {

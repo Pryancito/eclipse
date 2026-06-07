@@ -365,7 +365,8 @@ impl FileLike for RawSocketState {
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        unimplemented!()
+        // Sockets do not support positioned reads.
+        Err(LxError::ESPIPE)
     }
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {

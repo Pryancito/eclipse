@@ -1797,7 +1797,10 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult;
     /// wait for some event (in, out, err) on a fd
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        unimplemented!()
+        // Default implementation: socket type does not support poll().
+        // Return (false, false, false) instead of panicking.
+        warn!("poll() called on a socket that does not implement it");
+        (false, false, false)
     }
     /// missing documentation
     async fn connect(&self, endpoint: Endpoint) -> SysResult;
