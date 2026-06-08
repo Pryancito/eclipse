@@ -1416,9 +1416,10 @@ impl Scheme for E1000eInterface {
 
         let icr = unsafe { mmio_read(self.base, E1000E_ICR) };
         if icr == 0 {
-            if !self.poll_pending.load(Ordering::SeqCst) {
-                self.ims_rearm();
-            }
+            // Algunos i219/e1000e pueden disparar IRQ con ICR limpio mientras hay
+            // RX pendiente; drenar en diferido evita quedar con GPRC creciendo
+            // pero sin avanzar rx_packets.
+            self.queue_deferred_poll();
             return;
         }
 
