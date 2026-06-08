@@ -38,6 +38,7 @@ use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use crate::utils::dma::DmaRegion;
+use crate::utils::dma_sync::{dma_sync_region, dma_sync_rx_desc_span, DmaSyncDir};
 use pci::{PCIDevice, BAR, Location};
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
 use lock::Mutex;
@@ -331,12 +332,16 @@ pub struct E1000eHw {
     mac: [u8; 6],
 
     rx_ring:         DmaRegion,
+    rx_coherent:     bool,
     rx_buf_pool:     DmaRegion,
+    rx_buf_coherent: bool,
     rx_next_to_clean: usize,
     rx_rdt_last_written: usize,
 
     tx_ring:     DmaRegion,
+    tx_coherent:     bool,
     tx_buf_pool: DmaRegion,
+    tx_buf_coherent: bool,
     tx_tail:     usize,
 
     pub stats: NetStats,
@@ -971,6 +976,15 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_TDT, 0);
         self.tx_tail = 0;
 
+        dma_sync_rx_desc_span(
+            &self.tx_ring,
+            self.tx_coherent,
+            0,
+            NUM_TX,
+            size_of::<TxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
+
         // Timers
         mmio_write(self.base, E1000E_TIDV, 0);
         mmio_write(self.base, E1000E_TADV, 0);
@@ -1030,6 +1044,15 @@ impl E1000eHw {
         }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
+
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.rx_coherent,
+            0,
+            NUM_RX,
+            size_of::<RxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
 
         // Disable checksum offload
         mmio_write(self.base, E1000E_RXCSUM, 0);
@@ -1133,6 +1156,14 @@ impl E1000eHw {
             return None;
         }
 
+        dma_sync_region(
+            &self.rx_buf_pool,
+            self.rx_buf_coherent,
+            i * BUF_SIZE,
+            len,
+            DmaSyncDir::FromDevice,
+        );
+
         // Copy packet from buffer
         let packet = unsafe {
             core::slice::from_raw_parts(self.rx_buf_vaddr(i) as *const u8, len).to_vec()
@@ -1156,6 +1187,15 @@ impl E1000eHw {
         write_volatile((desc_ptr as usize + 8) as *mut u32, 0u32);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
+
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.rx_coherent,
+            i,
+            1,
+            size_of::<RxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1205,6 +1245,14 @@ impl E1000eHw {
         };
         buf.copy_from_slice(data);
 
+        dma_sync_region(
+            &self.tx_buf_pool,
+            self.tx_buf_coherent,
+            idx * BUF_SIZE,
+            data.len(),
+            DmaSyncDir::ToDevice,
+        );
+
         self.stats.tx_packets += 1;
         self.stats.tx_bytes += data.len() as u64;
 
@@ -1222,6 +1270,15 @@ impl E1000eHw {
         unsafe { write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS); }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
+
+        dma_sync_rx_desc_span(
+            &self.tx_ring,
+            self.tx_coherent,
+            idx,
+            1,
+            size_of::<TxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
 
         self.tx_tail = (idx + 1) % NUM_TX;
         unsafe { mmio_write(self.base, E1000E_TDT, self.tx_tail as u32); }
@@ -1686,13 +1743,13 @@ pub fn init(
         name, vaddr, irq, pci.id.device_id, E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+    let (rx_ring, rx_coherent)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, tx_coherent)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
+    let (rx_buf_pool, rx_buf_coherent)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
+    let (tx_buf_pool, tx_buf_coherent)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
 
     // Alignment checks
@@ -1718,11 +1775,15 @@ pub fn init(
         device_id: pci.id.device_id,
         mac: [0u8; 6],
         rx_ring,
+        rx_coherent,
         rx_buf_pool,
+        rx_buf_coherent,
         rx_next_to_clean: 0,
         rx_rdt_last_written: NUM_RX - 1,
         tx_ring,
+        tx_coherent,
         tx_buf_pool,
+        tx_buf_coherent,
         tx_tail: 0,
         stats: NetStats::default(),
         rx_poll_budget: 32,
