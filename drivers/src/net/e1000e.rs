@@ -9,6 +9,8 @@
 const E1000E_DRIVER_TAG: &str = "e1000e-simple";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
+const E1000E_DEFAULT_ITR: u32 = 512;
+const E1000E_RX_POLL_BUDGET: u8 = 128;
 const E1000E_LOG_VERBOSE: bool = false;
 
 macro_rules! e1000e_vlog {
@@ -148,12 +150,11 @@ const EERD_DONE_BIT1:  u32 = 1 << 1;
 const EERD_DATA_SHIFT: u32 = 16;
 
 // ICR / IMS bits
-const ICR_TXDW:   u32 = 1 << 0;
 const ICR_LSC:    u32 = 1 << 2;
 const ICR_RXDMT0: u32 = 1 << 4;
 const ICR_RXT0:   u32 = 1 << 7;
 const ICR_RX_ANY: u32 = ICR_RXT0 | ICR_RXDMT0;
-const IMS_REARM:  u32 = ICR_TXDW | ICR_LSC | ICR_RXDMT0 | ICR_RXT0 | (1 << 6) | (1 << 8);
+const IMS_REARM:  u32 = ICR_LSC | ICR_RXDMT0 | ICR_RXT0 | (1 << 6) | (1 << 8);
 
 // RCTL bits
 const RCTL_EN:    u32 = 1 << 1;
@@ -266,7 +267,6 @@ const RXD_EXT_EOP: u32 = 1 << 1;
 // TX descriptor CMD bits
 const TX_CMD_EOP:  u8 = 1 << 0;
 const TX_CMD_IFCS: u8 = 1 << 1;
-const TX_CMD_RS:   u8 = 1 << 3;
 
 // DMA ring sizing
 const NUM_RX: usize = 256;
@@ -1010,9 +1010,9 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
         
-        // Write ITR to throttle interrupts (e.g. 250 translates to ~15,625 interrupts/sec,
-        // which is 250 * 256 ns = 64 us interval).
-        mmio_write(self.base, E1000E_ITR, 250);
+        // Use a more Linux-like moderation interval for bulk traffic.
+        // 512 * 256 ns ≈ 131 us, or ~7.6k interrupts/sec.
+        mmio_write(self.base, E1000E_ITR, E1000E_DEFAULT_ITR);
 
         // Program RX ring base, length, head
         let rx_pa = self.rx_ring.paddr();
@@ -1214,7 +1214,8 @@ impl E1000eHw {
         }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        unsafe { write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS); }
+        // TX ring space is tracked via TDH, so per-packet report-status interrupts are unnecessary.
+        unsafe { write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS); }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
@@ -1368,7 +1369,7 @@ impl E1000eInterface {
         unsafe { self.driver.hw.lock().ensure_rx_armed_if_link_up(); }
         {
             let mut hw = self.driver.hw.lock();
-            hw.rx_poll_budget = 32;
+            hw.rx_poll_budget = E1000E_RX_POLL_BUDGET;
         }
 
         // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
@@ -1632,7 +1633,7 @@ impl phy::Device<'_> for E1000eDriver {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(64);
+        caps.max_burst_size = Some(E1000E_RX_POLL_BUDGET as usize);
         caps
     }
 }
@@ -1726,7 +1727,7 @@ pub fn init(
         tx_buf_pool,
         tx_tail: 0,
         stats: NetStats::default(),
-        rx_poll_budget: 32,
+        rx_poll_budget: E1000E_RX_POLL_BUDGET,
         link_up: false,
         link_watchdog_next_us: 0,
     };
