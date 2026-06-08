@@ -340,7 +340,6 @@ pub struct E1000eHw {
 
     pub stats: NetStats,
 
-    rx_poll_budget: u8,
     link_up: bool,
     link_watchdog_next_us: u64,
 }
@@ -1008,7 +1007,7 @@ impl E1000eHw {
         // Timers off
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
-        mmio_write(self.base, E1000E_ITR,  0);
+        mmio_write(self.base, E1000E_ITR,  195); // 20,000 interrupts/sec (units of 256 ns)
 
         // Program RX ring base, length, head
         let rx_pa = self.rx_ring.paddr();
@@ -1079,10 +1078,6 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     fn receive(&mut self) -> Option<Vec<u8>> {
-        if self.rx_poll_budget == 0 {
-            return None;
-        }
-
         let i = self.rx_next_to_clean;
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
@@ -1098,8 +1093,6 @@ impl E1000eHw {
         }
 
         let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
-
-        self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
         if status & 2 == 0 || len == 0 || len > BUF_SIZE {
@@ -1319,18 +1312,6 @@ impl E1000eInterface {
         }
     }
 
-    fn queue_deferred_poll(&self) {
-        if self.poll_pending.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let poll_pending = self.poll_pending.clone();
-        let me = self.clone();
-        crate::utils::deferred_job::push_deferred_job(move || {
-            let _ = me.poll_with_irq_hint(0);
-            poll_pending.store(false, Ordering::SeqCst);
-        });
-    }
-
     /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
     fn poll_with_irq_hint(&self, irq_icr: u32) -> DeviceResult {
         use crate::pulse::{PULSE_LINK, PULSE_NET_RX};
@@ -1351,10 +1332,6 @@ impl E1000eInterface {
 
         let ts = Instant::from_micros(now as i64);
         unsafe { self.driver.hw.lock().ensure_rx_armed_if_link_up(); }
-        {
-            let mut hw = self.driver.hw.lock();
-            hw.rx_poll_budget = 32;
-        }
 
         // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
         let intr_was_on = super::intr_get();
@@ -1374,33 +1351,8 @@ impl E1000eInterface {
             super::intr_on();
         }
 
-        let mut hw_rx = 0u32;
-        {
-            let mut hw = self.driver.hw.lock();
-            for _ in 0..32 {
-                if hw.rx_poll_budget == 0 {
-                    hw.rx_poll_budget = 32;
-                }
-                match hw.receive() {
-                    Some(pkt) => {
-                        hw_rx += 1;
-                        drop(hw);
-                        super::net_dispatch_packet(&pkt);
-                        hw = self.driver.hw.lock();
-                    }
-                    None => break,
-                }
-            }
-        }
-        if hw_rx > 0 {
-            pulse |= PULSE_NET_RX;
-        }
-        if self.driver.hw.lock().rx_poll_budget == 0 {
-            self.queue_deferred_poll();
-        }
-        if self.driver.hw.lock().rx_poll_budget < 32 {
-            self.ims_rearm();
-        }
+        super::net_flush_deferred_packets();
+        self.ims_rearm();
 
         self.pulse(pulse);
         if pulse & PULSE_NET_RX != 0 {
@@ -1648,7 +1600,7 @@ impl phy::RxToken for E1000eRxToken {
     fn consume<R, F>(self, _ts: Instant, f: F) -> SmolResult<R>
     where F: FnOnce(&mut [u8]) -> SmolResult<R> {
         let mut data = self.data;
-        super::net_dispatch_packet(&data);
+        super::net_defer_packet(&data);
         f(&mut data)
     }
 }
@@ -1732,7 +1684,6 @@ pub fn init(
         tx_buf_pool,
         tx_tail: 0,
         stats: NetStats::default(),
-        rx_poll_budget: 32,
         link_up: false,
         link_watchdog_next_us: 0,
     };
