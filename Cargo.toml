@@ -45,3 +45,7 @@ smoltcp = { path = "./smoltcp" }
 # APIC ID -> id lógico denso para que los arrays per-CPU no se desborden bajo SMP.
 [patch."https://github.com/DeathWish5/kernel-sync"]
 lock = { path = "vendor/kernel-sync" }
+
+[patch."https://github.com/rcore-os/rcore-fs"]
+rcore-fs = { path = "vendor/rcore-fs" }
+rcore-fs-mountfs = { path = "vendor/rcore-fs-mountfs" }

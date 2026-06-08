@@ -126,6 +126,18 @@ impl LinuxRootfs {
         // /etc/hostname
         fs::write(etc.join("hostname"), b"Eclipse\n").unwrap();
 
+        // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount syscall)
+        fs::write(
+            etc.join("fstab"),
+            b"# /etc/fstab - generado por install-eclipse\n\
+# <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n\
+__ECLIPSE_ROOT_DEV__  /                  ext2    defaults          0  1\n\
+__ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0\n\
+__ECLIPSE_HOME_DEV__  /home              ext2    defaults          0  0\n\
+__ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
+        )
+        .unwrap();
+
         // 拷贝 libc.so
         let from = musl
             .join(format!("{}-linux-musl", self.0.name()))

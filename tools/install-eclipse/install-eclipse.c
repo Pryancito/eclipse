@@ -36,6 +36,12 @@
 
 #define INST_ROOT_MNT   "/tmp/eclipse-inst-root"
 
+#define FSTAB_PLACEHOLDER_ROOT "__ECLIPSE_ROOT_DEV__"
+#define FSTAB_PLACEHOLDER_EFI  "__ECLIPSE_EFI_DEV___"
+#define FSTAB_PLACEHOLDER_HOME "__ECLIPSE_HOME_DEV__"
+#define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
+#define FSTAB_PLACEHOLDER_LEN  20U
+
 #define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 #define GPT_LINUX_TYPE "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
 
@@ -2082,6 +2088,212 @@ static int shell_umount(const char *target, int dry_run) {
     return run_command_logged(cmd, dry_run);
 }
 
+static void format_fstab_device_field(const char *device, char out[FSTAB_PLACEHOLDER_LEN + 1]) {
+    size_t i;
+    size_t dev_len = strlen(device);
+
+    memset(out, ' ', FSTAB_PLACEHOLDER_LEN);
+    out[FSTAB_PLACEHOLDER_LEN] = '\0';
+    if (dev_len > FSTAB_PLACEHOLDER_LEN) {
+        dev_len = FSTAB_PLACEHOLDER_LEN;
+    }
+    memcpy(out, device, dev_len);
+}
+
+static int patch_placeholder_in_buffer(void *buf, size_t len, const char *placeholder,
+                                       const char *replacement) {
+    size_t plen = strlen(placeholder);
+    size_t rlen = strlen(replacement);
+    int found = 0;
+    char *data = (char *)buf;
+
+    if (plen == 0 || rlen != plen) {
+        return -1;
+    }
+
+    for (size_t i = 0; i + plen <= len; i++) {
+        if (memcmp(data + i, placeholder, plen) == 0) {
+            memcpy(data + i, replacement, rlen);
+            found = 1;
+            i += plen - 1;
+        }
+    }
+    return found ? 0 : -1;
+}
+
+static int patch_fstab_line_to_comment(void *buf, size_t len, const char *placeholder) {
+    size_t plen = strlen(placeholder);
+    char *data = (char *)buf;
+    int found = 0;
+
+    for (size_t i = 0; i + plen <= len; i++) {
+        if (memcmp(data + i, placeholder, plen) == 0) {
+            size_t line_start = i;
+            while (line_start > 0 && data[line_start - 1] != '\n') {
+                line_start--;
+            }
+            data[line_start] = '#';
+            found = 1;
+            break;
+        }
+    }
+    return found ? 0 : -1;
+}
+
+static int write_fstab_file(const char *path, const char *efi_dev, const char *root_dev,
+                            const char *home_dev, const char *swap_dev,
+                            enum layout_mode layout, int dry_run) {
+    FILE *f;
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] Escribiría fstab en %s." COLOR_RESET, path);
+        return 0;
+    }
+
+    f = fopen(path, "w");
+    if (f == NULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
+            path, strerror(errno));
+        return -1;
+    }
+
+    fprintf(f, "# /etc/fstab - generado por install-eclipse\n");
+    fprintf(f, "# <dispositivo>  <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n");
+    fprintf(f, "%-20s  /                  ext2    defaults          0  1\n", root_dev);
+    fprintf(f, "%-20s  /boot/efi          vfat    defaults,noatime  0  0\n", efi_dev);
+    if (layout == LAYOUT_ADVANCED && home_dev[0] != '\0') {
+        fprintf(f, "%-20s  /home              ext2    defaults          0  0\n", home_dev);
+    }
+    if (layout == LAYOUT_ADVANCED && swap_dev[0] != '\0') {
+        fprintf(f, "%-20s  none               swap    sw                0  0\n", swap_dev);
+    }
+
+    if (fclose(f) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo cerrar %s (%s)." COLOR_RESET,
+            path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
+                                 const char *home_dev, const char *swap_dev,
+                                 enum layout_mode layout, int dry_run) {
+    char path[512];
+
+    if (shell_mkdir_p(INST_ROOT_MNT, dry_run) != 0) {
+        return -1;
+    }
+    if (shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/etc/fstab", INST_ROOT_MNT);
+    if (write_fstab_file(path, efi_dev, root_dev, home_dev, swap_dev, layout, dry_run) != 0) {
+        shell_umount(INST_ROOT_MNT, dry_run);
+        return -1;
+    }
+
+    shell_umount(INST_ROOT_MNT, dry_run);
+    log(COLOR_GREEN "fstab actualizado en %s (vía mount)." COLOR_RESET, root_dev);
+    return 0;
+}
+
+static int patch_fstab_on_block_device(const char *block_dev, const char *efi_dev,
+                                       const char *root_dev, const char *home_dev,
+                                       const char *swap_dev, enum layout_mode layout,
+                                       int dry_run) {
+    char efi_field[FSTAB_PLACEHOLDER_LEN + 1];
+    char root_field[FSTAB_PLACEHOLDER_LEN + 1];
+    char home_field[FSTAB_PLACEHOLDER_LEN + 1];
+    char swap_field[FSTAB_PLACEHOLDER_LEN + 1];
+    uint8_t *buf = NULL;
+    size_t total = 0;
+    ssize_t nread;
+    int fd = -1;
+    int rc = -1;
+
+    format_fstab_device_field(efi_dev, efi_field);
+    format_fstab_device_field(root_dev, root_field);
+    format_fstab_device_field(home_dev, home_field);
+    format_fstab_device_field(swap_dev, swap_field);
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] Parchearía fstab en %s (ROOT=%s, EFI=%s)." COLOR_RESET,
+            block_dev, root_dev, efi_dev);
+        return 0;
+    }
+
+    fd = open(block_dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
+            block_dev, strerror(errno));
+        return -1;
+    }
+
+    buf = (uint8_t *)malloc(64 * 1024 * 1024ULL);
+    if (buf == NULL) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Sin memoria para parchear fstab." COLOR_RESET);
+        close(fd);
+        return -1;
+    }
+
+    while ((nread = read(fd, buf + total, (64 * 1024 * 1024ULL) - total)) > 0) {
+        total += (size_t)nread;
+        if (total >= 64 * 1024 * 1024ULL) {
+            break;
+        }
+    }
+    if (nread < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+            block_dev, strerror(errno));
+        goto cleanup;
+    }
+
+    if (patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_ROOT, root_field) != 0 ||
+        patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_EFI, efi_field) != 0) {
+        log(COLOR_RED COLOR_BOLD
+            "ERROR: No se encontraron placeholders de fstab en %s." COLOR_RESET, block_dev);
+        log(COLOR_YELLOW
+            "Reconstruya el medio de instalación (cargo rootfs && cargo image) para incluir /etc/fstab con placeholders." COLOR_RESET);
+        goto cleanup;
+    }
+
+    if (layout == LAYOUT_ADVANCED) {
+        if (patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_HOME, home_field) != 0 ||
+            patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_SWAP, swap_field) != 0) {
+            log(COLOR_RED COLOR_BOLD
+                "ERROR: No se encontraron placeholders HOME/SWAP en fstab." COLOR_RESET);
+            goto cleanup;
+        }
+    } else {
+        (void)patch_fstab_line_to_comment(buf, total, FSTAB_PLACEHOLDER_HOME);
+        (void)patch_fstab_line_to_comment(buf, total, FSTAB_PLACEHOLDER_SWAP);
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: seek en %s falló (%s)." COLOR_RESET,
+            block_dev, strerror(errno));
+        goto cleanup;
+    }
+    if (write(fd, buf, total) != (ssize_t)total) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
+            block_dev, strerror(errno));
+        goto cleanup;
+    }
+    if (fsync(fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, block_dev, strerror(errno));
+    }
+
+    log(COLOR_GREEN "fstab actualizado en %s (sin montar)." COLOR_RESET, block_dev);
+    rc = 0;
+
+cleanup:
+    free(buf);
+    close(fd);
+    return rc;
+}
+
 static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run) {
     if (!struct_file_exists(src)) {
         log(COLOR_YELLOW "Omitido (no presente en el medio de instalación): %s" COLOR_RESET, src);
@@ -2098,9 +2310,7 @@ static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int 
 static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
                                int part_count, enum layout_mode layout, int dry_run) {
     char efi_dev[160], root_dev[160], home_dev[160], swap_dev[160];
-    char fstab_path[256];
     char cmd[512];
-    int rc = 0;
     (void)parts;
 
     /* EFI = part 1, ROOT = part 2, HOME = part 3, SWAP = part 4 */
@@ -2132,45 +2342,22 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
         }
     }
 
-    log(COLOR_GREEN "Montando ROOT para escribir /etc/fstab..." COLOR_RESET);
-    shell_mkdir_p(INST_ROOT_MNT, dry_run);
-
-    if (shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar ROOT en %s." COLOR_RESET, INST_ROOT_MNT);
-        return -1;
-    }
-
-    snprintf(fstab_path, sizeof(fstab_path), "%s/etc/fstab", INST_ROOT_MNT);
-
-    if (!dry_run) {
-        shell_mkdir_p(INST_ROOT_MNT "/etc", dry_run);
-        FILE *f = fopen(fstab_path, "w");
-        if (f == NULL) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear %s (%s)." COLOR_RESET,
-                fstab_path, strerror(errno));
-            shell_umount(INST_ROOT_MNT, dry_run);
-            return -1;
+    log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
+    if (layout == LAYOUT_ADVANCED && part_count >= 4) {
+        if (write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run) == 0) {
+            return 0;
         }
-        fprintf(f, "# /etc/fstab - generado por install-eclipse\n");
-        fprintf(f, "# <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n");
-        fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
-                root_dev, "/",     "ext2", "defaults",           1);
-        fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
-                efi_dev,  "/boot/efi", "vfat", "defaults,noatime", 0);
-        if (layout == LAYOUT_ADVANCED && part_count >= 4) {
-            fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
-                    home_dev, "/home", "ext2", "defaults",        0);
-            fprintf(f, "%-20s  %-18s  %-6s  %-15s  0  %d\n",
-                    swap_dev, "none",  "swap", "sw",              0);
-        }
-        fclose(f);
-        log(COLOR_GREEN "fstab escrito en %s." COLOR_RESET, fstab_path);
-    } else {
-        log("[dry-run] Se escribiría fstab en %s", fstab_path);
+        log(COLOR_YELLOW
+            "ADVERTENCIA: mount falló; parcheando fstab en el dispositivo en bruto." COLOR_RESET);
+        return patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
+                                           layout, dry_run);
     }
-
-    shell_umount(INST_ROOT_MNT, dry_run);
-    return rc;
+    if (write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
+        return 0;
+    }
+    log(COLOR_YELLOW
+        "ADVERTENCIA: mount falló; parcheando fstab en el dispositivo en bruto." COLOR_RESET);
+    return patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
 static int run_upgrade(const char *disk_path, int dry_run) {

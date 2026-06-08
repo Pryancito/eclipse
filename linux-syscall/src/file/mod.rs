@@ -9,6 +9,7 @@ mod dir;
 mod fd;
 #[allow(clippy::module_inception)]
 mod file;
+mod mount;
 mod poll;
 mod stat;
 

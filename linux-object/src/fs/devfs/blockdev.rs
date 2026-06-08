@@ -24,6 +24,10 @@ impl BlockDev {
             inode_id: DevFS::new_inode_id(),
         }
     }
+
+    pub fn block_scheme(&self) -> Arc<dyn BlockScheme> {
+        self.block.clone()
+    }
 }
 
 impl INode for BlockDev {

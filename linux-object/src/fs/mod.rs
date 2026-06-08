@@ -1,8 +1,15 @@
 //! Linux file objects
 
+mod block_mount;
 mod devfs;
+mod ext2_editor;
+mod ext2_mount;
+mod fat_mount;
+mod flagged_fs;
 mod file;
 pub mod ioctl;
+mod mount_ops;
+mod mount_state;
 mod pipe;
 mod procfs;
 mod proc_self;
@@ -66,6 +73,7 @@ struct MountEntry {
     target: String,
     fstype: String,
     options: String,
+    state: Arc<mount_state::MountState>,
 }
 
 lazy_static! {
@@ -76,13 +84,62 @@ fn reset_mount_table() {
     MOUNT_TABLE.lock().clear();
 }
 
-fn register_mount(source: &str, target: &str, fstype: &str, options: &str) {
+fn boot_mount_state() -> Arc<mount_state::MountState> {
+    Arc::new(mount_state::MountState::new(false))
+}
+
+pub(crate) fn register_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    options: &str,
+    state: Arc<mount_state::MountState>,
+) {
     MOUNT_TABLE.lock().push(MountEntry {
         source: source.to_string(),
         target: target.to_string(),
         fstype: fstype.to_string(),
         options: options.to_string(),
+        state,
     });
+}
+
+pub(crate) fn unregister_mount(target: &str) {
+    MOUNT_TABLE.lock().retain(|m| m.target != target);
+}
+
+pub(crate) fn remount_flags(target: &str, flags: usize, data: &str) -> LxResult<()> {
+    let target = normalize_mount_target(target);
+    let mut mounts = MOUNT_TABLE.lock();
+    let entry = mounts
+        .iter_mut()
+        .find(|m| m.target == target)
+        .ok_or(LxError::EINVAL)?;
+    let ro = mount_state::flags_read_only(flags, data);
+    entry.state.set_read_only(ro);
+    entry.options = mount_state::build_options_string(flags, data);
+    Ok(())
+}
+
+pub(crate) fn move_mount_entry(old_target: &str, new_target: &str) -> LxResult<()> {
+    let old_target = normalize_mount_target(old_target);
+    let new_target = normalize_mount_target(new_target);
+    let mut mounts = MOUNT_TABLE.lock();
+    let entry = mounts
+        .iter_mut()
+        .find(|m| m.target == old_target)
+        .ok_or(LxError::EINVAL)?;
+    entry.target = new_target;
+    Ok(())
+}
+
+fn normalize_mount_target(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() || path == "/" {
+        String::from("/")
+    } else {
+        String::from(path.trim_end_matches('/'))
+    }
 }
 
 pub(crate) fn proc_mounts_content() -> String {
@@ -189,7 +246,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     let rootfs = MountFS::new(rootfs);
     let root = rootfs.mountpoint_root_inode();
     reset_mount_table();
-    register_mount("rootfs", "/", "rootfs", "rw");
+    register_mount("rootfs", "/", "rootfs", "rw", boot_mount_state());
 
     // create DevFS
     let devfs = DevFS::new();
@@ -335,7 +392,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /dev")
     });
     dev.mount(devfs).expect("failed to mount DevFS");
-    register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid");
+    register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
 
     // mount RamFS at /tmp
     let ramfs = RamFS::new();
@@ -344,7 +401,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /tmp")
     });
     tmp.mount(ramfs).expect("failed to mount RamFS");
-    register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev");
+    register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
 
     // mount RamFS at /run (essential for DHCP clients and other daemons)
     let run_ramfs = RamFS::new();
@@ -353,7 +410,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             .expect("failed to mkdir /run")
     });
     run.mount(run_ramfs).expect("failed to mount RamFS at /run");
-    register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev");
+    register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
 
     // Ensure /var/run exists and can be used (often it's a symlink or needs its own mount)
     if let Ok(var) = root.find(true, "var") {
@@ -369,7 +426,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     proc.mount(Arc::new(ProcFS::new()))
         .expect("failed to mount ProcFS");
-    register_mount("proc", "/proc", "proc", "rw,nosuid,nodev,noexec,relatime");
+    register_mount(
+        "proc",
+        "/proc",
+        "proc",
+        "rw,nosuid,nodev,noexec,relatime",
+        boot_mount_state(),
+    );
 
     // mount SysFS at /sys
     let sys = root.find(true, "sys").unwrap_or_else(|_| {
@@ -378,10 +441,19 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     });
     sys.mount(Arc::new(SysFS::new()))
         .expect("failed to mount SysFS");
-    register_mount("sysfs", "/sys", "sysfs", "rw,nosuid,nodev,noexec,relatime");
+    register_mount(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        "rw,nosuid,nodev,noexec,relatime",
+        boot_mount_state(),
+    );
 
+    mount_ops::set_vfs_root(root.clone());
     root
 }
+
+pub use mount_ops::{mount_fs, umount_fs};
 
 /// extension for INode
 pub trait INodeExt {

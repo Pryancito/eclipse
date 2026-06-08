@@ -161,8 +161,8 @@ impl Syscall<'_> {
             Sys::STATFS => self.sys_statfs(a0.into(), a1.into()),
             Sys::FSTATFS => self.sys_fstatfs(a0.into(), a1.into()),
             Sys::SYNC => self.sys_sync(),
-            Sys::MOUNT => self.unimplemented("mount", Err(LxError::EACCES)),
-            Sys::UMOUNT2 => self.unimplemented("umount2", Err(LxError::EACCES)),
+            Sys::MOUNT => self.sys_mount(a0.into(), a1.into(), a2.into(), a3, a4.into()),
+            Sys::UMOUNT2 => self.sys_umount2(a0.into(), a1),
 
             // memory
             Sys::BRK => self.sys_brk(a0),

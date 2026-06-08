@@ -204,6 +204,7 @@ impl<P: Read> UserPtr<u8, P> {
     // 从一个 C 风格的零结尾字符串构造一个字符切片。
     /// Forms a zero-terminated string slice from a user pointer to a c style string.
     pub fn as_c_str(&self) -> Result<&'static str> {
+        self.check()?;
         self.as_str(unsafe { (0usize..).find(|&i| *self.0.add(i) == 0).unwrap() })
     }
 }
