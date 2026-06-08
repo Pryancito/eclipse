@@ -38,7 +38,6 @@ use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use crate::utils::dma::DmaRegion;
-use crate::utils::dma_sync::{dma_sync_region, dma_sync_rx_desc_span, DmaSyncDir};
 use pci::{PCIDevice, BAR, Location};
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
 use lock::Mutex;
@@ -282,13 +281,13 @@ const CACHE_LINE_SIZE: usize = 64;
 // Descriptor layouts
 // ---------------------------------------------------------------------------
 
-/// RX descriptor (16 bytes) — extended write-back format (RFCTL_EXTEN=1).
-/// HW writes back: staterr[31:0] at +8 (DD=bit0, EOP=bit1), pkt_len[15:0] at +12.
+/// Legacy RX descriptor (16 bytes). With RFCTL_EXTEN, HW writes extended WB
+/// at +8 (staterr u32) and +12 (length u16).
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct RxDesc {
     addr:     u64,  // buffer physical address (driver writes)
-    reserved: u64,  // HW write-back: staterr[31:0] @ +8, pkt_len[15:0] @ +12
+    reserved: u64,  // HW write-back: staterr[31:0] @ +8, length[15:0] @ +12
 }
 const _RX_DESC_SIZE: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
@@ -332,16 +331,12 @@ pub struct E1000eHw {
     mac: [u8; 6],
 
     rx_ring:         DmaRegion,
-    rx_coherent:     bool,
     rx_buf_pool:     DmaRegion,
-    rx_buf_coherent: bool,
     rx_next_to_clean: usize,
     rx_rdt_last_written: usize,
 
     tx_ring:     DmaRegion,
-    tx_coherent:     bool,
     tx_buf_pool: DmaRegion,
-    tx_buf_coherent: bool,
     tx_tail:     usize,
 
     pub stats: NetStats,
@@ -976,15 +971,6 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_TDT, 0);
         self.tx_tail = 0;
 
-        dma_sync_rx_desc_span(
-            &self.tx_ring,
-            self.tx_coherent,
-            0,
-            NUM_TX,
-            size_of::<TxDesc>(),
-            DmaSyncDir::ToDevice,
-        );
-
         // Timers
         mmio_write(self.base, E1000E_TIDV, 0);
         mmio_write(self.base, E1000E_TADV, 0);
@@ -1045,26 +1031,14 @@ impl E1000eHw {
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
-        dma_sync_rx_desc_span(
-            &self.rx_ring,
-            self.rx_coherent,
-            0,
-            NUM_RX,
-            size_of::<RxDesc>(),
-            DmaSyncDir::ToDevice,
-        );
-
         // Disable checksum offload
         mmio_write(self.base, E1000E_RXCSUM, 0);
 
-        // RFCTL: force extended write-back (RFCTL_EXTEN=1).
-        // On i219/PCH-SPT the hardware ignores RFCTL_EXTEN writes and always
-        // uses extended WB, so we must read staterr from +8 (u32) and pkt_len
-        // from +12 (u16).  Using legacy mode here causes GPRC > 0 / rx_pkt = 0
-        // because pkt_len[0] is 0 for even-length frames, which the legacy path
-        // misinterprets as DD = 0.
+        // RFCTL: use legacy write-back (no RFCTL_EXTEN) — matches OSDev i219-V guide.
+        // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
+        // confirmed to work on real i219-V hardware without RFCTL_EXTEN.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
-        rfctl |= RFCTL_EXTEN;  // extended mode: staterr at +8 u32, pkt_len at +12 u16
+        rfctl &= !RFCTL_EXTEN;  // legacy mode: status at +12 u8, length at +8 u16
         rfctl |= RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
         let _ = mmio_read(self.base, E1000E_RFCTL);
@@ -1131,38 +1105,28 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
 
-        // Extended descriptor write-back layout (RFCTL_EXTEN=1, i219/PCH-SPT default):
-        //   +8  u32  staterr  (DD=bit0, EOP=bit1)
-        //   +12 u16  pkt_len
+        // Legacy descriptor write-back layout (no RFCTL_EXTEN):
+        //   +8  u16  length
+        //   +12 u8   status  (DD=bit0, EOP=bit1)
         compiler_fence(Ordering::SeqCst);
-        let staterr = unsafe { read_volatile((desc_ptr as usize + 8) as *const u32) };
-        if staterr & RXD_EXT_DD == 0 {
+        let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
+        if status & 1 == 0 {
             // DD (Descriptor Done) not set — hardware hasn't written back yet
             unsafe { self.flush_rx_ring(); }
             return None;
         }
 
-        let len = unsafe { read_volatile((desc_ptr as usize + 12) as *const u16) } as usize;
+        let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
 
         self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
-        if staterr & RXD_EXT_EOP == 0 || len == 0 || len > BUF_SIZE {
-            e1000e_vlog!("[e1000e] rx drop: staterr={:#010x} len={}\n", staterr, len);
-            self.stats.rx_dropped += 1;
+        if status & 2 == 0 || len == 0 || len > BUF_SIZE {
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             unsafe { self.flush_rx_ring(); }
             return None;
         }
-
-        dma_sync_region(
-            &self.rx_buf_pool,
-            self.rx_buf_coherent,
-            i * BUF_SIZE,
-            len,
-            DmaSyncDir::FromDevice,
-        );
 
         // Copy packet from buffer
         let packet = unsafe {
@@ -1182,20 +1146,11 @@ impl E1000eHw {
     unsafe fn recycle_rx_slot(&self, i: usize) {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = ring.add(i);
-        // Clear staterr (extended WB: staterr at +8 u32) to reset DD bit.
+        // Clear the status byte (legacy WB: status at +12) so hardware can reuse slot.
         // Re-post buffer address (addr at +0).
-        write_volatile((desc_ptr as usize + 8) as *mut u32, 0u32);
+        write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-
-        dma_sync_rx_desc_span(
-            &self.rx_ring,
-            self.rx_coherent,
-            i,
-            1,
-            size_of::<RxDesc>(),
-            DmaSyncDir::ToDevice,
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1245,14 +1200,6 @@ impl E1000eHw {
         };
         buf.copy_from_slice(data);
 
-        dma_sync_region(
-            &self.tx_buf_pool,
-            self.tx_buf_coherent,
-            idx * BUF_SIZE,
-            data.len(),
-            DmaSyncDir::ToDevice,
-        );
-
         self.stats.tx_packets += 1;
         self.stats.tx_bytes += data.len() as u64;
 
@@ -1270,15 +1217,6 @@ impl E1000eHw {
         unsafe { write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS); }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
-
-        dma_sync_rx_desc_span(
-            &self.tx_ring,
-            self.tx_coherent,
-            idx,
-            1,
-            size_of::<TxDesc>(),
-            DmaSyncDir::ToDevice,
-        );
 
         self.tx_tail = (idx + 1) % NUM_TX;
         unsafe { mmio_write(self.base, E1000E_TDT, self.tx_tail as u32); }
@@ -1311,8 +1249,8 @@ impl E1000eHw {
         // were dropped (no free descriptors or DMA ring not armed).
         let gprc = mmio_read(self.base, E1000E_GPRC);
         let mpc  = mmio_read(self.base, E1000E_MPC);
-        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_drop={}\n",
-            link, gprc, mpc, self.stats.rx_packets, self.stats.rx_dropped);
+        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
+            link, gprc, mpc, self.stats.rx_packets);
         link_changed
     }
 
@@ -1433,7 +1371,11 @@ impl E1000eInterface {
             hw.rx_poll_budget = 32;
         }
 
-        // Mutex::lock() uses push_off/pop_off — do not mix manual intr_off/intr_on here.
+        // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
+        let intr_was_on = super::intr_get();
+        if intr_was_on {
+            super::intr_off();
+        }
         let sockets = get_sockets();
         {
             let mut sockets = sockets.lock();
@@ -1443,7 +1385,9 @@ impl E1000eInterface {
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
         }
-        super::net_flush_deferred_packets();
+        if intr_was_on {
+            super::intr_on();
+        }
 
         if self.driver.hw.lock().rx_poll_budget == 0 {
             self.queue_deferred_poll();
@@ -1697,7 +1641,7 @@ impl phy::RxToken for E1000eRxToken {
     fn consume<R, F>(self, _ts: Instant, f: F) -> SmolResult<R>
     where F: FnOnce(&mut [u8]) -> SmolResult<R> {
         let mut data = self.data;
-        super::net_defer_packet(&data);
+        super::net_dispatch_packet(&data);
         f(&mut data)
     }
 }
@@ -1743,13 +1687,13 @@ pub fn init(
         name, vaddr, irq, pci.id.device_id, E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, rx_coherent)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+    let (rx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, tx_coherent)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, rx_buf_coherent)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
+    let (rx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, tx_buf_coherent)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
+    let (tx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
 
     // Alignment checks
@@ -1775,15 +1719,11 @@ pub fn init(
         device_id: pci.id.device_id,
         mac: [0u8; 6],
         rx_ring,
-        rx_coherent,
         rx_buf_pool,
-        rx_buf_coherent,
         rx_next_to_clean: 0,
         rx_rdt_last_written: NUM_RX - 1,
         tx_ring,
-        tx_coherent,
         tx_buf_pool,
-        tx_buf_coherent,
         tx_tail: 0,
         stats: NetStats::default(),
         rx_poll_budget: 32,
