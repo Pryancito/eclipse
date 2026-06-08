@@ -41,6 +41,9 @@
 #define FSTAB_PLACEHOLDER_HOME "__ECLIPSE_HOME_DEV__"
 #define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
 #define FSTAB_PLACEHOLDER_LEN  20U
+#define FSTAB_PATCH_CHUNK      (64U * 1024U)
+#define FSTAB_PATCH_MAX_SCAN   (16U * 1024U * 1024U)
+#define FSTAB_PATCH_OVERLAP    FSTAB_PLACEHOLDER_LEN
 
 #define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 #define GPT_LINUX_TYPE "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
@@ -2100,44 +2103,167 @@ static void format_fstab_device_field(const char *device, char out[FSTAB_PLACEHO
     memcpy(out, device, dev_len);
 }
 
-static int patch_placeholder_in_buffer(void *buf, size_t len, const char *placeholder,
-                                       const char *replacement) {
+typedef enum {
+    FSTAB_PATCH_REPLACE = 0,
+    FSTAB_PATCH_COMMENT_LINE = 1,
+} fstab_patch_kind;
+
+struct fstab_patch_target {
+    const char *placeholder;
+    const char *replacement;
+    fstab_patch_kind kind;
+    int required;
+    int found;
+    off_t offset;
+};
+
+static int placeholder_in_window(const uint8_t *window, size_t window_len, off_t window_base,
+                                 const char *placeholder, off_t *out_offset) {
     size_t plen = strlen(placeholder);
-    size_t rlen = strlen(replacement);
-    int found = 0;
-    char *data = (char *)buf;
+    size_t i;
 
-    if (plen == 0 || rlen != plen) {
-        return -1;
+    if (plen == 0 || window_len < plen) {
+        return 0;
     }
-
-    for (size_t i = 0; i + plen <= len; i++) {
-        if (memcmp(data + i, placeholder, plen) == 0) {
-            memcpy(data + i, replacement, rlen);
-            found = 1;
-            i += plen - 1;
+    for (i = 0; i + plen <= window_len; i++) {
+        if (memcmp(window + i, placeholder, plen) == 0) {
+            *out_offset = window_base + (off_t)i;
+            return 1;
         }
     }
-    return found ? 0 : -1;
+    return 0;
 }
 
-static int patch_fstab_line_to_comment(void *buf, size_t len, const char *placeholder) {
-    size_t plen = strlen(placeholder);
-    char *data = (char *)buf;
-    int found = 0;
+static off_t line_start_offset(const uint8_t *window, size_t index, off_t window_base) {
+    size_t line_start = index;
 
-    for (size_t i = 0; i + plen <= len; i++) {
-        if (memcmp(data + i, placeholder, plen) == 0) {
-            size_t line_start = i;
-            while (line_start > 0 && data[line_start - 1] != '\n') {
-                line_start--;
-            }
-            data[line_start] = '#';
-            found = 1;
-            break;
+    while (line_start > 0 && window[line_start - 1] != '\n') {
+        line_start--;
+    }
+    return window_base + (off_t)line_start;
+}
+
+static int fstab_targets_ready(const struct fstab_patch_target *targets, size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (targets[i].required && !targets[i].found) {
+            return 0;
         }
     }
-    return found ? 0 : -1;
+    return 1;
+}
+
+static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_target *targets,
+                              size_t target_count) {
+    uint8_t window[FSTAB_PATCH_CHUNK + FSTAB_PATCH_OVERLAP];
+    size_t carry_len = 0;
+    off_t file_pos = 0;
+    ssize_t nread;
+
+    log("Buscando placeholders de fstab en %s...", block_dev);
+    while (file_pos < (off_t)FSTAB_PATCH_MAX_SCAN) {
+        size_t room = sizeof(window) - carry_len;
+        size_t chunk = room < FSTAB_PATCH_CHUNK ? room : FSTAB_PATCH_CHUNK;
+
+        nread = read(fd, window + carry_len, chunk);
+        if (nread < 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+                block_dev, strerror(errno));
+            return -1;
+        }
+        if (nread == 0 && carry_len == 0) {
+            break;
+        }
+
+        {
+            size_t window_len = carry_len + (nread > 0 ? (size_t)nread : 0);
+            off_t window_base = file_pos - (off_t)carry_len;
+            size_t t;
+
+            for (t = 0; t < target_count; t++) {
+                struct fstab_patch_target *slot = &targets[t];
+                off_t hit;
+
+                if (slot->found) {
+                    continue;
+                }
+                if (!placeholder_in_window(window, window_len, window_base, slot->placeholder,
+                                           &hit)) {
+                    continue;
+                }
+                if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
+                    slot->offset = line_start_offset(window, (size_t)(hit - window_base),
+                                                     window_base);
+                } else {
+                    slot->offset = hit;
+                }
+                slot->found = 1;
+            }
+        }
+
+        if (fstab_targets_ready(targets, target_count)) {
+            return 0;
+        }
+        if (nread == 0) {
+            break;
+        }
+
+        file_pos += nread;
+        {
+            size_t window_len = carry_len + (size_t)nread;
+            if (window_len > FSTAB_PATCH_OVERLAP) {
+                memmove(window, window + window_len - FSTAB_PATCH_OVERLAP, FSTAB_PATCH_OVERLAP);
+                carry_len = FSTAB_PATCH_OVERLAP;
+            } else {
+                carry_len = window_len;
+            }
+        }
+    }
+
+    if (!fstab_targets_ready(targets, target_count)) {
+        log(COLOR_RED COLOR_BOLD
+            "ERROR: No se encontraron placeholders de fstab en %s (escaneados %lld bytes)." COLOR_RESET,
+            block_dev, (long long)file_pos);
+        log(COLOR_YELLOW
+            "Reconstruya el medio de instalación (cargo rootfs && cargo image) para incluir /etc/fstab con placeholders." COLOR_RESET);
+        return -1;
+    }
+    return 0;
+}
+
+static int apply_fstab_targets(int fd, const char *block_dev,
+                               const struct fstab_patch_target *targets, size_t target_count) {
+    size_t i;
+
+    for (i = 0; i < target_count; i++) {
+        const struct fstab_patch_target *slot = &targets[i];
+
+        if (!slot->found) {
+            continue;
+        }
+        if (lseek(fd, slot->offset, SEEK_SET) < 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: seek en %s falló (%s)." COLOR_RESET,
+                block_dev, strerror(errno));
+            return -1;
+        }
+        if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
+            if (write(fd, "#", 1) != 1) {
+                log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
+                    block_dev, strerror(errno));
+                return -1;
+            }
+        } else if (write(fd, slot->replacement, FSTAB_PLACEHOLDER_LEN) !=
+                   (ssize_t)FSTAB_PLACEHOLDER_LEN) {
+            log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
+                block_dev, strerror(errno));
+            return -1;
+        }
+    }
+    if (fsync(fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, block_dev, strerror(errno));
+    }
+    return 0;
 }
 
 static int write_fstab_file(const char *path, const char *efi_dev, const char *root_dev,
@@ -2207,9 +2333,8 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *efi_de
     char root_field[FSTAB_PLACEHOLDER_LEN + 1];
     char home_field[FSTAB_PLACEHOLDER_LEN + 1];
     char swap_field[FSTAB_PLACEHOLDER_LEN + 1];
-    uint8_t *buf = NULL;
-    size_t total = 0;
-    ssize_t nread;
+    struct fstab_patch_target targets[4];
+    size_t target_count = 4;
     int fd = -1;
     int rc = -1;
 
@@ -2224,6 +2349,28 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *efi_de
         return 0;
     }
 
+    targets[0] = (struct fstab_patch_target){
+        FSTAB_PLACEHOLDER_ROOT, root_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+    };
+    targets[1] = (struct fstab_patch_target){
+        FSTAB_PLACEHOLDER_EFI, efi_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+    };
+    if (layout == LAYOUT_ADVANCED) {
+        targets[2] = (struct fstab_patch_target){
+            FSTAB_PLACEHOLDER_HOME, home_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+        };
+        targets[3] = (struct fstab_patch_target){
+            FSTAB_PLACEHOLDER_SWAP, swap_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+        };
+    } else {
+        targets[2] = (struct fstab_patch_target){
+            FSTAB_PLACEHOLDER_HOME, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0,
+        };
+        targets[3] = (struct fstab_patch_target){
+            FSTAB_PLACEHOLDER_SWAP, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0,
+        };
+    }
+
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
@@ -2231,65 +2378,17 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *efi_de
         return -1;
     }
 
-    buf = (uint8_t *)malloc(64 * 1024 * 1024ULL);
-    if (buf == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Sin memoria para parchear fstab." COLOR_RESET);
-        close(fd);
-        return -1;
-    }
-
-    while ((nread = read(fd, buf + total, (64 * 1024 * 1024ULL) - total)) > 0) {
-        total += (size_t)nread;
-        if (total >= 64 * 1024 * 1024ULL) {
-            break;
-        }
-    }
-    if (nread < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
-            block_dev, strerror(errno));
+    if (scan_fstab_targets(fd, block_dev, targets, target_count) != 0) {
         goto cleanup;
     }
-
-    if (patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_ROOT, root_field) != 0 ||
-        patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_EFI, efi_field) != 0) {
-        log(COLOR_RED COLOR_BOLD
-            "ERROR: No se encontraron placeholders de fstab en %s." COLOR_RESET, block_dev);
-        log(COLOR_YELLOW
-            "Reconstruya el medio de instalación (cargo rootfs && cargo image) para incluir /etc/fstab con placeholders." COLOR_RESET);
+    if (apply_fstab_targets(fd, block_dev, targets, target_count) != 0) {
         goto cleanup;
-    }
-
-    if (layout == LAYOUT_ADVANCED) {
-        if (patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_HOME, home_field) != 0 ||
-            patch_placeholder_in_buffer(buf, total, FSTAB_PLACEHOLDER_SWAP, swap_field) != 0) {
-            log(COLOR_RED COLOR_BOLD
-                "ERROR: No se encontraron placeholders HOME/SWAP en fstab." COLOR_RESET);
-            goto cleanup;
-        }
-    } else {
-        (void)patch_fstab_line_to_comment(buf, total, FSTAB_PLACEHOLDER_HOME);
-        (void)patch_fstab_line_to_comment(buf, total, FSTAB_PLACEHOLDER_SWAP);
-    }
-
-    if (lseek(fd, 0, SEEK_SET) < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: seek en %s falló (%s)." COLOR_RESET,
-            block_dev, strerror(errno));
-        goto cleanup;
-    }
-    if (write(fd, buf, total) != (ssize_t)total) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
-            block_dev, strerror(errno));
-        goto cleanup;
-    }
-    if (fsync(fd) != 0) {
-        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, block_dev, strerror(errno));
     }
 
     log(COLOR_GREEN "fstab actualizado en %s (sin montar)." COLOR_RESET, block_dev);
     rc = 0;
 
 cleanup:
-    free(buf);
     close(fd);
     return rc;
 }
@@ -2343,21 +2442,22 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     }
 
     log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
+    /* Parche en bruto primero: no depende de mount(2) y evita bloqueos en Eclipse OS. */
     if (layout == LAYOUT_ADVANCED && part_count >= 4) {
-        if (write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run) == 0) {
+        if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
+                                        layout, dry_run) == 0) {
             return 0;
         }
         log(COLOR_YELLOW
-            "ADVERTENCIA: mount falló; parcheando fstab en el dispositivo en bruto." COLOR_RESET);
-        return patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
-                                           layout, dry_run);
+            "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
+        return write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run);
     }
-    if (write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
+    if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
         return 0;
     }
     log(COLOR_YELLOW
-        "ADVERTENCIA: mount falló; parcheando fstab en el dispositivo en bruto." COLOR_RESET);
-    return patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run);
+        "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
+    return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
 static int run_upgrade(const char *disk_path, int dry_run) {
