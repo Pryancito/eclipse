@@ -333,6 +333,7 @@ pub struct E1000eHw {
     rx_ring:         DmaRegion,
     rx_buf_pool:     DmaRegion,
     rx_next_to_clean: usize,
+    rx_rdt_last_written: usize,
 
     tx_ring:     DmaRegion,
     tx_buf_pool: DmaRegion,
@@ -1008,7 +1009,10 @@ impl E1000eHw {
         // Timers off
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
-        mmio_write(self.base, E1000E_ITR,  0);
+        
+        // Write ITR to throttle interrupts (e.g. 250 translates to ~15,625 interrupts/sec,
+        // which is 250 * 256 ns = 64 us interval).
+        mmio_write(self.base, E1000E_ITR, 250);
 
         // Program RX ring base, length, head
         let rx_pa = self.rx_ring.paddr();
@@ -1045,10 +1049,13 @@ impl E1000eHw {
         // SRRCTL: 2 KB buffer size
         mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31)); // 2 KB, Drop_En
 
-        // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN
+        // Configure RXDCTL for DMA burst (Linux RXDCTL_DMA_BURST_ENABLE)
+        let mut rxdctl = 0x0104_0420; // Granularity=1, WTHRESH=4, HTHRESH=4, PTHRESH=32
         if self.is_pch_spt_or_later() {
-            let rxdctl = mmio_read(self.base, E1000E_RXDCTL) | RXDCTL_QUEUE_ENABLE;
-            mmio_write(self.base, E1000E_RXDCTL, rxdctl);
+            rxdctl |= RXDCTL_QUEUE_ENABLE;
+        }
+        mmio_write(self.base, E1000E_RXDCTL, rxdctl);
+        if self.is_pch_spt_or_later() {
             for _ in 0..100u32 {
                 Self::udelay(100);
                 if mmio_read(self.base, E1000E_RXDCTL) & RXDCTL_QUEUE_ENABLE != 0 {
@@ -1061,6 +1068,7 @@ impl E1000eHw {
         // RDT = last descriptor index hardware can use
         mmio_write(self.base, E1000E_RDT, (NUM_RX - 1) as u32);
         let _ = mmio_read(self.base, E1000E_RDT); // flush
+        self.rx_rdt_last_written = NUM_RX - 1;
 
         // Small settle before enabling RCTL
         Self::udelay(1_000);
@@ -1078,8 +1086,18 @@ impl E1000eHw {
     // RX data path
     // -----------------------------------------------------------------------
 
+    pub unsafe fn flush_rx_ring(&mut self) {
+        let rdt = (self.rx_next_to_clean + NUM_RX - 1) % NUM_RX;
+        if rdt != self.rx_rdt_last_written {
+            fence(Ordering::SeqCst);
+            mmio_write(self.base, E1000E_RDT, rdt as u32);
+            self.rx_rdt_last_written = rdt;
+        }
+    }
+
     fn receive(&mut self) -> Option<Vec<u8>> {
         if self.rx_poll_budget == 0 {
+            unsafe { self.flush_rx_ring(); }
             return None;
         }
 
@@ -1094,6 +1112,7 @@ impl E1000eHw {
         let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
         if status & 1 == 0 {
             // DD (Descriptor Done) not set — hardware hasn't written back yet
+            unsafe { self.flush_rx_ring(); }
             return None;
         }
 
@@ -1105,6 +1124,7 @@ impl E1000eHw {
         if status & 2 == 0 || len == 0 || len > BUF_SIZE {
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
+            unsafe { self.flush_rx_ring(); }
             return None;
         }
 
@@ -1116,7 +1136,7 @@ impl E1000eHw {
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += len as u64;
 
-        // Recycle: clear descriptor, post new buffer, ring doorbell
+        // Recycle: clear descriptor, post new buffer
         unsafe { self.recycle_rx_slot(i); }
         self.rx_next_to_clean = (i + 1) % NUM_RX;
 
@@ -1131,11 +1151,6 @@ impl E1000eHw {
         write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-        // Full memory barrier: ensure the DMA engine sees the updated descriptor
-        // before we ring the doorbell.
-        fence(Ordering::SeqCst);
-        // Advance RDT to this slot (give it back to hardware)
-        mmio_write(self.base, E1000E_RDT, i as u32);
     }
 
     // -----------------------------------------------------------------------
@@ -1368,30 +1383,9 @@ impl E1000eInterface {
         }
         super::net_flush_deferred_packets();
 
-        let mut hw_rx = 0u32;
-        {
-            let mut hw = self.driver.hw.lock();
-            for _ in 0..32 {
-                if hw.rx_poll_budget == 0 {
-                    hw.rx_poll_budget = 32;
-                }
-                match hw.receive() {
-                    Some(pkt) => {
-                        hw_rx += 1;
-                        super::net_defer_packet(&pkt);
-                    }
-                    None => break,
-                }
-            }
-        }
-        super::net_flush_deferred_packets();
-        if hw_rx > 0 {
-            pulse |= PULSE_NET_RX;
-        }
         if self.driver.hw.lock().rx_poll_budget == 0 {
             self.queue_deferred_poll();
-        }
-        if self.driver.hw.lock().rx_poll_budget < 32 {
+        } else {
             self.ims_rearm();
         }
 
@@ -1721,6 +1715,7 @@ pub fn init(
         rx_ring,
         rx_buf_pool,
         rx_next_to_clean: 0,
+        rx_rdt_last_written: NUM_RX - 1,
         tx_ring,
         tx_buf_pool,
         tx_tail: 0,

@@ -1,7 +1,10 @@
 //! Virtual memory operations.
 
 use core::fmt::{Debug, Formatter, Result};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{convert::TryFrom, slice};
+
+static KERNEL_VMTOKEN: AtomicUsize = AtomicUsize::new(0);
 
 use x86_64::{
     instructions::tlb,
@@ -25,6 +28,25 @@ hal_fn_impl! {
 
         fn current_vmtoken() -> PhysAddr {
             Cr3::read().0.start_address().as_u64() as _
+        }
+
+        fn pin_kernel_vmtoken() {
+            let token = current_vmtoken();
+            let prev = KERNEL_VMTOKEN.swap(token, Ordering::Release);
+            if prev != 0 && prev != token {
+                crate::klog_warn!(
+                    "pin_kernel_vmtoken: retoken {:#x} -> {:#x}",
+                    prev,
+                    token
+                );
+            }
+        }
+
+        fn activate_kernel_paging() {
+            let token = KERNEL_VMTOKEN.load(Ordering::Acquire);
+            if token != 0 {
+                activate_paging(token);
+            }
         }
 
         fn flush_tlb(vaddr: Option<VirtAddr>) {

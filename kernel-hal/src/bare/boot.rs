@@ -23,6 +23,7 @@ hal_fn_impl! {
         fn primary_init() {
             crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
             unsafe { trapframe::init() };
+            crate::vm::pin_kernel_vmtoken();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).
             super::percpu::register();
             super::arch::primary_init();

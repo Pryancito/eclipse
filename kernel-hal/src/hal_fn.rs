@@ -81,6 +81,12 @@ hal_fn_def! {
         /// page table root address.
         pub fn activate_paging(vmtoken: PhysAddr);
 
+        /// Record the kernel page table root once at boot (BSP CR3 / kernel PT).
+        pub fn pin_kernel_vmtoken() {}
+
+        /// Restore the kernel page table after running userspace on this CPU.
+        pub fn activate_kernel_paging() {}
+
         /// Flush TLB by the associated `vaddr`, or flush the entire TLB. (`vaddr` is `None`).
         pub(crate) fn flush_tlb(vaddr: Option<VirtAddr>);
 

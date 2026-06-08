@@ -645,6 +645,10 @@ impl core::ops::Deref for CurrentThread {
 
 impl Drop for CurrentThread {
     fn drop(&mut self) {
+        // Drop runs while ThreadSwitchFuture may still have the process CR3
+        // active; switch back before terminate() can unmap the process VM.
+        #[cfg(target_os = "none")]
+        kernel_hal::vm::activate_kernel_paging();
         self.terminate();
     }
 }
@@ -748,6 +752,12 @@ impl Future for ThreadSwitchFuture {
         kernel_hal::thread::set_current_thread(Some(self.thread.clone()));
         let ret = self.future.lock().as_mut().poll(cx);
         kernel_hal::thread::set_current_thread(None);
+        // User threads switch CR3 to the process page table during poll.
+        // Restore the kernel CR3 before returning to executor/idle code — otherwise
+        // SMP task stealing leaves APs with a user CR3 saved in switch stacks, and
+        // process exit can free the user PT while CR3 still points at it.
+        #[cfg(target_os = "none")]
+        kernel_hal::vm::activate_kernel_paging();
         ret
     }
 }

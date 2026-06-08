@@ -4,6 +4,7 @@ use crate::utils::page_table::{GenericPTE, PageTableImpl, PageTableLevel4};
 use crate::MMUFlags;
 use crate::{PhysAddr, VirtAddr, KCONFIG};
 use core::fmt::{Debug, Formatter, Result};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use cortex_a::registers::*;
 use lock::Mutex;
 use tock_registers::interfaces::{Readable, Writeable};
@@ -12,6 +13,8 @@ use zcore_drivers::irq::gic_400::{GICC_SIZE, GICD_SIZE};
 lazy_static! {
     static ref KERNEL_PT: Mutex<PageTable> = Mutex::new(init_kernel_page_table().unwrap());
 }
+
+static KERNEL_VMTOKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// remap kernel ELF segments with 4K page
 fn init_kernel_page_table() -> PagingResult<PageTable> {
@@ -136,6 +139,18 @@ hal_fn_impl! {
 
         fn current_vmtoken() -> PhysAddr {
             TTBR1_EL1.get() as _
+        }
+
+        fn pin_kernel_vmtoken() {
+            let token = KERNEL_PT.lock().table_phys();
+            KERNEL_VMTOKEN.store(token, Ordering::Release);
+        }
+
+        fn activate_kernel_paging() {
+            let token = KERNEL_VMTOKEN.load(Ordering::Acquire);
+            if token != 0 {
+                activate_paging(token);
+            }
         }
 
         fn flush_tlb(vaddr: Option<VirtAddr>) {
