@@ -282,13 +282,13 @@ const CACHE_LINE_SIZE: usize = 64;
 // Descriptor layouts
 // ---------------------------------------------------------------------------
 
-/// Legacy RX descriptor (16 bytes). With RFCTL_EXTEN, HW writes extended WB
-/// at +8 (staterr u32) and +12 (length u16).
+/// RX descriptor (16 bytes) — extended write-back format (RFCTL_EXTEN=1).
+/// HW writes back: staterr[31:0] at +8 (DD=bit0, EOP=bit1), pkt_len[15:0] at +12.
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct RxDesc {
     addr:     u64,  // buffer physical address (driver writes)
-    reserved: u64,  // HW write-back: staterr[31:0] @ +8, length[15:0] @ +12
+    reserved: u64,  // HW write-back: staterr[31:0] @ +8, pkt_len[15:0] @ +12
 }
 const _RX_DESC_SIZE: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
@@ -1057,11 +1057,14 @@ impl E1000eHw {
         // Disable checksum offload
         mmio_write(self.base, E1000E_RXCSUM, 0);
 
-        // RFCTL: use legacy write-back (no RFCTL_EXTEN) — matches OSDev i219-V guide.
-        // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
-        // confirmed to work on real i219-V hardware without RFCTL_EXTEN.
+        // RFCTL: force extended write-back (RFCTL_EXTEN=1).
+        // On i219/PCH-SPT the hardware ignores RFCTL_EXTEN writes and always
+        // uses extended WB, so we must read staterr from +8 (u32) and pkt_len
+        // from +12 (u16).  Using legacy mode here causes GPRC > 0 / rx_pkt = 0
+        // because pkt_len[0] is 0 for even-length frames, which the legacy path
+        // misinterprets as DD = 0.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
-        rfctl &= !RFCTL_EXTEN;  // legacy mode: status at +12 u8, length at +8 u16
+        rfctl |= RFCTL_EXTEN;  // extended mode: staterr at +8 u32, pkt_len at +12 u16
         rfctl |= RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
         let _ = mmio_read(self.base, E1000E_RFCTL);
@@ -1128,32 +1131,25 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
 
-        dma_sync_rx_desc_span(
-            &self.rx_ring,
-            self.rx_coherent,
-            i,
-            1,
-            size_of::<RxDesc>(),
-            DmaSyncDir::FromDevice,
-        );
-
-        // Legacy descriptor write-back layout (no RFCTL_EXTEN):
-        //   +8  u16  length
-        //   +12 u8   status  (DD=bit0, EOP=bit1)
+        // Extended descriptor write-back layout (RFCTL_EXTEN=1, i219/PCH-SPT default):
+        //   +8  u32  staterr  (DD=bit0, EOP=bit1)
+        //   +12 u16  pkt_len
         compiler_fence(Ordering::SeqCst);
-        let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
-        if status & 1 == 0 {
+        let staterr = unsafe { read_volatile((desc_ptr as usize + 8) as *const u32) };
+        if staterr & RXD_EXT_DD == 0 {
             // DD (Descriptor Done) not set — hardware hasn't written back yet
             unsafe { self.flush_rx_ring(); }
             return None;
         }
 
-        let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
+        let len = unsafe { read_volatile((desc_ptr as usize + 12) as *const u16) } as usize;
 
         self.rx_poll_budget = self.rx_poll_budget.saturating_sub(1);
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
-        if status & 2 == 0 || len == 0 || len > BUF_SIZE {
+        if staterr & RXD_EXT_EOP == 0 || len == 0 || len > BUF_SIZE {
+            e1000e_vlog!("[e1000e] rx drop: staterr={:#010x} len={}\n", staterr, len);
+            self.stats.rx_dropped += 1;
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             unsafe { self.flush_rx_ring(); }
@@ -1186,9 +1182,9 @@ impl E1000eHw {
     unsafe fn recycle_rx_slot(&self, i: usize) {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = ring.add(i);
-        // Clear the status byte (legacy WB: status at +12) so hardware can reuse slot.
+        // Clear staterr (extended WB: staterr at +8 u32) to reset DD bit.
         // Re-post buffer address (addr at +0).
-        write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
+        write_volatile((desc_ptr as usize + 8) as *mut u32, 0u32);
         compiler_fence(Ordering::SeqCst);
         write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
 
@@ -1315,8 +1311,8 @@ impl E1000eHw {
         // were dropped (no free descriptors or DMA ring not armed).
         let gprc = mmio_read(self.base, E1000E_GPRC);
         let mpc  = mmio_read(self.base, E1000E_MPC);
-        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
-            link, gprc, mpc, self.stats.rx_packets);
+        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_drop={}\n",
+            link, gprc, mpc, self.stats.rx_packets, self.stats.rx_dropped);
         link_changed
     }
 
