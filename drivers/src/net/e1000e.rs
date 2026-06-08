@@ -1,12 +1,15 @@
-//! Intel e1000e NIC driver — simplified for I219 (PCH-SPT / 82574L / QEMU e1000)
+//! Intel e1000e NIC driver (82574L / 82579 / I217 / I218 / I219 family)
 //!
-//! Based on the Onyx (heatd/Onyx) and LittleKernel e1000 reference drivers.
-//! No AMT open sequence, no BM WUC filter management, no complex MDIO autoneg.
-//! Reset → read MAC → init rings → enable RX/TX → done.
+//! Supports PCH-integrated (I217/I218/I219) and discrete (82574L/82579) NICs.
+//! Includes ULP disable, LANPHYPC toggle, K1 config, TARC0 speed-mode errata,
+//! TIPG/EMI tuning after link-up, PHY speed via reg26, and DMA sync for
+//! non-coherent mappings.
 
 #![allow(unused_imports, dead_code)]
 
-const E1000E_DRIVER_TAG: &str = "e1000e-simple";
+/// Set to `true` only for legacy 82574L / QEMU e1000 emulation (no PCH sequences).
+const E1000E_CONVENTIONAL: bool = false;
+const E1000E_DRIVER_TAG: &str = "e1000e-osdev-rx";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
 const E1000E_LOG_VERBOSE: bool = false;
@@ -38,6 +41,7 @@ use crate::{Device, DeviceError, DeviceResult};
 use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
 use crate::utils::dma::DmaRegion;
+use crate::utils::dma_sync::{dma_sync_wb_from_device};
 use pci::{PCIDevice, BAR, Location};
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
 use lock::Mutex;
@@ -260,6 +264,19 @@ const CTRL_EXT_LPCD:          u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy con
 const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
 const MII_CR_AUTO_NEG_EN:      u16 = 0x1000;
 
+// PHY register 26 (reg26 / MII_PHY_STATUS_2 / M88E1000_PHY_SPEC_STATUS) —
+// present on M88-based PHYs used in I217/I219. Bits [15:14] encode link speed:
+//   00 = 10 Mb/s, 01 = 100 Mb/s, 10 = 1000 Mb/s
+const PHY_REG26_SPEED_MASK:  u16 = 0xC000;
+const PHY_REG26_SPEED_SHIFT: u16 = 14;
+const PHY_REG26_LINK:        u16 = 1 << 10; // real-time link bit
+
+// TIPG values tuned for I217/I219 EMI compliance (from Linux ich8lan.c)
+// Default is 8 | (8<<10) | (12<<20); after link-up use 0x00702008 at GbE, 0x00C07004 at 100M.
+const TIPG_GIGE: u32 = 0x0070_2008; // 10 ns IFG at 1000 Mb/s
+const TIPG_100M: u32 = 0x00C0_7004; // 960 ns IFG at 100 Mb/s (EMI reduction)
+const TIPG_10M:  u32 = 0x00C0_7004; // same as 100M for 10 Mb/s
+
 // Extended RX write-back layout (RFCTL_EXTEN=1):
 //   +0:  addr u64 (driver writes)
 //   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
@@ -354,6 +371,11 @@ pub struct E1000eHw {
     tx_head_cache: usize,
     link_up: bool,
     link_watchdog_next_us: u64,
+    /// Speed at last link-up (10/100/1000 Mb/s). Used to apply TIPG/TARC0 tuning.
+    link_speed_mbps: u32,
+    /// True if DMA rings are cache-coherent (UC-mapped). If false, we must
+    /// call dma_sync_wb_from_device() before reading RX write-back status.
+    rx_coherent: bool,
 }
 
 impl E1000eHw {
@@ -751,6 +773,69 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // PHY speed resolution via reg26 (MII_PHY_STATUS_2 / M88E1000_PHY_SPEC_STATUS)
+    // Falls back to MAC STATUS register if MDIO is unavailable.
+    // -----------------------------------------------------------------------
+
+    unsafe fn read_phy_speed_mbps(&self) -> u32 {
+        // Try PHY addr 1 first (PCH); addr 2 fallback (discrete)
+        for phy_addr in [1u8, 2u8] {
+            if let Some(reg26) = self.mdic_read(phy_addr, 26) {
+                if reg26 == 0xFFFF || reg26 == 0 { continue; }
+                if reg26 & PHY_REG26_LINK == 0 { continue; }
+                return match (reg26 & PHY_REG26_SPEED_MASK) >> PHY_REG26_SPEED_SHIFT {
+                    2 => 1000,
+                    1 => 100,
+                    _ => 10,
+                };
+            }
+        }
+        // Fallback: use MAC STATUS[8:7] speed bits
+        let status = mmio_read(self.base, E1000E_STATUS);
+        match (status >> 6) & 0x3 {
+            2 => 1000,
+            1 => 100,
+            _ => 10,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TARC0 + TIPG tuning after link-up (I217/I219 errata / EMI).
+    // Called from watchdog when link state transitions to UP.
+    // -----------------------------------------------------------------------
+
+    unsafe fn apply_link_up_tuning(&mut self, speed_mbps: u32) {
+        self.link_speed_mbps = speed_mbps;
+
+        // TARC0.SPEED_MODE (bit 21) must be clear at GbE, set at 10/100 Mb/s
+        // to avoid I219 TX underrun errata at lower speeds.
+        if self.is_pch_spt_or_later() {
+            let mut tarc0 = mmio_read(self.base, E1000E_TARC0);
+            if speed_mbps < 1000 {
+                tarc0 |= TARC0_SPEED_MODE;
+            } else {
+                tarc0 &= !TARC0_SPEED_MODE;
+            }
+            mmio_write(self.base, E1000E_TARC0, tarc0);
+        }
+
+        // TIPG tuning: tighter IFG at 1 GbE, relaxed for 10/100 (EMI reduction).
+        if self.is_pch() {
+            let tipg = match speed_mbps {
+                1000 => TIPG_GIGE,
+                100  => TIPG_100M,
+                _    => TIPG_10M,
+            };
+            mmio_write(self.base, E1000E_TIPG, tipg);
+        }
+
+        crate::klog_warn!("[e1000e] link-up tuning: {} Mb/s TARC0={:#010x} TIPG={:#010x}\n",
+            speed_mbps,
+            mmio_read(self.base, E1000E_TARC0),
+            mmio_read(self.base, E1000E_TIPG));
+    }
+
+    // -----------------------------------------------------------------------
     // MAC address
     // -----------------------------------------------------------------------
 
@@ -1107,6 +1192,12 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
 
+        // For non-coherent (WB-mapped) DMA we must invalidate the descriptor
+        // cache line before reading HW write-back status, to prevent stale data.
+        if !self.rx_coherent {
+            dma_sync_wb_from_device(desc_ptr as usize, core::mem::size_of::<RxDesc>());
+        }
+
         // Legacy descriptor write-back layout (no RFCTL_EXTEN):
         //   +8  u16  length
         //   +12 u8   status  (DD=bit0, EOP=bit1)
@@ -1126,6 +1217,11 @@ impl E1000eHw {
             unsafe { self.recycle_rx_slot(i); }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             return None;
+        }
+
+        // Sync data buffer from device before copying (no-op on coherent DMA).
+        if !self.rx_coherent {
+            dma_sync_wb_from_device(self.rx_buf_vaddr(i), len);
         }
 
         // Copy packet from buffer
@@ -1266,8 +1362,17 @@ impl E1000eHw {
             link_changed = true;
             self.link_up = link;
             if link {
-                crate::klog_warn!("[e1000e] link UP STATUS={:#010x}\n", status);
+                // Read actual link speed from PHY reg26, not just MAC STATUS bits
+                // (MAC STATUS can be stale after ULP / LANPHYPC dance on I219).
+                let speed = if self.is_pch() {
+                    self.read_phy_speed_mbps()
+                } else {
+                    match (status >> 6) & 0x3 { 2 => 1000, 1 => 100, _ => 10 }
+                };
+                crate::klog_warn!("[e1000e] link UP STATUS={:#010x} speed={}M\n", status, speed);
+                self.apply_link_up_tuning(speed);
             } else {
+                self.link_speed_mbps = 0;
                 crate::klog_warn!("[e1000e] link DOWN\n");
             }
         }
@@ -1277,8 +1382,8 @@ impl E1000eHw {
         // were dropped (no free descriptors or DMA ring not armed).
         let gprc = mmio_read(self.base, E1000E_GPRC);
         let mpc  = mmio_read(self.base, E1000E_MPC);
-        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
-            link, gprc, mpc, self.stats.rx_packets);
+        crate::klog_warn!("[e1000e] watchdog: link={} speed={}M GPRC={} MPC={} rx_pkt={}\n",
+            link, self.link_speed_mbps, gprc, mpc, self.stats.rx_packets);
         link_changed
     }
 
@@ -1734,14 +1839,16 @@ pub fn init(
         name, vaddr, irq, pci.id.device_id, E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+    let (rx_ring, rx_coherent)     = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, _tx_ring_coh)   = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
+    let (rx_buf_pool, rx_buf_coh) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
+    let (tx_buf_pool, _)          = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
         .ok_or(DeviceError::DmaError)?;
+    // Both the ring and its buffers must be coherent for the fast path to skip sync.
+    let rx_fully_coherent = rx_coherent && rx_buf_coh;
 
     // Alignment checks
     for (label, region, align, span) in [
@@ -1777,6 +1884,8 @@ pub fn init(
         tx_head_cache: 0,
         link_up: false,
         link_watchdog_next_us: 0,
+        link_speed_mbps: 0,
+        rx_coherent: rx_fully_coherent,
     };
 
     unsafe { hw.reset_and_init()?; }
