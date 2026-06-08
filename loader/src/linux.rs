@@ -228,16 +228,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 vaddr, flags, pid
             );
             let vmar = thread.proc().vmar();
-            vmar.handle_page_fault(vaddr, flags).map_err(|err| {
-                error!(
-                    "failed to handle page fault from user mode @ {:#x}({:?}): {:?}\n{:#x?}",
+            if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
+                warn!(
+                    "failed to handle page fault from user mode @ {:#x}({:?}): {:?}, delivering SIGSEGV",
                     vaddr,
                     flags,
                     err,
-                    thread.context_cloned(),
                 );
-                err
-            })
+                thread.inner().lock_linux().signals.insert(Signal::SIGSEGV);
+            }
+            Ok(())
         }
         TrapReason::UndefinedInstruction => {
             warn!("undefined instruction from user mode, pid={}", pid);
