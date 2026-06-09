@@ -489,12 +489,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 /// installed ext2 ROOT partition when one is available.
 ///
 /// Resolution order:
-/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`). This is
-///    the explicit, unambiguous override.
-/// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
-///    real, resolvable device (e.g. an initrd patched by the installer).
-/// 3. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
-///    that very partition as `/` (a self-consistent installed Eclipse root).
+/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) is
+///    *authoritative*: if present we obey it, and if it cannot be resolved
+///    (e.g. the unpatched placeholder of a live/installer medium) we keep the
+///    boot medium as `/` rather than guessing — so a live medium never pivots
+///    onto an attached installed disk by accident.
+/// 2. If there is no `ROOT=` directive at all: the root (`/`) entry of the boot
+///    medium's `/etc/fstab`, when it names a real, resolvable device.
+/// 3. Otherwise: auto-detection of the first ext2 partition whose own
+///    `/etc/fstab` declares that very partition as `/` (self-consistent root).
 ///
 /// Returns the filesystem to use as `/` together with its device path, or
 /// `None` to keep the boot medium as the root.
@@ -502,19 +505,24 @@ fn determine_real_root(
     boot_root: &Arc<MNode>,
     candidates: &[(String, Arc<dyn INode>)],
 ) -> Option<(Arc<dyn FileSystem>, String)> {
-    // 1. Explicit `ROOT=<dev>` override from the kernel command line.
+    // 1. An explicit `ROOT=<dev>` on the kernel command line is authoritative.
     let cmdline = kernel_hal::boot::cmdline();
     if let Some(dev) = parse_root_cmdline(&cmdline) {
         match lookup_candidate(candidates, dev) {
             Some(inode) => match open_ext2_root(inode) {
                 Some(fs) => return Some((fs, String::from(dev))),
-                None => warn!("create_root_fs: ROOT={} is not a mountable ext2 device", dev),
+                None => warn!("create_root_fs: ROOT={} no es un ext2 montable", dev),
             },
-            None => warn!("create_root_fs: ROOT={} from cmdline not found under /dev", dev),
+            None => info!(
+                "create_root_fs: ROOT={} sin resolver; se mantiene el medio de arranque",
+                dev
+            ),
         }
+        // A ROOT= directive was given but is unusable: do not auto-detect.
+        return None;
     }
 
-    // 2. Explicit root device declared in the boot medium's fstab.
+    // 2. No explicit ROOT=: use the boot medium's fstab root entry, if real.
     if let Some(res) = root_fs_from_fstab(boot_root, candidates) {
         return Some(res);
     }

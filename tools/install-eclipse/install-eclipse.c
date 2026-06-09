@@ -43,6 +43,10 @@ static const char *resolve_image_path(const char *path);
 #define FSTAB_PLACEHOLDER_EFI  "__ECLIPSE_EFI_DEV___"
 #define FSTAB_PLACEHOLDER_HOME "__ECLIPSE_HOME_DEV__"
 #define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
+/* Placeholder de la cmdline de rboot.conf (clave ROOT=). Debe medir
+ * exactamente FSTAB_PLACEHOLDER_LEN (20) caracteres y ser distinto de los de
+ * fstab para no colisionar con la imagen initramfs alojada en la partición EFI. */
+#define RBOOT_PLACEHOLDER_ROOT "__ECLIPSE_CMDROOTDEV"
 #define FSTAB_PLACEHOLDER_LEN  20U
 #define FSTAB_PATCH_CHUNK      (64U * 1024U)
 #define FSTAB_PATCH_MAX_SCAN   (48U * 1024U * 1024U)
@@ -423,6 +427,8 @@ static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int 
 static int run_upgrade(const char *disk_path, int dry_run);
 static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
                                int part_count, enum layout_mode layout, int dry_run);
+static int patch_rboot_root_on_efi(const char *block_dev, const char *disk_path,
+                                   uint64_t start_sector, const char *root_dev, int dry_run);
 static void close_log_file(void);
 
 static void close_log_file(void) {
@@ -2479,6 +2485,73 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
+/* Fija ROOT=<root_dev> en la cmdline de rboot.conf de la partición EFI,
+ * sustituyendo en bruto el placeholder RBOOT_PLACEHOLDER_ROOT. Esto hace que el
+ * kernel pivote de forma determinista a la partición ext2 instalada. Es una
+ * operación no fatal: si el placeholder no está (imagen EFI antigua) o no se
+ * puede escribir, el kernel recurre a la auto-detección del root. */
+static int patch_rboot_root_on_efi(const char *block_dev, const char *disk_path,
+                                   uint64_t start_sector, const char *root_dev, int dry_run) {
+    char root_field[FSTAB_PLACEHOLDER_LEN + 1];
+    struct fstab_patch_target targets[1];
+    int fd = -1;
+    uint64_t partition_offset = 0;
+
+    format_fstab_device_field(root_dev, root_field);
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] Fijaría ROOT=%s en rboot.conf de %s." COLOR_RESET,
+            root_dev, block_dev);
+        return 0;
+    }
+
+    targets[0] = (struct fstab_patch_target){
+        RBOOT_PLACEHOLDER_ROOT, root_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+    };
+
+    fd = open(block_dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        /* Fallback para pruebas en host sobre una imagen de disco plana. */
+        if (errno == ENOENT && disk_path != NULL && struct_file_exists(disk_path)) {
+            fd = open(disk_path, O_RDWR | O_CLOEXEC);
+            if (fd >= 0) {
+                partition_offset = start_sector * SECTOR_SIZE;
+                if (lseek(fd, partition_offset, SEEK_SET) < 0) {
+                    log(COLOR_YELLOW "ADVERTENCIA: seek a sector %" PRIu64 " en %s falló." COLOR_RESET,
+                        start_sector, disk_path);
+                    close(fd);
+                    return 0;
+                }
+            }
+        }
+    }
+    if (fd < 0) {
+        log(COLOR_YELLOW
+            "ADVERTENCIA: no se pudo abrir %s para fijar ROOT= en rboot.conf (%s); se usará auto-detección." COLOR_RESET,
+            block_dev, strerror(errno));
+        return 0;
+    }
+
+    if (scan_fstab_targets(fd, block_dev, targets, 1) != 0) {
+        log(COLOR_YELLOW
+            "ADVERTENCIA: rboot.conf sin placeholder ROOT en %s; se usará auto-detección del root." COLOR_RESET,
+            block_dev);
+        close(fd);
+        return 0;
+    }
+    if (apply_fstab_targets(fd, block_dev, partition_offset, targets, 1) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: no se pudo escribir ROOT= en rboot.conf de %s." COLOR_RESET,
+            block_dev);
+        close(fd);
+        return 0;
+    }
+
+    log(COLOR_GREEN "rboot.conf: ROOT=%s fijado en %s (cmdline del kernel)." COLOR_RESET,
+        root_dev, block_dev);
+    close(fd);
+    return 0;
+}
+
 static int run_upgrade(const char *disk_path, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
@@ -2581,6 +2654,10 @@ cleanup:
     shell_umount(UPD_STAGING_MNT, dry_run);
     if (!dry_run) {
         unlink(UPD_STAGING_IMG);
+    }
+    if (rc == 0) {
+        /* La partición EFI ya está desmontada: fija ROOT= en rboot.conf (no fatal). */
+        patch_rboot_root_on_efi(efi_dev, disk_path, 0, root_dev, dry_run);
     }
     return rc;
 }
@@ -2788,6 +2865,16 @@ int main(int argc, char **argv) {
 
         if (write_fstab_to_root(cfg.disk_path, parts, part_count, cfg.layout, cfg.dry_run) != 0) {
             return 1;
+        }
+
+        /* Fija ROOT=<part2> en la cmdline de rboot.conf de la EFI (no fatal). */
+        {
+            char rb_efi_dev[160], rb_root_dev[160];
+            if (partition_dev_path(cfg.disk_path, 1, rb_efi_dev, sizeof(rb_efi_dev)) == 0 &&
+                partition_dev_path(cfg.disk_path, 2, rb_root_dev, sizeof(rb_root_dev)) == 0) {
+                patch_rboot_root_on_efi(rb_efi_dev, cfg.disk_path, parts[0].start_sector,
+                                        rb_root_dev, cfg.dry_run);
+            }
         }
     } else {
         if (run_upgrade(cfg.disk_path, cfg.dry_run) != 0) {
