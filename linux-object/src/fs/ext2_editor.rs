@@ -123,7 +123,9 @@ impl<'a> Ext2Editor<'a> {
             .device
             .read_at(offset, &mut buf)
             .map_err(|_| FsError::DeviceError)?;
-        Ok(unsafe { *(buf.as_ptr() as *const RawInode) })
+        // `buf` is a `Vec<u8>` (align 1); `RawInode` has align 4, so a plain
+        // dereference would be undefined behaviour. Use an unaligned read.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const RawInode) })
     }
 
     fn write_raw_inode(&self, inode_num: u32, inode: &RawInode) -> Result<()> {
@@ -176,13 +178,22 @@ impl<'a> Ext2Editor<'a> {
     fn alloc_inode(&self) -> Result<u32> {
         let inodes_per_group = self.inodes_per_group();
         let groups = self.fs.synced.inner().block_groups_len();
+        // Never hand out a reserved inode (root is 2). Floor the on-disk value
+        // at EXT2_GOOD_OLD_FIRST_INO=11 in case it is unset on old revisions.
+        let first_inode = self.fs.synced.inner().first_inode().max(11) as usize;
         for bg in 0..groups {
             if self.fs.synced.inner().block_group(bg).free_inodes_count == 0 {
                 continue;
             }
             let bitmap_block = self.fs.synced.inner().block_group(bg).inode_usage_addr;
             let mut bitmap = self.read_block(bitmap_block)?;
-            for bit in 0..inodes_per_group {
+            // Skip reserved inodes living in the first block group.
+            let start_bit = if bg == 0 {
+                first_inode.saturating_sub(1)
+            } else {
+                0
+            };
+            for bit in start_bit..inodes_per_group {
                 let byte = bit / 8;
                 let mask = 1u8 << (bit % 8);
                 if bitmap[byte] & mask != 0 {
@@ -269,6 +280,12 @@ impl<'a> Ext2Editor<'a> {
         let mut bitmap = self.read_block(bitmap_block)?;
         let byte = bit / 8;
         let mask = 1u8 << (bit % 8);
+        // Guard against double-free: if the block is already marked free, do
+        // not bump the free counters again (that would inflate them and let an
+        // in-use block be handed out a second time).
+        if bitmap[byte] & mask == 0 {
+            return Ok(());
+        }
         bitmap[byte] &= !mask;
         self.write_block(bitmap_block, &bitmap)?;
         {
@@ -472,6 +489,13 @@ impl<'a> Ext2Editor<'a> {
         }
         let bs = self.block_size();
         let len = Self::inode_full_size(&raw);
+        // A symlink target can never exceed PATH_MAX. Reject a corrupted size
+        // field instead of trying to allocate a multi-gigabyte buffer (which
+        // would OOM / hang the kernel from a readlink/stat syscall).
+        const SYMLINK_MAX: usize = 4096;
+        if len > SYMLINK_MAX {
+            return Err(FsError::InvalidParam);
+        }
         let mut out = vec![0u8; len];
         for block_idx in 0..self.inode_data_blocks(&raw) {
             let disk = self
@@ -564,9 +588,17 @@ impl<'a> Ext2Editor<'a> {
 
     fn is_subdir_of(&self, child: u32, ancestor: u32) -> Result<bool> {
         let mut cur = child;
+        // Bound the walk: a corrupted `..` chain could otherwise form a cycle
+        // that never reaches the root (inode 2) and hang the kernel.
+        let max_depth = self.fs.synced.inner().total_inodes_count().max(1);
+        let mut steps = 0usize;
         while cur != 2 {
             if cur == ancestor {
                 return Ok(true);
+            }
+            steps += 1;
+            if steps > max_depth {
+                return Err(FsError::InvalidParam);
             }
             cur = self.parent_inode(cur)?;
         }
