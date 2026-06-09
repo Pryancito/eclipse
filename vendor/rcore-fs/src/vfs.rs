@@ -182,6 +182,10 @@ impl dyn INode {
                 let len = inode.read_at(0, &mut content)?;
                 let link_path =
                     String::from(str::from_utf8(&content[..len]).map_err(|_| FsError::NotDir)?);
+                log::warn!(
+                    "lookup_follow: symlink {:?} -> {:?} (rest={:?}, follow_left={})",
+                    name, link_path, rest_path, follow_times
+                );
                 // result remains unchanged
                 let new_path = link_path + "/" + &rest_path;
                 return result.lookup_follow(&new_path, follow_times - 1);
