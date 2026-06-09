@@ -247,10 +247,14 @@ impl From<FileDesc> for i32 {
 
 /// create root filesystem, mount DevFS and RamFS
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
-    let rootfs = MountFS::new(rootfs);
-    let root = rootfs.mountpoint_root_inode();
-    reset_mount_table();
-    register_mount("rootfs", "/", "rootfs", "rw", boot_mount_state());
+    // Filesystem from the boot medium (initrd / SFS). We use it to read the boot
+    // `/etc/fstab` and, when an installed ext2 ROOT partition is detected, to
+    // pivot the real root onto it (similar to an initramfs `switch_root`).
+    let boot_mountfs = MountFS::new(rootfs);
+    let boot_root = boot_mountfs.mountpoint_root_inode();
+
+    // Block devices / partitions registered in DevFS, used to locate the root.
+    let mut block_candidates: Vec<(String, Arc<dyn INode>)> = Vec::new();
 
     // create DevFS
     let devfs = DevFS::new();
@@ -363,8 +367,12 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         
         // Use i * 16 as the base index for minor numbers to leave room for partitions
         let base_index = i * 16;
-        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(base_index, block.clone(), fname.clone()))) {
+        let dev = Arc::new(devfs::BlockDev::new(base_index, block.clone(), fname.clone()));
+        let dev_dyn: Arc<dyn INode> = dev.clone();
+        if let Err(e) = devfs_root.add(&fname, dev) {
             warn!("failed to mknod /dev/{}: {:?}", &fname, e);
+        } else {
+            block_candidates.push((fname.clone(), dev_dyn));
         }
 
         // Scan for partitions on this block device
@@ -383,13 +391,31 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 block_count,
             ));
             let part_dev_index = base_index + part_num;
-            if let Err(e) = devfs_root.add(&part_name, Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver, part_name.clone()))) {
+            let part = Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver, part_name.clone()));
+            let part_dyn: Arc<dyn INode> = part.clone();
+            if let Err(e) = devfs_root.add(&part_name, part) {
                 warn!("failed to mknod /dev/{}: {:?}", &part_name, e);
             } else {
                 info!("Registered partition /dev/{} (start: {}, count: {})", part_name, start_block, block_count);
+                block_candidates.push((part_name.clone(), part_dyn));
             }
         }
     }
+
+    // Decide the real root filesystem: pivot from the boot medium onto an
+    // installed ext2 ROOT partition when one is available, otherwise keep the
+    // boot medium as `/`.
+    let (rootfs, root_source, root_fstype) =
+        match determine_real_root(&boot_root, &block_candidates) {
+            Some((fs, source)) => {
+                info!("create_root_fs: pivoting root onto {} (ext2)", source);
+                (MountFS::new(fs), source, "ext2")
+            }
+            None => (boot_mountfs, String::from("rootfs"), "rootfs"),
+        };
+    let root = rootfs.mountpoint_root_inode();
+    reset_mount_table();
+    register_mount(&root_source, "/", root_fstype, "rw", boot_mount_state());
 
     // mount DevFS at /dev
     let dev = root.find(true, "dev").unwrap_or_else(|_| {
@@ -457,6 +483,199 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     mount_ops::set_vfs_root(root.clone());
     mount_fstab(&root);
     root
+}
+
+/// Choose the real root filesystem, pivoting from the boot medium onto an
+/// installed ext2 ROOT partition when one is available.
+///
+/// Resolution order:
+/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) when it
+///    resolves to a real ext2 device — a deterministic, explicit pivot.
+/// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
+///    real, resolvable device.
+/// 3. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
+///    that very partition as `/` (self-consistent installed root).
+/// 4. Lenient fallback: the first ext2 partition that otherwise looks like an
+///    installed Eclipse root (has `/etc/fstab` and an init), to tolerate the
+///    device being enumerated under a different name than at install time.
+///
+/// An unresolved `ROOT=` (for instance the unpatched placeholder baked into a
+/// live medium's `rboot.conf`) is ignored and we fall through to auto-detection
+/// instead of staying on the boot medium.
+///
+/// Returns the filesystem to use as `/` together with its device path, or
+/// `None` to keep the boot medium as the root.
+fn determine_real_root(
+    boot_root: &Arc<MNode>,
+    candidates: &[(String, Arc<dyn INode>)],
+) -> Option<(Arc<dyn FileSystem>, String)> {
+    // 1. An explicit `ROOT=<dev>` that resolves to a real ext2 device wins.
+    let cmdline = kernel_hal::boot::cmdline();
+    if let Some(dev) = parse_root_cmdline(&cmdline) {
+        if let Some(inode) = lookup_candidate(candidates, dev) {
+            if let Some(fs) = open_ext2_root(inode) {
+                info!("create_root_fs: root via ROOT={}", dev);
+                return Some((fs, String::from(dev)));
+            }
+            warn!("create_root_fs: ROOT={} no es un ext2 montable", dev);
+        } else {
+            info!(
+                "create_root_fs: ROOT={} sin resolver; se intenta fstab/auto-detección",
+                dev
+            );
+        }
+    }
+
+    // 2. The boot medium's fstab root entry, if it names a real device.
+    if let Some(res) = root_fs_from_fstab(boot_root, candidates) {
+        return Some(res);
+    }
+
+    // 3. Auto-detect a self-consistent installed ext2 root (name matches fstab).
+    for (name, inode) in candidates {
+        if let Some(fs) = open_ext2_root(inode.clone()) {
+            if fstab_declares_self_root(&fs, name) {
+                info!(
+                    "create_root_fs: root auto-detectado (autoconsistente) en /dev/{}",
+                    name
+                );
+                return Some((fs, format!("/dev/{}", name)));
+            }
+        }
+    }
+
+    // 4. Lenient fallback: the first ext2 partition that looks like an installed
+    //    Eclipse root, tolerating a device-name mismatch with its own fstab.
+    for (name, inode) in candidates {
+        if let Some(fs) = open_ext2_root(inode.clone()) {
+            if looks_like_eclipse_root(&fs) {
+                info!("create_root_fs: root Eclipse detectado en /dev/{}", name);
+                return Some((fs, format!("/dev/{}", name)));
+            }
+        }
+    }
+    None
+}
+
+/// Heuristic: an ext2 that carries an `/etc/fstab` together with a userspace
+/// init looks like an installed Eclipse root (data partitions like `/home` do
+/// not have `/etc/fstab`).
+fn looks_like_eclipse_root(fs: &Arc<dyn FileSystem>) -> bool {
+    let root = fs.root_inode();
+    let exists = |path: &[&str]| -> bool {
+        let mut cur = root.clone();
+        for comp in path {
+            match cur.find(comp) {
+                Ok(n) => cur = n,
+                Err(_) => return false,
+            }
+        }
+        true
+    };
+    exists(&["etc", "fstab"])
+        && (exists(&["bin", "busybox"]) || exists(&["sbin", "init"]) || exists(&["init"]))
+}
+
+/// Extract the `ROOT=` device from the kernel command line, which is a
+/// `:`-separated list of `KEY=value` pairs (e.g. `LOG=info:ROOT=/dev/sda2`).
+fn parse_root_cmdline(cmdline: &str) -> Option<&str> {
+    for opt in cmdline.split(':') {
+        let mut it = opt.trim().splitn(2, '=');
+        let key = it.next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("ROOT") {
+            let val = it.next().unwrap_or("").trim();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Find a registered block device whose name matches the basename of `dev`
+/// (e.g. `/dev/sda2` -> `sda2`).
+fn lookup_candidate(
+    candidates: &[(String, Arc<dyn INode>)],
+    dev: &str,
+) -> Option<Arc<dyn INode>> {
+    let want = dev.trim().rsplit('/').next()?;
+    candidates
+        .iter()
+        .find(|(n, _)| n.as_str() == want)
+        .map(|(_, i)| i.clone())
+}
+
+/// Open a block-device inode as an ext2 filesystem, if possible.
+fn open_ext2_root(inode: Arc<dyn INode>) -> Option<Arc<dyn FileSystem>> {
+    let backend = block_mount::MountBackend::from_inode(inode).ok()?;
+    mount_ops::open_filesystem(backend, "ext2").ok()
+}
+
+/// Open the ext2 root declared by the `/` entry of the boot medium's fstab,
+/// when that entry names a real, resolvable device.
+fn root_fs_from_fstab(
+    boot_root: &Arc<MNode>,
+    candidates: &[(String, Arc<dyn INode>)],
+) -> Option<(Arc<dyn FileSystem>, String)> {
+    let etc = boot_root.find(true, "etc").ok()?;
+    let fstab = etc.find(true, "fstab").ok()?;
+    let fstab_dyn: Arc<dyn INode> = fstab;
+    let content_vec = fstab_dyn.read_as_vec().ok()?;
+    let content = core::str::from_utf8(&content_vec).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 || parts[1] != "/" {
+            continue;
+        }
+        // Only ext-family roots can be mounted here; bail out otherwise.
+        if mount_ops::parse_fstype(parts[2]).ok()? != "ext2" {
+            return None;
+        }
+        let inode = lookup_candidate(candidates, parts[0])?;
+        let fs = open_ext2_root(inode)?;
+        return Some((fs, String::from(parts[0])));
+    }
+    None
+}
+
+/// Returns `true` when `fs` contains an `/etc/fstab` whose root (`/`) entry
+/// names exactly the partition `dev_name`, i.e. this is the installed root.
+fn fstab_declares_self_root(fs: &Arc<dyn FileSystem>, dev_name: &str) -> bool {
+    let root = fs.root_inode();
+    let etc = match root.find("etc") {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let fstab = match etc.find("fstab") {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let content_vec = match fstab.read_as_vec() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let content = match core::str::from_utf8(&content_vec) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 || parts[1] != "/" {
+            continue;
+        }
+        // The root entry must name a real device (not a placeholder) that
+        // corresponds to this very partition.
+        return parts[0].trim().rsplit('/').next() == Some(dev_name);
+    }
+    false
 }
 
 fn resolve_or_create_dir(root: &Arc<MNode>, path: &str) -> LxResult<Arc<MNode>> {
