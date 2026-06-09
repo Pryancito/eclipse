@@ -31,6 +31,11 @@ impl LinuxRootfs {
             Self::install_ca_certs(&dir);
             let musl = self.0.linux_musl_cross();
             let bin = dir.join("bin");
+            // Ensure busybox applet symlinks are present even on incremental builds.
+            // Without this, a rootfs built before symlink support was added (or from a
+            // partial build) would produce an ext2 image where `ls`, `cat`, etc. are
+            // missing, making the installed system unusable.
+            Self::ensure_busybox_applets(&bin);
             let nl_dump = self.nl_dump(&musl);
             if nl_dump.is_file() {
                 let _ = fs::copy(&nl_dump, bin.join("nl_dump"));
@@ -147,41 +152,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         fs::copy(from, &to).unwrap();
         Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
         // 为 busybox 支持的所有 applets 建立符号链接
-        let bin = dir.join("bin");
-        let busybox_bin = bin.join("busybox");
-        
-        // Base list of essential applets
-        let mut applets: Vec<String> = vec![
-            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill",
-            "ln", "ls", "mkdir", "mv", "pidof", "ping", "ps", "pwd", "rm", 
-            "rmdir", "sh", "sleep", "stat", "tar", "touch", "true", "uname", 
-            "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6", 
-            "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort", 
-            "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr", 
-            "id", "date", "env", "chmod", "chown", "vi", "top", "less",
-            "ssl_client", "ssl_server", "wget", "traceroute", "traceroute6",
-        ].into_iter().map(String::from).collect();
-
-        // Try to complement the list with busybox --list if it can run on host
-        if let Ok(out) = std::process::Command::new(&busybox_bin).arg("--list").output() {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    for line in s.lines() {
-                        let applet = line.trim().to_string();
-                        if !applet.is_empty() && !applets.contains(&applet) {
-                            applets.push(applet);
-                        }
-                    }
-                }
-            }
-        }
-
-        for applet in &applets {
-            let link = bin.join(applet);
-            if !link.exists() && !link.is_symlink() {
-                let _ = unix::fs::symlink("busybox", &link);
-            }
-        }
+        Self::ensure_busybox_applets(&bin);
         // Create standard pseudo-filesystem mount points
         let _ = fs::create_dir_all(dir.join("run"));
         let _ = fs::create_dir_all(dir.join("proc"));
@@ -379,6 +350,49 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n",
         )
         .unwrap();
+    }
+
+    /// Creates symlinks in `bin/` for every busybox applet.
+    ///
+    /// Called on both full and incremental builds so that a rootfs directory
+    /// created before this feature existed (or after a partial build) still ends
+    /// up with all applet symlinks in the final ext2 image.  Existing entries
+    /// (real binaries like `nl_dump`) are never overwritten.
+    fn ensure_busybox_applets(bin: &Path) {
+        // Base list of essential applets
+        let mut applets: Vec<String> = vec![
+            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill",
+            "ln", "ls", "mkdir", "mv", "pidof", "ping", "ps", "pwd", "rm",
+            "rmdir", "sh", "sleep", "stat", "tar", "touch", "true", "uname",
+            "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6",
+            "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort",
+            "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr",
+            "id", "date", "env", "chmod", "chown", "vi", "top", "less",
+            "ssl_client", "ssl_server", "wget", "traceroute", "traceroute6",
+        ].into_iter().map(String::from).collect();
+
+        // Complement the list with `busybox --list` when it runs on the host.
+        let busybox_bin = bin.join("busybox");
+        if let Ok(out) = std::process::Command::new(&busybox_bin).arg("--list").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    for line in s.lines() {
+                        let applet = line.trim().to_string();
+                        if !applet.is_empty() && !applets.contains(&applet) {
+                            applets.push(applet);
+                        }
+                    }
+                }
+            }
+        }
+
+        for applet in &applets {
+            let link = bin.join(applet);
+            if !link.exists() && !link.is_symlink() {
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink("busybox", &link);
+            }
+        }
     }
 
     const CA_PEM_URL: &str = "https://curl.se/ca/cacert.pem";
