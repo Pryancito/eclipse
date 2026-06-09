@@ -116,6 +116,38 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
         self.superblock.inner.log_block_size + 10
     }
 
+    pub fn first_data_block(&self) -> u32 {
+        self.superblock.inner.first_data_block
+    }
+
+    pub fn blocks_per_group(&self) -> u32 {
+        self.superblock.inner.blocks_per_group
+    }
+
+    pub fn free_inodes_count_raw(&self) -> u32 {
+        self.superblock.inner.free_inodes_count
+    }
+
+    pub fn free_blocks_count_raw(&self) -> u32 {
+        self.superblock.inner.free_blocks_count
+    }
+
+    pub fn block_groups_len(&self) -> usize {
+        self.block_groups.inner.len()
+    }
+
+    pub fn block_group(&self, index: usize) -> BlockGroupDescriptor {
+        self.block_groups.inner[index]
+    }
+
+    pub fn block_group_mut(&mut self, index: usize) -> &mut BlockGroupDescriptor {
+        &mut self.block_groups.inner[index]
+    }
+
+    pub fn superblock_mut(&mut self) -> &mut Superblock {
+        &mut self.superblock.inner
+    }
+
     pub fn sector_size(&self) -> usize {
         S::SIZE
     }

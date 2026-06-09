@@ -489,15 +489,19 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 /// installed ext2 ROOT partition when one is available.
 ///
 /// Resolution order:
-/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) is
-///    *authoritative*: if present we obey it, and if it cannot be resolved
-///    (e.g. the unpatched placeholder of a live/installer medium) we keep the
-///    boot medium as `/` rather than guessing — so a live medium never pivots
-///    onto an attached installed disk by accident.
-/// 2. If there is no `ROOT=` directive at all: the root (`/`) entry of the boot
-///    medium's `/etc/fstab`, when it names a real, resolvable device.
-/// 3. Otherwise: auto-detection of the first ext2 partition whose own
-///    `/etc/fstab` declares that very partition as `/` (self-consistent root).
+/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) when it
+///    resolves to a real ext2 device — a deterministic, explicit pivot.
+/// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
+///    real, resolvable device.
+/// 3. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
+///    that very partition as `/` (self-consistent installed root).
+/// 4. Lenient fallback: the first ext2 partition that otherwise looks like an
+///    installed Eclipse root (has `/etc/fstab` and an init), to tolerate the
+///    device being enumerated under a different name than at install time.
+///
+/// An unresolved `ROOT=` (for instance the unpatched placeholder baked into a
+/// live medium's `rboot.conf`) is ignored and we fall through to auto-detection
+/// instead of staying on the boot medium.
 ///
 /// Returns the filesystem to use as `/` together with its device path, or
 /// `None` to keep the boot medium as the root.
@@ -505,37 +509,71 @@ fn determine_real_root(
     boot_root: &Arc<MNode>,
     candidates: &[(String, Arc<dyn INode>)],
 ) -> Option<(Arc<dyn FileSystem>, String)> {
-    // 1. An explicit `ROOT=<dev>` on the kernel command line is authoritative.
+    // 1. An explicit `ROOT=<dev>` that resolves to a real ext2 device wins.
     let cmdline = kernel_hal::boot::cmdline();
     if let Some(dev) = parse_root_cmdline(&cmdline) {
-        match lookup_candidate(candidates, dev) {
-            Some(inode) => match open_ext2_root(inode) {
-                Some(fs) => return Some((fs, String::from(dev))),
-                None => warn!("create_root_fs: ROOT={} no es un ext2 montable", dev),
-            },
-            None => info!(
-                "create_root_fs: ROOT={} sin resolver; se mantiene el medio de arranque",
+        if let Some(inode) = lookup_candidate(candidates, dev) {
+            if let Some(fs) = open_ext2_root(inode) {
+                info!("create_root_fs: root via ROOT={}", dev);
+                return Some((fs, String::from(dev)));
+            }
+            warn!("create_root_fs: ROOT={} no es un ext2 montable", dev);
+        } else {
+            info!(
+                "create_root_fs: ROOT={} sin resolver; se intenta fstab/auto-detección",
                 dev
-            ),
+            );
         }
-        // A ROOT= directive was given but is unusable: do not auto-detect.
-        return None;
     }
 
-    // 2. No explicit ROOT=: use the boot medium's fstab root entry, if real.
+    // 2. The boot medium's fstab root entry, if it names a real device.
     if let Some(res) = root_fs_from_fstab(boot_root, candidates) {
         return Some(res);
     }
 
-    // 3. Auto-detect a self-consistent installed ext2 root.
+    // 3. Auto-detect a self-consistent installed ext2 root (name matches fstab).
     for (name, inode) in candidates {
         if let Some(fs) = open_ext2_root(inode.clone()) {
             if fstab_declares_self_root(&fs, name) {
+                info!(
+                    "create_root_fs: root auto-detectado (autoconsistente) en /dev/{}",
+                    name
+                );
+                return Some((fs, format!("/dev/{}", name)));
+            }
+        }
+    }
+
+    // 4. Lenient fallback: the first ext2 partition that looks like an installed
+    //    Eclipse root, tolerating a device-name mismatch with its own fstab.
+    for (name, inode) in candidates {
+        if let Some(fs) = open_ext2_root(inode.clone()) {
+            if looks_like_eclipse_root(&fs) {
+                info!("create_root_fs: root Eclipse detectado en /dev/{}", name);
                 return Some((fs, format!("/dev/{}", name)));
             }
         }
     }
     None
+}
+
+/// Heuristic: an ext2 that carries an `/etc/fstab` together with a userspace
+/// init looks like an installed Eclipse root (data partitions like `/home` do
+/// not have `/etc/fstab`).
+fn looks_like_eclipse_root(fs: &Arc<dyn FileSystem>) -> bool {
+    let root = fs.root_inode();
+    let exists = |path: &[&str]| -> bool {
+        let mut cur = root.clone();
+        for comp in path {
+            match cur.find(comp) {
+                Ok(n) => cur = n,
+                Err(_) => return false,
+            }
+        }
+        true
+    };
+    exists(&["etc", "fstab"])
+        && (exists(&["bin", "busybox"]) || exists(&["sbin", "init"]) || exists(&["init"]))
 }
 
 /// Extract the `ROOT=` device from the kernel command line, which is a

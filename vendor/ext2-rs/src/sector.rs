@@ -93,11 +93,12 @@ impl<S: SectorSize> Address<S> {
 }
 
 impl<S: SectorSize> Step for Address<S> {
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
         if end.sector >= start.sector {
-            Some(end.sector as usize - start.sector as usize)
+            let steps = end.sector as usize - start.sector as usize;
+            (steps, Some(steps))
         } else {
-            None
+            (0, None)
         }
     }
 

@@ -386,6 +386,11 @@ impl<S: SectorSize, V: Volume<u8, S>> Inode<S, V> {
         self.inner.type_perm.contains(TypePerm::DIRECTORY)
     }
 
+    pub fn is_symlink(&self) -> bool {
+        use sys::inode::TypePerm;
+        self.inner.type_perm.contains(TypePerm::SYMLINK)
+    }
+
     pub fn block(&self, index: usize) -> Option<NonZeroU32> {
         self.try_block(index).ok().and_then(|block| block)
     }
