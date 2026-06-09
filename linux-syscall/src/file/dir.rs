@@ -121,16 +121,15 @@ impl Syscall<'_> {
         let mut kbuf = vec![0; cap_size];
         let mut writer = DirentBufWriter::new(&mut kbuf);
         loop {
-            let name = match file.read_entry() {
+            let (metadata, name) = match file.read_entry_with_metadata() {
                 Err(LxError::ENOENT) => break,
                 r => r,
             }?;
-            // Query child inode to report correct file type
-            let child_type = file.inode().find(&name)
-                .and_then(|c| c.metadata())
-                .map(|m| m.type_)
-                .unwrap_or(FileType::File);
-            let ok = writer.try_write(0, DirentType::from(child_type).bits(), &name);
+            let ok = writer.try_write(
+                metadata.inode as u64,
+                DirentType::from(metadata.type_).bits(),
+                &name,
+            );
             if !ok {
                 break;
             }

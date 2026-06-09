@@ -173,15 +173,19 @@ struct ProcRootINode;
 
 impl ProcRootINode {
     fn entry_name(id: usize) -> Result<String> {
-        if id < PROC_ROOT_STATIC.len() {
-            return Ok(PROC_ROOT_STATIC[id].into());
+        match id {
+            0 => Ok(String::from(".")),
+            1 => Ok(String::from("..")),
+            i if i - 2 < PROC_ROOT_STATIC.len() => Ok(PROC_ROOT_STATIC[i - 2].into()),
+            i => {
+                let idx = i - 2 - PROC_ROOT_STATIC.len();
+                let procs = all_processes();
+                if idx >= procs.len() {
+                    return Err(FsError::EntryNotFound);
+                }
+                Ok(alloc::format!("{}", procs[idx].id()))
+            }
         }
-        let idx = id - PROC_ROOT_STATIC.len();
-        let procs = all_processes();
-        if idx >= procs.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(alloc::format!("{}", procs[idx].id()))
     }
 }
 
@@ -457,13 +461,13 @@ impl INode for ProcSeqINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let size = (self.generate)().len();
+        // Linux reports size 0 for seq_file pseudo entries; content is generated on read.
         Ok(Metadata {
             dev: 0,
             inode: self.inode,
-            size,
+            size: 0,
             blk_size: 4096,
-            blocks: (size + 4095) / 4096,
+            blocks: 0,
             atime: Timespec { sec: 0, nsec: 0 },
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
@@ -853,6 +857,21 @@ fn proc_eclipse_pulse_content() -> String {
         "signals {}\nhid_backup {}\nnet_poll {}\nnet_poll_irq {}\nhlt {}\n",
         p.signals, p.hid_backup, p.net_poll, p.net_poll_irq, p.hlt
     )
+}
+
+/// Resolve an absolute `/proc/...` path without walking the ext2 backing store.
+pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
+    let path = path.trim_end_matches('/');
+    if path == "/proc" {
+        return Ok(PROC_ROOT.clone());
+    }
+    let rest = path
+        .strip_prefix("/proc/")
+        .ok_or(FsError::EntryNotFound)?;
+    if rest.is_empty() {
+        return Ok(PROC_ROOT.clone());
+    }
+    PROC_ROOT.lookup_follow(rest, follow_times)
 }
 
 lazy_static! {

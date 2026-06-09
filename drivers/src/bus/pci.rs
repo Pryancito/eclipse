@@ -6,7 +6,7 @@ use alloc::{sync::Arc, vec::Vec};
 use pci::*;
 const BAR0: u16 = 0x10;
 #[allow(dead_code)]
-const BAR5_REG: u16 = 0x24;
+pub(crate) const BAR5_REG: u16 = 0x24;
 #[allow(dead_code)]
 const PCI_CAP_PTR: u16 = 0x34;
 const PCI_INTERRUPT_LINE: u16 = 0x3c;

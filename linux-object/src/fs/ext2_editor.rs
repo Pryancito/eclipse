@@ -409,6 +409,50 @@ impl<'a> Ext2Editor<'a> {
         Self::set_inode_full_size(raw, target.len());
     }
 
+    /// Read bytes from a regular file or symlink inode using on-disk block maps.
+    pub(crate) fn read_file_at(
+        &self,
+        inode_num: u32,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let raw = self.read_raw_inode(inode_num)?;
+        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+            return Err(FsError::IsDir);
+        }
+        if raw.type_perm.contains(TypePerm::SYMLINK) {
+            let target = self.read_symlink(inode_num)?;
+            if offset >= target.len() {
+                return Ok(0);
+            }
+            let take = (target.len() - offset).min(buf.len());
+            buf[..take].copy_from_slice(&target[offset..offset + take]);
+            return Ok(take);
+        }
+        let total = Self::inode_full_size(&raw);
+        if offset >= total {
+            return Ok(0);
+        }
+        let want = (total - offset).min(buf.len());
+        let bs = self.block_size();
+        let mut done = 0usize;
+        let mut pos = offset;
+        while done < want {
+            let file_block = pos / bs;
+            let block_off = pos % bs;
+            let disk_block = match self.inode_block_at(&raw, file_block)? {
+                Some(b) => b,
+                None => break,
+            };
+            let data = self.read_block(disk_block)?;
+            let take = (want - done).min(bs - block_off);
+            buf[done..done + take].copy_from_slice(&data[block_off..block_off + take]);
+            done += take;
+            pos += take;
+        }
+        Ok(done)
+    }
+
     pub(crate) fn read_symlink(&self, inode_num: u32) -> Result<Vec<u8>> {
         let raw = self.read_raw_inode(inode_num)?;
         if !raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -539,15 +583,18 @@ impl<'a> Ext2Editor<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn raw_uid_gid(&self, inode_num: u32) -> Result<(u16, u16)> {
         let raw = self.read_raw_inode(inode_num)?;
         Ok((raw.uid, raw.gid))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn raw_hard_links(&self, inode_num: u32) -> Result<u16> {
         Ok(self.read_raw_inode(inode_num)?.hard_links)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn raw_mode(&self, inode_num: u32) -> Result<u16> {
         Ok(self.read_raw_inode(inode_num)?.type_perm.bits())
     }

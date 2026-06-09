@@ -200,13 +200,18 @@ impl File {
 
     /// get the name of dir entry
     pub fn read_entry(&self) -> LxResult<String> {
+        Ok(self.read_entry_with_metadata()?.1)
+    }
+
+    /// get the next directory entry and its metadata
+    pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
         let mut inner = self.inner.write();
         if !inner.flags.readable() {
             return Err(LxError::EBADF);
         }
-        let name = inner.inode.get_entry(inner.offset as usize)?;
+        let entry = inner.inode.get_entry_with_metadata(inner.offset as usize)?;
         inner.offset += 1;
-        Ok(name)
+        Ok(entry)
     }
 
     /// get INode of this file

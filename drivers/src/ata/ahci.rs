@@ -549,6 +549,9 @@ pub struct AhciInterface {
     name: String,
     port: Mutex<AhciPort>,
     _capacity: u64,
+    /// Page-aligned DMA bounce buffer for callers that pass stack-backed sectors.
+    bounce_phys: usize,
+    bounce_virt: usize,
 }
 
 impl AhciInterface {
@@ -671,24 +674,33 @@ impl AhciInterface {
                             continue;
                         }
                         if sectors >= 2097152 {
-                            crate::klog_info!(
+                            warn!(
                                 "ahci{}: SATA disk attached, {} sectors ({} GiB)",
                                 i,
                                 sectors,
                                 sectors / 2097152
                             );
                         } else {
-                            crate::klog_info!(
+                            warn!(
                                 "ahci{}: SATA disk attached, {} sectors ({} MiB)",
                                 i,
                                 sectors,
                                 sectors / 2048
                             );
                         }
+                        let bounce_phys = unsafe { drivers_dma_alloc(1) };
+                        if bounce_phys == 0 {
+                            unsafe {
+                                drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                            }
+                            return Err(DeviceError::NoResources);
+                        }
                         return Ok(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
                             _capacity: sectors,
+                            bounce_phys,
+                            bounce_virt: phys_to_virt(bounce_phys),
                         });
                     } else {
                         crate::klog_warn!("[AHCI] port {} IDENTIFY failed", i);
@@ -711,21 +723,77 @@ impl AhciInterface {
 
 impl BlockScheme for AhciInterface {
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+        if read_buf.is_empty() || read_buf.len() % SECTOR_SIZE != 0 {
+            return Err(DeviceError::InvalidParam);
+        }
         let lba = (block_id * (read_buf.len() / SECTOR_SIZE)) as u64;
-        let paddr = virt_to_phys(read_buf.as_ptr() as usize);
-        crate::klog_warn!("[AHCI] read_block: block_id={}, lba={}, vaddr={:#x}, paddr={:#x}", block_id, lba, read_buf.as_ptr() as usize, paddr);
-        self.port
-            .lock()
-            .rw_block(lba, paddr as u64, read_buf.len(), false)
+        let user_ptr = read_buf.as_ptr() as usize;
+        if user_ptr % 4096 == 0 {
+            let paddr = virt_to_phys(user_ptr);
+            return self
+                .port
+                .lock()
+                .rw_block(lba, paddr as u64, read_buf.len(), false);
+        }
+        let mut offset = 0usize;
+        let mut sector_lba = lba;
+        while offset < read_buf.len() {
+            let chunk = core::cmp::min(SECTOR_SIZE, read_buf.len() - offset);
+            let res = self
+                .port
+                .lock()
+                .rw_block(sector_lba, self.bounce_phys as u64, chunk, false);
+            if res.is_err() {
+                return res;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.bounce_virt as *const u8,
+                    read_buf.as_mut_ptr().add(offset),
+                    chunk,
+                );
+            }
+            offset += chunk;
+            sector_lba += 1;
+        }
+        Ok(())
     }
 
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
+        if write_buf.is_empty() || write_buf.len() % SECTOR_SIZE != 0 {
+            return Err(DeviceError::InvalidParam);
+        }
         let lba = (block_id * (write_buf.len() / SECTOR_SIZE)) as u64;
-        let paddr = virt_to_phys(write_buf.as_ptr() as usize);
-        crate::klog_warn!("[AHCI] write_block: block_id={}, lba={}, vaddr={:#x}, paddr={:#x}", block_id, lba, write_buf.as_ptr() as usize, paddr);
-        self.port
-            .lock()
-            .rw_block(lba, paddr as u64, write_buf.len(), true)
+        let user_ptr = write_buf.as_ptr() as usize;
+        if user_ptr % 4096 == 0 {
+            let paddr = virt_to_phys(user_ptr);
+            return self
+                .port
+                .lock()
+                .rw_block(lba, paddr as u64, write_buf.len(), true);
+        }
+        let mut offset = 0usize;
+        let mut sector_lba = lba;
+        while offset < write_buf.len() {
+            let chunk = core::cmp::min(SECTOR_SIZE, write_buf.len() - offset);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    write_buf.as_ptr().add(offset),
+                    self.bounce_virt as *mut u8,
+                    chunk,
+                );
+            }
+            let res = self
+                .port
+                .lock()
+                .rw_block(sector_lba, self.bounce_phys as u64, chunk, true);
+            if res.is_err() {
+                return res;
+            }
+            offset += chunk;
+            sector_lba += 1;
+        }
+        Ok(())
     }
 
     fn flush(&self) -> DeviceResult {
@@ -763,10 +831,26 @@ impl PciDriver for AhciDriverPci {
     }
 
     fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+        // AHCI ABAR lives in BAR5 (config offset 0x24). Some firmware/VMs (e.g.
+        // VirtualBox) leave `dev.bars[5]` empty even though the register is valid.
         let (addr, len) = if let Some(BAR::Memory(a, l, _, _)) = dev.bars[5] {
             (a as usize, l as usize)
         } else {
-            return Err(DeviceError::NotSupported);
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS, BAR5_REG};
+                let a = unsafe {
+                    read_bar_addr(&PortOpsImpl, PCI_ACCESS, dev.loc, BAR5_REG) as usize
+                };
+                if a == 0 {
+                    return Err(DeviceError::NotSupported);
+                }
+                (a, 4096 * 8)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return Err(DeviceError::NotSupported);
+            }
         };
 
         if addr == 0 {

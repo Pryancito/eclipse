@@ -49,6 +49,12 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
                 by_blocks: a,
                 by_inodes: b,
             })?;
+        const MAX_BLOCK_GROUPS: usize = 8192;
+        if block_groups_count > MAX_BLOCK_GROUPS {
+            return Err(Error::Other(alloc::string::String::from(
+                "block group count exceeds sanity limit",
+            )));
+        }
         let block_groups = unsafe {
             BlockGroupDescriptor::find_descriptor_table(
                 &volume,
@@ -75,7 +81,6 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
         if self.version().0 == 0 {
             mem::size_of::<RawInode>()
         } else {
-            // note: inodes bigger than 128 are not supported
             self.superblock.inner.inode_size as usize
         }
     }

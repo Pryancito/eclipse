@@ -34,7 +34,6 @@ pub fn init(mode: ModeInfo, fb_addr: u64) {
         // taking an interrupt with a half-updated setup.
         x86_64::instructions::interrupts::disable();
         IDT.load();
-        x86_64::instructions::interrupts::enable();
     }
 }
 

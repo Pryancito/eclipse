@@ -60,11 +60,13 @@ pub fn primary_init_early() {
 
 pub fn primary_init() {
     drivers::init().unwrap();
+    warn!("[boot] drivers init complete");
     unsafe {
         // enable global page
         Cr4::update(|f| f.insert(Cr4Flags::PAGE_GLOBAL));
     }
     smp::start_application_processors();
+    warn!("[boot] smp init complete");
 }
 
 pub fn timer_init() {

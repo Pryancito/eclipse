@@ -92,6 +92,41 @@ fn boot_mount_state() -> Arc<mount_state::MountState> {
     Arc::new(mount_state::MountState::new(false))
 }
 
+/// Resolve a top-level mount directory on the pivoted ext2 root without
+/// `MNode::find` overlay/metadata overhead (VBox disk boot).
+fn boot_resolve_mount_dir(
+    rootfs: &Arc<MountFS>,
+    root: &Arc<MNode>,
+    name: &str,
+    mode: u32,
+) -> Arc<MNode> {
+    warn!("[boot] lookup /{} on backing", name);
+    if let Ok(inode) = rootfs.inner_fs().root_inode().find(name) {
+        warn!("[boot] found /{}", name);
+        return MNode::from_backing(rootfs.clone(), inode);
+    }
+    warn!("[boot] mkdir /{}", name);
+    root.create(name, FileType::Dir, mode)
+        .expect("failed to mkdir")
+}
+
+fn resolve_mount_dir(
+    rootfs: &Arc<MountFS>,
+    root: &Arc<MNode>,
+    root_fstype: &str,
+    name: &str,
+    mode: u32,
+) -> Arc<MNode> {
+    if root_fstype == "ext2" {
+        boot_resolve_mount_dir(rootfs, root, name, mode)
+    } else {
+        root.find(true, name).unwrap_or_else(|_| {
+            root.create(name, FileType::Dir, mode)
+                .expect("failed to mkdir")
+        })
+    }
+}
+
 pub(crate) fn register_mount(
     source: &str,
     target: &str,
@@ -247,6 +282,7 @@ impl From<FileDesc> for i32 {
 
 /// create root filesystem, mount DevFS and RamFS
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
+    warn!("[boot] create_root_fs: begin");
     // Filesystem from the boot medium (initrd / SFS). We use it to read the boot
     // `/etc/fstab` and, when an installed ext2 ROOT partition is detected, to
     // pivot the real root onto it (similar to an initramfs `switch_root`).
@@ -339,8 +375,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         }
     }
 
+    warn!("[boot] create_root_fs: devfs ready");
+
     // Add block devices at `/dev/` using Linux naming conventions
     let blocks = drivers::all_block().as_vec();
+    warn!(
+        "[boot] create_root_fs: scanning {} block device(s)",
+        blocks.len()
+    );
     for (i, block) in blocks.iter().enumerate() {
         let name = block.name();
         let fname = if name.starts_with("nvme") {
@@ -377,6 +419,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 
         // Scan for partitions on this block device
         let partitions = devfs::blockdev::scan_partitions(block);
+        warn!(
+            "[boot] create_root_fs: /dev/{} has {} partition(s)",
+            fname,
+            partitions.len()
+        );
         for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
             let part_num = part_idx + 1;
             let part_name = if fname.starts_with("nvme") {
@@ -405,83 +452,100 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // Decide the real root filesystem: pivot from the boot medium onto an
     // installed ext2 ROOT partition when one is available, otherwise keep the
     // boot medium as `/`.
+    warn!(
+        "[boot] create_root_fs: determine_real_root ({} candidate(s))",
+        block_candidates.len()
+    );
     let (rootfs, root_source, root_fstype) =
         match determine_real_root(&boot_root, &block_candidates) {
             Some((fs, source)) => {
-                info!("create_root_fs: pivoting root onto {} (ext2)", source);
+                warn!("[boot] create_root_fs: pivot onto {} (ext2)", source);
                 (MountFS::new(fs), source, "ext2")
             }
-            None => (boot_mountfs, String::from("rootfs"), "rootfs"),
+            None => {
+                warn!("[boot] create_root_fs: keep boot medium as /");
+                (boot_mountfs, String::from("rootfs"), "rootfs")
+            }
         };
+    warn!("[boot] create_root_fs: root inode");
     let root = rootfs.mountpoint_root_inode();
     reset_mount_table();
     register_mount(&root_source, "/", root_fstype, "rw", boot_mount_state());
 
     // mount DevFS at /dev
-    let dev = root.find(true, "dev").unwrap_or_else(|_| {
-        root.create("dev", FileType::Dir, 0o666)
-            .expect("failed to mkdir /dev")
-    });
-    dev.mount(devfs).expect("failed to mount DevFS");
-    register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
+    let dev = resolve_mount_dir(&rootfs, &root, root_fstype, "dev", 0o666);
+    warn!("[boot] create_root_fs: mount devfs on /dev");
+    if let Err(e) = dev.mount(devfs) {
+        warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
+    } else {
+        register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
+    }
 
     // mount RamFS at /tmp
+    warn!("[boot] create_root_fs: mount /tmp");
     let ramfs = RamFS::new();
-    let tmp = root.find(true, "tmp").unwrap_or_else(|_| {
-        root.create("tmp", FileType::Dir, 0o666)
-            .expect("failed to mkdir /tmp")
-    });
-    tmp.mount(ramfs).expect("failed to mount RamFS");
-    register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
+    let tmp = resolve_mount_dir(&rootfs, &root, root_fstype, "tmp", 0o666);
+    if let Err(e) = tmp.mount(ramfs) {
+        warn!("[boot] create_root_fs: mount /tmp failed: {:?}", e);
+    } else {
+        register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
+    }
 
     // mount RamFS at /run (essential for DHCP clients and other daemons)
+    warn!("[boot] create_root_fs: mount /run");
     let run_ramfs = RamFS::new();
-    let run = root.find(true, "run").unwrap_or_else(|_| {
-        root.create("run", FileType::Dir, 0o755)
-            .expect("failed to mkdir /run")
-    });
-    run.mount(run_ramfs).expect("failed to mount RamFS at /run");
-    register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
+    let run = resolve_mount_dir(&rootfs, &root, root_fstype, "run", 0o755);
+    if let Err(e) = run.mount(run_ramfs) {
+        warn!("[boot] create_root_fs: mount /run failed: {:?}", e);
+    } else {
+        register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
+    }
 
-    // Ensure /var/run exists and can be used (often it's a symlink or needs its own mount)
-    if let Ok(var) = root.find(true, "var") {
-        if var.find(true, "run").is_err() {
-            var.create("run", FileType::Dir, 0o755).ok();
+    // Ensure /var/run exists. Skip while pivoting onto an installed ext2 root:
+    // scanning /var during early boot has stalled some VBox/VDI setups, and /run
+    // is already a dedicated tmpfs mount above.
+    if root_fstype != "ext2" {
+        if let Ok(var) = root.find(true, "var") {
+            if var.find(true, "run").is_err() {
+                var.create("run", FileType::Dir, 0o755).ok();
+            }
         }
     }
 
     // mount ProcFS at /proc
-    let proc = root.find(true, "proc").unwrap_or_else(|_| {
-        root.create("proc", FileType::Dir, 0o755)
-            .expect("failed to mkdir /proc")
-    });
-    proc.mount(Arc::new(ProcFS::new()))
-        .expect("failed to mount ProcFS");
-    register_mount(
-        "proc",
-        "/proc",
-        "proc",
-        "rw,nosuid,nodev,noexec,relatime",
-        boot_mount_state(),
-    );
+    warn!("[boot] create_root_fs: mount /proc");
+    let proc = resolve_mount_dir(&rootfs, &root, root_fstype, "proc", 0o755);
+    if let Err(e) = proc.mount(Arc::new(ProcFS::new())) {
+        warn!("[boot] create_root_fs: mount /proc failed: {:?}", e);
+    } else {
+        register_mount(
+            "proc",
+            "/proc",
+            "proc",
+            "rw,nosuid,nodev,noexec,relatime",
+            boot_mount_state(),
+        );
+    }
 
     // mount SysFS at /sys
-    let sys = root.find(true, "sys").unwrap_or_else(|_| {
-        root.create("sys", FileType::Dir, 0o755)
-            .expect("failed to mkdir /sys")
-    });
-    sys.mount(Arc::new(SysFS::new()))
-        .expect("failed to mount SysFS");
-    register_mount(
-        "sysfs",
-        "/sys",
-        "sysfs",
-        "rw,nosuid,nodev,noexec,relatime",
-        boot_mount_state(),
-    );
+    warn!("[boot] create_root_fs: mount /sys");
+    let sys = resolve_mount_dir(&rootfs, &root, root_fstype, "sys", 0o755);
+    if let Err(e) = sys.mount(Arc::new(SysFS::new())) {
+        warn!("[boot] create_root_fs: mount /sys failed: {:?}", e);
+    } else {
+        register_mount(
+            "sysfs",
+            "/sys",
+            "sysfs",
+            "rw,nosuid,nodev,noexec,relatime",
+            boot_mount_state(),
+        );
+    }
 
     mount_ops::set_vfs_root(root.clone());
-    mount_fstab(&root);
+    // Defer non-root fstab mounts (/boot vfat, /home, …) until after init starts.
+    // Mounting them here can stall disk boot (AHCI + SMP) before the shell appears.
+    warn!("[boot] create_root_fs: done");
     root
 }
 
@@ -493,11 +557,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 ///    resolves to a real ext2 device — a deterministic, explicit pivot.
 /// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
 ///    real, resolvable device.
-/// 3. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
-///    that very partition as `/` (self-consistent installed root).
-/// 4. Lenient fallback: the first ext2 partition that otherwise looks like an
-///    installed Eclipse root (has `/etc/fstab` and an init), to tolerate the
-///    device being enumerated under a different name than at install time.
+/// 3. Auto-detection: the first partition block device that passes the ext2
+///    superblock probe and mounts cleanly (typically `/dev/sda2` on an AHCI
+///    install with EFI on `sda1`).  We intentionally avoid walking installed
+///    root directories here — that has stalled some VBox/VDI setups.
 ///
 /// An unresolved `ROOT=` (for instance the unpatched placeholder baked into a
 /// live medium's `rboot.conf`) is ignored and we fall through to auto-detection
@@ -527,53 +590,20 @@ fn determine_real_root(
     }
 
     // 2. The boot medium's fstab root entry, if it names a real device.
+    warn!("[boot] determine_real_root: boot fstab");
     if let Some(res) = root_fs_from_fstab(boot_root, candidates) {
         return Some(res);
     }
 
-    // 3. Auto-detect a self-consistent installed ext2 root (name matches fstab).
-    for (name, inode) in candidates {
+    // 3. First mountable ext2 partition (vfat EFI on sda1 fails the probe).
+    for (name, inode) in ext2_mount_candidates(candidates) {
+        warn!("[boot] determine_real_root: probe /dev/{}", name);
         if let Some(fs) = open_ext2_root(inode.clone()) {
-            if fstab_declares_self_root(&fs, name) {
-                info!(
-                    "create_root_fs: root auto-detectado (autoconsistente) en /dev/{}",
-                    name
-                );
-                return Some((fs, format!("/dev/{}", name)));
-            }
-        }
-    }
-
-    // 4. Lenient fallback: the first ext2 partition that looks like an installed
-    //    Eclipse root, tolerating a device-name mismatch with its own fstab.
-    for (name, inode) in candidates {
-        if let Some(fs) = open_ext2_root(inode.clone()) {
-            if looks_like_eclipse_root(&fs) {
-                info!("create_root_fs: root Eclipse detectado en /dev/{}", name);
-                return Some((fs, format!("/dev/{}", name)));
-            }
+            warn!("[boot] determine_real_root: pivot /dev/{}", name);
+            return Some((fs, format!("/dev/{}", name)));
         }
     }
     None
-}
-
-/// Heuristic: an ext2 that carries an `/etc/fstab` together with a userspace
-/// init looks like an installed Eclipse root (data partitions like `/home` do
-/// not have `/etc/fstab`).
-fn looks_like_eclipse_root(fs: &Arc<dyn FileSystem>) -> bool {
-    let root = fs.root_inode();
-    let exists = |path: &[&str]| -> bool {
-        let mut cur = root.clone();
-        for comp in path {
-            match cur.find(comp) {
-                Ok(n) => cur = n,
-                Err(_) => return false,
-            }
-        }
-        true
-    };
-    exists(&["etc", "fstab"])
-        && (exists(&["bin", "busybox"]) || exists(&["sbin", "init"]) || exists(&["init"]))
 }
 
 /// Extract the `ROOT=` device from the kernel command line, which is a
@@ -584,12 +614,33 @@ fn parse_root_cmdline(cmdline: &str) -> Option<&str> {
         let key = it.next().unwrap_or("").trim();
         if key.eq_ignore_ascii_case("ROOT") {
             let val = it.next().unwrap_or("").trim();
-            if !val.is_empty() {
+            if !val.is_empty()
+                && !val.starts_with("__ECLIPSE_")
+                && val != "/dev/__ECLIPSE_CMDROOTDEV"
+            {
                 return Some(val);
             }
         }
     }
     None
+}
+
+/// True for partition nodes (`sda2`, `nvme0n1p3`, …), false for whole disks (`sda`).
+fn is_partition_candidate(name: &str) -> bool {
+    name.chars().last().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Prefer partition devices when GPT/MBR children exist; probing whole disks is
+/// slow and often matches garbage superblocks on protective-MBR layouts.
+fn ext2_mount_candidates<'a>(
+    candidates: &'a [(String, Arc<dyn INode>)],
+) -> impl Iterator<Item = &'a (String, Arc<dyn INode>)> {
+    let prefer_partitions = candidates
+        .iter()
+        .any(|(name, _)| is_partition_candidate(name));
+    candidates.iter().filter(move |(name, _)| {
+        !prefer_partitions || is_partition_candidate(name)
+    })
 }
 
 /// Find a registered block device whose name matches the basename of `dev`
@@ -608,6 +659,11 @@ fn lookup_candidate(
 /// Open a block-device inode as an ext2 filesystem, if possible.
 fn open_ext2_root(inode: Arc<dyn INode>) -> Option<Arc<dyn FileSystem>> {
     let backend = block_mount::MountBackend::from_inode(inode).ok()?;
+    if let block_mount::MountBackend::Block(block) = &backend {
+        if !block_mount::probe_ext2_superblock(block) {
+            return None;
+        }
+    }
     mount_ops::open_filesystem(backend, "ext2").ok()
 }
 
@@ -642,42 +698,6 @@ fn root_fs_from_fstab(
     None
 }
 
-/// Returns `true` when `fs` contains an `/etc/fstab` whose root (`/`) entry
-/// names exactly the partition `dev_name`, i.e. this is the installed root.
-fn fstab_declares_self_root(fs: &Arc<dyn FileSystem>, dev_name: &str) -> bool {
-    let root = fs.root_inode();
-    let etc = match root.find("etc") {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let fstab = match etc.find("fstab") {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let content_vec = match fstab.read_as_vec() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let content = match core::str::from_utf8(&content_vec) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 || parts[1] != "/" {
-            continue;
-        }
-        // The root entry must name a real device (not a placeholder) that
-        // corresponds to this very partition.
-        return parts[0].trim().rsplit('/').next() == Some(dev_name);
-    }
-    false
-}
-
 fn resolve_or_create_dir(root: &Arc<MNode>, path: &str) -> LxResult<Arc<MNode>> {
     let mut cur = root.clone();
     for comp in path.split('/').filter(|s| !s.is_empty()) {
@@ -689,6 +709,12 @@ fn resolve_or_create_dir(root: &Arc<MNode>, path: &str) -> LxResult<Arc<MNode>> 
     Ok(cur)
 }
 
+/// Mount entries from `/etc/fstab` (except `/`). Call after init is up.
+pub fn mount_vfs_fstab(root: &Arc<MNode>) {
+    mount_fstab(root);
+}
+
+#[allow(dead_code)]
 fn mount_fstab(root: &Arc<MNode>) {
     info!("mount_fstab: parsing /etc/fstab");
     if let Ok(etc) = root.find(true, "etc") {
@@ -878,6 +904,11 @@ impl LinuxProcess {
         }
 
         let follow_max_depth = if follow { FOLLOW_MAX_DEPTH } else { 0 };
+        if path.starts_with('/') {
+            if let Some(result) = lookup_virtual_fs(path, follow_max_depth) {
+                return result;
+            }
+        }
         if dirfd == FileDesc::CWD {
             Ok(self
                 .root_inode()
@@ -885,6 +916,11 @@ impl LinuxProcess {
                 .lookup_follow(path, follow_max_depth)?)
         } else {
             let file = self.get_file(dirfd)?;
+            if path.starts_with('/') {
+                if let Some(result) = lookup_virtual_fs(path, follow_max_depth) {
+                    return result;
+                }
+            }
             Ok(file.lookup_follow(path, follow_max_depth)?)
         }
     }
@@ -910,6 +946,31 @@ pub fn split_path(path: &str) -> (&str, &str) {
 
 /// the max depth for following a link
 const FOLLOW_MAX_DEPTH: usize = 1;
+
+/// Fast path for virtual filesystems mounted at `/proc`, `/sys`, and `/dev`.
+/// Avoids ext2 directory scans on every access (VBox AHCI can stall there).
+fn lookup_virtual_fs(path: &str, follow_times: usize) -> Option<LxResult<Arc<dyn INode>>> {
+    let path = path.trim_end_matches('/');
+    if path == "/proc" || path.starts_with("/proc/") {
+        return Some(procfs::lookup_path(path, follow_times).map_err(LxError::from));
+    }
+    if path == "/sys" || path.starts_with("/sys/") {
+        return Some(sysfs::lookup_path(path, follow_times).map_err(LxError::from));
+    }
+    if path == "/dev" || path.starts_with("/dev/") {
+        let root = DEVFS_ROOT.lock().clone()?;
+        let root: Arc<dyn INode> = root;
+        if path == "/dev" {
+            return Some(Ok(root));
+        }
+        let rest = path.strip_prefix("/dev/").unwrap();
+        return Some(
+            root.lookup_follow(rest, follow_times)
+                .map_err(LxError::from),
+        );
+    }
+    None
+}
 
 /// Rescans and registers partitions for a block device in devfs.
 pub fn rescan_partitions(fname: &str, block: &Arc<dyn zcore_drivers::scheme::BlockScheme>, base_index: usize) -> LxResult<()> {

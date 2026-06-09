@@ -2450,7 +2450,7 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
         }
 
         log(COLOR_GREEN "[4/5] Formateando partición HOME (ext2)..." COLOR_RESET);
-        snprintf(cmd, sizeof(cmd), "sh -c \"mke2fs -t ext2 -L HOME '%s'\"", home_dev);
+        snprintf(cmd, sizeof(cmd), "sh -c \"mke2fs -t ext2 -I 128 -O ^dir_index -L HOME '%s'\"", home_dev);
         if (run_command_logged(cmd, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo formatear HOME." COLOR_RESET);
             return -1;

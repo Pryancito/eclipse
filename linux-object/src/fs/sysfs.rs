@@ -3,6 +3,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
+use lazy_static::lazy_static;
 use kernel_hal::drivers;
 use kernel_hal::net::get_net_device;
 use rcore_fs::vfs::{
@@ -25,7 +26,7 @@ impl FileSystem for SysFS {
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
-        Arc::new(SysRootINode)
+        SYS_ROOT.clone()
     }
 
     fn info(&self) -> FsInfo {
@@ -141,7 +142,7 @@ impl INode for SysRootINode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." | ".." => Ok(Arc::new(SysRootINode)),
+            "." | ".." => Ok(SYS_ROOT.clone()),
             "class" => Ok(Arc::new(SysClassINode)),
             "block" => Ok(Arc::new(SysBlockDirINode)),
             "bus" => Ok(Arc::new(SysBusDirINode)),
@@ -1035,4 +1036,23 @@ fn get_pci_devices() -> Vec<PciDevInfo> {
     {
         Vec::new()
     }
+}
+
+/// Resolve an absolute `/sys/...` path without walking the ext2 backing store.
+pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
+    let path = path.trim_end_matches('/');
+    if path == "/sys" {
+        return Ok(SYS_ROOT.clone());
+    }
+    let rest = path
+        .strip_prefix("/sys/")
+        .ok_or(FsError::EntryNotFound)?;
+    if rest.is_empty() {
+        return Ok(SYS_ROOT.clone());
+    }
+    SYS_ROOT.lookup_follow(rest, follow_times)
+}
+
+lazy_static! {
+    static ref SYS_ROOT: Arc<dyn INode> = Arc::new(SysRootINode);
 }

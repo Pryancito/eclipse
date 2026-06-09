@@ -40,6 +40,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
     memory::init();
     kernel_hal::primary_init_early(config, &handler::ZcoreKernelHandler);
+    kernel_hal::console::early_progress_bar(55);
     kernel_hal::console::early_progress_bar(60);
     let options = utils::boot_options();
     logging::set_max_level(&options.log_level);
@@ -58,7 +59,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
     kernel_hal::console::early_progress_bar(90);
-    STARTED.store(true, Ordering::SeqCst);
     cfg_if! {
         if #[cfg(all(feature = "linux", feature = "zircon"))] {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
@@ -71,12 +71,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             let rootfs = fs::rootfs();
             kernel_hal::console::early_progress_bar(95);
             let proc = zcore_loader::linux::run(args, envs, rootfs);
+            // Keep secondary CPUs idle until root is mounted and init is spawned.
+            STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
             utils::wait_for_exit(Some(proc))
         } else if #[cfg(feature = "zircon")] {
             let zbi = fs::zbi();
             kernel_hal::console::early_progress_bar(95);
             let proc = zcore_loader::zircon::run_userboot(zbi, &options.cmdline);
+            STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
             utils::wait_for_exit(Some(proc))
         } else {

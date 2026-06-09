@@ -90,13 +90,11 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     }
     info!("rboot: start (log={:?})", log::max_level());
 
+    // Snapshot cmdline flags before ExitBootServices: `config` lives on the stack
+    // and must not be read after firmware reclaims that memory.
+    let use_rboot_idt = has_cmdline_flag(config.cmdline, "RBOOT_IDT");
+
     let graphic_info = init_graphic(bs, config.resolution);
-    // Optional: install a minimal IDT so faults after ExitBootServices aren't silent.
-    // Enabled via `RBOOT_IDT=1` in cmdline, because some firmware/QEMU setups
-    // behave unexpectedly when replacing the UEFI IDT early.
-    if has_cmdline_flag(config.cmdline, "RBOOT_IDT") {
-        idt::init(graphic_info.mode, graphic_info.fb_addr);
-    }
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
     if has_cmdline_flag(config.cmdline, "FB_ROT180") {
         progress::set_rot180(true);
@@ -274,6 +272,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // If we see 51% but not the kernel marker (52%), the hang is inside the
         // handoff asm / very first instruction fetch.
         progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
+        if use_rboot_idt {
+            idt::init(graphic_info.mode, graphic_info.fb_addr);
+        }
         jump_to_entry(bootinfo, stacktop);
     }
 }

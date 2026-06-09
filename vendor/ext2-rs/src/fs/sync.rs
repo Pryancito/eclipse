@@ -386,6 +386,22 @@ impl<S: SectorSize, V: Volume<u8, S>> Inode<S, V> {
         self.inner.type_perm.contains(TypePerm::DIRECTORY)
     }
 
+    pub fn uid(&self) -> u16 {
+        self.inner.uid
+    }
+
+    pub fn gid(&self) -> u16 {
+        self.inner.gid
+    }
+
+    pub fn mode_bits(&self) -> u16 {
+        self.inner.type_perm.bits()
+    }
+
+    pub fn nlink(&self) -> u16 {
+        self.inner.hard_links
+    }
+
     pub fn is_symlink(&self) -> bool {
         use sys::inode::TypePerm;
         self.inner.type_perm.contains(TypePerm::SYMLINK)
@@ -444,30 +460,36 @@ impl<S: SectorSize, V: Volume<u8, S>> Inode<S, V> {
         index -= 12;
 
         if index < bs4 {
-            let block = self.inner.indirect_pointer;
-            return block_index(&fs.volume, block, index, log_block_size);
+            if self.inner.indirect_pointer == 0 {
+                return Ok(None);
+            }
+            return block_index(
+                &fs.volume,
+                self.inner.indirect_pointer,
+                index,
+                log_block_size,
+            );
         }
 
         index -= bs4;
 
         if index < bs4 * bs4 {
-            let indirect_index = index >> (log_block_size + 2);
+            if self.inner.doubly_indirect == 0 {
+                return Ok(None);
+            }
+            let lvl1 = index / bs4;
+            let lvl2 = index % bs4;
             let block = match block_index(
                 &fs.volume,
                 self.inner.doubly_indirect,
-                indirect_index,
+                lvl1,
                 log_block_size,
             ) {
                 Ok(Some(block)) => block.get(),
                 Ok(None) => return Ok(None),
                 Err(err) => return Err(err),
             };
-            return block_index(
-                &fs.volume,
-                block,
-                index & (bs4 - 1),
-                log_block_size,
-            );
+            return block_index(&fs.volume, block, lvl2, log_block_size);
         }
 
         index -= bs4 * bs4;
@@ -508,10 +530,6 @@ impl<S: SectorSize, V: Volume<u8, S>> Inode<S, V> {
 
     pub fn in_use(&self) -> bool {
         self.inner.hard_links > 0
-    }
-
-    pub fn uid(&self) -> u16 {
-        self.inner.uid
     }
 
     pub fn sectors(&self) -> usize {
@@ -586,10 +604,16 @@ pub struct InodeBlocks<S: SectorSize, V: Volume<u8, S>> {
     index: usize,
 }
 
+/// Cap directory/file block walks so a corrupt inode cannot stall boot.
+const MAX_INODE_DATA_BLOCKS: usize = 256;
+
 impl<S: SectorSize, V: Volume<u8, S>> Iterator for InodeBlocks<S, V> {
     type Item = Result<(Vec<u8>, Address<S>), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= MAX_INODE_DATA_BLOCKS {
+            return None;
+        }
         let block = self.inode.try_block(self.index);
         let block = match block {
             Ok(Some(ok)) => ok,
@@ -654,6 +678,13 @@ impl<S: SectorSize, V: Volume<u8, S>> Iterator for Directory<S, V> {
         let size = buffer[4] as u16 | (buffer[5] as u16) << 8;
         let len = buffer[6];
         let ty = buffer[7];
+
+        if size == 0 || size < 8 || (size as usize) > self.block_size || size % 4 != 0 {
+            return None;
+        }
+        if (len as usize) + 8 > size as usize {
+            return None;
+        }
 
         let name = buffer[8..8 + len as usize].to_vec();
 

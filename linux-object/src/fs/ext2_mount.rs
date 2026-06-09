@@ -1,9 +1,10 @@
 //! ext2/ext3/ext4 mount support via ext2-rs.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use lock::Mutex;
 use alloc::vec::Vec;
+use lock::Mutex;
 use core::any::Any;
 use core::cmp::min;
 use core::ops::Range;
@@ -99,6 +100,8 @@ pub struct Ext2MountFs {
     pub(crate) synced: Synced<Ext2<Size512, Ext2Volume>>,
     pub(crate) device: Arc<dyn Device>,
     pub(crate) block_size: usize,
+    /// Cached directory listings keyed by inode number.
+    dir_cache: Mutex<BTreeMap<usize, Vec<(String, usize)>>>,
     this: Mutex<Weak<Self>>,
 }
 
@@ -117,6 +120,7 @@ impl Ext2MountFs {
             synced,
             device,
             block_size,
+            dir_cache: Mutex::new(BTreeMap::new()),
             this: Mutex::new(Weak::new()),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
@@ -131,6 +135,23 @@ impl Ext2MountFs {
         self.synced
             .inode_nth(num)
             .ok_or(FsError::EntryNotFound)
+    }
+
+    pub(crate) fn dir_entries_cached(
+        &self,
+        inode_num: usize,
+        scan: impl FnOnce() -> Result<Vec<(String, usize)>>,
+    ) -> Result<Vec<(String, usize)>> {
+        if let Some(entries) = self.dir_cache.lock().get(&inode_num) {
+            return Ok(entries.clone());
+        }
+        let entries = scan()?;
+        self.dir_cache.lock().insert(inode_num, entries.clone());
+        Ok(entries)
+    }
+
+    pub(crate) fn invalidate_dir_cache(&self, inode_num: usize) {
+        self.dir_cache.lock().remove(&inode_num);
     }
 }
 
@@ -191,21 +212,47 @@ impl Ext2MountINode {
         }
         let want = min(buf.len(), total - offset);
         let block_size = self.fs.block_size;
+        let log_block_size = self.fs.synced.inner().log_block_size();
         let mut done = 0;
-        let mut skip = offset % block_size;
-        for block in self.inode.blocks() {
-            if done >= want {
-                break;
-            }
-            let (data, _) = block.map_err(|_| FsError::DeviceError)?;
-            if skip >= data.len() {
-                skip -= data.len();
-                continue;
-            }
-            let take = min(want - done, data.len() - skip);
-            buf[done..done + take].copy_from_slice(&data[skip..skip + take]);
+        let mut pos = offset;
+        // Use the synced inode's block map (in memory). Fall back to the on-disk
+        // editor only when try_block cannot resolve an indirect pointer.
+        while done < want {
+            let file_block = pos / block_size;
+            let block_off = pos % block_size;
+            let disk_block = match self.inode.try_block(file_block) {
+                Ok(Some(b)) => b.get(),
+                Ok(None) => {
+                    if done == 0 {
+                        return self.fs.editor().read_file_at(
+                            self.inode_num as u32,
+                            offset,
+                            buf,
+                        );
+                    }
+                    let tail = self.fs.editor().read_file_at(
+                        self.inode_num as u32,
+                        pos,
+                        &mut buf[done..],
+                    )?;
+                    done += tail;
+                    break;
+                }
+                Err(_) => return Err(FsError::DeviceError),
+            };
+            let byte_base = Address::<Size512>::with_block_size(
+                disk_block,
+                block_off as i32,
+                log_block_size,
+            )
+            .into_index() as usize;
+            let take = min(want - done, block_size - block_off);
+            self.fs
+                .device
+                .read_at(byte_base, &mut buf[done..done + take])
+                .map_err(|_| FsError::DeviceError)?;
             done += take;
-            skip = 0;
+            pos += take;
         }
         Ok(done)
     }
@@ -273,18 +320,142 @@ impl Ext2MountINode {
         Ok(done)
     }
 
-    fn list_dir_entries(&self) -> Result<Vec<(String, usize)>> {
-        let mut out = Vec::new();
-        let dir = self.inode.directory().ok_or(FsError::NotDir)?;
-        for entry in dir {
-            let entry = entry.map_err(|_| FsError::DeviceError)?;
-            let name = String::from_utf8(entry.name).map_err(|_| FsError::InvalidParam)?;
-            if name == "." || name == ".." {
-                continue;
+    /// Look up a single child by name scanning direct directory blocks only.
+    fn find_direct_child(&self, name: &str) -> Result<usize> {
+        if !self.inode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        let block_size = self.fs.block_size;
+        let log_block_size = self.fs.synced.inner().log_block_size();
+        for block_idx in 0..12 {
+            let disk_block = match self.inode.try_block(block_idx) {
+                Ok(Some(b)) => b.get(),
+                Ok(None) => break,
+                Err(_) => return Err(FsError::DeviceError),
+            };
+            let byte_base = Address::<Size512>::with_block_size(disk_block, 0, log_block_size)
+                .into_index() as usize;
+            let mut block = vec![0u8; block_size];
+            self.fs
+                .device
+                .read_at(byte_base, &mut block)
+                .map_err(|_| FsError::DeviceError)?;
+            let mut off = 0usize;
+            while off < block_size {
+                if off + 8 > block_size {
+                    break;
+                }
+                let rec = &block[off..];
+                let inode_num = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                if inode_num == 0 {
+                    break;
+                }
+                let rec_len = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+                let name_len = rec[6] as usize;
+                if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > block_size {
+                    break;
+                }
+                if name_len + 8 > rec_len {
+                    break;
+                }
+                let entry_name = core::str::from_utf8(&rec[8..8 + name_len])
+                    .map_err(|_| FsError::InvalidParam)?;
+                if entry_name != "." && entry_name != ".." && entry_name == name {
+                    return Ok(inode_num as usize);
+                }
+                off += rec_len;
             }
-            out.push((name, entry.inode));
+        }
+        Err(FsError::EntryNotFound)
+    }
+
+    /// Scan directory data blocks using the synced inode's block map (direct blocks
+    /// only). Used for path lookup during boot; file reads use `read_file_at`.
+    fn scan_direct_dir_blocks(&self) -> Result<Vec<(String, usize)>> {
+        const MAX_DIR_ENTRIES: usize = 4096;
+        if !self.inode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        let block_size = self.fs.block_size;
+        let log_block_size = self.fs.synced.inner().log_block_size();
+        let mut out = Vec::new();
+        for block_idx in 0..12 {
+            let disk_block = match self.inode.try_block(block_idx) {
+                Ok(Some(b)) => b.get(),
+                Ok(None) => break,
+                Err(_) => return Err(FsError::DeviceError),
+            };
+            let byte_base = Address::<Size512>::with_block_size(disk_block, 0, log_block_size)
+                .into_index() as usize;
+            let mut block = vec![0u8; block_size];
+            self.fs
+                .device
+                .read_at(byte_base, &mut block)
+                .map_err(|_| FsError::DeviceError)?;
+            let mut off = 0usize;
+            while off < block_size {
+                if out.len() >= MAX_DIR_ENTRIES {
+                    return Ok(out);
+                }
+                if off + 8 > block_size {
+                    break;
+                }
+                let rec = &block[off..];
+                let inode_num = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                if inode_num == 0 {
+                    break;
+                }
+                let rec_len = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+                let name_len = rec[6] as usize;
+                if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > block_size {
+                    break;
+                }
+                if name_len + 8 > rec_len {
+                    break;
+                }
+                let name = core::str::from_utf8(&rec[8..8 + name_len])
+                    .map_err(|_| FsError::InvalidParam)?;
+                if name != "." && name != ".." {
+                    out.push((String::from(name), inode_num as usize));
+                }
+                off += rec_len;
+            }
         }
         Ok(out)
+    }
+
+    fn list_dir_entries(&self) -> Result<Vec<(String, usize)>> {
+        if !self.inode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        self.fs
+            .dir_entries_cached(self.inode_num, || self.scan_direct_dir_blocks())
+    }
+
+    fn child_metadata(inode_num: usize, inode: &Ext2Inode<Size512, Ext2Volume>) -> Metadata {
+        let size = inode.size();
+        Metadata {
+            dev: 0,
+            inode: inode_num,
+            size,
+            blk_size: 512,
+            blocks: (size + 511) / 512,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: if inode.is_dir() {
+                FileType::Dir
+            } else if inode.is_symlink() {
+                FileType::SymLink
+            } else {
+                FileType::File
+            },
+            mode: inode.mode_bits(),
+            nlinks: inode.nlink() as usize,
+            uid: inode.uid() as usize,
+            gid: inode.gid() as usize,
+            rdev: 0,
+        }
     }
 }
 
@@ -308,13 +479,14 @@ impl INode for Ext2MountINode {
     fn metadata(&self) -> Result<Metadata> {
         let is_dir = self.inode.is_dir();
         let is_symlink = self.inode.is_symlink();
-        let editor = self.fs.editor();
         let size = if is_symlink {
-            editor.read_symlink(self.inode_num as u32)?.len()
+            self.fs
+                .editor()
+                .read_symlink(self.inode_num as u32)?
+                .len()
         } else {
             self.inode.size()
         };
-        let (uid, gid) = editor.raw_uid_gid(self.inode_num as u32)?;
         Ok(Metadata {
             dev: 0,
             inode: self.inode_num,
@@ -331,10 +503,10 @@ impl INode for Ext2MountINode {
             } else {
                 FileType::File
             },
-            mode: editor.raw_mode(self.inode_num as u32)?,
-            nlinks: editor.raw_hard_links(self.inode_num as u32)? as usize,
-            uid: uid as usize,
-            gid: gid as usize,
+            mode: self.inode.mode_bits(),
+            nlinks: self.inode.nlink() as usize,
+            uid: self.inode.uid() as usize,
+            gid: self.inode.gid() as usize,
             rdev: 0,
         })
     }
@@ -348,31 +520,33 @@ impl INode for Ext2MountINode {
             })),
             ".." => Err(FsError::EntryNotFound),
             name => {
-                for (entry_name, inode_num) in self.list_dir_entries()? {
-                    if entry_name == name {
-                        let child = self.fs.inode_from_num(inode_num)?;
-                        return Ok(Arc::new(Ext2MountINode {
-                            fs: self.fs.clone(),
-                            inode: child,
-                            inode_num,
-                        }));
-                    }
-                }
-                Err(FsError::EntryNotFound)
+                let inode_num = self.find_direct_child(name)?;
+                let child = self.fs.inode_from_num(inode_num)?;
+                Ok(Arc::new(Ext2MountINode {
+                    fs: self.fs.clone(),
+                    inode: child,
+                    inode_num,
+                }))
             }
         }
     }
 
     fn get_entry(&self, id: usize) -> Result<String> {
+        Ok(self.get_entry_with_metadata(id)?.1)
+    }
+
+    fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, String)> {
         match id {
-            0 => Ok(String::from(".")),
-            1 => Ok(String::from("..")),
+            0 => Ok((self.metadata()?, String::from("."))),
+            1 => Ok((self.metadata()?, String::from(".."))),
             i => {
                 let entries = self.list_dir_entries()?;
-                entries
-                    .get(i - 2)
-                    .map(|(name, _)| name.clone())
-                    .ok_or(FsError::EntryNotFound)
+                let (name, child_num) = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
+                let child = self.fs.inode_from_num(*child_num)?;
+                Ok((
+                    Self::child_metadata(*child_num, &child),
+                    name.clone(),
+                ))
             }
         }
     }
@@ -402,6 +576,7 @@ impl INode for Ext2MountINode {
             .fs
             .editor()
             .create(self.inode_num as u32, name, type_, mode)?;
+        self.fs.invalidate_dir_cache(self.inode_num);
         let inode = self.fs.inode_from_num(child as usize)?;
         Ok(Arc::new(Ext2MountINode {
             fs: self.fs.clone(),
@@ -416,7 +591,9 @@ impl INode for Ext2MountINode {
         }
         self.fs
             .editor()
-            .unlink(self.inode_num as u32, name)
+            .unlink(self.inode_num as u32, name)?;
+        self.fs.invalidate_dir_cache(self.inode_num);
+        Ok(())
     }
 
     fn resize(&self, len: usize) -> Result<()> {
@@ -438,7 +615,9 @@ impl INode for Ext2MountINode {
         }
         self.fs
             .editor()
-            .link(self.inode_num as u32, name, other.inode_num as u32)
+            .link(self.inode_num as u32, name, other.inode_num as u32)?;
+        self.fs.invalidate_dir_cache(self.inode_num);
+        Ok(())
     }
 
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> Result<()> {
@@ -453,7 +632,10 @@ impl INode for Ext2MountINode {
             old_name,
             target.inode_num as u32,
             new_name,
-        )
+        )?;
+        self.fs.invalidate_dir_cache(self.inode_num);
+        self.fs.invalidate_dir_cache(target.inode_num);
+        Ok(())
     }
 
     fn as_any_ref(&self) -> &dyn Any {

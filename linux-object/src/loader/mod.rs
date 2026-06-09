@@ -91,6 +91,10 @@ impl LinuxElfLoader {
         // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
         if data.starts_with(b"\x7fELF") {
             debug!("elf: detected ELF for {:?}", path);
+            if data.len() < 64 {
+                error!("elf: truncated header for {:?}", path);
+                return Err(ZxError::INVALID_ARGS.into());
+            }
         } else if data.starts_with(b"#!") {
             debug!("elf: detected shebang for {:?}", path);
             let scan_limit = data.len().min(512);

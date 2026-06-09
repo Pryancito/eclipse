@@ -40,7 +40,11 @@ else ifeq ($(ARCH), riscv64)
 endif
 
 ifeq ($(LINUX), 1)
-  CMDLINE ?= LOG=$(LOG)
+  ifeq ($(ARCH), x86_64)
+    CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOT=/dev/vda:ROOTPROC=/bin/busybox?sh
+  else
+    CMDLINE ?= LOG=$(LOG)
+  endif
 else
   CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true
 endif
@@ -374,36 +378,7 @@ VMDISK := $(build_path)/boot.vdi
 
 .PHONY: vbox
 vbox: build
-	# Update rboot.conf with the current CMDLINE/LOG settings
-	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
-	# Create a temporary raw image of 128MB
-	dd if=/dev/zero of=$(build_path)/boot.raw bs=1M count=128
-	# Format it as FAT32
-	/usr/sbin/mkfs.vfat -F 32 $(build_path)/boot.raw
-	# Create folders inside the fat image
-	mmd -i $(build_path)/boot.raw ::/EFI
-	mmd -i $(build_path)/boot.raw ::/EFI/Boot
-	mmd -i $(build_path)/boot.raw ::/EFI/zCore
-	# Copy files into it
-	mcopy -i $(build_path)/boot.raw -s $(build_path)/esp/EFI/Boot/* ::/EFI/Boot/
-	mcopy -i $(build_path)/boot.raw -s $(build_path)/esp/EFI/zCore/* ::/EFI/zCore/
-	# Unregister and delete VM if it exists to reset state
-	-vboxmanage unregistervm EclipseOS --delete >/dev/null 2>&1
-	# Close old medium in VirtualBox registry
-	-vboxmanage closemedium disk $(VMDISK) >/dev/null 2>&1
-	# Remove old VDI
-	rm -f $(VMDISK)
-	# Convert raw to VDI
-	vboxmanage convertfromraw $(build_path)/boot.raw $(VMDISK) --format VDI
-	# Clean up temporary raw image
-	rm -f $(build_path)/boot.raw
-	# Create VM and configure it
-	vboxmanage createvm --name EclipseOS --basefolder $(build_path) --register
-	vboxmanage storagectl EclipseOS --name DiskCtrlr --controller IntelAhci --add sata
-	vboxmanage storageattach EclipseOS --storagectl DiskCtrlr --port 0 --device 0 --type hdd --medium $(VMDISK)
-	vboxmanage modifyvm EclipseOS --memory 1024 --firmware efi --usbxhci on --keyboard usb --mouse usbtablet --uart1 0x3F8 4 --uartmode1 file $(abspath $(build_path)/serial.log) --nic1 bridged --bridgeadapter1 $(IFACE) --nictype1 82540EM --cableconnected1 on
-	# Start the VM
-	vboxmanage startvm EclipseOS
+	@bash $(abspath ../scripts/vbox-eclipse.sh)
 
 $(qemu_disk):
 ifeq ($(ARCH), riscv64)

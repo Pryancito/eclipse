@@ -242,7 +242,7 @@ pub fn start_application_processors() {
 
     let acpi_rsdp = KCONFIG.acpi_rsdp as usize;
     if acpi_rsdp == 0 {
-        crate::klog_warn!("[smp] No ACPI RSDP — skipping AP startup");
+        warn!("[smp] No ACPI RSDP — skipping AP startup");
         return;
     }
 
@@ -252,11 +252,15 @@ pub fn start_application_processors() {
     };
 
     if ap_lapic_ids.is_empty() {
-        crate::klog_info!("[smp] ACPI MADT: no application processors found");
+        warn!("[smp] no application processors in ACPI MADT");
         return;
     }
 
-    crate::klog_info!("[smp] Found {} AP(s), LAPIC IDs: {:?}", ap_lapic_ids.len(), ap_lapic_ids);
+    warn!(
+        "[smp] starting {} AP(s), LAPIC IDs: {:?}",
+        ap_lapic_ids.len(),
+        ap_lapic_ids
+    );
 
     // Identity-map 0x6000..0x8000 so the trampoline can run after enabling paging.
     {
@@ -330,7 +334,11 @@ pub fn start_application_processors() {
         }
     }
 
-    crate::klog_info!("[smp] SMP init done — {}/{} AP(s) came online", started, ap_lapic_ids.len());
+    warn!(
+        "[smp] done — {}/{} AP(s) online",
+        started,
+        ap_lapic_ids.len()
+    );
 }
 
 /// Called by each AP from `secondary_init()` to announce it is running.

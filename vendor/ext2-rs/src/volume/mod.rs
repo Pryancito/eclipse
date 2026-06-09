@@ -80,7 +80,7 @@ impl<'a, S: SectorSize> VolumeSlice<'a, u8, S> {
     pub unsafe fn dynamic_cast<T: Copy>(&self) -> (T, Address<S>) {
         assert!(self.inner.len() >= mem::size_of::<T>());
         let index = self.index;
-        let cast = mem::transmute_copy(self.inner.as_ptr().as_ref().unwrap());
+        let cast = core::ptr::read_unaligned(self.inner.as_ptr() as *const T);
         (cast, index)
     }
 

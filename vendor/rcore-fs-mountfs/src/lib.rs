@@ -150,6 +150,21 @@ impl MNode {
             == self.inode.metadata().unwrap().inode
     }
 
+    /// Look up a direct child on the backing inode (no mount-overlay walk).
+    pub fn backing_find(&self, name: &str) -> Result<Arc<Self>> {
+        Ok(MNode::from_backing(self.vfs.clone(), self.inode.find(name)?))
+    }
+
+    /// Wrap a backing-store child inode without traversing mount overlays.
+    pub fn from_backing(vfs: Arc<MountFS>, inode: Arc<dyn INode>) -> Arc<Self> {
+        MNode {
+            inode,
+            vfs,
+            self_ref: Weak::default(),
+        }
+        .wrap()
+    }
+
     pub fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<Self>> {
         Ok(MNode {
             inode: self.inode.create(name, type_, mode)?,
@@ -179,13 +194,20 @@ impl MNode {
                     .wrap())
                 }
             }
-            _ => Ok(MNode {
-                inode: self.overlaid_inode().inode.find(name)?,
-                vfs: self.vfs.clone(),
-                self_ref: Weak::default(),
+            _ => {
+                let node = MNode {
+                    inode: self.inode.find(name)?,
+                    vfs: self.vfs.clone(),
+                    self_ref: Weak::default(),
+                }
+                .wrap();
+                let inode_id = node.inode.metadata().map(|m| m.inode).unwrap_or(0);
+                if let Some(sub_vfs) = self.vfs.mountpoints.read().get(&inode_id) {
+                    Ok(sub_vfs.mountpoint_root_inode())
+                } else {
+                    Ok(node)
+                }
             }
-            .wrap()
-            .overlaid_inode()),
         }
     }
 
