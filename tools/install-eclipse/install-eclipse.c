@@ -2275,6 +2275,47 @@ static int apply_fstab_targets(int fd, const char *block_dev, uint64_t partition
     return 0;
 }
 
+/* Re-lee los bytes parcheados para confirmar que la sustitución llegó al
+ * almacenamiento. Si un placeholder requerido sigue presente (escritura corta,
+ * offset erróneo o caché incoherente), devolvemos -1 para que el llamante caiga
+ * al método basado en mount en lugar de dejar el fstab con placeholders. */
+static int verify_fstab_targets(int fd, const char *block_dev, uint64_t partition_offset,
+                                const struct fstab_patch_target *targets, size_t target_count) {
+    size_t i;
+
+    for (i = 0; i < target_count; i++) {
+        const struct fstab_patch_target *slot = &targets[i];
+        uint8_t buf[FSTAB_PLACEHOLDER_LEN];
+        size_t want;
+        uint64_t at;
+
+        if (!slot->found) {
+            continue;
+        }
+        want = (slot->kind == FSTAB_PATCH_COMMENT_LINE) ? 1U : (size_t)FSTAB_PLACEHOLDER_LEN;
+        at = partition_offset + (uint64_t)slot->offset;
+        if (disk_pread_all(fd, buf, want, at) != (ssize_t)want) {
+            log(COLOR_RED COLOR_BOLD "ERROR: lectura de verificación de fstab en %s falló (%s)." COLOR_RESET,
+                block_dev, strerror(errno));
+            return -1;
+        }
+        if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
+            if (buf[0] != '#') {
+                log(COLOR_RED COLOR_BOLD
+                    "ERROR: verificación de fstab: la línea de %s no quedó comentada en %s." COLOR_RESET,
+                    slot->placeholder, block_dev);
+                return -1;
+            }
+        } else if (memcmp(buf, slot->replacement, FSTAB_PLACEHOLDER_LEN) != 0) {
+            log(COLOR_RED COLOR_BOLD
+                "ERROR: verificación de fstab: %s no se sustituyó en %s." COLOR_RESET,
+                slot->placeholder, block_dev);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int write_fstab_file(const char *path, const char *efi_dev, const char *root_dev,
                             const char *home_dev, const char *swap_dev,
                             enum layout_mode layout, int dry_run) {
@@ -2418,8 +2459,11 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *disk_p
     if (apply_fstab_targets(fd, block_dev, partition_offset, targets, target_count) != 0) {
         goto cleanup;
     }
+    if (verify_fstab_targets(fd, block_dev, partition_offset, targets, target_count) != 0) {
+        goto cleanup;
+    }
 
-    log(COLOR_GREEN "fstab actualizado en %s (sin montar)." COLOR_RESET, block_dev);
+    log(COLOR_GREEN "fstab actualizado y verificado en %s (sin montar)." COLOR_RESET, block_dev);
     rc = 0;
 
 cleanup:
