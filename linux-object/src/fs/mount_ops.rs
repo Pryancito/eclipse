@@ -54,7 +54,7 @@ fn resolve_mnode(target: &str) -> LxResult<Arc<MNode>> {
     Ok(cur)
 }
 
-fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
+pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     if fstype.is_empty() {
         return Err(LxError::EINVAL);
     }
@@ -75,7 +75,7 @@ fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     }
 }
 
-fn open_filesystem(backend: MountBackend, fstype: &str) -> LxResult<Arc<dyn FileSystem>> {
+pub(crate) fn open_filesystem(backend: MountBackend, fstype: &str) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
         "ext2" => open_ext2(&backend).map_err(LxError::from),
         "vfat" => open_fat(backend)
@@ -85,7 +85,7 @@ fn open_filesystem(backend: MountBackend, fstype: &str) -> LxResult<Arc<dyn File
     }
 }
 
-fn prepare_fs(
+pub(crate) fn prepare_fs(
     fs: Arc<dyn FileSystem>,
     flags: usize,
     data: &str,

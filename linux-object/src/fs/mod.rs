@@ -46,10 +46,14 @@ use kernel_hal::drivers;
 use rcore_fs::vfs::{FileSystem, FileType, INode, Result};
 use rcore_fs_devfs::{
     special::{NullINode, ZeroINode},
-    DevFS,
+    DevFS, DevINode,
 };
-use rcore_fs_mountfs::MountFS;
+use rcore_fs_mountfs::{MountFS, MNode};
 use rcore_fs_ramfs::RamFS;
+
+lazy_static! {
+    pub(crate) static ref DEVFS_ROOT: Mutex<Option<Arc<DevINode>>> = Mutex::new(None);
+}
 use zircon_object::{object::KernelObject, vm::VmObject};
 
 use crate::error::{LxError, LxResult};
@@ -251,6 +255,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // create DevFS
     let devfs = DevFS::new();
     let devfs_root = devfs.root();
+    *DEVFS_ROOT.lock() = Some(devfs_root.clone());
     devfs_root
         .add("null", Arc::new(NullINode::new()))
         .expect("failed to mknod /dev/null");
@@ -358,7 +363,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         
         // Use i * 16 as the base index for minor numbers to leave room for partitions
         let base_index = i * 16;
-        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(base_index, block.clone()))) {
+        if let Err(e) = devfs_root.add(&fname, Arc::new(devfs::BlockDev::new(base_index, block.clone(), fname.clone()))) {
             warn!("failed to mknod /dev/{}: {:?}", &fname, e);
         }
 
@@ -378,7 +383,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 block_count,
             ));
             let part_dev_index = base_index + part_num;
-            if let Err(e) = devfs_root.add(&part_name, Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver))) {
+            if let Err(e) = devfs_root.add(&part_name, Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver, part_name.clone()))) {
                 warn!("failed to mknod /dev/{}: {:?}", &part_name, e);
             } else {
                 info!("Registered partition /dev/{} (start: {}, count: {})", part_name, start_block, block_count);
@@ -450,7 +455,121 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     );
 
     mount_ops::set_vfs_root(root.clone());
+    mount_fstab(&root);
     root
+}
+
+fn resolve_or_create_dir(root: &Arc<MNode>, path: &str) -> LxResult<Arc<MNode>> {
+    let mut cur = root.clone();
+    for comp in path.split('/').filter(|s| !s.is_empty()) {
+        cur = match cur.find(true, comp) {
+            Ok(node) => node,
+            Err(_) => cur.create(comp, FileType::Dir, 0o755).map_err(LxError::from)?,
+        };
+    }
+    Ok(cur)
+}
+
+fn mount_fstab(root: &Arc<MNode>) {
+    info!("mount_fstab: parsing /etc/fstab");
+    if let Ok(etc) = root.find(true, "etc") {
+        if let Ok(fstab_inode) = etc.find(true, "fstab") {
+            let fstab_dyn: Arc<dyn INode> = fstab_inode;
+            if let Ok(content_vec) = fstab_dyn.read_as_vec() {
+                if let Ok(content) = core::str::from_utf8(&content_vec) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() < 3 {
+                            continue;
+                        }
+                        let source = parts[0];
+                        let target = parts[1];
+                        let fstype = parts[2];
+                        let options = parts.get(3).copied().unwrap_or("defaults");
+
+                        if target == "/" || target == "none" || fstype == "swap" {
+                            continue;
+                        }
+
+                        // Resolve the source inode using coerced root_dyn
+                        let source_rel = source.trim_start_matches('/');
+                        let root_dyn: Arc<dyn INode> = root.clone();
+                        let source_inode = match root_dyn.lookup_follow(source_rel, 4) {
+                            Ok(inode) => inode,
+                            Err(e) => {
+                                warn!("mount_fstab: failed to lookup source {:?}: {:?}", source, e);
+                                continue;
+                            }
+                        };
+
+                        let backend = match block_mount::MountBackend::from_inode(source_inode) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("mount_fstab: failed to create MountBackend for {:?}: {:?}", source, e);
+                                continue;
+                            }
+                        };
+
+                        let fstype_parsed = match mount_ops::parse_fstype(fstype) {
+                            Ok(ft) => ft,
+                            Err(e) => {
+                                warn!("mount_fstab: unsupported fstype {:?}: {:?}", fstype, e);
+                                continue;
+                            }
+                        };
+
+                        let target_node = match resolve_or_create_dir(root, target) {
+                            Ok(node) => node,
+                            Err(e) => {
+                                warn!("mount_fstab: failed to resolve/create target {:?}: {:?}", target, e);
+                                continue;
+                            }
+                        };
+
+                        if target_node.is_mountpoint() {
+                            warn!("mount_fstab: target {:?} is already a mountpoint", target);
+                            continue;
+                        }
+
+                        let fs = match mount_ops::open_filesystem(backend, fstype_parsed) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!("mount_fstab: failed to open filesystem for {:?}: {:?}", source, e);
+                                continue;
+                            }
+                        };
+
+                        // Parse options for flags
+                        let mut flags = 0;
+                        for opt in options.split(',') {
+                            match opt.trim() {
+                                "ro" => flags |= mount_state::MS_RDONLY,
+                                "rw" => flags &= !mount_state::MS_RDONLY,
+                                "nosuid" => flags |= mount_state::MS_NOSUID,
+                                "nodev" => flags |= mount_state::MS_NODEV,
+                                "noexec" => flags |= mount_state::MS_NOEXEC,
+                                _ => {}
+                            }
+                        }
+
+                        let (fs, state) = mount_ops::prepare_fs(fs, flags, options);
+                        if let Err(e) = target_node.mount(fs) {
+                            warn!("mount_fstab: failed to mount {:?} to {:?}: {:?}", source, target, e);
+                            continue;
+                        }
+
+                        let opts = mount_state::build_options_string(flags, options);
+                        register_mount(source, target, fstype_parsed, &opts, state);
+                        info!("mount_fstab: successfully mounted {:?} to {:?}", source, target);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub use mount_ops::{mount_fs, umount_fs};
@@ -572,3 +691,42 @@ pub fn split_path(path: &str) -> (&str, &str) {
 
 /// the max depth for following a link
 const FOLLOW_MAX_DEPTH: usize = 1;
+
+/// Rescans and registers partitions for a block device in devfs.
+pub fn rescan_partitions(fname: &str, block: &Arc<dyn zcore_drivers::scheme::BlockScheme>, base_index: usize) -> LxResult<()> {
+    if let Some(devfs_root) = DEVFS_ROOT.lock().as_ref() {
+        // First, remove existing partition nodes (e.g. sda1..=sda15)
+        for part_num in 1..=15 {
+            let part_name = if fname.starts_with("nvme") {
+                format!("{}p{}", fname, part_num)
+            } else {
+                format!("{}{}", fname, part_num)
+            };
+            let _ = devfs_root.remove(&part_name);
+        }
+
+        // Now, scan partitions
+        let partitions = devfs::blockdev::scan_partitions(block);
+        for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
+            let part_num = part_idx + 1;
+            let part_name = if fname.starts_with("nvme") {
+                format!("{}p{}", fname, part_num)
+            } else {
+                format!("{}{}", fname, part_num)
+            };
+            let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
+                block.clone(),
+                format!("{}-part{}", fname, part_num),
+                start_block,
+                block_count,
+            ));
+            let part_dev_index = base_index + part_num;
+            if let Err(e) = devfs_root.add(&part_name, Arc::new(devfs::BlockDev::new(part_dev_index, partition_driver, part_name.clone()))) {
+                warn!("failed to mknod /dev/{} during rescan: {:?}", &part_name, e);
+            } else {
+                info!("Rescanned and registered partition /dev/{} (start: {}, count: {})", part_name, start_block, block_count);
+            }
+        }
+    }
+    Ok(())
+}

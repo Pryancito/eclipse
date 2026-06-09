@@ -28,11 +28,14 @@
 #define GIB (1024ULL * 1024ULL * 1024ULL)
 #define MIB (1024ULL * 1024ULL)
 
+static const char *resolve_image_path(const char *path);
+
 #define UPD_STAGING_IMG "/tmp/eclipse-upd-efi.img"
 #define UPD_STAGING_MNT "/tmp/eclipse-upd-staging"
 #define UPD_EFI_MNT     "/tmp/eclipse-upd-efi"
 #define UPD_ROOT_MNT    "/tmp/eclipse-upd-root"
-#define EFI_IMAGE_GZ    "/boot/efi.img.gz"
+#define EFI_IMAGE_GZ    resolve_image_path("/boot/efi.img.gz")
+#define ROOTFS_IMAGE_GZ resolve_image_path("/boot/rootfs.ext2.gz")
 
 #define INST_ROOT_MNT   "/tmp/eclipse-inst-root"
 
@@ -42,7 +45,7 @@
 #define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
 #define FSTAB_PLACEHOLDER_LEN  20U
 #define FSTAB_PATCH_CHUNK      (64U * 1024U)
-#define FSTAB_PATCH_MAX_SCAN   (16U * 1024U * 1024U)
+#define FSTAB_PATCH_MAX_SCAN   (48U * 1024U * 1024U)
 #define FSTAB_PATCH_OVERLAP    FSTAB_PLACEHOLDER_LEN
 
 #define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
@@ -1273,7 +1276,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     parts[0].sectors = PART1_SECTORS;
     parts[0].mbr_type = 0xEF;
     parts[0].gpt_type = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
-    parts[0].image_path = "/boot/efi.img.gz";
+    parts[0].image_path = EFI_IMAGE_GZ;
     parts[0].write_image = 1;
     parts[0].verify_after_write = 1;
 
@@ -1289,7 +1292,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         }
         parts[1].mbr_type = 0x83;
         parts[1].gpt_type = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
-        parts[1].image_path = "/boot/rootfs.ext2.gz";
+        parts[1].image_path = ROOTFS_IMAGE_GZ;
         parts[1].write_image = 1;
         parts[1].verify_after_write = 1;
         *part_count = 2;
@@ -1332,7 +1335,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     parts[1].sectors = root_target;
     parts[1].mbr_type = 0x83;
     parts[1].gpt_type = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
-    parts[1].image_path = "/boot/rootfs.ext2.gz";
+    parts[1].image_path = ROOTFS_IMAGE_GZ;
     parts[1].write_image = 1;
     parts[1].verify_after_write = 1;
 
@@ -2232,7 +2235,7 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
     return 0;
 }
 
-static int apply_fstab_targets(int fd, const char *block_dev,
+static int apply_fstab_targets(int fd, const char *block_dev, uint64_t partition_offset,
                                const struct fstab_patch_target *targets, size_t target_count) {
     size_t i;
 
@@ -2242,7 +2245,7 @@ static int apply_fstab_targets(int fd, const char *block_dev,
         if (!slot->found) {
             continue;
         }
-        if (lseek(fd, slot->offset, SEEK_SET) < 0) {
+        if (lseek(fd, partition_offset + slot->offset, SEEK_SET) < 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: seek en %s falló (%s)." COLOR_RESET,
                 block_dev, strerror(errno));
             return -1;
@@ -2325,10 +2328,9 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     return 0;
 }
 
-static int patch_fstab_on_block_device(const char *block_dev, const char *efi_dev,
-                                       const char *root_dev, const char *home_dev,
-                                       const char *swap_dev, enum layout_mode layout,
-                                       int dry_run) {
+static int patch_fstab_on_block_device(const char *block_dev, const char *disk_path, uint64_t start_sector,
+                                       const char *efi_dev, const char *root_dev, const char *home_dev,
+                                       const char *swap_dev, enum layout_mode layout, int dry_run) {
     char efi_field[FSTAB_PLACEHOLDER_LEN + 1];
     char root_field[FSTAB_PLACEHOLDER_LEN + 1];
     char home_field[FSTAB_PLACEHOLDER_LEN + 1];
@@ -2337,6 +2339,7 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *efi_de
     size_t target_count = 4;
     int fd = -1;
     int rc = -1;
+    uint64_t partition_offset = 0;
 
     format_fstab_device_field(efi_dev, efi_field);
     format_fstab_device_field(root_dev, root_field);
@@ -2373,15 +2376,30 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *efi_de
 
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
-            block_dev, strerror(errno));
+        // Fallback for host testing if block_dev (e.g. disk.img2) doesn't exist.
+        if (errno == ENOENT && disk_path != NULL && struct_file_exists(disk_path)) {
+            fd = open(disk_path, O_RDWR | O_CLOEXEC);
+            if (fd >= 0) {
+                partition_offset = start_sector * SECTOR_SIZE;
+                if (lseek(fd, partition_offset, SEEK_SET) < 0) {
+                    log(COLOR_RED COLOR_BOLD "ERROR: No se pudo hacer seek al sector %" PRIu64 " en %s." COLOR_RESET, start_sector, disk_path);
+                    close(fd);
+                    return -1;
+                }
+                log(COLOR_YELLOW "ADVERTENCIA: Usando fallback de disco plano %s sector %" PRIu64 "." COLOR_RESET, disk_path, start_sector);
+            }
+        }
+    }
+    if (fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s o %s (%s)." COLOR_RESET,
+            block_dev, disk_path ? disk_path : "(null)", strerror(errno));
         return -1;
     }
 
     if (scan_fstab_targets(fd, block_dev, targets, target_count) != 0) {
         goto cleanup;
     }
-    if (apply_fstab_targets(fd, block_dev, targets, target_count) != 0) {
+    if (apply_fstab_targets(fd, block_dev, partition_offset, targets, target_count) != 0) {
         goto cleanup;
     }
 
@@ -2410,7 +2428,6 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
                                int part_count, enum layout_mode layout, int dry_run) {
     char efi_dev[160], root_dev[160], home_dev[160], swap_dev[160];
     char cmd[512];
-    (void)parts;
 
     /* EFI = part 1, ROOT = part 2, HOME = part 3, SWAP = part 4 */
     if (partition_dev_path(disk_path, 1, efi_dev,  sizeof(efi_dev))  != 0 ||
@@ -2444,7 +2461,8 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
     /* Parche en bruto primero: no depende de mount(2) y evita bloqueos en Eclipse OS. */
     if (layout == LAYOUT_ADVANCED && part_count >= 4) {
-        if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
+        if (patch_fstab_on_block_device(root_dev, disk_path, parts[1].start_sector,
+                                        efi_dev, root_dev, home_dev, swap_dev,
                                         layout, dry_run) == 0) {
             return 0;
         }
@@ -2452,7 +2470,8 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
             "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
         return write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run);
     }
-    if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
+    if (patch_fstab_on_block_device(root_dev, disk_path, parts[1].start_sector,
+                                    efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
         return 0;
     }
     log(COLOR_YELLOW
@@ -2566,6 +2585,22 @@ cleanup:
     return rc;
 }
 
+static void trigger_partition_rescan(const char *disk_path) {
+    int fd = open(disk_path, O_RDONLY);
+    if (fd >= 0) {
+#ifndef BLKRRPART
+#define BLKRRPART 0x125f
+#endif
+        if (ioctl(fd, BLKRRPART, 0) == 0) {
+            log(COLOR_GREEN "Solicitada recarga de tabla de particiones para %s." COLOR_RESET, disk_path);
+        } else {
+            log(COLOR_YELLOW "ADVERTENCIA: No se pudo solicitar recarga de tabla de particiones para %s (%s)." COLOR_RESET,
+                disk_path, strerror(errno));
+        }
+        close(fd);
+    }
+}
+
 int main(int argc, char **argv) {
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -2658,18 +2693,18 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.mode == MODE_NEW) {
-        if (!struct_file_exists("/boot/efi.img.gz")) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/efi.img.gz" COLOR_RESET);
+        if (!struct_file_exists(EFI_IMAGE_GZ)) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, EFI_IMAGE_GZ);
             return 1;
         }
-        if (!struct_file_exists("/boot/rootfs.ext2.gz")) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /boot/rootfs.ext2.gz" COLOR_RESET);
+        if (!struct_file_exists(ROOTFS_IMAGE_GZ)) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, ROOTFS_IMAGE_GZ);
             return 1;
         }
-        if (verify_sha256_file("/boot/efi.img.gz") != 0) {
+        if (verify_sha256_file(EFI_IMAGE_GZ) != 0) {
             return 1;
         }
-        if (verify_sha256_file("/boot/rootfs.ext2.gz") != 0) {
+        if (verify_sha256_file(ROOTFS_IMAGE_GZ) != 0) {
             return 1;
         }
     } else {
@@ -2728,6 +2763,7 @@ int main(int argc, char **argv) {
         if (table_rc != 0) {
             return 1;
         }
+        trigger_partition_rescan(cfg.disk_path);
 
         int total_steps = (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3;
         (void)total_steps;
@@ -2787,4 +2823,24 @@ int main(int argc, char **argv) {
 int struct_file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+static const char *resolve_image_path(const char *path) {
+    static char resolved[256];
+    struct stat st;
+    if (strncmp(path, "/boot/", 6) == 0) {
+        snprintf(resolved, sizeof(resolved), "ignored/target/%s", path + 6);
+        if (stat(resolved, &st) == 0) {
+            return strdup(resolved);
+        }
+        snprintf(resolved, sizeof(resolved), "rootfs/x86_64%s", path);
+        if (stat(resolved, &st) == 0) {
+            return strdup(resolved);
+        }
+        snprintf(resolved, sizeof(resolved), "boot/%s", path + 6);
+        if (stat(resolved, &st) == 0) {
+            return strdup(resolved);
+        }
+    }
+    return path;
 }

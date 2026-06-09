@@ -14,14 +14,16 @@ pub struct BlockDev {
     index: usize,
     block: Arc<dyn BlockScheme>,
     inode_id: usize,
+    name: alloc::string::String,
 }
 
 impl BlockDev {
-    pub fn new(index: usize, block: Arc<dyn BlockScheme>) -> Self {
+    pub fn new(index: usize, block: Arc<dyn BlockScheme>, name: alloc::string::String) -> Self {
         Self {
             index,
             block,
             inode_id: DevFS::new_inode_id(),
+            name,
         }
     }
 
@@ -126,21 +128,29 @@ impl INode for BlockDev {
     }
 
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        if data == 0 {
-            return Err(FsError::InvalidParam);
-        }
         let sectors = self.block.block_count() as u64;
         match cmd {
             BLKGETSIZE64 => {
+                if data == 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 let size = sectors.saturating_mul(512);
                 let mut out_ptr = kernel_hal::user::UserOutPtr::<u64>::from(data);
                 out_ptr.write(size).map_err(|_| FsError::InvalidParam)?;
                 Ok(0)
             }
             BLKGETSIZE => {
+                if data == 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 let legacy = sectors as usize;
                 let mut out_ptr = kernel_hal::user::UserOutPtr::<usize>::from(data);
                 out_ptr.write(legacy).map_err(|_| FsError::InvalidParam)?;
+                Ok(0)
+            }
+            0x0000_125f => { // BLKRRPART
+                crate::fs::rescan_partitions(&self.name, &self.block, self.index)
+                    .map_err(|_| FsError::DeviceError)?;
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
