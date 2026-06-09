@@ -77,6 +77,53 @@ impl Syscall<'_> {
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
         Ok(0)
     }
+
+    /// create a special or ordinary file (see mknod(2)).
+    pub fn sys_mknod(&self, path: UserInPtr<u8>, mode: usize, dev: usize) -> SysResult {
+        self.sys_mknodat(FileDesc::CWD, path, mode, dev)
+    }
+
+    /// create a special or ordinary file relative to a directory fd.
+    pub fn sys_mknodat(
+        &self,
+        dirfd: FileDesc,
+        path: UserInPtr<u8>,
+        mode: usize,
+        dev: usize,
+    ) -> SysResult {
+        let path = path.as_c_str()?;
+        info!(
+            "mknodat: dirfd={:?}, path={:?}, mode={:#o}, dev={:#x}",
+            dirfd, path, mode, dev
+        );
+        const S_IFMT: usize = 0o170000;
+        let file_type = match mode & S_IFMT {
+            0o010000 => FileType::NamedPipe,  // S_IFIFO
+            0o020000 => FileType::CharDevice, // S_IFCHR
+            0o060000 => FileType::BlockDevice, // S_IFBLK
+            0o140000 => FileType::Socket,     // S_IFSOCK
+            0o100000 | 0 => FileType::File,   // S_IFREG / unspecified => regular file
+            _ => return Err(LxError::EINVAL), // directories must use mkdir
+        };
+        let (dir_path, file_name) = split_path(path);
+        let proc = self.linux_process();
+        let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let dir_metadata = inode.metadata()?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
+        if inode.find(file_name).is_ok() {
+            return Err(LxError::EEXIST);
+        }
+        let create_mode = proc.apply_umask((mode & 0o7777) as u16);
+        let rdev = if matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
+            dev
+        } else {
+            0
+        };
+        let created = inode.create2(file_name, file_type, create_mode as u32, rdev)?;
+        proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, false)?;
+        Ok(0)
+    }
+
     /// Remove a directory.
     /// - path – pointer to string with directory name
     pub fn sys_rmdir(&self, path: UserInPtr<u8>) -> SysResult {

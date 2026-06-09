@@ -294,6 +294,21 @@ impl INode for MNode {
         Ok(self.create(name, type_, mode)?)
     }
 
+    fn create2(
+        &self,
+        name: &str,
+        type_: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn INode>> {
+        Ok(MNode {
+            inode: self.inode.create2(name, type_, mode, data)?,
+            vfs: self.vfs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap())
+    }
+
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
         self.inode.link(name, other)
     }

@@ -520,9 +520,15 @@ impl INode for Ext2MountINode {
         // Read the live inode so `stat` reflects writes/resizes/chmod made
         // through the editor since this handle was opened.
         let cur = self.fresh_inode();
-        let is_dir = cur.is_dir();
-        let is_symlink = cur.is_symlink();
-        let size = if is_symlink {
+        // Authoritative type/rdev/timestamps from the raw inode (the synced
+        // `is_dir`/`is_symlink` accessors cannot distinguish device/fifo/socket
+        // nodes, which share format bits with dir/symlink).
+        let (type_, rdev, atime, mtime, ctime) = self
+            .fs
+            .editor()
+            .inode_meta_extra(self.inode_num as u32)
+            .unwrap_or((FileType::File, 0, 0, 0, 0));
+        let size = if matches!(type_, FileType::SymLink) {
             self.fs
                 .editor()
                 .read_symlink(self.inode_num as u32)?
@@ -530,11 +536,6 @@ impl INode for Ext2MountINode {
         } else {
             cur.size()
         };
-        let (atime, mtime, ctime) = self
-            .fs
-            .editor()
-            .inode_times(self.inode_num as u32)
-            .unwrap_or((0, 0, 0));
         Ok(Metadata {
             dev: 0,
             inode: self.inode_num,
@@ -544,18 +545,12 @@ impl INode for Ext2MountINode {
             atime: Timespec { sec: atime as i64, nsec: 0 },
             mtime: Timespec { sec: mtime as i64, nsec: 0 },
             ctime: Timespec { sec: ctime as i64, nsec: 0 },
-            type_: if is_dir {
-                FileType::Dir
-            } else if is_symlink {
-                FileType::SymLink
-            } else {
-                FileType::File
-            },
+            type_,
             mode: cur.mode_bits(),
             nlinks: cur.nlink() as usize,
             uid: cur.uid() as usize,
             gid: cur.gid() as usize,
-            rdev: 0,
+            rdev,
         })
     }
 
@@ -616,14 +611,20 @@ impl INode for Ext2MountINode {
         self.fs.clone()
     }
 
-    fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
-        if !self.inode.is_dir() {
+    fn create2(
+        &self,
+        name: &str,
+        type_: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn INode>> {
+        if !self.fresh_inode().is_dir() {
             return Err(FsError::NotDir);
         }
         let child = self
             .fs
             .editor()
-            .create(self.inode_num as u32, name, type_, mode)?;
+            .create(self.inode_num as u32, name, type_, mode, data)?;
         self.fs.invalidate_dir_cache(self.inode_num);
         let inode = self.fs.inode_from_num(child as usize)?;
         Ok(Arc::new(Ext2MountINode {

@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use core::mem;
 
 use ext2::sector::Address;
-use ext2::sys::inode::{Inode as RawInode, TypePerm, DIRECTORY, FILE, SYMLINK};
+use ext2::sys::inode::{
+    Inode as RawInode, TypePerm, BLOCK_DEVICE, CHAR_DEVICE, DIRECTORY, FIFO, FILE, SOCKET, SYMLINK,
+};
 use rcore_fs::vfs::{FileType, FsError, Result};
 
 use super::ext2_mount::Ext2MountFs;
@@ -153,6 +155,51 @@ impl<'a> Ext2Editor<'a> {
     pub(crate) fn inode_times(&self, inode_num: u32) -> Result<(u32, u32, u32)> {
         let raw = self.read_raw_inode(inode_num)?;
         Ok((raw.atime, raw.mtime, raw.ctime))
+    }
+
+    /// True iff the inode's 4-bit format field is exactly DIRECTORY.
+    ///
+    /// `type_perm.contains(DIRECTORY)` is wrong here: DIRECTORY is 0x4000 and
+    /// BLOCK_DEVICE (0x6000) / SOCKET (0xC000) also have that bit set, so they
+    /// would be misclassified as directories.
+    fn is_dir_raw(raw: &RawInode) -> bool {
+        raw.type_perm & TypePerm::from_bits_truncate(0xF000) == TypePerm::DIRECTORY
+    }
+
+    /// Map the inode's 4-bit format field to a VFS `FileType`.
+    fn file_type_of(raw: &RawInode) -> FileType {
+        let fmt = raw.type_perm & TypePerm::from_bits_truncate(0xF000);
+        if fmt == TypePerm::DIRECTORY {
+            FileType::Dir
+        } else if fmt == TypePerm::SYMLINK {
+            FileType::SymLink
+        } else if fmt == TypePerm::CHAR_DEVICE {
+            FileType::CharDevice
+        } else if fmt == TypePerm::BLOCK_DEVICE {
+            FileType::BlockDevice
+        } else if fmt == TypePerm::FIFO {
+            FileType::NamedPipe
+        } else if fmt == TypePerm::SOCKET {
+            FileType::Socket
+        } else {
+            FileType::File
+        }
+    }
+
+    /// Type, device number and timestamps in a single raw-inode read, used to
+    /// build `stat`. `rdev` is only meaningful for device nodes.
+    pub(crate) fn inode_meta_extra(
+        &self,
+        inode_num: u32,
+    ) -> Result<(FileType, usize, u32, u32, u32)> {
+        let raw = self.read_raw_inode(inode_num)?;
+        let ft = Self::file_type_of(&raw);
+        let rdev = if matches!(ft, FileType::CharDevice | FileType::BlockDevice) {
+            raw.direct_pointer[0] as usize
+        } else {
+            0
+        };
+        Ok((ft, rdev, raw.atime, raw.mtime, raw.ctime))
     }
 
     /// Update timestamps after a change. Always bumps ctime; also bumps mtime
@@ -418,10 +465,22 @@ impl<'a> Ext2Editor<'a> {
     }
 
     fn dirent_ty(raw: &RawInode) -> u8 {
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        // The file-type is a 4-bit format field (0xF000), not a bitset, so we
+        // must compare the masked value for equality. `contains()` would, e.g.,
+        // report a BLOCK_DEVICE (0x6000) as a DIRECTORY (0x4000).
+        let fmt = raw.type_perm & TypePerm::from_bits_truncate(0xF000);
+        if fmt == TypePerm::DIRECTORY {
             DIRECTORY
-        } else if raw.type_perm.contains(TypePerm::SYMLINK) {
+        } else if fmt == TypePerm::SYMLINK {
             SYMLINK
+        } else if fmt == TypePerm::CHAR_DEVICE {
+            CHAR_DEVICE
+        } else if fmt == TypePerm::BLOCK_DEVICE {
+            BLOCK_DEVICE
+        } else if fmt == TypePerm::FIFO {
+            FIFO
+        } else if fmt == TypePerm::SOCKET {
+            SOCKET
         } else {
             FILE
         }
@@ -467,7 +526,7 @@ impl<'a> Ext2Editor<'a> {
         buf: &mut [u8],
     ) -> Result<usize> {
         let raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -582,7 +641,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn parent_inode(&self, dir_inode: u32) -> Result<u32> {
         let inode = self.read_raw_inode(dir_inode)?;
-        if !inode.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&inode) {
             return Err(FsError::NotDir);
         }
         let blocks = self.inode_data_blocks(&inode).max(1);
@@ -631,7 +690,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn adjust_parent_nlink(&self, parent_num: u32, delta: i16) -> Result<()> {
         let mut raw = self.read_raw_inode(parent_num)?;
-        if !raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&raw) {
             return Err(FsError::NotDir);
         }
         if delta < 0 {
@@ -1049,7 +1108,7 @@ impl<'a> Ext2Editor<'a> {
         let bs = self.block_size();
         let blocks_needed = (size + bs - 1) / bs;
         let mut raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         let current_blocks = self.inode_data_blocks(&raw);
@@ -1081,7 +1140,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn dir_is_empty(&self, inode_num: u32) -> Result<bool> {
         let inode = self.read_raw_inode(inode_num)?;
-        if !inode.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&inode) {
             return Ok(true);
         }
         let blocks = self.inode_data_blocks(&inode).max(1);
@@ -1115,6 +1174,7 @@ impl<'a> Ext2Editor<'a> {
         name: &str,
         type_: FileType,
         mode: u32,
+        rdev: usize,
     ) -> Result<u32> {
         if !self
             .fs
@@ -1186,8 +1246,31 @@ impl<'a> Ext2Editor<'a> {
                 self.write_raw_inode(child, &raw)?;
                 self.add_dir_entry(parent_num, name, child, SYMLINK)?;
             }
-            _ => return Err(FsError::NotSupported),
+            FileType::CharDevice | FileType::BlockDevice => {
+                raw.type_perm = if matches!(type_, FileType::CharDevice) {
+                    TypePerm::CHAR_DEVICE
+                } else {
+                    TypePerm::BLOCK_DEVICE
+                } | perm;
+                // Device number: legacy ext2 encoding stores it in i_block[0].
+                raw.direct_pointer[0] = rdev as u32;
+                self.write_raw_inode(child, &raw)?;
+                let dty = Self::dirent_ty(&raw);
+                self.add_dir_entry(parent_num, name, child, dty)?;
+            }
+            FileType::NamedPipe | FileType::Socket => {
+                raw.type_perm = if matches!(type_, FileType::NamedPipe) {
+                    TypePerm::FIFO
+                } else {
+                    TypePerm::SOCKET
+                } | perm;
+                self.write_raw_inode(child, &raw)?;
+                let dty = Self::dirent_ty(&raw);
+                self.add_dir_entry(parent_num, name, child, dty)?;
+            }
         }
+        // The parent directory was modified (a new entry was added).
+        let _ = self.touch_times(parent_num, true);
         Ok(child)
     }
 
@@ -1221,10 +1304,10 @@ impl<'a> Ext2Editor<'a> {
     pub fn unlink(&self, parent_num: u32, name: &str) -> Result<()> {
         let child_inode = self.lookup_in_dir(parent_num, name)?;
         let child_raw = self.read_raw_inode(child_inode)?;
-        if child_raw.type_perm.contains(TypePerm::DIRECTORY) && !self.dir_is_empty(child_inode)? {
+        if Self::is_dir_raw(&child_raw) && !self.dir_is_empty(child_inode)? {
             return Err(FsError::DirNotEmpty);
         }
-        let is_dir = child_raw.type_perm.contains(TypePerm::DIRECTORY);
+        let is_dir = Self::is_dir_raw(&child_raw);
         self.remove_dir_entry(parent_num, name)?;
         let mut raw = self.read_raw_inode(child_inode)?;
         if raw.hard_links <= 1 {
@@ -1243,8 +1326,11 @@ impl<'a> Ext2Editor<'a> {
             self.free_inode(child_inode)?;
         } else {
             raw.hard_links -= 1;
+            raw.ctime = Self::now_secs();
             self.write_raw_inode(child_inode, &raw)?;
         }
+        // The parent directory was modified (an entry was removed).
+        let _ = self.touch_times(parent_num, true);
         Ok(())
     }
 
@@ -1260,7 +1346,7 @@ impl<'a> Ext2Editor<'a> {
             return Err(FsError::EntryExist);
         }
         let mut raw = self.read_raw_inode(target_inode)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -1284,7 +1370,7 @@ impl<'a> Ext2Editor<'a> {
         }
         let inode = self.lookup_in_dir(old_parent, old_name)?;
         let raw = self.read_raw_inode(inode)?;
-        let src_is_dir = raw.type_perm.contains(TypePerm::DIRECTORY);
+        let src_is_dir = Self::is_dir_raw(&raw);
 
         if src_is_dir && self.is_subdir_of(new_parent, inode)? {
             return Err(FsError::InvalidParam);
@@ -1295,7 +1381,7 @@ impl<'a> Ext2Editor<'a> {
                 return Ok(());
             }
             let existing_raw = self.read_raw_inode(existing)?;
-            let dst_is_dir = existing_raw.type_perm.contains(TypePerm::DIRECTORY);
+            let dst_is_dir = Self::is_dir_raw(&existing_raw);
             if src_is_dir != dst_is_dir {
                 return if dst_is_dir {
                     Err(FsError::IsDir)
@@ -1317,14 +1403,23 @@ impl<'a> Ext2Editor<'a> {
             }
         }
         let ty = Self::dirent_ty(&raw);
-        self.remove_dir_entry(old_parent, old_name)?;
+        // Add the new link before removing the old one: if the second step
+        // fails the file is still reachable (two links, fsck-fixable) rather
+        // than lost entirely.
         self.add_dir_entry(new_parent, new_name, inode, ty)?;
+        self.remove_dir_entry(old_parent, old_name)?;
+        // The moved inode's ctime changes; both parent directories are modified.
+        let _ = self.touch_times(inode, false);
+        let _ = self.touch_times(old_parent, true);
+        if new_parent != old_parent {
+            let _ = self.touch_times(new_parent, true);
+        }
         Ok(())
     }
 
     pub fn resize(&self, inode_num: u32, len: usize) -> Result<()> {
         let raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {

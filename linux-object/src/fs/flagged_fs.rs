@@ -114,6 +114,17 @@ impl INode for FlaggedINode {
         Ok(self.wrap(self.inner.create(name, type_, mode)?))
     }
 
+    fn create2(
+        &self,
+        name: &str,
+        type_: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn INode>> {
+        self.check_write()?;
+        Ok(self.wrap(self.inner.create2(name, type_, mode, data)?))
+    }
+
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
         self.check_write()?;
         self.inner.link(name, other)
