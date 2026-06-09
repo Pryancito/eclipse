@@ -159,6 +159,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(dir.join("sys"));
         let _ = fs::create_dir_all(dir.join("tmp"));
         let _ = fs::create_dir_all(dir.join("dev"));
+        // Mount points referenced by /etc/fstab (EFI system partition, /home).
+        // They must exist so `mount` (and the boot-time fstab processing) can
+        // attach the filesystems there.
+        let _ = fs::create_dir_all(dir.join("boot/efi"));
+        let _ = fs::create_dir_all(dir.join("home"));
 
         // udhcpc / udhcpc6 scripts — apply leases via `ip` (no ifconfig/route)
         let udhcpc_dir = dir.join("usr/share/udhcpc");
