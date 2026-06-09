@@ -28,7 +28,6 @@ impl<T, S: SectorSize> From<(T, Address<S>)> for Struct<T, S> {
 
 /// Safe wrapper for raw sys structs
 pub struct Ext2<S: SectorSize, V: Volume<u8, S>> {
-    // TODO: should this have some different vis?
     pub(crate) volume: V,
     pub(crate) superblock: Struct<Superblock, S>,
     pub(crate) block_groups: Struct<Vec<BlockGroupDescriptor>, S>,
@@ -108,6 +107,14 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
         self.superblock.inner.free_blocks_count as _
     }
 
+    pub fn free_blocks_count_raw(&self) -> u32 {
+        self.superblock.inner.free_blocks_count
+    }
+
+    pub fn free_inodes_count_raw(&self) -> u32 {
+        self.superblock.inner.free_inodes_count
+    }
+
     pub fn block_size(&self) -> usize {
         self.superblock.inner.block_size()
     }
@@ -122,14 +129,6 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
 
     pub fn blocks_per_group(&self) -> u32 {
         self.superblock.inner.blocks_per_group
-    }
-
-    pub fn free_inodes_count_raw(&self) -> u32 {
-        self.superblock.inner.free_inodes_count
-    }
-
-    pub fn free_blocks_count_raw(&self) -> u32 {
-        self.superblock.inner.free_blocks_count
     }
 
     pub fn block_groups_len(&self) -> usize {

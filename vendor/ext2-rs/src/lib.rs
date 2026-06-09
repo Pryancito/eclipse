@@ -1,5 +1,4 @@
 #![feature(step_trait)]
-#![feature(const_fn_trait_bound)]
 #![cfg_attr(all(not(test), feature = "no_std"), no_std)]
 
 #[macro_use]
