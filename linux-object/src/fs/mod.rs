@@ -489,9 +489,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 /// installed ext2 ROOT partition when one is available.
 ///
 /// Resolution order:
-/// 1. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
+/// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`). This is
+///    the explicit, unambiguous override.
+/// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
 ///    real, resolvable device (e.g. an initrd patched by the installer).
-/// 2. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
+/// 3. Auto-detection: the first ext2 partition whose own `/etc/fstab` declares
 ///    that very partition as `/` (a self-consistent installed Eclipse root).
 ///
 /// Returns the filesystem to use as `/` together with its device path, or
@@ -500,16 +502,44 @@ fn determine_real_root(
     boot_root: &Arc<MNode>,
     candidates: &[(String, Arc<dyn INode>)],
 ) -> Option<(Arc<dyn FileSystem>, String)> {
-    // 1. Explicit root device declared in the boot medium's fstab.
+    // 1. Explicit `ROOT=<dev>` override from the kernel command line.
+    let cmdline = kernel_hal::boot::cmdline();
+    if let Some(dev) = parse_root_cmdline(&cmdline) {
+        match lookup_candidate(candidates, dev) {
+            Some(inode) => match open_ext2_root(inode) {
+                Some(fs) => return Some((fs, String::from(dev))),
+                None => warn!("create_root_fs: ROOT={} is not a mountable ext2 device", dev),
+            },
+            None => warn!("create_root_fs: ROOT={} from cmdline not found under /dev", dev),
+        }
+    }
+
+    // 2. Explicit root device declared in the boot medium's fstab.
     if let Some(res) = root_fs_from_fstab(boot_root, candidates) {
         return Some(res);
     }
 
-    // 2. Auto-detect a self-consistent installed ext2 root.
+    // 3. Auto-detect a self-consistent installed ext2 root.
     for (name, inode) in candidates {
         if let Some(fs) = open_ext2_root(inode.clone()) {
             if fstab_declares_self_root(&fs, name) {
                 return Some((fs, format!("/dev/{}", name)));
+            }
+        }
+    }
+    None
+}
+
+/// Extract the `ROOT=` device from the kernel command line, which is a
+/// `:`-separated list of `KEY=value` pairs (e.g. `LOG=info:ROOT=/dev/sda2`).
+fn parse_root_cmdline(cmdline: &str) -> Option<&str> {
+    for opt in cmdline.split(':') {
+        let mut it = opt.trim().splitn(2, '=');
+        let key = it.next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("ROOT") {
+            let val = it.next().unwrap_or("").trim();
+            if !val.is_empty() {
+                return Some(val);
             }
         }
     }
