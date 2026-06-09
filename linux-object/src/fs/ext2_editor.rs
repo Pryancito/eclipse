@@ -143,6 +143,30 @@ impl<'a> Ext2Editor<'a> {
         Ok(())
     }
 
+    /// Current wall-clock time in seconds since the Unix epoch (ext2 stores
+    /// 32-bit POSIX timestamps).
+    fn now_secs() -> u32 {
+        kernel_hal::timer::wall_clock_now().as_secs() as u32
+    }
+
+    /// Read this inode's (atime, mtime, ctime).
+    pub(crate) fn inode_times(&self, inode_num: u32) -> Result<(u32, u32, u32)> {
+        let raw = self.read_raw_inode(inode_num)?;
+        Ok((raw.atime, raw.mtime, raw.ctime))
+    }
+
+    /// Update timestamps after a change. Always bumps ctime; also bumps mtime
+    /// when the file's contents changed.
+    pub(crate) fn touch_times(&self, inode_num: u32, content_changed: bool) -> Result<()> {
+        let mut raw = self.read_raw_inode(inode_num)?;
+        let now = Self::now_secs();
+        raw.ctime = now;
+        if content_changed {
+            raw.mtime = now;
+        }
+        self.write_raw_inode(inode_num, &raw)
+    }
+
     fn write_superblock_counts(&self) -> Result<()> {
         let inner = self.fs.synced.inner();
         let mut buf = vec![0u8; mem::size_of::<ext2::sys::superblock::Superblock>()];
@@ -660,6 +684,8 @@ impl<'a> Ext2Editor<'a> {
         raw.type_perm = type_bits | perm;
         raw.uid = uid as u16;
         raw.gid = gid as u16;
+        // A metadata change (chmod/chown) updates ctime only.
+        raw.ctime = Self::now_secs();
         self.write_raw_inode(inode_num, &raw)?;
         Ok(())
     }
@@ -708,6 +734,15 @@ impl<'a> Ext2Editor<'a> {
 
     fn add_dir_entry(&self, dir_inode: u32, name: &str, child: u32, ty: u8) -> Result<()> {
         if name == "." || name == ".." {
+            return Err(FsError::InvalidParam);
+        }
+        // Directory entry names: non-empty, <=255 bytes (name_len is a u8) and
+        // free of '/' and NUL. Otherwise the on-disk dirent would be truncated
+        // or corrupted.
+        if name.is_empty()
+            || name.len() > 255
+            || name.as_bytes().iter().any(|&b| b == b'/' || b == 0)
+        {
             return Err(FsError::InvalidParam);
         }
         let name_bytes = name.as_bytes();
@@ -949,6 +984,37 @@ impl<'a> Ext2Editor<'a> {
         self.free_metadata_block(block)
     }
 
+    /// Free now-empty intermediate indirect-block metadata at and below `block`.
+    ///
+    /// `levels` is the indirection depth of `block` (1 = singly-indirect whose
+    /// slots are data pointers, 2 = doubly, 3 = triply). For depth > 1, each
+    /// child that becomes entirely empty after a truncation is freed and its
+    /// slot cleared. Returns `true` when `block` itself ends up all-zero, so the
+    /// caller can free it too. Without this, partially-truncated files leak the
+    /// intermediate indirect blocks that no longer reference any data.
+    fn prune_indirect(&self, block: u32, levels: u8) -> Result<bool> {
+        if block == 0 {
+            return Ok(true);
+        }
+        let bs4 = self.block_size() / 4;
+        let mut data = self.read_block(block)?;
+        if levels > 1 {
+            let mut changed = false;
+            for i in 0..bs4 {
+                let child = Self::read_u32_at(&data, i);
+                if child != 0 && self.prune_indirect(child, levels - 1)? {
+                    self.free_metadata_block(child)?;
+                    Self::write_u32_at(&mut data, i, 0);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.write_block(block, &data)?;
+            }
+        }
+        Ok(Self::block_ptrs_all_zero(&data))
+    }
+
     fn truncate_inode_blocks(&self, inode_num: u32, new_blocks: usize) -> Result<()> {
         let mut raw = self.read_raw_inode(inode_num)?;
         let old_blocks = self.inode_data_blocks(&raw);
@@ -960,27 +1026,20 @@ impl<'a> Ext2Editor<'a> {
         }
         self.write_raw_inode(inode_num, &raw)?;
 
+        // Reclaim indirect metadata blocks that no longer point at any data,
+        // including intermediate levels inside the doubly/triply trees.
         let mut raw = self.read_raw_inode(inode_num)?;
-        if raw.indirect_pointer != 0 {
-            let data = self.read_block(raw.indirect_pointer)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.free_metadata_block(raw.indirect_pointer)?;
-                raw.indirect_pointer = 0;
-            }
+        if raw.indirect_pointer != 0 && self.prune_indirect(raw.indirect_pointer, 1)? {
+            self.free_metadata_block(raw.indirect_pointer)?;
+            raw.indirect_pointer = 0;
         }
-        if raw.doubly_indirect != 0 {
-            let data = self.read_block(raw.doubly_indirect)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.release_doubly_indirect_block(raw.doubly_indirect)?;
-                raw.doubly_indirect = 0;
-            }
+        if raw.doubly_indirect != 0 && self.prune_indirect(raw.doubly_indirect, 2)? {
+            self.free_metadata_block(raw.doubly_indirect)?;
+            raw.doubly_indirect = 0;
         }
-        if raw.triply_indirect != 0 {
-            let data = self.read_block(raw.triply_indirect)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.release_triply_indirect_block(raw.triply_indirect)?;
-                raw.triply_indirect = 0;
-            }
+        if raw.triply_indirect != 0 && self.prune_indirect(raw.triply_indirect, 3)? {
+            self.free_metadata_block(raw.triply_indirect)?;
+            raw.triply_indirect = 0;
         }
         self.write_raw_inode(inode_num, &raw)?;
         Ok(())
@@ -1068,13 +1127,14 @@ impl<'a> Ext2Editor<'a> {
             return Err(FsError::EntryExist);
         }
         let child = self.alloc_inode()?;
+        let now = Self::now_secs();
         let mut raw = RawInode {
             type_perm: TypePerm::empty(),
             uid: 0,
             size_low: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
+            atime: now,
+            ctime: now,
+            mtime: now,
             dtime: 0,
             gid: 0,
             hard_links: 1,
@@ -1287,6 +1347,9 @@ impl<'a> Ext2Editor<'a> {
             let mut raw = self.read_raw_inode(inode_num)?;
             Self::set_inode_full_size(&mut raw, len);
             self.write_raw_inode(inode_num, &raw)?;
+        }
+        if len != old {
+            self.touch_times(inode_num, true)?;
         }
         Ok(())
     }

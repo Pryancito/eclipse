@@ -336,6 +336,9 @@ impl Ext2MountINode {
             }
             done += take;
         }
+        if done > 0 {
+            let _ = self.fs.editor().touch_times(self.inode_num as u32, true);
+        }
         Ok(done)
     }
 
@@ -527,15 +530,20 @@ impl INode for Ext2MountINode {
         } else {
             cur.size()
         };
+        let (atime, mtime, ctime) = self
+            .fs
+            .editor()
+            .inode_times(self.inode_num as u32)
+            .unwrap_or((0, 0, 0));
         Ok(Metadata {
             dev: 0,
             inode: self.inode_num,
             size,
             blk_size: 512,
             blocks: (size + 511) / 512,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
+            atime: Timespec { sec: atime as i64, nsec: 0 },
+            mtime: Timespec { sec: mtime as i64, nsec: 0 },
+            ctime: Timespec { sec: ctime as i64, nsec: 0 },
             type_: if is_dir {
                 FileType::Dir
             } else if is_symlink {
