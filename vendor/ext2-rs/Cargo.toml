@@ -1,0 +1,13 @@
+[package]
+name = "ext2"
+version = "0.1.0"
+authors = ["Szymon Walter <walter.szymon.98@gmail.com>"]
+
+[dependencies]
+bitflags = "1.3"
+spin = "0.9"
+genfs = "^0.1.4"
+
+[features]
+default = ["no_std"]
+no_std = []
