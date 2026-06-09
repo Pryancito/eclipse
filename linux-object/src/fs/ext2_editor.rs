@@ -57,15 +57,24 @@ impl<'a> Ext2Editor<'a> {
     }
 
     fn inode_byte_offset(&self, inode_num: u32) -> usize {
-        let inner = self.fs.synced.inner();
+        // NOTE: `synced.inner()` is a non-reentrant `spin::Mutex`.  The helper
+        // accessors below (`inodes_per_group`, `inode_size`, `log_block_size`)
+        // each lock it independently, so they MUST be evaluated *before* we hold
+        // our own guard — otherwise we self-deadlock and hang the whole core.
+        // This path is reached by `read_raw_inode`, e.g. when resolving a
+        // symlink (`/bin/ls` -> busybox), which is why `ls` froze the system
+        // while `busybox ls` (a regular file, read via the synced inode) did not.
+        let inodes_per_group = self.inodes_per_group();
+        let inode_size = self.inode_size();
+        let log_block_size = self.log_block_size();
         let index = (inode_num - 1) as usize;
-        let bg = index / self.inodes_per_group();
-        let idx = index % self.inodes_per_group();
-        let table_block = inner.block_group(bg).inode_table_block;
+        let bg = index / inodes_per_group;
+        let idx = index % inodes_per_group;
+        let table_block = self.fs.synced.inner().block_group(bg).inode_table_block;
         Address::<ext2::sector::Size512>::with_block_size(
             table_block,
-            (idx * self.inode_size()) as i32,
-            self.log_block_size(),
+            (idx * inode_size) as i32,
+            log_block_size,
         )
         .into_index() as usize
     }
