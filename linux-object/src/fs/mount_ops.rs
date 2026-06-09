@@ -29,6 +29,11 @@ pub(crate) fn set_vfs_root(root: Arc<MNode>) {
     *VFS_ROOT.lock() = Some(root);
 }
 
+/// The VFS root remembered by `set_vfs_root`, if any.
+pub(crate) fn vfs_root() -> Option<Arc<MNode>> {
+    VFS_ROOT.lock().clone()
+}
+
 fn normalize_target(path: &str) -> String {
     let path = path.trim();
     if path.is_empty() || path == "/" {

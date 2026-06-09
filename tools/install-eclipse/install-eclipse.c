@@ -2380,20 +2380,30 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *disk_p
         };
     }
 
-    fd = open(block_dev, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        // Fallback for host testing if block_dev (e.g. disk.img2) doesn't exist.
-        if (errno == ENOENT && disk_path != NULL && struct_file_exists(disk_path)) {
-            fd = open(disk_path, O_RDWR | O_CLOEXEC);
-            if (fd >= 0) {
-                partition_offset = start_sector * SECTOR_SIZE;
-                if (lseek(fd, partition_offset, SEEK_SET) < 0) {
-                    log(COLOR_RED COLOR_BOLD "ERROR: No se pudo hacer seek al sector %" PRIu64 " en %s." COLOR_RESET, start_sector, disk_path);
-                    close(fd);
-                    return -1;
-                }
-                log(COLOR_YELLOW "ADVERTENCIA: Usando fallback de disco plano %s sector %" PRIu64 "." COLOR_RESET, disk_path, start_sector);
+    /* IMPORTANTE: parcheamos sobre el MISMO dispositivo en el que se escribió y
+     * verificó la imagen ext2: el disco completo (`disk_path`) en el offset de
+     * la partición. El dispositivo de partición (`block_dev`, p.ej. /dev/sda2)
+     * es un objeto de bloque distinto y su caché puede no ser coherente con la
+     * del disco completo, de modo que el parche "tenía éxito" pero no llegaba
+     * al almacenamiento que el kernel lee al arrancar (fstab quedaba con los
+     * placeholders sin sustituir). Usamos block_dev solo como reserva. */
+    if (disk_path != NULL && struct_file_exists(disk_path)) {
+        fd = open(disk_path, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            partition_offset = start_sector * SECTOR_SIZE;
+            if (lseek(fd, partition_offset, SEEK_SET) < 0) {
+                log(COLOR_RED COLOR_BOLD "ERROR: No se pudo hacer seek al sector %" PRIu64 " en %s." COLOR_RESET, start_sector, disk_path);
+                close(fd);
+                return -1;
             }
+        }
+    }
+    if (fd < 0) {
+        // Reserva: parchear directamente el dispositivo de partición.
+        partition_offset = 0;
+        fd = open(block_dev, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            log(COLOR_YELLOW "ADVERTENCIA: usando dispositivo de partición %s (sin disco completo)." COLOR_RESET, block_dev);
         }
     }
     if (fd < 0) {

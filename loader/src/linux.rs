@@ -77,6 +77,15 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
+
+    // Now that init is started, mount the non-root entries from /etc/fstab
+    // (/boot/efi vfat, /home, …) as a deferred kernel task. This is done off
+    // the synchronous boot path on purpose: the blocking block-device I/O it
+    // performs would otherwise risk stalling disk boot before the shell shows.
+    kernel_hal::thread::spawn(async {
+        linux_object::fs::mount_fstab_deferred();
+    });
+
     proc
 }
 

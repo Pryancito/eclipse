@@ -5,7 +5,7 @@ use alloc::{boxed::Box, string::String, sync::Arc};
 use async_trait::async_trait;
 use lock::RwLock;
 
-use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus};
+use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
 use zircon_object::object::*;
 use zircon_object::vm::{pages, VmObject};
 
@@ -209,9 +209,42 @@ impl File {
         if !inner.flags.readable() {
             return Err(LxError::EBADF);
         }
-        let entry = inner.inode.get_entry_with_metadata(inner.offset as usize)?;
-        inner.offset += 1;
-        Ok(entry)
+        let offset = inner.offset as usize;
+        match inner.inode.get_entry_with_metadata(offset) {
+            Ok(entry) => {
+                inner.offset += 1;
+                Ok(entry)
+            }
+            Err(e) => {
+                // `get_entry_with_metadata`'s default implementation resolves
+                // the entry's metadata via `find(name)`, which can fail even
+                // though the entry exists — e.g. the devfs root's ".." has no
+                // parent, so `find("..")` returns EntryNotFound. Treating that
+                // as end-of-directory truncates the listing (this made
+                // `ls /dev` appear empty). Distinguish the two: if the name
+                // still resolves, emit it with a synthetic directory metadata;
+                // only a missing name means we reached the end.
+                let name = inner.inode.get_entry(offset).map_err(|_| e)?;
+                inner.offset += 1;
+                let meta = Metadata {
+                    dev: 0,
+                    inode: 0,
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: Timespec { sec: 0, nsec: 0 },
+                    mtime: Timespec { sec: 0, nsec: 0 },
+                    ctime: Timespec { sec: 0, nsec: 0 },
+                    type_: FileType::Dir,
+                    mode: 0,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                };
+                Ok((meta, name))
+            }
+        }
     }
 
     /// get INode of this file

@@ -714,7 +714,22 @@ pub fn mount_vfs_fstab(root: &Arc<MNode>) {
     mount_fstab(root);
 }
 
-#[allow(dead_code)]
+/// Process `/etc/fstab` using the VFS root remembered by `create_root_fs`.
+///
+/// Intended to be called *after* init has started (e.g. spawned as a kernel
+/// task), since mounting extra filesystems (/boot/efi vfat, /home, …) does
+/// blocking block-device I/O that must not run on the early-boot path before
+/// the shell appears.
+pub fn mount_fstab_deferred() {
+    match mount_ops::vfs_root() {
+        Some(root) => {
+            warn!("[boot] mount_fstab_deferred: processing /etc/fstab");
+            mount_fstab(&root);
+        }
+        None => warn!("[boot] mount_fstab_deferred: no VFS root set; skipping"),
+    }
+}
+
 fn mount_fstab(root: &Arc<MNode>) {
     info!("mount_fstab: parsing /etc/fstab");
     if let Ok(etc) = root.find(true, "etc") {
