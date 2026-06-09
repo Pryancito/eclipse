@@ -320,14 +320,28 @@ impl Ext2MountINode {
         Ok(done)
     }
 
-    /// Look up a single child by name scanning direct directory blocks only.
+    /// Number of data blocks backing this inode, derived from its size.
+    ///
+    /// Directories store their entries in fully-allocated blocks up to
+    /// `i_size`, so this also bounds the directory-scan loops below.  Capped at
+    /// a generous limit to stay safe against a corrupted size field.
+    fn data_block_count(&self) -> usize {
+        const MAX_DIR_BLOCKS: usize = 1 << 20; // 1M blocks (>= 1GiB of dir data)
+        let block_size = self.fs.block_size;
+        let blocks = (self.inode.size() + block_size - 1) / block_size;
+        blocks.min(MAX_DIR_BLOCKS)
+    }
+
+    /// Look up a single child by name scanning every directory block,
+    /// including those reachable through indirect block pointers.
     fn find_direct_child(&self, name: &str) -> Result<usize> {
         if !self.inode.is_dir() {
             return Err(FsError::NotDir);
         }
         let block_size = self.fs.block_size;
         let log_block_size = self.fs.synced.inner().log_block_size();
-        for block_idx in 0..12 {
+        let n_blocks = self.data_block_count().max(1);
+        for block_idx in 0..n_blocks {
             let disk_block = match self.inode.try_block(block_idx) {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => break,
@@ -369,17 +383,19 @@ impl Ext2MountINode {
         Err(FsError::EntryNotFound)
     }
 
-    /// Scan directory data blocks using the synced inode's block map (direct blocks
-    /// only). Used for path lookup during boot; file reads use `read_file_at`.
+    /// Scan directory data blocks using the synced inode's block map, walking
+    /// both direct and indirect block pointers. Used for path lookup during
+    /// boot and for `readdir`; file reads use `read_file_at`.
     fn scan_direct_dir_blocks(&self) -> Result<Vec<(String, usize)>> {
-        const MAX_DIR_ENTRIES: usize = 4096;
+        const MAX_DIR_ENTRIES: usize = 65536;
         if !self.inode.is_dir() {
             return Err(FsError::NotDir);
         }
         let block_size = self.fs.block_size;
         let log_block_size = self.fs.synced.inner().log_block_size();
+        let n_blocks = self.data_block_count().max(1);
         let mut out = Vec::new();
-        for block_idx in 0..12 {
+        for block_idx in 0..n_blocks {
             let disk_block = match self.inode.try_block(block_idx) {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => break,
