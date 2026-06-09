@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use core::mem;
 
 use ext2::sector::Address;
-use ext2::sys::inode::{Inode as RawInode, TypePerm, DIRECTORY, FILE, SYMLINK};
+use ext2::sys::inode::{
+    Inode as RawInode, TypePerm, BLOCK_DEVICE, CHAR_DEVICE, DIRECTORY, FIFO, FILE, SOCKET, SYMLINK,
+};
 use rcore_fs::vfs::{FileType, FsError, Result};
 
 use super::ext2_mount::Ext2MountFs;
@@ -57,15 +59,24 @@ impl<'a> Ext2Editor<'a> {
     }
 
     fn inode_byte_offset(&self, inode_num: u32) -> usize {
-        let inner = self.fs.synced.inner();
+        // NOTE: `synced.inner()` is a non-reentrant `spin::Mutex`.  The helper
+        // accessors below (`inodes_per_group`, `inode_size`, `log_block_size`)
+        // each lock it independently, so they MUST be evaluated *before* we hold
+        // our own guard — otherwise we self-deadlock and hang the whole core.
+        // This path is reached by `read_raw_inode`, e.g. when resolving a
+        // symlink (`/bin/ls` -> busybox), which is why `ls` froze the system
+        // while `busybox ls` (a regular file, read via the synced inode) did not.
+        let inodes_per_group = self.inodes_per_group();
+        let inode_size = self.inode_size();
+        let log_block_size = self.log_block_size();
         let index = (inode_num - 1) as usize;
-        let bg = index / self.inodes_per_group();
-        let idx = index % self.inodes_per_group();
-        let table_block = inner.block_group(bg).inode_table_block;
+        let bg = index / inodes_per_group;
+        let idx = index % inodes_per_group;
+        let table_block = self.fs.synced.inner().block_group(bg).inode_table_block;
         Address::<ext2::sector::Size512>::with_block_size(
             table_block,
-            (idx * self.inode_size()) as i32,
-            self.log_block_size(),
+            (idx * inode_size) as i32,
+            log_block_size,
         )
         .into_index() as usize
     }
@@ -114,7 +125,9 @@ impl<'a> Ext2Editor<'a> {
             .device
             .read_at(offset, &mut buf)
             .map_err(|_| FsError::DeviceError)?;
-        Ok(unsafe { *(buf.as_ptr() as *const RawInode) })
+        // `buf` is a `Vec<u8>` (align 1); `RawInode` has align 4, so a plain
+        // dereference would be undefined behaviour. Use an unaligned read.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const RawInode) })
     }
 
     fn write_raw_inode(&self, inode_num: u32, inode: &RawInode) -> Result<()> {
@@ -130,6 +143,75 @@ impl<'a> Ext2Editor<'a> {
             .write_at(offset, bytes)
             .map_err(|_| FsError::DeviceError)?;
         Ok(())
+    }
+
+    /// Current wall-clock time in seconds since the Unix epoch (ext2 stores
+    /// 32-bit POSIX timestamps).
+    fn now_secs() -> u32 {
+        kernel_hal::timer::wall_clock_now().as_secs() as u32
+    }
+
+    /// Read this inode's (atime, mtime, ctime).
+    pub(crate) fn inode_times(&self, inode_num: u32) -> Result<(u32, u32, u32)> {
+        let raw = self.read_raw_inode(inode_num)?;
+        Ok((raw.atime, raw.mtime, raw.ctime))
+    }
+
+    /// True iff the inode's 4-bit format field is exactly DIRECTORY.
+    ///
+    /// `type_perm.contains(DIRECTORY)` is wrong here: DIRECTORY is 0x4000 and
+    /// BLOCK_DEVICE (0x6000) / SOCKET (0xC000) also have that bit set, so they
+    /// would be misclassified as directories.
+    fn is_dir_raw(raw: &RawInode) -> bool {
+        raw.type_perm & TypePerm::from_bits_truncate(0xF000) == TypePerm::DIRECTORY
+    }
+
+    /// Map the inode's 4-bit format field to a VFS `FileType`.
+    fn file_type_of(raw: &RawInode) -> FileType {
+        let fmt = raw.type_perm & TypePerm::from_bits_truncate(0xF000);
+        if fmt == TypePerm::DIRECTORY {
+            FileType::Dir
+        } else if fmt == TypePerm::SYMLINK {
+            FileType::SymLink
+        } else if fmt == TypePerm::CHAR_DEVICE {
+            FileType::CharDevice
+        } else if fmt == TypePerm::BLOCK_DEVICE {
+            FileType::BlockDevice
+        } else if fmt == TypePerm::FIFO {
+            FileType::NamedPipe
+        } else if fmt == TypePerm::SOCKET {
+            FileType::Socket
+        } else {
+            FileType::File
+        }
+    }
+
+    /// Type, device number and timestamps in a single raw-inode read, used to
+    /// build `stat`. `rdev` is only meaningful for device nodes.
+    pub(crate) fn inode_meta_extra(
+        &self,
+        inode_num: u32,
+    ) -> Result<(FileType, usize, u32, u32, u32)> {
+        let raw = self.read_raw_inode(inode_num)?;
+        let ft = Self::file_type_of(&raw);
+        let rdev = if matches!(ft, FileType::CharDevice | FileType::BlockDevice) {
+            raw.direct_pointer[0] as usize
+        } else {
+            0
+        };
+        Ok((ft, rdev, raw.atime, raw.mtime, raw.ctime))
+    }
+
+    /// Update timestamps after a change. Always bumps ctime; also bumps mtime
+    /// when the file's contents changed.
+    pub(crate) fn touch_times(&self, inode_num: u32, content_changed: bool) -> Result<()> {
+        let mut raw = self.read_raw_inode(inode_num)?;
+        let now = Self::now_secs();
+        raw.ctime = now;
+        if content_changed {
+            raw.mtime = now;
+        }
+        self.write_raw_inode(inode_num, &raw)
     }
 
     fn write_superblock_counts(&self) -> Result<()> {
@@ -167,13 +249,22 @@ impl<'a> Ext2Editor<'a> {
     fn alloc_inode(&self) -> Result<u32> {
         let inodes_per_group = self.inodes_per_group();
         let groups = self.fs.synced.inner().block_groups_len();
+        // Never hand out a reserved inode (root is 2). Floor the on-disk value
+        // at EXT2_GOOD_OLD_FIRST_INO=11 in case it is unset on old revisions.
+        let first_inode = self.fs.synced.inner().first_inode().max(11) as usize;
         for bg in 0..groups {
             if self.fs.synced.inner().block_group(bg).free_inodes_count == 0 {
                 continue;
             }
             let bitmap_block = self.fs.synced.inner().block_group(bg).inode_usage_addr;
             let mut bitmap = self.read_block(bitmap_block)?;
-            for bit in 0..inodes_per_group {
+            // Skip reserved inodes living in the first block group.
+            let start_bit = if bg == 0 {
+                first_inode.saturating_sub(1)
+            } else {
+                0
+            };
+            for bit in start_bit..inodes_per_group {
                 let byte = bit / 8;
                 let mask = 1u8 << (bit % 8);
                 if bitmap[byte] & mask != 0 {
@@ -260,6 +351,12 @@ impl<'a> Ext2Editor<'a> {
         let mut bitmap = self.read_block(bitmap_block)?;
         let byte = bit / 8;
         let mask = 1u8 << (bit % 8);
+        // Guard against double-free: if the block is already marked free, do
+        // not bump the free counters again (that would inflate them and let an
+        // in-use block be handed out a second time).
+        if bitmap[byte] & mask == 0 {
+            return Ok(());
+        }
         bitmap[byte] &= !mask;
         self.write_block(bitmap_block, &bitmap)?;
         {
@@ -368,10 +465,22 @@ impl<'a> Ext2Editor<'a> {
     }
 
     fn dirent_ty(raw: &RawInode) -> u8 {
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        // The file-type is a 4-bit format field (0xF000), not a bitset, so we
+        // must compare the masked value for equality. `contains()` would, e.g.,
+        // report a BLOCK_DEVICE (0x6000) as a DIRECTORY (0x4000).
+        let fmt = raw.type_perm & TypePerm::from_bits_truncate(0xF000);
+        if fmt == TypePerm::DIRECTORY {
             DIRECTORY
-        } else if raw.type_perm.contains(TypePerm::SYMLINK) {
+        } else if fmt == TypePerm::SYMLINK {
             SYMLINK
+        } else if fmt == TypePerm::CHAR_DEVICE {
+            CHAR_DEVICE
+        } else if fmt == TypePerm::BLOCK_DEVICE {
+            BLOCK_DEVICE
+        } else if fmt == TypePerm::FIFO {
+            FIFO
+        } else if fmt == TypePerm::SOCKET {
+            SOCKET
         } else {
             FILE
         }
@@ -417,7 +526,7 @@ impl<'a> Ext2Editor<'a> {
         buf: &mut [u8],
     ) -> Result<usize> {
         let raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -463,6 +572,13 @@ impl<'a> Ext2Editor<'a> {
         }
         let bs = self.block_size();
         let len = Self::inode_full_size(&raw);
+        // A symlink target can never exceed PATH_MAX. Reject a corrupted size
+        // field instead of trying to allocate a multi-gigabyte buffer (which
+        // would OOM / hang the kernel from a readlink/stat syscall).
+        const SYMLINK_MAX: usize = 4096;
+        if len > SYMLINK_MAX {
+            return Err(FsError::InvalidParam);
+        }
         let mut out = vec![0u8; len];
         for block_idx in 0..self.inode_data_blocks(&raw) {
             let disk = self
@@ -525,7 +641,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn parent_inode(&self, dir_inode: u32) -> Result<u32> {
         let inode = self.read_raw_inode(dir_inode)?;
-        if !inode.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&inode) {
             return Err(FsError::NotDir);
         }
         let blocks = self.inode_data_blocks(&inode).max(1);
@@ -555,9 +671,17 @@ impl<'a> Ext2Editor<'a> {
 
     fn is_subdir_of(&self, child: u32, ancestor: u32) -> Result<bool> {
         let mut cur = child;
+        // Bound the walk: a corrupted `..` chain could otherwise form a cycle
+        // that never reaches the root (inode 2) and hang the kernel.
+        let max_depth = self.fs.synced.inner().total_inodes_count().max(1);
+        let mut steps = 0usize;
         while cur != 2 {
             if cur == ancestor {
                 return Ok(true);
+            }
+            steps += 1;
+            if steps > max_depth {
+                return Err(FsError::InvalidParam);
             }
             cur = self.parent_inode(cur)?;
         }
@@ -566,7 +690,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn adjust_parent_nlink(&self, parent_num: u32, delta: i16) -> Result<()> {
         let mut raw = self.read_raw_inode(parent_num)?;
-        if !raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&raw) {
             return Err(FsError::NotDir);
         }
         if delta < 0 {
@@ -619,6 +743,8 @@ impl<'a> Ext2Editor<'a> {
         raw.type_perm = type_bits | perm;
         raw.uid = uid as u16;
         raw.gid = gid as u16;
+        // A metadata change (chmod/chown) updates ctime only.
+        raw.ctime = Self::now_secs();
         self.write_raw_inode(inode_num, &raw)?;
         Ok(())
     }
@@ -667,6 +793,15 @@ impl<'a> Ext2Editor<'a> {
 
     fn add_dir_entry(&self, dir_inode: u32, name: &str, child: u32, ty: u8) -> Result<()> {
         if name == "." || name == ".." {
+            return Err(FsError::InvalidParam);
+        }
+        // Directory entry names: non-empty, <=255 bytes (name_len is a u8) and
+        // free of '/' and NUL. Otherwise the on-disk dirent would be truncated
+        // or corrupted.
+        if name.is_empty()
+            || name.len() > 255
+            || name.as_bytes().iter().any(|&b| b == b'/' || b == 0)
+        {
             return Err(FsError::InvalidParam);
         }
         let name_bytes = name.as_bytes();
@@ -908,6 +1043,37 @@ impl<'a> Ext2Editor<'a> {
         self.free_metadata_block(block)
     }
 
+    /// Free now-empty intermediate indirect-block metadata at and below `block`.
+    ///
+    /// `levels` is the indirection depth of `block` (1 = singly-indirect whose
+    /// slots are data pointers, 2 = doubly, 3 = triply). For depth > 1, each
+    /// child that becomes entirely empty after a truncation is freed and its
+    /// slot cleared. Returns `true` when `block` itself ends up all-zero, so the
+    /// caller can free it too. Without this, partially-truncated files leak the
+    /// intermediate indirect blocks that no longer reference any data.
+    fn prune_indirect(&self, block: u32, levels: u8) -> Result<bool> {
+        if block == 0 {
+            return Ok(true);
+        }
+        let bs4 = self.block_size() / 4;
+        let mut data = self.read_block(block)?;
+        if levels > 1 {
+            let mut changed = false;
+            for i in 0..bs4 {
+                let child = Self::read_u32_at(&data, i);
+                if child != 0 && self.prune_indirect(child, levels - 1)? {
+                    self.free_metadata_block(child)?;
+                    Self::write_u32_at(&mut data, i, 0);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.write_block(block, &data)?;
+            }
+        }
+        Ok(Self::block_ptrs_all_zero(&data))
+    }
+
     fn truncate_inode_blocks(&self, inode_num: u32, new_blocks: usize) -> Result<()> {
         let mut raw = self.read_raw_inode(inode_num)?;
         let old_blocks = self.inode_data_blocks(&raw);
@@ -919,27 +1085,20 @@ impl<'a> Ext2Editor<'a> {
         }
         self.write_raw_inode(inode_num, &raw)?;
 
+        // Reclaim indirect metadata blocks that no longer point at any data,
+        // including intermediate levels inside the doubly/triply trees.
         let mut raw = self.read_raw_inode(inode_num)?;
-        if raw.indirect_pointer != 0 {
-            let data = self.read_block(raw.indirect_pointer)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.free_metadata_block(raw.indirect_pointer)?;
-                raw.indirect_pointer = 0;
-            }
+        if raw.indirect_pointer != 0 && self.prune_indirect(raw.indirect_pointer, 1)? {
+            self.free_metadata_block(raw.indirect_pointer)?;
+            raw.indirect_pointer = 0;
         }
-        if raw.doubly_indirect != 0 {
-            let data = self.read_block(raw.doubly_indirect)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.release_doubly_indirect_block(raw.doubly_indirect)?;
-                raw.doubly_indirect = 0;
-            }
+        if raw.doubly_indirect != 0 && self.prune_indirect(raw.doubly_indirect, 2)? {
+            self.free_metadata_block(raw.doubly_indirect)?;
+            raw.doubly_indirect = 0;
         }
-        if raw.triply_indirect != 0 {
-            let data = self.read_block(raw.triply_indirect)?;
-            if Self::block_ptrs_all_zero(&data) {
-                self.release_triply_indirect_block(raw.triply_indirect)?;
-                raw.triply_indirect = 0;
-            }
+        if raw.triply_indirect != 0 && self.prune_indirect(raw.triply_indirect, 3)? {
+            self.free_metadata_block(raw.triply_indirect)?;
+            raw.triply_indirect = 0;
         }
         self.write_raw_inode(inode_num, &raw)?;
         Ok(())
@@ -949,7 +1108,7 @@ impl<'a> Ext2Editor<'a> {
         let bs = self.block_size();
         let blocks_needed = (size + bs - 1) / bs;
         let mut raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         let current_blocks = self.inode_data_blocks(&raw);
@@ -981,7 +1140,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn dir_is_empty(&self, inode_num: u32) -> Result<bool> {
         let inode = self.read_raw_inode(inode_num)?;
-        if !inode.type_perm.contains(TypePerm::DIRECTORY) {
+        if !Self::is_dir_raw(&inode) {
             return Ok(true);
         }
         let blocks = self.inode_data_blocks(&inode).max(1);
@@ -1015,6 +1174,7 @@ impl<'a> Ext2Editor<'a> {
         name: &str,
         type_: FileType,
         mode: u32,
+        rdev: usize,
     ) -> Result<u32> {
         if !self
             .fs
@@ -1027,13 +1187,14 @@ impl<'a> Ext2Editor<'a> {
             return Err(FsError::EntryExist);
         }
         let child = self.alloc_inode()?;
+        let now = Self::now_secs();
         let mut raw = RawInode {
             type_perm: TypePerm::empty(),
             uid: 0,
             size_low: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
+            atime: now,
+            ctime: now,
+            mtime: now,
             dtime: 0,
             gid: 0,
             hard_links: 1,
@@ -1085,8 +1246,31 @@ impl<'a> Ext2Editor<'a> {
                 self.write_raw_inode(child, &raw)?;
                 self.add_dir_entry(parent_num, name, child, SYMLINK)?;
             }
-            _ => return Err(FsError::NotSupported),
+            FileType::CharDevice | FileType::BlockDevice => {
+                raw.type_perm = if matches!(type_, FileType::CharDevice) {
+                    TypePerm::CHAR_DEVICE
+                } else {
+                    TypePerm::BLOCK_DEVICE
+                } | perm;
+                // Device number: legacy ext2 encoding stores it in i_block[0].
+                raw.direct_pointer[0] = rdev as u32;
+                self.write_raw_inode(child, &raw)?;
+                let dty = Self::dirent_ty(&raw);
+                self.add_dir_entry(parent_num, name, child, dty)?;
+            }
+            FileType::NamedPipe | FileType::Socket => {
+                raw.type_perm = if matches!(type_, FileType::NamedPipe) {
+                    TypePerm::FIFO
+                } else {
+                    TypePerm::SOCKET
+                } | perm;
+                self.write_raw_inode(child, &raw)?;
+                let dty = Self::dirent_ty(&raw);
+                self.add_dir_entry(parent_num, name, child, dty)?;
+            }
         }
+        // The parent directory was modified (a new entry was added).
+        let _ = self.touch_times(parent_num, true);
         Ok(child)
     }
 
@@ -1120,10 +1304,10 @@ impl<'a> Ext2Editor<'a> {
     pub fn unlink(&self, parent_num: u32, name: &str) -> Result<()> {
         let child_inode = self.lookup_in_dir(parent_num, name)?;
         let child_raw = self.read_raw_inode(child_inode)?;
-        if child_raw.type_perm.contains(TypePerm::DIRECTORY) && !self.dir_is_empty(child_inode)? {
+        if Self::is_dir_raw(&child_raw) && !self.dir_is_empty(child_inode)? {
             return Err(FsError::DirNotEmpty);
         }
-        let is_dir = child_raw.type_perm.contains(TypePerm::DIRECTORY);
+        let is_dir = Self::is_dir_raw(&child_raw);
         self.remove_dir_entry(parent_num, name)?;
         let mut raw = self.read_raw_inode(child_inode)?;
         if raw.hard_links <= 1 {
@@ -1142,8 +1326,11 @@ impl<'a> Ext2Editor<'a> {
             self.free_inode(child_inode)?;
         } else {
             raw.hard_links -= 1;
+            raw.ctime = Self::now_secs();
             self.write_raw_inode(child_inode, &raw)?;
         }
+        // The parent directory was modified (an entry was removed).
+        let _ = self.touch_times(parent_num, true);
         Ok(())
     }
 
@@ -1159,7 +1346,7 @@ impl<'a> Ext2Editor<'a> {
             return Err(FsError::EntryExist);
         }
         let mut raw = self.read_raw_inode(target_inode)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -1183,7 +1370,7 @@ impl<'a> Ext2Editor<'a> {
         }
         let inode = self.lookup_in_dir(old_parent, old_name)?;
         let raw = self.read_raw_inode(inode)?;
-        let src_is_dir = raw.type_perm.contains(TypePerm::DIRECTORY);
+        let src_is_dir = Self::is_dir_raw(&raw);
 
         if src_is_dir && self.is_subdir_of(new_parent, inode)? {
             return Err(FsError::InvalidParam);
@@ -1194,7 +1381,7 @@ impl<'a> Ext2Editor<'a> {
                 return Ok(());
             }
             let existing_raw = self.read_raw_inode(existing)?;
-            let dst_is_dir = existing_raw.type_perm.contains(TypePerm::DIRECTORY);
+            let dst_is_dir = Self::is_dir_raw(&existing_raw);
             if src_is_dir != dst_is_dir {
                 return if dst_is_dir {
                     Err(FsError::IsDir)
@@ -1216,14 +1403,23 @@ impl<'a> Ext2Editor<'a> {
             }
         }
         let ty = Self::dirent_ty(&raw);
-        self.remove_dir_entry(old_parent, old_name)?;
+        // Add the new link before removing the old one: if the second step
+        // fails the file is still reachable (two links, fsck-fixable) rather
+        // than lost entirely.
         self.add_dir_entry(new_parent, new_name, inode, ty)?;
+        self.remove_dir_entry(old_parent, old_name)?;
+        // The moved inode's ctime changes; both parent directories are modified.
+        let _ = self.touch_times(inode, false);
+        let _ = self.touch_times(old_parent, true);
+        if new_parent != old_parent {
+            let _ = self.touch_times(new_parent, true);
+        }
         Ok(())
     }
 
     pub fn resize(&self, inode_num: u32, len: usize) -> Result<()> {
         let raw = self.read_raw_inode(inode_num)?;
-        if raw.type_perm.contains(TypePerm::DIRECTORY) {
+        if Self::is_dir_raw(&raw) {
             return Err(FsError::IsDir);
         }
         if raw.type_perm.contains(TypePerm::SYMLINK) {
@@ -1246,6 +1442,9 @@ impl<'a> Ext2Editor<'a> {
             let mut raw = self.read_raw_inode(inode_num)?;
             Self::set_inode_full_size(&mut raw, len);
             self.write_raw_inode(inode_num, &raw)?;
+        }
+        if len != old {
+            self.touch_times(inode_num, true)?;
         }
         Ok(())
     }

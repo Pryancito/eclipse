@@ -132,6 +132,13 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
         self.superblock.inner.first_data_block
     }
 
+    /// First inode usable for regular files/dirs. Inodes below this are
+    /// reserved (root is 2). For old-revision filesystems the on-disk field
+    /// may be 0, so callers should floor it at `EXT2_GOOD_OLD_FIRST_INO` (11).
+    pub fn first_inode(&self) -> u32 {
+        self.superblock.inner.first_inode
+    }
+
     pub fn blocks_per_group(&self) -> u32 {
         self.superblock.inner.blocks_per_group
     }

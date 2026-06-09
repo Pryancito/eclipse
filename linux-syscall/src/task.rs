@@ -337,17 +337,10 @@ impl Syscall<'_> {
 
         // Read program file
         let proc = self.linux_process();
-        warn!("execve[1]: lookup_inode {:?}", path_str);
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
-        warn!(
-            "execve[2]: resolved {:?} -> inode={} type={:?} size={}",
-            path_str, metadata.inode, metadata.type_, metadata.size
-        );
         proc.check_access(&metadata, 0o1, true)?;
-        warn!("execve[3]: read_as_vmo (size={})", metadata.size);
         let vmo = inode.read_as_vmo()?;
-        warn!("execve[4]: read_as_vmo done, vmo len={}", vmo.len());
 
         proc.remove_cloexec_files();
 
@@ -356,7 +349,6 @@ impl Syscall<'_> {
         let path_str = path_str.to_string();
         let vmar = self.zircon_process().vmar();
         vmar.clear()?;
-        warn!("execve[5]: vmar cleared, loading ELF");
 
         let (entry, sp, initial_brk, execute_path) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
@@ -368,10 +360,6 @@ impl Syscall<'_> {
             error!("execve: LinuxElfLoader::load failed: {:?}", e);
             e
         })?;
-        warn!(
-            "execve[6]: load done entry={:#x} sp={:#x} execute_path={:?}",
-            entry, sp, execute_path
-        );
         proc.set_execute_path(&execute_path);
         proc.set_cmdline(args);
         proc.set_brk(initial_brk);
@@ -379,7 +367,6 @@ impl Syscall<'_> {
         self.zircon_process()
             .set_name(comm_from_path(&execute_path));
 
-        warn!("execve[7]: signaling USER_SIGNAL_0, entering user space");
         self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
             *ctx = UserContext::new();

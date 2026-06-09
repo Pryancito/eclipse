@@ -76,9 +76,12 @@ impl Volume<u8, Size512> for Ext2Volume {
         let index = range.start;
         let len = range.end - range.start;
         let mut vec = vec![0u8; len.into_index() as usize];
-        self.inner
-            .read_at(index.into_index() as usize, vec.as_mut_slice())
-            .unwrap();
+        // Do NOT panic on device I/O errors: this is reachable from mount and
+        // inode lookups. On failure leave the buffer zero-filled rather than
+        // crashing the whole kernel.
+        let _ = self
+            .inner
+            .read_at(index.into_index() as usize, vec.as_mut_slice());
         VolumeSlice::new_owned(vec, index)
     }
 
@@ -190,11 +193,27 @@ struct Ext2MountINode {
 }
 
 impl Ext2MountINode {
+    /// Re-read this inode from the backing store.
+    ///
+    /// The `self.inode` field is an immutable in-memory snapshot taken at
+    /// lookup time, while every mutation (write, resize, dir growth, …) goes
+    /// through the on-disk `editor`.  Reading through the snapshot therefore
+    /// returns stale size/type/nlink and, crucially, a stale block map (so
+    /// freshly allocated directory/file blocks would be invisible).  Read
+    /// paths must use this fresh copy instead.  Falls back to the snapshot if
+    /// the inode can no longer be read (e.g. concurrently freed).
+    fn fresh_inode(&self) -> Ext2Inode<Size512, Ext2Volume> {
+        self.fs
+            .inode_from_num(self.inode_num)
+            .unwrap_or_else(|_| self.inode.clone())
+    }
+
     fn read_inode_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        if self.inode.is_dir() {
+        let cur = self.fresh_inode();
+        if cur.is_dir() {
             return Err(FsError::IsDir);
         }
-        if self.inode.is_symlink() {
+        if cur.is_symlink() {
             let target = self
                 .fs
                 .editor()
@@ -206,7 +225,7 @@ impl Ext2MountINode {
             buf[..take].copy_from_slice(&target[offset..offset + take]);
             return Ok(take);
         }
-        let total = self.inode.size();
+        let total = cur.size();
         if offset >= total {
             return Ok(0);
         }
@@ -215,12 +234,12 @@ impl Ext2MountINode {
         let log_block_size = self.fs.synced.inner().log_block_size();
         let mut done = 0;
         let mut pos = offset;
-        // Use the synced inode's block map (in memory). Fall back to the on-disk
+        // Use the freshly-read inode's block map. Fall back to the on-disk
         // editor only when try_block cannot resolve an indirect pointer.
         while done < want {
             let file_block = pos / block_size;
             let block_off = pos % block_size;
-            let disk_block = match self.inode.try_block(file_block) {
+            let disk_block = match cur.try_block(file_block) {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => {
                     if done == 0 {
@@ -258,17 +277,17 @@ impl Ext2MountINode {
     }
 
     fn write_inode_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
-        if self.inode.is_dir() {
+        let mut inode = self.fresh_inode();
+        if inode.is_dir() {
             return Err(FsError::IsDir);
         }
-        if self.inode.is_symlink() {
+        if inode.is_symlink() {
             return self
                 .fs
                 .editor()
                 .write_symlink(self.inode_num as u32, offset, buf);
         }
         let end = offset.saturating_add(buf.len());
-        let mut inode = self.inode.clone();
         if end > inode.size() {
             self.fs
                 .editor()
@@ -317,6 +336,9 @@ impl Ext2MountINode {
             }
             done += take;
         }
+        if done > 0 {
+            let _ = self.fs.editor().touch_times(self.inode_num as u32, true);
+        }
         Ok(done)
     }
 
@@ -325,24 +347,25 @@ impl Ext2MountINode {
     /// Directories store their entries in fully-allocated blocks up to
     /// `i_size`, so this also bounds the directory-scan loops below.  Capped at
     /// a generous limit to stay safe against a corrupted size field.
-    fn data_block_count(&self) -> usize {
+    fn data_block_count(&self, inode: &Ext2Inode<Size512, Ext2Volume>) -> usize {
         const MAX_DIR_BLOCKS: usize = 1 << 20; // 1M blocks (>= 1GiB of dir data)
         let block_size = self.fs.block_size;
-        let blocks = (self.inode.size() + block_size - 1) / block_size;
+        let blocks = (inode.size() + block_size - 1) / block_size;
         blocks.min(MAX_DIR_BLOCKS)
     }
 
     /// Look up a single child by name scanning every directory block,
     /// including those reachable through indirect block pointers.
     fn find_direct_child(&self, name: &str) -> Result<usize> {
-        if !self.inode.is_dir() {
+        let cur = self.fresh_inode();
+        if !cur.is_dir() {
             return Err(FsError::NotDir);
         }
         let block_size = self.fs.block_size;
         let log_block_size = self.fs.synced.inner().log_block_size();
-        let n_blocks = self.data_block_count().max(1);
+        let n_blocks = self.data_block_count(&cur).max(1);
         for block_idx in 0..n_blocks {
-            let disk_block = match self.inode.try_block(block_idx) {
+            let disk_block = match cur.try_block(block_idx) {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => break,
                 Err(_) => return Err(FsError::DeviceError),
@@ -388,15 +411,16 @@ impl Ext2MountINode {
     /// boot and for `readdir`; file reads use `read_file_at`.
     fn scan_direct_dir_blocks(&self) -> Result<Vec<(String, usize)>> {
         const MAX_DIR_ENTRIES: usize = 65536;
-        if !self.inode.is_dir() {
+        let cur = self.fresh_inode();
+        if !cur.is_dir() {
             return Err(FsError::NotDir);
         }
         let block_size = self.fs.block_size;
         let log_block_size = self.fs.synced.inner().log_block_size();
-        let n_blocks = self.data_block_count().max(1);
+        let n_blocks = self.data_block_count(&cur).max(1);
         let mut out = Vec::new();
         for block_idx in 0..n_blocks {
-            let disk_block = match self.inode.try_block(block_idx) {
+            let disk_block = match cur.try_block(block_idx) {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => break,
                 Err(_) => return Err(FsError::DeviceError),
@@ -493,15 +517,24 @@ impl INode for Ext2MountINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let is_dir = self.inode.is_dir();
-        let is_symlink = self.inode.is_symlink();
-        let size = if is_symlink {
+        // Read the live inode so `stat` reflects writes/resizes/chmod made
+        // through the editor since this handle was opened.
+        let cur = self.fresh_inode();
+        // Authoritative type/rdev/timestamps from the raw inode (the synced
+        // `is_dir`/`is_symlink` accessors cannot distinguish device/fifo/socket
+        // nodes, which share format bits with dir/symlink).
+        let (type_, rdev, atime, mtime, ctime) = self
+            .fs
+            .editor()
+            .inode_meta_extra(self.inode_num as u32)
+            .unwrap_or((FileType::File, 0, 0, 0, 0));
+        let size = if matches!(type_, FileType::SymLink) {
             self.fs
                 .editor()
                 .read_symlink(self.inode_num as u32)?
                 .len()
         } else {
-            self.inode.size()
+            cur.size()
         };
         Ok(Metadata {
             dev: 0,
@@ -509,21 +542,15 @@ impl INode for Ext2MountINode {
             size,
             blk_size: 512,
             blocks: (size + 511) / 512,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: if is_dir {
-                FileType::Dir
-            } else if is_symlink {
-                FileType::SymLink
-            } else {
-                FileType::File
-            },
-            mode: self.inode.mode_bits(),
-            nlinks: self.inode.nlink() as usize,
-            uid: self.inode.uid() as usize,
-            gid: self.inode.gid() as usize,
-            rdev: 0,
+            atime: Timespec { sec: atime as i64, nsec: 0 },
+            mtime: Timespec { sec: mtime as i64, nsec: 0 },
+            ctime: Timespec { sec: ctime as i64, nsec: 0 },
+            type_,
+            mode: cur.mode_bits(),
+            nlinks: cur.nlink() as usize,
+            uid: cur.uid() as usize,
+            gid: cur.gid() as usize,
+            rdev,
         })
     }
 
@@ -584,14 +611,20 @@ impl INode for Ext2MountINode {
         self.fs.clone()
     }
 
-    fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
-        if !self.inode.is_dir() {
+    fn create2(
+        &self,
+        name: &str,
+        type_: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn INode>> {
+        if !self.fresh_inode().is_dir() {
             return Err(FsError::NotDir);
         }
         let child = self
             .fs
             .editor()
-            .create(self.inode_num as u32, name, type_, mode)?;
+            .create(self.inode_num as u32, name, type_, mode, data)?;
         self.fs.invalidate_dir_cache(self.inode_num);
         let inode = self.fs.inode_from_num(child as usize)?;
         Ok(Arc::new(Ext2MountINode {
