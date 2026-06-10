@@ -216,6 +216,49 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// Announce an intention to access file data in a specific pattern
+    /// (`posix_fadvise`). The hint is purely advisory, so we validate the
+    /// descriptor and otherwise treat it as a no-op returning success. This
+    /// silences the spurious `unknown syscall: FADVISE64` errors emitted by
+    /// tools such as `e2fsck`.
+    pub fn sys_fadvise64(&self, fd: FileDesc, offset: usize, len: usize, advice: usize) -> SysResult {
+        info!(
+            "fadvise64: fd={:?}, offset={}, len={}, advice={}",
+            fd, offset, len, advice
+        );
+        // Honour Linux's EBADF for an invalid descriptor; ignore the hint itself.
+        let _ = self.linux_process().get_file_like(fd)?;
+        Ok(0)
+    }
+
+    /// Manipulate the allocated disk space for the file referenced by `fd`
+    /// (`fallocate`). We support the default mode by growing a regular file so
+    /// that `offset + len` bytes are backed; every other mode (and any non
+    /// regular file such as a block device) is treated as a successful no-op.
+    /// That is enough for `resize2fs`/`e2fsck`, which only rely on the size
+    /// effect, and avoids the `unknown syscall: FALLOCATE` errors.
+    pub fn sys_fallocate(&self, fd: FileDesc, mode: usize, offset: usize, len: usize) -> SysResult {
+        info!(
+            "fallocate: fd={:?}, mode={:#x}, offset={}, len={}",
+            fd, mode, offset, len
+        );
+        let file = self.linux_process().get_file(fd)?;
+        // Only the plain allocate mode (mode == 0) implies the file may need to
+        // grow. KEEP_SIZE, the hole-punch/zero-range variants, and any request
+        // against a non-regular file (e.g. a block device) must leave the size
+        // untouched, so they fall through to a successful no-op.
+        if mode == 0 {
+            let meta = file.metadata()?;
+            if meta.type_ == linux_object::fs::vfs::FileType::File {
+                let end = offset.checked_add(len).ok_or(LxError::EINVAL)?;
+                if end > meta.size {
+                    file.set_len(end as u64)?;
+                }
+            }
+        }
+        Ok(0)
+    }
+
     /// copies data between one file descriptor and another.
     pub async fn sys_sendfile(
         &self,
