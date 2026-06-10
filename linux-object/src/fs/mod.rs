@@ -757,6 +757,19 @@ fn mount_fstab(root: &Arc<MNode>) {
 
                         // Resolve the source inode using coerced root_dyn
                         let source_rel = source.trim_start_matches('/');
+
+                        // Skip entries the installer never substituted (e.g. a raw
+                        // install medium booted directly): the source is still an
+                        // `__ECLIPSE_*` placeholder that can never name a real
+                        // device. Mirrors the guard in parse_root_cmdline so the
+                        // boot path stays quiet instead of logging failed lookups.
+                        if source_rel.starts_with("__ECLIPSE_") {
+                            info!(
+                                "mount_fstab: skipping unsubstituted placeholder source {:?} -> {:?}",
+                                source, target
+                            );
+                            continue;
+                        }
                         let root_dyn: Arc<dyn INode> = root.clone();
                         let source_inode = match root_dyn.lookup_follow(source_rel, 4) {
                             Ok(inode) => inode,
