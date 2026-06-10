@@ -2468,7 +2468,11 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *disk_p
      * placeholders sin sustituir tras instalar; (2) obliga a que la verificación
      * siguiente lea del almacenamiento real y no de la caché. */
     sync();
-    if (ioctl(fd, BLKFLSBUF, 0) != 0) {
+    /* En Eclipse OS las escrituras de bloque van directas al dispositivo (sin
+     * caché), así que BLKFLSBUF puede no estar implementado: eso es benigno. Sólo
+     * avisamos ante errores inesperados. */
+    if (ioctl(fd, BLKFLSBUF, 0) != 0 &&
+        errno != ENOSYS && errno != ENOTTY && errno != EOPNOTSUPP) {
         log(COLOR_YELLOW "ADVERTENCIA: BLKFLSBUF en %s: %s" COLOR_RESET, block_dev, strerror(errno));
     }
 
@@ -2583,7 +2587,8 @@ static int resize_root_to_partition(const char *root_dev, int dry_run) {
     {
         int pfd = open(root_dev, O_RDONLY | O_CLOEXEC);
         if (pfd >= 0) {
-            if (ioctl(pfd, BLKFLSBUF, 0) != 0) {
+            if (ioctl(pfd, BLKFLSBUF, 0) != 0 &&
+                errno != ENOSYS && errno != ENOTTY && errno != EOPNOTSUPP) {
                 log(COLOR_YELLOW "ADVERTENCIA: BLKFLSBUF en %s: %s" COLOR_RESET, root_dev, strerror(errno));
             }
             close(pfd);

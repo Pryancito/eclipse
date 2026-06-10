@@ -8,6 +8,8 @@ use zcore_drivers::{scheme::BlockScheme, scheme::Scheme, DeviceError};
 const BLKGETSIZE64: u32 = 0x8008_1272;
 /// Linux `BLKGETSIZE` — size in 512-byte sectors (`linux/fs.h`).
 const BLKGETSIZE: u32 = 0x0000_1260;
+/// Linux `BLKFLSBUF` — flush block device buffers (`_IO(0x12,97)`).
+const BLKFLSBUF: u32 = 0x0000_1261;
 
 /// Block device INode.
 pub struct BlockDev {
@@ -151,6 +153,14 @@ impl INode for BlockDev {
             0x0000_125f => { // BLKRRPART
                 crate::fs::rescan_partitions(&self.name, &self.block, self.index)
                     .map_err(|_| FsError::DeviceError)?;
+                Ok(0)
+            }
+            BLKFLSBUF => {
+                // Eclipse escribe directamente al dispositivo (sin caché de
+                // bloques), así que basta con delegar el flush del driver y
+                // devolver éxito en lugar de ENOSYS. Herramientas como el
+                // instalador lo invocan para asegurar la persistencia.
+                let _ = self.block.flush();
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
