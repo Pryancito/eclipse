@@ -119,6 +119,8 @@ impl Syscall<'_> {
             Sys::FDATASYNC => self.sys_fdatasync(a0.into()),
             Sys::TRUNCATE => self.sys_truncate(a0.into(), a1),
             Sys::FTRUNCATE => self.sys_ftruncate(a0.into(), a1),
+            Sys::FADVISE64 => self.sys_fadvise64(a0.into(), a1, a2, a3),
+            Sys::FALLOCATE => self.sys_fallocate(a0.into(), a1, a2, a3),
             Sys::GETDENTS64 => self.sys_getdents64(a0.into(), a1.into(), a2),
             Sys::GETCWD => self.sys_getcwd(a0.into(), a1),
             Sys::CHDIR => self.sys_chdir(a0.into()),
