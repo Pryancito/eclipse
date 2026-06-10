@@ -412,11 +412,11 @@ static int prepare_gpt_or_fallback(enum table_mode *table);
 static int write_mbr_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run);
 static int write_gpt_partition_table_native(const char *disk_path, const struct partition_plan *parts, int part_count);
 static int write_gpt_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run);
-static int write_partition_image_with_retry(const char *disk_path, const struct partition_plan *part, int dry_run);
+static int write_partition_image_with_retry(const char *part_path, const struct partition_plan *part, int dry_run);
 static ssize_t disk_pwrite_all(int fd, const void *buf, size_t len, uint64_t offset);
 static int decompress_gz_to_path(const char *gz_path, const char *out_path, int dry_run);
 static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, uint64_t start_sector, int dry_run);
-static int verify_partition_write(const char *disk_path, const struct partition_plan *part, int dry_run);
+static int verify_partition_write(const char *part_path, const struct partition_plan *part, int dry_run);
 static int partition_dev_path(const char *disk_path, int part_num, char *out, size_t out_size);
 static int discover_partitions(const char *disk_path, struct discovered_partitions *out);
 static int shell_mkdir_p(const char *path, int dry_run);
@@ -428,8 +428,7 @@ static int run_upgrade(const char *disk_path, int dry_run);
 static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
                                int part_count, enum layout_mode layout, int dry_run);
 static int resize_root_to_partition(const char *root_dev, int dry_run);
-static int patch_rboot_root_on_efi(const char *block_dev, const char *disk_path,
-                                   uint64_t start_sector, const char *root_dev, int dry_run);
+static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, int dry_run);
 static void close_log_file(void);
 
 static void close_log_file(void) {
@@ -1873,9 +1872,9 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
     return 0;
 }
 
-static int write_partition_image_with_retry(const char *disk_path, const struct partition_plan *part, int dry_run) {
+static int write_partition_image_with_retry(const char *part_path, const struct partition_plan *part, int dry_run) {
     for (int attempt = 1; attempt <= 3; attempt++) {
-        if (write_gz_image_to_disk(part->image_path, disk_path, part->start_sector, dry_run) == 0) {
+        if (write_gz_image_to_disk(part->image_path, part_path, 0, dry_run) == 0) {
             log(COLOR_GREEN "%s escrita correctamente en intento %d." COLOR_RESET, part->name, attempt);
             return 0;
         }
@@ -1886,7 +1885,7 @@ static int write_partition_image_with_retry(const char *disk_path, const struct 
     return -1;
 }
 
-static int verify_partition_write(const char *disk_path, const struct partition_plan *part, int dry_run) {
+static int verify_partition_write(const char *part_path, const struct partition_plan *part, int dry_run) {
     uint8_t disk_buf[VERIFY_PREFIX_BYTES];
     uint8_t src_buf[VERIFY_PREFIX_BYTES];
     char disk_sha[SHA256_HEX_LEN + 1];
@@ -1904,17 +1903,17 @@ static int verify_partition_write(const char *disk_path, const struct partition_
         return 0;
     }
 
-    fd = open(disk_path, O_RDONLY | O_CLOEXEC);
+    fd = open(part_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para verificación (%s)." COLOR_RESET,
-            disk_path, strerror(errno));
+            part_path, strerror(errno));
         return -1;
     }
 
-    offset = part->start_sector * SECTOR_SIZE;
+    offset = 0;
     if (disk_pread_all(fd, disk_buf, sizeof(disk_buf), offset) != (ssize_t)sizeof(disk_buf)) {
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer %s @ %" PRIu64 " para verificación (%s)." COLOR_RESET,
-            disk_path, offset, strerror(errno));
+            part_path, offset, strerror(errno));
         close(fd);
         return -1;
     }
@@ -2376,7 +2375,7 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     return 0;
 }
 
-static int patch_fstab_on_block_device(const char *block_dev, const char *disk_path, uint64_t start_sector,
+static int patch_fstab_on_block_device(const char *block_dev,
                                        const char *efi_dev, const char *root_dev, const char *home_dev,
                                        const char *swap_dev, enum layout_mode layout, int dry_run) {
     char efi_field[FSTAB_PLACEHOLDER_LEN + 1];
@@ -2422,35 +2421,10 @@ static int patch_fstab_on_block_device(const char *block_dev, const char *disk_p
         };
     }
 
-    /* IMPORTANTE: parcheamos sobre el MISMO dispositivo en el que se escribió y
-     * verificó la imagen ext2: el disco completo (`disk_path`) en el offset de
-     * la partición. El dispositivo de partición (`block_dev`, p.ej. /dev/sda2)
-     * es un objeto de bloque distinto y su caché puede no ser coherente con la
-     * del disco completo, de modo que el parche "tenía éxito" pero no llegaba
-     * al almacenamiento que el kernel lee al arrancar (fstab quedaba con los
-     * placeholders sin sustituir). Usamos block_dev solo como reserva. */
-    if (disk_path != NULL && struct_file_exists(disk_path)) {
-        fd = open(disk_path, O_RDWR | O_CLOEXEC);
-        if (fd >= 0) {
-            partition_offset = start_sector * SECTOR_SIZE;
-            if (lseek(fd, partition_offset, SEEK_SET) < 0) {
-                log(COLOR_RED COLOR_BOLD "ERROR: No se pudo hacer seek al sector %" PRIu64 " en %s." COLOR_RESET, start_sector, disk_path);
-                close(fd);
-                return -1;
-            }
-        }
-    }
+    fd = open(block_dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        // Reserva: parchear directamente el dispositivo de partición.
-        partition_offset = 0;
-        fd = open(block_dev, O_RDWR | O_CLOEXEC);
-        if (fd >= 0) {
-            log(COLOR_YELLOW "ADVERTENCIA: usando dispositivo de partición %s (sin disco completo)." COLOR_RESET, block_dev);
-        }
-    }
-    if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s o %s (%s)." COLOR_RESET,
-            block_dev, disk_path ? disk_path : "(null)", strerror(errno));
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
+            block_dev, strerror(errno));
         return -1;
     }
 
@@ -2538,8 +2512,7 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
     /* Parche en bruto primero: no depende de mount(2) y evita bloqueos en Eclipse OS. */
     if (layout == LAYOUT_ADVANCED && part_count >= 4) {
-        if (patch_fstab_on_block_device(root_dev, disk_path, parts[1].start_sector,
-                                        efi_dev, root_dev, home_dev, swap_dev,
+        if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
                                         layout, dry_run) == 0) {
             return 0;
         }
@@ -2547,8 +2520,7 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
             "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
         return write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run);
     }
-    if (patch_fstab_on_block_device(root_dev, disk_path, parts[1].start_sector,
-                                    efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
+    if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
         return 0;
     }
     log(COLOR_YELLOW
@@ -2620,8 +2592,7 @@ static int resize_root_to_partition(const char *root_dev, int dry_run) {
  * kernel pivote de forma determinista a la partición ext2 instalada. Es una
  * operación no fatal: si el placeholder no está (imagen EFI antigua) o no se
  * puede escribir, el kernel recurre a la auto-detección del root. */
-static int patch_rboot_root_on_efi(const char *block_dev, const char *disk_path,
-                                   uint64_t start_sector, const char *root_dev, int dry_run) {
+static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, int dry_run) {
     char root_field[FSTAB_PLACEHOLDER_LEN + 1];
     struct fstab_patch_target targets[1];
     int fd = -1;
@@ -2640,21 +2611,6 @@ static int patch_rboot_root_on_efi(const char *block_dev, const char *disk_path,
     };
 
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        /* Fallback para pruebas en host sobre una imagen de disco plana. */
-        if (errno == ENOENT && disk_path != NULL && struct_file_exists(disk_path)) {
-            fd = open(disk_path, O_RDWR | O_CLOEXEC);
-            if (fd >= 0) {
-                partition_offset = start_sector * SECTOR_SIZE;
-                if (lseek(fd, partition_offset, SEEK_SET) < 0) {
-                    log(COLOR_YELLOW "ADVERTENCIA: seek a sector %" PRIu64 " en %s falló." COLOR_RESET,
-                        start_sector, disk_path);
-                    close(fd);
-                    return 0;
-                }
-            }
-        }
-    }
     if (fd < 0) {
         log(COLOR_YELLOW
             "ADVERTENCIA: no se pudo abrir %s para fijar ROOT= en rboot.conf (%s); se usará auto-detección." COLOR_RESET,
@@ -2787,7 +2743,7 @@ cleanup:
     }
     if (rc == 0) {
         /* La partición EFI ya está desmontada: fija ROOT= en rboot.conf (no fatal). */
-        patch_rboot_root_on_efi(efi_dev, disk_path, 0, root_dev, dry_run);
+        patch_rboot_root_on_efi(efi_dev, root_dev, dry_run);
     }
     return rc;
 }
@@ -2972,24 +2928,31 @@ int main(int argc, char **argv) {
         }
         trigger_partition_rescan(cfg.disk_path);
 
+        char efi_dev[160], root_dev[160];
+        if (partition_dev_path(cfg.disk_path, 1, efi_dev, sizeof(efi_dev)) != 0 ||
+            partition_dev_path(cfg.disk_path, 2, root_dev, sizeof(root_dev)) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de las particiones." COLOR_RESET);
+            return 1;
+        }
+
         int total_steps = (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3;
         (void)total_steps;
 
         log(COLOR_GREEN "[2/%d] Escribiendo partición EFI..." COLOR_RESET,
             (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3);
-        if (write_partition_image_with_retry(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
+        if (write_partition_image_with_retry(efi_dev, &parts[0], cfg.dry_run) != 0) {
             return 1;
         }
-        if (verify_partition_write(cfg.disk_path, &parts[0], cfg.dry_run) != 0) {
+        if (verify_partition_write(efi_dev, &parts[0], cfg.dry_run) != 0) {
             return 1;
         }
 
         log(COLOR_GREEN "[3/%d] Escribiendo partición ROOT..." COLOR_RESET,
             (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3);
-        if (write_partition_image_with_retry(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
+        if (write_partition_image_with_retry(root_dev, &parts[1], cfg.dry_run) != 0) {
             return 1;
         }
-        if (verify_partition_write(cfg.disk_path, &parts[1], cfg.dry_run) != 0) {
+        if (verify_partition_write(root_dev, &parts[1], cfg.dry_run) != 0) {
             return 1;
         }
 
@@ -3008,12 +2971,7 @@ int main(int argc, char **argv) {
 
         /* Fija ROOT=<part2> en la cmdline de rboot.conf de la EFI (no fatal). */
         {
-            char rb_efi_dev[160], rb_root_dev[160];
-            if (partition_dev_path(cfg.disk_path, 1, rb_efi_dev, sizeof(rb_efi_dev)) == 0 &&
-                partition_dev_path(cfg.disk_path, 2, rb_root_dev, sizeof(rb_root_dev)) == 0) {
-                patch_rboot_root_on_efi(rb_efi_dev, cfg.disk_path, parts[0].start_sector,
-                                        rb_root_dev, cfg.dry_run);
-            }
+            patch_rboot_root_on_efi(efi_dev, root_dev, cfg.dry_run);
         }
     } else {
         if (run_upgrade(cfg.disk_path, cfg.dry_run) != 0) {

@@ -151,12 +151,6 @@ impl<'a> Ext2Editor<'a> {
         kernel_hal::timer::wall_clock_now().as_secs() as u32
     }
 
-    /// Read this inode's (atime, mtime, ctime).
-    pub(crate) fn inode_times(&self, inode_num: u32) -> Result<(u32, u32, u32)> {
-        let raw = self.read_raw_inode(inode_num)?;
-        Ok((raw.atime, raw.mtime, raw.ctime))
-    }
-
     /// True iff the inode's 4-bit format field is exactly DIRECTORY.
     ///
     /// `type_perm.contains(DIRECTORY)` is wrong here: DIRECTORY is 0x4000 and

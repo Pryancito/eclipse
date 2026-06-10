@@ -21,12 +21,9 @@ fn comm_from_path(path: &str) -> &str {
 /// Create and run main Linux process
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
     info!("Run Linux process: args={:?}, envs={:?}", args, envs);
-    kernel_hal::console::serial_write_str("[linux] run: begin\n");
     linux_object::net::init();
-    kernel_hal::console::serial_write_str("[linux] run: net ok\n");
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc = Process::create_linux(&job, rootfs.clone()).expect("create_linux");
-    kernel_hal::console::serial_write_str("[linux] run: rootfs ok\n");
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -36,7 +33,6 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
         root_inode: root_inode.clone(),
     };
 
-    kernel_hal::console::serial_write_str("[linux] run: lookup busybox\n");
     let inode = match root_inode.lookup(&args[0]) {
         Ok(inode) => inode,
         Err(e) => {
@@ -50,11 +46,9 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
                 .expect("lookup root process on initramfs")
         }
     };
-    kernel_hal::console::serial_write_str("[linux] run: read busybox\n");
     let vmo = inode
         .read_as_vmo()
         .unwrap_or_else(|e| panic!("failed to read root process {:?}: {:?}", args[0], e));
-    kernel_hal::console::serial_write_str("[linux] run: read busybox ok\n");
     let path = args[0].clone();
 
     // Boot UX: clear to black right before the first graphic-console output (prompt).
@@ -64,11 +58,9 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    kernel_hal::console::serial_write_str("[linux] run: elf load\n");
     let (entry, sp, initial_brk, execute_path) = loader
         .load(&proc.vmar(), &vmo, args.clone(), envs, path)
         .unwrap_or_else(|e| panic!("failed to load root process {:?}: {:?}", args[0], e));
-    kernel_hal::console::serial_write_str("[linux] run: elf ok\n");
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);

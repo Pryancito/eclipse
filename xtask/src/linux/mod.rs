@@ -834,7 +834,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         let musl = musl.canonicalize().unwrap();
         let arch = self.0.name();
-        let cc = format!("{}/bin/{}-linux-musl-gcc", musl.display(), arch);
+        let musl_bin = musl.join("bin");
+        let path_env = join_path_env([&musl_bin]);
+        let cc = format!("{}/{}-linux-musl-gcc", musl_bin.display(), arch);
+        let ar = format!("{}/{}-linux-musl-ar", musl_bin.display(), arch);
+        let ranlib = format!("{}/{}-linux-musl-ranlib", musl_bin.display(), arch);
+        let strip_tool = format!("{}/{}-linux-musl-strip", musl_bin.display(), arch);
 
         // Build VPATH en árbol separado para no ensuciar la fuente.
         let build = self.0.target().join("e2fsprogs-build");
@@ -846,10 +851,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let configure = source.join("configure");
         let status = Ext::new("sh")
             .current_dir(&build)
+            .env("PATH", &path_env)
             .arg(configure.display().to_string())
             .arg(format!("CC={cc}"))
+            .arg(format!("AR={ar}"))
+            .arg(format!("RANLIB={ranlib}"))
+            .arg(format!("STRIP={strip_tool}"))
             .arg("CFLAGS=-O2 -fno-PIC -fno-PIE")
-            .arg("LDFLAGS=-static")
+            .arg("EXTRA_CFLAGS=-O2 -fno-PIC -fno-PIE")
+            .arg("LDFLAGS=-static -no-pie")
+            .arg("EXTRA_LDFLAGS=-static -no-pie")
             .arg(format!("--host={arch}-linux-musl"))
             .arg("--disable-nls")
             .arg("--disable-rpath")
@@ -862,9 +873,30 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             return out;
         }
 
-        // make (no fatal: los binarios concretos pueden quedar construidos aunque
-        // algún sub-objetivo opcional falle).
-        let _ = Make::new().current_dir(&build).status();
+        // lib/uuid/Makefile.in enlaza tst_uuid en `all::`; con GCC reciente y
+        // -static falla (R_X86_64_32 vs PIE). Solo necesitamos libuuid.a.
+        let uuid_mk = build.join("lib/uuid/Makefile");
+        if let Ok(text) = fs::read_to_string(&uuid_mk) {
+            let patched = text.replace("all:: tst_uuid uuid_time", "all:: uuid_time");
+            if patched != text {
+                let _ = fs::write(&uuid_mk, patched);
+            }
+        }
+
+        // Bibliotecas estáticas primero. Los binarios se construyen dentro de cada
+        // subdirectorio: `make resize/resize2fs` desde la raíz no enlaza libext2fs.
+        let _ = Make::new()
+            .current_dir(&build)
+            .env("PATH", &path_env)
+            .arg("libs")
+            .status();
+        for (subdir, prog) in [("resize", "resize2fs"), ("e2fsck", "e2fsck"), ("misc", "mke2fs")] {
+            let _ = Make::new()
+                .current_dir(build.join(subdir))
+                .env("PATH", &path_env)
+                .arg(prog)
+                .status();
+        }
 
         fs::create_dir_all(&out).unwrap();
         let strip = self.strip(&musl);
