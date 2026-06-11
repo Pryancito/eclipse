@@ -98,7 +98,7 @@ pub trait GenericPageTable: Sync + Send {
         flags: MMUFlags,
     ) -> PagingResult {
         assert!(is_aligned(start_vaddr));
-        assert!(is_aligned(start_vaddr));
+        assert!(is_aligned(start_paddr));
         assert!(is_aligned(size));
         debug!(
             "map_cont: {:#x?} => {:#x}, flags={:?}",

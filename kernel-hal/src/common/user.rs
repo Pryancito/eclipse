@@ -184,6 +184,11 @@ impl<T, P: Read> UserPtr<T, P> {
             Ok(Vec::default())
         } else {
             self.check()?;
+            // The total number of bytes to copy must not overflow `usize`,
+            // otherwise the allocation would be smaller than `set_len` claims
+            // and the following copy would write out of bounds.
+            len.checked_mul(core::mem::size_of::<T>())
+                .ok_or(Error::InvalidLength)?;
             let mut ret = Vec::<T>::with_capacity(len);
             unsafe {
                 ret.set_len(len);
@@ -203,11 +208,26 @@ impl<P: Read> UserPtr<u8, P> {
 
     // 从一个 C 风格的零结尾字符串构造一个字符切片。
     /// Forms a zero-terminated string slice from a user pointer to a c style string.
+    ///
+    /// The scan for the terminating `'\0'` is bounded by [`MAX_C_STR_LEN`] so a
+    /// malicious or buggy user pointer that is not null-terminated cannot make
+    /// the kernel walk an unbounded amount of memory (and the previous
+    /// `unwrap()` could panic the kernel).
     pub fn as_c_str(&self) -> Result<&'static str> {
         self.check()?;
-        self.as_str(unsafe { (0usize..).find(|&i| *self.0.add(i) == 0).unwrap() })
+        let len = (0..MAX_C_STR_LEN)
+            .find(|&i| unsafe { *self.0.add(i) == 0 })
+            .ok_or(Error::InvalidLength)?;
+        self.as_str(len)
     }
 }
+
+/// Upper bound for the length of a C string read from user space.
+const MAX_C_STR_LEN: usize = 4 * 1024 * 1024;
+
+/// Upper bound for the number of entries in a user-supplied pointer array
+/// (e.g. `argv`/`envp`), to bound kernel work and allocations.
+const MAX_C_STR_ARRAY_LEN: usize = 1 << 20;
 
 impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
     // 拷贝一组 C 风格的零结尾字符串到 `String`，
@@ -218,15 +238,15 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
         self.check()?;
         let mut result = Vec::new();
         let mut pptr = self.0;
-        loop {
+        for _ in 0..MAX_C_STR_ARRAY_LEN {
             let sptr = unsafe { pptr.read() };
             if sptr.is_null() {
-                break;
+                return Ok(result);
             }
             result.push(sptr.as_c_str()?.into());
             pptr = unsafe { pptr.add(1) };
         }
-        Ok(result)
+        Err(Error::InvalidLength)
     }
 }
 
@@ -317,6 +337,11 @@ impl<P: Policy> UserInPtr<IoVec<P>> {
     pub fn read_iovecs(&self, count: usize) -> Result<IoVecs<P>> {
         if self.0.is_null() {
             return Err(Error::InvalidPointer);
+        }
+        // Linux caps the number of iovecs at `IOV_MAX` (1024); reject anything
+        // larger so a huge `count` cannot trigger an unbounded allocation.
+        if count > 1024 {
+            return Err(Error::InvalidLength);
         }
         let vec = self.read_array(count)?;
         // The sum of length should not overflow.

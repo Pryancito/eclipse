@@ -72,7 +72,13 @@ impl Syscall<'_> {
         let mut written = 0usize;
         while written < len {
             let n = (len - written).min(chunk_size);
-            written += file_like.write(base.add(written).as_slice(n)?)?;
+            let w = file_like.write(base.add(written).as_slice(n)?)?;
+            // A write of 0 would otherwise spin forever; stop and report the
+            // bytes written so far (short write).
+            if w == 0 {
+                break;
+            }
+            written += w;
         }
         Ok(written)
     }

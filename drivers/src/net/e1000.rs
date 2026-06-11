@@ -26,6 +26,8 @@ use crate::utils::dma::DmaRegion;
 use core::sync::atomic::{fence, Ordering};
 
 const NUM_DESC: usize = 256;
+/// Size in bytes of each RX/TX DMA buffer (one page).
+const RX_BUF_SIZE: usize = 4096;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -121,12 +123,12 @@ impl E1000 {
         let mut tx_bufs = Vec::with_capacity(NUM_DESC);
 
         for _ in 0..NUM_DESC {
-            let buf = DmaRegion::alloc_uninit(4096).ok_or(DeviceError::IoError)?;
+            let buf = DmaRegion::alloc_uninit(RX_BUF_SIZE).ok_or(DeviceError::IoError)?;
             rx_bufs.push(buf);
         }
 
         for _ in 0..NUM_DESC {
-            let buf = DmaRegion::alloc_uninit(4096).ok_or(DeviceError::IoError)?;
+            let buf = DmaRegion::alloc_uninit(RX_BUF_SIZE).ok_or(DeviceError::IoError)?;
             tx_bufs.push(buf);
         }
 
@@ -268,7 +270,9 @@ impl E1000 {
 
         fence(Ordering::Acquire);
 
-        let len = unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize;
+        // `len` is written by the device; clamp it to the actual buffer size so
+        // a misbehaving device cannot make us read past the DMA buffer.
+        let len = (unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize).min(RX_BUF_SIZE);
 
         let buf_vaddr = self.rx_bufs[self.rx_next_to_clean].vaddr();
         let buffer = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
@@ -307,9 +311,13 @@ impl E1000 {
 
         assert!(self.first_trans || unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 });
 
+        // The TX buffer is a single page; never copy more than it can hold,
+        // otherwise we would overflow into adjacent DMA buffers.
+        let len = buffer.len().min(RX_BUF_SIZE);
+        let buffer = &buffer[..len];
         let buf_vaddr = self.tx_bufs[index].vaddr();
-        let target = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, buffer.len()) };
-        target[..buffer.len()].copy_from_slice(buffer);
+        let target = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, len) };
+        target[..len].copy_from_slice(buffer);
 
         unsafe {
             core::ptr::write_volatile(&mut (*desc_addr).len, buffer.len() as u16);

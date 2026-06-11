@@ -188,7 +188,7 @@ impl Syscall<'_> {
         let timeout_msecs = if timeout.is_null() {
             -1
         } else {
-            let timeout = timeout.read().unwrap();
+            let timeout = timeout.read()?;
             info!("sys_ppoll: timeout: {:?}", timeout);
             timeout.to_msec() as isize
         };

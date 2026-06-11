@@ -94,6 +94,11 @@ impl Syscall<'_> {
             SYSLOG_ACTION_READ |
             SYSLOG_ACTION_READ_ALL |
             SYSLOG_ACTION_READ_CLEAR => {
+                // A negative `len` would sign-extend to a huge `usize`, letting
+                // the read write past the (smaller) user buffer.
+                if len < 0 {
+                    return Err(LxError::EINVAL);
+                }
                 let cap = (len as usize).min(kernel_hal::console::klog_buf_size().max(1));
                 let mut tmp = vec![0u8; cap];
                 let n = kernel_hal::console::klog_read(&mut tmp);
@@ -140,12 +145,15 @@ impl Syscall<'_> {
             // return Err(LxError::ENOSYS);
         }
         let op = op - FutexFlags::PRIVATE;
-        let futex = self.linux_process().get_futex(uaddr);
+        let futex = self
+            .linux_process()
+            .get_futex(uaddr)
+            .ok_or(LxError::EINVAL)?;
         match op {
             FutexFlags::WAIT => {
                 let future = futex.wait(val as _);
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                let res = if let Some(timeout) = timeout_addr.read_if_not_null().unwrap() {
+                let res = if let Some(timeout) = timeout_addr.read_if_not_null()? {
                     self.thread
                         .blocking_run(
                             future,
@@ -164,7 +172,10 @@ impl Syscall<'_> {
             }
             FutexFlags::WAKE => Ok(futex.wake(val as _)),
             FutexFlags::REQUEUE => {
-                let requeue_futex = self.linux_process().get_futex(uaddr2);
+                let requeue_futex = self
+                    .linux_process()
+                    .get_futex(uaddr2)
+                    .ok_or(LxError::EINVAL)?;
                 let res = futex.requeue(0, val as _, val2, &requeue_futex, None, false);
                 match res {
                     Ok(_) => Ok(0),
