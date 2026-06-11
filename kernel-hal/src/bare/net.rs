@@ -116,11 +116,6 @@ pub fn wake_net_rx_waiters() {
     }
 }
 
-/// Used by [`crate::pulse::pulse_signal`] — does not re-enter Pulse.
-pub(crate) fn wake_net_rx_waiters_inner() {
-    wake_net_rx_waiters();
-}
-
 /// Future that resolves when either:
 ///   (a) `wake_net_rx_waiters()` is called (NIC received data), or
 ///   (b) the timeout expires.

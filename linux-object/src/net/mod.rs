@@ -760,8 +760,12 @@ const DEFERRED_NET_JOBS_PER_TICK_MAX: usize = 12;
 /// Minimum interval for heavy net housekeeping (route/neighbor/prune).
 const NET_HOUSEKEEPING_INTERVAL_US: u64 = 250_000;
 
+/// Deferred IRQ drain when epoll/poll is not waiting on sockets.
+const DEFERRED_IDLE_INTERVAL_US: u64 = 20_000;
+
 static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
 static LAST_NET_HOUSEKEEPING_US: AtomicU64 = AtomicU64::new(0);
+static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
 
 /// True for socket / packet / netlink fds (see [`SOCKET_FD`]).
 #[inline]
@@ -793,20 +797,18 @@ fn net_poll_interval_elapsed(interval_us: u64) -> bool {
 
 #[inline]
 fn adaptive_deferred_jobs_per_tick() -> usize {
-    let pending = kernel_hal::pulse::pending_bits();
     let q = kernel_hal::deferred_job::pending_deferred_jobs();
-    if (pending & (kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK)) != 0 {
-        DEFERRED_NET_JOBS_PER_TICK_MAX
-    } else {
-        DEFERRED_NET_JOBS_PER_TICK_BASE + q.min(DEFERRED_NET_JOBS_PER_TICK_MAX.saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE))
-    }
+    DEFERRED_NET_JOBS_PER_TICK_BASE
+        + q.min(
+            DEFERRED_NET_JOBS_PER_TICK_MAX
+                .saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE),
+        )
 }
 
 #[inline]
 fn adaptive_net_poll_interval_us() -> u64 {
-    let pending = kernel_hal::pulse::pending_bits();
     let q = kernel_hal::deferred_job::pending_deferred_jobs();
-    if (pending & (kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK)) != 0 || q >= 8 {
+    if q >= 8 {
         NET_POLL_INTERVAL_MIN_US
     } else if q == 0 {
         NET_POLL_INTERVAL_MAX_US
@@ -839,29 +841,20 @@ pub fn poll_ifaces_throttled() {
     poll_ifaces();
 }
 
-/// Socket path: deferred IRQ work + immediate poll if Pulse has NET/LINK pending.
-pub fn pulse_drain_net() {
-    let budget = adaptive_deferred_jobs_per_tick();
-    kernel_hal::deferred_job::drain_deferred_jobs_max(budget);
-    if kernel_hal::pulse::consume_pending(
-        kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK,
-    ) != 0
-    {
-        poll_ifaces();
-    } else {
-        poll_ifaces_throttled();
-    }
+/// Socket path: deferred IRQ work + throttled NIC poll.
+pub fn drain_net_tick() {
+    kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
+    poll_ifaces_throttled();
 }
 
 /// After recv/send or connect: always run a full NIC poll once.
-pub fn pulse_drain_net_urgent() {
+pub fn drain_net_urgent() {
     kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
     poll_ifaces();
 }
 
-/// Register wakers for poll/epoll/select so MSI/HID IRQs resume the task before tier-C timers.
+/// Register wakers for poll/epoll/select so MSI/TTY IRQs resume the task before timers.
 pub fn register_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_interactive: bool) {
-    kernel_hal::pulse::register_pulse_waker(waker.clone());
     if watch_net {
         kernel_hal::net::register_net_rx_waker(waker.clone());
     }
@@ -872,7 +865,6 @@ pub fn register_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch
 
 /// Called on the poll after an IRQ or timer wake (keep registrations).
 pub fn retain_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_interactive: bool) {
-    kernel_hal::pulse::retain_pulse_waker(waker);
     if watch_net {
         kernel_hal::net::retain_net_rx_waker(waker);
     }
@@ -881,26 +873,22 @@ pub fn retain_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_i
     }
 }
 
-/// One tick of an I/O wait loop (Eclipse Pulse): IRQ-first, tier-C backup, `hlt` when idle.
-pub fn io_wait_tick(watch_net: bool, watch_interactive: bool) {
-    let work = kernel_hal::pulse::pulse_io_tick(watch_net, watch_interactive);
-    if work.run_hid_backup || watch_interactive {
-        kernel_hal::input_poll::poll_input_devices();
-    }
-    // Keyboard-only waits: skip heavy NIC poll unless RX/LINK IRQ fired.
-    if watch_interactive && !watch_net && !work.run_net_poll_now {
-        if work.run_net_deferred {
+/// One tick of an I/O wait loop: HID/USB first, then throttled NIC / deferred work.
+///
+/// When `watch_interactive` and not `watch_net`, skips [`poll_ifaces`] so shell/TTY
+/// loops are not blocked by smoltcp/NIC work.
+pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
+    kernel_hal::input_poll::poll_input_devices();
+    if watch_net {
+        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
+        poll_ifaces_throttled();
+    } else {
+        let now = mono_us();
+        let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
+            LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
             kernel_hal::deferred_job::drain_deferred_jobs_max(1);
         }
-        return;
-    }
-    if work.run_net_deferred {
-        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
-    }
-    if work.run_net_poll_now {
-        poll_ifaces();
-    } else if work.run_net_poll {
-        poll_ifaces_throttled();
     }
 }
 
@@ -914,9 +902,7 @@ pub fn poll_ifaces() {
             }
         }
     }
-    let pending = kernel_hal::pulse::pending_bits();
-    let force_housekeeping = (pending & kernel_hal::pulse::PULSE_LINK) != 0;
-    maybe_run_net_housekeeping(mono_us(), force_housekeeping);
+    maybe_run_net_housekeeping(mono_us(), false);
 }
 
 /// Poll a single NIC once (smoltcp path — can hold the global socket set lock).
@@ -955,9 +941,9 @@ pub fn drain_net_poll(rounds: usize) {
     }
     for i in 0..rounds {
         if i == 0 {
-            pulse_drain_net_urgent();
+            drain_net_urgent();
         } else {
-            pulse_drain_net();
+            drain_net_tick();
         }
         kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
     }

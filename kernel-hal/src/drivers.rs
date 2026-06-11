@@ -383,14 +383,9 @@ mod drivers_ffi {
         }
     }
 
-    /// Wake RX waiters and Pulse NET_RX (NIC deferred poll is scheduled separately).
+    /// Wake tasks blocked on NIC RX (TCP/UDP recv, poll/epoll).
     #[no_mangle]
     extern "C" fn drivers_wake_net_rx_waiters() {
-        crate::pulse::pulse_signal(crate::pulse::PULSE_NET_RX);
-    }
-
-    #[no_mangle]
-    extern "C" fn drivers_pulse_signal(bits: u32) {
-        crate::pulse::pulse_signal(bits);
+        crate::net::wake_net_rx_waiters();
     }
 }

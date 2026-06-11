@@ -1215,7 +1215,7 @@ impl E1000eHw {
     // Watchdog — simple link check
     // -----------------------------------------------------------------------
 
-    /// Returns `true` when carrier state changed (for Eclipse Pulse `PULSE_LINK`).
+    /// Returns `true` when carrier state changed.
     pub unsafe fn watchdog_tick(&mut self) -> bool {
         let now = timer_now_as_micros();
         let status = mmio_read(self.base, E1000E_STATUS);
@@ -1304,13 +1304,6 @@ pub struct E1000eInterface {
 }
 
 impl E1000eInterface {
-    /// Notify Eclipse Pulse from thread/deferred context (never from raw IRQ).
-    fn pulse(&self, bits: u32) {
-        if bits != 0 {
-            crate::pulse::pulse_signal(bits);
-        }
-    }
-
     pub fn schedule_watchdog(&self, fast: bool) {
         let now = timer_now_as_micros();
         {
@@ -1340,7 +1333,6 @@ impl E1000eInterface {
             };
             if link_changed {
                 me.link_up_seen.store(link_up, Ordering::Release);
-                me.pulse(crate::pulse::PULSE_LINK);
             }
             me.schedule_watchdog(false);
         });
@@ -1357,20 +1349,10 @@ impl E1000eInterface {
 
     /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
     fn poll_with_irq_hint(&self, irq_icr: u32) -> DeviceResult {
-        use crate::pulse::{PULSE_LINK, PULSE_NET_RX};
-
         let now = timer_now_as_micros();
         let due = self.driver.hw.lock().link_watchdog_next_us <= now;
         if due {
             self.schedule_watchdog(false);
-        }
-
-        let mut pulse = 0u32;
-        if irq_icr & ICR_LSC != 0 {
-            pulse |= PULSE_LINK;
-        }
-        if irq_icr & ICR_RX_ANY != 0 {
-            pulse |= PULSE_NET_RX;
         }
 
         let ts = Instant::from_micros(now as i64);
@@ -1382,10 +1364,11 @@ impl E1000eInterface {
             super::intr_off();
         }
         let sockets = get_sockets();
+        let mut had_rx = (irq_icr & ICR_RX_ANY) != 0;
         {
             let mut sockets = sockets.lock();
             match self.iface.lock().poll(&mut sockets, ts) {
-                Ok(true) => pulse |= PULSE_NET_RX,
+                Ok(true) => had_rx = true,
                 Ok(false) => {}
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
@@ -1397,12 +1380,11 @@ impl E1000eInterface {
         super::net_flush_deferred_packets();
         {
             let mut hw = self.driver.hw.lock();
-            hw.tune_itr(now, (pulse & PULSE_NET_RX) != 0 || (irq_icr & ICR_RX_ANY) != 0);
+            hw.tune_itr(now, had_rx);
         }
         self.ims_rearm();
 
-        self.pulse(pulse);
-        if pulse & PULSE_NET_RX != 0 {
+        if had_rx {
             super::wake_net_rx_waiters();
         }
         Ok(())
@@ -1413,7 +1395,7 @@ impl Scheme for E1000eInterface {
     fn name(&self) -> &str { "e1000e" }
 
     /// Minimal IRQ top-half (same as [`e1000::E1000Interface`]): read ICR, mask IMS,
-    /// queue one deferred poll. Pulse is signaled from [`E1000eInterface::poll_with_irq_hint`]
+    /// queue one deferred poll. RX waiters are woken from [`E1000eInterface::poll_with_irq_hint`]
     /// in thread context — never here (avoids `RefCell already borrowed`).
     fn handle_irq(&self, irq: usize) {
         if irq != self.irq {

@@ -486,7 +486,7 @@ impl INode for Stdin {
                     this.armed = true;
                 }
 
-                // Eclipse Pulse: poll xHCI + hlt (read() does not go through poll(2)).
+                // Poll xHCI from read() path (does not go through poll(2)).
                 crate::net::io_wait_tick(false, true);
 
                 this.stdin.flush_ready_flag();

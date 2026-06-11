@@ -120,9 +120,7 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     info!("executor run!");
     loop {
         let has_task = executor::run_until_idle();
-        if kernel_hal::pulse::idle_deferred_due() {
-            kernel_hal::deferred_job::drain_deferred_jobs_max(1);
-        }
+        kernel_hal::deferred_job::drain_deferred_jobs();
         if !has_task && cfg!(feature = "baremetal-test") {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();

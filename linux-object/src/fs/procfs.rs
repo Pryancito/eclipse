@@ -14,7 +14,7 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 10] = [
+const PROC_ROOT_STATIC: [&str; 9] = [
     "net",
     "meminfo",
     "cpuinfo",
@@ -24,7 +24,6 @@ const PROC_ROOT_STATIC: [&str; 10] = [
     "self",
     "stat",
     "loadavg",
-    "eclipse_pulse",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -244,7 +243,6 @@ impl INode for ProcRootINode {
             "mounts" => Ok(PROC_MOUNTS.clone()),
             "stat" => Ok(PROC_STAT.clone()),
             "loadavg" => Ok(PROC_LOADAVG.clone()),
-            "eclipse_pulse" => Ok(PROC_ECLIPSE_PULSE.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -887,14 +885,6 @@ fn proc_net_if_inet6_content() -> String {
     s
 }
 
-fn proc_eclipse_pulse_content() -> String {
-    let p = kernel_hal::pulse::pulse_stats();
-    alloc::format!(
-        "signals {}\nhid_backup {}\nnet_poll {}\nnet_poll_irq {}\nhlt {}\n",
-        p.signals, p.hid_backup, p.net_poll, p.net_poll_irq, p.hlt
-    )
-}
-
 /// Resolve an absolute `/proc/...` path without walking the ext2 backing store.
 pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
     let path = path.trim_end_matches('/');
@@ -941,10 +931,6 @@ lazy_static! {
     static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 16,
         generate: proc_loadavg_content,
-    });
-    static ref PROC_ECLIPSE_PULSE: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 17,
-        generate: proc_eclipse_pulse_content,
     });
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,

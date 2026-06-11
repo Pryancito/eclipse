@@ -26,8 +26,8 @@ fn schedule_poll_wakeup(cx: &mut Context, after: Duration) {
     timer::timer_set(deadline, Box::new(move |_| waker.wake_by_ref()));
 }
 
-/// Wakeup granularity for select/poll/epoll (tier-C; IRQ wakes via Pulse earlier).
-const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::PULSE_IO_WAIT_TICK_MS);
+/// Wakeup granularity for select/poll/epoll (IRQ wakes can arrive earlier).
+const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::IO_WAIT_TICK_MS);
 
 fn arm_io_wait(cx: &mut Context, watch_net: bool, watch_interactive: bool, io_armed: &mut bool) {
     if *io_armed {

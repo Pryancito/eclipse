@@ -186,7 +186,7 @@ impl Socket for IcmpSocketState {
                     return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                 }
                 Err(smoltcp::Error::Exhausted) => {
-                    pulse_drain_net_urgent();
+                    drain_net_urgent();
                     drain_all_nic_rx();
                     if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
                         let n = pkt.len().min(data.len());
@@ -296,7 +296,7 @@ impl Socket for IcmpSocketState {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
-        crate::net::pulse_drain_net();
+        crate::net::drain_net_tick();
         let inner = self.inner.lock();
         let readable = {
             let sets = get_sockets();

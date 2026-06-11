@@ -1,4 +1,4 @@
-//! Input device poll hook — only used when Eclipse Pulse requests HID tier-C backup.
+//! Input device poll hook for I/O wait loops and stdin read().
 pub fn poll_input_devices() {
     #[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
     {

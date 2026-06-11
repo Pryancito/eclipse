@@ -1,4 +1,4 @@
-//! Futures for Eclipse Pulse–aware I/O waits (NIC, HID, TTY).
+//! Futures for I/O waits (NIC, HID, TTY).
 
 use alloc::boxed::Box;
 use core::future::Future;
@@ -8,10 +8,10 @@ use core::time::Duration;
 
 use super::{register_io_wait_wakers, retain_io_wait_wakers};
 
-/// Tier-C fallback when no IRQ wakes a multiplex wait (poll/epoll/select).
-pub const PULSE_IO_WAIT_TICK_MS: u64 = 4;
+/// Fallback timer when no IRQ wakes a multiplex wait (poll/epoll/select).
+pub const IO_WAIT_TICK_MS: u64 = 4;
 
-/// Resolves when Ctrl+C is pending, NET RX wakers fire, Pulse signals, or deadline.
+/// Resolves when Ctrl+C is pending, NET RX wakers fire, or deadline.
 pub struct NetOrTtyWait {
     deadline: Duration,
     armed: bool,
@@ -49,7 +49,7 @@ impl Future for NetOrTtyWait {
     }
 }
 
-/// One sleep cycle in epoll/poll: wake on Pulse/NET/TTY IRQ or tier-C timer.
+/// One sleep cycle in epoll/poll: wake on NET/TTY IRQ or fallback timer.
 pub struct IoMultiplexWait {
     deadline: Option<Duration>,
     watch_net: bool,
@@ -92,7 +92,7 @@ impl Future for IoMultiplexWait {
         register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
         let waker = cx.waker().clone();
         let wake_at = if let Some(dl) = self.deadline {
-            let tick = Duration::from_millis(PULSE_IO_WAIT_TICK_MS);
+            let tick = Duration::from_millis(IO_WAIT_TICK_MS);
             let now = kernel_hal::timer::timer_now();
             if now + tick < dl {
                 now + tick
@@ -100,7 +100,7 @@ impl Future for IoMultiplexWait {
                 dl
             }
         } else {
-            kernel_hal::timer::timer_now() + Duration::from_millis(PULSE_IO_WAIT_TICK_MS)
+            kernel_hal::timer::timer_now() + Duration::from_millis(IO_WAIT_TICK_MS)
         };
         kernel_hal::timer::timer_set(wake_at, Box::new(move |_| waker.wake_by_ref()));
         self.armed = true;
