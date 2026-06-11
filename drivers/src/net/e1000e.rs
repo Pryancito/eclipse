@@ -9,7 +9,12 @@
 const E1000E_DRIVER_TAG: &str = "e1000e-simple";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
+const E1000E_WATCHDOG_LOG_US: u64 = 5_000_000;
 const E1000E_LOG_VERBOSE: bool = false;
+const E1000E_ITR_LOW_LATENCY: u32 = 98;
+const E1000E_ITR_BALANCED: u32 = 195;
+const E1000E_ITR_THROUGHPUT: u32 = 512;
+const E1000E_ITR_TUNE_PERIOD_US: u64 = 250_000;
 
 macro_rules! e1000e_vlog {
     ($($t:tt)*) => {
@@ -342,6 +347,10 @@ pub struct E1000eHw {
 
     link_up: bool,
     link_watchdog_next_us: u64,
+    watchdog_log_next_us: u64,
+    itr_setting: u32,
+    itr_last_rx_packets: u64,
+    itr_tune_next_us: u64,
 }
 
 impl E1000eHw {
@@ -1007,7 +1016,7 @@ impl E1000eHw {
         // Timers off
         mmio_write(self.base, E1000E_RDTR, 0);
         mmio_write(self.base, E1000E_RADV, 0);
-        mmio_write(self.base, E1000E_ITR,  195); // 20,000 interrupts/sec (units of 256 ns)
+        self.program_itr(E1000E_ITR_BALANCED);
 
         // Program RX ring base, length, head
         let rx_pa = self.rx_ring.paddr();
@@ -1208,6 +1217,7 @@ impl E1000eHw {
 
     /// Returns `true` when carrier state changed (for Eclipse Pulse `PULSE_LINK`).
     pub unsafe fn watchdog_tick(&mut self) -> bool {
+        let now = timer_now_as_micros();
         let status = mmio_read(self.base, E1000E_STATUS);
         let link = status & STATUS_LU != 0;
         let mut link_changed = false;
@@ -1222,14 +1232,47 @@ impl E1000eHw {
             }
         }
 
-        // Log GPRC/MPC periodically to diagnose RX issues.
-        // GPRC>0 means the MAC received frames. MPC>0 means frames arrived but
-        // were dropped (no free descriptors or DMA ring not armed).
-        let gprc = mmio_read(self.base, E1000E_GPRC);
-        let mpc  = mmio_read(self.base, E1000E_MPC);
-        crate::klog_warn!("[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={}\n",
-            link, gprc, mpc, self.stats.rx_packets);
+        if link_changed || now >= self.watchdog_log_next_us {
+            self.watchdog_log_next_us = now.saturating_add(E1000E_WATCHDOG_LOG_US);
+            // GPRC>0 means the MAC received frames. MPC>0 means frames arrived but
+            // were dropped (no free descriptors or DMA ring not armed).
+            let gprc = mmio_read(self.base, E1000E_GPRC);
+            let mpc = mmio_read(self.base, E1000E_MPC);
+            crate::klog_info!(
+                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} itr={}\n",
+                link,
+                gprc,
+                mpc,
+                self.stats.rx_packets,
+                self.itr_setting
+            );
+        }
         link_changed
+    }
+
+    fn program_itr(&mut self, itr: u32) {
+        self.itr_setting = itr;
+        unsafe { mmio_write(self.base, E1000E_ITR, itr) };
+    }
+
+    fn tune_itr(&mut self, now_us: u64, rx_event: bool) {
+        if now_us < self.itr_tune_next_us && !rx_event {
+            return;
+        }
+        self.itr_tune_next_us = now_us.saturating_add(E1000E_ITR_TUNE_PERIOD_US);
+        let rx_now = self.stats.rx_packets;
+        let rx_delta = rx_now.saturating_sub(self.itr_last_rx_packets);
+        self.itr_last_rx_packets = rx_now;
+        let target = if rx_event && rx_delta <= 4 {
+            E1000E_ITR_LOW_LATENCY
+        } else if rx_delta >= 64 {
+            E1000E_ITR_THROUGHPUT
+        } else {
+            E1000E_ITR_BALANCED
+        };
+        if target != self.itr_setting {
+            self.program_itr(target);
+        }
     }
 
     fn merged_stats(&self) -> NetStats {
@@ -1352,6 +1395,10 @@ impl E1000eInterface {
         }
 
         super::net_flush_deferred_packets();
+        {
+            let mut hw = self.driver.hw.lock();
+            hw.tune_itr(now, (pulse & PULSE_NET_RX) != 0 || (irq_icr & ICR_RX_ANY) != 0);
+        }
         self.ims_rearm();
 
         self.pulse(pulse);
@@ -1686,6 +1733,10 @@ pub fn init(
         stats: NetStats::default(),
         link_up: false,
         link_watchdog_next_us: 0,
+        watchdog_log_next_us: 0,
+        itr_setting: E1000E_ITR_BALANCED,
+        itr_last_rx_packets: 0,
+        itr_tune_next_us: 0,
     };
 
     unsafe { hw.reset_and_init()?; }

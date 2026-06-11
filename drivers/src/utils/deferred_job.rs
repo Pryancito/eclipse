@@ -7,12 +7,12 @@
 //! drained with [`drain_deferred_jobs`].
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use lock::Mutex;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
+static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
 const MAX_DEFERRED_JOBS: usize = 256;
@@ -21,10 +21,8 @@ const MAX_JOBS_PER_DRAIN: usize = 2;
 
 /// Drop the oldest queued job without running it (IRQ must not execute arbitrary work).
 #[allow(unused_must_use)]
-fn evict_oldest_job(q: &mut Vec<Job>) {
-    if !q.is_empty() {
-        drop(q.remove(0));
-    }
+fn evict_oldest_job(q: &mut VecDeque<Job>) {
+    let _ = q.pop_front();
 }
 
 /// Enqueue a closure to be executed later outside of IRQ context.
@@ -39,7 +37,7 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     if q.len() >= MAX_DEFERRED_JOBS {
         evict_oldest_job(&mut q);
     }
-    q.push(Box::new(f));
+    q.push_back(Box::new(f));
 }
 
 /// Execute all currently queued deferred jobs.
@@ -54,21 +52,19 @@ pub fn drain_deferred_jobs() {
 /// stdin/HID must stay responsive.
 pub fn drain_deferred_jobs_max(max: usize) {
     let cap = max.max(1).min(MAX_DEFERRED_JOBS);
-    // Mutex::lock() uses push_off/pop_off which handles interrupt
-    // disabling. Manual intr_off/on here bypasses noff accounting and
-    // causes "RefCell already borrowed" panics under SMP.
-    let mut jobs: Vec<Job> = {
-        let mut q = JOBS.lock();
-        core::mem::take(&mut *q)
-    };
-    let run = jobs.len().min(cap);
-    for job in jobs.drain(..run) {
-        job();
-    }
-    if !jobs.is_empty() {
-        let mut q = JOBS.lock();
-        for job in jobs.into_iter().rev() {
-            q.insert(0, job);
+    for _ in 0..cap {
+        let job = {
+            let mut q = JOBS.lock();
+            q.pop_front()
+        };
+        match job {
+            Some(job) => job(),
+            None => break,
         }
     }
+}
+
+/// Number of queued jobs (best-effort snapshot).
+pub fn pending_deferred_jobs() -> usize {
+    JOBS.lock().len()
 }
