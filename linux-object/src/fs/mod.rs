@@ -758,23 +758,51 @@ fn mount_fstab(root: &Arc<MNode>) {
                         // Resolve the source inode using coerced root_dyn
                         let source_rel = source.trim_start_matches('/');
 
-                        // Skip entries the installer never substituted (e.g. a raw
-                        // install medium booted directly): the source is still an
-                        // `__ECLIPSE_*` placeholder that can never name a real
-                        // device. Mirrors the guard in parse_root_cmdline so the
-                        // boot path stays quiet instead of logging failed lookups.
-                        if source_rel.starts_with("__ECLIPSE_") {
+                        // When the installer left an unsubstituted __ECLIPSE_EFI_DEV*
+                        // placeholder for /boot/efi, try to derive the EFI partition
+                        // from ROOT= on the kernel command line (e.g. ROOT=/dev/sda2 →
+                        // EFI=/dev/sda1). This covers the edge case where raw-block
+                        // patching of fstab did not take effect on the first boot.
+                        let derived_efi: Option<String>;
+                        let effective_source = if source_rel.starts_with("__ECLIPSE_EFI")
+                            && target == "/boot/efi"
+                        {
+                            derived_efi = efi_dev_from_root_cmdline();
+                            match derived_efi.as_deref() {
+                                Some(dev) => {
+                                    warn!(
+                                        "mount_fstab: fstab EFI placeholder sin sustituir; \
+                                         intentando ROOT= derivado {:?} -> {:?}",
+                                        dev, target
+                                    );
+                                    dev
+                                }
+                                None => {
+                                    info!(
+                                        "mount_fstab: skipping unsubstituted EFI placeholder \
+                                         (ROOT= no disponible para derivar EFI)"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if source_rel.starts_with("__ECLIPSE_") {
+                            // Other unsubstituted placeholders: skip silently.
                             info!(
                                 "mount_fstab: skipping unsubstituted placeholder source {:?} -> {:?}",
                                 source, target
                             );
                             continue;
-                        }
+                        } else {
+                            derived_efi = None;
+                            source_rel
+                        };
+
+                        let effective_source_rel = effective_source.trim_start_matches('/');
                         let root_dyn: Arc<dyn INode> = root.clone();
-                        let source_inode = match root_dyn.lookup_follow(source_rel, 4) {
+                        let source_inode = match root_dyn.lookup_follow(effective_source_rel, 4) {
                             Ok(inode) => inode,
                             Err(e) => {
-                                warn!("mount_fstab: failed to lookup source {:?}: {:?}", source, e);
+                                warn!("mount_fstab: failed to lookup source {:?}: {:?}", effective_source, e);
                                 continue;
                             }
                         };
@@ -782,7 +810,7 @@ fn mount_fstab(root: &Arc<MNode>) {
                         let backend = match block_mount::MountBackend::from_inode(source_inode) {
                             Ok(b) => b,
                             Err(e) => {
-                                warn!("mount_fstab: failed to create MountBackend for {:?}: {:?}", source, e);
+                                warn!("mount_fstab: failed to create MountBackend for {:?}: {:?}", effective_source, e);
                                 continue;
                             }
                         };
@@ -811,7 +839,7 @@ fn mount_fstab(root: &Arc<MNode>) {
                         let fs = match mount_ops::open_filesystem(backend, fstype_parsed) {
                             Ok(f) => f,
                             Err(e) => {
-                                warn!("mount_fstab: failed to open filesystem for {:?}: {:?}", source, e);
+                                warn!("mount_fstab: failed to open filesystem for {:?}: {:?}", effective_source, e);
                                 continue;
                             }
                         };
@@ -831,17 +859,45 @@ fn mount_fstab(root: &Arc<MNode>) {
 
                         let (fs, state) = mount_ops::prepare_fs(fs, flags, options);
                         if let Err(e) = target_node.mount(fs) {
-                            warn!("mount_fstab: failed to mount {:?} to {:?}: {:?}", source, target, e);
+                            warn!("mount_fstab: failed to mount {:?} to {:?}: {:?}", effective_source, target, e);
                             continue;
                         }
 
+                        let mount_source = derived_efi.as_deref().unwrap_or(source);
                         let opts = mount_state::build_options_string(flags, options);
-                        register_mount(source, target, fstype_parsed, &opts, state);
-                        info!("mount_fstab: successfully mounted {:?} to {:?}", source, target);
+                        register_mount(mount_source, target, fstype_parsed, &opts, state);
+                        info!("mount_fstab: successfully mounted {:?} to {:?}", mount_source, target);
                     }
                 }
             }
         }
+    }
+}
+
+/// Derive the EFI partition path from `ROOT=` on the kernel command line.
+///
+/// `ROOT=` names the installed ext2 root (e.g. `/dev/sda2`). On a standard
+/// Eclipse OS layout the EFI system partition is always partition 1 on the
+/// same disk (e.g. `/dev/sda1`, `/dev/nvme0n1p1`, `/dev/vda1`).
+///
+/// Returns `None` when `ROOT=` is absent, unresolved (still a placeholder),
+/// or cannot be mapped to a partition-1 path.
+fn efi_dev_from_root_cmdline() -> Option<String> {
+    let cmdline = kernel_hal::boot::cmdline();
+    let root_dev = parse_root_cmdline(&cmdline)?;
+    // Strip trailing partition number. For NVMe paths (…p2) strip the 'p'
+    // separator too; for sda/vda paths the separator is implicit.
+    let without_digits = root_dev.trim_end_matches(|c: char| c.is_ascii_digit());
+    if without_digits.len() == root_dev.len() {
+        // No trailing digits — not a partition path we can map.
+        return None;
+    }
+    if without_digits.ends_with('p') {
+        // NVMe style: /dev/nvme0n1p2 → /dev/nvme0n1p1
+        Some(format!("{}p1", &without_digits[..without_digits.len() - 1]))
+    } else {
+        // SATA/virtio style: /dev/sda2 → /dev/sda1, /dev/vda2 → /dev/vda1
+        Some(format!("{}1", without_digits))
     }
 }
 
