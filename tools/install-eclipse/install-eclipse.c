@@ -2713,7 +2713,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         goto cleanup;
     }
 
-    log(COLOR_GREEN "Actualizando bootloader y kernel en EFI (copia selectiva, sin dd)..." COLOR_RESET);
+    log(COLOR_GREEN "Actualizando bootloader, kernel e initramfs en EFI (copia selectiva, sin dd)..." COLOR_RESET);
     if (shell_mkdir_p(UPD_EFI_MNT "/EFI/Boot", dry_run) != 0 ||
         shell_mkdir_p(UPD_EFI_MNT "/EFI/zCore", dry_run) != 0) {
         rc = -1;
@@ -2898,7 +2898,7 @@ int main(int argc, char **argv) {
         }
     } else {
         snprintf(partition_summary, sizeof(partition_summary),
-                 "Actualización selectiva (EFI: boot+kernel)");
+                 "Actualización selectiva (EFI: bootloader + kernel + initramfs)");
     }
 
     log("========================================");
