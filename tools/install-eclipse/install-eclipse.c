@@ -36,7 +36,8 @@ static const char *resolve_image_path(const char *path);
 #define UPD_EFI_MNT     "/tmp/eclipse-upd-efi"
 #define UPD_ROOT_MNT    "/tmp/eclipse-upd-root"
 #define EFI_IMAGE_GZ    resolve_image_path("/boot/efi.img.gz")
-#define ROOTFS_IMAGE_GZ resolve_image_path("/boot/rootfs.ext2.gz")
+#define ROOTFS_IMAGE_GZ resolve_image_path("/boot/rootfs.btrfs.gz")
+#define HOME_IMAGE_GZ   resolve_image_path("/boot/home.btrfs.gz")
 
 #define INST_ROOT_MNT   "/tmp/eclipse-inst-root"
 
@@ -44,9 +45,9 @@ static const char *resolve_image_path(const char *path);
 #define FSTAB_PLACEHOLDER_EFI  "__ECLIPSE_EFI_DEV___"
 #define FSTAB_PLACEHOLDER_HOME "__ECLIPSE_HOME_DEV__"
 #define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
-#define FSTAB_TEMPLATE_LINE_ROOT "__ECLIPSE_ROOT_DEV__  /                  ext2    defaults          0  1"
+#define FSTAB_TEMPLATE_LINE_ROOT "__ECLIPSE_ROOT_DEV__  /                  btrfs   defaults          0  1"
 #define FSTAB_TEMPLATE_LINE_EFI  "__ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0"
-#define FSTAB_TEMPLATE_LINE_HOME "__ECLIPSE_HOME_DEV__  /home              ext2    defaults          0  0"
+#define FSTAB_TEMPLATE_LINE_HOME "__ECLIPSE_HOME_DEV__  /home              btrfs   defaults          0  0"
 #define FSTAB_TEMPLATE_LINE_SWAP "__ECLIPSE_SWAP_DEV__  none               swap    sw                0  0"
 /* Placeholder de la cmdline de rboot.conf (clave ROOT=). Debe medir
  * exactamente FSTAB_PLACEHOLDER_LEN (20) caracteres y ser distinto de los de
@@ -55,7 +56,7 @@ static const char *resolve_image_path(const char *path);
 #define RBOOT_TEMPLATE_ROOT_KEY "ROOT=__ECLIPSE_CMDROOTDEV"
 #define FSTAB_PLACEHOLDER_LEN  20U
 #define FSTAB_PATCH_CHUNK      (64U * 1024U)
-#define FSTAB_PATCH_MAX_SCAN   (48U * 1024U * 1024U)
+#define FSTAB_PATCH_MAX_SCAN   (160U * 1024U * 1024U)
 #define FSTAB_PATCH_OVERLAP    FSTAB_PLACEHOLDER_LEN
 
 #define GPT_ESP_TYPE   "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
@@ -2428,10 +2429,10 @@ static int write_fstab_file(const char *path, const char *efi_dev, const char *r
 
     fprintf(f, "# /etc/fstab - generado por install-eclipse\n");
     fprintf(f, "# <dispositivo>  <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n");
-    fprintf(f, "%-20s  /                  ext2    defaults          0  1\n", root_dev);
+    fprintf(f, "%-20s  /                  btrfs   defaults          0  1\n", root_dev);
     fprintf(f, "%-20s  /boot/efi          vfat    defaults,noatime  0  0\n", efi_dev);
     if (layout == LAYOUT_ADVANCED && home_dev[0] != '\0') {
-        fprintf(f, "%-20s  /home              ext2    defaults          0  0\n", home_dev);
+        fprintf(f, "%-20s  /home              btrfs   defaults          0  0\n", home_dev);
     }
     if (layout == LAYOUT_ADVANCED && swap_dev[0] != '\0') {
         fprintf(f, "%-20s  none               swap    sw                0  0\n", swap_dev);
@@ -2453,7 +2454,10 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     if (shell_mkdir_p(INST_ROOT_MNT, dry_run) != 0) {
         return -1;
     }
-    if (shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+    /* ROOT instalado: btrfs en instalaciones nuevas; ext2 sólo como
+     * compatibilidad con instalaciones antiguas. */
+    if (shell_mount(root_dev, INST_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
+        shell_mount(root_dev, INST_ROOT_MNT, "ext2", 0, dry_run) != 0) {
         return -1;
     }
 
@@ -2587,9 +2591,13 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
             return -1;
         }
 
-        log(COLOR_GREEN "[4/5] Formateando partición HOME (ext2)..." COLOR_RESET);
-        snprintf(cmd, sizeof(cmd), "sh -c \"mke2fs -t ext2 -I 128 -O ^dir_index -L HOME '%s'\"", home_dev);
-        if (run_command_logged(cmd, dry_run) != 0) {
+        log(COLOR_GREEN "[4/5] Formateando partición HOME (btrfs)..." COLOR_RESET);
+        /* Se vuelca una plantilla btrfs vacía generada en build; el kernel la
+         * expande a toda la partición en el primer montaje. */
+        if (!struct_file_exists(HOME_IMAGE_GZ)) {
+            log(COLOR_YELLOW
+                "ADVERTENCIA: falta %s; HOME quedará sin formatear." COLOR_RESET, HOME_IMAGE_GZ);
+        } else if (write_gz_image_to_disk(HOME_IMAGE_GZ, home_dev, 0, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo formatear HOME." COLOR_RESET);
             return -1;
         }
@@ -2621,68 +2629,25 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
-/* Expande el sistema de archivos ext2 de ROOT para que ocupe toda la partición.
- * La imagen rootfs.ext2 se escribe con su tamaño original (p.ej. 48 MiB), de modo
- * que sin esto una partición de varios GiB quedaría desaprovechada. No es fatal:
- * si resize2fs no está disponible o falla, ROOT conserva el tamaño de la imagen.
- *
- * Importante: se llama DESPUÉS de parchear el fstab (que se hace sobre el disco
- * completo con fsync). resize2fs sólo añade grupos de bloques al final y no toca
- * el bloque de datos del fstab, así que el parche sobrevive a la expansión. */
+/* Con btrfs no hay que expandir ROOT en el instalador: el kernel de Eclipse
+ * detecta en el primer montaje que la partición es mayor que el sistema de
+ * archivos y lo expande automáticamente (grow_to_device). Sólo aseguramos que
+ * lo escrito esté en disco. */
 static int resize_root_to_partition(const char *root_dev, int dry_run) {
-    char cmd[512];
-
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] e2fsck -f -y %s && resize2fs %s." COLOR_RESET, root_dev, root_dev);
-        return 0;
-    }
-    if (!command_exists("resize2fs")) {
-        log(COLOR_YELLOW
-            "ADVERTENCIA: resize2fs no disponible; ROOT no se expandirá a toda la partición." COLOR_RESET);
-        return 0;
-    }
-
-    /* Asegura que el fstab parcheado esté en el disco antes de tocar la FS. */
-    sync();
-
-    /* La imagen ext2 se escribió a través del DISCO COMPLETO (/dev/sda); la caché
-     * del dispositivo de PARTICIÓN (/dev/sda2) es un objeto distinto que puede
-     * estar obsoleto. Vaciamos su caché de bloques (BLKFLSBUF) para que e2fsck y
-     * resize2fs lean el contenido real desde el disco y no ceros antiguos. */
-    {
-        int pfd = open(root_dev, O_RDONLY | O_CLOEXEC);
-        if (pfd >= 0) {
-            if (ioctl(pfd, BLKFLSBUF, 0) != 0 &&
-                errno != ENOSYS && errno != ENOTTY && errno != EOPNOTSUPP) {
-                log(COLOR_YELLOW "ADVERTENCIA: BLKFLSBUF en %s: %s" COLOR_RESET, root_dev, strerror(errno));
-            }
-            close(pfd);
-        }
-    }
-
-    /* resize2fs exige un fsck previo; la imagen viene limpia, pero e2fsck -f -y
-     * normaliza el estado. Devuelve 1 si reparó algo: no es fatal. */
-    if (command_exists("e2fsck")) {
-        snprintf(cmd, sizeof(cmd), "sh -c \"e2fsck -f -y '%s'\"", root_dev);
-        (void)run_command_logged(cmd, dry_run);
-    }
-
-    log(COLOR_GREEN "Expandiendo ROOT para ocupar toda la partición (resize2fs %s)..." COLOR_RESET, root_dev);
-    snprintf(cmd, sizeof(cmd), "sh -c \"resize2fs '%s'\"", root_dev);
-    if (run_command_logged(cmd, dry_run) != 0) {
-        log(COLOR_YELLOW
-            "ADVERTENCIA: resize2fs falló en %s; ROOT conservará el tamaño de la imagen." COLOR_RESET,
-            root_dev);
+        log(COLOR_YELLOW "[dry-run] ROOT (btrfs) se expandirá en el primer montaje." COLOR_RESET);
         return 0;
     }
     sync();
-    log(COLOR_GREEN "ROOT expandido correctamente (%s)." COLOR_RESET, root_dev);
+    log(COLOR_GREEN
+        "ROOT (btrfs, %s) se expandirá a toda la partición en el primer arranque." COLOR_RESET,
+        root_dev);
     return 0;
 }
 
 /* Fija ROOT=<root_dev> en la cmdline de rboot.conf de la partición EFI,
  * sustituyendo en bruto el placeholder RBOOT_PLACEHOLDER_ROOT. Esto hace que el
- * kernel pivote de forma determinista a la partición ext2 instalada. Es una
+ * kernel pivote de forma determinista a la partición ROOT instalada. Es una
  * operación no fatal: si el placeholder no está (imagen EFI antigua) o no se
  * puede escribir, el kernel recurre a la auto-detección del root. */
 static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, int dry_run) {
@@ -2794,7 +2759,8 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
             return -1;
         }
-        if (shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
+            shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
             return -1;
         }
@@ -3102,11 +3068,8 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Expande el ext2 de ROOT a toda la partición ANTES de parchear el
-         * fstab en bruto. Así e2fsck y resize2fs operan sobre el sistema de
-         * archivos limpio recién copiado y no pueden interferir con el parche
-         * posterior. No es fatal: si resize2fs no está disponible, ROOT conserva
-         * el tamaño de la imagen original. */
+        /* ROOT es btrfs: el kernel lo expandirá a toda la partición en el
+         * primer montaje; aquí sólo se sincroniza lo escrito. */
         {
             char grow_root_dev[160];
             if (partition_dev_path(cfg.disk_path, 2, grow_root_dev, sizeof(grow_root_dev)) == 0) {

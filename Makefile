@@ -139,7 +139,8 @@ ifeq ($(ARCH), x86_64)
 	@mkdir -p "$(ISO_STAGING)/boot"
 	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
 	@cp -f "ignored/target/efi.img.gz" "$(ISO_STAGING)/boot/efi.img.gz"
-	@cp -f "ignored/target/rootfs.ext2.gz" "$(ISO_STAGING)/boot/rootfs.ext2.gz"
+	@cp -f "ignored/target/rootfs.btrfs.gz" "$(ISO_STAGING)/boot/rootfs.btrfs.gz"
+	@cp -f "ignored/target/home.btrfs.gz" "$(ISO_STAGING)/boot/home.btrfs.gz"
 	@xorriso -as mkisofs \
 		-R -J -V "ECLIPSE" \
 		-eltorito-alt-boot \

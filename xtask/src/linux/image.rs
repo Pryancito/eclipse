@@ -122,46 +122,44 @@ impl super::LinuxRootfs {
             let efi_gz = boot_dir.join("efi.img.gz");
             fs::copy(&target_efi_gz, &efi_gz).unwrap();
 
-            // 5. Build rootfs.ext2
-            println!("Building rootfs.ext2...");
-            let ext2_img = TARGET.join("rootfs.ext2");
-            let _ = fs::remove_file(&ext2_img);
-            
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&ext2_img)
-                .unwrap();
-            file.set_len(48 * 1024 * 1024).unwrap();
-            drop(file);
+            // 5. Build rootfs.btrfs (populated with the rootfs directory)
+            println!("Building rootfs.btrfs...");
+            let btrfs_img = TARGET.join("rootfs.btrfs");
+            super::btrfs_image::make_btrfs_image(
+                &btrfs_img,
+                96 * 1024 * 1024,
+                "ECLIPSE",
+                Some(&rootfs_path),
+            );
 
-            let status = std::process::Command::new("mke2fs")
-                .arg("-t")
-                .arg("ext2")
-                .arg("-I")
-                .arg("128")
-                .arg("-O")
-                .arg("^dir_index")
-                .arg("-d")
-                .arg(&rootfs_path)
-                .arg(&ext2_img)
-                .status()
-                .unwrap();
-            assert!(status.success(), "Failed to format/populate rootfs.ext2");
-
-            println!("Compressing rootfs.ext2 -> rootfs.ext2.gz...");
-            let target_ext2_gz = TARGET.join("rootfs.ext2.gz");
+            println!("Compressing rootfs.btrfs -> rootfs.btrfs.gz...");
+            let target_btrfs_gz = TARGET.join("rootfs.btrfs.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
-                .arg(&ext2_img)
-                .stdout(fs::File::create(&target_ext2_gz).unwrap())
+                .arg(&btrfs_img)
+                .stdout(fs::File::create(&target_btrfs_gz).unwrap())
                 .status()
                 .unwrap();
-            assert!(status.success(), "Failed to compress rootfs.ext2");
+            assert!(status.success(), "Failed to compress rootfs.btrfs");
 
-            let ext2_gz = boot_dir.join("rootfs.ext2.gz");
-            fs::copy(&target_ext2_gz, &ext2_gz).unwrap();
+            let btrfs_gz = boot_dir.join("rootfs.btrfs.gz");
+            fs::copy(&target_btrfs_gz, &btrfs_gz).unwrap();
+
+            // 5b. Empty btrfs template used by the installer to format HOME
+            // (written raw onto the partition; the kernel auto-expands it).
+            println!("Building home.btrfs template...");
+            let home_img = TARGET.join("home.btrfs");
+            super::btrfs_image::make_btrfs_image(&home_img, 32 * 1024 * 1024, "HOME", None);
+            let target_home_gz = TARGET.join("home.btrfs.gz");
+            let status = std::process::Command::new("gzip")
+                .arg("-c")
+                .arg(&home_img)
+                .stdout(fs::File::create(&target_home_gz).unwrap())
+                .status()
+                .unwrap();
+            assert!(status.success(), "Failed to compress home.btrfs");
+            let home_gz = boot_dir.join("home.btrfs.gz");
+            fs::copy(&target_home_gz, &home_gz).unwrap();
 
             // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
             println!("Building final installer-enabled image...");
@@ -169,7 +167,8 @@ impl super::LinuxRootfs {
             fuse(&rootfs_path, &image, 80 * 1024 * 1024);
 
             let _ = fs::remove_file(efi_gz);
-            let _ = fs::remove_file(ext2_gz);
+            let _ = fs::remove_file(btrfs_gz);
+            let _ = fs::remove_file(home_gz);
             println!("Build completed successfully!");
             return;
         }

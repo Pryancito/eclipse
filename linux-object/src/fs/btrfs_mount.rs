@@ -1,7 +1,9 @@
 //! btrfs mount support via the in-tree `btrfs` crate.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryInto;
 
@@ -81,6 +83,9 @@ fn wall_clock() -> (u64, u32) {
 pub struct BtrfsMountFs {
     inner: Mutex<Btrfs>,
     this: Mutex<Weak<Self>>,
+    /// Cached directory listings keyed by inode number (cleared on any
+    /// mutation of that directory).
+    dir_cache: Mutex<BTreeMap<u64, Arc<Vec<btrfs::DirEntry>>>>,
 }
 
 impl BtrfsMountFs {
@@ -103,6 +108,7 @@ impl BtrfsMountFs {
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
             this: Mutex::new(Weak::new()),
+            dir_cache: Mutex::new(BTreeMap::new()),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         Ok(arc)
@@ -117,6 +123,19 @@ impl BtrfsMountFs {
             fs: self.arc(),
             ino,
         })
+    }
+
+    fn cached_readdir(&self, dir: u64) -> Result<Arc<Vec<btrfs::DirEntry>>> {
+        if let Some(entries) = self.dir_cache.lock().get(&dir) {
+            return Ok(entries.clone());
+        }
+        let entries = Arc::new(self.inner.lock().readdir(dir).map_err(map_err)?);
+        self.dir_cache.lock().insert(dir, entries.clone());
+        Ok(entries)
+    }
+
+    fn invalidate_dir(&self, dir: u64) {
+        self.dir_cache.lock().remove(&dir);
     }
 }
 
@@ -288,10 +307,12 @@ impl INode for BtrfsMountINode {
             0 => Ok((self.metadata()?, String::from("."))),
             1 => Ok((self.metadata()?, String::from(".."))),
             i => {
-                let mut fs = self.fs.inner.lock();
-                let entries = fs.readdir(self.ino).map_err(map_err)?;
+                let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
-                let st = fs.stat(entry.ino).map_err(map_err)?;
+                let st = {
+                    let mut fs = self.fs.inner.lock();
+                    fs.stat(entry.ino).map_err(map_err)?
+                };
                 Ok((stat_to_metadata(&st), entry.name.clone()))
             }
         }
@@ -310,12 +331,17 @@ impl INode for BtrfsMountINode {
             fs.create(self.ino, name, kind, mode, data as u64)
                 .map_err(map_err)?
         };
+        self.fs.invalidate_dir(self.ino);
         Ok(self.fs.inode(ino))
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
-        let mut fs = self.fs.inner.lock();
-        fs.unlink(self.ino, name).map_err(map_err)
+        {
+            let mut fs = self.fs.inner.lock();
+            fs.unlink(self.ino, name).map_err(map_err)?;
+        }
+        self.fs.invalidate_dir(self.ino);
+        Ok(())
     }
 
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
@@ -325,8 +351,12 @@ impl INode for BtrfsMountINode {
         if !Arc::ptr_eq(&self.fs, &other.fs) {
             return Err(FsError::NotSameFs);
         }
-        let mut fs = self.fs.inner.lock();
-        fs.link(self.ino, name, other.ino).map_err(map_err)
+        {
+            let mut fs = self.fs.inner.lock();
+            fs.link(self.ino, name, other.ino).map_err(map_err)?;
+        }
+        self.fs.invalidate_dir(self.ino);
+        Ok(())
     }
 
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> Result<()> {
@@ -336,9 +366,14 @@ impl INode for BtrfsMountINode {
         if !Arc::ptr_eq(&self.fs, &target.fs) {
             return Err(FsError::NotSameFs);
         }
-        let mut fs = self.fs.inner.lock();
-        fs.rename(self.ino, old_name, target.ino, new_name)
-            .map_err(map_err)
+        {
+            let mut fs = self.fs.inner.lock();
+            fs.rename(self.ino, old_name, target.ino, new_name)
+                .map_err(map_err)?;
+        }
+        self.fs.invalidate_dir(self.ino);
+        self.fs.invalidate_dir(target.ino);
+        Ok(())
     }
 
     fn resize(&self, len: usize) -> Result<()> {

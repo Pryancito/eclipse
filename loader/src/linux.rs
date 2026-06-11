@@ -25,7 +25,7 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc = Process::create_linux(&job, rootfs.clone()).expect("create_linux");
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
-    // Use the pivoted root (e.g. installed ext2), not the initramfs SFS passed in.
+    // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
     let loader = LinuxElfLoader {
         syscall_entry: kernel_hal::context::syscall_entry as *const () as usize,
