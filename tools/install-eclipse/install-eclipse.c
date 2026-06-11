@@ -43,10 +43,15 @@ static const char *resolve_image_path(const char *path);
 #define FSTAB_PLACEHOLDER_EFI  "__ECLIPSE_EFI_DEV___"
 #define FSTAB_PLACEHOLDER_HOME "__ECLIPSE_HOME_DEV__"
 #define FSTAB_PLACEHOLDER_SWAP "__ECLIPSE_SWAP_DEV__"
+#define FSTAB_TEMPLATE_LINE_ROOT "__ECLIPSE_ROOT_DEV__  /                  ext2    defaults          0  1"
+#define FSTAB_TEMPLATE_LINE_EFI  "__ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0"
+#define FSTAB_TEMPLATE_LINE_HOME "__ECLIPSE_HOME_DEV__  /home              ext2    defaults          0  0"
+#define FSTAB_TEMPLATE_LINE_SWAP "__ECLIPSE_SWAP_DEV__  none               swap    sw                0  0"
 /* Placeholder de la cmdline de rboot.conf (clave ROOT=). Debe medir
  * exactamente FSTAB_PLACEHOLDER_LEN (20) caracteres y ser distinto de los de
  * fstab para no colisionar con la imagen initramfs alojada en la partición EFI. */
 #define RBOOT_PLACEHOLDER_ROOT "__ECLIPSE_CMDROOTDEV"
+#define RBOOT_TEMPLATE_ROOT_KEY "ROOT=__ECLIPSE_CMDROOTDEV"
 #define FSTAB_PLACEHOLDER_LEN  20U
 #define FSTAB_PATCH_CHUNK      (64U * 1024U)
 #define FSTAB_PATCH_MAX_SCAN   (48U * 1024U * 1024U)
@@ -2119,37 +2124,30 @@ typedef enum {
 
 struct fstab_patch_target {
     const char *placeholder;
+    const char *match_text;
     const char *replacement;
     fstab_patch_kind kind;
+    size_t match_offset;
     int required;
     int found;
     off_t offset;
 };
 
-static int placeholder_in_window(const uint8_t *window, size_t window_len, off_t window_base,
-                                 const char *placeholder, off_t *out_offset) {
-    size_t plen = strlen(placeholder);
+static int text_in_window(const uint8_t *window, size_t window_len, off_t window_base,
+                          const char *text, off_t *out_offset) {
+    size_t plen = strlen(text);
     size_t i;
 
     if (plen == 0 || window_len < plen) {
         return 0;
     }
     for (i = 0; i + plen <= window_len; i++) {
-        if (memcmp(window + i, placeholder, plen) == 0) {
+        if (memcmp(window + i, text, plen) == 0) {
             *out_offset = window_base + (off_t)i;
             return 1;
         }
     }
     return 0;
-}
-
-static off_t line_start_offset(const uint8_t *window, size_t index, off_t window_base) {
-    size_t line_start = index;
-
-    while (line_start > 0 && window[line_start - 1] != '\n') {
-        line_start--;
-    }
-    return window_base + (off_t)line_start;
 }
 
 static int fstab_targets_ready(const struct fstab_patch_target *targets, size_t count) {
@@ -2197,16 +2195,11 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
                 if (slot->found) {
                     continue;
                 }
-                if (!placeholder_in_window(window, window_len, window_base, slot->placeholder,
-                                           &hit)) {
+                if (!text_in_window(window, window_len, window_base,
+                                    slot->match_text ? slot->match_text : slot->placeholder, &hit)) {
                     continue;
                 }
-                if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
-                    slot->offset = line_start_offset(window, (size_t)(hit - window_base),
-                                                     window_base);
-                } else {
-                    slot->offset = hit;
-                }
+                slot->offset = hit + (off_t)slot->match_offset;
                 slot->found = 1;
             }
         }
@@ -2400,24 +2393,24 @@ static int patch_fstab_on_block_device(const char *block_dev,
     }
 
     targets[0] = (struct fstab_patch_target){
-        FSTAB_PLACEHOLDER_ROOT, root_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+        FSTAB_PLACEHOLDER_ROOT, FSTAB_TEMPLATE_LINE_ROOT, root_field, FSTAB_PATCH_REPLACE, 0, 1, 0, 0,
     };
     targets[1] = (struct fstab_patch_target){
-        FSTAB_PLACEHOLDER_EFI, efi_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+        FSTAB_PLACEHOLDER_EFI, FSTAB_TEMPLATE_LINE_EFI, efi_field, FSTAB_PATCH_REPLACE, 0, 1, 0, 0,
     };
     if (layout == LAYOUT_ADVANCED) {
         targets[2] = (struct fstab_patch_target){
-            FSTAB_PLACEHOLDER_HOME, home_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+            FSTAB_PLACEHOLDER_HOME, FSTAB_TEMPLATE_LINE_HOME, home_field, FSTAB_PATCH_REPLACE, 0, 1, 0, 0,
         };
         targets[3] = (struct fstab_patch_target){
-            FSTAB_PLACEHOLDER_SWAP, swap_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+            FSTAB_PLACEHOLDER_SWAP, FSTAB_TEMPLATE_LINE_SWAP, swap_field, FSTAB_PATCH_REPLACE, 0, 1, 0, 0,
         };
     } else {
         targets[2] = (struct fstab_patch_target){
-            FSTAB_PLACEHOLDER_HOME, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0,
+            FSTAB_PLACEHOLDER_HOME, FSTAB_TEMPLATE_LINE_HOME, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0, 0,
         };
         targets[3] = (struct fstab_patch_target){
-            FSTAB_PLACEHOLDER_SWAP, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0,
+            FSTAB_PLACEHOLDER_SWAP, FSTAB_TEMPLATE_LINE_SWAP, NULL, FSTAB_PATCH_COMMENT_LINE, 0, 0, 0, 0,
         };
     }
 
@@ -2607,7 +2600,7 @@ static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, 
     }
 
     targets[0] = (struct fstab_patch_target){
-        RBOOT_PLACEHOLDER_ROOT, root_field, FSTAB_PATCH_REPLACE, 1, 0, 0,
+        RBOOT_PLACEHOLDER_ROOT, RBOOT_TEMPLATE_ROOT_KEY, root_field, FSTAB_PATCH_REPLACE, 5, 1, 0, 0,
     };
 
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
