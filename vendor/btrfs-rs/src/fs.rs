@@ -933,6 +933,39 @@ impl Btrfs {
         Ok(ino)
     }
 
+    /// Splice `data` into a symlink's target at `offset` (the rcore-fs VFS
+    /// creates symlinks empty and fills the target through `write_at`).
+    pub fn write_symlink(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        self.prepare_mutation()?;
+        let mut inode = self.read_inode(ino)?;
+        if inode.kind() != FileKind::Symlink {
+            return Err(Error::Invalid);
+        }
+        let mut target = alloc::vec![0u8; inode.size as usize];
+        self.read(ino, 0, &mut target)?;
+        let end = offset as usize + data.len();
+        if end > MAX_NAME_LEN * 16 {
+            return Err(Error::Invalid);
+        }
+        if end > target.len() {
+            target.resize(end, 0);
+        }
+        target[offset as usize..end].copy_from_slice(data);
+        let enc = FileExtent::encode_inline(self.generation, &target);
+        {
+            let mut t = self.tree();
+            t.set_item(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, 0), &enc)?;
+        }
+        inode.size = target.len() as u64;
+        inode.nbytes = target.len() as u64;
+        let now = self.now();
+        inode.mtime = now;
+        inode.ctime = now;
+        self.write_inode(ino, &inode)?;
+        self.commit(false)?;
+        Ok(data.len())
+    }
+
     pub fn read_link(&mut self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino)?;
         if inode.kind() != FileKind::Symlink {

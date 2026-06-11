@@ -12,6 +12,7 @@ use crate::error::{LxError, LxResult};
 use crate::process::LinuxProcess;
 
 use super::block_mount::MountBackend;
+use super::btrfs_mount::open_btrfs;
 use super::ext2_mount::open_ext2;
 use super::fat_mount::open_fat;
 use super::flagged_fs::wrap_fs;
@@ -63,7 +64,9 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     if fstype.is_empty() {
         return Err(LxError::EINVAL);
     }
-    if fstype.eq_ignore_ascii_case("ext2")
+    if fstype.eq_ignore_ascii_case("btrfs") {
+        Ok("btrfs")
+    } else if fstype.eq_ignore_ascii_case("ext2")
         || fstype.eq_ignore_ascii_case("ext3")
         || fstype.eq_ignore_ascii_case("ext4")
     {
@@ -82,6 +85,7 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
 
 pub(crate) fn open_filesystem(backend: MountBackend, fstype: &str) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
+        "btrfs" => open_btrfs(&backend).map_err(LxError::from),
         "ext2" => open_ext2(&backend).map_err(LxError::from),
         "vfat" => open_fat(backend)
             .map(|fs| fs as Arc<dyn FileSystem>)
