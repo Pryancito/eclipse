@@ -211,7 +211,8 @@ impl Syscall<'_> {
 
         let proc = self.linux_process();
         let (new_dir_path, new_file_name) = split_path(newpath);
-        let inode = proc.lookup_inode_at(olddirfd, oldpath, true)?;
+        let follow = flags.contains(AtFlags::SYMLINK_FOLLOW);
+        let inode = proc.lookup_inode_at(olddirfd, oldpath, follow)?;
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
@@ -484,5 +485,6 @@ bitflags! {
         const EMPTY_PATH = 0x1000;
         const SYMLINK_NOFOLLOW = 0x100;
         const EACCESS = 0x200;
+        const SYMLINK_FOLLOW = 0x400;
     }
 }

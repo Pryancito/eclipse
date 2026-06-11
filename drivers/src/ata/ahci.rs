@@ -726,7 +726,7 @@ impl BlockScheme for AhciInterface {
         if read_buf.is_empty() || read_buf.len() % SECTOR_SIZE != 0 {
             return Err(DeviceError::InvalidParam);
         }
-        let lba = (block_id * (read_buf.len() / SECTOR_SIZE)) as u64;
+        let lba = block_id as u64;
         let user_ptr = read_buf.as_ptr() as usize;
         if user_ptr % 4096 == 0 {
             let paddr = virt_to_phys(user_ptr);
@@ -763,7 +763,7 @@ impl BlockScheme for AhciInterface {
         if write_buf.is_empty() || write_buf.len() % SECTOR_SIZE != 0 {
             return Err(DeviceError::InvalidParam);
         }
-        let lba = (block_id * (write_buf.len() / SECTOR_SIZE)) as u64;
+        let lba = block_id as u64;
         let user_ptr = write_buf.as_ptr() as usize;
         if user_ptr % 4096 == 0 {
             let paddr = virt_to_phys(user_ptr);

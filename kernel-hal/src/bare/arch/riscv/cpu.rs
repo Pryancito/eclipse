@@ -66,6 +66,14 @@ hal_fn_impl! {
             *CPU_FREQ_MHZ
         }
 
+        fn cpu_brand() -> alloc::string::String {
+            alloc::string::String::from("RISC-V CPU")
+        }
+
+        fn cpu_count() -> u8 {
+            LOGICAL_COUNT.load(Ordering::Acquire)
+        }
+
         fn reset() -> ! {
             info!("shutdown...");
             sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);

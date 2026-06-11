@@ -66,6 +66,14 @@ hal_fn_impl! {
             0
         }
 
+        fn cpu_brand() -> alloc::string::String {
+            alloc::string::String::from("AArch64 CPU")
+        }
+
+        fn cpu_count() -> u8 {
+            LOGICAL_COUNT.load(Ordering::Acquire)
+        }
+
         fn reset() -> ! {
             info!("shutdown...");
             let psci_system_off = 0x8400_0008_usize;

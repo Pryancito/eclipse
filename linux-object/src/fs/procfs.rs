@@ -756,14 +756,50 @@ fn proc_meminfo_content() -> String {
 
 /// Minimal `/proc/cpuinfo` for fastfetch CPU detection on x86_64.
 fn proc_cpuinfo_content() -> String {
-    #[cfg(target_arch = "x86_64")]
-    {
-        "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Eclipse Virtual CPU\nstepping\t: 0\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncore id\t\t: 0\ncpu cores\t: 1\n".into()
+    let mut brand = kernel_hal::cpu::cpu_brand();
+    if brand.is_empty() {
+        brand = "Eclipse CPU".into();
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        "processor\t: 0\nmodel name\t: Eclipse CPU\ncpu cores\t: 1\n".into()
+    let cpu_count = kernel_hal::cpu::cpu_count() as usize;
+    let mut s = String::new();
+    for i in 0..cpu_count {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::fmt::Write;
+            let _ = writeln!(
+                s,
+                "processor\t: {}\n\
+                 vendor_id\t: GenuineIntel\n\
+                 model name\t: {}\n\
+                 stepping\t: 0\n\
+                 cpu MHz\t\t: {:.3}\n\
+                 cache size\t: 4096 KB\n\
+                 physical id\t: {}\n\
+                 core id\t\t: {}\n\
+                 cpu cores\t: {}",
+                i,
+                brand,
+                kernel_hal::cpu::cpu_frequency() as f64,
+                i,
+                i,
+                cpu_count
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            use core::fmt::Write;
+            let _ = writeln!(
+                s,
+                "processor\t: {}\n\
+                 model name\t: {}\n\
+                 cpu cores\t: {}",
+                i,
+                brand,
+                cpu_count
+            );
+        }
     }
+    s
 }
 
 /// Empty swap table (header only) — fastfetch falls back to meminfo for swap stats.

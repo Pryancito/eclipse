@@ -159,7 +159,7 @@ static LOGICAL_TO_APIC: [AtomicU8; crate::config::MAX_CORE_NUM] = {
 };
 
 /// Number of logical ids assigned so far (next id to hand out).
-static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub(super) static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Raw Local APIC ID of the calling CPU (MMIO when mapped, else CPUID).
 fn raw_apic_id() -> u8 {

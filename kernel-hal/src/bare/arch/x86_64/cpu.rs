@@ -26,6 +26,26 @@ hal_fn_impl! {
             })
         }
 
+        fn cpu_brand() -> alloc::string::String {
+            use core::arch::x86_64::__cpuid;
+            let mut brand = alloc::vec::Vec::new();
+            for leaf in 0x80000002..=0x80000004 {
+                let res = __cpuid(leaf);
+                for reg in &[res.eax, res.ebx, res.ecx, res.edx] {
+                    brand.extend_from_slice(&reg.to_le_bytes());
+                }
+            }
+            let brand_str = core::str::from_utf8(&brand)
+                .unwrap_or("")
+                .trim_matches('\0')
+                .trim();
+            alloc::string::String::from(brand_str)
+        }
+
+        fn cpu_count() -> u8 {
+            super::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as u8
+        }
+
         fn reset() -> ! {
             info!("resetting/shutting down...");
             use zcore_drivers::io::{Io, Pmio};

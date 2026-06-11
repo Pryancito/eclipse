@@ -35,6 +35,12 @@ hal_fn_def! {
         /// Current CPU frequency in MHz.
         pub fn cpu_frequency() -> u16 { 3000 }
 
+        /// Get the CPU brand/model name.
+        pub fn cpu_brand() -> String { String::new() }
+
+        /// Get the number of online CPU cores.
+        pub fn cpu_count() -> u8 { 1 }
+
         /// Shutdown/reboot the machine.
         pub fn reset() -> !;
     }
