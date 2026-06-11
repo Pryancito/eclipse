@@ -150,17 +150,11 @@ impl WakerPage {
         self.borrowed.fetch_and(mask)
     }
 
-    pub fn make_waker(
-        self: &Arc<Self>,
-        idx: usize,
-        dropped: &Arc<AtomicBool>,
-        cpu_id: u8,
-    ) -> WakerRef {
+    pub fn make_waker(self: &Arc<Self>, idx: usize, dropped: &Arc<AtomicBool>) -> WakerRef {
         WakerRef {
             page: self.clone(),
             idx,
             dropped: dropped.clone(),
-            cpu_id,
         }
     }
 }
@@ -171,8 +165,6 @@ pub struct WakerRef {
     page: Arc<WakerPage>,
     idx: usize,
     dropped: Arc<AtomicBool>,
-    /// CPU whose run queue owns the task; used to kick it out of HLT on wake.
-    cpu_id: u8,
 }
 
 impl WakerRef {
@@ -187,7 +179,6 @@ impl WakerRef {
     pub fn wake_by_ref(&self) {
         if !self.dropped.load(Ordering::SeqCst) {
             self.page.notify(self.idx);
-            crate::wake_cpu(self.cpu_id as usize);
         }
     }
 
@@ -210,7 +201,6 @@ impl Clone for WakerRef {
             page: self.page.clone(),
             idx: self.idx,
             dropped: self.dropped.clone(),
-            cpu_id: self.cpu_id,
         }
     }
 }

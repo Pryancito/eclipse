@@ -128,9 +128,7 @@ impl FutureCollection {
 }
 
 pub struct TaskCollection {
-    /// Dense logical id of the CPU that owns this queue; stamped into wakers
-    /// so a wake can IPI this CPU out of HLT.
-    cpu_id: u8,
+    cpu_id: u8, // Just for debug, not used
     future_collections: Vec<Mutex<FutureCollection>>,
     pub task_num: AtomicUsize,
     generator: Option<Mutex<Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>>>,
@@ -195,8 +193,7 @@ impl TaskCollection {
                     let (priority, page_idx, subpage_idx) = unpack_key(key);
                     let mut inner = self.get_mut_inner(priority);
                     let task = inner.slab.get(unmask_priority(key)).unwrap().clone();
-                    let waker =
-                        inner.pages[page_idx].make_waker(subpage_idx, &task.finish, self.cpu_id);
+                    let waker = inner.pages[page_idx].make_waker(subpage_idx, &task.finish);
                     let droper = waker.clone();
                     Some((key, task, waker, droper))
                 } else {

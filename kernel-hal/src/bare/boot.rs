@@ -22,10 +22,6 @@ hal_fn_impl! {
 
         fn primary_init() {
             crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
-            // Cross-CPU wakeups: when the executor makes a task runnable on
-            // another CPU's queue, IPI that CPU if it is parked in HLT —
-            // otherwise the task waits for the next periodic timer tick.
-            executor::set_wake_cpu_hook(crate::common::ipi::wake_cpu_if_idle);
             unsafe { trapframe::init() };
             crate::vm::pin_kernel_vmtoken();
             // Bind this CPU to its PercpuBlock (sets the GS fast-path on x86_64).

@@ -69,17 +69,11 @@ pub(super) fn init() -> DeviceResult {
     if Apic::local_apic_ready() {
         // SAFETY: called once on BSP during primary_init
         let lapic = Apic::local_apic();
-        lapic.set_timer_divide(TimerDivide::Div256); // indeed it is Div1, the name is confusing.
-
-        // The LAPIC timer counts at the bus/crystal clock, NOT the CPU core
-        // frequency — measure it against the PIT instead of guessing from
-        // cpu_frequency() (which made one "10 ms" tick last seconds on real
-        // hardware). This also calibrates the TSC used by timer_now().
-        let initial = super::timer::calibrate_apic_timer_bsp();
         lapic.set_timer_mode(TimerMode::Periodic);
-        lapic.set_timer_initial(initial);
-        // APs inherit this mode/divide/initial when init_local_apic_ap() runs
-        // x2apic's enable(), which replays the values stored above.
+        lapic.set_timer_divide(TimerDivide::Div256); // indeed it is Div1, the name is confusing.
+        let cycles =
+            super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
+        lapic.set_timer_initial(cycles as u32);
         lapic.disable_timer();
     } else {
         crate::klog_warn!("[drivers] LAPIC unavailable — APIC timer left disabled");

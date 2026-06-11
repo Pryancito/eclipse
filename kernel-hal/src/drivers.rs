@@ -279,11 +279,6 @@ mod drivers_ffi {
         if paddr == 0 || pages == 0 {
             return -1;
         }
-        // Serialize against other CPUs marking buffers in the same 2 MiB
-        // huge page: two concurrent split_to_4k() calls on one entry would
-        // each build a table and one of them would be silently lost.
-        static DMA_PT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
-        let _guard = DMA_PT_LOCK.lock();
         let vaddr = paddr + KCONFIG.phys_to_virt_offset;
         let flags = MMUFlags::READ
             | MMUFlags::WRITE
@@ -292,16 +287,7 @@ mod drivers_ffi {
         for i in 0..pages {
             let va = vaddr + i * PAGE_SIZE;
             match pt.query(va) {
-                Ok((pa, _, size)) => {
-                    // The boot linear map uses 2 MiB huge pages; split down to
-                    // 4 KiB first so only this frame becomes uncacheable, not
-                    // the whole surrounding huge page.
-                    if size != crate::vm::PageSize::Size4K {
-                        if let Err(e) = pt.split_to_4k(va) {
-                            trace!("drivers_dma_mark_uncached: split {:#x} failed {:?}", va, e);
-                            return -1;
-                        }
-                    }
+                Ok((pa, _, _)) => {
                     if let Err(e) = pt.update(va, Some(pa), Some(flags)) {
                         trace!("drivers_dma_mark_uncached: update {:#x} failed {:?}", va, e);
                         return -1;
