@@ -1,9 +1,9 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-// use core::mem::size_of;
 use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{fence, Ordering};
 
 use crate::scheme::{BlockScheme, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
@@ -15,6 +15,8 @@ use lock::Mutex;
 
 use super::nvme_queue::*;
 
+const SECTOR_SIZE: usize = 512;
+
 pub struct NvmeInterface {
     name: String,
 
@@ -24,47 +26,57 @@ pub struct NvmeInterface {
 
     bar: usize,
 
+    /// Doorbell stride in bytes (4 << CAP.DSTRD).
+    stride: usize,
+
     irq: usize,
 
+    /// Capacity in 512-byte sectors.
     capacity: usize,
+
+    /// log2 of the namespace LBA size (9 = 512B, 12 = 4KiB).
+    lba_shift: u8,
 }
 
 impl NvmeInterface {
-    const CQ_WAIT_TIMEOUT_US: u64 = 1_000_000;
+    const ADMIN_TIMEOUT_US: u64 = 5_000_000;
+    const IO_TIMEOUT_US: u64 = 5_000_000;
     const CQ_WAIT_MAX_SPINS: u64 = 50_000_000;
 
     pub fn new(bar: usize, irq: usize) -> DeviceResult<NvmeInterface> {
-        // Read CAP register to determine doorbell stride (DSTRD)
+        // Controller Capabilities: doorbell stride, max queue entries, ready timeout
         let cap = unsafe { read_volatile(bar as *const u64) };
         let dstrd = ((cap >> 32) & 0xf) as u32;
-        let stride = 4 << dstrd;
-        warn!("[nvme] CAP: {:#x}, DSTRD: {}, stride: {} bytes", cap, dstrd, stride);
+        let stride = (4usize) << dstrd;
+        let mqes = (cap & 0xffff) as usize + 1;
+        // CAP.TO is in 500 ms units; keep at least 1 s as a floor.
+        let ready_timeout_us = (((cap >> 24) & 0xff) as u64 * 500_000).max(1_000_000);
+        warn!(
+            "[nvme] CAP: {:#x}, DSTRD: {} (stride {}B), MQES: {}, TO: {}us",
+            cap, dstrd, stride, mqes, ready_timeout_us
+        );
 
-        // SQ y tail doorbell offset is 2 * y * stride
-        let admin_db_offset = 0;
-        let io_db_offset = 2 * stride as usize;
+        let admin_q_size = mqes.min(32);
+        let io_q_size = mqes.min(128);
 
-        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_db_offset)));
-        let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(1, io_db_offset)))];
+        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_q_size)));
+        let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(1, io_q_size)))];
 
         let mut interface = NvmeInterface {
             name: String::from("nvme"),
             admin_queue,
             io_queues,
             bar,
+            stride,
             irq,
             capacity: 0,
+            lba_shift: 9,
         };
 
-        interface.init(stride as usize)?;
+        interface.nvme_configure_admin_queue(ready_timeout_us)?;
+        interface.nvme_alloc_io_queue()?;
 
         Ok(interface)
-    }
-
-    pub fn init(&mut self, stride: usize) -> DeviceResult {
-        self.nvme_configure_admin_queue(stride)?;
-        self.nvme_alloc_io_queue(stride)?;
-        Ok(())
     }
 
     pub fn get_name_irq(&self) -> (String, usize) {
@@ -94,61 +106,98 @@ fn clflush_range(vaddr: usize, len: usize) {
 }
 
 impl NvmeInterface {
-    fn wait_cq_complete(
+    /// Submit one command on `queue` and poll its completion queue until done.
+    ///
+    /// Handles SQ tail wrap, phase tracking and both doorbells; the CQ head
+    /// doorbell is updated even on error completions so the queue never gets
+    /// out of sync with the controller. Returns CQE dword 0 (command result).
+    fn submit_sync(
+        bar: usize,
+        stride: usize,
         queue: &mut NvmeQueue<ProviderImpl>,
+        mut cmd: NvmeCommonCommand,
+        timeout_us: u64,
         context: &str,
-    ) -> DeviceResult {
+    ) -> DeviceResult<u32> {
+        let sq_db = bar + NVME_REG_DBS + 2 * queue.qid * stride;
+        let cq_db = sq_db + stride;
+
+        let cid = queue.next_cid();
+        cmd.command_id = cid;
+
+        let tail = queue.sq_tail;
+        queue.sq[tail].write(cmd);
+        queue.sq_tail = if tail + 1 >= queue.sq.len() { 0 } else { tail + 1 };
+
+        // Make the SQ entry visible to the device before ringing the doorbell.
+        clflush_range(&queue.sq[tail] as *const _ as usize, 64);
+        fence(Ordering::SeqCst);
+        unsafe { write_volatile(sq_db as *mut u32, queue.sq_tail as u32) }
+
         let start = timer_now_as_micros();
         let mut spins = 0_u64;
-        let head = queue.cq_head;
-        let expected_phase = queue.cq_phase;
 
         loop {
-            let status = queue.cq[head].read();
-            let phase = (status.status & 1) as usize;
-            if phase == expected_phase {
-                let sc = (status.status >> 1) & 0xff;
-                let sct = (status.status >> 9) & 0x7;
-                if sc != 0 || sct != 0 {
+            let head = queue.cq_head;
+            clflush_range(&queue.cq[head] as *const _ as usize, 16);
+            let entry = queue.cq[head].read();
+
+            if (entry.status & 1) as usize == queue.cq_phase {
+                queue.cq_head += 1;
+                if queue.cq_head >= queue.cq.len() {
+                    queue.cq_head = 0;
+                    queue.cq_phase ^= 1;
+                }
+                unsafe { write_volatile(cq_db as *mut u32, queue.cq_head as u32) }
+
+                if entry.command_id != cid {
                     warn!(
-                        "[nvme] completion error: status={:#x} (sct={}, sc={}) for {}",
-                        status.status, sct, sc, context
+                        "[nvme] unexpected completion cid {:#x} (wanted {:#x}) for {}",
+                        entry.command_id, cid, context
                     );
                     return Err(DeviceError::IoError);
                 }
 
-                // Advance cq_head
-                queue.cq_head += 1;
-                if queue.cq_head >= queue.cq.len() {
-                    queue.cq_head = 0;
-                    queue.cq_phase = 1 - queue.cq_phase;
+                let sc = (entry.status >> 1) & 0xff;
+                let sct = (entry.status >> 9) & 0x7;
+                if sc != 0 || sct != 0 {
+                    warn!(
+                        "[nvme] completion error: status={:#x} (sct={}, sc={}) for {}",
+                        entry.status, sct, sc, context
+                    );
+                    return Err(DeviceError::IoError);
                 }
-                return Ok(());
+                return Ok(entry.result as u32);
             }
 
             core::hint::spin_loop();
             spins = spins.saturating_add(1);
-            if timer_now_as_micros().wrapping_sub(start) >= Self::CQ_WAIT_TIMEOUT_US
+
+            if spins % 256 == 0 {
+                let csts = unsafe { read_volatile((bar + NVME_REG_CSTS) as *const u32) };
+                if csts & NVME_CSTS_CFS != 0 {
+                    warn!("[nvme] controller fatal status while waiting for {}", context);
+                    return Err(DeviceError::IoError);
+                }
+            }
+
+            if timer_now_as_micros().wrapping_sub(start) >= timeout_us
                 || spins >= Self::CQ_WAIT_MAX_SPINS
             {
                 warn!(
                     "[nvme] timeout waiting CQ{} completion (head={}, phase={}) for {}",
-                    head, head, expected_phase, context
+                    queue.qid, head, queue.cq_phase, context
                 );
                 return Err(DeviceError::IoError);
             }
         }
     }
 
-    pub fn nvme_configure_admin_queue(&mut self, stride: usize) -> DeviceResult {
-        let mut admin_queue = self.admin_queue.lock();
-
+    pub fn nvme_configure_admin_queue(&mut self, ready_timeout_us: u64) -> DeviceResult {
         let bar = self.bar;
-        let dbs = bar + NVME_REG_DBS;
-
-        let sq_dma_pa = admin_queue.sq_pa as u64;
-        let cq_dma_pa = admin_queue.cq_pa as u64;
-        let data_dma_pa = admin_queue.data_pa as u64;
+        let stride = self.stride;
+        let admin = self.admin_queue.clone();
+        let mut admin_queue = admin.lock();
 
         // Reset controller first
         warn!("[nvme] Resetting controller...");
@@ -164,22 +213,21 @@ impl NvmeInterface {
             if (csts & NVME_CSTS_RDY) == 0 {
                 break;
             }
-            if timer_now_as_micros().wrapping_sub(start) > 2_000_000 {
+            if timer_now_as_micros().wrapping_sub(start) > ready_timeout_us {
                 warn!("[nvme] timeout waiting for controller reset");
                 return Err(DeviceError::IoError);
             }
             core::hint::spin_loop();
         }
 
-        let aqa_low_16 = 31_u16; // 32 entries (0-based)
-        let aqa_high_16 = 31_u16; // 32 entries (0-based)
-        let aqa = (aqa_high_16 as u32) << 16 | aqa_low_16 as u32;
-        let aqa_address = bar + NVME_REG_AQA;
+        // Admin queue attributes: 0-based sizes for SQ (bits 0-11) and CQ (bits 16-27)
+        let aqa_entries = (admin_queue.sq.len() - 1) as u32;
+        let aqa = (aqa_entries << 16) | aqa_entries;
 
         unsafe {
-            write_volatile(aqa_address as *mut u32, aqa);
-            write_volatile((bar + NVME_REG_ASQ) as *mut u64, sq_dma_pa);
-            write_volatile((bar + NVME_REG_ACQ) as *mut u64, cq_dma_pa);
+            write_volatile((bar + NVME_REG_AQA) as *mut u32, aqa);
+            write_volatile((bar + NVME_REG_ASQ) as *mut u64, admin_queue.sq_pa as u64);
+            write_volatile((bar + NVME_REG_ACQ) as *mut u64, admin_queue.cq_pa as u64);
         }
 
         // enable ctrl
@@ -197,7 +245,11 @@ impl NvmeInterface {
             if (csts & NVME_CSTS_RDY) != 0 {
                 break;
             }
-            if timer_now_as_micros().wrapping_sub(start) > 2_000_000 {
+            if csts & NVME_CSTS_CFS != 0 {
+                warn!("[nvme] controller fatal status during enable");
+                return Err(DeviceError::IoError);
+            }
+            if timer_now_as_micros().wrapping_sub(start) > ready_timeout_us {
                 warn!("[nvme] timeout waiting for controller ready");
                 return Err(DeviceError::IoError);
             }
@@ -205,250 +257,285 @@ impl NvmeInterface {
         }
         warn!("[nvme] Controller ready!");
 
-        let data_va = phys_to_virt(data_dma_pa as usize);
+        // We poll for completions; mask all controller interrupts.
+        unsafe { write_volatile((bar + NVME_REG_INTMS) as *mut u32, 0xffff_ffff) }
 
-        // Invalidate cache before command so no dirty lines are written back
+        let data_va = admin_queue.data_va;
+        let data_pa = admin_queue.data_pa;
+
+        // Identify Controller (CNS = 1)
         clflush_range(data_va, 4096);
-
-        // config identify (CNS = 1: Identify Controller)
         let mut cmd = NvmeIdentify::new();
-        cmd.prp1 = data_dma_pa;
-        cmd.command_id = 0x1018;
+        cmd.prp1 = data_pa as u64;
         cmd.nsid = 0;
         cmd.cns = 1;
         let common_cmd = unsafe { core::mem::transmute(cmd) };
-
-        let tail = admin_queue.sq_tail;
-        admin_queue.sq[tail].write(common_cmd);
-        admin_queue.sq_tail += 1;
-        if admin_queue.sq_tail >= admin_queue.sq.len() {
-            admin_queue.sq_tail = 0;
-        }
-
-        let admin_q_db = dbs + admin_queue.db_offset;
-        unsafe { write_volatile(admin_q_db as *mut u32, (tail + 1) as u32) }
-
-        Self::wait_cq_complete(&mut admin_queue, "identify admin queue")?;
-        unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
-
-        // Invalidate cache after command so CPU reads from RAM
+        Self::submit_sync(
+            bar,
+            stride,
+            &mut admin_queue,
+            common_cmd,
+            Self::ADMIN_TIMEOUT_US,
+            "identify controller",
+        )?;
         clflush_range(data_va, 4096);
 
-        // config identify (CNS = 0: Identify Namespace)
+        // Model number: bytes 24..63 of the Identify Controller data (ASCII)
+        let model = unsafe { core::slice::from_raw_parts((data_va + 24) as *const u8, 40) };
+        if let Ok(model) = core::str::from_utf8(model) {
+            warn!("[nvme] model: {}", model.trim());
+        }
+
+        // Identify Namespace 1 (CNS = 0)
+        clflush_range(data_va, 4096);
         let mut cmd = NvmeIdentify::new();
         cmd.cns = 0;
-        cmd.prp1 = data_dma_pa;
-        cmd.command_id = 0x1019;
+        cmd.prp1 = data_pa as u64;
         cmd.nsid = 1;
         let common_cmd = unsafe { core::mem::transmute(cmd) };
-
-        let tail = admin_queue.sq_tail;
-        admin_queue.sq[tail].write(common_cmd);
-        admin_queue.sq_tail += 1;
-        if admin_queue.sq_tail >= admin_queue.sq.len() {
-            admin_queue.sq_tail = 0;
-        }
-
-        unsafe { write_volatile(admin_q_db as *mut u32, (tail + 1) as u32) }
-
-        Self::wait_cq_complete(&mut admin_queue, "identify namespace")?;
-        unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
-
-        // Invalidate cache after command so CPU reads from RAM
+        Self::submit_sync(
+            bar,
+            stride,
+            &mut admin_queue,
+            common_cmd,
+            Self::ADMIN_TIMEOUT_US,
+            "identify namespace",
+        )?;
         clflush_range(data_va, 4096);
 
-        // read namespace size and check LBA size format
-        let nsze = unsafe { core::ptr::read_volatile(data_va as *const u64) };
-        let flbas = unsafe { core::ptr::read_volatile((data_va + 26) as *const u8) };
+        // Namespace size (LBAs) and current LBA format
+        let nsze = unsafe { read_volatile(data_va as *const u64) };
+        let flbas = unsafe { read_volatile((data_va + 26) as *const u8) };
         let lbaf_index = (flbas & 0xF) as usize;
         let lbaf_offset = 128 + lbaf_index * 4;
-        let lbaf = unsafe { core::ptr::read_volatile((data_va + lbaf_offset) as *const u32) };
+        let lbaf = unsafe { read_volatile((data_va + lbaf_offset) as *const u32) };
         let lbads = ((lbaf >> 16) & 0xFF) as u8;
-        let block_size = if lbads >= 9 && lbads <= 16 {
-            1 << lbads
-        } else {
-            512
-        };
 
-        self.capacity = nsze as usize * (block_size / 512);
+        drop(admin_queue);
+
+        if nsze == 0 {
+            warn!("[nvme] namespace 1 has zero size, not usable");
+            return Err(DeviceError::NoResources);
+        }
+        // The bounce buffer is 2 pages, so we can handle LBA sizes up to 8 KiB.
+        if lbads < 9 || lbads > 13 {
+            warn!("[nvme] unsupported LBA size 2^{} bytes", lbads);
+            return Err(DeviceError::NotSupported);
+        }
+
+        self.lba_shift = lbads;
+        self.capacity = (nsze as usize) << (lbads - 9);
         warn!(
-            "[nvme] Identified namespace size: {} blocks (block_size: {}B), capacity: {} sectors (512B)",
-            nsze, block_size, self.capacity
+            "[nvme] namespace 1: {} LBAs of {}B, capacity {} sectors (512B)",
+            nsze,
+            1u32 << lbads,
+            self.capacity
         );
 
         Ok(())
     }
 
-    pub fn nvme_alloc_io_queue(&mut self, stride: usize) -> DeviceResult {
+    pub fn nvme_alloc_io_queue(&mut self) -> DeviceResult {
+        let bar = self.bar;
+        let stride = self.stride;
         let mut admin_queue = self.admin_queue.lock();
         let io_queue = self.io_queues[0].lock();
 
-        let bar = self.bar;
-        let dbs = bar + NVME_REG_DBS;
-        let admin_q_db = dbs;
-
-        // Set Features: Number of Queues
+        // Set Features: Number of Queues (request 1 IO SQ + 1 IO CQ, 0-based)
         let mut cmd = NvmeCommonCommand::new();
         cmd.opcode = 0x09;
-        cmd.command_id = 0x2;
-        cmd.nsid = 0;
-        cmd.cdw10 = 0x7;
-        cmd.cdw11 = 0x0007_0007; // Request 8 SQs and 8 CQs
+        cmd.cdw10 = NVME_FEAT_NUM_QUEUES;
+        cmd.cdw11 = 0;
+        let result = Self::submit_sync(
+            bar,
+            stride,
+            &mut admin_queue,
+            cmd,
+            Self::ADMIN_TIMEOUT_US,
+            "set queue count",
+        )?;
+        trace!(
+            "[nvme] controller allocated {} IO SQs / {} IO CQs",
+            (result & 0xffff) + 1,
+            (result >> 16) + 1
+        );
 
-        let tail = admin_queue.sq_tail;
-        admin_queue.sq[tail].write(cmd);
-        admin_queue.sq_tail += 1;
-        if admin_queue.sq_tail >= admin_queue.sq.len() {
-            admin_queue.sq_tail = 0;
-        }
-
-        unsafe { write_volatile(admin_q_db as *mut u32, (tail + 1) as u32) }
-
-        Self::wait_cq_complete(&mut admin_queue, "set queue count")?;
-        unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
-
-        // Create IO Completion Queue
+        // Create IO Completion Queue (qid 1). We poll, so no interrupts.
         let mut cmd = NvmeCreateCq::new();
-        cmd.opcode = 0x05;
-        cmd.command_id = 0x3;
         cmd.prp1 = io_queue.cq_pa as u64;
         cmd.cqid = 1;
-        cmd.qsize = (io_queue.cq.len() - 1) as u16; // 0-based size (e.g. 127 for 128 entries)
-        cmd.cq_flags = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;
-
+        cmd.qsize = (io_queue.cq.len() - 1) as u16;
+        cmd.cq_flags = NVME_QUEUE_PHYS_CONTIG;
         let common_cmd = unsafe { core::mem::transmute(cmd) };
+        Self::submit_sync(
+            bar,
+            stride,
+            &mut admin_queue,
+            common_cmd,
+            Self::ADMIN_TIMEOUT_US,
+            "create io completion queue",
+        )?;
 
-        let tail = admin_queue.sq_tail;
-        admin_queue.sq[tail].write(common_cmd);
-        admin_queue.sq_tail += 1;
-        if admin_queue.sq_tail >= admin_queue.sq.len() {
-            admin_queue.sq_tail = 0;
-        }
-        unsafe { write_volatile(admin_q_db as *mut u32, (tail + 1) as u32) }
-        Self::wait_cq_complete(&mut admin_queue, "create io completion queue")?;
-        unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
-
-        // Create IO Submission Queue
+        // Create IO Submission Queue (qid 1, bound to CQ 1)
         let mut cmd = NvmeCreateSq::new();
-        cmd.opcode = 0x01;
-        cmd.command_id = 0x4;
         cmd.prp1 = io_queue.sq_pa as u64;
         cmd.sqid = 1;
-        cmd.qsize = (io_queue.sq.len() - 1) as u16; // 0-based size
-        cmd.sq_flags = 0x1;
+        cmd.qsize = (io_queue.sq.len() - 1) as u16;
+        cmd.sq_flags = NVME_QUEUE_PHYS_CONTIG;
         cmd.cqid = 1;
+        let common_cmd = unsafe { core::mem::transmute(cmd) };
+        Self::submit_sync(
+            bar,
+            stride,
+            &mut admin_queue,
+            common_cmd,
+            Self::ADMIN_TIMEOUT_US,
+            "create io submission queue",
+        )?;
+
+        Ok(())
+    }
+
+    /// One read/write command on the IO queue, transferring `len` bytes
+    /// through the queue's bounce buffer (PRP1, plus PRP2 for a second page).
+    fn io_rw(
+        &self,
+        queue: &mut NvmeQueue<ProviderImpl>,
+        write: bool,
+        slba: u64,
+        nlb_minus_1: u16,
+        len: usize,
+    ) -> DeviceResult {
+        let mut cmd = if write {
+            NvmeRWCommand::new_write_command()
+        } else {
+            NvmeRWCommand::new_read_command()
+        };
+        cmd.nsid = 1;
+        cmd.prp1 = queue.data_pa as u64;
+        if len > PAGE_SIZE {
+            cmd.prp2 = (queue.data_pa + PAGE_SIZE) as u64;
+        }
+        cmd.slba = slba;
+        cmd.length = nlb_minus_1;
 
         let common_cmd = unsafe { core::mem::transmute(cmd) };
-
-        // write command to sq
-        let tail = admin_queue.sq_tail;
-        admin_queue.sq[tail].write(common_cmd);
-        admin_queue.sq_tail += 1;
-        if admin_queue.sq_tail >= admin_queue.sq.len() {
-            admin_queue.sq_tail = 0;
-        }
-
-        // write doorbell register
-        unsafe { write_volatile(admin_q_db as *mut u32, (tail + 1) as u32) }
-
-        // wait for command complete
-        Self::wait_cq_complete(&mut admin_queue, "create io submission queue")?;
-        unsafe { write_volatile((admin_q_db + stride) as *mut u32, admin_queue.cq_head as u32) }
+        Self::submit_sync(
+            self.bar,
+            self.stride,
+            queue,
+            common_cmd,
+            Self::IO_TIMEOUT_US,
+            if write { "write block" } else { "read block" },
+        )?;
         Ok(())
     }
 }
 
 impl BlockScheme for NvmeInterface {
+    // `block_id` follows the same convention as the AHCI driver: it indexes
+    // blocks of `buf.len()` bytes, i.e. the first sector is block_id * (len/512).
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
-        let mut io_queue = self.io_queues[0].lock();
-        let db_offset = io_queue.db_offset;
-        let bar = self.bar;
-        let dbs = bar + NVME_REG_DBS;
-
-        let ptr = read_buf.as_mut_ptr();
-        let addr = virt_to_phys(ptr as usize);
-        let buf_len = read_buf.len();
-
-        // Invalidate cache before command so no dirty lines are written back
-        clflush_range(ptr as usize, buf_len);
-
-        // build nvme read command
-        let mut cmd = NvmeRWCommand::new_read_command();
-        cmd.nsid = 1;
-        cmd.prp1 = addr as u64;
-        cmd.command_id = 101;
-        cmd.length = 0; // 0 means 1 block
-        cmd.slba = block_id as u64;
-
-        let common_cmd = unsafe { core::mem::transmute(cmd) };
-
-        let tail = io_queue.sq_tail;
-        io_queue.sq[tail].write(common_cmd);
-        io_queue.sq_tail += 1;
-        if io_queue.sq_tail >= io_queue.sq.len() {
-            io_queue.sq_tail = 0;
+        if read_buf.is_empty() || read_buf.len() % SECTOR_SIZE != 0 {
+            return Err(DeviceError::InvalidParam);
         }
+        let lba_bytes = 1usize << self.lba_shift;
+        let mut queue = self.io_queues[0].lock();
+        let queue = &mut *queue;
 
-        // write SQ tail doorbell
-        unsafe { write_volatile((dbs + db_offset) as *mut u32, (tail + 1) as u32) }
+        let mut byte_addr = block_id * read_buf.len();
+        let mut done = 0usize;
+        while done < read_buf.len() {
+            let remaining = read_buf.len() - done;
+            let lba = (byte_addr / lba_bytes) as u64;
+            let off = byte_addr % lba_bytes;
 
-        // wait for command complete on io_queue
-        Self::wait_cq_complete(&mut io_queue, "read block")?;
+            // Whole-LBA transfers go in chunks of up to the bounce buffer size;
+            // a sector range inside a bigger LBA reads the full LBA and copies out.
+            let (io_len, take) = if off == 0 && remaining >= lba_bytes {
+                let n = (remaining / lba_bytes).min(queue.data_len / lba_bytes);
+                (n * lba_bytes, n * lba_bytes)
+            } else {
+                (lba_bytes, remaining.min(lba_bytes - off))
+            };
 
-        // Invalidate cache after command so CPU reads from RAM
-        clflush_range(ptr as usize, buf_len);
+            clflush_range(queue.data_va, io_len);
+            self.io_rw(queue, false, lba, (io_len / lba_bytes - 1) as u16, io_len)?;
+            clflush_range(queue.data_va, io_len);
 
-        // write CQ head doorbell
-        let stride = db_offset / 2;
-        unsafe { write_volatile((dbs + db_offset + stride) as *mut u32, io_queue.cq_head as u32) }
+            let src = unsafe {
+                core::slice::from_raw_parts((queue.data_va + off) as *const u8, take)
+            };
+            read_buf[done..done + take].copy_from_slice(src);
 
+            done += take;
+            byte_addr += take;
+        }
         Ok(())
     }
 
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
-        let mut io_queue = self.io_queues[0].lock();
-        let db_offset = io_queue.db_offset;
-        let bar = self.bar;
-        let dbs = bar + NVME_REG_DBS;
-
-        let ptr = write_buf.as_ptr();
-        let addr = virt_to_phys(ptr as usize);
-        let buf_len = write_buf.len();
-
-        // Flush cache before command so device reads fresh data from RAM
-        clflush_range(ptr as usize, buf_len);
-
-        // build nvme write command
-        let mut cmd = NvmeRWCommand::new_write_command();
-        cmd.nsid = 1;
-        cmd.prp1 = addr as u64;
-        cmd.length = 0; // 0 means 1 block
-        cmd.command_id = 100;
-        cmd.slba = block_id as u64;
-
-        let common_cmd = unsafe { core::mem::transmute(cmd) };
-
-        let tail = io_queue.sq_tail;
-        io_queue.sq[tail].write(common_cmd);
-        io_queue.sq_tail += 1;
-        if io_queue.sq_tail >= io_queue.sq.len() {
-            io_queue.sq_tail = 0;
+        if write_buf.is_empty() || write_buf.len() % SECTOR_SIZE != 0 {
+            return Err(DeviceError::InvalidParam);
         }
+        let lba_bytes = 1usize << self.lba_shift;
+        let mut queue = self.io_queues[0].lock();
+        let queue = &mut *queue;
 
-        // write SQ tail doorbell
-        unsafe { write_volatile((dbs + db_offset) as *mut u32, (tail + 1) as u32) }
+        let mut byte_addr = block_id * write_buf.len();
+        let mut done = 0usize;
+        while done < write_buf.len() {
+            let remaining = write_buf.len() - done;
+            let lba = (byte_addr / lba_bytes) as u64;
+            let off = byte_addr % lba_bytes;
 
-        // wait for command complete on io_queue
-        Self::wait_cq_complete(&mut io_queue, "write block")?;
+            let take;
+            if off == 0 && remaining >= lba_bytes {
+                let n = (remaining / lba_bytes).min(queue.data_len / lba_bytes);
+                let io_len = n * lba_bytes;
+                take = io_len;
 
-        // write CQ head doorbell
-        let stride = db_offset / 2;
-        unsafe { write_volatile((dbs + db_offset + stride) as *mut u32, io_queue.cq_head as u32) }
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(queue.data_va as *mut u8, io_len)
+                };
+                dst.copy_from_slice(&write_buf[done..done + io_len]);
+                clflush_range(queue.data_va, io_len);
+                self.io_rw(queue, true, lba, (n - 1) as u16, io_len)?;
+            } else {
+                // Partial LBA update: read-modify-write through the bounce buffer.
+                take = remaining.min(lba_bytes - off);
 
+                clflush_range(queue.data_va, lba_bytes);
+                self.io_rw(queue, false, lba, 0, lba_bytes)?;
+                clflush_range(queue.data_va, lba_bytes);
+
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut((queue.data_va + off) as *mut u8, take)
+                };
+                dst.copy_from_slice(&write_buf[done..done + take]);
+                clflush_range(queue.data_va, lba_bytes);
+                self.io_rw(queue, true, lba, 0, lba_bytes)?;
+            }
+
+            done += take;
+            byte_addr += take;
+        }
         Ok(())
     }
 
     fn flush(&self) -> DeviceResult {
+        let mut queue = self.io_queues[0].lock();
+        let mut cmd = NvmeCommonCommand::new();
+        cmd.opcode = 0x00; // Flush
+        cmd.nsid = 1;
+        Self::submit_sync(
+            self.bar,
+            self.stride,
+            &mut queue,
+            cmd,
+            Self::IO_TIMEOUT_US,
+            "flush",
+        )?;
         Ok(())
     }
 
@@ -463,7 +550,8 @@ impl Scheme for NvmeInterface {
     }
 
     fn handle_irq(&self, irq: usize) {
-        warn!("nvme device irq {}", irq);
+        // Completions are polled; interrupts are masked via INTMS.
+        trace!("nvme device irq {}", irq);
     }
 }
 
@@ -531,7 +619,7 @@ impl NvmeIdentify {
         Self {
             opcode: 0x06,
             flags: 0,
-            command_id: 0x1,
+            command_id: 0,
             nsid: 1,
             rsvd2: [0; 2],
             prp1: 0,
@@ -642,39 +730,13 @@ impl NvmeRWCommand {
     pub fn new_write_command() -> Self {
         Self {
             opcode: 0x01,
-            flags: 0,
-            command_id: 0,
-            nsid: 0,
-            rsvd2: 0,
-            metadata: 0,
-            prp1: 0,
-            prp2: 0,
-            slba: 0,
-            length: 0,
-            control: 0,
-            dsmgmt: 0,
-            reftag: 0,
-            apptag: 0,
-            appmask: 0,
+            ..Default::default()
         }
     }
     pub fn new_read_command() -> Self {
         Self {
             opcode: 0x02,
-            flags: 0,
-            command_id: 0,
-            nsid: 0,
-            rsvd2: 0,
-            metadata: 0,
-            prp1: 0,
-            prp2: 0,
-            slba: 0,
-            length: 0,
-            control: 0,
-            dsmgmt: 0,
-            reftag: 0,
-            apptag: 0,
-            appmask: 0,
+            ..Default::default()
         }
     }
 }
@@ -683,7 +745,6 @@ impl NvmeRWCommand {
 #[derive(Debug, Copy, Clone, Default)]
 pub struct NvmeCompletion {
     pub result: u64,
-    // pub rsvd: u32,
     pub sq_head: u16,
     pub sq_id: u16,
     pub command_id: u16,
