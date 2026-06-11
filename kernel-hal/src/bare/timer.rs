@@ -45,16 +45,11 @@ hal_fn_impl! {
         }
 
         fn timer_tick() {
-            // Every CPU's LAPIC timer lands here; polling the (single) xHCI
-            // controller from all of them just multiplies MMIO traffic and
-            // lock contention by the core count, so only CPU 0 polls.
             #[cfg(all(
                 target_arch = "x86_64",
                 not(feature = "no-pci")
             ))]
-            if crate::cpu::cpu_id() == 0 {
-                zcore_drivers::usb::xhci_hid::poll();
-            }
+            zcore_drivers::usb::xhci_hid::poll();
             NAIVE_TIMER.lock().expire(timer_now());
         }
     }
