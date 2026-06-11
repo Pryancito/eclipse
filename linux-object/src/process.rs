@@ -18,7 +18,7 @@ use core::sync::atomic::AtomicI32;
 use hashbrown::HashMap;
 use kernel_hal::VirtAddr;
 use lock::{Mutex, MutexGuard};
-use rcore_fs::vfs::{FileSystem, INode, Metadata};
+use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
@@ -614,7 +614,15 @@ impl LinuxProcess {
         };
         let granted = Self::access_bits_for(&creds, metadata, use_effective);
         if selected_uid == ROOT_UID {
-            if requested & ACCESS_EXEC != 0 && granted & ACCESS_EXEC == 0 {
+            // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
+            // except executing a non-directory with no exec bit set anywhere
+            // (mode & 0o111 == 0). Directories are always searchable by root;
+            // testing only the others-exec bit here used to lock root out of
+            // 0700 directories (e.g. apk's /lib/apk/exec, breaking triggers).
+            if requested & ACCESS_EXEC != 0
+                && metadata.type_ != FileType::Dir
+                && metadata.mode as u16 & 0o111 == 0
+            {
                 return Err(LxError::EACCES);
             }
             return Ok(());

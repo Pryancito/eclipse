@@ -970,6 +970,10 @@ impl LinuxProcess {
         );
         // hard code special path
         if path == "/proc/self/exe" {
+            if follow {
+                let exe = self.execute_path();
+                return self.lookup_inode_at(FileDesc::CWD, &exe, true);
+            }
             return Ok(Arc::new(Pseudo::new(
                 &self.execute_path(),
                 FileType::SymLink,
@@ -984,6 +988,12 @@ impl LinuxProcess {
         if fd_dir_path == "/proc/self/fd" {
             let fd = FileDesc::try_from(fd_name)?;
             let file = self.get_file(fd)?;
+            if follow {
+                // Magic link: resolve to the open file itself (like Linux),
+                // so execve("/proc/self/fd/N") runs the file, not the
+                // symlink's path text.
+                return Ok(file.inode());
+            }
             return Ok(Arc::new(Pseudo::new(file.path(), FileType::SymLink)));
         }
 
