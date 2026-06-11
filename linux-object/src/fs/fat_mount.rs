@@ -5,6 +5,23 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::min;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Asigna un identificador de dispositivo único a cada FS FAT montado.
+/// Empieza alto para no colisionar con los ids de otros sistemas de archivos.
+static FAT_DEV_COUNTER: AtomicU64 = AtomicU64::new(0xFA70_0000);
+
+/// Hash FNV-1a de 64 bits del path, usado como número de inodo estable.
+/// Evita que dos rutas distintas (o la misma ruta en montajes distintos)
+/// compartan identidad (st_dev, st_ino) y confundan a herramientas como `cp`.
+fn fnv1a_path(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 use fatfs::{FileSystem, FsOptions, IoBase, Read, Seek, SeekFrom, Write};
 use lock::Mutex;
@@ -128,6 +145,8 @@ impl Seek for FatDisk {
 pub struct FatMountFs {
     inner: Mutex<FileSystem<FatDisk>>,
     this: Mutex<Weak<Self>>,
+    /// Identificador de dispositivo único de este montaje (para st_dev).
+    dev: u64,
 }
 
 impl FatMountFs {
@@ -140,6 +159,7 @@ impl FatMountFs {
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
             this: Mutex::new(Weak::new()),
+            dev: FAT_DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         Ok(arc)
@@ -258,8 +278,8 @@ impl INode for FatMountINode {
                 .map_err(|_| FsError::DeviceError)? as usize
         };
         Ok(Metadata {
-            dev: 0,
-            inode: self.path.len(),
+            dev: self.fs.dev as usize,
+            inode: fnv1a_path(&self.path) as usize,
             size,
             blk_size: 512,
             blocks: (size + 511) / 512,
@@ -277,6 +297,16 @@ impl INode for FatMountINode {
             gid: 0,
             rdev: 0,
         })
+    }
+
+    /// FAT no persiste uid/gid/mode; aceptar la llamada como no-op.
+    ///
+    /// `open(O_CREAT)` invoca `set_metadata` justo después de crear el fichero
+    /// (initialize_created_metadata). Con el default del trait (NotSupported →
+    /// ENOSYS) cualquier creación de fichero sobre vfat fallaba con
+    /// "Function not implemented".
+    fn set_metadata(&self, _metadata: &Metadata) -> rcore_fs::vfs::Result<()> {
+        Ok(())
     }
 
     fn find(&self, name: &str) -> rcore_fs::vfs::Result<Arc<dyn INode>> {
@@ -298,10 +328,17 @@ impl INode for FatMountINode {
                 };
                 for entry in dir.iter() {
                     let entry = entry.map_err(|_| FsError::DeviceError)?;
-                    if entry.file_name() == name {
+                    // FAT es case-insensitive: una entrada 8.3 puede estar
+                    // almacenada como "BOOTX64.EFI" y buscarse "BootX64.efi".
+                    // Con comparación exacta el lookup fallaba (EntryNotFound)
+                    // y open(O_CREAT) intentaba re-crear el fichero existente.
+                    let entry_name = entry.file_name();
+                    if entry_name.eq_ignore_ascii_case(name) {
                         return Ok(Arc::new(FatMountINode {
                             fs: self.fs.clone(),
-                            path: self.child_path(name),
+                            // Usar el nombre tal como está en el directorio para
+                            // que open_file/open_dir posteriores lo encuentren.
+                            path: self.child_path(&entry_name),
                             is_dir: entry.is_dir(),
                         }));
                     }

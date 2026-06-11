@@ -2112,12 +2112,66 @@ static int shell_mkdir_p(const char *path, int dry_run) {
 }
 
 static int shell_copy_file(const char *src, const char *dst, int dry_run) {
-    char cmd[2048];
-    /* Use intermediate file in /tmp to prevent 'cp' complaining that src and dst
-     * are the same file, which happens when the source and destination are both
-     * FAT filesystems on some kernels (where device/inode numbers aren't unique). */
-    snprintf(cmd, sizeof(cmd), "sh -c \"cp -f '%s' /tmp/eclipse_copy_temp && cp -f /tmp/eclipse_copy_temp '%s' && rm -f /tmp/eclipse_copy_temp\"", src, dst);
-    return run_command_logged(cmd, dry_run);
+    uint8_t buf[64 * 1024];
+    int in_fd, out_fd;
+    ssize_t nread;
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] copiar %s -> %s" COLOR_RESET, src, dst);
+        return 0;
+    }
+
+    /* Copia nativa (no se usa `cp`): el driver vfat de Eclipse OS reporta el
+     * mismo par (st_dev, st_ino) para distintos montajes, y `cp` aborta con
+     * "are the same file" al comparar identidades. Leer/escribir directamente
+     * evita por completo esa heurística. */
+    in_fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (in_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir origen %s (%s)." COLOR_RESET,
+            src, strerror(errno));
+        return -1;
+    }
+
+    out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear destino %s (%s)." COLOR_RESET,
+            dst, strerror(errno));
+        close(in_fd);
+        return -1;
+    }
+
+    while ((nread = read(in_fd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < nread) {
+            ssize_t nwritten = write(out_fd, buf + off, (size_t)(nread - off));
+            if (nwritten < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
+                    dst, strerror(errno));
+                close(in_fd);
+                close(out_fd);
+                return -1;
+            }
+            off += nwritten;
+        }
+    }
+
+    if (nread < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+            src, strerror(errno));
+        close(in_fd);
+        close(out_fd);
+        return -1;
+    }
+
+    if (fsync(out_fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, dst, strerror(errno));
+    }
+    close(in_fd);
+    close(out_fd);
+    return 0;
 }
 
 static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run) {
@@ -2677,6 +2731,34 @@ static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, 
     return 0;
 }
 
+/* Busca `mountpoint` en /proc/mounts. Devuelve 0 si está montado (copiando el
+ * dispositivo de origen en dev_out, si no es NULL) o -1 si no lo está / no se
+ * pudo leer /proc/mounts. El formato de cada línea es:
+ *   <source> <target> <fstype> <options> 0 0 */
+static int find_mount_device(const char *mountpoint, char *dev_out, size_t dev_size) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    char line[1024];
+    int found = -1;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char src[256];
+        char tgt[256];
+        if (sscanf(line, "%255s %255s", src, tgt) == 2 && strcmp(tgt, mountpoint) == 0) {
+            if (dev_out != NULL && dev_size > 0) {
+                strncpy(dev_out, src, dev_size - 1);
+                dev_out[dev_size - 1] = '\0';
+            }
+            found = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
 static int run_upgrade(const char *disk_path, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
@@ -2740,20 +2822,39 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         src_mnt = UPD_STAGING_MNT;
     }
 
-    if (shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0) {
-        rc = -1;
-        goto cleanup;
+    /* Destino EFI: preferir la ESP que el sistema YA tiene montada en /boot/efi
+     * (p. ej. /dev/sda1). Así evitamos un segundo montaje del MISMO dispositivo
+     * de bloque, que crearía dos instancias FAT con cachés independientes sobre
+     * la misma partición. Si /boot/efi no está montada, la montamos nosotros. */
+    char efi_dest[256];
+    char mounted_dev[256] = "";
+    int efi_we_mounted = 0;
+    if (find_mount_device("/boot/efi", mounted_dev, sizeof(mounted_dev)) == 0) {
+        snprintf(efi_dest, sizeof(efi_dest), "/boot/efi");
+        log(COLOR_GREEN "ESP ya montada en /boot/efi (origen %s); se escribe directamente sin re-montar." COLOR_RESET,
+            mounted_dev[0] ? mounted_dev : efi_dev);
+    } else {
+        if (shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0) {
+            rc = -1;
+            goto cleanup;
+        }
+        if (shell_mount(efi_dev, UPD_EFI_MNT, "vfat", 0, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, efi_dev);
+            rc = -1;
+            goto cleanup;
+        }
+        snprintf(efi_dest, sizeof(efi_dest), "%s", UPD_EFI_MNT);
+        efi_we_mounted = 1;
     }
 
-    if (shell_mount(efi_dev, UPD_EFI_MNT, "vfat", 0, dry_run) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, efi_dev);
-        rc = -1;
-        goto cleanup;
-    }
+    log(COLOR_GREEN "Actualizando bootloader, kernel e initramfs en EFI (copia selectiva, sin dd)..." COLOR_RESET);
 
-    log(COLOR_GREEN "Actualizando bootloader y kernel en EFI (copia selectiva, sin dd)..." COLOR_RESET);
-    if (shell_mkdir_p(UPD_EFI_MNT "/EFI/Boot", dry_run) != 0 ||
-        shell_mkdir_p(UPD_EFI_MNT "/EFI/zCore", dry_run) != 0) {
+    char dst_boot_dir[320], dst_zcore_dir[320];
+    char dst_boot[400], dst_zcore[400], dst_initramfs[400];
+    snprintf(dst_boot_dir, sizeof(dst_boot_dir), "%s/EFI/Boot", efi_dest);
+    snprintf(dst_zcore_dir, sizeof(dst_zcore_dir), "%s/EFI/zCore", efi_dest);
+    if (shell_mkdir_p(dst_boot_dir, dry_run) != 0 ||
+        shell_mkdir_p(dst_zcore_dir, dry_run) != 0) {
         rc = -1;
         goto cleanup_mount;
     }
@@ -2763,19 +2864,26 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/BootX64.efi", src_mnt);
     snprintf(src_zcore, sizeof(src_zcore), "%s/EFI/zCore/zcore.elf", src_mnt);
     snprintf(src_initramfs, sizeof(src_initramfs), "%s/EFI/zCore/initramfs.img", src_mnt);
+    snprintf(dst_boot, sizeof(dst_boot), "%s/EFI/Boot/BootX64.efi", efi_dest);
+    snprintf(dst_zcore, sizeof(dst_zcore), "%s/EFI/zCore/zcore.elf", efi_dest);
+    snprintf(dst_initramfs, sizeof(dst_initramfs), "%s/EFI/zCore/initramfs.img", efi_dest);
 
-    if (copy_upgrade_payload_if_exists(src_boot,
-                                       UPD_EFI_MNT "/EFI/Boot/BootX64.efi", dry_run) != 0 ||
-        copy_upgrade_payload_if_exists(src_zcore,
-                                       UPD_EFI_MNT "/EFI/zCore/zcore.elf", dry_run) != 0) {
+    if (copy_upgrade_payload_if_exists(src_boot, dst_boot, dry_run) != 0 ||
+        copy_upgrade_payload_if_exists(src_zcore, dst_zcore, dry_run) != 0) {
         rc = -1;
         goto cleanup_mount;
     }
-    copy_upgrade_payload_if_exists(src_initramfs,
-                                   UPD_EFI_MNT "/EFI/zCore/initramfs.img", dry_run);
+    copy_upgrade_payload_if_exists(src_initramfs, dst_initramfs, dry_run);
+    if (!dry_run) {
+        sync();
+    }
 
 cleanup_mount:
-    shell_umount(UPD_EFI_MNT, dry_run);
+    /* Solo desmontamos lo que montamos nosotros; la ESP del sistema en /boot/efi
+     * se deja intacta. */
+    if (efi_we_mounted) {
+        shell_umount(UPD_EFI_MNT, dry_run);
+    }
 
 cleanup:
     if (mount_needed) {
@@ -2936,7 +3044,7 @@ int main(int argc, char **argv) {
         }
     } else {
         snprintf(partition_summary, sizeof(partition_summary),
-                 "Actualización selectiva (EFI: boot+kernel)");
+                 "Actualización selectiva (EFI: bootloader + kernel + initramfs)");
     }
 
     log("========================================");
