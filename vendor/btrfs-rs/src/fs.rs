@@ -73,15 +73,22 @@ impl Btrfs {
     // ------------------------------------------------------------------
 
     pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Self> {
-        let vol = Volume::open(dev)?;
+        let mut vol = Volume::open(dev)?;
         let generation = vol.sb.generation();
+        // A non-empty log tree comes from an unclean Linux shutdown. We do
+        // not replay it, and once we modify the filesystem a later Linux
+        // mount must not replay it either: drop it with the first commit.
+        let stale_log = vol.sb.log_root() != 0;
+        if stale_log {
+            vol.sb.set_log_root(0);
+        }
         let mut fs = Self {
             vol,
             roots: RootCache::new(),
             alloc: FreeSpace::default(),
             next_ino: FIRST_FREE_OBJECTID,
             generation,
-            sb_dirty: false,
+            sb_dirty: stale_log,
             clock: None,
         };
         fs.alloc.nodesize = fs.vol.nodesize as u64;
@@ -1199,11 +1206,41 @@ impl Btrfs {
         Ok(want)
     }
 
+    /// Allocate, zero and record one data extent for `[pos, pos+len)`.
+    fn install_data_extent(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        pos: u64,
+        bytenr: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.alloc.note_data_extent(bytenr, len, FS_TREE, ino, pos);
+        let zeros = alloc::vec![0u8; 64 * 1024];
+        let mut z = 0u64;
+        while z < len {
+            let take = zeros.len().min((len - z) as usize);
+            self.vol.write_logical(bytenr + z, &zeros[..take])?;
+            z += take as u64;
+        }
+        let ext = FileExtent::encode_regular(self.generation, bytenr, len, 0, len);
+        {
+            let mut t = self.tree();
+            t.insert(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, pos), &ext)?;
+        }
+        inode.nbytes += len;
+        self.apply_pending()
+    }
+
     /// Make sure the file has allocated extents covering `[0, end)`; newly
     /// allocated space is zeroed on disk. Flips the inode to NODATASUM first
     /// (a structural change invalidates any pre-existing checksums) and
     /// converts inline extents to regular ones.
-    fn ensure_coverage(&mut self, ino: u64, inode: &mut InodeItem, end: u64) -> Result<()> {
+    ///
+    /// Returns the byte offset covered by extents afterwards. On disk-full
+    /// this is smaller than requested (POSIX-style short writes); the
+    /// filesystem stays consistent.
+    fn ensure_coverage(&mut self, ino: u64, inode: &mut InodeItem, end: u64) -> Result<u64> {
         let sector = self.vol.sectorsize as u64;
         let mut target = (end + sector - 1) / sector * sector;
         // Current coverage: end of the last extent.
@@ -1227,10 +1264,29 @@ impl Btrfs {
                 }
             }
         }
-        // Convert an inline extent into regular coverage: stash the data,
-        // drop the inline item, then write the data back below.
-        let mut writeback = None;
         if let Some(inline_len) = inline {
+            // Inline → regular conversion must not lose data on ENOSPC:
+            // reserve the whole replacement up front, and only then drop the
+            // inline item.
+            target = target.max((inline_len as u64 + sector - 1) / sector * sector);
+            let _ = self.ensure_data_space(target);
+            let mut reserved: Vec<(u64, u64)> = Vec::new();
+            let mut got_total = 0u64;
+            while got_total < target {
+                match self.alloc.alloc_data(target - got_total) {
+                    Ok((bytenr, got)) => {
+                        reserved.push((bytenr, got));
+                        got_total += got;
+                    }
+                    Err(Error::NoSpace) => {
+                        for (bytenr, got) in reserved {
+                            self.alloc.unreserve_data(bytenr, got)?;
+                        }
+                        return Err(Error::NoSpace);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             let mut data = alloc::vec![0u8; inline_len];
             self.read(ino, 0, &mut data)?;
             {
@@ -1238,43 +1294,36 @@ impl Btrfs {
                 t.delete(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, 0))?;
             }
             inode.nbytes = 0;
-            covered = 0;
-            target = target.max((inline_len as u64 + sector - 1) / sector * sector);
-            writeback = Some(data);
-        }
-        if covered >= target && writeback.is_none() {
-            return Ok(());
-        }
-        self.set_nodatasum(ino, inode)?;
-        self.ensure_data_space(target.saturating_sub(covered))?;
-        let zeros = alloc::vec![0u8; 64 * 1024];
-        let mut pos = covered;
-        while pos < target {
-            let (bytenr, got) = self.alloc.alloc_data(target - pos)?;
-            self.alloc
-                .note_data_extent(bytenr, got, FS_TREE, ino, pos);
-            // Zero the freshly allocated region.
-            let mut z = 0u64;
-            while z < got {
-                let take = zeros.len().min((got - z) as usize);
-                self.vol.write_logical(bytenr + z, &zeros[..take])?;
-                z += take as u64;
+            self.set_nodatasum(ino, inode)?;
+            let mut pos = 0u64;
+            for (bytenr, got) in reserved {
+                self.install_data_extent(ino, inode, pos, bytenr, got)?;
+                pos += got;
             }
-            let ext = FileExtent::encode_regular(self.generation, bytenr, got, 0, got);
-            {
-                let mut t = self.tree();
-                t.insert(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, pos), &ext)?;
-            }
-            inode.nbytes += got;
-            pos += got;
-            self.apply_pending()?;
-        }
-        if let Some(data) = writeback {
             if !data.is_empty() {
                 self.write_extents(ino, 0, &data)?;
             }
+            return Ok(pos);
         }
-        Ok(())
+        if covered >= target {
+            return Ok(covered);
+        }
+        self.set_nodatasum(ino, inode)?;
+        let _ = self.ensure_data_space(target.saturating_sub(covered));
+        let mut pos = covered;
+        while pos < target {
+            match self.alloc.alloc_data(target - pos) {
+                Ok((bytenr, got)) => {
+                    self.install_data_extent(ino, inode, pos, bytenr, got)?;
+                    pos += got;
+                }
+                // Disk full: report how far we got; the file stays
+                // consistent (extents are contiguous from 0 to `pos`).
+                Err(Error::NoSpace) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pos)
     }
 
     /// Set NODATASUM/NODATACOW on the inode, dropping any stale checksums.
@@ -1353,17 +1402,33 @@ impl Btrfs {
             self.set_nodatasum(ino, &mut inode)?;
             self.write_inode(ino, &inode)?;
         }
-        self.ensure_coverage(ino, &mut inode, end)?;
-        self.write_extents(ino, offset, data)?;
-        if end > inode.size {
-            inode.size = end;
+        let covered = match self.ensure_coverage(ino, &mut inode, end) {
+            Ok(covered) => covered,
+            Err(e) => {
+                // Keep nbytes consistent with whatever extents were added.
+                let _ = self.write_inode(ino, &inode);
+                let _ = self.commit(false);
+                return Err(e);
+            }
+        };
+        // Disk-full can leave the coverage short: do a POSIX-style partial
+        // write of the covered prefix.
+        let write_end = end.min(covered);
+        if write_end <= offset {
+            self.write_inode(ino, &inode)?;
+            self.commit(false)?;
+            return Err(Error::NoSpace);
+        }
+        self.write_extents(ino, offset, &data[..(write_end - offset) as usize])?;
+        if write_end > inode.size {
+            inode.size = write_end;
         }
         let now = self.now();
         inode.mtime = now;
         inode.ctime = now;
         self.write_inode(ino, &inode)?;
         self.commit(false)?;
-        Ok(data.len())
+        Ok((write_end - offset) as usize)
     }
 
     pub fn truncate(&mut self, ino: u64, new_size: u64) -> Result<()> {

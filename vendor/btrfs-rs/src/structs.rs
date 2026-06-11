@@ -1026,6 +1026,9 @@ impl Superblock {
     pub fn log_root(&self) -> u64 {
         get_u64(&self.raw, sb::OFF_LOG_ROOT)
     }
+    pub fn set_log_root(&mut self, v: u64) {
+        put_u64(&mut self.raw, sb::OFF_LOG_ROOT, v)
+    }
     pub fn num_devices(&self) -> u64 {
         get_u64(&self.raw, sb::OFF_NUM_DEVICES)
     }

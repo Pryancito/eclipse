@@ -305,3 +305,117 @@ fn grow_to_device_size() {
     check(&path);
     fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn stress_random_ops() {
+    if !have_progs() {
+        eprintln!("btrfs-progs not available; skipping");
+        return;
+    }
+    let path = tmpfile("stress", 128 * 1024 * 1024);
+    let dev = open_dev(&path);
+    mkfs::format(&*dev, &opts()).unwrap();
+    let mut fs = Btrfs::mount(dev).unwrap();
+    let root = fs.root_ino();
+
+    // Simple LCG for reproducible pseudo-random decisions.
+    let mut seed = 0xdead_beef_u64;
+    let mut rng = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+
+    // live[i] = (dir_ino, name, ino)
+    let mut live: Vec<(u64, String, u64)> = Vec::new();
+    let mut dirs: Vec<u64> = vec![root];
+    let mut counter = 0usize;
+
+    for step in 0..4000 {
+        match rng() % 10 {
+            0 | 1 => {
+                // mkdir
+                let parent = dirs[rng() % dirs.len()];
+                let name = format!("d{}", counter);
+                counter += 1;
+                let ino = fs.create(parent, &name, FileKind::Dir, 0o755, 0).unwrap();
+                dirs.push(ino);
+                live.push((parent, name, ino));
+            }
+            2..=5 => {
+                // create file + write random-sized data
+                let parent = dirs[rng() % dirs.len()];
+                let name = format!("f{}", counter);
+                counter += 1;
+                let ino = fs
+                    .create(parent, &name, FileKind::Regular, 0o644, 0)
+                    .unwrap();
+                let size = rng() % 200_000;
+                let data: Vec<u8> = (0..size).map(|i| (i ^ step) as u8).collect();
+                let mut off = 0u64;
+                'chunks: for chunk in data.chunks(33333) {
+                    // Disk-full is expected near the end of the run; the
+                    // filesystem must stay consistent through it.
+                    match fs.write(ino, off, chunk) {
+                        Ok(n) => {
+                            off += n as u64;
+                            if n < chunk.len() {
+                                break 'chunks;
+                            }
+                        }
+                        Err(btrfs::Error::NoSpace) => break 'chunks,
+                        Err(e) => panic!("write: {:?}", e),
+                    }
+                }
+                live.push((parent, name, ino));
+            }
+            6 => {
+                // symlink
+                let parent = dirs[rng() % dirs.len()];
+                let name = format!("s{}", counter);
+                counter += 1;
+                let ino = fs.symlink(parent, &name, b"../some/target").unwrap();
+                live.push((parent, name, ino));
+            }
+            7 => {
+                // truncate a random file
+                if let Some(&(_, _, ino)) = live.get(rng() % live.len().max(1)) {
+                    let st = fs.stat(ino).unwrap();
+                    if st.kind == FileKind::Regular {
+                        fs.truncate(ino, (rng() % 300_000) as u64).unwrap();
+                    }
+                }
+            }
+            8 => {
+                // unlink a random non-dir entry
+                if !live.is_empty() {
+                    let i = rng() % live.len();
+                    let (parent, name, ino) = live[i].clone();
+                    let st = fs.stat(ino).unwrap();
+                    if st.kind != FileKind::Dir {
+                        fs.unlink(parent, &name).unwrap();
+                        live.remove(i);
+                    }
+                }
+            }
+            _ => {
+                // rename into another directory
+                if !live.is_empty() {
+                    let i = rng() % live.len();
+                    let (parent, name, ino) = live[i].clone();
+                    let st = fs.stat(ino).unwrap();
+                    if st.kind != FileKind::Dir {
+                        let new_parent = dirs[rng() % dirs.len()];
+                        let new_name = format!("r{}", counter);
+                        counter += 1;
+                        fs.rename(parent, &name, new_parent, &new_name).unwrap();
+                        live[i] = (new_parent, new_name, ino);
+                    }
+                }
+            }
+        }
+    }
+    fs.sync().unwrap();
+    drop(fs);
+    check(&path);
+    fs::remove_file(&path).unwrap();
+}

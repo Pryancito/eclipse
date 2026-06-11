@@ -220,6 +220,13 @@ impl FreeSpace {
         Ok((start, len))
     }
 
+    /// Return a just-allocated (but not yet recorded) data range to the free
+    /// pool — used to back out of multi-extent reservations on ENOSPC.
+    pub fn unreserve_data(&mut self, bytenr: u64, len: u64) -> Result<()> {
+        self.free.insert(bytenr, len);
+        self.account(bytenr, len, -1)
+    }
+
     pub fn note_data_extent(&mut self, bytenr: u64, len: u64, root: u64, objectid: u64, offset: u64) {
         self.pending.push(PendingOp::AddData {
             bytenr,
