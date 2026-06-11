@@ -1755,10 +1755,17 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     gzFile gz;
     int out_fd;
     size_t total = 0;
+    off_t file_size = 0;
+    int last_pct = -1;
 
     if (dry_run) {
         log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s" COLOR_RESET, gz_path, out_path);
         return 0;
+    }
+
+    struct stat st;
+    if (stat(gz_path, &st) == 0) {
+        file_size = st.st_size;
     }
 
     gz = gzopen(gz_path, "rb");
@@ -1778,6 +1785,10 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     for (;;) {
         int nread = gzread(gz, buf, sizeof(buf));
         if (nread < 0) {
+            if (last_pct >= 0) {
+                fprintf(stdout, "\r\x1b[K");
+                fflush(stdout);
+            }
             log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
                 gz_path, gzerror(gz, NULL));
             close(out_fd);
@@ -1790,6 +1801,10 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
 
         ssize_t nwritten = write(out_fd, buf, (size_t)nread);
         if (nwritten < 0 || (size_t)nwritten != (size_t)nread) {
+            if (last_pct >= 0) {
+                fprintf(stdout, "\r\x1b[K");
+                fflush(stdout);
+            }
             log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
                 out_path, strerror(errno));
             close(out_fd);
@@ -1797,6 +1812,26 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
             return -1;
         }
         total += (size_t)nread;
+
+        if (file_size > 0) {
+            z_off_t curr = gzoffset(gz);
+            if (curr >= 0) {
+                int pct = (int)((curr * 100) / file_size);
+                if (pct > 100) {
+                    pct = 100;
+                }
+                if (pct > last_pct) {
+                    fprintf(stdout, "\rDescomprimiendo %s: %d%%...", disk_basename(gz_path), pct);
+                    fflush(stdout);
+                    last_pct = pct;
+                }
+            }
+        }
+    }
+
+    if (last_pct >= 0) {
+        fprintf(stdout, "\r\x1b[K");
+        fflush(stdout);
     }
 
     if (fsync(out_fd) != 0) {
