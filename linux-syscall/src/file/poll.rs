@@ -188,7 +188,7 @@ impl Syscall<'_> {
         let timeout_msecs = if timeout.is_null() {
             -1
         } else {
-            let timeout = timeout.read().unwrap();
+            let timeout = timeout.read()?;
             info!("sys_ppoll: timeout: {:?}", timeout);
             timeout.to_msec() as isize
         };
@@ -243,12 +243,30 @@ impl Syscall<'_> {
         };
         let begin_time = mono_now();
 
+        // The select set membership (`origin`) does not change while the future
+        // is being polled, so whether we need to pump the network / interactive
+        // I/O is invariant. Compute it once here instead of on every wakeup.
+        let watch_net = (0..nfds).any(|fd| {
+            fd >= linux_object::net::SOCKET_FD
+                && (read_fds.contains(FileDesc::from(fd))
+                    || write_fds.contains(FileDesc::from(fd))
+                    || err_fds.contains(FileDesc::from(fd)))
+        });
+        let watch_interactive = (0..nfds).any(|fd| {
+            linux_object::net::fd_is_interactive(FileDesc::from(fd))
+                && (read_fds.contains(FileDesc::from(fd))
+                    || write_fds.contains(FileDesc::from(fd))
+                    || err_fds.contains(FileDesc::from(fd)))
+        });
+
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SelectFuture<'a> {
             read_fds: &'a mut FdSet,
             write_fds: &'a mut FdSet,
             err_fds: &'a mut FdSet,
             nfds: usize,
+            watch_net: bool,
+            watch_interactive: bool,
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
@@ -262,18 +280,8 @@ impl Syscall<'_> {
                 if let Err(e) = linux_object::process::check_signals() {
                     return Poll::Ready(Err(e));
                 }
-                let watch_net = (0..self.nfds).any(|fd| {
-                    fd >= linux_object::net::SOCKET_FD
-                        && (self.read_fds.contains(FileDesc::from(fd))
-                            || self.write_fds.contains(FileDesc::from(fd))
-                            || self.err_fds.contains(FileDesc::from(fd)))
-                });
-                let watch_interactive = (0..self.nfds).any(|fd| {
-                    linux_object::net::fd_is_interactive(FileDesc::from(fd))
-                        && (self.read_fds.contains(FileDesc::from(fd))
-                            || self.write_fds.contains(FileDesc::from(fd))
-                            || self.err_fds.contains(FileDesc::from(fd)))
-                });
+                let watch_net = self.watch_net;
+                let watch_interactive = self.watch_interactive;
                 if self.io_armed {
                     arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                 }
@@ -281,13 +289,20 @@ impl Syscall<'_> {
                 let files = self.syscall.linux_process().get_files()?;
 
                 let mut events = 0;
-                for (&fd, file_like) in files.iter() {
+                // Iterate only the fds in the select set instead of every open
+                // fd in the process.
+                for fd in 0..self.nfds {
+                    let fd = FileDesc::from(fd);
                     if !self.err_fds.contains(fd)
                         && !self.read_fds.contains(fd)
                         && !self.write_fds.contains(fd)
                     {
                         continue;
                     }
+                    let file_like = match files.get(&fd) {
+                        Some(f) => f,
+                        None => continue,
+                    };
                     let mut fut = Box::pin(file_like.async_poll(PollEvents::all()));
                     let status = match fut.as_mut().poll(cx) {
                         Poll::Ready(Ok(ret)) => ret,
@@ -310,6 +325,10 @@ impl Syscall<'_> {
 
                 // some event happens, so evoke the process
                 if events > 0 {
+                    // Flush the ready bitmaps to user space once.
+                    self.read_fds.commit();
+                    self.write_fds.commit();
+                    self.err_fds.commit();
                     return Poll::Ready(Ok(events));
                 }
 
@@ -341,6 +360,8 @@ impl Syscall<'_> {
             write_fds: &mut write_fds,
             err_fds: &mut err_fds,
             nfds,
+            watch_net,
+            watch_interactive,
             timeout_msecs,
             begin_time,
             syscall: self,
@@ -458,17 +479,26 @@ impl FdSet {
         }
     }
 
-    /// Try to set fd in `FdSet`
-    /// Return true when `FdSet` is valid, and false when `FdSet` is bad (i.e. null pointer)
+    /// Mark `fd` as ready in this `FdSet`.
+    ///
+    /// This only updates the in-memory bitmap; the result is flushed to user
+    /// space once via [`commit`](Self::commit) instead of rewriting the whole
+    /// bit buffer on every ready fd.
     /// Fd should be less than nfds
-    fn set(&mut self, fd: FileDesc) -> bool {
+    fn set(&mut self, fd: FileDesc) {
         let fd: usize = fd.into();
-        if self.ready.is_empty() {
-            return false;
+        if fd < self.ready.len() {
+            self.ready.set(fd, true);
         }
-        self.ready.set(fd, true);
+    }
+
+    /// Write the ready bitmap back to user memory once.
+    fn commit(&mut self) {
+        if self.ready.is_empty() {
+            return;
+        }
         let vec: Vec<u32> = self.ready.clone().into();
-        self.addr.write_array(&vec).is_ok()
+        let _ = self.addr.write_array(&vec);
     }
 
     /// Check to see whether `fd` is in original `FdSet`

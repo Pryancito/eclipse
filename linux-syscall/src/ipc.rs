@@ -105,14 +105,20 @@ impl Syscall<'_> {
         for &SemBuf { num, op, flags } in ops {
             let flags = SemFlags::from_bits_truncate(flags);
             if flags.contains(SemFlags::IPC_NOWAIT) {
-                unimplemented!("Semaphore: semop.IPC_NOWAIT");
+                warn!("Semaphore: semop.IPC_NOWAIT unsupported");
+                return Err(LxError::ENOSYS);
             }
-            let sem = &sem_array[num as usize];
+            // `num` is user-controlled; bounds-check it instead of letting the
+            // `Index` impl panic.
+            let sem = sem_array.get_sem(num as usize).ok_or(LxError::EFBIG)?;
 
             match op {
                 1 => sem.release(),
                 -1 => sem.acquire().await?,
-                _ => unimplemented!("Semaphore: semop.(Not 1/-1)"),
+                _ => {
+                    warn!("Semaphore: semop op {} unsupported", op);
+                    return Err(LxError::ENOSYS);
+                }
             }
             sem.set_pid(self.zircon_process().id() as usize);
             if flags.contains(SemFlags::SEM_UNDO) {
@@ -170,7 +176,9 @@ impl Syscall<'_> {
                 Ok(0)
             }
             _ => {
-                let sem = &sem_array[num as usize];
+                // `num` is user-controlled; bounds-check it instead of letting
+                // the `Index` impl panic.
+                let sem = sem_array.get_sem(num).ok_or(LxError::EINVAL)?;
                 match cmd {
                     SemctlCmds::GETPID => Ok(sem.get_pid()),
                     SemctlCmds::GETVAL => Ok(sem.get() as usize),
@@ -182,7 +190,10 @@ impl Syscall<'_> {
                         sem_array.ctime();
                         Ok(0)
                     }
-                    _ => unimplemented!("Semaphore Semctl cmd: {:?}", cmd),
+                    _ => {
+                        warn!("unsupported semctl cmd: {:?}", cmd);
+                        Err(LxError::EINVAL)
+                    }
                 }
             }
         }
@@ -315,7 +326,10 @@ impl Syscall<'_> {
                 buffer.write(ShmInfo::default())?;
                 Ok(0)
             }
-            _ => unimplemented!("Semaphore Semctl cmd: {:?}", cmd),
+            _ => {
+                warn!("unsupported shmctl cmd: {:?}", cmd);
+                Err(LxError::EINVAL)
+            }
         }
     }
 }

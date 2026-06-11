@@ -121,7 +121,10 @@ impl ShmGuard {
     pub fn detach(&self, pid: u32) {
         let mut ds = self.shmid_ds.lock();
         ds.dtime = TimeSpec::now().sec;
-        ds.nattch -= 1;
+        // Guard against underflow if detach is called without a matching
+        // attach, which would otherwise wrap `nattch` to a huge value and
+        // prevent the segment from ever being cleaned up.
+        ds.nattch = ds.nattch.saturating_sub(1);
         ds.lpid = pid;
     }
 

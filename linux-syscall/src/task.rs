@@ -269,7 +269,10 @@ impl Syscall<'_> {
             -1 => WaitTarget::AnyChild,
             0 => WaitTarget::AnyChildInGroup,
             p if p > 0 => WaitTarget::Pid(p as KoID),
-            _ => unimplemented!(),
+            // pid < -1 means "any child in process group |pid|". Process groups
+            // are not tracked here, so fall back to waiting on any child rather
+            // than panicking the kernel on user-controlled input.
+            _ => WaitTarget::AnyChildInGroup,
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);

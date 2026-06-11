@@ -111,8 +111,9 @@ impl CurrentThreadExt for CurrentThread {
                     if !is_handle_write_pagefault {
                         clear_child_tid.write(0).unwrap();
                         let uaddr = clear_child_tid.as_addr();
-                        let futex = self.proc().linux().get_futex(uaddr);
-                        futex.wake(1);
+                        if let Some(futex) = self.proc().linux().get_futex(uaddr) {
+                            futex.wake(1);
+                        }
                     }
                 }
             }
@@ -120,8 +121,9 @@ impl CurrentThreadExt for CurrentThread {
             {
                 clear_child_tid.write(0).unwrap();
                 let uaddr = clear_child_tid.as_addr();
-                let futex = self.proc().linux().get_futex(uaddr);
-                futex.wake(1);
+                if let Some(futex) = self.proc().linux().get_futex(uaddr) {
+                    futex.wake(1);
+                }
             }
         }
         self.exit();

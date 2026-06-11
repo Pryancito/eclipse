@@ -181,7 +181,7 @@ impl Syscall<'_> {
                 const LOCK_UN = 8;
             }
         }
-        let operation = Operation::from_bits(operation as u8).unwrap();
+        let operation = Operation::from_bits(operation as u8).ok_or(LxError::EINVAL)?;
         info!("flock: fd: {:?}, operation: {:?}", fd, operation);
         let proc = self.linux_process();
 

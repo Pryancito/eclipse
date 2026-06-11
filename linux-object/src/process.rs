@@ -375,17 +375,26 @@ impl LinuxProcess {
     }
 
     /// Get futex object.
+    ///
+    /// Returns `None` if `uaddr` is null or not aligned for an `AtomicI32`;
+    /// dereferencing such an address would otherwise fault or be undefined
+    /// behaviour.
     #[allow(unsafe_code)]
-    pub fn get_futex(&self, uaddr: VirtAddr) -> Arc<Futex> {
+    pub fn get_futex(&self, uaddr: VirtAddr) -> Option<Arc<Futex>> {
+        if uaddr == 0 || uaddr % core::mem::align_of::<AtomicI32>() != 0 {
+            return None;
+        }
         let mut inner = self.inner.lock();
-        inner
-            .futexes
-            .entry(uaddr)
-            .or_insert_with(|| {
-                let value = unsafe { &*(uaddr as *const AtomicI32) };
-                Futex::new(value)
-            })
-            .clone()
+        Some(
+            inner
+                .futexes
+                .entry(uaddr)
+                .or_insert_with(|| {
+                    let value = unsafe { &*(uaddr as *const AtomicI32) };
+                    Futex::new(value)
+                })
+                .clone(),
+        )
     }
 
     /// Get lowest free fd

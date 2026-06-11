@@ -40,6 +40,23 @@ impl Index<usize> for SemArray {
     }
 }
 
+impl SemArray {
+    /// Number of semaphores in the set.
+    pub fn len(&self) -> usize {
+        self.sems.len()
+    }
+
+    /// Returns `true` if the set contains no semaphores.
+    pub fn is_empty(&self) -> bool {
+        self.sems.is_empty()
+    }
+
+    /// Returns the semaphore at `idx`, or `None` if out of range.
+    pub fn get_sem(&self, idx: usize) -> Option<&Semaphore> {
+        self.sems.get(idx)
+    }
+}
+
 lazy_static! {
     static ref KEY2SEM: RwLock<BTreeMap<u32, Weak<SemArray>>> = RwLock::new(BTreeMap::new());
 }

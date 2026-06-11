@@ -157,11 +157,22 @@ impl File {
     /// seek from given type and offset
     pub fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
         let mut inner = self.inner.write();
-        inner.offset = match pos {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::End(offset) => (inner.inode.metadata()?.size as i64 + offset) as u64,
-            SeekFrom::Current(offset) => (inner.offset as i64 + offset) as u64,
+        // Compute the new offset with checked arithmetic and reject results
+        // that would be negative; otherwise a negative relative seek would wrap
+        // to a huge `u64` and let later reads/writes use an out-of-range offset.
+        let new_offset: i64 = match pos {
+            SeekFrom::Start(offset) => offset as i64,
+            SeekFrom::End(offset) => (inner.inode.metadata()?.size as i64)
+                .checked_add(offset)
+                .ok_or(LxError::EINVAL)?,
+            SeekFrom::Current(offset) => (inner.offset as i64)
+                .checked_add(offset)
+                .ok_or(LxError::EINVAL)?,
         };
+        if new_offset < 0 {
+            return Err(LxError::EINVAL);
+        }
+        inner.offset = new_offset as u64;
         Ok(inner.offset)
     }
 
