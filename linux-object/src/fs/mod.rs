@@ -1,6 +1,7 @@
 //! Linux file objects
 
 mod block_mount;
+mod btrfs_mount;
 mod devfs;
 mod ext2_editor;
 mod ext2_mount;
@@ -94,8 +95,9 @@ fn boot_mount_state() -> Arc<mount_state::MountState> {
     Arc::new(mount_state::MountState::new(false))
 }
 
-/// Resolve a top-level mount directory on the pivoted ext2 root without
-/// `MNode::find` overlay/metadata overhead (VBox disk boot).
+/// Resolve a top-level mount directory on the pivoted block-device root
+/// (btrfs/ext2) without `MNode::find` overlay/metadata overhead (VBox disk
+/// boot).
 fn boot_resolve_mount_dir(
     rootfs: &Arc<MountFS>,
     root: &Arc<MNode>,
@@ -119,7 +121,7 @@ fn resolve_mount_dir(
     name: &str,
     mode: u32,
 ) -> Arc<MNode> {
-    if root_fstype == "ext2" {
+    if root_fstype == "ext2" || root_fstype == "btrfs" {
         boot_resolve_mount_dir(rootfs, root, name, mode)
     } else {
         root.find(true, name).unwrap_or_else(|_| {
@@ -286,8 +288,9 @@ impl From<FileDesc> for i32 {
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     warn!("[boot] create_root_fs: begin");
     // Filesystem from the boot medium (initrd / SFS). We use it to read the boot
-    // `/etc/fstab` and, when an installed ext2 ROOT partition is detected, to
-    // pivot the real root onto it (similar to an initramfs `switch_root`).
+    // `/etc/fstab` and, when an installed btrfs/ext2 ROOT partition is
+    // detected, to pivot the real root onto it (similar to an initramfs
+    // `switch_root`).
     let boot_mountfs = MountFS::new(rootfs);
     let boot_root = boot_mountfs.mountpoint_root_inode();
 
@@ -452,17 +455,17 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     }
 
     // Decide the real root filesystem: pivot from the boot medium onto an
-    // installed ext2 ROOT partition when one is available, otherwise keep the
-    // boot medium as `/`.
+    // installed btrfs/ext2 ROOT partition when one is available, otherwise
+    // keep the boot medium as `/`.
     warn!(
         "[boot] create_root_fs: determine_real_root ({} candidate(s))",
         block_candidates.len()
     );
     let (rootfs, root_source, root_fstype) =
         match determine_real_root(&boot_root, &block_candidates) {
-            Some((fs, source)) => {
-                warn!("[boot] create_root_fs: pivot onto {} (ext2)", source);
-                (MountFS::new(fs), source, "ext2")
+            Some((fs, source, fstype)) => {
+                warn!("[boot] create_root_fs: pivot onto {} ({})", source, fstype);
+                (MountFS::new(fs), source, fstype)
             }
             None => {
                 warn!("[boot] create_root_fs: keep boot medium as /");
@@ -503,10 +506,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", boot_mount_state());
     }
 
-    // Ensure /var/run exists. Skip while pivoting onto an installed ext2 root:
-    // scanning /var during early boot has stalled some VBox/VDI setups, and /run
-    // is already a dedicated tmpfs mount above.
-    if root_fstype != "ext2" {
+    // Ensure /var/run exists. Skip while pivoting onto an installed block
+    // root (btrfs/ext2): scanning /var during early boot has stalled some
+    // VBox/VDI setups, and /run is already a dedicated tmpfs mount above.
+    if root_fstype != "ext2" && root_fstype != "btrfs" {
         if let Ok(var) = root.find(true, "var") {
             if var.find(true, "run").is_err() {
                 var.create("run", FileType::Dir, 0o755).ok();
@@ -552,17 +555,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 }
 
 /// Choose the real root filesystem, pivoting from the boot medium onto an
-/// installed ext2 ROOT partition when one is available.
+/// installed btrfs (or legacy ext2) ROOT partition when one is available.
 ///
 /// Resolution order:
 /// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) when it
-///    resolves to a real ext2 device — a deterministic, explicit pivot.
+///    resolves to a real btrfs/ext2 device — a deterministic, explicit pivot.
 /// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
 ///    real, resolvable device.
-/// 3. Auto-detection: the first partition block device that passes the ext2
-///    superblock probe and mounts cleanly (typically `/dev/sda2` on an AHCI
-///    install with EFI on `sda1`).  We intentionally avoid walking installed
-///    root directories here — that has stalled some VBox/VDI setups.
+/// 3. Auto-detection: the first partition block device that passes the btrfs
+///    or ext2 superblock probe and mounts cleanly (typically `/dev/sda2` on an
+///    AHCI install with EFI on `sda1`).  We intentionally avoid walking
+///    installed root directories here — that has stalled some VBox/VDI
+///    setups.
 ///
 /// An unresolved `ROOT=` (for instance the unpatched placeholder baked into a
 /// live medium's `rboot.conf`) is ignored and we fall through to auto-detection
@@ -573,16 +577,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 fn determine_real_root(
     boot_root: &Arc<MNode>,
     candidates: &[(String, Arc<dyn INode>)],
-) -> Option<(Arc<dyn FileSystem>, String)> {
-    // 1. An explicit `ROOT=<dev>` that resolves to a real ext2 device wins.
+) -> Option<(Arc<dyn FileSystem>, String, &'static str)> {
+    // 1. An explicit `ROOT=<dev>` that resolves to a real device wins.
     let cmdline = kernel_hal::boot::cmdline();
     if let Some(dev) = parse_root_cmdline(&cmdline) {
         if let Some(inode) = lookup_candidate(candidates, dev) {
-            if let Some(fs) = open_ext2_root(inode) {
-                info!("create_root_fs: root via ROOT={}", dev);
-                return Some((fs, String::from(dev)));
+            if let Some((fs, fstype)) = open_block_root(inode) {
+                info!("create_root_fs: root via ROOT={} ({})", dev, fstype);
+                return Some((fs, String::from(dev), fstype));
             }
-            warn!("create_root_fs: ROOT={} no es un ext2 montable", dev);
+            warn!("create_root_fs: ROOT={} no es un btrfs/ext2 montable", dev);
         } else {
             info!(
                 "create_root_fs: ROOT={} sin resolver; se intenta fstab/auto-detección",
@@ -597,12 +601,13 @@ fn determine_real_root(
         return Some(res);
     }
 
-    // 3. First mountable ext2 partition (vfat EFI on sda1 fails the probe).
-    for (name, inode) in ext2_mount_candidates(candidates) {
+    // 3. First mountable btrfs/ext2 partition (vfat EFI on sda1 fails the
+    //    probes).
+    for (name, inode) in root_mount_candidates(candidates) {
         warn!("[boot] determine_real_root: probe /dev/{}", name);
-        if let Some(fs) = open_ext2_root(inode.clone()) {
-            warn!("[boot] determine_real_root: pivot /dev/{}", name);
-            return Some((fs, format!("/dev/{}", name)));
+        if let Some((fs, fstype)) = open_block_root(inode.clone()) {
+            warn!("[boot] determine_real_root: pivot /dev/{} ({})", name, fstype);
+            return Some((fs, format!("/dev/{}", name), fstype));
         }
     }
     None
@@ -634,7 +639,7 @@ fn is_partition_candidate(name: &str) -> bool {
 
 /// Prefer partition devices when GPT/MBR children exist; probing whole disks is
 /// slow and often matches garbage superblocks on protective-MBR layouts.
-fn ext2_mount_candidates<'a>(
+fn root_mount_candidates<'a>(
     candidates: &'a [(String, Arc<dyn INode>)],
 ) -> impl Iterator<Item = &'a (String, Arc<dyn INode>)> {
     let prefer_partitions = candidates
@@ -658,23 +663,40 @@ fn lookup_candidate(
         .map(|(_, i)| i.clone())
 }
 
-/// Open a block-device inode as an ext2 filesystem, if possible.
-fn open_ext2_root(inode: Arc<dyn INode>) -> Option<Arc<dyn FileSystem>> {
-    let backend = block_mount::MountBackend::from_inode(inode).ok()?;
+/// Open a block-device inode as a btrfs (preferred) or ext2 filesystem, if
+/// possible. Returns the filesystem together with its fstype name.
+fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'static str)> {
+    let backend = block_mount::MountBackend::from_inode(inode.clone()).ok()?;
     if let block_mount::MountBackend::Block(block) = &backend {
+        if btrfs_mount::probe_btrfs_superblock(block) {
+            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs") {
+                return Some((fs, "btrfs"));
+            }
+            return None;
+        }
         if !block_mount::probe_ext2_superblock(block) {
             return None;
         }
+        let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+        return Some((fs, "ext2"));
     }
-    mount_ops::open_filesystem(backend, "ext2").ok()
+    // File-backed (loop) roots: try btrfs, then ext2.
+    match mount_ops::open_filesystem(backend, "btrfs") {
+        Ok(fs) => Some((fs, "btrfs")),
+        Err(_) => {
+            let backend = block_mount::MountBackend::from_inode(inode).ok()?;
+            let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+            Some((fs, "ext2"))
+        }
+    }
 }
 
-/// Open the ext2 root declared by the `/` entry of the boot medium's fstab,
-/// when that entry names a real, resolvable device.
+/// Open the root declared by the `/` entry of the boot medium's fstab, when
+/// that entry names a real, resolvable device.
 fn root_fs_from_fstab(
     boot_root: &Arc<MNode>,
     candidates: &[(String, Arc<dyn INode>)],
-) -> Option<(Arc<dyn FileSystem>, String)> {
+) -> Option<(Arc<dyn FileSystem>, String, &'static str)> {
     let etc = boot_root.find(true, "etc").ok()?;
     let fstab = etc.find(true, "fstab").ok()?;
     let fstab_dyn: Arc<dyn INode> = fstab;
@@ -689,13 +711,14 @@ fn root_fs_from_fstab(
         if parts.len() < 3 || parts[1] != "/" {
             continue;
         }
-        // Only ext-family roots can be mounted here; bail out otherwise.
-        if mount_ops::parse_fstype(parts[2]).ok()? != "ext2" {
+        // Only block-device roots (btrfs/ext-family) can be mounted here.
+        let fstype = mount_ops::parse_fstype(parts[2]).ok()?;
+        if fstype != "btrfs" && fstype != "ext2" {
             return None;
         }
         let inode = lookup_candidate(candidates, parts[0])?;
-        let fs = open_ext2_root(inode)?;
-        return Some((fs, String::from(parts[0])));
+        let (fs, fstype) = open_block_root(inode)?;
+        return Some((fs, String::from(parts[0]), fstype));
     }
     None
 }

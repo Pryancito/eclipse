@@ -12,7 +12,7 @@ members = [
     "xtask",
 ]
 default-members = ["xtask"]
-exclude = ["zircon-user", "rboot"]
+exclude = ["zircon-user", "rboot", "vendor/btrfs-rs"]
 
 [profile.release]
 lto = true

@@ -26,6 +26,7 @@ rcore-fs-sfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 rcore-fs-ramfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 rcore-fs-mountfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 ext2 = { path = "../vendor/ext2-rs" }
+btrfs = { path = "../vendor/btrfs-rs" }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn", "log_level_warn"] }
 spin = "0.9"
 rcore-fs-devfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }

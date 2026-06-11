@@ -1,3 +1,4 @@
+mod btrfs_image;
 mod image;
 mod opencv;
 mod test;
@@ -33,7 +34,7 @@ impl LinuxRootfs {
             let bin = dir.join("bin");
             // Ensure busybox applet symlinks are present even on incremental builds.
             // Without this, a rootfs built before symlink support was added (or from a
-            // partial build) would produce an ext2 image where `ls`, `cat`, etc. are
+            // partial build) would produce a rootfs image where `ls`, `cat`, etc. are
             // missing, making the installed system unusable.
             Self::ensure_busybox_applets(&bin);
             let nl_dump = self.nl_dump(&musl);
@@ -138,9 +139,9 @@ impl LinuxRootfs {
             etc.join("fstab"),
             b"# /etc/fstab - generado por install-eclipse\n\
 # <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n\
-__ECLIPSE_ROOT_DEV__  /                  ext2    defaults          0  1\n\
+__ECLIPSE_ROOT_DEV__  /                  btrfs   defaults          0  1\n\
 __ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0\n\
-__ECLIPSE_HOME_DEV__  /home              ext2    defaults          0  0\n\
+__ECLIPSE_HOME_DEV__  /home              btrfs   defaults          0  0\n\
 __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
