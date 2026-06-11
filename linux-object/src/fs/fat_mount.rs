@@ -299,6 +299,16 @@ impl INode for FatMountINode {
         })
     }
 
+    /// FAT no persiste uid/gid/mode; aceptar la llamada como no-op.
+    ///
+    /// `open(O_CREAT)` invoca `set_metadata` justo después de crear el fichero
+    /// (initialize_created_metadata). Con el default del trait (NotSupported →
+    /// ENOSYS) cualquier creación de fichero sobre vfat fallaba con
+    /// "Function not implemented".
+    fn set_metadata(&self, _metadata: &Metadata) -> rcore_fs::vfs::Result<()> {
+        Ok(())
+    }
+
     fn find(&self, name: &str) -> rcore_fs::vfs::Result<Arc<dyn INode>> {
         match name {
             "." => Ok(Arc::new(FatMountINode {
@@ -318,10 +328,17 @@ impl INode for FatMountINode {
                 };
                 for entry in dir.iter() {
                     let entry = entry.map_err(|_| FsError::DeviceError)?;
-                    if entry.file_name() == name {
+                    // FAT es case-insensitive: una entrada 8.3 puede estar
+                    // almacenada como "BOOTX64.EFI" y buscarse "BootX64.efi".
+                    // Con comparación exacta el lookup fallaba (EntryNotFound)
+                    // y open(O_CREAT) intentaba re-crear el fichero existente.
+                    let entry_name = entry.file_name();
+                    if entry_name.eq_ignore_ascii_case(name) {
                         return Ok(Arc::new(FatMountINode {
                             fs: self.fs.clone(),
-                            path: self.child_path(name),
+                            // Usar el nombre tal como está en el directorio para
+                            // que open_file/open_dir posteriores lo encuentren.
+                            path: self.child_path(&entry_name),
                             is_dir: entry.is_dir(),
                         }));
                     }
