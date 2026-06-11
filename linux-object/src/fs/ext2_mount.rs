@@ -529,10 +529,14 @@ impl INode for Ext2MountINode {
             .inode_meta_extra(self.inode_num as u32)
             .unwrap_or((FileType::File, 0, 0, 0, 0));
         let size = if matches!(type_, FileType::SymLink) {
+            // Fall back to the inode's size field if the target cannot be
+            // read (e.g. a corrupted block-mapped symlink): failing lstat
+            // here would make the entry impossible to inspect or replace.
             self.fs
                 .editor()
-                .read_symlink(self.inode_num as u32)?
-                .len()
+                .read_symlink(self.inode_num as u32)
+                .map(|t| t.len())
+                .unwrap_or_else(|_| cur.size())
         } else {
             cur.size()
         };
