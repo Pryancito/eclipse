@@ -2173,7 +2173,11 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
         size_t room = sizeof(window) - carry_len;
         size_t chunk = room < FSTAB_PATCH_CHUNK ? room : FSTAB_PATCH_CHUNK;
 
-        nread = read(fd, window + carry_len, chunk);
+        /* Use pread() with explicit offset instead of read() so that the scan
+         * works correctly regardless of the fd position left by previous
+         * operations (e.g. verify_partition_write) and avoids any lseek
+         * side-effects on Eclipse OS block devices. */
+        nread = pread(fd, window + carry_len, chunk, file_pos);
         if (nread < 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
                 block_dev, strerror(errno));
@@ -2240,22 +2244,20 @@ static int apply_fstab_targets(int fd, const char *block_dev, uint64_t partition
 
     for (i = 0; i < target_count; i++) {
         const struct fstab_patch_target *slot = &targets[i];
+        uint64_t at = partition_offset + (uint64_t)slot->offset;
 
         if (!slot->found) {
             continue;
         }
-        if (lseek(fd, partition_offset + slot->offset, SEEK_SET) < 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: seek en %s falló (%s)." COLOR_RESET,
-                block_dev, strerror(errno));
-            return -1;
-        }
+        /* Use pwrite() with explicit offset instead of lseek()+write() to
+         * avoid any seek-position issues on Eclipse OS block devices. */
         if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
-            if (write(fd, "#", 1) != 1) {
+            if (pwrite(fd, "#", 1, (off_t)at) != 1) {
                 log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
                     block_dev, strerror(errno));
                 return -1;
             }
-        } else if (write(fd, slot->replacement, FSTAB_PLACEHOLDER_LEN) !=
+        } else if (pwrite(fd, slot->replacement, FSTAB_PLACEHOLDER_LEN, (off_t)at) !=
                    (ssize_t)FSTAB_PLACEHOLDER_LEN) {
             log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
                 block_dev, strerror(errno));
@@ -2949,17 +2951,20 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if (write_fstab_to_root(cfg.disk_path, parts, part_count, cfg.layout, cfg.dry_run) != 0) {
-            return 1;
-        }
-
-        /* Expande el ext2 de ROOT a toda la partición (no fatal). Se hace tras
-         * parchear el fstab para no interferir con el parcheo en bruto. */
+        /* Expande el ext2 de ROOT a toda la partición ANTES de parchear el
+         * fstab en bruto. Así e2fsck y resize2fs operan sobre el sistema de
+         * archivos limpio recién copiado y no pueden interferir con el parche
+         * posterior. No es fatal: si resize2fs no está disponible, ROOT conserva
+         * el tamaño de la imagen original. */
         {
             char grow_root_dev[160];
             if (partition_dev_path(cfg.disk_path, 2, grow_root_dev, sizeof(grow_root_dev)) == 0) {
                 resize_root_to_partition(grow_root_dev, cfg.dry_run);
             }
+        }
+
+        if (write_fstab_to_root(cfg.disk_path, parts, part_count, cfg.layout, cfg.dry_run) != 0) {
+            return 1;
         }
 
         /* Fija ROOT=<part2> en la cmdline de rboot.conf de la EFI (no fatal). */
