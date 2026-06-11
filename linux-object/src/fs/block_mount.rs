@@ -51,43 +51,86 @@ impl BlockByteDevice {
 
 impl Device for BlockByteDevice {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
-        let block_size = 512;
-        let mut done = 0;
-        while done < buf.len() {
-            let abs = offset + done;
-            let block_id = abs / block_size;
-            let block_off = abs % block_size;
-            let take = min(buf.len() - done, block_size - block_off);
-            let mut temp = SectorBuf([0u8; 512]);
+        const BS: usize = 512;
+        let mut temp = SectorBuf([0u8; 512]);
+        let mut done = 0usize;
+
+        // Partial leading sector.
+        let head_off = offset % BS;
+        if head_off != 0 && done < buf.len() {
+            let take = min(buf.len(), BS - head_off);
             self.block
-                .read_block(block_id, &mut temp.0)
+                .read_block(offset / BS, &mut temp.0)
                 .map_err(|_| DevError)?;
-            buf[done..done + take].copy_from_slice(&temp.0[block_off..block_off + take]);
+            buf[..take].copy_from_slice(&temp.0[head_off..head_off + take]);
             done += take;
         }
+
+        // Whole-sector middle: a single multi-sector transfer.
+        let mid = ((buf.len() - done) / BS) * BS;
+        if mid > 0 {
+            self.block
+                .read_block((offset + done) / BS, &mut buf[done..done + mid])
+                .map_err(|_| DevError)?;
+            done += mid;
+        }
+
+        // Partial trailing sector.
+        if done < buf.len() {
+            let take = buf.len() - done;
+            self.block
+                .read_block((offset + done) / BS, &mut temp.0)
+                .map_err(|_| DevError)?;
+            buf[done..].copy_from_slice(&temp.0[..take]);
+            done += take;
+        }
+
         Ok(done)
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> DevResult<usize> {
-        let block_size = 512;
-        let mut done = 0;
-        while done < buf.len() {
-            let abs = offset + done;
-            let block_id = abs / block_size;
-            let block_off = abs % block_size;
-            let take = min(buf.len() - done, block_size - block_off);
-            let mut temp = SectorBuf([0u8; 512]);
-            if block_off != 0 || take != block_size {
-                self.block
-                    .read_block(block_id, &mut temp.0)
-                    .map_err(|_| DevError)?;
-            }
-            temp.0[block_off..block_off + take].copy_from_slice(&buf[done..done + take]);
+        const BS: usize = 512;
+        let mut temp = SectorBuf([0u8; 512]);
+        let mut done = 0usize;
+
+        // Partial leading sector: read-modify-write.
+        let head_off = offset % BS;
+        if head_off != 0 && done < buf.len() {
+            let take = min(buf.len(), BS - head_off);
+            let block_id = offset / BS;
+            self.block
+                .read_block(block_id, &mut temp.0)
+                .map_err(|_| DevError)?;
+            temp.0[head_off..head_off + take].copy_from_slice(&buf[..take]);
             self.block
                 .write_block(block_id, &temp.0)
                 .map_err(|_| DevError)?;
             done += take;
         }
+
+        // Whole-sector middle: a single multi-sector transfer.
+        let mid = ((buf.len() - done) / BS) * BS;
+        if mid > 0 {
+            self.block
+                .write_block((offset + done) / BS, &buf[done..done + mid])
+                .map_err(|_| DevError)?;
+            done += mid;
+        }
+
+        // Partial trailing sector: read-modify-write.
+        if done < buf.len() {
+            let take = buf.len() - done;
+            let block_id = (offset + done) / BS;
+            self.block
+                .read_block(block_id, &mut temp.0)
+                .map_err(|_| DevError)?;
+            temp.0[..take].copy_from_slice(&buf[done..]);
+            self.block
+                .write_block(block_id, &temp.0)
+                .map_err(|_| DevError)?;
+            done += take;
+        }
+
         Ok(done)
     }
 

@@ -65,6 +65,8 @@ const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_CMD_READ_DMA: u8 = 0xC8;
 const ATA_CMD_WRITE_DMA: u8 = 0xCA;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
+const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -89,12 +91,18 @@ struct PrdEntry {
     dbc_ioc: u32,
 }
 
+// The PRDT starts at offset 0x80 of the command table (AHCI spec §4.2.3).
+// 56 entries × 16 B fill the table exactly to its 1 KiB stride, allowing one
+// command to cover up to 56 non-contiguous pages (224 KiB) without growing
+// the per-port DMA footprint.
+const PRDT_MAX: usize = 56;
+
 #[repr(C, align(1024))]
 struct CommandTable {
     cfis: [u8; 64],
     acmd: [u8; 16],
     _rsvd: [u8; 48],
-    prdt: [PrdEntry; 1],
+    prdt: [PrdEntry; PRDT_MAX],
 }
 
 const _: () = {
@@ -127,6 +135,16 @@ const CMD_TIMEOUT_US: u64 = 10_000_000;
 const IDENTIFY_TIMEOUT_US: u64 = 5_000_000;
 // Timeout for port TFD-busy before issuing a command: 2 seconds.
 const TFD_TIMEOUT_US: u64 = 2_000_000;
+// FLUSH CACHE may need to drain a large write cache on spinning disks.
+const FLUSH_TIMEOUT_US: u64 = 30_000_000;
+
+// Pages for the bounce buffer used with non-page-aligned caller buffers.
+// 32 pages = 128 KiB = 256 sectors per command (vs. 1 sector previously).
+const BOUNCE_PAGES: usize = 32;
+// Upper bound for a direct (zero-copy) transfer: one page per PRD entry.
+const DIRECT_MAX_BYTES: usize = PRDT_MAX * 4096;
+// 28-bit DMA commands carry an 8-bit sector count (0 means 256; we stay at 255).
+const LBA28_MAX_SECTORS: usize = 255;
 
 /// Busy-wait for `us` microseconds using the TSC-based driver timer.
 #[inline]
@@ -213,6 +231,8 @@ struct AhciPort {
     _fb_virt: usize,
     ct_phys: u64,
     ct_virt: usize,
+    /// Device supports the 48-bit LBA feature set (IDENTIFY word 83 bit 10).
+    lba48: bool,
 }
 
 impl AhciPort {
@@ -376,8 +396,26 @@ impl AhciPort {
         Ok(())
     }
 
-    fn rw_block(&self, lba: u64, buf_phys: u64, buf_len: usize, write: bool) -> DeviceResult {
+    /// Issue one DMA read/write command covering `prds` (physical ranges,
+    /// each a multiple of 512 bytes) starting at sector `lba`.
+    fn rw_block(&self, lba: u64, prds: &[(u64, usize)], write: bool) -> DeviceResult {
         let slot = 0u32;
+        let buf_len: usize = prds.iter().map(|p| p.1).sum();
+        let count = buf_len / SECTOR_SIZE;
+        if prds.is_empty()
+            || prds.len() > PRDT_MAX
+            || buf_len == 0
+            || buf_len % SECTOR_SIZE != 0
+        {
+            return Err(DeviceError::InvalidParam);
+        }
+        if self.lba48 {
+            if count > 65536 {
+                return Err(DeviceError::InvalidParam);
+            }
+        } else if count > LBA28_MAX_SECTORS || lba + count as u64 > (1 << 28) {
+            return Err(DeviceError::InvalidParam);
+        }
 
         // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
         if !wait_until(TFD_TIMEOUT_US, || {
@@ -400,15 +438,14 @@ impl AhciPort {
             );
 
             let fis = (*cmd_table).cfis.as_mut_ptr();
-            let use_lba48 = true;
             *fis.add(0) = FIS_TYPE_REG_H2D;
             *fis.add(1) = 0x80;
             *fis.add(2) = if write {
-                if use_lba48 { ATA_CMD_WRITE_DMA_EXT } else { ATA_CMD_WRITE_DMA }
+                if self.lba48 { ATA_CMD_WRITE_DMA_EXT } else { ATA_CMD_WRITE_DMA }
             } else {
-                if use_lba48 { ATA_CMD_READ_DMA_EXT } else { ATA_CMD_READ_DMA }
+                if self.lba48 { ATA_CMD_READ_DMA_EXT } else { ATA_CMD_READ_DMA }
             };
-            if use_lba48 {
+            if self.lba48 {
                 *fis.add(4) = lba as u8;
                 *fis.add(5) = (lba >> 8) as u8;
                 *fis.add(6) = (lba >> 16) as u8;
@@ -416,7 +453,7 @@ impl AhciPort {
                 *fis.add(8) = (lba >> 24) as u8;
                 *fis.add(9) = (lba >> 32) as u8;
                 *fis.add(10) = (lba >> 40) as u8;
-                let count = (buf_len / SECTOR_SIZE) as u16;
+                // count == 65536 encodes as 0 per the ATA spec.
                 *fis.add(12) = count as u8;
                 *fis.add(13) = (count >> 8) as u8;
             } else {
@@ -424,35 +461,83 @@ impl AhciPort {
                 *fis.add(5) = (lba >> 8) as u8;
                 *fis.add(6) = (lba >> 16) as u8;
                 *fis.add(7) = 0xE0 | ((lba >> 24) & 0x0F) as u8;
-                let count = (buf_len / SECTOR_SIZE) as u16;
                 *fis.add(12) = count as u8;
                 *fis.add(13) = 0;
             }
 
-            (*cmd_table).prdt[0].dba = buf_phys as u32;
-            (*cmd_table).prdt[0].dbau = (buf_phys >> 32) as u32;
-            (*cmd_table).prdt[0].dbc_ioc = ((buf_len as u32) - 1) | (1 << 31);
+            for (i, &(phys, len)) in prds.iter().enumerate() {
+                let e = &mut (*cmd_table).prdt[i];
+                e.dba = phys as u32;
+                e.dbau = (phys >> 32) as u32;
+                let ioc = if i == prds.len() - 1 { 1u32 << 31 } else { 0 };
+                e.dbc_ioc = ((len as u32) - 1) | ioc;
+            }
 
             let header = self.cl_virt as *mut CommandHeader;
             (*header).cfl = 5 | (if write { 1 << 6 } else { 0 });
             (*header).pm = 0; // Do NOT clear busy upon R_OK (c = 0) for data commands
-            (*header).prdtl = 1;
+            (*header).prdtl = prds.len() as u16;
             (*header).prdbc = 0;
         }
         clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
         clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
-        let vaddr = phys_to_virt(buf_phys as usize);
-        clflush_range(vaddr, buf_len);
+        for &(phys, len) in prds {
+            clflush_range(phys_to_virt(phys as usize), len);
+        }
 
         let res = self.exec_cmd(slot);
         if res.is_ok() && !write {
-            clflush_range(vaddr, buf_len);
+            for &(phys, len) in prds {
+                clflush_range(phys_to_virt(phys as usize), len);
+            }
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         res
     }
 
-    fn identify(&self) -> Option<u64> {
+    /// ATA FLUSH CACHE — force the device write cache to non-volatile media.
+    fn flush_cache(&self) -> DeviceResult {
+        if !wait_until(TFD_TIMEOUT_US, || {
+            self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
+        }) {
+            crate::klog_err!(
+                "[AHCI] port {} TFD busy timeout before flush",
+                self.port_idx
+            );
+            self.reset_port();
+            return Err(DeviceError::IoError);
+        }
+
+        unsafe {
+            let cmd_table = self.ct_virt as *mut CommandTable;
+            core::ptr::write_bytes(
+                cmd_table as *mut u8,
+                0,
+                core::mem::size_of::<CommandTable>(),
+            );
+            let fis = (*cmd_table).cfis.as_mut_ptr();
+            *fis.add(0) = FIS_TYPE_REG_H2D;
+            *fis.add(1) = 0x80;
+            *fis.add(2) = if self.lba48 {
+                ATA_CMD_FLUSH_CACHE_EXT
+            } else {
+                ATA_CMD_FLUSH_CACHE
+            };
+
+            let header = self.cl_virt as *mut CommandHeader;
+            (*header).cfl = 5;
+            (*header).pm = 0;
+            (*header).prdtl = 0;
+            (*header).prdbc = 0;
+        }
+        clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
+        clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+
+        self.exec_cmd_with_timeout(0, FLUSH_TIMEOUT_US)
+    }
+
+    /// Returns `(sectors, lba48_supported)` from ATA IDENTIFY data.
+    fn identify(&self) -> Option<(u64, bool)> {
         // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
         if !wait_until(TFD_TIMEOUT_US, || {
             self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
@@ -541,17 +626,49 @@ impl AhciPort {
             drivers_dma_dealloc(paddr, 1);
         }
 
-        Some(sectors)
+        Some((sectors, lba48_supported))
     }
+}
+
+/// Translate a virtually contiguous kernel buffer into physical ranges
+/// suitable for a PRDT, coalescing physically adjacent pages. Returns the
+/// number of ranges, or `None` if a page fails to translate or the buffer
+/// would need more than `PRDT_MAX` entries (callers then fall back to the
+/// bounce buffer).
+fn build_prds(vaddr: usize, len: usize, prds: &mut [(u64, usize); PRDT_MAX]) -> Option<usize> {
+    let mut n = 0usize;
+    let mut va = vaddr;
+    let end = vaddr + len;
+    while va < end {
+        let page_rem = 4096 - (va & 4095);
+        let piece = page_rem.min(end - va);
+        let pa = virt_to_phys(va) as u64;
+        if pa == 0 {
+            return None;
+        }
+        if n > 0 && prds[n - 1].0 + prds[n - 1].1 as u64 == pa {
+            prds[n - 1].1 += piece;
+        } else {
+            if n == PRDT_MAX {
+                return None;
+            }
+            prds[n] = (pa, piece);
+            n += 1;
+        }
+        va += piece;
+    }
+    Some(n)
 }
 
 pub struct AhciInterface {
     name: String,
     port: Mutex<AhciPort>,
-    _capacity: u64,
-    /// Page-aligned DMA bounce buffer for callers that pass stack-backed sectors.
+    capacity: u64,
+    /// Page-aligned DMA bounce buffer for callers whose buffers are not
+    /// page-aligned (`BOUNCE_PAGES` contiguous pages).
     bounce_phys: usize,
     bounce_virt: usize,
+    bounce_len: usize,
 }
 
 impl AhciInterface {
@@ -616,7 +733,7 @@ impl AhciInterface {
                 let dma_paddr = unsafe { drivers_dma_alloc(DMA_PAGES) };
                 let dma_vaddr = phys_to_virt(dma_paddr);
 
-                let port = AhciPort {
+                let mut port = AhciPort {
                     base: pbase,
                     port_idx: i as u32,
                     cl_phys: dma_paddr as u64,
@@ -625,6 +742,9 @@ impl AhciInterface {
                     _fb_virt: dma_vaddr + 1024,
                     ct_phys: (dma_paddr + 4096) as u64,
                     ct_virt: dma_vaddr + 4096,
+                    // Assume LBA48 until IDENTIFY says otherwise; READ/WRITE DMA
+                    // EXT is mandatory on every SATA device.
+                    lba48: true,
                 };
 
                 // Skip ports that are explicitly disabled (DET=4).
@@ -662,7 +782,8 @@ impl AhciInterface {
                 let is_ata = sig == HBA_SIG_ATA
                     || (sig == 0 && port.read_reg(PORT_SSTS) & 0xF == 3);
                 if is_ata {
-                    if let Some(sectors) = port.identify() {
+                    if let Some((sectors, lba48)) = port.identify() {
+                        port.lba48 = lba48;
                         if sectors == 0 {
                             crate::klog_warn!(
                                 "[AHCI] port {} reported 0 sectors after IDENTIFY; skipping device",
@@ -688,7 +809,7 @@ impl AhciInterface {
                                 sectors / 2048
                             );
                         }
-                        let bounce_phys = unsafe { drivers_dma_alloc(1) };
+                        let bounce_phys = unsafe { drivers_dma_alloc(BOUNCE_PAGES) };
                         if bounce_phys == 0 {
                             unsafe {
                                 drivers_dma_dealloc(dma_paddr, DMA_PAGES);
@@ -698,9 +819,10 @@ impl AhciInterface {
                         return Ok(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
-                            _capacity: sectors,
+                            capacity: sectors,
                             bounce_phys,
                             bounce_virt: phys_to_virt(bounce_phys),
+                            bounce_len: BOUNCE_PAGES * 4096,
                         });
                     } else {
                         crate::klog_warn!("[AHCI] port {} IDENTIFY failed", i);
@@ -721,87 +843,107 @@ impl AhciInterface {
     }
 }
 
-impl BlockScheme for AhciInterface {
-    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
-        if read_buf.is_empty() || read_buf.len() % SECTOR_SIZE != 0 {
+impl AhciInterface {
+    /// Validate a request and return the sector count, or `InvalidParam`.
+    fn check_request(&self, block_id: usize, len: usize) -> DeviceResult<usize> {
+        if len == 0 || len % SECTOR_SIZE != 0 {
             return Err(DeviceError::InvalidParam);
         }
-        let lba = block_id as u64;
-        let user_ptr = read_buf.as_ptr() as usize;
-        if user_ptr % 4096 == 0 {
-            let paddr = virt_to_phys(user_ptr);
-            return self
-                .port
-                .lock()
-                .rw_block(lba, paddr as u64, read_buf.len(), false);
+        let nsectors = len / SECTOR_SIZE;
+        match block_id.checked_add(nsectors) {
+            Some(end) if end as u64 <= self.capacity => Ok(nsectors),
+            _ => Err(DeviceError::InvalidParam),
         }
+    }
+
+    /// Largest chunk a single command may move on this device.
+    fn max_chunk(&self, lba48: bool, path_max: usize) -> usize {
+        if lba48 {
+            path_max
+        } else {
+            path_max.min(LBA28_MAX_SECTORS * SECTOR_SIZE)
+        }
+    }
+}
+
+impl BlockScheme for AhciInterface {
+    // `block_id` indexes 512-byte sectors; `buf.len()` may be any multiple
+    // of 512 and is transferred in as few commands as possible.
+    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+        self.check_request(block_id, read_buf.len())?;
+        let port = self.port.lock();
+        let mut lba = block_id as u64;
         let mut offset = 0usize;
-        let mut sector_lba = lba;
         while offset < read_buf.len() {
-            let chunk = core::cmp::min(SECTOR_SIZE, read_buf.len() - offset);
-            let res = self
-                .port
-                .lock()
-                .rw_block(sector_lba, self.bounce_phys as u64, chunk, false);
-            if res.is_err() {
-                return res;
+            let remaining = read_buf.len() - offset;
+            let ptr = unsafe { read_buf.as_ptr().add(offset) } as usize;
+            let mut prds = [(0u64, 0usize); PRDT_MAX];
+            let mut chunk = 0usize;
+            if ptr % 4096 == 0 {
+                // Zero-copy: DMA straight into the caller's buffer, page by page.
+                let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
+                if let Some(n) = build_prds(ptr, want, &mut prds) {
+                    port.rw_block(lba, &prds[..n], false)?;
+                    chunk = want;
+                }
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.bounce_virt as *const u8,
-                    read_buf.as_mut_ptr().add(offset),
-                    chunk,
-                );
+            if chunk == 0 {
+                chunk = remaining.min(self.max_chunk(port.lba48, self.bounce_len));
+                port.rw_block(lba, &[(self.bounce_phys as u64, chunk)], false)?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.bounce_virt as *const u8,
+                        read_buf.as_mut_ptr().add(offset),
+                        chunk,
+                    );
+                }
             }
             offset += chunk;
-            sector_lba += 1;
+            lba += (chunk / SECTOR_SIZE) as u64;
         }
         Ok(())
     }
 
     fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
-        if write_buf.is_empty() || write_buf.len() % SECTOR_SIZE != 0 {
-            return Err(DeviceError::InvalidParam);
-        }
-        let lba = block_id as u64;
-        let user_ptr = write_buf.as_ptr() as usize;
-        if user_ptr % 4096 == 0 {
-            let paddr = virt_to_phys(user_ptr);
-            return self
-                .port
-                .lock()
-                .rw_block(lba, paddr as u64, write_buf.len(), true);
-        }
+        self.check_request(block_id, write_buf.len())?;
+        let port = self.port.lock();
+        let mut lba = block_id as u64;
         let mut offset = 0usize;
-        let mut sector_lba = lba;
         while offset < write_buf.len() {
-            let chunk = core::cmp::min(SECTOR_SIZE, write_buf.len() - offset);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    write_buf.as_ptr().add(offset),
-                    self.bounce_virt as *mut u8,
-                    chunk,
-                );
+            let remaining = write_buf.len() - offset;
+            let ptr = unsafe { write_buf.as_ptr().add(offset) } as usize;
+            let mut prds = [(0u64, 0usize); PRDT_MAX];
+            let mut chunk = 0usize;
+            if ptr % 4096 == 0 {
+                let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
+                if let Some(n) = build_prds(ptr, want, &mut prds) {
+                    port.rw_block(lba, &prds[..n], true)?;
+                    chunk = want;
+                }
             }
-            let res = self
-                .port
-                .lock()
-                .rw_block(sector_lba, self.bounce_phys as u64, chunk, true);
-            if res.is_err() {
-                return res;
+            if chunk == 0 {
+                chunk = remaining.min(self.max_chunk(port.lba48, self.bounce_len));
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        write_buf.as_ptr().add(offset),
+                        self.bounce_virt as *mut u8,
+                        chunk,
+                    );
+                }
+                port.rw_block(lba, &[(self.bounce_phys as u64, chunk)], true)?;
             }
             offset += chunk;
-            sector_lba += 1;
+            lba += (chunk / SECTOR_SIZE) as u64;
         }
         Ok(())
     }
 
     fn flush(&self) -> DeviceResult {
-        Ok(())
+        self.port.lock().flush_cache()
     }
 
     fn block_count(&self) -> usize {
-        self._capacity as usize
+        self.capacity as usize
     }
 }
 

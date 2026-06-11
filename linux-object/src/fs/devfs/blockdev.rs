@@ -35,69 +35,92 @@ impl BlockDev {
 }
 
 impl INode for BlockDev {
-    fn read_at(&self, mut offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let block_size = 512;
-        let mut read_len = 0;
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        const BS: usize = 512;
         #[repr(align(4096))]
         struct AlignedBuf([u8; 512]);
         let mut temp_buf = AlignedBuf([0u8; 512]);
+        let mut done = 0usize;
 
-        while read_len < buf.len() {
-            let block_id = offset / block_size;
-            let block_offset = offset % block_size;
-            let current_len = (buf.len() - read_len).min(block_size - block_offset);
-
-            if block_offset == 0 && current_len == block_size {
-                self.block
-                    .read_block(block_id, &mut temp_buf.0)
-                    .map_err(convert_error)?;
-                buf[read_len..read_len + block_size].copy_from_slice(&temp_buf.0);
-            } else {
-                self.block
-                    .read_block(block_id, &mut temp_buf.0)
-                    .map_err(convert_error)?;
-                buf[read_len..read_len + current_len].copy_from_slice(&temp_buf.0[block_offset..block_offset + current_len]);
-            }
-
-            read_len += current_len;
-            offset += current_len;
+        // Partial leading sector.
+        let head_off = offset % BS;
+        if head_off != 0 && done < buf.len() {
+            let take = buf.len().min(BS - head_off);
+            self.block
+                .read_block(offset / BS, &mut temp_buf.0)
+                .map_err(convert_error)?;
+            buf[..take].copy_from_slice(&temp_buf.0[head_off..head_off + take]);
+            done += take;
         }
 
-        Ok(read_len)
+        // Whole-sector middle: a single multi-sector transfer.
+        let mid = ((buf.len() - done) / BS) * BS;
+        if mid > 0 {
+            self.block
+                .read_block((offset + done) / BS, &mut buf[done..done + mid])
+                .map_err(convert_error)?;
+            done += mid;
+        }
+
+        // Partial trailing sector.
+        if done < buf.len() {
+            let take = buf.len() - done;
+            self.block
+                .read_block((offset + done) / BS, &mut temp_buf.0)
+                .map_err(convert_error)?;
+            buf[done..].copy_from_slice(&temp_buf.0[..take]);
+            done += take;
+        }
+
+        Ok(done)
     }
 
-    fn write_at(&self, mut offset: usize, buf: &[u8]) -> Result<usize> {
-        let block_size = 512;
-        let mut write_len = 0;
+    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        const BS: usize = 512;
         #[repr(align(4096))]
         struct AlignedBuf([u8; 512]);
         let mut temp_buf = AlignedBuf([0u8; 512]);
+        let mut done = 0usize;
 
-        while write_len < buf.len() {
-            let block_id = offset / block_size;
-            let block_offset = offset % block_size;
-            let current_len = (buf.len() - write_len).min(block_size - block_offset);
-
-            if block_offset == 0 && current_len == block_size {
-                temp_buf.0.copy_from_slice(&buf[write_len..write_len + block_size]);
-                self.block
-                    .write_block(block_id, &temp_buf.0)
-                    .map_err(convert_error)?;
-            } else {
-                self.block
-                    .read_block(block_id, &mut temp_buf.0)
-                    .map_err(convert_error)?;
-                temp_buf.0[block_offset..block_offset + current_len].copy_from_slice(&buf[write_len..write_len + current_len]);
-                self.block
-                    .write_block(block_id, &temp_buf.0)
-                    .map_err(convert_error)?;
-            }
-
-            write_len += current_len;
-            offset += current_len;
+        // Partial leading sector: read-modify-write.
+        let head_off = offset % BS;
+        if head_off != 0 && done < buf.len() {
+            let take = buf.len().min(BS - head_off);
+            let block_id = offset / BS;
+            self.block
+                .read_block(block_id, &mut temp_buf.0)
+                .map_err(convert_error)?;
+            temp_buf.0[head_off..head_off + take].copy_from_slice(&buf[..take]);
+            self.block
+                .write_block(block_id, &temp_buf.0)
+                .map_err(convert_error)?;
+            done += take;
         }
 
-        Ok(write_len)
+        // Whole-sector middle: a single multi-sector transfer.
+        let mid = ((buf.len() - done) / BS) * BS;
+        if mid > 0 {
+            self.block
+                .write_block((offset + done) / BS, &buf[done..done + mid])
+                .map_err(convert_error)?;
+            done += mid;
+        }
+
+        // Partial trailing sector: read-modify-write.
+        if done < buf.len() {
+            let take = buf.len() - done;
+            let block_id = (offset + done) / BS;
+            self.block
+                .read_block(block_id, &mut temp_buf.0)
+                .map_err(convert_error)?;
+            temp_buf.0[..take].copy_from_slice(&buf[done..]);
+            self.block
+                .write_block(block_id, &temp_buf.0)
+                .map_err(convert_error)?;
+            done += take;
+        }
+
+        Ok(done)
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -228,14 +251,16 @@ impl Scheme for PartitionBlock {
 
 impl BlockScheme for PartitionBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) -> zcore_drivers::DeviceResult {
-        if block_id >= self.block_count {
+        let nsectors = buf.len() / 512;
+        if block_id + nsectors > self.block_count {
             return Err(zcore_drivers::DeviceError::InvalidParam);
         }
         self.parent.read_block(self.start_block + block_id, buf)
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) -> zcore_drivers::DeviceResult {
-        if block_id >= self.block_count {
+        let nsectors = buf.len() / 512;
+        if block_id + nsectors > self.block_count {
             return Err(zcore_drivers::DeviceError::InvalidParam);
         }
         self.parent.write_block(self.start_block + block_id, buf)
