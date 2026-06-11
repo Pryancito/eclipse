@@ -4,15 +4,25 @@ use alloc::vec::Vec;
 use core::mem;
 
 use ext2::sector::Address;
-use ext2::sys::inode::{
-    Inode as RawInode, TypePerm, BLOCK_DEVICE, CHAR_DEVICE, DIRECTORY, FIFO, FILE, SOCKET, SYMLINK,
-};
+use ext2::sys::inode::{Inode as RawInode, TypePerm};
 use rcore_fs::vfs::{FileType, FsError, Result};
 
 use super::ext2_mount::Ext2MountFs;
 
 const SUPERBLOCK_OFFSET: usize = 1024;
 const FAST_SYMLINK_LEN: usize = 60;
+
+// On-disk directory-entry `file_type` values (EXT2_FT_*). These are NOT the
+// inode-format ordinals exported by `ext2::sys::inode` (there FILE is 5 and
+// DIRECTORY is 3); writing those into dirents makes every kernel-created
+// entry carry a wrong d_type (a directory would read back as a chardev).
+const FT_REG_FILE: u8 = 1;
+const FT_DIR: u8 = 2;
+const FT_CHRDEV: u8 = 3;
+const FT_BLKDEV: u8 = 4;
+const FT_FIFO: u8 = 5;
+const FT_SOCK: u8 = 6;
+const FT_SYMLINK: u8 = 7;
 
 pub(crate) struct Ext2Editor<'a> {
     fs: &'a Ext2MountFs,
@@ -373,10 +383,40 @@ impl<'a> Ext2Editor<'a> {
         raw.size_low as usize | ((raw.size_high as usize) << 32)
     }
 
+    /// Set the inode's byte size. The caller must also refresh
+    /// `sectors_count` (`sectors_for_size` for block-mapped inodes, 0 for
+    /// fast symlinks): i_blocks counts whole filesystem blocks including
+    /// indirect metadata, not `size/512`.
     fn set_inode_full_size(raw: &mut RawInode, size: usize) {
         raw.size_low = size as u32;
         raw.size_high = (size >> 32) as u32;
-        raw.sectors_count = ((size + 511) / 512) as u32;
+    }
+
+    /// Exact i_blocks value (in 512-byte sectors) for a block-mapped inode of
+    /// `size` bytes under this editor's allocation policy: blocks 0..n are
+    /// allocated contiguously with no holes, so the data-block count plus the
+    /// indirect metadata blocks needed to map them is a pure function of size.
+    fn sectors_for_size(&self, size: usize) -> u32 {
+        let bs = self.block_size();
+        let bs4 = bs / 4;
+        let n = (size + bs - 1) / bs;
+        let mut total = n;
+        if n > 12 {
+            total += 1; // singly-indirect block
+            let beyond_single = n.saturating_sub(12 + bs4);
+            if beyond_single > 0 {
+                total += 1; // doubly-indirect block
+                // singly-indirect children hanging off the doubly tree
+                total += (beyond_single.min(bs4 * bs4) + bs4 - 1) / bs4;
+                let beyond_double = n.saturating_sub(12 + bs4 + bs4 * bs4);
+                if beyond_double > 0 {
+                    total += 1; // triply-indirect block
+                    total += (beyond_double + bs4 * bs4 - 1) / (bs4 * bs4);
+                    total += (beyond_double + bs4 - 1) / bs4;
+                }
+            }
+        }
+        (total * (bs / 512)) as u32
     }
 
     fn read_u32_at(block: &[u8], index: usize) -> u32 {
@@ -464,26 +504,32 @@ impl<'a> Ext2Editor<'a> {
         // report a BLOCK_DEVICE (0x6000) as a DIRECTORY (0x4000).
         let fmt = raw.type_perm & TypePerm::from_bits_truncate(0xF000);
         if fmt == TypePerm::DIRECTORY {
-            DIRECTORY
+            FT_DIR
         } else if fmt == TypePerm::SYMLINK {
-            SYMLINK
+            FT_SYMLINK
         } else if fmt == TypePerm::CHAR_DEVICE {
-            CHAR_DEVICE
+            FT_CHRDEV
         } else if fmt == TypePerm::BLOCK_DEVICE {
-            BLOCK_DEVICE
+            FT_BLKDEV
         } else if fmt == TypePerm::FIFO {
-            FIFO
+            FT_FIFO
         } else if fmt == TypePerm::SOCKET {
-            SOCKET
+            FT_SOCK
         } else {
-            FILE
+            FT_REG_FILE
         }
     }
 
     fn is_fast_symlink(raw: &RawInode) -> bool {
+        // Classify by size alone: every writer we support (this editor and
+        // mke2fs -d) stores a target of <= 60 bytes inline in i_block. Do NOT
+        // require i_blocks == 0 here: an external xattr block is charged to
+        // i_blocks, and kernels with the old pack_fast_symlink bug stamped
+        // (size+511)/512 into it. Treating such an inode as block-mapped would
+        // interpret the target text as block numbers — EIO on lstat/readlink
+        // and bogus block frees on unlink.
         raw.type_perm.contains(TypePerm::SYMLINK)
             && Self::inode_full_size(raw) <= FAST_SYMLINK_LEN
-            && raw.sectors_count == 0
     }
 
     fn unpack_fast_symlink(raw: &RawInode) -> Vec<u8> {
@@ -508,8 +554,11 @@ impl<'a> Ext2Editor<'a> {
         raw.indirect_pointer = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
         raw.doubly_indirect = u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]);
         raw.triply_indirect = u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]);
-        raw.sectors_count = 0;
+        // set_inode_full_size stamps sectors_count from the byte size, which
+        // would mark this inode as block-mapped. A fast symlink keeps its
+        // target inline and must leave i_blocks at 0, so zero it afterwards.
         Self::set_inode_full_size(raw, target.len());
+        raw.sectors_count = 0;
     }
 
     /// Read bytes from a regular file or symlink inode using on-disk block maps.
@@ -628,7 +677,7 @@ impl<'a> Ext2Editor<'a> {
                 self.write_block(disk, chunk)?;
             }
             Self::set_inode_full_size(&mut raw, target.len());
-            raw.sectors_count = ((target.len() + 511) / 512) as u32;
+            raw.sectors_count = self.sectors_for_size(target.len());
             self.write_raw_inode(inode_num, &raw)?;
         }
         Ok(data.len())
@@ -841,6 +890,7 @@ impl<'a> Ext2Editor<'a> {
                 data[off..off + ent.len()].copy_from_slice(&ent);
                 self.write_block(disk_block, &data)?;
                 Self::set_inode_full_size(&mut inode, bs);
+                inode.sectors_count = self.sectors_for_size(bs);
                 self.write_raw_inode(dir_inode, &inode)?;
                 return Ok(());
             }
@@ -854,6 +904,7 @@ impl<'a> Ext2Editor<'a> {
         let new_size = Self::inode_full_size(&inode).saturating_add(bs);
         self.set_inode_block(&mut inode, block_idx, new_block)?;
         Self::set_inode_full_size(&mut inode, new_size);
+        inode.sectors_count = self.sectors_for_size(new_size);
         self.write_raw_inode(dir_inode, &inode)?;
         Ok(())
     }
@@ -1112,6 +1163,7 @@ impl<'a> Ext2Editor<'a> {
             self.set_inode_block(&mut raw, idx, block)?;
         }
         Self::set_inode_full_size(&mut raw, size);
+        raw.sectors_count = self.sectors_for_size(size);
         self.write_raw_inode(inode_num, &raw)?;
         Ok(())
     }
@@ -1217,12 +1269,12 @@ impl<'a> Ext2Editor<'a> {
                 self.write_raw_inode(child, &raw)?;
                 let bs = self.block_size();
                 let mut data = vec![0u8; bs];
-                let dot = Self::pack_dirent(child, 12, b".", DIRECTORY);
-                let dotdot = Self::pack_dirent(parent_num, 12, b"..", DIRECTORY);
+                let dot = Self::pack_dirent(child, 12, b".", FT_DIR);
+                let dotdot = Self::pack_dirent(parent_num, 12, b"..", FT_DIR);
                 data[..dot.len()].copy_from_slice(&dot);
                 data[12..12 + dotdot.len()].copy_from_slice(&dotdot);
                 self.write_block(block, &data)?;
-                self.add_dir_entry(parent_num, name, child, DIRECTORY)?;
+                self.add_dir_entry(parent_num, name, child, FT_DIR)?;
                 self.adjust_parent_nlink(parent_num, 1)?;
                 let bg = ((child - 1) as usize) / self.inodes_per_group();
                 {
@@ -1234,12 +1286,12 @@ impl<'a> Ext2Editor<'a> {
             FileType::File => {
                 raw.type_perm = TypePerm::FILE | perm;
                 self.write_raw_inode(child, &raw)?;
-                self.add_dir_entry(parent_num, name, child, FILE)?;
+                self.add_dir_entry(parent_num, name, child, FT_REG_FILE)?;
             }
             FileType::SymLink => {
                 raw.type_perm = TypePerm::SYMLINK | perm;
                 self.write_raw_inode(child, &raw)?;
-                self.add_dir_entry(parent_num, name, child, SYMLINK)?;
+                self.add_dir_entry(parent_num, name, child, FT_SYMLINK)?;
             }
             FileType::CharDevice | FileType::BlockDevice => {
                 raw.type_perm = if matches!(type_, FileType::CharDevice) {
@@ -1307,6 +1359,12 @@ impl<'a> Ext2Editor<'a> {
         let mut raw = self.read_raw_inode(child_inode)?;
         if raw.hard_links <= 1 {
             self.free_inode_completely(child_inode)?;
+            // Mark the on-disk inode as deleted. Clearing only the bitmap bit
+            // leaves mode/nlink set with dtime 0, which fsck reports as an
+            // unattached in-use inode and "resurrects" into lost+found.
+            raw.hard_links = 0;
+            raw.dtime = Self::now_secs();
+            self.write_raw_inode(child_inode, &raw)?;
             if is_dir {
                 self.adjust_parent_nlink(parent_num, -1)?;
                 let bg = ((child_inode - 1) as usize) / self.inodes_per_group();
@@ -1347,7 +1405,7 @@ impl<'a> Ext2Editor<'a> {
         if raw.type_perm.contains(TypePerm::SYMLINK) {
             return Err(FsError::NotSupported);
         }
-        self.add_dir_entry(parent_num, name, target_inode, FILE)?;
+        self.add_dir_entry(parent_num, name, target_inode, FT_REG_FILE)?;
         raw.hard_links += 1;
         self.write_raw_inode(target_inode, &raw)?;
         Ok(())
@@ -1436,6 +1494,7 @@ impl<'a> Ext2Editor<'a> {
             self.truncate_inode_blocks(inode_num, new_blocks)?;
             let mut raw = self.read_raw_inode(inode_num)?;
             Self::set_inode_full_size(&mut raw, len);
+            raw.sectors_count = self.sectors_for_size(len);
             self.write_raw_inode(inode_num, &raw)?;
         }
         if len != old {
