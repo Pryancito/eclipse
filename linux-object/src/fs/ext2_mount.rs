@@ -384,14 +384,18 @@ impl Ext2MountINode {
                 }
                 let rec = &block[off..];
                 let inode_num = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                if inode_num == 0 {
-                    break;
-                }
                 let rec_len = u16::from_le_bytes([rec[4], rec[5]]) as usize;
-                let name_len = rec[6] as usize;
                 if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > block_size {
                     break;
                 }
+                if inode_num == 0 {
+                    // A zero inode is a deleted entry (hole), not end-of-block:
+                    // `remove_dir_entry` leaves one when the first entry of a
+                    // block is unlinked. Live entries may follow it.
+                    off += rec_len;
+                    continue;
+                }
+                let name_len = rec[6] as usize;
                 if name_len + 8 > rec_len {
                     break;
                 }
@@ -442,14 +446,16 @@ impl Ext2MountINode {
                 }
                 let rec = &block[off..];
                 let inode_num = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                if inode_num == 0 {
-                    break;
-                }
                 let rec_len = u16::from_le_bytes([rec[4], rec[5]]) as usize;
-                let name_len = rec[6] as usize;
                 if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > block_size {
                     break;
                 }
+                if inode_num == 0 {
+                    // Deleted entry (hole); skip it, live entries may follow.
+                    off += rec_len;
+                    continue;
+                }
+                let name_len = rec[6] as usize;
                 if name_len + 8 > rec_len {
                     break;
                 }
