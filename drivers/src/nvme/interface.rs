@@ -433,8 +433,8 @@ impl NvmeInterface {
 }
 
 impl BlockScheme for NvmeInterface {
-    // `block_id` follows the same convention as the AHCI driver: it indexes
-    // blocks of `buf.len()` bytes, i.e. the first sector is block_id * (len/512).
+    // `block_id` indexes 512-byte sectors (same convention as the AHCI
+    // driver); `buf.len()` may be any multiple of 512.
     fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         if read_buf.is_empty() || read_buf.len() % SECTOR_SIZE != 0 {
             return Err(DeviceError::InvalidParam);
@@ -443,7 +443,7 @@ impl BlockScheme for NvmeInterface {
         let mut queue = self.io_queues[0].lock();
         let queue = &mut *queue;
 
-        let mut byte_addr = block_id * read_buf.len();
+        let mut byte_addr = block_id * SECTOR_SIZE;
         let mut done = 0usize;
         while done < read_buf.len() {
             let remaining = read_buf.len() - done;
@@ -482,7 +482,7 @@ impl BlockScheme for NvmeInterface {
         let mut queue = self.io_queues[0].lock();
         let queue = &mut *queue;
 
-        let mut byte_addr = block_id * write_buf.len();
+        let mut byte_addr = block_id * SECTOR_SIZE;
         let mut done = 0usize;
         while done < write_buf.len() {
             let remaining = write_buf.len() - done;
