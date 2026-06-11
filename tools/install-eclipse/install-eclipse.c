@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 #include <linux/fs.h>
 #include <errno.h>
 #include <zlib.h>
@@ -2082,27 +2083,32 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
 }
 
 static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run) {
-    char cmd[1024];
-    if (fstype != NULL && fstype[0] != '\0') {
-        if (loop) {
-            snprintf(cmd, sizeof(cmd), "sh -c \"mount -t %s -o loop '%s' '%s'\"",
-                     fstype, source, target);
-        } else {
-            snprintf(cmd, sizeof(cmd), "sh -c \"mount -t %s '%s' '%s'\"",
-                     fstype, source, target);
-        }
-    } else if (loop) {
-        snprintf(cmd, sizeof(cmd), "sh -c \"mount -o loop '%s' '%s'\"", source, target);
-    } else {
-        snprintf(cmd, sizeof(cmd), "sh -c \"mount '%s' '%s'\"", source, target);
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] mount -t %s %s -> %s" COLOR_RESET, fstype ? fstype : "auto", source, target);
+        return 0;
     }
-    return run_command_logged(cmd, dry_run);
+    (void)loop; /* zCore mounts files/block-devices directly without loop devices */
+    log("Montando %s en %s (tipo: %s)...", source, target, fstype ? fstype : "auto");
+    if (mount(source, target, fstype, 0, NULL) != 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: mount(%s, %s, %s) falló: %s" COLOR_RESET,
+            source, target, fstype ? fstype : "auto", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 static int shell_umount(const char *target, int dry_run) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sh -c \"umount '%s' 2>/dev/null || true\"", target);
-    return run_command_logged(cmd, dry_run);
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] umount %s" COLOR_RESET, target);
+        return 0;
+    }
+    log("Desmontando %s...", target);
+    if (umount(target) != 0) {
+        if (errno != EINVAL) {
+            log(COLOR_YELLOW "ADVERTENCIA: umount(%s) falló: %s" COLOR_RESET, target, strerror(errno));
+        }
+    }
+    return 0;
 }
 
 static void format_fstab_device_field(const char *device, char out[FSTAB_PLACEHOLDER_LEN + 1]) {
@@ -2637,8 +2643,9 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
     char root_dev[160];
-    char cmd[1024];
     int rc = 0;
+    const char *src_mnt = NULL;
+    int mount_needed = 1;
 
     if (discover_partitions(disk_path, &parts) != 0) {
         return -1;
@@ -2652,89 +2659,78 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     log("Partición EFI detectada:  %s", efi_dev);
     log("Partición ROOT detectada: %s", root_dev);
 
-    if (!struct_file_exists(EFI_IMAGE_GZ)) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s (fuente del bootloader/kernel)." COLOR_RESET, EFI_IMAGE_GZ);
-        return -1;
-    }
-    if (!struct_file_exists("/bin/edhcpc")) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/edhcpc en el medio de instalación." COLOR_RESET);
-        return -1;
-    }
-    if (!struct_file_exists("/bin/eclipse-useradd")) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/eclipse-useradd en el medio de instalación." COLOR_RESET);
-        return -1;
+    if (struct_file_exists("/boot/efi-staging/EFI/Boot/BootX64.efi")) {
+        log("Se detectaron archivos de actualización pre-extraídos en /boot/efi-staging.");
+        src_mnt = "/boot/efi-staging";
+        mount_needed = 0;
+    } else {
+        if (!struct_file_exists(EFI_IMAGE_GZ)) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s (fuente del bootloader/kernel)." COLOR_RESET, EFI_IMAGE_GZ);
+            return -1;
+        }
+
+        if (shell_mkdir_p(UPD_STAGING_MNT, dry_run) != 0) {
+            return -1;
+        }
+
+        if (decompress_gz_to_path(EFI_IMAGE_GZ, UPD_STAGING_IMG, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s." COLOR_RESET, EFI_IMAGE_GZ);
+            return -1;
+        }
+
+        if (shell_mount(UPD_STAGING_IMG, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI de origen." COLOR_RESET);
+            if (!dry_run) {
+                unlink(UPD_STAGING_IMG);
+            }
+            return -1;
+        }
+        src_mnt = UPD_STAGING_MNT;
     }
 
-    if (shell_mkdir_p(UPD_STAGING_MNT, dry_run) != 0 ||
-        shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0 ||
-        shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
-        return -1;
+    if (shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0) {
+        rc = -1;
+        goto cleanup;
     }
 
-    if (decompress_gz_to_path(EFI_IMAGE_GZ, UPD_STAGING_IMG, dry_run) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s." COLOR_RESET, EFI_IMAGE_GZ);
-        return -1;
-    }
-
-    if (shell_mount(UPD_STAGING_IMG, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI de origen." COLOR_RESET);
-        return -1;
-    }
     if (shell_mount(efi_dev, UPD_EFI_MNT, "vfat", 0, dry_run) != 0) {
-        shell_umount(UPD_STAGING_MNT, dry_run);
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, efi_dev);
-        return -1;
-    }
-    if (shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
-        shell_umount(UPD_EFI_MNT, dry_run);
-        shell_umount(UPD_STAGING_MNT, dry_run);
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, root_dev);
-        return -1;
+        rc = -1;
+        goto cleanup;
     }
 
-    log(COLOR_GREEN "[1/2] Actualizando bootloader y kernel en EFI (copia selectiva, sin dd)..." COLOR_RESET);
+    log(COLOR_GREEN "Actualizando bootloader y kernel en EFI (copia selectiva, sin dd)..." COLOR_RESET);
     if (shell_mkdir_p(UPD_EFI_MNT "/EFI/Boot", dry_run) != 0 ||
         shell_mkdir_p(UPD_EFI_MNT "/EFI/zCore", dry_run) != 0) {
         rc = -1;
-        goto cleanup;
+        goto cleanup_mount;
     }
 
-    if (copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/Boot/BootX64.efi",
+    /* Copiamos solamente el kernel y el bootloader, preservando rboot.conf */
+    char src_boot[256], src_zcore[256], src_initramfs[256];
+    snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/BootX64.efi", src_mnt);
+    snprintf(src_zcore, sizeof(src_zcore), "%s/EFI/zCore/zcore.elf", src_mnt);
+    snprintf(src_initramfs, sizeof(src_initramfs), "%s/EFI/zCore/initramfs.img", src_mnt);
+
+    if (copy_upgrade_payload_if_exists(src_boot,
                                        UPD_EFI_MNT "/EFI/Boot/BootX64.efi", dry_run) != 0 ||
-        copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/Boot/rboot.conf",
-                                       UPD_EFI_MNT "/EFI/Boot/rboot.conf", dry_run) != 0 ||
-        copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/zCore/zcore.elf",
+        copy_upgrade_payload_if_exists(src_zcore,
                                        UPD_EFI_MNT "/EFI/zCore/zcore.elf", dry_run) != 0) {
         rc = -1;
-        goto cleanup;
+        goto cleanup_mount;
     }
-    copy_upgrade_payload_if_exists(UPD_STAGING_MNT "/EFI/zCore/initramfs.img",
+    copy_upgrade_payload_if_exists(src_initramfs,
                                    UPD_EFI_MNT "/EFI/zCore/initramfs.img", dry_run);
 
-    log(COLOR_GREEN "[2/2] Actualizando binarios base en ROOT (edhcpc, eclipse-useradd)..." COLOR_RESET);
-    if (shell_mkdir_p(UPD_ROOT_MNT "/bin", dry_run) != 0) {
-        rc = -1;
-        goto cleanup;
-    }
-    if (copy_upgrade_payload_if_exists("/bin/edhcpc", UPD_ROOT_MNT "/bin/edhcpc", dry_run) != 0 ||
-        copy_upgrade_payload_if_exists("/bin/eclipse-useradd", UPD_ROOT_MNT "/bin/eclipse-useradd", dry_run) != 0) {
-        rc = -1;
-        goto cleanup;
-    }
-
-    snprintf(cmd, sizeof(cmd),
-             "sh -c \"chmod 755 '%s/bin/edhcpc' '%s/bin/eclipse-useradd'\"",
-             UPD_ROOT_MNT, UPD_ROOT_MNT);
-    if (run_command_logged(cmd, dry_run) != 0) {
-        rc = -1;
-    }
+cleanup_mount:
+    shell_umount(UPD_EFI_MNT, dry_run);
 
 cleanup:
-    shell_umount(UPD_ROOT_MNT, dry_run);
-    shell_umount(UPD_EFI_MNT, dry_run);
-    shell_umount(UPD_STAGING_MNT, dry_run);
-    if (!dry_run) {
-        unlink(UPD_STAGING_IMG);
+    if (mount_needed) {
+        shell_umount(UPD_STAGING_MNT, dry_run);
+        if (!dry_run) {
+            unlink(UPD_STAGING_IMG);
+        }
     }
     if (rc == 0) {
         /* La partición EFI ya está desmontada: fija ROOT= en rboot.conf (no fatal). */
@@ -2870,14 +2866,6 @@ int main(int argc, char **argv) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, EFI_IMAGE_GZ);
             return 1;
         }
-        if (!struct_file_exists("/bin/edhcpc")) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/edhcpc en el medio de instalación." COLOR_RESET);
-            return 1;
-        }
-        if (!struct_file_exists("/bin/eclipse-useradd")) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró /bin/eclipse-useradd en el medio de instalación." COLOR_RESET);
-            return 1;
-        }
         if (verify_sha256_file(EFI_IMAGE_GZ) != 0) {
             return 1;
         }
@@ -2893,7 +2881,7 @@ int main(int argc, char **argv) {
         }
     } else {
         snprintf(partition_summary, sizeof(partition_summary),
-                 "Actualización selectiva (EFI: boot+kernel; ROOT: edhcpc, eclipse-useradd)");
+                 "Actualización selectiva (EFI: boot+kernel)");
     }
 
     log("========================================");

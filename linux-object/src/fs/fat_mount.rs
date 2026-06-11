@@ -164,15 +164,30 @@ impl VfsFileSystem for FatMountFs {
     }
 
     fn info(&self) -> FsInfo {
-        FsInfo {
-            bsize: 512,
-            frsize: 512,
-            blocks: 0,
-            bfree: 0,
-            bavail: 0,
-            files: 0,
-            ffree: 0,
-            namemax: 255,
+        let fs = self.inner.lock();
+        if let Ok(stats) = fs.stats() {
+            let cluster_size = stats.cluster_size() as usize;
+            FsInfo {
+                bsize: cluster_size,
+                frsize: cluster_size,
+                blocks: stats.total_clusters() as usize,
+                bfree: stats.free_clusters() as usize,
+                bavail: stats.free_clusters() as usize,
+                files: 0,
+                ffree: 0,
+                namemax: 255,
+            }
+        } else {
+            FsInfo {
+                bsize: 512,
+                frsize: 512,
+                blocks: 0,
+                bfree: 0,
+                bavail: 0,
+                files: 0,
+                ffree: 0,
+                namemax: 255,
+            }
         }
     }
 }
