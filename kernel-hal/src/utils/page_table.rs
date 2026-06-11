@@ -196,6 +196,43 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         crate::vm::pt_clone_kernel_space(pt.table_phys(), self.table_phys());
         pt
     }
+
+    /// Split the huge-page leaf covering `vaddr` (if any) until it is mapped
+    /// by a 4 KiB entry. Each new intermediate table replicates the original
+    /// mapping, so translation is unchanged — only the granularity is finer.
+    ///
+    /// Needed because the boot linear map uses 2 MiB pages: updating the
+    /// flags of a single 4 KiB frame (e.g. marking a DMA buffer uncacheable)
+    /// must not change the cacheability of the surrounding 2 MiB.
+    pub fn split_to_4k(&mut self, vaddr: VirtAddr) -> PagingResult {
+        loop {
+            let (entry_ptr, size) = {
+                let (entry, size) = self.get_entry_mut(vaddr)?;
+                (entry as *mut PTE, size)
+            };
+            // SAFETY: the entry lives in a page-table frame; growing
+            // `intrm_tables` below does not move or free it.
+            let entry = unsafe { &mut *entry_ptr };
+            if !entry.is_present() {
+                return Err(PagingError::NotMapped);
+            }
+            let (child_size, child_is_huge) = match size {
+                PageSize::Size4K => return Ok(()),
+                PageSize::Size2M => (PageSize::Size4K, false),
+                PageSize::Size1G => (PageSize::Size2M, true),
+            };
+            let paddr = entry.addr();
+            let flags = entry.flags();
+            let table_paddr = self.alloc_intrm_table().ok_or(PagingError::NoMemory)?;
+            let table = table_of_mut::<PTE>(table_paddr);
+            for (i, e) in table.iter_mut().enumerate() {
+                e.set_addr(paddr + i * (child_size as usize));
+                e.set_flags(flags, child_is_huge);
+            }
+            entry.set_table(table_paddr);
+            crate::vm::flush_tlb(Some(vaddr));
+        }
+    }
 }
 
 impl<L: PageTableLevel, PTE: GenericPTE> Default for PageTableImpl<L, PTE> {

@@ -160,17 +160,24 @@ fn map_segment(
 
 /// Map physical memory [0, max_addr)
 /// to virtual space [offset, offset + max_addr)
+///
+/// Uses 2 MiB huge pages: with 4 KiB pages a 64 GiB machine needs ~16 million
+/// `map_to` calls plus 128 MiB of page tables, which takes ages at boot and
+/// thrashes the TLB at runtime. The kernel splits individual huge pages back
+/// into 4 KiB mappings on demand (e.g. to mark DMA buffers uncacheable).
 pub fn map_physical_memory(
     offset: u64,
     max_addr: u64,
-    page_table: &mut impl Mapper<Size4KiB>,
+    page_table: &mut impl Mapper<Size2MiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) {
     //info!("mapping physical memory");
-    let start_frame = PhysFrame::containing_address(PhysAddr::new(0));
-    let end_frame = PhysFrame::containing_address(PhysAddr::new(max_addr));
+    let start_frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(0));
+    let end_frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(max_addr));
     for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
-        let page = Page::containing_address(VirtAddr::new(frame.start_address().as_u64() + offset));
+        let page = Page::<Size2MiB>::containing_address(VirtAddr::new(
+            frame.start_address().as_u64() + offset,
+        ));
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         unsafe {
             page_table

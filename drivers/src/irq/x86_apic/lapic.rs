@@ -102,4 +102,9 @@ impl LocalApic {
     pub fn set_timer_initial(&mut self, initial: u32) {
         unsafe { self.inner.set_timer_initial(initial) }
     }
+
+    /// Current count of the LAPIC timer (counts down from the initial value).
+    pub fn timer_current(&self) -> u32 {
+        unsafe { self.inner.timer_current() }
+    }
 }
