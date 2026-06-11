@@ -122,11 +122,30 @@ lazy_static! {
 
 // obtain a task from other cpu.
 pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
-    let runtime = GLOBAL_RUNTIME
-        .iter()
-        .max_by_key(|runtime| runtime.lock().task_num())
-        .unwrap();
-    let runtime = runtime.lock();
+    let current_cpu = crate::arch::cpu_id() as usize;
+    // Use try_lock() so that idle CPUs never spin-wait on each other's runtime
+    // locks during the scan phase.  On a many-core machine this prevents the
+    // O(N) blocking-lock storm that otherwise occurs when N-1 idle CPUs
+    // simultaneously try to steal work.  A locked runtime is by definition
+    // actively being used; we simply skip it and try again next scheduling
+    // cycle rather than queue-spinning on its lock.
+    let mut best_cpu_idx = None;
+    let mut best_count = 0usize;
+    for (i, runtime_mutex) in GLOBAL_RUNTIME.iter().enumerate() {
+        if i == current_cpu {
+            // Never steal from ourselves; our own collection is already empty.
+            continue;
+        }
+        if let Some(runtime) = runtime_mutex.try_lock() {
+            let count = runtime.task_num();
+            if count > best_count {
+                best_count = count;
+                best_cpu_idx = Some(i);
+            }
+        }
+    }
+    let cpu = best_cpu_idx?;
+    let runtime = GLOBAL_RUNTIME[cpu].lock();
     if runtime.task_num() > 0 {
         runtime.task_collection.take_task()
     } else {
@@ -190,7 +209,11 @@ pub fn run_until_idle() -> bool {
 
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     super::run_with_intr_saved_off! {
-        spawn_task(future, None, Some(crate::arch::cpu_id() as _))
+        // Distribute tasks to the least-loaded CPU rather than pinning all new
+        // work to the spawner's CPU.  spawn_task with cpu_id=None picks the
+        // least-loaded CPU via a non-blocking try_lock scan, which is cheap and
+        // keeps all cores busy on a many-core machine.
+        spawn_task(future, None, None)
     }
 }
 
@@ -213,10 +236,22 @@ pub fn spawn_task(
         );
         &GLOBAL_RUNTIME[cpu_id]
     } else {
-        GLOBAL_RUNTIME
-            .iter()
-            .min_by_key(|runtime| runtime.lock().task_num())
-            .unwrap()
+        // Use try_lock() to find the least-loaded CPU without stalling callers.
+        // If a runtime is currently locked (busy), we skip it and consider the
+        // others; the CPU whose runtime is unlocked and has the fewest tasks wins.
+        // Fallback to CPU 0 when every runtime happens to be locked.
+        let mut best = 0usize;
+        let mut best_count = usize::MAX;
+        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate() {
+            if let Some(rt) = rt.try_lock() {
+                let count = rt.task_num();
+                if count < best_count {
+                    best_count = count;
+                    best = i;
+                }
+            }
+        }
+        &GLOBAL_RUNTIME[best]
     };
     runtime.lock().add_task(priority, future);
 }
