@@ -17,12 +17,22 @@ hal_fn_impl! {
         fn cpu_frequency() -> u16 {
             static CPU_FREQ_MHZ: spin::Once<u16> = spin::Once::new();
             *CPU_FREQ_MHZ.call_once(|| {
-                const DEFAULT: u16 = 4000;
+                // Fallback used when CPUID leaf 0x16 is absent (AMD, older Intel,
+                // or a QEMU guest that does not pass it through).  2000 MHz is a
+                // conservative estimate; real CPUs are usually faster and CPUID
+                // gives the exact value when available.
+                //
+                // NOTE: do NOT apply .max(4000) here — that old floor made
+                // timer_now() run 2–4× faster than wall-clock on CPUs < 4 GHz,
+                // causing every sleep/timeout to block 2–4× longer than requested.
+                // Callers that need a safety ceiling for SMP delays (smp::delay_us)
+                // apply their own floor independently.
+                const DEFAULT: u16 = 2000;
                 CpuId::new()
                     .get_processor_frequency_info()
                     .map(|info| info.processor_base_frequency())
+                    .filter(|&f| f >= 100) // reject obviously bogus readings
                     .unwrap_or(DEFAULT)
-                    .max(DEFAULT)
             })
         }
 

@@ -750,12 +750,18 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
     IpEndpoint::new(addr, 0)
 }
 
-/// Min interval between full [`poll_ifaces`] (~62 Hz cap — keeps PS/2 IRQ responsive).
-const NET_POLL_MIN_INTERVAL_US: u64 = 32_000;
-/// Max NIC deferred jobs per I/O wait tick when sockets are watched (HID first).
-const DEFERRED_NET_JOBS_PER_TICK: usize = 1;
+/// Adaptive poll interval bounds for full [`poll_ifaces`] in multiplex wait loops.
+const NET_POLL_INTERVAL_MIN_US: u64 = 4_000;
+const NET_POLL_INTERVAL_BASE_US: u64 = 16_000;
+const NET_POLL_INTERVAL_MAX_US: u64 = 32_000;
+/// Deferred job budget bounds per net tick.
+const DEFERRED_NET_JOBS_PER_TICK_BASE: usize = 4;
+const DEFERRED_NET_JOBS_PER_TICK_MAX: usize = 12;
+/// Minimum interval for heavy net housekeeping (route/neighbor/prune).
+const NET_HOUSEKEEPING_INTERVAL_US: u64 = 250_000;
 
 static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
+static LAST_NET_HOUSEKEEPING_US: AtomicU64 = AtomicU64::new(0);
 
 /// True for socket / packet / netlink fds (see [`SOCKET_FD`]).
 #[inline]
@@ -775,19 +781,59 @@ fn mono_us() -> u64 {
     kernel_hal::timer::timer_now().as_micros() as u64
 }
 
-fn net_poll_interval_elapsed() -> bool {
+fn net_poll_interval_elapsed(interval_us: u64) -> bool {
     let now = mono_us();
     let last = LAST_NET_POLL_US.load(Ordering::Relaxed);
-    if now.wrapping_sub(last) < NET_POLL_MIN_INTERVAL_US {
+    if now.wrapping_sub(last) < interval_us {
         return false;
     }
     LAST_NET_POLL_US.store(now, Ordering::Relaxed);
     true
 }
 
+#[inline]
+fn adaptive_deferred_jobs_per_tick() -> usize {
+    let pending = kernel_hal::pulse::pending_bits();
+    let q = kernel_hal::deferred_job::pending_deferred_jobs();
+    if (pending & (kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK)) != 0 {
+        DEFERRED_NET_JOBS_PER_TICK_MAX
+    } else {
+        DEFERRED_NET_JOBS_PER_TICK_BASE + q.min(DEFERRED_NET_JOBS_PER_TICK_MAX.saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE))
+    }
+}
+
+#[inline]
+fn adaptive_net_poll_interval_us() -> u64 {
+    let pending = kernel_hal::pulse::pending_bits();
+    let q = kernel_hal::deferred_job::pending_deferred_jobs();
+    if (pending & (kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK)) != 0 || q >= 8 {
+        NET_POLL_INTERVAL_MIN_US
+    } else if q == 0 {
+        NET_POLL_INTERVAL_MAX_US
+    } else {
+        NET_POLL_INTERVAL_BASE_US
+    }
+}
+
+#[inline]
+fn maybe_run_net_housekeeping(now_us: u64, force: bool) {
+    let last = LAST_NET_HOUSEKEEPING_US.load(Ordering::Relaxed);
+    if !force && now_us.wrapping_sub(last) < NET_HOUSEKEEPING_INTERVAL_US {
+        return;
+    }
+    LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
+    sync_neighbor_cache_into_smoltcp();
+    if has_usable_ipv4() {
+        prepare_ipv4_stack();
+    }
+    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
+        sockets.prune();
+    }
+}
+
 /// Throttled NIC poll for multiplex wait loops (epoll/poll/select).
 pub fn poll_ifaces_throttled() {
-    if !net_poll_interval_elapsed() {
+    if !net_poll_interval_elapsed(adaptive_net_poll_interval_us()) {
         return;
     }
     poll_ifaces();
@@ -795,7 +841,8 @@ pub fn poll_ifaces_throttled() {
 
 /// Socket path: deferred IRQ work + immediate poll if Pulse has NET/LINK pending.
 pub fn pulse_drain_net() {
-    kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
+    let budget = adaptive_deferred_jobs_per_tick();
+    kernel_hal::deferred_job::drain_deferred_jobs_max(budget);
     if kernel_hal::pulse::consume_pending(
         kernel_hal::pulse::PULSE_NET_RX | kernel_hal::pulse::PULSE_LINK,
     ) != 0
@@ -808,7 +855,7 @@ pub fn pulse_drain_net() {
 
 /// After recv/send or connect: always run a full NIC poll once.
 pub fn pulse_drain_net_urgent() {
-    kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
+    kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
     poll_ifaces();
 }
 
@@ -848,7 +895,7 @@ pub fn io_wait_tick(watch_net: bool, watch_interactive: bool) {
         return;
     }
     if work.run_net_deferred {
-        kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
+        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
     }
     if work.run_net_poll_now {
         poll_ifaces();
@@ -867,13 +914,9 @@ pub fn poll_ifaces() {
             }
         }
     }
-    sync_neighbor_cache_into_smoltcp();
-    if has_usable_ipv4() {
-        prepare_ipv4_stack();
-    }
-    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
-        sockets.prune();
-    }
+    let pending = kernel_hal::pulse::pending_bits();
+    let force_housekeeping = (pending & kernel_hal::pulse::PULSE_LINK) != 0;
+    maybe_run_net_housekeeping(mono_us(), force_housekeeping);
 }
 
 /// Poll a single NIC once (smoltcp path — can hold the global socket set lock).
@@ -916,7 +959,7 @@ pub fn drain_net_poll(rounds: usize) {
         } else {
             pulse_drain_net();
         }
-        kernel_hal::deferred_job::drain_deferred_jobs_max(DEFERRED_NET_JOBS_PER_TICK);
+        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
     }
 }
 
