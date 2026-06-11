@@ -17,6 +17,7 @@ mod pseudo;
 mod sysfs;
 mod epoll;
 mod eventfd;
+mod pidfd;
 pub mod rcore_fs_wrapper;
 pub mod stdio;
 
@@ -68,6 +69,7 @@ pub use file::{File, OpenFlags, PollEvents, SeekFrom};
 pub use pipe::Pipe;
 pub use epoll::{Epoll, EpollEvent};
 pub use eventfd::EventFd;
+pub use pidfd::{PidFd, PIDFD_THREAD};
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use stdio::{STDIN, STDOUT};
 

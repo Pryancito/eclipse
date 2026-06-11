@@ -340,16 +340,16 @@ impl Stdin {
                 let _ = crate::process::send_signal_to_process(pgid as usize, crate::signal::Signal::SIGINT);
             }
         }
-        Self::echo_char(c);
         self.buf.lock().push_back(c);
-        // Signal availability. If we can grab the eventbus cheaply, notify
-        // waiters immediately; otherwise leave the flag for later executor-side
-        // flush_ready_flag() call to avoid lock inversion from input callbacks.
+        // Buffer first, then wake readers (before slow VGA/serial echo).
         self.data_ready.store(true, Ordering::Release);
         if let Some(mut eb) = self.eventbus.try_lock() {
             self.data_ready.store(false, Ordering::Relaxed);
             eb.set(Event::READABLE);
+        } else {
+            wake_tty_intr_waiters();
         }
+        Self::echo_char(c);
     }
 
     /// Drain the atomic flag and propagate to EventBus.
@@ -456,30 +456,41 @@ impl INode for Stdin {
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SerialFuture<'a> {
             stdin: &'a Stdin,
+            armed: bool,
         }
 
         impl<'a> Future for SerialFuture<'a> {
             type Output = Result<PollStatus>;
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                // Propagate any IRQ-side pushes into the EventBus.
-                self.stdin.flush_ready_flag();
-                if self.stdin.can_read() {
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                let this = self.as_mut().get_mut();
+                this.stdin.flush_ready_flag();
+                if this.stdin.can_read() {
                     return Poll::Ready(Ok(PollStatus {
                         read: true,
                         write: false,
                         error: false,
                     }));
                 }
-                let waker = cx.waker().clone();
-                self.stdin.eventbus.lock().subscribe(Box::new({
-                    move |_| {
+
+                if this.armed {
+                    crate::net::retain_io_wait_wakers(cx.waker(), false, true);
+                    this.armed = false;
+                } else {
+                    crate::net::register_io_wait_wakers(cx.waker(), false, true);
+                    let waker = cx.waker().clone();
+                    this.stdin.eventbus.lock().subscribe(Box::new(move |_| {
                         waker.wake_by_ref();
                         true
-                    }
-                }));
-                self.stdin.flush_ready_flag();
-                if self.stdin.can_read() {
+                    }));
+                    this.armed = true;
+                }
+
+                // Eclipse Pulse: poll xHCI + hlt (read() does not go through poll(2)).
+                crate::net::io_wait_tick(false, true);
+
+                this.stdin.flush_ready_flag();
+                if this.stdin.can_read() {
                     Poll::Ready(Ok(PollStatus {
                         read: true,
                         write: false,
@@ -491,7 +502,10 @@ impl INode for Stdin {
             }
         }
 
-        Box::pin(SerialFuture { stdin: self })
+        Box::pin(SerialFuture {
+            stdin: self,
+            armed: false,
+        })
     }
 
     //

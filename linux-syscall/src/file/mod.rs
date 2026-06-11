@@ -10,6 +10,7 @@ mod fd;
 #[allow(clippy::module_inception)]
 mod file;
 mod mount;
+mod pidfd;
 mod poll;
 mod stat;
 

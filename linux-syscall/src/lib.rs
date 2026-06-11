@@ -30,8 +30,8 @@ use core::convert::TryFrom;
 use kernel_hal::user::{IoVecIn, IoVecOut, UserInOutPtr, UserInPtr, UserOutPtr};
 use linux_object::error::{LxError, SysResult};
 use linux_object::fs::FileDesc;
-use linux_object::process::{wait_child, wait_child_any, LinuxProcess, ProcessExt, RLimit};
-use zircon_object::object::{KernelObject, KoID, Signal};
+use linux_object::process::{LinuxProcess, ProcessExt, RLimit};
+use zircon_object::object::{KernelObject, KoID};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadFn};
 use zircon_object::vm::VirtAddr;
 
@@ -216,12 +216,18 @@ impl Syscall<'_> {
             Sys::EXIT => self.sys_exit(a0 as _),
             Sys::EXIT_GROUP => self.sys_exit_group(a0 as _),
             Sys::WAIT4 => self.sys_wait4(a0 as _, a1.into(), a2 as _).await,
+            Sys::WAITID => self.sys_waitid(a0 as i32, a1, a2.into(), a3 as u32).await,
             Sys::SET_TID_ADDRESS => self.sys_set_tid_address(a0.into()),
             Sys::FUTEX => self.sys_futex(a0, a1 as _, a2 as _, a3, a4, a5 as _).await,
             Sys::GET_ROBUST_LIST => self.sys_get_robust_list(a0 as _, a1.into(), a2.into()),
             Sys::SET_ROBUST_LIST => self.sys_set_robust_list(a0.into(), a1 as _),
             Sys::TKILL => self.sys_tkill(a0, a1),
             Sys::TGKILL => self.sys_tgkill(a0, a1, a2),
+            Sys::PIDFD_OPEN => self.sys_pidfd_open(a0, a1 as u32),
+            Sys::PIDFD_SEND_SIGNAL => {
+                self.sys_pidfd_send_signal(a0.into(), a1, a2.into(), a3 as u32)
+            }
+            Sys::PIDFD_GETFD => self.sys_pidfd_getfd(a0.into(), a1 as i32, a2 as u32),
 
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,

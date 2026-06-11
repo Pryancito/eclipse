@@ -482,6 +482,12 @@ impl LinuxProcess {
         inner.files.remove(&fd).map(|_| ()).ok_or(LxError::EBADF)
     }
 
+    /// Whether `pid` is a tracked child of this process (live or not yet reaped).
+    pub fn has_child(&self, pid: KoID) -> bool {
+        let inner = self.inner.lock();
+        inner.children.contains_key(&pid) || inner.reaped_children.contains_key(&pid)
+    }
+
     /// Close all file descriptors between `first` and `last`.
     pub fn close_range(&self, first: FileDesc, last: FileDesc) {
         let mut inner = self.inner.lock();

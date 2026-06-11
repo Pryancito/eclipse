@@ -8,7 +8,7 @@ use cfg_if::cfg_if;
 
 
 /// xHCI HID backup poll interval when no MSI (tier C).
-pub const PULSE_HID_FALLBACK_US: u64 = 16_000;
+pub const PULSE_HID_FALLBACK_US: u64 = 4_000;
 /// smoltcp/NIC backup when no RX IRQ (tier C).
 pub const PULSE_NET_FALLBACK_US: u64 = 32_000;
 /// Deferred NIC jobs when not watching sockets.

@@ -8,11 +8,32 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use kernel_hal::context::{UserContext, UserContextField};
+use linux_object::fs::{FileLike, PidFd};
+use linux_object::process::{wait_child, wait_child_any};
+use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
-use zircon_object::object::KernelObject;
+use zircon_object::object::{KernelObject, KoID, Signal};
+use zircon_object::task::Status;
 use zircon_object::vm::USER_STACK_PAGES;
+
+const P_ALL: i32 = 0;
+const P_PID: i32 = 1;
+const P_PGID: i32 = 2;
+const P_PIDFD: i32 = 5;
+
+fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
+    if infop.is_null() {
+        return Ok(0);
+    }
+    infop.write(SigInfo::child_exited(pid as i32, status))?;
+    Ok(0)
+}
+
+fn is_child_process(parent: &zircon_object::task::Process, child: &zircon_object::task::Process) -> bool {
+    parent.linux().has_child(child.id())
+}
 
 fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -275,6 +296,62 @@ impl Syscall<'_> {
         };
         wstatus.write_if_not_null(code)?;
         Ok(pid as usize)
+    }
+
+    /// Wait for a child state change (`waitid(2)`). Supports `P_PID`, `P_PIDFD`, and `P_ALL`.
+    pub async fn sys_waitid(
+        &self,
+        idtype: i32,
+        id: usize,
+        infop: UserOutPtr<SigInfo>,
+        options: u32,
+    ) -> SysResult {
+        bitflags! {
+            struct WaitIdOptions: u32 {
+                const WNOHANG   = 0x0100_0000;
+                const WEXITED   = 0x0000_0004;
+            }
+        }
+        let opts = WaitIdOptions::from_bits_truncate(options);
+        let nohang = opts.contains(WaitIdOptions::WNOHANG);
+        let caller = self.zircon_process();
+
+        let (child_pid, status) = match idtype {
+            P_PID => {
+                if id == 0 {
+                    return Err(LxError::EINVAL);
+                }
+                let code = wait_child(caller, id as KoID, nohang).await?;
+                (id as KoID, code)
+            }
+            P_PIDFD => {
+                let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(id.into())?)?;
+                let target = pidfd.target();
+                if !is_child_process(caller, target) {
+                    return Err(LxError::ECHILD);
+                }
+                if FileLike::flags(pidfd.as_ref()).non_block()
+                    && !matches!(target.status(), Status::Exited(_))
+                    && !nohang
+                {
+                    return Err(LxError::EAGAIN);
+                }
+                let code = wait_child(caller, target.id(), nohang).await?;
+                (target.id(), code)
+            }
+            P_ALL => {
+                let (pid, code) = wait_child_any(caller, nohang).await?;
+                (pid, code)
+            }
+            P_PGID => return Err(LxError::ENOSYS),
+            _ => return Err(LxError::EINVAL),
+        };
+
+        if opts.contains(WaitIdOptions::WEXITED) || options == 0 {
+            let exit_status = status >> 8;
+            write_sigchld_info(infop, child_pid, exit_status)?;
+        }
+        Ok(0)
     }
 
     /// `sys_execve` executes the program referred to by `path`
