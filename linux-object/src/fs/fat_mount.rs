@@ -5,6 +5,23 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::min;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Asigna un identificador de dispositivo único a cada FS FAT montado.
+/// Empieza alto para no colisionar con los ids de otros sistemas de archivos.
+static FAT_DEV_COUNTER: AtomicU64 = AtomicU64::new(0xFA70_0000);
+
+/// Hash FNV-1a de 64 bits del path, usado como número de inodo estable.
+/// Evita que dos rutas distintas (o la misma ruta en montajes distintos)
+/// compartan identidad (st_dev, st_ino) y confundan a herramientas como `cp`.
+fn fnv1a_path(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 use fatfs::{FileSystem, FsOptions, IoBase, Read, Seek, SeekFrom, Write};
 use lock::Mutex;
@@ -128,6 +145,8 @@ impl Seek for FatDisk {
 pub struct FatMountFs {
     inner: Mutex<FileSystem<FatDisk>>,
     this: Mutex<Weak<Self>>,
+    /// Identificador de dispositivo único de este montaje (para st_dev).
+    dev: u64,
 }
 
 impl FatMountFs {
@@ -140,6 +159,7 @@ impl FatMountFs {
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
             this: Mutex::new(Weak::new()),
+            dev: FAT_DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         Ok(arc)
@@ -258,8 +278,8 @@ impl INode for FatMountINode {
                 .map_err(|_| FsError::DeviceError)? as usize
         };
         Ok(Metadata {
-            dev: 0,
-            inode: self.path.len(),
+            dev: self.fs.dev as usize,
+            inode: fnv1a_path(&self.path) as usize,
             size,
             blk_size: 512,
             blocks: (size + 511) / 512,

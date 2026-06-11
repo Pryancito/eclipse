@@ -2077,9 +2077,66 @@ static int shell_mkdir_p(const char *path, int dry_run) {
 }
 
 static int shell_copy_file(const char *src, const char *dst, int dry_run) {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "sh -c \"cp -f '%s' '%s'\"", src, dst);
-    return run_command_logged(cmd, dry_run);
+    uint8_t buf[64 * 1024];
+    int in_fd, out_fd;
+    ssize_t nread;
+
+    if (dry_run) {
+        log(COLOR_YELLOW "[dry-run] copiar %s -> %s" COLOR_RESET, src, dst);
+        return 0;
+    }
+
+    /* Copia nativa (no se usa `cp`): el driver vfat de Eclipse OS reporta el
+     * mismo par (st_dev, st_ino) para distintos montajes, y `cp` aborta con
+     * "are the same file" al comparar identidades. Leer/escribir directamente
+     * evita por completo esa heurística. */
+    in_fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (in_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir origen %s (%s)." COLOR_RESET,
+            src, strerror(errno));
+        return -1;
+    }
+
+    out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out_fd < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear destino %s (%s)." COLOR_RESET,
+            dst, strerror(errno));
+        close(in_fd);
+        return -1;
+    }
+
+    while ((nread = read(in_fd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < nread) {
+            ssize_t nwritten = write(out_fd, buf + off, (size_t)(nread - off));
+            if (nwritten < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
+                    dst, strerror(errno));
+                close(in_fd);
+                close(out_fd);
+                return -1;
+            }
+            off += nwritten;
+        }
+    }
+
+    if (nread < 0) {
+        log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+            src, strerror(errno));
+        close(in_fd);
+        close(out_fd);
+        return -1;
+    }
+
+    if (fsync(out_fd) != 0) {
+        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, dst, strerror(errno));
+    }
+    close(in_fd);
+    close(out_fd);
+    return 0;
 }
 
 static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run) {
