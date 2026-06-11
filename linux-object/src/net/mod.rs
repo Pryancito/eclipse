@@ -751,9 +751,9 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
 }
 
 /// Min interval between full [`poll_ifaces`] (~62 Hz cap — keeps PS/2 IRQ responsive).
-const NET_POLL_MIN_INTERVAL_US: u64 = 32_000;
+const NET_POLL_MIN_INTERVAL_US: u64 = 16_000;
 /// Max NIC deferred jobs per I/O wait tick when sockets are watched (HID first).
-const DEFERRED_NET_JOBS_PER_TICK: usize = 1;
+const DEFERRED_NET_JOBS_PER_TICK: usize = 4;
 
 static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
 

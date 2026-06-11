@@ -218,13 +218,12 @@ impl AcpiHandler for AcpiMap {
 // ─── Timing ──────────────────────────────────────────────────────────────────
 
 fn delay_us(us: u64) {
-    // TSC ticks per microsecond ≈ CPU base frequency in MHz. The previous code
-    // hard-coded 1 GHz (1000 ticks/µs); on a real 3–4 GHz CPU that made every
-    // delay 3–4× too short, so the INIT→SIPI gap and the AP-online wait could
-    // expire before the AP was ready, intermittently losing APs. `cpu_frequency()`
-    // reports at least 4000 MHz, so we err on the side of waiting slightly longer
-    // (always safe) rather than too short.
-    let ticks_per_us = crate::cpu::cpu_frequency() as u64;
+    // TSC ticks per microsecond ≈ CPU base frequency in MHz.
+    // Apply a 4 GHz floor so the INIT→SIPI gap and AP-online wait are never
+    // too short on a fast CPU where CPUID isn't available.  cpu_frequency()
+    // now returns the raw CPUID value (no global floor) so we add the floor
+    // here explicitly — it is safe to wait *longer* than needed, but not shorter.
+    let ticks_per_us = crate::cpu::cpu_frequency().max(4000) as u64;
     let ticks = us.saturating_mul(ticks_per_us);
     let start = unsafe { core::arch::x86_64::_rdtsc() };
     while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < ticks {
