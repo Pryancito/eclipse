@@ -2645,7 +2645,9 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     char root_dev[160];
     int rc = 0;
     const char *src_mnt = NULL;
-    int mount_needed = 1;
+    int mount_needed = 0;
+    int root_mounted = 0;
+    char root_img_path[512] = "";
 
     if (discover_partitions(disk_path, &parts) != 0) {
         return -1;
@@ -2662,29 +2664,41 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     if (struct_file_exists("/boot/efi-staging/EFI/Boot/BootX64.efi")) {
         log("Se detectaron archivos de actualización pre-extraídos en /boot/efi-staging.");
         src_mnt = "/boot/efi-staging";
-        mount_needed = 0;
     } else {
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s (fuente del bootloader/kernel)." COLOR_RESET, EFI_IMAGE_GZ);
             return -1;
         }
 
+        /* Mount ROOT partition onto UPD_ROOT_MNT so we can write the decompressed image on disk instead of RAM (tmpfs) */
+        if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
+            return -1;
+        }
+        if (shell_mount(root_dev, UPD_ROOT_MNT, "ext2", 0, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
+            return -1;
+        }
+        root_mounted = 1;
+
+        snprintf(root_img_path, sizeof(root_img_path), "%s/eclipse-upd-efi.img", UPD_ROOT_MNT);
+
+        if (decompress_gz_to_path(EFI_IMAGE_GZ, root_img_path, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s a la partición ROOT." COLOR_RESET, EFI_IMAGE_GZ);
+            rc = -1;
+            goto cleanup;
+        }
+
         if (shell_mkdir_p(UPD_STAGING_MNT, dry_run) != 0) {
-            return -1;
+            rc = -1;
+            goto cleanup;
         }
 
-        if (decompress_gz_to_path(EFI_IMAGE_GZ, UPD_STAGING_IMG, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s." COLOR_RESET, EFI_IMAGE_GZ);
-            return -1;
+        if (shell_mount(root_img_path, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
+            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI extraída en disco." COLOR_RESET);
+            rc = -1;
+            goto cleanup;
         }
-
-        if (shell_mount(UPD_STAGING_IMG, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI de origen." COLOR_RESET);
-            if (!dry_run) {
-                unlink(UPD_STAGING_IMG);
-            }
-            return -1;
-        }
+        mount_needed = 1;
         src_mnt = UPD_STAGING_MNT;
     }
 
@@ -2728,9 +2742,12 @@ cleanup_mount:
 cleanup:
     if (mount_needed) {
         shell_umount(UPD_STAGING_MNT, dry_run);
-        if (!dry_run) {
-            unlink(UPD_STAGING_IMG);
+    }
+    if (root_mounted) {
+        if (root_img_path[0] != '\0' && !dry_run) {
+            unlink(root_img_path);
         }
+        shell_umount(UPD_ROOT_MNT, dry_run);
     }
     if (rc == 0) {
         /* La partición EFI ya está desmontada: fija ROOT= en rboot.conf (no fatal). */
