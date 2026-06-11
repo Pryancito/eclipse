@@ -110,14 +110,17 @@ impl super::LinuxRootfs {
             assert!(status.success(), "Failed to copy initramfs.img");
 
             println!("Compressing efi.img -> efi.img.gz...");
-            let efi_gz = boot_dir.join("efi.img.gz");
+            let target_efi_gz = TARGET.join("efi.img.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&efi_img)
-                .stdout(fs::File::create(&efi_gz).unwrap())
+                .stdout(fs::File::create(&target_efi_gz).unwrap())
                 .status()
                 .unwrap();
             assert!(status.success(), "Failed to compress efi.img");
+
+            let efi_gz = boot_dir.join("efi.img.gz");
+            fs::copy(&target_efi_gz, &efi_gz).unwrap();
 
             // 5. Build rootfs.ext2
             println!("Building rootfs.ext2...");
@@ -148,14 +151,17 @@ impl super::LinuxRootfs {
             assert!(status.success(), "Failed to format/populate rootfs.ext2");
 
             println!("Compressing rootfs.ext2 -> rootfs.ext2.gz...");
-            let ext2_gz = boot_dir.join("rootfs.ext2.gz");
+            let target_ext2_gz = TARGET.join("rootfs.ext2.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&ext2_img)
-                .stdout(fs::File::create(&ext2_gz).unwrap())
+                .stdout(fs::File::create(&target_ext2_gz).unwrap())
                 .status()
                 .unwrap();
             assert!(status.success(), "Failed to compress rootfs.ext2");
+
+            let ext2_gz = boot_dir.join("rootfs.ext2.gz");
+            fs::copy(&target_ext2_gz, &ext2_gz).unwrap();
 
             // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
             println!("Building final installer-enabled image...");

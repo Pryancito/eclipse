@@ -543,13 +543,14 @@ impl<'a> Ext2Editor<'a> {
         while done < want {
             let file_block = pos / bs;
             let block_off = pos % bs;
-            let disk_block = match self.inode_block_at(&raw, file_block)? {
-                Some(b) => b,
-                None => break,
-            };
-            let data = self.read_block(disk_block)?;
+            let disk_block = self.inode_block_at(&raw, file_block)?;
             let take = (want - done).min(bs - block_off);
-            buf[done..done + take].copy_from_slice(&data[block_off..block_off + take]);
+            if let Some(b) = disk_block {
+                let data = self.read_block(b)?;
+                buf[done..done + take].copy_from_slice(&data[block_off..block_off + take]);
+            } else {
+                buf[done..done + take].fill(0);
+            }
             done += take;
             pos += take;
         }

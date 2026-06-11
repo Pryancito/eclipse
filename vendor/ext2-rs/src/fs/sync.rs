@@ -605,7 +605,7 @@ pub struct InodeBlocks<S: SectorSize, V: Volume<u8, S>> {
 }
 
 /// Cap directory/file block walks so a corrupt inode cannot stall boot.
-const MAX_INODE_DATA_BLOCKS: usize = 256;
+const MAX_INODE_DATA_BLOCKS: usize = 1048576;
 
 impl<S: SectorSize, V: Volume<u8, S>> Iterator for InodeBlocks<S, V> {
     type Item = Result<(Vec<u8>, Address<S>), Error>;
@@ -904,5 +904,69 @@ mod tests {
         let mut vec = Vec::new();
         assert!(inode.read_to_end(&mut vec).is_ok());
         println!("{}", str::from_utf8(&vec).unwrap());
+    }
+
+    #[test]
+    fn apk_test() {
+        use std::path::Path;
+        let ext2_path = "/home/moebius/eclipse2/ignored/target/rootfs.ext2";
+        if !Path::new(ext2_path).exists() {
+            println!("rootfs.ext2 not found, skipping apk_test");
+            return;
+        }
+        let file = RefCell::new(File::open(ext2_path).unwrap());
+        let fs = Synced::<Ext2<Size512, _>>::new(file).unwrap();
+        let found = fs.open(b"/bin/apk", &OpenOptions::new());
+        assert!(found.is_ok(), "failed to open /bin/apk in rootfs.ext2");
+        let inode = found.unwrap();
+        let block_size = fs.inner().block_size();
+        let log_block_size = fs.inner().log_block_size();
+        println!("Found /bin/apk, size = {}, block_size = {}, log_block_size = {}", inode.size(), block_size, log_block_size);
+        let mut buf = vec![0u8; inode.size()];
+        let mut offset = 0;
+        
+        for b in 0..15 {
+            println!("block {}: {:?}", b, inode.try_block(b).unwrap());
+        }
+        println!("Transition to single indirect:");
+        for b in 10..20 {
+            println!("block {}: {:?}", b, inode.try_block(b).unwrap());
+        }
+        println!("Transition to doubly indirect:");
+        for b in 1030..1045 {
+            println!("block {}: {:?}", b, inode.try_block(b).unwrap());
+        }
+        println!("Around block 1890:");
+        for b in 1880..1900 {
+            println!("block {}: {:?}", b, inode.try_block(b).unwrap());
+        }
+        
+        while offset < inode.size() {
+            let file_block = offset / block_size;
+            let block_off = offset % block_size;
+            let res = inode.try_block(file_block).unwrap();
+            let take = std::cmp::min(inode.size() - offset, block_size - block_off);
+            if let Some(disk_block) = res {
+                let byte_base = crate::sector::Address::<crate::sector::Size512>::with_block_size(
+                    disk_block.get(),
+                    block_off as i32,
+                    log_block_size,
+                )
+                .into_index() as usize;
+                
+                let range = crate::sector::Address::<crate::sector::Size512>::from(byte_base as u64)..crate::sector::Address::<crate::sector::Size512>::from((byte_base + take) as u64);
+                let inner = fs.inner();
+                let slice = inner.volume.slice(range).unwrap();
+                buf[offset..offset + take].copy_from_slice(slice.as_ref());
+            } else {
+                buf[offset..offset + take].fill(0);
+            }
+            offset += take;
+        }
+        
+        let host_apk = std::fs::read("/home/moebius/eclipse2/rootfs/x86_64/bin/apk").unwrap();
+        assert_eq!(buf.len(), host_apk.len(), "length mismatch!");
+        assert_eq!(buf, host_apk, "content mismatch!");
+        println!("apk_test PASSED successfully!");
     }
 }
