@@ -334,13 +334,12 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn remove_mapping(&self, mapping: Weak<VmMapping>) {
-        let inner = &mut self.get_inner_mut().1;
-        let mappings = core::mem::take(&mut inner.mappings);
-        for x in mappings {
-            if x.strong_count() > 0 && !Weak::ptr_eq(&x, &mapping) {
-                inner.mappings.push(x);
-            }
-        }
+        // Drop the target mapping and any dead weak refs in a single in-place
+        // pass, without taking and rebuilding the vector.
+        self.get_inner_mut()
+            .1
+            .mappings
+            .retain(|x| x.strong_count() > 0 && !Weak::ptr_eq(x, &mapping));
     }
 
     fn complete_info(&self, info: &mut VmoInfo) {
@@ -522,8 +521,9 @@ impl VMObjectPagedInner {
             CommitResult::Ref(paddr) => Ok(paddr),
             _ => unreachable!(),
         };
-        // force check conntiguous on each leaf node
-        assert!(self.check_contig());
+        // Validate physical contiguity only in debug builds; this runs on
+        // every page commit and is O(committed pages) for contiguous VMOs.
+        debug_assert!(self.check_contig());
         ret
     }
 
