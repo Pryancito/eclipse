@@ -11,11 +11,22 @@ use x86_64::instructions::interrupts;
 hal_fn_impl! {
     impl mod crate::hal_fn::interrupt {
         fn wait_for_interrupt() {
+            let cpu = super::cpu::cpu_id() as usize;
+            // Publish "idle" before checking for pending wakes: a waker either
+            // sees the flag (and IPIs us out of HLT) or we see its pending bit
+            // here and skip the HLT entirely. `sti; hlt` is atomic against the
+            // IPI arriving in between.
+            crate::common::ipi::idle_enter(cpu);
+            if crate::common::ipi::idle_should_skip_halt(cpu) {
+                crate::common::ipi::idle_exit(cpu);
+                return;
+            }
             let enable = interrupts::are_enabled();
             interrupts::enable_and_hlt();
             if !enable {
                 interrupts::disable();
             }
+            crate::common::ipi::idle_exit(cpu);
         }
 
         fn is_valid_irq(gsi: usize) -> bool {

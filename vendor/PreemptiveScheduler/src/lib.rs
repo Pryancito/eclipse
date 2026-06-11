@@ -34,6 +34,43 @@ mod waker_page;
 
 pub use runtime::{handle_timeout, run_until_idle, sched_yield, spawn};
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static WAKE_CPU_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register a callback invoked right after a task becomes runnable on some
+/// CPU's queue (the argument is that CPU's dense logical id). The kernel uses
+/// this to IPI idle (HLT'ed) CPUs so cross-CPU wakeups don't wait for the
+/// next periodic timer tick.
+pub fn set_wake_cpu_hook(hook: fn(usize)) {
+    WAKE_CPU_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn wake_cpu(cpu_id: usize) {
+    let f = WAKE_CPU_HOOK.load(Ordering::Acquire);
+    if f != 0 {
+        let f: fn(usize) = unsafe { core::mem::transmute(f) };
+        f(cpu_id);
+    }
+}
+
+/// CPUs that actually came online; spawn distribution only targets these.
+/// Defaults to all queues so behavior is unchanged until the kernel reports
+/// the real count after SMP bring-up.
+static ACTIVE_CPUS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Tell the executor how many CPUs are online, so new tasks are not parked
+/// on the run queue of a CPU that does not exist (those would only ever run
+/// when some real CPU steals them on a later timer tick).
+pub fn set_active_cpu_count(count: usize) {
+    ACTIVE_CPUS.store(count.max(1), Ordering::Release);
+}
+
+pub(crate) fn active_cpu_count() -> usize {
+    ACTIVE_CPUS.load(Ordering::Acquire)
+}
+
 #[macro_export]
 macro_rules! run_with_intr_saved_on {
     ($($statements:stmt)*) => {

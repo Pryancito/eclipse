@@ -67,6 +67,9 @@ pub fn primary_init() {
     }
     smp::start_application_processors();
     warn!("[boot] smp init complete");
+    // Now that the real CPU count is known, keep new tasks off the run
+    // queues of CPUs that never came online.
+    executor::set_active_cpu_count(cpu::cpu_count() as usize);
 }
 
 pub fn timer_init() {

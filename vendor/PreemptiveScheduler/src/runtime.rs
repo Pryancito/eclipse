@@ -227,22 +227,25 @@ pub fn spawn_task(
 ) {
     debug!("try to spawn {:?} {:?}", priority, cpu_id);
     let priority = priority.unwrap_or(DEFAULT_PRIORITY);
-    let runtime = if let Some(cpu_id) = cpu_id {
+    let target_cpu = if let Some(cpu_id) = cpu_id {
         assert!(
             cpu_id < MAX_CORE_NUM,
             "spawn_task: cpu_id {} out of range (MAX_CORE_NUM={})",
             cpu_id,
             MAX_CORE_NUM
         );
-        &GLOBAL_RUNTIME[cpu_id]
+        cpu_id
     } else {
         // Use try_lock() to find the least-loaded CPU without stalling callers.
         // If a runtime is currently locked (busy), we skip it and consider the
         // others; the CPU whose runtime is unlocked and has the fewest tasks wins.
         // Fallback to CPU 0 when every runtime happens to be locked.
+        // Only CPUs that are actually online are considered — queues of absent
+        // CPUs would strand the task until someone steals it.
+        let limit = crate::active_cpu_count().min(MAX_CORE_NUM);
         let mut best = 0usize;
         let mut best_count = usize::MAX;
-        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate() {
+        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate().take(limit) {
             if let Some(rt) = rt.try_lock() {
                 let count = rt.task_num();
                 if count < best_count {
@@ -251,9 +254,12 @@ pub fn spawn_task(
                 }
             }
         }
-        &GLOBAL_RUNTIME[best]
+        best
     };
-    runtime.lock().add_task(priority, future);
+    GLOBAL_RUNTIME[target_cpu].lock().add_task(priority, future);
+    // The chosen CPU may be HLT'ed in its idle loop; kick it so the new task
+    // doesn't wait for the next periodic tick.
+    crate::wake_cpu(target_cpu);
 }
 
 /// check whether the running coroutine of current cpu time out, if yes, we will
