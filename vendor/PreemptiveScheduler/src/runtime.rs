@@ -10,12 +10,45 @@ use crate::context::Context;
 use crate::context::ContextData as Context;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use lazy_static::*;
 use spin::{Mutex, MutexGuard};
 
-/// Must match `kernel_hal::config::MAX_CORE_NUM` and `lock`'s per-CPU array size.
-const MAX_CORE_NUM: usize = 64;
+/// Shared with the `lock` crate (and checked against `kernel_hal::config`) so
+/// every per-CPU array in the system agrees on one size.
+const MAX_CORE_NUM: usize = lock::MAX_CORE_NUM;
+
+/// One past the highest dense logical cpu id that has entered `run_until_idle`.
+/// Task placement and work stealing only consider CPUs in `0..num_online_cpus()`:
+/// a task parked on the queue of a CPU that never runs an executor would only
+/// ever execute if some idle CPU happened to steal it.
+static NUM_ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+pub(crate) fn num_online_cpus() -> usize {
+    NUM_ONLINE_CPUS.load(Ordering::Relaxed)
+}
+
+/// Callback invoked by an executor when its CPU runs out of work, right before
+/// halting to wait for an interrupt. Returns `true` if it made progress (e.g.
+/// drained deferred driver jobs), in which case the executor re-checks its run
+/// queue instead of halting.
+static IDLE_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_idle_callback(f: fn() -> bool) {
+    IDLE_CALLBACK.store(f as usize, Ordering::Release);
+}
+
+pub(crate) fn run_idle_callback() -> bool {
+    let f = IDLE_CALLBACK.load(Ordering::Acquire);
+    if f != 0 {
+        let f: fn() -> bool = unsafe { core::mem::transmute(f) };
+        f()
+    } else {
+        false
+    }
+}
 
 pub struct ExecutorRuntime {
     // runtime only run on this cpu
@@ -131,7 +164,7 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
     // cycle rather than queue-spinning on its lock.
     let mut best_cpu_idx = None;
     let mut best_count = 0usize;
-    for (i, runtime_mutex) in GLOBAL_RUNTIME.iter().enumerate() {
+    for (i, runtime_mutex) in GLOBAL_RUNTIME.iter().enumerate().take(num_online_cpus()) {
         if i == current_cpu {
             // Never steal from ourselves; our own collection is already empty.
             continue;
@@ -156,6 +189,8 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
 // per-cpu scheduler.
 pub fn run_until_idle() -> bool {
     debug!("GLOBAL_RUNTIME.run()");
+    // Make this CPU eligible for task placement and work stealing.
+    NUM_ONLINE_CPUS.fetch_max(crate::arch::cpu_id() as usize + 1, Ordering::Relaxed);
     loop {
         let mut runtime = get_current_runtime();
         let runtime_cx = runtime.get_context();
@@ -236,13 +271,13 @@ pub fn spawn_task(
         );
         &GLOBAL_RUNTIME[cpu_id]
     } else {
-        // Use try_lock() to find the least-loaded CPU without stalling callers.
-        // If a runtime is currently locked (busy), we skip it and consider the
-        // others; the CPU whose runtime is unlocked and has the fewest tasks wins.
-        // Fallback to CPU 0 when every runtime happens to be locked.
+        // Use try_lock() to find the least-loaded online CPU without stalling
+        // callers. If a runtime is currently locked (busy), we skip it and
+        // consider the others; the CPU whose runtime is unlocked and has the
+        // fewest tasks wins. Fallback to CPU 0 when every runtime is locked.
         let mut best = 0usize;
         let mut best_count = usize::MAX;
-        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate() {
+        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate().take(num_online_cpus()) {
             if let Some(rt) = rt.try_lock() {
                 let count = rt.task_num();
                 if count < best_count {

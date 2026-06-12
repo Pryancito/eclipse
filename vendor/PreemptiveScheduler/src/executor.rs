@@ -137,6 +137,11 @@ impl Executor {
                 } else if weak_executor != 0 {
                     debug!("return to runtime and run weak executor");
                     crate::runtime::sched_yield();
+                } else if crate::runtime::run_idle_callback() {
+                    // The idle callback made progress (e.g. drained deferred
+                    // driver jobs that may have woken tasks): re-check the run
+                    // queue instead of halting until the next interrupt.
+                    continue;
                 } else {
                     debug!("no other tasks, wait for interrupt");
                     crate::arch::wait_for_interrupt();

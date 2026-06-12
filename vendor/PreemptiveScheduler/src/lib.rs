@@ -32,7 +32,7 @@ mod runtime;
 mod task_collection;
 mod waker_page;
 
-pub use runtime::{handle_timeout, run_until_idle, sched_yield, spawn};
+pub use runtime::{handle_timeout, run_until_idle, sched_yield, set_idle_callback, spawn};
 
 #[macro_export]
 macro_rules! run_with_intr_saved_on {

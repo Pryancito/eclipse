@@ -1,5 +1,10 @@
 #![no_std]
 
+/// Single source of truth for the size of every per-CPU array indexed by the
+/// dense logical cpu id (this crate's `CPUS`, the scheduler's `GLOBAL_RUNTIME`,
+/// kernel-hal's percpu storage).
+pub const MAX_CORE_NUM: usize = 64;
+
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", feature = "ticket"))] {
         extern crate alloc;
