@@ -117,21 +117,33 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
 #[cfg(not(feature = "libos"))]
 pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     kernel_hal::timer::timer_enable();
-    info!("executor run!");
-    loop {
-        let has_task = executor::run_until_idle();
-        kernel_hal::deferred_job::drain_deferred_jobs();
-        if !has_task && cfg!(feature = "baremetal-test") {
-            proc.map(check_exit_code);
-            kernel_hal::cpu::reset();
+    // Executors call this when their CPU runs out of tasks, right before
+    // halting: drain NIC/driver work pushed from IRQ context and flush stdin
+    // data whose EventBus notification was deferred (try_lock failed), so the
+    // wakers fire now instead of waiting for a thread to re-enter the net
+    // stack or for the next timer tick. Returning `true` makes the executor
+    // re-check its run queue instead of halting.
+    executor::set_idle_callback(|| {
+        let had_jobs = kernel_hal::deferred_job::pending_deferred_jobs() > 0;
+        if had_jobs {
+            kernel_hal::deferred_job::drain_deferred_jobs();
         }
-        // Flush any stdin data pushed from IRQ context whose EventBus
-        // notification was deferred (try_lock failed).  This ensures
-        // the waker fires before we halt waiting for the next interrupt.
         #[cfg(feature = "linux")]
         {
             use linux_object::fs::stdio::STDIN;
             STDIN.flush_ready_flag();
+        }
+        had_jobs
+    });
+    info!("executor run!");
+    loop {
+        // In normal builds `run_until_idle` never returns (idle work happens in
+        // the callback above); it only returns under `baremetal-test` when the
+        // task queue is empty.
+        let has_task = executor::run_until_idle();
+        if !has_task && cfg!(feature = "baremetal-test") {
+            proc.map(check_exit_code);
+            kernel_hal::cpu::reset();
         }
         kernel_hal::interrupt::wait_for_interrupt();
     }

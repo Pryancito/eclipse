@@ -14,6 +14,10 @@ cfg_if! {
     }
 }
 
+// Every per-CPU array indexed by the dense logical cpu id (`lock::CPUS`, the
+// scheduler's `GLOBAL_RUNTIME`, our `percpu`) must cover `config::MAX_CORE_NUM`.
+const _: () = assert!(crate::config::MAX_CORE_NUM <= lock::MAX_CORE_NUM);
+
 pub mod boot;
 pub mod input_poll;
 pub mod mem;

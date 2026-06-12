@@ -269,9 +269,10 @@ impl CpuStorage {
 #[allow(clippy::declare_interior_mutable_const)]
 const DEFAULT_CPU: CpuStorage = CpuStorage::new();
 
-// Debe ser >= al MAX_CORE_NUM del kernel (kernel-hal::config), que comparte el
-// mismo espacio de id lógico denso usado para indexar este array.
-const MAX_CORE_NUM: usize = 64;
+// Tamaño único de los arrays per-CPU del sistema (id lógico denso); lo
+// reutilizan el scheduler (vendor/PreemptiveScheduler) y kernel-hal lo
+// verifica en compilación contra su `config::MAX_CORE_NUM`.
+use crate::MAX_CORE_NUM;
 
 static CPUS: [CpuStorage; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 

@@ -130,11 +130,18 @@ impl WakerPage {
     pub fn take_notified(&self) -> u64 {
         // Unset all ready bits, since spurious notifications for completed futures would lead
         // us to poll them after completion.
-        let mut notified = self.notified.swap(0);
-        // notified &= !self.completed.load();
-        notified &= !self.dropped.load();
-        notified &= !self.borrowed.load();
-        notified
+        let raw = self.notified.swap(0);
+        let dropped = self.dropped.load();
+        let borrowed = self.borrowed.load();
+        // A wake that races with an in-flight poll (bit borrowed by an executor,
+        // possibly on another CPU via work stealing) must not be discarded with
+        // the swap above: re-publish it so the task is polled again once the
+        // borrow is released. Discarding it left the task asleep forever.
+        let deferred = raw & borrowed & !dropped;
+        if deferred != 0 {
+            self.notified.fetch_or(deferred);
+        }
+        raw & !dropped & !borrowed
     }
 
     pub fn take_dropped(&self) -> u64 {
