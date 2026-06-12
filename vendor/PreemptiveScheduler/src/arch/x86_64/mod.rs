@@ -14,7 +14,15 @@ extern "C" {
 
 pub(crate) fn cpu_id() -> u8 {
     // Dense logical id (0..NCPU), not the sparse Local APIC id — see `lock`.
-    lock::current_cpu_id()
+    #[cfg(target_os = "none")]
+    {
+        lock::current_cpu_id()
+    }
+    // Hosted builds (libos) don't use this executor; async-std drives tasks.
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
 }
 
 // pub(crate) fn pg_base_addr() -> usize {

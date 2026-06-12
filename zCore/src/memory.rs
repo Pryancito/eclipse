@@ -123,11 +123,13 @@ pub fn stats() -> (usize, usize) {
 }
 
 /// Bytes of heap currently in use (mirrors `memory_x86_64::heap_used`).
+#[allow(dead_code)]
 pub fn heap_used() -> usize {
     USED_MEMORY.load(Ordering::Relaxed)
 }
 
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
+#[allow(dead_code)]
 pub fn heap_total() -> usize {
     TOTAL_MEMORY.load(Ordering::Relaxed)
 }

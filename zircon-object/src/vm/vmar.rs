@@ -510,7 +510,8 @@ impl VmAddressRegion {
             .find(|&offset| self.test_map(inner, offset, len, align))
     }
 
-    fn end_addr(&self) -> VirtAddr {
+    /// Get the end address (base + size) of this VMAR.
+    pub fn end_addr(&self) -> VirtAddr {
         self.addr + self.size
     }
 
@@ -1041,9 +1042,18 @@ impl Drop for VmMapping {
 
 /// The base of kernel address space
 /// In x86 fuchsia this is 0xffff_ff80_0000_0000 instead
+#[cfg(target_os = "none")]
 pub const KERNEL_ASPACE_BASE: u64 = 0xffff_ff02_0000_0000;
+/// Hosted (libos) builds run in a normal user process: keep the "kernel"
+/// aspace inside the host's mappable range, above the mock PMEM window.
+#[cfg(not(target_os = "none"))]
+pub const KERNEL_ASPACE_BASE: u64 = 0x0000_0010_0000_0000;
 /// The size of kernel address space
+#[cfg(target_os = "none")]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0080_0000_0000;
+/// Hosted (libos) kernel aspace size.
+#[cfg(not(target_os = "none"))]
+pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0010_0000_0000;
 /// The base of user address space
 pub const USER_ASPACE_BASE: u64 = 0;
 // pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0100_0000;

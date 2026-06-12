@@ -115,6 +115,7 @@ pub fn stats() -> (usize, usize) {
 }
 
 /// Kernel heap bytes currently allocated (diagnostics / OOM handler).
+#[allow(dead_code)]
 pub fn heap_used() -> usize {
     HEAP_USED.load(Ordering::Relaxed)
 }

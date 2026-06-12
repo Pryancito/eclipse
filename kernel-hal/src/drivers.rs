@@ -243,6 +243,18 @@ mod virtio_drivers_ffi {
     }
 }
 
+/// Minimal FFI shims for hosted (libos) builds: zcore_drivers' portable code
+/// (e.g. the loopback NetScheme) still links against these symbols.
+#[cfg(feature = "libos")]
+mod drivers_ffi_libos {
+    use crate::hal_fn::timer::timer_now;
+
+    #[no_mangle]
+    extern "C" fn drivers_timer_now_as_micros() -> u64 {
+        timer_now().as_micros() as _
+    }
+}
+
 #[cfg(not(feature = "libos"))]
 mod drivers_ffi {
     use crate::{PhysAddr, VirtAddr, KCONFIG, KHANDLER, PAGE_SIZE};

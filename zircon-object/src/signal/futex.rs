@@ -70,16 +70,27 @@ impl Futex {
     ///
     /// The owner of the futex is set to nothing, regardless of the wake count.
     pub fn wake(&self, wake_count: usize) -> usize {
-        let mut inner = self.inner.lock();
-        inner.set_owner(None);
-        for i in 0..wake_count {
-            if let Some(waiter) = inner.waiter_queue.pop_front() {
-                waiter.wake();
-            } else {
-                return i;
+        // Pop waiters under the queue lock, but deliver the wakeups after
+        // releasing it: `Waiter::wake` takes the waiter lock, and holding
+        // futex.inner -> waiter.inner here while poll/Drop take
+        // waiter.inner -> futex.inner would be a lock-order inversion
+        // (deadlock under SMP).
+        let mut woken = 0;
+        while woken < wake_count {
+            let waiter = self.inner.lock().waiter_queue.pop_front();
+            match waiter {
+                // Skip waiters that were already cancelled (timed out) —
+                // their wake() returns false and must not consume the count.
+                Some(waiter) => {
+                    if waiter.wake() {
+                        woken += 1;
+                    }
+                }
+                None => break,
             }
         }
-        wake_count
+        self.inner.lock().set_owner(None);
+        woken
     }
 
     // ------ Advanced APIs on Zircon ------
@@ -137,19 +148,25 @@ impl Futex {
                 }
                 // first time?
                 if inner.waker.is_none() {
-                    // check value
-                    let value = inner.futex.value.load(Ordering::SeqCst);
+                    let futex = inner.futex.clone();
+                    let mut futex_inner = futex.inner.lock();
+                    // Check the value while holding the futex queue lock: a
+                    // concurrent FUTEX_WAKE pops waiters under the same lock,
+                    // so the check-and-enqueue is atomic with respect to it.
+                    // Checking the value before taking the lock allowed a wake
+                    // to slip in between the check and the enqueue, leaving
+                    // the waiter asleep forever (lost wakeup), which hung
+                    // pthread barriers/condvars (e.g. sysbench startup).
+                    let value = futex.value.load(Ordering::SeqCst);
                     if value != self.current_value {
                         return Poll::Ready(Err(ZxError::BAD_STATE));
                     }
                     // check new owner
-                    let mut futex = inner.futex.inner.lock();
-                    if !futex.is_valid_new_owner(&self.new_owner) {
+                    if !futex_inner.is_valid_new_owner(&self.new_owner) {
                         return Poll::Ready(Err(ZxError::INVALID_ARGS));
                     }
-                    futex.waiter_queue.push_back(self.waiter.clone());
-                    drop(futex);
                     inner.waker.replace(cx.waker().clone());
+                    futex_inner.waiter_queue.push_back(self.waiter.clone());
                 }
                 Poll::Pending
             }
@@ -158,8 +175,12 @@ impl Futex {
         // if we wake without be woken, remove myself from the waiter_queue
         impl Drop for FutexFuture {
             fn drop(&mut self) {
-                let inner = self.waiter.inner.lock();
+                let mut inner = self.waiter.inner.lock();
                 if !inner.woken {
+                    // Tombstone the waiter: if a concurrent wake/requeue
+                    // already popped it from the queue (so the search below
+                    // misses), its wake() must report "already consumed".
+                    inner.woken = true;
                     let futex = inner.futex.clone();
                     let queue = &mut futex.inner.lock().waiter_queue;
                     if let Some(pos) = queue.iter().position(|x| Arc::ptr_eq(x, &self.waiter)) {
@@ -194,12 +215,14 @@ impl Futex {
     /// If there is at least one thread to wake, the owner of the futex will be
     /// set to the thread which was woken. Otherwise, the futex will have no owner.
     pub fn wake_single_owner(&self) {
-        let mut inner = self.inner.lock();
-        let new_owner = inner.waiter_queue.pop_front().and_then(|waiter| {
+        // Pop under the queue lock, wake after releasing it (lock order:
+        // never hold futex.inner while taking waiter.inner).
+        let waiter = self.inner.lock().waiter_queue.pop_front();
+        let new_owner = waiter.and_then(|waiter| {
             waiter.wake();
             waiter.thread.clone()
         });
-        inner.set_owner(new_owner);
+        self.inner.lock().set_owner(new_owner);
     }
 
     /// Requeuing is a generalization of waking.
@@ -224,31 +247,44 @@ impl Futex {
         new_requeue_owner: Option<Arc<Thread>>,
         check_value: bool,
     ) -> ZxResult {
-        let mut inner = self.inner.lock();
-        if check_value {
-            // check value
-            if self.value.load(Ordering::SeqCst) != current_value {
-                return Err(ZxError::BAD_STATE);
+        let mut to_wake = alloc::vec::Vec::new();
+        let mut to_requeue = alloc::vec::Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            if check_value {
+                // check value (under the queue lock, like FUTEX_WAIT does)
+                if self.value.load(Ordering::SeqCst) != current_value {
+                    return Err(ZxError::BAD_STATE);
+                }
             }
-        }
-        // wake
-        for _ in 0..wake_count {
-            if let Some(waiter) = inner.waiter_queue.pop_front() {
-                waiter.wake();
-            } else {
-                break;
+            for _ in 0..wake_count {
+                if let Some(waiter) = inner.waiter_queue.pop_front() {
+                    to_wake.push(waiter);
+                } else {
+                    break;
+                }
             }
+            let requeue_count = requeue_count.min(inner.waiter_queue.len());
+            to_requeue.extend(inner.waiter_queue.drain(..requeue_count));
+            inner.set_owner(None);
         }
-        // requeue
-        let mut new_inner = requeue_futex.inner.lock();
-        let requeue_count = requeue_count.min(inner.waiter_queue.len());
-        for waiter in inner.waiter_queue.drain(..requeue_count) {
+        // Retarget waiters outside the queue locks (`reset_futex` takes the
+        // waiter lock; holding futex.inner here would invert the poll/Drop
+        // lock order), then publish them on the new queue.
+        for waiter in &to_requeue {
             waiter.reset_futex(requeue_futex.clone());
-            new_inner.waiter_queue.push_back(waiter);
         }
-        // set owner
-        inner.set_owner(None);
-        new_inner.set_owner(new_requeue_owner);
+        {
+            let mut new_inner = requeue_futex.inner.lock();
+            for waiter in to_requeue {
+                new_inner.waiter_queue.push_back(waiter);
+            }
+            new_inner.set_owner(new_requeue_owner);
+        }
+        // Deliver wakeups last, with no futex lock held.
+        for waiter in to_wake {
+            waiter.wake();
+        }
         Ok(())
     }
 }
@@ -290,10 +326,25 @@ struct WaiterInner {
 
 impl Waiter {
     /// Wake up the waiting thread.
-    fn wake(&self) {
-        let mut inner = self.inner.lock();
-        inner.woken = true;
-        inner.waker.as_ref().unwrap().wake_by_ref();
+    ///
+    /// Returns `false` if the waiter was already woken or cancelled (its
+    /// future dropped, e.g. on timeout), in which case it must not consume
+    /// a wake count. The waker is invoked after releasing the waiter lock.
+    fn wake(&self) -> bool {
+        let waker = {
+            let mut inner = self.inner.lock();
+            if inner.woken {
+                return false;
+            }
+            inner.woken = true;
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+            true
+        } else {
+            false
+        }
     }
 
     /// Reset futex on requeue.

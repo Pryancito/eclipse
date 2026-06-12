@@ -1,5 +1,4 @@
 use super::*;
-use bitflags::bitflags;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
 use linux_object::time::*;
@@ -125,7 +124,7 @@ impl Syscall<'_> {
     /// - `val` -  a value whose meaning and purpose depends on op
     /// - `val2` - provides a timeout for the attempt or acts as val2 when op is REQUEUE
     /// - `uaddr2` - when op is REQUEUE, points to the target futex
-    /// - `_val3` - is not used
+    /// - `val3` - expected futex value for CMP_REQUEUE; bitset mask for *_BITSET
     pub async fn sys_futex(
         &self,
         uaddr: usize,
@@ -133,34 +132,57 @@ impl Syscall<'_> {
         val: u32,
         val2: usize,
         uaddr2: usize,
-        _val3: u32,
+        val3: u32,
     ) -> SysResult {
+        const FUTEX_WAIT: u32 = 0;
+        const FUTEX_WAKE: u32 = 1;
+        const FUTEX_REQUEUE: u32 = 3;
+        const FUTEX_CMP_REQUEUE: u32 = 4;
+        const FUTEX_WAIT_BITSET: u32 = 9;
+        const FUTEX_WAKE_BITSET: u32 = 10;
+        const FUTEX_PRIVATE_FLAG: u32 = 0x80;
+        const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+
         debug!(
             "Futex uaddr: {:#x}, op: {:x}, val: {}, val2(timeout_addr): {:x}",
             uaddr, op, val, val2,
         );
-        let op = FutexFlags::from_bits_truncate(op);
-        if !op.contains(FutexFlags::PRIVATE) {
-            warn!("process-shared futex is unimplemented");
-            // return Err(LxError::ENOSYS);
+        if op & FUTEX_PRIVATE_FLAG == 0 {
+            // Futexes are per-process objects here, which is correct for
+            // private futexes and a usable approximation for shared ones
+            // within a single process (e.g. musl pthread_join passes priv=0).
+            debug!("process-shared futex is treated as process-private");
         }
-        let op = op - FutexFlags::PRIVATE;
+        // NOTE: do NOT parse `op` as bitflags — command values are an enum
+        // (WAIT_BITSET=9 would alias WAKE=1 when bits are truncated).
+        let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
         let futex = self
             .linux_process()
             .get_futex(uaddr)
             .ok_or(LxError::EINVAL)?;
-        match op {
-            FutexFlags::WAIT => {
+        match cmd {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                // FUTEX_WAIT_BITSET with a mask is approximated as match-any;
+                // both musl and glibc only use FUTEX_BITSET_MATCH_ANY here.
                 let future = futex.wait(val as _);
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                 let res = if let Some(timeout) = timeout_addr.read_if_not_null()? {
+                    // FUTEX_WAIT takes a relative timeout; FUTEX_WAIT_BITSET
+                    // takes an absolute one on the clock selected by
+                    // FUTEX_CLOCK_REALTIME. Convert absolute deadlines to the
+                    // kernel's monotonic deadline base.
+                    let deadline = if cmd == FUTEX_WAIT_BITSET {
+                        let now = if op & FUTEX_CLOCK_REALTIME != 0 {
+                            Duration::from(TimeSpec::now())
+                        } else {
+                            Duration::from(TimeSpec::now_monotonic())
+                        };
+                        timer_now() + Duration::from(timeout).saturating_sub(now)
+                    } else {
+                        timer_now() + Duration::from(timeout)
+                    };
                     self.thread
-                        .blocking_run(
-                            future,
-                            ThreadState::BlockedFutex,
-                            timer_now() + Duration::from(timeout),
-                            None,
-                        )
+                        .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
                         .await
                 } else {
                     future.await
@@ -170,20 +192,28 @@ impl Syscall<'_> {
                     Err(e) => Err(e.into()),
                 }
             }
-            FutexFlags::WAKE => Ok(futex.wake(val as _)),
-            FutexFlags::REQUEUE => {
+            FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(futex.wake(val as _)),
+            FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
                 let requeue_futex = self
                     .linux_process()
                     .get_futex(uaddr2)
                     .ok_or(LxError::EINVAL)?;
-                let res = futex.requeue(0, val as _, val2, &requeue_futex, None, false);
+                // FUTEX_CMP_REQUEUE checks *uaddr against val3 first.
+                let res = futex.requeue(
+                    val3 as i32,
+                    val as _,
+                    val2,
+                    &requeue_futex,
+                    None,
+                    cmd == FUTEX_CMP_REQUEUE,
+                );
                 match res {
                     Ok(_) => Ok(0),
                     Err(e) => Err(e.into()),
                 }
             }
             _ => {
-                warn!("unsupported futex operation: {:?}", op);
+                warn!("unsupported futex operation: {:#x} (cmd {})", op, cmd);
                 Err(LxError::ENOSYS)
             }
         }
@@ -323,26 +353,6 @@ impl Syscall<'_> {
             written += current_len;
         }
         Ok(len)
-    }
-}
-
-bitflags! {
-    /// for op argument in futex()
-    struct FutexFlags: u32 {
-        /// tests that the value at the futex word pointed
-        /// to by the address uaddr still contains the expected value val,
-        /// and if so, then sleeps waiting for a FUTEX_WAKE operation on the futex word.
-        const WAIT      = 0;
-        /// wakes at most val of the waiters that are waiting on the futex word at the address uaddr.
-        const WAKE      = 1;
-        /// wakes up a maximum of val waiters that are waiting on the futex at uaddr.  If there are more than val waiters, then the remaining waiters are removed from the wait queue of the source futex at uaddr and added to the wait queue of the target futex at uaddr2.  The val2 argument specifies an upper limit on the number of waiters that are requeued to the futex at uaddr2.
-        const REQUEUE   = 3;
-        /// (unsupported) is used after an attempt to acquire the lock via an atomic user-mode instruction failed.
-        const LOCK_PI   = 6;
-        /// (unsupported) is called when the user-space value at uaddr cannot be changed atomically from a TID (of the owner) to 0.
-        const UNLOCK_PI = 7;
-        /// can be employed with all futex operations, tells the kernel that the futex is process-private and not shared with another process
-        const PRIVATE   = 0x80;
     }
 }
 

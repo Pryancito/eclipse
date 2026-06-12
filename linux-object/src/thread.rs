@@ -90,28 +90,23 @@ impl CurrentThreadExt for CurrentThread {
                 let vaddr = clear_child_tid.as_addr();
                 let vmar = self.proc().vmar();
                 if vmar.contains(vaddr) {
-                    let mut is_handle_write_pagefault = true;
-
-                    match vmar.get_vaddr_flags(vaddr) {
-                        Ok(vaddr_flags) => {
-                            is_handle_write_pagefault &=
-                                !vaddr_flags.contains(kernel_hal::MMUFlags::WRITE);
-                        }
-                        Err(kernel_hal::vm::PagingError::NotMapped) => {
-                            is_handle_write_pagefault &= true;
-                        }
-                        Err(kernel_hal::vm::PagingError::NoMemory) => {
-                            is_handle_write_pagefault &= true;
-                        }
-                        Err(kernel_hal::vm::PagingError::AlreadyMapped) => {
-                            is_handle_write_pagefault &= true;
-                        }
-                    }
-
-                    if !is_handle_write_pagefault {
-                        clear_child_tid.write(0).unwrap();
-                        let uaddr = clear_child_tid.as_addr();
-                        if let Some(futex) = self.proc().linux().get_futex(uaddr) {
+                    // The page may be lazily allocated or CoW (mapped
+                    // read-only after fork): fault it in writable first.
+                    // Skipping the clear+wake here would leave pthread_join
+                    // (and musl's __tl_sync) waiting forever.
+                    let writable = matches!(
+                        vmar.get_vaddr_flags(vaddr),
+                        Ok(flags) if flags.contains(kernel_hal::MMUFlags::WRITE)
+                    );
+                    let mapped = writable
+                        || vmar
+                            .handle_page_fault(
+                                vaddr,
+                                kernel_hal::MMUFlags::WRITE | kernel_hal::MMUFlags::USER,
+                            )
+                            .is_ok();
+                    if mapped && clear_child_tid.write(0).is_ok() {
+                        if let Some(futex) = self.proc().linux().get_futex(vaddr) {
                             futex.wake(1);
                         }
                     }
