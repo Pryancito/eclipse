@@ -159,49 +159,54 @@ impl Syscall<'_> {
         newtls: usize,
         mut child_tid: UserOutPtr<i32>,
     ) -> SysResult {
-        let _flags = CloneFlags::from_bits_truncate(flags);
+        let clone_flags = CloneFlags::from_bits_truncate(flags);
         info!(
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
-        // Fork-like clones: if the THREAD bit is not set, treat as fork.
-        // This covers SIGCHLD (0x11), VFORK|SIGCHLD (0x4111), and other
-        // fork-like combinations used by musl/glibc posix_spawn/system().
-        let sigchld_bits = flags & 0xff;
-        let has_thread = flags & CloneFlags::THREAD.bits() != 0;
-        if !has_thread && (sigchld_bits == 0x11 || sigchld_bits == 0x00) && newsp == 0 {
-            warn!("sys_clone is calling sys_fork for flags {:#x}", flags);
-            return self.sys_fork(0, 0);
-        }
-        if flags == 0x4111 {
-            // VFORK | VM | SIGCHILD
-            warn!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-            return self.sys_vfork(newsp, newtls).await;
-        }
-        if flags != 0x7d_0f00 && flags != 0x5d_0f00 {
-            // 0x5d0f00: gcc of alpine linux
-            // 0x7d0f00: pthread_create of alpine linux
-            warn!("sys_clone: unsupported flags {:#x}, trying fork", flags);
+        // Fork-like clones: if the THREAD bit is not set, the caller wants a
+        // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
+        // and other combinations used by musl/glibc fork/posix_spawn/system().
+        if !clone_flags.contains(CloneFlags::THREAD) {
+            if clone_flags.contains(CloneFlags::VFORK) {
+                info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
+                return self.sys_vfork(newsp, newtls).await;
+            }
+            info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
             return self.sys_fork(newsp, newtls);
         }
+        // Thread creation. Accept any CLONE_THREAD combination instead of the
+        // two exact musl flag values: glibc's pthread_create passes 0x3d0f00
+        // (no CLONE_DETACHED), and falling back to fork() for it silently
+        // created a separate process whose "threads" could never synchronize
+        // through futexes with the parent.
         let new_thread = Thread::create_linux(self.zircon_process())?;
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
-        new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        if clone_flags.contains(CloneFlags::SETTLS) {
+            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        }
         new_ctx.set_field(UserContextField::ReturnValue, 0);
-        info!(
-            "clone: tid_parent={} context={:#x?}",
-            self.thread.id(),
-            new_ctx
-        );
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        new_thread.start(self.thread_fn)?;
 
         let tid = new_thread.id();
         info!("clone: {} -> {}", self.thread.id(), tid);
-        parent_tid.write(tid as i32)?;
-        child_tid.write(tid as i32)?;
-        new_thread.set_tid_address(child_tid);
+        // Honor the TID bookkeeping flags BEFORE the thread starts running:
+        // the child and the parent's pthread library may read these
+        // immediately. In particular, ctid must only be written here when
+        // CLONE_CHILD_SETTID is set — musl points ctid at its global
+        // __thread_list_lock (for the CLONE_CHILD_CLEARTID exit wake), and
+        // unconditionally storing the TID there corrupts that lock.
+        if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+            parent_tid.write_if_not_null(tid as i32)?;
+        }
+        if clone_flags.contains(CloneFlags::CHILD_SETTID) {
+            child_tid.write_if_not_null(tid as i32)?;
+        }
+        if clone_flags.contains(CloneFlags::CHILD_CLEARTID) {
+            new_thread.set_tid_address(child_tid);
+        }
+        new_thread.start(self.thread_fn)?;
         Ok(tid as usize)
     }
 

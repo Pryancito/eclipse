@@ -167,15 +167,18 @@ impl LinuxElfLoader {
                 e
             })?;
             let app_base = app_vmar.addr();
-            let app_vmo = app_vmar.load_from_elf(&elf).map_err(|e| {
+            let _app_vmo = app_vmar.load_from_elf(&elf).map_err(|e| {
                 error!("elf: load app from elf failed: {:?}", e);
                 e
             })?;
             let app_entry = app_base + elf.header.pt2.entry_point() as usize;
 
             // Patch any in-binary syscall-entry trampoline present in the main program.
+            // Write through the VMAR (which resolves the per-segment VMO): the symbol
+            // usually lives in .data/.rodata, NOT in the first LOAD segment's VMO.
             if let Some(offset) = elf.get_symbol_address("rcore_syscall_entry") {
-                app_vmo.write(offset as usize, &self.syscall_entry.to_ne_bytes())?;
+                app_vmar
+                    .write_memory(app_base + offset as usize, &self.syscall_entry.to_ne_bytes())?;
             }
 
             // Load the interpreter (ld.so) into a second sub-VMAR placed right after the
@@ -237,9 +240,12 @@ impl LinuxElfLoader {
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
             let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            // Place the stack at the top of the user address space so the heap
-            // (which grows up from initial_brk) never collides with the stack.
-            let stack_bottom = STACK_TOP - stack_vmo.len();
+            // Place the stack at the top of the process VMAR (which equals the
+            // top of the user address space on bare metal, but is a smaller
+            // window in aspace-separate/libos builds) so the heap, which grows
+            // up from initial_brk, never collides with the stack.
+            let stack_top = vmar.end_addr().min(STACK_TOP);
+            let stack_bottom = stack_top - stack_vmo.len();
             vmar.map(
                 Some(stack_bottom - vmar.addr()),
                 stack_vmo.clone(),
@@ -247,7 +253,7 @@ impl LinuxElfLoader {
                 stack_vmo.len(),
                 stack_flags,
             )?;
-            let mut sp = STACK_TOP;
+            let mut sp = stack_top;
 
             let info = abi::ProcInitInfo {
                 args,
@@ -310,7 +316,7 @@ impl LinuxElfLoader {
             e
         })?;
         let base = image_vmar.addr();
-        let vmo = image_vmar.load_from_elf(&elf).map_err(|e| {
+        let _vmo = image_vmar.load_from_elf(&elf).map_err(|e| {
             error!("elf: load_from_elf failed: {:?}", e);
             e
         })?;
@@ -324,8 +330,10 @@ impl LinuxElfLoader {
         );
 
         // fill syscall entry
+        // Write through the VMAR (which resolves the per-segment VMO): the symbol
+        // usually lives in .data/.rodata, NOT in the first LOAD segment's VMO.
         if let Some(offset) = elf.get_symbol_address("rcore_syscall_entry") {
-            vmo.write(offset as usize, &self.syscall_entry.to_ne_bytes())?;
+            image_vmar.write_memory(base + offset as usize, &self.syscall_entry.to_ne_bytes())?;
         }
 
         match elf.relocate(image_vmar) {
@@ -343,9 +351,12 @@ impl LinuxElfLoader {
 
         let stack_vmo = VmObject::new_paged(self.stack_pages);
         let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-        // Place the stack at the top of the user address space so the heap
-        // (which grows up from initial_brk) never collides with the stack.
-        let stack_bottom = STACK_TOP - stack_vmo.len();
+        // Place the stack at the top of the process VMAR (which equals the top
+        // of the user address space on bare metal, but is a smaller window in
+        // aspace-separate/libos builds) so the heap, which grows up from
+        // initial_brk, never collides with the stack.
+        let stack_top = vmar.end_addr().min(STACK_TOP);
+        let stack_bottom = stack_top - stack_vmo.len();
         vmar.map(
             Some(stack_bottom - vmar.addr()),
             stack_vmo.clone(),
@@ -353,7 +364,7 @@ impl LinuxElfLoader {
             stack_vmo.len(),
             flags,
         )?;
-        let mut sp = STACK_TOP;
+        let mut sp = stack_top;
         debug!("load stack bottom: {:#x}", stack_bottom);
 
         let info = abi::ProcInitInfo {

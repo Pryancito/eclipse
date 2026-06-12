@@ -188,7 +188,10 @@ impl Syscall<'_> {
             Sys::KILL => self.sys_kill(a0 as isize, a1),
 
             // schedule
-            Sys::SCHED_YIELD => self.unimplemented("yield", Ok(0)),
+            Sys::SCHED_YIELD => {
+                kernel_hal::thread::yield_now().await;
+                Ok(0)
+            }
             Sys::SCHED_GETAFFINITY => self.unimplemented("sched_getaffinity", Ok(0)),
             Sys::SCHED_SETAFFINITY => self.unimplemented("sched_setaffinity", Ok(0)),
 
