@@ -750,13 +750,8 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
     IpEndpoint::new(addr, 0)
 }
 
-/// Adaptive poll interval bounds for full [`poll_ifaces`] in multiplex wait loops.
-const NET_POLL_INTERVAL_MIN_US: u64 = 4_000;
-const NET_POLL_INTERVAL_BASE_US: u64 = 16_000;
-const NET_POLL_INTERVAL_MAX_US: u64 = 32_000;
-/// Deferred job budget bounds per net tick.
-const DEFERRED_NET_JOBS_PER_TICK_BASE: usize = 4;
-const DEFERRED_NET_JOBS_PER_TICK_MAX: usize = 12;
+mod adaptive;
+
 /// Minimum interval for heavy net housekeeping (route/neighbor/prune).
 const NET_HOUSEKEEPING_INTERVAL_US: u64 = 250_000;
 
@@ -797,24 +792,12 @@ fn net_poll_interval_elapsed(interval_us: u64) -> bool {
 
 #[inline]
 fn adaptive_deferred_jobs_per_tick() -> usize {
-    let q = kernel_hal::deferred_job::pending_deferred_jobs();
-    DEFERRED_NET_JOBS_PER_TICK_BASE
-        + q.min(
-            DEFERRED_NET_JOBS_PER_TICK_MAX
-                .saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE),
-        )
+    adaptive::deferred_jobs_budget(kernel_hal::deferred_job::pending_deferred_jobs())
 }
 
 #[inline]
 fn adaptive_net_poll_interval_us() -> u64 {
-    let q = kernel_hal::deferred_job::pending_deferred_jobs();
-    if q >= 8 {
-        NET_POLL_INTERVAL_MIN_US
-    } else if q == 0 {
-        NET_POLL_INTERVAL_MAX_US
-    } else {
-        NET_POLL_INTERVAL_BASE_US
-    }
+    adaptive::net_poll_interval_us(kernel_hal::deferred_job::pending_deferred_jobs())
 }
 
 #[inline]
@@ -1901,3 +1884,32 @@ impl From<SocketFlags> for OpenOptions {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::wire::Ipv4Address;
+
+    #[test]
+    fn ipv4_placeholder_is_class_e_sentinel() {
+        assert!(is_ipv4_placeholder(Ipv4Address::new(240, 0, 0, 0)));
+        assert!(!is_ipv4_placeholder(Ipv4Address::new(192, 168, 1, 1)));
+        assert!(!is_ipv4_placeholder(Ipv4Address::new(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn fd_is_socket_uses_socket_base() {
+        assert!(!fd_is_socket(FileDesc::from(0)));
+        assert!(!fd_is_socket(FileDesc::from(999)));
+        assert!(fd_is_socket(FileDesc::from(SOCKET_FD as i32)));
+        assert!(fd_is_socket(FileDesc::from((SOCKET_FD + 42) as i32)));
+    }
+
+    #[test]
+    fn fd_is_interactive_covers_stdin_not_sockets() {
+        assert!(fd_is_interactive(FileDesc::from(0)));
+        assert!(fd_is_interactive(FileDesc::from(2)));
+        assert!(!fd_is_interactive(FileDesc::from(SOCKET_FD as i32)));
+        assert!(!fd_is_interactive(FileDesc::from(-1)));
+    }
+}

@@ -1,4 +1,6 @@
 // May need move to drivers
+use core::task::Waker;
+
 use smoltcp::{
     iface::{InterfaceBuilder, Route, Routes},
     phy::Medium,
@@ -64,6 +66,15 @@ pub fn init() {
     let dev = Device::Net(Arc::new(loopback_iface));
     add_device(dev);
 }
+
+/// libOS host build: RX wakers are no-ops (real NIC path is bare-metal only).
+pub fn register_net_rx_waker(_waker: Waker) {}
+
+/// libOS host build: RX wakers are no-ops.
+pub fn retain_net_rx_waker(_waker: &Waker) {}
+
+/// libOS host build: RX wakers are no-ops.
+pub fn wake_net_rx_waiters() {}
 
 pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
     let mut devices = all_net().as_vec().clone();

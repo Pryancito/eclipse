@@ -69,5 +69,10 @@ acpi = "4.1"
 x2apic = "0.4"
 x86_64 = "0.14"
 
+[[test]]
+name = "deferred_job"
+path = "tests/deferred_job.rs"
+required-features = ["mock"]
+
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.10.1"

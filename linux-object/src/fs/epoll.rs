@@ -168,3 +168,14 @@ impl Epoll {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod abi_tests {
+    use super::*;
+    use core::mem::size_of;
+
+    #[test]
+    fn epoll_event_matches_linux_uapi() {
+        assert_eq!(size_of::<EpollEvent>(), 12);
+    }
+}

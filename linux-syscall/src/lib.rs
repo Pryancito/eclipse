@@ -46,6 +46,8 @@ mod consts {
 /// exhaust or fragment it after long network sessions.
 pub(crate) const SYSCALL_IO_MAX: usize = 64 * 1024;
 
+#[cfg(test)]
+mod abi;
 mod file;
 mod ipc;
 mod misc;

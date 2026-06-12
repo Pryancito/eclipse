@@ -434,3 +434,15 @@ impl From<Metadata> for Statx {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod abi_tests {
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    #[test]
+    fn stat_layout_is_stable() {
+        // Lock layout: userspace musl binaries depend on this size/alignment.
+        assert_eq!(size_of::<Stat>(), 120);
+        assert_eq!(align_of::<Stat>(), 8);
+    }
+}

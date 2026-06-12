@@ -512,3 +512,14 @@ impl FdSet {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod abi_tests {
+    use super::*;
+    use core::mem::size_of;
+
+    #[test]
+    fn pollfd_matches_linux_uapi() {
+        assert_eq!(size_of::<PollFd>(), 8);
+    }
+}

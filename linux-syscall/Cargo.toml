@@ -26,3 +26,5 @@ futures = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 async-std = { version = "1.10", features = ["unstable"] }
+kernel-hal = { path = "../kernel-hal", features = ["libos"] }
+zcore-drivers = { path = "../drivers", features = ["mock"] }

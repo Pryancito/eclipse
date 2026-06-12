@@ -176,3 +176,54 @@ impl Deref for SemaphoreGuard<'_> {
         self.sem
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::LxError;
+
+    #[async_std::test]
+    async fn acquire_decrements_count() {
+        let sem = Semaphore::new(2);
+        sem.acquire().await.unwrap();
+        assert_eq!(sem.get(), 1);
+        sem.acquire().await.unwrap();
+        assert_eq!(sem.get(), 0);
+    }
+
+    #[async_std::test]
+    async fn release_wakes_waiter() {
+        let sem = Arc::new(Semaphore::new(0));
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            async_std::task::spawn(async move { sem.acquire().await })
+        };
+        async_std::task::yield_now().await;
+        sem.release();
+        waiter.await.unwrap();
+        assert_eq!(sem.get(), 0);
+    }
+
+    #[async_std::test]
+    async fn remove_causes_eidrm_on_acquire() {
+        let sem = Arc::new(Semaphore::new(0));
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            async_std::task::spawn(async move { sem.acquire().await })
+        };
+        async_std::task::yield_now().await;
+        sem.remove();
+        assert!(matches!(waiter.await, Err(LxError::EIDRM)));
+    }
+
+    #[test]
+    fn guard_releases_on_drop() {
+        let sem = Semaphore::new(0);
+        {
+            sem.set(1);
+            let _guard = async_std::task::block_on(sem.access()).unwrap();
+            assert_eq!(sem.get(), 0);
+        }
+        assert_eq!(sem.get(), 1);
+    }
+}
