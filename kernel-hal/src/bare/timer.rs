@@ -6,8 +6,11 @@ use core::time::Duration;
 use lock::Mutex;
 use naive_timer::Timer;
 
-#[allow(dead_code)]
-pub(super) const TICKS_PER_SEC: u64 = 100;
+/// Timer interrupt frequency in Hz.
+/// 250 Hz gives a 4 ms tick granularity — a good balance between
+/// scheduler responsiveness and interrupt overhead for a desktop/interactive
+/// workload. (Previous value was 100 Hz / 10 ms which caused noticeable lag.)
+pub(super) const TICKS_PER_SEC: u64 = 250;
 
 lazy_static::lazy_static! {
     static ref NAIVE_TIMER: Mutex<Timer> = Mutex::new(Timer::default());

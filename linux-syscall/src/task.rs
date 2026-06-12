@@ -529,15 +529,23 @@ impl Syscall<'_> {
         info!("nanosleep: deadline={:?}", req);
         let duration = req.read()?.into();
         let deadline = kernel_hal::timer::deadline_after(duration);
-        loop {
-            if let Err(e) = linux_object::process::check_signals() {
-                return Err(e);
-            }
-            if kernel_hal::timer::timer_now() >= deadline {
-                return Ok(0);
-            }
-            kernel_hal::thread::yield_now().await;
+        // Check for pending signals before blocking.
+        if let Err(e) = linux_object::process::check_signals() {
+            return Err(e);
         }
+        if kernel_hal::timer::timer_now() >= deadline {
+            return Ok(0);
+        }
+        // Sleep efficiently until the deadline instead of spinning with
+        // yield_now(). This eliminates per-tick rescheduling noise for all
+        // sleeping tasks, which was the primary source of scheduler lag.
+        // A signal check after wakeup preserves EINTR semantics for signals
+        // that arrive while the task is dormant.
+        kernel_hal::thread::sleep_until(deadline).await;
+        if let Err(e) = linux_object::process::check_signals() {
+            return Err(e);
+        }
+        Ok(0)
     }
 
     //    pub fn sys_set_priority(&self, priority: usize) -> SysResult {
