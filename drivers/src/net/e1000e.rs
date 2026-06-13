@@ -1757,6 +1757,24 @@ impl phy::RxToken for E1000eRxToken {
     {
         let mut data = self.data;
         super::net_defer_packet(&data);
+        // DEBUG: per-frame fingerprint to cross-check against host pcap.
+        // Only TCP segments to/from port 80 (HTTP) to avoid spam.
+        if data.len() >= 34 && data.get(12).copied() == Some(0x08) && data.get(13).copied() == Some(0x00) && data.get(23).copied() == Some(6) {
+            let sport = u16::from_be_bytes([data[34], data[35]]);
+            let dport = u16::from_be_bytes([data[36], data[37]]);
+            if sport == 80 || dport == 80 {
+                let seq = u32::from_be_bytes([data[38], data[39], data[40], data[41]]);
+                let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
+                for &b in data.iter() {
+                    fp ^= b as u64;
+                    fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                log::error!(
+                    "[rx http] len={} sport={} dport={} seq={} fp={:016x}",
+                    data.len(), sport, dport, seq, fp
+                );
+            }
+        }
         f(&mut data)
     }
 }
