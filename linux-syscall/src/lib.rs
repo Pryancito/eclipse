@@ -72,6 +72,15 @@ impl Syscall<'_> {
     ///
     /// This is intentionally centralized so we don't sprinkle per-program hacks.
     fn maybe_handle_tty_intr(&mut self) -> SysResult {
+        // Cheap relaxed-style peek first: the latch is empty on the
+        // overwhelming majority of syscalls, and a plain load avoids the
+        // `lock xchg` on x86 / locked CAS on aarch64/riscv that the swap in
+        // `ctrl_c_pending_take` would otherwise issue per syscall.
+        if !linux_object::fs::stdio::ctrl_c_pending_peek() {
+            return Ok(0);
+        }
+        // Race-safe: another syscall may have claimed the latch between the
+        // peek and the swap.
         if !linux_object::fs::stdio::ctrl_c_pending_take() {
             return Ok(0);
         }
