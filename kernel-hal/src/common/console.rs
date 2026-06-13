@@ -198,6 +198,17 @@ pub fn early_progress_bar(progress: u32) {
     crate::hal_fn::console::console_progress_early(progress);
 }
 
+/// Scrolls the graphic console history up (direction > 0) or down (direction < 0).
+#[allow(unused_variables)]
+pub fn scroll_graphic_console(direction: i32) {
+    #[cfg(feature = "graphic")]
+    if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+        if let Some(mut g) = cons.try_lock() {
+            g.buf_mut().scroll_history(direction);
+        }
+    }
+}
+
 /// Writes a string slice into the graphic console.
 #[allow(unused_variables)]
 pub fn graphic_console_write_str(s: &str) {

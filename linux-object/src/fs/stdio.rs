@@ -1,4 +1,5 @@
 //! Implement INode for Stdin & Stdout
+#![allow(dead_code)]
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
@@ -18,6 +19,69 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
+
+// c_iflag
+const IGNBRK: u32 = 0x0001;
+const BRKINT: u32 = 0x0002;
+const IGNPAR: u32 = 0x0004;
+const PARMRK: u32 = 0x0008;
+const INPCK: u32  = 0x0010;
+const ISTRIP: u32 = 0x0020;
+const INLCR: u32  = 0x0040;
+const IGNCR: u32  = 0x0080;
+const ICRNL: u32  = 0x0100;
+const IUCLC: u32  = 0x0200;
+const IXON: u32   = 0x0400;
+const IXANY: u32  = 0x0800;
+const IXOFF: u32  = 0x1000;
+const IMAXBEL: u32 = 0x2000;
+const IUTF8: u32  = 0x4000;
+
+// c_oflag
+const OPOST: u32  = 0x0001;
+const OLCUC: u32  = 0x0002;
+const ONLCR: u32  = 0x0004;
+const OCRNL: u32  = 0x0008;
+const ONOCR: u32  = 0x0010;
+const ONLRET: u32 = 0x0020;
+const OFILL: u32  = 0x0040;
+const OFDEL: u32  = 0x0080;
+
+// c_lflag
+const ISIG: u32   = 0x0001;
+const ICANON: u32 = 0x0002;
+const XCASE: u32  = 0x0004;
+const ECHO: u32   = 0x0008;
+const ECHOE: u32  = 0x0010;
+const ECHOK: u32  = 0x0020;
+const ECHONL: u32 = 0x0040;
+const NOFLSH: u32 = 0x0080;
+const TOSTOP: u32 = 0x0100;
+const ECHOCTL: u32 = 0x0200;
+const ECHOPRT: u32 = 0x0400;
+const ECHOKE: u32 = 0x0800;
+const FLUSHO: u32 = 0x1000;
+const PENDIN: u32 = 0x4000;
+const IEXTEN: u32 = 0x8000;
+
+// c_cc indices
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+const VSWTC: usize = 7;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
+const VWERASE: usize = 14;
+const VLNEXT: usize = 15;
+const VEOL2: usize = 16;
 
 // Foreground process group for the (single) controlling TTY.
 // This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
@@ -152,6 +216,18 @@ lazy_static! {
                     }
 
                     if event.value == 1 || event.value == 2 {
+                        // Shift+PageUp / Shift+PageDown scrollback
+                        if SHIFT_DOWN.load(Ordering::SeqCst) {
+                            if event.code == KEY_PAGEUP {
+                                kernel_hal::console::scroll_graphic_console(1);
+                                return;
+                            }
+                            if event.code == KEY_PAGEDOWN {
+                                kernel_hal::console::scroll_graphic_console(-1);
+                                return;
+                            }
+                        }
+
                         // Ctrl+C => ETX (0x03)
                         if CTRL_DOWN.load(Ordering::SeqCst) && event.code == KEY_C {
                             cloned.push('\u{3}');
@@ -291,6 +367,7 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
 /// where the ISR only writes to a circular buffer with interrupts disabled.
 pub struct Stdin {
     buf: Mutex<VecDeque<char>>,
+    canon_buf: Mutex<VecDeque<char>>,
     eventbus: Mutex<EventBus>,
     /// Atomic flag set by `push()` so `SerialFuture` can detect new data
     /// without requiring `eventbus.lock()` from the IRQ path.
@@ -301,6 +378,7 @@ impl Default for Stdin {
     fn default() -> Self {
         Self {
             buf: Mutex::new(VecDeque::new()),
+            canon_buf: Mutex::new(VecDeque::new()),
             eventbus: Mutex::new(EventBus::default()),
             data_ready: core::sync::atomic::AtomicBool::new(false),
         }
@@ -309,15 +387,41 @@ impl Default for Stdin {
 
 impl Stdin {
     fn echo_char(c: char) {
-        const ECHO: u32 = 0x0008;
-        if TTY_TERMIOS.lock().c_lflag & ECHO == 0 {
+        let termios = TTY_TERMIOS.lock();
+        let echo = termios.c_lflag & ECHO != 0;
+        let echoctl = termios.c_lflag & ECHOCTL != 0;
+        let opost = termios.c_oflag & OPOST != 0;
+        let onlcr = termios.c_oflag & ONLCR != 0;
+        drop(termios);
+
+        if !echo {
             return;
         }
+
         match c {
-            '\u{8}' | '\u{7f}' => kernel_hal::console::console_write_str("\x08 \x08"),
-            '\n' => kernel_hal::console::console_write_str("\r\n"),
-            '\r' => {}
-            c if c.is_control() => {}
+            '\u{8}' | '\u{7f}' => {
+                kernel_hal::console::console_write_str("\x08 \x08");
+            }
+            '\n' => {
+                if opost && onlcr {
+                    kernel_hal::console::console_write_str("\r\n");
+                } else {
+                    kernel_hal::console::console_write_str("\n");
+                }
+            }
+            '\r' => {
+                kernel_hal::console::console_write_str("\r");
+            }
+            c if c.is_control() => {
+                if echoctl {
+                    let mut s = [0u8; 2];
+                    s[0] = b'^';
+                    s[1] = (c as u8 + 64) & 0x7f;
+                    if let Ok(s_str) = core::str::from_utf8(&s) {
+                        kernel_hal::console::console_write_str(s_str);
+                    }
+                }
+            }
             c => {
                 let mut buf = [0u8; 4];
                 kernel_hal::console::console_write_str(c.encode_utf8(&mut buf));
@@ -332,27 +436,177 @@ impl Stdin {
     /// *tries* to propagate to the EventBus via try_lock().  If the
     /// EventBus is contended the flag is left set for the next
     /// executor-side flush_ready_flag() call.
-    pub fn push(&self, c: char) {
-        if c == '\u{3}' {
-            ctrl_c_pending_set();
-            let pgid = get_foreground_pgrp();
-            if pgid > 0 {
-                let _ = crate::process::send_signal_to_process(
-                    pgid as usize,
-                    crate::signal::Signal::SIGINT,
-                );
+    pub fn push(&self, mut c: char) {
+        let termios = TTY_TERMIOS.lock();
+        let iflag = termios.c_iflag;
+        let lflag = termios.c_lflag;
+        let c_cc = termios.c_cc;
+        drop(termios);
+
+        // 1. Input translations
+        if c == '\r' {
+            if iflag & IGNCR != 0 {
+                return;
+            } else if iflag & ICRNL != 0 {
+                c = '\n';
+            }
+        } else if c == '\n' {
+            if iflag & INLCR != 0 {
+                c = '\r';
             }
         }
-        self.buf.lock().push_back(c);
-        // Buffer first, then wake readers (before slow VGA/serial echo).
-        self.data_ready.store(true, Ordering::Release);
-        if let Some(mut eb) = self.eventbus.try_lock() {
-            self.data_ready.store(false, Ordering::Relaxed);
-            eb.set(Event::READABLE);
-        } else {
-            wake_tty_intr_waiters();
+
+        // 2. Signals
+        if lflag & ISIG != 0 {
+            if c as u8 == c_cc[VINTR] {
+                ctrl_c_pending_set();
+                let pgid = get_foreground_pgrp();
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGINT,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    kernel_hal::console::console_write_str("^C\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
+            if c as u8 == c_cc[VQUIT] {
+                let pgid = get_foreground_pgrp();
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGQUIT,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    kernel_hal::console::console_write_str("^\\\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
+            if c as u8 == c_cc[VSUSP] {
+                let pgid = get_foreground_pgrp();
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGTSTP,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    kernel_hal::console::console_write_str("^Z\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
         }
-        Self::echo_char(c);
+
+        // 3. Canon vs Raw mode
+        if lflag & ICANON != 0 {
+            if c as u8 == c_cc[VERASE] {
+                let mut canon = self.canon_buf.lock();
+                if let Some(_popped) = canon.pop_back() {
+                    if lflag & ECHO != 0 {
+                        if lflag & ECHOE != 0 {
+                            kernel_hal::console::console_write_str("\x08 \x08");
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let erase_char = (c_cc[VERASE] as char).encode_utf8(&mut buf);
+                            kernel_hal::console::console_write_str(erase_char);
+                        }
+                    }
+                }
+            } else if c as u8 == c_cc[VKILL] {
+                let mut canon = self.canon_buf.lock();
+                let len = canon.len();
+                canon.clear();
+                if lflag & ECHO != 0 {
+                    if lflag & ECHOKE != 0 {
+                        for _ in 0..len {
+                            kernel_hal::console::console_write_str("\x08 \x08");
+                        }
+                    } else if lflag & ECHOK != 0 {
+                        kernel_hal::console::console_write_str("\n");
+                    }
+                }
+            } else if c as u8 == c_cc[VEOF] {
+                let mut canon = self.canon_buf.lock();
+                let mut buf = self.buf.lock();
+                while let Some(ch) = canon.pop_front() {
+                    buf.push_back(ch);
+                }
+                // Wake readers
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+            } else {
+                self.canon_buf.lock().push_back(c);
+                Self::echo_char(c);
+                if c == '\n' {
+                    let mut canon = self.canon_buf.lock();
+                    let mut buf = self.buf.lock();
+                    while let Some(ch) = canon.pop_front() {
+                        buf.push_back(ch);
+                    }
+                    // Wake readers
+                    self.data_ready.store(true, Ordering::Release);
+                    if let Some(mut eb) = self.eventbus.try_lock() {
+                        self.data_ready.store(false, Ordering::Relaxed);
+                        eb.set(Event::READABLE);
+                    } else {
+                        wake_tty_intr_waiters();
+                    }
+                }
+            }
+        } else {
+            // Raw mode
+            self.buf.lock().push_back(c);
+            Self::echo_char(c);
+            // Wake readers
+            self.data_ready.store(true, Ordering::Release);
+            if let Some(mut eb) = self.eventbus.try_lock() {
+                self.data_ready.store(false, Ordering::Relaxed);
+                eb.set(Event::READABLE);
+            } else {
+                wake_tty_intr_waiters();
+            }
+        }
     }
 
     /// Drain the atomic flag and propagate to EventBus.
@@ -365,7 +619,6 @@ impl Stdin {
 
     /// pop a char from the Stdin buffer
     pub fn pop(&self) -> char {
-        // Propagate any pending push signals first.
         self.flush_ready_flag();
         let mut buf_lock = self.buf.lock();
         let c = buf_lock.pop_front().unwrap();
@@ -374,6 +627,7 @@ impl Stdin {
         }
         c
     }
+
     /// specify whether the Stdin buffer is readable
     pub fn can_read(&self) -> bool {
         self.buf.lock().len() > 0
@@ -390,6 +644,35 @@ impl Stdin {
             self.data_ready.store(false, Ordering::Relaxed);
             eb.set(Event::READABLE);
         }
+    }
+}
+
+/// Helper function to post-process output data (e.g. translating \n to \r\n if OPOST and ONLCR are set)
+fn tty_write_out(buf: &[u8]) {
+    let termios = TTY_TERMIOS.lock();
+    let opost = termios.c_oflag & OPOST != 0;
+    let onlcr = termios.c_oflag & ONLCR != 0;
+    drop(termios);
+
+    if opost && onlcr {
+        let mut start = 0;
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' {
+                if i > start {
+                    let s = unsafe { core::str::from_utf8_unchecked(&buf[start..i]) };
+                    kernel_hal::console::console_write_str(s);
+                }
+                kernel_hal::console::console_write_str("\r\n");
+                start = i + 1;
+            }
+        }
+        if start < buf.len() {
+            let s = unsafe { core::str::from_utf8_unchecked(&buf[start..]) };
+            kernel_hal::console::console_write_str(s);
+        }
+    } else {
+        let s = unsafe { core::str::from_utf8_unchecked(buf) };
+        kernel_hal::console::console_write_str(s);
     }
 }
 
@@ -432,19 +715,32 @@ pub struct Stdout;
 impl INode for Stdin {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
         self.flush_ready_flag();
-        if self.can_read() {
-            buf[0] = self.pop() as u8;
-            Ok(1)
-        } else {
-            Err(FsError::Again)
+        let mut stdin_buf = self.buf.lock();
+        if stdin_buf.is_empty() {
+            return Err(FsError::Again);
         }
+        let is_canon = (TTY_TERMIOS.lock().c_lflag & ICANON) != 0;
+        let mut read_bytes = 0;
+        while read_bytes < buf.len() && !stdin_buf.is_empty() {
+            let ch = stdin_buf.pop_front().unwrap();
+            buf[read_bytes] = ch as u8;
+            read_bytes += 1;
+            if is_canon && ch == '\n' {
+                break;
+            }
+        }
+        if stdin_buf.is_empty() {
+            self.eventbus.lock().clear(Event::READABLE);
+        }
+        Ok(read_bytes)
     }
+
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
         tty_handle_outgoing(buf);
-        let s = unsafe { core::str::from_utf8_unchecked(buf) };
-        kernel_hal::console::console_write_str(s);
+        tty_write_out(buf);
         Ok(buf.len())
     }
+
     fn poll(&self) -> Result<PollStatus> {
         self.flush_ready_flag();
         Ok(PollStatus {
@@ -453,6 +749,7 @@ impl INode for Stdin {
             error: false,
         })
     }
+
     fn async_poll<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
@@ -511,7 +808,6 @@ impl INode for Stdin {
         })
     }
 
-    //
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd as usize {
             TIOCGWINSZ => {
@@ -528,19 +824,13 @@ impl INode for Stdin {
                 Ok(0)
             }
             TIOCSPGRP => {
-                // Set foreground process group.
-                // `data` is a user pointer to an int.
-                // TODO: validate pointer in a proper usercopy layer.
                 let pgid = unsafe { *(data as *const i32) };
                 TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
                 Ok(0)
             }
             TIOCGPGRP => {
-                // Get foreground process group.
                 let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
                 if pgid == 0 {
-                    // If no foreground group is set, pretend the caller is in foreground.
-                    // This is a common hack for simple OSs to support interactive shells.
                     if let Some(arc) = kernel_hal::thread::get_current_thread() {
                         if let Ok(thread) = arc.downcast::<Thread>() {
                             pgid = thread.proc().id() as i32;
@@ -553,12 +843,23 @@ impl INode for Stdin {
                 unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
-            TCSETS | TCSETSW | TCSETSF => {
+            TCSETS | TCSETSW => {
                 let termios = data as *const Termios;
                 if termios.is_null() {
                     return Err(FsError::InvalidParam);
                 }
                 *TTY_TERMIOS.lock() = unsafe { *termios };
+                Ok(0)
+            }
+            TCSETSF => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *TTY_TERMIOS.lock() = unsafe { *termios };
+                self.buf.lock().clear();
+                self.canon_buf.lock().clear();
+                self.eventbus.lock().clear(Event::READABLE);
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
@@ -594,13 +895,13 @@ impl INode for Stdout {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         unimplemented!()
     }
+
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
         tty_handle_outgoing(buf);
-        // we do not care the utf-8 things, we just want to print it!
-        let s = unsafe { core::str::from_utf8_unchecked(buf) };
-        kernel_hal::console::console_write_str(s);
+        tty_write_out(buf);
         Ok(buf.len())
     }
+
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: false,
@@ -608,6 +909,7 @@ impl INode for Stdout {
             error: false,
         })
     }
+
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd as usize {
             TIOCGWINSZ => {
@@ -616,7 +918,11 @@ impl INode for Stdout {
                 Ok(0)
             }
             TCGETS => {
-                warn!("stdout TCGETS, pretend to be tty.");
+                let termios = data as *mut Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                unsafe { *termios = *TTY_TERMIOS.lock() };
                 Ok(0)
             }
             TIOCSPGRP => {
@@ -625,7 +931,6 @@ impl INode for Stdout {
                 Ok(0)
             }
             TIOCGPGRP => {
-                // pretend to be have a tty process group
                 let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
                 if pgid == 0 {
                     if let Some(arc) = kernel_hal::thread::get_current_thread() {
@@ -640,8 +945,23 @@ impl INode for Stdout {
                 unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
-            TCSETS | TCSETSW | TCSETSF => {
-                debug!("stdout TCSETS/W/F, stubbed.");
+            TCSETS | TCSETSW => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *TTY_TERMIOS.lock() = unsafe { *termios };
+                Ok(0)
+            }
+            TCSETSF => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *TTY_TERMIOS.lock() = unsafe { *termios };
+                STDIN.buf.lock().clear();
+                STDIN.canon_buf.lock().clear();
+                STDIN.eventbus.lock().clear(Event::READABLE);
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

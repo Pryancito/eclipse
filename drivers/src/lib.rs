@@ -4,6 +4,7 @@
 #![deny(warnings)]
 #![feature(doc_cfg)]
 
+#[macro_use]
 extern crate alloc;
 
 #[macro_use]

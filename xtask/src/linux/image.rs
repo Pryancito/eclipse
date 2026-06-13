@@ -3,9 +3,9 @@ use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
 /// SFS initramfs size (live/QEMU root + apk headroom).
-const INITRAMFS_BYTES: usize = 128 * 1024 * 1024;
+const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 /// FAT32 ESP image: initramfs + zcore (~40 MiB) + boot loader + metadata.
-const EFI_FAT_BYTES: usize = 256 * 1024 * 1024;
+const EFI_FAT_BYTES: usize = 128 * 1024 * 1024;
 
 impl super::LinuxRootfs {
     /// 生成镜像。
