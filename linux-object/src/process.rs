@@ -161,11 +161,20 @@ impl ProcessExt for Process {
 /// - the child terminated.
 /// - the child was stopped by a signal. TODO
 /// - the child was resumed by a signal. TODO
-pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxResult<ExitCode> {
+pub async fn wait_child(
+    proc: &Arc<Process>,
+    pid: KoID,
+    nonblock: bool,
+    reap: bool,
+) -> LxResult<ExitCode> {
     loop {
         {
             let mut inner = proc.linux().inner.lock();
-            if let Some(code) = inner.reaped_children.remove(&pid) {
+            if let Some(code) = inner.reaped_children.get(&pid) {
+                let code = *code;
+                if reap {
+                    inner.reaped_children.remove(&pid);
+                }
                 return Ok((code as i32) << 8);
             }
         }
@@ -174,9 +183,11 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
         if let Status::Exited(code) = child.status() {
-            let mut inner = proc.linux().inner.lock();
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                let mut inner = proc.linux().inner.lock();
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((code as i32) << 8);
         }
         if nonblock {
@@ -187,9 +198,11 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
 
         // Check again after wait
         if let Status::Exited(code) = child.status() {
-            let mut inner = proc.linux().inner.lock();
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                let mut inner = proc.linux().inner.lock();
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((code as i32) << 8);
         }
         continue;
@@ -197,14 +210,20 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
 }
 
 /// Wait for state changes in a child of the calling process.
-pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(KoID, ExitCode)> {
+pub async fn wait_child_any(
+    proc: &Arc<Process>,
+    nonblock: bool,
+    reap: bool,
+) -> LxResult<(KoID, ExitCode)> {
     loop {
         let mut inner = proc.linux().inner.lock();
         if inner.children.is_empty() && inner.reaped_children.is_empty() {
             return Err(LxError::ECHILD);
         }
         if let Some((pid, code)) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c)) {
-            inner.reaped_children.remove(&pid);
+            if reap {
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((pid, (code as i32) << 8));
         }
         let mut exited_pid = None;
@@ -219,8 +238,10 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         }
         if let Some((pid, code)) = exited_pid {
             trace!("wait_child_any: reaping child {}", pid);
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((pid, (code as i32) << 8));
         }
         if nonblock {

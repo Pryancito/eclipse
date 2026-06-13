@@ -173,12 +173,21 @@ impl Syscall<'_> {
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
         // and other combinations used by musl/glibc fork/posix_spawn/system().
         if !clone_flags.contains(CloneFlags::THREAD) {
-            if clone_flags.contains(CloneFlags::VFORK) {
+            let pid = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                return self.sys_vfork(newsp, newtls).await;
+                self.sys_vfork(newsp, newtls).await?
+            } else {
+                info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
+                self.sys_fork(newsp, newtls)?
+            };
+
+            if clone_flags.contains(CloneFlags::PIDFD) {
+                let process = zircon_object::task::ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
+                let pidfd = linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
+                let fd = self.linux_process().add_file(pidfd)?;
+                parent_tid.write(fd.into())?;
             }
-            info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-            return self.sys_fork(newsp, newtls);
+            return Ok(pid);
         }
         // Thread creation. Accept any CLONE_THREAD combination instead of the
         // two exact musl flag values: glibc's pthread_create passes 0x3d0f00
@@ -286,15 +295,16 @@ impl Syscall<'_> {
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);
+        let reap = !flags.contains(WaitFlags::NOWAIT);
         warn!(
             "wait4: target={:?}, wstatus={:?}, options={:?}",
             target, wstatus, flags,
         );
         let result = match target {
             WaitTarget::AnyChild | WaitTarget::AnyChildInGroup => {
-                wait_child_any(self.zircon_process(), nohang).await
+                wait_child_any(self.zircon_process(), nohang, reap).await
             }
-            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang)
+            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang, reap)
                 .await
                 .map(|code| (pid, code)),
         };
@@ -319,14 +329,29 @@ impl Syscall<'_> {
         infop: UserOutPtr<SigInfo>,
         options: u32,
     ) -> SysResult {
+        // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT
+        let valid_mask = 0x0100_0000 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008;
+        if (options & !valid_mask) != 0 {
+            return Err(LxError::EINVAL);
+        }
+        // At least one of WEXITED, WSTOPPED, WCONTINUED must be specified
+        let required_mask = 0x0000_0002 | 0x0000_0004 | 0x0000_0008;
+        if (options & required_mask) == 0 {
+            return Err(LxError::EINVAL);
+        }
+
         bitflags! {
             struct WaitIdOptions: u32 {
-                const WNOHANG   = 0x0100_0000;
+                const WNOHANG   = 0x0000_0001;
+                const WSTOPPED  = 0x0000_0002;
                 const WEXITED   = 0x0000_0004;
+                const WCONTINUED = 0x0000_0008;
+                const WNOWAIT   = 0x0100_0000;
             }
         }
         let opts = WaitIdOptions::from_bits_truncate(options);
         let nohang = opts.contains(WaitIdOptions::WNOHANG);
+        let reap = !opts.contains(WaitIdOptions::WNOWAIT);
         let caller = self.zircon_process();
 
         let (child_pid, status) = match idtype {
@@ -334,7 +359,7 @@ impl Syscall<'_> {
                 if id == 0 {
                     return Err(LxError::EINVAL);
                 }
-                let code = wait_child(caller, id as KoID, nohang).await?;
+                let code = wait_child(caller, id as KoID, nohang, reap).await?;
                 (id as KoID, code)
             }
             P_PIDFD => {
@@ -349,11 +374,11 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EAGAIN);
                 }
-                let code = wait_child(caller, target.id(), nohang).await?;
+                let code = wait_child(caller, target.id(), nohang, reap).await?;
                 (target.id(), code)
             }
             P_ALL => {
-                let (pid, code) = wait_child_any(caller, nohang).await?;
+                let (pid, code) = wait_child_any(caller, nohang, reap).await?;
                 (pid, code)
             }
             P_PGID => return Err(LxError::ENOSYS),
@@ -791,6 +816,8 @@ bitflags! {
         const FILES =           1 << 10;
         /// the calling process and the child process share the same table of signal handlers.
         const SIGHAND =         1 << 11;
+        /// return a pidfd referring to the child process
+        const PIDFD =           1 << 12;
         /// the calling process is being traced
         const PTRACE =          1 << 13;
         /// the execution of the calling process is suspended until the child releases its virtual memory resources
