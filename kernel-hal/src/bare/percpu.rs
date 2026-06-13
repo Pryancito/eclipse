@@ -24,6 +24,9 @@ pub struct PercpuBlock {
     cpu_id: AtomicU32,
     /// The thread currently running on this CPU.
     pub current_thread: PerCpuCell<Option<Arc<dyn Any + Send + Sync>>>,
+    /// Remaining timer ticks before the current task must yield.
+    /// See [`tick_should_preempt`].
+    tick_quantum: PerCpuCell<u32>,
 }
 
 impl PercpuBlock {
@@ -31,6 +34,7 @@ impl PercpuBlock {
         Self {
             cpu_id: AtomicU32::new(u32::MAX),
             current_thread: PerCpuCell::new(None),
+            tick_quantum: PerCpuCell::new(0),
         }
     }
 
@@ -38,6 +42,34 @@ impl PercpuBlock {
     #[inline]
     pub fn cpu_id(&self) -> u32 {
         self.cpu_id.load(Ordering::Relaxed)
+    }
+}
+
+/// How many timer ticks one task gets before the preemption point fires.
+///
+/// At 250 Hz (4 ms tick), 5 ticks ≈ 20 ms — close to Linux's default
+/// non-interactive time slice. Yielding on every raw tick (the previous
+/// behaviour) churned the async executor at 250 Hz even when the same task
+/// was the only runnable one, which showed up as scheduler overhead on
+/// CPU-bound workloads.
+const TICKS_PER_QUANTUM: u32 = 5;
+
+/// Decrement the current CPU's quantum and report whether the caller should
+/// yield. Returns `true` exactly once every [`TICKS_PER_QUANTUM`] calls from a
+/// given CPU.
+///
+/// Called from the timer-interrupt path of the user-trap handler; the cell is
+/// only ever touched by its owning CPU, so the unsynchronised access is sound.
+#[inline]
+pub fn tick_should_preempt() -> bool {
+    let cell = &current().tick_quantum;
+    let n = *cell.get();
+    if n == 0 {
+        *cell.get_mut() = TICKS_PER_QUANTUM - 1;
+        true
+    } else {
+        *cell.get_mut() = n - 1;
+        false
     }
 }
 

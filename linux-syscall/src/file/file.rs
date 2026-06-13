@@ -36,7 +36,21 @@ impl Syscall<'_> {
             };
 
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; chunk_size];
+        // Hybrid stack/heap buffer: line-oriented apps (busybox shell, getline,
+        // fgetc) drive a stream of small reads — keep those alloc-free. The
+        // ~64 KiB ceiling case still goes via the buddy allocator.
+        const STACK_BUF: usize = 512;
+        let mut stack_buf = [0u8; STACK_BUF];
+        let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
+            vec![0u8; chunk_size]
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let buf: &mut [u8] = if chunk_size > STACK_BUF {
+            &mut heap_buf[..]
+        } else {
+            &mut stack_buf[..chunk_size]
+        };
         let mut read_len = 0;
 
         while read_len < len {
@@ -102,7 +116,21 @@ impl Syscall<'_> {
         let file_like = proc.get_file_like(fd)?;
 
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; chunk_size];
+        // Same hybrid buffer as sys_read — short positional reads (e.g. ELF
+        // header probes during dlopen, libc pread of small struct slots) hit
+        // the stack path.
+        const STACK_BUF: usize = 512;
+        let mut stack_buf = [0u8; STACK_BUF];
+        let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
+            vec![0u8; chunk_size]
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let buf: &mut [u8] = if chunk_size > STACK_BUF {
+            &mut heap_buf[..]
+        } else {
+            &mut stack_buf[..chunk_size]
+        };
         let mut read_len = 0;
 
         while read_len < len {
@@ -154,8 +182,22 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; total_len];
-        let len = file_like.read(&mut buf).await?;
+        // Mirror the sys_read hybrid buffer: many readv callers (e.g. socket
+        // headers + payload split into two small iovecs) request totals well
+        // under 512 B, so keep those alloc-free.
+        const STACK_BUF: usize = 512;
+        let mut stack_buf = [0u8; STACK_BUF];
+        let mut heap_buf: alloc::vec::Vec<u8> = if total_len > STACK_BUF {
+            vec![0u8; total_len]
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let buf: &mut [u8] = if total_len > STACK_BUF {
+            &mut heap_buf[..]
+        } else {
+            &mut stack_buf[..total_len]
+        };
+        let len = file_like.read(buf).await?;
         iovs.write_from_buf(&buf[..len])?;
         Ok(len)
     }
