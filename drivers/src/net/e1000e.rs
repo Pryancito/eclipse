@@ -1196,11 +1196,15 @@ impl E1000eHw {
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += len as u64;
 
-        // Recycle: clear descriptor, post new buffer, ring doorbell
+        // Advance our index FIRST so even a re-entrant call (or a spurious
+        // re-read of the same slot) sees the next slot to consume. Then
+        // recycle the slot we just consumed — at this point we already have
+        // a copy of the bytes in `packet`, so hardware overwriting the buffer
+        // immediately after RDT advances cannot corrupt our copy.
+        self.rx_next_to_clean = (i + 1) % NUM_RX;
         unsafe {
             self.recycle_rx_slot(i);
         }
-        self.rx_next_to_clean = (i + 1) % NUM_RX;
 
         Some(packet)
     }
@@ -1216,8 +1220,13 @@ impl E1000eHw {
         // Full memory barrier: ensure the DMA engine sees the updated descriptor
         // before we ring the doorbell.
         fence(Ordering::SeqCst);
-        // Advance RDT to this slot (give it back to hardware)
-        mmio_write(self.base, E1000E_RDT, i as u32);
+        // Advance RDT past this slot (give it back to hardware). The e1000e
+        // convention is RDT == next slot SW will use, i.e. HW can fill slots
+        // in [RDH, RDT). Using `i` here would actually exclude slot `i` from
+        // HW use; using `(i + 1) % NUM_RX` correctly releases the just-recycled
+        // slot. The previous off-by-one caused HW to reuse a slot still owned
+        // by SW under heavy traffic, overwriting buffers we hadn't yet read.
+        mmio_write(self.base, E1000E_RDT, ((i + 1) % NUM_RX) as u32);
     }
 
     // -----------------------------------------------------------------------
