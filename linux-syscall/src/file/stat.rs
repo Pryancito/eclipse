@@ -74,8 +74,7 @@ impl Syscall<'_> {
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
         let inode = if flags.contains(AtFlags::EMPTY_PATH)
-            && (pathname.is_null()
-                || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
+            && (pathname.is_null() || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
         {
             if dirfd == FileDesc::CWD {
                 proc.root_inode()

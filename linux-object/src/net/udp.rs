@@ -39,7 +39,6 @@ pub struct UdpInner {
     ipv6: bool,
 }
 
-
 // Moved to mod.rs as public constants
 
 // Moved to mod.rs as public structures

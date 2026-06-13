@@ -1,9 +1,9 @@
 //! Event handler and device tree.
 
+pub mod deferred_job;
 mod event_listener;
 mod id_allocator;
 mod irq_manager;
-pub mod deferred_job;
 
 #[cfg(feature = "graphic")]
 mod graphic_console;

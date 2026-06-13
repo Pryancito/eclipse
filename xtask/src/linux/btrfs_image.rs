@@ -44,7 +44,8 @@ pub fn make_btrfs_image(image: &Path, size: u64, label: &str, rootdir: Option<&P
         .truncate(true)
         .open(image)
         .expect("no se pudo crear la imagen btrfs");
-    file.set_len(size).expect("no se pudo dimensionar la imagen");
+    file.set_len(size)
+        .expect("no se pudo dimensionar la imagen");
     let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(file).unwrap());
     mkfs::format(&*dev, &mkfs_options(label)).expect("mkfs btrfs falló");
     let mut fs = Btrfs::mount(dev).expect("no se pudo montar la imagen recién formateada");
@@ -69,7 +70,10 @@ fn populate(fs: &mut Btrfs, dir_ino: u64, dir: &Path) {
         let mode = meta.permissions().mode() & 0o7777;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(&path).unwrap();
-            let target = target.as_os_str().to_str().expect("destino de symlink no UTF-8");
+            let target = target
+                .as_os_str()
+                .to_str()
+                .expect("destino de symlink no UTF-8");
             fs.symlink(dir_ino, name, target.as_bytes())
                 .unwrap_or_else(|e| panic!("symlink {:?}: {:?}", path, e));
         } else if meta.is_dir() {

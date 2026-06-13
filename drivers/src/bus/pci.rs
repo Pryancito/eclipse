@@ -297,7 +297,6 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
     Err(DeviceError::NotSupported)
 }
 
-
 pub fn detach_driver(_loc: &Location) -> bool {
     false
 }

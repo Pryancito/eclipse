@@ -9,21 +9,21 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities, Checksum};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result;
 
 use super::{timer_now_as_micros, ProviderImpl};
-use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme, SchemeUpcast, RouteInfo, NetStats};
-use crate::{Device, DeviceError, DeviceResult};
-use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
-use pci::{PCIDevice, BAR};
-use lock::Mutex;
+use crate::bus::pci_drivers::PciDriver;
+use crate::net::get_sockets;
+use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme, SchemeUpcast};
 use crate::utils::dma::DmaRegion;
+use crate::{Device, DeviceError, DeviceResult};
 use core::sync::atomic::{fence, Ordering};
+use lock::Mutex;
+use pci::{PCIDevice, BAR};
 
 const NUM_DESC: usize = 256;
 /// Size in bytes of each RX/TX DMA buffer (one page).
@@ -56,12 +56,12 @@ pub struct E1000 {
     base: usize,
     size: usize,
     mac: EthernetAddress,
-    
+
     // RX ring & buffers
     rx_ring: DmaRegion,
     rx_bufs: Vec<DmaRegion>,
     rx_next_to_clean: usize,
-    
+
     // TX ring & buffers
     tx_ring: DmaRegion,
     tx_bufs: Vec<DmaRegion>,
@@ -133,9 +133,8 @@ impl E1000 {
         }
 
         // Initialize descriptors
-        let rx_desc_slice = unsafe {
-            core::slice::from_raw_parts_mut(rx_ring.as_ptr::<E1000RecvDesc>(), NUM_DESC)
-        };
+        let rx_desc_slice =
+            unsafe { core::slice::from_raw_parts_mut(rx_ring.as_ptr::<E1000RecvDesc>(), NUM_DESC) };
         for (i, desc) in rx_desc_slice.iter_mut().enumerate() {
             desc.addr = rx_bufs[i].paddr() as u64;
             desc.status = 0;
@@ -145,9 +144,8 @@ impl E1000 {
             desc.special = 0;
         }
 
-        let tx_desc_slice = unsafe {
-            core::slice::from_raw_parts_mut(tx_ring.as_ptr::<E1000SendDesc>(), NUM_DESC)
-        };
+        let tx_desc_slice =
+            unsafe { core::slice::from_raw_parts_mut(tx_ring.as_ptr::<E1000SendDesc>(), NUM_DESC) };
         for (i, desc) in tx_desc_slice.iter_mut().enumerate() {
             desc.addr = tx_bufs[i].paddr() as u64;
             desc.len = 0;
@@ -166,7 +164,7 @@ impl E1000 {
             // 2. Device Reset
             let ctrl = mmio_read(base, E1000_CTRL);
             mmio_write(base, E1000_CTRL, ctrl | (1 << 26)); // Device Reset (RST)
-            
+
             // Wait for reset to complete
             Self::udelay(10_000); // 10ms
 
@@ -182,13 +180,17 @@ impl E1000 {
             mmio_write(base, E1000_TDBAL, tx_ring.paddr() as u32);
             mmio_write(base, E1000_TDBAH, (tx_ring.paddr() >> 32) as u32);
             mmio_write(base, E1000_TDLEN, 4096);
-            
+
             // Initialize head and tail to 0
             mmio_write(base, E1000_TDH, 0);
             mmio_write(base, E1000_TDT, 0);
-            
+
             // TCTL: EN | PSP | CT=0x10 | COLD=0x40
-            mmio_write(base, E1000_TCTL, (1 << 1) | (1 << 3) | (0x10 << 4) | (0x40 << 12));
+            mmio_write(
+                base,
+                E1000_TCTL,
+                (1 << 1) | (1 << 3) | (0x10 << 4) | (0x40 << 12),
+            );
             // TIPG: IPGT=0xa | IPGR1=0x8 | IPGR2=0xc
             mmio_write(base, E1000_TIPG, 0xa | (0x8 << 10) | (0xc << 20));
 
@@ -223,7 +225,7 @@ impl E1000 {
 
             // Clear pending interrupts
             let _icr = mmio_read(base, E1000_ICR);
-            
+
             // Enable RXT0 and LSC interrupts
             mmio_write(base, E1000_IMS, (1 << 7) | (1 << 2)); // RXT0 | LSC
             let _ = mmio_read(base, E1000_IMS);
@@ -250,7 +252,10 @@ impl E1000 {
                 if (icr & (1 << 2)) != 0 {
                     let status = mmio_read(self.base, E1000_STATUS);
                     let link_up = (status & (1 << 1)) != 0;
-                    info!("[e1000] Link status changed. Link is {}", if link_up { "UP" } else { "DOWN" });
+                    info!(
+                        "[e1000] Link status changed. Link is {}",
+                        if link_up { "UP" } else { "DOWN" }
+                    );
                 }
                 true
             } else {
@@ -263,7 +268,7 @@ impl E1000 {
         let ring = self.rx_ring.as_ptr::<E1000RecvDesc>();
         let desc_addr = unsafe { ring.add(self.rx_next_to_clean) };
         let status = unsafe { core::ptr::read_volatile(&((*desc_addr).status)) };
-        
+
         if (status & 1) == 0 {
             return None;
         }
@@ -272,7 +277,8 @@ impl E1000 {
 
         // `len` is written by the device; clamp it to the actual buffer size so
         // a misbehaving device cannot make us read past the DMA buffer.
-        let len = (unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize).min(RX_BUF_SIZE);
+        let len =
+            (unsafe { core::ptr::read_volatile(&((*desc_addr).len)) } as usize).min(RX_BUF_SIZE);
 
         let buf_vaddr = self.rx_bufs[self.rx_next_to_clean].vaddr();
         let buffer = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, len) };
@@ -309,7 +315,10 @@ impl E1000 {
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
         let desc_addr = unsafe { ring.add(index) };
 
-        assert!(self.first_trans || unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 });
+        assert!(
+            self.first_trans
+                || unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 }
+        );
 
         // The TX buffer is a single page; never copy more than it can hold,
         // otherwise we would overflow into adjacent DMA buffers.
@@ -391,7 +400,8 @@ impl Scheme for E1000Interface {
         }
 
         if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
-            self.poll_pending.store(true, core::sync::atomic::Ordering::SeqCst);
+            self.poll_pending
+                .store(true, core::sync::atomic::Ordering::SeqCst);
             unsafe {
                 mmio_write(self.base, E1000_IMC, 0xffffffff);
                 let _ = mmio_read(self.base, E1000_IMC);
@@ -593,8 +603,11 @@ impl NetScheme for E1000Interface {
         let mut iface = self.iface.lock();
         if cidr.prefix_len() == 0 {
             match cidr {
-                IpCidr::Ipv4(_) => { let _ = iface.routes_mut().remove_default_ipv4_route(); }
-                IpCidr::Ipv6(_) => { /* no simple remove_default_ipv6_route in smoltcp but tracked in routes */ }
+                IpCidr::Ipv4(_) => {
+                    let _ = iface.routes_mut().remove_default_ipv4_route();
+                }
+                IpCidr::Ipv6(_) => { /* no simple remove_default_ipv6_route in smoltcp but tracked in routes */
+                }
                 _ => {}
             }
         }
@@ -605,7 +618,7 @@ impl NetScheme for E1000Interface {
     fn get_routes(&self) -> Vec<RouteInfo> {
         let iface = self.iface.lock();
         let mut res = Vec::new();
-        
+
         // 1. Add tracked routes
         res.extend(self.routes.lock().clone());
 
@@ -659,15 +672,24 @@ impl phy::Device<'_> for E1000Driver {
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         self.hw.lock().receive().map(|pkt| {
             (
-                E1000RxToken { data: pkt, stats: self.stats.clone() },
-                E1000TxToken { driver: self.clone(), stats: self.stats.clone() },
+                E1000RxToken {
+                    data: pkt,
+                    stats: self.stats.clone(),
+                },
+                E1000TxToken {
+                    driver: self.clone(),
+                    stats: self.stats.clone(),
+                },
             )
         })
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken> {
         if self.hw.lock().can_send() {
-            Some(E1000TxToken { driver: self.clone(), stats: self.stats.clone() })
+            Some(E1000TxToken {
+                driver: self.clone(),
+                stats: self.stats.clone(),
+            })
         } else {
             None
         }
@@ -708,7 +730,7 @@ impl phy::TxToken for E1000TxToken {
         let mut driver = self.driver.hw.lock();
         driver.send(&buffer[..len]);
         drop(driver);
-        
+
         let mut stats = self.stats.lock();
         stats.tx_packets += 1;
         stats.tx_bytes += len as u64;
@@ -731,7 +753,10 @@ pub fn init(
     let e1000 = E1000::new(header, size, ethernet_addr)?;
     let hw = Arc::new(Mutex::new(e1000));
     let stats = Arc::new(Mutex::new(NetStats::default()));
-    let net_driver = E1000Driver { hw: hw.clone(), stats: stats.clone() };
+    let net_driver = E1000Driver {
+        hw: hw.clone(),
+        stats: stats.clone(),
+    };
 
     let mut eui64 = [0u8; 8];
     eui64[0] = mac[0] ^ 2;
@@ -743,7 +768,10 @@ pub fn init(
     eui64[6] = mac[4];
     eui64[7] = mac[5];
     let link_local = Ipv6Address::new(
-        0xfe80, 0, 0, 0,
+        0xfe80,
+        0,
+        0,
+        0,
         (eui64[0] as u16) << 8 | eui64[1] as u16,
         (eui64[2] as u16) << 8 | eui64[3] as u16,
         (eui64[4] as u16) << 8 | eui64[5] as u16,
@@ -794,7 +822,12 @@ impl PciDriver for E1000DriverPci {
         vendor_id == 0x8086 && (device_id == 0x100e || device_id == 0x100f)
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
             if let Some(m) = mapper {
                 m.query_or_map(addr as usize, 4096 * 8);

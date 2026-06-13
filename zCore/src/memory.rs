@@ -2,6 +2,7 @@
 
 use crate::platform::phys_to_virt_offset;
 use alloc::alloc::handle_alloc_error;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{
     alloc::{GlobalAlloc, Layout},
     num::NonZeroUsize,
@@ -10,12 +11,10 @@ use core::{
 };
 use customizable_buddy::{BuddyAllocator, LinkedListBuddy, UsizeBuddy};
 use kernel_hal::PhysAddr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use lock::Mutex;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
-
 
 /// 堆分配器。
 ///

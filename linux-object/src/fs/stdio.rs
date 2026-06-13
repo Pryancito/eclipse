@@ -337,7 +337,10 @@ impl Stdin {
             ctrl_c_pending_set();
             let pgid = get_foreground_pgrp();
             if pgid > 0 {
-                let _ = crate::process::send_signal_to_process(pgid as usize, crate::signal::Signal::SIGINT);
+                let _ = crate::process::send_signal_to_process(
+                    pgid as usize,
+                    crate::signal::Signal::SIGINT,
+                );
             }
         }
         self.buf.lock().push_back(c);

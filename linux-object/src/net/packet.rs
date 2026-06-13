@@ -9,12 +9,12 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 
 // use kernel_hal::user::UserInOutPtr;
-use kernel_hal::{thread, net::get_net_device};
-use zcore_drivers::scheme::NetScheme;
-use lock::Mutex;
-use zircon_object::object::*;
+use kernel_hal::{net::get_net_device, thread};
 use lazy_static::lazy_static;
+use lock::Mutex;
 use smoltcp::wire::{EthernetAddress, EthernetFrame};
+use zcore_drivers::scheme::NetScheme;
+use zircon_object::object::*;
 
 /// Per-socket RX queue depth (enough for DHCP bursts).
 const PACKET_QUEUE_MAX: usize = 16;
@@ -223,7 +223,8 @@ impl Drop for PacketSocketState {
 #[async_trait]
 impl Socket for PacketSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let mut endpoint = Endpoint::LinkLevel(LinkLevelEndpoint::new(*self.inner.ifindex.lock() as usize));
+        let mut endpoint =
+            Endpoint::LinkLevel(LinkLevelEndpoint::new(*self.inner.ifindex.lock() as usize));
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
@@ -263,14 +264,13 @@ impl Socket for PacketSocketState {
                     }
                 }
                 let payload = if self.inner.socket_type == SocketType::SOCK_DGRAM {
-                    ipv4_datagram_from_eth_frame(&internal_buf[..n])
-                        .unwrap_or_else(|| {
-                            if n > 14 {
-                                &internal_buf[14..n]
-                            } else {
-                                &internal_buf[..0]
-                            }
-                        })
+                    ipv4_datagram_from_eth_frame(&internal_buf[..n]).unwrap_or_else(|| {
+                        if n > 14 {
+                            &internal_buf[14..n]
+                        } else {
+                            &internal_buf[..0]
+                        }
+                    })
                 } else {
                     &internal_buf[..n]
                 };
@@ -293,7 +293,10 @@ impl Socket for PacketSocketState {
             // interval. On real hardware the NIC IRQ enqueues a deferred_job; draining here
             // ensures we don't miss a packet that arrived just before we slept.
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+            thread::sleep_until(
+                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+            )
+            .await;
         }
     }
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
@@ -301,13 +304,12 @@ impl Socket for PacketSocketState {
         let dev = if ifindex > 0 {
             crate::net::iface_by_linux_ifindex(ifindex)?
         } else {
-            crate::net::netdev_for_ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
-                .or_else(|_| {
-                    get_net_device()
-                        .into_iter()
-                        .find(|n| n.get_ifname() != "loopback")
-                        .ok_or(LxError::ENODEV)
-                })?
+            crate::net::netdev_for_ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED).or_else(|_| {
+                get_net_device()
+                    .into_iter()
+                    .find(|n| n.get_ifname() != "loopback")
+                    .ok_or(LxError::ENODEV)
+            })?
         };
 
         if self.inner.socket_type == SocketType::SOCK_DGRAM {
@@ -366,7 +368,10 @@ impl Socket for PacketSocketState {
             *self.inner.ifindex.lock() = ll.interface_index as u32;
             let proto = ll.protocol;
             *self.inner.protocol.lock() = proto;
-            info!("PacketSocket: bound to ifindex {}, proto (host)={:#x}", ll.interface_index, proto);
+            info!(
+                "PacketSocket: bound to ifindex {}, proto (host)={:#x}",
+                ll.interface_index, proto
+            );
             Ok(0)
         } else {
             Err(LxError::EINVAL)
@@ -427,7 +432,10 @@ impl Socket for PacketSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
-        warn!("PacketSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
+        warn!(
+            "PacketSocket: ioctl request={:#x}, arg1={:#x}",
+            request, arg1
+        );
         handle_net_ioctl(request, arg1, arg2, arg3, false)
     }
 
@@ -493,7 +501,11 @@ impl FileLike for PacketSocketState {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             kernel_hal::deferred_job::drain_deferred_jobs();
             let (read2, write2, error2) = Socket::poll(self, events);
-            return Ok(PollStatus { read: read2, write: write2, error: error2 });
+            return Ok(PollStatus {
+                read: read2,
+                write: write2,
+                error: error2,
+            });
         }
         Ok(PollStatus { read, write, error })
     }

@@ -1,7 +1,7 @@
+use crate::error::{LxError, LxResult};
 use alloc::{boxed::Box, vec::Vec};
 use lock::Mutex;
 use smoltcp::wire::IpEndpoint;
-use crate::error::{LxError, LxResult};
 
 const PORT_NUM: usize = 65536;
 

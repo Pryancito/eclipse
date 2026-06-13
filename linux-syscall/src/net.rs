@@ -27,7 +27,10 @@ impl Syscall<'_> {
         let socket_type = match SocketType::try_from(socket_type_val) {
             Ok(t) => t,
             Err(_) => {
-                warn!("sys_socket: invalid socket type: {:#x} (masked: {:#x})", _type, socket_type_val);
+                warn!(
+                    "sys_socket: invalid socket type: {:#x} (masked: {:#x})",
+                    _type, socket_type_val
+                );
                 return Err(LxError::EINVAL);
             }
         };
@@ -36,7 +39,10 @@ impl Syscall<'_> {
         let protocol_num = protocol;
         let protocol = Protocol::try_from(protocol_num).ok();
 
-        info!("sys_socket: domain:{:?}, type:{:?}, protocol:{:?}", domain, socket_type, protocol);
+        info!(
+            "sys_socket: domain:{:?}, type:{:?}, protocol:{:?}",
+            domain, socket_type, protocol
+        );
 
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
@@ -64,8 +70,12 @@ impl Syscall<'_> {
             }
             // Be tolerant for AF_INET/AF_INET6 datagram sockets.
             // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(false)?),
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => Arc::new(UdpSocketState::new(true)?),
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => {
+                Arc::new(UdpSocketState::new(false)?)
+            }
+            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => {
+                Arc::new(UdpSocketState::new(true)?)
+            }
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
@@ -310,7 +320,8 @@ impl Syscall<'_> {
         );
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let old_flags = file_like.flags();
-        let force_nonblock = (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
+        let force_nonblock =
+            (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
         if force_nonblock {
             file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
         }
@@ -392,7 +403,8 @@ impl Syscall<'_> {
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let old_flags = file_like.flags();
-        let force_nonblock = (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
+        let force_nonblock =
+            (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
         if force_nonblock {
             file_like.set_flags(old_flags | OpenFlags::NON_BLOCK)?;
         }
@@ -574,7 +586,7 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// creates a pair of connected sockets in the specified domain, of the specified type, 
+    /// creates a pair of connected sockets in the specified domain, of the specified type,
     /// and using the optionally specified protocol.
     pub fn sys_socketpair(
         &mut self,

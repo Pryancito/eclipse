@@ -9,8 +9,8 @@
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
-use kernel_hal::PhysAddr;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use kernel_hal::PhysAddr;
 use lock::Mutex;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
@@ -57,7 +57,10 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
         let frame_end = phys_addr_to_frame_idx(end - 1) + 1;
         if frame_start < frame_end {
             ba.insert(frame_start..frame_end);
-            TOTAL_MEMORY.fetch_add(frame_idx_to_phys_addr(frame_end - frame_start), Ordering::Relaxed);
+            TOTAL_MEMORY.fetch_add(
+                frame_idx_to_phys_addr(frame_end - frame_start),
+                Ordering::Relaxed,
+            );
             let range_start = frame_idx_to_phys_addr(frame_start);
             let range_end = frame_idx_to_phys_addr(frame_end);
             let mib = (range_end - range_start) / (1024 * 1024);
@@ -111,7 +114,10 @@ pub fn frame_stats() -> (usize, usize) {
 pub fn stats() -> (usize, usize) {
     let heap_used = HEAP_USED.load(Ordering::Relaxed);
     let frames_used = FRAMES_USED.load(Ordering::Relaxed);
-    (heap_used + frames_used, heap_total() + TOTAL_MEMORY.load(Ordering::Relaxed))
+    (
+        heap_used + frames_used,
+        heap_total() + TOTAL_MEMORY.load(Ordering::Relaxed),
+    )
 }
 
 /// Kernel heap bytes currently allocated (diagnostics / OOM handler).

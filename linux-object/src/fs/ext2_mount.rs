@@ -4,10 +4,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use lock::Mutex;
 use core::any::Any;
 use core::cmp::min;
 use core::ops::Range;
+use lock::Mutex;
 
 use ext2::error::Error as Ext2RawError;
 use ext2::fs::sync::{Inode as Ext2Inode, Synced};
@@ -114,7 +114,8 @@ impl Ext2MountFs {
         let volume = Ext2Volume {
             inner: device.clone(),
         };
-        let synced = Synced::new(volume).map_err(|e: Ext2RawError| FsError::from(Ext2VfsError(e)))?;
+        let synced =
+            Synced::new(volume).map_err(|e: Ext2RawError| FsError::from(Ext2VfsError(e)))?;
         let block_size = {
             let inner = synced.inner();
             inner.block_size()
@@ -135,9 +136,7 @@ impl Ext2MountFs {
     }
 
     pub(crate) fn inode_from_num(&self, num: usize) -> Result<Ext2Inode<Size512, Ext2Volume>> {
-        self.synced
-            .inode_nth(num)
-            .ok_or(FsError::EntryNotFound)
+        self.synced.inode_nth(num).ok_or(FsError::EntryNotFound)
     }
 
     pub(crate) fn dir_entries_cached(
@@ -214,10 +213,7 @@ impl Ext2MountINode {
             return Err(FsError::IsDir);
         }
         if cur.is_symlink() {
-            let target = self
-                .fs
-                .editor()
-                .read_symlink(self.inode_num as u32)?;
+            let target = self.fs.editor().read_symlink(self.inode_num as u32)?;
             if offset >= target.len() {
                 return Ok(0);
             }
@@ -243,11 +239,10 @@ impl Ext2MountINode {
                 Ok(Some(b)) => b.get(),
                 Ok(None) => {
                     if done == 0 {
-                        return self.fs.editor().read_file_at(
-                            self.inode_num as u32,
-                            offset,
-                            buf,
-                        );
+                        return self
+                            .fs
+                            .editor()
+                            .read_file_at(self.inode_num as u32, offset, buf);
                     }
                     let tail = self.fs.editor().read_file_at(
                         self.inode_num as u32,
@@ -259,12 +254,9 @@ impl Ext2MountINode {
                 }
                 Err(_) => return Err(FsError::DeviceError),
             };
-            let byte_base = Address::<Size512>::with_block_size(
-                disk_block,
-                block_off as i32,
-                log_block_size,
-            )
-            .into_index() as usize;
+            let byte_base =
+                Address::<Size512>::with_block_size(disk_block, block_off as i32, log_block_size)
+                    .into_index() as usize;
             let take = min(want - done, block_size - block_off);
             self.fs
                 .device
@@ -552,9 +544,18 @@ impl INode for Ext2MountINode {
             size,
             blk_size: 512,
             blocks: (size + 511) / 512,
-            atime: Timespec { sec: atime as i64, nsec: 0 },
-            mtime: Timespec { sec: mtime as i64, nsec: 0 },
-            ctime: Timespec { sec: ctime as i64, nsec: 0 },
+            atime: Timespec {
+                sec: atime as i64,
+                nsec: 0,
+            },
+            mtime: Timespec {
+                sec: mtime as i64,
+                nsec: 0,
+            },
+            ctime: Timespec {
+                sec: ctime as i64,
+                nsec: 0,
+            },
             type_,
             mode: cur.mode_bits(),
             nlinks: cur.nlink() as usize,
@@ -596,10 +597,7 @@ impl INode for Ext2MountINode {
                 let entries = self.list_dir_entries()?;
                 let (name, child_num) = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
                 let child = self.fs.inode_from_num(*child_num)?;
-                Ok((
-                    Self::child_metadata(*child_num, &child),
-                    name.clone(),
-                ))
+                Ok((Self::child_metadata(*child_num, &child), name.clone()))
             }
         }
     }
@@ -648,9 +646,7 @@ impl INode for Ext2MountINode {
         if !self.inode.is_dir() {
             return Err(FsError::NotDir);
         }
-        self.fs
-            .editor()
-            .unlink(self.inode_num as u32, name)?;
+        self.fs.editor().unlink(self.inode_num as u32, name)?;
         self.fs.invalidate_dir_cache(self.inode_num);
         Ok(())
     }

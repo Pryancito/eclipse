@@ -12,14 +12,18 @@ use log::{self, Level, LevelFilter, Log, Metadata, Record};
 const KLOG_BUF_SIZE: usize = 256 * 1024; // 256 KiB
 
 struct KlogBuf {
-    buf:   [u8; KLOG_BUF_SIZE],
-    head:  usize,   // write pointer (wraps around)
-    used:  usize,   // bytes currently stored (≤ KLOG_BUF_SIZE)
+    buf: [u8; KLOG_BUF_SIZE],
+    head: usize, // write pointer (wraps around)
+    used: usize, // bytes currently stored (≤ KLOG_BUF_SIZE)
 }
 
 impl KlogBuf {
     const fn new() -> Self {
-        Self { buf: [0u8; KLOG_BUF_SIZE], head: 0, used: 0 }
+        Self {
+            buf: [0u8; KLOG_BUF_SIZE],
+            head: 0,
+            used: 0,
+        }
     }
 
     /// Append bytes; oldest data is silently overwritten when full.
@@ -37,12 +41,14 @@ impl KlogBuf {
     /// Returns the number of bytes written.
     fn read_all(&self, dst: &mut [u8]) -> usize {
         let len = self.used.min(dst.len());
-        if len == 0 { return 0; }
+        if len == 0 {
+            return 0;
+        }
         // start = position of oldest byte
         let start = if self.used < KLOG_BUF_SIZE {
             0
         } else {
-            self.head  // head points to the oldest byte when full
+            self.head // head points to the oldest byte when full
         };
         for i in 0..len {
             dst[i] = self.buf[(start + i) % KLOG_BUF_SIZE];
@@ -50,12 +56,14 @@ impl KlogBuf {
         len
     }
 
-    fn size(&self) -> usize { self.used }
+    fn size(&self) -> usize {
+        self.used
+    }
 }
 
 struct KlogLock {
     locked: core::sync::atomic::AtomicBool,
-    buf:    core::cell::UnsafeCell<KlogBuf>,
+    buf: core::cell::UnsafeCell<KlogBuf>,
 }
 
 // SAFETY: we serialise all access with the spinlock.
@@ -73,9 +81,11 @@ impl KlogLock {
     fn with<R>(&self, f: impl FnOnce(&mut KlogBuf) -> R) -> R {
         use core::sync::atomic::Ordering;
         // Spin until we acquire the lock.
-        while self.locked.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
         // SAFETY: we hold the lock.
@@ -109,7 +119,10 @@ pub fn klog_emit(priority: u8, msg: &str) {
     let now = kernel_hal::timer::timer_now();
     let micros = now.as_micros();
     let mut line = [0u8; 512];
-    struct W<'a> { buf: &'a mut [u8], pos: usize }
+    struct W<'a> {
+        buf: &'a mut [u8],
+        pos: usize,
+    }
     impl fmt::Write for W<'_> {
         fn write_str(&mut self, s: &str) -> fmt::Result {
             let n = s.len().min(self.buf.len().saturating_sub(self.pos));
@@ -119,7 +132,10 @@ pub fn klog_emit(priority: u8, msg: &str) {
         }
     }
     let pos = {
-        let mut w = W { buf: &mut line, pos: 0 };
+        let mut w = W {
+            buf: &mut line,
+            pos: 0,
+        };
         let _ = write!(
             w,
             "<{prio}>[{s:>3}.{us:06}] {msg}\n",
@@ -294,7 +310,10 @@ impl Log for SimpleLogger {
 
         // Also write a plain-text copy into the ring buffer for dmesg.
         {
-            struct KlogWriter { buf: [u8; 1024], pos: usize }
+            struct KlogWriter {
+                buf: [u8; 1024],
+                pos: usize,
+            }
             impl fmt::Write for KlogWriter {
                 fn write_str(&mut self, s: &str) -> fmt::Result {
                     let bytes = s.as_bytes();
@@ -305,12 +324,15 @@ impl Log for SimpleLogger {
                     Ok(())
                 }
             }
-            let mut w = KlogWriter { buf: [0u8; 1024], pos: 0 };
+            let mut w = KlogWriter {
+                buf: [0u8; 1024],
+                pos: 0,
+            };
             let micros = now.as_micros();
             let syslog_prio = match level {
                 Level::Error => 3u8,
-                Level::Warn  => 4,
-                Level::Info  => 6,
+                Level::Warn => 4,
+                Level::Info => 6,
                 Level::Debug => 7,
                 Level::Trace => 7,
             };
@@ -319,7 +341,7 @@ impl Log for SimpleLogger {
                 format_args!(
                     "<{prio}>[{s:>3}.{us:06}] {args}\n",
                     prio = syslog_prio,
-                    s  = micros / 1_000_000,
+                    s = micros / 1_000_000,
                     us = micros % 1_000_000,
                     args = record.args(),
                 ),

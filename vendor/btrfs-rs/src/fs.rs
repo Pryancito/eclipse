@@ -159,8 +159,7 @@ impl Btrfs {
             t.iter_from(EXTENT_TREE, Key::MIN, |key, data| {
                 match key.item_type {
                     BLOCK_GROUP_ITEM_KEY => {
-                        let item =
-                            BlockGroupItem::parse(data).ok_or(Error::Corrupt("bg item"))?;
+                        let item = BlockGroupItem::parse(data).ok_or(Error::Corrupt("bg item"))?;
                         bgs.push((key.objectid, key.offset, item));
                     }
                     EXTENT_ITEM_KEY => used.push((key.objectid, key.offset)),
@@ -191,7 +190,10 @@ impl Btrfs {
 
         // Device free space: device minus dev extents minus reserved areas.
         let dev_item = self.vol.sb.dev_item().ok_or(Error::Corrupt("dev item"))?;
-        self.alloc.dev_free.insert(DEV_RESERVED, dev_item.total_bytes.saturating_sub(DEV_RESERVED));
+        self.alloc.dev_free.insert(
+            DEV_RESERVED,
+            dev_item.total_bytes.saturating_sub(DEV_RESERVED),
+        );
         let mut dev_used: Vec<(u64, u64)> = Vec::new();
         {
             let mut t = self.tree();
@@ -209,20 +211,14 @@ impl Btrfs {
         }
         // Never allocate over superblock mirrors.
         for &off in SUPERBLOCK_OFFSETS.iter() {
-            let _ = self
-                .alloc
-                .dev_free
-                .take(off, SUPERBLOCK_SIZE as u64);
+            let _ = self.alloc.dev_free.take(off, SUPERBLOCK_SIZE as u64);
         }
         Ok(())
     }
 
     fn load_next_ino(&mut self) -> Result<()> {
         let mut t = self.tree();
-        let last = t.prev_item(
-            FS_TREE,
-            Key::new(LAST_FREE_OBJECTID, u8::MAX, u64::MAX),
-        )?;
+        let last = t.prev_item(FS_TREE, Key::new(LAST_FREE_OBJECTID, u8::MAX, u64::MAX))?;
         self.next_ino = match last {
             Some((key, _)) if key.objectid >= FIRST_FREE_OBJECTID => key.objectid + 1,
             _ => FIRST_FREE_OBJECTID,
@@ -438,7 +434,15 @@ impl Btrfs {
         if self.alloc.data_free() >= want {
             return Ok(());
         }
-        let size = want.max(DATA_CHUNK_SIZE.min(self.alloc.dev_free.largest_in(0, u64::MAX).map(|r| r.1).unwrap_or(0)));
+        let size = want.max(
+            DATA_CHUNK_SIZE.min(
+                self.alloc
+                    .dev_free
+                    .largest_in(0, u64::MAX)
+                    .map(|r| r.1)
+                    .unwrap_or(0),
+            ),
+        );
         match self.create_chunk(BLOCK_GROUP_DATA, size) {
             Ok(()) => Ok(()),
             Err(Error::NoSpace) if self.alloc.data_free() > 0 => Ok(()),
@@ -482,10 +486,14 @@ impl Btrfs {
             .dev_free
             .alloc_in(0, u64::MAX, size, ALIGN)
             .ok_or(Error::NoSpace)?;
-        let logical = self
-            .alloc
-            .logical_end()
-            .max(self.vol.chunks().iter().map(|c| c.logical + c.length).max().unwrap_or(0));
+        let logical = self.alloc.logical_end().max(
+            self.vol
+                .chunks()
+                .iter()
+                .map(|c| c.logical + c.length)
+                .max()
+                .unwrap_or(0),
+        );
         let dev_item = self.vol.sb.dev_item().ok_or(Error::Corrupt("dev item"))?;
         let chunk = ChunkItem {
             length: size,
@@ -923,7 +931,9 @@ impl Btrfs {
     }
 
     pub fn symlink(&mut self, dir: u64, name: &str, target: &[u8]) -> Result<u64> {
-        if target.is_empty() || target.len() + FILE_EXTENT_HDR_LEN + ITEM_SIZE > self.vol.nodesize - HEADER_SIZE {
+        if target.is_empty()
+            || target.len() + FILE_EXTENT_HDR_LEN + ITEM_SIZE > self.vol.nodesize - HEADER_SIZE
+        {
             return Err(Error::Invalid);
         }
         let ino = self.create(dir, name, FileKind::Symlink, 0o777, 0)?;
@@ -1140,15 +1150,19 @@ impl Btrfs {
             }
         };
         let mut t = self.tree();
-        t.iter_from(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, from), |key, data| {
-            if key.objectid != ino || key.item_type != EXTENT_DATA_KEY || key.offset >= end {
-                return Ok(false);
-            }
-            if let Some(ext) = FileExtent::parse(data) {
-                out.push((key.offset, ext, data.to_vec()));
-            }
-            Ok(true)
-        })?;
+        t.iter_from(
+            FS_TREE,
+            Key::new(ino, EXTENT_DATA_KEY, from),
+            |key, data| {
+                if key.objectid != ino || key.item_type != EXTENT_DATA_KEY || key.offset >= end {
+                    return Ok(false);
+                }
+                if let Some(ext) = FileExtent::parse(data) {
+                    out.push((key.offset, ext, data.to_vec()));
+                }
+                Ok(true)
+            },
+        )?;
         Ok(out)
     }
 
@@ -1370,10 +1384,8 @@ impl Btrfs {
                     continue;
                 }
                 let disk = disk_bytenr + ext_off + (lo - file_off);
-                self.vol.write_logical(
-                    disk,
-                    &data[(lo - offset) as usize..(hi - offset) as usize],
-                )?;
+                self.vol
+                    .write_logical(disk, &data[(lo - offset) as usize..(hi - offset) as usize])?;
                 done = hi;
             }
         }
@@ -1519,8 +1531,7 @@ impl Btrfs {
                                     put_u64(d, 45, new_len); // num_bytes
                                 },
                             )?;
-                            inode.nbytes =
-                                inode.nbytes.saturating_sub(num_bytes - new_len);
+                            inode.nbytes = inode.nbytes.saturating_sub(num_bytes - new_len);
                         }
                     }
                 }

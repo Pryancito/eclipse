@@ -67,8 +67,7 @@ impl FatDisk {
                     return Ok(0);
                 }
                 let take = min(buf.len(), len - offset);
-                file.read_at(offset, &mut buf[..take])
-                    .map_err(|_| ())
+                file.read_at(offset, &mut buf[..take]).map_err(|_| ())
             }
         }
     }
@@ -99,8 +98,7 @@ impl FatDisk {
                     return Ok(0);
                 }
                 let take = min(buf.len(), len - offset);
-                file.write_at(offset, &buf[..take])
-                    .map_err(|_| ())
+                file.write_at(offset, &buf[..take]).map_err(|_| ())
             }
         }
     }
@@ -151,10 +149,7 @@ pub struct FatMountFs {
 
 impl FatMountFs {
     pub fn open(backend: MountBackend) -> rcore_fs::vfs::Result<Arc<Self>> {
-        let disk = FatDisk {
-            backend,
-            pos: 0,
-        };
+        let disk = FatDisk { backend, pos: 0 };
         let fs = FileSystem::new(disk, FsOptions::new()).map_err(|_| FsError::DeviceError)?;
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),

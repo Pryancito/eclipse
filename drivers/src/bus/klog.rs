@@ -25,7 +25,10 @@ fn emit(priority: u8, msg: &str) {
 pub fn klog_emit(priority: u8, args: fmt::Arguments<'_>) {
     let mut buf = [0u8; 256];
     let mut pos = {
-        let mut w = KlogBufWriter { buf: &mut buf, pos: 0 };
+        let mut w = KlogBufWriter {
+            buf: &mut buf,
+            pos: 0,
+        };
         let _ = w.write_fmt(args);
         w.pos
     };

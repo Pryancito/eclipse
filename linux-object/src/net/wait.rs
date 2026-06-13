@@ -60,10 +60,7 @@ pub struct IoMultiplexWait {
 impl IoMultiplexWait {
     pub fn new(timeout_msecs: isize, watch_net: bool, watch_hid: bool) -> Self {
         let deadline = if timeout_msecs >= 0 {
-            Some(
-                kernel_hal::timer::timer_now()
-                    + Duration::from_millis(timeout_msecs as u64),
-            )
+            Some(kernel_hal::timer::timer_now() + Duration::from_millis(timeout_msecs as u64))
         } else {
             None
         };

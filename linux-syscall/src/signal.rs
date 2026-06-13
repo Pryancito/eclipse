@@ -154,9 +154,7 @@ impl Syscall<'_> {
         };
         let caller = self.zircon_process().clone();
         let send_to_pid = |pid: KoID| -> SysResult {
-            let process = ROOT_JOB
-                .find_process(pid)
-                .ok_or(LxError::ESRCH)?;
+            let process = ROOT_JOB.find_process(pid).ok_or(LxError::ESRCH)?;
             match signal {
                 Signal::SIGKILL => {
                     let retcode = (128 + Signal::SIGKILL as i32) as i64;

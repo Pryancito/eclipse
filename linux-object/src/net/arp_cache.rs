@@ -4,14 +4,13 @@
 
 use alloc::collections::BTreeMap;
 use lock::Mutex;
-use smoltcp::wire::{
-    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, Ipv4Address,
-};
+use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetAddress, Ipv4Address};
 
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref LOCAL_MACS: Mutex<alloc::vec::Vec<EthernetAddress>> = Mutex::new(alloc::vec::Vec::new());
+    static ref LOCAL_MACS: Mutex<alloc::vec::Vec<EthernetAddress>> =
+        Mutex::new(alloc::vec::Vec::new());
 }
 
 /// Refresh cached NIC MACs (call after probe / NewAddr).
@@ -27,11 +26,14 @@ fn is_local_mac(mac: EthernetAddress) -> bool {
 const CACHE_MAX: usize = 512;
 
 lazy_static! {
-    static ref CACHE: Mutex<BTreeMap<Ipv4Address, EthernetAddress>> =
-        Mutex::new(BTreeMap::new());
+    static ref CACHE: Mutex<BTreeMap<Ipv4Address, EthernetAddress>> = Mutex::new(BTreeMap::new());
 }
 
-fn insert_bounded(map: &mut BTreeMap<Ipv4Address, EthernetAddress>, ip: Ipv4Address, mac: EthernetAddress) {
+fn insert_bounded(
+    map: &mut BTreeMap<Ipv4Address, EthernetAddress>,
+    ip: Ipv4Address,
+    mac: EthernetAddress,
+) {
     if map.len() >= CACHE_MAX && !map.contains_key(&ip) {
         if let Some(old) = map.keys().next().copied() {
             map.remove(&old);
@@ -61,10 +63,7 @@ pub fn learn_from_frame(frame: &[u8]) {
             }
             let src = Ipv4Address::from_bytes(&frame[26..30]);
             // QEMU slirp DHCP can carry server IP (10.0.2.2) with our own L2 source — skip.
-            if src.is_unicast()
-                && !src.is_unspecified()
-                && !is_local_mac(src_mac)
-            {
+            if src.is_unicast() && !src.is_unspecified() && !is_local_mac(src_mac) {
                 insert_bounded(&mut *CACHE.lock(), src, src_mac);
             }
         }
@@ -122,4 +121,3 @@ pub fn insert(dst: Ipv4Address, mac: EthernetAddress) {
 pub fn get_entries() -> alloc::vec::Vec<(Ipv4Address, EthernetAddress)> {
     CACHE.lock().iter().map(|(&ip, &mac)| (ip, mac)).collect()
 }
-

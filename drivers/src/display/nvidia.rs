@@ -1,14 +1,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
-use crate::{Device, DeviceResult, DeviceError, builder::IoMapper};
-use crate::bus::pci_drivers::PciDriver;
-use pci::{PCIDevice, BAR};
+use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
 use alloc::sync::Arc;
 use lock::Mutex;
+use pci::{PCIDevice, BAR};
 
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
 #[allow(dead_code)]
@@ -646,7 +646,12 @@ impl PciDriver for NvidiaGpuDriverPci {
         dev.id.vendor_id == 0x10DE && dev.id.class == 0x03
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, _irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        _irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         #[cfg(target_arch = "x86_64")]
         use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS};
         use crate::bus::phys_to_virt;
@@ -714,11 +719,16 @@ impl PciDriver for NvidiaGpuDriverPci {
 
             let gpu_name = alloc::format!(
                 "nvidia-gpu-{}:{}.{}",
-                dev.loc.bus, dev.loc.device, dev.loc.function
+                dev.loc.bus,
+                dev.loc.device,
+                dev.loc.function
             );
             log::warn!(
                 "[NVIDIA] GPU at {} bar0={:#x} fb={:#x} fb_len={:#x}",
-                gpu_name, bar0_addr, fb_addr, fb_len
+                gpu_name,
+                bar0_addr,
+                fb_addr,
+                fb_len
             );
             let gpu = Arc::new(NvidiaGpu::new(
                 gpu_name,
@@ -735,4 +745,3 @@ impl PciDriver for NvidiaGpuDriverPci {
         }
     }
 }
-

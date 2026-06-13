@@ -41,7 +41,7 @@ impl super::LinuxRootfs {
             println!("Building efi.img...");
             let efi_img = TARGET.join("efi.img");
             let _ = fs::remove_file(&efi_img);
-            
+
             let file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -163,7 +163,9 @@ impl super::LinuxRootfs {
 
             // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
             println!("Building final installer-enabled image...");
-            let image = PROJECT_DIR.join("zCore").join(format!("{arch}.img", arch = self.0.name()));
+            let image = PROJECT_DIR
+                .join("zCore")
+                .join(format!("{arch}.img", arch = self.0.name()));
             fuse(&rootfs_path, &image, 80 * 1024 * 1024);
 
             let _ = fs::remove_file(efi_gz);
@@ -214,9 +216,9 @@ fn fuse(dir: impl AsRef<Path>, image: impl AsRef<Path>, fs_size: usize) {
         .truncate(true)
         .open(image)
         .expect("failed to open image");
-    file.set_len(fs_size as u64).expect("failed to set image size");
+    file.set_len(fs_size as u64)
+        .expect("failed to set image size");
     let fs = SimpleFileSystem::create(Arc::new(Mutex::new(file)), fs_size)
         .expect("failed to create sfs");
     zip_dir(dir.as_ref(), fs.root_inode()).expect("failed to zip fs");
 }
-

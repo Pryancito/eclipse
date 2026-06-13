@@ -188,10 +188,7 @@ pub fn current_cpu_id() -> u8 {
 }
 
 /// Raw hardware Local APIC ID (x86). Sparse; use [`current_cpu_id`] to index arrays.
-#[cfg(all(
-    target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn hardware_apic_id() -> u8 {
     interrupts::raw_apic_id()
 }
@@ -215,19 +212,13 @@ pub fn set_logical_cpu_id(hw_id: u8, logical_id: u8) {
 }
 
 /// Register phys→virt linear map offset for LAPIC MMIO reads on x86.
-#[cfg(all(
-    target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn set_phys_virt_offset(offset: u64) {
     interrupts::set_phys_virt_offset(offset)
 }
 
 /// Run `f` while [`cpu_id`] returns `logical` (AP [`init_ap`] before GS is ready).
-#[cfg(all(
-    target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn with_ap_boot_logical<R>(logical: u8, f: impl FnOnce() -> R) -> R {
     interrupts::with_ap_boot_logical(logical, f)
 }

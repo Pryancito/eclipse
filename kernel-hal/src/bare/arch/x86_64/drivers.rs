@@ -58,13 +58,16 @@ pub(super) fn init() -> DeviceResult {
 
     irq.register_local_apic_handler(trap::X86_INT_APIC_TIMER, Box::new(super::trap::super_timer))?;
     // IPI vector: 0xf3 = X86_INT_LOCAL_APIC_BASE + 3
-    irq.register_local_apic_handler(0xf3, Box::new(|| {
-        // Drain and process IPI reasons on this CPU
-        use crate::common::ipi::IpiReason;
-        for entry in crate::common::ipi::ipi_reason() {
-            let _ = IpiReason::from(entry); // parsed; kernel handles via ipi_reason() call-sites
-        }
-    }))?;
+    irq.register_local_apic_handler(
+        0xf3,
+        Box::new(|| {
+            // Drain and process IPI reasons on this CPU
+            use crate::common::ipi::IpiReason;
+            for entry in crate::common::ipi::ipi_reason() {
+                let _ = IpiReason::from(entry); // parsed; kernel handles via ipi_reason() call-sites
+            }
+        }),
+    )?;
 
     if Apic::local_apic_ready() {
         // SAFETY: called once on BSP during primary_init
@@ -182,12 +185,7 @@ pub(super) fn init() -> DeviceResult {
             crate::console::init_graphic_console(display.clone());
             let _ = display.need_flush();
             let info = display.info();
-            Some(format!(
-                "{} {}x{}",
-                display.name(),
-                info.width,
-                info.height
-            ))
+            Some(format!("{} {}x{}", display.name(), info.width, info.height))
         } else {
             use crate::KCONFIG;
             use zcore_drivers::display::UefiDisplay;

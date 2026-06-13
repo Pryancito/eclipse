@@ -31,7 +31,10 @@ fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) ->
     Ok(0)
 }
 
-fn is_child_process(parent: &zircon_object::task::Process, child: &zircon_object::task::Process) -> bool {
+fn is_child_process(
+    parent: &zircon_object::task::Process,
+    child: &zircon_object::task::Process,
+) -> bool {
     parent.linux().has_child(child.id())
 }
 
@@ -139,7 +142,9 @@ impl Syscall<'_> {
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc.wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED).await; // wait for execve or termination
+        new_proc
+            .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
+            .await; // wait for execve or termination
         Ok(new_proc.id() as usize)
     }
 
@@ -730,7 +735,10 @@ impl Syscall<'_> {
         mut euid: UserOutPtr<u32>,
         mut suid: UserOutPtr<u32>,
     ) -> SysResult {
-        debug!("getresuid: ruid={:?}, euid={:?}, suid={:?}", ruid, euid, suid);
+        debug!(
+            "getresuid: ruid={:?}, euid={:?}, suid={:?}",
+            ruid, euid, suid
+        );
         let creds = self.linux_process().credentials();
         ruid.write(creds.ruid)?;
         euid.write(creds.euid)?;
@@ -745,7 +753,10 @@ impl Syscall<'_> {
         mut egid: UserOutPtr<u32>,
         mut sgid: UserOutPtr<u32>,
     ) -> SysResult {
-        debug!("getresgid: rgid={:?}, egid={:?}, sgid={:?}", rgid, egid, sgid);
+        debug!(
+            "getresgid: rgid={:?}, egid={:?}, sgid={:?}",
+            rgid, egid, sgid
+        );
         let creds = self.linux_process().credentials();
         rgid.write(creds.rgid)?;
         egid.write(creds.egid)?;

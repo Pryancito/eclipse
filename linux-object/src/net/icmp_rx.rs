@@ -8,8 +8,8 @@ use lazy_static::lazy_static;
 use lock::Mutex;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    Icmpv4Packet, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-    Ipv4Packet, Ipv6Packet,
+    Icmpv4Packet, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet,
+    Ipv6Packet,
 };
 /// Pre-DHCP sentinel still present in older images; not a usable host address.
 pub fn is_ipv4_placeholder(addr: Ipv4Address) -> bool {
@@ -240,11 +240,7 @@ pub fn pending_for(ipv6: bool) -> bool {
 }
 
 /// Build a full IPv4 frame (header + ICMP) for `SOCK_RAW` recv (BusyBox ping as root).
-pub fn wrap_icmpv4_raw_frame(
-    src_addr: Ipv4Address,
-    dst_addr: Ipv4Address,
-    icmp: &[u8],
-) -> Vec<u8> {
+pub fn wrap_icmpv4_raw_frame(src_addr: Ipv4Address, dst_addr: Ipv4Address, icmp: &[u8]) -> Vec<u8> {
     let total = 20 + icmp.len();
     let mut buf = vec![0u8; total];
     let mut pkt = Ipv4Packet::new_unchecked(&mut buf);
@@ -261,10 +257,7 @@ pub fn wrap_icmpv4_raw_frame(
 }
 
 /// Dequeue an echo reply and wrap it for `SOCK_RAW` + `IPPROTO_ICMP` read(2).
-pub fn pop_ipv4_raw_reply(
-    remote: Option<IpAddress>,
-    buf: &mut [u8],
-) -> Option<(usize, IpAddress)> {
+pub fn pop_ipv4_raw_reply(remote: Option<IpAddress>, buf: &mut [u8]) -> Option<(usize, IpAddress)> {
     let (icmp, peer) = pop_for(false, remote)?;
     let IpAddress::Ipv4(peer_v4) = peer else {
         return None;

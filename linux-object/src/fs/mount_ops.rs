@@ -17,8 +17,8 @@ use super::ext2_mount::open_ext2;
 use super::fat_mount::open_fat;
 use super::flagged_fs::wrap_fs;
 use super::mount_state::{
-    self, build_options_string, flags_read_only, MS_BIND, MS_MOVE, MS_REMOUNT, MNT_DETACH,
-    MNT_FORCE,
+    self, build_options_string, flags_read_only, MNT_DETACH, MNT_FORCE, MS_BIND, MS_MOVE,
+    MS_REMOUNT,
 };
 
 lazy_static! {
@@ -83,7 +83,10 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     }
 }
 
-pub(crate) fn open_filesystem(backend: MountBackend, fstype: &str) -> LxResult<Arc<dyn FileSystem>> {
+pub(crate) fn open_filesystem(
+    backend: MountBackend,
+    fstype: &str,
+) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
         "btrfs" => open_btrfs(&backend).map_err(LxError::from),
         "ext2" => open_ext2(&backend).map_err(LxError::from),
@@ -128,9 +131,7 @@ pub fn mount_fs(
         if !source_node.is_mountpoint() {
             return Err(LxError::EINVAL);
         }
-        let inner = source_node
-            .mounted_inner_fs()
-            .ok_or(LxError::EINVAL)?;
+        let inner = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
         let mount_node = resolve_mnode(&target_norm)?;
         if mount_node.is_mountpoint() {
             return Err(LxError::EBUSY);
@@ -177,9 +178,7 @@ fn mount_move(source: &str, target: &str) -> LxResult<()> {
     if target_node.is_mountpoint() {
         return Err(LxError::EBUSY);
     }
-    let fs = source_node
-        .mounted_inner_fs()
-        .ok_or(LxError::EINVAL)?;
+    let fs = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
     source_node.umount().map_err(LxError::from)?;
     target_node.mount(fs).map_err(LxError::from)?;
     super::move_mount_entry(&source_norm, &target_norm)?;

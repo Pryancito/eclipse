@@ -93,7 +93,10 @@ impl EventBus {
     /// push a EventHandler into the callback vector
     pub fn subscribe(&mut self, callback: EventHandler) {
         if self.callbacks.len() >= MAX_EVENT_CALLBACKS {
-            trace!("EventBus: callback table full ({}), ignoring subscribe", MAX_EVENT_CALLBACKS);
+            trace!(
+                "EventBus: callback table full ({}), ignoring subscribe",
+                MAX_EVENT_CALLBACKS
+            );
             return;
         }
         self.callbacks.push(callback);

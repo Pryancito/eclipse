@@ -27,14 +27,26 @@ impl btrfs::BlockDevice for DevAdapter {
         self.inner
             .read_at(offset as usize, buf)
             .map_err(|_| BtrfsError::Io)
-            .and_then(|n| if n == buf.len() { Ok(()) } else { Err(BtrfsError::Io) })
+            .and_then(|n| {
+                if n == buf.len() {
+                    Ok(())
+                } else {
+                    Err(BtrfsError::Io)
+                }
+            })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
         self.inner
             .write_at(offset as usize, buf)
             .map_err(|_| BtrfsError::Io)
-            .and_then(|n| if n == buf.len() { Ok(()) } else { Err(BtrfsError::Io) })
+            .and_then(|n| {
+                if n == buf.len() {
+                    Ok(())
+                } else {
+                    Err(BtrfsError::Io)
+                }
+            })
     }
 
     fn sync(&self) -> btrfs::Result<()> {

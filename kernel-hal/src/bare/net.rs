@@ -17,7 +17,7 @@ use lock::Mutex;
 
 use crate::drivers::add_device;
 use crate::drivers::all_net;
-use zcore_drivers::net::{LoopbackInterface, LoopbackDevice};
+use zcore_drivers::net::{LoopbackDevice, LoopbackInterface};
 use zcore_drivers::scheme::{NetScheme, NetStats};
 use zcore_drivers::Device;
 
@@ -40,7 +40,7 @@ pub fn init() {
         IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
         IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
     ];
-    
+
     // Loopback does not require any default route/gateway
     static mut ROUTES_STORAGE: [Option<(IpCidr, Route)>; 4] = [None; 4];
     let routes = unsafe { Routes::new(&mut ROUTES_STORAGE[..]) };
@@ -131,8 +131,7 @@ impl NetRxOrTimeoutFuture {
     pub fn new(timeout_ms: u64) -> Self {
         Self {
             registered: false,
-            deadline: crate::timer::timer_now()
-                + core::time::Duration::from_millis(timeout_ms),
+            deadline: crate::timer::timer_now() + core::time::Duration::from_millis(timeout_ms),
         }
     }
 }

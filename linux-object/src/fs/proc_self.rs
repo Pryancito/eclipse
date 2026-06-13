@@ -1,12 +1,12 @@
+use crate::fs::pseudo::Pseudo;
+use crate::process::ProcessExt;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use rcore_fs::vfs::*;
-use zircon_object::task::Process;
 use zircon_object::object::KernelObject;
-use crate::process::ProcessExt;
-use crate::fs::pseudo::Pseudo;
+use zircon_object::task::Process;
 
 pub struct ProcSelfFdDir {
     pub process: Arc<Process>,
@@ -55,13 +55,21 @@ impl INode for ProcSelfFdDir {
             "." | ".." => Ok(Arc::new(Pseudo::new("/proc/self/fd", FileType::Dir))),
             _ => {
                 let fd = name.parse::<i32>().map_err(|_| FsError::EntryNotFound)?;
-                let file = self.process.linux().get_file(fd.into()).map_err(|_| FsError::EntryNotFound)?;
+                let file = self
+                    .process
+                    .linux()
+                    .get_file(fd.into())
+                    .map_err(|_| FsError::EntryNotFound)?;
                 Ok(Arc::new(Pseudo::new(file.path(), FileType::SymLink)))
             }
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let files = self.process.linux().get_files().map_err(|_| FsError::DeviceError)?;
+        let files = self
+            .process
+            .linux()
+            .get_files()
+            .map_err(|_| FsError::DeviceError)?;
         let mut keys: Vec<_> = files.keys().collect();
         keys.sort();
         if id < keys.len() {

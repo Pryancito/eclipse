@@ -128,7 +128,8 @@ impl Volume {
     fn load_chunk_tree(&mut self) -> Result<()> {
         let root = self.sb.chunk_root();
         let root_block = self.read_block(root)?;
-        self.chunk_tree_uuid = root_block[header::OFF_CHUNK_TREE_UUID..header::OFF_CHUNK_TREE_UUID + 16]
+        self.chunk_tree_uuid = root_block
+            [header::OFF_CHUNK_TREE_UUID..header::OFF_CHUNK_TREE_UUID + 16]
             .try_into()
             .unwrap();
         self.load_chunk_node(root)
@@ -152,8 +153,8 @@ impl Volume {
             for slot in 0..n {
                 let key = leaf::key(&block, slot);
                 if key.item_type == CHUNK_ITEM_KEY {
-                    let chunk =
-                        ChunkItem::parse(leaf::data(&block, slot)).ok_or(Error::Corrupt("chunk item"))?;
+                    let chunk = ChunkItem::parse(leaf::data(&block, slot))
+                        .ok_or(Error::Corrupt("chunk item"))?;
                     found.push((key.offset, chunk));
                 }
             }
@@ -168,10 +169,7 @@ impl Volume {
     /// Map a logical range to physical stripes. Returns (stripes, length
     /// available at this logical offset within the chunk).
     pub fn map_logical(&self, logical: u64, len: u64) -> Result<(Vec<u64>, u64)> {
-        let idx = match self
-            .chunks
-            .binary_search_by_key(&logical, |c| c.logical)
-        {
+        let idx = match self.chunks.binary_search_by_key(&logical, |c| c.logical) {
             Ok(i) => i,
             Err(0) => return Err(Error::Corrupt("logical address before first chunk")),
             Err(i) => i - 1,
@@ -182,11 +180,7 @@ impl Volume {
         }
         let within = logical - chunk.logical;
         let avail = (chunk.length - within).min(len);
-        let phys = chunk
-            .stripes
-            .iter()
-            .map(|s| s.offset + within)
-            .collect();
+        let phys = chunk.stripes.iter().map(|s| s.offset + within).collect();
         Ok((phys, avail))
     }
 
@@ -201,8 +195,7 @@ impl Volume {
             let (phys, avail) =
                 self.map_logical(logical + done as u64, (buf.len() - done) as u64)?;
             let take = avail as usize;
-            self.dev
-                .read_at(phys[0], &mut buf[done..done + take])?;
+            self.dev.read_at(phys[0], &mut buf[done..done + take])?;
             done += take;
         }
         Ok(())

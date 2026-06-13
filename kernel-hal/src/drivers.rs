@@ -369,7 +369,7 @@ mod drivers_ffi {
         timer_now().as_micros() as _
     }
 
-    use crate::hal_fn::interrupt::{intr_on, intr_off, intr_get};
+    use crate::hal_fn::interrupt::{intr_get, intr_off, intr_on};
     #[no_mangle]
     extern "C" fn drivers_intr_on() {
         intr_on();

@@ -3,9 +3,9 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
-use lazy_static::lazy_static;
 use kernel_hal::drivers;
 use kernel_hal::net::get_net_device;
+use lazy_static::lazy_static;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -94,13 +94,14 @@ fn list_block_devices() -> Vec<String> {
 }
 
 fn block_index_by_name(name: &str) -> Option<usize> {
-    list_block_devices()
-        .iter()
-        .position(|n| n.as_str() == name)
+    list_block_devices().iter().position(|n| n.as_str() == name)
 }
 
 fn block_size_sectors(index: usize) -> Option<usize> {
-    drivers::all_block().as_vec().get(index).map(|b| b.block_count())
+    drivers::all_block()
+        .as_vec()
+        .get(index)
+        .map(|b| b.block_count())
 }
 
 struct SysRootINode;
@@ -317,7 +318,10 @@ impl INode for SysBlockDevINode {
             ".." => Ok(Arc::new(SysBlockDirINode)),
             "size" => {
                 let sectors = block_size_sectors(self.index).ok_or(FsError::EntryNotFound)?;
-                Ok(Arc::new(Pseudo::new(&format!("{}\n", sectors), FileType::File)))
+                Ok(Arc::new(Pseudo::new(
+                    &format!("{}\n", sectors),
+                    FileType::File,
+                )))
             }
             "removable" => Ok(Arc::new(Pseudo::new("0\n", FileType::File))),
             _ => Err(FsError::EntryNotFound),
@@ -447,15 +451,176 @@ impl INode for SysDevicesDirINode {
             "." => Ok(Arc::new(SysDevicesDirINode)),
             ".." => Ok(Arc::new(SysRootINode)),
             "pci0000:00" => Ok(Arc::new(SysDevicesPciBusDirINode)),
+            "system" => Ok(Arc::new(SysDevicesSystemDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok("pci0000:00".into()),
+            1 => Ok("system".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+}
+
+struct SysDevicesSystemDirINode;
+
+impl INode for SysDevicesSystemDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(110))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysDevicesSystemDirINode)),
+            ".." => Ok(Arc::new(SysDevicesDirINode)),
+            "node" => Ok(Arc::new(SysDevicesSystemNodeDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
         if id == 0 {
-            Ok("pci0000:00".into())
+            Ok("node".into())
         } else {
             Err(FsError::EntryNotFound)
         }
+    }
+}
+
+struct SysDevicesSystemNodeDirINode;
+
+impl INode for SysDevicesSystemNodeDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(120))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysDevicesSystemNodeDirINode)),
+            ".." => Ok(Arc::new(SysDevicesSystemDirINode)),
+            "node0" => Ok(Arc::new(SysDevicesSystemNode0DirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        if id == 0 {
+            Ok("node0".into())
+        } else {
+            Err(FsError::EntryNotFound)
+        }
+    }
+}
+
+struct SysDevicesSystemNode0DirINode;
+
+impl SysDevicesSystemNode0DirINode {
+    fn entries() -> [&'static str; 2] {
+        ["cpulist", "cpumap"]
+    }
+}
+
+impl INode for SysDevicesSystemNode0DirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(130))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysDevicesSystemNode0DirINode)),
+            ".." => Ok(Arc::new(SysDevicesSystemNodeDirINode)),
+            "cpulist" => {
+                let cpu_count = kernel_hal::cpu::cpu_count() as usize;
+                let cpulist = if cpu_count <= 1 {
+                    String::from("0\n")
+                } else {
+                    format!("0-{}\n", cpu_count - 1)
+                };
+                Ok(Arc::new(Pseudo::new(&cpulist, FileType::File)))
+            }
+            "cpumap" => {
+                let cpu_count = kernel_hal::cpu::cpu_count() as usize;
+                let mut cpumap = String::new();
+                let num_groups = (cpu_count + 31) / 32;
+                for g in (0..num_groups).rev() {
+                    let mut group_val = 0u32;
+                    for i in 0..32 {
+                        let cpu_idx = g * 32 + i;
+                        if cpu_idx < cpu_count {
+                            group_val |= 1 << i;
+                        }
+                    }
+                    if !cpumap.is_empty() {
+                        cpumap.push(',');
+                    }
+                    cpumap.push_str(&format!("{:08x}", group_val));
+                }
+                cpumap.push('\n');
+                Ok(Arc::new(Pseudo::new(&cpumap, FileType::File)))
+            }
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
     }
 }
 
@@ -503,7 +668,10 @@ impl INode for SysDevicesPciBusDirINode {
                 class: dev.class.clone(),
             }))
         } else {
-            log::trace!("SysDevicesPciBusDirINode::find name={} -> EntryNotFound", name);
+            log::trace!(
+                "SysDevicesPciBusDirINode::find name={} -> EntryNotFound",
+                name
+            );
             Err(FsError::EntryNotFound)
         }
     }
@@ -552,7 +720,11 @@ impl INode for SysPciDevicesDirINode {
         let devices = get_pci_devices();
         if let Some(dev) = devices.iter().find(|d| d.name == name) {
             let target = format!("../../../devices/pci0000:00/{}", dev.name);
-            log::trace!("SysPciDevicesDirINode::find name={} -> target={}", name, target);
+            log::trace!(
+                "SysPciDevicesDirINode::find name={} -> target={}",
+                name,
+                target
+            );
             Ok(Arc::new(Pseudo::new(&target, FileType::SymLink)))
         } else {
             log::trace!("SysPciDevicesDirINode::find name={} -> EntryNotFound", name);
@@ -600,7 +772,11 @@ impl INode for SysPciDevDirINode {
         Arc::new(SysFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
-        log::trace!("SysPciDevDirINode::find name={} self.name={}", name, self.name);
+        log::trace!(
+            "SysPciDevDirINode::find name={} self.name={}",
+            name,
+            self.name
+        );
         match name {
             "." => Ok(Arc::new(SysPciDevDirINode {
                 index: self.index,
@@ -610,9 +786,18 @@ impl INode for SysPciDevDirINode {
                 class: self.class.clone(),
             })),
             ".." => Ok(Arc::new(SysDevicesPciBusDirINode)),
-            "vendor" => Ok(Arc::new(Pseudo::new(&format!("{}\n", self.vendor), FileType::File))),
-            "device" => Ok(Arc::new(Pseudo::new(&format!("{}\n", self.device), FileType::File))),
-            "class" => Ok(Arc::new(Pseudo::new(&format!("{}\n", self.class), FileType::File))),
+            "vendor" => Ok(Arc::new(Pseudo::new(
+                &format!("{}\n", self.vendor),
+                FileType::File,
+            ))),
+            "device" => Ok(Arc::new(Pseudo::new(
+                &format!("{}\n", self.device),
+                FileType::File,
+            ))),
+            "class" => Ok(Arc::new(Pseudo::new(
+                &format!("{}\n", self.class),
+                FileType::File,
+            ))),
             "uevent" => {
                 let vendor_hex = self.vendor.trim_start_matches("0x");
                 let device_hex = self.device.trim_start_matches("0x");
@@ -878,9 +1063,7 @@ impl INode for SysClassNetDirINode {
             ".." => Ok(Arc::new(SysClassINode)),
             name => {
                 if list_net_ifnames().iter().any(|n| n.as_str() == name) {
-                    Ok(Arc::new(SysNetIfaceINode {
-                        name: name.into(),
-                    }))
+                    Ok(Arc::new(SysNetIfaceINode { name: name.into() }))
                 } else {
                     Err(FsError::EntryNotFound)
                 }
@@ -941,7 +1124,10 @@ impl INode for SysNetIfaceINode {
                 } else {
                     "up"
                 };
-                Ok(Arc::new(Pseudo::new(&format!("{}\n", state), FileType::File)))
+                Ok(Arc::new(Pseudo::new(
+                    &format!("{}\n", state),
+                    FileType::File,
+                )))
             }
             "carrier" => Ok(Arc::new(Pseudo::new("1\n", FileType::File))),
             "address" => {
@@ -1044,9 +1230,7 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
     if path == "/sys" {
         return Ok(SYS_ROOT.clone());
     }
-    let rest = path
-        .strip_prefix("/sys/")
-        .ok_or(FsError::EntryNotFound)?;
+    let rest = path.strip_prefix("/sys/").ok_or(FsError::EntryNotFound)?;
     if rest.is_empty() {
         return Ok(SYS_ROOT.clone());
     }

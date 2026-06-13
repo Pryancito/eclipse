@@ -15,15 +15,7 @@ use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
 const PROC_ROOT_STATIC: [&str; 9] = [
-    "net",
-    "meminfo",
-    "cpuinfo",
-    "swaps",
-    "uptime",
-    "mounts",
-    "self",
-    "stat",
-    "loadavg",
+    "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -791,9 +783,7 @@ fn proc_cpuinfo_content() -> String {
                 "processor\t: {}\n\
                  model name\t: {}\n\
                  cpu cores\t: {}",
-                i,
-                brand,
-                cpu_count
+                i, brand, cpu_count
             );
         }
     }
@@ -869,11 +859,7 @@ fn proc_net_if_inet6_content() -> String {
                 } else {
                     "00"
                 };
-                let flags_hex = if addr.is_loopback() {
-                    "80"
-                } else {
-                    "00"
-                };
+                let flags_hex = if addr.is_loopback() { "80" } else { "00" };
                 let _ = writeln!(
                     s,
                     "{} {} {} {} {} {}",
@@ -891,9 +877,7 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
     if path == "/proc" {
         return Ok(PROC_ROOT.clone());
     }
-    let rest = path
-        .strip_prefix("/proc/")
-        .ok_or(FsError::EntryNotFound)?;
+    let rest = path.strip_prefix("/proc/").ok_or(FsError::EntryNotFound)?;
     if rest.is_empty() {
         return Ok(PROC_ROOT.clone());
     }

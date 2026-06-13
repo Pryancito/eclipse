@@ -596,8 +596,16 @@ impl LinuxProcess {
     }
 
     fn access_bits_for(creds: &Credentials, metadata: &Metadata, use_effective: bool) -> u16 {
-        let uid = if use_effective { creds.euid } else { creds.ruid };
-        let gid = if use_effective { creds.egid } else { creds.rgid };
+        let uid = if use_effective {
+            creds.euid
+        } else {
+            creds.ruid
+        };
+        let gid = if use_effective {
+            creds.egid
+        } else {
+            creds.rgid
+        };
         if uid == ROOT_UID {
             return metadata.mode as u16 & 0o777;
         }
@@ -620,7 +628,12 @@ impl LinuxProcess {
     }
 
     /// Check inode access against current credentials.
-    pub fn check_access(&self, metadata: &Metadata, requested: u16, use_effective: bool) -> LxResult {
+    pub fn check_access(
+        &self,
+        metadata: &Metadata,
+        requested: u16,
+        use_effective: bool,
+    ) -> LxResult {
         let creds = self.credentials();
         let selected_uid = if use_effective {
             creds.euid
@@ -666,11 +679,7 @@ impl LinuxProcess {
     }
 
     /// Check if sticky-directory removal/rename is allowed.
-    pub fn check_sticky(
-        &self,
-        dir_metadata: &Metadata,
-        target_metadata: &Metadata,
-    ) -> LxResult {
+    pub fn check_sticky(&self, dir_metadata: &Metadata, target_metadata: &Metadata) -> LxResult {
         if (dir_metadata.mode as u16 & MODE_STICKY) == 0 {
             return Ok(());
         }

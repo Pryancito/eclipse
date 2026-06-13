@@ -7,8 +7,7 @@ pub type IpiEntry = usize;
 type IRQueue = MpscQueue<'static, IpiEntry>;
 
 /// Per-CPU backing storage for the IPI queues, indexed by dense logical CPU id.
-static mut IPI_BUFFERS: [[IpiEntry; REASON_SIZE]; MAX_CORE_NUM] =
-    [[0; REASON_SIZE]; MAX_CORE_NUM];
+static mut IPI_BUFFERS: [[IpiEntry; REASON_SIZE]; MAX_CORE_NUM] = [[0; REASON_SIZE]; MAX_CORE_NUM];
 
 lazy_static::lazy_static! {
     /// One IPI queue per CPU, each backed by its slot in `IPI_BUFFERS`.

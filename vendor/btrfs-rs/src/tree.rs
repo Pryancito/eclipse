@@ -399,15 +399,18 @@ impl<'a> Tree<'a> {
             let old_gen = header::generation(&old);
             drop(old);
             let gen = self.vol.sb.generation();
-            let new_root = self
-                .alloc
-                .alloc_tree_block(tree, root_level + 1, self.meta_flags(tree))?;
+            let new_root =
+                self.alloc
+                    .alloc_tree_block(tree, root_level + 1, self.meta_flags(tree))?;
             self.write_node(
                 tree,
                 new_root,
                 gen,
                 root_level + 1,
-                &[(old_key0, root_bytenr, old_gen), (split_key, split_ptr, gen)],
+                &[
+                    (old_key0, root_bytenr, old_gen),
+                    (split_key, split_ptr, gen),
+                ],
             )?;
             self.set_tree_root(tree, new_root, root_level + 1)?;
         }
@@ -527,7 +530,9 @@ impl<'a> Tree<'a> {
         }
         let right_key0 = right[0].0;
         let gen = self.vol.sb.generation();
-        let right_bytenr = self.alloc.alloc_tree_block(tree, 0, self.meta_flags(tree))?;
+        let right_bytenr = self
+            .alloc
+            .alloc_tree_block(tree, 0, self.meta_flags(tree))?;
         self.write_leaf(tree, right_bytenr, gen, &right)?;
         self.write_leaf(tree, bytenr, generation, &items)?;
         Ok(Some((right_key0, right_bytenr)))
@@ -572,13 +577,7 @@ impl<'a> Tree<'a> {
         Ok(())
     }
 
-    fn delete_rec(
-        &mut self,
-        tree: u64,
-        bytenr: u64,
-        level: u8,
-        key: Key,
-    ) -> Result<DeleteOutcome> {
+    fn delete_rec(&mut self, tree: u64, bytenr: u64, level: u8, key: Key) -> Result<DeleteOutcome> {
         if level == 0 {
             let mut items = self.leaf_items(bytenr)?;
             let generation = {

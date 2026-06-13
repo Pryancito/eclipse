@@ -22,7 +22,7 @@ impl ProcInitInfo {
         // We will build the stack from top to bottom.
         // The strings and random bytes go first (highest addresses).
         let mut writer = Stack::new(stack_top);
-        
+
         // 1. Random bytes for AT_RANDOM (16 bytes)
         let random_bytes = [0u8; 16]; // TODO: use real random
         writer.push_slice(&random_bytes);
@@ -55,7 +55,7 @@ impl ProcInitInfo {
         // Now we prepare the pointer arrays (auxv, envp, argv, argc).
         // These must be contiguous and the final sp (at argc) must be 16-byte aligned.
         let mut table = Vec::new();
-        
+
         // Argc
         table.push(self.args.len());
         // Argv
@@ -63,12 +63,12 @@ impl ProcInitInfo {
             table.push(ptr);
         }
         table.push(0); // NULL
-        // Envp
+                       // Envp
         for ptr in env_ptrs {
             table.push(ptr);
         }
         table.push(0); // NULL
-        
+
         // Auxv
         for (&type_, &value) in self.auxv.iter() {
             table.push(type_ as usize);
@@ -97,7 +97,7 @@ impl ProcInitInfo {
         // Push the table. Since push_usize_slice decrements sp first and then
         // copies the slice, table[0] (argc) will end up at the lowest address (the new sp).
         writer.push_usize_slice(&table);
-        
+
         writer
     }
 }

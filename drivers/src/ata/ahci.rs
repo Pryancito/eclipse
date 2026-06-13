@@ -9,11 +9,11 @@ use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
+use crate::builder::IoMapper;
+use crate::bus::pci_drivers::PciDriver;
 use crate::bus::{drivers_dma_alloc, drivers_timer_now_as_micros, phys_to_virt, virt_to_phys};
 use crate::scheme::{BlockScheme, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
-use crate::bus::pci_drivers::PciDriver;
-use crate::builder::IoMapper;
 use alloc::sync::Arc;
 use pci::{PCIDevice, BAR};
 
@@ -30,7 +30,7 @@ const GHC_HR: u32 = 1 << 0;
 // BOHC bits (AHCI spec §10.6)
 const BOHC_BOS: u32 = 1 << 0; // BIOS Owns Semaphore
 const BOHC_OOS: u32 = 1 << 1; // OS Owns Semaphore
-const BOHC_BB: u32 = 1 << 4;  // BIOS Busy
+const BOHC_BB: u32 = 1 << 4; // BIOS Busy
 
 // --- Per-port register offsets ---
 const PORT_CLB: usize = 0x00;
@@ -161,7 +161,10 @@ fn udelay(us: u64) {
         spin_loop();
         spins = spins.wrapping_add(1);
         if spins >= MAX_SPINS {
-            warn!("[AHCI] udelay fallback hit ({}us requested — timer did not advance)", us);
+            warn!(
+                "[AHCI] udelay fallback hit ({}us requested — timer did not advance)",
+                us
+            );
             break;
         }
     }
@@ -181,14 +184,19 @@ fn wait_until<F: Fn() -> bool>(timeout_us: u64, pred: F) -> bool {
     let max_spins: u64 = 500_000_000u64.max(timeout_us.saturating_mul(500));
     let mut spins = 0u64;
     loop {
-        if pred() { return true; }
+        if pred() {
+            return true;
+        }
         spin_loop();
         spins = spins.wrapping_add(1);
         if unsafe { drivers_timer_now_as_micros() }.wrapping_sub(t0) >= timeout_us {
             return false;
         }
         if spins >= max_spins {
-            warn!("[AHCI] wait_until fallback: timer stuck, forcing timeout after {} spins", spins);
+            warn!(
+                "[AHCI] wait_until fallback: timer stuck, forcing timeout after {} spins",
+                spins
+            );
             return false;
         }
     }
@@ -289,13 +297,12 @@ impl AhciPort {
                 h.ctbau = (ct_phys >> 32) as u32;
             }
             // Zero the FIS receive area (size 256 bytes, located at cl_virt + 1024)
-            core::ptr::write_bytes(
-                (self.cl_virt + 1024) as *mut u8,
-                0,
-                256,
-            );
+            core::ptr::write_bytes((self.cl_virt + 1024) as *mut u8, 0, 256);
         }
-        clflush_range(self.cl_virt, CMD_SLOTS * core::mem::size_of::<CommandHeader>());
+        clflush_range(
+            self.cl_virt,
+            CMD_SLOTS * core::mem::size_of::<CommandHeader>(),
+        );
         clflush_range(self.cl_virt + 1024, 256);
 
         self.write_reg(PORT_CLB, self.cl_phys as u32);
@@ -402,11 +409,7 @@ impl AhciPort {
         let slot = 0u32;
         let buf_len: usize = prds.iter().map(|p| p.1).sum();
         let count = buf_len / SECTOR_SIZE;
-        if prds.is_empty()
-            || prds.len() > PRDT_MAX
-            || buf_len == 0
-            || buf_len % SECTOR_SIZE != 0
-        {
+        if prds.is_empty() || prds.len() > PRDT_MAX || buf_len == 0 || buf_len % SECTOR_SIZE != 0 {
             return Err(DeviceError::InvalidParam);
         }
         if self.lba48 {
@@ -441,9 +444,17 @@ impl AhciPort {
             *fis.add(0) = FIS_TYPE_REG_H2D;
             *fis.add(1) = 0x80;
             *fis.add(2) = if write {
-                if self.lba48 { ATA_CMD_WRITE_DMA_EXT } else { ATA_CMD_WRITE_DMA }
+                if self.lba48 {
+                    ATA_CMD_WRITE_DMA_EXT
+                } else {
+                    ATA_CMD_WRITE_DMA
+                }
             } else {
-                if self.lba48 { ATA_CMD_READ_DMA_EXT } else { ATA_CMD_READ_DMA }
+                if self.lba48 {
+                    ATA_CMD_READ_DMA_EXT
+                } else {
+                    ATA_CMD_READ_DMA
+                }
             };
             if self.lba48 {
                 *fis.add(4) = lba as u8;
@@ -583,7 +594,10 @@ impl AhciPort {
         clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
         clflush_range(vaddr, 512);
 
-        if self.exec_cmd_with_timeout(slot, IDENTIFY_TIMEOUT_US).is_err() {
+        if self
+            .exec_cmd_with_timeout(slot, IDENTIFY_TIMEOUT_US)
+            .is_err()
+        {
             unsafe {
                 drivers_dma_dealloc(paddr, 1);
             }
@@ -594,9 +608,7 @@ impl AhciPort {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         let id_ptr = vaddr as *const u16;
-        let read_id = |idx: usize| -> u16 {
-            unsafe { read_volatile(id_ptr.add(idx)) }
-        };
+        let read_id = |idx: usize| -> u16 { unsafe { read_volatile(id_ptr.add(idx)) } };
 
         let lba48 = (read_id(100) as u64)
             | ((read_id(101) as u64) << 16)
@@ -679,7 +691,10 @@ impl AhciInterface {
             // Request ownership and wait for the BIOS to release before resetting.
             let bohc = read_volatile((base + HBA_BOHC) as *const u32);
             if bohc & BOHC_BOS != 0 {
-                crate::klog_info!("[AHCI] BIOS owns HBA (BOHC={:#x}), requesting handoff", bohc);
+                crate::klog_info!(
+                    "[AHCI] BIOS owns HBA (BOHC={:#x}), requesting handoff",
+                    bohc
+                );
                 write_volatile((base + HBA_BOHC) as *mut u32, bohc | BOHC_OOS);
                 // Wait up to 25 ms for BIOS to clear BOS
                 wait_until(25_000, || {
@@ -719,10 +734,14 @@ impl AhciInterface {
         // before scanning individual ports, so we don't skip them prematurely.
         let _ = wait_until(2_000_000, || {
             for i in 0..32u32 {
-                if pi & (1 << i) == 0 { continue; }
+                if pi & (1 << i) == 0 {
+                    continue;
+                }
                 let pbase = base + 0x100 + (i as usize * 0x80);
                 let det = unsafe { read_volatile((pbase + PORT_SSTS) as *const u32) } & 0xF;
-                if det != 0 { return true; }
+                if det != 0 {
+                    return true;
+                }
             }
             false
         });
@@ -779,8 +798,8 @@ impl AhciInterface {
                 // (device present, PHY comms up). Some real controllers populate
                 // SIG asynchronously and may show 0 even after link-up; IDENTIFY
                 // will confirm whether a disk is actually there.
-                let is_ata = sig == HBA_SIG_ATA
-                    || (sig == 0 && port.read_reg(PORT_SSTS) & 0xF == 3);
+                let is_ata =
+                    sig == HBA_SIG_ATA || (sig == 0 && port.read_reg(PORT_SSTS) & 0xF == 3);
                 if is_ata {
                     if let Some((sectors, lba48)) = port.identify() {
                         port.lba48 = lba48;
@@ -969,10 +988,17 @@ impl PciDriver for AhciDriverPci {
     fn matched_dev(&self, dev: &PCIDevice) -> bool {
         // Match standard AHCI (SATA, IDE, or RAID subclass in AHCI mode):
         // class=0x01 (mass storage), prog_if=0x01 (AHCI)
-        dev.id.class == 0x01 && dev.id.prog_if == 0x01 && (dev.id.subclass == 0x06 || dev.id.subclass == 0x01 || dev.id.subclass == 0x04)
+        dev.id.class == 0x01
+            && dev.id.prog_if == 0x01
+            && (dev.id.subclass == 0x06 || dev.id.subclass == 0x01 || dev.id.subclass == 0x04)
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         // AHCI ABAR lives in BAR5 (config offset 0x24). Some firmware/VMs (e.g.
         // VirtualBox) leave `dev.bars[5]` empty even though the register is valid.
         let (addr, len) = if let Some(BAR::Memory(a, l, _, _)) = dev.bars[5] {
@@ -980,10 +1006,9 @@ impl PciDriver for AhciDriverPci {
         } else {
             #[cfg(target_arch = "x86_64")]
             {
-                use crate::bus::pci::{read_bar_addr, PortOpsImpl, PCI_ACCESS, BAR5_REG};
-                let a = unsafe {
-                    read_bar_addr(&PortOpsImpl, PCI_ACCESS, dev.loc, BAR5_REG) as usize
-                };
+                use crate::bus::pci::{read_bar_addr, PortOpsImpl, BAR5_REG, PCI_ACCESS};
+                let a =
+                    unsafe { read_bar_addr(&PortOpsImpl, PCI_ACCESS, dev.loc, BAR5_REG) as usize };
                 if a == 0 {
                     return Err(DeviceError::NotSupported);
                 }

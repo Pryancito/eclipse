@@ -172,7 +172,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let udhcpc_dir = dir.join("usr/share/udhcpc");
         fs::create_dir_all(&udhcpc_dir).unwrap();
         let udhcpc_script = udhcpc_dir.join("default.script");
-        fs::write(&udhcpc_script,
+        fs::write(
+            &udhcpc_script,
             b"#!/bin/sh\n\
               # udhcpc (DHCPv4) script for Eclipse OS\n\
               RESOLV_CONF=/etc/resolv.conf\n\
@@ -220,10 +221,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 leasefail|nak)\n\
                   ;;\n\
               esac\n\
-              exit 0\n"
-        ).unwrap();
+              exit 0\n",
+        )
+        .unwrap();
         let udhcpc6_script = udhcpc_dir.join("default6.script");
-        fs::write(&udhcpc6_script,
+        fs::write(
+            &udhcpc6_script,
             b"#!/bin/sh\n\
               # udhcpc6 (DHCPv6) script for Eclipse OS\n\
               RESOLV_CONF=/etc/resolv.conf\n\
@@ -250,8 +253,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 leasefail|nak)\n\
                   ;;\n\
               esac\n\
-              exit 0\n"
-        ).unwrap();
+              exit 0\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -263,7 +267,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let usr_sbin = dir.join("usr/sbin");
         fs::create_dir_all(&usr_sbin).unwrap();
         let openssl_script = usr_sbin.join("openssl");
-        fs::write(&openssl_script,
+        fs::write(
+            &openssl_script,
             b"#!/bin/sh\n\
               if [ \"$1\" != \"s_client\" ]; then\n\
                 echo \"openssl wrapper: command '$1' not supported\" >&2\n\
@@ -298,8 +303,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 exec ssl_client -n \"$SERVERNAME\" \"$CONNECT\"\n\
               else\n\
                 exec ssl_client \"$CONNECT\"\n\
-              fi\n"
-        ).unwrap();
+              fi\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -372,19 +378,77 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     fn ensure_busybox_applets(bin: &Path) {
         // Base list of essential applets
         let mut applets: Vec<String> = vec![
-            "cat", "cp", "echo", "false", "grep", "gzip", "ip", "kill",
-            "ln", "ls", "mkdir", "mv", "pidof", "ping", "ps", "pwd", "rm",
-            "rmdir", "sh", "sleep", "stat", "tar", "touch", "true", "uname",
-            "usleep", "watch", "ifconfig", "route", "udhcpc", "udhcpc6",
-            "sed", "awk", "cmp", "diff", "logger", "hostname", "cut", "sort",
-            "uniq", "head", "tail", "wc", "xargs", "find", "test", "expr",
-            "id", "date", "env", "chmod", "chown", "vi", "top", "less",
-            "ssl_client", "ssl_server", "wget", "traceroute", "traceroute6",
-        ].into_iter().map(String::from).collect();
+            "cat",
+            "cp",
+            "echo",
+            "false",
+            "grep",
+            "gzip",
+            "ip",
+            "kill",
+            "ln",
+            "ls",
+            "mkdir",
+            "mv",
+            "pidof",
+            "ping",
+            "ps",
+            "pwd",
+            "rm",
+            "rmdir",
+            "sh",
+            "sleep",
+            "stat",
+            "tar",
+            "touch",
+            "true",
+            "uname",
+            "usleep",
+            "watch",
+            "ifconfig",
+            "route",
+            "udhcpc",
+            "udhcpc6",
+            "sed",
+            "awk",
+            "cmp",
+            "diff",
+            "logger",
+            "hostname",
+            "cut",
+            "sort",
+            "uniq",
+            "head",
+            "tail",
+            "wc",
+            "xargs",
+            "find",
+            "test",
+            "expr",
+            "id",
+            "date",
+            "env",
+            "chmod",
+            "chown",
+            "vi",
+            "top",
+            "less",
+            "ssl_client",
+            "ssl_server",
+            "wget",
+            "traceroute",
+            "traceroute6",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
         // Complement the list with `busybox --list` when it runs on the host.
         let busybox_bin = bin.join("busybox");
-        if let Ok(out) = std::process::Command::new(&busybox_bin).arg("--list").output() {
+        if let Ok(out) = std::process::Command::new(&busybox_bin)
+            .arg("--list")
+            .output()
+        {
             if out.status.success() {
                 if let Ok(s) = String::from_utf8(out.stdout) {
                     for line in s.lines() {
@@ -505,7 +569,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         Ext::new("sed")
             .current_dir(&target)
             .arg("-i")
-            .arg("s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/;\
+            .arg(
+                "s/.*CONFIG_STATIC.*/CONFIG_STATIC=y/;\
                   s/.*CONFIG_PIE.*/CONFIG_PIE=n/;\
                   s/.*CONFIG_FEATURE_INDIVIDUAL.*/CONFIG_FEATURE_INDIVIDUAL=n/;\
                   s/.*CONFIG_FEATURE_SHARED_BUSYBOX.*/CONFIG_FEATURE_SHARED_BUSYBOX=n/;\
@@ -514,7 +579,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                   s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/;\
                   s/.*CONFIG_FEATURE_IPV6.*/CONFIG_FEATURE_IPV6=y/;\
                   s/.*CONFIG_UDHCPC6.*/CONFIG_UDHCPC6=y/;\
-                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/")
+                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/",
+            )
             .arg(".config")
             .invoke();
         Ext::new("sh")
@@ -530,7 +596,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             musl = musl.display(),
             arch = self.0.name(),
         );
-        
+
         Make::new()
             .current_dir(&target)
             .arg(format!("CROSS_COMPILE={cross_compile}"))
@@ -548,7 +614,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .invoke();
         executable
     }
-
 
     /// Descarga (o actualiza) el binario estático de apk-tools desde Chimera Linux.
     ///
@@ -614,8 +679,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if executable.is_file() && source.is_file() {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
-                {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }
@@ -658,8 +722,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if executable.is_file() && source.is_file() {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
-                {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }
@@ -702,8 +765,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if executable.is_file() && source.is_file() {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
-                {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }
@@ -763,8 +825,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if executable.is_file() && source.is_file() {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified())
-                {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }
@@ -891,7 +952,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .env("PATH", &path_env)
             .arg("libs")
             .status();
-        for (subdir, prog) in [("resize", "resize2fs"), ("e2fsck", "e2fsck"), ("misc", "mke2fs")] {
+        for (subdir, prog) in [
+            ("resize", "resize2fs"),
+            ("e2fsck", "e2fsck"),
+            ("misc", "mke2fs"),
+        ] {
             let _ = Make::new()
                 .current_dir(build.join(subdir))
                 .env("PATH", &path_env)

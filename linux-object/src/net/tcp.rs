@@ -512,14 +512,10 @@ impl Socket for TcpSocketState {
                     (socket.local_endpoint(), socket.remote_endpoint())
                 };
 
-                let rx_buffer =
-                    TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_RECVBUF)?);
-                let tx_buffer =
-                    TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_SENDBUF)?);
+                let rx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_RECVBUF)?);
+                let tx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(super::TCP_SENDBUF)?);
                 let mut new_listen = TcpSocket::new(rx_buffer, tx_buffer);
-                new_listen
-                    .listen(endpoint)
-                    .map_err(|_| LxError::ENOBUFS)?;
+                new_listen.listen(endpoint).map_err(|_| LxError::ENOBUFS)?;
 
                 let new_listen_handle = {
                     let sockets = get_sockets();

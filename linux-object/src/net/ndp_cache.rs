@@ -28,7 +28,11 @@ lazy_static! {
     static ref CACHE: Mutex<BTreeMap<Ipv6Address, EthernetAddress>> = Mutex::new(BTreeMap::new());
 }
 
-fn insert_bounded(map: &mut BTreeMap<Ipv6Address, EthernetAddress>, ip: Ipv6Address, mac: EthernetAddress) {
+fn insert_bounded(
+    map: &mut BTreeMap<Ipv6Address, EthernetAddress>,
+    ip: Ipv6Address,
+    mac: EthernetAddress,
+) {
     if map.len() >= CACHE_MAX && !map.contains_key(&ip) {
         if let Some(old) = map.keys().next().copied() {
             map.remove(&old);
@@ -88,11 +92,7 @@ pub fn learn_from_frame(frame: &[u8]) {
             ..
         }) => {
             if target_addr.is_unicast() && !target_addr.is_unspecified() {
-                insert_bounded(
-                    &mut *CACHE.lock(),
-                    target_addr,
-                    lladdr.unwrap_or(src_mac),
-                );
+                insert_bounded(&mut *CACHE.lock(), target_addr, lladdr.unwrap_or(src_mac));
             }
         }
         _ => {}

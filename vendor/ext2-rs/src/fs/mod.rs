@@ -151,7 +151,10 @@ impl<S: SectorSize, V: Volume<u8, S>> Ext2<S, V> {
         self.block_groups.inner[index]
     }
 
-    pub fn block_group_mut(&mut self, index: usize) -> &mut BlockGroupDescriptor {
+    pub fn block_group_mut(
+        &mut self,
+        index: usize,
+    ) -> &mut BlockGroupDescriptor {
         &mut self.block_groups.inner[index]
     }
 
