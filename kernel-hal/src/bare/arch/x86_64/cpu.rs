@@ -86,7 +86,7 @@ hal_fn_impl! {
                 // and on QEMU guests CPUID leaf 0x16 is absent altogether.
                 // Without calibration the kernel clock ran ~1.8× too fast,
                 // collapsing TCP RTOs and inflating uptime on real hardware.
-                if let Some(mhz) = unsafe { super::calibrate_tsc_mhz_via_pit() } {
+                if let Some(mhz) = unsafe { calibrate_tsc_mhz_via_pit() } {
                     return mhz;
                 }
                 // Fallback chain: CPUID base frequency, then a conservative

@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-
+use core::convert::TryFrom;
 use lock::Mutex;
 use naive_timer::Timer;
 

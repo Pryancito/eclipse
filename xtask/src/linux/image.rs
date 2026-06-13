@@ -2,6 +2,11 @@ use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
 use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
+/// SFS initramfs size (live/QEMU root + apk headroom).
+const INITRAMFS_BYTES: usize = 128 * 1024 * 1024;
+/// FAT32 ESP image: initramfs + zcore (~40 MiB) + boot loader + metadata.
+const EFI_FAT_BYTES: usize = 256 * 1024 * 1024;
+
 impl super::LinuxRootfs {
     /// 生成镜像。
     pub fn image(&self) {
@@ -32,12 +37,12 @@ impl super::LinuxRootfs {
             });
             build_config.invoke(os_xtask_utils::Cargo::build);
 
-            // 3. Build initramfs SFS (x86_64.img, 80MB)
+            // 3. Build initramfs SFS (x86_64.img)
             println!("Building x86_64.img...");
             let initramfs_img = PROJECT_DIR.join("zCore").join("x86_64.img");
-            fuse(&rootfs_path, &initramfs_img, 80 * 1024 * 1024);
+            fuse(&rootfs_path, &initramfs_img, INITRAMFS_BYTES);
 
-            // 4. Build efi.img (FAT32, 128MB)
+            // 4. Build efi.img (FAT32)
             println!("Building efi.img...");
             let efi_img = TARGET.join("efi.img");
             let _ = fs::remove_file(&efi_img);
@@ -48,7 +53,7 @@ impl super::LinuxRootfs {
                 .truncate(true)
                 .open(&efi_img)
                 .unwrap();
-            file.set_len(128 * 1024 * 1024).unwrap();
+            file.set_len(EFI_FAT_BYTES as u64).unwrap();
             drop(file);
 
             let status = std::process::Command::new("mkfs.vfat")
@@ -161,12 +166,12 @@ impl super::LinuxRootfs {
             let home_gz = boot_dir.join("home.btrfs.gz");
             fs::copy(&target_home_gz, &home_gz).unwrap();
 
-            // 6. Build the final installer-enabled x86_64.img (SFS, 80MB) for QEMU/ESP dev
+            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP dev
             println!("Building final installer-enabled image...");
             let image = PROJECT_DIR
                 .join("zCore")
                 .join(format!("{arch}.img", arch = self.0.name()));
-            fuse(&rootfs_path, &image, 80 * 1024 * 1024);
+            fuse(&rootfs_path, &image, INITRAMFS_BYTES);
 
             let _ = fs::remove_file(efi_gz);
             let _ = fs::remove_file(btrfs_gz);

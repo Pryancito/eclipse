@@ -55,6 +55,7 @@ impl LinuxRootfs {
             }
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
+            self.install_thread_tests(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -348,6 +349,61 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
+        self.install_thread_tests(&dir);
+    }
+
+    /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
+    fn install_thread_tests(&self, rootfs: &Path) {
+        if let Arch::X86_64 = self.0 {
+            let thr3 = self.thread_test_thr3();
+            if thr3.is_file() {
+                let dst = rootfs.join("thr3");
+                let _ = dir::rm(&dst);
+                fs::copy(&thr3, &dst).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Compila thr3 con gcc del host (bare metal, sin libc).
+    fn thread_test_thr3(&self) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("thread-tests");
+        let source = dir.join("thr3.c");
+        let executable = dir.join("thr3-metal");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling thr3 (sysbench barrier regression test)...");
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new("gcc")
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-no-pie")
+            .arg("-nostdlib")
+            .arg("-fno-stack-protector")
+            .arg("-fno-builtin")
+            .arg("-O1")
+            .arg("-DQUICK_TEST")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile thr3");
+        }
+        executable
     }
 
     fn write_resolv_conf(etc: &Path) {
@@ -364,7 +420,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
-              export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n",
+              export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
+              export HOME=/root\n\
+              export TERM=xterm-256color\n"
         )
         .unwrap();
     }

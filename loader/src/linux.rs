@@ -244,7 +244,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             kernel_hal::interrupt::handle_irq(vector);
             #[cfg(not(feature = "libos"))]
             if vector == kernel_hal::context::TIMER_INTERRUPT_VEC
-                && kernel_hal::bare::percpu::tick_should_preempt()
+                && kernel_hal::percpu::tick_should_preempt()
             {
                 // Preempt on a multiple-of-tick quantum (≈ 20 ms at 250 Hz)
                 // instead of every raw tick. Cuts executor churn on

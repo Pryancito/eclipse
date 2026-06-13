@@ -9,12 +9,15 @@
 
 CFLAGS_COMMON := -nostdlib -fno-stack-protector -fno-builtin -O1
 
-all: thr-metal thr-libos thr2-metal thr2-libos
+all: thr-metal thr-libos thr2-metal thr2-libos thr3-metal thr3-libos
 
 thr-metal: thr.c
 	gcc -static -no-pie $(CFLAGS_COMMON) -o $@ $<
 
 thr2-metal: thr2.c
+	gcc -static -no-pie $(CFLAGS_COMMON) -o $@ $<
+
+thr3-metal: thr3.c
 	gcc -static -no-pie $(CFLAGS_COMMON) -o $@ $<
 
 # libos runs user code in-process; syscalls go through the patched
@@ -26,7 +29,10 @@ thr-libos: thr.c
 thr2-libos: thr2.c
 	gcc -DVIA_CALL -static-pie -fPIC $(CFLAGS_COMMON) -o $@ $<
 
+thr3-libos: thr3.c
+	gcc -DVIA_CALL -static-pie -fPIC $(CFLAGS_COMMON) -o $@ $<
+
 clean:
-	rm -f thr-metal thr-libos thr2-metal thr2-libos
+	rm -f thr-metal thr-libos thr2-metal thr2-libos thr3-metal thr3-libos
 
 .PHONY: all clean

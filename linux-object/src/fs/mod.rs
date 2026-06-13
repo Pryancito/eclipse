@@ -538,6 +538,31 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 var.create("run", FileType::Dir, 0o755).ok();
             }
         }
+        // Keep apk's download cache off the small initramfs SFS: edge indexes
+        // plus .apk blobs can exceed the free space left after zip_dir.
+        warn!("[boot] create_root_fs: mount /var/cache/apk on tmpfs");
+        if let Ok(var) = root.find(true, "var") {
+            let cache = var.find(true, "cache").unwrap_or_else(|_| {
+                var.create("cache", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache")
+            });
+            let apk_cache = cache.find(true, "apk").unwrap_or_else(|_| {
+                cache
+                    .create("apk", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache/apk")
+            });
+            if apk_cache.mount(RamFS::new()).is_ok() {
+                register_mount(
+                    "tmpfs",
+                    "/var/cache/apk",
+                    "tmpfs",
+                    "rw,nosuid,nodev",
+                    boot_mount_state(),
+                );
+            } else {
+                warn!("[boot] create_root_fs: mount /var/cache/apk failed");
+            }
+        }
     }
 
     // mount ProcFS at /proc
