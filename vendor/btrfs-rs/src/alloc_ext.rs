@@ -16,10 +16,30 @@ use crate::{Error, Result};
 /// Deferred extent-tree bookkeeping.
 #[derive(Debug, Clone)]
 pub enum PendingOp {
-    AddMeta { bytenr: u64, owner: u64, level: u8 },
-    DelMeta { bytenr: u64, owner: u64, level: u8 },
-    AddData { bytenr: u64, len: u64, root: u64, objectid: u64, offset: u64 },
-    DelData { bytenr: u64, len: u64, root: u64, objectid: u64, offset: u64 },
+    AddMeta {
+        bytenr: u64,
+        owner: u64,
+        level: u8,
+    },
+    DelMeta {
+        bytenr: u64,
+        owner: u64,
+        level: u8,
+    },
+    AddData {
+        bytenr: u64,
+        len: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    },
+    DelData {
+        bytenr: u64,
+        len: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -65,11 +85,7 @@ impl RangeMap {
 
     /// Remove `[start, start+len)` from the free map (must be fully free).
     pub fn take(&mut self, start: u64, len: u64) -> Result<()> {
-        let (&rs, &rl) = self
-            .map
-            .range(..=start)
-            .next_back()
-            .ok_or(Error::NoSpace)?;
+        let (&rs, &rl) = self.map.range(..=start).next_back().ok_or(Error::NoSpace)?;
         if rs > start || rs + rl < start + len {
             return Err(Error::NoSpace);
         }
@@ -177,7 +193,13 @@ impl FreeSpace {
         Ok(bytenr)
     }
 
-    pub fn free_tree_block(&mut self, bytenr: u64, owner: u64, level: u8, _flags: u64) -> Result<()> {
+    pub fn free_tree_block(
+        &mut self,
+        bytenr: u64,
+        owner: u64,
+        level: u8,
+        _flags: u64,
+    ) -> Result<()> {
         let nodesize = self.nodesize;
         self.free.insert(bytenr, nodesize);
         self.account(bytenr, nodesize, -1)?;
@@ -227,7 +249,14 @@ impl FreeSpace {
         self.account(bytenr, len, -1)
     }
 
-    pub fn note_data_extent(&mut self, bytenr: u64, len: u64, root: u64, objectid: u64, offset: u64) {
+    pub fn note_data_extent(
+        &mut self,
+        bytenr: u64,
+        len: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    ) {
         self.pending.push(PendingOp::AddData {
             bytenr,
             len,
@@ -237,7 +266,14 @@ impl FreeSpace {
         });
     }
 
-    pub fn free_data(&mut self, bytenr: u64, len: u64, root: u64, objectid: u64, offset: u64) -> Result<()> {
+    pub fn free_data(
+        &mut self,
+        bytenr: u64,
+        len: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    ) -> Result<()> {
         self.free.insert(bytenr, len);
         self.account(bytenr, len, -1)?;
         self.pending.push(PendingOp::DelData {

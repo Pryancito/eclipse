@@ -158,7 +158,10 @@ impl Syscall<'_> {
             Sys::PPOLL => self.sys_ppoll(a0.into(), a1, a2.into()).await, // ignore sigmask
             Sys::EPOLL_CREATE1 => self.sys_epoll_create1(a0),
             Sys::EPOLL_CTL => self.sys_epoll_ctl(a0.into(), a1 as i32, a2.into(), a3.into()),
-            Sys::EPOLL_PWAIT => self.sys_epoll_pwait(a0.into(), a1.into(), a2, a3 as isize, a4).await,
+            Sys::EPOLL_PWAIT => {
+                self.sys_epoll_pwait(a0.into(), a1.into(), a2, a3 as isize, a4)
+                    .await
+            }
             Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
 
             Sys::SOCKETPAIR => self.sys_socketpair(a0, a1, a2, a3.into()),
@@ -179,6 +182,9 @@ impl Syscall<'_> {
                 Ok(0)
             }
             Sys::MREMAP => self.unimplemented("mremap", Err(LxError::ENOMEM)),
+            Sys::MBIND => self.unimplemented("mbind", Err(LxError::ENOSYS)),
+            Sys::GET_MEMPOLICY => self.unimplemented("get_mempolicy", Err(LxError::ENOSYS)),
+            Sys::SET_MEMPOLICY => self.unimplemented("set_mempolicy", Err(LxError::ENOSYS)),
 
             // signal
             Sys::RT_SIGACTION => self.sys_rt_sigaction(a0, a1.into(), a2.into(), a3),
@@ -371,7 +377,10 @@ impl Syscall<'_> {
             Sys::TIME => self.sys_time(a0.into()),
             Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()).await,
             Sys::EPOLL_CREATE => self.sys_epoll_create(a0),
-            Sys::EPOLL_WAIT => self.sys_epoll_wait(a0.into(), a1.into(), a2, a3 as isize).await,
+            Sys::EPOLL_WAIT => {
+                self.sys_epoll_wait(a0.into(), a1.into(), a2, a3 as isize)
+                    .await
+            }
             _ => self.unknown_syscall(sys_type),
         }
     }

@@ -59,7 +59,8 @@ pub const CHUNK_ITEM_KEY: u8 = 228;
 pub const BLOCK_GROUP_DATA: u64 = 1 << 0;
 pub const BLOCK_GROUP_SYSTEM: u64 = 1 << 1;
 pub const BLOCK_GROUP_METADATA: u64 = 1 << 2;
-pub const BLOCK_GROUP_RAID_MASK: u64 = !(BLOCK_GROUP_DATA | BLOCK_GROUP_SYSTEM | BLOCK_GROUP_METADATA);
+pub const BLOCK_GROUP_RAID_MASK: u64 =
+    !(BLOCK_GROUP_DATA | BLOCK_GROUP_SYSTEM | BLOCK_GROUP_METADATA);
 pub const BLOCK_GROUP_DUP: u64 = 1 << 5;
 
 // Extent item flags.
@@ -562,11 +563,11 @@ impl RootItem {
         put_u64(&mut b, 160, self.generation); // generation
         put_u64(&mut b, 168, self.root_dirid); // root_dirid
         put_u64(&mut b, 176, self.bytenr); // bytenr
-        // byte_limit (184) = 0
+                                           // byte_limit (184) = 0
         put_u64(&mut b, 192, self.bytes_used); // bytes_used
-        // last_snapshot (200) = 0, flags (208) = 0
+                                               // last_snapshot (200) = 0, flags (208) = 0
         put_u32(&mut b, 216, self.refs); // refs
-        // drop_progress key (220..237) zero, drop_level (237) zero
+                                         // drop_progress key (220..237) zero, drop_level (237) zero
         b[238] = self.level;
         // generation_v2 must match generation for modern kernels.
         put_u64(&mut b, 239, self.generation);
@@ -847,8 +848,8 @@ impl DevItem {
         put_u32(&mut b, 24, sector_size); // io_align
         put_u32(&mut b, 28, sector_size); // io_width
         put_u32(&mut b, 32, sector_size); // sector_size
-        // type(36)=0, generation(44)=0, start_offset(52)=0, dev_group(60)=0
-        // seek_speed(64)=0, bandwidth(65)=0
+                                          // type(36)=0, generation(44)=0, start_offset(52)=0, dev_group(60)=0
+                                          // seek_speed(64)=0, bandwidth(65)=0
         b[66..82].copy_from_slice(&self.uuid);
         b[82..98].copy_from_slice(&self.fsid);
         b
@@ -967,7 +968,9 @@ impl Superblock {
     }
 
     pub fn fsid(&self) -> [u8; 16] {
-        self.raw[sb::OFF_FSID..sb::OFF_FSID + 16].try_into().unwrap()
+        self.raw[sb::OFF_FSID..sb::OFF_FSID + 16]
+            .try_into()
+            .unwrap()
     }
     pub fn generation(&self) -> u64 {
         get_u64(&self.raw, sb::OFF_GENERATION)

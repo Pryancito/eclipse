@@ -1,3 +1,4 @@
+use lazy_static::lazy_static;
 use {
     super::exception::*,
     super::job_policy::*,
@@ -8,7 +9,6 @@ use {
     alloc::vec::Vec,
     lock::Mutex,
 };
-use lazy_static::lazy_static;
 
 /// Control a group of processes
 ///

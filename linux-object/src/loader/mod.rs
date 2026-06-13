@@ -73,7 +73,12 @@ impl LinuxElfLoader {
         path: String,
         recursion: u8,
     ) -> LxResult<(VirtAddr, VirtAddr, usize, String)> {
-        debug!("elf: load_impl recursion={} len={:#x} path={:?}", recursion, data.len(), path);
+        debug!(
+            "elf: load_impl recursion={} len={:#x} path={:?}",
+            recursion,
+            data.len(),
+            path
+        );
         debug!(
             "load: vmar.addr & size: {:#x?}, data {:#x?}, args: {:?}, envs: {:?}",
             vmar.get_info(),
@@ -134,7 +139,8 @@ impl LinuxElfLoader {
                 interp_size,
                 zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE,
             )?;
-            let interp_data = unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
+            let interp_data =
+                unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
 
             let interp_path: String = interp.into();
             let mut new_args = vec![interp_path.clone()];
@@ -143,7 +149,14 @@ impl LinuxElfLoader {
             }
             new_args.push(path);
             new_args.extend_from_slice(args.get(1..).unwrap_or_default());
-            let res = self.load_impl(vmar, interp_data, new_args, envs, interp_path, recursion + 1);
+            let res = self.load_impl(
+                vmar,
+                interp_data,
+                new_args,
+                envs,
+                interp_path,
+                recursion + 1,
+            );
 
             zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size)?;
             return res;
@@ -162,10 +175,15 @@ impl LinuxElfLoader {
             // Load the main program into the first sub-VMAR (allocated at offset 0 in an
             // empty address space, so app_base is typically 0 for a non-PIE binary).
             let app_size = elf.load_segment_size();
-            let app_vmar = vmar.allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
-                error!("elf: allocate vmar for app size {:#x} failed: {:?}", app_size, e);
-                e
-            })?;
+            let app_vmar = vmar
+                .allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                .map_err(|e| {
+                    error!(
+                        "elf: allocate vmar for app size {:#x} failed: {:?}",
+                        app_size, e
+                    );
+                    e
+                })?;
             let app_base = app_vmar.addr();
             let _app_vmo = app_vmar.load_from_elf(&elf).map_err(|e| {
                 error!("elf: load app from elf failed: {:?}", e);
@@ -177,8 +195,10 @@ impl LinuxElfLoader {
             // Write through the VMAR (which resolves the per-segment VMO): the symbol
             // usually lives in .data/.rodata, NOT in the first LOAD segment's VMO.
             if let Some(offset) = elf.get_symbol_address("rcore_syscall_entry") {
-                app_vmar
-                    .write_memory(app_base + offset as usize, &self.syscall_entry.to_ne_bytes())?;
+                app_vmar.write_memory(
+                    app_base + offset as usize,
+                    &self.syscall_entry.to_ne_bytes(),
+                )?;
             }
 
             // Load the interpreter (ld.so) into a second sub-VMAR placed right after the
@@ -192,7 +212,10 @@ impl LinuxElfLoader {
             // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
             let interp_rel = interp.trim_start_matches('/');
             let inode = self.root_inode.lookup_follow(interp_rel, 4).map_err(|e| {
-                error!("elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)", interp, e);
+                error!(
+                    "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",
+                    interp, e
+                );
                 e
             })?;
             let interp_vmo = inode.read_as_vmo().map_err(|e| {
@@ -207,16 +230,21 @@ impl LinuxElfLoader {
                 interp_size_aligned,
                 zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE,
             )?;
-            let interp_data = unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
+            let interp_data =
+                unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
 
             let interp_elf = ElfFile::new(interp_data).map_err(|_| {
                 error!("elf: interp {:?} is not a valid ELF", interp);
                 ZxError::INVALID_ARGS
             })?;
             let interp_size = interp_elf.load_segment_size();
-            let interp_vmar =
-                vmar.allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
-                    error!("elf: allocate vmar for interp {:?} size {:#x} failed: {:?}", interp, interp_size, e);
+            let interp_vmar = vmar
+                .allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                .map_err(|e| {
+                    error!(
+                        "elf: allocate vmar for interp {:?} size {:#x} failed: {:?}",
+                        interp, interp_size, e
+                    );
                     e
                 })?;
             let interp_base = interp_vmar.addr();
@@ -311,10 +339,12 @@ impl LinuxElfLoader {
         }
 
         let size = elf.load_segment_size();
-        let image_vmar = vmar.allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE).map_err(|e| {
-            error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
-            e
-        })?;
+        let image_vmar = vmar
+            .allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .map_err(|e| {
+                error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
+                e
+            })?;
         let base = image_vmar.addr();
         let _vmo = image_vmar.load_from_elf(&elf).map_err(|e| {
             error!("elf: load_from_elf failed: {:?}", e);

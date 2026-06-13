@@ -186,9 +186,12 @@ impl IoApicList {
             Err(e) => {
                 crate::klog_err!(
                     "[ioapic] ACPI parse failed (RSDP={:#x}): {:?} — PCI IRQ routing disabled",
-                    acpi_rsdp, e
+                    acpi_rsdp,
+                    e
                 );
-                return Self { io_apics: Vec::new() };
+                return Self {
+                    io_apics: Vec::new(),
+                };
             }
         };
         let io_apics = match tables.platform_info() {
@@ -210,10 +213,7 @@ impl IoApicList {
                 }
             },
             Err(e) => {
-                crate::klog_err!(
-                    "[ioapic] ACPI platform info failed: {:?} — no I/O APICs",
-                    e
-                );
+                crate::klog_err!("[ioapic] ACPI platform info failed: {:?} — no I/O APICs", e);
                 Vec::new()
             }
         };

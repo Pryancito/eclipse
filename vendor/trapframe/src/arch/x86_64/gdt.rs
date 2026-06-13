@@ -194,7 +194,10 @@ pub fn init() {
         BSP_GDT_BASE.store(gdt.as_ptr() as u64, Ordering::Release);
         BSP_GDT_COUNT.store(gdt.len(), Ordering::Release);
         // Pack STAR fields so APs can replicate the write.
-        BSP_STAR.store(((star_u_cs as u32) << 16) | star_k_cs as u32, Ordering::Release);
+        BSP_STAR.store(
+            ((star_u_cs as u32) << 16) | star_k_cs as u32,
+            Ordering::Release,
+        );
     }
 }
 

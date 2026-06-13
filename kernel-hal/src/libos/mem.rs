@@ -25,7 +25,8 @@ lazy_static! {
     pub(super) static ref MOCK_PHYS_MEM: MockMemory = MockMemory::new(PMEM_SIZE);
 }
 
-pub(super) static USED_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub(super) static USED_PAGES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 hal_fn_impl! {
     impl mod crate::hal_fn::mem {

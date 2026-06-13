@@ -54,7 +54,6 @@ global_asm!(
     ".equ entry_ptr, 0x6ff0",
     ".equ stack_ptr, 0x6fe8",
     ".equ temp_stack_top, 0x6fe0",
-
     ".section .text",
     ".code16",
     ".global ap_trampoline_start",
@@ -90,7 +89,6 @@ global_asm!(
     "  lea  eax, [ap_start64_paddr]",
     "  push eax",
     "  retf",
-
     ".code64",
     "ap_trampoline64:",
     "  xor  ax, ax",
@@ -105,21 +103,19 @@ global_asm!(
     "1:",
     "  hlt",
     "  jmp 1b",
-
     // GDT
     ".align 4",
     "gdt_64_smp:",
-    "  .quad 0x0000000000000000",   // null
-    "  .quad 0x00209A0000000000",   // 64-bit code
-    "  .quad 0x0000920000000000",   // 64-bit data
+    "  .quad 0x0000000000000000", // null
+    "  .quad 0x00209A0000000000", // 64-bit code
+    "  .quad 0x0000920000000000", // 64-bit data
     ".align 4",
-    "  .word 0",                    // padding
+    "  .word 0", // padding
     "gdt_64_ptr_smp:",
     "  .word gdt_64_ptr_smp - gdt_64_smp - 1",
     "  .long gdt_64_paddr",
-
     "ap_trampoline_end:",
-    ".code64",                      // restore default for remaining file
+    ".code64", // restore default for remaining file
 );
 
 extern "C" {
@@ -270,7 +266,10 @@ pub fn start_application_processors() {
             | MMUFlags::EXECUTE
             | MMUFlags::from_bits_truncate(CachePolicy::Cached as usize);
         if let Err(e) = pt.map_cont(TRAMPOLINE_PADDR, PAGE_SIZE * 2, TRAMPOLINE_PADDR, flags) {
-            crate::klog_warn!("[smp] identity-map 0x6000 failed: {:?} — AP may triple-fault", e);
+            crate::klog_warn!(
+                "[smp] identity-map 0x6000 failed: {:?} — AP may triple-fault",
+                e
+            );
         }
         core::mem::forget(pt);
     }
@@ -287,7 +286,11 @@ pub fn start_application_processors() {
     let mut started = 0usize;
     for (idx, &lapic_id) in ap_lapic_ids.iter().enumerate() {
         if idx >= MAX_APS {
-            crate::klog_warn!("[smp] Too many APs (max {}), skipping LAPIC {}", MAX_APS, lapic_id);
+            crate::klog_warn!(
+                "[smp] Too many APs (max {}), skipping LAPIC {}",
+                MAX_APS,
+                lapic_id
+            );
             break;
         }
 

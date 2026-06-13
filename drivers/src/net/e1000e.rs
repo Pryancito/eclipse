@@ -32,148 +32,148 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities, Checksum};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result as SmolResult;
 
-use crate::net::get_sockets;
-use crate::scheme::{NetScheme, Scheme, SchemeUpcast, RouteInfo, NetStats};
-use crate::{Device, DeviceError, DeviceResult};
-use crate::bus::pci_drivers::PciDriver;
 use crate::builder::IoMapper;
-use crate::utils::dma::DmaRegion;
-use pci::{PCIDevice, BAR, Location};
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+use crate::bus::pci_drivers::PciDriver;
+use crate::net::get_sockets;
+use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme, SchemeUpcast};
+use crate::utils::dma::DmaRegion;
+use crate::{Device, DeviceError, DeviceResult};
 use lock::Mutex;
+use pci::{Location, PCIDevice, BAR};
 
 use super::timer_now_as_micros;
 
 // ---------------------------------------------------------------------------
 // Register offsets (byte address / 4 → u32 index into MMIO array)
 // ---------------------------------------------------------------------------
-const E1000E_CTRL:      usize = 0x0000 / 4;
-const E1000E_STATUS:    usize = 0x0008 / 4;
-const E1000E_EECD:      usize = 0x0010 / 4;
-const E1000E_EERD:      usize = 0x0014 / 4;
-const E1000E_CTRL_EXT:  usize = 0x0018 / 4;
-const E1000E_MDIC:      usize = 0x0020 / 4;
+const E1000E_CTRL: usize = 0x0000 / 4;
+const E1000E_STATUS: usize = 0x0008 / 4;
+const E1000E_EECD: usize = 0x0010 / 4;
+const E1000E_EERD: usize = 0x0014 / 4;
+const E1000E_CTRL_EXT: usize = 0x0018 / 4;
+const E1000E_MDIC: usize = 0x0020 / 4;
 const E1000E_EXTCNF_CTRL: usize = 0x0F00 / 4;
-const E1000E_PHY_CTRL:  usize = 0x00F10 / 4;
-const E1000E_FEXTNVM6:  usize = 0x01014 / 4;
-const E1000E_FEXTNVM7:  usize = 0x01018 / 4;
-const E1000E_PBA:       usize = 0x01000 / 4;
-const E1000E_ICR:       usize = 0x00C0 / 4;
-const E1000E_ITR:       usize = 0x00C4 / 4;
-const E1000E_IMS:       usize = 0x00D0 / 4;
-const E1000E_IMC:       usize = 0x00D8 / 4;
-const E1000E_RCTL:      usize = 0x0100 / 4;
-const E1000E_TCTL:      usize = 0x0400 / 4;
-const E1000E_TIPG:      usize = 0x0410 / 4;
-const E1000E_RDBAL:     usize = 0x2800 / 4;
-const E1000E_RDBAH:     usize = 0x2804 / 4;
-const E1000E_RDLEN:     usize = 0x2808 / 4;
-const E1000E_RDH:       usize = 0x2810 / 4;
-const E1000E_RDT:       usize = 0x2818 / 4;
-const E1000E_RDTR:      usize = 0x2820 / 4;
-const E1000E_RXDCTL:    usize = 0x02828 / 4;
-const E1000E_RADV:      usize = 0x282C / 4;
-const E1000E_SRRCTL:    usize = 0x0280C / 4;
-const E1000E_TDBAL:     usize = 0x3800 / 4;
-const E1000E_TDBAH:     usize = 0x3804 / 4;
-const E1000E_TDLEN:     usize = 0x3808 / 4;
-const E1000E_TDH:       usize = 0x3810 / 4;
-const E1000E_TDT:       usize = 0x3818 / 4;
-const E1000E_TXDCTL:    usize = 0x03828 / 4;
-const E1000E_TXDCTL1:   usize = E1000E_TXDCTL + (0x100 / 4);
-const E1000E_TIDV:      usize = 0x03820 / 4;
-const E1000E_TADV:      usize = 0x0382C / 4;
-const E1000E_TARC0:     usize = 0x03840 / 4;
-const E1000E_RAL0:      usize = 0x5400 / 4;
-const E1000E_RAH0:      usize = 0x5404 / 4;
-const E1000E_MTA_BASE:  usize = 0x5200 / 4;
-const E1000E_RXCSUM:    usize = 0x5000 / 4;
-const E1000E_RFCTL:     usize = 0x5008 / 4;
-const E1000E_MRQC:      usize = 0x5818 / 4;
-const E1000E_VET:       usize = 0x0038 / 4;
-const E1000E_GPRC:      usize = 0x04074 / 4;
-const E1000E_GPTC:      usize = 0x04080 / 4;
-const E1000E_GORCL:     usize = 0x04088 / 4;
-const E1000E_GORCH:     usize = 0x0408C / 4;
-const E1000E_MPC:       usize = 0x04010 / 4;
-const E1000E_WUC:       usize = 0x05800 / 4;
-const E1000E_WUFC:      usize = 0x05808 / 4;
-const E1000E_WUS:       usize = 0x05810 / 4;
-const E1000E_MANC:      usize = 0x05820 / 4;
-const E1000E_FWSM:      usize = 0x05B54 / 4;
-const E1000E_H2ME:      usize = 0x05B50 / 4;
-const E1000E_IOSFPC:    usize = 0x00F28 / 4;
+const E1000E_PHY_CTRL: usize = 0x00F10 / 4;
+const E1000E_FEXTNVM6: usize = 0x01014 / 4;
+const E1000E_FEXTNVM7: usize = 0x01018 / 4;
+const E1000E_PBA: usize = 0x01000 / 4;
+const E1000E_ICR: usize = 0x00C0 / 4;
+const E1000E_ITR: usize = 0x00C4 / 4;
+const E1000E_IMS: usize = 0x00D0 / 4;
+const E1000E_IMC: usize = 0x00D8 / 4;
+const E1000E_RCTL: usize = 0x0100 / 4;
+const E1000E_TCTL: usize = 0x0400 / 4;
+const E1000E_TIPG: usize = 0x0410 / 4;
+const E1000E_RDBAL: usize = 0x2800 / 4;
+const E1000E_RDBAH: usize = 0x2804 / 4;
+const E1000E_RDLEN: usize = 0x2808 / 4;
+const E1000E_RDH: usize = 0x2810 / 4;
+const E1000E_RDT: usize = 0x2818 / 4;
+const E1000E_RDTR: usize = 0x2820 / 4;
+const E1000E_RXDCTL: usize = 0x02828 / 4;
+const E1000E_RADV: usize = 0x282C / 4;
+const E1000E_SRRCTL: usize = 0x0280C / 4;
+const E1000E_TDBAL: usize = 0x3800 / 4;
+const E1000E_TDBAH: usize = 0x3804 / 4;
+const E1000E_TDLEN: usize = 0x3808 / 4;
+const E1000E_TDH: usize = 0x3810 / 4;
+const E1000E_TDT: usize = 0x3818 / 4;
+const E1000E_TXDCTL: usize = 0x03828 / 4;
+const E1000E_TXDCTL1: usize = E1000E_TXDCTL + (0x100 / 4);
+const E1000E_TIDV: usize = 0x03820 / 4;
+const E1000E_TADV: usize = 0x0382C / 4;
+const E1000E_TARC0: usize = 0x03840 / 4;
+const E1000E_RAL0: usize = 0x5400 / 4;
+const E1000E_RAH0: usize = 0x5404 / 4;
+const E1000E_MTA_BASE: usize = 0x5200 / 4;
+const E1000E_RXCSUM: usize = 0x5000 / 4;
+const E1000E_RFCTL: usize = 0x5008 / 4;
+const E1000E_MRQC: usize = 0x5818 / 4;
+const E1000E_VET: usize = 0x0038 / 4;
+const E1000E_GPRC: usize = 0x04074 / 4;
+const E1000E_GPTC: usize = 0x04080 / 4;
+const E1000E_GORCL: usize = 0x04088 / 4;
+const E1000E_GORCH: usize = 0x0408C / 4;
+const E1000E_MPC: usize = 0x04010 / 4;
+const E1000E_WUC: usize = 0x05800 / 4;
+const E1000E_WUFC: usize = 0x05808 / 4;
+const E1000E_WUS: usize = 0x05810 / 4;
+const E1000E_MANC: usize = 0x05820 / 4;
+const E1000E_FWSM: usize = 0x05B54 / 4;
+const E1000E_H2ME: usize = 0x05B50 / 4;
+const E1000E_IOSFPC: usize = 0x00F28 / 4;
 const E1000E_VFTA_BASE: usize = 0x5600 / 4;
 
 // CTRL register bits
-const CTRL_FD:      u32 = 1 << 0;
-const CTRL_ASDE:    u32 = 1 << 5;
-const CTRL_SLU:     u32 = 1 << 6;
-const CTRL_FRCSPD:  u32 = 1 << 12;
-const CTRL_FRCDPX:  u32 = 1 << 11;
-const CTRL_RST:     u32 = 1 << 26;
+const CTRL_FD: u32 = 1 << 0;
+const CTRL_ASDE: u32 = 1 << 5;
+const CTRL_SLU: u32 = 1 << 6;
+const CTRL_FRCSPD: u32 = 1 << 12;
+const CTRL_FRCDPX: u32 = 1 << 11;
+const CTRL_RST: u32 = 1 << 26;
 const CTRL_PHY_RST: u32 = 1 << 31;
 
 // STATUS register bits
-const STATUS_LU:    u32 = 1 << 1;
-const STATUS_FD:    u32 = 1 << 0;
+const STATUS_LU: u32 = 1 << 1;
+const STATUS_FD: u32 = 1 << 0;
 
 // CTRL_EXT bits
-const CTRL_EXT_RO_DIS:   u32 = 1 << 17; // PCIe Relaxed Ordering Disable
+const CTRL_EXT_RO_DIS: u32 = 1 << 17; // PCIe Relaxed Ordering Disable
 const CTRL_EXT_DRV_LOAD: u32 = 1 << 28; // Driver loaded (release ME)
-const CTRL_EXT_IAME:     u32 = 1 << 27;
+const CTRL_EXT_IAME: u32 = 1 << 27;
 
 // PHY_CTRL (MAC-side register 0xF10) — LPLU bits for I219
-const PHY_CTRL_D0A_LPLU:        u32 = 1 << 1;
-const PHY_CTRL_NOND0A_LPLU:     u32 = 1 << 2;
+const PHY_CTRL_D0A_LPLU: u32 = 1 << 1;
+const PHY_CTRL_NOND0A_LPLU: u32 = 1 << 2;
 const PHY_CTRL_NOND0A_GBE_DISABLE: u32 = 1 << 3;
-const PHY_CTRL_GBE_DISABLE:     u32 = 1 << 6;
+const PHY_CTRL_GBE_DISABLE: u32 = 1 << 6;
 
 // MDIC register bits
-const MDIC_REG_SHIFT:   u32 = 16;
+const MDIC_REG_SHIFT: u32 = 16;
 const MDIC_PHYADD_SHIFT: u32 = 21;
-const MDIC_OP_WRITE:    u32 = 1 << 26;
-const MDIC_OP_READ:     u32 = 2 << 26;
-const MDIC_READY:       u32 = 1 << 28;
-const MDIC_ERROR:       u32 = 1 << 30;
-const MDIC_POLL_TRIES:  u32 = 2000;
+const MDIC_OP_WRITE: u32 = 1 << 26;
+const MDIC_OP_READ: u32 = 2 << 26;
+const MDIC_READY: u32 = 1 << 28;
+const MDIC_ERROR: u32 = 1 << 30;
+const MDIC_POLL_TRIES: u32 = 2000;
 
 // PHY register 0 (BMCR)
 const BMCR_RESET: u16 = 0x8000;
 
 // EERD
-const EERD_START:      u32 = 1 << 0;
-const EERD_DONE_BIT4:  u32 = 1 << 4;
-const EERD_DONE_BIT1:  u32 = 1 << 1;
+const EERD_START: u32 = 1 << 0;
+const EERD_DONE_BIT4: u32 = 1 << 4;
+const EERD_DONE_BIT1: u32 = 1 << 1;
 const EERD_DATA_SHIFT: u32 = 16;
 
 // ICR / IMS bits
-const ICR_TXDW:   u32 = 1 << 0;
-const ICR_LSC:    u32 = 1 << 2;
+const ICR_TXDW: u32 = 1 << 0;
+const ICR_LSC: u32 = 1 << 2;
 const ICR_RXDMT0: u32 = 1 << 4;
-const ICR_RXT0:   u32 = 1 << 7;
+const ICR_RXT0: u32 = 1 << 7;
 const ICR_RX_ANY: u32 = ICR_RXT0 | ICR_RXDMT0;
-const IMS_REARM:  u32 = ICR_TXDW | ICR_LSC | ICR_RXDMT0 | ICR_RXT0 | (1 << 6) | (1 << 8);
+const IMS_REARM: u32 = ICR_TXDW | ICR_LSC | ICR_RXDMT0 | ICR_RXT0 | (1 << 6) | (1 << 8);
 
 // RCTL bits
-const RCTL_EN:    u32 = 1 << 1;
-const RCTL_SBP:   u32 = 1 << 2;
-const RCTL_UPE:   u32 = 1 << 3;
-const RCTL_MPE:   u32 = 1 << 4;
-const RCTL_BAM:   u32 = 1 << 15;
+const RCTL_EN: u32 = 1 << 1;
+const RCTL_SBP: u32 = 1 << 2;
+const RCTL_UPE: u32 = 1 << 3;
+const RCTL_MPE: u32 = 1 << 4;
+const RCTL_BAM: u32 = 1 << 15;
 const RCTL_SECRC: u32 = 1 << 26;
 
 // TCTL bits
-const TCTL_EN:   u32 = 1 << 1;
-const TCTL_PSP:  u32 = 1 << 3;
+const TCTL_EN: u32 = 1 << 1;
+const TCTL_PSP: u32 = 1 << 3;
 const TCTL_RTLC: u32 = 1 << 24;
 const TCTL_CT_SHIFT: u32 = 4;
-const TCTL_CT_LINUX:   u32 = 15 << TCTL_CT_SHIFT;
+const TCTL_CT_LINUX: u32 = 15 << TCTL_CT_SHIFT;
 const TCTL_COLD_LINUX: u32 = 63 << 12;
 
 // TXDCTL / RXDCTL
@@ -183,7 +183,7 @@ const TXDCTL_FULL_TX_DESC_WB: u32 = 0x0101_0000;
 const TXDCTL_DMA_BURST: u32 = (1 << 22) | (1 << 8) | 1; // wthresh=1, pthresh=1, hthresh=1
 
 // RFCTL bits
-const RFCTL_EXTEN:    u32 = 1 << 15;
+const RFCTL_EXTEN: u32 = 1 << 15;
 const RFCTL_NFSW_DIS: u32 = 1 << 6;
 const RFCTL_NFSR_DIS: u32 = 1 << 7;
 
@@ -199,85 +199,85 @@ const FWSM_FW_VALID: u32 = 1 << 14;
 // ULP (Ultra Low Power) disable — i219/PCH-SPT only. On real hardware the ME
 // firmware often leaves the PHY in ULP, so STATUS.LU never asserts. QEMU has no
 // ME, which is why this is only needed on real hardware.
-const ICH_FWSM_FW_VALID:          u32 = 0x0000_8000;
-const FWSM_ULP_CFG_DONE:          u32 = 0x0000_0400;
-const H2ME_ULP:                   u32 = 0x0000_0800;
-const H2ME_ENFORCE_SETTINGS:      u32 = 0x0000_1000;
+const ICH_FWSM_FW_VALID: u32 = 0x0000_8000;
+const FWSM_ULP_CFG_DONE: u32 = 0x0000_0400;
+const H2ME_ULP: u32 = 0x0000_0800;
+const H2ME_ENFORCE_SETTINGS: u32 = 0x0000_1000;
 const FEXTNVM7_DISABLE_SMB_PERST: u32 = 0x0000_0020;
-const CTRL_EXT_FORCE_SMBUS:       u32 = 0x0000_0800; // CTRL_EXT bit 11
+const CTRL_EXT_FORCE_SMBUS: u32 = 0x0000_0800; // CTRL_EXT bit 11
 
 // SW/FW semaphore (EXTCNF_CTRL)
 const EXTCNF_CTRL_SWFLAG: u32 = 0x0000_0020; // bit 5
 
 // HV PHY paged-register access: value at page-select reg = page << PHY_PAGE_SHIFT,
 // then access (reg & MAX_PHY_REG_ADDRESS) via MDIC.
-const PHY_PAGE_SHIFT:       u32 = 5;
-const PHY_PAGE_SELECT_REG:  u32 = 0x1F; // IGP01E1000_PHY_PAGE_SELECT
-const MAX_PHY_REG_ADDRESS:  u32 = 0x1F;
+const PHY_PAGE_SHIFT: u32 = 5;
+const PHY_PAGE_SELECT_REG: u32 = 0x1F; // IGP01E1000_PHY_PAGE_SELECT
+const MAX_PHY_REG_ADDRESS: u32 = 0x1F;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0F;
-const HV_PHY_ADDR:          u8  = 1;    // pages >= 768 live at PHY addr 1
+const HV_PHY_ADDR: u8 = 1; // pages >= 768 live at PHY addr 1
 
 // CV_SMB_CTRL = PHY_REG(769, 23)
 const CV_SMB_CTRL_PAGE: u32 = 769;
-const CV_SMB_CTRL_REG:  u32 = 23;
+const CV_SMB_CTRL_REG: u32 = 23;
 const CV_SMB_CTRL_FORCE_SMBUS: u16 = 0x0001;
 // HV_PM_CTRL = PHY_REG(770, 17)
 const HV_PM_CTRL_PAGE: u32 = 770;
-const HV_PM_CTRL_REG:  u32 = 17;
+const HV_PM_CTRL_REG: u32 = 17;
 const HV_PM_CTRL_K1_ENABLE: u16 = 0x4000;
 // I218_ULP_CONFIG1 = PHY_REG(779, 16)
 const ULP_CONFIG1_PAGE: u32 = 779;
-const ULP_CONFIG1_REG:  u32 = 16;
-const ULP_CONFIG1_START:             u16 = 0x0001;
-const ULP_CONFIG1_IND:               u16 = 0x0004;
-const ULP_CONFIG1_STICKY_ULP:        u16 = 0x0010;
-const ULP_CONFIG1_INBAND_EXIT:       u16 = 0x0020;
-const ULP_CONFIG1_WOL_HOST:          u16 = 0x0040;
-const ULP_CONFIG1_RESET_TO_SMBUS:    u16 = 0x0100;
+const ULP_CONFIG1_REG: u32 = 16;
+const ULP_CONFIG1_START: u16 = 0x0001;
+const ULP_CONFIG1_IND: u16 = 0x0004;
+const ULP_CONFIG1_STICKY_ULP: u16 = 0x0010;
+const ULP_CONFIG1_INBAND_EXIT: u16 = 0x0020;
+const ULP_CONFIG1_WOL_HOST: u16 = 0x0040;
+const ULP_CONFIG1_RESET_TO_SMBUS: u16 = 0x0100;
 const ULP_CONFIG1_DISABLE_SMB_PERST: u16 = 0x1000;
 
 // GIO master disable (quiesce DMA before CTRL_RST)
-const CTRL_GIO_MASTER_DISABLE:  u32 = 0x0000_0004; // CTRL bit 2
+const CTRL_GIO_MASTER_DISABLE: u32 = 0x0000_0004; // CTRL bit 2
 const STATUS_GIO_MASTER_ENABLE: u32 = 0x0008_0000; // STATUS bit 19
-const MASTER_DISABLE_TIMEOUT:   u32 = 800;
+const MASTER_DISABLE_TIMEOUT: u32 = 800;
 
 // Kumeran (KMRN) register access + K1 config
-const E1000E_KMRNCTRLSTA:      usize = 0x0034 / 4;
+const E1000E_KMRNCTRLSTA: usize = 0x0034 / 4;
 const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
-const KMRNCTRLSTA_OFFSET:       u32 = 0x001F_0000;
-const KMRNCTRLSTA_REN:          u32 = 0x0020_0000;
-const KMRNCTRLSTA_K1_CONFIG:    u32 = 0x7;
-const KMRNCTRLSTA_K1_ENABLE:    u16 = 0x0002;
+const KMRNCTRLSTA_OFFSET: u32 = 0x001F_0000;
+const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
+const KMRNCTRLSTA_K1_CONFIG: u32 = 0x7;
+const KMRNCTRLSTA_K1_ENABLE: u16 = 0x0002;
 const CTRL_EXT_SPD_BYPS: u32 = 0x0000_8000;
-const CTRL_SPD_1000:     u32 = 0x0000_0200;
-const CTRL_SPD_100:      u32 = 0x0000_0100;
+const CTRL_SPD_1000: u32 = 0x0000_0200;
+const CTRL_SPD_100: u32 = 0x0000_0100;
 
 // LANPHYPC toggle — re-powers the PHY after it leaves ULP
 const CTRL_LANPHYPC_OVERRIDE: u32 = 0x0001_0000; // CTRL bit 16
-const CTRL_LANPHYPC_VALUE:    u32 = 0x0002_0000; // CTRL bit 17
-const CTRL_EXT_LPCD:          u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
+const CTRL_LANPHYPC_VALUE: u32 = 0x0002_0000; // CTRL bit 17
+const CTRL_EXT_LPCD: u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
 
 // MII BMCR (PHY register 0) — IEEE standard autoneg bits
 const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
-const MII_CR_AUTO_NEG_EN:      u16 = 0x1000;
+const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
 
 // Extended RX write-back layout (RFCTL_EXTEN=1):
 //   +0:  addr u64 (driver writes)
 //   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
 //   +12: length u16 (HW writes back)
-const RXD_EXT_DD:  u32 = 1 << 0;
+const RXD_EXT_DD: u32 = 1 << 0;
 const RXD_EXT_EOP: u32 = 1 << 1;
 
 // TX descriptor CMD bits
-const TX_CMD_EOP:  u8 = 1 << 0;
+const TX_CMD_EOP: u8 = 1 << 0;
 const TX_CMD_IFCS: u8 = 1 << 1;
-const TX_CMD_RS:   u8 = 1 << 3;
+const TX_CMD_RS: u8 = 1 << 3;
 
 // DMA ring sizing
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
 const BUF_SIZE: usize = 2048 + 128;
-const DMA_RING_BYTES: usize    = NUM_RX * size_of::<RxDesc>();
+const DMA_RING_BYTES: usize = NUM_RX * size_of::<RxDesc>();
 const DMA_TX_RING_BYTES: usize = NUM_TX * size_of::<TxDesc>();
 const DMA_DESC_ALIGN: usize = 16;
 const CACHE_LINE_SIZE: usize = 64;
@@ -291,8 +291,8 @@ const CACHE_LINE_SIZE: usize = 64;
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct RxDesc {
-    addr:     u64,  // buffer physical address (driver writes)
-    reserved: u64,  // HW write-back: staterr[31:0] @ +8, length[15:0] @ +12
+    addr: u64,     // buffer physical address (driver writes)
+    reserved: u64, // HW write-back: staterr[31:0] @ +8, length[15:0] @ +12
 }
 const _RX_DESC_SIZE: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
@@ -300,12 +300,12 @@ const _RX_DESC_SIZE: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct TxDesc {
-    addr:    u64,
-    len:     u16,
-    cso:     u8,
-    cmd:     u8,
-    status:  u8,
-    css:     u8,
+    addr: u64,
+    len: u16,
+    cso: u8,
+    cmd: u8,
+    status: u8,
+    css: u8,
     special: u16,
 }
 const _TX_DESC_SIZE: () = assert!(core::mem::size_of::<TxDesc>() == 16);
@@ -329,19 +329,19 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
 // ---------------------------------------------------------------------------
 
 pub struct E1000eHw {
-    base:    usize,
+    base: usize,
     pci_loc: Location,
     device_id: u16,
 
     mac: [u8; 6],
 
-    rx_ring:         DmaRegion,
-    rx_buf_pool:     DmaRegion,
+    rx_ring: DmaRegion,
+    rx_buf_pool: DmaRegion,
     rx_next_to_clean: usize,
 
-    tx_ring:     DmaRegion,
+    tx_ring: DmaRegion,
     tx_buf_pool: DmaRegion,
-    tx_tail:     usize,
+    tx_tail: usize,
 
     pub stats: NetStats,
 
@@ -359,14 +359,18 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     fn udelay(us: u64) {
-        if us == 0 { return; }
+        if us == 0 {
+            return;
+        }
         let t0 = timer_now_as_micros();
         const MAX_SPINS: u64 = 10_000_000;
         let mut n = 0u64;
         while timer_now_as_micros().wrapping_sub(t0) < us {
             core::hint::spin_loop();
             n += 1;
-            if n >= MAX_SPINS { break; }
+            if n >= MAX_SPINS {
+                break;
+            }
         }
     }
 
@@ -374,16 +378,20 @@ impl E1000eHw {
     // Buffer address helpers
     // -----------------------------------------------------------------------
 
-    #[inline] fn rx_buf_paddr(&self, i: usize) -> u64 {
+    #[inline]
+    fn rx_buf_paddr(&self, i: usize) -> u64 {
         (self.rx_buf_pool.paddr() + i * BUF_SIZE) as u64
     }
-    #[inline] fn rx_buf_vaddr(&self, i: usize) -> usize {
+    #[inline]
+    fn rx_buf_vaddr(&self, i: usize) -> usize {
         self.rx_buf_pool.vaddr() + i * BUF_SIZE
     }
-    #[inline] fn tx_buf_paddr(&self, i: usize) -> u64 {
+    #[inline]
+    fn tx_buf_paddr(&self, i: usize) -> u64 {
         (self.tx_buf_pool.paddr() + i * BUF_SIZE) as u64
     }
-    #[inline] fn tx_buf_vaddr(&self, i: usize) -> usize {
+    #[inline]
+    fn tx_buf_vaddr(&self, i: usize) -> usize {
         self.tx_buf_pool.vaddr() + i * BUF_SIZE
     }
 
@@ -454,15 +462,15 @@ impl E1000eHw {
     }
 
     unsafe fn mdic_read(&self, phy_addr: u8, reg: u32) -> Option<u16> {
-        let cmd = (reg << MDIC_REG_SHIFT)
-            | ((phy_addr as u32) << MDIC_PHYADD_SHIFT)
-            | MDIC_OP_READ;
+        let cmd = (reg << MDIC_REG_SHIFT) | ((phy_addr as u32) << MDIC_PHYADD_SHIFT) | MDIC_OP_READ;
         mmio_write(self.base, E1000E_MDIC, cmd);
         for _ in 0..MDIC_POLL_TRIES {
             Self::udelay(50);
             let v = mmio_read(self.base, E1000E_MDIC);
             if v & MDIC_READY != 0 {
-                if v & MDIC_ERROR != 0 { return None; }
+                if v & MDIC_ERROR != 0 {
+                    return None;
+                }
                 return Some(v as u16);
             }
         }
@@ -479,8 +487,12 @@ impl E1000eHw {
         let mut timeout = 100u32;
         loop {
             ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
-            if ext & EXTCNF_CTRL_SWFLAG == 0 { break; }
-            if timeout == 0 { return false; }
+            if ext & EXTCNF_CTRL_SWFLAG == 0 {
+                break;
+            }
+            if timeout == 0 {
+                return false;
+            }
             Self::udelay(1_000);
             timeout -= 1;
         }
@@ -489,7 +501,9 @@ impl E1000eHw {
         let mut timeout = 1_000u32;
         loop {
             ext = mmio_read(self.base, E1000E_EXTCNF_CTRL);
-            if ext & EXTCNF_CTRL_SWFLAG != 0 { return true; }
+            if ext & EXTCNF_CTRL_SWFLAG != 0 {
+                return true;
+            }
             if timeout == 0 {
                 ext &= !EXTCNF_CTRL_SWFLAG;
                 mmio_write(self.base, E1000E_EXTCNF_CTRL, ext);
@@ -512,7 +526,11 @@ impl E1000eHw {
 
     unsafe fn phy_read_hv(&self, page: u32, reg: u32) -> Option<u16> {
         if reg > MAX_PHY_MULTI_PAGE_REG
-            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, (page << PHY_PAGE_SHIFT) as u16)
+            && !self.mdic_write(
+                HV_PHY_ADDR,
+                PHY_PAGE_SELECT_REG,
+                (page << PHY_PAGE_SHIFT) as u16,
+            )
         {
             return None;
         }
@@ -521,7 +539,11 @@ impl E1000eHw {
 
     unsafe fn phy_write_hv(&self, page: u32, reg: u32, val: u16) -> bool {
         if reg > MAX_PHY_MULTI_PAGE_REG
-            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, (page << PHY_PAGE_SHIFT) as u16)
+            && !self.mdic_write(
+                HV_PHY_ADDR,
+                PHY_PAGE_SELECT_REG,
+                (page << PHY_PAGE_SHIFT) as u16,
+            )
         {
             return false;
         }
@@ -535,7 +557,9 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     unsafe fn disable_ulp(&self, force: bool) {
-        if !self.is_pch_spt_or_later() { return; }
+        if !self.is_pch_spt_or_later() {
+            return;
+        }
 
         let fwsm = mmio_read(self.base, E1000E_FWSM);
         if fwsm & ICH_FWSM_FW_VALID != 0 {
@@ -556,9 +580,16 @@ impl E1000eHw {
                 Self::udelay(10_000);
             }
             let mut h2me = mmio_read(self.base, E1000E_H2ME);
-            if force { h2me &= !H2ME_ENFORCE_SETTINGS; } else { h2me &= !H2ME_ULP; }
+            if force {
+                h2me &= !H2ME_ENFORCE_SETTINGS;
+            } else {
+                h2me &= !H2ME_ULP;
+            }
             mmio_write(self.base, E1000E_H2ME, h2me);
-            crate::klog_warn!("[e1000e] disable_ulp FW-path cfg_done_cleared={}\n", cleared);
+            crate::klog_warn!(
+                "[e1000e] disable_ulp FW-path cfg_done_cleared={}\n",
+                cleared
+            );
             return;
         }
 
@@ -583,11 +614,11 @@ impl E1000eHw {
         // Clear the ULP configuration and commit (START).
         if let Some(mut p) = self.phy_read_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG) {
             p &= !(ULP_CONFIG1_IND
-                 | ULP_CONFIG1_STICKY_ULP
-                 | ULP_CONFIG1_RESET_TO_SMBUS
-                 | ULP_CONFIG1_WOL_HOST
-                 | ULP_CONFIG1_INBAND_EXIT
-                 | ULP_CONFIG1_DISABLE_SMB_PERST);
+                | ULP_CONFIG1_STICKY_ULP
+                | ULP_CONFIG1_RESET_TO_SMBUS
+                | ULP_CONFIG1_WOL_HOST
+                | ULP_CONFIG1_INBAND_EXIT
+                | ULP_CONFIG1_DISABLE_SMB_PERST);
             let _ = self.phy_write_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG, p);
             p |= ULP_CONFIG1_START;
             let _ = self.phy_write_hv(ULP_CONFIG1_PAGE, ULP_CONFIG1_REG, p);
@@ -639,13 +670,19 @@ impl E1000eHw {
     }
 
     unsafe fn configure_k1(&self, enable: bool) {
-        if !self.is_pch() { return; }
+        if !self.is_pch() {
+            return;
+        }
         if !self.acquire_swflag() {
             crate::klog_warn!("[e1000e] configure_k1: SW/FW semaphore busy\n");
             return;
         }
         let mut kmrn = self.kmrn_read(KMRNCTRLSTA_K1_CONFIG);
-        if enable { kmrn |= KMRNCTRLSTA_K1_ENABLE; } else { kmrn &= !KMRNCTRLSTA_K1_ENABLE; }
+        if enable {
+            kmrn |= KMRNCTRLSTA_K1_ENABLE;
+        } else {
+            kmrn &= !KMRNCTRLSTA_K1_ENABLE;
+        }
         self.kmrn_write(KMRNCTRLSTA_K1_CONFIG, kmrn);
         Self::udelay(30);
 
@@ -672,7 +709,9 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     unsafe fn toggle_lanphypc(&self) {
-        if !self.is_pch() { return; }
+        if !self.is_pch() {
+            return;
+        }
         // Toggle LANPHYPC value bit with override asserted, then deasserted.
         let mut ctrl = mmio_read(self.base, E1000E_CTRL);
         ctrl |= CTRL_LANPHYPC_OVERRIDE;
@@ -689,8 +728,12 @@ impl E1000eHw {
             let mut count = 20u16;
             loop {
                 Self::udelay(6_000);
-                if mmio_read(self.base, E1000E_CTRL_EXT) & CTRL_EXT_LPCD != 0 { break; }
-                if count == 0 { break; }
+                if mmio_read(self.base, E1000E_CTRL_EXT) & CTRL_EXT_LPCD != 0 {
+                    break;
+                }
+                if count == 0 {
+                    break;
+                }
                 count -= 1;
             }
             Self::udelay(30_000);
@@ -705,10 +748,14 @@ impl E1000eHw {
     // -----------------------------------------------------------------------
 
     unsafe fn restart_autoneg(&self) {
-        if !self.acquire_swflag() { return; }
+        if !self.acquire_swflag() {
+            return;
+        }
         for phy_addr in [1u8, 2u8] {
             if let Some(bmcr) = self.mdic_read(phy_addr, 0) {
-                if bmcr == 0xFFFF { continue; }
+                if bmcr == 0xFFFF {
+                    continue;
+                }
                 let v = bmcr | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG;
                 if self.mdic_write(phy_addr, 0, v) {
                     crate::klog_warn!("[e1000e] restart autoneg on phy_addr={}\n", phy_addr);
@@ -773,7 +820,7 @@ impl E1000eHw {
             if w == 0 || w == 0xFFFF {
                 continue;
             }
-            self.mac[(word as usize) * 2]     = (w & 0xFF) as u8;
+            self.mac[(word as usize) * 2] = (w & 0xFF) as u8;
             self.mac[(word as usize) * 2 + 1] = (w >> 8) as u8;
         }
     }
@@ -796,7 +843,7 @@ impl E1000eHw {
 
     fn is_valid_mac(&self) -> bool {
         let all_zeros = self.mac.iter().all(|&b| b == 0);
-        let all_ff    = self.mac.iter().all(|&b| b == 0xFF);
+        let all_ff = self.mac.iter().all(|&b| b == 0xFF);
         !all_zeros && !all_ff
     }
 
@@ -826,7 +873,7 @@ impl E1000eHw {
         }
 
         // 4. Clear WUC/WUFC so PHY WUC filter is disabled at the MAC level too
-        mmio_write(self.base, E1000E_WUC,  0);
+        mmio_write(self.base, E1000E_WUC, 0);
         mmio_write(self.base, E1000E_WUFC, 0);
 
         // 4.5 Disable ULP (i219 real hardware): bring the PHY out of Ultra Low
@@ -882,7 +929,7 @@ impl E1000eHw {
             let fext6 = mmio_read(self.base, E1000E_FEXTNVM6);
             mmio_write(self.base, E1000E_FEXTNVM6, fext6 & !0x0000_0010); // clear bit 4
             let fext7 = mmio_read(self.base, E1000E_FEXTNVM7);
-            mmio_write(self.base, E1000E_FEXTNVM7, fext7 | 0x0000_0001);  // set bit 0
+            mmio_write(self.base, E1000E_FEXTNVM7, fext7 | 0x0000_0001); // set bit 0
         }
 
         // 10. Disable LPLU via MAC PHY_CTRL register (no MDIO needed)
@@ -940,7 +987,7 @@ impl E1000eHw {
         mmio_write(self.base, E1000E_VET, 0);
 
         // 17. Disable WUC at MAC level
-        mmio_write(self.base, E1000E_WUC,  0);
+        mmio_write(self.base, E1000E_WUC, 0);
         mmio_write(self.base, E1000E_WUFC, 0);
 
         // 18. Program TX ring
@@ -973,7 +1020,11 @@ impl E1000eHw {
         let tx_pa = self.tx_ring.paddr();
         mmio_write(self.base, E1000E_TDBAL, tx_pa as u32);
         mmio_write(self.base, E1000E_TDBAH, (tx_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_TDLEN, (NUM_TX * size_of::<TxDesc>()) as u32);
+        mmio_write(
+            self.base,
+            E1000E_TDLEN,
+            (NUM_TX * size_of::<TxDesc>()) as u32,
+        );
         mmio_write(self.base, E1000E_TDH, 0);
         mmio_write(self.base, E1000E_TDT, 0);
         self.tx_tail = 0;
@@ -997,13 +1048,21 @@ impl E1000eHw {
                 }
             }
             // Mirror to queue 1 (Linux e1000_configure_tx)
-            mmio_write(self.base, E1000E_TXDCTL1, mmio_read(self.base, E1000E_TXDCTL));
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL1,
+                mmio_read(self.base, E1000E_TXDCTL),
+            );
             // IOSF PCIe compliance
             let iosfpc = mmio_read(self.base, E1000E_IOSFPC);
             mmio_write(self.base, E1000E_IOSFPC, iosfpc | 0x0001_0000);
             let _ = mmio_read(self.base, E1000E_IOSFPC);
         } else {
-            mmio_write(self.base, E1000E_TXDCTL, TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB);
+            mmio_write(
+                self.base,
+                E1000E_TXDCTL,
+                TXDCTL_DMA_BURST | TXDCTL_FULL_TX_DESC_WB,
+            );
         }
 
         // TCTL: enable TX
@@ -1022,7 +1081,11 @@ impl E1000eHw {
         let rx_pa = self.rx_ring.paddr();
         mmio_write(self.base, E1000E_RDBAL, rx_pa as u32);
         mmio_write(self.base, E1000E_RDBAH, (rx_pa >> 32) as u32);
-        mmio_write(self.base, E1000E_RDLEN, (NUM_RX * size_of::<RxDesc>()) as u32);
+        mmio_write(
+            self.base,
+            E1000E_RDLEN,
+            (NUM_RX * size_of::<RxDesc>()) as u32,
+        );
         mmio_write(self.base, E1000E_RDH, 0);
         self.rx_next_to_clean = 0;
 
@@ -1042,7 +1105,7 @@ impl E1000eHw {
         // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
         // confirmed to work on real i219-V hardware without RFCTL_EXTEN.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
-        rfctl &= !RFCTL_EXTEN;  // legacy mode: status at +12 u8, length at +8 u16
+        rfctl &= !RFCTL_EXTEN; // legacy mode: status at +12 u8, length at +8 u16
         rfctl |= RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
         let _ = mmio_read(self.base, E1000E_RFCTL);
@@ -1105,21 +1168,24 @@ impl E1000eHw {
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
         if status & 2 == 0 || len == 0 || len > BUF_SIZE {
-            unsafe { self.recycle_rx_slot(i); }
+            unsafe {
+                self.recycle_rx_slot(i);
+            }
             self.rx_next_to_clean = (i + 1) % NUM_RX;
             return None;
         }
 
         // Copy packet from buffer
-        let packet = unsafe {
-            core::slice::from_raw_parts(self.rx_buf_vaddr(i) as *const u8, len).to_vec()
-        };
+        let packet =
+            unsafe { core::slice::from_raw_parts(self.rx_buf_vaddr(i) as *const u8, len).to_vec() };
 
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += len as u64;
 
         // Recycle: clear descriptor, post new buffer, ring doorbell
-        unsafe { self.recycle_rx_slot(i); }
+        unsafe {
+            self.recycle_rx_slot(i);
+        }
         self.rx_next_to_clean = (i + 1) % NUM_RX;
 
         Some(packet)
@@ -1192,21 +1258,25 @@ impl E1000eHw {
 
         // Write descriptor fields (cmd last so HW doesn't fetch partial descriptor)
         unsafe {
-            write_volatile(&mut desc.addr,    self.tx_buf_paddr(idx));
-            write_volatile(&mut desc.len,     data.len() as u16);
-            write_volatile(&mut desc.cso,     0);
-            write_volatile(&mut desc.status,  0);
-            write_volatile(&mut desc.css,     0);
+            write_volatile(&mut desc.addr, self.tx_buf_paddr(idx));
+            write_volatile(&mut desc.len, data.len() as u16);
+            write_volatile(&mut desc.cso, 0);
+            write_volatile(&mut desc.status, 0);
+            write_volatile(&mut desc.css, 0);
             write_volatile(&mut desc.special, 0);
         }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        unsafe { write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS); }
+        unsafe {
+            write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
+        }
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
         self.tx_tail = (idx + 1) % NUM_TX;
-        unsafe { mmio_write(self.base, E1000E_TDT, self.tx_tail as u32); }
+        unsafe {
+            mmio_write(self.base, E1000E_TDT, self.tx_tail as u32);
+        }
 
         Ok(())
     }
@@ -1323,7 +1393,11 @@ impl E1000eInterface {
         let me = self.clone();
         crate::utils::deferred_job::push_deferred_job(move || {
             struct Guard(Arc<AtomicBool>);
-            impl Drop for Guard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
             let _g = Guard(Arc::clone(&me.watchdog_job_scheduled));
             me.watchdog_job_scheduled.store(false, Ordering::Release);
             let (link_changed, link_up) = {
@@ -1356,7 +1430,9 @@ impl E1000eInterface {
         }
 
         let ts = Instant::from_micros(now as i64);
-        unsafe { self.driver.hw.lock().ensure_rx_armed_if_link_up(); }
+        unsafe {
+            self.driver.hw.lock().ensure_rx_armed_if_link_up();
+        }
 
         // Keep IRQs off while SOCKETS + iface are locked (rtlx / e1000 pattern).
         let intr_was_on = super::intr_get();
@@ -1392,7 +1468,9 @@ impl E1000eInterface {
 }
 
 impl Scheme for E1000eInterface {
-    fn name(&self) -> &str { "e1000e" }
+    fn name(&self) -> &str {
+        "e1000e"
+    }
 
     /// Minimal IRQ top-half (same as [`e1000::E1000Interface`]): read ICR, mask IMS,
     /// queue one deferred poll. RX waiters are woken from [`E1000eInterface::poll_with_irq_hint`]
@@ -1471,7 +1549,9 @@ impl NetScheme for E1000eInterface {
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
         let mut iface = self.iface.lock();
         iface.update_ip_addrs(|addrs| {
-            if addrs.contains(&cidr) { return; }
+            if addrs.contains(&cidr) {
+                return;
+            }
             for slot in addrs.iter_mut() {
                 if slot.address().is_unspecified() && slot.prefix_len() == 0 {
                     *slot = cidr;
@@ -1536,30 +1616,46 @@ impl NetScheme for E1000eInterface {
         hw.send(data)?;
         Ok(data.len())
     }
-    fn can_recv(&self) -> bool { true }
-    fn can_send(&self) -> bool { self.driver.hw.lock().can_send() }
+    fn can_recv(&self) -> bool {
+        true
+    }
+    fn can_send(&self) -> bool {
+        self.driver.hw.lock().can_send()
+    }
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
         let mut iface = self.iface.lock();
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
                 if cidr.prefix_len() == 0 {
-                    iface.routes_mut().add_default_ipv4_route(gw)
+                    iface
+                        .routes_mut()
+                        .add_default_ipv4_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
                 }
                 let mut routes = self.routes.lock();
                 routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
-                routes.push(RouteInfo { dst: cidr, gateway: Some(IpAddress::Ipv4(gw)) });
+                routes.push(RouteInfo {
+                    dst: cidr,
+                    gateway: Some(IpAddress::Ipv4(gw)),
+                });
             }
             Some(IpAddress::Ipv6(gw)) => {
                 if cidr.prefix_len() == 0 {
-                    iface.routes_mut().add_default_ipv6_route(gw)
+                    iface
+                        .routes_mut()
+                        .add_default_ipv6_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
                 }
                 let mut routes = self.routes.lock();
                 routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
-                routes.push(RouteInfo { dst: cidr, gateway: Some(IpAddress::Ipv6(gw)) });
+                routes.push(RouteInfo {
+                    dst: cidr,
+                    gateway: Some(IpAddress::Ipv6(gw)),
+                });
             }
-            None => { self.routes.lock().push(RouteInfo { dst: cidr, gateway }); }
+            None => {
+                self.routes.lock().push(RouteInfo { dst: cidr, gateway });
+            }
             _ => {}
         }
         Ok(())
@@ -1568,7 +1664,9 @@ impl NetScheme for E1000eInterface {
         let mut iface = self.iface.lock();
         if cidr.prefix_len() == 0 {
             match cidr {
-                IpCidr::Ipv4(_) => { let _ = iface.routes_mut().remove_default_ipv4_route(); }
+                IpCidr::Ipv4(_) => {
+                    let _ = iface.routes_mut().remove_default_ipv4_route();
+                }
                 _ => {}
             }
         }
@@ -1581,25 +1679,37 @@ impl NetScheme for E1000eInterface {
         for cidr in iface.ip_addrs() {
             match cidr {
                 IpCidr::Ipv4(v4) if v4.prefix_len() > 0 => {
-                    res.push(RouteInfo { dst: IpCidr::Ipv4(v4.network()), gateway: None });
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv4(v4.network()),
+                        gateway: None,
+                    });
                 }
                 IpCidr::Ipv6(v6) if v6.prefix_len() > 0 => {
-                    res.push(RouteInfo { dst: IpCidr::Ipv6(v6.network()), gateway: None });
+                    res.push(RouteInfo {
+                        dst: IpCidr::Ipv6(v6.network()),
+                        gateway: None,
+                    });
                 }
                 _ => {}
             }
         }
         res
     }
-    fn get_stats(&self) -> NetStats { self.driver.hw.lock().merged_stats() }
-    fn get_mtu(&self) -> usize { 1500 }
+    fn get_stats(&self) -> NetStats {
+        self.driver.hw.lock().merged_stats()
+    }
+    fn get_mtu(&self) -> usize {
+        1500
+    }
 }
 
 // ---------------------------------------------------------------------------
 // smoltcp Device impl
 // ---------------------------------------------------------------------------
 
-pub struct E1000eRxToken { data: Vec<u8> }
+pub struct E1000eRxToken {
+    data: Vec<u8>,
+}
 pub struct E1000eTxToken(E1000eDriver);
 
 impl phy::Device<'_> for E1000eDriver {
@@ -1608,7 +1718,8 @@ impl phy::Device<'_> for E1000eDriver {
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let mut hw = self.hw.lock();
-        hw.receive().map(|pkt| (E1000eRxToken { data: pkt }, E1000eTxToken(self.clone())))
+        hw.receive()
+            .map(|pkt| (E1000eRxToken { data: pkt }, E1000eTxToken(self.clone())))
     }
     fn transmit(&mut self) -> Option<Self::TxToken> {
         if self.hw.lock().can_send() {
@@ -1627,7 +1738,9 @@ impl phy::Device<'_> for E1000eDriver {
 
 impl phy::RxToken for E1000eRxToken {
     fn consume<R, F>(self, _ts: Instant, f: F) -> SmolResult<R>
-    where F: FnOnce(&mut [u8]) -> SmolResult<R> {
+    where
+        F: FnOnce(&mut [u8]) -> SmolResult<R>,
+    {
         let mut data = self.data;
         super::net_defer_packet(&data);
         f(&mut data)
@@ -1636,7 +1749,9 @@ impl phy::RxToken for E1000eRxToken {
 
 impl phy::TxToken for E1000eTxToken {
     fn consume<R, F>(self, _ts: Instant, len: usize, f: F) -> SmolResult<R>
-    where F: FnOnce(&mut [u8]) -> SmolResult<R> {
+    where
+        F: FnOnce(&mut [u8]) -> SmolResult<R>,
+    {
         let len = len.min(65536);
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
@@ -1672,24 +1787,28 @@ pub fn init(
 ) -> DeviceResult<E1000eInterface> {
     crate::klog_warn!(
         "[e1000e] probing {} vaddr={:#x} irq={} device={:#x} tag={}\n",
-        name, vaddr, irq, pci.id.device_id, E1000E_DRIVER_TAG
+        name,
+        vaddr,
+        irq,
+        pci.id.device_id,
+        E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+    let (rx_ring, _) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, _)      = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, _) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE)
-        .ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, _)  = DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE)
-        .ok_or(DeviceError::DmaError)?;
+    let (rx_buf_pool, _) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let (tx_buf_pool, _) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
 
     // Alignment checks
     for (label, region, align, span) in [
-        ("rx_ring",    &rx_ring,    DMA_DESC_ALIGN, DMA_RING_BYTES),
-        ("tx_ring",    &tx_ring,    DMA_DESC_ALIGN, DMA_TX_RING_BYTES),
-        ("rx_buf_pool",&rx_buf_pool,64,             NUM_RX * BUF_SIZE),
-        ("tx_buf_pool",&tx_buf_pool,64,             NUM_TX * BUF_SIZE),
+        ("rx_ring", &rx_ring, DMA_DESC_ALIGN, DMA_RING_BYTES),
+        ("tx_ring", &tx_ring, DMA_DESC_ALIGN, DMA_TX_RING_BYTES),
+        ("rx_buf_pool", &rx_buf_pool, 64, NUM_RX * BUF_SIZE),
+        ("tx_buf_pool", &tx_buf_pool, 64, NUM_TX * BUF_SIZE),
     ] {
         if region.paddr() % align != 0 || region.vaddr() % align != 0 {
             crate::klog_err!("[e1000e] {} DMA misaligned\n", label);
@@ -1721,7 +1840,9 @@ pub fn init(
         itr_tune_next_us: 0,
     };
 
-    unsafe { hw.reset_and_init()?; }
+    unsafe {
+        hw.reset_and_init()?;
+    }
 
     let mac_bytes = hw.mac;
     crate::klog_warn!(
@@ -1729,8 +1850,12 @@ pub fn init(
         name,
         pci.id.vendor_id,
         pci.id.device_id,
-        mac_bytes[0], mac_bytes[1], mac_bytes[2],
-        mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        mac_bytes[0],
+        mac_bytes[1],
+        mac_bytes[2],
+        mac_bytes[3],
+        mac_bytes[4],
+        mac_bytes[5],
         E1000E_DRIVER_TAG
     );
 
@@ -1750,7 +1875,10 @@ pub fn init(
     eui64[6] = mac_bytes[4];
     eui64[7] = mac_bytes[5];
     let link_local = Ipv6Address::new(
-        0xfe80, 0, 0, 0,
+        0xfe80,
+        0,
+        0,
+        0,
         (eui64[0] as u16) << 8 | eui64[1] as u16,
         (eui64[2] as u16) << 8 | eui64[3] as u16,
         (eui64[4] as u16) << 8 | eui64[5] as u16,
@@ -1776,9 +1904,9 @@ pub fn init(
         .routes(routes)
         .finalize();
 
-    let link_up_seen = Arc::new(AtomicBool::new(
-        unsafe { mmio_read(vaddr, E1000E_STATUS) & STATUS_LU != 0 },
-    ));
+    let link_up_seen = Arc::new(AtomicBool::new(unsafe {
+        mmio_read(vaddr, E1000E_STATUS) & STATUS_LU != 0
+    }));
     let e1000e_iface = E1000eInterface {
         iface: Arc::new(Mutex::new(iface)),
         driver,
@@ -1805,10 +1933,14 @@ pub fn init(
 pub struct E1000eDriverPci;
 
 impl PciDriver for E1000eDriverPci {
-    fn name(&self) -> &str { "e1000e" }
+    fn name(&self) -> &str {
+        "e1000e"
+    }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        if vendor_id != 0x8086 { return false; }
+        if vendor_id != 0x8086 {
+            return false;
+        }
         matches!(
             device_id,
             0x10d3 | 0x10f5 | 0x150c |
@@ -1822,10 +1954,17 @@ impl PciDriver for E1000eDriverPci {
         )
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         crate::klog_warn!(
             "e1000e: probe PCI {:#x}:{:#x} tag={}\n",
-            dev.id.vendor_id, dev.id.device_id, E1000E_DRIVER_TAG
+            dev.id.vendor_id,
+            dev.id.device_id,
+            E1000E_DRIVER_TAG
         );
         let bar0_addr = if let Some(BAR::Memory(a, _, _, _)) = dev.bars[0] {
             a as usize

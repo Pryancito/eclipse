@@ -3,7 +3,7 @@ use bitflags::bitflags;
 use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject};
 
 /// Per-call cap for anonymous `mmap` / `brk` growth (uses physical frames; also limits metadata).
-const MAX_MMAP_LEN: usize = 16 * 1024 * 1024;
+const MAX_MMAP_LEN: usize = 128 * 1024 * 1024;
 
 /// Syscalls for virtual memory.
 ///
@@ -102,9 +102,6 @@ impl Syscall<'_> {
         }
         let vmar_offset = flags.contains(MmapFlags::FIXED).then(|| addr - vmar.addr());
         if flags.contains(MmapFlags::ANONYMOUS) {
-            if flags.contains(MmapFlags::SHARED) {
-                return Err(LxError::EINVAL);
-            }
             let vmo = VmObject::new_paged(pages(len));
             let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())?;
             Ok(addr)

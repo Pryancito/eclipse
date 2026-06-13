@@ -23,16 +23,17 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
 
-        let is_seekable = if let Ok(file) = file_like.clone().downcast_arc::<linux_object::fs::File>() {
-            if let Ok(meta) = file.metadata() {
-                meta.type_ == linux_object::fs::vfs::FileType::File
-                    || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
+        let is_seekable =
+            if let Ok(file) = file_like.clone().downcast_arc::<linux_object::fs::File>() {
+                if let Ok(meta) = file.metadata() {
+                    meta.type_ == linux_object::fs::vfs::FileType::File
+                        || meta.type_ == linux_object::fs::vfs::FileType::BlockDevice
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
 
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let mut buf = vec![0u8; chunk_size];
@@ -106,7 +107,9 @@ impl Syscall<'_> {
 
         while read_len < len {
             let current_len = (len - read_len).min(chunk_size);
-            let n = file_like.read_at(offset + read_len as u64, &mut buf[..current_len]).await?;
+            let n = file_like
+                .read_at(offset + read_len as u64, &mut buf[..current_len])
+                .await?;
             if n == 0 {
                 break;
             }
@@ -227,7 +230,13 @@ impl Syscall<'_> {
     /// descriptor and otherwise treat it as a no-op returning success. This
     /// silences the spurious `unknown syscall: FADVISE64` errors emitted by
     /// tools such as `e2fsck`.
-    pub fn sys_fadvise64(&self, fd: FileDesc, offset: usize, len: usize, advice: usize) -> SysResult {
+    pub fn sys_fadvise64(
+        &self,
+        fd: FileDesc,
+        offset: usize,
+        len: usize,
+        advice: usize,
+    ) -> SysResult {
         info!(
             "fadvise64: fd={:?}, offset={}, len={}, advice={}",
             fd, offset, len, advice

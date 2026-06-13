@@ -1,14 +1,14 @@
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
+use crate::builder::IoMapper;
+use crate::bus::pci_drivers::PciDriver;
 use crate::scheme::{BlockScheme, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
-use crate::bus::pci_drivers::PciDriver;
-use crate::builder::IoMapper;
 use pci::{PCIDevice, BAR};
 
 use lock::Mutex;
@@ -60,7 +60,9 @@ impl NvmeInterface {
         let io_q_size = mqes.min(128);
 
         let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_q_size)));
-        let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(1, io_q_size)))];
+        let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(
+            1, io_q_size,
+        )))];
 
         let mut interface = NvmeInterface {
             name: String::from("nvme"),
@@ -127,7 +129,11 @@ impl NvmeInterface {
 
         let tail = queue.sq_tail;
         queue.sq[tail].write(cmd);
-        queue.sq_tail = if tail + 1 >= queue.sq.len() { 0 } else { tail + 1 };
+        queue.sq_tail = if tail + 1 >= queue.sq.len() {
+            0
+        } else {
+            tail + 1
+        };
 
         // Make the SQ entry visible to the device before ringing the doorbell.
         clflush_range(&queue.sq[tail] as *const _ as usize, 64);
@@ -176,7 +182,10 @@ impl NvmeInterface {
             if spins % 256 == 0 {
                 let csts = unsafe { read_volatile((bar + NVME_REG_CSTS) as *const u32) };
                 if csts & NVME_CSTS_CFS != 0 {
-                    warn!("[nvme] controller fatal status while waiting for {}", context);
+                    warn!(
+                        "[nvme] controller fatal status while waiting for {}",
+                        context
+                    );
                     return Err(DeviceError::IoError);
                 }
             }
@@ -463,9 +472,8 @@ impl BlockScheme for NvmeInterface {
             self.io_rw(queue, false, lba, (io_len / lba_bytes - 1) as u16, io_len)?;
             clflush_range(queue.data_va, io_len);
 
-            let src = unsafe {
-                core::slice::from_raw_parts((queue.data_va + off) as *const u8, take)
-            };
+            let src =
+                unsafe { core::slice::from_raw_parts((queue.data_va + off) as *const u8, take) };
             read_buf[done..done + take].copy_from_slice(src);
 
             done += take;
@@ -495,9 +503,8 @@ impl BlockScheme for NvmeInterface {
                 let io_len = n * lba_bytes;
                 take = io_len;
 
-                let dst = unsafe {
-                    core::slice::from_raw_parts_mut(queue.data_va as *mut u8, io_len)
-                };
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(queue.data_va as *mut u8, io_len) };
                 dst.copy_from_slice(&write_buf[done..done + io_len]);
                 clflush_range(queue.data_va, io_len);
                 self.io_rw(queue, true, lba, (n - 1) as u16, io_len)?;
@@ -837,7 +844,12 @@ impl PciDriver for NvmeDriverPci {
         dev.id.class == 0x01 && dev.id.subclass == 0x08
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, _len, _, _)) = dev.bars[0] {
             if let Some(m) = mapper {
                 m.query_or_map(addr as usize, 4096 * 8);

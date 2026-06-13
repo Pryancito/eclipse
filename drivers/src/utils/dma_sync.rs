@@ -55,7 +55,13 @@ pub fn dma_sync_rx_desc_span(
     if count == 0 {
         return;
     }
-    dma_sync_region(region, coherent, start_idx * desc_size, count * desc_size, dir);
+    dma_sync_region(
+        region,
+        coherent,
+        start_idx * desc_size,
+        count * desc_size,
+        dir,
+    );
 }
 
 /// Linux `dma_sync_single_for_device` on WB pages: clflush + sfence before MMIO doorbell.

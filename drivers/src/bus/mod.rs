@@ -1,7 +1,11 @@
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64"))]
+pub mod klog;
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
 pub mod pci;
 pub mod pci_drivers;
-pub mod klog;
 
 pub fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
     unsafe { drivers_phys_to_virt(paddr) }

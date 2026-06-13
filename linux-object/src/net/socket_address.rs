@@ -206,7 +206,11 @@ impl From<Endpoint> for SockAddr {
         } else if let Endpoint::LinkLevel(link_level) = endpoint {
             let mut sll_addr = [0u8; 8];
             sll_addr.copy_from_slice(&link_level.addr);
-            let hatype = if link_level.interface_index == 1 { ARPHRD_LOOPBACK } else { ARPHRD_ETHER };
+            let hatype = if link_level.interface_index == 1 {
+                ARPHRD_LOOPBACK
+            } else {
+                ARPHRD_ETHER
+            };
             SockAddr {
                 addr_ll: SockAddrLl {
                     sll_family: AddressFamily::Packet.into(),
@@ -287,8 +291,7 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
             AddressFamily::Unix => {
                 let path = {
                     let max_path_len = if len > 2 { len - 2 } else { 0 };
-                    let path_slice =
-                        &addr.addr_un.sun_path[..core::cmp::min(max_path_len, 108)];
+                    let path_slice = &addr.addr_un.sun_path[..core::cmp::min(max_path_len, 108)];
                     let actual_len = path_slice
                         .iter()
                         .position(|&b| b == 0)
@@ -389,14 +392,18 @@ impl SockAddr {
         if written_len > 0 && !hdr.msg_name.is_null() {
             #[allow(unsafe_code)]
             unsafe {
-                let source = core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
-                info!("write_to_msg: family={}, msg_namelen={}, written_len={}, source={:x?}", self.family, hdr.msg_namelen, written_len, source);
+                let source =
+                    core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
+                info!(
+                    "write_to_msg: family={}, msg_namelen={}, written_len={}, source={:x?}",
+                    self.family, hdr.msg_namelen, written_len, source
+                );
                 // Use transmute_copy to convert UserInOutPtr<SockAddr> to UserOutPtr<u8> for byte-wise writing
                 let mut addr_ptr: UserOutPtr<u8> = core::mem::transmute_copy(&hdr.msg_name);
                 addr_ptr.write_array(source)?;
             }
         }
-        
+
         msg.write(hdr)?;
         Ok(0)
     }

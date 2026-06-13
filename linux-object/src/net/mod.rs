@@ -4,13 +4,13 @@
 /// missing documentation
 #[macro_use]
 pub mod socket_address;
+use crate::error::{LxError, LxResult};
 use crate::fs::{FileDesc, FileLike, PollEvents};
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::error::{LxError, LxResult};
-use kernel_hal::user::{IoVecOut, UserInPtr, UserInOutPtr};
+use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
+use log::*;
 use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
 pub use socket_address::*;
-use log::*;
 
 pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -19,7 +19,11 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
 
 fn loopback_tx_handler(packet: &[u8]) {
     let version = packet.get(0).map(|b| b >> 4).unwrap_or(4);
-    info!("[loopback tx] packet version={}, len={}", version, packet.len());
+    info!(
+        "[loopback tx] packet version={}, len={}",
+        version,
+        packet.len()
+    );
     let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
     const FRAME_CAP: usize = 2048;
     let payload_len = packet.len().min(FRAME_CAP.saturating_sub(14));
@@ -102,7 +106,9 @@ pub fn iface_by_linux_ifindex(idx: u32) -> LxResult<Arc<dyn zcore_drivers::schem
 }
 
 /// Pick the Ethernet netdev for an IPv4 destination (never loopback).
-pub fn netdev_for_ipv4(dst: smoltcp::wire::Ipv4Address) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+pub fn netdev_for_ipv4(
+    dst: smoltcp::wire::Ipv4Address,
+) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
     use smoltcp::wire::IpCidr;
     let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
     for iface in get_net_device().iter() {
@@ -149,7 +155,9 @@ pub fn netdev_for_ipv4(dst: smoltcp::wire::Ipv4Address) -> LxResult<Arc<dyn zcor
 }
 
 /// Pick the Ethernet netdev for an IPv6 destination (never loopback).
-pub fn netdev_for_ipv6(dst: smoltcp::wire::Ipv6Address) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+pub fn netdev_for_ipv6(
+    dst: smoltcp::wire::Ipv6Address,
+) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
     use smoltcp::wire::IpCidr;
     let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
     for iface in get_net_device().iter() {
@@ -191,17 +199,20 @@ pub fn netdev_for_ipv6(dst: smoltcp::wire::Ipv6Address) -> LxResult<Arc<dyn zcor
 }
 
 pub fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
-    iface.get_ip_address().into_iter().find_map(|cidr| match cidr {
-        IpCidr::Ipv4(cidr) => {
-            let addr = cidr.address();
-            if addr.is_unspecified() || cidr.prefix_len() == 0 || is_ipv4_placeholder(addr) {
-                None
-            } else {
-                Some(cidr)
+    iface
+        .get_ip_address()
+        .into_iter()
+        .find_map(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => {
+                let addr = cidr.address();
+                if addr.is_unspecified() || cidr.prefix_len() == 0 || is_ipv4_placeholder(addr) {
+                    None
+                } else {
+                    Some(cidr)
+                }
             }
-        }
-        _ => None,
-    })
+            _ => None,
+        })
 }
 
 pub fn ipv4_sockaddr(addr: Ipv4Address) -> SockAddrIn {
@@ -246,7 +257,6 @@ pub fn prefix_len_from_netmask(addr: Ipv4Address) -> LxResult<u8> {
     }
     Ok(prefix_len)
 }
-
 
 /// missing documentation
 pub mod tcp;
@@ -406,7 +416,6 @@ pub const IFF_LOWER_UP: u32 = 0x1_0000;
 /// Kernel-writable bits mask for SIOCSIFFLAGS (ignored — we accept any write).
 pub const IFF_CHANGE_ALL: u32 = 0xFFFF_FFFF;
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SockAddrHw {
@@ -436,7 +445,11 @@ pub struct IfReq {
 
 impl IfReq {
     pub fn name(&self) -> &str {
-        let len = self.ifr_name.iter().position(|&b| b == 0).unwrap_or(self.ifr_name.len());
+        let len = self
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.ifr_name.len());
         core::str::from_utf8(&self.ifr_name[..len]).unwrap_or("")
     }
 }
@@ -589,7 +602,6 @@ impl MsgHdr {
     }
 }
 
-
 numeric_enum! {
     #[repr(usize)]
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -699,7 +711,9 @@ pub fn has_usable_ipv4() -> bool {
 }
 
 /// Resolve the IPv4 default gateway from routes or `.1` on the host subnet.
-pub fn ipv4_default_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smoltcp::wire::Ipv4Address> {
+pub fn ipv4_default_gateway(
+    dev: &dyn zcore_drivers::scheme::NetScheme,
+) -> Option<smoltcp::wire::Ipv4Address> {
     ipv4_gateway_from_routes(&dev.get_routes())
         .filter(|gw| !gw.is_unspecified())
         .or_else(|| infer_ipv4_gateway(dev))
@@ -837,7 +851,11 @@ pub fn drain_net_urgent() {
 }
 
 /// Register wakers for poll/epoll/select so MSI/TTY IRQs resume the task before timers.
-pub fn register_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_interactive: bool) {
+pub fn register_io_wait_wakers(
+    waker: &core::task::Waker,
+    watch_net: bool,
+    watch_interactive: bool,
+) {
     if watch_net {
         kernel_hal::net::register_net_rx_waker(waker.clone());
     }
@@ -944,17 +962,15 @@ pub fn is_local_host_ipv4(dst: smoltcp::wire::Ipv4Address) -> bool {
         return false;
     }
     get_net_device().iter().any(|dev| {
-        dev.get_ip_address().iter().any(|ip| {
-            match ip {
-                IpCidr::Ipv4(cidr) => {
-                    let addr = cidr.address();
-                    !addr.is_unspecified()
-                        && !is_ipv4_placeholder(addr)
-                        && cidr.prefix_len() > 0
-                        && addr == dst
-                }
-                _ => false,
+        dev.get_ip_address().iter().any(|ip| match ip {
+            IpCidr::Ipv4(cidr) => {
+                let addr = cidr.address();
+                !addr.is_unspecified()
+                    && !is_ipv4_placeholder(addr)
+                    && cidr.prefix_len() > 0
+                    && addr == dst
             }
+            _ => false,
         })
     })
 }
@@ -999,7 +1015,10 @@ pub fn flush_socket_egress() {
     drain_net_poll(128);
 }
 
-fn is_ipv4_on_link(dev: &dyn zcore_drivers::scheme::NetScheme, dst: smoltcp::wire::Ipv4Address) -> bool {
+fn is_ipv4_on_link(
+    dev: &dyn zcore_drivers::scheme::NetScheme,
+    dst: smoltcp::wire::Ipv4Address,
+) -> bool {
     use smoltcp::wire::IpCidr;
     dev.get_ip_address().iter().any(|cidr| match cidr {
         IpCidr::Ipv4(v4) => {
@@ -1059,7 +1078,9 @@ fn resolve_ipv4_next_hop(
 }
 
 /// Guess the default gateway when DHCP/`ip route` did not install one.
-fn infer_ipv4_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smoltcp::wire::Ipv4Address> {
+fn infer_ipv4_gateway(
+    dev: &dyn zcore_drivers::scheme::NetScheme,
+) -> Option<smoltcp::wire::Ipv4Address> {
     use smoltcp::wire::{IpCidr, Ipv4Address};
     for ip in dev.get_ip_address() {
         if let IpCidr::Ipv4(cidr) = ip {
@@ -1086,16 +1107,20 @@ fn infer_ipv4_gateway(dev: &dyn zcore_drivers::scheme::NetScheme) -> Option<smol
     None
 }
 
-fn ipv4_gateway_from_routes(routes: &[zcore_drivers::scheme::RouteInfo]) -> Option<smoltcp::wire::Ipv4Address> {
+fn ipv4_gateway_from_routes(
+    routes: &[zcore_drivers::scheme::RouteInfo],
+) -> Option<smoltcp::wire::Ipv4Address> {
     use smoltcp::wire::{IpAddress, IpCidr};
-    routes.iter().find_map(|route| match (route.dst, route.gateway) {
-        (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gw)))
-            if cidr.prefix_len() == 0 && !gw.is_unspecified() =>
-        {
-            Some(gw)
-        }
-        _ => None,
-    })
+    routes
+        .iter()
+        .find_map(|route| match (route.dst, route.gateway) {
+            (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gw)))
+                if cidr.prefix_len() == 0 && !gw.is_unspecified() =>
+            {
+                Some(gw)
+            }
+            _ => None,
+        })
 }
 
 /// Install `0.0.0.0/0` via DHCP gateway or inferred gateway on the host subnet.
@@ -1108,10 +1133,7 @@ pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
         return;
     }
     let default = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
-    if iface
-        .add_route(default, Some(IpAddress::Ipv4(gw)))
-        .is_ok()
-    {
+    if iface.add_route(default, Some(IpAddress::Ipv4(gw))).is_ok() {
         info!(
             "[net] inferred default IPv4 route via {} on {}",
             gw,
@@ -1190,8 +1212,7 @@ pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
         dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
         drain_ipv4_nic(dev.as_ref(), 4);
         if attempt + 1 < ARP_TRIES {
-            let deadline =
-                kernel_hal::timer::timer_now() + core::time::Duration::from_millis(25);
+            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(25);
             while kernel_hal::timer::timer_now() < deadline {
                 drain_ipv4_nic(dev.as_ref(), 2);
                 if arp_cache::lookup(arp_target).is_some() {
@@ -1285,7 +1306,8 @@ fn resolve_ipv6_next_hop(
 /// Send a complete IPv6 datagram on the wire.
 pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
     use smoltcp::wire::{
-        EthernetAddress, EthernetFrame, Ipv6Packet, Ipv6Repr, Icmpv6Packet, Icmpv6Repr, NdiscRepr, IpAddress, IpProtocol,
+        EthernetAddress, EthernetFrame, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol,
+        Ipv6Packet, Ipv6Repr, NdiscRepr,
     };
 
     if ip.len() < 40 {
@@ -1357,7 +1379,7 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
             target_addr: ndp_target,
             lladdr: Some(our_mac_eth),
         });
-        
+
         let ip_repr = Ipv6Repr {
             src_addr: src,
             dst_addr: solicited_node_ip,
@@ -1373,10 +1395,10 @@ pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
             eth.set_dst_addr(dst_mac);
             eth.set_src_addr(our_mac_eth);
             eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
-            
+
             let mut ip_packet = Ipv6Packet::new_unchecked(eth.payload_mut());
             ip_repr.emit(&mut ip_packet);
-            
+
             let mut icmp_packet = Icmpv6Packet::new_unchecked(ip_packet.payload_mut());
             ns_repr.emit(
                 &IpAddress::Ipv6(src),
@@ -1431,7 +1453,13 @@ fn get_ephemeral_port() -> u16 {
 // ============= Rand Port =============
 // ============= IOCTL =============
 
-pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize, ipv6: bool) -> LxResult<usize> {
+pub fn handle_net_ioctl(
+    request: usize,
+    arg1: usize,
+    _arg2: usize,
+    _arg3: usize,
+    ipv6: bool,
+) -> LxResult<usize> {
     match request {
         // SIOCGIFCONF: get list of interfaces
         SIOCGIFCONF => {
@@ -1494,7 +1522,9 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             let ifaces = get_net_device();
             for (i, iface) in ifaces.iter().enumerate() {
                 if iface.get_ifname() == ifname {
-                    ifr.ifr_ifru = IfReqUnion { ifindex: (i + 1) as i32 };
+                    ifr.ifr_ifru = IfReqUnion {
+                        ifindex: (i + 1) as i32,
+                    };
                     return Ok(0);
                 }
             }
@@ -1561,7 +1591,8 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let iface = iface_by_name(ifname)?;
             #[allow(unsafe_code)]
-            let addr = unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
+            let addr =
+                unsafe { Ipv4Address::from_bytes(&ifr.ifr_ifru.addr.sin_addr.to_ne_bytes()) };
             let prefix_len = iface_ipv4_cidr(&*iface)
                 .map(|cidr| cidr.prefix_len())
                 .unwrap_or(24); // default /24 until SIOCSIFNETMASK sets the real prefix
@@ -1576,9 +1607,7 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
         // SIOCSIFBRDADDR: set broadcast address.
         // The broadcast is fully determined by addr + netmask; we just accept the
         // write silently and return success so udhcpc / ifconfig don't error out.
-        SIOCSIFBRDADDR => {
-            Ok(0)
-        }
+        SIOCSIFBRDADDR => Ok(0),
 
         SIOCGIFBRDADDR => {
             #[allow(unsafe_code)]
@@ -1656,7 +1685,9 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let iface = iface_by_name(ifname)?;
-            ifr.ifr_ifru = IfReqUnion { ifmtu: iface.get_mtu() as i32 };
+            ifr.ifr_ifru = IfReqUnion {
+                ifmtu: iface.get_mtu() as i32,
+            };
             Ok(0)
         }
 
@@ -1687,7 +1718,12 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
                 } else {
                     iface_by_name("eth0")?
                 };
-                info!("SIOCADDRT IPv6: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, iface.get_ifname());
+                info!(
+                    "SIOCADDRT IPv6: cidr={:?}, gateway={:?}, dev={}",
+                    cidr,
+                    gateway,
+                    iface.get_ifname()
+                );
                 iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
                 Ok(0)
             } else {
@@ -1706,12 +1742,17 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
 
                 let ifname = if !rt.rt_dev.is_null() {
                     #[allow(unsafe_code)]
-                    unsafe { from_cstr(rt.rt_dev) }
+                    unsafe {
+                        from_cstr(rt.rt_dev)
+                    }
                 } else {
                     "eth0" // default to eth0 if not specified
                 };
 
-                info!("SIOCADDRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+                info!(
+                    "SIOCADDRT: cidr={:?}, gateway={:?}, dev={}",
+                    cidr, gateway, ifname
+                );
                 let iface = iface_by_name(ifname)?;
                 iface.add_route(cidr, gateway).map_err(|_| LxError::EIO)?;
                 Ok(0)
@@ -1737,7 +1778,12 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
                 } else {
                     iface_by_name("eth0")?
                 };
-                info!("SIOCDELRT IPv6: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, iface.get_ifname());
+                info!(
+                    "SIOCDELRT IPv6: cidr={:?}, gateway={:?}, dev={}",
+                    cidr,
+                    gateway,
+                    iface.get_ifname()
+                );
                 iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
                 Ok(0)
             } else {
@@ -1756,12 +1802,17 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
 
                 let ifname = if !rt.rt_dev.is_null() {
                     #[allow(unsafe_code)]
-                    unsafe { from_cstr(rt.rt_dev) }
+                    unsafe {
+                        from_cstr(rt.rt_dev)
+                    }
                 } else {
                     "eth0" // default to eth0 if not specified
                 };
 
-                info!("SIOCDELRT: cidr={:?}, gateway={:?}, dev={}", cidr, gateway, ifname);
+                info!(
+                    "SIOCDELRT: cidr={:?}, gateway={:?}, dev={}",
+                    cidr, gateway, ifname
+                );
                 let iface = iface_by_name(ifname)?;
                 iface.del_route(cidr, gateway).map_err(|_| LxError::EIO)?;
                 Ok(0)
@@ -1769,9 +1820,7 @@ pub fn handle_net_ioctl(request: usize, arg1: usize, _arg2: usize, _arg3: usize,
         }
 
         // SIOCGARP
-        SIOCGARP => {
-            Err(LxError::ENOENT)
-        }
+        SIOCGARP => Err(LxError::ENOENT),
 
         _ => Err(LxError::ENOSYS),
     }

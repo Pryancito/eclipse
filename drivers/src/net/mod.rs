@@ -10,7 +10,7 @@ pub mod e1000e;
 // pub mod ixgbe;
 pub mod loopback;
 pub use isomorphic_drivers::provider::Provider;
-pub use loopback::{LoopbackInterface, LoopbackDevice};
+pub use loopback::{LoopbackDevice, LoopbackInterface};
 
 use crate::scheme::{IrqScheme, Scheme};
 use crate::DeviceResult;
@@ -25,9 +25,10 @@ fn enqueue_pending_msi(
     vector: usize,
     dev: &Arc<dyn Scheme>,
 ) {
-    if pending.iter().any(|(v, d)| {
-        *v == vector && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(dev))
-    }) {
+    if pending
+        .iter()
+        .any(|(v, d)| *v == vector && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(dev)))
+    {
         return;
     }
     if pending.len() >= MAX_MSI_PENDING {
@@ -54,11 +55,7 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
                     crate::klog_info!("[net] IRQ vector {} registered for NIC", v);
                     let _ = host.unmask(v);
                 }
-                Err(e) => crate::klog_warn!(
-                    "[net] failed to register IRQ vector {}: {:?}",
-                    v,
-                    e
-                ),
+                Err(e) => crate::klog_warn!("[net] failed to register IRQ vector {}: {:?}", v, e),
             }
         }
     }

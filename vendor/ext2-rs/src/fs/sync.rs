@@ -679,7 +679,11 @@ impl<S: SectorSize, V: Volume<u8, S>> Iterator for Directory<S, V> {
         let len = buffer[6];
         let ty = buffer[7];
 
-        if size == 0 || size < 8 || (size as usize) > self.block_size || size % 4 != 0 {
+        if size == 0
+            || size < 8
+            || (size as usize) > self.block_size
+            || size % 4 != 0
+        {
             return None;
         }
         if (len as usize) + 8 > size as usize {
@@ -921,10 +925,15 @@ mod tests {
         let inode = found.unwrap();
         let block_size = fs.inner().block_size();
         let log_block_size = fs.inner().log_block_size();
-        println!("Found /bin/apk, size = {}, block_size = {}, log_block_size = {}", inode.size(), block_size, log_block_size);
+        println!(
+            "Found /bin/apk, size = {}, block_size = {}, log_block_size = {}",
+            inode.size(),
+            block_size,
+            log_block_size
+        );
         let mut buf = vec![0u8; inode.size()];
         let mut offset = 0;
-        
+
         for b in 0..15 {
             println!("block {}: {:?}", b, inode.try_block(b).unwrap());
         }
@@ -940,12 +949,13 @@ mod tests {
         for b in 1880..1900 {
             println!("block {}: {:?}", b, inode.try_block(b).unwrap());
         }
-        
+
         while offset < inode.size() {
             let file_block = offset / block_size;
             let block_off = offset % block_size;
             let res = inode.try_block(file_block).unwrap();
-            let take = std::cmp::min(inode.size() - offset, block_size - block_off);
+            let take =
+                std::cmp::min(inode.size() - offset, block_size - block_off);
             if let Some(disk_block) = res {
                 let byte_base = crate::sector::Address::<crate::sector::Size512>::with_block_size(
                     disk_block.get(),
@@ -953,7 +963,7 @@ mod tests {
                     log_block_size,
                 )
                 .into_index() as usize;
-                
+
                 let range = crate::sector::Address::<crate::sector::Size512>::from(byte_base as u64)..crate::sector::Address::<crate::sector::Size512>::from((byte_base + take) as u64);
                 let inner = fs.inner();
                 let slice = inner.volume.slice(range).unwrap();
@@ -963,8 +973,10 @@ mod tests {
             }
             offset += take;
         }
-        
-        let host_apk = std::fs::read("/home/moebius/eclipse2/rootfs/x86_64/bin/apk").unwrap();
+
+        let host_apk =
+            std::fs::read("/home/moebius/eclipse2/rootfs/x86_64/bin/apk")
+                .unwrap();
         assert_eq!(buf.len(), host_apk.len(), "length mismatch!");
         assert_eq!(buf, host_apk, "content mismatch!");
         println!("apk_test PASSED successfully!");

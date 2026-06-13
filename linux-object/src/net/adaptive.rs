@@ -10,10 +10,8 @@ pub(crate) const DEFERRED_NET_JOBS_PER_TICK_MAX: usize = 12;
 #[inline]
 pub(crate) fn deferred_jobs_budget(pending: usize) -> usize {
     DEFERRED_NET_JOBS_PER_TICK_BASE
-        + pending.min(
-            DEFERRED_NET_JOBS_PER_TICK_MAX
-                .saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE),
-        )
+        + pending
+            .min(DEFERRED_NET_JOBS_PER_TICK_MAX.saturating_sub(DEFERRED_NET_JOBS_PER_TICK_BASE))
 }
 
 /// Full [`super::poll_ifaces`] interval for multiplex wait loops.

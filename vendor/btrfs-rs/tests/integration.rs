@@ -46,7 +46,9 @@ fn opts() -> mkfs::MkfsOptions {
     let mut uuid = || {
         let mut u = [0u8; 16];
         for b in u.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (seed >> 33) as u8;
         }
         // RFC4122-ish version/variant bits.
@@ -132,7 +134,8 @@ fn populate_and_check() {
         off += chunk.len() as u64;
     }
     let fstab = etc_file(&mut fs, etc, "fstab");
-    fs.write(fstab, 0, b"/dev/root / btrfs defaults 0 1\n").unwrap();
+    fs.write(fstab, 0, b"/dev/root / btrfs defaults 0 1\n")
+        .unwrap();
     fs.symlink(bin, "sh", b"busybox").unwrap();
     fs.link(bin, "ash", busybox).unwrap();
     // Lots of small files to force leaf splits.
@@ -260,11 +263,16 @@ fn read_foreign_mkfs_image() {
     // into an inline file) and ensure btrfs check stays happy.
     fs.write(hello, 0, b"HELLO").unwrap();
     fs.write(small, 10, b"more data beyond inline\n").unwrap();
-    let newf = fs.create(dir, "added.txt", FileKind::Regular, 0o644, 0).unwrap();
+    let newf = fs
+        .create(dir, "added.txt", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fs.write(newf, 0, b"added after mkfs\n").unwrap();
     fs.unlink(dir, "big.bin").unwrap();
     fs.sync().unwrap();
-    assert_eq!(read_all(&mut fs, small), b"inline me\nmore data beyond inline\n");
+    assert_eq!(
+        read_all(&mut fs, small),
+        b"inline me\nmore data beyond inline\n"
+    );
     drop(fs);
     check(&path);
 
@@ -321,7 +329,9 @@ fn stress_random_ops() {
     // Simple LCG for reproducible pseudo-random decisions.
     let mut seed = 0xdead_beef_u64;
     let mut rng = move || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (seed >> 33) as usize
     };
 

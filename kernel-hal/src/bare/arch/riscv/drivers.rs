@@ -93,12 +93,7 @@ pub(super) fn init() -> DeviceResult {
                 ));
             }
             let info = display.info();
-            Some(format!(
-                "{} {}x{}",
-                display.name(),
-                info.width,
-                info.height
-            ))
+            Some(format!("{} {}x{}", display.name(), info.width, info.height))
         } else {
             None
         }

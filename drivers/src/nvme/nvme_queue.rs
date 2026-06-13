@@ -49,7 +49,12 @@ impl<P: Provider> NvmeQueue<P> {
         let (sq_va, sq_pa) = P::alloc_dma(sq_pages * P::PAGE_SIZE);
         let (cq_va, cq_pa) = P::alloc_dma(cq_pages * P::PAGE_SIZE);
 
-        trace!("data_va: {:x}, sq_pa: {:x}, cq_pa: {:x}", data_va, sq_pa, cq_pa);
+        trace!(
+            "data_va: {:x}, sq_pa: {:x}, cq_pa: {:x}",
+            data_va,
+            sq_pa,
+            cq_pa
+        );
 
         // Completion queue memory must start zeroed so the phase-bit polling
         // doesn't mistake stale data for a valid completion.
@@ -58,13 +63,11 @@ impl<P: Provider> NvmeQueue<P> {
             core::ptr::write_bytes(cq_va as *mut u8, 0, cq_pages * P::PAGE_SIZE);
         }
 
-        let submit_queue = unsafe {
-            slice::from_raw_parts_mut(sq_va as *mut Volatile<NvmeCommonCommand>, q_size)
-        };
+        let submit_queue =
+            unsafe { slice::from_raw_parts_mut(sq_va as *mut Volatile<NvmeCommonCommand>, q_size) };
 
-        let complete_queue = unsafe {
-            slice::from_raw_parts_mut(cq_va as *mut Volatile<NvmeCompletion>, q_size)
-        };
+        let complete_queue =
+            unsafe { slice::from_raw_parts_mut(cq_va as *mut Volatile<NvmeCompletion>, q_size) };
 
         NvmeQueue {
             provider: PhantomData,

@@ -305,10 +305,7 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     ];
     let mut extent_items: Vec<(Key, Vec<u8>)> = Vec::new();
     for &(bytenr, owner) in &meta_blocks {
-        extent_items.push((
-            Key::new(bytenr, METADATA_ITEM_KEY, 0),
-            metadata_item(owner),
-        ));
+        extent_items.push((Key::new(bytenr, METADATA_ITEM_KEY, 0), metadata_item(owner)));
     }
     for &(start, len, flags) in &chunks {
         let used = match flags {
@@ -430,7 +427,10 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     put_u64(
         &mut raw,
         sb::OFF_INCOMPAT_FLAGS,
-        INCOMPAT_MIXED_BACKREF | INCOMPAT_EXTENDED_IREF | INCOMPAT_SKINNY_METADATA | INCOMPAT_NO_HOLES,
+        INCOMPAT_MIXED_BACKREF
+            | INCOMPAT_EXTENDED_IREF
+            | INCOMPAT_SKINNY_METADATA
+            | INCOMPAT_NO_HOLES,
     );
     // csum_type = 0 (crc32c); root/chunk_root levels = 0.
     let dev_item = DevItem {

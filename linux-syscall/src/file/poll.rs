@@ -386,12 +386,22 @@ impl Syscall<'_> {
     }
 
     /// control interface for an epoll file descriptor
-    pub fn sys_epoll_ctl(&self, epfd: FileDesc, op: i32, fd: FileDesc, event: UserInPtr<EpollEvent>) -> SysResult {
-        info!("epoll_ctl: epfd={:?}, op={}, fd={:?}, event={:?}", epfd, op, fd, event);
+    pub fn sys_epoll_ctl(
+        &self,
+        epfd: FileDesc,
+        op: i32,
+        fd: FileDesc,
+        event: UserInPtr<EpollEvent>,
+    ) -> SysResult {
+        info!(
+            "epoll_ctl: epfd={:?}, op={}, fd={:?}, event={:?}",
+            epfd, op, fd, event
+        );
         let proc = self.linux_process();
         let epoll_file = proc.get_file_like(epfd)?;
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
-        let event = if op == 2 { // EPOLL_CTL_DEL
+        let event = if op == 2 {
+            // EPOLL_CTL_DEL
             EpollEvent { events: 0, data: 0 }
         } else {
             event.read()?
@@ -408,11 +418,16 @@ impl Syscall<'_> {
         timeout: isize,
         _sigmask: usize,
     ) -> SysResult {
-        log::trace!("epoll_pwait: epfd={:?}, maxevents={}, timeout={}", epfd, maxevents, timeout);
+        log::trace!(
+            "epoll_pwait: epfd={:?}, maxevents={}, timeout={}",
+            epfd,
+            maxevents,
+            timeout
+        );
         let proc = self.linux_process();
         let epoll_file = proc.get_file_like(epfd)?;
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
-        
+
         // TODO: handle timeout
         let res_events = epoll.wait(maxevents, proc, timeout).await?;
         events.write_array(&res_events)?;
@@ -427,7 +442,8 @@ impl Syscall<'_> {
         maxevents: usize,
         timeout: isize,
     ) -> SysResult {
-        self.sys_epoll_pwait(epfd, events, maxevents, timeout, 0).await
+        self.sys_epoll_pwait(epfd, events, maxevents, timeout, 0)
+            .await
     }
 }
 
@@ -475,7 +491,11 @@ impl FdSet {
             vec0.resize(len, 0);
             addr.write_array(&vec0)?;
             let ready = BitVec::from_slice(&vec0).unwrap();
-            Ok(FdSet { addr, origin, ready })
+            Ok(FdSet {
+                addr,
+                origin,
+                ready,
+            })
         }
     }
 

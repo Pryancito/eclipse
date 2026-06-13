@@ -103,8 +103,8 @@ impl Inode {
         size: usize,
     ) -> Result<(Inode, Address<S>), Error> {
         let inode_bytes = mem::size_of::<Inode>();
-        // Newer mke2fs uses 256-byte inode slots (rev 1); only the first 128 bytes
-        // hold the classic ext2 fields we model.
+        // Newer mke2fs uses 256-byte inode slots (rev 1); only the first 128
+        // bytes hold the classic ext2 fields we model.
         if size < inode_bytes {
             return Err(Error::OutOfBounds { index: size });
         }

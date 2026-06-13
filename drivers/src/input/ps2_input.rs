@@ -82,7 +82,7 @@ impl Ps2Input {
             status_port.write(0xD4);
             wait_write();
             data_port.write(0xF4); // Enable packet reporting command
-            
+
             // Wait for mouse ACK (0xFA)
             if wait_read() {
                 let _ack = data_port.read();
@@ -157,7 +157,7 @@ impl Scheme for Ps2Input {
                             });
                             self.listener.trigger(InputEvent {
                                 event_type: InputEventType::RelAxis,
-                                code: 1, // REL_Y
+                                code: 1,    // REL_Y
                                 value: -dy, // Invert Y delta for standard mouse behavior
                             });
 

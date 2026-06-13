@@ -1,9 +1,9 @@
+use crate::builder::IoMapper;
+use crate::bus::pci_drivers::PciDriver;
+use crate::bus::phys_to_virt;
+use crate::{Device, DeviceError, DeviceResult};
 use alloc::sync::Arc;
 use pci::{PCIDevice, BAR};
-use crate::{Device, DeviceResult, DeviceError};
-use crate::bus::pci_drivers::PciDriver;
-use crate::builder::IoMapper;
-use crate::bus::phys_to_virt;
 
 pub struct VirtIoPciDriver;
 
@@ -16,9 +16,14 @@ impl PciDriver for VirtIoPciDriver {
         vendor_id == 0x1af4
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, _irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        _irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         let device_id = dev.id.device_id;
-        
+
         warn!("VirtIO device {:x} found!", device_id);
 
         #[cfg(feature = "virtio")]
@@ -64,8 +69,7 @@ impl PciDriver for VirtIoPciDriver {
                     let common_vaddr = phys_to_virt(addr as usize + offset as usize);
 
                     let device_vaddr = if let Some((d_bar, d_offset, _)) = device_cfg {
-                        if let Some(BAR::Memory(d_addr, d_len, _, _)) = dev.bars[d_bar as usize]
-                        {
+                        if let Some(BAR::Memory(d_addr, d_len, _, _)) = dev.bars[d_bar as usize] {
                             if d_bar != bar {
                                 if let Some(m) = mapper {
                                     m.query_or_map(d_addr as usize, d_len as usize);
@@ -80,8 +84,7 @@ impl PciDriver for VirtIoPciDriver {
                     };
 
                     let notify_vaddr = if let Some((n_bar, n_offset, _)) = notify_cfg {
-                        if let Some(BAR::Memory(n_addr, n_len, _, _)) = dev.bars[n_bar as usize]
-                        {
+                        if let Some(BAR::Memory(n_addr, n_len, _, _)) = dev.bars[n_bar as usize] {
                             if n_bar != bar
                                 && n_bar != (device_cfg.map(|(b, _, _)| b).unwrap_or(255))
                             {
@@ -132,7 +135,7 @@ impl PciDriver for VirtIoPciDriver {
                 }
                 let vaddr = phys_to_virt(addr as usize);
                 let header = unsafe { &mut *(vaddr as *mut crate::virtio::VirtIOHeader) };
-                
+
                 match device_id {
                     0x1050 => {
                         if let Ok(gpu) = crate::virtio::VirtIoGpu::new(header) {
@@ -159,7 +162,7 @@ impl PciDriver for VirtIoPciDriver {
                     }
                 }
             }
-            
+
             Err(DeviceError::NotSupported)
         }
         #[cfg(not(feature = "virtio"))]

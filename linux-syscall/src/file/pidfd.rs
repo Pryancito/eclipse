@@ -3,9 +3,9 @@
 use super::*;
 use linux_object::fs::{OpenFlags, PidFd, PIDFD_THREAD};
 use linux_object::process::send_signal_to_process;
-use linux_object::signal::{Signal, SigInfo};
+use linux_object::signal::{SigInfo, Signal};
 use zircon_object::object::KoID;
-use zircon_object::task::{ROOT_JOB, Status};
+use zircon_object::task::{Status, ROOT_JOB};
 
 impl Syscall<'_> {
     /// Create a pollable file descriptor referring to `pid`.
@@ -21,9 +21,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
 
-        let process = ROOT_JOB
-            .find_process(pid as KoID)
-            .ok_or(LxError::ESRCH)?;
+        let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
 
         let mut open_flags = OpenFlags::CLOEXEC;
         if flags & NONBLOCK != 0 {
@@ -74,10 +72,7 @@ impl Syscall<'_> {
         if matches!(target_proc.status(), Status::Exited(_)) {
             return Err(LxError::ESRCH);
         }
-        let file = target_proc
-            .linux()
-            .get_file_like(targetfd.into())?
-            .dup();
+        let file = target_proc.linux().get_file_like(targetfd.into())?.dup();
         let mut open_flags = file.flags();
         open_flags |= OpenFlags::CLOEXEC;
         file.set_flags(open_flags)?;

@@ -2,13 +2,13 @@
 //! - clock_gettime
 //!
 use crate::Syscall;
+use alloc::boxed::Box;
+use core::time::Duration;
 use kernel_hal::{user::UserInPtr, user::UserOutPtr};
 use linux_object::error::{LxError, SysResult};
-use linux_object::time::*;
 use linux_object::signal::Signal;
 use linux_object::thread::ThreadExt;
-use core::time::Duration;
-use alloc::boxed::Box;
+use linux_object::time::*;
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
 
@@ -36,7 +36,11 @@ impl Syscall<'_> {
 
     /// set the time of the clock with id clockid
     pub fn sys_clock_settime(&self, clock: usize, timespec: UserInPtr<TimeSpec>) -> SysResult {
-        info!("clock_settime: id={:?} timespec={:?}", clock, timespec.read_if_not_null()?);
+        info!(
+            "clock_settime: id={:?} timespec={:?}",
+            clock,
+            timespec.read_if_not_null()?
+        );
         if clock != 0 {
             return Err(LxError::EINVAL);
         }
@@ -47,18 +51,13 @@ impl Syscall<'_> {
     }
 
     /// legacy settimeofday (seconds + microseconds since Unix epoch)
-    pub fn sys_settimeofday(
-        &mut self,
-        tv: UserInPtr<TimeVal>,
-        tz: UserInPtr<u8>,
-    ) -> SysResult {
+    pub fn sys_settimeofday(&mut self, tv: UserInPtr<TimeVal>, tz: UserInPtr<u8>) -> SysResult {
         info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
         if !tz.is_null() {
             return Err(LxError::EINVAL);
         }
         let timeval = tv.read()?;
-        let target =
-            Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
+        let target = Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
         kernel_hal::timer::wall_clock_set(target);
         Ok(0)
     }
@@ -221,20 +220,24 @@ impl Syscall<'_> {
         );
         let val = new_value.read()?;
         if val.value.sec != 0 || val.value.usec != 0 {
-            let duration = Duration::from_secs(val.value.sec as u64) + Duration::from_micros(val.value.usec as u64);
+            let duration = Duration::from_secs(val.value.sec as u64)
+                + Duration::from_micros(val.value.usec as u64);
             let deadline = kernel_hal::timer::timer_now() + duration;
             let proc = self.zircon_process().clone();
-            kernel_hal::timer::timer_set(deadline, Box::new(move |_| {
-                let tids = proc.thread_ids();
-                for tid in tids {
-                    if let Ok(obj) = proc.get_child(tid) {
-                        if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                            thread.lock_linux().signals.insert(Signal::SIGALRM);
-                            thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+            kernel_hal::timer::timer_set(
+                deadline,
+                Box::new(move |_| {
+                    let tids = proc.thread_ids();
+                    for tid in tids {
+                        if let Ok(obj) = proc.get_child(tid) {
+                            if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                                thread.lock_linux().signals.insert(Signal::SIGALRM);
+                                thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+                            }
                         }
                     }
-                }
-            }));
+                }),
+            );
         }
         if !old_value.is_null() {
             old_value.write(ITimerVal::default())?;
@@ -250,16 +253,19 @@ impl Syscall<'_> {
         let duration = Duration::from_secs(seconds as u64);
         let deadline = kernel_hal::timer::timer_now() + duration;
         let proc = self.zircon_process().clone();
-        kernel_hal::timer::timer_set(deadline, Box::new(move |_| {
-            for tid in proc.thread_ids() {
-                if let Ok(obj) = proc.get_child(tid) {
-                    if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                        thread.lock_linux().signals.insert(Signal::SIGALRM);
-                        thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+        kernel_hal::timer::timer_set(
+            deadline,
+            Box::new(move |_| {
+                for tid in proc.thread_ids() {
+                    if let Ok(obj) = proc.get_child(tid) {
+                        if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                            thread.lock_linux().signals.insert(Signal::SIGALRM);
+                            thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+                        }
                     }
                 }
-            }
-        }));
+            }),
+        );
         Ok(0)
     }
 }

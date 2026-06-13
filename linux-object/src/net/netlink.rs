@@ -7,7 +7,7 @@ use crate::{
     fs::FileLike,
     net::{
         AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST,
-        IFF_LOOPBACK, IFF_NOARP, IFF_CHANGE_ALL, IFF_LOWER_UP, IFF_RUNNING, IFF_UP,
+        IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_NOARP, IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -78,8 +78,6 @@ fn reply_nl_pid(req: &NetlinkMessageHeader, local_port: u32) -> u32 {
     }
 }
 
-
-
 #[async_trait]
 impl Socket for NetlinkSocketState {
     /// missing documentation
@@ -94,7 +92,11 @@ impl Socket for NetlinkSocketState {
                     None
                 } else {
                     let msg = buffer.remove(0);
-                    info!("[netlink] read: type={}, len={}", u16::from_le_bytes([msg[4], msg[5]]), msg.len());
+                    info!(
+                        "[netlink] read: type={}, len={}",
+                        u16::from_le_bytes([msg[4], msg[5]]),
+                        msg.len()
+                    );
                     Some(msg)
                 }
             };
@@ -114,7 +116,10 @@ impl Socket for NetlinkSocketState {
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
                 None => {
                     kernel_hal::deferred_job::drain_deferred_jobs();
-                    thread::sleep_until(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5)).await;
+                    thread::sleep_until(
+                        kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
+                    )
+                    .await;
                 }
             }
         }
@@ -130,7 +135,10 @@ impl Socket for NetlinkSocketState {
             return Err(LxError::EINVAL);
         }
         let message_type = NetlinkMessageType::from(header.nlmsg_type);
-        info!("Netlink write: message_type={:?}, len={}, seq={}, hex: {:?}", message_type, header.nlmsg_len, header.nlmsg_seq, data);
+        info!(
+            "Netlink write: message_type={:?}, len={}, seq={}, hex: {:?}",
+            message_type, header.nlmsg_len, header.nlmsg_seq, data
+        );
         let local_port = self.local_port_id();
         let reply_pid = reply_nl_pid(header, local_port);
         let mut buffer = self.data.lock();
@@ -151,7 +159,11 @@ impl Socket for NetlinkSocketState {
                     msg.push_ext(new_header);
 
                     let is_loopback = iface.get_ifname() == "loopback";
-                    let ifi_type = if is_loopback { ARPHRD_LOOPBACK } else { ARPHRD_ETHER };
+                    let ifi_type = if is_loopback {
+                        ARPHRD_LOOPBACK
+                    } else {
+                        ARPHRD_ETHER
+                    };
                     let ifi_flags = if is_loopback {
                         IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP | IFF_LOWER_UP
                     } else {
@@ -175,7 +187,11 @@ impl Socket for NetlinkSocketState {
                     push_rtattr_bytes(
                         &mut attrs,
                         RouteAttrTypes::Address.into(),
-                        if is_loopback { &[0; 6] } else { mac_addr.as_bytes() },
+                        if is_loopback {
+                            &[0; 6]
+                        } else {
+                            mac_addr.as_bytes()
+                        },
                     );
 
                     if !is_loopback {
@@ -194,21 +210,13 @@ impl Socket for NetlinkSocketState {
                     push_rtattr_bytes(&mut attrs, RouteAttrTypes::OperState.into(), &[6u8]);
 
                     // IFLA_LINK: for plain Ethernet, point to self ifindex.
-                    push_rtattr_u32(
-                        &mut attrs,
-                        RouteAttrTypes::Link.into(),
-                        (i as u32) + 1,
-                    );
+                    push_rtattr_u32(&mut attrs, RouteAttrTypes::Link.into(), (i as u32) + 1);
 
                     let ifname = iface.get_ifname();
                     // IFLA_IFNAME includes a null terminator (Linux kernel convention)
                     let mut ifname_bytes = Vec::from(ifname.as_bytes());
                     ifname_bytes.push(0u8);
-                    push_rtattr_bytes(
-                        &mut attrs,
-                        RouteAttrTypes::Ifname.into(),
-                        &ifname_bytes,
-                    );
+                    push_rtattr_bytes(&mut attrs, RouteAttrTypes::Ifname.into(), &ifname_bytes);
 
                     msg.align4();
                     msg.append(&mut attrs);
@@ -289,30 +297,19 @@ impl Socket for NetlinkSocketState {
                         let mut attrs = Vec::new();
 
                         // IFA_LOCAL and IFA_ADDRESS are both used by userland.
-                        push_rtattr_bytes(
-                            &mut attrs,
-                            IfAddrAttrTypes::Local.into(),
-                            ip_bytes,
-                        );
-                        push_rtattr_bytes(
-                            &mut attrs,
-                            IfAddrAttrTypes::Address.into(),
-                            ip_bytes,
-                        );
+                        push_rtattr_bytes(&mut attrs, IfAddrAttrTypes::Local.into(), ip_bytes);
+                        push_rtattr_bytes(&mut attrs, IfAddrAttrTypes::Address.into(), ip_bytes);
 
                         // Label (interface name) with NUL terminator.
                         let ifname = iface.get_ifname();
                         let mut ifname_bytes = Vec::from(ifname.as_bytes());
                         ifname_bytes.push(0u8);
-                        push_rtattr_bytes(
-                            &mut attrs,
-                            IfAddrAttrTypes::Label.into(),
-                            &ifname_bytes,
-                        );
+                        push_rtattr_bytes(&mut attrs, IfAddrAttrTypes::Label.into(), &ifname_bytes);
 
                         // IFA_FLAGS (musl getifaddrs / udhcpc6 expect this on IPv6 addrs).
                         if ip_bytes.len() == 16 {
-                            let flags: u32 = if ip_bytes[0] == 0xfe && (ip_bytes[1] & 0xc0) == 0x80 {
+                            let flags: u32 = if ip_bytes[0] == 0xfe && (ip_bytes[1] & 0xc0) == 0x80
+                            {
                                 0x82 // IFA_F_NODAD | IFA_F_PERMANENT
                             } else {
                                 0x80 // IFA_F_PERMANENT
@@ -487,7 +484,9 @@ impl Socket for NetlinkSocketState {
         }
         let is_dump = matches!(
             message_type,
-            NetlinkMessageType::GetLink | NetlinkMessageType::GetAddr | NetlinkMessageType::GetRoute
+            NetlinkMessageType::GetLink
+                | NetlinkMessageType::GetAddr
+                | NetlinkMessageType::GetRoute
         );
         if is_dump {
             let mut msg = Vec::new();
@@ -504,7 +503,10 @@ impl Socket for NetlinkSocketState {
             msg.align4();
             msg.set_ext(0, msg.len() as u32);
             push_netlink_rx(&mut buffer, msg);
-            info!("[netlink] write: pushed DONE, buffer len now {}", buffer.len());
+            info!(
+                "[netlink] write: pushed DONE, buffer len now {}",
+                buffer.len()
+            );
         }
         self.base.signal_set(Signal::READABLE);
         Ok(data.len())
@@ -974,19 +976,19 @@ fn push_route_dump_entry(
         IpCidr::Ipv4(cidr) => {
             let f: u16 = AddressFamily::Internet.into();
             (
-            f as u8,
-            cidr.prefix_len(),
-            cidr.address().as_bytes().to_vec(),
-            if route.gateway.is_some() { 0u8 } else { 253u8 },
+                f as u8,
+                cidr.prefix_len(),
+                cidr.address().as_bytes().to_vec(),
+                if route.gateway.is_some() { 0u8 } else { 253u8 },
             )
         }
         IpCidr::Ipv6(cidr) => {
             let f: u16 = AddressFamily::Internet6.into();
             (
-            f as u8,
-            cidr.prefix_len(),
-            cidr.address().as_bytes().to_vec(),
-            if route.gateway.is_some() { 0u8 } else { 253u8 },
+                f as u8,
+                cidr.prefix_len(),
+                cidr.address().as_bytes().to_vec(),
+                if route.gateway.is_some() { 0u8 } else { 253u8 },
             )
         }
         _ => return,
@@ -1007,11 +1009,15 @@ fn push_route_dump_entry(
         rtm_dst_len: dst_len,
         rtm_src_len: 0,
         rtm_tos: 0,
-        rtm_table: 254, // RT_TABLE_MAIN
+        rtm_table: 254,  // RT_TABLE_MAIN
         rtm_protocol: 4, // RTPROT_STATIC
         rtm_scope: scope,
         rtm_type: 2, // RTN_UNICAST
-        rtm_flags: if route.gateway.is_some() { 0x0001 | 0x0002 } else { 0x0001 },
+        rtm_flags: if route.gateway.is_some() {
+            0x0001 | 0x0002
+        } else {
+            0x0001
+        },
     };
     msg.align4();
     msg.push_ext(rtm);
@@ -1057,7 +1063,11 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32) 
     msg.push_ext(err);
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
-    info!("[netlink] push_ack: seq={}, len={}", req.nlmsg_seq, msg.len());
+    info!(
+        "[netlink] push_ack: seq={}, len={}",
+        req.nlmsg_seq,
+        msg.len()
+    );
     push_netlink_rx(buffer, msg);
 }
 
@@ -1105,5 +1115,3 @@ impl VecExt for Vec<u8> {
         self[offset..(bytes.len() + offset)].copy_from_slice(bytes);
     }
 }
-
-

@@ -11,15 +11,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // pointers here so that `linux-syscall` can call `klog_read` / `klog_buf_size`
 // without a direct crate dependency on `zcore`.
 
-static KLOG_READ_FN:  AtomicUsize = AtomicUsize::new(0);
-static KLOG_SIZE_FN:  AtomicUsize = AtomicUsize::new(0);
+static KLOG_READ_FN: AtomicUsize = AtomicUsize::new(0);
+static KLOG_SIZE_FN: AtomicUsize = AtomicUsize::new(0);
 static KLOG_EMIT_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// Called once by `zcore` at startup to register the ring-buffer accessors.
 pub fn klog_register(
-    read_fn:  fn(&mut [u8]) -> usize,
-    size_fn:  fn() -> usize,
-    emit_fn:  fn(u8, &str),
+    read_fn: fn(&mut [u8]) -> usize,
+    size_fn: fn() -> usize,
+    emit_fn: fn(u8, &str),
 ) {
     KLOG_READ_FN.store(read_fn as usize, Ordering::SeqCst);
     KLOG_SIZE_FN.store(size_fn as usize, Ordering::SeqCst);
@@ -30,7 +30,9 @@ pub fn klog_register(
 /// Returns 0 if no callback has been registered yet.
 pub fn klog_read(dst: &mut [u8]) -> usize {
     let p = KLOG_READ_FN.load(Ordering::SeqCst);
-    if p == 0 { return 0; }
+    if p == 0 {
+        return 0;
+    }
     let f: fn(&mut [u8]) -> usize = unsafe { core::mem::transmute(p) };
     f(dst)
 }
@@ -38,7 +40,9 @@ pub fn klog_read(dst: &mut [u8]) -> usize {
 /// Total bytes currently stored in the kernel log ring buffer.
 pub fn klog_buf_size() -> usize {
     let p = KLOG_SIZE_FN.load(Ordering::SeqCst);
-    if p == 0 { return 0; }
+    if p == 0 {
+        return 0;
+    }
     let f: fn() -> usize = unsafe { core::mem::transmute(p) };
     f()
 }
@@ -58,8 +62,6 @@ pub fn klog_emit(priority: u8, msg: &str) {
     let f: fn(u8, &str) = unsafe { core::mem::transmute(p) };
     f(priority, msg);
 }
-
-
 
 struct SerialWriter;
 
@@ -202,7 +204,7 @@ pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         maybe_clear_graphic_before_write();
-        // Use try_lock to avoid deadlock if an IRQ tries to log while 
+        // Use try_lock to avoid deadlock if an IRQ tries to log while
         // the console is scrolling.
         if let Some(mut g) = cons.try_lock() {
             let _ = g.write_str(s);

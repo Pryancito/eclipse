@@ -173,7 +173,8 @@ impl INode for BlockDev {
                 out_ptr.write(legacy).map_err(|_| FsError::InvalidParam)?;
                 Ok(0)
             }
-            0x0000_125f => { // BLKRRPART
+            0x0000_125f => {
+                // BLKRRPART
                 crate::fs::rescan_partitions(&self.name, &self.block, self.index)
                     .map_err(|_| FsError::DeviceError)?;
                 Ok(0)
@@ -312,12 +313,24 @@ pub fn scan_partitions(block: &Arc<dyn BlockScheme>) -> alloc::vec::Vec<(usize, 
                 let partition_entry = &gpt_buffer.0[offset..offset + 128];
                 if !partition_entry.iter().all(|&b| b == 0) {
                     let start_sector = u64::from_le_bytes([
-                        partition_entry[32], partition_entry[33], partition_entry[34], partition_entry[35],
-                        partition_entry[36], partition_entry[37], partition_entry[38], partition_entry[39],
+                        partition_entry[32],
+                        partition_entry[33],
+                        partition_entry[34],
+                        partition_entry[35],
+                        partition_entry[36],
+                        partition_entry[37],
+                        partition_entry[38],
+                        partition_entry[39],
                     ]) as usize;
                     let end_sector = u64::from_le_bytes([
-                        partition_entry[40], partition_entry[41], partition_entry[42], partition_entry[43],
-                        partition_entry[44], partition_entry[45], partition_entry[46], partition_entry[47],
+                        partition_entry[40],
+                        partition_entry[41],
+                        partition_entry[42],
+                        partition_entry[43],
+                        partition_entry[44],
+                        partition_entry[45],
+                        partition_entry[46],
+                        partition_entry[47],
                     ]) as usize;
                     if end_sector >= start_sector && start_sector > 0 {
                         let size_sectors = end_sector - start_sector + 1;
@@ -334,10 +347,16 @@ pub fn scan_partitions(block: &Arc<dyn BlockScheme>) -> alloc::vec::Vec<(usize, 
             let part_type = partition_entry[4];
             if part_type != 0 {
                 let start_sector = u32::from_le_bytes([
-                    partition_entry[8], partition_entry[9], partition_entry[10], partition_entry[11],
+                    partition_entry[8],
+                    partition_entry[9],
+                    partition_entry[10],
+                    partition_entry[11],
                 ]) as usize;
                 let size_sectors = u32::from_le_bytes([
-                    partition_entry[12], partition_entry[13], partition_entry[14], partition_entry[15],
+                    partition_entry[12],
+                    partition_entry[13],
+                    partition_entry[14],
+                    partition_entry[15],
                 ]) as usize;
                 if size_sectors > 0 && start_sector > 0 {
                     partitions.push((start_sector, size_sectors));
@@ -347,4 +366,3 @@ pub fn scan_partitions(block: &Arc<dyn BlockScheme>) -> alloc::vec::Vec<(usize, 
     }
     partitions
 }
-

@@ -59,11 +59,8 @@ impl<'a> Ext2Editor<'a> {
 
     fn bgdt_byte_offset(&self, bg: usize) -> usize {
         let first = self.first_data_block();
-        let table_base = Address::<ext2::sector::Size512>::with_block_size(
-            first + 1,
-            0,
-            self.log_block_size(),
-        );
+        let table_base =
+            Address::<ext2::sector::Size512>::with_block_size(first + 1, 0, self.log_block_size());
         let descr_size = mem::size_of::<ext2::sys::block_group::BlockGroupDescriptor>();
         (table_base + Address::<ext2::sector::Size512>::from(bg * descr_size)).into_index() as usize
     }
@@ -143,10 +140,7 @@ impl<'a> Ext2Editor<'a> {
     fn write_raw_inode(&self, inode_num: u32, inode: &RawInode) -> Result<()> {
         let offset = self.inode_byte_offset(inode_num);
         let bytes = unsafe {
-            core::slice::from_raw_parts(
-                inode as *const RawInode as *const u8,
-                self.inode_size(),
-            )
+            core::slice::from_raw_parts(inode as *const RawInode as *const u8, self.inode_size())
         };
         self.fs
             .device
@@ -406,7 +400,7 @@ impl<'a> Ext2Editor<'a> {
             let beyond_single = n.saturating_sub(12 + bs4);
             if beyond_single > 0 {
                 total += 1; // doubly-indirect block
-                // singly-indirect children hanging off the doubly tree
+                            // singly-indirect children hanging off the doubly tree
                 total += (beyond_single.min(bs4 * bs4) + bs4 - 1) / bs4;
                 let beyond_double = n.saturating_sub(12 + bs4 + bs4 * bs4);
                 if beyond_double > 0 {
@@ -421,12 +415,7 @@ impl<'a> Ext2Editor<'a> {
 
     fn read_u32_at(block: &[u8], index: usize) -> u32 {
         let off = index * 4;
-        u32::from_le_bytes([
-            block[off],
-            block[off + 1],
-            block[off + 2],
-            block[off + 3],
-        ])
+        u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]])
     }
 
     fn write_u32_at(block: &mut [u8], index: usize, value: u32) {
@@ -528,8 +517,7 @@ impl<'a> Ext2Editor<'a> {
         // (size+511)/512 into it. Treating such an inode as block-mapped would
         // interpret the target text as block numbers — EIO on lstat/readlink
         // and bogus block frees on unlink.
-        raw.type_perm.contains(TypePerm::SYMLINK)
-            && Self::inode_full_size(raw) <= FAST_SYMLINK_LEN
+        raw.type_perm.contains(TypePerm::SYMLINK) && Self::inode_full_size(raw) <= FAST_SYMLINK_LEN
     }
 
     fn unpack_fast_symlink(raw: &RawInode) -> Vec<u8> {
@@ -636,7 +624,12 @@ impl<'a> Ext2Editor<'a> {
         Ok(out)
     }
 
-    pub(crate) fn write_symlink(&self, inode_num: u32, offset: usize, data: &[u8]) -> Result<usize> {
+    pub(crate) fn write_symlink(
+        &self,
+        inode_num: u32,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize> {
         let mut raw = self.read_raw_inode(inode_num)?;
         if !raw.type_perm.contains(TypePerm::SYMLINK) {
             return Err(FsError::NotSupported);
@@ -1223,11 +1216,7 @@ impl<'a> Ext2Editor<'a> {
         mode: u32,
         rdev: usize,
     ) -> Result<u32> {
-        if !self
-            .fs
-            .inode_from_num(parent_num as usize)?
-            .is_dir()
-        {
+        if !self.fs.inode_from_num(parent_num as usize)?.is_dir() {
             return Err(FsError::NotDir);
         }
         if self.lookup_in_dir(parent_num, name).is_ok() {
@@ -1388,11 +1377,7 @@ impl<'a> Ext2Editor<'a> {
     }
 
     pub fn link(&self, parent_num: u32, name: &str, target_inode: u32) -> Result<()> {
-        if !self
-            .fs
-            .inode_from_num(parent_num as usize)?
-            .is_dir()
-        {
+        if !self.fs.inode_from_num(parent_num as usize)?.is_dir() {
             return Err(FsError::NotDir);
         }
         if self.lookup_in_dir(parent_num, name).is_ok() {

@@ -1,8 +1,8 @@
 //! Virtual memory operations.
 
 use core::fmt::{Debug, Formatter, Result};
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::slice;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use lock::Mutex;
 use riscv::{asm, register::satp};

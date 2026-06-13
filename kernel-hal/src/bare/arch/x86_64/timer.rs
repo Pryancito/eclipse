@@ -170,10 +170,7 @@ fn read_rtc_epoch() -> Option<u64> {
         if days < 0 {
             return None;
         }
-        let secs = days as u64 * 86_400
-            + hour as u64 * 3_600
-            + min as u64 * 60
-            + sec as u64;
+        let secs = days as u64 * 86_400 + hour as u64 * 3_600 + min as u64 * 60 + sec as u64;
         Some(secs)
     }
 }

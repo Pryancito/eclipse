@@ -35,7 +35,6 @@ impl MountBackend {
             _ => Err(FsError::NotSupported),
         }
     }
-
 }
 
 /// Byte-oriented device over a block driver.
@@ -198,10 +197,7 @@ const EXT2_SUPERBLOCK_SECTOR: usize = 2;
 /// block-group table and stall boot for a long time.
 pub(crate) fn probe_ext2_superblock(block: &Arc<dyn BlockScheme>) -> bool {
     let mut sb = SectorBuf([0u8; 512]);
-    if block
-        .read_block(EXT2_SUPERBLOCK_SECTOR, &mut sb.0)
-        .is_err()
-    {
+    if block.read_block(EXT2_SUPERBLOCK_SECTOR, &mut sb.0).is_err() {
         return false;
     }
     let magic = u16::from_le_bytes([sb.0[56], sb.0[57]]);

@@ -120,7 +120,8 @@ impl Scheme for Apic {
 
 impl IrqScheme for Apic {
     fn is_valid_irq(&self, gsi: usize) -> bool {
-        self.ioapic_list.find(gsi as _).is_some() || (gsi >= X86_INT_BASE && gsi < X86_INT_LOCAL_APIC_BASE)
+        self.ioapic_list.find(gsi as _).is_some()
+            || (gsi >= X86_INT_BASE && gsi < X86_INT_LOCAL_APIC_BASE)
     }
 
     fn mask(&self, gsi: usize) -> DeviceResult {
@@ -132,7 +133,10 @@ impl IrqScheme for Apic {
             // managed at the PCI device level.
             Ok(())
         } else {
-            error!("cannot find IOAPIC for global system interrupt number {}", gsi);
+            error!(
+                "cannot find IOAPIC for global system interrupt number {}",
+                gsi
+            );
             Err(DeviceError::InvalidParam)
         }
     }
@@ -145,7 +149,10 @@ impl IrqScheme for Apic {
             // MSI vector
             Ok(())
         } else {
-            error!("cannot find IOAPIC for global system interrupt number {}", gsi);
+            error!(
+                "cannot find IOAPIC for global system interrupt number {}",
+                gsi
+            );
             Err(DeviceError::InvalidParam)
         }
     }

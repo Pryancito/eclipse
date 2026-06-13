@@ -45,16 +45,19 @@ impl Epoll {
     pub fn ctl(&self, op: i32, fd: FileDesc, event: EpollEvent) -> LxResult<usize> {
         let mut inner = self.inner.lock();
         match op {
-            1 => { // EPOLL_CTL_ADD
+            1 => {
+                // EPOLL_CTL_ADD
                 if inner.interest_list.contains_key(&fd) {
                     return Err(LxError::EEXIST);
                 }
                 inner.interest_list.insert(fd, event);
             }
-            2 => { // EPOLL_CTL_DEL
+            2 => {
+                // EPOLL_CTL_DEL
                 inner.interest_list.remove(&fd).ok_or(LxError::ENOENT)?;
             }
-            3 => { // EPOLL_CTL_MOD
+            3 => {
+                // EPOLL_CTL_MOD
                 let e = inner.interest_list.get_mut(&fd).ok_or(LxError::ENOENT)?;
                 *e = event;
             }
@@ -109,16 +112,19 @@ impl FileLike for Epoll {
 
 impl Epoll {
     /// wait for events on the interest list
-    pub async fn wait(&self, maxevents: usize, process: &crate::process::LinuxProcess, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
+    pub async fn wait(
+        &self,
+        maxevents: usize,
+        process: &crate::process::LinuxProcess,
+        timeout_msecs: isize,
+    ) -> LxResult<Vec<EpollEvent>> {
         let begin_time = kernel_hal::timer::timer_now();
         loop {
             if let Err(e) = crate::process::check_signals() {
                 return Err(e);
             }
             let interest_list = self.inner.lock().interest_list.clone();
-            let watch_net = interest_list
-                .keys()
-                .any(|fd| crate::net::fd_is_socket(*fd));
+            let watch_net = interest_list.keys().any(|fd| crate::net::fd_is_socket(*fd));
             let watch_interactive = interest_list
                 .keys()
                 .any(|fd| crate::net::fd_is_interactive(*fd));
@@ -138,7 +144,7 @@ impl Epoll {
                     if status.error {
                         ready_events |= PollEvents::ERR.bits() as u32;
                     }
-                    
+
                     if ready_events != 0 {
                         events.push(EpollEvent {
                             events: ready_events,
@@ -150,14 +156,13 @@ impl Epoll {
                     }
                 }
             }
-            
+
             if !events.is_empty() {
                 return Ok(events);
             }
 
             if timeout_msecs >= 0 {
-                let deadline =
-                    begin_time + core::time::Duration::from_millis(timeout_msecs as u64);
+                let deadline = begin_time + core::time::Duration::from_millis(timeout_msecs as u64);
                 if kernel_hal::timer::timer_now() >= deadline {
                     return Ok(Vec::new());
                 }

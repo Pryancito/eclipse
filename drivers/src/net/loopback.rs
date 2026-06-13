@@ -1,6 +1,11 @@
 // smoltcp
-use smoltcp::{iface::Interface, phy::{self, DeviceCapabilities, Medium}, time::Instant, Result};
 use alloc::collections::VecDeque;
+use smoltcp::{
+    iface::Interface,
+    phy::{self, DeviceCapabilities, Medium},
+    time::Instant,
+    Result,
+};
 
 use crate::net::get_sockets;
 use alloc::sync::Arc;
@@ -8,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use lock::Mutex;
 
-use crate::scheme::{NetScheme, Scheme, RouteInfo, NetStats};
+use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
 
 use alloc::vec::Vec;
@@ -45,7 +50,10 @@ impl<'a> phy::Device<'a> for LoopbackDevice {
     fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
         let stats = self.stats.clone();
         self.queue.pop_front().map(move |buffer| {
-            let rx = LoopbackRxToken { buffer, stats: stats.clone() };
+            let rx = LoopbackRxToken {
+                buffer,
+                stats: stats.clone(),
+            };
             let tx = LoopbackTxToken {
                 queue: &mut self.queue,
                 stats,
@@ -211,7 +219,7 @@ impl NetScheme for LoopbackInterface {
         *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
         Ok(())
     }
-    
+
     fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
         self.routes.lock().push(RouteInfo { dst: cidr, gateway });
         Ok(())
@@ -225,7 +233,7 @@ impl NetScheme for LoopbackInterface {
     fn get_routes(&self) -> Vec<RouteInfo> {
         let iface = self.iface.lock();
         let mut res = Vec::new();
-        
+
         // 1. Add tracked routes
         res.extend(self.routes.lock().clone());
 

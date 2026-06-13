@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use lock::Mutex;
 
 use smoltcp::iface::*;
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, Checksum};
+use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
 // use smoltcp::socket::SocketSet;
 use smoltcp::time::Instant;
 use smoltcp::wire::*;
@@ -178,8 +178,11 @@ impl NetScheme for RTLxInterface {
         let mut iface = self.iface.lock();
         if cidr.prefix_len() == 0 {
             match cidr {
-                IpCidr::Ipv4(_) => { let _ = iface.routes_mut().remove_default_ipv4_route(); }
-                IpCidr::Ipv6(_) => { /* no simple remove_default_ipv6_route in smoltcp but tracked in routes */ }
+                IpCidr::Ipv4(_) => {
+                    let _ = iface.routes_mut().remove_default_ipv4_route();
+                }
+                IpCidr::Ipv6(_) => { /* no simple remove_default_ipv6_route in smoltcp but tracked in routes */
+                }
                 _ => {}
             }
         }
@@ -359,7 +362,10 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
     eui64[6] = mac[4];
     eui64[7] = mac[5];
     let link_local = Ipv6Address::new(
-        0xfe80, 0, 0, 0,
+        0xfe80,
+        0,
+        0,
+        0,
         (eui64[0] as u16) << 8 | eui64[1] as u16,
         (eui64[2] as u16) << 8 | eui64[3] as u16,
         (eui64[4] as u16) << 8 | eui64[5] as u16,

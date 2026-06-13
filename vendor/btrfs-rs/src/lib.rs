@@ -19,14 +19,14 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
+pub mod alloc_ext;
 pub mod crc;
 pub mod device;
-pub mod structs;
-pub mod volume;
-pub mod tree;
-pub mod alloc_ext;
 pub mod fs;
 pub mod mkfs;
+pub mod structs;
+pub mod tree;
+pub mod volume;
 
 pub use device::BlockDevice;
 pub use fs::{Btrfs, DirEntry, FsStat, InodeStat};

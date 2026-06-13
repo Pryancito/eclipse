@@ -50,19 +50,25 @@ impl BlockDevice for FileDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset)).map_err(|_| crate::Error::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| crate::Error::Io)?;
         f.read_exact(buf).map_err(|_| crate::Error::Io)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset)).map_err(|_| crate::Error::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| crate::Error::Io)?;
         f.write_all(buf).map_err(|_| crate::Error::Io)
     }
 
     fn sync(&self) -> Result<()> {
-        self.file.lock().unwrap().sync_data().map_err(|_| crate::Error::Io)
+        self.file
+            .lock()
+            .unwrap()
+            .sync_data()
+            .map_err(|_| crate::Error::Io)
     }
 
     fn size(&self) -> u64 {

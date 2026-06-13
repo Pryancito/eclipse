@@ -98,12 +98,12 @@ impl Syscall<'_> {
         );
         const S_IFMT: usize = 0o170000;
         let file_type = match mode & S_IFMT {
-            0o010000 => FileType::NamedPipe,  // S_IFIFO
-            0o020000 => FileType::CharDevice, // S_IFCHR
+            0o010000 => FileType::NamedPipe,   // S_IFIFO
+            0o020000 => FileType::CharDevice,  // S_IFCHR
             0o060000 => FileType::BlockDevice, // S_IFBLK
-            0o140000 => FileType::Socket,     // S_IFSOCK
-            0o100000 | 0 => FileType::File,   // S_IFREG / unspecified => regular file
-            _ => return Err(LxError::EINVAL), // directories must use mkdir
+            0o140000 => FileType::Socket,      // S_IFSOCK
+            0o100000 | 0 => FileType::File,    // S_IFREG / unspecified => regular file
+            _ => return Err(LxError::EINVAL),  // directories must use mkdir
         };
         let (dir_path, file_name) = split_path(path);
         let proc = self.linux_process();

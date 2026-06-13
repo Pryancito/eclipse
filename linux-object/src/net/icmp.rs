@@ -312,9 +312,7 @@ fn is_local_host_ipv6(dst: Ipv6Address) -> bool {
     use smoltcp::wire::IpCidr;
     get_net_device().iter().any(|dev| {
         dev.get_ip_address().iter().any(|ip| match ip {
-            IpCidr::Ipv6(cidr) => {
-                cidr.prefix_len() > 0 && cidr.address() == dst
-            }
+            IpCidr::Ipv6(cidr) => cidr.prefix_len() > 0 && cidr.address() == dst,
             _ => false,
         })
     })
@@ -330,9 +328,15 @@ impl FileLike for IcmpSocketState {
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         let mut inner = self.inner.lock();
-        inner.flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner.flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner.flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        inner
+            .flags
+            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
+        inner
+            .flags
+            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
+        inner
+            .flags
+            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
         Ok(())
     }
 

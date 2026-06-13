@@ -62,37 +62,31 @@ impl Syscall<'_> {
     pub fn sys_syslog(&self, type_: i32, mut buf: UserOutPtr<u8>, len: i32) -> SysResult {
         info!("syslog: type={}, buf={:?}, len={}", type_, buf, len);
         // syslog(2) action codes
-        const SYSLOG_ACTION_CLOSE:         i32 = 0;
-        const SYSLOG_ACTION_OPEN:          i32 = 1;
-        const SYSLOG_ACTION_READ:          i32 = 2; // read & clear (we treat as READ_ALL)
-        const SYSLOG_ACTION_READ_ALL:      i32 = 3;
-        const SYSLOG_ACTION_READ_CLEAR:    i32 = 4;
-        const SYSLOG_ACTION_CLEAR:         i32 = 5;
-        const SYSLOG_ACTION_CONSOLE_OFF:   i32 = 6;
-        const SYSLOG_ACTION_CONSOLE_ON:    i32 = 7;
+        const SYSLOG_ACTION_CLOSE: i32 = 0;
+        const SYSLOG_ACTION_OPEN: i32 = 1;
+        const SYSLOG_ACTION_READ: i32 = 2; // read & clear (we treat as READ_ALL)
+        const SYSLOG_ACTION_READ_ALL: i32 = 3;
+        const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+        const SYSLOG_ACTION_CLEAR: i32 = 5;
+        const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+        const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
         const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
-        const SYSLOG_ACTION_SIZE_UNREAD:   i32 = 9;
-        const SYSLOG_ACTION_SIZE_BUFFER:   i32 = 10;
+        const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+        const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
 
         match type_ {
-            SYSLOG_ACTION_CLOSE |
-            SYSLOG_ACTION_OPEN  |
-            SYSLOG_ACTION_CLEAR |
-            SYSLOG_ACTION_CONSOLE_OFF |
-            SYSLOG_ACTION_CONSOLE_ON  |
-            SYSLOG_ACTION_CONSOLE_LEVEL => Ok(0),
+            SYSLOG_ACTION_CLOSE
+            | SYSLOG_ACTION_OPEN
+            | SYSLOG_ACTION_CLEAR
+            | SYSLOG_ACTION_CONSOLE_OFF
+            | SYSLOG_ACTION_CONSOLE_ON
+            | SYSLOG_ACTION_CONSOLE_LEVEL => Ok(0),
 
-            SYSLOG_ACTION_SIZE_BUFFER => {
-                Ok(kernel_hal::console::klog_buf_size())
-            }
+            SYSLOG_ACTION_SIZE_BUFFER => Ok(kernel_hal::console::klog_buf_size()),
 
-            SYSLOG_ACTION_SIZE_UNREAD => {
-                Ok(kernel_hal::console::klog_buf_size())
-            }
+            SYSLOG_ACTION_SIZE_UNREAD => Ok(kernel_hal::console::klog_buf_size()),
 
-            SYSLOG_ACTION_READ |
-            SYSLOG_ACTION_READ_ALL |
-            SYSLOG_ACTION_READ_CLEAR => {
+            SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
                 // A negative `len` would sign-extend to a huge `usize`, letting
                 // the read write past the (smaller) user buffer.
                 if len < 0 {

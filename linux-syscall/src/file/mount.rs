@@ -16,11 +16,7 @@ impl Syscall<'_> {
         let source = source.as_c_str()?;
         let target = target.as_c_str()?;
         let fstype = fstype.as_c_str()?;
-        let data = if data.is_null() {
-            ""
-        } else {
-            data.as_c_str()?
-        };
+        let data = if data.is_null() { "" } else { data.as_c_str()? };
         info!(
             "mount: source={:?}, target={:?}, fstype={:?}, flags={:#x}",
             source, target, fstype, flags

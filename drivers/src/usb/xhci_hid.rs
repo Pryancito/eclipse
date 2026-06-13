@@ -16,15 +16,15 @@ use core::sync::atomic::{fence, AtomicBool, Ordering};
 use lock::Mutex;
 use pci::PCIDevice;
 
+use crate::builder::IoMapper;
 use crate::bus::drivers_timer_now_as_micros;
+use crate::bus::pci_drivers::PciDriver;
 use crate::bus::{phys_to_virt, PAGE_SIZE};
 use crate::input::input_event_codes::{ev::*, key::*, rel::*, syn::*};
 use crate::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{Device, DeviceError, DeviceResult};
-use crate::bus::pci_drivers::PciDriver;
-use crate::builder::IoMapper;
 use pci::BAR;
 
 fn timer_now_us() -> u64 {
@@ -131,9 +131,10 @@ fn enqueue_pending_msi(
     vector: usize,
     dev: &Arc<dyn Scheme>,
 ) {
-    if pending.iter().any(|(v, d)| {
-        *v == vector && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(dev))
-    }) {
+    if pending
+        .iter()
+        .any(|(v, d)| *v == vector && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(dev)))
+    {
         return;
     }
     if pending.len() >= MAX_MSI_PENDING {
@@ -1061,7 +1062,10 @@ impl XhciInner {
     }
 
     fn reset_endpoint_and_dequeue(&mut self, slot: u8, dci: u8) -> DeviceResult<()> {
-        info!("[xhci] reset_endpoint_and_dequeue slot={} dci={}", slot, dci);
+        info!(
+            "[xhci] reset_endpoint_and_dequeue slot={} dci={}",
+            slot, dci
+        );
         let p_reset = self.cmd.push(trb_reset_endpoint(slot, dci))?;
         self.mmio.ring_db(0, 0);
         if let Err(e) = self.wait_cmd_phys(p_reset) {
@@ -1072,8 +1076,13 @@ impl XhciInner {
         if let Some(ring) = self.xfer_rings.get(ri).and_then(|o| o.as_ref()) {
             let deq_phys = ring.deq_phys();
             let dcs = ring.deq_cycle();
-            info!("[xhci] set tr dequeue pointer: deq_phys={:#x} dcs={}", deq_phys, dcs);
-            let p_deq = self.cmd.push(trb_set_tr_dequeue_pointer(deq_phys, dcs, slot, dci))?;
+            info!(
+                "[xhci] set tr dequeue pointer: deq_phys={:#x} dcs={}",
+                deq_phys, dcs
+            );
+            let p_deq = self
+                .cmd
+                .push(trb_set_tr_dequeue_pointer(deq_phys, dcs, slot, dci))?;
             self.mmio.ring_db(0, 0);
             if let Err(e) = self.wait_cmd_phys(p_deq) {
                 warn!("[xhci] set tr dequeue pointer command failed: {:?}", e);
@@ -1135,11 +1144,17 @@ impl XhciInner {
                             return Ok(());
                         }
                         if cc == 6 {
-                            info!("[xhci] EP0 slot={} STALL (CC=6). Clearing halt, returning OK.", slot);
+                            info!(
+                                "[xhci] EP0 slot={} STALL (CC=6). Clearing halt, returning OK.",
+                                slot
+                            );
                             let _ = self.reset_endpoint_and_dequeue(slot, 1);
                             return Ok(());
                         }
-                        warn!("[xhci] EP0 slot={} error CC={}. Intentando reset_endpoint.", slot, cc);
+                        warn!(
+                            "[xhci] EP0 slot={} error CC={}. Intentando reset_endpoint.",
+                            slot, cc
+                        );
                         let _ = self.reset_endpoint_and_dequeue(slot, 1);
                         return Err(DeviceError::IoError);
                     } else {
@@ -1158,7 +1173,10 @@ impl XhciInner {
             spin_loop();
         }
         if spins >= xhci_wait_spin_limit(timeout_us) {
-            warn!("[xhci] EP0 slot={} salió por guard de spins (timer estancado?)", slot);
+            warn!(
+                "[xhci] EP0 slot={} salió por guard de spins (timer estancado?)",
+                slot
+            );
         }
         error!(
             "[xhci] timeout EP0 slot={} ({} eventos vistos, setup={:#x})",
@@ -1752,7 +1770,10 @@ impl XhciInner {
 
         let mut raw = alloc::vec![0u8; total];
         cfgb.read_into(0, &mut raw[..total]);
-        info!("[xhci] Configuration Descriptor slot={} bytes: {:?}", slot, raw);
+        info!(
+            "[xhci] Configuration Descriptor slot={} bytes: {:?}",
+            slot, raw
+        );
         let config_val = raw.get(5).copied().unwrap_or(1).max(1);
 
         // SET_CONFIGURATION
@@ -2480,7 +2501,12 @@ impl PciDriver for XhciDriverPci {
         dev.id.class == 0x0c && dev.id.subclass == 0x03
     }
 
-    fn init(&self, dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> DeviceResult<Device> {
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
         let (addr, len) = if let Some(BAR::Memory(ba, bl, _, _)) = dev.bars[0] {
             (ba, bl as u64)
         } else {
@@ -2493,14 +2519,15 @@ impl PciDriver for XhciDriverPci {
 
         let base_addr = (addr as usize) & !0xfff;
         let offset = (addr as usize) & 0xfff;
-        let map_len = ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
+        let map_len =
+            ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
 
         if let Some(m) = mapper {
             m.query_or_map(base_addr, map_len);
         }
 
         let vaddr = crate::bus::phys_to_virt(addr as usize);
-        
+
         let vector = irq.map(|idx| idx + 32).unwrap_or(NO_MSI_VECTOR);
 
         // Handle xHCI

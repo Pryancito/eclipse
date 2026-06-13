@@ -15,7 +15,10 @@ mod trap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fncall::syscall_fn_entry;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
-pub use gdt::{logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id, write_cpu_local, write_logical_cpu_id};
+pub use gdt::{
+    logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id, write_cpu_local,
+    write_logical_cpu_id,
+};
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use trap::TrapFrame;
 
