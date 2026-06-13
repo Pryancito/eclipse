@@ -290,6 +290,13 @@ struct LinuxProcessInner {
     /// via [`LinuxProcess::set_brk`] before the first user instruction runs.
     /// Updated by `sys_brk` as the heap grows or shrinks.
     brk: usize,
+    /// Upper bound of the address range actually mapped to back the heap.
+    ///
+    /// `sys_brk` reserves heap pages in [`BRK_CHUNK`]-sized strides instead of
+    /// one VMO per user-visible grow, so the user-visible `brk` typically
+    /// trails `mapped_brk`. Lazily initialised on first `sys_brk`: a value of
+    /// 0 means "matches `brk`".
+    mapped_brk: usize,
     /// Process credentials.
     credentials: Credentials,
 }
@@ -1000,6 +1007,18 @@ impl LinuxProcess {
     /// Set the current program break.
     pub fn set_brk(&self, brk: usize) {
         self.inner.lock().brk = brk;
+    }
+
+    /// Get the heap address actually mapped by `sys_brk` (>= the user-visible
+    /// `brk` whenever the heap has been grown in chunks). Zero before the
+    /// first `sys_brk`.
+    pub fn mapped_brk(&self) -> usize {
+        self.inner.lock().mapped_brk
+    }
+
+    /// Record the new upper bound of the heap's actual mapping.
+    pub fn set_mapped_brk(&self, mapped_brk: usize) {
+        self.inner.lock().mapped_brk = mapped_brk;
     }
 
     /// Get signal action.
