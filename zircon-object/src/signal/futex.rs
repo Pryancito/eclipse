@@ -70,17 +70,70 @@ impl Futex {
     ///
     /// The owner of the futex is set to nothing, regardless of the wake count.
     pub fn wake(&self, wake_count: usize) -> usize {
-        // Pop waiters under the queue lock, but deliver the wakeups after
-        // releasing it: `Waiter::wake` takes the waiter lock, and holding
+        // Drain up to `wake_count` waiters in a single critical section,
+        // clear the owner in the same lock, then deliver wakeups after the
+        // lock is released. `Waiter::wake` takes the waiter lock, so holding
         // futex.inner -> waiter.inner here while poll/Drop take
         // waiter.inner -> futex.inner would be a lock-order inversion
-        // (deadlock under SMP).
+        // (deadlock under SMP). This collapses N lock acquires (one per
+        // waker) into one for the common case.
+        if wake_count == 0 {
+            self.inner.lock().set_owner(None);
+            return 0;
+        }
+        // Wake-one fast path (the canonical pthread_mutex_unlock case): one
+        // lock acquire, zero allocations.
+        if wake_count == 1 {
+            let waiter = {
+                let mut inner = self.inner.lock();
+                let w = inner.waiter_queue.pop_front();
+                inner.set_owner(None);
+                w
+            };
+            return match waiter {
+                Some(w) if w.wake() => 1,
+                Some(_) => {
+                    // Tombstoned (cancelled / timed out); try the next live waiter.
+                    loop {
+                        let w = self.inner.lock().waiter_queue.pop_front();
+                        match w {
+                            Some(w) if w.wake() => break 1,
+                            Some(_) => continue,
+                            None => break 0,
+                        }
+                    }
+                }
+                None => 0,
+            };
+        }
+        // Wake-many (broadcast / condvar): drain the batch under one lock,
+        // wake outside it. Trades N lock acquires for one Vec allocation.
+        let batch: alloc::vec::Vec<Arc<Waiter>> = {
+            let mut inner = self.inner.lock();
+            let take = wake_count.min(inner.waiter_queue.len());
+            let mut v = alloc::vec::Vec::with_capacity(take);
+            for _ in 0..take {
+                if let Some(w) = inner.waiter_queue.pop_front() {
+                    v.push(w);
+                }
+            }
+            inner.set_owner(None);
+            v
+        };
         let mut woken = 0;
+        for waiter in batch {
+            // Tombstoned waiters (timed-out / cancelled) return false and
+            // must not consume the wake count.
+            if waiter.wake() {
+                woken += 1;
+            }
+        }
+        // Tombstone top-up: rare path where some popped waiters were already
+        // cancelled. Keep semantics: we must wake exactly up to `wake_count`
+        // live waiters when available.
         while woken < wake_count {
             let waiter = self.inner.lock().waiter_queue.pop_front();
             match waiter {
-                // Skip waiters that were already cancelled (timed out) —
-                // their wake() returns false and must not consume the count.
                 Some(waiter) => {
                     if waiter.wake() {
                         woken += 1;
@@ -89,8 +142,21 @@ impl Futex {
                 None => break,
             }
         }
-        self.inner.lock().set_owner(None);
         woken
+    }
+
+    /// Fast comparison against the futex's current value, without taking the
+    /// queue lock or allocating a waiter.
+    ///
+    /// Used by `FUTEX_WAIT` to short-circuit `EAGAIN` when userspace already
+    /// lost the cmpxchg race — the canonical sysbench / pthread mutex hot
+    /// path. A `false` result is authoritative; a `true` result must still
+    /// be re-checked under the queue lock by the slow path.
+    pub fn value_eq(&self, expected: i32) -> bool {
+        // `Acquire` suffices: the producer (FUTEX_WAKE side) Release-stores
+        // the new value in userspace before issuing the wake; we only need
+        // happens-before with that store, not full SeqCst.
+        self.value.load(Ordering::Acquire) == expected
     }
 
     // ------ Advanced APIs on Zircon ------
@@ -215,14 +281,21 @@ impl Futex {
     /// If there is at least one thread to wake, the owner of the futex will be
     /// set to the thread which was woken. Otherwise, the futex will have no owner.
     pub fn wake_single_owner(&self) {
-        // Pop under the queue lock, wake after releasing it (lock order:
-        // never hold futex.inner while taking waiter.inner).
-        let waiter = self.inner.lock().waiter_queue.pop_front();
-        let new_owner = waiter.and_then(|waiter| {
+        // Pop the waiter and set the new owner under one lock acquire
+        // (pre-compute the next owner from the popped waiter's thread,
+        // independent of whether the wakeup itself raced with cancellation).
+        // The actual wake happens after the lock is released to preserve the
+        // futex.inner -> waiter.inner ordering ban.
+        let waiter = {
+            let mut inner = self.inner.lock();
+            let w = inner.waiter_queue.pop_front();
+            let new_owner = w.as_ref().and_then(|w| w.thread.clone());
+            inner.set_owner(new_owner);
+            w
+        };
+        if let Some(waiter) = waiter {
             waiter.wake();
-            waiter.thread.clone()
-        });
-        self.inner.lock().set_owner(new_owner);
+        }
     }
 
     /// Requeuing is a generalization of waking.

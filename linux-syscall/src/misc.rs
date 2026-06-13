@@ -156,6 +156,15 @@ impl Syscall<'_> {
             .ok_or(LxError::EINVAL)?;
         match cmd {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                // Fast-path EAGAIN: the userspace cmpxchg often loses by the
+                // time we get here (the canonical contended-mutex case in
+                // musl/glibc). Short-circuit before allocating the Waiter
+                // future and engaging the blocking machinery — the slow path
+                // re-checks under the queue lock so this is purely an
+                // optimization.
+                if !futex.value_eq(val as i32) {
+                    return Err(LxError::EAGAIN);
+                }
                 // FUTEX_WAIT_BITSET with a mask is approximated as match-any;
                 // both musl and glibc only use FUTEX_BITSET_MATCH_ANY here.
                 let future = futex.wait(val as _);
