@@ -25,6 +25,19 @@ lazy_static::lazy_static! {
 /// enough for any wall-clock we care about.
 static WALL_CLOCK_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Earliest pending timer deadline (in monotonic nanoseconds), or `u64::MAX`
+/// when no timer is registered. Maintained alongside the heap inside the
+/// `NAIVE_TIMER` lock, but readable lock-free. Lets every CPU's per-tick
+/// `timer_tick` skip the spinlock when there is nothing to expire — the
+/// common case under multi-CPU where all CPUs would otherwise contend on
+/// the timer mutex 250 times a second.
+static NEXT_DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[inline]
+fn duration_to_ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Wall-clock time (Unix epoch): monotonic since boot + adjustable offset.
 pub fn wall_clock_now() -> Duration {
     let offset = Duration::from_nanos(WALL_CLOCK_OFFSET_NS.load(Ordering::Relaxed));
@@ -57,7 +70,13 @@ hal_fn_impl! {
             // Mutex::lock() uses push_off/pop_off which already handles interrupt
             // disabling. Manual intr_off/on here would bypass the noff accounting
             // and cause "RefCell already borrowed" panics under SMP.
-            NAIVE_TIMER.lock().add(deadline, callback);
+            let mut t = NAIVE_TIMER.lock();
+            t.add(deadline, callback);
+            // Republish the new earliest deadline so other CPUs' fast-path
+            // ticks observe it. Done under the lock so concurrent updates
+            // can't race with `timer_tick`'s post-expire publish.
+            let next = t.next().map(duration_to_ns).unwrap_or(u64::MAX);
+            NEXT_DEADLINE_NS.store(next, Ordering::Release);
         }
 
         fn timer_tick() {
@@ -66,7 +85,18 @@ hal_fn_impl! {
                 not(feature = "no-pci")
             ))]
             zcore_drivers::usb::xhci_hid::poll();
-            NAIVE_TIMER.lock().expire(timer_now());
+            // Lock-free fast path: if the earliest pending deadline hasn't
+            // arrived yet, skip the mutex entirely. Saves a spinlock acquire
+            // per CPU per tick (250 Hz × N CPUs), which is the dominant
+            // contention on the timer mutex under SMP.
+            let now = timer_now();
+            if duration_to_ns(now) < NEXT_DEADLINE_NS.load(Ordering::Acquire) {
+                return;
+            }
+            let mut t = NAIVE_TIMER.lock();
+            t.expire(now);
+            let next = t.next().map(duration_to_ns).unwrap_or(u64::MAX);
+            NEXT_DEADLINE_NS.store(next, Ordering::Release);
         }
     }
 }
