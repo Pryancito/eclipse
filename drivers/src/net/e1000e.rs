@@ -1157,13 +1157,22 @@ impl E1000eHw {
         // Legacy descriptor write-back layout (no RFCTL_EXTEN):
         //   +8  u16  length
         //   +12 u8   status  (DD=bit0, EOP=bit1)
-        compiler_fence(Ordering::SeqCst);
+        //
+        // Full memory fence (not just compiler_fence) before reading the
+        // descriptor: pairs with the DMA write of (len, status) by the device.
+        // On x86 loads are TSO so this is usually unnecessary, but a hard
+        // fence here makes the read order explicit and is cheap.
+        fence(Ordering::SeqCst);
         let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
         if status & 1 == 0 {
             // DD (Descriptor Done) not set — hardware hasn't written back yet
             return None;
         }
 
+        // Acquire fence between observing DD=1 and reading length/payload.
+        // Guarantees that subsequent loads from the descriptor and the
+        // packet buffer see values at least as recent as the DD bit.
+        fence(Ordering::Acquire);
         let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
@@ -1175,6 +1184,11 @@ impl E1000eHw {
             return None;
         }
 
+        // Second acquire fence right before reading the buffer payload: the
+        // device wrote the bytes before setting DD, but spell that ordering
+        // out explicitly so the compiler and any weakly-ordered emulated
+        // memory honour it.
+        fence(Ordering::Acquire);
         // Copy packet from buffer
         let packet =
             unsafe { core::slice::from_raw_parts(self.rx_buf_vaddr(i) as *const u8, len).to_vec() };
