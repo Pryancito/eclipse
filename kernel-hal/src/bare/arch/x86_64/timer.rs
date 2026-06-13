@@ -1,10 +1,21 @@
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use spin::Once;
 use x86_64::instructions::port::Port;
 
+/// Global monotonic floor in nanoseconds. Unsynchronized per-CPU TSCs can read
+/// backwards across cores; smoltcp's TCP timers (and every sleep/timeout in the
+/// kernel) require non-decreasing time, so clamp each reading to the highest
+/// value observed on any CPU.
+static MONO_NS: AtomicU64 = AtomicU64::new(0);
+
 pub fn timer_now() -> Duration {
     let cycle = unsafe { core::arch::x86_64::_rdtsc() };
-    Duration::from_nanos(cycle * 1000 / super::cpu::cpu_frequency() as u64)
+    let ns = cycle.wrapping_mul(1000) / super::cpu::cpu_frequency() as u64;
+    // `fetch_max` returns the previous value; the effective clock is the larger
+    // of the previous floor and this reading, guaranteeing it never goes back.
+    let prev = MONO_NS.fetch_max(ns, Ordering::Relaxed);
+    Duration::from_nanos(prev.max(ns))
 }
 
 static WALL_CLOCK_INIT: Once = Once::new();
