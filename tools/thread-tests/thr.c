@@ -145,7 +145,19 @@ static i64 musl_clone(int (*fn)(void *), void *stack_top, i64 flags, void *arg,
     return ret;
 }
 
-void _start(void)
+__attribute__((used)) static void run_main(void);
+
+/* Process entry: realign rsp (kernel hands it 16-aligned; C functions
+ * expect entry-via-call alignment, rsp ≡ 8 mod 16). */
+__attribute__((naked)) void _start(void)
+{
+    __asm__ volatile("and $-16, %rsp\n\t"
+                     "xor %ebp, %ebp\n\t"
+                     "call run_main\n\t"
+                     "hlt");
+}
+
+__attribute__((used)) static void run_main(void)
 {
     print("thr: start\n");
     child_tls[0] = (u64)child_tls;

@@ -282,9 +282,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         }
         TrapReason::GernelFault(trap_num) => {
             let signal = cpu_fault_signal(trap_num);
+            let pc = thread
+                .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                .unwrap_or(0);
             warn!(
-                "cpu fault from user mode: trap={:#x} -> {:?}, pid={}",
-                trap_num, signal, pid
+                "cpu fault from user mode: trap={:#x} -> {:?}, pid={}, tid={}, pc={:#x}",
+                trap_num,
+                signal,
+                pid,
+                thread.id(),
+                pc
             );
             thread.inner().lock_linux().signals.insert(signal);
             Ok(())

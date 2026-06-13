@@ -67,16 +67,35 @@ impl LocalApic {
         unsafe { (self.inner.id() >> 24) as u8 }
     }
 
+    /// Encode an APIC id for the ICR destination as the x2apic crate expects.
+    ///
+    /// The crate writes `dest` into ICR bits 63:32 verbatim, which is the
+    /// x2APIC layout. In xAPIC (MMIO) mode the destination lives in
+    /// ICR_HIGH[31:24], so the id must be shifted — otherwise every IPI is
+    /// delivered to APIC id 0 (the BSP), and an INIT/SIPI sequence aimed at
+    /// an AP resets the boot processor instead (endless reboot loop on
+    /// machines/emulators without x2APIC).
+    fn icr_dest(dest: u32) -> u32 {
+        const IA32_APIC_BASE: u32 = 0x1B;
+        const EXTD: u64 = 1 << 10; // x2APIC mode enable
+        let apic_base = unsafe { x86_64::registers::model_specific::Msr::new(IA32_APIC_BASE).read() };
+        if apic_base & EXTD != 0 {
+            dest
+        } else {
+            dest << 24
+        }
+    }
+
     pub fn send_init_ipi(&mut self, dest: u32) {
-        unsafe { self.inner.send_init_ipi(dest) }
+        unsafe { self.inner.send_init_ipi(Self::icr_dest(dest)) }
     }
 
     pub fn send_sipi(&mut self, vector: u8, dest: u32) {
-        unsafe { self.inner.send_sipi(vector, dest) }
+        unsafe { self.inner.send_sipi(vector, Self::icr_dest(dest)) }
     }
 
     pub fn send_ipi_to(&mut self, vector: u8, dest: u32) {
-        unsafe { self.inner.send_ipi(vector, dest) }
+        unsafe { self.inner.send_ipi(vector, Self::icr_dest(dest)) }
     }
 
     pub fn eoi(&mut self) {
