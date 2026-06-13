@@ -13,7 +13,9 @@ hal_fn_impl! {
 
         fn handle_irq(vector: usize) {
             // TODO: timer and other devices with GIC interrupt controller
-            crate::drivers::all_irq().first_unwrap().handle_irq(vector);
+            // Cached primary-IRQ reference avoids the RwLock + Arc clone on
+            // each interrupt that `all_irq().first_unwrap()` would do.
+            crate::drivers::primary_irq().handle_irq(vector);
             if vector == 30 {
                 debug!("Timer");
             }
