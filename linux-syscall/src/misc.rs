@@ -2,6 +2,7 @@ use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
 use linux_object::time::*;
+use zircon_object::signal::WakeOp;
 use zircon_object::task::ThreadState;
 
 impl Syscall<'_> {
@@ -130,12 +131,26 @@ impl Syscall<'_> {
     ) -> SysResult {
         const FUTEX_WAIT: u32 = 0;
         const FUTEX_WAKE: u32 = 1;
+        const FUTEX_WAKE_OP: u32 = 5;
         const FUTEX_REQUEUE: u32 = 3;
         const FUTEX_CMP_REQUEUE: u32 = 4;
         const FUTEX_WAIT_BITSET: u32 = 9;
         const FUTEX_WAKE_BITSET: u32 = 10;
         const FUTEX_PRIVATE_FLAG: u32 = 0x80;
         const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+        const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+        const FUTEX_OP_SET: u32 = 0;
+        const FUTEX_OP_ADD: u32 = 1;
+        const FUTEX_OP_OR: u32 = 2;
+        const FUTEX_OP_ANDN: u32 = 3;
+        const FUTEX_OP_XOR: u32 = 4;
+        const FUTEX_OP_ARG_SHIFT: u32 = 8;
+        const FUTEX_OP_CMP_EQ: u32 = 0;
+        const FUTEX_OP_CMP_NE: u32 = 1;
+        const FUTEX_OP_CMP_LT: u32 = 2;
+        const FUTEX_OP_CMP_LE: u32 = 3;
+        const FUTEX_OP_CMP_GT: u32 = 4;
+        const FUTEX_OP_CMP_GE: u32 = 5;
 
         debug!(
             "Futex uaddr: {:#x}, op: {:x}, val: {}, val2(timeout_addr): {:x}",
@@ -158,6 +173,12 @@ impl Syscall<'_> {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
                 // FUTEX_WAIT_BITSET with a mask is approximated as match-any;
                 // both musl and glibc only use FUTEX_BITSET_MATCH_ANY here.
+                if cmd == FUTEX_WAIT_BITSET && val3 == 0 {
+                    return Err(LxError::EINVAL);
+                }
+                if cmd == FUTEX_WAIT_BITSET && val3 != FUTEX_BITSET_MATCH_ANY {
+                    warn!("FUTEX_WAIT_BITSET non-MATCH_ANY mask {:#x} treated as MATCH_ANY", val3);
+                }
                 let future = futex.wait(val as _);
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                 let res = if let Some(timeout) = timeout_addr.read_if_not_null()? {
@@ -186,7 +207,50 @@ impl Syscall<'_> {
                     Err(e) => Err(e.into()),
                 }
             }
-            FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(futex.wake(val as _)),
+            FUTEX_WAKE => Ok(futex.wake(val as _)),
+            FUTEX_WAKE_BITSET => {
+                if val3 == 0 {
+                    return Err(LxError::EINVAL);
+                }
+                if val3 != FUTEX_BITSET_MATCH_ANY {
+                    warn!("FUTEX_WAKE_BITSET non-MATCH_ANY mask {:#x} treated as MATCH_ANY", val3);
+                }
+                Ok(futex.wake(val as _))
+            }
+            FUTEX_WAKE_OP => {
+                let requeue_futex = self
+                    .linux_process()
+                    .get_futex(uaddr2)
+                    .ok_or(LxError::EINVAL)?;
+                let encoded_op = (val3 >> 28) & 0xf;
+                let encoded_cmp = (val3 >> 24) & 0xf;
+                let shift_arg = (encoded_op & FUTEX_OP_ARG_SHIFT) != 0;
+                let op = match encoded_op & !FUTEX_OP_ARG_SHIFT {
+                    FUTEX_OP_SET => WakeOp::Set,
+                    FUTEX_OP_ADD => WakeOp::Add,
+                    FUTEX_OP_OR => WakeOp::Or,
+                    FUTEX_OP_ANDN => WakeOp::AndN,
+                    FUTEX_OP_XOR => WakeOp::Xor,
+                    _ => return Err(LxError::EINVAL),
+                };
+                let op_arg = (((val3 >> 12) & 0xfff) as i32) << 20 >> 20;
+                let cmp_arg = ((val3 & 0xfff) as i32) << 20 >> 20;
+                let old = requeue_futex.wake_op_apply(op, op_arg, shift_arg);
+                let cmp_ok = match encoded_cmp {
+                    FUTEX_OP_CMP_EQ => old == cmp_arg,
+                    FUTEX_OP_CMP_NE => old != cmp_arg,
+                    FUTEX_OP_CMP_LT => old < cmp_arg,
+                    FUTEX_OP_CMP_LE => old <= cmp_arg,
+                    FUTEX_OP_CMP_GT => old > cmp_arg,
+                    FUTEX_OP_CMP_GE => old >= cmp_arg,
+                    _ => return Err(LxError::EINVAL),
+                };
+                let mut woken = futex.wake(val as _);
+                if cmp_ok {
+                    woken += requeue_futex.wake(val2);
+                }
+                Ok(woken)
+            }
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
                 let requeue_futex = self
                     .linux_process()

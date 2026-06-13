@@ -24,6 +24,16 @@ pub struct Futex {
 
 impl_kobject!(Futex);
 
+/// Atomic operation used by Linux FUTEX_WAKE_OP.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WakeOp {
+    Set,
+    Add,
+    Or,
+    AndN,
+    Xor,
+}
+
 #[derive(Default)]
 struct FutexInner {
     waiter_queue: VecDeque<Arc<Waiter>>,
@@ -91,6 +101,18 @@ impl Futex {
         }
         self.inner.lock().set_owner(None);
         woken
+    }
+
+    /// Apply an atomic operation to the futex value and return the previous value.
+    pub fn wake_op_apply(&self, op: WakeOp, arg: i32, shift_arg: bool) -> i32 {
+        let op_arg = if shift_arg { 1_i32.wrapping_shl(arg as u32) } else { arg };
+        match op {
+            WakeOp::Set => self.value.swap(op_arg, Ordering::SeqCst),
+            WakeOp::Add => self.value.fetch_add(op_arg, Ordering::SeqCst),
+            WakeOp::Or => self.value.fetch_or(op_arg, Ordering::SeqCst),
+            WakeOp::AndN => self.value.fetch_and(!op_arg, Ordering::SeqCst),
+            WakeOp::Xor => self.value.fetch_xor(op_arg, Ordering::SeqCst),
+        }
     }
 
     // ------ Advanced APIs on Zircon ------
