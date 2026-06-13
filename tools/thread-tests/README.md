@@ -19,3 +19,17 @@ Ambos hacen las syscalls a mano: con la instrucción `syscall` en bare metal y
 a través del puntero `rcore_syscall_entry` (parcheado por el loader) en libos.
 
 Véase el `Makefile` para compilar y ejecutar.
+
+## Verificación con sysbench real
+
+`build-sysbench.sh` compila sysbench 1.0.20 (dinámico, musl, con LuaJIT
+empaquetado) — el mismo programa que se colgaba en "Initializing worker
+threads...". Con el kernel corregido llega a "Threads started!" y completa el
+benchmark de CPU. Verificado en QEMU (`-smp 4`) con 1 y con 4 hilos:
+
+    sysbench cpu --time=10 run            -> ~240 ev/s, termina
+    sysbench cpu --time=10 --threads=4 run -> ~960 ev/s (escala ~4x), termina
+
+Si en tu sistema sysbench sigue colgándose pero estos tests pasan, casi seguro
+estás arrancando un kernel anterior a los fixes (reinstala `zcore.elf` en el
+ESP / regenera la ISO antes de probar).
