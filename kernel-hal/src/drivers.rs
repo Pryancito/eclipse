@@ -111,6 +111,19 @@ pub fn all_irq() -> &'static DeviceList<dyn IrqScheme> {
     &DEVICES.irq
 }
 
+/// Cached `&'static dyn IrqScheme` for the primary (boot-time) IRQ
+/// controller — i.e. what `all_irq().first_unwrap()` would resolve to. The
+/// IRQ-dispatch hot path runs on every interrupt (timer × 250 Hz × N CPUs,
+/// plus every device IRQ), and going through the regular accessor each time
+/// would acquire an `RwLock` and clone an `Arc` per interrupt. The primary
+/// controller is registered at boot and never replaced, so we can stash it
+/// once and hand out a borrowed reference.
+pub fn primary_irq() -> &'static (dyn IrqScheme + Send + Sync + 'static) {
+    static PRIMARY_IRQ: spin::Once<Arc<dyn IrqScheme>> = spin::Once::new();
+    let arc = PRIMARY_IRQ.call_once(|| all_irq().first_unwrap());
+    &**arc
+}
+
 /// Returns all devices which implement the [`NetScheme`].
 pub fn all_net() -> &'static DeviceList<dyn NetScheme> {
     &DEVICES.net
