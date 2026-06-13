@@ -85,11 +85,12 @@ global_asm!(
     "  mov  esp, temp_stack_top",
     // Load 64-bit GDT
     "  lgdt [gdt_64_pointer_paddr]",
-    // Far-return to 64-bit code
-    "  push 0x8",
-    "  lea  eax, [ap_start64_paddr]",
-    "  push eax",
-    "  retf",
+    // Far-jump to 64-bit code. Encoded by hand (66 EA imm32 sel16): the
+    // 16-bit push/retf pair mixes operand sizes and is fragile across
+    // hypervisors/emulators; the direct ljmpl is the canonical switch.
+    "  .byte 0x66, 0xea",
+    "  .long ap_start64_paddr",
+    "  .word 0x8",
 
     ".code64",
     "ap_trampoline64:",

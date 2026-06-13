@@ -250,7 +250,31 @@ impl Futex {
         let mut to_wake = alloc::vec::Vec::new();
         let mut to_requeue = alloc::vec::Vec::new();
         {
-            let mut inner = self.inner.lock();
+            // Hold BOTH queue locks while moving waiters: if a waiter is
+            // popped from this queue but not yet visible on the target one,
+            // a concurrent FUTEX_WAKE on the target (e.g. a mutex unlock
+            // racing musl's condvar unlock_requeue) finds an empty queue and
+            // the wakeup is lost — threads then stall until a timeout.
+            // Lock in address order so two concurrent requeues with swapped
+            // futexes cannot deadlock (ABBA).
+            let this = self as *const Futex;
+            let that = Arc::as_ptr(requeue_futex);
+            if this == that {
+                // Requeueing a futex onto itself is meaningless and would
+                // self-deadlock below; treat it as a plain wake.
+                drop(to_wake);
+                let woken = self.wake(wake_count);
+                let _ = woken;
+                return Ok(());
+            }
+            let (mut inner, mut new_inner);
+            if (this as usize) <= (that as usize) {
+                inner = self.inner.lock();
+                new_inner = requeue_futex.inner.lock();
+            } else {
+                new_inner = requeue_futex.inner.lock();
+                inner = self.inner.lock();
+            }
             if check_value {
                 // check value (under the queue lock, like FUTEX_WAIT does)
                 if self.value.load(Ordering::SeqCst) != current_value {
@@ -265,21 +289,20 @@ impl Futex {
                 }
             }
             let requeue_count = requeue_count.min(inner.waiter_queue.len());
-            to_requeue.extend(inner.waiter_queue.drain(..requeue_count));
-            inner.set_owner(None);
-        }
-        // Retarget waiters outside the queue locks (`reset_futex` takes the
-        // waiter lock; holding futex.inner here would invert the poll/Drop
-        // lock order), then publish them on the new queue.
-        for waiter in &to_requeue {
-            waiter.reset_futex(requeue_futex.clone());
-        }
-        {
-            let mut new_inner = requeue_futex.inner.lock();
-            for waiter in to_requeue {
-                new_inner.waiter_queue.push_back(waiter);
+            for waiter in inner.waiter_queue.drain(..requeue_count) {
+                new_inner.waiter_queue.push_back(waiter.clone());
+                to_requeue.push(waiter);
             }
+            inner.set_owner(None);
             new_inner.set_owner(new_requeue_owner);
+        }
+        // Retarget waiters after releasing the queue locks (`reset_futex`
+        // takes the waiter lock; taking it under futex.inner would invert
+        // the poll/Drop lock order). A waiter cancelled in this window
+        // searches its old queue, misses, and stays tombstoned on the new
+        // queue, where wake() skips it without consuming a count.
+        for waiter in to_requeue {
+            waiter.reset_futex(requeue_futex.clone());
         }
         // Deliver wakeups last, with no futex lock held.
         for waiter in to_wake {
