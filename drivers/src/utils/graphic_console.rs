@@ -113,6 +113,16 @@ impl LinearScrollbackBuffer {
             .present_with_cursor(&*self.display, cursor, CHAR_WIDTH, CHAR_HEIGHT);
     }
 
+    /// Repaint the whole screen from the backing buffer into the shadow.
+    ///
+    /// Used when this VT becomes the active one (a different VT or a graphics
+    /// client may have left arbitrary pixels on screen), so the shadow is first
+    /// cleared to black and then every cell is redrawn.
+    pub fn repaint_all(&mut self) {
+        self.shadow.clear(0x0000_0000);
+        self.redraw();
+    }
+
     pub fn scroll_history(&mut self, direction: i32) {
         let height = self.height();
         let scroll_amount = (height as i32 - 2).max(1);
@@ -320,6 +330,12 @@ impl GraphicConsole {
     /// without touching the text content.
     pub fn set_cursor_blink(&mut self, visible: bool) {
         self.inner.buf_mut().present(visible);
+    }
+
+    /// Repaint the entire screen from the backing buffer (e.g. on VT switch).
+    pub fn repaint(&mut self) {
+        self.inner.buf_mut().repaint_all();
+        self.present();
     }
 }
 
