@@ -1204,24 +1204,16 @@ impl E1000eHw {
         // SEQ = sequence, CXE = carrier extension, RXE = generic RX data
         // error. Any of these means the frame itself is unreliable at the
         // link layer; drop it so smoltcp never sees corrupt bytes.
+        //
+        // NOTE: we DELIBERATELY do NOT drop on IPE/TCPE (L3/L4 checksum
+        // errors). QEMU's e1000e emulator can flag those bits on legitimate
+        // packets for cases the spec calls out (encapsulation it doesn't
+        // recognise, fragmented IP, GSO/segmentation artifacts), which
+        // caused mass spurious drops (apk went from ~20% to ~100% failure).
+        // smoltcp re-verifies the TCP/IP checksum in software anyway, so
+        // dropping at the driver level was redundant and dangerous.
         const ERR_FRAME_MASK: u8 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 7);
         if errors & ERR_FRAME_MASK != 0 {
-            self.stats.rx_dropped += 1;
-            unsafe {
-                self.recycle_rx_slot(i);
-            }
-            self.rx_next_to_clean = (i + 1) % NUM_RX;
-            return None;
-        }
-
-        // L3/L4 checksum errors. Only meaningful when IXSM=0 (HW actually
-        // ran the checks); for non-IP frames or fragments HW sets IXSM=1
-        // and the IPE/TCPE bits are not valid. When IXSM=0 and IPE/TCPE is
-        // set, the IP or TCP/UDP checksum failed and the payload bytes are
-        // corrupt — drop so smoltcp doesn't reassemble bad data.
-        const STATUS_IXSM: u8 = 1 << 2;
-        const ERR_CSUM_MASK: u8 = (1 << 5) | (1 << 6); // TCPE | IPE
-        if status & STATUS_IXSM == 0 && errors & ERR_CSUM_MASK != 0 {
             self.stats.rx_dropped += 1;
             unsafe {
                 self.recycle_rx_slot(i);
