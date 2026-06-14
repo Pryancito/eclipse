@@ -10,7 +10,7 @@ use crate::context::Context;
 use crate::context::ContextData as Context;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use lazy_static::*;
 use spin::{Mutex, MutexGuard};
@@ -112,9 +112,14 @@ impl ExecutorRuntime {
     }
 
     // 添加一个task，它的初始状态是 notified，也就是说它可以被执行.
-    fn add_task<F: Future<Output = ()> + 'static + Send>(&self, priority: usize, future: F) -> Key {
+    fn add_task<F: Future<Output = ()> + 'static + Send>(
+        &self,
+        priority: usize,
+        future: F,
+        affinity: Option<Arc<AtomicU64>>,
+    ) -> Key {
         debug_assert!(priority < MAX_PRIORITY);
-        self.task_collection.add_task(future)
+        self.task_collection.add_task(future, affinity)
     }
 
     fn remove_task(&self, key: Key) {
@@ -162,8 +167,13 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
     // simultaneously try to steal work.  A locked runtime is by definition
     // actively being used; we simply skip it and try again next scheduling
     // cycle rather than queue-spinning on its lock.
-    let mut best_cpu_idx = None;
-    let mut best_count = 0usize;
+    //
+    // Affinity is enforced inside `take_task` (its generator skips tasks not
+    // allowed on the current CPU), so a victim with the most tasks may still
+    // yield nothing for us. We therefore consider every non-empty victim,
+    // most-loaded first, and try them in turn until one hands us a runnable
+    // task — instead of giving up after probing a single busiest CPU.
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for (i, runtime_mutex) in GLOBAL_RUNTIME.iter().enumerate().take(num_online_cpus()) {
         if i == current_cpu {
             // Never steal from ourselves; our own collection is already empty.
@@ -171,19 +181,22 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, WakerRef, D
         }
         if let Some(runtime) = runtime_mutex.try_lock() {
             let count = runtime.task_num();
-            if count > best_count {
-                best_count = count;
-                best_cpu_idx = Some(i);
+            if count > 0 {
+                candidates.push((i, count));
             }
         }
     }
-    let cpu = best_cpu_idx?;
-    let runtime = GLOBAL_RUNTIME[cpu].lock();
-    if runtime.task_num() > 0 {
-        runtime.task_collection.take_task()
-    } else {
-        None
+    // Most-loaded victims first to spread work off the busiest cores.
+    candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for (cpu, _) in candidates {
+        let runtime = GLOBAL_RUNTIME[cpu].lock();
+        if runtime.task_num() > 0 {
+            if let Some(task) = runtime.task_collection.take_task() {
+                return Some(task);
+            }
+        }
     }
+    None
 }
 
 // per-cpu scheduler.
@@ -248,17 +261,33 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
         // work to the spawner's CPU.  spawn_task with cpu_id=None picks the
         // least-loaded CPU via a non-blocking try_lock scan, which is cheap and
         // keeps all cores busy on a many-core machine.
-        spawn_task(future, None, None)
+        spawn_task(future, None, None, None)
     }
 }
 
-/// Spawn a coroutine with `priority` and `cpu_id`
+/// Spawn a coroutine carrying a CPU affinity mask.
+///
+/// The task will only ever be placed on, and stolen by, CPUs whose bit is set
+/// in `affinity`. The mask is shared (`Arc`) so the owning thread can update it
+/// later via `sched_setaffinity`; the scheduler re-reads it on every placement
+/// and steal decision.
+pub fn spawn_with_affinity(
+    future: impl Future<Output = ()> + Send + 'static,
+    affinity: Arc<AtomicU64>,
+) {
+    super::run_with_intr_saved_off! {
+        spawn_task(future, None, None, Some(affinity))
+    }
+}
+
+/// Spawn a coroutine with `priority`, `cpu_id` and an optional affinity mask.
 /// Default priority: DEFAULT_PRIORITY
-/// Default cpu_id: the cpu with fewest number of tasks
+/// Default cpu_id: the least-loaded CPU allowed by `affinity`
 pub fn spawn_task(
     future: impl Future<Output = ()> + Send + 'static,
     priority: Option<usize>,
     cpu_id: Option<usize>,
+    affinity: Option<Arc<AtomicU64>>,
 ) {
     debug!("try to spawn {:?} {:?}", priority, cpu_id);
     let priority = priority.unwrap_or(DEFAULT_PRIORITY);
@@ -274,10 +303,24 @@ pub fn spawn_task(
         // Use try_lock() to find the least-loaded online CPU without stalling
         // callers. If a runtime is currently locked (busy), we skip it and
         // consider the others; the CPU whose runtime is unlocked and has the
-        // fewest tasks wins. Fallback to CPU 0 when every runtime is locked.
-        let mut best = 0usize;
+        // fewest tasks wins. Only CPUs allowed by the affinity mask are
+        // considered, so an affine task is born on a legal CPU instead of being
+        // placed anywhere and then bounced off by the affinity check.
+        let online = num_online_cpus();
+        let mask = affinity
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(u64::MAX);
+        // First CPU allowed by the mask, used as the fallback home when every
+        // candidate runtime is momentarily locked.
+        let mut best = (0..online)
+            .find(|&i| (mask >> i) & 1 != 0)
+            .unwrap_or(0);
         let mut best_count = usize::MAX;
-        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate().take(num_online_cpus()) {
+        for (i, rt) in GLOBAL_RUNTIME.iter().enumerate().take(online) {
+            if (mask >> i) & 1 == 0 {
+                continue;
+            }
             if let Some(rt) = rt.try_lock() {
                 let count = rt.task_num();
                 if count < best_count {
@@ -288,7 +331,7 @@ pub fn spawn_task(
         }
         &GLOBAL_RUNTIME[best]
     };
-    runtime.lock().add_task(priority, future);
+    runtime.lock().add_task(priority, future, affinity);
 }
 
 /// check whether the running coroutine of current cpu time out, if yes, we will

@@ -610,6 +610,105 @@ impl Syscall<'_> {
     //        Ok(0)
     //    }
 
+    /// Bitmask of CPUs that are currently online (logical ids `0..cpu_count`).
+    fn online_cpu_mask() -> u64 {
+        let ncpu = kernel_hal::cpu::cpu_count() as u32;
+        if ncpu >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << ncpu) - 1
+        }
+    }
+
+    /// Resolve the thread targeted by a `sched_*affinity` call.
+    ///
+    /// Per Linux semantics the `pid` argument is a TID. `pid == 0` (handled by
+    /// the callers) means the calling thread. Otherwise we search every live
+    /// process for a thread whose TID matches; failing that we treat `pid` as a
+    /// process id and return its leader thread, so `taskset -p <pid>` works for
+    /// single-threaded processes.
+    fn find_thread_by_tid(&self, pid: usize) -> Option<Arc<Thread>> {
+        let id = pid as KoID;
+        for proc in linux_object::process::all_live_processes() {
+            if let Ok(obj) = proc.get_child(id) {
+                if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                    return Some(thread);
+                }
+            }
+        }
+        let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
+        let first = *proc.thread_ids().first()?;
+        proc.get_child(first).ok()?.downcast_arc::<Thread>().ok()
+    }
+
+    /// `sched_setaffinity` sets the CPU affinity mask of the thread `pid`.
+    ///
+    /// The mask is masked down to the set of online CPUs; an empty effective
+    /// mask is rejected with `EINVAL`. See
+    /// [linux man sched_setaffinity(2)](https://www.man7.org/linux/man-pages/man2/sched_setaffinity.2.html).
+    pub fn sys_sched_setaffinity(
+        &self,
+        pid: usize,
+        cpusetsize: usize,
+        mask_ptr: UserInPtr<u8>,
+    ) -> SysResult {
+        info!(
+            "sched_setaffinity: pid={} cpusetsize={} mask_ptr={:?}",
+            pid, cpusetsize, mask_ptr
+        );
+        if cpusetsize == 0 {
+            return Err(LxError::EINVAL);
+        }
+        // Only the low 64 CPUs are representable (MAX_CORE_NUM == 64).
+        let n = cpusetsize.min(8);
+        let bytes = mask_ptr.read_array(n)?;
+        let mut mask = 0u64;
+        for (i, b) in bytes.iter().enumerate() {
+            mask |= (*b as u64) << (i * 8);
+        }
+        let eff = mask & Self::online_cpu_mask();
+        if eff == 0 {
+            return Err(LxError::EINVAL);
+        }
+        if pid == 0 || pid as u64 == self.thread.id() {
+            self.thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        } else {
+            let thread = self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?;
+            thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        }
+        Ok(0)
+    }
+
+    /// `sched_getaffinity` writes the CPU affinity mask of the thread `pid`
+    /// into the user buffer and returns the number of bytes written.
+    ///
+    /// See [linux man sched_getaffinity(2)](https://www.man7.org/linux/man-pages/man2/sched_getaffinity.2.html).
+    pub fn sys_sched_getaffinity(
+        &self,
+        pid: usize,
+        cpusetsize: usize,
+        mut mask_ptr: UserOutPtr<u8>,
+    ) -> SysResult {
+        info!(
+            "sched_getaffinity: pid={} cpusetsize={} mask_ptr={:?}",
+            pid, cpusetsize, mask_ptr
+        );
+        if cpusetsize == 0 {
+            return Err(LxError::EINVAL);
+        }
+        let mask = if pid == 0 || pid as u64 == self.thread.id() {
+            self.thread.affinity()
+        } else {
+            self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?.affinity()
+        } & Self::online_cpu_mask();
+        // The kernel cpumask is 8 bytes wide for up to 64 CPUs; copy out at most
+        // that many (libc zero-fills any remaining bytes of its cpu_set_t).
+        let n = cpusetsize.min(8);
+        let bytes = mask.to_le_bytes();
+        mask_ptr.write_array(&bytes[..n])?;
+        Ok(n)
+    }
+
     /// `set_tid_address` sets the clear_child_tid value for the calling thread to `tidptr`,
     /// and return the caller's thread ID
     /// (see [linux man set_tid_address(2)](https://www.man7.org/linux/man-pages/man2/set_tid_address.2.html).

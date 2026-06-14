@@ -167,6 +167,15 @@ hal_fn_def! {
         /// Spawn a new thread.
         pub fn spawn(future: impl Future<Output = ()> + Send + 'static);
 
+        /// Spawn a new thread bound to a CPU affinity mask.
+        ///
+        /// Bit `i` of `affinity` set means the thread may run on logical CPU `i`.
+        /// The mask is shared so it can be updated at runtime (e.g. via
+        /// `sched_setaffinity`); the scheduler observes changes on its next
+        /// placement or work-stealing decision. On hosted (libos) builds the
+        /// mask is ignored.
+        pub fn spawn_with_affinity(future: impl Future<Output = ()> + Send + 'static, affinity: Arc<core::sync::atomic::AtomicU64>);
+
         /// Set tid and pid of current task.
         pub fn set_current_thread(thread: Option<Arc<dyn Any + Send + Sync>>) {}
 
