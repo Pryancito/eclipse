@@ -205,6 +205,7 @@ pub fn scroll_graphic_console(direction: i32) {
     if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
         if let Some(mut g) = cons.try_lock() {
             g.buf_mut().scroll_history(direction);
+            g.present();
         }
     }
 }
@@ -219,6 +220,7 @@ pub fn graphic_console_write_str(s: &str) {
         // the console is scrolling.
         if let Some(mut g) = cons.try_lock() {
             let _ = g.write_str(s);
+            g.present();
         }
     }
 }
@@ -231,6 +233,7 @@ pub fn graphic_console_write_fmt(fmt: Arguments) {
         maybe_clear_graphic_before_write();
         if let Some(mut g) = cons.try_lock() {
             let _ = g.write_fmt(fmt);
+            g.present();
         }
     }
 }

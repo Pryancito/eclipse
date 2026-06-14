@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::bus::pci_drivers::PciDriver;
-use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
+use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
@@ -485,6 +485,19 @@ impl DisplayScheme for NvidiaGpu {
     fn fb(&self) -> FrameBuffer<'_> {
         unsafe {
             FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
+        }
+    }
+
+    /// The framebuffer is the GPU's own VRAM, mapped through the PCI BAR. The
+    /// generic 2D primitives (`fill_rect` / `copy_rect` / `blit_from`) therefore
+    /// write straight into video memory in bulk — already far cheaper than the
+    /// per-pixel MMIO path — so we advertise them as accelerated. (A future step
+    /// would offload these to the GPU's own copy engine via command channels.)
+    fn accel_caps(&self) -> AccelCaps {
+        AccelCaps {
+            fill: true,
+            copy: true,
+            blit: true,
         }
     }
 }
