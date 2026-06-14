@@ -1611,7 +1611,6 @@ impl E1000eInterface {
             let mut hw = self.driver.hw.lock();
             hw.tune_itr(now, had_rx);
         }
-        self.ims_rearm();
 
         if had_rx {
             super::wake_net_rx_waiters();
@@ -1660,7 +1659,13 @@ impl Scheme for E1000eInterface {
                 me.schedule_watchdog(true);
             }
             let _ = me.poll_with_irq_hint(icr);
+            // Clear poll_pending BEFORE re-arming IMS so that any IRQ that fires
+            // after ims_rearm() finds poll_pending=false and properly queues a new
+            // deferred job.  With IMS masked throughout the poll, new packets
+            // accumulate in ICR; re-arming causes the NIC to re-assert the IRQ for
+            // those accumulated bits.
             poll_pending.store(false, Ordering::SeqCst);
+            me.ims_rearm();
         });
     }
 }
@@ -1753,7 +1758,9 @@ impl NetScheme for E1000eInterface {
             || unsafe { mmio_read(self.base, E1000E_STATUS) & STATUS_LU != 0 }
     }
     fn poll(&self) -> DeviceResult {
-        self.poll_with_irq_hint(0)
+        self.poll_with_irq_hint(0)?;
+        self.ims_rearm();
+        Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         if let Some(pkt) = self.driver.hw.lock().receive() {
