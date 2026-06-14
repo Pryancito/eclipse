@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use kernel_hal::context::{UserContext, UserContextField};
+use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{wait_child, wait_child_any};
 use linux_object::signal::SigInfo;
@@ -90,7 +91,7 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
+    fn fork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
         let path = new_proc.linux().execute_path();
@@ -109,17 +110,10 @@ impl Syscall<'_> {
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
-        Ok(new_proc.id() as usize)
+        Ok(new_proc)
     }
 
-    /// `sys_vfork`, just like [`Self::sys_fork`], creates a child process of the calling process
-    /// (see [linux man vfork(2)](https://www.man7.org/linux/man-pages/man2/vfork.2.html)).
-    /// For details, see [`Self::sys_fork`].
-    ///
-    /// `sys_vfork` differs from [`Self::sys_fork`] in that the calling thread is suspended until the child terminates
-    /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
-    /// or it makes a call to [`Self::sys_execve`].
-    pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
+    async fn vfork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         self.zircon_process().vmar().dump();
         let new_proc = Process::fork_from(self.zircon_process(), true)?;
@@ -136,16 +130,26 @@ impl Syscall<'_> {
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
 
-        let new_proc: Arc<dyn KernelObject> = new_proc;
+        let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
             "vfork: {} -> {}. Waiting for execve SIGNALED",
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc
+        new_proc_obj
             .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
             .await; // wait for execve or termination
-        Ok(new_proc.id() as usize)
+        Ok(new_proc)
+    }
+
+    /// `sys_fork` creates a child process.
+    pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
+        self.fork_impl(newsp, newtls).map(|proc| proc.id() as usize)
+    }
+
+    /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
+    pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
+        self.vfork_impl(newsp, newtls).await.map(|proc| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -169,20 +173,23 @@ impl Syscall<'_> {
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
+        if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
+            return Err(LxError::EINVAL);
+        }
         // Fork-like clones: if the THREAD bit is not set, the caller wants a
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
         // and other combinations used by musl/glibc fork/posix_spawn/system().
         if !clone_flags.contains(CloneFlags::THREAD) {
-            let pid = if clone_flags.contains(CloneFlags::VFORK) {
+            let process = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                self.sys_vfork(newsp, newtls).await?
+                self.vfork_impl(newsp, newtls).await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.sys_fork(newsp, newtls)?
+                self.fork_impl(newsp, newtls)?
             };
+            let pid = process.id() as usize;
 
             if clone_flags.contains(CloneFlags::PIDFD) {
-                let process = zircon_object::task::ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
                 let pidfd = linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
                 let fd = self.linux_process().add_file(pidfd)?;
                 parent_tid.write(fd.into())?;
@@ -329,8 +336,8 @@ impl Syscall<'_> {
         infop: UserOutPtr<SigInfo>,
         options: u32,
     ) -> SysResult {
-        // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT
-        let valid_mask = 0x0100_0000 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008;
+        // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WCLONE | __WALL
+        let valid_mask = 0x0100_0000 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
         if (options & !valid_mask) != 0 {
             return Err(LxError::EINVAL);
         }
@@ -347,6 +354,9 @@ impl Syscall<'_> {
                 const WEXITED   = 0x0000_0004;
                 const WCONTINUED = 0x0000_0008;
                 const WNOWAIT   = 0x0100_0000;
+                const WNOTHREAD = 0x2000_0000;
+                const WCLONE    = 0x4000_0000;
+                const WALL      = 0x8000_0000;
             }
         }
         let opts = WaitIdOptions::from_bits_truncate(options);
@@ -354,13 +364,16 @@ impl Syscall<'_> {
         let reap = !opts.contains(WaitIdOptions::WNOWAIT);
         let caller = self.zircon_process();
 
-        let (child_pid, status) = match idtype {
+        let res = match idtype {
             P_PID => {
                 if id == 0 {
                     return Err(LxError::EINVAL);
                 }
-                let code = wait_child(caller, id as KoID, nohang, reap).await?;
-                (id as KoID, code)
+                match wait_child(caller, id as KoID, nohang, reap).await {
+                    Ok(code) => Ok((id as KoID, code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_PIDFD => {
                 let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(id.into())?)?;
@@ -374,16 +387,24 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EAGAIN);
                 }
-                let code = wait_child(caller, target.id(), nohang, reap).await?;
-                (target.id(), code)
+                match wait_child(caller, target.id(), nohang, reap).await {
+                    Ok(code) => Ok((target.id(), code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_ALL => {
-                let (pid, code) = wait_child_any(caller, nohang, reap).await?;
-                (pid, code)
+                match wait_child_any(caller, nohang, reap).await {
+                    Ok((pid, code)) => Ok((pid, code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_PGID => return Err(LxError::ENOSYS),
             _ => return Err(LxError::EINVAL),
         };
+
+        let (child_pid, status) = res?;
 
         if opts.contains(WaitIdOptions::WEXITED) || options == 0 {
             let exit_status = status >> 8;
