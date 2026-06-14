@@ -244,7 +244,9 @@ lazy_static! {
                         // Esc funcionen en aplicaciones de pantalla completa
                         // (nano, vi, less, ...).
                         if let Some(seq) = input_event_to_escape_seq(event.code) {
-                            cloned.push_bytes(seq);
+                            for &b in seq {
+                                cloned.push(b as char);
+                            }
                             return;
                         }
 
