@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bit_iter::BitIter;
 use core::ops::{Coroutine, CoroutineState};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 use unicycle::pin_slab::PinSlab;
 use {
@@ -29,6 +29,12 @@ pub struct Task {
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
     inner: Mutex<TaskInner>,
     finish: Arc<AtomicBool>,
+    /// Optional CPU affinity mask: bit `i` set means the task may run on the
+    /// logical CPU `i`. `None` means "run anywhere" (no restriction, no extra
+    /// allocation). The mask lives behind an `Arc<AtomicU64>` so a thread can
+    /// change its own affinity at runtime (`sched_setaffinity`) and the
+    /// scheduler observes the new value on the next placement/steal decision.
+    affinity: Option<Arc<AtomicU64>>,
 }
 
 struct TaskInner {
@@ -54,7 +60,11 @@ fn alloc_id() -> usize {
 }
 
 impl Task {
-    pub fn new(future: impl Future<Output = ()> + Send + 'static, priority: usize) -> Self {
+    pub fn new(
+        future: impl Future<Output = ()> + Send + 'static,
+        priority: usize,
+        affinity: Option<Arc<AtomicU64>>,
+    ) -> Self {
         Self {
             id: alloc_id(),
             future: Mutex::new(Box::pin(future)),
@@ -64,6 +74,19 @@ impl Task {
                 intr_enable: false,
             }),
             finish: Arc::new(AtomicBool::new(false)),
+            affinity,
+        }
+    }
+
+    /// Whether this task is allowed to be polled on the given logical CPU.
+    ///
+    /// A task with no affinity mask runs anywhere. CPU ids `>= 64` are always
+    /// allowed (the mask only tracks the first 64 logical CPUs, which matches
+    /// `MAX_CORE_NUM`).
+    pub fn allowed_on(&self, cpu: usize) -> bool {
+        match &self.affinity {
+            None => true,
+            Some(mask) => cpu >= 64 || (mask.load(Ordering::Relaxed) >> cpu) & 1 != 0,
         }
     }
     pub fn poll(&self, cx: &mut Context) -> Poll<()> {
@@ -108,8 +131,14 @@ impl FutureCollection {
 
     /// Insert a future into our scheduler returning an integer key representing this future. This
     /// key is used to index into the slab for accessing the future.
-    pub fn insert<F: Future<Output = ()> + 'static + Send>(&mut self, future: F) -> Key {
-        let key = self.slab.insert(Arc::new(Task::new(future, self.priority)));
+    pub fn insert<F: Future<Output = ()> + 'static + Send>(
+        &mut self,
+        future: F,
+        affinity: Option<Arc<AtomicU64>>,
+    ) -> Key {
+        let key = self
+            .slab
+            .insert(Arc::new(Task::new(future, self.priority, affinity)));
         // Add a new page to hold this future's status if the current page is filled.
         while key >= self.pages.len() * WAKER_PAGE_SIZE {
             self.pages.push(WakerPage::new());
@@ -154,8 +183,12 @@ impl TaskCollection {
     }
 
     /// 插入一个Future, 其优先级为 DEFAULT_PRIORITY
-    pub fn add_task<F: Future<Output = ()> + 'static + Send>(&self, future: F) -> usize {
-        self.priority_add_task(DEFAULT_PRIORITY, future)
+    pub fn add_task<F: Future<Output = ()> + 'static + Send>(
+        &self,
+        future: F,
+        affinity: Option<Arc<AtomicU64>>,
+    ) -> usize {
+        self.priority_add_task(DEFAULT_PRIORITY, future, affinity)
     }
 
     /// remove the task correponding to the key.
@@ -169,9 +202,12 @@ impl TaskCollection {
         &self,
         priority: usize,
         future: F,
+        affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
         debug_assert!(priority == DEFAULT_PRIORITY);
-        let key = self.future_collections[priority].lock().insert(future);
+        let key = self.future_collections[priority]
+            .lock()
+            .insert(future, affinity);
         debug_assert!(key < TASK_NUM_PER_PRIORITY);
         self.task_num.fetch_add(1, Ordering::Relaxed);
         key | (priority << PRIORITY_SHIFT)
@@ -217,9 +253,28 @@ impl TaskCollection {
                         let notified = page.take_notified();
                         let dropped = page.take_dropped();
                         if notified != 0 {
+                            let cpu = crate::arch::cpu_id() as usize;
                             for subpage_idx in BitIter::from(notified) {
                                 // the key corresponding to the task
-                                found_key = Some(pack_key(priority, page_idx, subpage_idx));
+                                let key = pack_key(priority, page_idx, subpage_idx);
+                                // Honor CPU affinity: a task may only be polled
+                                // on a CPU allowed by its mask. If the CPU that
+                                // is currently draining this collection (its own
+                                // executor, or a thief during work stealing) is
+                                // not allowed, re-arm the notified bit and skip
+                                // it — an allowed CPU will pick it up on its next
+                                // scan or steal. Leaving the bit set keeps the
+                                // task discoverable instead of losing the wakeup.
+                                let allowed = inner
+                                    .slab
+                                    .get(unmask_priority(key))
+                                    .map(|task| task.allowed_on(cpu))
+                                    .unwrap_or(true);
+                                if !allowed {
+                                    inner.pages[page_idx].notify(subpage_idx);
+                                    continue;
+                                }
+                                found_key = Some(key);
                                 drop(inner);
                                 yield found_key;
                                 inner = self.get_mut_inner(priority);
