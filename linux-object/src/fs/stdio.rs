@@ -228,11 +228,26 @@ lazy_static! {
                             }
                         }
 
-                        // Ctrl+C => ETX (0x03)
-                        if CTRL_DOWN.load(Ordering::SeqCst) && event.code == KEY_C {
-                            cloned.push('\u{3}');
+                        // Ctrl+<tecla> => carácter de control (Ctrl+C=0x03,
+                        // Ctrl+X=0x18, Ctrl+O=0x0f, ...). Antes solo se traducía
+                        // Ctrl+C, por lo que editores como nano nunca recibían el
+                        // resto de atajos y parecían "no reconocer las teclas Ctrl".
+                        if CTRL_DOWN.load(Ordering::SeqCst) {
+                            if let Some(c) = input_event_to_ctrl_char(event.code) {
+                                cloned.push(c);
+                                return;
+                            }
+                        }
+
+                        // Teclas de navegación => secuencias de escape ANSI/xterm,
+                        // para que flechas, Inicio/Fin, RePág/AvPág, Supr, Insert y
+                        // Esc funcionen en aplicaciones de pantalla completa
+                        // (nano, vi, less, ...).
+                        if let Some(seq) = input_event_to_escape_seq(event.code) {
+                            cloned.push_bytes(seq);
                             return;
                         }
+
                         let mods = KeyMods {
                             shift: SHIFT_DOWN.load(Ordering::SeqCst),
                             altgr: ALTGR_DOWN.load(Ordering::SeqCst),
@@ -279,6 +294,70 @@ impl KeyMods {
         } else {
             base
         }
+    }
+}
+
+/// Carácter de control generado por `Ctrl+<tecla>`.
+///
+/// `Ctrl+A`..`Ctrl+Z` => `0x01`..`0x1A` (p. ej. `Ctrl+O` = `0x0f`, `Ctrl+X` =
+/// `0x18`), más `Ctrl+Espacio` = `NUL`. Devuelve `None` para teclas sin
+/// equivalente de control, de modo que el llamador siga con el tratamiento
+/// normal del carácter.
+fn input_event_to_ctrl_char(code: u16) -> Option<char> {
+    use zcore_drivers::input::input_event_codes::key::*;
+    // ASCII: el control de una letra es su valor & 0x1f (a=0x61 -> 0x01).
+    let ctrl = |b: u8| Some((b & 0x1f) as char);
+    match code {
+        KEY_A => ctrl(b'a'),
+        KEY_B => ctrl(b'b'),
+        KEY_C => ctrl(b'c'),
+        KEY_D => ctrl(b'd'),
+        KEY_E => ctrl(b'e'),
+        KEY_F => ctrl(b'f'),
+        KEY_G => ctrl(b'g'),
+        KEY_H => ctrl(b'h'),
+        KEY_I => ctrl(b'i'),
+        KEY_J => ctrl(b'j'),
+        KEY_K => ctrl(b'k'),
+        KEY_L => ctrl(b'l'),
+        KEY_M => ctrl(b'm'),
+        KEY_N => ctrl(b'n'),
+        KEY_O => ctrl(b'o'),
+        KEY_P => ctrl(b'p'),
+        KEY_Q => ctrl(b'q'),
+        KEY_R => ctrl(b'r'),
+        KEY_S => ctrl(b's'),
+        KEY_T => ctrl(b't'),
+        KEY_U => ctrl(b'u'),
+        KEY_V => ctrl(b'v'),
+        KEY_W => ctrl(b'w'),
+        KEY_X => ctrl(b'x'),
+        KEY_Y => ctrl(b'y'),
+        KEY_Z => ctrl(b'z'),
+        KEY_SPACE => Some('\u{0}'), // Ctrl+Espacio = NUL
+        _ => None,
+    }
+}
+
+/// Secuencia de escape ANSI/xterm para teclas de navegación.
+///
+/// Permite usar editores y paginadores de pantalla completa (nano, vi,
+/// less, ...) que esperan estas secuencias para mover el cursor.
+fn input_event_to_escape_seq(code: u16) -> Option<&'static [u8]> {
+    use zcore_drivers::input::input_event_codes::key::*;
+    match code {
+        KEY_UP => Some(b"\x1b[A"),
+        KEY_DOWN => Some(b"\x1b[B"),
+        KEY_RIGHT => Some(b"\x1b[C"),
+        KEY_LEFT => Some(b"\x1b[D"),
+        KEY_HOME => Some(b"\x1b[H"),
+        KEY_END => Some(b"\x1b[F"),
+        KEY_PAGEUP => Some(b"\x1b[5~"),
+        KEY_PAGEDOWN => Some(b"\x1b[6~"),
+        KEY_INSERT => Some(b"\x1b[2~"),
+        KEY_DELETE => Some(b"\x1b[3~"),
+        KEY_ESC => Some(b"\x1b"),
+        _ => None,
     }
 }
 
