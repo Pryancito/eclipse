@@ -724,7 +724,7 @@ fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'stat
     let backend = block_mount::MountBackend::from_inode(inode.clone()).ok()?;
     if let block_mount::MountBackend::Block(block) = &backend {
         if btrfs_mount::probe_btrfs_superblock(block) {
-            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs") {
+            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs", false) {
                 return Some((fs, "btrfs"));
             }
             return None;
@@ -732,15 +732,15 @@ fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'stat
         if !block_mount::probe_ext2_superblock(block) {
             return None;
         }
-        let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+        let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
         return Some((fs, "ext2"));
     }
     // File-backed (loop) roots: try btrfs, then ext2.
-    match mount_ops::open_filesystem(backend, "btrfs") {
+    match mount_ops::open_filesystem(backend, "btrfs", false) {
         Ok(fs) => Some((fs, "btrfs")),
         Err(_) => {
             let backend = block_mount::MountBackend::from_inode(inode).ok()?;
-            let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+            let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
             Some((fs, "ext2"))
         }
     }
@@ -927,17 +927,6 @@ fn mount_fstab(root: &Arc<MNode>) {
                             continue;
                         }
 
-                        let fs = match mount_ops::open_filesystem(backend, fstype_parsed) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                warn!(
-                                    "mount_fstab: failed to open filesystem for {:?}: {:?}",
-                                    effective_source, e
-                                );
-                                continue;
-                            }
-                        };
-
                         // Parse options for flags
                         let mut flags = 0;
                         for opt in options.split(',') {
@@ -950,6 +939,21 @@ fn mount_fstab(root: &Arc<MNode>) {
                                 _ => {}
                             }
                         }
+
+                        let fs = match mount_ops::open_filesystem(
+                            backend,
+                            fstype_parsed,
+                            mount_state::flags_read_only(flags, options),
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(
+                                    "mount_fstab: failed to open filesystem for {:?}: {:?}",
+                                    effective_source, e
+                                );
+                                continue;
+                            }
+                        };
 
                         let (fs, state) = mount_ops::prepare_fs(fs, flags, options);
                         if let Err(e) = target_node.mount(fs) {

@@ -95,7 +95,7 @@ fn mkfs_passes_btrfs_check() {
     check(&path);
 
     // And it must be mountable by our own driver.
-    let mut fs = Btrfs::mount(dev).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
     let root = fs.root_ino();
     assert_eq!(fs.readdir(root).unwrap().len(), 0);
     let st = fs.stat(root).unwrap();
@@ -112,7 +112,7 @@ fn populate_and_check() {
     let path = tmpfile("populate", 64 * 1024 * 1024);
     let dev = open_dev(&path);
     mkfs::format(&*dev, &opts()).unwrap();
-    let mut fs = Btrfs::mount(dev).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
     let root = fs.root_ino();
 
     // Directory tree with files of various sizes, symlinks and hard links.
@@ -246,7 +246,7 @@ fn read_foreign_mkfs_image() {
     );
 
     let dev = open_dev(&path);
-    let mut fs = Btrfs::mount(dev).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
     let root = fs.root_ino();
     let dir = fs.lookup(root, "dir").unwrap();
     let sub = fs.lookup(dir, "sub").unwrap();
@@ -295,7 +295,7 @@ fn grow_to_device_size() {
     f.set_len(512 * 1024 * 1024).unwrap();
     drop(f);
     let dev = open_dev(&path);
-    let mut fs = Btrfs::mount(dev).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
     assert!(fs.grow_to_device().unwrap());
     let root = fs.root_ino();
     // Write enough data to require new chunks beyond the original 64 MiB.
@@ -323,7 +323,7 @@ fn stress_random_ops() {
     let path = tmpfile("stress", 128 * 1024 * 1024);
     let dev = open_dev(&path);
     mkfs::format(&*dev, &opts()).unwrap();
-    let mut fs = Btrfs::mount(dev).unwrap();
+    let mut fs = Btrfs::mount(dev, false).unwrap();
     let root = fs.root_ino();
 
     // Simple LCG for reproducible pseudo-random decisions.
