@@ -44,48 +44,6 @@ pub struct TcpInner {
     flags: OpenFlags,
     /// ipv6 domain socket flag
     ipv6: bool,
-    /// DEBUG: cumulative bytes delivered via recv_slice on this socket.
-    total_recv: u64,
-    /// DEBUG: rolling FNV-1a hash of the CURRENT chunk only (resets at
-    /// each MILESTONE_BYTES boundary). Used to record per-chunk hashes
-    /// so divergence in cabeceras HTTP doesn't contaminate later chunks.
-    chunk_hash: u64,
-    /// DEBUG: completed per-chunk hashes: (chunk index, hash). chunk 0
-    /// covers stream bytes [0, MILESTONE_BYTES), chunk 1 covers
-    /// [MILESTONE_BYTES, 2*MILESTONE_BYTES), etc.
-    chunk_hashes: alloc::vec::Vec<(u64, u64)>,
-}
-
-/// DEBUG: each per-chunk hash covers this many stream bytes. 256 KiB
-/// keeps log volume sane while sampling enough points across a ~3 MB
-/// APKINDEX download.
-const MILESTONE_BYTES: u64 = 256 * 1024;
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-
-impl Drop for TcpSocketState {
-    fn drop(&mut self) {
-        // DEBUG: log per-connection summary at close. Only the last owner
-        // (apk closing the fd) loops in; dup'd descriptors don't trip this.
-        if Arc::strong_count(&self.inner) == 1 {
-            let inner = self.inner.lock();
-            if inner.total_recv > 0 {
-                log::error!(
-                    "[tcp drop] handle={} total={} tail_hash={:016x}",
-                    inner.handle.0, inner.total_recv, inner.chunk_hash
-                );
-                for &(chunk_idx, hash) in inner.chunk_hashes.iter() {
-                    let start = chunk_idx * (MILESTONE_BYTES / 1024);
-                    let end = start + (MILESTONE_BYTES / 1024);
-                    log::error!(
-                        "[tcp chk] handle={} bytes=[{}KiB,{}KiB) hash={:016x}",
-                        inner.handle.0, start, end, hash
-                    );
-                }
-            }
-        }
-    }
 }
 
 impl TcpSocketState {
@@ -104,9 +62,6 @@ impl TcpSocketState {
                 is_listening: false,
                 flags: OpenFlags::RDWR,
                 ipv6,
-                total_recv: 0,
-                chunk_hash: FNV_OFFSET,
-                chunk_hashes: alloc::vec::Vec::new(),
             })),
         })
     }
@@ -190,27 +145,6 @@ impl Socket for TcpSocketState {
                         .lock()
                         .get::<TcpSocket>(handle)
                         .remote_endpoint();
-                    // DEBUG: feed bytes into a per-chunk FNV-1a, snapshotting
-                    // and resetting every MILESTONE_BYTES so each chunk hash
-                    // is independent of earlier chunks (HTTP headers won't
-                    // contaminate body chunks).
-                    {
-                        let mut inner = self.inner.lock();
-                        let mut off = inner.total_recv;
-                        let mut h = inner.chunk_hash;
-                        for &b in &data[..size] {
-                            h ^= b as u64;
-                            h = h.wrapping_mul(FNV_PRIME);
-                            off = off.saturating_add(1);
-                            if off % MILESTONE_BYTES == 0 {
-                                let chunk_idx = off / MILESTONE_BYTES - 1;
-                                inner.chunk_hashes.push((chunk_idx, h));
-                                h = FNV_OFFSET;
-                            }
-                        }
-                        inner.chunk_hash = h;
-                        inner.total_recv = off;
-                    }
                     return (Ok(size), Endpoint::Ip(endpoint));
                 }
                 Err(smoltcp::Error::Finished) => {
@@ -596,9 +530,6 @@ impl Socket for TcpSocketState {
                         is_listening: false,
                         flags: OpenFlags::RDWR,
                         ipv6: is_ipv6,
-                        total_recv: 0,
-                        chunk_hash: FNV_OFFSET,
-                        chunk_hashes: alloc::vec::Vec::new(),
                     })),
                 });
                 return Ok((new_socket as Arc<dyn FileLike>, Endpoint::Ip(remote)));
