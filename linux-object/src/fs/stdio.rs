@@ -487,9 +487,13 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_COMMA => Some(mods.pick(',', ';', ',', ';')),
         KEY_DOT | KEY_KPDOT => Some(mods.pick('.', ':', '.', ':')),
         KEY_SLASH => Some(mods.pick('-', '_', '-', '_')),
-        KEY_ENTER | KEY_KPENTER => Some('\n'),
+        // Enter envía CR (0x0d), como una terminal real / la consola de Linux;
+        // el flag de entrada ICRNL lo convierte a NL en modo canónico.
+        KEY_ENTER | KEY_KPENTER => Some('\r'),
         KEY_SPACE => Some(' '),
-        KEY_BACKSPACE => Some('\x08'),
+        // Backspace envía DEL (0x7f), igual que la consola de Linux y el
+        // `kbs=\177` de la terminfo xterm; además coincide con c_cc[VERASE].
+        KEY_BACKSPACE => Some('\x7f'),
         KEY_TAB => Some('\t'),
         KEY_KP0 => Some('0'),
         KEY_KP1 => Some('1'),
