@@ -319,6 +319,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
+    // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
+    for vt in 0..kernel_hal::console::NUM_VTS {
+        let name = alloc::format!("tty{}", vt + 1);
+        if let Err(e) = devfs_root.add(&name, stdio::vt_stdin(vt)) {
+            warn!("failed to mknod /dev/{}: {:?}", name, e);
+        }
+    }
     if let Some(display) = drivers::all_display().first() {
         use devfs::FbDev;
 

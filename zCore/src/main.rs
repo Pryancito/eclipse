@@ -63,14 +63,29 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         if #[cfg(all(feature = "linux", feature = "zircon"))] {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
         } else if #[cfg(feature = "linux")] {
-            let args = options.root_proc.split('?').map(Into::into).collect(); // parse "arg0?arg1?arg2"
-            let envs = alloc::vec![
+            use linux_object::process::ProcessExt;
+            let args: alloc::vec::Vec<alloc::string::String> =
+                options.root_proc.split('?').map(Into::into).collect(); // parse "arg0?arg1?arg2"
+            let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
             ];
             let rootfs = fs::rootfs();
             kernel_hal::console::early_progress_bar(95);
-            let proc = zcore_loader::linux::run(args, envs, rootfs);
+            let proc = zcore_loader::linux::run(args.clone(), envs.clone(), rootfs.clone());
+            // Spawn an extra shell on each additional virtual terminal
+            // (tty2..ttyN, reachable via Ctrl+Alt+F2..F6), sharing the primary
+            // process's mounted root filesystem (by `Arc`, like `fork`).
+            let shared_root = proc.linux().root_inode().clone();
+            for vt in 1..kernel_hal::console::NUM_VTS {
+                let _ = zcore_loader::linux::run_on_vt(
+                    args.clone(),
+                    envs.clone(),
+                    rootfs.clone(),
+                    vt,
+                    Some(shared_root.clone()),
+                );
+            }
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
