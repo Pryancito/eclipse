@@ -5,14 +5,35 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::ops::{Deref, DerefMut};
 
-use rcore_console::{Cell, Console, DrawTarget, Flags, OriginDimensions, Pixel, Rgb888, Size, TextBuffer, TextOnGraphic};
 use rcore_console::embedded_graphics::prelude::RgbColor as _;
+use rcore_console::{
+    Cell, Console, DrawTarget, Flags, OriginDimensions, Pixel, Rgb888, Size, TextBuffer,
+    TextOnGraphic,
+};
 
-use crate::scheme::display::{DisplayScheme, RgbColor, Rectangle};
+use super::shadow_fb::ShadowFramebuffer;
+use crate::scheme::display::DisplayScheme;
 
-pub struct DisplayWrapper(Arc<dyn DisplayScheme>);
+/// Height in pixels of one text row (matches `rcore_console`'s `FONT_9X18`).
+const CHAR_HEIGHT: usize = 18;
 
-impl DrawTarget for DisplayWrapper {
+/// Convert an `rcore_console` glyph color to a packed `0x00RRGGBB` value, matching
+/// the byte layout previously written straight to the ARGB8888 framebuffer.
+#[inline]
+fn rgb888_to_argb(color: Rgb888) -> u32 {
+    ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32)
+}
+
+/// A `DrawTarget` that renders into a CPU-side [`ShadowFramebuffer`] instead of
+/// writing pixels straight to GPU memory. Glyph rendering therefore touches only
+/// cached RAM; the dirty region is later pushed to the device in bulk.
+pub struct ShadowDraw {
+    shadow: Arc<ShadowFramebuffer>,
+    width: u32,
+    height: u32,
+}
+
+impl DrawTarget for ShadowDraw {
     type Color = Rgb888;
     type Error = Infallible;
 
@@ -20,18 +41,20 @@ impl DrawTarget for DisplayWrapper {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
-        for p in pixels {
-            let color = RgbColor::new(p.1.r(), p.1.g(), p.1.b());
-            self.0.draw_pixel(p.0.x as u32, p.0.y as u32, color);
-        }
+        self.shadow.put_pixels(pixels.into_iter().filter_map(|p| {
+            let (x, y) = (p.0.x, p.0.y);
+            if x < 0 || y < 0 {
+                return None;
+            }
+            Some((x as usize, y as usize, rgb888_to_argb(p.1)))
+        }));
         Ok(())
     }
 }
 
-impl OriginDimensions for DisplayWrapper {
+impl OriginDimensions for ShadowDraw {
     fn size(&self) -> Size {
-        let info = self.0.info();
-        Size::new(info.width, info.height)
+        Size::new(self.width, self.height)
     }
 }
 
@@ -39,15 +62,21 @@ pub struct LinearScrollbackBuffer {
     buf: Vec<Vec<Cell>>,
     history: VecDeque<Vec<Cell>>,
     scrollback_offset: Option<usize>,
-    inner: TextOnGraphic<DisplayWrapper>,
+    inner: TextOnGraphic<ShadowDraw>,
+    shadow: Arc<ShadowFramebuffer>,
     display: Arc<dyn DisplayScheme>,
 }
 
 impl LinearScrollbackBuffer {
     pub fn new(display: Arc<dyn DisplayScheme>) -> Self {
-        let display_wrapper = DisplayWrapper(display.clone());
         let info = display.info();
-        let inner = TextOnGraphic::new(display_wrapper, info.width, info.height);
+        let shadow = ShadowFramebuffer::new(info.width as usize, info.height as usize);
+        let draw = ShadowDraw {
+            shadow: shadow.clone(),
+            width: info.width,
+            height: info.height,
+        };
+        let inner = TextOnGraphic::new(draw, info.width, info.height);
         let width = inner.width();
         let height = inner.height();
         Self {
@@ -55,8 +84,17 @@ impl LinearScrollbackBuffer {
             history: VecDeque::new(),
             scrollback_offset: None,
             inner,
+            shadow,
             display,
         }
+    }
+
+    /// Push the dirty region of the shadow buffer to the real display.
+    ///
+    /// Called once per batch of writes (per `write_str` / scroll) so a whole
+    /// line of output becomes a single bulk transfer to the GPU.
+    pub fn present(&self) {
+        self.shadow.present(&*self.display);
     }
 
     pub fn scroll_history(&mut self, direction: i32) {
@@ -94,7 +132,8 @@ impl LinearScrollbackBuffer {
         if let Some(offset) = self.scrollback_offset {
             let history_len = self.history.len();
             for r in 0..height {
-                let index = (history_len as isize) - (offset as isize) - ((height as isize) - 1 - (r as isize));
+                let index = (history_len as isize) - (offset as isize)
+                    - ((height as isize) - 1 - (r as isize));
                 if index < 0 {
                     let bg_cell = Cell::default();
                     for col in 0..width {
@@ -196,31 +235,17 @@ impl TextBuffer for LinearScrollbackBuffer {
             self.scrollback_offset = Some((offset + 1).min(max_offset));
             self.redraw();
         } else {
-            let info = self.display.info();
-            let pitch = info.pitch() as usize;
-            let char_height = 18;
-            let text_height_pixels = height * char_height;
-
-            if text_height_pixels > char_height {
-                let src_start = char_height * pitch;
-                let src_end = text_height_pixels * pitch;
-                let dest_start = 0;
-
-                let mut fb = self.display.fb();
-                if src_end <= fb.len() {
-                    fb.copy_within(src_start..src_end, dest_start);
-                }
+            // Scroll the shadow buffer up by one text row, entirely in cached
+            // RAM — no read-back from GPU memory.
+            let width_px = self.shadow.width();
+            let text_h = height * CHAR_HEIGHT;
+            if text_h > CHAR_HEIGHT {
+                self.shadow
+                    .copy_rect(0, CHAR_HEIGHT, 0, 0, width_px, text_h - CHAR_HEIGHT);
             }
-
-            let rect = Rectangle {
-                x: 0,
-                y: ((height - 1) * char_height) as u32,
-                width: info.width,
-                height: char_height as u32,
-            };
-            let rgb = cell.bg.to_rgb();
-            let color = RgbColor::new(rgb.r(), rgb.g(), rgb.b());
-            self.display.fill_rect(&rect, color);
+            let bg_argb = rgb888_to_argb(cell.bg.to_rgb());
+            self.shadow
+                .fill_rect(0, (height - 1) * CHAR_HEIGHT, width_px, CHAR_HEIGHT, bg_argb);
         }
     }
 
@@ -237,9 +262,8 @@ impl TextBuffer for LinearScrollbackBuffer {
         self.history.clear();
         self.scrollback_offset = None;
 
-        let rgb = cell.bg.to_rgb();
-        let color = RgbColor::new(rgb.r(), rgb.g(), rgb.b());
-        self.display.clear(color);
+        let bg_argb = rgb888_to_argb(cell.bg.to_rgb());
+        self.shadow.clear(bg_argb);
     }
 }
 
@@ -252,6 +276,14 @@ impl GraphicConsole {
         Self {
             inner: Console::on_text_buffer(LinearScrollbackBuffer::new(display)),
         }
+    }
+
+    /// Flush all pending console output to the display.
+    ///
+    /// Drawing accumulates in the shadow buffer; this pushes the dirty region to
+    /// the GPU in one bulk transfer. Call it after a batch of writes.
+    pub fn present(&mut self) {
+        self.inner.buf_mut().present();
     }
 }
 
