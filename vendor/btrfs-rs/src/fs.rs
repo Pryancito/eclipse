@@ -76,7 +76,7 @@ impl Btrfs {
     // ------------------------------------------------------------------
 
     pub fn mount(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<Self> {
-        let mut vol = Volume::open(dev)?;
+        let vol = Volume::open(dev)?;
         let generation = vol.sb.generation();
         // A non-empty log tree comes from an unclean Linux shutdown. We do
         // not replay it, so writable mounts are unsafe until replay happens.
