@@ -44,11 +44,43 @@ pub struct TcpInner {
     flags: OpenFlags,
     /// ipv6 domain socket flag
     ipv6: bool,
-    /// Bytes delivered via recv_slice so far (debug counter for
-    /// chasing intermittent stream corruption).
+    /// DEBUG: cumulative bytes delivered via recv_slice on this socket.
     total_recv: u64,
-    /// Debug: FNV-1a over the entire delivered stream (boundary-independent).
+    /// DEBUG: FNV-1a over the entire delivered stream.
     stream_hash: u64,
+    /// DEBUG: snapshot of stream_hash at each MILESTONE_BYTES boundary
+    /// crossed by total_recv. Indexed by milestone number.
+    milestone_hashes: alloc::vec::Vec<(u64, u64)>,
+}
+
+/// DEBUG: log a hash snapshot every N bytes of TCP stream delivered.
+/// 256 KiB keeps log volume sane while sampling enough points across a
+/// ~3 MB APKINDEX download to spot divergence.
+const MILESTONE_BYTES: u64 = 256 * 1024;
+
+
+impl Drop for TcpSocketState {
+    fn drop(&mut self) {
+        // DEBUG: log per-connection summary at close. Only the last owner
+        // (apk closing the fd) loops in; dup'd descriptors don't trip this.
+        if Arc::strong_count(&self.inner) == 1 {
+            let inner = self.inner.lock();
+            if inner.total_recv > 0 {
+                log::error!(
+                    "[tcp drop] handle={} total={} hash={:016x}",
+                    inner.handle.0, inner.total_recv, inner.stream_hash
+                );
+                for &(milestone, hash) in inner.milestone_hashes.iter() {
+                    log::error!(
+                        "[tcp ms] handle={} at={}KiB hash={:016x}",
+                        inner.handle.0,
+                        milestone * (MILESTONE_BYTES / 1024),
+                        hash
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl TcpSocketState {
@@ -69,6 +101,7 @@ impl TcpSocketState {
                 ipv6,
                 total_recv: 0,
                 stream_hash: 0xcbf2_9ce4_8422_2325,
+                milestone_hashes: alloc::vec::Vec::new(),
             })),
         })
     }
@@ -175,15 +208,25 @@ impl Socket for TcpSocketState {
                         .lock()
                         .get::<TcpSocket>(handle)
                         .remote_endpoint();
+                    // DEBUG: roll the stream hash and snapshot it every
+                    // MILESTONE_BYTES. Lets us compare what smoltcp delivered
+                    // across runs at known stream offsets.
                     {
                         let mut inner = self.inner.lock();
+                        let before = inner.total_recv;
+                        let after = before.saturating_add(size as u64);
                         let mut h = inner.stream_hash;
                         for &b in &data[..size] {
                             h ^= b as u64;
                             h = h.wrapping_mul(0x0000_0100_0000_01b3);
                         }
                         inner.stream_hash = h;
-                        inner.total_recv = inner.total_recv.wrapping_add(size as u64);
+                        inner.total_recv = after;
+                        let prev_milestone = before / MILESTONE_BYTES;
+                        let cur_milestone = after / MILESTONE_BYTES;
+                        if cur_milestone > prev_milestone {
+                            inner.milestone_hashes.push((cur_milestone, h));
+                        }
                     }
                     return (Ok(size), Endpoint::Ip(endpoint));
                 }
@@ -579,6 +622,7 @@ impl Socket for TcpSocketState {
                         ipv6: is_ipv6,
                         total_recv: 0,
                         stream_hash: 0xcbf2_9ce4_8422_2325,
+                        milestone_hashes: alloc::vec::Vec::new(),
                     })),
                 });
                 return Ok((new_socket as Arc<dyn FileLike>, Endpoint::Ip(remote)));
