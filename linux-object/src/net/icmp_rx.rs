@@ -95,6 +95,13 @@ pub fn deliver_from_frame(frame: &[u8]) {
             // 0 = Echo Reply
             return;
         }
+        // Verify the ICMPv4 checksum to reject corrupt/truncated frames.
+        let Ok(icmp_pkt) = Icmpv4Packet::new_checked(payload) else {
+            return;
+        };
+        if !icmp_pkt.verify_checksum() {
+            return;
+        }
         let mut q = RX_QUEUE.lock();
         if q.len() >= RX_QUEUE_MAX {
             q.pop_front();
