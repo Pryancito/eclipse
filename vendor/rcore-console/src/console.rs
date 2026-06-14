@@ -102,6 +102,15 @@ impl<T: TextBuffer> Console<T> {
     pub fn columns(&self) -> usize {
         self.inner.buf.width()
     }
+
+    /// Current cursor position as `(row, col)` in character cells.
+    ///
+    /// This is the authoritative logical cursor maintained while parsing the
+    /// escape stream (updated by `goto` / `move_*` / `input` / ...), as opposed
+    /// to any position a [`TextBuffer`] might infer from `write` calls alone.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.inner.cursor.row, self.inner.cursor.col)
+    }
 }
 
 impl<T: TextBuffer> fmt::Write for Console<T> {

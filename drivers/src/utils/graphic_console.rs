@@ -113,6 +113,16 @@ impl LinearScrollbackBuffer {
             .present_with_cursor(&*self.display, cursor, CHAR_WIDTH, CHAR_HEIGHT);
     }
 
+    /// Set the text cursor position (cell coords) used to draw the block cursor.
+    ///
+    /// Driven from the owning [`Console`]'s authoritative cursor so the block
+    /// cursor follows `goto`/`move_*` escape sequences, not just the last cell
+    /// written (which is where full-screen editors like nano leave it).
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.cursor_row = row;
+        self.cursor_col = col;
+    }
+
     /// Repaint the whole screen from the backing buffer into the shadow.
     ///
     /// Used when this VT becomes the active one (a different VT or a graphics
@@ -321,7 +331,10 @@ impl GraphicConsole {
     /// Drawing accumulates in the shadow buffer; this pushes the dirty region to
     /// the GPU in one bulk transfer. Call it after a batch of writes.
     pub fn present(&mut self) {
-        self.inner.buf_mut().present(true);
+        let (row, col) = self.inner.cursor();
+        let buf = self.inner.buf_mut();
+        buf.set_cursor(row, col);
+        buf.present(true);
     }
 
     /// Redraw only the blinking cursor with the given visibility.
@@ -329,7 +342,10 @@ impl GraphicConsole {
     /// Called from the timer tick (~2 Hz) so the cursor blinks while idle,
     /// without touching the text content.
     pub fn set_cursor_blink(&mut self, visible: bool) {
-        self.inner.buf_mut().present(visible);
+        let (row, col) = self.inner.cursor();
+        let buf = self.inner.buf_mut();
+        buf.set_cursor(row, col);
+        buf.present(visible);
     }
 
     /// Repaint the entire screen from the backing buffer (e.g. on VT switch).
