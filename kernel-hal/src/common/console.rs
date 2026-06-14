@@ -189,6 +189,32 @@ pub fn kd_mode() -> u32 {
     KD_MODE.load(Ordering::SeqCst) as u32
 }
 
+/// Blink the graphic-console text cursor.
+///
+/// Invoked from the timer tick (~250 Hz). It rate-limits itself to a ~2 Hz
+/// blink using the monotonic clock and only does work when the blink phase
+/// actually flips, so the common tick is just one atomic load. A no-op when the
+/// `graphic` feature is disabled or while in `KD_GRAPHICS`.
+pub fn cursor_blink_tick() {
+    #[cfg(feature = "graphic")]
+    {
+        if kd_mode() != KD_TEXT {
+            return;
+        }
+        static LAST_PHASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let ms = crate::hal_fn::timer::timer_now().as_millis() as usize;
+        let phase = (ms / 500) & 1;
+        if LAST_PHASE.swap(phase, Ordering::SeqCst) == phase {
+            return;
+        }
+        if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+            if let Some(mut g) = cons.try_lock() {
+                g.set_cursor_blink(phase == 0);
+            }
+        }
+    }
+}
+
 /// Request a one-shot clear-to-black of the graphic console before the next write.
 ///
 /// When `feature="graphic"` is disabled, this is a no-op.
