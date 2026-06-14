@@ -1098,8 +1098,18 @@ impl E1000eHw {
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
-        // Disable checksum offload
-        mmio_write(self.base, E1000E_RXCSUM, 0);
+        // Enable RX checksum offload so HW computes IP/TCP/UDP checksums and
+        // reports the result via the descriptor's status (IPCS/TCPCS) and
+        // errors (IPE/TCPE) bytes. The receive path then drops frames that
+        // HW flags as corrupt, before they reach smoltcp. Bits per 8254x
+        // datasheet §13.4.18: bit 8 = IPOFLD, bit 9 = TUOFLD.
+        const RXCSUM_IPOFLD: u32 = 1 << 8;
+        const RXCSUM_TUOFLD: u32 = 1 << 9;
+        mmio_write(
+            self.base,
+            E1000E_RXCSUM,
+            RXCSUM_IPOFLD | RXCSUM_TUOFLD,
+        );
 
         // RFCTL: use legacy write-back (no RFCTL_EXTEN) — matches OSDev i219-V guide.
         // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
@@ -1154,9 +1164,14 @@ impl E1000eHw {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         let desc_ptr = unsafe { ring.add(i) };
 
-        // Legacy descriptor write-back layout (no RFCTL_EXTEN):
+        // Legacy descriptor write-back layout (no RFCTL_EXTEN), 8254x §3.2.3.1:
         //   +8  u16  length
-        //   +12 u8   status  (DD=bit0, EOP=bit1)
+        //   +10 u16  packet checksum
+        //   +12 u8   status   (DD=bit0, EOP=bit1, IXSM=bit2, VP=bit3,
+        //                      TCPCS=bit5, IPCS=bit6, PIF=bit7)
+        //   +13 u8   errors   (CE=bit0, SE=bit1, SEQ=bit2, CXE=bit4,
+        //                      TCPE=bit5, IPE=bit6, RXE=bit7)
+        //   +14 u16  VLAN tag
         //
         // Full memory fence (not just compiler_fence) before reading the
         // descriptor: pairs with the DMA write of (len, status) by the device.
@@ -1174,9 +1189,40 @@ impl E1000eHw {
         // packet buffer see values at least as recent as the DD bit.
         fence(Ordering::Acquire);
         let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
+        let errors = unsafe { read_volatile((desc_ptr as usize + 13) as *const u8) };
 
         // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
         if status & 2 == 0 || len == 0 || len > BUF_SIZE {
+            unsafe {
+                self.recycle_rx_slot(i);
+            }
+            self.rx_next_to_clean = (i + 1) % NUM_RX;
+            return None;
+        }
+
+        // Hardware-detected frame errors. CE = CRC/alignment, SE = symbol,
+        // SEQ = sequence, CXE = carrier extension, RXE = generic RX data
+        // error. Any of these means the frame itself is unreliable at the
+        // link layer; drop it so smoltcp never sees corrupt bytes.
+        const ERR_FRAME_MASK: u8 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 7);
+        if errors & ERR_FRAME_MASK != 0 {
+            self.stats.rx_dropped += 1;
+            unsafe {
+                self.recycle_rx_slot(i);
+            }
+            self.rx_next_to_clean = (i + 1) % NUM_RX;
+            return None;
+        }
+
+        // L3/L4 checksum errors. Only meaningful when IXSM=0 (HW actually
+        // ran the checks); for non-IP frames or fragments HW sets IXSM=1
+        // and the IPE/TCPE bits are not valid. When IXSM=0 and IPE/TCPE is
+        // set, the IP or TCP/UDP checksum failed and the payload bytes are
+        // corrupt — drop so smoltcp doesn't reassemble bad data.
+        const STATUS_IXSM: u8 = 1 << 2;
+        const ERR_CSUM_MASK: u8 = (1 << 5) | (1 << 6); // TCPE | IPE
+        if status & STATUS_IXSM == 0 && errors & ERR_CSUM_MASK != 0 {
+            self.stats.rx_dropped += 1;
             unsafe {
                 self.recycle_rx_slot(i);
             }
