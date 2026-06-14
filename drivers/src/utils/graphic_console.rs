@@ -16,6 +16,8 @@ use crate::scheme::display::DisplayScheme;
 
 /// Height in pixels of one text row (matches `rcore_console`'s `FONT_9X18`).
 const CHAR_HEIGHT: usize = 18;
+/// Width in pixels of one character cell (matches `rcore_console`'s `FONT_9X18`).
+const CHAR_WIDTH: usize = 9;
 
 /// Convert an `rcore_console` glyph color to a packed `0x00RRGGBB` value, matching
 /// the byte layout previously written straight to the ARGB8888 framebuffer.
@@ -65,6 +67,10 @@ pub struct LinearScrollbackBuffer {
     inner: TextOnGraphic<ShadowDraw>,
     shadow: Arc<ShadowFramebuffer>,
     display: Arc<dyn DisplayScheme>,
+    /// Best-effort text cursor position (cell coords) for the block cursor.
+    /// Tracks where the next character will be drawn.
+    cursor_row: usize,
+    cursor_col: usize,
 }
 
 impl LinearScrollbackBuffer {
@@ -86,15 +92,35 @@ impl LinearScrollbackBuffer {
             inner,
             shadow,
             display,
+            cursor_row: 0,
+            cursor_col: 0,
         }
     }
 
-    /// Push the dirty region of the shadow buffer to the real display.
+    /// Push the dirty region of the shadow buffer to the real display, drawing
+    /// the text cursor when `visible`.
     ///
     /// Called once per batch of writes (per `write_str` / scroll) so a whole
-    /// line of output becomes a single bulk transfer to the GPU.
-    pub fn present(&self) {
-        self.shadow.present(&*self.display);
+    /// line of output becomes a single bulk transfer to the GPU. The cursor is
+    /// hidden while viewing scrollback history.
+    pub fn present(&self, visible: bool) {
+        let cursor = if visible && self.scrollback_offset.is_none() {
+            Some((self.cursor_col, self.cursor_row))
+        } else {
+            None
+        };
+        self.shadow
+            .present_with_cursor(&*self.display, cursor, CHAR_WIDTH, CHAR_HEIGHT);
+    }
+
+    /// Repaint the whole screen from the backing buffer into the shadow.
+    ///
+    /// Used when this VT becomes the active one (a different VT or a graphics
+    /// client may have left arbitrary pixels on screen), so the shadow is first
+    /// cleared to black and then every cell is redrawn.
+    pub fn repaint_all(&mut self) {
+        self.shadow.clear(0x0000_0000);
+        self.redraw();
     }
 
     pub fn scroll_history(&mut self, direction: i32) {
@@ -200,6 +226,13 @@ impl TextBuffer for LinearScrollbackBuffer {
 
         if self.scrollback_offset.is_none() {
             self.inner.write(row, col, cell);
+            // Track the cursor as the position just after the written cell.
+            self.cursor_row = row;
+            self.cursor_col = col + 1;
+            if self.cursor_col >= width {
+                self.cursor_col = 0;
+                self.cursor_row = (self.cursor_row + 1).min(height.saturating_sub(1));
+            }
         }
     }
 
@@ -247,6 +280,9 @@ impl TextBuffer for LinearScrollbackBuffer {
             self.shadow
                 .fill_rect(0, (height - 1) * CHAR_HEIGHT, width_px, CHAR_HEIGHT, bg_argb);
         }
+        // After a scroll the next character lands at the bottom-left.
+        self.cursor_row = height - 1;
+        self.cursor_col = 0;
     }
 
     fn clear(&mut self, cell: Cell) {
@@ -264,6 +300,8 @@ impl TextBuffer for LinearScrollbackBuffer {
 
         let bg_argb = rgb888_to_argb(cell.bg.to_rgb());
         self.shadow.clear(bg_argb);
+        self.cursor_row = 0;
+        self.cursor_col = 0;
     }
 }
 
@@ -278,12 +316,26 @@ impl GraphicConsole {
         }
     }
 
-    /// Flush all pending console output to the display.
+    /// Flush all pending console output to the display, showing the cursor.
     ///
     /// Drawing accumulates in the shadow buffer; this pushes the dirty region to
     /// the GPU in one bulk transfer. Call it after a batch of writes.
     pub fn present(&mut self) {
-        self.inner.buf_mut().present();
+        self.inner.buf_mut().present(true);
+    }
+
+    /// Redraw only the blinking cursor with the given visibility.
+    ///
+    /// Called from the timer tick (~2 Hz) so the cursor blinks while idle,
+    /// without touching the text content.
+    pub fn set_cursor_blink(&mut self, visible: bool) {
+        self.inner.buf_mut().present(visible);
+    }
+
+    /// Repaint the entire screen from the backing buffer (e.g. on VT switch).
+    pub fn repaint(&mut self) {
+        self.inner.buf_mut().repaint_all();
+        self.present();
     }
 }
 

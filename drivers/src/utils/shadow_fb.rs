@@ -33,6 +33,9 @@ struct ShadowInner {
     /// Smallest rectangle covering everything changed since the last present,
     /// or `None` when the shadow and the real framebuffer are in sync.
     dirty: Option<DirtyRect>,
+    /// Pixel rectangle `(x, y, w, h)` where the inverted text cursor was last
+    /// drawn directly to the device, so it can be erased on the next present.
+    prev_cursor: Option<DirtyRect>,
 }
 
 /// A CPU-side shadow of the display framebuffer with dirty-region tracking.
@@ -57,6 +60,7 @@ impl ShadowFramebuffer {
             inner: Mutex::new(ShadowInner {
                 data: vec![0; width.saturating_mul(height)],
                 dirty: None,
+                prev_cursor: None,
             }),
         })
     }
@@ -184,6 +188,99 @@ impl ShadowFramebuffer {
         drop(g);
         if display.need_flush() {
             let _ = display.flush();
+        }
+    }
+
+    /// Present the dirty region and overlay a blinking text cursor.
+    ///
+    /// `cursor` is the cell to highlight `(col, row)` or `None` to hide it;
+    /// `cw`/`ch` are the character cell size in pixels. The cursor is drawn as
+    /// an inverted block straight to the device (never stored in the shadow, so
+    /// it can be erased cleanly) by reading the cell's pixels from the shadow,
+    /// XOR-ing them and blitting them back. Because it is always rebuilt from
+    /// the clean shadow, redrawing the same cell is idempotent.
+    pub fn present_with_cursor(
+        &self,
+        display: &dyn DisplayScheme,
+        cursor: Option<(usize, usize)>,
+        cw: usize,
+        ch: usize,
+    ) {
+        let mut g = self.inner.lock();
+
+        // 1. Flush the dirty content region.
+        if let Some((x0, y0, x1, y1)) = g.dirty.take() {
+            let x0 = x0.min(self.width);
+            let y0 = y0.min(self.height);
+            let x1 = x1.min(self.width);
+            let y1 = y1.min(self.height);
+            if x0 < x1 && y0 < y1 {
+                let start = y0 * self.width + x0;
+                display.blit_from(
+                    x0 as u32,
+                    y0 as u32,
+                    &g.data[start..],
+                    self.width,
+                    (x1 - x0) as u32,
+                    (y1 - y0) as u32,
+                );
+            }
+        }
+
+        // Pixel rectangle of the requested cursor cell, clamped to the screen.
+        let new_rect = cursor.and_then(|(cx, cy)| {
+            let x = (cx * cw).min(self.width);
+            let y = (cy * ch).min(self.height);
+            let w = cw.min(self.width - x);
+            let h = ch.min(self.height - y);
+            if w == 0 || h == 0 {
+                None
+            } else {
+                Some((x, y, w, h))
+            }
+        });
+
+        // 2. Erase the previously drawn cursor if it has moved or is hidden.
+        if let Some(prev) = g.prev_cursor {
+            if Some(prev) != new_rect {
+                Self::blit_cell(display, &g.data, self.width, prev, false);
+            }
+        }
+
+        // 3. Draw the cursor (inverted) at its new position.
+        if let Some(rect) = new_rect {
+            Self::blit_cell(display, &g.data, self.width, rect, true);
+        }
+        g.prev_cursor = new_rect;
+
+        drop(g);
+        if display.need_flush() {
+            let _ = display.flush();
+        }
+    }
+
+    /// Blit one character cell from the shadow to the device, optionally
+    /// inverting it (for the cursor). `rect` is `(x, y, w, h)` in pixels.
+    fn blit_cell(
+        display: &dyn DisplayScheme,
+        data: &[u32],
+        width: usize,
+        rect: DirtyRect,
+        invert: bool,
+    ) {
+        let (x, y, w, h) = rect;
+        if invert {
+            let mut tmp = Vec::with_capacity(w * h);
+            for r in 0..h {
+                let base = (y + r) * width + x;
+                for c in 0..w {
+                    tmp.push(data[base + c] ^ 0x00FF_FFFF);
+                }
+            }
+            display.blit_from(x as u32, y as u32, &tmp, w, w as u32, h as u32);
+        } else {
+            let start = y * width + x;
+            display.blit_from(x as u32, y as u32, &data[start..], width, w as u32, h as u32);
         }
     }
 }

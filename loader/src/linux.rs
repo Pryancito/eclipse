@@ -8,7 +8,10 @@ use linux_object::signal::{
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 use kernel_hal::interrupt::intr_on;
-use linux_object::fs::{vfs::FileSystem, INodeExt};
+use linux_object::fs::{
+    vfs::{FileSystem, INode},
+    INodeExt,
+};
 use linux_object::thread::{CurrentThreadExt, ThreadExt};
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
@@ -18,12 +21,29 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Create and run main Linux process
+/// Create and run the main Linux process (virtual terminal 0).
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
-    info!("Run Linux process: args={:?}, envs={:?}", args, envs);
-    linux_object::net::init();
+    run_on_vt(args, envs, rootfs, 0, None)
+}
+
+/// Create and run a Linux process bound to virtual terminal `vt`.
+///
+/// `shared_root` lets extra per-VT shells reuse the primary process's mounted
+/// root filesystem (by `Arc`) instead of re-scanning disks. One-time boot work
+/// (network init, fstab mount, console clear) only runs for `vt == 0`.
+pub fn run_on_vt(
+    args: Vec<String>,
+    envs: Vec<String>,
+    rootfs: Arc<dyn FileSystem>,
+    vt: usize,
+    shared_root: Option<Arc<dyn INode>>,
+) -> Arc<Process> {
+    info!("Run Linux process on vt{}: args={:?}, envs={:?}", vt, args, envs);
+    if vt == 0 {
+        linux_object::net::init();
+    }
     let job = zircon_object::task::ROOT_JOB.clone();
-    let proc = Process::create_linux(&job, rootfs.clone()).expect("create_linux");
+    let proc = Process::create_linux(&job, rootfs.clone(), vt, shared_root).expect("create_linux");
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -52,8 +72,10 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let path = args[0].clone();
 
     // Boot UX: clear to black right before the first graphic-console output (prompt).
-    // This call is a no-op when graphic mode is disabled.
-    kernel_hal::console::request_clear_graphic_on_next_write();
+    // This call is a no-op when graphic mode is disabled. Only for the primary VT.
+    if vt == 0 {
+        kernel_hal::console::request_clear_graphic_on_next_write();
+    }
 
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
@@ -74,9 +96,11 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     // (/boot/efi vfat, /home, …) as a deferred kernel task. This is done off
     // the synchronous boot path on purpose: the blocking block-device I/O it
     // performs would otherwise risk stalling disk boot before the shell shows.
-    kernel_hal::thread::spawn(async {
-        linux_object::fs::mount_fstab_deferred();
-    });
+    if vt == 0 {
+        kernel_hal::thread::spawn(async {
+            linux_object::fs::mount_fstab_deferred();
+        });
+    }
 
     proc
 }
