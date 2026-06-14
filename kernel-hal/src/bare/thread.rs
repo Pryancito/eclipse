@@ -11,6 +11,13 @@ hal_fn_impl! {
             executor::spawn(future);
         }
 
+        fn spawn_with_affinity(
+            future: impl Future<Output = ()> + Send + 'static,
+            affinity: Arc<core::sync::atomic::AtomicU64>,
+        ) {
+            executor::spawn_with_affinity(future, affinity);
+        }
+
         fn set_current_thread(thread: Option<Arc<dyn Any + Send + Sync>>) {
             *percpu::current().current_thread.get_mut() = thread;
         }

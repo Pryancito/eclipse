@@ -207,8 +207,8 @@ impl Syscall<'_> {
                 kernel_hal::thread::yield_now().await;
                 Ok(0)
             }
-            Sys::SCHED_GETAFFINITY => self.unimplemented("sched_getaffinity", Ok(0)),
-            Sys::SCHED_SETAFFINITY => self.unimplemented("sched_setaffinity", Ok(0)),
+            Sys::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a0, a1, a2.into()),
+            Sys::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a0, a1, a2.into()),
 
             // socket
             Sys::SOCKET => self.sys_socket(a0, a1, a2),
