@@ -862,6 +862,15 @@ impl INode for Stdin {
                 self.eventbus.lock().clear(Event::READABLE);
                 Ok(0)
             }
+            KDGETMODE => {
+                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
+                Ok(0)
+            }
+            KDSETMODE => {
+                let mode = unsafe { *(data as *const i32) } as u32;
+                console::set_kd_mode(mode);
+                Ok(0)
+            }
             _ => Err(FsError::NotSupported),
         }
     }
@@ -962,6 +971,15 @@ impl INode for Stdout {
                 STDIN.buf.lock().clear();
                 STDIN.canon_buf.lock().clear();
                 STDIN.eventbus.lock().clear(Event::READABLE);
+                Ok(0)
+            }
+            KDGETMODE => {
+                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
+                Ok(0)
+            }
+            KDSETMODE => {
+                let mode = unsafe { *(data as *const i32) } as u32;
+                console::set_kd_mode(mode);
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

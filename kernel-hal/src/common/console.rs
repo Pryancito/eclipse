@@ -144,7 +144,49 @@ cfg_if! {
                 *cons.lock() = GraphicConsole::new(display.clone());  // spin::Mutex — IRQs stay enabled
             }
         }
+
+        /// Repaint the whole text console from its backing buffer.
+        ///
+        /// Used when returning from `KD_GRAPHICS` to `KD_TEXT`: a userspace
+        /// graphics server may have overwritten the framebuffer, so the text
+        /// console must be drawn again from scratch.
+        pub(crate) fn redraw_graphic_console_impl() {
+            if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+                if let Some(mut g) = cons.try_lock() {
+                    g.buf_mut().redraw();
+                    g.present();
+                }
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// KD console mode (Linux VT `KD_SETMODE` / `KD_GETMODE` semantics)
+// ---------------------------------------------------------------------------
+// In `KD_GRAPHICS` the kernel stops drawing the text console so a userspace
+// graphics server (X/Wayland/DRM client) can own the framebuffer. Switching
+// back to `KD_TEXT` repaints the text console.
+
+/// Text mode: the kernel owns and draws the framebuffer console.
+pub const KD_TEXT: u32 = 0x00;
+/// Graphics mode: userspace owns the framebuffer; the console stops drawing.
+pub const KD_GRAPHICS: u32 = 0x01;
+
+static KD_MODE: AtomicUsize = AtomicUsize::new(KD_TEXT as usize);
+
+/// Set the console KD mode (`KD_TEXT` or `KD_GRAPHICS`).
+pub fn set_kd_mode(mode: u32) {
+    KD_MODE.store(mode as usize, Ordering::SeqCst);
+    #[cfg(feature = "graphic")]
+    if mode == KD_TEXT {
+        redraw_graphic_console_impl();
+    }
+}
+
+/// Get the current console KD mode.
+pub fn kd_mode() -> u32 {
+    KD_MODE.load(Ordering::SeqCst) as u32
 }
 
 /// Request a one-shot clear-to-black of the graphic console before the next write.
@@ -214,13 +256,15 @@ pub fn scroll_graphic_console(direction: i32) {
 #[allow(unused_variables)]
 pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
-    if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
-        maybe_clear_graphic_before_write();
-        // Use try_lock to avoid deadlock if an IRQ tries to log while
-        // the console is scrolling.
-        if let Some(mut g) = cons.try_lock() {
-            let _ = g.write_str(s);
-            g.present();
+    if kd_mode() == KD_TEXT {
+        if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+            maybe_clear_graphic_before_write();
+            // Use try_lock to avoid deadlock if an IRQ tries to log while
+            // the console is scrolling.
+            if let Some(mut g) = cons.try_lock() {
+                let _ = g.write_str(s);
+                g.present();
+            }
         }
     }
 }
@@ -229,11 +273,13 @@ pub fn graphic_console_write_str(s: &str) {
 #[allow(unused_variables)]
 pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
-    if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
-        maybe_clear_graphic_before_write();
-        if let Some(mut g) = cons.try_lock() {
-            let _ = g.write_fmt(fmt);
-            g.present();
+    if kd_mode() == KD_TEXT {
+        if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
+            maybe_clear_graphic_before_write();
+            if let Some(mut g) = cons.try_lock() {
+                let _ = g.write_fmt(fmt);
+                g.present();
+            }
         }
     }
 }
