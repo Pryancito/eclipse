@@ -133,6 +133,11 @@ static ALTGR_DOWN: AtomicBool = AtomicBool::new(false);
 /// Alt izquierdo — usado para la conmutación de VT (Ctrl+Alt+F1..F6).
 static LEFT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPSLOCK_ON: AtomicBool = AtomicBool::new(false);
+/// Modo cursor de aplicación (DECCKM). Lo activa/desactiva la aplicación con
+/// `ESC [ ? 1 h` / `ESC [ ? 1 l` (p. ej. el `smkx`/`rmkx` de ncurses). Cuando
+/// está activo, las teclas de cursor emiten `ESC O x` en lugar de `ESC [ x`,
+/// igual que `vc_decckm` en el VT de Linux.
+static APP_CURSOR_KEYS: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)]
 pub fn ctrl_c_pending_take() -> bool {
@@ -304,27 +309,43 @@ fn handle_key_event(event: &InputEvent) {
         }
     }
 
-    // Ctrl+C → ETX (0x03).
-    if CTRL_DOWN.load(Ordering::SeqCst) && event.code == KEY_C {
-        active_stdin().push('\u{3}');
-        return;
-    }
-
+    // Estado de modificadores, equivalente al `shift_state` de la capa keyboard
+    // del kernel de Linux (drivers/tty/vt/keyboard.c).
     let mods = KeyMods {
         shift: SHIFT_DOWN.load(Ordering::SeqCst),
         altgr: ALTGR_DOWN.load(Ordering::SeqCst),
         caps: CAPSLOCK_ON.load(Ordering::SeqCst),
+        ctrl: CTRL_DOWN.load(Ordering::SeqCst),
     };
-    if let Some(c) = input_event_to_char_es(event.code, mods) {
-        active_stdin().push(c);
+
+    // Traducción keycode -> keysym, al estilo de los tipos KT_LATIN / KT_CUR /
+    // KT_FN del VT de Linux. Ctrl+letra produce su carácter de control (Ctrl+C
+    // = 0x03, que el TTY interpreta como VINTR/SIGINT).
+    let stdin = active_stdin();
+    match translate_key(event.code, mods) {
+        Some(KeySym::Char(c)) => stdin.push(c),
+        Some(KeySym::Cursor(final_byte)) => {
+            // applkey(): ESC O x en modo cursor de aplicación (DECCKM activo),
+            // ESC [ x en modo normal — igual que `applkey()` en el VT de Linux.
+            let mid = if APP_CURSOR_KEYS.load(Ordering::SeqCst) {
+                b'O'
+            } else {
+                b'['
+            };
+            stdin.push_bytes(&[0x1b, mid, final_byte]);
+        }
+        Some(KeySym::Func(seq)) => stdin.push_bytes(seq),
+        None => {}
     }
 }
 
 /// Estado de modificadores para el layout español (XKB `es`).
+#[derive(Clone, Copy)]
 struct KeyMods {
     shift: bool,
     altgr: bool,
     caps: bool,
+    ctrl: bool,
 }
 
 impl KeyMods {
@@ -350,68 +371,68 @@ impl KeyMods {
     }
 }
 
-/// Carácter de control generado por `Ctrl+<tecla>`.
-///
-/// `Ctrl+A`..`Ctrl+Z` => `0x01`..`0x1A` (p. ej. `Ctrl+O` = `0x0f`, `Ctrl+X` =
-/// `0x18`), más `Ctrl+Espacio` = `NUL`. Devuelve `None` para teclas sin
-/// equivalente de control, de modo que el llamador siga con el tratamiento
-/// normal del carácter.
-fn input_event_to_ctrl_char(code: u16) -> Option<char> {
-    use zcore_drivers::input::input_event_codes::key::*;
-    // ASCII: el control de una letra es su valor & 0x1f (a=0x61 -> 0x01).
-    let ctrl = |b: u8| Some((b & 0x1f) as char);
-    match code {
-        KEY_A => ctrl(b'a'),
-        KEY_B => ctrl(b'b'),
-        KEY_C => ctrl(b'c'),
-        KEY_D => ctrl(b'd'),
-        KEY_E => ctrl(b'e'),
-        KEY_F => ctrl(b'f'),
-        KEY_G => ctrl(b'g'),
-        KEY_H => ctrl(b'h'),
-        KEY_I => ctrl(b'i'),
-        KEY_J => ctrl(b'j'),
-        KEY_K => ctrl(b'k'),
-        KEY_L => ctrl(b'l'),
-        KEY_M => ctrl(b'm'),
-        KEY_N => ctrl(b'n'),
-        KEY_O => ctrl(b'o'),
-        KEY_P => ctrl(b'p'),
-        KEY_Q => ctrl(b'q'),
-        KEY_R => ctrl(b'r'),
-        KEY_S => ctrl(b's'),
-        KEY_T => ctrl(b't'),
-        KEY_U => ctrl(b'u'),
-        KEY_V => ctrl(b'v'),
-        KEY_W => ctrl(b'w'),
-        KEY_X => ctrl(b'x'),
-        KEY_Y => ctrl(b'y'),
-        KEY_Z => ctrl(b'z'),
-        KEY_SPACE => Some('\u{0}'), // Ctrl+Espacio = NUL
-        _ => None,
-    }
+/// Resultado de traducir un keycode, análogo a los tipos de keysym del VT de
+/// Linux (`drivers/tty/vt/keyboard.c`).
+enum KeySym {
+    /// Carácter imprimible (KT_LATIN/KT_LETTER). El bit de control ya está
+    /// aplicado si correspondía.
+    Char(char),
+    /// Tecla de cursor (KT_CUR): se entrega la letra final (`A`..`D`, `H`, `F`).
+    /// El emisor añade el prefijo `ESC O` (modo aplicación, DECCKM) o `ESC [`
+    /// (modo normal), igual que `applkey()` en el kernel.
+    Cursor(u8),
+    /// Cadena fija de tecla de función / navegación (KT_FN): se emite tal cual.
+    Func(&'static [u8]),
 }
 
-/// Secuencia de escape ANSI/xterm para teclas de navegación.
-///
-/// Permite usar editores y paginadores de pantalla completa (nano, vi,
-/// less, ...) que esperan estas secuencias para mover el cursor.
-fn input_event_to_escape_seq(code: u16) -> Option<&'static [u8]> {
+/// Traduce un keycode + modificadores a un keysym, replicando el modelo del VT
+/// de Linux: teclas de cursor (KT_CUR), teclas de función con cadena fija
+/// (KT_FN) y caracteres imprimibles (KT_LATIN) con el bit de control aplicado
+/// como la columna `control` del keymap.
+fn translate_key(code: u16, mods: KeyMods) -> Option<KeySym> {
     use zcore_drivers::input::input_event_codes::key::*;
+
+    // Teclas de cursor: el prefijo lo decide el modo DECCKM al emitir.
     match code {
-        KEY_UP => Some(b"\x1b[A"),
-        KEY_DOWN => Some(b"\x1b[B"),
-        KEY_RIGHT => Some(b"\x1b[C"),
-        KEY_LEFT => Some(b"\x1b[D"),
-        KEY_HOME => Some(b"\x1b[H"),
-        KEY_END => Some(b"\x1b[F"),
-        KEY_PAGEUP => Some(b"\x1b[5~"),
-        KEY_PAGEDOWN => Some(b"\x1b[6~"),
-        KEY_INSERT => Some(b"\x1b[2~"),
-        KEY_DELETE => Some(b"\x1b[3~"),
-        KEY_ESC => Some(b"\x1b"),
-        _ => None,
+        KEY_UP => return Some(KeySym::Cursor(b'A')),
+        KEY_DOWN => return Some(KeySym::Cursor(b'B')),
+        KEY_RIGHT => return Some(KeySym::Cursor(b'C')),
+        KEY_LEFT => return Some(KeySym::Cursor(b'D')),
+        KEY_HOME => return Some(KeySym::Cursor(b'H')),
+        KEY_END => return Some(KeySym::Cursor(b'F')),
+        // Teclas con cadena fija (no dependen de DECCKM).
+        KEY_PAGEUP => return Some(KeySym::Func(b"\x1b[5~")),
+        KEY_PAGEDOWN => return Some(KeySym::Func(b"\x1b[6~")),
+        KEY_INSERT => return Some(KeySym::Func(b"\x1b[2~")),
+        KEY_DELETE => return Some(KeySym::Func(b"\x1b[3~")),
+        KEY_ESC => return Some(KeySym::Func(b"\x1b")),
+        _ => {}
     }
+
+    // Carácter imprimible según el layout español.
+    let c = input_event_to_char_es(code, mods)?;
+
+    // Bit de control (KG_CTRL). El kernel toma el carácter de la columna
+    // `control` del keymap; para el rango ASCII relevante equivale a estas
+    // reglas: letras y `@ [ \ ] ^ _ ? espacio` -> carácter de control.
+    if mods.ctrl {
+        let ctrl_c = match c {
+            ' ' | '@' => Some('\u{0}'), // NUL
+            '?' => Some('\u{7f}'),      // DEL
+            '[' => Some('\u{1b}'),      // ESC
+            '\\' => Some('\u{1c}'),     // FS
+            ']' => Some('\u{1d}'),      // GS
+            '^' => Some('\u{1e}'),      // RS
+            '_' => Some('\u{1f}'),      // US
+            c if c.is_ascii_alphabetic() => Some(((c.to_ascii_uppercase() as u8) & 0x1f) as char),
+            _ => None,
+        };
+        if let Some(ctrl_c) = ctrl_c {
+            return Some(KeySym::Char(ctrl_c));
+        }
+    }
+
+    Some(KeySym::Char(c))
 }
 
 /// Layout QWERTY español (España), alineado con `symbols/es` de xkeyboard-config.
@@ -825,6 +846,26 @@ fn tty_handle_outgoing(vt: usize, data: &[u8]) {
     let mut i = 0;
     while i < data.len() {
         if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            // CSI ? Pm (h|l): modos privados DEC. Rastreamos DECCKM (modo 1)
+            // para alternar el prefijo de las teclas de cursor, como el VT
+            // de Linux con `\E[?1h` (smkx) / `\E[?1l` (rmkx).
+            if i + 2 < data.len() && data[i + 2] == b'?' {
+                let mut j = i + 3;
+                let mut num: u32 = 0;
+                let mut has_digit = false;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    num = num.saturating_mul(10) + (data[j] - b'0') as u32;
+                    has_digit = true;
+                    j += 1;
+                }
+                if has_digit && j < data.len() && (data[j] == b'h' || data[j] == b'l') {
+                    if num == 1 {
+                        APP_CURSOR_KEYS.store(data[j] == b'h', Ordering::SeqCst);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
             if i + 3 < data.len() && data[i + 2] == b'6' && data[i + 3] == b'n' {
                 need_cpr = true;
                 i += 4;
