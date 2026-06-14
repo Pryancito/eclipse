@@ -647,6 +647,30 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("yes '' | make oldconfig")
             .invoke();
 
+        // Pin the DHCP client dispatcher scripts explicitly.
+        //
+        // `udhcpc6 -i eth0` (without `-s`) uses CONFIG_UDHCPC6_DEFAULT_SCRIPT. Its
+        // default value differs across busybox versions: older trees point it at the
+        // IPv4 `default.script`, whose `deconfig` runs `ip -4 addr flush` (wiping the
+        // IPv4 lease) and whose `bound` has no `ip -6 addr add` (so the DHCPv6 lease
+        // is never applied). Force the IPv6 client to use `default6.script` and keep
+        // the IPv4 client on `default.script` so both are deterministic. Done after
+        // `oldconfig` so the (now enabled) UDHCPC6 symbols already exist in `.config`.
+        Ext::new("sed")
+            .current_dir(&target)
+            .arg("-i")
+            .arg(
+                "s#^CONFIG_UDHCPC_DEFAULT_SCRIPT=.*#CONFIG_UDHCPC_DEFAULT_SCRIPT=\"/usr/share/udhcpc/default.script\"#;\
+                  s#^CONFIG_UDHCPC6_DEFAULT_SCRIPT=.*#CONFIG_UDHCPC6_DEFAULT_SCRIPT=\"/usr/share/udhcpc/default6.script\"#",
+            )
+            .arg(".config")
+            .invoke();
+        Ext::new("sh")
+            .current_dir(&target)
+            .arg("-c")
+            .arg("yes '' | make oldconfig")
+            .invoke();
+
         // 编译
         let musl = musl.as_ref().canonicalize().unwrap();
         let cross_compile = format!(
