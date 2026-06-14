@@ -97,25 +97,33 @@ pub struct BtrfsMountFs {
     this: Mutex<Weak<Self>>,
     /// Cached directory listings keyed by inode number (cleared on any
     /// mutation of that directory).
-    dir_cache: Mutex<BTreeMap<u64, Arc<Vec<btrfs::DirEntry>>>>,
+    dir_cache: Mutex<BTreeMap<u64, Arc<Vec<CachedDirEntry>>>>,
+}
+
+#[derive(Clone)]
+struct CachedDirEntry {
+    name: String,
+    metadata: Metadata,
 }
 
 impl BtrfsMountFs {
-    pub fn open(backend: &MountBackend) -> Result<Arc<Self>> {
+    pub fn open(backend: &MountBackend, read_only: bool) -> Result<Arc<Self>> {
         let size = backend_size(backend)?;
         let device = device_from_backend(backend)?;
         let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter {
             inner: device,
             size,
         });
-        let mut fs = Btrfs::mount(adapter).map_err(map_err)?;
+        let mut fs = Btrfs::mount(adapter, read_only).map_err(map_err)?;
         fs.set_clock(wall_clock);
         // Auto-expand to the partition size (the installer writes a small
         // image onto a larger partition and relies on this).
-        match fs.grow_to_device() {
-            Ok(true) => info!("btrfs: filesystem expanded to device size"),
-            Ok(false) => {}
-            Err(e) => warn!("btrfs: grow_to_device failed: {:?}", e),
+        if !read_only {
+            match fs.grow_to_device() {
+                Ok(true) => info!("btrfs: filesystem expanded to device size"),
+                Ok(false) => {}
+                Err(e) => warn!("btrfs: grow_to_device failed: {:?}", e),
+            }
         }
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
@@ -137,11 +145,23 @@ impl BtrfsMountFs {
         })
     }
 
-    fn cached_readdir(&self, dir: u64) -> Result<Arc<Vec<btrfs::DirEntry>>> {
+    fn cached_readdir(&self, dir: u64) -> Result<Arc<Vec<CachedDirEntry>>> {
         if let Some(entries) = self.dir_cache.lock().get(&dir) {
             return Ok(entries.clone());
         }
-        let entries = Arc::new(self.inner.lock().readdir(dir).map_err(map_err)?);
+        let entries = {
+            let mut fs = self.inner.lock();
+            let entries = fs.readdir(dir).map_err(map_err)?;
+            let mut cached = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let st = fs.stat(entry.ino).map_err(map_err)?;
+                cached.push(CachedDirEntry {
+                    name: entry.name,
+                    metadata: stat_to_metadata(&st),
+                });
+            }
+            Arc::new(cached)
+        };
         self.dir_cache.lock().insert(dir, entries.clone());
         Ok(entries)
     }
@@ -321,11 +341,7 @@ impl INode for BtrfsMountINode {
             i => {
                 let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
-                let st = {
-                    let mut fs = self.fs.inner.lock();
-                    fs.stat(entry.ino).map_err(map_err)?
-                };
-                Ok((stat_to_metadata(&st), entry.name.clone()))
+                Ok((entry.metadata.clone(), entry.name.clone()))
             }
         }
     }
@@ -411,8 +427,8 @@ impl INode for BtrfsMountINode {
 }
 
 /// Open a mount backend as a btrfs filesystem.
-pub fn open_btrfs(backend: &MountBackend) -> Result<Arc<dyn FileSystem>> {
-    BtrfsMountFs::open(backend).map(|fs| fs as Arc<dyn FileSystem>)
+pub fn open_btrfs(backend: &MountBackend, read_only: bool) -> Result<Arc<dyn FileSystem>> {
+    BtrfsMountFs::open(backend, read_only).map(|fs| fs as Arc<dyn FileSystem>)
 }
 
 /// Cheap pre-mount probe: does the backing device look like btrfs?

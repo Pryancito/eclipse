@@ -48,7 +48,7 @@ pub fn make_btrfs_image(image: &Path, size: u64, label: &str, rootdir: Option<&P
         .expect("no se pudo dimensionar la imagen");
     let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(file).unwrap());
     mkfs::format(&*dev, &mkfs_options(label)).expect("mkfs btrfs falló");
-    let mut fs = Btrfs::mount(dev).expect("no se pudo montar la imagen recién formateada");
+    let mut fs = Btrfs::mount(dev, false).expect("no se pudo montar la imagen recién formateada");
     if let Some(dir) = rootdir {
         let root = fs.root_ino();
         populate(&mut fs, root, dir);
