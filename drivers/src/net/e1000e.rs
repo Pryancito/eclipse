@@ -1819,10 +1819,6 @@ impl phy::RxToken for E1000eRxToken {
                     fp ^= b as u64;
                     fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
                 }
-                log::error!(
-                    "[rx http] len={} sport={} dport={} seq={} fp={:016x}",
-                    data.len(), sport, dport, seq, fp
-                );
             }
         }
         f(&mut data)

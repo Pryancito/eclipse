@@ -19,7 +19,7 @@
 
 #define SECTOR_SIZE 512ULL
 #define PART1_START 2048ULL
-#define PART1_SIZE_MIB 128ULL
+#define PART1_SIZE_MIB 256ULL
 #define PART1_SECTORS ((PART1_SIZE_MIB * 1024ULL * 1024ULL) / SECTOR_SIZE)
 #define GPT_BACKUP_RESERVED_SECTORS 34ULL
 #define MAX_DISKS 64
@@ -702,9 +702,9 @@ static const char *mode_label(enum install_mode mode) {
 static const char *layout_label(enum layout_mode layout) {
     switch (layout) {
         case LAYOUT_SIMPLE:
-            return "Simple (EFI 128MB + ROOT resto)";
+            return "Simple (EFI 256MB + ROOT resto)";
         case LAYOUT_ADVANCED:
-            return "Avanzado (EFI 128MB + ROOT + HOME + SWAP)";
+            return "Avanzado (EFI 256MB + ROOT + HOME + SWAP)";
         default:
             return "Sin definir";
     }
@@ -1062,8 +1062,8 @@ static int prompt_layout(struct config *cfg) {
 
     char input[32];
     log("Seleccione el esquema de particiones:");
-    log("  [1] Simple    -> EFI 128MB + ROOT resto");
-    log("  [2] Avanzado  -> EFI 128MB + ROOT + HOME + SWAP");
+    log("  [1] Simple    -> EFI 256MB + ROOT resto");
+    log("  [2] Avanzado  -> EFI 256MB + ROOT + HOME + SWAP");
     log("Opción recomendada [1]:");
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->layout = LAYOUT_SIMPLE;
@@ -1309,7 +1309,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         parts[1].write_image = 1;
         parts[1].verify_after_write = 1;
         *part_count = 2;
-        snprintf(summary, summary_size, "Simple (EFI 128MB + ROOT resto)");
+        snprintf(summary, summary_size, "Simple (EFI 256MB + ROOT resto)");
         return 0;
     }
 
@@ -1375,7 +1375,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     parts[3].verify_after_write = 0;
 
     *part_count = 4;
-    snprintf(summary, summary_size, "Avanzado (EFI 128MB + ROOT + HOME + SWAP)");
+    snprintf(summary, summary_size, "Avanzado (EFI 256MB + ROOT + HOME + SWAP)");
     return 0;
 }
 

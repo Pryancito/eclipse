@@ -2,7 +2,7 @@
 
 use crate::{
     error::{LxError, LxResult},
-    fs::{File, FileDesc, FileLike, OpenFlags, STDIN, STDOUT},
+    fs::{File, FileDesc, FileLike, OpenFlags},
     ipc::*,
     net::SOCKET_FD,
     signal::{Signal as LinuxSignal, SignalAction},
@@ -32,7 +32,12 @@ pub use rcore_fs::vfs::FsInfo;
 /// Process extension for linux
 pub trait ProcessExt {
     /// create Linux process
-    fn create_linux(job: &Arc<Job>, rootfs: Arc<dyn FileSystem>) -> ZxResult<Arc<Self>>;
+    fn create_linux(
+        job: &Arc<Job>,
+        rootfs: Arc<dyn FileSystem>,
+        vt: usize,
+        shared_root: Option<Arc<dyn INode>>,
+    ) -> ZxResult<Arc<Self>>;
     /// get linux process
     fn linux(&self) -> &LinuxProcess;
     /// fork from current linux process
@@ -76,8 +81,16 @@ impl Default for Credentials {
 }
 
 impl ProcessExt for Process {
-    fn create_linux(job: &Arc<Job>, rootfs: Arc<dyn FileSystem>) -> ZxResult<Arc<Self>> {
-        let linux_proc = LinuxProcess::new(rootfs);
+    fn create_linux(
+        job: &Arc<Job>,
+        rootfs: Arc<dyn FileSystem>,
+        vt: usize,
+        shared_root: Option<Arc<dyn INode>>,
+    ) -> ZxResult<Arc<Self>> {
+        let linux_proc = match shared_root {
+            Some(root) => LinuxProcess::with_root(root, vt),
+            None => LinuxProcess::new(rootfs, vt),
+        };
         let proc = Process::create_init_with_ext(job, "root", linux_proc)?;
         let weak_proc = Arc::downgrade(&proc);
         proc.add_signal_callback(Box::new(move |signal| {
@@ -161,11 +174,20 @@ impl ProcessExt for Process {
 /// - the child terminated.
 /// - the child was stopped by a signal. TODO
 /// - the child was resumed by a signal. TODO
-pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxResult<ExitCode> {
+pub async fn wait_child(
+    proc: &Arc<Process>,
+    pid: KoID,
+    nonblock: bool,
+    reap: bool,
+) -> LxResult<ExitCode> {
     loop {
         {
             let mut inner = proc.linux().inner.lock();
-            if let Some(code) = inner.reaped_children.remove(&pid) {
+            if let Some(code) = inner.reaped_children.get(&pid) {
+                let code = *code;
+                if reap {
+                    inner.reaped_children.remove(&pid);
+                }
                 return Ok((code as i32) << 8);
             }
         }
@@ -174,9 +196,11 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
         if let Status::Exited(code) = child.status() {
-            let mut inner = proc.linux().inner.lock();
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                let mut inner = proc.linux().inner.lock();
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((code as i32) << 8);
         }
         if nonblock {
@@ -187,9 +211,11 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
 
         // Check again after wait
         if let Status::Exited(code) = child.status() {
-            let mut inner = proc.linux().inner.lock();
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                let mut inner = proc.linux().inner.lock();
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((code as i32) << 8);
         }
         continue;
@@ -197,14 +223,20 @@ pub async fn wait_child(proc: &Arc<Process>, pid: KoID, nonblock: bool) -> LxRes
 }
 
 /// Wait for state changes in a child of the calling process.
-pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(KoID, ExitCode)> {
+pub async fn wait_child_any(
+    proc: &Arc<Process>,
+    nonblock: bool,
+    reap: bool,
+) -> LxResult<(KoID, ExitCode)> {
     loop {
         let mut inner = proc.linux().inner.lock();
         if inner.children.is_empty() && inner.reaped_children.is_empty() {
             return Err(LxError::ECHILD);
         }
         if let Some((pid, code)) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c)) {
-            inner.reaped_children.remove(&pid);
+            if reap {
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((pid, (code as i32) << 8));
         }
         let mut exited_pid = None;
@@ -219,8 +251,10 @@ pub async fn wait_child_any(proc: &Arc<Process>, nonblock: bool) -> LxResult<(Ko
         }
         if let Some((pid, code)) = exited_pid {
             trace!("wait_child_any: reaping child {}", pid);
-            inner.children.remove(&pid);
-            inner.reaped_children.remove(&pid);
+            if reap {
+                inner.children.remove(&pid);
+                inner.reaped_children.remove(&pid);
+            }
             return Ok((pid, (code as i32) << 8));
         }
         if nonblock {
@@ -344,20 +378,29 @@ impl LinuxProcess {
         inner.reaped_children.insert(child_id, exit_code);
     }
 
-    /// Create a new process.
-    pub fn new(rootfs: Arc<dyn FileSystem>) -> Self {
+    /// Create a new process bound to virtual terminal `vt`, building a fresh
+    /// root filesystem.
+    pub fn new(rootfs: Arc<dyn FileSystem>, vt: usize) -> Self {
+        Self::with_root(crate::fs::create_root_fs(rootfs), vt)
+    }
+
+    /// Create a new process reusing an already-built root filesystem (shared by
+    /// `Arc`, like `fork`), bound to virtual terminal `vt`. Used to spawn the
+    /// extra per-VT shells without re-scanning disks / re-mounting.
+    pub fn with_root(root_inode: Arc<dyn INode>, vt: usize) -> Self {
         let stdin = File::new(
-            STDIN.clone(), // FIXME: stdin
+            crate::fs::stdio::vt_stdin(vt),
             OpenFlags::RDONLY,
             String::from("/dev/stdin"),
         ) as Arc<dyn FileLike>;
+        let stdout_dev = crate::fs::stdio::vt_stdout(vt);
         let stdout = File::new(
-            STDOUT.clone(), // TODO: open from '/dev/stdout'
+            stdout_dev.clone(),
             OpenFlags::WRONLY,
             String::from("/dev/stdout"),
         ) as Arc<dyn FileLike>;
         let stderr = File::new(
-            STDOUT.clone(), // TODO: open from '/dev/stderr'
+            stdout_dev,
             OpenFlags::WRONLY,
             String::from("/dev/stderr"),
         ) as Arc<dyn FileLike>;
@@ -367,7 +410,7 @@ impl LinuxProcess {
         files.insert(2.into(), stderr);
 
         LinuxProcess {
-            root_inode: crate::fs::create_root_fs(rootfs), //Arc::clone(&ROOT_INODE),访问磁盘可能更快？
+            root_inode,
             parent: Weak::default(),
             inner: Mutex::new(LinuxProcessInner {
                 files,

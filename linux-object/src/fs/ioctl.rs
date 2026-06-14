@@ -81,3 +81,13 @@ pub const FIOCLEX: usize = 0x6601;
 // rustc using pipe and ioctl pipe file with this request id
 // for non-blocking/blocking IO control setting
 pub const FIONBIO: usize = 0x5421;
+
+// VT / KD console ioctls (Linux `<linux/kd.h>`).
+/// Get console mode (`KD_TEXT` / `KD_GRAPHICS`) into an `int`.
+pub const KDGETMODE: usize = 0x4B3B;
+/// Set console mode from an `int` (`KD_TEXT` / `KD_GRAPHICS`).
+pub const KDSETMODE: usize = 0x4B3A;
+/// Text mode: the kernel draws the framebuffer console.
+pub const KD_TEXT: usize = 0x00;
+/// Graphics mode: userspace owns the framebuffer; the console stops drawing.
+pub const KD_GRAPHICS: usize = 0x01;

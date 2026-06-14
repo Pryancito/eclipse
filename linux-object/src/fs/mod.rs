@@ -319,6 +319,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
+    // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
+    for vt in 0..kernel_hal::console::NUM_VTS {
+        let name = alloc::format!("tty{}", vt + 1);
+        if let Err(e) = devfs_root.add(&name, stdio::vt_stdin(vt)) {
+            warn!("failed to mknod /dev/{}: {:?}", name, e);
+        }
+    }
     if let Some(display) = drivers::all_display().first() {
         use devfs::FbDev;
 
@@ -536,6 +543,31 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         if let Ok(var) = root.find(true, "var") {
             if var.find(true, "run").is_err() {
                 var.create("run", FileType::Dir, 0o755).ok();
+            }
+        }
+        // Keep apk's download cache off the small initramfs SFS: edge indexes
+        // plus .apk blobs can exceed the free space left after zip_dir.
+        warn!("[boot] create_root_fs: mount /var/cache/apk on tmpfs");
+        if let Ok(var) = root.find(true, "var") {
+            let cache = var.find(true, "cache").unwrap_or_else(|_| {
+                var.create("cache", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache")
+            });
+            let apk_cache = cache.find(true, "apk").unwrap_or_else(|_| {
+                cache
+                    .create("apk", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache/apk")
+            });
+            if apk_cache.mount(RamFS::new()).is_ok() {
+                register_mount(
+                    "tmpfs",
+                    "/var/cache/apk",
+                    "tmpfs",
+                    "rw,nosuid,nodev",
+                    boot_mount_state(),
+                );
+            } else {
+                warn!("[boot] create_root_fs: mount /var/cache/apk failed");
             }
         }
     }

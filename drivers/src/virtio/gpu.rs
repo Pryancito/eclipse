@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use lock::Mutex;
 use virtio_drivers::{VirtIOGpu as InnerDriver, VirtIOHeader};
 
-use crate::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
+use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::DeviceResult;
 
@@ -103,6 +103,17 @@ impl<'a> DisplayScheme for VirtIoGpu<'a> {
     fn fb(&self) -> FrameBuffer<'_> {
         unsafe {
             FrameBuffer::from_raw_parts_mut(self.info.fb_base_vaddr as *mut u8, self.info.fb_size)
+        }
+    }
+
+    /// The framebuffer is host-shared memory: the generic 2D primitives fill /
+    /// copy / blit it in bulk in RAM and a single [`flush`](Self::flush) hands
+    /// the dirty frame to the host (QEMU / VirtualBox) for display.
+    fn accel_caps(&self) -> AccelCaps {
+        AccelCaps {
+            fill: true,
+            copy: true,
+            blit: true,
         }
     }
 

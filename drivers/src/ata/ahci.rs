@@ -898,7 +898,7 @@ impl BlockScheme for AhciInterface {
             let ptr = unsafe { read_buf.as_ptr().add(offset) } as usize;
             let mut prds = [(0u64, 0usize); PRDT_MAX];
             let mut chunk = 0usize;
-            if ptr % 4096 == 0 {
+            if ptr % 4096 == 0 && false {
                 // Zero-copy: DMA straight into the caller's buffer, page by page.
                 let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
                 if let Some(n) = build_prds(ptr, want, &mut prds) {
@@ -933,7 +933,7 @@ impl BlockScheme for AhciInterface {
             let ptr = unsafe { write_buf.as_ptr().add(offset) } as usize;
             let mut prds = [(0u64, 0usize); PRDT_MAX];
             let mut chunk = 0usize;
-            if ptr % 4096 == 0 {
+            if ptr % 4096 == 0 && false {
                 let want = remaining.min(self.max_chunk(port.lba48, DIRECT_MAX_BYTES));
                 if let Some(n) = build_prds(ptr, want, &mut prds) {
                     port.rw_block(lba, &prds[..n], true)?;

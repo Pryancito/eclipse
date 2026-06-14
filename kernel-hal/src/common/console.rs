@@ -72,7 +72,7 @@ impl Write for SerialWriter {
         if let Some(uart) = drivers::all_uart().first() {
             uart.write_str(s).unwrap();
             #[cfg(feature = "graphic")]
-            if GRAPHIC_CONSOLE.try_get().is_none() {
+            if GRAPHIC_VTS.try_get().is_none() {
                 crate::hal_fn::console::console_write_early(s);
             }
         } else {
@@ -100,26 +100,40 @@ cfg_if! {
         use core::sync::atomic::AtomicBool;
         use zcore_drivers::{scheme::DisplayScheme, utils::GraphicConsole};
 
-        static GRAPHIC_CONSOLE: InitOnce<spin::Mutex<GraphicConsole>> = InitOnce::new();
+        use alloc::vec::Vec;
+
+        static GRAPHIC_VTS: InitOnce<Vec<spin::Mutex<GraphicConsole>>> = InitOnce::new();
         static CONSOLE_WIN_SIZE: InitOnce<ConsoleWinSize> = InitOnce::new();
         static GRAPHIC_DISPLAY: InitOnce<Arc<dyn DisplayScheme>> = InitOnce::new();
+        static ACTIVE_VT: AtomicUsize = AtomicUsize::new(0);
         static CLEAR_ON_NEXT_GRAPHIC_WRITE: AtomicBool = AtomicBool::new(false);
 
         pub(crate) fn init_graphic_console(display: Arc<dyn DisplayScheme>) {
             let info = display.info();
             GRAPHIC_DISPLAY.init_once_by(display.clone());
-            let cons = GraphicConsole::new(display);
-            let winsz = ConsoleWinSize {
-                ws_row: cons.rows() as u16,
-                ws_col: cons.columns() as u16,
-                ws_xpixel: info.width as u16,
-                ws_ypixel: info.height as u16,
-            };
+            let mut vts = Vec::with_capacity(NUM_VTS);
+            let mut winsz = ConsoleWinSize::default();
+            for i in 0..NUM_VTS {
+                let cons = GraphicConsole::new(display.clone());
+                if i == 0 {
+                    winsz = ConsoleWinSize {
+                        ws_row: cons.rows() as u16,
+                        ws_col: cons.columns() as u16,
+                        ws_xpixel: info.width as u16,
+                        ws_ypixel: info.height as u16,
+                    };
+                }
+                vts.push(spin::Mutex::new(cons));
+            }
             CONSOLE_WIN_SIZE.init_once_by(winsz);
-            GRAPHIC_CONSOLE.init_once_by(spin::Mutex::new(cons));
+            GRAPHIC_VTS.init_once_by(vts);
             // Make boot UX robust on real hardware: clear once on first graphic write
             // even if userspace/loader ordering differs.
             CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
+        }
+
+        fn vt_mutex(n: usize) -> Option<&'static spin::Mutex<GraphicConsole>> {
+            GRAPHIC_VTS.try_get().and_then(|v| v.get(n))
         }
 
         /// Request a one-shot clear-to-black of the graphic console before the next write.
@@ -130,12 +144,11 @@ cfg_if! {
             CLEAR_ON_NEXT_GRAPHIC_WRITE.store(true, Ordering::SeqCst);
         }
 
-        fn maybe_clear_graphic_before_write() {
+        fn maybe_clear_graphic_before_write(vt: usize) {
             if !CLEAR_ON_NEXT_GRAPHIC_WRITE.swap(false, Ordering::SeqCst) {
                 return;
             }
-            if let (Some(display), Some(cons)) = (GRAPHIC_DISPLAY.try_get(), GRAPHIC_CONSOLE.try_get())
-            {
+            if let (Some(display), Some(cons)) = (GRAPHIC_DISPLAY.try_get(), vt_mutex(vt)) {
                 // Clear to black with opaque alpha (ARGB8888) and reset the console state.
                 let _ = crate::boot_logo::clear_screen(
                     &**display,
@@ -144,6 +157,194 @@ cfg_if! {
                 *cons.lock() = GraphicConsole::new(display.clone());  // spin::Mutex — IRQs stay enabled
             }
         }
+
+        /// Write to a specific VT's console buffer. The pixels are only pushed to
+        /// the display when this is the active VT and we are in text mode;
+        /// background VTs keep accumulating in their own shadow buffer.
+        pub(crate) fn vt_write_str_impl(vt: usize, s: &str) {
+            let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
+            if active {
+                maybe_clear_graphic_before_write(vt);
+            }
+            if let Some(cons) = vt_mutex(vt) {
+                if let Some(mut g) = cons.try_lock() {
+                    let _ = g.write_str(s);
+                    if active && kd_mode() == KD_TEXT {
+                        g.present();
+                    }
+                }
+            }
+        }
+
+        pub(crate) fn vt_write_fmt_impl(vt: usize, fmt: Arguments) {
+            let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
+            if active {
+                maybe_clear_graphic_before_write(vt);
+            }
+            if let Some(cons) = vt_mutex(vt) {
+                if let Some(mut g) = cons.try_lock() {
+                    let _ = g.write_fmt(fmt);
+                    if active && kd_mode() == KD_TEXT {
+                        g.present();
+                    }
+                }
+            }
+        }
+
+        /// Make VT `n` the active one and repaint it to the display.
+        pub(crate) fn switch_vt_impl(n: usize) {
+            if let Some(v) = GRAPHIC_VTS.try_get() {
+                if n >= v.len() {
+                    return;
+                }
+                ACTIVE_VT.store(n, Ordering::SeqCst);
+                if kd_mode() == KD_TEXT {
+                    if let Some(mut g) = v[n].try_lock() {
+                        g.repaint();
+                    }
+                }
+            }
+        }
+
+        pub(crate) fn scroll_active_vt(direction: i32) {
+            if let Some(cons) = vt_mutex(ACTIVE_VT.load(Ordering::SeqCst)) {
+                if let Some(mut g) = cons.try_lock() {
+                    g.buf_mut().scroll_history(direction);
+                    g.present();
+                }
+            }
+        }
+
+        pub(crate) fn blink_active_vt(visible: bool) {
+            if let Some(cons) = vt_mutex(ACTIVE_VT.load(Ordering::SeqCst)) {
+                if let Some(mut g) = cons.try_lock() {
+                    g.set_cursor_blink(visible);
+                }
+            }
+        }
+
+        /// Repaint the active VT from its backing buffer.
+        ///
+        /// Used when returning from `KD_GRAPHICS` to `KD_TEXT`: a userspace
+        /// graphics server may have overwritten the framebuffer.
+        pub(crate) fn redraw_graphic_console_impl() {
+            if let Some(cons) = vt_mutex(ACTIVE_VT.load(Ordering::SeqCst)) {
+                if let Some(mut g) = cons.try_lock() {
+                    g.repaint();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KD console mode (Linux VT `KD_SETMODE` / `KD_GETMODE` semantics)
+// ---------------------------------------------------------------------------
+// In `KD_GRAPHICS` the kernel stops drawing the text console so a userspace
+// graphics server (X/Wayland/DRM client) can own the framebuffer. Switching
+// back to `KD_TEXT` repaints the text console.
+
+/// Text mode: the kernel owns and draws the framebuffer console.
+pub const KD_TEXT: u32 = 0x00;
+/// Graphics mode: userspace owns the framebuffer; the console stops drawing.
+pub const KD_GRAPHICS: u32 = 0x01;
+
+static KD_MODE: AtomicUsize = AtomicUsize::new(KD_TEXT as usize);
+
+/// Set the console KD mode (`KD_TEXT` or `KD_GRAPHICS`).
+pub fn set_kd_mode(mode: u32) {
+    KD_MODE.store(mode as usize, Ordering::SeqCst);
+    #[cfg(feature = "graphic")]
+    if mode == KD_TEXT {
+        redraw_graphic_console_impl();
+    }
+}
+
+/// Get the current console KD mode.
+pub fn kd_mode() -> u32 {
+    KD_MODE.load(Ordering::SeqCst) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Virtual terminals (VT) — Linux-style tty1..ttyN multiplexed on one display
+// ---------------------------------------------------------------------------
+
+/// Number of virtual terminals (Linux-style `tty1..ttyN`).
+pub const NUM_VTS: usize = 6;
+
+/// Number of virtual terminals available.
+pub fn num_vts() -> usize {
+    #[cfg(feature = "graphic")]
+    {
+        return GRAPHIC_VTS.try_get().map(|v| v.len()).unwrap_or(1);
+    }
+    #[cfg(not(feature = "graphic"))]
+    {
+        1
+    }
+}
+
+/// Index of the currently active VT.
+pub fn active_vt() -> usize {
+    #[cfg(feature = "graphic")]
+    {
+        return ACTIVE_VT.load(Ordering::SeqCst);
+    }
+    #[cfg(not(feature = "graphic"))]
+    {
+        0
+    }
+}
+
+/// Make VT `n` the active one and repaint it to the display.
+#[allow(unused_variables)]
+pub fn switch_vt(n: usize) {
+    #[cfg(feature = "graphic")]
+    switch_vt_impl(n);
+}
+
+/// Write a string into a specific VT's graphic console.
+#[allow(unused_variables)]
+pub fn vt_write_str(vt: usize, s: &str) {
+    #[cfg(feature = "graphic")]
+    vt_write_str_impl(vt, s);
+}
+
+/// Write formatted data into a specific VT's graphic console.
+#[allow(unused_variables)]
+pub fn vt_write_fmt(vt: usize, fmt: Arguments) {
+    #[cfg(feature = "graphic")]
+    vt_write_fmt_impl(vt, fmt);
+}
+
+/// Write a string to VT `vt`: always to its graphic console, and to the serial
+/// port when `vt` is the active terminal (so the serial log mirrors the screen).
+pub fn vt_console_write_str(vt: usize, s: &str) {
+    if vt == active_vt() {
+        serial_write_str(s);
+    }
+    vt_write_str(vt, s);
+}
+
+/// Blink the graphic-console text cursor.
+///
+/// Invoked from the timer tick (~250 Hz). It rate-limits itself to a ~2 Hz
+/// blink using the monotonic clock and only does work when the blink phase
+/// actually flips, so the common tick is just one atomic load. A no-op when the
+/// `graphic` feature is disabled or while in `KD_GRAPHICS`.
+pub fn cursor_blink_tick() {
+    #[cfg(feature = "graphic")]
+    {
+        if kd_mode() != KD_TEXT {
+            return;
+        }
+        static LAST_PHASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let ms = crate::hal_fn::timer::timer_now().as_millis() as usize;
+        let phase = (ms / 500) & 1;
+        if LAST_PHASE.swap(phase, Ordering::SeqCst) == phase {
+            return;
+        }
+        blink_active_vt(phase == 0);
     }
 }
 
@@ -198,30 +399,25 @@ pub fn early_progress_bar(progress: u32) {
     crate::hal_fn::console::console_progress_early(progress);
 }
 
+/// Scrolls the graphic console history up (direction > 0) or down (direction < 0).
+#[allow(unused_variables)]
+pub fn scroll_graphic_console(direction: i32) {
+    #[cfg(feature = "graphic")]
+    scroll_active_vt(direction);
+}
+
 /// Writes a string slice into the graphic console.
 #[allow(unused_variables)]
 pub fn graphic_console_write_str(s: &str) {
     #[cfg(feature = "graphic")]
-    if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
-        maybe_clear_graphic_before_write();
-        // Use try_lock to avoid deadlock if an IRQ tries to log while
-        // the console is scrolling.
-        if let Some(mut g) = cons.try_lock() {
-            let _ = g.write_str(s);
-        }
-    }
+    vt_write_str_impl(active_vt(), s);
 }
 
 /// Writes formatted data into the graphic console.
 #[allow(unused_variables)]
 pub fn graphic_console_write_fmt(fmt: Arguments) {
     #[cfg(feature = "graphic")]
-    if let Some(cons) = GRAPHIC_CONSOLE.try_get() {
-        maybe_clear_graphic_before_write();
-        if let Some(mut g) = cons.try_lock() {
-            let _ = g.write_fmt(fmt);
-        }
-    }
+    vt_write_fmt_impl(active_vt(), fmt);
 }
 
 /// Writes a string slice into the serial, and the graphic console if it exists.

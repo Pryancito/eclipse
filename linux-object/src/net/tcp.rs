@@ -114,6 +114,22 @@ impl TcpSocketState {
     }
 }
 
+impl Drop for TcpSocketState {
+    fn drop(&mut self) {
+        // Solo el último dueño del inner (cuando apk cierra el fd) loguea el
+        // tally final: total de bytes entregados + hash del stream completo.
+        if Arc::strong_count(&self.inner) == 1 {
+            let inner = self.inner.lock();
+            if inner.total_recv > 0 {
+                log::warn!(
+                    "[tcp drop] handle={} total={} hash={:016x}",
+                    inner.handle.0, inner.total_recv, inner.stream_hash
+                );
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Socket for TcpSocketState {
     /// read to buffer
@@ -164,6 +180,13 @@ impl Socket for TcpSocketState {
             // buffer), treat it as EOF so callers don't loop forever.
             if peer_closed {
                 if let Err(smoltcp::Error::Exhausted) = copied_len {
+                    {
+                        let inner = self.inner.lock();
+                        log::error!(
+                            "[tcp eof] handle={} total={} hash={:016x}",
+                            handle, inner.total_recv, inner.stream_hash
+                        );
+                    }
                     return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                 }
             }
@@ -180,12 +203,6 @@ impl Socket for TcpSocketState {
                     }
                 }
                 Ok(size) => {
-                    // We just freed RX buffer space via recv_slice. Drive the
-                    // NIC again so smoltcp emits the window-update/ACK now,
-                    // instead of on the next read() call. Without this, a peer
-                    // sending more than one receive-window (TLS handshakes and
-                    // large downloads exceed the 64 KiB window) can stall
-                    // waiting for the window to reopen.
                     crate::net::drain_net_urgent();
                     let endpoint = get_sockets()
                         .lock()
@@ -214,6 +231,13 @@ impl Socket for TcpSocketState {
                     return (Ok(size), Endpoint::Ip(endpoint));
                 }
                 Err(smoltcp::Error::Finished) => {
+                    {
+                        let inner = self.inner.lock();
+                        log::error!(
+                            "[tcp eof] handle={} total={} hash={:016x}",
+                            handle, inner.total_recv, inner.stream_hash
+                        );
+                    }
                     return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                 }
                 Err(err) => {
