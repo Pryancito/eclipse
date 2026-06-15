@@ -302,8 +302,10 @@ impl Syscall<'_> {
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);
-        let reap = !flags.contains(WaitFlags::NOWAIT);
-        warn!(
+        // Hot path (shells, fork+exec, sysbench worker reaping): keep at debug
+        // so a default `LOG=warn` boot doesn't pay a synchronous serial write
+        // on every wait.
+        debug!(
             "wait4: target={:?}, wstatus={:?}, options={:?}",
             target, wstatus, flags,
         );
@@ -444,8 +446,9 @@ impl Syscall<'_> {
             error!("execve: path.as_c_str() failed: {:?}", e);
             e
         })?;
-        debug!("EXECVE ENTER: path={:?}", path_str);
-        warn!("EXECVE: path={:?}", path_str);
+        // Normal program launch — keep at debug so shells / fork+exec loops
+        // don't pay a synchronous serial write per exec at the default LOG=warn.
+        debug!("EXECVE: path={:?}", path_str);
         let args = argv.read_cstring_array().map_err(|e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
             e

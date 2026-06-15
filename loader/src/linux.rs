@@ -279,7 +279,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             Ok(())
         }
         TrapReason::PageFault(vaddr, flags) => {
-            warn!(
+            // A user page fault is the normal demand-paging / CoW / stack-growth
+            // path and happens constantly; logging each one at `warn!` forces a
+            // synchronous serial write per fault and dominates fault-heavy
+            // workloads (sysbench `memory`, fresh `mmap`, stack growth). Only the
+            // failure case below (a real SIGSEGV) is worth a warning.
+            trace!(
                 "page fault from user mode @ {:#x}({:?}), pid={}",
                 vaddr, flags, pid
             );

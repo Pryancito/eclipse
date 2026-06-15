@@ -257,7 +257,7 @@ impl LinuxElfLoader {
             match interp_elf.relocate(interp_vmar) {
                 Ok(()) => info!("interp relocate passed!"),
                 Err(e) => {
-                    warn!(
+                    debug!(
                         "interp relocate Err: {:?}, keeping base {:#x}",
                         e, interp_base
                     )
@@ -372,7 +372,10 @@ impl LinuxElfLoader {
                 // Segments stay mapped under `image_vmar.addr()`; do not clobber `base` with the
                 // first program header vaddr (often not PT_LOAD). Wrong AT_BASE breaks PIE/musl
                 // (e.g. user PC stuck at raw e_entry like 0x423a7 -> page fault NOT_FOUND).
-                warn!(
+                // A missing `.rela.dyn` is the normal case for non-PIE static
+                // binaries, so this is a debug note, not a warning (it fired on
+                // every program load at the default LOG=warn).
+                debug!(
                     "elf relocate Err:{:?}, keeping load base {:#x}",
                     error, base
                 );

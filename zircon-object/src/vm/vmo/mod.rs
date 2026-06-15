@@ -393,7 +393,14 @@ impl Drop for VmObject {
         children.append(&mut inner.children);
         children.retain(|c| c.strong_count() != 0);
         for child in children.iter() {
-            let child = child.upgrade().unwrap();
+            // `retain` above filtered out dead weak refs, but on SMP another
+            // CPU can drop the last strong ref between that check and this
+            // `upgrade()` (concurrent process teardown of forked COW VMOs).
+            // Skip the racing-away child instead of `unwrap()`-panicking.
+            let child = match child.upgrade() {
+                Some(child) => child,
+                None => continue,
+            };
             let mut inner = child.inner.lock();
             inner.children.retain(|c| c.strong_count() != 0);
             if inner.children.is_empty() {
