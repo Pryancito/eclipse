@@ -50,7 +50,7 @@ lock = { path = "vendor/kernel-sync" }
 [patch."https://github.com/rcore-os/rcore-fs"]
 rcore-fs = { path = "vendor/rcore-fs" }
 rcore-fs-mountfs = { path = "vendor/rcore-fs-mountfs" }
+rcore-fs-ramfs = { path = "vendor/rcore-fs-ramfs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }
-

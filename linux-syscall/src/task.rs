@@ -302,6 +302,9 @@ impl Syscall<'_> {
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);
+        // Consume (reap) the child's exit status unless WNOWAIT was requested,
+        // which only peeks at it and leaves the zombie for a later wait.
+        let reap = !flags.contains(WaitFlags::NOWAIT);
         // Hot path (shells, fork+exec, sysbench worker reaping): keep at debug
         // so a default `LOG=warn` boot doesn't pay a synchronous serial write
         // on every wait.
