@@ -1007,6 +1007,11 @@ fn efi_dev_from_root_cmdline() -> Option<String> {
 
 pub use mount_ops::{mount_fs, umount_fs};
 
+/// VFS root for kernel services that need to read `/etc/*` (e.g. DNS/hosts).
+pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {
+    mount_ops::vfs_root().map(|root| root as Arc<dyn INode>)
+}
+
 /// extension for INode
 pub trait INodeExt {
     /// similar to read, but return a u8 vector

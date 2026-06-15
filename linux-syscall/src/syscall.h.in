@@ -352,3 +352,4 @@
 
 // JUST FOR TEST
 #define __NR_block_in_kernel 600
+#define __NR_eclipse_dns_query 601

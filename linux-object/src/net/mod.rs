@@ -296,6 +296,8 @@ pub mod ndp_cache;
 /// ICMP echo replies from `push_packet` (ping RX).
 pub mod icmp_rx;
 
+pub mod dns;
+
 pub mod wait;
 pub use icmp_rx::*;
 

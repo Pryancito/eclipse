@@ -100,6 +100,7 @@ impl LinuxRootfs {
             }
 
             Self::write_resolv_conf(&etc);
+            Self::write_hosts(&etc);
             let lib_apk = dir.join("lib").join("apk");
             fs::create_dir_all(&lib_apk).unwrap();
             let lib_apk_db = lib_apk.join("db");
@@ -122,6 +123,9 @@ impl LinuxRootfs {
         fs::create_dir_all(&etc).unwrap();
         if !etc.join("resolv.conf").exists() {
             Self::write_resolv_conf(&etc);
+        }
+        if !etc.join("hosts").exists() {
+            Self::write_hosts(&etc);
         }
         Self::write_profile(&etc);
         Self::install_ca_certs(&dir);
@@ -331,6 +335,18 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&edhcpc, &dst).unwrap();
         }
 
+        // DNS/hosts resolver shim (dynamic) + CLI helper.
+        let eclipse_resolv = self.eclipse_resolv(&musl);
+        if eclipse_resolv.is_file() {
+            let _ = dir::rm(&bin.join("eclipse-resolv"));
+            fs::copy(&eclipse_resolv, bin.join("eclipse-resolv")).unwrap();
+        }
+        let libeclipse_dns = self.libeclipse_dns(&musl);
+        if libeclipse_dns.is_file() {
+            let _ = dir::rm(&lib.join("libeclipse_dns.so"));
+            fs::copy(&libeclipse_dns, lib.join("libeclipse_dns.so")).unwrap();
+        }
+
         // 拷贝 install-eclipse
         let install_eclipse = self.install_eclipse(&musl);
         if install_eclipse.is_file() {
@@ -414,6 +430,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
     }
 
+    fn write_hosts(etc: &Path) {
+        fs::write(
+            etc.join("hosts"),
+            b"127.0.0.1\tlocalhost\n\
+::1\t\tlocalhost ip6-localhost ip6-loopback\n\
+127.0.1.1\tEclipse\n",
+        )
+        .unwrap();
+    }
+
     fn write_profile(etc: &Path) {
         fs::write(
             etc.join("profile"),
@@ -421,6 +447,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
+              export LD_PRELOAD=/lib/libeclipse_dns.so\n\
               export HOME=/root\n\
               export TERM=xterm-256color\n"
         )
@@ -834,6 +861,80 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             return executable;
         }
 
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Build libeclipse_dns.so (LD_PRELOAD resolver shim).
+    fn libeclipse_dns(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-resolv");
+        let lib = dir.join("libeclipse_dns.so");
+        let source = dir.join("resolv.c");
+        if lib.is_file() && source.is_file() {
+            if let (Ok(lib_meta), Ok(src_meta)) = (fs::metadata(&lib), fs::metadata(&source)) {
+                if let (Ok(lib_mtime), Ok(src_mtime)) = (lib_meta.modified(), src_meta.modified()) {
+                    if lib_mtime >= src_mtime {
+                        return lib;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling libeclipse_dns.so...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&lib)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile libeclipse_dns.so");
+        }
+        lib
+    }
+
+    /// Build eclipse-resolv CLI (static).
+    fn eclipse_resolv(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("eclipse-resolv");
+        let executable = dir.join("eclipse-resolv");
+        let source = dir.join("eclipse-resolv.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling eclipse-resolv...");
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", musl.join("bin").display(), arch);
+        let strip = self.strip(&musl);
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            eprintln!("warning: failed to compile eclipse-resolv");
+            return executable;
+        }
         Ext::new(strip).arg("-s").arg(&executable).status();
         executable
     }

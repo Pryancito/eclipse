@@ -1,4 +1,5 @@
-//! Minimal DNS resolver (A / AAAA) using smoltcp UDP and `/etc/resolv.conf`.
+//! Hostname resolver: `/etc/hosts` first, then DNS (A / AAAA) via smoltcp UDP
+//! and `/etc/resolv.conf`.
 
 use crate::error::{LxError, LxResult};
 use crate::net::{drain_net_poll, local_udp_endpoint_for, UDP_METADATA_BUF};
@@ -63,10 +64,15 @@ impl DnsFamily {
     }
 }
 
-/// Resolve `hostname` using nameservers from `/etc/resolv.conf`.
+/// Resolve `hostname` using `/etc/hosts`, then nameservers from `/etc/resolv.conf`.
 pub fn resolve(root: &Arc<dyn INode>, hostname: &str, family: DnsFamily) -> LxResult<Vec<IpAddress>> {
     if hostname.is_empty() || hostname.len() > 253 {
         return Err(LxError::EINVAL);
+    }
+
+    let hosts = lookup_hosts(root, hostname, family);
+    if !hosts.is_empty() {
+        return Ok(hosts);
     }
 
     let servers = read_nameservers(root);
@@ -99,6 +105,57 @@ pub fn resolve(root: &Arc<dyn INode>, hostname: &str, family: DnsFamily) -> LxRe
     } else {
         Ok(out)
     }
+}
+
+fn lookup_hosts(root: &Arc<dyn INode>, hostname: &str, family: DnsFamily) -> Vec<IpAddress> {
+    let Ok(inode) = root.lookup("/etc/hosts") else {
+        return Vec::new();
+    };
+    let Ok(meta) = inode.metadata() else {
+        return Vec::new();
+    };
+    let size = meta.size as usize;
+    if size == 0 || size > 65536 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size];
+    if inode.read_at(0, &mut buf).unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let text = core::str::from_utf8(&buf).unwrap_or("");
+    let want_v4 = matches!(family, DnsFamily::Unspec | DnsFamily::V4);
+    let want_v6 = matches!(family, DnsFamily::Unspec | DnsFamily::V6);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(ip_raw) = parts.next() else { continue };
+        let ip = if let Some(v4) = parse_ipv4(ip_raw) {
+            if !want_v4 {
+                continue;
+            }
+            IpAddress::Ipv4(v4)
+        } else if let Some(v6) = parse_ipv6(ip_raw) {
+            if !want_v6 {
+                continue;
+            }
+            IpAddress::Ipv6(v6)
+        } else {
+            continue;
+        };
+        for alias in parts {
+            if alias.eq_ignore_ascii_case(hostname) {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn read_nameservers(root: &Arc<dyn INode>) -> Vec<IpAddress> {
