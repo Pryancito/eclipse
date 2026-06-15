@@ -5,6 +5,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
@@ -684,7 +685,11 @@ pub struct AhciInterface {
 }
 
 impl AhciInterface {
-    pub fn new(base: usize, _irq: usize) -> DeviceResult<Self> {
+    /// Reset the HBA once and enumerate **every** port that has a disk,
+    /// returning one [`AhciInterface`] per attached SATA device. (The old
+    /// `new` returned only the first disk, so Eclipse could never use a
+    /// second SATA drive on the same controller.)
+    pub fn new_all(base: usize, _irq: usize) -> DeviceResult<Vec<Self>> {
         unsafe {
             // AHCI spec §10.6: BIOS/OS Handoff.
             // On real hardware the BIOS may still own the HBA (BOHC.BOS=1).
@@ -746,6 +751,7 @@ impl AhciInterface {
             false
         });
 
+        let mut disks: Vec<Self> = Vec::new();
         for i in 0..32 {
             if pi & (1 << i) != 0 {
                 let pbase = base + 0x100 + (i * 0x80);
@@ -835,7 +841,7 @@ impl AhciInterface {
                             }
                             return Err(DeviceError::NoResources);
                         }
-                        return Ok(Self {
+                        disks.push(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
                             capacity: sectors,
@@ -843,6 +849,7 @@ impl AhciInterface {
                             bounce_virt: phys_to_virt(bounce_phys),
                             bounce_len: BOUNCE_PAGES * 4096,
                         });
+                        continue;
                     } else {
                         crate::klog_warn!("[AHCI] port {} IDENTIFY failed", i);
                         unsafe {
@@ -858,7 +865,11 @@ impl AhciInterface {
             }
         }
 
-        Err(DeviceError::NoResources)
+        if disks.is_empty() {
+            Err(DeviceError::NoResources)
+        } else {
+            Ok(disks)
+        }
     }
 }
 
@@ -1040,7 +1051,25 @@ impl PciDriver for AhciDriverPci {
 
         let vaddr = phys_to_virt(addr);
         let vector = irq.map(|idx| idx + 32).unwrap_or(33);
-        let blk = Arc::new(AhciInterface::new(vaddr, vector)?);
-        Ok(Device::Block(blk))
+        let mut disks = AhciInterface::new_all(vaddr, vector)?;
+        // The PCI probe framework returns a single `Device` per function, but
+        // one AHCI controller can host several disks. Return the first here and
+        // stash the rest; `pci::init` drains them after the bus scan so each
+        // SATA disk is registered as its own block device.
+        let first = disks.remove(0);
+        for extra in disks {
+            EXTRA_DISKS.lock().push(Device::Block(Arc::new(extra)));
+        }
+        Ok(Device::Block(Arc::new(first)))
     }
+}
+
+/// Additional SATA disks found on AHCI controllers beyond the first one on each
+/// controller. The PCI probe returns a single `Device` per function, so the
+/// extra disks are parked here and drained by `pci::init` after the bus scan.
+static EXTRA_DISKS: Mutex<Vec<Device>> = Mutex::new(Vec::new());
+
+/// Take (and clear) the AHCI disks discovered beyond the first per controller.
+pub fn take_extra_disks() -> Vec<Device> {
+    core::mem::take(&mut *EXTRA_DISKS.lock())
 }
