@@ -283,4 +283,66 @@ impl Syscall<'_> {
             .unwrap();
         Ok(0)
     }
+
+    /// Temporarily replace the signal mask of the calling thread with `mask`
+    /// and suspend the thread until a signal is delivered whose action is to
+    /// invoke a handler or to terminate the process.
+    ///
+    /// Always returns `-EINTR` once a signal is delivered. The original mask is
+    /// restored after the handler returns, via the saved-mask mechanism in
+    /// `LinuxThread` (see `handle_signal`).
+    pub async fn sys_rt_sigsuspend(
+        &mut self,
+        mask: UserInPtr<Sigset>,
+        sigsetsize: usize,
+    ) -> SysResult {
+        if sigsetsize != core::mem::size_of::<Sigset>() {
+            return Err(LxError::EINVAL);
+        }
+        let mut newmask = mask.read()?;
+        // SIGKILL and SIGSTOP can never be blocked.
+        newmask.remove(Signal::SIGKILL);
+        newmask.remove(Signal::SIGSTOP);
+        info!(
+            "rt_sigsuspend: mask={:#x}, thread={}",
+            newmask.val(),
+            self.thread.id()
+        );
+        // Install the temporary mask and remember the previous one so it is
+        // restored once the awakening signal handler returns.
+        {
+            let mut thread = self.thread.lock_linux();
+            let old_mask = thread.signal_mask;
+            thread.signal_mask = newmask;
+            thread.saved_sigmask = Some(old_mask);
+        }
+        // Block until a signal becomes deliverable under the temporary mask
+        // (or the thread/process is being torn down). `check_signals` reports
+        // this as `EINTR`, which is exactly the return value `sigsuspend` owes
+        // its caller.
+        loop {
+            if let Err(e) = linux_object::process::check_signals() {
+                return Err(e);
+            }
+            let deadline =
+                kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
+            kernel_hal::thread::sleep_until(deadline).await;
+        }
+    }
+
+    /// Suspend the calling thread until a signal is delivered that either
+    /// terminates the process or causes a signal handler to be invoked.
+    ///
+    /// Always returns `-EINTR`.
+    pub async fn sys_pause(&mut self) -> SysResult {
+        info!("pause: thread {}", self.thread.id());
+        loop {
+            if let Err(e) = linux_object::process::check_signals() {
+                return Err(e);
+            }
+            let deadline =
+                kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
+            kernel_hal::thread::sleep_until(deadline).await;
+        }
+    }
 }
