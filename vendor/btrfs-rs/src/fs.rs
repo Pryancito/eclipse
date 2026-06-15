@@ -68,6 +68,23 @@ pub struct Btrfs {
     sb_dirty: bool,
     deferred_sb_commits: u32,
     clock: Option<fn() -> (u64, u32)>,
+    /// Read-side cache for the most recently read file: its inode and full
+    /// extent list. Sequential reads otherwise re-walk the fs tree (inode +
+    /// extent lookups) on every call, which dominated read cost. Keyed by the
+    /// volume's write epoch so any mutation invalidates it.
+    read_cache: Option<ReadCacheEntry>,
+}
+
+struct ReadCacheEntry {
+    ino: u64,
+    epoch: u64,
+    inode: InodeItem,
+    /// Extents looked up so far, in file-offset order.
+    extents: Vec<(u64, FileExtent, Vec<u8>)>,
+    /// File offset up to which `extents` is known complete; lookups only cover
+    /// `[cached_end, need_end)` so a single sequential pass isn't penalised by
+    /// an upfront full-file extent scan.
+    cached_end: u64,
 }
 
 impl Btrfs {
@@ -93,6 +110,7 @@ impl Btrfs {
             read_only,
             sb_dirty: false,
             deferred_sb_commits: 0,
+            read_cache: None,
             clock: None,
         };
         fs.alloc.nodesize = fs.vol.nodesize as u64;
@@ -1177,26 +1195,60 @@ impl Btrfs {
     }
 
     pub fn read(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let inode = self.read_inode(ino)?;
-        if inode.kind() == FileKind::Dir {
-            return Err(Error::IsDir);
+        // (Re)build the per-file read cache when the file changed (different
+        // ino) or the volume was written since (epoch bumped). Caches the inode
+        // and the full extent list so sequential reads avoid a tree walk each
+        // call.
+        let epoch = self.vol.write_epoch();
+        let stale = match &self.read_cache {
+            Some(c) => c.ino != ino || c.epoch != epoch,
+            None => true,
+        };
+        if stale {
+            let inode = self.read_inode(ino)?;
+            if inode.kind() == FileKind::Dir {
+                return Err(Error::IsDir);
+            }
+            self.read_cache = Some(ReadCacheEntry {
+                ino,
+                epoch,
+                inode,
+                extents: Vec::new(),
+                cached_end: 0,
+            });
         }
-        if offset >= inode.size {
+        let size = self.read_cache.as_ref().unwrap().inode.size;
+        if offset >= size {
             return Ok(0);
         }
-        let want = (buf.len() as u64).min(inode.size - offset) as usize;
+        let want = (buf.len() as u64).min(size - offset) as usize;
         let buf = &mut buf[..want];
         buf.fill(0);
         let end = offset + want as u64;
-        let extents = self.extents_in_range(ino, offset, end)?;
-        for (file_off, ext, raw) in extents {
+        // Extend the cached extent list to cover `[.., end)`. Only extents
+        // beginning at/after the previously-cached boundary are appended;
+        // an extent that merely spans the boundary was cached earlier.
+        let from = self.read_cache.as_ref().unwrap().cached_end;
+        if end > from {
+            let mut found = self.extents_in_range(ino, from, end)?;
+            let c = self.read_cache.as_mut().unwrap();
+            for e in found.drain(..) {
+                if e.0 >= from {
+                    c.extents.push(e);
+                }
+            }
+            c.cached_end = end;
+        }
+        let cache = self.read_cache.as_ref().unwrap();
+        for (file_off, ext, raw) in cache.extents.iter() {
+            let file_off = *file_off;
             match ext {
                 FileExtent::Inline {
                     ram_bytes,
                     data_off,
                 } => {
-                    let data = &raw[data_off..];
-                    let len = (ram_bytes as usize).min(data.len());
+                    let data = &raw[*data_off..];
+                    let len = (*ram_bytes as usize).min(data.len());
                     // Inline extents always start at file offset 0.
                     let lo = offset.max(file_off) as usize;
                     let hi = (end as usize).min(len);
@@ -1211,11 +1263,16 @@ impl Btrfs {
                     num_bytes,
                     ..
                 } => {
-                    if disk_bytenr == 0 {
+                    if *disk_bytenr == 0 {
                         continue; // hole
                     }
+                    // Extents past the requested range can be skipped (the list
+                    // covers the whole file).
+                    if file_off >= end || file_off + *num_bytes <= offset {
+                        continue;
+                    }
                     let lo = offset.max(file_off);
-                    let hi = end.min(file_off + num_bytes);
+                    let hi = end.min(file_off + *num_bytes);
                     if lo >= hi {
                         continue;
                     }

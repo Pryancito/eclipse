@@ -40,6 +40,22 @@ pub struct Volume {
     pub chunk_tree_uuid: [u8; 16],
     cache: BTreeMap<u64, CachedBlock>,
     cache_tick: u64,
+    /// Bumped on every device write. The fs read-side cache (inode + extents)
+    /// keys off this so any mutation transparently invalidates it, without
+    /// having to track every individual write site.
+    write_epoch: core::sync::atomic::AtomicU64,
+}
+
+impl Volume {
+    /// Monotonic counter incremented on each device write.
+    pub fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline]
+    fn bump_write_epoch(&self) {
+        self.write_epoch
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Volume {
@@ -75,6 +91,7 @@ impl Volume {
             chunk_tree_uuid: [0u8; 16],
             cache: BTreeMap::new(),
             cache_tick: 0,
+            write_epoch: core::sync::atomic::AtomicU64::new(0),
         };
         vol.bootstrap_chunks()?;
         vol.load_chunk_tree()?;
@@ -203,6 +220,7 @@ impl Volume {
 
     /// Write bytes at a logical address, hitting every stripe (DUP).
     pub fn write_logical(&self, logical: u64, buf: &[u8]) -> Result<()> {
+        self.bump_write_epoch();
         let mut done = 0usize;
         while done < buf.len() {
             let (phys, avail) =
