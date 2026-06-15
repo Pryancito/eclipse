@@ -16,3 +16,8 @@ Cargo.lock
 
 # Generado por zCore/build.rs durante la compilación de riscv64.
 /zCore/src/platform/riscv/kernel-vars.ld
+local-mirror/
+
+# Benchmark e1000e: entradas generadas/descargadas y artefactos
+prebuilt/
+tools/install-eclipse/install-eclipse
