@@ -726,13 +726,21 @@ pub struct ThreadInfo {
 
 struct ThreadSwitchFuture {
     thread: Arc<Thread>,
-    future: Mutex<ThreadFuturePinned>,
+    // Plain spin mutex (NOT `lock::Mutex`): this guard is held across the inner
+    // future's `poll`, which legitimately re-enables interrupts (syscalls run
+    // with IRQs on) and can return `Pending` with interrupts still enabled.
+    // `lock::Mutex` would `push_off`/`pop_off` around that span, and dropping
+    // the guard with interrupts on trips the `pop_off: intr_on` assertion (a
+    // kernel panic under heavy mutex/yield workloads, e.g. sysbench `threads`).
+    // The future is only ever polled by one executor at a time (task borrow
+    // bit), so this mutex is never actually contended.
+    future: spin::Mutex<ThreadFuturePinned>,
 }
 
 impl ThreadSwitchFuture {
     pub fn new(thread: Arc<Thread>, future: ThreadFuturePinned) -> Self {
         Self {
-            future: Mutex::new(future),
+            future: spin::Mutex::new(future),
             thread,
         }
     }
