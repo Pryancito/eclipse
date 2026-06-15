@@ -335,6 +335,11 @@ pub fn init(mapper: Option<Arc<dyn IoMapper>>) -> DeviceResult<Vec<Device>> {
             ),
         }
     }
+    // One AHCI controller can host several disks but the probe only returns the
+    // first as a `Device`; collect the remaining SATA disks it parked.
+    for extra in crate::ata::ahci::take_extra_disks() {
+        dev_list.push(extra);
+    }
     info!("---------");
     info!("");
 
