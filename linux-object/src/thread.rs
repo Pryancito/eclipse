@@ -40,6 +40,7 @@ impl ThreadExt for Thread {
             clear_child_tid: 0.into(),
             signals: Sigset::default(),
             signal_mask: Sigset::default(),
+            saved_sigmask: None,
             signal_alternate_stack: SignalStack::default(),
             robust_list: 0.into(),
             robust_list_len: 0,
@@ -145,6 +146,10 @@ pub struct LinuxThread {
     pub signals: Sigset,
     /// Signal mask
     pub signal_mask: Sigset,
+    /// Signal mask to restore once the currently-awaited signal handler
+    /// returns. Set by `rt_sigsuspend` so that the original mask is restored
+    /// after the temporarily-unblocked signal is delivered.
+    pub saved_sigmask: Option<Sigset>,
     /// signal alternate stack
     pub signal_alternate_stack: SignalStack,
     /// robust_list
@@ -212,7 +217,11 @@ impl LinuxThread {
             if let Some(signal) = signal {
                 self.handling_signal = Some(signal as u32);
                 self.signals.remove(signal);
-                return Some((signal, self.signal_mask));
+                // If a `rt_sigsuspend` (or similar) saved a mask to restore once
+                // the handler returns, hand that mask to the signal frame so it
+                // is reinstated on `sigreturn`. Otherwise keep the current mask.
+                let restore_mask = self.saved_sigmask.take().unwrap_or(self.signal_mask);
+                return Some((signal, restore_mask));
             }
         }
         None

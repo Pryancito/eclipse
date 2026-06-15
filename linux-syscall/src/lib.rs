@@ -199,6 +199,7 @@ impl Syscall<'_> {
             Sys::RT_SIGACTION => self.sys_rt_sigaction(a0, a1.into(), a2.into(), a3),
             Sys::RT_SIGPROCMASK => self.sys_rt_sigprocmask(a0 as _, a1.into(), a2.into(), a3),
             Sys::RT_SIGRETURN => self.sys_rt_sigreturn(),
+            Sys::RT_SIGSUSPEND => self.sys_rt_sigsuspend(a0.into(), a1).await,
             Sys::SIGALTSTACK => self.sys_sigaltstack(a0.into(), a1.into()),
             Sys::KILL => self.sys_kill(a0 as isize, a1),
 
@@ -312,7 +313,12 @@ impl Syscall<'_> {
             Sys::GETPGID => self.sys_getpgid(a0),
             Sys::GETGROUPS => self.sys_getgroups(a0, a1.into()),
             Sys::SETGROUPS => self.sys_setgroups(a0, a1.into()),
-            //            Sys::SETPRIORITY => self.sys_set_priority(a0),
+            // Scheduling priority (nice). We do not implement priority
+            // scheduling, so accept setpriority as a no-op and report the
+            // default nice value (0) for getpriority. getpriority returns
+            // `20 - nice` so that valid values stay non-negative.
+            Sys::SETPRIORITY => self.unimplemented("setpriority", Ok(0)),
+            Sys::GETPRIORITY => self.unimplemented("getpriority", Ok(20)),
             Sys::PRCTL => self.unimplemented("prctl", Ok(0)),
             Sys::MEMBARRIER => self.unimplemented("membarrier", Ok(0)),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
@@ -370,6 +376,7 @@ impl Syscall<'_> {
             }
             Sys::DUP2 => self.sys_dup2(a0.into(), a1.into()),
             //            Sys::ALARM => self.unimplemented("alarm", Ok(0)),
+            Sys::PAUSE => self.sys_pause().await,
             Sys::FORK => self.sys_fork(0, 0),
             Sys::VFORK => self.sys_vfork(0, 0).await,
             Sys::RENAME => self.sys_rename(a0.into(), a1.into()),
