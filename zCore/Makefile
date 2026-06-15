@@ -207,6 +207,7 @@ endif
 qemu_opts += \
 	-netdev user,id=net1 \
 	-device e1000e,netdev=net1 \
+	-object filter-dump,id=f0,netdev=net1,file=/tmp/eclipse.pcap \
 	-no-reboot
 
 # Capture packets to dump.pcap only when explicitly requested (PCAP=on).

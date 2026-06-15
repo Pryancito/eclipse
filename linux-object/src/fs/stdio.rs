@@ -1,4 +1,5 @@
 //! Implement INode for Stdin & Stdout
+#![allow(dead_code)]
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
@@ -13,23 +14,113 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicI32, Ordering};
 use core::task::{Context, Poll};
 use kernel_hal::console::{self, ConsoleWinSize};
+use zcore_drivers::prelude::{InputEvent, InputEventType};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
 
-// Foreground process group for the (single) controlling TTY.
-// This is a minimal job-control hook for Ctrl+C / SIGINT delivery.
-static TTY_FG_PGRP: AtomicI32 = AtomicI32::new(0);
-static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios::default_tty());
+// c_iflag
+const IGNBRK: u32 = 0x0001;
+const BRKINT: u32 = 0x0002;
+const IGNPAR: u32 = 0x0004;
+const PARMRK: u32 = 0x0008;
+const INPCK: u32  = 0x0010;
+const ISTRIP: u32 = 0x0020;
+const INLCR: u32  = 0x0040;
+const IGNCR: u32  = 0x0080;
+const ICRNL: u32  = 0x0100;
+const IUCLC: u32  = 0x0200;
+const IXON: u32   = 0x0400;
+const IXANY: u32  = 0x0800;
+const IXOFF: u32  = 0x1000;
+const IMAXBEL: u32 = 0x2000;
+const IUTF8: u32  = 0x4000;
 
+// c_oflag
+const OPOST: u32  = 0x0001;
+const OLCUC: u32  = 0x0002;
+const ONLCR: u32  = 0x0004;
+const OCRNL: u32  = 0x0008;
+const ONOCR: u32  = 0x0010;
+const ONLRET: u32 = 0x0020;
+const OFILL: u32  = 0x0040;
+const OFDEL: u32  = 0x0080;
+
+// c_lflag
+const ISIG: u32   = 0x0001;
+const ICANON: u32 = 0x0002;
+const XCASE: u32  = 0x0004;
+const ECHO: u32   = 0x0008;
+const ECHOE: u32  = 0x0010;
+const ECHOK: u32  = 0x0020;
+const ECHONL: u32 = 0x0040;
+const NOFLSH: u32 = 0x0080;
+const TOSTOP: u32 = 0x0100;
+const ECHOCTL: u32 = 0x0200;
+const ECHOPRT: u32 = 0x0400;
+const ECHOKE: u32 = 0x0800;
+const FLUSHO: u32 = 0x1000;
+const PENDIN: u32 = 0x4000;
+const IEXTEN: u32 = 0x8000;
+
+// c_cc indices
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+const VSWTC: usize = 7;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
+const VWERASE: usize = 14;
+const VLNEXT: usize = 15;
+const VEOL2: usize = 16;
+
+// Per-VT TTY state: each virtual terminal has its own termios and foreground
+// process group, so e.g. a shell putting its terminal in raw mode on tty2 does
+// not disturb the cooked shell on tty1.
+struct TtyState {
+    termios: Mutex<Termios>,
+    fg_pgrp: AtomicI32,
+}
+
+lazy_static! {
+    static ref TTY_STATES: Vec<TtyState> = (0..kernel_hal::console::NUM_VTS)
+        .map(|_| TtyState {
+            termios: Mutex::new(Termios::default_tty()),
+            fg_pgrp: AtomicI32::new(0),
+        })
+        .collect();
+}
+
+#[inline]
+fn vt_clamp(vt: usize) -> usize {
+    vt.min(kernel_hal::console::NUM_VTS - 1)
+}
+
+fn tty_termios(vt: usize) -> &'static Mutex<Termios> {
+    &TTY_STATES[vt_clamp(vt)].termios
+}
+
+fn tty_fg_pgrp(vt: usize) -> &'static AtomicI32 {
+    &TTY_STATES[vt_clamp(vt)].fg_pgrp
+}
+
+/// Foreground process group of the *active* terminal (for signal delivery).
 pub fn get_foreground_pgrp() -> i32 {
-    TTY_FG_PGRP.load(Ordering::Relaxed)
+    tty_fg_pgrp(kernel_hal::console::active_vt()).load(Ordering::Relaxed)
 }
 
 pub fn set_foreground_pgrp(pgid: i32) {
-    TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
+    tty_fg_pgrp(kernel_hal::console::active_vt()).store(pgid, Ordering::Relaxed);
 }
 
 // Global Ctrl+C latch. Since many programs (e.g. udhcpc) never read stdin while running,
@@ -39,7 +130,14 @@ static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 /// AltGr (Alt derecho) — layout `es` de Linux/XKB.
 static ALTGR_DOWN: AtomicBool = AtomicBool::new(false);
+/// Alt izquierdo — usado para la conmutación de VT (Ctrl+Alt+F1..F6).
+static LEFT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPSLOCK_ON: AtomicBool = AtomicBool::new(false);
+/// Modo cursor de aplicación (DECCKM). Lo activa/desactiva la aplicación con
+/// `ESC [ ? 1 h` / `ESC [ ? 1 l` (p. ej. el `smkx`/`rmkx` de ncurses). Cuando
+/// está activo, las teclas de cursor emiten `ESC O x` en lugar de `ESC [ x`,
+/// igual que `vc_decckm` en el VT de Linux.
+static APP_CURSOR_KEYS: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)]
 pub fn ctrl_c_pending_take() -> bool {
@@ -89,98 +187,165 @@ pub fn retain_tty_intr_waker(waker: &core::task::Waker) {
 }
 
 lazy_static! {
-    /// STDIN global reference
-    pub static ref STDIN: Arc<Stdin> = {
-        let stdin = Arc::new(Stdin::default());
-        let cloned = stdin.clone();
+    /// One [`Stdin`] per virtual terminal. Building this also wires keyboard /
+    /// UART input to the active terminal.
+    pub static ref STDINS: Vec<Arc<Stdin>> = {
+        let v: Vec<Arc<Stdin>> = (0..kernel_hal::console::NUM_VTS)
+            .map(|i| Arc::new(Stdin::new(i)))
+            .collect();
+
+        // UART input goes to the active VT.
         if let Some(uart) = kernel_hal::drivers::all_uart().first() {
             uart.clone().subscribe(
                 Box::new(move |_| {
                     while let Some(c) = uart.try_recv().unwrap_or(None) {
                         trace!("UART received byte: 0x{:02x}", c);
-                        cloned.push(c as char);
+                        active_stdin().push(c as char);
                     }
                 }),
                 false,
             );
         }
 
-        // Suscribirse a dispositivos de entrada (teclados USB/virtio)
+        // Keyboards (USB / virtio / PS2): translated + routed by `handle_key_event`.
         for input in kernel_hal::drivers::all_input().as_vec().iter() {
-            let cloned = stdin.clone();
-            use zcore_drivers::prelude::{InputEventType, InputEvent};
-            input.subscribe(
-                Box::new(move |event: &InputEvent| {
-                    if event.event_type != InputEventType::Key {
-                        return;
-                    }
-                    // Linux input: value 1 = key press, 0 = release, 2 = autorepeat.
-                    use zcore_drivers::input::input_event_codes::key::*;
-                    match event.code {
-                        KEY_LEFTCTRL | KEY_RIGHTCTRL => {
-                            if event.value == 1 {
-                                CTRL_DOWN.store(true, Ordering::SeqCst);
-                            } else if event.value == 0 {
-                                CTRL_DOWN.store(false, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
-                            if event.value == 1 {
-                                SHIFT_DOWN.store(true, Ordering::SeqCst);
-                            } else if event.value == 0 {
-                                SHIFT_DOWN.store(false, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        KEY_RIGHTALT => {
-                            if event.value == 1 {
-                                ALTGR_DOWN.store(true, Ordering::SeqCst);
-                            } else if event.value == 0 {
-                                ALTGR_DOWN.store(false, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        KEY_CAPSLOCK => {
-                            if event.value == 1 {
-                                let on = CAPSLOCK_ON.load(Ordering::SeqCst);
-                                CAPSLOCK_ON.store(!on, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    if event.value == 1 || event.value == 2 {
-                        // Ctrl+C => ETX (0x03)
-                        if CTRL_DOWN.load(Ordering::SeqCst) && event.code == KEY_C {
-                            cloned.push('\u{3}');
-                            return;
-                        }
-                        let mods = KeyMods {
-                            shift: SHIFT_DOWN.load(Ordering::SeqCst),
-                            altgr: ALTGR_DOWN.load(Ordering::SeqCst),
-                            caps: CAPSLOCK_ON.load(Ordering::SeqCst),
-                        };
-                        if let Some(c) = input_event_to_char_es(event.code, mods) {
-                            cloned.push(c);
-                        }
-                    }
-                }),
-                false,
-            );
+            input.subscribe(Box::new(handle_key_event), false);
         }
-        stdin
+        v
     };
-    /// STDOUT global reference
-    pub static ref STDOUT: Arc<Stdout> = Default::default();
+    /// One [`Stdout`] per virtual terminal.
+    pub static ref STDOUTS: Vec<Arc<Stdout>> = (0..kernel_hal::console::NUM_VTS)
+        .map(|i| Arc::new(Stdout { vt: i }))
+        .collect();
+    /// Backwards-compatible alias for the first VT's stdin.
+    pub static ref STDIN: Arc<Stdin> = STDINS[0].clone();
+    /// Backwards-compatible alias for the first VT's stdout.
+    pub static ref STDOUT: Arc<Stdout> = STDOUTS[0].clone();
+}
+
+/// Stdin of the currently active virtual terminal.
+fn active_stdin() -> Arc<Stdin> {
+    STDINS[vt_clamp(kernel_hal::console::active_vt())].clone()
+}
+
+/// Stdin of a specific virtual terminal.
+pub fn vt_stdin(vt: usize) -> Arc<Stdin> {
+    STDINS[vt_clamp(vt)].clone()
+}
+
+/// Stdout of a specific virtual terminal.
+pub fn vt_stdout(vt: usize) -> Arc<Stdout> {
+    STDOUTS[vt_clamp(vt)].clone()
+}
+
+/// Keyboard handler: tracks modifiers, switches VTs on Ctrl+Alt+F1..F6, handles
+/// scrollback (Shift+PageUp/Down) and Ctrl+C, and feeds translated characters
+/// to the active terminal.
+fn handle_key_event(event: &InputEvent) {
+    use zcore_drivers::input::input_event_codes::key::*;
+    if event.event_type != InputEventType::Key {
+        return;
+    }
+    // Linux input: value 1 = press, 0 = release, 2 = autorepeat.
+    match event.code {
+        KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+            CTRL_DOWN.store(event.value != 0, Ordering::SeqCst);
+            return;
+        }
+        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+            SHIFT_DOWN.store(event.value != 0, Ordering::SeqCst);
+            return;
+        }
+        KEY_RIGHTALT => {
+            ALTGR_DOWN.store(event.value != 0, Ordering::SeqCst);
+            return;
+        }
+        KEY_LEFTALT => {
+            LEFT_ALT_DOWN.store(event.value != 0, Ordering::SeqCst);
+            return;
+        }
+        KEY_CAPSLOCK => {
+            if event.value == 1 {
+                let on = CAPSLOCK_ON.load(Ordering::SeqCst);
+                CAPSLOCK_ON.store(!on, Ordering::SeqCst);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if event.value != 1 && event.value != 2 {
+        return;
+    }
+
+    // Ctrl+Alt+F1..F6 → switch virtual terminal.
+    if CTRL_DOWN.load(Ordering::SeqCst) && LEFT_ALT_DOWN.load(Ordering::SeqCst) {
+        let target = match event.code {
+            KEY_F1 => Some(0),
+            KEY_F2 => Some(1),
+            KEY_F3 => Some(2),
+            KEY_F4 => Some(3),
+            KEY_F5 => Some(4),
+            KEY_F6 => Some(5),
+            _ => None,
+        };
+        if let Some(n) = target {
+            if n < kernel_hal::console::num_vts() {
+                kernel_hal::console::switch_vt(n);
+            }
+            return;
+        }
+    }
+
+    // Shift+PageUp / Shift+PageDown scrollback on the active VT.
+    if SHIFT_DOWN.load(Ordering::SeqCst) {
+        if event.code == KEY_PAGEUP {
+            kernel_hal::console::scroll_graphic_console(1);
+            return;
+        }
+        if event.code == KEY_PAGEDOWN {
+            kernel_hal::console::scroll_graphic_console(-1);
+            return;
+        }
+    }
+
+    // Estado de modificadores, equivalente al `shift_state` de la capa keyboard
+    // del kernel de Linux (drivers/tty/vt/keyboard.c).
+    let mods = KeyMods {
+        shift: SHIFT_DOWN.load(Ordering::SeqCst),
+        altgr: ALTGR_DOWN.load(Ordering::SeqCst),
+        caps: CAPSLOCK_ON.load(Ordering::SeqCst),
+        ctrl: CTRL_DOWN.load(Ordering::SeqCst),
+    };
+
+    // Traducción keycode -> keysym, al estilo de los tipos KT_LATIN / KT_CUR /
+    // KT_FN del VT de Linux. Ctrl+letra produce su carácter de control (Ctrl+C
+    // = 0x03, que el TTY interpreta como VINTR/SIGINT).
+    let stdin = active_stdin();
+    match translate_key(event.code, mods) {
+        Some(KeySym::Char(c)) => stdin.push(c),
+        Some(KeySym::Cursor(final_byte)) => {
+            // applkey(): ESC O x en modo cursor de aplicación (DECCKM activo),
+            // ESC [ x en modo normal — igual que `applkey()` en el VT de Linux.
+            let mid = if APP_CURSOR_KEYS.load(Ordering::SeqCst) {
+                b'O'
+            } else {
+                b'['
+            };
+            stdin.push_bytes(&[0x1b, mid, final_byte]);
+        }
+        Some(KeySym::Func(seq)) => stdin.push_bytes(seq),
+        None => {}
+    }
 }
 
 /// Estado de modificadores para el layout español (XKB `es`).
+#[derive(Clone, Copy)]
 struct KeyMods {
     shift: bool,
     altgr: bool,
     caps: bool,
+    ctrl: bool,
 }
 
 impl KeyMods {
@@ -204,6 +369,70 @@ impl KeyMods {
             base
         }
     }
+}
+
+/// Resultado de traducir un keycode, análogo a los tipos de keysym del VT de
+/// Linux (`drivers/tty/vt/keyboard.c`).
+enum KeySym {
+    /// Carácter imprimible (KT_LATIN/KT_LETTER). El bit de control ya está
+    /// aplicado si correspondía.
+    Char(char),
+    /// Tecla de cursor (KT_CUR): se entrega la letra final (`A`..`D`, `H`, `F`).
+    /// El emisor añade el prefijo `ESC O` (modo aplicación, DECCKM) o `ESC [`
+    /// (modo normal), igual que `applkey()` en el kernel.
+    Cursor(u8),
+    /// Cadena fija de tecla de función / navegación (KT_FN): se emite tal cual.
+    Func(&'static [u8]),
+}
+
+/// Traduce un keycode + modificadores a un keysym, replicando el modelo del VT
+/// de Linux: teclas de cursor (KT_CUR), teclas de función con cadena fija
+/// (KT_FN) y caracteres imprimibles (KT_LATIN) con el bit de control aplicado
+/// como la columna `control` del keymap.
+fn translate_key(code: u16, mods: KeyMods) -> Option<KeySym> {
+    use zcore_drivers::input::input_event_codes::key::*;
+
+    // Teclas de cursor: el prefijo lo decide el modo DECCKM al emitir.
+    match code {
+        KEY_UP => return Some(KeySym::Cursor(b'A')),
+        KEY_DOWN => return Some(KeySym::Cursor(b'B')),
+        KEY_RIGHT => return Some(KeySym::Cursor(b'C')),
+        KEY_LEFT => return Some(KeySym::Cursor(b'D')),
+        KEY_HOME => return Some(KeySym::Cursor(b'H')),
+        KEY_END => return Some(KeySym::Cursor(b'F')),
+        // Teclas con cadena fija (no dependen de DECCKM).
+        KEY_PAGEUP => return Some(KeySym::Func(b"\x1b[5~")),
+        KEY_PAGEDOWN => return Some(KeySym::Func(b"\x1b[6~")),
+        KEY_INSERT => return Some(KeySym::Func(b"\x1b[2~")),
+        KEY_DELETE => return Some(KeySym::Func(b"\x1b[3~")),
+        KEY_ESC => return Some(KeySym::Func(b"\x1b")),
+        _ => {}
+    }
+
+    // Carácter imprimible según el layout español.
+    let c = input_event_to_char_es(code, mods)?;
+
+    // Bit de control (KG_CTRL). El kernel toma el carácter de la columna
+    // `control` del keymap; para el rango ASCII relevante equivale a estas
+    // reglas: letras y `@ [ \ ] ^ _ ? espacio` -> carácter de control.
+    if mods.ctrl {
+        let ctrl_c = match c {
+            ' ' | '@' => Some('\u{0}'), // NUL
+            '?' => Some('\u{7f}'),      // DEL
+            '[' => Some('\u{1b}'),      // ESC
+            '\\' => Some('\u{1c}'),     // FS
+            ']' => Some('\u{1d}'),      // GS
+            '^' => Some('\u{1e}'),      // RS
+            '_' => Some('\u{1f}'),      // US
+            c if c.is_ascii_alphabetic() => Some(((c.to_ascii_uppercase() as u8) & 0x1f) as char),
+            _ => None,
+        };
+        if let Some(ctrl_c) = ctrl_c {
+            return Some(KeySym::Char(ctrl_c));
+        }
+    }
+
+    Some(KeySym::Char(c))
 }
 
 /// Layout QWERTY español (España), alineado con `symbols/es` de xkeyboard-config.
@@ -258,9 +487,13 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_COMMA => Some(mods.pick(',', ';', ',', ';')),
         KEY_DOT | KEY_KPDOT => Some(mods.pick('.', ':', '.', ':')),
         KEY_SLASH => Some(mods.pick('-', '_', '-', '_')),
-        KEY_ENTER | KEY_KPENTER => Some('\n'),
+        // Enter envía CR (0x0d), como una terminal real / la consola de Linux;
+        // el flag de entrada ICRNL lo convierte a NL en modo canónico.
+        KEY_ENTER | KEY_KPENTER => Some('\r'),
         KEY_SPACE => Some(' '),
-        KEY_BACKSPACE => Some('\x08'),
+        // Backspace envía DEL (0x7f), igual que la consola de Linux y el
+        // `kbs=\177` de la terminfo xterm; además coincide con c_cc[VERASE].
+        KEY_BACKSPACE => Some('\x7f'),
         KEY_TAB => Some('\t'),
         KEY_KP0 => Some('0'),
         KEY_KP1 => Some('1'),
@@ -290,37 +523,71 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
 /// This is aligned with the Eclipse OS 1 pattern (usb_hid.rs → push_key),
 /// where the ISR only writes to a circular buffer with interrupts disabled.
 pub struct Stdin {
+    /// Index of the virtual terminal this stdin belongs to.
+    vt: usize,
     buf: Mutex<VecDeque<char>>,
+    canon_buf: Mutex<VecDeque<char>>,
     eventbus: Mutex<EventBus>,
     /// Atomic flag set by `push()` so `SerialFuture` can detect new data
     /// without requiring `eventbus.lock()` from the IRQ path.
     data_ready: core::sync::atomic::AtomicBool,
 }
 
-impl Default for Stdin {
-    fn default() -> Self {
+impl Stdin {
+    fn new(vt: usize) -> Self {
         Self {
+            vt,
             buf: Mutex::new(VecDeque::new()),
+            canon_buf: Mutex::new(VecDeque::new()),
             eventbus: Mutex::new(EventBus::default()),
             data_ready: core::sync::atomic::AtomicBool::new(false),
         }
     }
-}
 
-impl Stdin {
-    fn echo_char(c: char) {
-        const ECHO: u32 = 0x0008;
-        if TTY_TERMIOS.lock().c_lflag & ECHO == 0 {
+    /// Echo to this terminal's console.
+    fn echo(&self, s: &str) {
+        kernel_hal::console::vt_console_write_str(self.vt, s);
+    }
+
+    fn echo_char(&self, c: char) {
+        let termios = tty_termios(self.vt).lock();
+        let echo = termios.c_lflag & ECHO != 0;
+        let echoctl = termios.c_lflag & ECHOCTL != 0;
+        let opost = termios.c_oflag & OPOST != 0;
+        let onlcr = termios.c_oflag & ONLCR != 0;
+        drop(termios);
+
+        if !echo {
             return;
         }
+
         match c {
-            '\u{8}' | '\u{7f}' => kernel_hal::console::console_write_str("\x08 \x08"),
-            '\n' => kernel_hal::console::console_write_str("\r\n"),
-            '\r' => {}
-            c if c.is_control() => {}
+            '\u{8}' | '\u{7f}' => {
+                self.echo("\x08 \x08");
+            }
+            '\n' => {
+                if opost && onlcr {
+                    self.echo("\r\n");
+                } else {
+                    self.echo("\n");
+                }
+            }
+            '\r' => {
+                self.echo("\r");
+            }
+            c if c.is_control() => {
+                if echoctl {
+                    let mut s = [0u8; 2];
+                    s[0] = b'^';
+                    s[1] = (c as u8 + 64) & 0x7f;
+                    if let Ok(s_str) = core::str::from_utf8(&s) {
+                        self.echo(s_str);
+                    }
+                }
+            }
             c => {
                 let mut buf = [0u8; 4];
-                kernel_hal::console::console_write_str(c.encode_utf8(&mut buf));
+                self.echo(c.encode_utf8(&mut buf));
             }
         }
     }
@@ -332,27 +599,177 @@ impl Stdin {
     /// *tries* to propagate to the EventBus via try_lock().  If the
     /// EventBus is contended the flag is left set for the next
     /// executor-side flush_ready_flag() call.
-    pub fn push(&self, c: char) {
-        if c == '\u{3}' {
-            ctrl_c_pending_set();
-            let pgid = get_foreground_pgrp();
-            if pgid > 0 {
-                let _ = crate::process::send_signal_to_process(
-                    pgid as usize,
-                    crate::signal::Signal::SIGINT,
-                );
+    pub fn push(&self, mut c: char) {
+        let termios = tty_termios(self.vt).lock();
+        let iflag = termios.c_iflag;
+        let lflag = termios.c_lflag;
+        let c_cc = termios.c_cc;
+        drop(termios);
+
+        // 1. Input translations
+        if c == '\r' {
+            if iflag & IGNCR != 0 {
+                return;
+            } else if iflag & ICRNL != 0 {
+                c = '\n';
+            }
+        } else if c == '\n' {
+            if iflag & INLCR != 0 {
+                c = '\r';
             }
         }
-        self.buf.lock().push_back(c);
-        // Buffer first, then wake readers (before slow VGA/serial echo).
-        self.data_ready.store(true, Ordering::Release);
-        if let Some(mut eb) = self.eventbus.try_lock() {
-            self.data_ready.store(false, Ordering::Relaxed);
-            eb.set(Event::READABLE);
-        } else {
-            wake_tty_intr_waiters();
+
+        // 2. Signals
+        if lflag & ISIG != 0 {
+            if c as u8 == c_cc[VINTR] {
+                ctrl_c_pending_set();
+                let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGINT,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    self.echo("^C\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
+            if c as u8 == c_cc[VQUIT] {
+                let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGQUIT,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    self.echo("^\\\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
+            if c as u8 == c_cc[VSUSP] {
+                let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
+                if pgid > 0 {
+                    let _ = crate::process::send_signal_to_process(
+                        pgid as usize,
+                        crate::signal::Signal::SIGTSTP,
+                    );
+                }
+                if lflag & NOFLSH == 0 {
+                    self.buf.lock().clear();
+                    self.canon_buf.lock().clear();
+                }
+                if lflag & ECHO != 0 {
+                    self.echo("^Z\n");
+                }
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+                return;
+            }
         }
-        Self::echo_char(c);
+
+        // 3. Canon vs Raw mode
+        if lflag & ICANON != 0 {
+            if c as u8 == c_cc[VERASE] {
+                let mut canon = self.canon_buf.lock();
+                if let Some(_popped) = canon.pop_back() {
+                    if lflag & ECHO != 0 {
+                        if lflag & ECHOE != 0 {
+                            self.echo("\x08 \x08");
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let erase_char = (c_cc[VERASE] as char).encode_utf8(&mut buf);
+                            self.echo(erase_char);
+                        }
+                    }
+                }
+            } else if c as u8 == c_cc[VKILL] {
+                let mut canon = self.canon_buf.lock();
+                let len = canon.len();
+                canon.clear();
+                if lflag & ECHO != 0 {
+                    if lflag & ECHOKE != 0 {
+                        for _ in 0..len {
+                            self.echo("\x08 \x08");
+                        }
+                    } else if lflag & ECHOK != 0 {
+                        self.echo("\n");
+                    }
+                }
+            } else if c as u8 == c_cc[VEOF] {
+                let mut canon = self.canon_buf.lock();
+                let mut buf = self.buf.lock();
+                while let Some(ch) = canon.pop_front() {
+                    buf.push_back(ch);
+                }
+                // Wake readers
+                self.data_ready.store(true, Ordering::Release);
+                if let Some(mut eb) = self.eventbus.try_lock() {
+                    self.data_ready.store(false, Ordering::Relaxed);
+                    eb.set(Event::READABLE);
+                } else {
+                    wake_tty_intr_waiters();
+                }
+            } else {
+                self.canon_buf.lock().push_back(c);
+                self.echo_char(c);
+                if c == '\n' {
+                    let mut canon = self.canon_buf.lock();
+                    let mut buf = self.buf.lock();
+                    while let Some(ch) = canon.pop_front() {
+                        buf.push_back(ch);
+                    }
+                    // Wake readers
+                    self.data_ready.store(true, Ordering::Release);
+                    if let Some(mut eb) = self.eventbus.try_lock() {
+                        self.data_ready.store(false, Ordering::Relaxed);
+                        eb.set(Event::READABLE);
+                    } else {
+                        wake_tty_intr_waiters();
+                    }
+                }
+            }
+        } else {
+            // Raw mode
+            self.buf.lock().push_back(c);
+            self.echo_char(c);
+            // Wake readers
+            self.data_ready.store(true, Ordering::Release);
+            if let Some(mut eb) = self.eventbus.try_lock() {
+                self.data_ready.store(false, Ordering::Relaxed);
+                eb.set(Event::READABLE);
+            } else {
+                wake_tty_intr_waiters();
+            }
+        }
     }
 
     /// Drain the atomic flag and propagate to EventBus.
@@ -365,7 +782,6 @@ impl Stdin {
 
     /// pop a char from the Stdin buffer
     pub fn pop(&self) -> char {
-        // Propagate any pending push signals first.
         self.flush_ready_flag();
         let mut buf_lock = self.buf.lock();
         let c = buf_lock.pop_front().unwrap();
@@ -374,6 +790,7 @@ impl Stdin {
         }
         c
     }
+
     /// specify whether the Stdin buffer is readable
     pub fn can_read(&self) -> bool {
         self.buf.lock().len() > 0
@@ -393,9 +810,38 @@ impl Stdin {
     }
 }
 
+/// Helper function to post-process output data (e.g. translating \n to \r\n if OPOST and ONLCR are set)
+fn tty_write_out(vt: usize, buf: &[u8]) {
+    let termios = tty_termios(vt).lock();
+    let opost = termios.c_oflag & OPOST != 0;
+    let onlcr = termios.c_oflag & ONLCR != 0;
+    drop(termios);
+
+    if opost && onlcr {
+        let mut start = 0;
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' {
+                if i > start {
+                    let s = unsafe { core::str::from_utf8_unchecked(&buf[start..i]) };
+                    kernel_hal::console::vt_console_write_str(vt, s);
+                }
+                kernel_hal::console::vt_console_write_str(vt, "\r\n");
+                start = i + 1;
+            }
+        }
+        if start < buf.len() {
+            let s = unsafe { core::str::from_utf8_unchecked(&buf[start..]) };
+            kernel_hal::console::vt_console_write_str(vt, s);
+        }
+    } else {
+        let s = unsafe { core::str::from_utf8_unchecked(buf) };
+        kernel_hal::console::vt_console_write_str(vt, s);
+    }
+}
+
 /// fastfetch and other tools send DSR queries to the terminal; serial consoles
 /// do not answer, so inject a minimal response into stdin.
-fn tty_handle_outgoing(data: &[u8]) {
+fn tty_handle_outgoing(vt: usize, data: &[u8]) {
     if data.is_empty() {
         return;
     }
@@ -404,6 +850,26 @@ fn tty_handle_outgoing(data: &[u8]) {
     let mut i = 0;
     while i < data.len() {
         if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            // CSI ? Pm (h|l): modos privados DEC. Rastreamos DECCKM (modo 1)
+            // para alternar el prefijo de las teclas de cursor, como el VT
+            // de Linux con `\E[?1h` (smkx) / `\E[?1l` (rmkx).
+            if i + 2 < data.len() && data[i + 2] == b'?' {
+                let mut j = i + 3;
+                let mut num: u32 = 0;
+                let mut has_digit = false;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    num = num.saturating_mul(10) + (data[j] - b'0') as u32;
+                    has_digit = true;
+                    j += 1;
+                }
+                if has_digit && j < data.len() && (data[j] == b'h' || data[j] == b'l') {
+                    if num == 1 {
+                        APP_CURSOR_KEYS.store(data[j] == b'h', Ordering::SeqCst);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
             if i + 3 < data.len() && data[i + 2] == b'6' && data[i + 3] == b'n' {
                 need_cpr = true;
                 i += 4;
@@ -418,33 +884,48 @@ fn tty_handle_outgoing(data: &[u8]) {
         i += 1;
     }
     if need_cpr {
-        STDIN.push_bytes(b"\x1b[1;1R");
+        vt_stdin(vt).push_bytes(b"\x1b[1;1R");
     }
     if need_status {
-        STDIN.push_bytes(b"\x1b[0n");
+        vt_stdin(vt).push_bytes(b"\x1b[0n");
     }
 }
 
-/// Stdout struct, empty now
-#[derive(Default)]
-pub struct Stdout;
+/// Per-VT stdout/stderr endpoint.
+pub struct Stdout {
+    /// Index of the virtual terminal this stdout belongs to.
+    vt: usize,
+}
 
 impl INode for Stdin {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
         self.flush_ready_flag();
-        if self.can_read() {
-            buf[0] = self.pop() as u8;
-            Ok(1)
-        } else {
-            Err(FsError::Again)
+        let mut stdin_buf = self.buf.lock();
+        if stdin_buf.is_empty() {
+            return Err(FsError::Again);
         }
+        let is_canon = (tty_termios(self.vt).lock().c_lflag & ICANON) != 0;
+        let mut read_bytes = 0;
+        while read_bytes < buf.len() && !stdin_buf.is_empty() {
+            let ch = stdin_buf.pop_front().unwrap();
+            buf[read_bytes] = ch as u8;
+            read_bytes += 1;
+            if is_canon && ch == '\n' {
+                break;
+            }
+        }
+        if stdin_buf.is_empty() {
+            self.eventbus.lock().clear(Event::READABLE);
+        }
+        Ok(read_bytes)
     }
+
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
-        tty_handle_outgoing(buf);
-        let s = unsafe { core::str::from_utf8_unchecked(buf) };
-        kernel_hal::console::console_write_str(s);
+        tty_handle_outgoing(self.vt, buf);
+        tty_write_out(self.vt, buf);
         Ok(buf.len())
     }
+
     fn poll(&self) -> Result<PollStatus> {
         self.flush_ready_flag();
         Ok(PollStatus {
@@ -453,6 +934,7 @@ impl INode for Stdin {
             error: false,
         })
     }
+
     fn async_poll<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
@@ -511,7 +993,6 @@ impl INode for Stdin {
         })
     }
 
-    //
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd as usize {
             TIOCGWINSZ => {
@@ -524,23 +1005,17 @@ impl INode for Stdin {
                 if termios.is_null() {
                     return Err(FsError::InvalidParam);
                 }
-                unsafe { *termios = *TTY_TERMIOS.lock() };
+                unsafe { *termios = *tty_termios(self.vt).lock() };
                 Ok(0)
             }
             TIOCSPGRP => {
-                // Set foreground process group.
-                // `data` is a user pointer to an int.
-                // TODO: validate pointer in a proper usercopy layer.
                 let pgid = unsafe { *(data as *const i32) };
-                TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
+                tty_fg_pgrp(self.vt).store(pgid, Ordering::Relaxed);
                 Ok(0)
             }
             TIOCGPGRP => {
-                // Get foreground process group.
-                let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                let mut pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 if pgid == 0 {
-                    // If no foreground group is set, pretend the caller is in foreground.
-                    // This is a common hack for simple OSs to support interactive shells.
                     if let Some(arc) = kernel_hal::thread::get_current_thread() {
                         if let Ok(thread) = arc.downcast::<Thread>() {
                             pgid = thread.proc().id() as i32;
@@ -553,12 +1028,32 @@ impl INode for Stdin {
                 unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
-            TCSETS | TCSETSW | TCSETSF => {
+            TCSETS | TCSETSW => {
                 let termios = data as *const Termios;
                 if termios.is_null() {
                     return Err(FsError::InvalidParam);
                 }
-                *TTY_TERMIOS.lock() = unsafe { *termios };
+                *tty_termios(self.vt).lock() = unsafe { *termios };
+                Ok(0)
+            }
+            TCSETSF => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *tty_termios(self.vt).lock() = unsafe { *termios };
+                self.buf.lock().clear();
+                self.canon_buf.lock().clear();
+                self.eventbus.lock().clear(Event::READABLE);
+                Ok(0)
+            }
+            KDGETMODE => {
+                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
+                Ok(0)
+            }
+            KDSETMODE => {
+                let mode = unsafe { *(data as *const i32) } as u32;
+                console::set_kd_mode(mode);
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
@@ -594,13 +1089,13 @@ impl INode for Stdout {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         unimplemented!()
     }
+
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
-        tty_handle_outgoing(buf);
-        // we do not care the utf-8 things, we just want to print it!
-        let s = unsafe { core::str::from_utf8_unchecked(buf) };
-        kernel_hal::console::console_write_str(s);
+        tty_handle_outgoing(self.vt, buf);
+        tty_write_out(self.vt, buf);
         Ok(buf.len())
     }
+
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: false,
@@ -608,6 +1103,7 @@ impl INode for Stdout {
             error: false,
         })
     }
+
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd as usize {
             TIOCGWINSZ => {
@@ -616,17 +1112,20 @@ impl INode for Stdout {
                 Ok(0)
             }
             TCGETS => {
-                warn!("stdout TCGETS, pretend to be tty.");
+                let termios = data as *mut Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                unsafe { *termios = *tty_termios(self.vt).lock() };
                 Ok(0)
             }
             TIOCSPGRP => {
                 let pgid = unsafe { *(data as *const i32) };
-                TTY_FG_PGRP.store(pgid, Ordering::Relaxed);
+                tty_fg_pgrp(self.vt).store(pgid, Ordering::Relaxed);
                 Ok(0)
             }
             TIOCGPGRP => {
-                // pretend to be have a tty process group
-                let mut pgid = TTY_FG_PGRP.load(Ordering::Relaxed);
+                let mut pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 if pgid == 0 {
                     if let Some(arc) = kernel_hal::thread::get_current_thread() {
                         if let Ok(thread) = arc.downcast::<Thread>() {
@@ -640,8 +1139,33 @@ impl INode for Stdout {
                 unsafe { *(data as *mut i32) = pgid };
                 Ok(0)
             }
-            TCSETS | TCSETSW | TCSETSF => {
-                debug!("stdout TCSETS/W/F, stubbed.");
+            TCSETS | TCSETSW => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *tty_termios(self.vt).lock() = unsafe { *termios };
+                Ok(0)
+            }
+            TCSETSF => {
+                let termios = data as *const Termios;
+                if termios.is_null() {
+                    return Err(FsError::InvalidParam);
+                }
+                *tty_termios(self.vt).lock() = unsafe { *termios };
+                let sin = vt_stdin(self.vt);
+                sin.buf.lock().clear();
+                sin.canon_buf.lock().clear();
+                sin.eventbus.lock().clear(Event::READABLE);
+                Ok(0)
+            }
+            KDGETMODE => {
+                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
+                Ok(0)
+            }
+            KDSETMODE => {
+                let mode = unsafe { *(data as *const i32) } as u32;
+                console::set_kd_mode(mode);
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),

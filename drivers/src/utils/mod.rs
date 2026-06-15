@@ -7,6 +7,8 @@ mod irq_manager;
 
 #[cfg(feature = "graphic")]
 mod graphic_console;
+#[cfg(feature = "graphic")]
+mod shadow_fb;
 
 pub mod devicetree;
 pub mod dma;
@@ -19,3 +21,5 @@ pub use event_listener::{EventHandler, EventListener};
 
 #[cfg(feature = "graphic")]
 pub use graphic_console::GraphicConsole;
+#[cfg(feature = "graphic")]
+pub use shadow_fb::ShadowFramebuffer;

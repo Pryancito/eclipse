@@ -23,6 +23,7 @@ const DATA_CHUNK_SIZE: u64 = 256 * 1024 * 1024;
 const META_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 const SYS_CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 const MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+const SUPERBLOCK_COMMIT_INTERVAL: u32 = 32;
 
 /// Directory entry returned by [`Btrfs::readdir`].
 #[derive(Debug, Clone)]
@@ -63,7 +64,9 @@ pub struct Btrfs {
     alloc: FreeSpace,
     next_ino: u64,
     generation: u64,
+    read_only: bool,
     sb_dirty: bool,
+    deferred_sb_commits: u32,
     clock: Option<fn() -> (u64, u32)>,
 }
 
@@ -72,15 +75,14 @@ impl Btrfs {
     // Mount / setup
     // ------------------------------------------------------------------
 
-    pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Self> {
-        let mut vol = Volume::open(dev)?;
+    pub fn mount(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<Self> {
+        let vol = Volume::open(dev)?;
         let generation = vol.sb.generation();
         // A non-empty log tree comes from an unclean Linux shutdown. We do
-        // not replay it, and once we modify the filesystem a later Linux
-        // mount must not replay it either: drop it with the first commit.
+        // not replay it, so writable mounts are unsafe until replay happens.
         let stale_log = vol.sb.log_root() != 0;
-        if stale_log {
-            vol.sb.set_log_root(0);
+        if stale_log && !read_only {
+            return Err(Error::Unsupported("log replay required for writable mount"));
         }
         let mut fs = Self {
             vol,
@@ -88,7 +90,9 @@ impl Btrfs {
             alloc: FreeSpace::default(),
             next_ino: FIRST_FREE_OBJECTID,
             generation,
-            sb_dirty: stale_log,
+            read_only,
+            sb_dirty: false,
+            deferred_sb_commits: 0,
             clock: None,
         };
         fs.alloc.nodesize = fs.vol.nodesize as u64;
@@ -132,6 +136,9 @@ impl Btrfs {
     }
 
     fn writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::Unsupported("read-only filesystem"));
+        }
         let unknown_ro = self.vol.sb.compat_ro_flags()
             & !(COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID);
         if unknown_ro != 0 {
@@ -402,9 +409,12 @@ impl Btrfs {
             self.alloc.dev_used_delta = 0;
             self.sb_dirty = true;
         }
-        if force_sb || self.sb_dirty {
+        if force_sb || (self.sb_dirty && self.deferred_sb_commits >= SUPERBLOCK_COMMIT_INTERVAL) {
             self.vol.write_superblock()?;
             self.sb_dirty = false;
+            self.deferred_sb_commits = 0;
+        } else if self.sb_dirty {
+            self.deferred_sb_commits = self.deferred_sb_commits.saturating_add(1);
         }
         Ok(())
     }
@@ -1228,14 +1238,50 @@ impl Btrfs {
         pos: u64,
         bytenr: u64,
         len: u64,
+        skip_file_ranges: &[(u64, u64)],
     ) -> Result<()> {
         self.alloc.note_data_extent(bytenr, len, FS_TREE, ino, pos);
+        let extent_start = pos;
+        let extent_end = pos + len;
+        let mut covered = Vec::new();
+        for &(start, end) in skip_file_ranges {
+            if end <= start || end <= extent_start || start >= extent_end {
+                continue;
+            }
+            covered.push((start.max(extent_start), end.min(extent_end)));
+        }
+        covered.sort_unstable_by_key(|(start, _)| *start);
+        let mut merged = Vec::new();
+        for (start, end) in covered {
+            if let Some((_, prev_end)) = merged.last_mut() {
+                if start <= *prev_end {
+                    *prev_end = (*prev_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
         let zeros = alloc::vec![0u8; 64 * 1024];
-        let mut z = 0u64;
-        while z < len {
-            let take = zeros.len().min((len - z) as usize);
-            self.vol.write_logical(bytenr + z, &zeros[..take])?;
-            z += take as u64;
+        let mut cursor = extent_start;
+        for (start, end) in merged {
+            if cursor < start {
+                let mut z = cursor - extent_start;
+                let stop = start - extent_start;
+                while z < stop {
+                    let take = zeros.len().min((stop - z) as usize);
+                    self.vol.write_logical(bytenr + z, &zeros[..take])?;
+                    z += take as u64;
+                }
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < extent_end {
+            let mut z = cursor - extent_start;
+            while z < len {
+                let take = zeros.len().min((len - z) as usize);
+                self.vol.write_logical(bytenr + z, &zeros[..take])?;
+                z += take as u64;
+            }
         }
         let ext = FileExtent::encode_regular(self.generation, bytenr, len, 0, len);
         {
@@ -1254,7 +1300,14 @@ impl Btrfs {
     /// Returns the byte offset covered by extents afterwards. On disk-full
     /// this is smaller than requested (POSIX-style short writes); the
     /// filesystem stays consistent.
-    fn ensure_coverage(&mut self, ino: u64, inode: &mut InodeItem, end: u64) -> Result<u64> {
+    fn ensure_coverage(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        end: u64,
+        write_start: u64,
+        write_end: u64,
+    ) -> Result<u64> {
         let sector = self.vol.sectorsize as u64;
         let mut target = (end + sector - 1) / sector * sector;
         // Current coverage: end of the last extent.
@@ -1310,8 +1363,10 @@ impl Btrfs {
             inode.nbytes = 0;
             self.set_nodatasum(ino, inode)?;
             let mut pos = 0u64;
+            let inline_skip = (0, inline_len as u64);
+            let write_skip = (write_start, write_end);
             for (bytenr, got) in reserved {
-                self.install_data_extent(ino, inode, pos, bytenr, got)?;
+                self.install_data_extent(ino, inode, pos, bytenr, got, &[inline_skip, write_skip])?;
                 pos += got;
             }
             if !data.is_empty() {
@@ -1328,7 +1383,14 @@ impl Btrfs {
         while pos < target {
             match self.alloc.alloc_data(target - pos) {
                 Ok((bytenr, got)) => {
-                    self.install_data_extent(ino, inode, pos, bytenr, got)?;
+                    self.install_data_extent(
+                        ino,
+                        inode,
+                        pos,
+                        bytenr,
+                        got,
+                        &[(write_start, write_end)],
+                    )?;
                     pos += got;
                 }
                 // Disk full: report how far we got; the file stays
@@ -1414,7 +1476,7 @@ impl Btrfs {
             self.set_nodatasum(ino, &mut inode)?;
             self.write_inode(ino, &inode)?;
         }
-        let covered = match self.ensure_coverage(ino, &mut inode, end) {
+        let covered = match self.ensure_coverage(ino, &mut inode, end, offset, end) {
             Ok(covered) => covered,
             Err(e) => {
                 // Keep nbytes consistent with whatever extents were added.

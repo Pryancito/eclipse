@@ -50,8 +50,13 @@ __attribute__((used, section(".rodata.rcore"))) u64 rcore_syscall_entry = 0xdead
 #define MAP_PRIV_ANON 0x22
 
 #define NWORKERS 3
+#ifdef QUICK_TEST
+#define ROUNDS 200 /* rootfs dev build via xtask: feedback en segundos */
+#else
 #define ROUNDS 3000
+#endif
 #define WATCHDOG_NS (2000 * 1000 * 1000UL) /* 2 s: round must finish well before */
+#define PROGRESS_EVERY 50
 
 struct timespec {
     i64 tv_sec;
@@ -429,8 +434,20 @@ __attribute__((used)) static void run_main(void)
     }
 
     print("workers created\n");
-    for (int r = 0; r < ROUNDS; r++)
+    print("barrier stress: ");
+    print_num("", ROUNDS);
+    print(" rounds (progress every ");
+    print_num("", PROGRESS_EVERY);
+    print(")\n");
+    for (int r = 0; r < ROUNDS; r++) {
         sb_barrier_wait(&barrier);
+        if (r == 0)
+            print("barrier round 0 ok\n");
+        else if ((r + 1) % PROGRESS_EVERY == 0) {
+            print_num("barrier round ", r + 1);
+            print("\n");
+        }
+    }
 
     print_num("rounds completed: ", rounds_done);
     print_num("lost wakeups: ", watchdog_hit);

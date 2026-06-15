@@ -319,6 +319,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
+    // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
+    for vt in 0..kernel_hal::console::NUM_VTS {
+        let name = alloc::format!("tty{}", vt + 1);
+        if let Err(e) = devfs_root.add(&name, stdio::vt_stdin(vt)) {
+            warn!("failed to mknod /dev/{}: {:?}", name, e);
+        }
+    }
     if let Some(display) = drivers::all_display().first() {
         use devfs::FbDev;
 
@@ -538,6 +545,31 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 var.create("run", FileType::Dir, 0o755).ok();
             }
         }
+        // Keep apk's download cache off the small initramfs SFS: edge indexes
+        // plus .apk blobs can exceed the free space left after zip_dir.
+        warn!("[boot] create_root_fs: mount /var/cache/apk on tmpfs");
+        if let Ok(var) = root.find(true, "var") {
+            let cache = var.find(true, "cache").unwrap_or_else(|_| {
+                var.create("cache", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache")
+            });
+            let apk_cache = cache.find(true, "apk").unwrap_or_else(|_| {
+                cache
+                    .create("apk", FileType::Dir, 0o755)
+                    .expect("failed to mkdir /var/cache/apk")
+            });
+            if apk_cache.mount(RamFS::new()).is_ok() {
+                register_mount(
+                    "tmpfs",
+                    "/var/cache/apk",
+                    "tmpfs",
+                    "rw,nosuid,nodev",
+                    boot_mount_state(),
+                );
+            } else {
+                warn!("[boot] create_root_fs: mount /var/cache/apk failed");
+            }
+        }
     }
 
     // mount ProcFS at /proc
@@ -692,7 +724,7 @@ fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'stat
     let backend = block_mount::MountBackend::from_inode(inode.clone()).ok()?;
     if let block_mount::MountBackend::Block(block) = &backend {
         if btrfs_mount::probe_btrfs_superblock(block) {
-            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs") {
+            if let Ok(fs) = mount_ops::open_filesystem(backend, "btrfs", false) {
                 return Some((fs, "btrfs"));
             }
             return None;
@@ -700,15 +732,15 @@ fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'stat
         if !block_mount::probe_ext2_superblock(block) {
             return None;
         }
-        let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+        let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
         return Some((fs, "ext2"));
     }
     // File-backed (loop) roots: try btrfs, then ext2.
-    match mount_ops::open_filesystem(backend, "btrfs") {
+    match mount_ops::open_filesystem(backend, "btrfs", false) {
         Ok(fs) => Some((fs, "btrfs")),
         Err(_) => {
             let backend = block_mount::MountBackend::from_inode(inode).ok()?;
-            let fs = mount_ops::open_filesystem(backend, "ext2").ok()?;
+            let fs = mount_ops::open_filesystem(backend, "ext2", false).ok()?;
             Some((fs, "ext2"))
         }
     }
@@ -895,17 +927,6 @@ fn mount_fstab(root: &Arc<MNode>) {
                             continue;
                         }
 
-                        let fs = match mount_ops::open_filesystem(backend, fstype_parsed) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                warn!(
-                                    "mount_fstab: failed to open filesystem for {:?}: {:?}",
-                                    effective_source, e
-                                );
-                                continue;
-                            }
-                        };
-
                         // Parse options for flags
                         let mut flags = 0;
                         for opt in options.split(',') {
@@ -918,6 +939,21 @@ fn mount_fstab(root: &Arc<MNode>) {
                                 _ => {}
                             }
                         }
+
+                        let fs = match mount_ops::open_filesystem(
+                            backend,
+                            fstype_parsed,
+                            mount_state::flags_read_only(flags, options),
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(
+                                    "mount_fstab: failed to open filesystem for {:?}: {:?}",
+                                    effective_source, e
+                                );
+                                continue;
+                            }
+                        };
 
                         let (fs, state) = mount_ops::prepare_fs(fs, flags, options);
                         if let Err(e) = target_node.mount(fs) {

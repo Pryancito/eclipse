@@ -72,6 +72,15 @@ impl Syscall<'_> {
     ///
     /// This is intentionally centralized so we don't sprinkle per-program hacks.
     fn maybe_handle_tty_intr(&mut self) -> SysResult {
+        // Cheap relaxed-style peek first: the latch is empty on the
+        // overwhelming majority of syscalls, and a plain load avoids the
+        // `lock xchg` on x86 / locked CAS on aarch64/riscv that the swap in
+        // `ctrl_c_pending_take` would otherwise issue per syscall.
+        if !linux_object::fs::stdio::ctrl_c_pending_peek() {
+            return Ok(0);
+        }
+        // Race-safe: another syscall may have claimed the latch between the
+        // peek and the swap.
         if !linux_object::fs::stdio::ctrl_c_pending_take() {
             return Ok(0);
         }
@@ -198,8 +207,8 @@ impl Syscall<'_> {
                 kernel_hal::thread::yield_now().await;
                 Ok(0)
             }
-            Sys::SCHED_GETAFFINITY => self.unimplemented("sched_getaffinity", Ok(0)),
-            Sys::SCHED_SETAFFINITY => self.unimplemented("sched_setaffinity", Ok(0)),
+            Sys::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a0, a1, a2.into()),
+            Sys::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a0, a1, a2.into()),
 
             // socket
             Sys::SOCKET => self.sys_socket(a0, a1, a2),

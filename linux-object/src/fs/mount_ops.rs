@@ -86,9 +86,10 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
 pub(crate) fn open_filesystem(
     backend: MountBackend,
     fstype: &str,
+    read_only: bool,
 ) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
-        "btrfs" => open_btrfs(&backend).map_err(LxError::from),
+        "btrfs" => open_btrfs(&backend, read_only).map_err(LxError::from),
         "ext2" => open_ext2(&backend).map_err(LxError::from),
         "vfat" => open_fat(backend)
             .map(|fs| fs as Arc<dyn FileSystem>)
@@ -150,7 +151,8 @@ pub fn mount_fs(
     }
     let source_inode = proc.lookup_inode(source)?;
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
-    let fs = open_filesystem(backend, fstype)?;
+    let read_only = flags_read_only(flags, data);
+    let fs = open_filesystem(backend, fstype, read_only)?;
     let (fs, state) = prepare_fs(fs, flags, data);
     mount_node.mount(fs).map_err(LxError::from)?;
     let opts = build_options_string(flags, data);

@@ -127,11 +127,28 @@ impl Syscall<'_> {
     /// stored on the process via `LinuxProcess::set_brk`.  A value of 0 means not yet
     /// initialized (e.g. the process called `brk` before any ELF was loaded).
     pub fn sys_brk(&self, new_brk: usize) -> SysResult {
+        // Reserve heap pages in 1 MiB chunks instead of issuing one VMO per
+        // user-visible call. Glibc malloc typically calls `brk` in 4–32 KiB
+        // increments, which the old code translated into a fresh VMO + VMAR
+        // mapping each time — hundreds of VMAR entries for a single arena
+        // and a corresponding bump in allocator / TLB-shootdown pressure.
+        const BRK_CHUNK: usize = 1 << 20;
+
         let proc = self.linux_process();
         let current_brk = proc.brk();
+        // Lazy init: the loader populates `brk` directly before the first
+        // sys_brk, so the mapped end matches it.
+        let mapped_brk = {
+            let m = proc.mapped_brk();
+            if m == 0 {
+                current_brk
+            } else {
+                m
+            }
+        };
         info!(
-            "brk: new_brk={:#x}, current_brk={:#x}",
-            new_brk, current_brk
+            "brk: new_brk={:#x}, current_brk={:#x}, mapped_brk={:#x}",
+            new_brk, current_brk, mapped_brk
         );
 
         // brk(0) → return current break unchanged (query).
@@ -143,41 +160,52 @@ impl Syscall<'_> {
         let vmar = self.zircon_process().vmar();
 
         if new_brk_aligned < current_brk {
-            // Shrink: unmap the freed pages [new_brk_aligned, current_brk).
-            let shrink_len = current_brk - new_brk_aligned;
-            match vmar.unmap(new_brk_aligned, shrink_len) {
-                Ok(()) => {
-                    proc.set_brk(new_brk_aligned);
-                    info!("brk: shrunk to {:#x}", new_brk_aligned);
-                    Ok(new_brk_aligned)
-                }
-                Err(e) => {
-                    warn!(
-                        "brk: failed to unmap {:#x} bytes at {:#x}: {:?}",
-                        shrink_len, new_brk_aligned, e
-                    );
-                    Ok(current_brk)
-                }
-            }
+            // Shrink: just move the user-visible break. The reserved pages
+            // stay mapped until they are reused on the next grow. Linux glibc
+            // essentially never shrinks brk, and skipping the unmap avoids
+            // the VMAR churn + TLB shootdown for transient shrink/grow
+            // patterns.
+            proc.set_brk(new_brk_aligned);
+            info!("brk: shrunk to {:#x} (mapping kept)", new_brk_aligned);
+            Ok(new_brk_aligned)
         } else if new_brk_aligned > current_brk {
-            // Grow: map new anonymous pages covering [current_brk, new_brk_aligned).
-            let size = new_brk_aligned - current_brk;
+            // Inside the already-reserved heap region — bookkeeping only.
+            if new_brk_aligned <= mapped_brk {
+                proc.set_brk(new_brk_aligned);
+                info!(
+                    "brk: extended to {:#x} (within reserved mapping)",
+                    new_brk_aligned
+                );
+                return Ok(new_brk_aligned);
+            }
+            // Extend the mapping. Round the request up to BRK_CHUNK so a
+            // burst of small grows is satisfied by a single map_at.
+            let want = new_brk_aligned - mapped_brk;
+            let size = want
+                .checked_next_multiple_of(BRK_CHUNK)
+                .unwrap_or(want)
+                .max(BRK_CHUNK);
             if size > MAX_MMAP_LEN {
                 return Ok(current_brk);
             }
+            let new_mapped_brk = mapped_brk + size;
             let vmo = VmObject::new_paged(pages(size));
             let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
             // vmar.addr() == 0 for user address spaces, so VMAR offset == absolute VA.
-            match vmar.map_at(current_brk, vmo, 0, size, flags) {
+            match vmar.map_at(mapped_brk, vmo, 0, size, flags) {
                 Ok(_) => {
                     proc.set_brk(new_brk_aligned);
-                    info!("brk: extended to {:#x}", new_brk_aligned);
+                    proc.set_mapped_brk(new_mapped_brk);
+                    info!(
+                        "brk: extended to {:#x}, mapping reserved up to {:#x}",
+                        new_brk_aligned, new_mapped_brk
+                    );
                     Ok(new_brk_aligned)
                 }
                 Err(e) => {
                     warn!(
                         "brk: failed to map {:#x} bytes at {:#x}: {:?}",
-                        size, current_brk, e
+                        size, mapped_brk, e
                     );
                     // Return current break on failure (Linux semantics).
                     Ok(current_brk)

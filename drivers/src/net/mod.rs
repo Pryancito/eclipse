@@ -158,7 +158,7 @@ lazy_static::lazy_static! {
     static ref PACKET_CALLBACK: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
 
     /// AF_PACKET taps queued during smoltcp `poll` (SOCKETS held) and flushed after.
-    static ref DEFERRED_PACKETS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    pub static ref DEFERRED_PACKETS: Mutex<alloc::collections::VecDeque<Vec<u8>>> = Mutex::new(alloc::collections::VecDeque::new());
 }
 
 const DEFERRED_PACKET_MAX: usize = 32;
@@ -187,14 +187,14 @@ pub fn net_dispatch_packet(data: &[u8]) {
 pub fn net_defer_packet(data: &[u8]) {
     let mut q = DEFERRED_PACKETS.lock();
     if q.len() >= DEFERRED_PACKET_MAX {
-        q.remove(0);
+        q.pop_front();
     }
-    q.push(data.to_vec());
+    q.push_back(data.to_vec());
 }
 
 /// Flush frames queued by [`net_defer_packet`]; call only after releasing smoltcp locks.
 pub fn net_flush_deferred_packets() {
-    let batch: Vec<Vec<u8>> = {
+    let batch: alloc::collections::VecDeque<Vec<u8>> = {
         let mut q = DEFERRED_PACKETS.lock();
         core::mem::take(&mut *q)
     };

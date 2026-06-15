@@ -140,12 +140,6 @@ impl Socket for TcpSocketState {
                     }
                 }
                 Ok(size) => {
-                    // We just freed RX buffer space via recv_slice. Drive the
-                    // NIC again so smoltcp emits the window-update/ACK now,
-                    // instead of on the next read() call. Without this, a peer
-                    // sending more than one receive-window (TLS handshakes and
-                    // large downloads exceed the 64 KiB window) can stall
-                    // waiting for the window to reopen.
                     crate::net::drain_net_urgent();
                     let endpoint = get_sockets()
                         .lock()

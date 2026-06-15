@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use kernel_hal::context::{UserContext, UserContextField};
+use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{wait_child, wait_child_any};
 use linux_object::signal::SigInfo;
@@ -90,7 +91,7 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
+    fn fork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process(), false)?; // old pt NULL here
         let path = new_proc.linux().execute_path();
@@ -109,17 +110,10 @@ impl Syscall<'_> {
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
-        Ok(new_proc.id() as usize)
+        Ok(new_proc)
     }
 
-    /// `sys_vfork`, just like [`Self::sys_fork`], creates a child process of the calling process
-    /// (see [linux man vfork(2)](https://www.man7.org/linux/man-pages/man2/vfork.2.html)).
-    /// For details, see [`Self::sys_fork`].
-    ///
-    /// `sys_vfork` differs from [`Self::sys_fork`] in that the calling thread is suspended until the child terminates
-    /// (either normally, by calling [`Self::sys_exit`], or abnormally, after delivery of a fatal signal),
-    /// or it makes a call to [`Self::sys_execve`].
-    pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
+    async fn vfork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         self.zircon_process().vmar().dump();
         let new_proc = Process::fork_from(self.zircon_process(), true)?;
@@ -136,16 +130,26 @@ impl Syscall<'_> {
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
 
-        let new_proc: Arc<dyn KernelObject> = new_proc;
+        let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
             "vfork: {} -> {}. Waiting for execve SIGNALED",
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc
+        new_proc_obj
             .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
             .await; // wait for execve or termination
-        Ok(new_proc.id() as usize)
+        Ok(new_proc)
+    }
+
+    /// `sys_fork` creates a child process.
+    pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
+        self.fork_impl(newsp, newtls).map(|proc| proc.id() as usize)
+    }
+
+    /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
+    pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
+        self.vfork_impl(newsp, newtls).await.map(|proc| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -169,16 +173,28 @@ impl Syscall<'_> {
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
+        if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
+            return Err(LxError::EINVAL);
+        }
         // Fork-like clones: if the THREAD bit is not set, the caller wants a
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
         // and other combinations used by musl/glibc fork/posix_spawn/system().
         if !clone_flags.contains(CloneFlags::THREAD) {
-            if clone_flags.contains(CloneFlags::VFORK) {
+            let process = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                return self.sys_vfork(newsp, newtls).await;
+                self.vfork_impl(newsp, newtls).await?
+            } else {
+                info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
+                self.fork_impl(newsp, newtls)?
+            };
+            let pid = process.id() as usize;
+
+            if clone_flags.contains(CloneFlags::PIDFD) {
+                let pidfd = linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
+                let fd = self.linux_process().add_file(pidfd)?;
+                parent_tid.write(fd.into())?;
             }
-            info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-            return self.sys_fork(newsp, newtls);
+            return Ok(pid);
         }
         // Thread creation. Accept any CLONE_THREAD combination instead of the
         // two exact musl flag values: glibc's pthread_create passes 0x3d0f00
@@ -295,9 +311,9 @@ impl Syscall<'_> {
         );
         let result = match target {
             WaitTarget::AnyChild | WaitTarget::AnyChildInGroup => {
-                wait_child_any(self.zircon_process(), nohang).await
+                wait_child_any(self.zircon_process(), nohang, reap).await
             }
-            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang)
+            WaitTarget::Pid(pid) => wait_child(self.zircon_process(), pid, nohang, reap)
                 .await
                 .map(|code| (pid, code)),
         };
@@ -322,23 +338,44 @@ impl Syscall<'_> {
         infop: UserOutPtr<SigInfo>,
         options: u32,
     ) -> SysResult {
+        // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WCLONE | __WALL
+        let valid_mask = 0x0100_0000 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+        if (options & !valid_mask) != 0 {
+            return Err(LxError::EINVAL);
+        }
+        // At least one of WEXITED, WSTOPPED, WCONTINUED must be specified
+        let required_mask = 0x0000_0002 | 0x0000_0004 | 0x0000_0008;
+        if (options & required_mask) == 0 {
+            return Err(LxError::EINVAL);
+        }
+
         bitflags! {
             struct WaitIdOptions: u32 {
-                const WNOHANG   = 0x0100_0000;
+                const WNOHANG   = 0x0000_0001;
+                const WSTOPPED  = 0x0000_0002;
                 const WEXITED   = 0x0000_0004;
+                const WCONTINUED = 0x0000_0008;
+                const WNOWAIT   = 0x0100_0000;
+                const WNOTHREAD = 0x2000_0000;
+                const WCLONE    = 0x4000_0000;
+                const WALL      = 0x8000_0000;
             }
         }
         let opts = WaitIdOptions::from_bits_truncate(options);
         let nohang = opts.contains(WaitIdOptions::WNOHANG);
+        let reap = !opts.contains(WaitIdOptions::WNOWAIT);
         let caller = self.zircon_process();
 
-        let (child_pid, status) = match idtype {
+        let res = match idtype {
             P_PID => {
                 if id == 0 {
                     return Err(LxError::EINVAL);
                 }
-                let code = wait_child(caller, id as KoID, nohang).await?;
-                (id as KoID, code)
+                match wait_child(caller, id as KoID, nohang, reap).await {
+                    Ok(code) => Ok((id as KoID, code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_PIDFD => {
                 let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(id.into())?)?;
@@ -352,16 +389,24 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EAGAIN);
                 }
-                let code = wait_child(caller, target.id(), nohang).await?;
-                (target.id(), code)
+                match wait_child(caller, target.id(), nohang, reap).await {
+                    Ok(code) => Ok((target.id(), code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_ALL => {
-                let (pid, code) = wait_child_any(caller, nohang).await?;
-                (pid, code)
+                match wait_child_any(caller, nohang, reap).await {
+                    Ok((pid, code)) => Ok((pid, code)),
+                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Err(e) => Err(e),
+                }
             }
             P_PGID => return Err(LxError::ENOSYS),
             _ => return Err(LxError::EINVAL),
         };
+
+        let (child_pid, status) = res?;
 
         if opts.contains(WaitIdOptions::WEXITED) || options == 0 {
             let exit_status = status >> 8;
@@ -567,6 +612,105 @@ impl Syscall<'_> {
     //        thread_manager().set_priority(pid, priority as u8);
     //        Ok(0)
     //    }
+
+    /// Bitmask of CPUs that are currently online (logical ids `0..cpu_count`).
+    fn online_cpu_mask() -> u64 {
+        let ncpu = kernel_hal::cpu::cpu_count() as u32;
+        if ncpu >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << ncpu) - 1
+        }
+    }
+
+    /// Resolve the thread targeted by a `sched_*affinity` call.
+    ///
+    /// Per Linux semantics the `pid` argument is a TID. `pid == 0` (handled by
+    /// the callers) means the calling thread. Otherwise we search every live
+    /// process for a thread whose TID matches; failing that we treat `pid` as a
+    /// process id and return its leader thread, so `taskset -p <pid>` works for
+    /// single-threaded processes.
+    fn find_thread_by_tid(&self, pid: usize) -> Option<Arc<Thread>> {
+        let id = pid as KoID;
+        for proc in linux_object::process::all_live_processes() {
+            if let Ok(obj) = proc.get_child(id) {
+                if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                    return Some(thread);
+                }
+            }
+        }
+        let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
+        let first = *proc.thread_ids().first()?;
+        proc.get_child(first).ok()?.downcast_arc::<Thread>().ok()
+    }
+
+    /// `sched_setaffinity` sets the CPU affinity mask of the thread `pid`.
+    ///
+    /// The mask is masked down to the set of online CPUs; an empty effective
+    /// mask is rejected with `EINVAL`. See
+    /// [linux man sched_setaffinity(2)](https://www.man7.org/linux/man-pages/man2/sched_setaffinity.2.html).
+    pub fn sys_sched_setaffinity(
+        &self,
+        pid: usize,
+        cpusetsize: usize,
+        mask_ptr: UserInPtr<u8>,
+    ) -> SysResult {
+        info!(
+            "sched_setaffinity: pid={} cpusetsize={} mask_ptr={:?}",
+            pid, cpusetsize, mask_ptr
+        );
+        if cpusetsize == 0 {
+            return Err(LxError::EINVAL);
+        }
+        // Only the low 64 CPUs are representable (MAX_CORE_NUM == 64).
+        let n = cpusetsize.min(8);
+        let bytes = mask_ptr.read_array(n)?;
+        let mut mask = 0u64;
+        for (i, b) in bytes.iter().enumerate() {
+            mask |= (*b as u64) << (i * 8);
+        }
+        let eff = mask & Self::online_cpu_mask();
+        if eff == 0 {
+            return Err(LxError::EINVAL);
+        }
+        if pid == 0 || pid as u64 == self.thread.id() {
+            self.thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        } else {
+            let thread = self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?;
+            thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        }
+        Ok(0)
+    }
+
+    /// `sched_getaffinity` writes the CPU affinity mask of the thread `pid`
+    /// into the user buffer and returns the number of bytes written.
+    ///
+    /// See [linux man sched_getaffinity(2)](https://www.man7.org/linux/man-pages/man2/sched_getaffinity.2.html).
+    pub fn sys_sched_getaffinity(
+        &self,
+        pid: usize,
+        cpusetsize: usize,
+        mut mask_ptr: UserOutPtr<u8>,
+    ) -> SysResult {
+        info!(
+            "sched_getaffinity: pid={} cpusetsize={} mask_ptr={:?}",
+            pid, cpusetsize, mask_ptr
+        );
+        if cpusetsize == 0 {
+            return Err(LxError::EINVAL);
+        }
+        let mask = if pid == 0 || pid as u64 == self.thread.id() {
+            self.thread.affinity()
+        } else {
+            self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?.affinity()
+        } & Self::online_cpu_mask();
+        // The kernel cpumask is 8 bytes wide for up to 64 CPUs; copy out at most
+        // that many (libc zero-fills any remaining bytes of its cpu_set_t).
+        let n = cpusetsize.min(8);
+        let bytes = mask.to_le_bytes();
+        mask_ptr.write_array(&bytes[..n])?;
+        Ok(n)
+    }
 
     /// `set_tid_address` sets the clear_child_tid value for the calling thread to `tidptr`,
     /// and return the caller's thread ID
@@ -795,6 +939,8 @@ bitflags! {
         const FILES =           1 << 10;
         /// the calling process and the child process share the same table of signal handlers.
         const SIGHAND =         1 << 11;
+        /// return a pidfd referring to the child process
+        const PIDFD =           1 << 12;
         /// the calling process is being traced
         const PTRACE =          1 << 13;
         /// the execution of the calling process is suspended until the child releases its virtual memory resources

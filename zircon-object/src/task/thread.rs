@@ -3,6 +3,7 @@ mod thread_state;
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use core::{any::Any, future::Future, pin::Pin};
@@ -89,6 +90,11 @@ pub struct Thread {
     ext: Box<dyn Any + Send + Sync>,
     inner: Mutex<ThreadInner>,
     exceptionate: Arc<Exceptionate>,
+    /// CPU affinity mask: bit `i` set means this thread may run on logical
+    /// CPU `i`. Shared with the scheduler (handed to `spawn_with_affinity`)
+    /// so `set_affinity` takes effect on a running thread. Defaults to
+    /// "all CPUs" (`u64::MAX`).
+    affinity: Arc<AtomicU64>,
 }
 
 impl_kobject!(Thread
@@ -227,6 +233,7 @@ impl Thread {
                 context: Some(Box::new(UserContext::new())),
                 ..Default::default()
             }),
+            affinity: Arc::new(AtomicU64::new(u64::MAX)),
         });
         proc.add_thread(thread.clone())?;
         Ok(thread)
@@ -281,7 +288,29 @@ impl Thread {
             .change_state(ThreadState::Running, &self.base);
         let current = CurrentThread(self.clone());
         let future = thread_fn(current);
-        kernel_hal::thread::spawn(ThreadSwitchFuture::new(self.clone(), future));
+        kernel_hal::thread::spawn_with_affinity(
+            ThreadSwitchFuture::new(self.clone(), future),
+            self.affinity.clone(),
+        );
+        Ok(())
+    }
+
+    /// Get the thread's CPU affinity mask (bit `i` set => may run on CPU `i`).
+    pub fn affinity(&self) -> u64 {
+        self.affinity.load(Ordering::Relaxed)
+    }
+
+    /// Set the thread's CPU affinity mask.
+    ///
+    /// `mask` must have at least one bit set; an all-zero mask is rejected
+    /// because it would make the thread unschedulable. The change is observed
+    /// by the scheduler on the thread's next placement or work-stealing
+    /// decision (it will migrate off a now-disallowed CPU once it next yields).
+    pub fn set_affinity(&self, mask: u64) -> ZxResult {
+        if mask == 0 {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        self.affinity.store(mask, Ordering::Relaxed);
         Ok(())
     }
 
@@ -367,7 +396,11 @@ impl Thread {
                 .exception
                 .as_ref()
                 .map_or(0, |exception| exception.current_channel_type() as u32),
-            cpu_affinity_mask: [0u64; 8],
+            cpu_affinity_mask: {
+                let mut m = [0u64; 8];
+                m[0] = self.affinity.load(Ordering::Relaxed);
+                m
+            },
         }
     }
 

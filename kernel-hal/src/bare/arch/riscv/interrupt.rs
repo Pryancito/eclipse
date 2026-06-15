@@ -18,10 +18,22 @@ hal_fn_impl! {
 
         fn handle_irq(cause: usize) {
             trace!("Handle irq cause: {}", cause);
-            let irq = crate::drivers::all_irq()
-                .find(alloc::format!("riscv-intc-cpu{}", super::cpu::raw_hart_id()).as_str())
-                .expect("IRQ device 'riscv-intc' not initialized!");
-            irq.handle_irq(cause)
+            // Per-hart cache: the previous code did a String allocation
+            // (`format!("riscv-intc-cpu{}", hart)`) plus a linear scan over
+            // the device list on every interrupt. Once the per-hart intc is
+            // located, store it so subsequent IRQs only pay an indexed load
+            // + a single Acquire on `Once`.
+            use alloc::sync::Arc;
+            use zcore_drivers::scheme::IrqScheme;
+            static IRQ_PER_HART: [spin::Once<Arc<dyn IrqScheme>>; crate::config::MAX_CORE_NUM] =
+                [const { spin::Once::new() }; crate::config::MAX_CORE_NUM];
+            let hart = super::cpu::raw_hart_id();
+            let arc = IRQ_PER_HART[hart].call_once(|| {
+                crate::drivers::all_irq()
+                    .find(alloc::format!("riscv-intc-cpu{}", hart).as_str())
+                    .expect("IRQ device 'riscv-intc' not initialized!")
+            });
+            arc.handle_irq(cause)
         }
 
         fn intr_on() {

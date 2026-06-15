@@ -6,7 +6,7 @@
 
 #![allow(unused_imports, dead_code)]
 
-const E1000E_DRIVER_TAG: &str = "e1000e-simple";
+const E1000E_DRIVER_TAG: &str = "e1000e-lk-rx2";
 const E1000E_WATCHDOG_PERIOD_US: u64 = 2_000_000;
 const E1000E_WATCHDOG_FAST_US: u64 = 50_000;
 const E1000E_WATCHDOG_LOG_US: u64 = 5_000_000;
@@ -43,6 +43,7 @@ use crate::bus::pci_drivers::PciDriver;
 use crate::net::get_sockets;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme, SchemeUpcast};
 use crate::utils::dma::DmaRegion;
+use crate::utils::dma_sync::{dma_sync_region, dma_sync_rx_desc_span, DmaSyncDir};
 use crate::{Device, DeviceError, DeviceResult};
 use lock::Mutex;
 use pci::{Location, PCIDevice, BAR};
@@ -66,6 +67,7 @@ const E1000E_PBA: usize = 0x01000 / 4;
 const E1000E_ICR: usize = 0x00C0 / 4;
 const E1000E_ITR: usize = 0x00C4 / 4;
 const E1000E_IMS: usize = 0x00D0 / 4;
+const E1000E_IAM: usize = 0x00E0 / 4;
 const E1000E_IMC: usize = 0x00D8 / 4;
 const E1000E_RCTL: usize = 0x0100 / 4;
 const E1000E_TCTL: usize = 0x0400 / 4;
@@ -152,13 +154,16 @@ const EERD_DONE_BIT4: u32 = 1 << 4;
 const EERD_DONE_BIT1: u32 = 1 << 1;
 const EERD_DATA_SHIFT: u32 = 16;
 
-// ICR / IMS bits
+// ICR / IMS bits (LK e1000_hw.h)
 const ICR_TXDW: u32 = 1 << 0;
 const ICR_LSC: u32 = 1 << 2;
 const ICR_RXDMT0: u32 = 1 << 4;
+const ICR_RXO: u32 = 1 << 6;
 const ICR_RXT0: u32 = 1 << 7;
-const ICR_RX_ANY: u32 = ICR_RXT0 | ICR_RXDMT0;
-const IMS_REARM: u32 = ICR_TXDW | ICR_LSC | ICR_RXDMT0 | ICR_RXT0 | (1 << 6) | (1 << 8);
+const ICR_RXTO: u32 = ICR_RXT0;
+const ICR_RX_WORK: u32 = ICR_RXTO | ICR_RXO | ICR_RXDMT0 | ICR_RXT0;
+const ICR_RX_ANY: u32 = ICR_RX_WORK;
+const IMS_REARM: u32 = ICR_TXDW | ICR_LSC | ICR_RX_WORK | (1 << 8);
 
 // RCTL bits
 const RCTL_EN: u32 = 1 << 1;
@@ -261,12 +266,9 @@ const CTRL_EXT_LPCD: u32 = 0x0000_0004; // CTRL_EXT bit 2 (link phy config done)
 const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
 const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
 
-// Extended RX write-back layout (RFCTL_EXTEN=1):
-//   +0:  addr u64 (driver writes)
-//   +8:  staterr u32 (HW writes back: DD=bit0, EOP=bit1)
-//   +12: length u16 (HW writes back)
-const RXD_EXT_DD: u32 = 1 << 0;
-const RXD_EXT_EOP: u32 = 1 << 1;
+// Legacy RX descriptor status (LK / 8254x §3.2.3.1)
+const RXD_STAT_DD: u8 = 1 << 0;
+const RXD_STAT_EOP: u8 = 1 << 1;
 
 // TX descriptor CMD bits
 const TX_CMD_EOP: u8 = 1 << 0;
@@ -276,7 +278,9 @@ const TX_CMD_RS: u8 = 1 << 3;
 // DMA ring sizing
 const NUM_RX: usize = 256;
 const NUM_TX: usize = 256;
-const BUF_SIZE: usize = 2048 + 128;
+/// LK uses 2048-byte RX buffers; one slot holds a full MTU frame.
+const BUF_SIZE: usize = 2048;
+const RX_DRAIN_BUDGET: usize = 64;
 const DMA_RING_BYTES: usize = NUM_RX * size_of::<RxDesc>();
 const DMA_TX_RING_BYTES: usize = NUM_TX * size_of::<TxDesc>();
 const DMA_DESC_ALIGN: usize = 16;
@@ -286,13 +290,16 @@ const CACHE_LINE_SIZE: usize = 64;
 // Descriptor layouts
 // ---------------------------------------------------------------------------
 
-/// Legacy RX descriptor (16 bytes). With RFCTL_EXTEN, HW writes extended WB
-/// at +8 (staterr u32) and +12 (length u16).
+/// Legacy RX descriptor (LK `rdesc` / Eclipse `E1000RecvDesc`).
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Default)]
 struct RxDesc {
-    addr: u64,     // buffer physical address (driver writes)
-    reserved: u64, // HW write-back: staterr[31:0] @ +8, length[15:0] @ +12
+    addr: u64,
+    len: u16,
+    chksum: u16,
+    status: u8,
+    errors: u8,
+    vlan: u16,
 }
 const _RX_DESC_SIZE: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
@@ -337,10 +344,17 @@ pub struct E1000eHw {
 
     rx_ring: DmaRegion,
     rx_buf_pool: DmaRegion,
+    rx_ring_coherent: bool,
+    rx_buf_coherent: bool,
+    /// LK `rx_last_head_`: next RX descriptor to inspect.
     rx_next_to_clean: usize,
+    /// Multi-descriptor frame being reassembled (LK `rx_pending_pkt_`).
+    rx_pending: Option<Vec<u8>>,
 
     tx_ring: DmaRegion,
     tx_buf_pool: DmaRegion,
+    tx_ring_coherent: bool,
+    tx_buf_coherent: bool,
     tx_tail: usize,
 
     pub stats: NetStats,
@@ -915,13 +929,21 @@ impl E1000eHw {
             PCI_ACCESS.write16(&PortOpsImpl, self.pci_loc, 0x04, cmd);
         }
 
-        // 8. CTRL_EXT: disable PCIe relaxed ordering, signal driver loaded
+        // 8. CTRL_EXT: disable PCIe relaxed ordering, signal driver loaded.
+        //    LK enables IAME on e1000e (QEMU 82574); keep it off on PCH i219.
         {
             let mut ext = mmio_read(self.base, E1000E_CTRL_EXT);
             ext |= CTRL_EXT_RO_DIS | CTRL_EXT_DRV_LOAD;
-            ext &= !CTRL_EXT_IAME;
+            if self.is_pch() {
+                ext &= !CTRL_EXT_IAME;
+            } else {
+                ext |= CTRL_EXT_IAME;
+            }
             mmio_write(self.base, E1000E_CTRL_EXT, ext);
             let _ = mmio_read(self.base, E1000E_CTRL_EXT);
+            if !self.is_pch() {
+                mmio_write(self.base, E1000E_IAM, 0);
+            }
         }
 
         // 9. FEXTNVM6/7 workarounds for PCH-SPT (Linux ich8lan.c)
@@ -1088,24 +1110,33 @@ impl E1000eHw {
         );
         mmio_write(self.base, E1000E_RDH, 0);
         self.rx_next_to_clean = 0;
+        self.rx_pending = None;
 
-        // Fill all RX descriptors with buffer addresses (status = 0)
+        // Fill RX ring (LK: post buffer per slot, legacy descriptor layout).
         let ring = self.rx_ring.as_ptr::<RxDesc>();
         for i in 0..NUM_RX {
-            write_volatile(&mut (*ring.add(i)).addr, self.rx_buf_paddr(i));
-            write_volatile(&mut (*ring.add(i)).reserved, 0);
+            let desc = unsafe { &mut *ring.add(i) };
+            write_volatile(&mut desc.addr, self.rx_buf_paddr(i));
+            write_volatile(&mut desc.len, 0);
+            write_volatile(&mut desc.chksum, 0);
+            write_volatile(&mut desc.status, 0);
+            write_volatile(&mut desc.errors, 0);
+            write_volatile(&mut desc.vlan, 0);
         }
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.rx_ring_coherent,
+            0,
+            NUM_RX,
+            size_of::<RxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
-        // Disable checksum offload
-        mmio_write(self.base, E1000E_RXCSUM, 0);
-
-        // RFCTL: use legacy write-back (no RFCTL_EXTEN) — matches OSDev i219-V guide.
-        // Extended WB and legacy WB differ in descriptor layout; legacy is simpler and
-        // confirmed to work on real i219-V hardware without RFCTL_EXTEN.
+        // Legacy write-back only (LK / QEMU). Linux extended WB is for PCH+RFCTL_EXTEN.
         let mut rfctl = mmio_read(self.base, E1000E_RFCTL);
-        rfctl &= !RFCTL_EXTEN; // legacy mode: status at +12 u8, length at +8 u16
+        rfctl &= !RFCTL_EXTEN;
         rfctl |= RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
         mmio_write(self.base, E1000E_RFCTL, rfctl);
         let _ = mmio_read(self.base, E1000E_RFCTL);
@@ -1113,8 +1144,10 @@ impl E1000eHw {
         // No multiqueue
         mmio_write(self.base, E1000E_MRQC, 0);
 
-        // SRRCTL: 2 KB buffer size
-        mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31)); // 2 KB, Drop_En
+        // PCH: SRRCTL 2 KB + Drop_En. Discrete/QEMU: RCTL buffer size alone (LK).
+        if self.is_pch() {
+            mmio_write(self.base, E1000E_SRRCTL, 2 | (1 << 31));
+        }
 
         // PCH-SPT: must set RXDCTL.QUEUE_ENABLE (bit 25) before RCTL.EN
         if self.is_pch_spt_or_later() {
@@ -1136,74 +1169,175 @@ impl E1000eHw {
         // Small settle before enabling RCTL
         Self::udelay(1_000);
 
-        // RCTL: enable RX, promiscuous, broadcast, strip CRC, 2 KB buffers
-        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC;
+        // RCTL: LK-style — EN, promisc, mcast promisc, broadcast, 2048-byte buffers.
+        let mut rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM;
+        if self.is_pch() {
+            rctl |= RCTL_SECRC;
+        }
         mmio_write(self.base, E1000E_RCTL, rctl);
-        let _ = mmio_read(self.base, E1000E_RCTL); // flush
+        let _ = mmio_read(self.base, E1000E_RCTL);
 
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
     }
 
     // -----------------------------------------------------------------------
-    // RX data path
+    // RX data path (LK e1000: drain by RDH, legacy rdesc, fragment reassembly)
     // -----------------------------------------------------------------------
+
+    fn rx_rdh(&self) -> usize {
+        unsafe { mmio_read(self.base, E1000E_RDH) as usize }
+    }
+
+    fn clear_rx_pending(&mut self) {
+        self.rx_pending = None;
+    }
+
+    /// LK `irq_handler` RXO path: drop any in-flight multi-descriptor frame.
+    pub fn handle_rx_irq(&mut self, icr: u32) {
+        if icr & ICR_RXO != 0 {
+            if self.rx_pending.is_some() {
+                self.clear_rx_pending();
+                self.stats.rx_dropped += 1;
+            }
+            crate::klog_warn!("[e1000e] RX overrun (ICR_RXO)\n");
+        }
+    }
+
+    /// Process one RX slot when `rx_next_to_clean != RDH`. Returns a complete frame if ready.
+    fn process_rx_slot(&mut self) -> Option<Vec<u8>> {
+        let head = self.rx_next_to_clean;
+        if head == self.rx_rdh() {
+            return None;
+        }
+
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.rx_ring_coherent,
+            head,
+            1,
+            size_of::<RxDesc>(),
+            DmaSyncDir::FromDevice,
+        );
+
+        // Copy descriptor locally (LK: consistent snapshot after dma_sync).
+        let rxd = unsafe { read_volatile(self.rx_ring.as_ptr::<RxDesc>().add(head)) };
+
+        // Never advance past a slot HW owns without DD — skipping desyncs the ring.
+        if rxd.status & RXD_STAT_DD == 0 {
+            return None;
+        }
+
+        fence(Ordering::Acquire);
+
+        let len = rxd.len as usize;
+        let eop = rxd.status & RXD_STAT_EOP != 0;
+        let expected_addr = self.rx_buf_paddr(head);
+
+        if rxd.addr != expected_addr {
+            crate::klog_warn!(
+                "[e1000e] RX addr mismatch slot={} desc={:#x} expected={:#x}\n",
+                head,
+                rxd.addr,
+                expected_addr
+            );
+            self.clear_rx_pending();
+            self.stats.rx_dropped += 1;
+            self.rx_next_to_clean = (head + 1) % NUM_RX;
+            unsafe {
+                self.recycle_rx_slot(head);
+            }
+            return None;
+        }
+
+        if rxd.errors != 0 || len == 0 || len > BUF_SIZE {
+            self.clear_rx_pending();
+            self.stats.rx_dropped += 1;
+            self.rx_next_to_clean = (head + 1) % NUM_RX;
+            unsafe {
+                self.recycle_rx_slot(head);
+            }
+            return None;
+        }
+
+        // Invalidate the whole buffer slot: a prior frame may have filled more cache lines.
+        dma_sync_region(
+            &self.rx_buf_pool,
+            self.rx_buf_coherent,
+            head * BUF_SIZE,
+            BUF_SIZE,
+            DmaSyncDir::FromDevice,
+        );
+        let frag = unsafe {
+            core::slice::from_raw_parts(self.rx_buf_vaddr(head) as *const u8, len)
+        };
+
+        let complete = if let Some(ref mut pending) = self.rx_pending {
+            if pending.len().saturating_add(len) > BUF_SIZE {
+                self.clear_rx_pending();
+                None
+            } else {
+                pending.extend_from_slice(frag);
+                if eop {
+                    Some(self.rx_pending.take().unwrap())
+                } else {
+                    None
+                }
+            }
+        } else if eop {
+            Some(frag.to_vec())
+        } else {
+            self.rx_pending = Some(frag.to_vec());
+            None
+        };
+
+        if let Some(ref pkt) = complete {
+            self.stats.rx_packets += 1;
+            self.stats.rx_bytes += pkt.len() as u64;
+        }
+
+        self.rx_next_to_clean = (head + 1) % NUM_RX;
+        unsafe {
+            self.recycle_rx_slot(head);
+        }
+        complete
+    }
 
     fn receive(&mut self) -> Option<Vec<u8>> {
-        let i = self.rx_next_to_clean;
-        let ring = self.rx_ring.as_ptr::<RxDesc>();
-        let desc_ptr = unsafe { ring.add(i) };
-
-        // Legacy descriptor write-back layout (no RFCTL_EXTEN):
-        //   +8  u16  length
-        //   +12 u8   status  (DD=bit0, EOP=bit1)
-        compiler_fence(Ordering::SeqCst);
-        let status = unsafe { read_volatile((desc_ptr as usize + 12) as *const u8) };
-        if status & 1 == 0 {
-            // DD (Descriptor Done) not set — hardware hasn't written back yet
-            return None;
-        }
-
-        let len = unsafe { read_volatile((desc_ptr as usize + 8) as *const u16) } as usize;
-
-        // EOP (End Of Packet) must be set; if not, this is a jumbo fragment we can't reassemble.
-        if status & 2 == 0 || len == 0 || len > BUF_SIZE {
-            unsafe {
-                self.recycle_rx_slot(i);
+        for _ in 0..RX_DRAIN_BUDGET {
+            let head_before = self.rx_next_to_clean;
+            if let Some(pkt) = self.process_rx_slot() {
+                return Some(pkt);
             }
-            self.rx_next_to_clean = (i + 1) % NUM_RX;
-            return None;
+            if self.rx_next_to_clean == self.rx_rdh() || self.rx_next_to_clean == head_before {
+                // Caught up with HW, or slot not ready (DD clear) — wait for next poll.
+                break;
+            }
         }
-
-        // Copy packet from buffer
-        let packet =
-            unsafe { core::slice::from_raw_parts(self.rx_buf_vaddr(i) as *const u8, len).to_vec() };
-
-        self.stats.rx_packets += 1;
-        self.stats.rx_bytes += len as u64;
-
-        // Recycle: clear descriptor, post new buffer, ring doorbell
-        unsafe {
-            self.recycle_rx_slot(i);
-        }
-        self.rx_next_to_clean = (i + 1) % NUM_RX;
-
-        Some(packet)
+        None
     }
 
-    unsafe fn recycle_rx_slot(&self, i: usize) {
+    /// LK `add_pktbuf_to_rxring_locked`: doorbell RDT on every recycle.
+    unsafe fn recycle_rx_slot(&mut self, i: usize) {
         let ring = self.rx_ring.as_ptr::<RxDesc>();
-        let desc_ptr = ring.add(i);
-        // Clear the status byte (legacy WB: status at +12) so hardware can reuse slot.
-        // Re-post buffer address (addr at +0).
-        write_volatile((desc_ptr as usize + 12) as *mut u8, 0u8);
-        compiler_fence(Ordering::SeqCst);
-        write_volatile(&mut (*desc_ptr).addr, self.rx_buf_paddr(i));
-        // Full memory barrier: ensure the DMA engine sees the updated descriptor
-        // before we ring the doorbell.
+        let desc = &mut *ring.add(i);
+        write_volatile(&mut desc.status, 0);
+        write_volatile(&mut desc.errors, 0);
+        write_volatile(&mut desc.len, 0);
+        write_volatile(&mut desc.chksum, 0);
+        write_volatile(&mut desc.vlan, 0);
+        write_volatile(&mut desc.addr, self.rx_buf_paddr(i));
+        dma_sync_rx_desc_span(
+            &self.rx_ring,
+            self.rx_ring_coherent,
+            i,
+            1,
+            size_of::<RxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
         fence(Ordering::SeqCst);
-        // Advance RDT to this slot (give it back to hardware)
         mmio_write(self.base, E1000E_RDT, i as u32);
+        let _ = mmio_read(self.base, E1000E_RDT);
     }
 
     // -----------------------------------------------------------------------
@@ -1270,6 +1404,21 @@ impl E1000eHw {
         unsafe {
             write_volatile(&mut desc.cmd, TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS);
         }
+        dma_sync_rx_desc_span(
+            &self.tx_ring,
+            self.tx_ring_coherent,
+            idx,
+            1,
+            size_of::<TxDesc>(),
+            DmaSyncDir::ToDevice,
+        );
+        dma_sync_region(
+            &self.tx_buf_pool,
+            self.tx_buf_coherent,
+            idx * BUF_SIZE,
+            data.len(),
+            DmaSyncDir::ToDevice,
+        );
         compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
@@ -1430,6 +1579,10 @@ impl E1000eInterface {
         }
 
         let ts = Instant::from_micros(now as i64);
+        {
+            let mut hw = self.driver.hw.lock();
+            hw.handle_rx_irq(irq_icr);
+        }
         unsafe {
             self.driver.hw.lock().ensure_rx_armed_if_link_up();
         }
@@ -1458,7 +1611,6 @@ impl E1000eInterface {
             let mut hw = self.driver.hw.lock();
             hw.tune_itr(now, had_rx);
         }
-        self.ims_rearm();
 
         if had_rx {
             super::wake_net_rx_waiters();
@@ -1507,7 +1659,13 @@ impl Scheme for E1000eInterface {
                 me.schedule_watchdog(true);
             }
             let _ = me.poll_with_irq_hint(icr);
+            // Clear poll_pending BEFORE re-arming IMS so that any IRQ that fires
+            // after ims_rearm() finds poll_pending=false and properly queues a new
+            // deferred job.  With IMS masked throughout the poll, new packets
+            // accumulate in ICR; re-arming causes the NIC to re-assert the IRQ for
+            // those accumulated bits.
             poll_pending.store(false, Ordering::SeqCst);
+            me.ims_rearm();
         });
     }
 }
@@ -1600,7 +1758,9 @@ impl NetScheme for E1000eInterface {
             || unsafe { mmio_read(self.base, E1000E_STATUS) & STATUS_LU != 0 }
     }
     fn poll(&self) -> DeviceResult {
-        self.poll_with_irq_hint(0)
+        self.poll_with_irq_hint(0)?;
+        self.ims_rearm();
+        Ok(())
     }
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         if let Some(pkt) = self.driver.hw.lock().receive() {
@@ -1794,14 +1954,22 @@ pub fn init(
         E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, _) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+    let (rx_ring, rx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, _) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, tx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, _) =
+    let (rx_buf_pool, rx_buf_coherent) =
         DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, _) =
+    let (tx_buf_pool, tx_buf_coherent) =
         DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+
+    crate::klog_warn!(
+        "[e1000e] LK-RX path: DMA coherent rx_ring={} rx_buf={} tx_ring={} tx_buf={}\n",
+        rx_ring_coherent,
+        rx_buf_coherent,
+        tx_ring_coherent,
+        tx_buf_coherent
+    );
 
     // Alignment checks
     for (label, region, align, span) in [
@@ -1827,9 +1995,14 @@ pub fn init(
         mac: [0u8; 6],
         rx_ring,
         rx_buf_pool,
+        rx_ring_coherent,
+        rx_buf_coherent,
         rx_next_to_clean: 0,
+        rx_pending: None,
         tx_ring,
         tx_buf_pool,
+        tx_ring_coherent,
+        tx_buf_coherent,
         tx_tail: 0,
         stats: NetStats::default(),
         link_up: false,
