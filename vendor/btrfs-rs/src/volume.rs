@@ -24,6 +24,10 @@ struct CachedBlock {
     data: Arc<Vec<u8>>,
     /// Monotonic counter for crude LRU eviction.
     last_use: u64,
+    /// Written in memory but not yet flushed to the device (write-back). Dirty
+    /// blocks are never evicted and are flushed (in `flush_dirty`) before the
+    /// superblock is written, so on-disk metadata is always self-consistent.
+    dirty: bool,
 }
 
 const CACHE_MAX_BLOCKS: usize = 256;
@@ -238,11 +242,21 @@ impl Volume {
         if self.cache.len() <= CACHE_MAX_BLOCKS {
             return;
         }
-        // Drop the least recently used half.
-        let mut uses: Vec<u64> = self.cache.values().map(|c| c.last_use).collect();
+        // Drop the least recently used half — but never a dirty (unflushed)
+        // block, or its write-back data would be lost. Dirty blocks are bounded
+        // by the live tree size between syncs.
+        let mut uses: Vec<u64> = self
+            .cache
+            .values()
+            .filter(|c| !c.dirty)
+            .map(|c| c.last_use)
+            .collect();
+        if uses.is_empty() {
+            return;
+        }
         uses.sort_unstable();
         let cutoff = uses[uses.len() / 2];
-        self.cache.retain(|_, c| c.last_use > cutoff);
+        self.cache.retain(|_, c| c.dirty || c.last_use > cutoff);
     }
 
     /// Read a tree block (cached).
@@ -267,6 +281,7 @@ impl Volume {
             CachedBlock {
                 data: data.clone(),
                 last_use: tick,
+                dirty: false,
             },
         );
         self.cache_evict_if_needed();
@@ -278,7 +293,14 @@ impl Volume {
     pub fn write_block(&mut self, logical: u64, mut data: Vec<u8>) -> Result<()> {
         debug_assert_eq!(data.len(), self.nodesize);
         header::update_csum(&mut data);
-        self.write_logical(logical, &data)?;
+        // Write-back: keep the block in the cache marked dirty instead of
+        // writing it to the device now. CoW means a tree block modified many
+        // times between syncs is re-allocated (old one `forget_block`-ed), so
+        // only the live version is dirty; `flush_dirty` writes each once at
+        // commit time. This collapses the per-write metadata write storm.
+        // The mutation still bumps the write epoch (it would have via
+        // `write_logical`) so the fs read cache is invalidated.
+        self.bump_write_epoch();
         self.cache_tick += 1;
         let tick = self.cache_tick;
         self.cache.insert(
@@ -286,9 +308,29 @@ impl Volume {
             CachedBlock {
                 data: Arc::new(data),
                 last_use: tick,
+                dirty: true,
             },
         );
         self.cache_evict_if_needed();
+        Ok(())
+    }
+
+    /// Flush every dirty (write-back) tree block to the device. Must be called
+    /// before writing the superblock so it never references unwritten blocks.
+    pub fn flush_dirty(&mut self) -> Result<()> {
+        // Collect first to avoid holding an immutable borrow over write_logical.
+        let dirty: Vec<(u64, Arc<Vec<u8>>)> = self
+            .cache
+            .iter()
+            .filter(|(_, b)| b.dirty)
+            .map(|(&l, b)| (l, b.data.clone()))
+            .collect();
+        for (logical, data) in dirty {
+            self.write_logical(logical, &data)?;
+            if let Some(b) = self.cache.get_mut(&logical) {
+                b.dirty = false;
+            }
+        }
         Ok(())
     }
 

@@ -428,6 +428,10 @@ impl Btrfs {
             self.sb_dirty = true;
         }
         if force_sb || (self.sb_dirty && self.deferred_sb_commits >= SUPERBLOCK_COMMIT_INTERVAL) {
+            // Write-back invariant: every dirty tree block must reach the device
+            // before the superblock that references it, otherwise a crash would
+            // leave the SB pointing at unwritten blocks.
+            self.vol.flush_dirty()?;
             self.vol.write_superblock()?;
             self.sb_dirty = false;
             self.deferred_sb_commits = 0;
