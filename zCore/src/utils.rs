@@ -124,6 +124,13 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     // stack or for the next timer tick. Returning `true` makes the executor
     // re-check its run queue instead of halting.
     executor::set_idle_callback(|| {
+        // Lazy-TLB restore point: this CPU is about to idle (or steal work),
+        // so drop any lingering user CR3 and return to the kernel page table.
+        // `ThreadSwitchFuture::poll` no longer restores the kernel CR3 after
+        // every poll (that TLB flush dominated yield/syscall latency); it is
+        // restored here instead, before the CPU can halt with a user CR3 that
+        // a concurrent process exit might later free.
+        kernel_hal::vm::activate_kernel_paging();
         let had_jobs = kernel_hal::deferred_job::pending_deferred_jobs() > 0;
         if had_jobs {
             kernel_hal::deferred_job::drain_deferred_jobs();

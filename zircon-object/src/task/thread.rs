@@ -760,12 +760,19 @@ impl Future for ThreadSwitchFuture {
         kernel_hal::thread::set_current_thread(Some(self.thread.clone()));
         let ret = self.future.lock().as_mut().poll(cx);
         kernel_hal::thread::set_current_thread(None);
-        // User threads switch CR3 to the process page table during poll.
-        // Restore the kernel CR3 before returning to executor/idle code — otherwise
-        // SMP task stealing leaves APs with a user CR3 saved in switch stacks, and
-        // process exit can free the user PT while CR3 still points at it.
-        #[cfg(target_os = "none")]
-        kernel_hal::vm::activate_kernel_paging();
+        // Lazy-TLB: keep the process CR3 active after the poll instead of
+        // reloading the kernel CR3 every time. A CR3 reload flushes the TLB,
+        // which is very expensive (especially under emulation), and doing it
+        // on every poll dominated the cost of syscall-heavy / yield-heavy
+        // workloads (e.g. sysbench `threads`, ~2 reloads per `sched_yield`).
+        // The next poll's `activate_paging` is a no-op when it is the same
+        // address space, so consecutive polls of one process cost zero CR3
+        // writes. Safety: the kernel mappings are shared into every process
+        // page table, so kernel code runs fine under the user CR3; the kernel
+        // CR3 is restored (a) before a CPU goes idle / steals work — see the
+        // executor idle callback in `zCore::utils::wait_for_exit` — and
+        // (b) on thread teardown in `CurrentThread::drop`, both of which run
+        // before any process page table can be freed.
         ret
     }
 }
