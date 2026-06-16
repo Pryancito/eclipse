@@ -44,6 +44,27 @@ struct CpuLocalRegion {
     logical_cpu_id: u8,
     logical_cpu_valid: u8,
     _pad: [u8; 6],
+    /// DEBUG: dirección base donde `trap_syscall_entry` guardó el último
+    /// `GeneralRegs` en ESTA CPU (escrita por el asm vía `gs:`).
+    dbg_save: usize,
+}
+
+/// DEBUG: offset de `dbg_save` dentro de [`CpuLocalRegion`], para el asm.
+pub const DBG_SAVE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, dbg_save);
+
+/// DEBUG: leer la dirección de save per-CPU registrada por el asm.
+#[inline]
+pub fn read_dbg_save() -> usize {
+    let ret: usize;
+    unsafe {
+        asm!(
+            "mov {ret}, gs:[{off}]",
+            ret = out(reg) ret,
+            off = const core::mem::offset_of!(CpuLocalRegion, dbg_save),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    ret
 }
 
 /// Read the kernel per-CPU pointer stored in this CPU's GS region.
@@ -141,6 +162,7 @@ pub fn init() {
         logical_cpu_id: 0,
         logical_cpu_valid: 0,
         _pad: [0; 6],
+        dbg_save: 0,
     });
     let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
@@ -214,6 +236,7 @@ pub fn init_ap() {
         logical_cpu_id: 0,
         logical_cpu_valid: 0,
         _pad: [0; 6],
+        dbg_save: 0,
     });
     let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
