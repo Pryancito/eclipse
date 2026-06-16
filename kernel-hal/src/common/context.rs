@@ -246,6 +246,12 @@ impl UserContext {
     fn dbg_validate_user_ctx(&self, when: &str) {
         #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
         {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static HB: AtomicUsize = AtomicUsize::new(0);
+            let n = HB.fetch_add(1, Ordering::Relaxed);
+            if n % 200_000 == 0 {
+                warn!("[ctxcheck] heartbeat n={} ({})", n, when);
+            }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
             let g = &self.0.general;
             if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
@@ -263,6 +269,19 @@ impl UserContext {
             }
         }
         let _ = when;
+    }
+
+    /// DEBUG: leer el `rbp` del contexto de usuario guardado (frame pointer en
+    /// x86_64). Usado por el handler de page-fault para comparar el `rbp` guardado
+    /// con la dirección que falló.
+    pub fn dbg_general_rbp(&self) -> usize {
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                self.0.general.rbp
+            } else {
+                0
+            }
+        }
     }
 
     /// Returns the `error_code` field of the context.

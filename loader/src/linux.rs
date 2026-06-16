@@ -345,24 +345,36 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     for i in 0..8 {
                         w[i] = unsafe { core::ptr::read_volatile((base + i * 8) as *const u64) };
                     }
-                    let (sp, tp, ret) = thread
+                    let (sp, saved_rbp) = thread
                         .with_context(|ctx| {
                             (
                                 ctx.get_field(UserContextField::StackPointer),
-                                ctx.get_field(UserContextField::ThreadPointer),
-                                ctx.get_field(UserContextField::ReturnValue),
+                                ctx.dbg_general_rbp(),
                             )
                         })
-                        .unwrap_or((0, 0, 0));
+                        .unwrap_or((0, 0));
                     warn!(
                         "[faultdump] target physmap {:#x} (phys {:#x}) content: {:#018x?}",
                         base,
                         base - 0xffff_8000_0000_0000,
                         w
                     );
+                    // CLAVE: ¿el rbp GUARDADO en el contexto coincide con la dirección
+                    // que falló (~vaddr)? Si sí -> el contexto tiene el rbp corrupto
+                    // (y ctxcheck debería haber disparado). Si el rbp guardado es
+                    // VÁLIDO mientras el registro real estaba corrupto -> el save del
+                    // asm escribió un rbp distinto al real.
                     warn!(
-                        "[faultdump] user rsp={:#x} fsbase={:#x} rax={:#x} pc={:#x}",
-                        sp, tp, ret, pc
+                        "[faultdump] saved_rbp={:#x} vaddr={:#x} user_rsp={:#x} pc={:#x} {}",
+                        saved_rbp,
+                        vaddr,
+                        sp,
+                        pc,
+                        if saved_rbp >= 0xffff_8000_0000_0000 {
+                            "(saved rbp YA corrupto en contexto)"
+                        } else {
+                            "(saved rbp VALIDO; registro real difiere)"
+                        }
                     );
                 }
                 force_fault_signal(thread, Signal::SIGSEGV);
