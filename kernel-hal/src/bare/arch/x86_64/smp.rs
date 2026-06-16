@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping};
 use x86::controlregs::cr3;
@@ -141,6 +141,25 @@ fn alloc_ap_stack() -> Option<usize> {
 
 /// Number of APs that have signalled they are running.
 pub static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Handshake flag: set by the AP currently starting once it has *latched* its
+/// logical id (and stack/entry) out of the shared trampoline slots. The
+/// trampoline data slots (`SLOT_LOGICAL`/`SLOT_STACK`/`SLOT_ENTRY`) live at
+/// fixed physical addresses and are reused for every AP, so the BSP must not
+/// overwrite them for the next AP until the current one has copied them into
+/// its own registers/locals. Without this, under single-threaded TCG (where a
+/// busy-waiting BSP can outrun a slow AP — the per-CPU PIT freq calibration
+/// alone spins ~55 ms) the BSP would clobber `SLOT_LOGICAL` mid-flight and two
+/// APs would read the *same* logical id, sharing one PercpuBlock/GS/scheduler
+/// slot — silent cross-CPU memory corruption.
+static AP_SLOT_CONSUMED: AtomicBool = AtomicBool::new(false);
+
+/// Called by the starting AP (from `secondary_init`) the instant it has copied
+/// its logical id out of the trampoline slot. Releases the BSP to reuse the
+/// shared trampoline slots for the next AP.
+pub fn ap_signal_slot_consumed() {
+    AP_SLOT_CONSUMED.store(true, Ordering::Release);
+}
 
 // ─── CPU topology: dense logical id  <->  Local APIC ID ─────────────────────────
 //
@@ -307,6 +326,9 @@ pub fn start_application_processors() {
                 break;
             }
         };
+        // Arm the slot-consumed handshake *before* publishing this AP's slots
+        // and sending the SIPI, so we can't miss an early ack.
+        AP_SLOT_CONSUMED.store(false, Ordering::Release);
         unsafe { (phys_to_virt(SLOT_STACK) as *mut usize).write_volatile(stack_top) };
         unsafe {
             (phys_to_virt(SLOT_LOGICAL) as *mut u8).write_volatile(logical as u8);
@@ -327,9 +349,35 @@ pub fn start_application_processors() {
         zcore_drivers::irq::x86::Apic::send_sipi(SIPI_VECTOR, lapic_id);
         delay_us(200);
 
-        // Wait up to 100 ms for AP to come online.
+        // CRITICAL: wait for this AP to *latch* its logical id out of the shared
+        // trampoline slots before we reuse them for the next AP. The AP signals
+        // this very early (right after copying the slot, before its slow per-CPU
+        // init), so this is quick in the common case; the long cap only guards
+        // against an AP that never started. Reusing the slots early makes two
+        // APs share a logical id and silently corrupt each other's per-CPU state.
+        let mut consumed = false;
+        for _ in 0..2_000 {
+            if AP_SLOT_CONSUMED.load(Ordering::Acquire) {
+                consumed = true;
+                break;
+            }
+            delay_us(1_000);
+        }
+        if !consumed {
+            crate::klog_warn!(
+                "[smp] AP LAPIC {} (logical {}) never latched its slot — skipping rest",
+                lapic_id,
+                logical
+            );
+            // The AP never picked up its slot; do not start more APs, as the
+            // dead AP may still wake up later and read whatever we write next.
+            break;
+        }
+
+        // Now wait (best effort) for the AP to finish coming fully online so the
+        // online accounting and TLB-shootdown set reflect reality before we move on.
         let before = AP_ONLINE_COUNT.load(Ordering::Acquire);
-        for _ in 0..100 {
+        for _ in 0..200 {
             delay_us(1_000);
             if AP_ONLINE_COUNT.load(Ordering::Acquire) > before {
                 started += 1;
