@@ -166,6 +166,17 @@ impl TrapReason {
 #[derive(Clone, Copy)]
 pub struct UserContext(UserContextInner);
 
+/// DEBUG: dirección donde el asm de trap guardó el último `GeneralRegs` (x86_64
+/// bare). Se compara con [`UserContext::dbg_ctx_addr`].
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+pub fn dbg_asm_save_addr() -> usize {
+    trapframe::dbg_save_addr()
+}
+#[cfg(not(all(target_arch = "x86_64", not(feature = "libos"))))]
+pub fn dbg_asm_save_addr() -> usize {
+    0
+}
+
 impl UserContext {
     /// Create an empty user context.
     pub fn new() -> Self {
@@ -282,6 +293,13 @@ impl UserContext {
                 0
             }
         }
+    }
+
+    /// DEBUG: dirección en memoria del `GeneralRegs` de este `UserContext`. Se
+    /// compara con [`dbg_asm_save_addr`] (donde el asm guardó de verdad) para
+    /// detectar si el save/restore usan memorias distintas.
+    pub fn dbg_ctx_addr(&self) -> usize {
+        core::ptr::addr_of!(self.0.general) as usize
     }
 
     /// Returns the `error_code` field of the context.

@@ -137,6 +137,10 @@ trap_syscall_entry:
     push rbx
     push rax
 
+    # DEBUG: registrar la direccion base donde el asm GUARDA el GeneralRegs
+    # (rsp apunta ahora al slot de rax = base de GeneralRegs).
+    mov [rip + {DBG_SAVE}], rsp
+
     # push fsbase gsbase
     mov ecx, 0xC0000100
     rdmsr

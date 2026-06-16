@@ -345,14 +345,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     for i in 0..8 {
                         w[i] = unsafe { core::ptr::read_volatile((base + i * 8) as *const u64) };
                     }
-                    let (sp, saved_rbp) = thread
+                    let (sp, saved_rbp, ctx_addr) = thread
                         .with_context(|ctx| {
                             (
                                 ctx.get_field(UserContextField::StackPointer),
                                 ctx.dbg_general_rbp(),
+                                ctx.dbg_ctx_addr(),
                             )
                         })
-                        .unwrap_or((0, 0));
+                        .unwrap_or((0, 0, 0));
+                    let asm_save = kernel_hal::context::dbg_asm_save_addr();
                     warn!(
                         "[faultdump] target physmap {:#x} (phys {:#x}) content: {:#018x?}",
                         base,
@@ -374,6 +376,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                             "(saved rbp YA corrupto en contexto)"
                         } else {
                             "(saved rbp VALIDO; registro real difiere)"
+                        }
+                    );
+                    warn!(
+                        "[faultdump] ctx_addr={:#x} asm_save_addr={:#x} {}",
+                        ctx_addr,
+                        asm_save,
+                        if asm_save != ctx_addr {
+                            "<<< MISMATCH: el asm guardó en OTRA direccion que el UserContext del kernel"
+                        } else {
+                            "(coinciden: save y contexto misma memoria)"
                         }
                     );
                 }

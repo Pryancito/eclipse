@@ -1,10 +1,21 @@
 use super::UserContext;
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-global_asm!(include_str!("syscall.S"));
+/// DEBUG: dirección base donde `trap_syscall_entry` guardó el último `GeneralRegs`
+/// (escrita por el asm). Permite comparar contra el `UserContext` que el kernel
+/// cree estar usando, para detectar desincronización save/restore.
+pub static DBG_SAVE_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+/// Leer [`DBG_SAVE_ADDR`].
+pub fn dbg_save_addr() -> usize {
+    DBG_SAVE_ADDR.load(Ordering::Relaxed)
+}
+
+global_asm!(include_str!("syscall.S"), DBG_SAVE = sym DBG_SAVE_ADDR);
 
 pub fn init() {
     let cpuid = raw_cpuid::CpuId::new();
