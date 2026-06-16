@@ -216,6 +216,42 @@ fn handle_signal(
     ctx
 }
 
+/// Deliver a *synchronous* fault signal (SIGSEGV / SIGBUS / SIGILL / SIGFPE).
+///
+/// A faulting instruction is re-executed when the thread returns to user mode.
+/// If the fault signal is merely queued but cannot actually be delivered — it is
+/// blocked by the signal mask, already pending (we are re-faulting on the same
+/// instruction), or a handler is already mid-flight — the thread loops on the
+/// same fault forever and starves every CPU (observed as a 0x9b SIGSEGV storm,
+/// ~71k faults, that hung the whole system under network load and stalled
+/// downloads like `apk update`).
+///
+/// Mirror Linux `force_sig`: in any of those un-deliverable cases, or when the
+/// disposition is the default/ignore action, terminate the process. Only a
+/// not-yet-faulted custom handler gets to run, exactly once — a fault inside it
+/// sets `handling_signal`, so the next fault terminates instead of looping.
+fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
+    let action = thread.proc().linux().signal_action(signal);
+    let inner = thread.inner();
+    let undeliverable = {
+        let linux = inner.lock_linux();
+        linux.signal_mask.contains(signal)
+            || linux.handling_signal.is_some()
+            || linux.signals.contains(signal)
+            || action.handler == SIG_DFL
+            || action.handler == SIG_IGN
+    };
+    if undeliverable {
+        thread.proc().exit(128 + signal as i64);
+    } else {
+        // Deliverable custom handler: unblock so it cannot be deferred and queue
+        // it for the next pass of the run loop.
+        let mut linux = inner.lock_linux();
+        linux.signal_mask.remove(signal);
+        linux.signals.insert(signal);
+    }
+}
+
 /// Push a object onto stack
 /// # Safety
 ///
@@ -290,19 +326,20 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             );
             let vmar = thread.proc().vmar();
             if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
+                let pc = thread
+                    .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                    .unwrap_or(0);
                 warn!(
-                    "failed to handle page fault from user mode @ {:#x}({:?}): {:?}, delivering SIGSEGV",
-                    vaddr,
-                    flags,
-                    err,
+                    "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
+                    vaddr, flags, err, pid, thread.proc().name(), pc,
                 );
-                thread.inner().lock_linux().signals.insert(Signal::SIGSEGV);
+                force_fault_signal(thread, Signal::SIGSEGV);
             }
             Ok(())
         }
         TrapReason::UndefinedInstruction => {
             warn!("undefined instruction from user mode, pid={}", pid);
-            thread.inner().lock_linux().signals.insert(Signal::SIGILL);
+            force_fault_signal(thread, Signal::SIGILL);
             Ok(())
         }
         TrapReason::SoftwareBreakpoint | TrapReason::HardwareBreakpoint => {
@@ -312,7 +349,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         }
         TrapReason::UnalignedAccess => {
             warn!("unaligned access from user mode, pid={}", pid);
-            thread.inner().lock_linux().signals.insert(Signal::SIGBUS);
+            force_fault_signal(thread, Signal::SIGBUS);
             Ok(())
         }
         TrapReason::GernelFault(trap_num) => {
@@ -328,7 +365,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 thread.id(),
                 pc
             );
-            thread.inner().lock_linux().signals.insert(signal);
+            force_fault_signal(thread, signal);
             Ok(())
         }
         _ => {
