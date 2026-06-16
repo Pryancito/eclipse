@@ -35,20 +35,11 @@ pub(crate) fn ipi_reason() -> Vec<usize> {
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Monotonic TLB-shootdown generation, bumped once per `remote_flush_tlb`.
-static TLB_GEN: AtomicU64 = AtomicU64::new(0);
-/// Highest generation each CPU has flushed through (indexed by logical id).
-static CPU_ACKED_GEN: [AtomicU64; crate::config::MAX_CORE_NUM] =
-    [const { AtomicU64::new(0) }; crate::config::MAX_CORE_NUM];
 /// Bitmask of logical CPU ids that are actually online and able to service
 /// IPIs. The BSP (logical 0) is always online; APs OR in their bit once they
-/// reach `secondary_init`. Shootdowns must only *wait* for online CPUs — APs
-/// that failed to start (partial SMP bring-up) would otherwise hang the waiter.
+/// reach `secondary_init`. Shootdowns only target online CPUs — APs that failed
+/// to start (partial SMP bring-up) must not be signalled.
 static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
-/// Bounded best-effort wait for shootdown acks. Short on purpose: a responsive
-/// CPU acks almost immediately, but the unmap path must not grind if an ack
-/// never comes (unreliable AP IPI delivery under partial SMP bring-up).
-const SHOOTDOWN_SPIN_LIMIT: u64 = 200_000;
 
 /// Mark a logical CPU id as online (called from each CPU's bring-up path).
 pub fn mark_cpu_online(logical_id: usize) {
@@ -57,21 +48,17 @@ pub fn mark_cpu_online(logical_id: usize) {
     }
 }
 
-/// Receiver side of the TLB shootdown: flush this CPU's TLB and publish the
-/// generation it has now satisfied. Called both from the IPI handler and from
-/// an initiator's spin-wait (so two CPUs shooting down each other can't
-/// deadlock even with interrupts disabled). The queue payload is irrelevant —
-/// a full flush covers every pending request — so it is just drained and
-/// discarded; this also makes the path robust to IPI-queue overflow.
+/// Receiver side of the TLB shootdown: flush this CPU's whole TLB. The queue
+/// payload is irrelevant — a full flush covers every pending request — so it is
+/// just drained and discarded; this also makes the path robust to IPI-queue
+/// overflow.
 pub fn tlb_shootdown_ack() {
     let me = crate::cpu::cpu_id() as usize;
-    let gen = TLB_GEN.load(Ordering::Acquire);
     crate::vm::flush_tlb(None);
     let _ = ipi_queue(me).consume_entrys();
-    CPU_ACKED_GEN[me].store(gen, Ordering::Release);
 }
 
-/// Synchronous cross-CPU TLB shootdown.
+/// Cross-CPU TLB shootdown.
 ///
 /// x86 `flush_tlb` only invalidates the *local* CPU's TLB. Without this, after
 /// one CPU unmaps/reprotects a page (COW copy-break, munmap, address-space
@@ -80,46 +67,28 @@ pub fn tlb_shootdown_ack() {
 /// read/write the wrong owner's memory — the cross-process and kernel↔user
 /// corruption that only shows up under SMP load.
 ///
-/// It is *synchronous*: it returns only once every other online CPU has flushed
-/// at or beyond this call's generation, so the caller may safely free/reuse the
-/// frame afterwards. Callers usually hold an IRQ-disabling spinlock, so the
-/// wait loop drains its own pending shootdowns to avoid a mutual-wait deadlock.
-/// `vaddr` is currently advisory (a full flush is used for simplicity/safety).
+/// Best-effort / asynchronous: it signals the other online CPUs and returns
+/// without waiting for them. A synchronous variant deadlocks here because the
+/// unmap path runs under IRQ-disabling spinlocks and the AP IPI/ack path is
+/// unreliable under partial SMP bring-up. `vaddr` is advisory (a full flush is
+/// used for simplicity/safety).
 pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     let me = crate::cpu::cpu_id() as usize;
     let online = CPU_ONLINE.load(Ordering::Acquire) & !(1u64 << me);
     if online == 0 {
         return; // we are the only online CPU
     }
-    let gen = TLB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    CPU_ACKED_GEN[me].store(gen, Ordering::Release);
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
-    // Fire the shootdown at every other online CPU, then wait *briefly* for the
-    // acks. The wait is bounded (best-effort): the IPI delivery path on the APs
-    // is currently unreliable under partial SMP bring-up, so we must never block
-    // the unmap path waiting for an ack that may not come. Each remote CPU still
-    // flushes its whole TLB when it does take the IPI (and on its next context
-    // switch), which closes the stale-entry window in the common case.
+    // Fire-and-forget: signal every other online CPU to flush. We do NOT block
+    // the unmap path waiting for acks — the IPI-delivery/ack path on the APs is
+    // unreliable under partial SMP bring-up and waiting there deadlocks against
+    // the spinlocks the unmap holds. Each remote CPU still flushes its whole TLB
+    // when it takes the IPI (and on its next context switch), which closes the
+    // stale-entry window in the common case.
     for cpu in 0..crate::config::MAX_CORE_NUM {
         if online & (1u64 << cpu) != 0 {
             let _ = crate::interrupt::send_ipi(cpu, reason);
         }
-    }
-    let mut spins: u64 = 0;
-    'wait: while spins < SHOOTDOWN_SPIN_LIMIT {
-        let mut all = true;
-        for cpu in 0..crate::config::MAX_CORE_NUM {
-            if online & (1u64 << cpu) != 0
-                && CPU_ACKED_GEN[cpu].load(Ordering::Acquire) < gen
-            {
-                all = false;
-            }
-        }
-        if all {
-            break 'wait;
-        }
-        core::hint::spin_loop();
-        spins += 1;
     }
 }
 
