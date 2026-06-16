@@ -150,6 +150,16 @@ pub fn frame_dealloc(target: PhysAddr) {
     // Marcar libre ANTES de devolverlo al allocator: si es un doble-free, lo
     // detectamos antes de reinsertarlo.
     track_mark_free(idx);
+    // DEBUG: envenenar el frame con 0x5A al liberarlo. Si un proceso lee este
+    // patrón en su memoria (fault a una dirección ~0x5a5a5a5a...), está leyendo
+    // un frame YA LIBERADO -> PTE rancia (free-sin-unmap / use-after-free).
+    unsafe {
+        core::ptr::write_bytes(
+            (0xffff_8000_0000_0000usize + target) as *mut u8,
+            0x5A,
+            1 << PAGE_BITS,
+        );
+    }
     FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
     FRAME_ALLOCATOR.lock().dealloc(idx);
 }
@@ -230,21 +240,51 @@ cfg_if! {
             }
         }
 
+        // DEBUG: redzone/canario tras cada asignación del heap. Si algo desborda
+        // una asignación (escribe pasado su final), se detecta al liberar y se
+        // panica con el tamaño/posición -> identifica la asignación culpable de la
+        // corrupción del heap (que se sospecha pisa los BTreeMap de frames de VMO).
+        const REDZONE: usize = 16;
+        const CANARY: u8 = 0xAB;
+
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let sz = layout.size();
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 self.0
                     .lock()
-                    .alloc(layout)
+                    .alloc(ext)
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
-                        HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
-                        allocation.as_ptr()
+                        HEAP_USED.fetch_add(sz, Ordering::Relaxed);
+                        let p = allocation.as_ptr();
+                        let cz = p.add(sz);
+                        for i in 0..REDZONE {
+                            core::ptr::write_volatile(cz.add(i), CANARY);
+                        }
+                        p
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
-                self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
+                let sz = layout.size();
+                // Comprobar el canario ANTES de tomar el lock del heap.
+                let cz = ptr.add(sz);
+                for i in 0..REDZONE {
+                    if core::ptr::read_volatile(cz.add(i)) != CANARY {
+                        panic!(
+                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered en +{} (val={:#x})",
+                            ptr as usize,
+                            sz,
+                            layout.align(),
+                            i,
+                            core::ptr::read_volatile(cz.add(i))
+                        );
+                    }
+                }
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
+                self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext)
             }
         }
     } else {
