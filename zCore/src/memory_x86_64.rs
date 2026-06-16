@@ -135,17 +135,6 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         for i in 0..frame_count {
             track_mark_alloc(idx + i);
         }
-        // DEBUG/test: poner a cero el/los frame(s) al asignarlos. Si esto elimina
-        // la corrupción, confirma que apk leía datos RANCIOS del kernel (punteros
-        // physmap) en un frame reusado sin limpiar.
-        let pa = frame_idx_to_phys_addr(idx);
-        unsafe {
-            core::ptr::write_bytes(
-                kernel_hal::mem::phys_to_virt(pa) as *mut u8,
-                0,
-                frame_count << PAGE_BITS,
-            );
-        }
     }
     let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
