@@ -90,4 +90,18 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
         self.chead.store(ptail, Ordering::Release);
         vec
     }
+
+    /// Whether there are committed-but-unconsumed entries. Allocation-free, so
+    /// it is safe to poll from contexts that must not touch the heap (e.g. the
+    /// TLB-shootdown wait loop, which runs under an IRQ-disabled spinlock).
+    pub fn is_empty(&self) -> bool {
+        self.ptail() == self.chead()
+    }
+
+    /// Drop every pending entry without allocating. Used by the TLB-shootdown
+    /// path, where a single full flush already covers all coalesced requests so
+    /// the payloads are irrelevant and a `Vec` (heap lock) must be avoided.
+    pub fn drain_discard(&self) {
+        self.chead.store(self.ptail(), Ordering::Release);
+    }
 }
