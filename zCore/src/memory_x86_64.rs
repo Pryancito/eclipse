@@ -150,6 +150,7 @@ pub fn frame_dealloc(target: PhysAddr) {
     // Marcar libre ANTES de devolverlo al allocator: si es un doble-free, lo
     // detectamos antes de reinsertarlo.
     track_mark_free(idx);
+    kernel_hal::dbg_frameowner::clear(idx);
     // DEBUG: envenenar el frame con 0x5A al liberarlo. Si un proceso lee este
     // patrón en su memoria (fault a una dirección ~0x5a5a5a5a...), está leyendo
     // un frame YA LIBERADO -> PTE rancia (free-sin-unmap / use-after-free).

@@ -454,6 +454,32 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     );
                 }
                 force_fault_signal(thread, Signal::SIGSEGV);
+            } else {
+                // DEBUG: detector de frame compartido ESCRIBIBLE entre procesos
+                // vivos (COW-break fallido). En faults de ESCRITURA, registrar el
+                // pid dueño del frame mapeado; si otro pid vivo ya lo tenía -> bug.
+                #[cfg(not(feature = "libos"))]
+                if flags.contains(kernel_hal::MMUFlags::WRITE) {
+                    use kernel_hal::vm::{GenericPageTable, PageTable};
+                    let pt = PageTable::from_current();
+                    if let Ok((pa, fl, _)) = pt.query(vaddr & !0xfff) {
+                        if fl.contains(kernel_hal::MMUFlags::WRITE) {
+                            if let Some(prev) = kernel_hal::dbg_frameowner::set_check(
+                                (pa & !0xfff) >> 12,
+                                pid as u32,
+                            ) {
+                                warn!(
+                                    "[shared-w] !!! frame {:#x} WRITABLE por pid {} Y pid {} (vaddr={:#x}) -> COW-break FALLIDO",
+                                    pa & !0xfff,
+                                    prev,
+                                    pid,
+                                    vaddr
+                                );
+                            }
+                        }
+                    }
+                    core::mem::forget(pt);
+                }
             }
             Ok(())
         }
