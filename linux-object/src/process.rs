@@ -1074,6 +1074,24 @@ impl LinuxProcess {
         self.inner.lock().signal_actions.table[signal as u8 as usize] = action;
     }
 
+    /// Reset signal dispositions across `execve`, as POSIX requires: every
+    /// signal that was being *caught* (a custom handler) is restored to
+    /// `SIG_DFL`; signals set to `SIG_IGN` or already `SIG_DFL` are left
+    /// untouched. Without this, a `fork`+`exec`'d child keeps the parent
+    /// shell's handler addresses; since busybox is one static binary, those
+    /// addresses are still valid code in the new image, so a delivered signal
+    /// (e.g. SIGINT) jumps into the shell's handler with the new applet's
+    /// uninitialised globals (`ptr_to_globals == NULL`) and crashes.
+    pub fn reset_signal_actions_for_exec(&self) {
+        use crate::signal::{SIG_DFL, SIG_IGN};
+        let mut inner = self.inner.lock();
+        for action in inner.signal_actions.table.iter_mut() {
+            if action.handler != SIG_DFL && action.handler != SIG_IGN {
+                *action = SignalAction::default();
+            }
+        }
+    }
+
     /// Close file that FD_CLOEXEC is set
     pub fn remove_cloexec_files(&self) {
         let mut inner = self.inner.lock();
