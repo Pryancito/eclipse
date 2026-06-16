@@ -347,6 +347,9 @@ pub fn start_application_processors() {
 
 /// Called by each AP from `secondary_init()` to announce it is running.
 pub fn ap_signal_online() {
+    // Mark this AP online so cross-CPU TLB shootdowns wait for it (and only
+    // CPUs that actually came up — partial bring-up must not hang the waiter).
+    crate::common::ipi::mark_cpu_online(super::cpu::cpu_id() as usize);
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);
 }
 

@@ -40,6 +40,20 @@ static TLB_GEN: AtomicU64 = AtomicU64::new(0);
 /// Highest generation each CPU has flushed through (indexed by logical id).
 static CPU_ACKED_GEN: [AtomicU64; crate::config::MAX_CORE_NUM] =
     [const { AtomicU64::new(0) }; crate::config::MAX_CORE_NUM];
+/// Bitmask of logical CPU ids that are actually online and able to service
+/// IPIs. The BSP (logical 0) is always online; APs OR in their bit once they
+/// reach `secondary_init`. Shootdowns must only *wait* for online CPUs — APs
+/// that failed to start (partial SMP bring-up) would otherwise hang the waiter.
+static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
+/// Safety backstop so a wedged (but "online") CPU can never hang a shootdown.
+const SHOOTDOWN_SPIN_LIMIT: u64 = 200_000_000;
+
+/// Mark a logical CPU id as online (called from each CPU's bring-up path).
+pub fn mark_cpu_online(logical_id: usize) {
+    if logical_id < 64 {
+        CPU_ONLINE.fetch_or(1u64 << logical_id, Ordering::Release);
+    }
+}
 
 /// Receiver side of the TLB shootdown: flush this CPU's TLB and publish the
 /// generation it has now satisfied. Called both from the IPI handler and from
@@ -70,28 +84,33 @@ pub fn tlb_shootdown_ack() {
 /// wait loop drains its own pending shootdowns to avoid a mutual-wait deadlock.
 /// `vaddr` is currently advisory (a full flush is used for simplicity/safety).
 pub fn remote_flush_tlb(_vaddr: Option<usize>) {
-    let n = crate::cpu::cpu_count() as usize;
-    if n <= 1 {
-        return;
-    }
     let me = crate::cpu::cpu_id() as usize;
+    let online = CPU_ONLINE.load(Ordering::Acquire) & !(1u64 << me);
+    if online == 0 {
+        return; // we are the only online CPU
+    }
     let gen = TLB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CPU_ACKED_GEN[me].store(gen, Ordering::Release);
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
-    for cpu in 0..n {
-        if cpu != me {
+    for cpu in 0..crate::config::MAX_CORE_NUM {
+        if online & (1u64 << cpu) != 0 {
             let _ = crate::interrupt::send_ipi(cpu, reason);
         }
     }
-    for cpu in 0..n {
-        if cpu == me {
+    for cpu in 0..crate::config::MAX_CORE_NUM {
+        if online & (1u64 << cpu) == 0 {
             continue;
         }
+        let mut spins: u64 = 0;
         while CPU_ACKED_GEN[cpu].load(Ordering::Acquire) < gen {
             // Service peers (and drain our own queue) so we can't deadlock with
-            // another CPU that is simultaneously waiting on us.
+            // another CPU simultaneously waiting on us.
             tlb_shootdown_ack();
             core::hint::spin_loop();
+            spins += 1;
+            if spins > SHOOTDOWN_SPIN_LIMIT {
+                break; // backstop: never hang on a wedged CPU
+            }
         }
     }
 }
