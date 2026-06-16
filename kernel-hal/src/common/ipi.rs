@@ -45,8 +45,10 @@ static CPU_ACKED_GEN: [AtomicU64; crate::config::MAX_CORE_NUM] =
 /// reach `secondary_init`. Shootdowns must only *wait* for online CPUs — APs
 /// that failed to start (partial SMP bring-up) would otherwise hang the waiter.
 static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
-/// Safety backstop so a wedged (but "online") CPU can never hang a shootdown.
-const SHOOTDOWN_SPIN_LIMIT: u64 = 200_000_000;
+/// Bounded best-effort wait for shootdown acks. Short on purpose: a responsive
+/// CPU acks almost immediately, but the unmap path must not grind if an ack
+/// never comes (unreliable AP IPI delivery under partial SMP bring-up).
+const SHOOTDOWN_SPIN_LIMIT: u64 = 200_000;
 
 /// Mark a logical CPU id as online (called from each CPU's bring-up path).
 pub fn mark_cpu_online(logical_id: usize) {
@@ -92,26 +94,32 @@ pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     let gen = TLB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CPU_ACKED_GEN[me].store(gen, Ordering::Release);
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
+    // Fire the shootdown at every other online CPU, then wait *briefly* for the
+    // acks. The wait is bounded (best-effort): the IPI delivery path on the APs
+    // is currently unreliable under partial SMP bring-up, so we must never block
+    // the unmap path waiting for an ack that may not come. Each remote CPU still
+    // flushes its whole TLB when it does take the IPI (and on its next context
+    // switch), which closes the stale-entry window in the common case.
     for cpu in 0..crate::config::MAX_CORE_NUM {
         if online & (1u64 << cpu) != 0 {
             let _ = crate::interrupt::send_ipi(cpu, reason);
         }
     }
-    for cpu in 0..crate::config::MAX_CORE_NUM {
-        if online & (1u64 << cpu) == 0 {
-            continue;
-        }
-        let mut spins: u64 = 0;
-        while CPU_ACKED_GEN[cpu].load(Ordering::Acquire) < gen {
-            // Service peers (and drain our own queue) so we can't deadlock with
-            // another CPU simultaneously waiting on us.
-            tlb_shootdown_ack();
-            core::hint::spin_loop();
-            spins += 1;
-            if spins > SHOOTDOWN_SPIN_LIMIT {
-                break; // backstop: never hang on a wedged CPU
+    let mut spins: u64 = 0;
+    'wait: while spins < SHOOTDOWN_SPIN_LIMIT {
+        let mut all = true;
+        for cpu in 0..crate::config::MAX_CORE_NUM {
+            if online & (1u64 << cpu) != 0
+                && CPU_ACKED_GEN[cpu].load(Ordering::Acquire) < gen
+            {
+                all = false;
             }
         }
+        if all {
+            break 'wait;
+        }
+        core::hint::spin_loop();
+        spins += 1;
     }
 }
 
