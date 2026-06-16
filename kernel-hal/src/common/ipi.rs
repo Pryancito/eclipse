@@ -41,26 +41,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// to start (partial SMP bring-up) must not be signalled.
 static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
 
-/// Per-CPU count of completed full TLB flushes (a "flush generation"). Each CPU
-/// bumps its own counter every time it services a shootdown. An initiator
-/// snapshots a target's counter *after* it has modified the page table, then
-/// waits for the counter to advance: that proves the target performed a full
-/// flush after the request, so it can no longer hold a stale entry for the page
-/// we are about to free. A monotonic per-CPU generation (rather than a shared
-/// down-counter) makes concurrent shootdowns from several CPUs compose.
-static TLB_GEN: [AtomicU64; MAX_CORE_NUM] = {
-    const ZERO: AtomicU64 = AtomicU64::new(0);
-    [ZERO; MAX_CORE_NUM]
-};
-
-/// Upper bound on the busy-wait for remote acks. Generous: under real
-/// parallelism (KVM) acks land in microseconds; under single-threaded TCG the
-/// initiator must spin long enough for the emulator to round-robin to the
-/// target vCPU so it can service the IPI. On timeout we fall back to the old
-/// best-effort behaviour (the remote still flushes on its next context switch)
-/// rather than hang the unmap forever on a wedged CPU.
-const ACK_SPIN_LIMIT: u64 = 200_000_000;
-
 /// Mark a logical CPU id as online (called from each CPU's bring-up path).
 pub fn mark_cpu_online(logical_id: usize) {
     if logical_id < 64 {
@@ -68,19 +48,14 @@ pub fn mark_cpu_online(logical_id: usize) {
     }
 }
 
-/// Service a pending shootdown on the *current* CPU: full-flush its TLB, publish
-/// the advanced generation so initiators waiting on us can proceed, then drop
-/// the coalesced requests. Allocation-free so it is safe both from the IPI
-/// handler (IRQs off) and from the self-service step of the wait loop below.
+/// Receiver side of the TLB shootdown: flush this CPU's whole TLB. The queue
+/// payload is irrelevant — a full flush covers every pending request — so it is
+/// just drained and discarded; this also makes the path robust to IPI-queue
+/// overflow.
 pub fn tlb_shootdown_ack() {
     let me = crate::cpu::cpu_id() as usize;
     crate::vm::flush_tlb(None);
-    // Publish *after* the flush (Release): an initiator that observes the new
-    // generation (Acquire) is guaranteed our flush has already happened.
-    if me < MAX_CORE_NUM {
-        TLB_GEN[me].fetch_add(1, Ordering::Release);
-    }
-    ipi_queue(me).drain_discard();
+    let _ = ipi_queue(me).consume_entrys();
 }
 
 /// Cross-CPU TLB shootdown.
@@ -92,17 +67,11 @@ pub fn tlb_shootdown_ack() {
 /// read/write the wrong owner's memory — the cross-process and kernel↔user
 /// corruption that only shows up under SMP load.
 ///
-/// Synchronous: signals every other online CPU and waits until each has done a
-/// full flush (its generation advances) before returning, so the caller may
-/// safely free the unmapped frame. `vaddr` is advisory — a full flush is used
-/// for simplicity/safety.
-///
-/// Deadlock-free despite running under the IRQ-disabled page-table spinlock:
-/// while waiting we *self-service* any shootdown aimed at us, so two CPUs
-/// cross-shooting-down (each spinning with IRQs off) still make progress
-/// instead of wedging on each other. The wait is also bounded — a CPU that
-/// never acks (still in early bring-up, wedged) drops us to best-effort rather
-/// than hanging the unmap.
+/// Best-effort / asynchronous: it signals the other online CPUs and returns
+/// without waiting for them. A synchronous variant deadlocks here because the
+/// unmap path runs under IRQ-disabling spinlocks and the AP IPI/ack path is
+/// unreliable under partial SMP bring-up. `vaddr` is advisory (a full flush is
+/// used for simplicity/safety).
 pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     let me = crate::cpu::cpu_id() as usize;
     let online = CPU_ONLINE.load(Ordering::Acquire) & !(1u64 << me);
@@ -110,44 +79,16 @@ pub fn remote_flush_tlb(_vaddr: Option<usize>) {
         return; // we are the only online CPU
     }
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
-
-    // Snapshot each target's flush generation *before* signalling it, so any
-    // advance we later observe corresponds to a flush triggered by this request.
-    let mut snapshot = [0u64; MAX_CORE_NUM];
-    for cpu in 0..MAX_CORE_NUM {
+    // Fire-and-forget: signal every other online CPU to flush. We do NOT block
+    // the unmap path waiting for acks — the IPI-delivery/ack path on the APs is
+    // unreliable under partial SMP bring-up and waiting there deadlocks against
+    // the spinlocks the unmap holds. Each remote CPU still flushes its whole TLB
+    // when it takes the IPI (and on its next context switch), which closes the
+    // stale-entry window in the common case.
+    for cpu in 0..crate::config::MAX_CORE_NUM {
         if online & (1u64 << cpu) != 0 {
-            snapshot[cpu] = TLB_GEN[cpu].load(Ordering::Acquire);
             let _ = crate::interrupt::send_ipi(cpu, reason);
         }
-    }
-
-    // Wait for every signalled CPU to advance its generation.
-    let mut pending = online;
-    let mut spins: u64 = 0;
-    while pending != 0 {
-        // Self-service: honour any shootdown targeted at us while our IRQs are
-        // off, so we cannot wedge another initiator that is waiting on us.
-        if !ipi_queue(me).is_empty() {
-            tlb_shootdown_ack();
-        }
-        let mut cpu = 0;
-        while cpu < MAX_CORE_NUM {
-            let bit = 1u64 << cpu;
-            if pending & bit != 0 && TLB_GEN[cpu].load(Ordering::Acquire) != snapshot[cpu] {
-                pending &= !bit;
-            }
-            cpu += 1;
-        }
-        if pending == 0 {
-            break;
-        }
-        spins += 1;
-        if spins >= ACK_SPIN_LIMIT {
-            // Best-effort fallback: do not hang the unmap on a CPU that never
-            // acked. The remote still flushes on its next context switch.
-            break;
-        }
-        core::hint::spin_loop();
     }
 }
 
