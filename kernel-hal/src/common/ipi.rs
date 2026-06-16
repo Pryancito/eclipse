@@ -33,6 +33,33 @@ pub(crate) fn ipi_reason() -> Vec<usize> {
     queue.consume_entrys().iter().map(|entry| entry.1).collect()
 }
 
+/// Broadcast a TLB-shootdown IPI to every *other* online CPU.
+///
+/// x86 `flush_tlb` only invalidates the *local* CPU's TLB. Without this, after
+/// one CPU unmaps a page (COW copy-break, munmap, process/address-space
+/// teardown) the other CPUs keep stale TLB entries that still point at the
+/// now-freed physical frame; once that frame is reallocated to another
+/// VMO/process the stale entries read/write the wrong owner's memory — the
+/// cross-process and kernel↔user corruption that only appears under SMP load.
+///
+/// Asynchronous (fire-and-forget): remote CPUs flush when they next take the
+/// IPI. `vaddr = None` (encoded as `vpn = 0`) requests a full remote flush.
+pub fn remote_flush_tlb(vaddr: Option<usize>) {
+    let n = crate::cpu::cpu_count() as usize;
+    if n <= 1 {
+        return;
+    }
+    let me = crate::cpu::cpu_id() as usize;
+    let vpn = vaddr.map(|v| v >> 12).unwrap_or(0);
+    let reason: IpiEntry = IpiReason::TlbShutdown { vpn }.into();
+    for cpu in 0..n {
+        if cpu == me {
+            continue;
+        }
+        let _ = crate::interrupt::send_ipi(cpu, reason);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum IpiReason {
     Invalid,
