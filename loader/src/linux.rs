@@ -366,19 +366,31 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     // la vmar del proceso y leer por physmap (0xffff8000... base).
                     {
                         use kernel_hal::vm::{GenericPageTable, PageTable};
-                        let src = rsi & !0x3f;
+                        // Volcar 256 B del buffer de apk para ver la granularidad de
+                        // la corrupción (trozos buenos/malos). Se interpreta cada
+                        // byte como ASCII imprimible ('.' si no) para ver texto vs
+                        // basura de un vistazo.
+                        let src = (rsi & !0x3f).saturating_sub(0x40);
                         let pt = PageTable::from_current();
                         if let Ok((pa, _, _)) = pt.query(src & !0xfff) {
                             let byte_pa = (pa & !0xfff) + (src & 0xfff);
                             let kv = 0xffff_8000_0000_0000usize + byte_pa;
-                            let mut w = [0u64; 8];
-                            for i in 0..8 {
-                                w[i] = unsafe { core::ptr::read_volatile((kv + i * 8) as *const u64) };
+                            for row in 0..16 {
+                                let mut s = [b'.'; 16];
+                                for j in 0..16 {
+                                    let b = unsafe {
+                                        core::ptr::read_volatile((kv + row * 16 + j) as *const u8)
+                                    };
+                                    if (0x20..0x7f).contains(&b) {
+                                        s[j] = b;
+                                    }
+                                }
+                                warn!(
+                                    "[bufdump] @{:#x} {}",
+                                    src + row * 16,
+                                    core::str::from_utf8(&s).unwrap_or("?")
+                                );
                             }
-                            warn!(
-                                "[faultdump] apk src buf @{:#x} phys={:#x}: {:#018x?}",
-                                src, byte_pa, w
-                            );
                         }
                         core::mem::forget(pt);
                     }
