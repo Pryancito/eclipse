@@ -33,30 +33,66 @@ pub(crate) fn ipi_reason() -> Vec<usize> {
     queue.consume_entrys().iter().map(|entry| entry.1).collect()
 }
 
-/// Broadcast a TLB-shootdown IPI to every *other* online CPU.
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic TLB-shootdown generation, bumped once per `remote_flush_tlb`.
+static TLB_GEN: AtomicU64 = AtomicU64::new(0);
+/// Highest generation each CPU has flushed through (indexed by logical id).
+static CPU_ACKED_GEN: [AtomicU64; crate::config::MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; crate::config::MAX_CORE_NUM];
+
+/// Receiver side of the TLB shootdown: flush this CPU's TLB and publish the
+/// generation it has now satisfied. Called both from the IPI handler and from
+/// an initiator's spin-wait (so two CPUs shooting down each other can't
+/// deadlock even with interrupts disabled). The queue payload is irrelevant —
+/// a full flush covers every pending request — so it is just drained and
+/// discarded; this also makes the path robust to IPI-queue overflow.
+pub fn tlb_shootdown_ack() {
+    let me = crate::cpu::cpu_id() as usize;
+    let gen = TLB_GEN.load(Ordering::Acquire);
+    crate::vm::flush_tlb(None);
+    let _ = ipi_queue(me).consume_entrys();
+    CPU_ACKED_GEN[me].store(gen, Ordering::Release);
+}
+
+/// Synchronous cross-CPU TLB shootdown.
 ///
 /// x86 `flush_tlb` only invalidates the *local* CPU's TLB. Without this, after
-/// one CPU unmaps a page (COW copy-break, munmap, process/address-space
-/// teardown) the other CPUs keep stale TLB entries that still point at the
-/// now-freed physical frame; once that frame is reallocated to another
-/// VMO/process the stale entries read/write the wrong owner's memory — the
-/// cross-process and kernel↔user corruption that only appears under SMP load.
+/// one CPU unmaps/reprotects a page (COW copy-break, munmap, address-space
+/// teardown) the other CPUs keep stale TLB entries pointing at the now-freed
+/// physical frame; once it is reallocated to another VMO/process those entries
+/// read/write the wrong owner's memory — the cross-process and kernel↔user
+/// corruption that only shows up under SMP load.
 ///
-/// Asynchronous (fire-and-forget): remote CPUs flush when they next take the
-/// IPI. `vaddr = None` (encoded as `vpn = 0`) requests a full remote flush.
-pub fn remote_flush_tlb(vaddr: Option<usize>) {
+/// It is *synchronous*: it returns only once every other online CPU has flushed
+/// at or beyond this call's generation, so the caller may safely free/reuse the
+/// frame afterwards. Callers usually hold an IRQ-disabling spinlock, so the
+/// wait loop drains its own pending shootdowns to avoid a mutual-wait deadlock.
+/// `vaddr` is currently advisory (a full flush is used for simplicity/safety).
+pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     let n = crate::cpu::cpu_count() as usize;
     if n <= 1 {
         return;
     }
     let me = crate::cpu::cpu_id() as usize;
-    let vpn = vaddr.map(|v| v >> 12).unwrap_or(0);
-    let reason: IpiEntry = IpiReason::TlbShutdown { vpn }.into();
+    let gen = TLB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    CPU_ACKED_GEN[me].store(gen, Ordering::Release);
+    let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
+    for cpu in 0..n {
+        if cpu != me {
+            let _ = crate::interrupt::send_ipi(cpu, reason);
+        }
+    }
     for cpu in 0..n {
         if cpu == me {
             continue;
         }
-        let _ = crate::interrupt::send_ipi(cpu, reason);
+        while CPU_ACKED_GEN[cpu].load(Ordering::Acquire) < gen {
+            // Service peers (and drain our own queue) so we can't deadlock with
+            // another CPU that is simultaneously waiting on us.
+            tlb_shootdown_ack();
+            core::hint::spin_loop();
+        }
     }
 }
 
