@@ -33,6 +33,65 @@ pub(crate) fn ipi_reason() -> Vec<usize> {
     queue.consume_entrys().iter().map(|entry| entry.1).collect()
 }
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Bitmask of logical CPU ids that are actually online and able to service
+/// IPIs. The BSP (logical 0) is always online; APs OR in their bit once they
+/// reach `secondary_init`. Shootdowns only target online CPUs — APs that failed
+/// to start (partial SMP bring-up) must not be signalled.
+static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
+
+/// Mark a logical CPU id as online (called from each CPU's bring-up path).
+pub fn mark_cpu_online(logical_id: usize) {
+    if logical_id < 64 {
+        CPU_ONLINE.fetch_or(1u64 << logical_id, Ordering::Release);
+    }
+}
+
+/// Receiver side of the TLB shootdown: flush this CPU's whole TLB. The queue
+/// payload is irrelevant — a full flush covers every pending request — so it is
+/// just drained and discarded; this also makes the path robust to IPI-queue
+/// overflow.
+pub fn tlb_shootdown_ack() {
+    let me = crate::cpu::cpu_id() as usize;
+    crate::vm::flush_tlb(None);
+    let _ = ipi_queue(me).consume_entrys();
+}
+
+/// Cross-CPU TLB shootdown.
+///
+/// x86 `flush_tlb` only invalidates the *local* CPU's TLB. Without this, after
+/// one CPU unmaps/reprotects a page (COW copy-break, munmap, address-space
+/// teardown) the other CPUs keep stale TLB entries pointing at the now-freed
+/// physical frame; once it is reallocated to another VMO/process those entries
+/// read/write the wrong owner's memory — the cross-process and kernel↔user
+/// corruption that only shows up under SMP load.
+///
+/// Best-effort / asynchronous: it signals the other online CPUs and returns
+/// without waiting for them. A synchronous variant deadlocks here because the
+/// unmap path runs under IRQ-disabling spinlocks and the AP IPI/ack path is
+/// unreliable under partial SMP bring-up. `vaddr` is advisory (a full flush is
+/// used for simplicity/safety).
+pub fn remote_flush_tlb(_vaddr: Option<usize>) {
+    let me = crate::cpu::cpu_id() as usize;
+    let online = CPU_ONLINE.load(Ordering::Acquire) & !(1u64 << me);
+    if online == 0 {
+        return; // we are the only online CPU
+    }
+    let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
+    // Fire-and-forget: signal every other online CPU to flush. We do NOT block
+    // the unmap path waiting for acks — the IPI-delivery/ack path on the APs is
+    // unreliable under partial SMP bring-up and waiting there deadlocks against
+    // the spinlocks the unmap holds. Each remote CPU still flushes its whole TLB
+    // when it takes the IPI (and on its next context switch), which closes the
+    // stale-entry window in the common case.
+    for cpu in 0..crate::config::MAX_CORE_NUM {
+        if online & (1u64 << cpu) != 0 {
+            let _ = crate::interrupt::send_ipi(cpu, reason);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum IpiReason {
     Invalid,

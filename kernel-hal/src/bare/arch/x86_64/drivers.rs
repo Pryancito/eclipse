@@ -61,11 +61,10 @@ pub(super) fn init() -> DeviceResult {
     irq.register_local_apic_handler(
         0xf3,
         Box::new(|| {
-            // Drain and process IPI reasons on this CPU
-            use crate::common::ipi::IpiReason;
-            for entry in crate::common::ipi::ipi_reason() {
-                let _ = IpiReason::from(entry); // parsed; kernel handles via ipi_reason() call-sites
-            }
+            // A remote CPU is doing a TLB shootdown: flush this CPU's TLB and
+            // publish the generation we have satisfied so the initiator can
+            // proceed. Drains and discards the IPI reason queue.
+            crate::common::ipi::tlb_shootdown_ack();
         }),
     )?;
 

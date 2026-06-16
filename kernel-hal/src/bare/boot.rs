@@ -33,6 +33,11 @@ hal_fn_impl! {
             #[cfg(target_arch = "x86_64")]
             {
                 let logical = super::arch::ap_trampoline_logical_id();
+                // We have now latched our logical id out of the shared trampoline
+                // slot — release the BSP to reuse the slots for the next AP. Do
+                // this *before* any slow per-CPU init so a busy-waiting BSP can't
+                // outrun us and clobber the slot mid-flight (see `smp.rs`).
+                super::arch::ap_signal_slot_consumed();
                 lock::with_ap_boot_logical(logical, || unsafe {
                     trapframe::init_ap();
                 });

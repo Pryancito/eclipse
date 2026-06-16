@@ -235,6 +235,10 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         let paddr = entry.addr();
         entry.clear();
         crate::vm::flush_tlb(Some(vaddr));
+        // Removing a mapping leaves stale TLB entries on the other CPUs that
+        // still point at `paddr`; once it is freed and reused this corrupts the
+        // new owner. Shoot down the entry on every other online CPU.
+        crate::common::ipi::remote_flush_tlb(Some(vaddr));
         trace!("PageTable unmap: {:x?} in {:#x?}", vaddr, self.table_phys());
         Ok((paddr, size))
     }
@@ -253,6 +257,9 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
             entry.set_flags(flags, size.is_huge());
         }
         crate::vm::flush_tlb(Some(vaddr));
+        // Reducing permissions / repointing a live mapping (e.g. COW write
+        // protect) must invalidate the stale entry on the other CPUs too.
+        crate::common::ipi::remote_flush_tlb(Some(vaddr));
         trace!(
             "PageTable update: {:x?}, flags={:?} in {:#x?}",
             vaddr,
