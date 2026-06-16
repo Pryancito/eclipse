@@ -61,10 +61,22 @@ pub(super) fn init() -> DeviceResult {
     irq.register_local_apic_handler(
         0xf3,
         Box::new(|| {
-            // Drain and process IPI reasons on this CPU
+            // Drain and process IPI reasons on this CPU.
             use crate::common::ipi::IpiReason;
+            use x86_64::instructions::tlb;
             for entry in crate::common::ipi::ipi_reason() {
-                let _ = IpiReason::from(entry); // parsed; kernel handles via ipi_reason() call-sites
+                match IpiReason::from(entry) {
+                    // TLB shootdown: a remote CPU unmapped/updated a page; drop
+                    // the stale entry from this CPU's TLB. vpn==0 => full flush.
+                    IpiReason::TlbShutdown { vpn } => {
+                        if vpn == 0 {
+                            tlb::flush_all();
+                        } else {
+                            tlb::flush(x86_64::VirtAddr::new((vpn << 12) as u64));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }),
     )?;
