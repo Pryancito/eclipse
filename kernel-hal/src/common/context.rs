@@ -302,6 +302,19 @@ impl UserContext {
         core::ptr::addr_of!(self.0.general) as usize
     }
 
+    /// DEBUG: registros del bucle de histograma de apk para ver cuál sostiene el
+    /// puntero corrupto `physmap`. Devuelve (rsi, rdi, r8, r9, r10, r11).
+    pub fn dbg_loop_regs(&self) -> (usize, usize, usize, usize, usize, usize) {
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                let g = &self.0.general;
+                (g.rsi, g.rdi, g.r8, g.r9, g.r10, g.r11)
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            }
+        }
+    }
+
     /// Returns the `error_code` field of the context.
     #[cfg(any(target_arch = "x86_64", doc))]
     #[doc(cfg(target_arch = "x86_64"))]

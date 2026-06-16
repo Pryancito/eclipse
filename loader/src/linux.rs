@@ -354,6 +354,13 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                             )
                         })
                         .unwrap_or((0, 0, 0));
+                    let (rsi, rdi, r8, r9, r10, r11) = thread
+                        .with_context(|ctx| ctx.dbg_loop_regs())
+                        .unwrap_or((0, 0, 0, 0, 0, 0));
+                    warn!(
+                        "[faultdump] regs: rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
+                        rsi, rdi, r8, r9, r10, r11
+                    );
                     let asm_save = kernel_hal::context::dbg_asm_save_addr();
                     warn!(
                         "[faultdump] target physmap {:#x} (phys {:#x}) content: {:#018x?}",
