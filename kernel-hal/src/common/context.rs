@@ -229,9 +229,40 @@ impl UserContext {
             if #[cfg(feature = "libos")] {
                 self.0.run_fncall()
             } else {
-                self.0.run()
+                self.dbg_validate_user_ctx("before enter_uspace");
+                self.0.run();
+                self.dbg_validate_user_ctx("after trap from user");
             }
         }
+    }
+
+    /// DEBUG instrumentation: catch a corrupted saved user context (rip/rsp/rbp
+    /// pointing into the kernel half) right before we (re)enter user mode and
+    /// right after a trap returns. A "before" hit means the saved `GeneralRegs`
+    /// were corrupted while sitting in kernel memory (or at save time); pairing
+    /// it with the "after" hit localizes the intermittent register-state
+    /// corruption behind the `apk` SIGSEGV / "BAD signature".
+    #[inline]
+    fn dbg_validate_user_ctx(&self, when: &str) {
+        #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+        {
+            const USER_MAX: usize = 0x0000_8000_0000_0000;
+            let g = &self.0.general;
+            if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
+                error!(
+                    "[ctxcheck] {} CORRUPT user ctx: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
+                     rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
+                     r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} \
+                     rflags={:#x} trap_num={:#x} err={:#x}",
+                    when,
+                    g.rip, g.rsp, g.rbp, g.fsbase,
+                    g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi,
+                    g.r8, g.r9, g.r10, g.r11, g.r12, g.r13, g.r14, g.r15,
+                    g.rflags, self.0.trap_num, self.0.error_code,
+                );
+            }
+        }
+        let _ = when;
     }
 
     /// Returns the `error_code` field of the context.

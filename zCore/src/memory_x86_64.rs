@@ -24,83 +24,6 @@ const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64G
 
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
 
-/// Deferred-reclamation quarantine for the cross-CPU TLB stale-entry race.
-///
-/// After one CPU unmaps a page the *other* CPUs may still hold a stale TLB
-/// entry pointing at the freed frame (the shootdown IPI is asynchronous — making
-/// it synchronous busy-waits under the page-table spinlock and hangs the boot).
-/// If that frame is handed straight back out and reused, those stale entries
-/// read/write the new owner's memory — intermittent SMP corruption (e.g. `apk`
-/// "BAD signature").
-///
-/// Instead, freed frames sit here for a grace period of `QUARANTINE_CAP` later
-/// frees before returning to the allocator. By the time a frame is reused every
-/// CPU has serviced the async shootdown and/or context-switched (a CR3 reload
-/// flushes non-global entries), so no stale entry for it survives. Bounded and
-/// allocation-free, so unlike the synchronous variant it can never stall a CPU.
-const QUARANTINE_CAP: usize = 512; // ~2 MiB held back; drained on allocation pressure
-
-struct Quarantine {
-    ring: [usize; QUARANTINE_CAP],
-    head: usize, // index of the next write slot
-    len: usize,
-}
-
-impl Quarantine {
-    const fn new() -> Self {
-        Self {
-            ring: [0; QUARANTINE_CAP],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    /// Enqueue a frame index. If the ring is full, evict and return the oldest
-    /// index (the caller returns it to the allocator).
-    fn push(&mut self, idx: usize) -> Option<usize> {
-        let slot = self.head;
-        self.head = (self.head + 1) % QUARANTINE_CAP;
-        if self.len < QUARANTINE_CAP {
-            self.ring[slot] = idx;
-            self.len += 1;
-            None
-        } else {
-            let evicted = self.ring[slot]; // oldest, since the ring is full
-            self.ring[slot] = idx;
-            Some(evicted)
-        }
-    }
-
-    /// Dequeue the oldest frame index, or `None` if empty.
-    fn pop(&mut self) -> Option<usize> {
-        if self.len == 0 {
-            return None;
-        }
-        let pos = (self.head + QUARANTINE_CAP - self.len) % QUARANTINE_CAP;
-        self.len -= 1;
-        Some(self.ring[pos])
-    }
-}
-
-static QUARANTINE: Mutex<Quarantine> = Mutex::new(Quarantine::new());
-
-/// Return every quarantined frame to the allocator (used when allocation fails:
-/// reclaiming the grace-period frames beats reporting OOM). Locks are taken one
-/// at a time — never `QUARANTINE` and `FRAME_ALLOCATOR` together — to avoid a
-/// lock-order inversion against `frame_dealloc`.
-fn drain_quarantine() {
-    loop {
-        let idx = QUARANTINE.lock().pop();
-        match idx {
-            Some(idx) => {
-                FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
-                FRAME_ALLOCATOR.lock().dealloc(idx);
-            }
-            None => break,
-        }
-    }
-}
-
 #[inline]
 fn phys_addr_to_frame_idx(addr: PhysAddr) -> usize {
     addr >> PAGE_BITS
@@ -158,20 +81,10 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-    let mut ret = FRAME_ALLOCATOR
+    let ret = FRAME_ALLOCATOR
         .lock()
-        .alloc_contiguous(frame_count, align_log2);
-    if ret.is_none() {
-        // Out of free frames: give back the quarantine's grace-period frames
-        // (accepting the small stale-entry risk over a hard OOM) and retry once.
-        // Also covers contiguous allocations the quarantine would otherwise
-        // fragment out of existence.
-        drain_quarantine();
-        ret = FRAME_ALLOCATOR
-            .lock()
-            .alloc_contiguous(frame_count, align_log2);
-    }
-    let ret = ret.map(frame_idx_to_phys_addr);
+        .alloc_contiguous(frame_count, align_log2)
+        .map(frame_idx_to_phys_addr);
     if ret.is_some() {
         FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
     }
@@ -184,15 +97,10 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
 
 pub fn frame_dealloc(target: PhysAddr) {
     trace!("frame_dealloc(): {target:x}");
-    // Don't return the frame to the allocator yet: park it in the quarantine so
-    // any stale cross-CPU TLB entry is gone before it can be reused. Only the
-    // frame evicted to make room is actually freed (and accounted) here. Take
-    // the quarantine lock alone, then the allocator lock alone — never nested.
-    let evicted = QUARANTINE.lock().push(phys_addr_to_frame_idx(target));
-    if let Some(idx) = evicted {
-        FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
-        FRAME_ALLOCATOR.lock().dealloc(idx);
-    }
+    FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+    FRAME_ALLOCATOR
+        .lock()
+        .dealloc(phys_addr_to_frame_idx(target));
 }
 
 pub fn frame_stats() -> (usize, usize) {
