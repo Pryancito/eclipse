@@ -482,6 +482,8 @@ mod dbg_rm {
     pub static DECOMMIT: AtomicUsize = AtomicUsize::new(0);
     pub static CLEAR: AtomicUsize = AtomicUsize::new(0);
     pub static MAPPED: AtomicUsize = AtomicUsize::new(0);
+    /// SPLIT remove sobre un VMO NO-oculto (hoja) -> candidato a stale PTE.
+    pub static LEAF_SPLIT: AtomicUsize = AtomicUsize::new(0);
     pub fn bump(site: &AtomicUsize, mapped: bool) {
         let n = site.fetch_add(1, Ordering::Relaxed);
         if mapped {
@@ -658,6 +660,17 @@ impl VMObjectPagedInner {
         let frame = self.frames.get_mut(&page_idx).unwrap();
         if frame.tag.is_split() {
             // has split, take out
+            if !self.type_.is_hidden() {
+                let n = dbg_rm::LEAF_SPLIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 20 {
+                    log::warn!(
+                        "[vmoleafsplit] SPLIT-remove en VMO HOJA: page_idx={} maps={} need_unmap={}",
+                        page_idx,
+                        self.mappings.len(),
+                        need_unmap
+                    );
+                }
+            }
             dbg_rm::bump(&dbg_rm::SPLIT, !self.mappings.is_empty());
             let target_frame = self.frames.remove(&page_idx).unwrap().take();
             return Ok(CommitResult::CopyOnWrite(target_frame, need_unmap));
