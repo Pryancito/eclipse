@@ -333,6 +333,38 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr, flags, err, pid, thread.proc().name(), pc,
                 );
+                // DEBUG: si el fault apunta a la mitad-kernel (rango physmap
+                // 0xffff8000_xxxx), apk dereferenció un puntero de kernel. Volcar
+                // el contenido del frame físico destino (el kernel SÍ lo tiene
+                // mapeado por physmap) para identificar qué estructura lee, y los
+                // registros de usuario para rastrear el origen del puntero.
+                #[cfg(not(feature = "libos"))]
+                if (0xffff_8000_0000_0000..0xffff_8000_4000_0000).contains(&vaddr) {
+                    let base = vaddr & !0x3f;
+                    let mut w = [0u64; 8];
+                    for i in 0..8 {
+                        w[i] = unsafe { core::ptr::read_volatile((base + i * 8) as *const u64) };
+                    }
+                    let (sp, tp, ret) = thread
+                        .with_context(|ctx| {
+                            (
+                                ctx.get_field(UserContextField::StackPointer),
+                                ctx.get_field(UserContextField::ThreadPointer),
+                                ctx.get_field(UserContextField::ReturnValue),
+                            )
+                        })
+                        .unwrap_or((0, 0, 0));
+                    warn!(
+                        "[faultdump] target physmap {:#x} (phys {:#x}) content: {:#018x?}",
+                        base,
+                        base - 0xffff_8000_0000_0000,
+                        w
+                    );
+                    warn!(
+                        "[faultdump] user rsp={:#x} fsbase={:#x} rax={:#x} pc={:#x}",
+                        sp, tp, ret, pc
+                    );
+                }
                 force_fault_signal(thread, Signal::SIGSEGV);
             }
             Ok(())

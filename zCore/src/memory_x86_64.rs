@@ -9,7 +9,7 @@
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_hal::PhysAddr;
 use lock::Mutex;
 
@@ -23,6 +23,52 @@ const PAGE_BITS: usize = 12;
 const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64GiB
 
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
+
+// ─── DEBUG: detector de doble-uso / use-after-free de frames físicos ───────────
+//
+// Bitset "frame actualmente asignado", paralelo al bitmap allocator. Cubre hasta
+// 4 GiB (suficiente para el bench de 1 GiB). Empieza todo a 0 (libre) porque el
+// allocator solo reparte frames libres y solo marcamos al repartir.
+//   - DOUBLE ALLOC: el allocator devuelve un frame que aún teníamos marcado como
+//     asignado -> dos dueños del mismo frame físico (la causa de la corrupción).
+//   - DOUBLE/UNTRACKED FREE: se libera un frame que no estaba asignado ->
+//     liberación prematura / doble free.
+const TRACK_MAX_FRAMES: usize = 1 << 20; // 4 GiB / 4 KiB
+const TRACK_WORDS: usize = TRACK_MAX_FRAMES / 64;
+static FRAME_ALLOCATED: [AtomicU64; TRACK_WORDS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; TRACK_WORDS]
+};
+
+fn track_mark_alloc(idx: usize) {
+    if idx >= TRACK_MAX_FRAMES {
+        return;
+    }
+    let bit = 1u64 << (idx % 64);
+    let prev = FRAME_ALLOCATED[idx / 64].fetch_or(bit, Ordering::SeqCst);
+    if prev & bit != 0 {
+        crate::klog_warn!(
+            "[frametrack] DOUBLE ALLOC frame_idx={:#x} paddr={:#x} (dos dueños del mismo frame)",
+            idx,
+            idx << PAGE_BITS
+        );
+    }
+}
+
+fn track_mark_free(idx: usize) {
+    if idx >= TRACK_MAX_FRAMES {
+        return;
+    }
+    let bit = 1u64 << (idx % 64);
+    let prev = FRAME_ALLOCATED[idx / 64].fetch_and(!bit, Ordering::SeqCst);
+    if prev & bit == 0 {
+        crate::klog_warn!(
+            "[frametrack] DOUBLE/UNTRACKED FREE frame_idx={:#x} paddr={:#x} (liberación prematura)",
+            idx,
+            idx << PAGE_BITS
+        );
+    }
+}
 
 #[inline]
 fn phys_addr_to_frame_idx(addr: PhysAddr) -> usize {
@@ -81,13 +127,27 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-    let ret = FRAME_ALLOCATOR
+    let start_idx = FRAME_ALLOCATOR
         .lock()
-        .alloc_contiguous(frame_count, align_log2)
-        .map(frame_idx_to_phys_addr);
-    if ret.is_some() {
+        .alloc_contiguous(frame_count, align_log2);
+    if let Some(idx) = start_idx {
         FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
+        for i in 0..frame_count {
+            track_mark_alloc(idx + i);
+        }
+        // DEBUG/test: poner a cero el/los frame(s) al asignarlos. Si esto elimina
+        // la corrupción, confirma que apk leía datos RANCIOS del kernel (punteros
+        // physmap) en un frame reusado sin limpiar.
+        let pa = frame_idx_to_phys_addr(idx);
+        unsafe {
+            core::ptr::write_bytes(
+                kernel_hal::mem::phys_to_virt(pa) as *mut u8,
+                0,
+                frame_count << PAGE_BITS,
+            );
+        }
     }
+    let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
         "frame_alloc_contiguous(): {ret:x?} ~ {end_ret:x?}, align_log2={align_log2}",
         end_ret = ret.map(|x| x + frame_count),
@@ -97,10 +157,12 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
 
 pub fn frame_dealloc(target: PhysAddr) {
     trace!("frame_dealloc(): {target:x}");
+    let idx = phys_addr_to_frame_idx(target);
+    // Marcar libre ANTES de devolverlo al allocator: si es un doble-free, lo
+    // detectamos antes de reinsertarlo.
+    track_mark_free(idx);
     FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
-    FRAME_ALLOCATOR
-        .lock()
-        .dealloc(phys_addr_to_frame_idx(target));
+    FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
 pub fn frame_stats() -> (usize, usize) {
