@@ -20,6 +20,8 @@ pub use gdt::{
     write_logical_cpu_id,
 };
 #[cfg(any(target_os = "none", target_os = "uefi"))]
+pub use syscall::dbg_save_addr;
+#[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use trap::TrapFrame;
 
 /// Initialize interrupt handling on x86_64.

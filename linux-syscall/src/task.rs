@@ -485,6 +485,10 @@ impl Syscall<'_> {
         let vmo = inode.read_as_vmo()?;
 
         proc.remove_cloexec_files();
+        // POSIX: caught signals are reset to their default disposition across
+        // exec (SIG_IGN stays). Otherwise the child keeps inherited handler
+        // addresses and a delivered signal jumps into stale handler code.
+        proc.reset_signal_actions_for_exec();
 
         // 注意！即将销毁旧应用程序的用户空间，现在将必要的信息拷贝到内核！
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!

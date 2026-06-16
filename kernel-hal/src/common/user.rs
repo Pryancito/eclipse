@@ -9,6 +9,31 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
+/// DEBUG: escanea los bytes que el kernel está a punto de copiar a memoria de
+/// usuario buscando el patrón LE `00 80 ff ff` (= la mitad alta `0xffff8000` de
+/// un puntero physmap del kernel). Si aparece, el kernel está FILTRANDO un
+/// puntero de kernel a usuario — la causa de que apk acabe con `rbp =
+/// 0xffff8000_xxxxxxxx`. Escaneo acotado a 4 KiB para no frenar copias grandes.
+#[cfg(not(feature = "libos"))]
+fn dbg_scan_physmap_leak(bytes: &[u8], dst: usize, who: &str) {
+    let n = bytes.len().min(4096);
+    let mut i = 0;
+    while i + 4 <= n {
+        if bytes[i] == 0x00 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0xff && bytes[i + 3] == 0xff
+        {
+            warn!(
+                "[uleak] physmap-high 0xffff8000 -> usuario dst={:#x} off={} via={} len={}",
+                dst,
+                i,
+                who,
+                bytes.len()
+            );
+            return;
+        }
+        i += 1;
+    }
+}
+
 // 来自用户空间的裸指针
 /// Raw pointer from user land.
 #[repr(transparent)]
@@ -257,6 +282,17 @@ impl<T, P: Write> UserPtr<T, P> {
     /// **without** reading or dropping the old value.
     pub fn write(&mut self, value: T) -> Result<()> {
         self.check()?;
+        #[cfg(not(feature = "libos"))]
+        dbg_scan_physmap_leak(
+            unsafe {
+                core::slice::from_raw_parts(
+                    &value as *const T as *const u8,
+                    core::mem::size_of::<T>(),
+                )
+            },
+            self.0 as usize,
+            "write",
+        );
         unsafe { self.0.write(value) };
         Ok(())
     }
@@ -280,6 +316,17 @@ impl<T, P: Write> UserPtr<T, P> {
     pub fn write_array(&mut self, values: &[T]) -> Result<()> {
         if !values.is_empty() {
             self.check()?;
+            #[cfg(not(feature = "libos"))]
+            dbg_scan_physmap_leak(
+                unsafe {
+                    core::slice::from_raw_parts(
+                        values.as_ptr() as *const u8,
+                        values.len() * core::mem::size_of::<T>(),
+                    )
+                },
+                self.0 as usize,
+                "write_array",
+            );
             unsafe {
                 self.0
                     .copy_from_nonoverlapping(values.as_ptr(), values.len())

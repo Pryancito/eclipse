@@ -29,6 +29,37 @@ mod utils;
 
 pub mod drivers;
 
+/// DEBUG: detector de frame compartido ESCRIBIBLE entre procesos vivos
+/// (COW-break fallido). `frame_dealloc` limpia al liberar; el handler de
+/// page-fault registra/comprueba el pid dueño de cada frame mapeado escribible.
+pub mod dbg_frameowner {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const N: usize = 1 << 20; // cubre hasta 4 GiB
+    static OWNER: [AtomicU32; N] = {
+        const Z: AtomicU32 = AtomicU32::new(0);
+        [Z; N]
+    };
+    /// Limpiar el dueño al liberar el frame (idx = paddr >> 12).
+    pub fn clear(frame_idx: usize) {
+        if frame_idx < N {
+            OWNER[frame_idx].store(0, Ordering::Relaxed);
+        }
+    }
+    /// Registrar `pid` como dueño escribible de `frame_idx`. Devuelve `Some(prev)`
+    /// si el frame ya estaba mapeado escribible por OTRO pid vivo (COW-break fail).
+    pub fn set_check(frame_idx: usize, pid: u32) -> Option<u32> {
+        if frame_idx >= N {
+            return None;
+        }
+        let prev = OWNER[frame_idx].swap(pid, Ordering::Relaxed);
+        if prev != 0 && prev != pid {
+            Some(prev)
+        } else {
+            None
+        }
+    }
+}
+
 cfg_if! {
     if #[cfg(feature = "libos")] {
         #[path = "libos/mod.rs"]

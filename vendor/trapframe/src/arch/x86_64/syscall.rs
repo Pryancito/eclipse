@@ -4,7 +4,16 @@ use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-global_asm!(include_str!("syscall.S"));
+/// DEBUG: dirección base (per-CPU) donde `trap_syscall_entry` guardó el último
+/// `GeneralRegs` en esta CPU. El asm la escribe en la región GS; aquí se lee.
+pub fn dbg_save_addr() -> usize {
+    super::gdt::read_dbg_save()
+}
+
+global_asm!(
+    include_str!("syscall.S"),
+    DBG_OFF = const super::gdt::DBG_SAVE_GS_OFFSET,
+);
 
 pub fn init() {
     let cpuid = raw_cpuid::CpuId::new();

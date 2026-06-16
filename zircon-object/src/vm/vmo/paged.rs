@@ -473,6 +473,35 @@ enum CommitResult {
     NewPage(PhysFrame),
 }
 
+// DEBUG: contadores de rutas que QUITAN una entrada de frame de un VMO, para
+// aislar cuál descarta una página privada SUCIA y MAPEADA bajo fork/COW.
+mod dbg_rm {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    pub static HIDDEN: AtomicUsize = AtomicUsize::new(0);
+    pub static SPLIT: AtomicUsize = AtomicUsize::new(0);
+    pub static DECOMMIT: AtomicUsize = AtomicUsize::new(0);
+    pub static CLEAR: AtomicUsize = AtomicUsize::new(0);
+    pub static MAPPED: AtomicUsize = AtomicUsize::new(0);
+    /// SPLIT remove sobre un VMO NO-oculto (hoja) -> candidato a stale PTE.
+    pub static LEAF_SPLIT: AtomicUsize = AtomicUsize::new(0);
+    pub fn bump(site: &AtomicUsize, mapped: bool) {
+        let n = site.fetch_add(1, Ordering::Relaxed);
+        if mapped {
+            MAPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        if n % 2000 == 0 {
+            log::warn!(
+                "[vmorm] hidden={} split={} decommit={} clear={} mapped_removes={}",
+                HIDDEN.load(Ordering::Relaxed),
+                SPLIT.load(Ordering::Relaxed),
+                DECOMMIT.load(Ordering::Relaxed),
+                CLEAR.load(Ordering::Relaxed),
+                MAPPED.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 impl VMObjectPagedInner {
     /// Helper function to split range into sub-ranges within pages.
     ///
@@ -607,6 +636,7 @@ impl VMObjectPagedInner {
                     page_idx >= start && page_idx < end
                 };
                 if !in_range {
+                    dbg_rm::bump(&dbg_rm::HIDDEN, !self.mappings.is_empty());
                     let frame = self.frames.remove(&page_idx).unwrap().take();
                     return Ok(CommitResult::CopyOnWrite(frame, need_unmap));
                 } else if need_unmap {
@@ -630,6 +660,18 @@ impl VMObjectPagedInner {
         let frame = self.frames.get_mut(&page_idx).unwrap();
         if frame.tag.is_split() {
             // has split, take out
+            if !self.type_.is_hidden() {
+                let n = dbg_rm::LEAF_SPLIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 20 {
+                    log::warn!(
+                        "[vmoleafsplit] SPLIT-remove en VMO HOJA: page_idx={} maps={} need_unmap={}",
+                        page_idx,
+                        self.mappings.len(),
+                        need_unmap
+                    );
+                }
+            }
+            dbg_rm::bump(&dbg_rm::SPLIT, !self.mappings.is_empty());
             let target_frame = self.frames.remove(&page_idx).unwrap().take();
             return Ok(CommitResult::CopyOnWrite(target_frame, need_unmap));
         } else if flags.contains(MMUFlags::WRITE) && child_tag.is_split() {
@@ -644,6 +686,9 @@ impl VMObjectPagedInner {
     }
 
     fn decommit(&mut self, page_idx: usize) {
+        if self.frames.contains_key(&page_idx) {
+            dbg_rm::bump(&dbg_rm::DECOMMIT, !self.mappings.is_empty());
+        }
         self.frames.remove(&page_idx);
     }
 
@@ -1010,6 +1055,9 @@ impl VMObjectPagedInner {
     fn resize(&mut self, new_size: usize) -> Option<Arc<VMObjectPaged>> {
         let mut old_parent = None;
         if new_size == 0 && new_size < self.size {
+            if !self.frames.is_empty() {
+                dbg_rm::bump(&dbg_rm::CLEAR, !self.mappings.is_empty());
+            }
             self.frames.clear();
             if let Some(parent) = self.parent.as_ref() {
                 parent.inner.borrow_mut().remove_child(&self.self_ref);

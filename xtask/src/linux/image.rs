@@ -207,6 +207,17 @@ impl super::LinuxRootfs {
     }
 }
 
+/// DEBUG: repackear solo el initramfs SFS desde rootfs/x86_64 sin reconstruir
+/// nada más. `cargo test -p xtask -- --nocapture dbg_repack_initramfs`.
+#[test]
+fn dbg_repack_initramfs() {
+    let rootfs = PROJECT_DIR.join("rootfs").join("x86_64");
+    let image = PROJECT_DIR.join("zCore").join("x86_64.img");
+    eprintln!("repack {} -> {}", rootfs.display(), image.display());
+    fuse(&rootfs, &image, INITRAMFS_BYTES);
+    eprintln!("repack done");
+}
+
 /// 制作镜像。
 fn fuse(dir: impl AsRef<Path>, image: impl AsRef<Path>, fs_size: usize) {
     use rcore_fs::vfs::FileSystem;

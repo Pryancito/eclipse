@@ -9,7 +9,7 @@
 
 use bitmap_allocator::BitAlloc;
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_hal::PhysAddr;
 use lock::Mutex;
 
@@ -23,6 +23,52 @@ const PAGE_BITS: usize = 12;
 const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64GiB
 
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
+
+// ─── DEBUG: detector de doble-uso / use-after-free de frames físicos ───────────
+//
+// Bitset "frame actualmente asignado", paralelo al bitmap allocator. Cubre hasta
+// 4 GiB (suficiente para el bench de 1 GiB). Empieza todo a 0 (libre) porque el
+// allocator solo reparte frames libres y solo marcamos al repartir.
+//   - DOUBLE ALLOC: el allocator devuelve un frame que aún teníamos marcado como
+//     asignado -> dos dueños del mismo frame físico (la causa de la corrupción).
+//   - DOUBLE/UNTRACKED FREE: se libera un frame que no estaba asignado ->
+//     liberación prematura / doble free.
+const TRACK_MAX_FRAMES: usize = 1 << 20; // 4 GiB / 4 KiB
+const TRACK_WORDS: usize = TRACK_MAX_FRAMES / 64;
+static FRAME_ALLOCATED: [AtomicU64; TRACK_WORDS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; TRACK_WORDS]
+};
+
+fn track_mark_alloc(idx: usize) {
+    if idx >= TRACK_MAX_FRAMES {
+        return;
+    }
+    let bit = 1u64 << (idx % 64);
+    let prev = FRAME_ALLOCATED[idx / 64].fetch_or(bit, Ordering::SeqCst);
+    if prev & bit != 0 {
+        crate::klog_warn!(
+            "[frametrack] DOUBLE ALLOC frame_idx={:#x} paddr={:#x} (dos dueños del mismo frame)",
+            idx,
+            idx << PAGE_BITS
+        );
+    }
+}
+
+fn track_mark_free(idx: usize) {
+    if idx >= TRACK_MAX_FRAMES {
+        return;
+    }
+    let bit = 1u64 << (idx % 64);
+    let prev = FRAME_ALLOCATED[idx / 64].fetch_and(!bit, Ordering::SeqCst);
+    if prev & bit == 0 {
+        crate::klog_warn!(
+            "[frametrack] DOUBLE/UNTRACKED FREE frame_idx={:#x} paddr={:#x} (liberación prematura)",
+            idx,
+            idx << PAGE_BITS
+        );
+    }
+}
 
 #[inline]
 fn phys_addr_to_frame_idx(addr: PhysAddr) -> usize {
@@ -81,13 +127,16 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-    let ret = FRAME_ALLOCATOR
+    let start_idx = FRAME_ALLOCATOR
         .lock()
-        .alloc_contiguous(frame_count, align_log2)
-        .map(frame_idx_to_phys_addr);
-    if ret.is_some() {
+        .alloc_contiguous(frame_count, align_log2);
+    if let Some(idx) = start_idx {
         FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
+        for i in 0..frame_count {
+            track_mark_alloc(idx + i);
+        }
     }
+    let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
         "frame_alloc_contiguous(): {ret:x?} ~ {end_ret:x?}, align_log2={align_log2}",
         end_ret = ret.map(|x| x + frame_count),
@@ -97,10 +146,23 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
 
 pub fn frame_dealloc(target: PhysAddr) {
     trace!("frame_dealloc(): {target:x}");
+    let idx = phys_addr_to_frame_idx(target);
+    // Marcar libre ANTES de devolverlo al allocator: si es un doble-free, lo
+    // detectamos antes de reinsertarlo.
+    track_mark_free(idx);
+    kernel_hal::dbg_frameowner::clear(idx);
+    // DEBUG: envenenar el frame con 0x5A al liberarlo. Si un proceso lee este
+    // patrón en su memoria (fault a una dirección ~0x5a5a5a5a...), está leyendo
+    // un frame YA LIBERADO -> PTE rancia (free-sin-unmap / use-after-free).
+    unsafe {
+        core::ptr::write_bytes(
+            (0xffff_8000_0000_0000usize + target) as *mut u8,
+            0x5A,
+            1 << PAGE_BITS,
+        );
+    }
     FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
-    FRAME_ALLOCATOR
-        .lock()
-        .dealloc(phys_addr_to_frame_idx(target));
+    FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
 pub fn frame_stats() -> (usize, usize) {
@@ -179,21 +241,51 @@ cfg_if! {
             }
         }
 
+        // DEBUG: redzone/canario tras cada asignación del heap. Si algo desborda
+        // una asignación (escribe pasado su final), se detecta al liberar y se
+        // panica con el tamaño/posición -> identifica la asignación culpable de la
+        // corrupción del heap (que se sospecha pisa los BTreeMap de frames de VMO).
+        const REDZONE: usize = 16;
+        const CANARY: u8 = 0xAB;
+
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let sz = layout.size();
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 self.0
                     .lock()
-                    .alloc(layout)
+                    .alloc(ext)
                     .ok()
                     .map_or(core::ptr::null_mut::<u8>(), |allocation| {
-                        HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
-                        allocation.as_ptr()
+                        HEAP_USED.fetch_add(sz, Ordering::Relaxed);
+                        let p = allocation.as_ptr();
+                        let cz = p.add(sz);
+                        for i in 0..REDZONE {
+                            core::ptr::write_volatile(cz.add(i), CANARY);
+                        }
+                        p
                     })
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
-                self.0.lock().dealloc(NonNull::new_unchecked(ptr), layout)
+                let sz = layout.size();
+                // Comprobar el canario ANTES de tomar el lock del heap.
+                let cz = ptr.add(sz);
+                for i in 0..REDZONE {
+                    if core::ptr::read_volatile(cz.add(i)) != CANARY {
+                        panic!(
+                            "[heapcanary] HEAP OVERFLOW: ptr={:#x} size={} align={} clobbered en +{} (val={:#x})",
+                            ptr as usize,
+                            sz,
+                            layout.align(),
+                            i,
+                            core::ptr::read_volatile(cz.add(i))
+                        );
+                    }
+                }
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
+                self.0.lock().dealloc(NonNull::new_unchecked(ptr), ext)
             }
         }
     } else {

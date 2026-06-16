@@ -33,6 +33,11 @@ pub struct Executor {
 const STACK_SIZE: usize = 4096 * 32;
 const STACK_LAYOUT: Layout = Layout::new::<[u8; STACK_SIZE]>();
 
+/// DEBUG: magic written to the lowest words of every coroutine stack. The stack
+/// grows down from `stack_base + STACK_SIZE`; if a deep kernel call chain reaches
+/// `stack_base`, the canary is clobbered and detected after the future yields.
+const STACK_CANARY: u64 = 0x5354_4143_4b5f_4f56; // "STACK_OV"
+
 fn executor_alloc_id() -> usize {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static EXECUTOR_ID: AtomicUsize = AtomicUsize::new(1);
@@ -46,6 +51,13 @@ impl Executor {
             .expect("Alloction Stack Failed.")
             .cast();
         let stack_base = stack.as_ptr() as usize;
+        // DEBUG: lay down the stack-overflow canary at the lowest 4 words.
+        unsafe {
+            let p = stack_base as *mut u64;
+            for i in 0..4 {
+                core::ptr::write_volatile(p.add(i), STACK_CANARY ^ i as u64);
+            }
+        }
         let mut pin_executor = Pin::new(Box::new(Executor {
             id: executor_alloc_id(),
             task_collection,
@@ -109,6 +121,19 @@ impl Executor {
                 self.task_id = task.id();
                 debug!("running future {}:{}", self.id(), task.id());
                 let ret = task.poll(&mut cx);
+                // DEBUG: did this future overflow the 128 KiB coroutine stack?
+                unsafe {
+                    let p = self.stack_base as *const u64;
+                    for i in 0..4 {
+                        if core::ptr::read_volatile(p.add(i)) != (STACK_CANARY ^ i as u64) {
+                            error!(
+                                "[stackcheck] COROUTINE STACK OVERFLOW: executor id={} task_id={} stack_base={:#x} size={:#x}",
+                                self.id(), task.id(), self.stack_base, STACK_SIZE
+                            );
+                            break;
+                        }
+                    }
+                }
                 debug!("back from future {}:{}", self.id(), task.id());
                 self.task_id = 0;
                 waker_ref.mark_borrowed(false);

@@ -166,6 +166,17 @@ impl TrapReason {
 #[derive(Clone, Copy)]
 pub struct UserContext(UserContextInner);
 
+/// DEBUG: dirección donde el asm de trap guardó el último `GeneralRegs` (x86_64
+/// bare). Se compara con [`UserContext::dbg_ctx_addr`].
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+pub fn dbg_asm_save_addr() -> usize {
+    trapframe::dbg_save_addr()
+}
+#[cfg(not(all(target_arch = "x86_64", not(feature = "libos"))))]
+pub fn dbg_asm_save_addr() -> usize {
+    0
+}
+
 impl UserContext {
     /// Create an empty user context.
     pub fn new() -> Self {
@@ -246,6 +257,12 @@ impl UserContext {
     fn dbg_validate_user_ctx(&self, when: &str) {
         #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
         {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static HB: AtomicUsize = AtomicUsize::new(0);
+            let n = HB.fetch_add(1, Ordering::Relaxed);
+            if n % 200_000 == 0 {
+                warn!("[ctxcheck] heartbeat n={} ({})", n, when);
+            }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
             let g = &self.0.general;
             if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
@@ -263,6 +280,39 @@ impl UserContext {
             }
         }
         let _ = when;
+    }
+
+    /// DEBUG: leer el `rbp` del contexto de usuario guardado (frame pointer en
+    /// x86_64). Usado por el handler de page-fault para comparar el `rbp` guardado
+    /// con la dirección que falló.
+    pub fn dbg_general_rbp(&self) -> usize {
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                self.0.general.rbp
+            } else {
+                0
+            }
+        }
+    }
+
+    /// DEBUG: dirección en memoria del `GeneralRegs` de este `UserContext`. Se
+    /// compara con [`dbg_asm_save_addr`] (donde el asm guardó de verdad) para
+    /// detectar si el save/restore usan memorias distintas.
+    pub fn dbg_ctx_addr(&self) -> usize {
+        core::ptr::addr_of!(self.0.general) as usize
+    }
+
+    /// DEBUG: registros del bucle de histograma de apk para ver cuál sostiene el
+    /// puntero corrupto `physmap`. Devuelve (rsi, rdi, r8, r9, r10, r11).
+    pub fn dbg_loop_regs(&self) -> (usize, usize, usize, usize, usize, usize) {
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                let g = &self.0.general;
+                (g.rsi, g.rdi, g.r8, g.r9, g.r10, g.r11)
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            }
+        }
     }
 
     /// Returns the `error_code` field of the context.
