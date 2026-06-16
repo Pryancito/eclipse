@@ -361,6 +361,27 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         "[faultdump] regs: rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
                         rsi, rdi, r8, r9, r10, r11
                     );
+                    // Volcar el buffer fuente de apk (rsi) para caracterizar la
+                    // corrupción de datos: traducir la vaddr de usuario a física vía
+                    // la vmar del proceso y leer por physmap (0xffff8000... base).
+                    {
+                        use kernel_hal::vm::{GenericPageTable, PageTable};
+                        let src = rsi & !0x3f;
+                        let pt = PageTable::from_current();
+                        if let Ok((pa, _, _)) = pt.query(src & !0xfff) {
+                            let byte_pa = (pa & !0xfff) + (src & 0xfff);
+                            let kv = 0xffff_8000_0000_0000usize + byte_pa;
+                            let mut w = [0u64; 8];
+                            for i in 0..8 {
+                                w[i] = unsafe { core::ptr::read_volatile((kv + i * 8) as *const u64) };
+                            }
+                            warn!(
+                                "[faultdump] apk src buf @{:#x} phys={:#x}: {:#018x?}",
+                                src, byte_pa, w
+                            );
+                        }
+                        core::mem::forget(pt);
+                    }
                     let asm_save = kernel_hal::context::dbg_asm_save_addr();
                     warn!(
                         "[faultdump] target physmap {:#x} (phys {:#x}) content: {:#018x?}",
