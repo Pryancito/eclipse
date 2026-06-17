@@ -275,6 +275,20 @@ impl TaskCollection {
                                     continue;
                                 }
                                 found_key = Some(key);
+                                // Mark the task borrowed ATOMICALLY here, under the
+                                // inner lock and before releasing it to be polled.
+                                // `take_notified` cleared this task's notified bit,
+                                // but the executor only set the borrowed bit AFTER
+                                // take_task returned — leaving a window where a wake
+                                // (e.g. a network IRQ) re-notified the task and a
+                                // second CPU's take_task/steal picked up the SAME
+                                // task, polling one future (and its single
+                                // UserContext + coroutine stack) on two CPUs at once
+                                // -> corrupted context -> iret to junk -> #UD/#SS.
+                                // Setting borrowed now makes any racing wake defer
+                                // the task (take_notified re-publishes borrowed bits)
+                                // until this poll releases the borrow.
+                                inner.pages[page_idx].mark_borrowed(subpage_idx, true);
                                 drop(inner);
                                 yield found_key;
                                 inner = self.get_mut_inner(priority);
