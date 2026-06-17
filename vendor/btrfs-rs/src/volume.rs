@@ -192,11 +192,25 @@ impl Volume {
     pub fn map_logical(&self, logical: u64, len: u64) -> Result<(Vec<u64>, u64)> {
         let idx = match self.chunks.binary_search_by_key(&logical, |c| c.logical) {
             Ok(i) => i,
-            Err(0) => return Err(Error::Corrupt("logical address before first chunk")),
+            Err(0) => {
+                warn!(
+                    "btrfs: map_logical {:#x} before first chunk (lowest chunk {:#x})",
+                    logical,
+                    self.chunks.first().map(|c| c.logical).unwrap_or(0),
+                );
+                return Err(Error::Corrupt("logical address before first chunk"));
+            }
             Err(i) => i - 1,
         };
         let chunk = &self.chunks[idx];
         if logical >= chunk.logical + chunk.length {
+            warn!(
+                "btrfs: map_logical {:#x} in chunk hole (chunk [{:#x},{:#x}), next {:?})",
+                logical,
+                chunk.logical,
+                chunk.logical + chunk.length,
+                self.chunks.get(idx + 1).map(|c| c.logical),
+            );
             return Err(Error::Corrupt("logical address in chunk hole"));
         }
         let within = logical - chunk.logical;

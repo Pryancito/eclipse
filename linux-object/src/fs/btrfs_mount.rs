@@ -40,11 +40,13 @@ impl btrfs::BlockDevice for DevAdapter {
                 other => {
                     if attempt + 1 == IO_RETRIES {
                         warn!(
-                            "btrfs: read_at({:#x}, {}) failed after {} attempts: {:?}",
+                            "btrfs: read_at(off={:#x}, len={}) failed after {} attempts: \
+                             {:?}, dev_size={:#x}",
                             offset,
                             buf.len(),
                             IO_RETRIES,
-                            other.err()
+                            other,
+                            self.size,
                         );
                     }
                 }
@@ -54,19 +56,33 @@ impl btrfs::BlockDevice for DevAdapter {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
+        let end = offset + buf.len() as u64;
+        if end > self.size {
+            // btrfs asked us to write past the end of the device it was told
+            // about: this is an allocation/geometry bug in the FS layer, not a
+            // device fault. Surface it loudly with the numbers needed to debug.
+            warn!(
+                "btrfs: write_at OUT OF BOUNDS off={:#x} len={} end={:#x} > dev_size={:#x}",
+                offset,
+                buf.len(),
+                end,
+                self.size,
+            );
+        }
         for attempt in 0..IO_RETRIES {
             match self.inner.write_at(offset as usize, buf) {
                 Ok(n) if n == buf.len() => return Ok(()),
                 other => {
-                    if attempt + 1 == IO_RETRIES {
-                        warn!(
-                            "btrfs: write_at({:#x}, {}) failed after {} attempts: {:?}",
-                            offset,
-                            buf.len(),
-                            IO_RETRIES,
-                            other.err()
-                        );
-                    }
+                    warn!(
+                        "btrfs: write_at(off={:#x}, len={}) attempt {}/{} failed: \
+                         got {:?}, dev_size={:#x}",
+                        offset,
+                        buf.len(),
+                        attempt + 1,
+                        IO_RETRIES,
+                        other,
+                        self.size,
+                    );
                 }
             }
         }
@@ -138,14 +154,20 @@ impl BtrfsMountFs {
             inner: device,
             size,
         });
+        warn!(
+            "btrfs: mounting, device size = {:#x} ({} MiB), read_only={}",
+            size,
+            size / (1024 * 1024),
+            read_only
+        );
         let mut fs = Btrfs::mount(adapter, read_only).map_err(map_err)?;
         fs.set_clock(wall_clock);
         // Auto-expand to the partition size (the installer writes a small
         // image onto a larger partition and relies on this).
         if !read_only {
             match fs.grow_to_device() {
-                Ok(true) => info!("btrfs: filesystem expanded to device size"),
-                Ok(false) => {}
+                Ok(true) => warn!("btrfs: filesystem expanded to device size"),
+                Ok(false) => warn!("btrfs: NOT expanded (FS dev size >= partition size)"),
                 Err(e) => warn!("btrfs: grow_to_device failed: {:?}", e),
             }
         }

@@ -279,7 +279,7 @@ impl Btrfs {
         }
         self.apply_pending()?;
         self.commit(true)?;
-        info!("btrfs: grown from {} to {} bytes", old, dev_size);
+        warn!("btrfs: grown from {} to {} bytes", old, dev_size);
         Ok(true)
     }
 
@@ -541,7 +541,7 @@ impl Btrfs {
                 offset: phys,
             }],
         };
-        info!(
+        warn!(
             "btrfs: new chunk flags={:#x} logical={:#x} phys={:#x} size={:#x}",
             flags, logical, phys, size
         );
