@@ -100,6 +100,36 @@ pub struct UserContext {
     pub general: GeneralRegs,
     pub trap_num: usize,
     pub error_code: usize,
+    /// FXSAVE area holding this thread's x87/SSE (FPU/MMX/XMM) state. The kernel
+    /// is compiled with SSE2 (`+sse2`) and freely uses XMM (memcpy, etc.), so the
+    /// per-thread user FPU state MUST be saved on every kernel entry and restored
+    /// on every kernel exit, otherwise a user SSE computation (e.g. musl memcpy)
+    /// that is preempted mid-way resumes with clobbered XMM -> corrupted data.
+    pub fpstate: FpState,
+}
+
+/// 512-byte 16-aligned FXSAVE/FXRSTOR area (see `UserContext::fpstate`).
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(C, align(16))]
+pub struct FpState([u8; 512]);
+
+impl core::fmt::Debug for FpState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FpState(..)")
+    }
+}
+
+impl Default for FpState {
+    fn default() -> Self {
+        let mut s = [0u8; 512];
+        // FCW = 0x037F (default x87 control word).
+        s[0] = 0x7F;
+        s[1] = 0x03;
+        // MXCSR = 0x1F80 (default; all SSE exceptions masked) at offset 24.
+        s[24] = 0x80;
+        s[25] = 0x1F;
+        FpState(s)
+    }
 }
 
 /// General registers
