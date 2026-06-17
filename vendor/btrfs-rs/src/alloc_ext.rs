@@ -121,7 +121,7 @@ impl RangeMap {
     /// Largest free range within `[lo, hi)`, if any: (start, len).
     pub fn largest_in(&self, lo: u64, hi: u64) -> Option<(u64, u64)> {
         let mut best: Option<(u64, u64)> = None;
-        for (&rs, &rl) in self.map.range(..hi) {
+        for (rs, rl) in self.ranges_overlapping(lo, hi) {
             let s = rs.max(lo);
             let e = (rs + rl).min(hi);
             if e > s && best.map_or(true, |(_, bl)| e - s > bl) {
@@ -132,14 +132,30 @@ impl RangeMap {
     }
 
     pub fn total_free_in(&self, lo: u64, hi: u64) -> u64 {
-        self.map
-            .range(..hi)
-            .map(|(&rs, &rl)| {
+        self.ranges_overlapping(lo, hi)
+            .map(|(rs, rl)| {
                 let s = rs.max(lo);
                 let e = (rs + rl).min(hi);
                 e.saturating_sub(s)
             })
             .sum()
+    }
+
+    /// Iterate only the free ranges that can overlap `[lo, hi)`: the at-most-one
+    /// range that starts before `lo` but extends into it, followed by every
+    /// range starting within `[lo, hi)`. This is `O(log n + k)` in the number
+    /// of overlapping ranges `k`, instead of scanning the whole map up to `hi`
+    /// (which made per-block-group queries like `meta_free` cost `O(n)` and the
+    /// surrounding per-mutation checks `O(n^2)` as free space fragmented).
+    fn ranges_overlapping(&self, lo: u64, hi: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let straddler = self
+            .map
+            .range(..lo)
+            .next_back()
+            .and_then(|(&rs, &rl)| (rs + rl > lo).then_some((rs, rl)));
+        straddler
+            .into_iter()
+            .chain(self.map.range(lo..hi).map(|(&rs, &rl)| (rs, rl)))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
