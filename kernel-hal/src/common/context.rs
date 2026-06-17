@@ -264,14 +264,22 @@ impl UserContext {
                 warn!("[ctxcheck] heartbeat n={} ({})", n, when);
             }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
+            // Lowest plausible user PC. Static busybox/apk load at 0x400000; the
+            // dynamic loader/vDSO sit far above 0x10000. A rip below this (the
+            // observed crash had rip=0x1000 / 0x3011) is a corrupted context, but
+            // the previous `>= USER_MAX` test missed it because the value is LOW.
+            const USER_PC_MIN: usize = 0x1_0000;
             let g = &self.0.general;
-            if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
+            let rip_bad = g.rip >= USER_MAX || (g.rip != 0 && g.rip < USER_PC_MIN);
+            if rip_bad || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
                 error!(
-                    "[ctxcheck] {} CORRUPT user ctx: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
+                    "[ctxcheck] {} CORRUPT user ctx cpu={} ctx_addr={:#x}: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
                      rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
                      r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} \
                      rflags={:#x} trap_num={:#x} err={:#x}",
                     when,
+                    crate::cpu::cpu_id(),
+                    core::ptr::addr_of!(self.0.general) as usize,
                     g.rip, g.rsp, g.rbp, g.fsbase,
                     g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi,
                     g.r8, g.r9, g.r10, g.r11, g.r12, g.r13, g.r14, g.r15,
