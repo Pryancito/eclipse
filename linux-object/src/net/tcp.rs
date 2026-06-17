@@ -101,28 +101,36 @@ impl Socket for TcpSocketState {
 
             let state = socket.state();
 
-            // Detect closed/reset connection BEFORE calling recv_slice.
-            // When the peer sends RST or FIN, smoltcp transitions the socket
-            // out of Established, but recv_slice may still return Exhausted
-            // (empty RX buffer) instead of Finished, causing an infinite loop.
-            let peer_closed = matches!(
-                state,
-                TcpState::Closed | TcpState::CloseWait | TcpState::TimeWait | TcpState::FinWait2
-            );
-
             let mut copied_len = socket.recv_slice(data);
             if let Ok(0) = copied_len {
                 if !data.is_empty() {
                     copied_len = Err(smoltcp::Error::Exhausted);
                 }
             }
-            trace!("[tcp read] state={:?} result={:?}", state, copied_len);
+
+            // Receive-half EOF must be decided by smoltcp's `may_recv()`, NOT by
+            // the raw TCP state. `may_recv()` stays true while the peer can still
+            // send — ESTABLISHED, and crucially FIN-WAIT-1/FIN-WAIT-2, where WE
+            // closed our transmit half but the peer keeps streaming (exactly what
+            // an HTTP client does: it `shutdown(SHUT_WR)`s after sending the
+            // request, then reads the response body). It only goes false once the
+            // peer's FIN has been received AND the receive buffer is drained
+            // (CLOSE-WAIT/CLOSING/LAST-ACK/TIME-WAIT/CLOSED with no buffered data).
+            //
+            // The previous code treated FIN-WAIT-2 as "peer closed" and returned
+            // EOF the moment `recv_slice` was momentarily Exhausted mid-transfer,
+            // which truncated downloads intermittently (apk then RSA-verified a
+            // short APKINDEX -> "BAD signature").
+            let recv_closed = !socket.may_recv();
+            trace!(
+                "[tcp read] state={:?} recv_closed={} result={:?}",
+                state, recv_closed, copied_len
+            );
             drop(socket);
             drop(sets);
 
-            // If the peer has closed but recv_slice returned Exhausted (empty
-            // buffer), treat it as EOF so callers don't loop forever.
-            if peer_closed {
+            // Receive half closed and nothing left to read -> real EOF.
+            if recv_closed {
                 if let Err(smoltcp::Error::Exhausted) = copied_len {
                     return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                 }
