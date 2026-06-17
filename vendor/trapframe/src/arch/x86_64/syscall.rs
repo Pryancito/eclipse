@@ -73,7 +73,16 @@ impl UserContext {
     /// ```
     pub fn run(&mut self) {
         unsafe {
+            // Restore this thread's user FPU/SSE state immediately before entering
+            // user mode, and save it immediately after the trap returns. The
+            // syscall_return / syscall_entry asm paths use no SSE, and this Rust
+            // wrapper has no float work, so XMM cannot be clobbered in between.
+            // `fpstate` is 16-aligned (FXSAVE requirement).
+            let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
+            core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
             syscall_return(self);
+            let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
+            core::arch::asm!("fxsave [{}]", in(reg) fp, options(nostack, preserves_flags));
         }
     }
 }
