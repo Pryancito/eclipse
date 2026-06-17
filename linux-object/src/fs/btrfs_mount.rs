@@ -31,28 +31,50 @@ struct DevAdapter {
 /// with EIO, which is exactly the "failed to extract …: I/O error" seen only on
 /// the biggest package. Re-issuing the same offset/buffer is idempotent.
 const IO_RETRIES: usize = 5;
+/// Cap one backend transfer to a moderate size so block drivers that reject
+/// very large requests don't fail a whole btrfs operation.
+const IO_CHUNK_BYTES: usize = 128 * 1024;
 
 impl btrfs::BlockDevice for DevAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
-        for attempt in 0..IO_RETRIES {
-            match self.inner.read_at(offset as usize, buf) {
-                Ok(n) if n == buf.len() => return Ok(()),
-                other => {
-                    if attempt + 1 == IO_RETRIES {
-                        warn!(
-                            "btrfs: read_at(off={:#x}, len={}) failed after {} attempts: \
-                             {:?}, dev_size={:#x}",
-                            offset,
-                            buf.len(),
-                            IO_RETRIES,
-                            other,
-                            self.size,
-                        );
+        let mut done = 0usize;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(IO_CHUNK_BYTES);
+            let mut chunk_done = 0usize;
+            let mut completed = false;
+            for attempt in 0..IO_RETRIES {
+                match self.inner.read_at(
+                    offset as usize + done + chunk_done,
+                    &mut buf[done + chunk_done..done + take],
+                ) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        chunk_done += n.min(take - chunk_done);
+                        if chunk_done == take {
+                            completed = true;
+                            break;
+                        }
                     }
+                    Err(_) => {}
+                }
+                if attempt + 1 == IO_RETRIES {
+                    warn!(
+                        "btrfs: read_at(off={:#x}, len={}, done={}, chunk_done={}) failed after {} attempts, dev_size={:#x}",
+                        offset,
+                        buf.len(),
+                        done,
+                        chunk_done,
+                        IO_RETRIES,
+                        self.size,
+                    );
                 }
             }
+            if !completed {
+                return Err(BtrfsError::Io);
+            }
+            done += take;
         }
-        Err(BtrfsError::Io)
+        Ok(())
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
@@ -69,24 +91,44 @@ impl btrfs::BlockDevice for DevAdapter {
                 self.size,
             );
         }
-        for attempt in 0..IO_RETRIES {
-            match self.inner.write_at(offset as usize, buf) {
-                Ok(n) if n == buf.len() => return Ok(()),
-                other => {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(IO_CHUNK_BYTES);
+            let mut chunk_done = 0usize;
+            let mut completed = false;
+            for attempt in 0..IO_RETRIES {
+                match self
+                    .inner
+                    .write_at(offset as usize + done + chunk_done, &buf[done + chunk_done..done + take])
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        chunk_done += n.min(take - chunk_done);
+                        if chunk_done == take {
+                            completed = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                if attempt + 1 == IO_RETRIES {
                     warn!(
-                        "btrfs: write_at(off={:#x}, len={}) attempt {}/{} failed: \
-                         got {:?}, dev_size={:#x}",
+                        "btrfs: write_at(off={:#x}, len={}, done={}, chunk_done={}) failed after {} attempts, dev_size={:#x}",
                         offset,
                         buf.len(),
-                        attempt + 1,
+                        done,
+                        chunk_done,
                         IO_RETRIES,
-                        other,
                         self.size,
                     );
                 }
             }
+            if !completed {
+                return Err(BtrfsError::Io);
+            }
+            done += take;
         }
-        Err(BtrfsError::Io)
+        Ok(())
     }
 
     fn sync(&self) -> btrfs::Result<()> {
@@ -143,7 +185,7 @@ pub struct BtrfsMountFs {
 #[derive(Clone)]
 struct CachedDirEntry {
     name: String,
-    metadata: Metadata,
+    ino: u64,
 }
 
 impl BtrfsMountFs {
@@ -200,10 +242,9 @@ impl BtrfsMountFs {
             let entries = fs.readdir(dir).map_err(map_err)?;
             let mut cached = Vec::with_capacity(entries.len());
             for entry in entries {
-                let st = fs.stat(entry.ino).map_err(map_err)?;
                 cached.push(CachedDirEntry {
                     name: entry.name,
-                    metadata: stat_to_metadata(&st),
+                    ino: entry.ino,
                 });
             }
             Arc::new(cached)
@@ -387,7 +428,12 @@ impl INode for BtrfsMountINode {
             i => {
                 let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
-                Ok((entry.metadata.clone(), entry.name.clone()))
+                let metadata = {
+                    let mut fs = self.fs.inner.lock();
+                    let st = fs.stat(entry.ino).map_err(map_err)?;
+                    stat_to_metadata(&st)
+                };
+                Ok((metadata, entry.name.clone()))
             }
         }
     }
