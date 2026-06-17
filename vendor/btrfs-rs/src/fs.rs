@@ -1375,20 +1375,46 @@ impl Btrfs {
         let mut covered = 0u64;
         let mut inline = None;
         {
-            let mut t = self.tree();
-            if let Some((key, data)) =
-                t.prev_item(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, u64::MAX))?
-            {
-                if key.objectid == ino && key.item_type == EXTENT_DATA_KEY {
-                    match FileExtent::parse(&data) {
-                        Some(FileExtent::Regular { num_bytes, .. }) => {
-                            covered = key.offset + num_bytes;
+            // Scan backward past any hole extents (disk_bytenr == 0) to find
+            // the last *real* extent.  Holes do not constitute actual on-disk
+            // coverage; counting them as coverage would cause write_extents to
+            // hit a "write into hole" error for every write following a
+            // truncate-up (the common ftruncate + write pattern used by apk).
+            let mut search_bound = u64::MAX;
+            loop {
+                let result = {
+                    let mut t = self.tree();
+                    t.prev_item(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, search_bound))?
+                };
+                match result {
+                    Some((key, data))
+                        if key.objectid == ino && key.item_type == EXTENT_DATA_KEY =>
+                    {
+                        match FileExtent::parse(&data) {
+                            Some(FileExtent::Regular {
+                                num_bytes,
+                                disk_bytenr,
+                                ..
+                            }) => {
+                                if disk_bytenr != 0 {
+                                    covered = key.offset + num_bytes;
+                                    break;
+                                }
+                                // Hole extent (disk_bytenr == 0): keep scanning
+                                // backward for a real extent.
+                                if key.offset == 0 {
+                                    break;
+                                }
+                                search_bound = key.offset - 1;
+                            }
+                            Some(FileExtent::Inline { ram_bytes, .. }) => {
+                                inline = Some(ram_bytes as usize);
+                                break;
+                            }
+                            None => return Err(Error::Corrupt("file extent")),
                         }
-                        Some(FileExtent::Inline { ram_bytes, .. }) => {
-                            inline = Some(ram_bytes as usize);
-                        }
-                        None => return Err(Error::Corrupt("file extent")),
                     }
+                    _ => break,
                 }
             }
         }
@@ -1439,6 +1465,24 @@ impl Btrfs {
             return Ok(covered);
         }
         self.set_nodatasum(ino, inode)?;
+        // Remove hole extents (disk_bytenr == 0) that the truncate-up path
+        // may have left in [covered, target).  We must delete them before
+        // calling install_data_extent so that the B-tree insert does not fail
+        // with Error::Exists on the same key offset.
+        {
+            let holes: Vec<u64> = self
+                .extents_in_range(ino, covered, target)?
+                .into_iter()
+                .filter_map(|(file_off, ext, _)| match ext {
+                    FileExtent::Regular { disk_bytenr: 0, .. } => Some(file_off),
+                    _ => None,
+                })
+                .collect();
+            for file_off in holes {
+                let mut t = self.tree();
+                t.delete(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, file_off))?;
+            }
+        }
         let _ = self.ensure_data_space(target.saturating_sub(covered));
         let mut pos = covered;
         while pos < target {
