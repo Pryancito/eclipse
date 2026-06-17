@@ -185,7 +185,7 @@ pub struct BtrfsMountFs {
 #[derive(Clone)]
 struct CachedDirEntry {
     name: String,
-    metadata: Metadata,
+    ino: u64,
 }
 
 impl BtrfsMountFs {
@@ -242,10 +242,9 @@ impl BtrfsMountFs {
             let entries = fs.readdir(dir).map_err(map_err)?;
             let mut cached = Vec::with_capacity(entries.len());
             for entry in entries {
-                let st = fs.stat(entry.ino).map_err(map_err)?;
                 cached.push(CachedDirEntry {
                     name: entry.name,
-                    metadata: stat_to_metadata(&st),
+                    ino: entry.ino,
                 });
             }
             Arc::new(cached)
@@ -429,7 +428,12 @@ impl INode for BtrfsMountINode {
             i => {
                 let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
-                Ok((entry.metadata.clone(), entry.name.clone()))
+                let metadata = {
+                    let mut fs = self.fs.inner.lock();
+                    let st = fs.stat(entry.ino).map_err(map_err)?;
+                    stat_to_metadata(&st)
+                };
+                Ok((metadata, entry.name.clone()))
             }
         }
     }
