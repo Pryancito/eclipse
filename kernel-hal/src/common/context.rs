@@ -264,14 +264,24 @@ impl UserContext {
                 warn!("[ctxcheck] heartbeat n={} ({})", n, when);
             }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
-            // Lowest plausible user PC. Static busybox/apk load at 0x400000; the
-            // dynamic loader/vDSO sit far above 0x10000. A rip below this (the
-            // observed crash had rip=0x1000 / 0x3011) is a corrupted context, but
-            // the previous `>= USER_MAX` test missed it because the value is LOW.
-            const USER_PC_MIN: usize = 0x1_0000;
+            // Do NOT treat a low rip/rsp/rbp as corruption: this loader maps PIE
+            // executables (apk and the musl dynamic linker `ld-musl`) at base 0
+            // (see `Loader::load_impl`: `app_base` is the start of an empty
+            // address space, i.e. 0), so genuinely-valid user code, stack and
+            // frame pointers legitimately live at very low virtual addresses —
+            // a running PIE has rip well below the old 0x1_0000 floor. The
+            // earlier `rip < USER_PC_MIN` heuristic therefore mis-fired on every
+            // asynchronous trap taken while such a process ran low. The dump that
+            // exposed this had trap_num=0xf3 (the IPI vector — an *interrupt*,
+            // not a page fault), which proves the CPU was executing normally at
+            // that low rip when the IPI arrived; a wild jump to an unmapped low
+            // address would have raised #PF (trap_num=0xe) instead.
+            //
+            // The only reliable corruption signal is a user register pointing
+            // into the *kernel* half (>= USER_MAX) — e.g. a user rbp that ended
+            // up inside the physmap window (0xffff_8000_…) — so keep just that.
             let g = &self.0.general;
-            let rip_bad = g.rip >= USER_MAX || (g.rip != 0 && g.rip < USER_PC_MIN);
-            if rip_bad || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
+            if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
                 error!(
                     "[ctxcheck] {} CORRUPT user ctx cpu={} ctx_addr={:#x}: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
                      rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
