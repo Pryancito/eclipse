@@ -6,6 +6,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryInto;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use btrfs::{Btrfs, Error as BtrfsError, FileKind};
 use lock::Mutex;
@@ -20,6 +21,12 @@ use super::block_mount::{device_from_backend, MountBackend};
 struct DevAdapter {
     inner: Arc<dyn rcore_fs::dev::Device>,
     size: u64,
+    /// Adaptive cap on a single backend transfer. Starts at `IO_CHUNK_BYTES`
+    /// and ratchets *down* (never up) the first time a larger transfer fails,
+    /// so a device/controller that can't sustain big DMA requests settles to a
+    /// working size instead of re-failing (and burning retries) on every chunk
+    /// of a large file. See `chunked`.
+    max_xfer: AtomicUsize,
 }
 
 /// How many times a single block transfer is retried before the error is
@@ -59,7 +66,8 @@ impl DevAdapter {
     ) -> btrfs::Result<()> {
         let mut done = 0usize;
         while done < len {
-            let mut piece = (len - done).min(IO_CHUNK_BYTES);
+            let cap = self.max_xfer.load(Ordering::Relaxed).max(IO_MIN_BYTES);
+            let mut piece = (len - done).min(cap);
             loop {
                 let mut ok = false;
                 for _ in 0..IO_RETRIES {
@@ -74,13 +82,20 @@ impl DevAdapter {
                 }
                 if piece > IO_MIN_BYTES {
                     // Re-issuing the same offset/buffer is idempotent; try a
-                    // smaller, more conservative transfer before giving up.
+                    // smaller, more conservative transfer. Remember the smaller
+                    // size so the rest of this (large) file uses it directly
+                    // instead of re-failing the big transfer on every chunk.
                     piece = (piece / 2).max(IO_MIN_BYTES);
+                    self.max_xfer.fetch_min(piece, Ordering::Relaxed);
+                    warn!(
+                        "btrfs: {} transfer shrunk to {} after failure (off={:#x}, +{})",
+                        what, piece, offset, done,
+                    );
                     continue;
                 }
                 warn!(
-                    "btrfs: {}(off={:#x}, len={}) failed at +{} after retries and shrink to {}, dev_size={:#x}",
-                    what, offset, len, done, piece, self.size,
+                    "btrfs: {}(off={:#x}, len={}) failed at +{} even at {}-byte transfers, dev_size={:#x}",
+                    what, offset, len, done, IO_MIN_BYTES, self.size,
                 );
                 return Err(BtrfsError::Io);
             }
@@ -187,6 +202,7 @@ impl BtrfsMountFs {
         let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter {
             inner: device,
             size,
+            max_xfer: AtomicUsize::new(IO_CHUNK_BYTES),
         });
         warn!(
             "btrfs: mounting, device size = {:#x} ({} MiB), read_only={}",
