@@ -9,7 +9,7 @@ use {
 };
 
 use crate::arch::executor_entry;
-use crate::task_collection::TaskCollection;
+use crate::task_collection::{Task, TaskCollection};
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExecutorState {
@@ -108,6 +108,36 @@ impl Executor {
     }
 
     pub fn run(&mut self) {
+        // Lazy-TLB safety pin.
+        //
+        // `ThreadSwitchFuture::poll` leaves this CPU on the polled thread's
+        // *process* page table after the poll (lazy-TLB: it skips reloading the
+        // kernel CR3 to avoid a TLB flush per poll). The scheduler code below —
+        // `take_task` and `steal_task_from_other_cpu` — therefore runs under
+        // that user CR3. Those routines only touch kernel-half memory, which is
+        // mapped in every process page table, so that is fine *as long as the
+        // page table still exists*.
+        //
+        // The danger is the page table being freed out from under us: if the
+        // process whose CR3 we are holding exits and is reaped on another CPU,
+        // its `PageTableImpl` drops and the root (PML4) / intermediate frames go
+        // back to the frame allocator and get reused. The MMU then walks freed,
+        // overwritten page-table memory on the next TLB miss, so our own kernel
+        // stack / the iret frame we are about to build reads garbage -> `iretq`
+        // to ring-0 junk -> #UD. This is exactly the intermittent SMP crash seen
+        // under `apk` (rapid fork/exit) — and ctxcheck never fires because the
+        // saved `UserContext` is valid; it is the physical memory behind it that
+        // changes under the stale CR3.
+        //
+        // Hold an `Arc` to the most-recently-polled task across the next
+        // `take_task`/`steal` step. That keeps its `Thread` -> `Process` ->
+        // `vmar` -> page table alive, so a concurrent exit cannot free the page
+        // table while its CR3 is still loaded here. The pin is replaced only
+        // after the *next* poll has switched CR3 to another address space (or to
+        // the kernel CR3, which `CurrentThread::drop` restores when a thread
+        // finishes), so the previous page table is released only once its CR3 is
+        // no longer loaded on this CPU.
+        let mut _cr3_pin: Option<Arc<Task>> = None;
         loop {
             let mut task_info = self.task_collection.take_task();
             if task_info.is_none() {
@@ -137,6 +167,14 @@ impl Executor {
                 debug!("back from future {}:{}", self.id(), task.id());
                 self.task_id = 0;
                 waker_ref.mark_borrowed(false);
+                // Pin this task's address space for the upcoming take_task/steal
+                // (which run under the CR3 this poll just (re)loaded). Replacing
+                // the previous pin here is safe: CR3 now points at *this* task's
+                // page table (or at the kernel CR3 if the thread just finished —
+                // `CurrentThread::drop` restored it), so the page table we drop
+                // is no longer the active one. See the comment at the top of
+                // `run`.
+                _cr3_pin = Some(task.clone());
                 match ret {
                     Poll::Ready(()) => {
                         debug!("task over id = {}", task.id());
