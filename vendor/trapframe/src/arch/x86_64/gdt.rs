@@ -164,7 +164,11 @@ pub fn init() {
         _pad: [0; 6],
         dbg_save: 0,
     });
-    let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
+    // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
+    // dangerously small for deep user-trap handling (page-fault -> VMO commit ->
+    // smoltcp ...): an overflow silently corrupts the adjacent heap (observed as
+    // wild UserContext corruption -> iret to ring-0 junk -> #UD). Use 64 KiB.
+    let trap_stack_top = Box::leak(Box::new([0u8; 0x10000])).as_ptr() as u64 + 0x10000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
@@ -238,7 +242,11 @@ pub fn init_ap() {
         _pad: [0; 6],
         dbg_save: 0,
     });
-    let trap_stack_top = Box::leak(Box::new([0u8; 0x1000])).as_ptr() as u64 + 0x1000;
+    // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
+    // dangerously small for deep user-trap handling (page-fault -> VMO commit ->
+    // smoltcp ...): an overflow silently corrupts the adjacent heap (observed as
+    // wild UserContext corruption -> iret to ring-0 junk -> #UD). Use 64 KiB.
+    let trap_stack_top = Box::leak(Box::new([0u8; 0x10000])).as_ptr() as u64 + 0x10000;
     region.tss.privilege_stack_table[0] = VirtAddr::new(trap_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
