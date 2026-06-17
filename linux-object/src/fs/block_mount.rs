@@ -68,9 +68,21 @@ impl Device for BlockByteDevice {
         // Whole-sector middle: a single multi-sector transfer.
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
+            let block_id = (offset + done) / BS;
             self.block
-                .read_block((offset + done) / BS, &mut buf[done..done + mid])
-                .map_err(|_| DevError)?;
+                .read_block(block_id, &mut buf[done..done + mid])
+                .map_err(|e| {
+                    warn!(
+                        "blockdev: read_block(block_id={}, {} sectors) failed: {:?} \
+                         (byte_off={:#x}, block_count={})",
+                        block_id,
+                        mid / BS,
+                        e,
+                        offset + done,
+                        self.block.block_count(),
+                    );
+                    DevError
+                })?;
             done += mid;
         }
 
@@ -110,9 +122,21 @@ impl Device for BlockByteDevice {
         // Whole-sector middle: a single multi-sector transfer.
         let mid = ((buf.len() - done) / BS) * BS;
         if mid > 0 {
+            let block_id = (offset + done) / BS;
             self.block
-                .write_block((offset + done) / BS, &buf[done..done + mid])
-                .map_err(|_| DevError)?;
+                .write_block(block_id, &buf[done..done + mid])
+                .map_err(|e| {
+                    warn!(
+                        "blockdev: write_block(block_id={}, {} sectors) failed: {:?} \
+                         (byte_off={:#x}, block_count={})",
+                        block_id,
+                        mid / BS,
+                        e,
+                        offset + done,
+                        self.block.block_count(),
+                    );
+                    DevError
+                })?;
             done += mid;
         }
 
