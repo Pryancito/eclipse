@@ -22,31 +22,55 @@ struct DevAdapter {
     size: u64,
 }
 
+/// How many times a single block transfer is retried before the error is
+/// surfaced to btrfs. A large file (e.g. the ~130 MiB `libLLVM.so` pulled in by
+/// `apk fix`) is written as *hundreds* of separate block commands, so even a
+/// rare transient device error (an AHCI task-file error that the driver clears
+/// with a port reset, a momentarily busy controller, …) becomes likely over the
+/// whole file. Without a retry that single hiccup aborts the entire extraction
+/// with EIO, which is exactly the "failed to extract …: I/O error" seen only on
+/// the biggest package. Re-issuing the same offset/buffer is idempotent.
+const IO_RETRIES: usize = 5;
+
 impl btrfs::BlockDevice for DevAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
-        self.inner
-            .read_at(offset as usize, buf)
-            .map_err(|_| BtrfsError::Io)
-            .and_then(|n| {
-                if n == buf.len() {
-                    Ok(())
-                } else {
-                    Err(BtrfsError::Io)
+        for attempt in 0..IO_RETRIES {
+            match self.inner.read_at(offset as usize, buf) {
+                Ok(n) if n == buf.len() => return Ok(()),
+                other => {
+                    if attempt + 1 == IO_RETRIES {
+                        warn!(
+                            "btrfs: read_at({:#x}, {}) failed after {} attempts: {:?}",
+                            offset,
+                            buf.len(),
+                            IO_RETRIES,
+                            other.err()
+                        );
+                    }
                 }
-            })
+            }
+        }
+        Err(BtrfsError::Io)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
-        self.inner
-            .write_at(offset as usize, buf)
-            .map_err(|_| BtrfsError::Io)
-            .and_then(|n| {
-                if n == buf.len() {
-                    Ok(())
-                } else {
-                    Err(BtrfsError::Io)
+        for attempt in 0..IO_RETRIES {
+            match self.inner.write_at(offset as usize, buf) {
+                Ok(n) if n == buf.len() => return Ok(()),
+                other => {
+                    if attempt + 1 == IO_RETRIES {
+                        warn!(
+                            "btrfs: write_at({:#x}, {}) failed after {} attempts: {:?}",
+                            offset,
+                            buf.len(),
+                            IO_RETRIES,
+                            other.err()
+                        );
+                    }
                 }
-            })
+            }
+        }
+        Err(BtrfsError::Io)
     }
 
     fn sync(&self) -> btrfs::Result<()> {
