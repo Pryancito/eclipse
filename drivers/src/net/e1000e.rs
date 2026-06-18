@@ -1954,37 +1954,40 @@ pub fn init(
         E1000E_DRIVER_TAG
     );
 
-    // Deliberately allocate the rings and buffers as plain write-back (cached)
-    // memory and keep them coherent with explicit dma_sync (clflush), instead of
-    // remapping them uncached (UC). This fixes BOTH real-hardware failure modes
-    // that QEMU (coherent, no real cache) never exposes:
+    // Split the DMA memory by access pattern, fixing both the UC-slowness AND
+    // the WB false-sharing failure modes (QEMU, coherent with no real cache,
+    // never exposes either):
     //
-    //   1. UC remap silently NOT taking effect (PAT vs MTRR, a cached alias, or a
-    //      huge-page physmap entry): the driver believed the memory was coherent
-    //      and skipped clflush, so the CPU read stale RX bytes / the NIC DMA'd
-    //      stale TX bytes -> corrupt packets -> RST -> "apk fetch ... I/O error".
-    //   2. UC remap actually WORKING: uncached reads are ~100x slower than
-    //      cached, so reading a multi-MB RX stream byte-by-byte starves the
-    //      drain loop, the RX ring overflows and the large download stalls/
-    //      times out. A small transfer is fast enough; a big one is not.
+    // Descriptor RINGS -> uncached (try_coherent). A descriptor is 16 bytes, so
+    // four pack into one 64-byte cache line. With WB+clflush, recycling one
+    // descriptor dirties its line and the ToDevice clflush writes the WHOLE line
+    // back — including neighbours the NIC may have just stamped DD into (in RAM)
+    // a moment earlier. That stale write-back erases their DD bits, the driver
+    // never sees those completions, and RX wedges: a deterministic mid-transfer
+    // stall on real hardware (the race cannot happen under QEMU's synchronous
+    // device model). UC sidesteps it entirely — and the rings are tiny, so the
+    // uncached cost is negligible.
     //
-    // Plain WB + clflush is the standard non-coherent-DMA model (Linux
-    // dma_sync_single_*): fast cached access AND correct, with no reliance on a
-    // UC remap that may not hold. DmaRegion::alloc_uninit now evicts the region's
-    // cache lines at allocation, so each buffer starts clean and a later
-    // FromDevice clflush only invalidates (never writes a stale line back over
-    // fresh DMA data). ToDevice clflush flushes CPU writes (descriptors, TX
-    // payload) to RAM before the doorbell.
-    let rx_ring = DmaRegion::alloc_uninit(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
-    let tx_ring = DmaRegion::alloc_uninit(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
+    // Packet BUFFERS -> write-back + clflush (alloc_uninit). These carry the
+    // bulk RX/TX payload, where uncached reads are ~100x slower and starve the
+    // RX drain on a multi-MB stream. They are safe as WB: BUF_SIZE is a multiple
+    // of the cache line and the pool is page-aligned, so buffers never share a
+    // line (no false sharing), RX buffers are only read by the CPU (FromDevice
+    // clflush only invalidates, never writes a stale line back), and
+    // alloc_uninit now evicts each region's lines at allocation so it starts
+    // clean.
+    let (rx_ring, rx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+        .ok_or(DeviceError::DmaError)?;
+    let (tx_ring, tx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+        .ok_or(DeviceError::DmaError)?;
     let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
     let tx_buf_pool = DmaRegion::alloc_uninit(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    let rx_ring_coherent = false;
     let rx_buf_coherent = false;
-    let tx_ring_coherent = false;
     let tx_buf_coherent = false;
     crate::klog_warn!(
-        "[e1000e] LK-RX path: DMA = write-back + clflush sync (no UC remap) for rx/tx ring+buffers\n"
+        "[e1000e] LK-RX path: rings UC(rx={} tx={}), buffers write-back+clflush\n",
+        rx_ring_coherent,
+        tx_ring_coherent
     );
 
     // Alignment checks
