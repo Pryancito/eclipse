@@ -1483,10 +1483,27 @@ impl Btrfs {
                 t.delete(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, file_off))?;
             }
         }
-        let _ = self.ensure_data_space(target.saturating_sub(covered));
+        // Linux-style speculative preallocation. A naive driver records one
+        // extent — and runs one synchronous metadata commit — per write(), so
+        // extracting a big package in 4 KiB chunks (libarchive) costs tens of
+        // thousands of tree updates and stalls for seconds. Instead, when a file
+        // grows, allocate a *geometrically growing* contiguous run past the
+        // requested range (up to MAX_PREALLOC) and record it as one extent. The
+        // following stream of small sequential writes then lands in already
+        // covered space (`covered >= target` on entry) and only writes data —
+        // no per-write extent insert. The speculative tail is zeroed like any
+        // freshly allocated space and sits beyond i_size until later writes fill
+        // it, so reads and `btrfs check` stay correct.
+        const MAX_PREALLOC: u64 = 1024 * 1024;
+        let prealloc = covered.min(MAX_PREALLOC);
+        let alloc_target = {
+            let want = covered.saturating_add((target - covered).max(prealloc));
+            ((want + sector - 1) / sector * sector).max(target)
+        };
+        let _ = self.ensure_data_space(alloc_target.saturating_sub(covered));
         let mut pos = covered;
-        while pos < target {
-            match self.alloc.alloc_data(target - pos) {
+        while pos < alloc_target {
+            match self.alloc.alloc_data(alloc_target - pos) {
                 Ok((bytenr, got)) => {
                     self.install_data_extent(
                         ino,
@@ -1498,8 +1515,10 @@ impl Btrfs {
                     )?;
                     pos += got;
                 }
-                // Disk full: report how far we got; the file stays
-                // consistent (extents are contiguous from 0 to `pos`).
+                // Disk full: stop. The needed prefix (up to `target`) is tried
+                // first since allocation starts at `covered`, so the write still
+                // succeeds for whatever was covered; the speculative tail is
+                // simply skipped.
                 Err(Error::NoSpace) => break,
                 Err(e) => return Err(e),
             }
