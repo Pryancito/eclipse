@@ -1894,9 +1894,33 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         None
     }
-    /// missing documentation
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        warn!("setsockopt is unimplemented");
+    /// Set a socket option.
+    ///
+    /// We don't yet plumb most options into the smoltcp sockets, but the common
+    /// ones that applications set (apk's HTTPS client sets several before a
+    /// download) are well-known and harmless to accept: returning success is the
+    /// correct, lenient behaviour — failing them would make clients abort. We
+    /// recognise the standard option names so the log stays quiet for them and
+    /// only note a genuinely unknown option, instead of crying "unimplemented"
+    /// on every ordinary `SO_*`/`TCP_*` call (which was a red herring while
+    /// debugging download failures). The data path is unchanged.
+    fn setsockopt(&self, level: usize, opt: usize, _data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const IPPROTO_IP: usize = 0;
+        const IPPROTO_TCP: usize = 6;
+        let known = match level {
+            // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
+            // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
+            SOL_SOCKET => matches!(opt, 2 | 6 | 7 | 8 | 9 | 13 | 15 | 20 | 21),
+            // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
+            IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
+            // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
+            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 35),
+            _ => false,
+        };
+        if !known {
+            debug!("setsockopt: accepting unhandled level={} opt={}", level, opt);
+        }
         Ok(0)
     }
     /// missing documentation
