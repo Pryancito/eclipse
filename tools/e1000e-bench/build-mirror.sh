@@ -1,95 +1,122 @@
 #!/usr/bin/env bash
-# build-mirror.sh — Genera un mirror Alpine local (firmado) para el benchmark del
-# driver e1000e bajo QEMU. No requiere acceso a dl-cdn.alpinelinux.org.
+# build-mirror.sh — Genera un mirror local FIRMADO con paquetes apk GRANDES y
+# REALES (v3), para estresar el camino RX/TX del driver e1000e bajo QEMU con
+# transferencias TCP largas. No requiere acceso a Internet.
 #
-#   repo/x86_64/APKINDEX.tar.gz   índice v2 firmado (apk update lo descarga)
-#   repo/x86_64/bigfile.bin       fichero grande de alta entropía (test wget/integridad)
-#   repo/x86_64/bigfile.sha256    checksum esperado de bigfile.bin
+#   repo/x86_64/APKINDEX.tar.gz      índice v3 firmado (mkndx) — apk lo descarga
+#   repo/x86_64/bench-bigNN-*.apk    paquetes grandes y firmados (apk fetch)
+#   repo/x86_64/bigfile.bin          fichero grande de alta entropía (wget)
+#   repo/x86_64/bigfile.sha256       checksum esperado de bigfile.bin
+#   keys/<pub>                       clave pública (el guest la confía vía HTTP)
 #
-# El tamaño del índice y del bigfile se controlan por entorno para ejercitar el
-# camino RX/TX del driver con transferencias TCP de varios MB.
+# El objetivo es reproducir `apk fetch` del paquete más grande de Alpine
+# (llvm22-libs, ~37 MB) que se atasca en hardware real: aquí servimos paquetes
+# de tamaño configurable (por defecto 2 × 64 MiB = 128 MiB) y el guest los
+# descarga en bucle durante periodos largos, verificando firma e integridad.
+#
+# Variables de entorno:
+#   NUM_BIGPKGS   nº de paquetes grandes a generar      (def. 2)
+#   BIGPKG_MB     tamaño de la carga de cada paquete MiB (def. 64)
+#   BIGFILE_MB    tamaño de bigfile.bin para wget   MiB  (def. 64)
+#   NUM_RECORDS   paquetes dummy extra para engordar el índice (def. 2000)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$REPO_ROOT/local-mirror"
-mkdir -p "$HERE"
 ROOT="$REPO_ROOT"
 APK="$ROOT/tools/apk/apk-x86_64.static"
 KEY="$HERE/keys/eclipse-bench@local-1.rsa"
 PUB="eclipse-bench@local-1.rsa.pub"
 
-# Generar clave de firma si no existe (privada gitignored bajo local-mirror/)
+NUM_BIGPKGS="${NUM_BIGPKGS:-2}"
+BIGPKG_MB="${BIGPKG_MB:-64}"
+BIGFILE_MB="${BIGFILE_MB:-64}"
+NUM_RECORDS="${NUM_RECORDS:-2000}"
+
+mkdir -p "$HERE/keys"
+# Clave de firma (privada gitignored bajo local-mirror/)
 if [ ! -f "$KEY" ]; then
   echo "[mirror] generando clave de firma..."
-  mkdir -p "$HERE/keys"
   openssl genrsa -out "$KEY" 2048 2>/dev/null
   openssl rsa -in "$KEY" -pubout -out "$HERE/keys/$PUB" 2>/dev/null
 fi
-# La pública debe estar en /etc/apk/keys del guest: el rootfs la toma de prebuilt/
+# La pública la confía el guest: (1) vía rootfs (prebuilt/alpine-apk-keys) y
+# (2) servida por HTTP para que bench.sh la coloque en /etc/apk/keys en runtime.
 mkdir -p "$ROOT/prebuilt/alpine-apk-keys"
 cp -f "$HERE/keys/$PUB" "$ROOT/prebuilt/alpine-apk-keys/$PUB"
-
-NUM_RECORDS="${NUM_RECORDS:-60000}"   # nº de paquetes ficticios en el índice
-BIGFILE_MB="${BIGFILE_MB:-16}"        # tamaño del fichero de integridad
 
 REPO="$HERE/repo/x86_64"
 rm -rf "$HERE/repo"
 mkdir -p "$REPO"
+KEYSDIR="$HERE/trust"; rm -rf "$KEYSDIR"; mkdir -p "$KEYSDIR"
+cp -f "$HERE/keys/$PUB" "$KEYSDIR/$PUB"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-echo "[mirror] generando APKINDEX con $NUM_RECORDS registros..."
-# Cabecera DESCRIPTION + cuerpo APKINDEX (registros de alta entropía -> índice grande)
-echo "Eclipse OS benchmark mirror $(date -u +%Y%m%d%H%M%S)" > "$WORK/DESCRIPTION"
-python3 - "$NUM_RECORDS" > "$WORK/APKINDEX" <<'PY'
-import sys, os, base64, hashlib
-n = int(sys.argv[1])
-out = sys.stdout
-for i in range(n):
-    # checksum Q1<base64(sha1)> de datos aleatorios -> entropía real en el índice
-    h = hashlib.sha1(os.urandom(20)).digest()
-    csum = "Q1" + base64.b64encode(h).decode()
-    name = f"benchpkg{i:06d}"
-    out.write(f"C:{csum}\n")
-    out.write(f"P:{name}\n")
-    out.write("V:1.0.0-r0\n")
-    out.write("A:x86_64\n")
-    out.write(f"S:{1000+i%5000}\n")
-    out.write(f"I:{4096+i%8192}\n")
-    out.write(f"T:Benchmark dummy package {i}\n")
-    out.write("U:https://eclipse.local/\n")
-    out.write("L:MIT\n")
-    out.write(f"o:{name}\n")
-    out.write("m:Eclipse Bench <bench@eclipse.local>\n")
-    out.write("t:1700000000\n")
-    out.write("\n")
-PY
+# --- Paquetes grandes y reales (v3, firmados) -------------------------------
+# Cada paquete lleva una carga de alta entropía de BIGPKG_MB MiB. apk fetch
+# descarga el .apk completo y verifica su firma -> si el driver pierde/corrompe
+# bytes, apk falla; si el camino es correcto, descarga OK.
+PKG_NAMES=""
+i=0
+while [ "$i" -lt "$NUM_BIGPKGS" ]; do
+  name="bench-big$(printf '%02d' "$i")"
+  br="$WORK/br-$name"
+  mkdir -p "$br/usr/share/$name"
+  echo "[mirror] generando $name (${BIGPKG_MB} MiB de carga)..."
+  head -c "$((BIGPKG_MB*1024*1024))" /dev/urandom > "$br/usr/share/$name/data.bin"
+  "$APK" mkpkg \
+    --info "name:$name" --info "version:1.0.0-r0" --info "arch:x86_64" \
+    --info "description:Eclipse e1000e bench large package $i" \
+    --info "license:MIT" --info "origin:$name" --info "url:https://eclipse.local/" \
+    --files "$br" --sign-key "$KEY" \
+    -o "$REPO/$name-1.0.0-r0.apk" >/dev/null
+  echo "[mirror]   -> $(stat -c%s "$REPO/$name-1.0.0-r0.apk") bytes"
+  PKG_NAMES="$PKG_NAMES $name"
+  i=$((i+1))
+done
 
-# Empaquetar índice v2 sin firmar (DESCRIPTION + APKINDEX), formato ustar
-UNS="$WORK/APKINDEX.unsigned.tar.gz"
-tar -c --format=ustar -C "$WORK" -f - DESCRIPTION APKINDEX | gzip -9 -n > "$UNS"
+# --- Paquetes dummy pequeños para engordar el índice -------------------------
+# (apk update/fetch descarga el índice antes de los paquetes; un índice grande
+# añade una transferencia TCP de varios MB más al inicio de cada corrida.)
+j=0
+while [ "$j" -lt "$NUM_RECORDS" ]; do
+  name="benchpkg$(printf '%06d' "$j")"
+  br="$WORK/br-dummy"
+  rm -rf "$br"; mkdir -p "$br/usr/share/doc/$name"
+  # contenido único por paquete (checksum real distinto en el índice)
+  head -c 256 /dev/urandom > "$br/usr/share/doc/$name/README"
+  "$APK" mkpkg \
+    --info "name:$name" --info "version:1.0.0-r0" --info "arch:x86_64" \
+    --info "description:dummy $j" --info "license:MIT" --info "origin:$name" \
+    --files "$br" --sign-key "$KEY" \
+    -o "$REPO/$name-1.0.0-r0.apk" >/dev/null
+  j=$((j+1))
+  [ "$((j % 500))" -eq 0 ] && echo "[mirror]   dummy $j/$NUM_RECORDS"
+done
 
-# Firmar (RSA-SHA256), miembro .SIGN.RSA256.<pub>, gzip propio, concatenado.
-# CLAVE: el tar de la firma NO debe llevar los bloques EOF (ceros) — equivale a
-# `abuild-tar --cut`. Si se incluyen, apk reporta "invalid or inconsistent".
-SIGDIR="$WORK/sig"; mkdir -p "$SIGDIR"
-openssl dgst -sha256 -sign "$KEY" -out "$SIGDIR/.SIGN.RSA256.$PUB" "$UNS"
-tar -c --format=ustar -C "$SIGDIR" -f "$WORK/sig.tar" ".SIGN.RSA256.$PUB"
-python3 - "$WORK/sig.tar" "$WORK/sig.tar.cut" <<'PY'
-import sys
-data = open(sys.argv[1], "rb").read()
-# Quitar todos los bloques de 512 bytes a cero del final (EOF de tar)
-while len(data) >= 512 and data[-512:] == b"\x00" * 512:
-    data = data[:-512]
-open(sys.argv[2], "wb").write(data)
-PY
-gzip -9 -n -c "$WORK/sig.tar.cut" > "$WORK/sig.tar.gz"
-cat "$WORK/sig.tar.gz" "$UNS" > "$REPO/APKINDEX.tar.gz"
+# --- Índice v3 firmado, publicado como APKINDEX.tar.gz ----------------------
+echo "[mirror] generando índice v3 (mkndx) sobre $(ls "$REPO"/*.apk | wc -l) paquetes..."
+"$APK" mkndx --keys-dir "$KEYSDIR" \
+  --description "Eclipse e1000e bench mirror" \
+  --sign-key "$KEY" \
+  -o "$REPO/APKINDEX.tar.gz" "$REPO"/*.apk >/dev/null
 echo "[mirror] APKINDEX.tar.gz: $(stat -c%s "$REPO/APKINDEX.tar.gz") bytes"
 
-# Fichero grande de alta entropía para test de integridad por wget
+# --- bigfile para la ruta wget (descarga cruda, sin apk) --------------------
 echo "[mirror] generando bigfile.bin (${BIGFILE_MB} MiB)..."
 head -c "$((BIGFILE_MB*1024*1024))" /dev/urandom > "$REPO/bigfile.bin"
 ( cd "$REPO" && sha256sum bigfile.bin > bigfile.sha256 )
+
+# --- Resumen para el runner / bench.sh --------------------------------------
+echo "[mirror] paquetes grandes:${PKG_NAMES}"
 echo "[mirror] bigfile.sha256: $(cat "$REPO/bigfile.sha256")"
-echo "[mirror] listo en $REPO"
+{
+  echo "PUB=$PUB"
+  echo "BIG_PKGS=\"${PKG_NAMES# }\""
+  echo "BIGPKG_MB=$BIGPKG_MB"
+  echo "BIGFILE_MB=$BIGFILE_MB"
+  echo "BIGFILE_SHA=$(awk '{print $1}' "$REPO/bigfile.sha256")"
+  echo "BIGFILE_SZ=$(stat -c%s "$REPO/bigfile.bin")"
+} > "$HERE/mirror.env"
+echo "[mirror] listo en $REPO (env -> $HERE/mirror.env)"
