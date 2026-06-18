@@ -6,7 +6,7 @@
 pub mod socket_address;
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileDesc, FileLike, PollEvents};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
 use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
@@ -895,8 +895,43 @@ pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
     }
 }
 
+/// Set once networking is up enough to be polled safely (after the first
+/// normal `poll_ifaces`, which happens during DHCP — long before any large
+/// disk transfer). The AHCI driver's wait loop consults this via
+/// `drivers_net_drain` so it never pokes the net stack during early-boot root
+/// mounting, before the interfaces/socket set exist.
+static NET_DRAIN_READY: AtomicBool = AtomicBool::new(false);
+/// Re-entrancy guard: `drivers_net_drain` must never recurse into itself (it
+/// won't in practice — the net path issues no disk I/O — but make it
+/// structurally impossible).
+static NET_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Hook called by polled block drivers (AHCI) from inside their command-wait
+/// busy loop on real hardware, where a single command/flush can hold the CPU
+/// (interrupts disabled, under the fs lock) for long enough to starve the
+/// *polled* network stack — overflowing the NIC RX ring and stalling an
+/// in-flight TLS download (the "failed to extract libLLVM.so: I/O error" seen
+/// only on real hardware, only for the largest package). Servicing the network
+/// here keeps the connection alive across long disk waits.
+///
+/// Safe to call with the fs/AHCI locks held: it only touches the network locks
+/// (disjoint), the network never issues disk I/O (no deadlock cycle), and it is
+/// a no-op until networking is ready and whenever already draining.
+#[no_mangle]
+pub extern "C" fn drivers_net_drain() {
+    if !NET_DRAIN_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    if NET_DRAINING.swap(true, Ordering::Acquire) {
+        return; // already draining on this stack
+    }
+    poll_ifaces();
+    NET_DRAINING.store(false, Ordering::Release);
+}
+
 /// miss doc
 pub fn poll_ifaces() {
+    NET_DRAIN_READY.store(true, Ordering::Relaxed);
     for iface in get_net_device().iter() {
         match iface.poll() {
             Ok(_) => {}
@@ -1894,9 +1929,33 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         None
     }
-    /// missing documentation
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        warn!("setsockopt is unimplemented");
+    /// Set a socket option.
+    ///
+    /// We don't yet plumb most options into the smoltcp sockets, but the common
+    /// ones that applications set (apk's HTTPS client sets several before a
+    /// download) are well-known and harmless to accept: returning success is the
+    /// correct, lenient behaviour — failing them would make clients abort. We
+    /// recognise the standard option names so the log stays quiet for them and
+    /// only note a genuinely unknown option, instead of crying "unimplemented"
+    /// on every ordinary `SO_*`/`TCP_*` call (which was a red herring while
+    /// debugging download failures). The data path is unchanged.
+    fn setsockopt(&self, level: usize, opt: usize, _data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const IPPROTO_IP: usize = 0;
+        const IPPROTO_TCP: usize = 6;
+        let known = match level {
+            // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
+            // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
+            SOL_SOCKET => matches!(opt, 2 | 6 | 7 | 8 | 9 | 13 | 15 | 20 | 21),
+            // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
+            IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
+            // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
+            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 35),
+            _ => false,
+        };
+        if !known {
+            debug!("setsockopt: accepting unhandled level={} opt={}", level, opt);
+        }
         Ok(0)
     }
     /// missing documentation

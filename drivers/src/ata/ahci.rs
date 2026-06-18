@@ -236,6 +236,30 @@ fn wait_until<F: Fn() -> bool>(timeout_us: u64, pred: F) -> bool {
 
 extern "C" {
     fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
+    /// Service the (polled) network stack. Implemented in linux-object; a no-op
+    /// until networking is up. Called from the command-wait loop so a slow disk
+    /// command/flush on real hardware doesn't starve an in-flight download.
+    fn drivers_net_drain();
+}
+
+/// Throttle for the in-wait network drain: service the net at most this often
+/// while busy-waiting for a command, so a long disk wait keeps the polled
+/// network alive without flooding it.
+const NET_DRAIN_INTERVAL_US: u64 = 300;
+static LAST_NET_DRAIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pump the network stack if at least `NET_DRAIN_INTERVAL_US` has elapsed since
+/// the last pump. Cheap and self-limiting: on QEMU commands complete on the
+/// first poll so this rarely fires; on real hardware, where a command/flush can
+/// hold the CPU for milliseconds, it keeps the TLS download from stalling.
+#[inline]
+fn net_drain_throttled() {
+    let now = unsafe { drivers_timer_now_as_micros() };
+    let last = LAST_NET_DRAIN_US.load(core::sync::atomic::Ordering::Relaxed);
+    if now.wrapping_sub(last) >= NET_DRAIN_INTERVAL_US {
+        LAST_NET_DRAIN_US.store(now, core::sync::atomic::Ordering::Relaxed);
+        unsafe { drivers_net_drain() };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -414,7 +438,17 @@ impl AhciPort {
             if self.read_reg(PORT_IS) & PXIS_ERR_MASK != 0 {
                 return true;
             }
-            self.read_reg(PORT_CI) & (1 << slot) == 0
+            if self.read_reg(PORT_CI) & (1 << slot) == 0 {
+                return true;
+            }
+            // Still pending: keep the polled network stack alive while we
+            // busy-wait. A slow command or a multi-hundred-ms FLUSH on real
+            // hardware otherwise monopolizes the CPU (interrupts disabled under
+            // the fs lock) and starves an in-flight TLS download, which then
+            // fails ("failed to extract …: I/O error"). No-op on QEMU, where
+            // commands complete before we ever reach here.
+            net_drain_throttled();
+            false
         }) {
             let tfd = self.read_reg(PORT_TFD);
             let ssts = self.read_reg(PORT_SSTS);
