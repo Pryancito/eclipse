@@ -264,6 +264,11 @@ impl UserContext {
                 warn!("[ctxcheck] heartbeat n={} ({})", n, when);
             }
             const USER_MAX: usize = 0x0000_8000_0000_0000;
+            // Kernel direct-map ("physmap") window. A *leaked* kernel pointer in
+            // a user general register lands here; that is the corruption we hunt
+            // (see the `[uleak]` scanner in `user.rs`).
+            const PHYSMAP_BASE: usize = 0xffff_8000_0000_0000;
+            const PHYSMAP_END: usize = 0xffff_c000_0000_0000;
             // Do NOT treat a low rip/rsp/rbp as corruption: this loader maps PIE
             // executables (apk and the musl dynamic linker `ld-musl`) at base 0
             // (see `Loader::load_impl`: `app_base` is the start of an empty
@@ -281,7 +286,16 @@ impl UserContext {
             // into the *kernel* half (>= USER_MAX) — e.g. a user rbp that ended
             // up inside the physmap window (0xffff_8000_…) — so keep just that.
             let g = &self.0.general;
-            if g.rip >= USER_MAX || g.rsp >= USER_MAX || g.rbp >= USER_MAX {
+            // `rip` and `rsp` are consumed by the CPU on `sysret`/`iret`, so a
+            // kernel-half value there is genuinely fatal. `rbp` (and every other
+            // GPR) is never dereferenced by the kernel and may legitimately hold
+            // a non-canonical sentinel — e.g. the System V outermost-frame
+            // marker `rbp = -1` (0xffff_ffff_ffff_ffff), which a process exiting
+            // via `exit_group` routinely carries. Flagging `rbp >= USER_MAX`
+            // therefore mis-fired on every such exit. Only treat `rbp` as
+            // corrupt when it is an actual leaked physmap pointer.
+            let rbp_leak = (PHYSMAP_BASE..PHYSMAP_END).contains(&g.rbp);
+            if g.rip >= USER_MAX || g.rsp >= USER_MAX || rbp_leak {
                 error!(
                     "[ctxcheck] {} CORRUPT user ctx cpu={} ctx_addr={:#x}: rip={:#x} rsp={:#x} rbp={:#x} fsbase={:#x} \
                      rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
