@@ -1954,45 +1954,37 @@ pub fn init(
         E1000E_DRIVER_TAG
     );
 
-    let (rx_ring, rx_ring_uc) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
-        .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, tx_ring_uc) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
-        .ok_or(DeviceError::DmaError)?;
-    let (rx_buf_pool, rx_buf_uc) =
-        DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, tx_buf_uc) =
-        DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-
-    // Never trust the UC mapping for DMA correctness: always run the dma_sync
-    // (clflush) path for BOTH RX and TX, regardless of whether map_coherent()
-    // reported success. On some real hardware the uncached remap of the physmap
-    // does not actually take effect (PAT vs MTRR resolution, a cached alias of
-    // the same physical page, or a huge-page physmap entry), so `coherent ==
-    // true` while the CPU still caches the data.
+    // Deliberately allocate the rings and buffers as plain write-back (cached)
+    // memory and keep them coherent with explicit dma_sync (clflush), instead of
+    // remapping them uncached (UC). This fixes BOTH real-hardware failure modes
+    // that QEMU (coherent, no real cache) never exposes:
     //
-    // RX: the CPU then reads stale bytes the NIC DMA'd in -> corrupt packets.
-    // TX (the more damaging case for a download): the CPU writes each ACK into
-    // the TX buffer but the dirty cache lines are never flushed to RAM, so the
-    // NIC DMAs *stale* bytes and transmits a corrupt segment. The peer drops or
-    // RSTs the connection -> "apk fetch ... I/O error". A large download sends
-    // thousands of ACKs, so it is almost certain to hit a stale one; a small
-    // transfer sends a handful and slips through.
+    //   1. UC remap silently NOT taking effect (PAT vs MTRR, a cached alias, or a
+    //      huge-page physmap entry): the driver believed the memory was coherent
+    //      and skipped clflush, so the CPU read stale RX bytes / the NIC DMA'd
+    //      stale TX bytes -> corrupt packets -> RST -> "apk fetch ... I/O error".
+    //   2. UC remap actually WORKING: uncached reads are ~100x slower than
+    //      cached, so reading a multi-MB RX stream byte-by-byte starves the
+    //      drain loop, the RX ring overflows and the large download stalls/
+    //      times out. A small transfer is fast enough; a big one is not.
     //
-    // clflush is correct either way: a no-op if the memory really is UC,
-    // required if it is actually WB (ToDevice writes the dirty lines back so the
-    // NIC sees fresh data; FromDevice invalidates stale lines so the CPU does).
-    // The `_uc` flags are kept only for the boot log below.
+    // Plain WB + clflush is the standard non-coherent-DMA model (Linux
+    // dma_sync_single_*): fast cached access AND correct, with no reliance on a
+    // UC remap that may not hold. DmaRegion::alloc_uninit now evicts the region's
+    // cache lines at allocation, so each buffer starts clean and a later
+    // FromDevice clflush only invalidates (never writes a stale line back over
+    // fresh DMA data). ToDevice clflush flushes CPU writes (descriptors, TX
+    // payload) to RAM before the doorbell.
+    let rx_ring = DmaRegion::alloc_uninit(NUM_RX * size_of::<RxDesc>()).ok_or(DeviceError::DmaError)?;
+    let tx_ring = DmaRegion::alloc_uninit(NUM_TX * size_of::<TxDesc>()).ok_or(DeviceError::DmaError)?;
+    let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
+    let tx_buf_pool = DmaRegion::alloc_uninit(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
     let rx_ring_coherent = false;
     let rx_buf_coherent = false;
     let tx_ring_coherent = false;
     let tx_buf_coherent = false;
-
     crate::klog_warn!(
-        "[e1000e] LK-RX path: UC-marked rx_ring={} rx_buf={} tx_ring={} tx_buf={}; RX+TX forced to clflush sync\n",
-        rx_ring_uc,
-        rx_buf_uc,
-        tx_ring_uc,
-        tx_buf_uc
+        "[e1000e] LK-RX path: DMA = write-back + clflush sync (no UC remap) for rx/tx ring+buffers\n"
     );
 
     // Alignment checks
