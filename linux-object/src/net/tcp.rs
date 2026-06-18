@@ -147,6 +147,33 @@ impl Socket for TcpSocketState {
                     if flags.contains(OpenFlags::NON_BLOCK) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
+                    // Stall diagnostic: when a blocking read keeps coming up empty,
+                    // log the TCP state periodically so a download stall shows the
+                    // receive side (state + whether the peer may still send + how
+                    // much is buffered) alongside the e1000e TX/GPTC watchdog.
+                    // If state=Established, may_recv=true and recv_queue=0 while the
+                    // GPTC counter still climbs, the peer has gone silent with our
+                    // window open -> window/ACK bug; if recv_queue grows but apk
+                    // stops reading, the consumer is stuck.
+                    {
+                        use core::sync::atomic::{AtomicU64, Ordering};
+                        static LAST_LOG_US: AtomicU64 = AtomicU64::new(0);
+                        let now_us = kernel_hal::timer::timer_now().as_micros() as u64;
+                        let last = LAST_LOG_US.load(Ordering::Relaxed);
+                        if now_us.wrapping_sub(last) >= 3_000_000 {
+                            LAST_LOG_US.store(now_us, Ordering::Relaxed);
+                            let (st, may, rq) = {
+                                let s = get_sockets();
+                                let mut s = s.lock();
+                                let sk = s.get::<TcpSocket>(handle);
+                                (sk.state(), sk.may_recv(), sk.recv_queue())
+                            };
+                            warn!(
+                                "[tcp read] STALL handle={} state={:?} may_recv={} recv_queue={}",
+                                handle, st, may, rq
+                            );
+                        }
+                    }
                     // Hard timeout: avoid blocking forever if the peer goes silent.
                     if kernel_hal::timer::timer_now() >= deadline {
                         warn!("[tcp read] deadline exceeded, returning EOF");
