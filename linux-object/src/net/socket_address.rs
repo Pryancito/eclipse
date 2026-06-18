@@ -290,13 +290,38 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
             ))),
             AddressFamily::Unix => {
                 let path = {
-                    let max_path_len = if len > 2 { len - 2 } else { 0 };
-                    let path_slice = &addr.addr_un.sun_path[..core::cmp::min(max_path_len, 108)];
-                    let actual_len = path_slice
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(path_slice.len());
-                    alloc::string::String::from_utf8_lossy(&path_slice[..actual_len]).into_owned()
+                    // Number of `sun_path` bytes the caller actually supplied.
+                    let avail = if len > 2 {
+                        core::cmp::min(len - 2, 108)
+                    } else {
+                        0
+                    };
+                    let sun_path = &addr.addr_un.sun_path[..avail];
+                    if avail == 0 {
+                        // Autobind / unnamed socket.
+                        alloc::string::String::new()
+                    } else if sun_path[0] == 0 {
+                        // Abstract-namespace socket: `sun_path[0]` is NUL and the
+                        // name is the remaining `avail - 1` bytes (which are NOT
+                        // NUL-terminated — their length comes from `addrlen`).
+                        // Represent it with a leading NUL so it can never collide
+                        // with a filesystem path (which never starts with NUL).
+                        // X11 connects to `\0/tmp/.X11-unix/X0` by default, so
+                        // getting this right is what lets `startx` reach the
+                        // server.
+                        let name = &sun_path[1..];
+                        let mut s = alloc::string::String::from("\0");
+                        s.push_str(&alloc::string::String::from_utf8_lossy(name));
+                        s
+                    } else {
+                        // Pathname socket: NUL-terminated within `sun_path`.
+                        let actual_len = sun_path
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(sun_path.len());
+                        alloc::string::String::from_utf8_lossy(&sun_path[..actual_len])
+                            .into_owned()
+                    }
                 };
                 Ok(Endpoint::Unix(path))
             }

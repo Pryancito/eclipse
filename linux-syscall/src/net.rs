@@ -490,27 +490,33 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         if let Endpoint::Unix(path) = &endpoint {
             if !path.is_empty() {
-                let (dir_path, file_name) = split_path(path);
-                match proc.lookup_inode_at(FileDesc::CWD, dir_path, true) {
-                    Ok(dir_inode) => {
-                        if dir_inode.find(file_name).is_err() {
-                            if let Err(err) = dir_inode.create(
-                                file_name,
-                                linux_object::fs::vfs::FileType::Socket,
-                                0o666,
-                            ) {
-                                warn!(
-                                    "sys_bind: unable to create unix socket node {:?}: {:?}; continuing with in-kernel registration only",
-                                    file_name, err
-                                );
+                // Abstract-namespace sockets (leading NUL, e.g. X11's
+                // `\0/tmp/.X11-unix/X0`) live only in the in-kernel registry and
+                // have no filesystem node; only pathname sockets get a node.
+                let is_abstract = path.starts_with('\0');
+                if !is_abstract {
+                    let (dir_path, file_name) = split_path(path);
+                    match proc.lookup_inode_at(FileDesc::CWD, dir_path, true) {
+                        Ok(dir_inode) => {
+                            if dir_inode.find(file_name).is_err() {
+                                if let Err(err) = dir_inode.create(
+                                    file_name,
+                                    linux_object::fs::vfs::FileType::Socket,
+                                    0o666,
+                                ) {
+                                    warn!(
+                                        "sys_bind: unable to create unix socket node {:?}: {:?}; continuing with in-kernel registration only",
+                                        file_name, err
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(err) => {
-                        warn!(
-                            "sys_bind: unable to lookup unix socket directory {:?}: {:?}; continuing with in-kernel registration only",
-                            dir_path, err
-                        );
+                        Err(err) => {
+                            warn!(
+                                "sys_bind: unable to lookup unix socket directory {:?}: {:?}; continuing with in-kernel registration only",
+                                dir_path, err
+                            );
+                        }
                     }
                 }
 
