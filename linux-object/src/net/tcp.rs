@@ -91,9 +91,15 @@ impl Socket for TcpSocketState {
         let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(120);
         loop {
             // Drive the NIC FIRST so any deferred RX is in the socket before
-            // recv_slice is called.
+            // recv_slice is called. Use the UNTHROTTLED drain here: this is a
+            // blocking read actively waiting for data, so we must pull RX as
+            // fast as it arrives. The throttled tick (every 4–32 ms) lets a
+            // fast download overflow the e1000e RX ring (~384 KiB fills in a
+            // few ms on a real link) before we drain it — packets drop and the
+            // large transfer wedges, while small ones that fit the ring work.
+            // The aggressive poll stops the instant recv_slice returns data.
             kernel_hal::deferred_job::drain_deferred_jobs();
-            crate::net::drain_net_tick();
+            crate::net::drain_net_urgent();
 
             let sets = get_sockets();
             let mut sets = sets.lock();
