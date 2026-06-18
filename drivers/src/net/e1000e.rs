@@ -281,6 +281,15 @@ const NUM_TX: usize = 256;
 /// LK uses 2048-byte RX buffers; one slot holds a full MTU frame.
 const BUF_SIZE: usize = 2048;
 const RX_DRAIN_BUDGET: usize = 64;
+/// Bounded retry budget for [`E1000eTxToken::consume`] when the TX ring is
+/// momentarily full. The NIC drains the ring autonomously via DMA (TDH advances
+/// without CPU help), so re-reading TDH a few times lets an in-flight frame
+/// complete before we give up. Each retry re-reads TDH over MMIO (~1 µs on real
+/// hardware) and a single 1514-byte frame clears the wire in ~12 µs at 1 Gbps,
+/// so this bounds the wait to a few milliseconds — enough to never drop a pure
+/// ACK / window-update under an RX burst, without spinning unboundedly if TX is
+/// genuinely wedged.
+const TX_SEND_SPIN_LIMIT: usize = 4096;
 const DMA_RING_BYTES: usize = NUM_RX * size_of::<RxDesc>();
 const DMA_TX_RING_BYTES: usize = NUM_TX * size_of::<TxDesc>();
 const DMA_DESC_ALIGN: usize = 16;
@@ -334,6 +343,12 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
 /// Count of received IPv4 frames whose header checksum did not verify — i.e.
 /// corrupted before smoltcp could parse them. Surfaced in the watchdog.
 static RX_CSUM_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count of outgoing frames smoltcp handed us that we had to DROP because the TX
+/// ring stayed full past [`TX_SEND_SPIN_LIMIT`]. Any non-zero value means a pure
+/// ACK / window-update was lost — the exact cause of the silent download
+/// deadlock — so the watchdog surfaces it. Should stay 0 once TX completes.
+static TX_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// True if `frame` is an IPv4 Ethernet frame whose IP *header* checksum is wrong
 /// (the one-complement sum of the header 16-bit words must be 0xffff). Returns
@@ -1503,8 +1518,9 @@ impl E1000eHw {
             let tdh = mmio_read(self.base, E1000E_TDH);
             let tdt = mmio_read(self.base, E1000E_TDT);
             let csum_bad = RX_CSUM_BAD.load(core::sync::atomic::Ordering::Relaxed);
+            let tx_dropped = TX_DROPPED.load(core::sync::atomic::Ordering::Relaxed);
             crate::klog_info!(
-                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_csum_bad={} GPTC={} tx_pkt={} TDH={} TDT={} itr={}\n",
+                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_csum_bad={} GPTC={} tx_pkt={} tx_drop={} TDH={} TDT={} itr={}\n",
                 link,
                 gprc,
                 mpc,
@@ -1512,6 +1528,7 @@ impl E1000eHw {
                 csum_bad,
                 gptc,
                 self.stats.tx_packets,
+                tx_dropped,
                 tdh,
                 tdt,
                 self.itr_setting
@@ -1967,8 +1984,33 @@ impl phy::TxToken for E1000eTxToken {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf)?;
         let mut hw = self.0.hw.lock();
-        hw.send(&buf).map_err(|_| smoltcp::Error::Exhausted)?;
-        Ok(result)
+        // NEVER silently drop a frame smoltcp handed us. The ingress path
+        // (`socket_ingress`) dispatches the ACK / window-update generated in
+        // direct response to a received segment through the TxToken paired with
+        // the RxToken — and if that send fails, smoltcp only logs it and moves
+        // on, having ALREADY advanced its remote_last_ack/remote_last_win state.
+        // The dropped ACK is never re-emitted, so the peer keeps waiting on a
+        // window it thinks is closed and the whole transfer deadlocks. On real
+        // hardware the 256-deep TX ring transiently fills under an RX burst
+        // (ITR throttles TX completion), losing exactly these ACKs — the silent
+        // mid-download stall seen only on real hardware, never under QEMU (which
+        // completes TX synchronously, so the ring never fills). The NIC drains
+        // the ring autonomously via DMA, so spin briefly on a free slot instead
+        // of dropping.
+        let mut tries = 0;
+        loop {
+            match hw.send(&buf) {
+                Ok(()) => return Ok(result),
+                Err(_) if tries < TX_SEND_SPIN_LIMIT => {
+                    tries += 1;
+                    core::hint::spin_loop();
+                }
+                Err(_) => {
+                    TX_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    return Err(smoltcp::Error::Exhausted);
+                }
+            }
+        }
     }
 }
 
