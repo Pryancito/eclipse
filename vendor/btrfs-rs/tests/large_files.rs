@@ -253,6 +253,48 @@ fn file_spanning_multiple_data_chunks() {
     run_huge_file(700 * 1024 * 1024, 300 * 1024 * 1024, None);
 }
 
+/// Reproduce the "apk hangs on big packages" symptom: write a large file in
+/// SMALL sequential chunks (like libarchive's block-by-block extraction) and
+/// report throughput as the file grows. A super-linear slowdown (throughput
+/// collapsing as size increases) is the stall; steady throughput rules out an
+/// O(n^2) write path.
+#[test]
+fn big_file_small_chunks_scaling() {
+    use std::time::Instant;
+    let chunk = 4096usize; // libarchive-style small writes
+    let total = 64 * 1024 * 1024u64;
+    let step = 8 * 1024 * 1024u64; // report every 8 MiB
+    println!("\n[big-file-small-chunks] 64 MiB written in 4 KiB chunks");
+    let path = tmp("smallchunks");
+    let dev = StrictDevice::create(&path, 512 * 1024 * 1024);
+    mkfs::format(&*dev, &opts()).unwrap();
+    let dev_arc: Arc<dyn BlockDevice> = dev.clone();
+    let mut fs = Btrfs::mount(dev_arc, false).unwrap();
+    let root = fs.root_ino();
+    let file = fs.create(root, "big", FileKind::Regular, 0o644, 0).unwrap();
+
+    let buf = vec![0xa5u8; chunk];
+    let mut off = 0u64;
+    let mut last_mark = 0u64;
+    let mut mark_t = Instant::now();
+    println!("    {:>8}  {:>12}  {:>14}", "MiB", "MiB/s (window)", "us/4KiB-write");
+    while off < total {
+        fs.write(file, off, &buf).unwrap();
+        off += chunk as u64;
+        if off - last_mark >= step {
+            let secs = mark_t.elapsed().as_secs_f64();
+            let mibps = (off - last_mark) as f64 / (1024.0 * 1024.0) / secs;
+            let us = secs * 1e6 / ((off - last_mark) / chunk as u64) as f64;
+            println!("    {:>8}  {:>12.1}  {:>14.2}", off / (1024 * 1024), mibps, us);
+            last_mark = off;
+            mark_t = Instant::now();
+        }
+    }
+    fs.sync().unwrap();
+    drop(fs);
+    fs::remove_file(&path).ok();
+}
+
 /// `ftruncate(size)` up-front then sequential writes (a common extractor
 /// pattern): the file is one big hole that each write must convert to real
 /// extents. Exercises the hole-extent path at scale on a strict device.
