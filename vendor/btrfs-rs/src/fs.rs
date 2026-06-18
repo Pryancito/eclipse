@@ -1552,6 +1552,7 @@ impl Btrfs {
     fn write_extents(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<()> {
         let end = offset + data.len() as u64;
         let extents = self.extents_in_range(ino, offset, end)?;
+        let extent_count = extents.len();
         let mut done = offset;
         for (file_off, ext, _) in extents {
             if let FileExtent::Regular {
@@ -1562,6 +1563,15 @@ impl Btrfs {
             } = ext
             {
                 if disk_bytenr == 0 {
+                    // A hole extent intersects the write range: ensure_coverage
+                    // should have filled it. Log the geometry so a large-file
+                    // EIO (e.g. `libLLVM.so` extraction) can be pinned to the
+                    // btrfs coverage path rather than the block device.
+                    warn!(
+                        "btrfs: write_extents hole in range ino={} off={:#x} end={:#x} \
+                         done={:#x} hole@{:#x} num_bytes={:#x} extents={}",
+                        ino, offset, end, done, file_off, num_bytes, extent_count,
+                    );
                     return Err(Error::Corrupt("write into hole"));
                 }
                 let lo = done.max(file_off);
@@ -1576,6 +1586,16 @@ impl Btrfs {
             }
         }
         if done < end {
+            warn!(
+                "btrfs: write_extents uncovered ino={} off={:#x} end={:#x} done={:#x} \
+                 (gap={:#x}) extents={}",
+                ino,
+                offset,
+                end,
+                done,
+                end - done,
+                extent_count,
+            );
             return Err(Error::Corrupt("uncovered write range"));
         }
         Ok(())
