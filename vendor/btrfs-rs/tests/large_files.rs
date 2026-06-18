@@ -138,15 +138,19 @@ fn payload_byte(i: u64) -> u8 {
 /// Write a single huge file in small chunks (mimicking apk/libarchive
 /// extraction) on a device that strictly rejects out-of-bounds I/O, then read
 /// it back and run `btrfs check`.
-fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
-    let path = tmp("huge");
+fn run_huge_file(name: &str, dev_size: u64, file_size: u64, grow_from: Option<u64>) {
+    // Each test gets its own temp paths; several tests call this helper and the
+    // suite runs them in parallel, so a shared path would let them clobber each
+    // other's image (a flaky failure unrelated to the filesystem).
+    let path = tmp(name);
     // If we simulate the installer, format a small image then present it on a
     // larger device and grow; otherwise format the whole device.
     let dev = StrictDevice::create(&path, dev_size);
 
     if let Some(small) = grow_from {
         // Format only within the first `small` bytes, then grow to dev_size.
-        let small_dev = StrictDevice::create(&tmp("ignored"), small);
+        let ignored = tmp(&format!("{name}-ignored"));
+        let small_dev = StrictDevice::create(&ignored, small);
         // Actually format directly on the big device but pretend it was small:
         // mkfs writes a superblock sized to `small`. Simplest: format a small
         // device file, copy it over the big one's head, then mount big.
@@ -158,7 +162,7 @@ fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
             b
         };
         dev.write_at(0, &head).unwrap();
-        let _ = fs::remove_file(tmp("ignored"));
+        let _ = fs::remove_file(&ignored);
     } else {
         mkfs::format(&*dev, &opts()).unwrap();
     }
@@ -232,7 +236,7 @@ fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
 /// data chunks and forces new chunk allocations mid-file.
 #[test]
 fn huge_file_plain() {
-    run_huge_file(1024 * 1024 * 1024, 200 * 1024 * 1024, None);
+    run_huge_file("plain", 1024 * 1024 * 1024, 200 * 1024 * 1024, None);
 }
 
 /// The real installer flow: a 64 MiB image grown onto a 1 GiB partition, then a
@@ -240,6 +244,7 @@ fn huge_file_plain() {
 #[test]
 fn huge_file_after_grow() {
     run_huge_file(
+        "after-grow",
         1024 * 1024 * 1024,
         200 * 1024 * 1024,
         Some(64 * 1024 * 1024),
@@ -250,7 +255,7 @@ fn huge_file_after_grow() {
 /// allocator must stitch multiple chunks and the device has little slack.
 #[test]
 fn file_spanning_multiple_data_chunks() {
-    run_huge_file(700 * 1024 * 1024, 300 * 1024 * 1024, None);
+    run_huge_file("multichunk", 700 * 1024 * 1024, 300 * 1024 * 1024, None);
 }
 
 /// Reproduce the "apk hangs on big packages" symptom: write a large file in
