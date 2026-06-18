@@ -1624,6 +1624,13 @@ impl Btrfs {
             Ok(covered) => covered,
             Err(e) => {
                 // Keep nbytes consistent with whatever extents were added.
+                warn!(
+                    "btrfs: write ino={} off={:#x} len={} ensure_coverage failed: {:?}",
+                    ino,
+                    offset,
+                    data.len(),
+                    e,
+                );
                 let _ = self.write_inode(ino, &inode);
                 let _ = self.commit(false);
                 return Err(e);
@@ -1637,7 +1644,16 @@ impl Btrfs {
             self.commit(false)?;
             return Err(Error::NoSpace);
         }
-        self.write_extents(ino, offset, &data[..(write_end - offset) as usize])?;
+        if let Err(e) = self.write_extents(ino, offset, &data[..(write_end - offset) as usize]) {
+            warn!(
+                "btrfs: write ino={} off={:#x} len={} write_extents failed: {:?}",
+                ino,
+                offset,
+                data.len(),
+                e,
+            );
+            return Err(e);
+        }
         if write_end > inode.size {
             inode.size = write_end;
         }
@@ -1645,7 +1661,16 @@ impl Btrfs {
         inode.mtime = now;
         inode.ctime = now;
         self.write_inode(ino, &inode)?;
-        self.commit(false)?;
+        if let Err(e) = self.commit(false) {
+            warn!(
+                "btrfs: write ino={} off={:#x} len={} commit failed: {:?}",
+                ino,
+                offset,
+                data.len(),
+                e,
+            );
+            return Err(e);
+        }
         Ok((write_end - offset) as usize)
     }
 
