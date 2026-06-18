@@ -51,6 +51,19 @@ impl DmaRegion {
         if zero {
             unsafe { core::ptr::write_bytes(virt as *mut u8, 0, pages * PAGE_SIZE) };
         }
+        // Evict any stale — possibly *dirty* — cache lines this physical memory
+        // carried from its previous life (it is recycled from the frame
+        // allocator and `alloc_uninit` does not zero it) BEFORE any device DMAs
+        // into it. Otherwise a later `dma_sync(FromDevice)` clflush would write
+        // such a dirty line back to RAM *over* the bytes the device just DMA'd
+        // in — silent RX corruption that scales with the number of buffers
+        // touched, so a large transfer (many buffers) fails while a small one
+        // (few buffers) slips through. Writing the zeros/garbage back to RAM now
+        // is harmless: the device overwrites it on the next receive. This also
+        // covers the WB->UC transition in `map_coherent`, which does not flush
+        // the cache itself. On non-x86 this is just a fence (those rely on UC
+        // mappings); see `dma_sync`.
+        crate::utils::dma_sync::dma_sync_wb_to_device(virt, pages * PAGE_SIZE);
         Some(Self { virt, phys, pages })
     }
 

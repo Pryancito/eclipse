@@ -1956,33 +1956,43 @@ pub fn init(
 
     let (rx_ring, rx_ring_uc) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
         .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, tx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+    let (tx_ring, tx_ring_uc) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
         .ok_or(DeviceError::DmaError)?;
     let (rx_buf_pool, rx_buf_uc) =
         DmaRegion::alloc_uninit_try_coherent(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
-    let (tx_buf_pool, tx_buf_coherent) =
+    let (tx_buf_pool, tx_buf_uc) =
         DmaRegion::alloc_uninit_try_coherent(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
 
-    // Never trust the UC mapping for *RX correctness*: always run the
-    // dma_sync (clflush) path for the RX ring and buffers, regardless of
-    // whether map_coherent() reported success. On some real hardware the
-    // uncached remap of the physmap does not actually take effect (PAT vs
-    // MTRR resolution, a cached alias of the same physical page, or a huge-page
-    // physmap entry), so `coherent == true` while the CPU still caches stale
-    // bytes the NIC DMA'd in — corrupting received packets and breaking the TLS
-    // stream of a large download ("apk fetch ... I/O error") while small
-    // transfers, which touch few RX buffers, slip through. clflush is correct
-    // either way: a no-op if the memory really is UC, required if it is WB. The
-    // `_uc` flags are kept only for the boot log below.
+    // Never trust the UC mapping for DMA correctness: always run the dma_sync
+    // (clflush) path for BOTH RX and TX, regardless of whether map_coherent()
+    // reported success. On some real hardware the uncached remap of the physmap
+    // does not actually take effect (PAT vs MTRR resolution, a cached alias of
+    // the same physical page, or a huge-page physmap entry), so `coherent ==
+    // true` while the CPU still caches the data.
+    //
+    // RX: the CPU then reads stale bytes the NIC DMA'd in -> corrupt packets.
+    // TX (the more damaging case for a download): the CPU writes each ACK into
+    // the TX buffer but the dirty cache lines are never flushed to RAM, so the
+    // NIC DMAs *stale* bytes and transmits a corrupt segment. The peer drops or
+    // RSTs the connection -> "apk fetch ... I/O error". A large download sends
+    // thousands of ACKs, so it is almost certain to hit a stale one; a small
+    // transfer sends a handful and slips through.
+    //
+    // clflush is correct either way: a no-op if the memory really is UC,
+    // required if it is actually WB (ToDevice writes the dirty lines back so the
+    // NIC sees fresh data; FromDevice invalidates stale lines so the CPU does).
+    // The `_uc` flags are kept only for the boot log below.
     let rx_ring_coherent = false;
     let rx_buf_coherent = false;
+    let tx_ring_coherent = false;
+    let tx_buf_coherent = false;
 
     crate::klog_warn!(
-        "[e1000e] LK-RX path: UC-marked rx_ring={} rx_buf={} tx_ring={} tx_buf={}; RX forced to clflush sync\n",
+        "[e1000e] LK-RX path: UC-marked rx_ring={} rx_buf={} tx_ring={} tx_buf={}; RX+TX forced to clflush sync\n",
         rx_ring_uc,
         rx_buf_uc,
-        tx_ring_coherent,
-        tx_buf_coherent
+        tx_ring_uc,
+        tx_buf_uc
     );
 
     // Alignment checks
