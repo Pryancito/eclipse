@@ -1457,12 +1457,24 @@ impl E1000eHw {
             // were dropped (no free descriptors or DMA ring not armed).
             let gprc = mmio_read(self.base, E1000E_GPRC);
             let mpc = mmio_read(self.base, E1000E_MPC);
+            // GPTC>0 means the MAC actually transmitted frames in this interval.
+            // If a download stalls with GPRC stuck but GPTC still climbing, the
+            // NIC is still sending our ACKs/window updates and the peer has gone
+            // silent (TCP window / server side); if GPTC also stalls and TDH ==
+            // TDT, our TX ring drained and we stopped queueing ACKs (TX side).
+            let gptc = mmio_read(self.base, E1000E_GPTC);
+            let tdh = mmio_read(self.base, E1000E_TDH);
+            let tdt = mmio_read(self.base, E1000E_TDT);
             crate::klog_info!(
-                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} itr={}\n",
+                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} GPTC={} tx_pkt={} TDH={} TDT={} itr={}\n",
                 link,
                 gprc,
                 mpc,
                 self.stats.rx_packets,
+                gptc,
+                self.stats.tx_packets,
+                tdh,
+                tdt,
                 self.itr_setting
             );
         }
