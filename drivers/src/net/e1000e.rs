@@ -2168,3 +2168,205 @@ impl PciDriver for E1000eDriverPci {
         Ok(Device::Net(iface_arc))
     }
 }
+
+#[cfg(test)]
+mod rx_ring_tests {
+    //! Host bench for the e1000e RX descriptor-ring state machine.
+    //!
+    //! Drives the *real* `receive`/`process_rx_slot`/`recycle_rx_slot` against a
+    //! simulated NIC: host memory stands in for the descriptor ring, the packet
+    //! buffers and the MMIO register file (RDH/RDT), with phys==virt identity
+    //! mapping. We play the hardware (fill descriptors, advance RDH) and assert
+    //! the driver hands every frame back intact, recycles slots, advances RDT,
+    //! and keeps working across a full-ring fill and ring wrap-around — the
+    //! conditions a large download exercises and where a wedge would hide.
+
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use std::alloc::{alloc_zeroed, Layout};
+
+    // --- mock kernel hooks: identity-mapped host memory, no-op the rest ---
+    #[no_mangle]
+    extern "C" fn drivers_dma_alloc(pages: usize) -> usize {
+        let layout = Layout::from_size_align(pages * 4096, 4096).unwrap();
+        unsafe { alloc_zeroed(layout) as usize }
+    }
+    #[no_mangle]
+    extern "C" fn drivers_dma_dealloc(_p: usize, _pages: usize) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn drivers_phys_to_virt(p: usize) -> usize { p }
+    #[no_mangle]
+    extern "C" fn drivers_virt_to_phys(v: usize) -> usize { v }
+    #[no_mangle]
+    extern "C" fn drivers_dma_mark_uncached(_p: usize, _pages: usize) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn drivers_dma_verify_uncached(_p: usize, _pages: usize) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn drivers_timer_now_as_micros() -> u64 { 0 }
+    #[no_mangle]
+    extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
+    #[no_mangle]
+    extern "C" fn drivers_intr_on() {}
+    #[no_mangle]
+    extern "C" fn drivers_intr_off() {}
+    #[no_mangle]
+    extern "C" fn drivers_intr_get() -> bool { false }
+    #[no_mangle]
+    extern "C" fn drivers_wake_net_rx_waiters() {}
+    #[no_mangle]
+    extern "C" fn drivers_net_drain() {}
+
+    fn reg_read(base: usize, reg: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+    }
+    fn reg_write(base: usize, reg: usize, val: u32) {
+        unsafe { core::ptr::write_volatile((base + reg * 4) as *mut u32, val) };
+    }
+
+    /// Build an `E1000eHw` over host memory, with the RX ring initialized exactly
+    /// like `init_rx` (each descriptor points at its buffer, RDH=0, RDT=NUM_RX-1).
+    fn make_hw() -> E1000eHw {
+        let regs = Box::leak(vec![0u32; 0x4000].into_boxed_slice());
+        let base = regs.as_ptr() as usize;
+        let rx_ring = DmaRegion::alloc(NUM_RX * core::mem::size_of::<RxDesc>()).unwrap();
+        let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).unwrap();
+        let tx_ring = DmaRegion::alloc(NUM_TX * core::mem::size_of::<TxDesc>()).unwrap();
+        let tx_buf_pool = DmaRegion::alloc(NUM_TX * BUF_SIZE).unwrap();
+
+        let mut hw = E1000eHw {
+            base,
+            pci_loc: Location { bus: 0, device: 0, function: 0 },
+            device_id: 0x10d3,
+            mac: [0x52, 0x54, 0, 0, 0, 1],
+            rx_ring,
+            rx_buf_pool,
+            rx_ring_coherent: false,
+            rx_buf_coherent: false,
+            rx_next_to_clean: 0,
+            rx_pending: None,
+            tx_ring,
+            tx_buf_pool,
+            tx_ring_coherent: false,
+            tx_buf_coherent: false,
+            tx_tail: 0,
+            stats: NetStats::default(),
+            link_up: true,
+            link_watchdog_next_us: 0,
+            watchdog_log_next_us: 0,
+            itr_setting: 0,
+            itr_last_rx_packets: 0,
+            itr_tune_next_us: 0,
+        };
+        // Initialize the descriptor ring (mirror of init_rx).
+        let ring = hw.rx_ring.as_ptr::<RxDesc>();
+        for i in 0..NUM_RX {
+            unsafe {
+                let d = &mut *ring.add(i);
+                d.addr = hw.rx_buf_paddr(i);
+                d.len = 0;
+                d.chksum = 0;
+                d.status = 0;
+                d.errors = 0;
+                d.vlan = 0;
+            }
+        }
+        reg_write(base, E1000E_RDH, 0);
+        reg_write(base, E1000E_RDT, (NUM_RX - 1) as u32);
+        hw
+    }
+
+    /// Play the hardware: DMA `data` into slot `slot`, mark it DD|EOP, advance RDH.
+    fn hw_deliver(hw: &E1000eHw, slot: usize, data: &[u8]) {
+        assert!(data.len() <= BUF_SIZE);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                hw.rx_buf_vaddr(slot) as *mut u8,
+                data.len(),
+            );
+            let d = &mut *hw.rx_ring.as_ptr::<RxDesc>().add(slot);
+            d.addr = hw.rx_buf_paddr(slot);
+            d.len = data.len() as u16;
+            d.status = RXD_STAT_DD | RXD_STAT_EOP;
+            d.errors = 0;
+        }
+        // HW head now points one past the slot it just filled.
+        reg_write(hw.base, E1000E_RDH, ((slot + 1) % NUM_RX) as u32);
+    }
+
+    fn pkt(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8).wrapping_mul(31)).collect()
+    }
+
+    #[test]
+    fn rx_single_packet_roundtrips() {
+        let mut hw = make_hw();
+        let p = pkt(7, 512);
+        hw_deliver(&hw, 0, &p);
+        let got = hw.receive().expect("expected a frame");
+        assert_eq!(got, p, "frame payload mismatch");
+        assert_eq!(hw.stats.rx_packets, 1);
+        // The consumed slot was recycled and handed back to HW via RDT.
+        assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 0, "RDT should point at recycled slot 0");
+    }
+
+    #[test]
+    fn rx_burst_in_order() {
+        let mut hw = make_hw();
+        let n = 200usize;
+        for i in 0..n {
+            hw_deliver(&hw, i, &pkt(i as u8, 64 + i % 900));
+        }
+        for i in 0..n {
+            let got = hw.receive().unwrap_or_else(|| panic!("missing frame {}", i));
+            assert_eq!(got, pkt(i as u8, 64 + i % 900), "frame {i} mismatch");
+        }
+        assert!(hw.receive().is_none(), "no more frames expected");
+        assert_eq!(hw.stats.rx_packets, n as u64);
+    }
+
+    #[test]
+    fn rx_full_ring_then_recover() {
+        let mut hw = make_hw();
+        // Fill every usable slot (HW leaves one guard between RDH and RDT).
+        let fill = NUM_RX - 1;
+        for i in 0..fill {
+            hw_deliver(&hw, i, &pkt(i as u8, 128));
+        }
+        let mut drained = 0;
+        while let Some(got) = hw.receive() {
+            assert_eq!(got, pkt(drained as u8, 128), "frame {drained} mismatch");
+            drained += 1;
+        }
+        assert_eq!(drained, fill, "should drain the whole ring");
+        // After draining, RDT must have advanced so HW can use slots again:
+        // deliver one more past the wrap and confirm it is received.
+        let next = fill % NUM_RX;
+        hw_deliver(&hw, next, &pkt(0xAB, 256));
+        let got = hw.receive().expect("ring did not recover after full drain");
+        assert_eq!(got, pkt(0xAB, 256));
+    }
+
+    #[test]
+    fn rx_wraps_around_ring() {
+        let mut hw = make_hw();
+        // Push well over NUM_RX packets, draining as we go, to wrap rx_next_to_clean.
+        let total = NUM_RX * 3 + 17;
+        let mut produced = 0usize;
+        let mut consumed = 0usize;
+        while consumed < total {
+            // keep the ring partly filled
+            while produced < total && (produced - consumed) < NUM_RX - 1 {
+                hw_deliver(&hw, produced % NUM_RX, &pkt(produced as u8, 100));
+                produced += 1;
+            }
+            while let Some(got) = hw.receive() {
+                assert_eq!(got, pkt(consumed as u8, 100), "wrap frame {consumed} mismatch");
+                consumed += 1;
+            }
+        }
+        assert_eq!(consumed, total);
+        assert_eq!(hw.stats.rx_packets, total as u64);
+    }
+}
