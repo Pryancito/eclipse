@@ -69,6 +69,11 @@ const CMD_CR: u32 = 1 << 15;
 
 const ATA_DEV_BUSY: u8 = 0x80;
 const ATA_DEV_DRQ: u8 = 0x08;
+// PxTFD status byte ERR bit. After a command completes, a device that failed
+// leaves ERR set in the task-file status even in the (rare) case the latched
+// PxIS.TFES interrupt bit was not observed. LK checks this directly; we add it
+// as a belt-and-suspenders completion check alongside the PxIS error mask.
+const ATA_DEV_ERR: u8 = 0x01;
 
 const HBA_SIG_ATA: u32 = 0x0000_0101;
 const FIS_TYPE_REG_H2D: u8 = 0x27;
@@ -410,13 +415,16 @@ impl AhciPort {
         }
 
         let is_now = self.read_reg(PORT_IS);
-        if is_now & PXIS_ERR_MASK != 0 {
+        let tfd_err = self.read_reg(PORT_TFD) & ATA_DEV_ERR as u32 != 0;
+        if is_now & PXIS_ERR_MASK != 0 || tfd_err {
             let tfd = self.read_reg(PORT_TFD);
             let ssts = self.read_reg(PORT_SSTS);
             let serr = self.read_reg(PORT_SERR);
             let ci = self.read_reg(PORT_CI);
             let kind = if is_now & PXIS_TFES != 0 {
                 "task file error"
+            } else if tfd_err {
+                "task-file ERR (TFD.ERR set, no PxIS latch)"
             } else {
                 "host-bus/interface error"
             };
