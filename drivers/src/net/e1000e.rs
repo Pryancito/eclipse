@@ -2582,4 +2582,86 @@ mod coherency_bench {
         let r = run(false, 100_000);
         assert!(r.is_err(), "WB rings should reproduce the wedge but passed");
     }
+
+    /// Batch recycle on *write-back* rings: defer recycling until a whole cache
+    /// line's PL descriptors are all consumed, then write+flush the line once.
+    /// By then the NIC has moved past that line (it fills sequentially and the
+    /// line was not returned via RDT yet, so it cannot wrap back), so the
+    /// write-back can never clobber a DD the NIC is still setting. This makes
+    /// write-back rings safe WITHOUT relying on an uncached remap that may not
+    /// take effect on real hardware.
+    fn run_batch(total: u32) -> Result<(), String> {
+        let mut m = Model {
+            ram: vec![D::default(); N],
+            cache: BTreeMap::new(),
+            uc: false,
+            rdh: 0,
+        };
+        let mut next = 0usize;
+        let mut rdt = N - 1;
+        let mut produced = 0u32;
+        let mut received = 0u32;
+        let nic_can_fill = |rdh: usize, rdt: usize| (rdh + 1) % N != rdt;
+        let mut guard = 0u64;
+        while received < total {
+            guard += 1;
+            if guard > total as u64 * 100 + 1_000_000 {
+                return Err(format!(
+                    "livelock: received {} of {} (next={}, rdh={})",
+                    received, total, next, m.rdh
+                ));
+            }
+            while produced < total && nic_can_fill(m.rdh, rdt) && (m.rdh + N - next) % N < 2 {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+            if next == m.rdh {
+                if produced >= total {
+                    break;
+                }
+                continue;
+            }
+            m.clflush_inval(next);
+            let d = m.read(next);
+            if produced < total && nic_can_fill(m.rdh, rdt) {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+            if !d.dd {
+                return Err(format!(
+                    "RX WEDGED (batch) at slot {} after {} of {} packets",
+                    next, received, total
+                ));
+            }
+            if d.seq != received {
+                return Err(format!(
+                    "corruption (batch) at slot {}: got seq {}, expected {}",
+                    next, d.seq, received
+                ));
+            }
+            received += 1;
+            // Recycle the whole cache line only once its last descriptor is done.
+            if next % PL == PL - 1 {
+                let l0 = next - (PL - 1);
+                for s in l0..=next {
+                    m.write(s, D { dd: false, seq: 0 });
+                }
+                m.clflush_wb(next);
+                rdt = next;
+            }
+            next = (next + 1) % N;
+        }
+        if received != total {
+            return Err(format!("incomplete: {} of {}", received, total));
+        }
+        Ok(())
+    }
+
+    /// The write-back-safe fix: cache-line batch recycle delivers the whole
+    /// >100 MB stream with no wedge, even though the rings are write-back and
+    /// the NIC DMAs concurrently. This does not depend on an uncached remap.
+    #[test]
+    fn batch_recycle_survives_large_download_on_writeback_rings() {
+        run_batch(100_000).expect("batch recycle must not wedge on write-back rings");
+    }
 }
