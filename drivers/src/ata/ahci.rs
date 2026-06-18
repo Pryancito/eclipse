@@ -154,9 +154,14 @@ const CMD_TIMEOUT_US: u64 = 10_000_000;
 // failure, and exec_cmd's own timeout bounds each attempt, so this only adds a
 // recovery path: a *single* transient SATA hiccup over the ~2000 commands a
 // 130 MiB file needs no longer aborts the whole operation with EIO.
-const RW_RETRIES: u32 = 4;
-// Settle time after a port reset before re-issuing the command.
+const RW_RETRIES: u32 = 8;
+// Base settle time after a port reset before re-issuing the command. The actual
+// wait grows exponentially per attempt (see rw_block) so a link that needs more
+// than a few ms to recover from a sustained-throughput hiccup still gets there
+// without burning the whole budget on the first retry.
 const RW_RETRY_SETTLE_US: u64 = 50_000;
+// Cap for the exponential retry backoff.
+const RW_RETRY_SETTLE_MAX_US: u64 = 1_000_000;
 // Shorter timeout for ATA IDENTIFY during init — 5 seconds is enough.
 const IDENTIFY_TIMEOUT_US: u64 = 5_000_000;
 // Timeout for port TFD-busy before issuing a command: 2 seconds.
@@ -541,7 +546,12 @@ impl AhciPort {
             // command table and re-issue. Re-issuing the same LBA/buffer is
             // idempotent, and exec_cmd's own timeout+reset bounds each attempt
             // so a buggy device can never wedge us here.
-            udelay(RW_RETRY_SETTLE_US);
+            // Exponential backoff: 50ms, 100ms, 200ms, ... capped. A single
+            // hiccup recovers on the first short wait; a link that is genuinely
+            // struggling under load gets progressively more time to settle.
+            let settle = (RW_RETRY_SETTLE_US << (attempt - 2).min(20))
+                .min(RW_RETRY_SETTLE_MAX_US);
+            udelay(settle);
             if !wait_until(TFD_TIMEOUT_US, || {
                 self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
             }) {
