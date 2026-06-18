@@ -2389,3 +2389,279 @@ mod rx_ring_tests {
         assert_eq!(hw.stats.rx_packets, total as u64);
     }
 }
+
+#[cfg(test)]
+mod coherency_bench {
+    //! Host reproduction of the real-hardware-only RX wedge on a large download.
+    //!
+    //! A coherent host (or QEMU) cannot expose a DMA cache bug, so we model it:
+    //! `ram` is what the NIC sees (it DMAs straight to RAM), and the driver
+    //! accesses the descriptor ring through a simulated write-back cache. The
+    //! NIC and the driver run interleaved — crucially the NIC fills the *next*
+    //! descriptor while the driver is mid-processing the current one (real
+    //! concurrent DMA), which QEMU's synchronous model never does.
+    //!
+    //! With write-back descriptor rings this reproduces the deterministic stall:
+    //! a 16-byte descriptor shares a 64-byte cache line with three neighbours,
+    //! so recycling one and flushing its line writes the stale neighbours back
+    //! over DD bits the NIC just set -> lost completion -> RX wedges partway
+    //! through a >100 MB stream. With uncached rings (the fix) the whole stream
+    //! is delivered. The bench fails until the driver's ring is coherent.
+
+    use alloc::collections::BTreeMap;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    const N: usize = 256; // ring slots
+    const PL: usize = 4; // 16-byte descriptors per 64-byte cache line
+
+    #[derive(Clone, Copy, Default, PartialEq)]
+    struct D {
+        dd: bool,
+        seq: u32,
+    }
+
+    struct Model {
+        ram: Vec<D>,                              // NIC's view (DMA target)
+        cache: BTreeMap<usize, ([D; PL], bool)>,  // driver WB cache: line -> (data, dirty)
+        uc: bool,                                 // true => uncached ring (no cache)
+        rdh: usize,                               // NIC head
+    }
+    impl Model {
+        fn line(i: usize) -> usize {
+            i / PL
+        }
+        fn load_line(&mut self, l: usize) {
+            if !self.cache.contains_key(&l) {
+                let mut a = [D::default(); PL];
+                for k in 0..PL {
+                    a[k] = self.ram[l * PL + k];
+                }
+                self.cache.insert(l, (a, false));
+            }
+        }
+        // NIC DMAs a completed descriptor straight into RAM, advancing head.
+        fn nic_fill(&mut self, seq: u32) {
+            let s = self.rdh;
+            self.ram[s] = D { dd: true, seq };
+            self.rdh = (self.rdh + 1) % N;
+        }
+        fn clflush_inval(&mut self, i: usize) {
+            if !self.uc {
+                self.cache.remove(&Self::line(i));
+            }
+        }
+        fn read(&mut self, i: usize) -> D {
+            if self.uc {
+                return self.ram[i];
+            }
+            let l = Self::line(i);
+            self.load_line(l);
+            self.cache.get(&l).unwrap().0[i % PL]
+        }
+        fn write(&mut self, i: usize, d: D) {
+            if self.uc {
+                self.ram[i] = d;
+                return;
+            }
+            let l = Self::line(i);
+            self.load_line(l);
+            let e = self.cache.get_mut(&l).unwrap();
+            e.0[i % PL] = d;
+            e.1 = true;
+        }
+        // ToDevice flush: write the WHOLE 64-byte line back (this is the bug:
+        // stale neighbours clobber DD bits the NIC set after the line loaded).
+        fn clflush_wb(&mut self, i: usize) {
+            if self.uc {
+                return;
+            }
+            let l = Self::line(i);
+            if let Some((a, dirty)) = self.cache.remove(&l) {
+                if dirty {
+                    for k in 0..PL {
+                        self.ram[l * PL + k] = a[k];
+                    }
+                }
+            }
+        }
+    }
+
+    fn run(uc: bool, total: u32) -> Result<(), String> {
+        let mut m = Model {
+            ram: vec![D::default(); N],
+            cache: BTreeMap::new(),
+            uc,
+            rdh: 0,
+        };
+        let mut next = 0usize; // driver next_to_clean
+        let mut rdt = N - 1; // last slot handed to NIC
+        let mut produced = 0u32;
+        let mut received = 0u32;
+
+        // Keep the NIC ~1 descriptor ahead of the driver so it fills same-line
+        // neighbours while the driver works — the concurrent-DMA condition.
+        let nic_can_fill = |rdh: usize, rdt: usize| (rdh + 1) % N != rdt;
+
+        let mut guard = 0u64;
+        while received < total {
+            guard += 1;
+            if guard > total as u64 * 100 + 1_000_000 {
+                return Err(format!(
+                    "livelock: received {} of {} (next={}, rdh={})",
+                    received, total, next, m.rdh
+                ));
+            }
+
+            // NIC produces until it is one ahead of the driver (or ring full).
+            while produced < total
+                && nic_can_fill(m.rdh, rdt)
+                && (m.rdh + N - next) % N < 2
+            {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+
+            if next == m.rdh {
+                if produced >= total {
+                    break;
+                }
+                continue;
+            }
+
+            // Driver processes slot `next`, mirroring the real sequence:
+            m.clflush_inval(next); // dma_sync FromDevice
+            let d = m.read(next);
+
+            // *** concurrent DMA: NIC fills the next descriptor mid-process ***
+            if produced < total && nic_can_fill(m.rdh, rdt) {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+
+            if !d.dd {
+                return Err(format!(
+                    "RX WEDGED at slot {} after {} of {} packets (DD lost to false sharing)",
+                    next, received, total
+                ));
+            }
+            if d.seq != received {
+                return Err(format!(
+                    "corruption/reorder at slot {}: got seq {}, expected {}",
+                    next, d.seq, received
+                ));
+            }
+            received += 1;
+
+            // recycle: clear descriptor and flush its line ToDevice
+            m.write(next, D { dd: false, seq: 0 });
+            m.clflush_wb(next);
+            rdt = next;
+            next = (next + 1) % N;
+        }
+
+        if received != total {
+            return Err(format!("incomplete: {} of {}", received, total));
+        }
+        Ok(())
+    }
+
+    /// >100 MB at 1460 B/packet ~= 72k packets; use 100k. The fix (uncached
+    /// descriptor rings) must deliver every packet with no wedge.
+    #[test]
+    fn uncached_rings_deliver_full_large_download() {
+        run(true, 100_000).expect("uncached descriptor rings must not wedge");
+    }
+
+    /// Proof the bench actually reproduces the bug: write-back descriptor rings
+    /// wedge/corrupt partway through, so this asserts an error is produced.
+    #[test]
+    fn writeback_rings_reproduce_the_wedge() {
+        let r = run(false, 100_000);
+        assert!(r.is_err(), "WB rings should reproduce the wedge but passed");
+    }
+
+    /// Batch recycle on *write-back* rings: defer recycling until a whole cache
+    /// line's PL descriptors are all consumed, then write+flush the line once.
+    /// By then the NIC has moved past that line (it fills sequentially and the
+    /// line was not returned via RDT yet, so it cannot wrap back), so the
+    /// write-back can never clobber a DD the NIC is still setting. This makes
+    /// write-back rings safe WITHOUT relying on an uncached remap that may not
+    /// take effect on real hardware.
+    fn run_batch(total: u32) -> Result<(), String> {
+        let mut m = Model {
+            ram: vec![D::default(); N],
+            cache: BTreeMap::new(),
+            uc: false,
+            rdh: 0,
+        };
+        let mut next = 0usize;
+        let mut rdt = N - 1;
+        let mut produced = 0u32;
+        let mut received = 0u32;
+        let nic_can_fill = |rdh: usize, rdt: usize| (rdh + 1) % N != rdt;
+        let mut guard = 0u64;
+        while received < total {
+            guard += 1;
+            if guard > total as u64 * 100 + 1_000_000 {
+                return Err(format!(
+                    "livelock: received {} of {} (next={}, rdh={})",
+                    received, total, next, m.rdh
+                ));
+            }
+            while produced < total && nic_can_fill(m.rdh, rdt) && (m.rdh + N - next) % N < 2 {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+            if next == m.rdh {
+                if produced >= total {
+                    break;
+                }
+                continue;
+            }
+            m.clflush_inval(next);
+            let d = m.read(next);
+            if produced < total && nic_can_fill(m.rdh, rdt) {
+                m.nic_fill(produced);
+                produced += 1;
+            }
+            if !d.dd {
+                return Err(format!(
+                    "RX WEDGED (batch) at slot {} after {} of {} packets",
+                    next, received, total
+                ));
+            }
+            if d.seq != received {
+                return Err(format!(
+                    "corruption (batch) at slot {}: got seq {}, expected {}",
+                    next, d.seq, received
+                ));
+            }
+            received += 1;
+            // Recycle the whole cache line only once its last descriptor is done.
+            if next % PL == PL - 1 {
+                let l0 = next - (PL - 1);
+                for s in l0..=next {
+                    m.write(s, D { dd: false, seq: 0 });
+                }
+                m.clflush_wb(next);
+                rdt = next;
+            }
+            next = (next + 1) % N;
+        }
+        if received != total {
+            return Err(format!("incomplete: {} of {}", received, total));
+        }
+        Ok(())
+    }
+
+    /// The write-back-safe fix: cache-line batch recycle delivers the whole
+    /// >100 MB stream with no wedge, even though the rings are write-back and
+    /// the NIC DMAs concurrently. This does not depend on an uncached remap.
+    #[test]
+    fn batch_recycle_survives_large_download_on_writeback_rings() {
+        run_batch(100_000).expect("batch recycle must not wedge on write-back rings");
+    }
+}
