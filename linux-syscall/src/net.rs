@@ -9,6 +9,46 @@ use linux_object::{
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
 
+/// Read a `sockaddr` from user space, honoring the user-supplied `addrlen`.
+///
+/// `SockAddr` is a union whose alignment (4, coming from the `u32` fields of
+/// the IP/netlink variants) is stricter than a C `struct sockaddr_un` (only
+/// 2-byte aligned), and whose size (~110 B) is larger than most concrete
+/// address structs. Reading it directly with `UserInPtr::<SockAddr>::read()`
+/// therefore had two bugs:
+///   (a) it rejected perfectly valid 2-byte-aligned `sockaddr_un` pointers with
+///       `EFAULT` (the alignment `check()` requires 4-byte alignment) — this is
+///       exactly why connecting to the X11 unix socket failed with
+///       "unable to connect to X server: Bad address"; and
+///   (b) it always read the full union size regardless of `addrlen`, over-
+///       reading past a short user buffer that sits near the end of a mapping.
+///
+/// Copy exactly `addrlen` bytes (capped at the union size) byte-wise (alignment
+/// 1) into a zeroed buffer instead, matching Linux `move_addr_to_kernel`
+/// semantics.
+#[allow(unsafe_code)]
+fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
+    if addr == 0 {
+        return Err(LxError::EFAULT);
+    }
+    let n = addrlen.min(size_of::<SockAddr>());
+    // Zeroed so any address bytes the user did not supply (`addrlen` shorter
+    // than the concrete struct) read back as zero, as Linux does.
+    let mut storage: SockAddr = unsafe { core::mem::zeroed() };
+    if n > 0 {
+        let bytes: UserInPtr<u8> = addr.into();
+        let src = bytes.read_array(n)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                &mut storage as *mut SockAddr as *mut u8,
+                n,
+            );
+        }
+    }
+    Ok(storage)
+}
+
 impl Syscall<'_> {
     /// creates an endpoint for communication and returns a file descriptor that refers to that endpoint.
     pub fn sys_socket(&mut self, domain: usize, _type: usize, protocol: usize) -> SysResult {
@@ -120,7 +160,7 @@ impl Syscall<'_> {
             "sys_connect: sockfd:{}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
-        let endpoint = sockaddr_to_endpoint(addr.read()?, addrlen)?;
+        let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(sockfd.into())?;
 
@@ -286,7 +326,8 @@ impl Syscall<'_> {
         let endpoint = if dest_addr.is_null() {
             None
         } else {
-            let endpoint = sockaddr_to_endpoint(dest_addr.read()?, addrlen)?;
+            let endpoint =
+                sockaddr_to_endpoint(read_sockaddr(dest_addr.as_addr(), addrlen)?, addrlen)?;
             info!("sys_sendto: sockfd:{:?}, endpoint:{:?}", sockfd, endpoint);
             Some(endpoint)
         };
@@ -371,7 +412,9 @@ impl Syscall<'_> {
         let data = iovs.read_to_vec()?;
 
         let endpoint = if !hdr.msg_name.is_null() {
-            let endpoint = sockaddr_to_endpoint(hdr.msg_name.read()?, hdr.msg_namelen as usize)?;
+            let namelen = hdr.msg_namelen as usize;
+            let endpoint =
+                sockaddr_to_endpoint(read_sockaddr(hdr.msg_name.as_addr(), namelen)?, namelen)?;
             Some(endpoint)
         } else {
             None
@@ -441,7 +484,7 @@ impl Syscall<'_> {
             "sys_bind: sockfd:{:?}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
-        let endpoint = sockaddr_to_endpoint(addr.read()?, addrlen)?;
+        let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
 
         let proc = self.linux_process();
