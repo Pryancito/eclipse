@@ -48,6 +48,18 @@ const PORT_SCTL: usize = 0x2C;
 const PORT_SERR: usize = 0x30;
 const PORT_CI: usize = 0x38;
 
+// PxIS fatal/error bits that mean the command did not transfer data correctly,
+// mirroring what Linux's libata treats as errors requiring a port reset:
+//   bit 30 TFES — Task File Error Status (device reported an error in the FIS)
+//   bit 29 HBFS — Host Bus Fatal Error (split/transaction error on the bus)
+//   bit 28 HBDS — Host Bus Data Error  (DMA data transfer error)
+//   bit 27 IFS  — Interface Fatal Error (SATA link/transport fatal error)
+// The old code only checked TFES, so a host-bus / interface data error on a
+// large multi-command transfer could complete with CI cleared and slip through
+// as a silent success. Catch all four.
+const PXIS_TFES: u32 = 1 << 30;
+const PXIS_ERR_MASK: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27);
+
 const CMD_ST: u32 = 1 << 0;
 const CMD_SUD: u32 = 1 << 1;
 const CMD_POD: u32 = 1 << 2;
@@ -375,7 +387,9 @@ impl AhciPort {
         self.write_reg(PORT_CI, 1 << slot);
 
         if !wait_until(timeout_us, || {
-            if self.read_reg(PORT_IS) & (1 << 30) != 0 {
+            // Stop early on any fatal error bit, not just TFES, so an interface
+            // or host-bus data error doesn't burn the whole timeout.
+            if self.read_reg(PORT_IS) & PXIS_ERR_MASK != 0 {
                 return true;
             }
             self.read_reg(PORT_CI) & (1 << slot) == 0
@@ -395,15 +409,20 @@ impl AhciPort {
             return Err(DeviceError::IoError);
         }
 
-        if self.read_reg(PORT_IS) & (1 << 30) != 0 {
+        let is_now = self.read_reg(PORT_IS);
+        if is_now & PXIS_ERR_MASK != 0 {
             let tfd = self.read_reg(PORT_TFD);
             let ssts = self.read_reg(PORT_SSTS);
             let serr = self.read_reg(PORT_SERR);
-            let is = self.read_reg(PORT_IS);
             let ci = self.read_reg(PORT_CI);
+            let kind = if is_now & PXIS_TFES != 0 {
+                "task file error"
+            } else {
+                "host-bus/interface error"
+            };
             crate::klog_err!(
-                "[AHCI] port {} task file error, TFD={:#x}, SSTS={:#x}, SERR={:#x}, IS={:#x}, CI={:#x}",
-                self.port_idx, tfd, ssts, serr, is, ci
+                "[AHCI] port {} {}, TFD={:#x}, SSTS={:#x}, SERR={:#x}, IS={:#x}, CI={:#x}",
+                self.port_idx, kind, tfd, ssts, serr, is_now, ci
             );
             self.reset_port();
             return Err(DeviceError::IoError);
@@ -539,6 +558,30 @@ impl AhciPort {
                 lba,
             );
             res = self.exec_cmd(slot);
+        }
+        // Verify the byte count the HBA actually transferred (CommandHeader
+        // PRDBC), like libata does. A command can clear CI with no error bit yet
+        // move fewer bytes than requested — a silent short transfer that would
+        // otherwise corrupt a large file with no log at all. Only treat a
+        // *non-zero* shortfall as a fault: some controllers/emulators leave
+        // PRDBC at 0 instead of populating it, and we must not fail every write
+        // on those (the no-error CI-clear is then authoritative).
+        if res.is_ok() {
+            let prdbc = unsafe {
+                clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+                (*(self.cl_virt as *const CommandHeader)).prdbc as usize
+            };
+            if prdbc != 0 && prdbc < buf_len {
+                crate::klog_err!(
+                    "[AHCI] port {} short {} transfer at lba {:#x}: PRDBC={} of {} bytes",
+                    self.port_idx,
+                    if write { "write" } else { "read" },
+                    lba,
+                    prdbc,
+                    buf_len,
+                );
+                res = Err(DeviceError::IoError);
+            }
         }
         if res.is_ok() && !write {
             for &(phys, len) in prds {
