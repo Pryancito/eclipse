@@ -343,3 +343,83 @@ fn small_writes_periodic_fsync() {
     fs.sync().unwrap();
     verify(&mut fs, f, LIBLLVM, 77);
 }
+
+/// Durability: extract the package, fsync, DROP the filesystem, then re-mount
+/// the same device and verify every byte survived. This is the crash-
+/// consistency path apk relies on (commit + superblock write-back); immediate-
+/// verify tests miss a broken commit because the data is still in the live
+/// trees. The sparse device keeps its pages across the remount.
+#[test]
+fn extract_sync_remount_persists() {
+    let dev = SparseDevice::new(238 * 1024 * 1024 * 1024);
+    mkfs::format(&*dev, &opts()).unwrap();
+
+    // Session 1: install a few small files and the huge one, then fsync + drop.
+    {
+        let arc: Arc<dyn BlockDevice> = dev.clone();
+        let mut fs = Btrfs::mount(arc, false).unwrap();
+        let root = fs.root_ino();
+        for i in 0..8u64 {
+            let f = fs.create(root, &format!("s{i}"), FileKind::Regular, 0o644, 0).unwrap();
+            fill(&mut fs, f, 256 * 1024, 500 + i, 64 * 1024);
+        }
+        let big = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0).unwrap();
+        fill(&mut fs, big, LIBLLVM, 88, 64 * 1024);
+        fs.sync().unwrap();
+        // fs dropped here — nothing else flushes.
+    }
+
+    // Session 2: fresh mount of the same bytes. Everything must be present.
+    {
+        let arc: Arc<dyn BlockDevice> = dev.clone();
+        let mut fs = Btrfs::mount(arc, false).unwrap();
+        let root = fs.root_ino();
+        for i in 0..8u64 {
+            let f = fs.lookup(root, &format!("s{i}")).unwrap();
+            verify(&mut fs, f, 256 * 1024, 500 + i);
+        }
+        let big = fs.lookup(root, "libLLVM.so.22.1").unwrap();
+        verify(&mut fs, big, LIBLLVM, 88);
+    }
+    assert_eq!(dev.oob.load(Ordering::Relaxed), 0, "out-of-bounds device access");
+}
+
+/// Repeated upgrades of the same large file (install, then upgrade several
+/// times), each via temp-file + rename, with the old version unlinked. Churns
+/// allocate/free of large extents so a leak or free-space-accounting drift
+/// surfaces; verifies the final content and that the fs still remounts clean.
+#[test]
+fn repeated_large_upgrades_churn() {
+    let dev = SparseDevice::new(238 * 1024 * 1024 * 1024);
+    mkfs::format(&*dev, &opts()).unwrap();
+    let arc: Arc<dyn BlockDevice> = dev.clone();
+    let mut fs = Btrfs::mount(arc, false).unwrap();
+    let root = fs.root_ino();
+
+    let mut salt = 1000u64;
+    // Initial install.
+    let f = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0).unwrap();
+    fill(&mut fs, f, LIBLLVM, salt, 64 * 1024);
+    fs.sync().unwrap();
+
+    // Five upgrade cycles: new temp, fill, rename over, sync.
+    for _ in 0..5 {
+        salt += 1;
+        let tmp = fs.create(root, "libLLVM.so.22.1.apk-new", FileKind::Regular, 0o644, 0).unwrap();
+        fill(&mut fs, tmp, LIBLLVM, salt, 64 * 1024);
+        fs.sync().unwrap();
+        fs.rename(root, "libLLVM.so.22.1.apk-new", root, "libLLVM.so.22.1").unwrap();
+        fs.sync().unwrap();
+    }
+    let cur = fs.lookup(root, "libLLVM.so.22.1").unwrap();
+    verify(&mut fs, cur, LIBLLVM, salt);
+    drop(fs);
+
+    // Remount: the churned filesystem is still consistent and keeps the latest.
+    let arc2: Arc<dyn BlockDevice> = dev.clone();
+    let mut fs2 = Btrfs::mount(arc2, false).unwrap();
+    let root2 = fs2.root_ino();
+    let cur2 = fs2.lookup(root2, "libLLVM.so.22.1").unwrap();
+    verify(&mut fs2, cur2, LIBLLVM, salt);
+    assert_eq!(dev.oob.load(Ordering::Relaxed), 0, "out-of-bounds device access");
+}
