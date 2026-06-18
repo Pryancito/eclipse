@@ -46,20 +46,48 @@ echo "[bench] QEMU terminó rc=$QEMU_RC"
 # 3. Parar mirror
 [ -f /tmp/mirror-httpd.pid ] && kill "$(cat /tmp/mirror-httpd.pid)" 2>/dev/null
 
-# 4. Resumen
+# 4. Resumen y veredicto
 echo "=================== RESUMEN BENCH ==================="
 EXPECTED=$(cat "$HERE/repo/x86_64/bigfile.sha256" 2>/dev/null | awk '{print $1}')
-grep -aE "BENCH_APK_RUN|BENCH_APK_FAILS|BENCH_BIGFILE_SHA|BENCH:|link UP|link DOWN|RX overrun|smoltcp poll" "$SERIAL" 2>/dev/null
+grep -aE "BENCH_APK_RUN|BENCH_APK_CORRUPT|BENCH_APK_NOIDX|BENCH_APK_FAILS|BENCH_WGET|BENCH_BIGFILE_SHA|link UP|link DOWN|RX overrun|smoltcp poll" "$SERIAL" 2>/dev/null
 echo "----------------------------------------------------"
+
 GOTSHA=$(grep -a "BENCH_BIGFILE_SHA=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_BIGFILE_SHA=//')
-FAILS=$(grep -a "BENCH_APK_FAILS=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_APK_FAILS=//')
-echo "apk update fails : ${FAILS:-<sin marcador>}"
+APK_FAILS=$(grep -a "BENCH_APK_FAILS=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_APK_FAILS=//' | cut -d/ -f1)
+APK_CORRUPT=$(grep -a "BENCH_APK_CORRUPT=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_APK_CORRUPT=//' | cut -d/ -f1)
+APK_NOIDX=$(grep -a "BENCH_APK_NOIDX=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_APK_NOIDX=//' | cut -d/ -f1)
+WGET_FAILS=$(grep -a "BENCH_WGET_FAILS=" "$SERIAL" 2>/dev/null | tail -1 | sed 's/.*BENCH_WGET_FAILS=//' | cut -d/ -f1)
+
+echo "apk update fails : ${APK_FAILS:-<sin marcador>}  (corrupt=${APK_CORRUPT:-?} noidx=${APK_NOIDX:-?})"
+echo "bigfile wget fails: ${WGET_FAILS:-<sin marcador>}"
 echo "bigfile sha got  : ${GOTSHA:-<sin marcador>}"
 echo "bigfile sha exp  : ${EXPECTED:-<desconocido>}"
+
+SHA_OK=0
 if [ -n "$GOTSHA" ] && [ "$GOTSHA" = "$EXPECTED" ]; then
   echo "bigfile integrity: OK"
+  SHA_OK=1
 else
   echo "bigfile integrity: MISMATCH/UNKNOWN"
 fi
+
 echo "serial log       : $SERIAL"
 echo "pcap             : $PCAP"
+echo "======================================================"
+
+# Veredicto: PASS only when apk signatures and bigfile transfer are clean.
+# Any CORRUPT or NOIDX → network/e1000e issue; any bigfile mismatch → same.
+# A clean bench with a subsequent Btrfs failure isolates the problem to storage.
+PASS=1
+[ "${APK_CORRUPT:-1}" != "0" ] && PASS=0
+[ "${APK_NOIDX:-1}"   != "0" ] && PASS=0
+[ "${WGET_FAILS:-1}"  != "0" ] && PASS=0
+[ "$SHA_OK" -eq 0 ] && PASS=0
+
+if [ "$PASS" -eq 1 ]; then
+  echo "BENCH RESULT: PASS — network/e1000e path sano"
+  exit 0
+else
+  echo "BENCH RESULT: FAIL — revisar e1000e/red (ver pcap: $PCAP)"
+  exit 1
+fi

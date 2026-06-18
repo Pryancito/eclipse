@@ -135,23 +135,16 @@ fn payload_byte(i: u64) -> u8 {
     (x >> 33) as u8
 }
 
-/// Write a single huge file in small chunks (mimicking apk/libarchive
-/// extraction) on a device that strictly rejects out-of-bounds I/O, then read
-/// it back and run `btrfs check`.
-fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
+/// Write a single huge file in configurable chunks on a strict device, read
+/// it back, and run `btrfs check`.  `chunk_size` mimics different extractor
+/// strategies (64 KiB for tar streaming, 4 KiB for libarchive/apk block I/O).
+fn run_huge_file_chunked(dev_size: u64, file_size: u64, grow_from: Option<u64>, chunk_size: usize) {
     let path = tmp("huge");
-    // If we simulate the installer, format a small image then present it on a
-    // larger device and grow; otherwise format the whole device.
     let dev = StrictDevice::create(&path, dev_size);
 
     if let Some(small) = grow_from {
-        // Format only within the first `small` bytes, then grow to dev_size.
         let small_dev = StrictDevice::create(&tmp("ignored"), small);
-        // Actually format directly on the big device but pretend it was small:
-        // mkfs writes a superblock sized to `small`. Simplest: format a small
-        // device file, copy it over the big one's head, then mount big.
         mkfs::format(&*small_dev, &opts()).unwrap();
-        // Copy the formatted head onto the big device.
         let head = {
             let mut b = vec![0u8; small as usize];
             small_dev.read_at(0, &mut b).unwrap();
@@ -173,12 +166,10 @@ fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
         .create(root, "libLLVM.so", FileKind::Regular, 0o755, 0)
         .unwrap();
 
-    // Write in 64 KiB chunks like an archive extractor.
-    let chunk = 64 * 1024usize;
-    let mut buf = vec![0u8; chunk];
+    let mut buf = vec![0u8; chunk_size];
     let mut off = 0u64;
     while off < file_size {
-        let n = (chunk as u64).min(file_size - off) as usize;
+        let n = (chunk_size as u64).min(file_size - off) as usize;
         for j in 0..n {
             buf[j] = payload_byte(off + j as u64);
         }
@@ -197,13 +188,12 @@ fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
     }
     fs.sync().unwrap();
 
-    // Read it back and verify.
     let st = fs.stat(file).unwrap();
     assert_eq!(st.size, file_size, "size mismatch");
-    let mut rbuf = vec![0u8; chunk];
+    let mut rbuf = vec![0u8; chunk_size];
     let mut off = 0u64;
     while off < file_size {
-        let want = (chunk as u64).min(file_size - off) as usize;
+        let want = (chunk_size as u64).min(file_size - off) as usize;
         let mut got = 0usize;
         while got < want {
             let n = fs.read(file, off + got as u64, &mut rbuf[got..want]).unwrap();
@@ -226,6 +216,13 @@ fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
     drop(fs);
     check(&path);
     fs::remove_file(&path).ok();
+}
+
+/// Write a single huge file in small chunks (mimicking apk/libarchive
+/// extraction) on a device that strictly rejects out-of-bounds I/O, then read
+/// it back and run `btrfs check`.
+fn run_huge_file(dev_size: u64, file_size: u64, grow_from: Option<u64>) {
+    run_huge_file_chunked(dev_size, file_size, grow_from, 64 * 1024);
 }
 
 /// 200 MiB file on a 1 GiB device formatted in place — crosses several 256 MiB
@@ -418,4 +415,28 @@ fn huge_file_sparse_writes() {
     drop(fs);
     check(&path);
     fs::remove_file(&path).ok();
+}
+
+/// Reproduces the "llvm22-lib local reinstall" diagnostic scenario (step 3 of
+/// the diagnostic plan): extract a ~130 MiB package (`libLLVM.so`) from a
+/// local cache — no network involved — using the exact 4 KiB block-by-block
+/// write pattern that `apk`/libarchive uses.
+///
+/// Passing this test means the failure is *not* a Btrfs geometry or allocation
+/// bug triggered by this specific write pattern.  If it fails, the panic message
+/// includes `oob_writes`/`oob_reads` counters and the exact failing offset,
+/// matching the `btrfs: write ino=... off=... len=...` log lines emitted by
+/// `linux-object/src/fs/btrfs_mount.rs` on the real kernel.
+///
+/// Interpretation (see tools/e1000e-bench/README.md):
+///   - PASS → run e1000e-bench first; if that also passes, failure is elsewhere
+///   - FAIL + oob_writes > 0 → OUT OF BOUNDS → geometry/allocation bug
+///   - FAIL + oob_writes = 0, oob_reads = 0 → EIO in Btrfs write path;
+///     check `btrfs: transfer shrunk...` logs for the failing offset
+#[test]
+fn llvm22_lib_local_reinstall() {
+    // libLLVM.so is ~130 MiB; use 132 MiB (clean multiple of 4 KiB).
+    // Device: 512 MiB — enough for the file plus btrfs metadata, little slack.
+    // Chunk: 4 KiB — the libarchive block size used by `apk fix`/`apk add`.
+    run_huge_file_chunked(512 * 1024 * 1024, 132 * 1024 * 1024, None, 4 * 1024);
 }
