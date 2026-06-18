@@ -424,3 +424,12 @@ fn huge_file_sparse_writes() {
     check(&path);
     fs::remove_file(&path).ok();
 }
+
+/// REPRO ATTEMPT: real-hardware geometry. A 238 GiB device (sparse file) like
+/// the actual rootfs, writing the ~130 MiB libLLVM.so. The first data chunk is
+/// only ~28 MiB (broken by the 64 MiB superblock mirror), so the write crosses
+/// into the second — *huge* — data chunk at ~21%, exactly where apk fails.
+#[test]
+fn repro_libllvm_real_geometry() {
+    run_huge_file("realgeom", 238 * 1024 * 1024 * 1024, 130 * 1024 * 1024, None);
+}
