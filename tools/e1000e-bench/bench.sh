@@ -59,23 +59,10 @@ i=1
 apk_ok=0; apk_fail=0
 wg_ok=0; wg_trunc=0; wg_corrupt=0; wg_hang=0
 while [ "$i" -le "$AN" ]; do
-  # ---- 1) apk fetch de paquetes grandes (firma verificada) ----
-  $B rm -rf /tmp/fetch; $B mkdir -p /tmp/fetch
-  if [ -x "$APK" ]; then
-    $B timeout 180 "$APK" fetch --no-cache -o /tmp/fetch $BIG_PKGS \
-       > /tmp/apk.log 2>&1
-    arc=$?
-    got=$($B ls /tmp/fetch/*.apk 2>/dev/null | $B wc -l)
-    want=$(echo $BIG_PKGS | $B wc -w)
-    if [ "$arc" = "0" ] && [ "$got" = "$want" ]; then
-      apk_ok=$((apk_ok+1)); echo "BENCH_APK $i OK pkgs=$got/$want"
-    else
-      apk_fail=$((apk_fail+1))
-      echo "BENCH_APK $i FAIL rc=$arc pkgs=$got/$want :: $($B tail -1 /tmp/apk.log 2>/dev/null)"
-    fi
-  fi
-
-  # ---- 2) wget crudo de bigfile.bin (tamaño + sha256) ----
+  # ---- 1) wget crudo de bigfile.bin: UN solo stream TCP grande, el análogo
+  #         fiel de la descarga de llvm22-libs que se atasca en hardware real.
+  #         Se hace PRIMERO para aislar el camino de transferencia larga del
+  #         comportamiento multi-conexión de apk. ----
   $B rm -f /tmp/big
   $B timeout 180 $B wget -q -O /tmp/big "$BIGURL"
   wrc=$?
@@ -91,7 +78,22 @@ while [ "$i" -le "$AN" ]; do
     wg_ok=$((wg_ok+1)); echo "BENCH_WGET $i OK size=$SZ"
   fi
 
-  echo "BENCH_PROGRESS $i/$AN apk_ok=$apk_ok apk_fail=$apk_fail wget_ok=$wg_ok"
+  # ---- 2) apk fetch de paquetes grandes (firma verificada, multi-conexión) ----
+  if [ -x "$APK" ] && [ -n "$BIG_PKGS" ]; then
+    $B rm -rf /tmp/fetch; $B mkdir -p /tmp/fetch
+    $B timeout 180 "$APK" fetch --no-cache -o /tmp/fetch $BIG_PKGS > /tmp/apk.log 2>&1
+    arc=$?
+    got=$($B ls /tmp/fetch/*.apk 2>/dev/null | $B wc -l)
+    want=$(echo $BIG_PKGS | $B wc -w)
+    if [ "$arc" = "0" ] && [ "$got" = "$want" ]; then
+      apk_ok=$((apk_ok+1)); echo "BENCH_APK $i OK pkgs=$got/$want"
+    else
+      apk_fail=$((apk_fail+1))
+      echo "BENCH_APK $i FAIL rc=$arc pkgs=$got/$want :: $($B tail -1 /tmp/apk.log 2>/dev/null)"
+    fi
+  fi
+
+  echo "BENCH_PROGRESS $i/$AN wget_ok=$wg_ok apk_ok=$apk_ok apk_fail=$apk_fail"
   i=$((i+1))
 done
 echo "BENCH_APK_SUMMARY ok=$apk_ok fail=$apk_fail total=$AN"
