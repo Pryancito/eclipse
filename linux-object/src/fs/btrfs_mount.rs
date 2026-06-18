@@ -6,6 +6,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryInto;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use btrfs::{Btrfs, Error as BtrfsError, FileKind};
 use lock::Mutex;
@@ -20,6 +21,12 @@ use super::block_mount::{device_from_backend, MountBackend};
 struct DevAdapter {
     inner: Arc<dyn rcore_fs::dev::Device>,
     size: u64,
+    /// Adaptive cap on a single backend transfer. Starts at `IO_CHUNK_BYTES`
+    /// and ratchets *down* (never up) the first time a larger transfer fails,
+    /// so a device/controller that can't sustain big DMA requests settles to a
+    /// working size instead of re-failing (and burning retries) on every chunk
+    /// of a large file. See `chunked`.
+    max_xfer: AtomicUsize,
 }
 
 /// How many times a single block transfer is retried before the error is
@@ -34,47 +41,78 @@ const IO_RETRIES: usize = 5;
 /// Cap one backend transfer to a moderate size so block drivers that reject
 /// very large requests don't fail a whole btrfs operation.
 const IO_CHUNK_BYTES: usize = 128 * 1024;
+/// Smallest transfer the shrink-on-error fallback drops to before giving up.
+/// Some controllers / DMA paths reject (or intermittently fail) a large
+/// request but accept smaller ones. The large requests only happen while
+/// streaming a big file's data, so without this fallback a single ~130 MiB
+/// package (`libLLVM.so`) fails extraction with EIO while every small package
+/// installs fine. Shrinking the failing transfer lets the big file complete
+/// (more, smaller commands) instead of aborting the whole operation.
+const IO_MIN_BYTES: usize = 512;
+
+impl DevAdapter {
+    /// Transfer `len` bytes in chunks via `op`. Each chunk is retried
+    /// `IO_RETRIES` times; if it still fails the chunk is halved (down to
+    /// `IO_MIN_BYTES`) and retried, so a size-sensitive device failure on a
+    /// large request degrades to slower-but-working smaller requests instead of
+    /// a hard EIO. `op(rel_off, this_len)` performs one transfer and returns
+    /// `true` on full success.
+    fn chunked<F: FnMut(usize, usize) -> bool>(
+        &self,
+        offset: u64,
+        len: usize,
+        what: &str,
+        mut op: F,
+    ) -> btrfs::Result<()> {
+        let mut done = 0usize;
+        while done < len {
+            let cap = self.max_xfer.load(Ordering::Relaxed).max(IO_MIN_BYTES);
+            let mut piece = (len - done).min(cap);
+            loop {
+                let mut ok = false;
+                for _ in 0..IO_RETRIES {
+                    if op(done, piece) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if ok {
+                    done += piece;
+                    break;
+                }
+                if piece > IO_MIN_BYTES {
+                    // Re-issuing the same offset/buffer is idempotent; try a
+                    // smaller, more conservative transfer. Remember the smaller
+                    // size so the rest of this (large) file uses it directly
+                    // instead of re-failing the big transfer on every chunk.
+                    piece = (piece / 2).max(IO_MIN_BYTES);
+                    self.max_xfer.fetch_min(piece, Ordering::Relaxed);
+                    warn!(
+                        "btrfs: {} transfer shrunk to {} after failure (off={:#x}, +{})",
+                        what, piece, offset, done,
+                    );
+                    continue;
+                }
+                warn!(
+                    "btrfs: {}(off={:#x}, len={}) failed at +{} even at {}-byte transfers, dev_size={:#x}",
+                    what, offset, len, done, IO_MIN_BYTES, self.size,
+                );
+                return Err(BtrfsError::Io);
+            }
+        }
+        Ok(())
+    }
+}
 
 impl btrfs::BlockDevice for DevAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let take = (buf.len() - done).min(IO_CHUNK_BYTES);
-            let mut chunk_done = 0usize;
-            let mut completed = false;
-            for attempt in 0..IO_RETRIES {
-                match self.inner.read_at(
-                    offset as usize + done + chunk_done,
-                    &mut buf[done + chunk_done..done + take],
-                ) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        chunk_done += n.min(take - chunk_done);
-                        if chunk_done == take {
-                            completed = true;
-                            break;
-                        }
-                    }
-                    Err(_) => {}
-                }
-                if attempt + 1 == IO_RETRIES {
-                    warn!(
-                        "btrfs: read_at(off={:#x}, len={}, done={}, chunk_done={}) failed after {} attempts, dev_size={:#x}",
-                        offset,
-                        buf.len(),
-                        done,
-                        chunk_done,
-                        IO_RETRIES,
-                        self.size,
-                    );
-                }
-            }
-            if !completed {
-                return Err(BtrfsError::Io);
-            }
-            done += take;
-        }
-        Ok(())
+        let len = buf.len();
+        self.chunked(offset, len, "read_at", |rel, n| {
+            matches!(
+                self.inner.read_at(offset as usize + rel, &mut buf[rel..rel + n]),
+                Ok(got) if got == n
+            )
+        })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
@@ -91,44 +129,13 @@ impl btrfs::BlockDevice for DevAdapter {
                 self.size,
             );
         }
-        let mut done = 0usize;
-        while done < buf.len() {
-            let take = (buf.len() - done).min(IO_CHUNK_BYTES);
-            let mut chunk_done = 0usize;
-            let mut completed = false;
-            for attempt in 0..IO_RETRIES {
-                match self
-                    .inner
-                    .write_at(offset as usize + done + chunk_done, &buf[done + chunk_done..done + take])
-                {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        chunk_done += n.min(take - chunk_done);
-                        if chunk_done == take {
-                            completed = true;
-                            break;
-                        }
-                    }
-                    Err(_) => {}
-                }
-                if attempt + 1 == IO_RETRIES {
-                    warn!(
-                        "btrfs: write_at(off={:#x}, len={}, done={}, chunk_done={}) failed after {} attempts, dev_size={:#x}",
-                        offset,
-                        buf.len(),
-                        done,
-                        chunk_done,
-                        IO_RETRIES,
-                        self.size,
-                    );
-                }
-            }
-            if !completed {
-                return Err(BtrfsError::Io);
-            }
-            done += take;
-        }
-        Ok(())
+        let len = buf.len();
+        self.chunked(offset, len, "write_at", |rel, n| {
+            matches!(
+                self.inner.write_at(offset as usize + rel, &buf[rel..rel + n]),
+                Ok(got) if got == n
+            )
+        })
     }
 
     fn sync(&self) -> btrfs::Result<()> {
@@ -195,6 +202,7 @@ impl BtrfsMountFs {
         let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter {
             inner: device,
             size,
+            max_xfer: AtomicUsize::new(IO_CHUNK_BYTES),
         });
         warn!(
             "btrfs: mounting, device size = {:#x} ({} MiB), read_only={}",
