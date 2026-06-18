@@ -21,6 +21,7 @@ use pci::{PCIDevice, BAR};
 use lock::Mutex;
 
 // --- HBA global register offsets ---
+const HBA_CAP: usize = 0x00; // HBA Capabilities (bit 31 = S64A: 64-bit addressing)
 const HBA_GHC: usize = 0x04;
 const HBA_PI: usize = 0x0C;
 const HBA_BOHC: usize = 0x28; // BIOS/OS Handoff Control and Status
@@ -272,7 +273,18 @@ struct AhciPort {
     ct_virt: usize,
     /// Device supports the 48-bit LBA feature set (IDENTIFY word 83 bit 10).
     lba48: bool,
+    /// HBA supports 64-bit DMA addressing (CAP.S64A). When false, any DMA
+    /// physical address that reaches >= 4 GiB is truncated by the controller
+    /// to its low 32 bits, silently reading/writing the wrong memory. On a
+    /// machine with > 4 GiB RAM (real hardware; never QEMU's 1 GiB) buffers
+    /// can land above 4 GiB, so we must reject such a transfer loudly instead
+    /// of corrupting data with no error — the failure mode behind the
+    /// real-hardware-only "failed to extract libLLVM.so: I/O error".
+    supports_64bit: bool,
 }
+
+/// First physical address that does not fit in 32 bits.
+const DMA_4G: u64 = 1u64 << 32;
 
 impl AhciPort {
     fn read_reg(&self, offset: usize) -> u32 {
@@ -459,6 +471,25 @@ impl AhciPort {
             }
         } else if count > LBA28_MAX_SECTORS || lba + count as u64 > (1 << 28) {
             return Err(DeviceError::InvalidParam);
+        }
+
+        // Guard against a DMA descriptor the controller cannot address. On a
+        // 32-bit-only HBA (CAP.S64A == 0) a physical address >= 4 GiB is
+        // truncated to its low 32 bits, so the transfer would silently hit the
+        // wrong memory and "succeed" with no error bit — the real-hardware-only
+        // corruption we are chasing. Fail loudly instead.
+        if !self.supports_64bit {
+            for &(phys, len) in prds {
+                if phys + len as u64 > DMA_4G {
+                    crate::klog_err!(
+                        "[AHCI] port {} {} at lba {:#x}: PRD {:#x}+{} exceeds 4 GiB on a 32-bit-only HBA",
+                        self.port_idx,
+                        if write { "write" } else { "read" },
+                        lba, phys, len,
+                    );
+                    return Err(DeviceError::IoError);
+                }
+            }
         }
 
         // Wait for port to become ready (TFD BUSY/DRQ clear), max 2 seconds
@@ -871,6 +902,22 @@ impl AhciInterface {
             udelay(1_000);
         }
 
+        let cap = unsafe { read_volatile((base + HBA_CAP) as *const u32) };
+        let supports_64bit = cap & (1 << 31) != 0;
+        let ncq = cap & (1 << 30) != 0;
+        crate::klog_info!(
+            "[AHCI] CAP={:#010x} S64A(64-bit DMA)={} SNCQ={} slots={}",
+            cap,
+            supports_64bit,
+            ncq,
+            ((cap >> 8) & 0x1f) + 1,
+        );
+        if !supports_64bit {
+            crate::klog_warn!(
+                "[AHCI] controller does NOT support 64-bit DMA; all DMA buffers must stay below 4 GiB"
+            );
+        }
+
         let pi = unsafe { read_volatile((base + HBA_PI) as *const u32) };
 
         // After a global HBA reset the SATA link can take up to 2 seconds to
@@ -897,6 +944,19 @@ impl AhciInterface {
                 let dma_paddr = unsafe { drivers_dma_alloc(DMA_PAGES) };
                 let dma_vaddr = phys_to_virt(dma_paddr);
 
+                // The command list / FIS / command table live in this block. If
+                // it landed above 4 GiB on a controller without 64-bit support,
+                // the HBA cannot address it at all — refuse rather than wedge.
+                let dma_end = dma_paddr as u64 + (DMA_PAGES * 4096) as u64;
+                if !supports_64bit && dma_end > DMA_4G {
+                    crate::klog_err!(
+                        "[AHCI] port {} DMA structures at {:#x} are above 4 GiB on a 32-bit-only HBA; skipping",
+                        i, dma_paddr,
+                    );
+                    unsafe { drivers_dma_dealloc(dma_paddr, DMA_PAGES) };
+                    continue;
+                }
+
                 let mut port = AhciPort {
                     base: pbase,
                     port_idx: i as u32,
@@ -909,6 +969,7 @@ impl AhciInterface {
                     // Assume LBA48 until IDENTIFY says otherwise; READ/WRITE DMA
                     // EXT is mandatory on every SATA device.
                     lba48: true,
+                    supports_64bit,
                 };
 
                 // Skip ports that are explicitly disabled (DET=4).
@@ -979,6 +1040,28 @@ impl AhciInterface {
                                 drivers_dma_dealloc(dma_paddr, DMA_PAGES);
                             }
                             return Err(DeviceError::NoResources);
+                        }
+                        // Every data transfer DMAs through this bounce buffer
+                        // (the zero-copy path is disabled), so its physical
+                        // address must be reachable by the HBA. Log it, and on
+                        // a 32-bit-only HBA refuse a >4 GiB buffer rather than
+                        // silently corrupt every read/write.
+                        let bounce_end = bounce_phys as u64 + (BOUNCE_PAGES * 4096) as u64;
+                        crate::klog_info!(
+                            "[AHCI] port {} bounce buffer at {:#x}..{:#x} ({}-bit DMA)",
+                            i, bounce_phys, bounce_end,
+                            if supports_64bit { 64 } else { 32 },
+                        );
+                        if !supports_64bit && bounce_end > DMA_4G {
+                            crate::klog_err!(
+                                "[AHCI] port {} bounce buffer above 4 GiB on a 32-bit-only HBA; skipping",
+                                i,
+                            );
+                            unsafe {
+                                drivers_dma_dealloc(bounce_phys, BOUNCE_PAGES);
+                                drivers_dma_dealloc(dma_paddr, DMA_PAGES);
+                            }
+                            continue;
                         }
                         disks.push(Self {
                             name: format!("ahci-{}", i),
