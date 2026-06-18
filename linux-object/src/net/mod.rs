@@ -6,7 +6,7 @@
 pub mod socket_address;
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileDesc, FileLike, PollEvents};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
 use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
@@ -895,8 +895,43 @@ pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
     }
 }
 
+/// Set once networking is up enough to be polled safely (after the first
+/// normal `poll_ifaces`, which happens during DHCP — long before any large
+/// disk transfer). The AHCI driver's wait loop consults this via
+/// `drivers_net_drain` so it never pokes the net stack during early-boot root
+/// mounting, before the interfaces/socket set exist.
+static NET_DRAIN_READY: AtomicBool = AtomicBool::new(false);
+/// Re-entrancy guard: `drivers_net_drain` must never recurse into itself (it
+/// won't in practice — the net path issues no disk I/O — but make it
+/// structurally impossible).
+static NET_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Hook called by polled block drivers (AHCI) from inside their command-wait
+/// busy loop on real hardware, where a single command/flush can hold the CPU
+/// (interrupts disabled, under the fs lock) for long enough to starve the
+/// *polled* network stack — overflowing the NIC RX ring and stalling an
+/// in-flight TLS download (the "failed to extract libLLVM.so: I/O error" seen
+/// only on real hardware, only for the largest package). Servicing the network
+/// here keeps the connection alive across long disk waits.
+///
+/// Safe to call with the fs/AHCI locks held: it only touches the network locks
+/// (disjoint), the network never issues disk I/O (no deadlock cycle), and it is
+/// a no-op until networking is ready and whenever already draining.
+#[no_mangle]
+pub extern "C" fn drivers_net_drain() {
+    if !NET_DRAIN_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    if NET_DRAINING.swap(true, Ordering::Acquire) {
+        return; // already draining on this stack
+    }
+    poll_ifaces();
+    NET_DRAINING.store(false, Ordering::Release);
+}
+
 /// miss doc
 pub fn poll_ifaces() {
+    NET_DRAIN_READY.store(true, Ordering::Relaxed);
     for iface in get_net_device().iter() {
         match iface.poll() {
             Ok(_) => {}
