@@ -678,3 +678,125 @@ impl FileLike for TcpSocketState {
         Ok(self)
     }
 }
+#[cfg(test)]
+mod transfer_bench {
+    //! Host bench: a large TCP transfer over a smoltcp loopback interface using
+    //! the *real* socket buffer sizes (TCP_RECVBUF/TCP_SENDBUF), with a
+    //! deliberately slow reader so the receive buffer fills and the connection
+    //! must ride the window / zero-window update path — exactly what separates a
+    //! large download from a small one. A stall detector fails the test if no
+    //! progress is made for a long time (a window-update deadlock), and the
+    //! payload is verified byte-for-byte (corruption).
+    //!
+    //! QEMU x86_64 runs with `-nic none`, so this is the only place we can
+    //! reproduce a large transfer off real hardware. If it passes, large-
+    //! transfer flow-control with our config is sound and the bug is in the
+    //! driver/integration; if it stalls or corrupts, we found it here.
+
+    use alloc::collections::BTreeMap;
+    use alloc::vec;
+    use smoltcp::iface::{InterfaceBuilder, Routes};
+    use smoltcp::phy::{Loopback, Medium};
+    use smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer};
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{IpAddress, IpCidr};
+
+    fn mk_sock() -> TcpSocket<'static> {
+        TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; crate::net::TCP_RECVBUF]),
+            TcpSocketBuffer::new(vec![0u8; crate::net::TCP_SENDBUF]),
+        )
+    }
+
+    fn run_transfer(total: usize, reader_chunk: usize) {
+        let device = Loopback::new(Medium::Ip);
+        let mut iface = InterfaceBuilder::new(device)
+            .ip_addrs([IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)])
+            .routes(Routes::new(BTreeMap::new()))
+            .finalize();
+
+        let mut sockets = SocketSet::new(vec![]);
+        let sh = sockets.add(mk_sock());
+        let ch = sockets.add(mk_sock());
+
+        sockets.get::<TcpSocket>(sh).listen(1234).unwrap();
+        sockets
+            .get::<TcpSocket>(ch)
+            .connect((IpAddress::v4(127, 0, 0, 1), 1234), 49152)
+            .unwrap();
+
+        let mut sent = 0usize;
+        let mut recvd = 0usize;
+        let mut rbuf = vec![0u8; reader_chunk];
+        let mut clock = 0i64;
+        let mut idle = 0u64;
+
+        while recvd < total {
+            clock += 1; // advance 1 ms per poll so smoltcp timers progress
+            let _ = iface.poll(&mut sockets, Instant::from_millis(clock));
+
+            // Sender: push as much as the send window allows.
+            {
+                let mut s = sockets.get::<TcpSocket>(sh);
+                while sent < total && s.can_send() {
+                    let remaining = total - sent;
+                    let mut chunk = vec![0u8; remaining.min(32 * 1024)];
+                    for (j, b) in chunk.iter_mut().enumerate() {
+                        *b = (sent + j) as u8;
+                    }
+                    match s.send_slice(&chunk) {
+                        Ok(n) if n > 0 => sent += n,
+                        _ => break,
+                    }
+                }
+            }
+
+            // Receiver: read at most `reader_chunk` per poll — the throttle that
+            // keeps the rx buffer near-full and forces window updates.
+            let mut progressed = false;
+            {
+                let mut c = sockets.get::<TcpSocket>(ch);
+                if c.can_recv() {
+                    if let Ok(n) = c.recv_slice(&mut rbuf) {
+                        for i in 0..n {
+                            assert_eq!(
+                                rbuf[i],
+                                (recvd + i) as u8,
+                                "data corruption at byte {}",
+                                recvd + i
+                            );
+                        }
+                        if n > 0 {
+                            recvd += n;
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+
+            idle = if progressed { 0 } else { idle + 1 };
+            assert!(
+                idle < 5_000_000,
+                "TRANSFER STALLED: recvd={} of {} (sent={}) — window-update deadlock",
+                recvd,
+                total,
+                sent
+            );
+        }
+        assert_eq!(recvd, total, "did not receive the whole stream");
+    }
+
+    /// 16 MiB through 2 MiB buffers with a 16 KiB/poll reader: the buffer fills
+    /// ~8 times over and the window cycles closed/open continuously.
+    #[test]
+    fn large_transfer_slow_reader() {
+        run_transfer(16 * 1024 * 1024, 16 * 1024);
+    }
+
+    /// A faster reader (256 KiB/poll) — should breeze through; guards against a
+    /// regression where even unthrottled large transfers stall.
+    #[test]
+    fn large_transfer_fast_reader() {
+        run_transfer(16 * 1024 * 1024, 256 * 1024);
+    }
+}
