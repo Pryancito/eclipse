@@ -364,7 +364,19 @@ impl INode for BtrfsMountINode {
                 buf[..take].copy_from_slice(&target[offset..offset + take]);
                 Ok(take)
             }
-            _ => fs.read(self.ino, offset as u64, buf).map_err(map_err),
+            _ => fs.read(self.ino, offset as u64, buf).map_err(|e| {
+                // Surface the exact failing operation in dmesg (klog bypasses the
+                // log-level filter), so an "I/O error" can be pinned to a btrfs
+                // reason + offset instead of guessing.
+                zcore_drivers::klog_err!(
+                    "btrfs: read ino={} off={:#x} len={} -> {:?}",
+                    self.ino,
+                    offset,
+                    buf.len(),
+                    e,
+                );
+                map_err(e)
+            }),
         }
     }
 
@@ -376,7 +388,16 @@ impl INode for BtrfsMountINode {
             FileKind::Symlink => fs
                 .write_symlink(self.ino, offset as u64, buf)
                 .map_err(map_err),
-            _ => fs.write(self.ino, offset as u64, buf).map_err(map_err),
+            _ => fs.write(self.ino, offset as u64, buf).map_err(|e| {
+                zcore_drivers::klog_err!(
+                    "btrfs: write ino={} off={:#x} len={} -> {:?}",
+                    self.ino,
+                    offset,
+                    buf.len(),
+                    e,
+                );
+                map_err(e)
+            }),
         }
     }
 
