@@ -251,3 +251,150 @@ pub(crate) fn probe_ext2_superblock(block: &Arc<dyn BlockScheme>) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod block_byte_tests {
+    //! Host tests for the byte<->sector translation in `BlockByteDevice` — the
+    //! kernel layer that sits between btrfs and the AHCI driver. btrfs is
+    //! exonerated by the `btrfs` crate's own suites; this exercises the layer
+    //! below it (partial-sector read-modify-write, multi-sector bulk, and
+    //! end-of-device bounds) against an in-memory reference so a translation bug
+    //! is caught on the host instead of only on hardware.
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use rcore_fs::dev::Device;
+    use std::sync::Mutex;
+    use zcore_drivers::scheme::{BlockScheme, Scheme};
+    use zcore_drivers::{DeviceError, DeviceResult};
+
+    /// In-memory 512-byte-sector block device. Records every `write_block`
+    /// length so the test can also assert how the byte layer chunked the I/O.
+    struct MockBlock {
+        sectors: Mutex<Vec<u8>>,
+        nsec: usize,
+    }
+    impl MockBlock {
+        fn new(nsec: usize) -> Arc<Self> {
+            Arc::new(Self {
+                sectors: Mutex::new(vec![0u8; nsec * 512]),
+                nsec,
+            })
+        }
+    }
+    impl Scheme for MockBlock {
+        fn name(&self) -> &str {
+            "mockblock"
+        }
+    }
+    impl BlockScheme for MockBlock {
+        fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+            if buf.is_empty() || buf.len() % 512 != 0 {
+                return Err(DeviceError::InvalidParam);
+            }
+            let start = block_id * 512;
+            let d = self.sectors.lock().unwrap();
+            if start + buf.len() > d.len() {
+                return Err(DeviceError::InvalidParam);
+            }
+            buf.copy_from_slice(&d[start..start + buf.len()]);
+            Ok(())
+        }
+        fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+            if buf.is_empty() || buf.len() % 512 != 0 {
+                return Err(DeviceError::InvalidParam);
+            }
+            let start = block_id * 512;
+            let mut d = self.sectors.lock().unwrap();
+            if start + buf.len() > d.len() {
+                return Err(DeviceError::InvalidParam);
+            }
+            d[start..start + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+        fn flush(&self) -> DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            self.nsec
+        }
+    }
+
+    fn pat(i: usize) -> u8 {
+        (i.wrapping_mul(2654435761) >> 13) as u8
+    }
+
+    /// Write through the byte device at many aligned/unaligned offsets and
+    /// sizes, mirror into a reference buffer, then read every byte back two ways
+    /// and require an exact match. Catches off-by-one / partial-sector RMW bugs.
+    #[test]
+    fn byte_sector_roundtrip() {
+        let nsec = 2048; // 1 MiB device
+        let dev = MockBlock::new(nsec);
+        let bbd = BlockByteDevice::new(dev.clone());
+        let total = nsec * 512;
+        let mut reference = vec![0u8; total];
+
+        // (offset, len): aligned, unaligned head, unaligned tail, sub-sector,
+        // multi-sector spanning, and right up to the last byte.
+        let cases = [
+            (0usize, 512usize),
+            (1, 10),
+            (511, 2),
+            (500, 100),
+            (0, 4096),
+            (1234, 5000),
+            (512 * 100 + 7, 9000),
+            (total - 10, 10),
+            (total - 513, 513),
+            (777, 1),
+        ];
+        for (k, &(off, len)) in cases.iter().enumerate() {
+            let payload: Vec<u8> = (0..len).map(|i| pat(off + i + k)).collect();
+            let w = bbd.write_at(off, &payload).unwrap();
+            assert_eq!(w, len, "short write off={off} len={len}");
+            reference[off..off + len].copy_from_slice(&payload);
+        }
+
+        // Read back the whole device in one call.
+        let mut got = vec![0u8; total];
+        let mut p = 0;
+        while p < total {
+            let n = bbd.read_at(p, &mut got[p..]).unwrap();
+            assert!(n > 0);
+            p += n;
+        }
+        assert_eq!(got, reference, "full-device readback mismatch");
+
+        // Read back in awkward unaligned slices too.
+        for &(off, len) in &cases {
+            let mut buf = vec![0u8; len];
+            let mut q = 0;
+            while q < len {
+                let n = bbd.read_at(off + q, &mut buf[q..]).unwrap();
+                assert!(n > 0);
+                q += n;
+            }
+            assert_eq!(buf, &reference[off..off + len], "slice readback off={off}");
+        }
+    }
+
+    /// A large contiguous write (bigger than any single AHCI command would do)
+    /// must land correctly sector-for-sector.
+    #[test]
+    fn large_contiguous_write() {
+        let nsec = 4096; // 2 MiB
+        let dev = MockBlock::new(nsec);
+        let bbd = BlockByteDevice::new(dev.clone());
+        let len = 1_500_000usize; // ~1.4 MiB, spans hundreds of sectors
+        let payload: Vec<u8> = (0..len).map(pat).collect();
+        assert_eq!(bbd.write_at(2048, &payload).unwrap(), len);
+        let mut got = vec![0u8; len];
+        let mut p = 0;
+        while p < len {
+            p += bbd.read_at(2048 + p, &mut got[p..]).unwrap();
+        }
+        assert_eq!(got, payload);
+    }
+}

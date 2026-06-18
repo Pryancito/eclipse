@@ -37,7 +37,7 @@ impl MockBlock {
             }
             core::hint::spin_loop();
         };
-        let mut entry = self.sq.entry_at(idx);
+        let entry = self.sq.entry_at(idx);
         entry.start = start;
         entry.op = op;
         entry.buf_ptr = buf.as_ptr() as _;
