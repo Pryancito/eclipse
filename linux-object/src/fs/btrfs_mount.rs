@@ -187,7 +187,25 @@ pub struct BtrfsMountFs {
     /// Cached directory listings keyed by inode number (cleared on any
     /// mutation of that directory).
     dir_cache: Mutex<BTreeMap<u64, Arc<Vec<CachedDirEntry>>>>,
+    /// Kernel-side write-back coalescing buffer (page-cache-lite). Sequential
+    /// small writes to one file are accumulated here and handed to the FS in
+    /// large chunks, turning the ~32000 tiny synchronous writes of a big
+    /// package extraction (which stalled `apk`) into a few hundred large ones.
+    /// At most one file is buffered at a time; any access that isn't a
+    /// contiguous append flushes it first, so reads always observe written
+    /// data. See `flush_inode` / `flush_any`.
+    write_buf: Mutex<Option<PendingWrite>>,
 }
+
+/// Pending tail of buffered, not-yet-committed writes for a single inode.
+struct PendingWrite {
+    ino: u64,
+    start: u64,
+    data: Vec<u8>,
+}
+
+/// Flush the accumulated buffer once it reaches this size.
+const WRITE_BUF_FLUSH: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct CachedDirEntry {
@@ -225,6 +243,7 @@ impl BtrfsMountFs {
             inner: Mutex::new(fs),
             this: Mutex::new(Weak::new()),
             dir_cache: Mutex::new(BTreeMap::new()),
+            write_buf: Mutex::new(None),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         Ok(arc)
@@ -264,11 +283,64 @@ impl BtrfsMountFs {
     fn invalidate_dir(&self, dir: u64) {
         self.dir_cache.lock().remove(&dir);
     }
+
+    /// Write a pending buffer out to the filesystem in full. `fs` is the
+    /// already-locked inner FS (callers must hold it; lock order is always
+    /// `inner` before `write_buf`, so this never deadlocks).
+    fn flush_pending(fs: &mut Btrfs, pw: PendingWrite) -> Result<()> {
+        let mut off = pw.start;
+        let mut done = 0usize;
+        while done < pw.data.len() {
+            let n = fs.write(pw.ino, off, &pw.data[done..]).map_err(map_err)?;
+            if n == 0 {
+                return Err(FsError::DeviceError);
+            }
+            off += n as u64;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Flush the buffer iff it belongs to `ino`.
+    fn flush_inode(&self, fs: &mut Btrfs, ino: u64) -> Result<()> {
+        let taken = {
+            let mut wb = self.write_buf.lock();
+            match &*wb {
+                Some(pw) if pw.ino == ino => wb.take(),
+                _ => None,
+            }
+        };
+        if let Some(pw) = taken {
+            Self::flush_pending(fs, pw)?;
+        }
+        Ok(())
+    }
+
+    /// Flush any pending buffer regardless of inode.
+    fn flush_any(&self, fs: &mut Btrfs) -> Result<()> {
+        let taken = self.write_buf.lock().take();
+        if let Some(pw) = taken {
+            Self::flush_pending(fs, pw)?;
+        }
+        Ok(())
+    }
+
+    /// Size contributed by a buffered tail for `ino`, if any (so `stat` reflects
+    /// not-yet-flushed writes without forcing a flush).
+    fn buffered_end(&self, ino: u64) -> Option<u64> {
+        let wb = self.write_buf.lock();
+        match &*wb {
+            Some(pw) if pw.ino == ino => Some(pw.start + pw.data.len() as u64),
+            _ => None,
+        }
+    }
 }
 
 impl FileSystem for BtrfsMountFs {
     fn sync(&self) -> Result<()> {
-        self.inner.lock().sync().map_err(map_err)
+        let mut fs = self.inner.lock();
+        self.flush_any(&mut fs)?;
+        fs.sync().map_err(map_err)
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
@@ -352,6 +424,9 @@ fn stat_to_metadata(st: &btrfs::InodeStat) -> Metadata {
 impl INode for BtrfsMountINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         let mut fs = self.fs.inner.lock();
+        // A read must observe everything written so far: flush this inode's
+        // coalescing buffer before serving it.
+        self.fs.flush_inode(&mut fs, self.ino)?;
         let st = fs.stat(self.ino).map_err(map_err)?;
         match st.kind {
             FileKind::Dir => Err(FsError::IsDir),
@@ -381,24 +456,67 @@ impl INode for BtrfsMountINode {
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut fs = self.fs.inner.lock();
+        let off = offset as u64;
+
+        // Fast path: a contiguous append to the already-buffered file. The file
+        // is known regular (only regular files are buffered, and unlink/rename
+        // flush first), so we skip even the `stat` and just grow the buffer.
+        {
+            let mut wb = self.fs.write_buf.lock();
+            let hit = matches!(
+                &*wb,
+                Some(pw) if pw.ino == self.ino && pw.start + pw.data.len() as u64 == off
+            );
+            if hit {
+                let pw = wb.as_mut().unwrap();
+                pw.data.extend_from_slice(buf);
+                if pw.data.len() < WRITE_BUF_FLUSH {
+                    return Ok(buf.len());
+                }
+                let full = wb.take().unwrap();
+                drop(wb);
+                BtrfsMountFs::flush_pending(&mut fs, full)?;
+                return Ok(buf.len());
+            }
+        }
+
+        // Slow path: new file / non-contiguous offset. Determine the kind and
+        // flush any other inode's pending buffer first.
         let st = fs.stat(self.ino).map_err(map_err)?;
         match st.kind {
-            FileKind::Dir => Err(FsError::IsDir),
-            FileKind::Symlink => fs
-                .write_symlink(self.ino, offset as u64, buf)
-                .map_err(map_err),
-            _ => fs.write(self.ino, offset as u64, buf).map_err(|e| {
-                zcore_drivers::klog_err!(
-                    "btrfs: write ino={} off={:#x} len={} -> {:?}",
-                    self.ino,
-                    offset,
-                    buf.len(),
-                    e,
-                );
-                map_err(e)
-            }),
+            FileKind::Dir => return Err(FsError::IsDir),
+            FileKind::Symlink => {
+                self.fs.flush_any(&mut fs)?;
+                return fs
+                    .write_symlink(self.ino, off, buf)
+                    .map_err(map_err);
+            }
+            _ => {}
         }
+        self.fs.flush_any(&mut fs)?;
+        // Small write: start a fresh buffer. Large write: straight through.
+        if buf.len() < WRITE_BUF_FLUSH {
+            *self.fs.write_buf.lock() = Some(PendingWrite {
+                ino: self.ino,
+                start: off,
+                data: buf.to_vec(),
+            });
+            return Ok(buf.len());
+        }
+        fs.write(self.ino, off, buf).map_err(|e| {
+            zcore_drivers::klog_err!(
+                "btrfs: write ino={} off={:#x} len={} -> {:?}",
+                self.ino,
+                offset,
+                buf.len(),
+                e,
+            );
+            map_err(e)
+        })
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -415,12 +533,24 @@ impl INode for BtrfsMountINode {
 
     fn metadata(&self) -> Result<Metadata> {
         let mut fs = self.fs.inner.lock();
-        let st = fs.stat(self.ino).map_err(map_err)?;
+        let mut st = fs.stat(self.ino).map_err(map_err)?;
+        // Reflect not-yet-flushed buffered writes in the reported size without
+        // forcing a flush (keeps buffering effective when callers `fstat`).
+        if let Some(end) = self.fs.buffered_end(self.ino) {
+            if end > st.size {
+                st.size = end;
+                st.nbytes = st.nbytes.max(end);
+            }
+        }
         Ok(stat_to_metadata(&st))
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
         let mut fs = self.fs.inner.lock();
+        // Flush first: a later flush would otherwise overwrite mtime/ctime with
+        // "now" and clobber the times being set here (apk sets archive mtimes
+        // right after extracting a file).
+        self.fs.flush_inode(&mut fs, self.ino)?;
         fs.set_attr(
             self.ino,
             Some(metadata.mode as u32),
@@ -477,6 +607,9 @@ impl INode for BtrfsMountINode {
         let kind = btrfs_kind(type_)?;
         let ino = {
             let mut fs = self.fs.inner.lock();
+            // Flush any buffered file before mutating the namespace, so its data
+            // is durable before another file/operation depends on it.
+            self.fs.flush_any(&mut fs)?;
             fs.create(self.ino, name, kind, mode, data as u64)
                 .map_err(map_err)?
         };
@@ -487,6 +620,7 @@ impl INode for BtrfsMountINode {
     fn unlink(&self, name: &str) -> Result<()> {
         {
             let mut fs = self.fs.inner.lock();
+            self.fs.flush_any(&mut fs)?;
             fs.unlink(self.ino, name).map_err(map_err)?;
         }
         self.fs.invalidate_dir(self.ino);
@@ -502,6 +636,7 @@ impl INode for BtrfsMountINode {
         }
         {
             let mut fs = self.fs.inner.lock();
+            self.fs.flush_any(&mut fs)?;
             fs.link(self.ino, name, other.ino).map_err(map_err)?;
         }
         self.fs.invalidate_dir(self.ino);
@@ -517,6 +652,7 @@ impl INode for BtrfsMountINode {
         }
         {
             let mut fs = self.fs.inner.lock();
+            self.fs.flush_any(&mut fs)?;
             fs.rename(self.ino, old_name, target.ino, new_name)
                 .map_err(map_err)?;
         }
@@ -527,11 +663,16 @@ impl INode for BtrfsMountINode {
 
     fn resize(&self, len: usize) -> Result<()> {
         let mut fs = self.fs.inner.lock();
+        // Pending writes must land before the truncate so the final size/extents
+        // are correct.
+        self.fs.flush_inode(&mut fs, self.ino)?;
         fs.truncate(self.ino, len as u64).map_err(map_err)
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.fs.inner.lock().sync().map_err(map_err)
+        let mut fs = self.fs.inner.lock();
+        self.fs.flush_any(&mut fs)?;
+        fs.sync().map_err(map_err)
     }
 
     fn sync_data(&self) -> Result<()> {
