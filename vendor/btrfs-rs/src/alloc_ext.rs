@@ -331,18 +331,28 @@ impl FreeSpace {
 
     /// Free METADATA (or mixed) bytes still available.
     pub fn meta_free(&self) -> u64 {
-        self.bgs
-            .values()
-            .filter(|bg| bg.flags & BLOCK_GROUP_METADATA != 0)
-            .map(|bg| self.free.total_free_in(bg.start, bg.start + bg.len))
-            .sum()
+        self.free_in_groups(BLOCK_GROUP_METADATA)
     }
 
     pub fn data_free(&self) -> u64 {
+        self.free_in_groups(BLOCK_GROUP_DATA)
+    }
+
+    /// Total free bytes across every block group whose flags intersect `flags`.
+    ///
+    /// Uses each block group's accounted `used` counter (`len - used`) instead
+    /// of summing the free-range fragments inside it. Both are kept in lock-step
+    /// by `account()`, but the fragment sum is `O(fragments)` while this is
+    /// `O(1)` per group. The fragment form turned every `prepare_mutation`
+    /// (which calls `meta_free`/system-free on *each* write) into `O(n^2)` as
+    /// the metadata block group's free list shattered while extracting a large
+    /// file — the "hang" partway through writing `libLLVM.so`, with `df`
+    /// blocking behind the held filesystem lock.
+    pub fn free_in_groups(&self, flags: u64) -> u64 {
         self.bgs
             .values()
-            .filter(|bg| bg.flags & BLOCK_GROUP_DATA != 0)
-            .map(|bg| self.free.total_free_in(bg.start, bg.start + bg.len))
+            .filter(|bg| bg.flags & flags != 0)
+            .map(|bg| bg.len.saturating_sub(bg.used))
             .sum()
     }
 

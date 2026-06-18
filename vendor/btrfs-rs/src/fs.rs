@@ -484,13 +484,10 @@ impl Btrfs {
 
     fn ensure_system_space(&mut self) -> Result<()> {
         let nodesize = self.vol.nodesize as u64;
-        let free: u64 = self
-            .alloc
-            .bgs
-            .values()
-            .filter(|bg| bg.flags & BLOCK_GROUP_SYSTEM != 0)
-            .map(|bg| self.alloc.free.total_free_in(bg.start, bg.start + bg.len))
-            .sum();
+        // O(#block-groups) via accounted `used`, not O(#free-fragments); see
+        // `FreeSpace::free_in_groups`. Runs on every mutation, so the old
+        // fragment sum made large writes quadratic.
+        let free = self.alloc.free_in_groups(BLOCK_GROUP_SYSTEM);
         if free >= 8 * nodesize {
             return Ok(());
         }
