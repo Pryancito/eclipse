@@ -550,44 +550,80 @@ impl AhciPort {
     }
 
     /// ATA FLUSH CACHE — force the device write cache to non-volatile media.
+    ///
+    /// Retried on a transient failure exactly like a data command (`rw_block`).
+    /// `apk` issues an `fsync()` after extracting each file; the ~130 MiB
+    /// `libLLVM.so` leaves a large device write-back cache, so its flush is by
+    /// far the most likely to hit a transient task-file error — and a single
+    /// un-retried hiccup here aborted the whole extraction with EIO ("failed to
+    /// extract …: I/O error") while every small package, whose flush completes
+    /// instantly, installed fine. Re-issuing FLUSH CACHE is idempotent.
     fn flush_cache(&self) -> DeviceResult {
-        if !wait_until(TFD_TIMEOUT_US, || {
-            self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
-        }) {
-            crate::klog_err!(
-                "[AHCI] port {} TFD busy timeout before flush",
-                self.port_idx
-            );
-            self.reset_port();
-            return Err(DeviceError::IoError);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            if !wait_until(TFD_TIMEOUT_US, || {
+                self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
+            }) {
+                crate::klog_err!(
+                    "[AHCI] port {} TFD busy timeout before flush (attempt {}/{})",
+                    self.port_idx,
+                    attempt,
+                    RW_RETRIES,
+                );
+                self.reset_port();
+                if attempt < RW_RETRIES {
+                    udelay(RW_RETRY_SETTLE_US);
+                    continue;
+                }
+                return Err(DeviceError::IoError);
+            }
+
+            unsafe {
+                let cmd_table = self.ct_virt as *mut CommandTable;
+                core::ptr::write_bytes(
+                    cmd_table as *mut u8,
+                    0,
+                    core::mem::size_of::<CommandTable>(),
+                );
+                let fis = (*cmd_table).cfis.as_mut_ptr();
+                *fis.add(0) = FIS_TYPE_REG_H2D;
+                *fis.add(1) = 0x80;
+                *fis.add(2) = if self.lba48 {
+                    ATA_CMD_FLUSH_CACHE_EXT
+                } else {
+                    ATA_CMD_FLUSH_CACHE
+                };
+
+                let header = self.cl_virt as *mut CommandHeader;
+                (*header).cfl = 5;
+                (*header).pm = 0;
+                (*header).prdtl = 0;
+                (*header).prdbc = 0;
+            }
+            clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
+            clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+
+            match self.exec_cmd_with_timeout(0, FLUSH_TIMEOUT_US) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // exec_cmd already reset the port on failure. Re-issuing the
+                    // same (idempotent) FLUSH after a short settle recovers a
+                    // single transient SATA hiccup instead of failing the fsync.
+                    if attempt < RW_RETRIES {
+                        crate::klog_err!(
+                            "[AHCI] port {} retrying flush (attempt {}/{})",
+                            self.port_idx,
+                            attempt + 1,
+                            RW_RETRIES,
+                        );
+                        udelay(RW_RETRY_SETTLE_US);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
-
-        unsafe {
-            let cmd_table = self.ct_virt as *mut CommandTable;
-            core::ptr::write_bytes(
-                cmd_table as *mut u8,
-                0,
-                core::mem::size_of::<CommandTable>(),
-            );
-            let fis = (*cmd_table).cfis.as_mut_ptr();
-            *fis.add(0) = FIS_TYPE_REG_H2D;
-            *fis.add(1) = 0x80;
-            *fis.add(2) = if self.lba48 {
-                ATA_CMD_FLUSH_CACHE_EXT
-            } else {
-                ATA_CMD_FLUSH_CACHE
-            };
-
-            let header = self.cl_virt as *mut CommandHeader;
-            (*header).cfl = 5;
-            (*header).pm = 0;
-            (*header).prdtl = 0;
-            (*header).prdbc = 0;
-        }
-        clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
-        clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
-
-        self.exec_cmd_with_timeout(0, FLUSH_TIMEOUT_US)
     }
 
     /// Returns `(sectors, lba48_supported)` from ATA IDENTIFY data.
