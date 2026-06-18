@@ -132,6 +132,14 @@ const HBA_RESET_TIMEOUT_US: u64 = 1_000_000;
 const ENGINE_STOP_TIMEOUT_US: u64 = 500_000;
 // Timeout for exec_cmd: 10 seconds covers slow spinning disks.
 const CMD_TIMEOUT_US: u64 = 10_000_000;
+// A data command that fails (task-file error / timeout) is retried at the
+// driver level after a short settle. The port is already reset by exec_cmd on
+// failure, and exec_cmd's own timeout bounds each attempt, so this only adds a
+// recovery path: a *single* transient SATA hiccup over the ~2000 commands a
+// 130 MiB file needs no longer aborts the whole operation with EIO.
+const RW_RETRIES: u32 = 4;
+// Settle time after a port reset before re-issuing the command.
+const RW_RETRY_SETTLE_US: u64 = 50_000;
 // Shorter timeout for ATA IDENTIFY during init — 5 seconds is enough.
 const IDENTIFY_TIMEOUT_US: u64 = 5_000_000;
 // Timeout for port TFD-busy before issuing a command: 2 seconds.
@@ -497,7 +505,41 @@ impl AhciPort {
             clflush_range(phys_to_virt(phys as usize), len);
         }
 
-        let res = self.exec_cmd(slot);
+        let mut res = self.exec_cmd(slot);
+        let mut attempt = 1u32;
+        while res.is_err() && attempt < RW_RETRIES {
+            attempt += 1;
+            // exec_cmd already reset the port on failure. Let the link settle,
+            // re-wait for the device to be ready, re-arm the (still-resident)
+            // command table and re-issue. Re-issuing the same LBA/buffer is
+            // idempotent, and exec_cmd's own timeout+reset bounds each attempt
+            // so a buggy device can never wedge us here.
+            udelay(RW_RETRY_SETTLE_US);
+            if !wait_until(TFD_TIMEOUT_US, || {
+                self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
+            }) {
+                self.reset_port();
+                continue;
+            }
+            unsafe {
+                // The device may have written PRDBC; clear it before re-issue.
+                (*(self.cl_virt as *mut CommandHeader)).prdbc = 0;
+            }
+            clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
+            clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
+            for &(phys, len) in prds {
+                clflush_range(phys_to_virt(phys as usize), len);
+            }
+            crate::klog_err!(
+                "[AHCI] port {} retrying {} command (attempt {}/{}) at lba {:#x}",
+                self.port_idx,
+                if write { "write" } else { "read" },
+                attempt,
+                RW_RETRIES,
+                lba,
+            );
+            res = self.exec_cmd(slot);
+        }
         if res.is_ok() && !write {
             for &(phys, len) in prds {
                 clflush_range(phys_to_virt(phys as usize), len);
