@@ -331,6 +331,33 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
     write_volatile((base + reg * 4) as *mut u32, val);
 }
 
+/// Count of received IPv4 frames whose header checksum did not verify — i.e.
+/// corrupted before smoltcp could parse them. Surfaced in the watchdog.
+static RX_CSUM_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// True if `frame` is an IPv4 Ethernet frame whose IP *header* checksum is wrong
+/// (the one-complement sum of the header 16-bit words must be 0xffff). Returns
+/// false for non-IPv4 frames (ARP/IPv6) so they are not counted as corrupt.
+fn rx_ipv4_hdr_csum_bad(frame: &[u8]) -> bool {
+    if frame.len() < 14 + 20 || frame[12] != 0x08 || frame[13] != 0x00 {
+        return false; // too short or not IPv4 (EtherType != 0x0800)
+    }
+    let ihl = (frame[14] & 0x0f) as usize * 4;
+    if ihl < 20 || frame.len() < 14 + ihl {
+        return false;
+    }
+    let mut sum: u32 = 0;
+    let mut i = 14;
+    while i < 14 + ihl {
+        sum += ((frame[i] as u32) << 8) | frame[i + 1] as u32;
+        i += 2;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum != 0xffff
+}
+
 // ---------------------------------------------------------------------------
 // E1000eHw — hardware state
 // ---------------------------------------------------------------------------
@@ -1307,6 +1334,16 @@ impl E1000eHw {
         for _ in 0..RX_DRAIN_BUDGET {
             let head_before = self.rx_next_to_clean;
             if let Some(pkt) = self.process_rx_slot() {
+                // Corruption probe: an IPv4 frame whose header checksum does not
+                // verify is corrupt before smoltcp ever sees it. smoltcp would
+                // then silently drop it (no ACK) — exactly the "RX climbs, TX
+                // freezes, peer keeps retransmitting" stall. If this counter
+                // climbs while the download is stuck, the bytes are being
+                // corrupted between the NIC DMA and here (memory corruption /
+                // DMA), not a TCP-window issue.
+                if rx_ipv4_hdr_csum_bad(&pkt) {
+                    RX_CSUM_BAD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 return Some(pkt);
             }
             if self.rx_next_to_clean == self.rx_rdh() || self.rx_next_to_clean == head_before {
@@ -1465,12 +1502,14 @@ impl E1000eHw {
             let gptc = mmio_read(self.base, E1000E_GPTC);
             let tdh = mmio_read(self.base, E1000E_TDH);
             let tdt = mmio_read(self.base, E1000E_TDT);
+            let csum_bad = RX_CSUM_BAD.load(core::sync::atomic::Ordering::Relaxed);
             crate::klog_info!(
-                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} GPTC={} tx_pkt={} TDH={} TDT={} itr={}\n",
+                "[e1000e] watchdog: link={} GPRC={} MPC={} rx_pkt={} rx_csum_bad={} GPTC={} tx_pkt={} TDH={} TDT={} itr={}\n",
                 link,
                 gprc,
                 mpc,
                 self.stats.rx_packets,
+                csum_bad,
                 gptc,
                 self.stats.tx_packets,
                 tdh,
