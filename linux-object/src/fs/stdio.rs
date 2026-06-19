@@ -90,6 +90,12 @@ const VEOL2: usize = 16;
 struct TtyState {
     termios: Mutex<Termios>,
     fg_pgrp: AtomicI32,
+    /// VT switch signalling mode (`VT_GETMODE` / `VT_SETMODE`).
+    vt_mode: Mutex<VtMode>,
+    /// Keyboard translation mode (`KDGKBMODE` / `KDSKBMODE`). When an X server
+    /// sets `K_RAW`/`K_OFF`, the line discipline stops cooking key presses into
+    /// this TTY (the raw events still reach userspace via `/dev/input/event*`).
+    kbd_mode: AtomicI32,
 }
 
 lazy_static! {
@@ -97,6 +103,8 @@ lazy_static! {
         .map(|_| TtyState {
             termios: Mutex::new(Termios::default_tty()),
             fg_pgrp: AtomicI32::new(0),
+            vt_mode: Mutex::new(VtMode::auto()),
+            kbd_mode: AtomicI32::new(K_XLATE),
         })
         .collect();
 }
@@ -112,6 +120,154 @@ fn tty_termios(vt: usize) -> &'static Mutex<Termios> {
 
 fn tty_fg_pgrp(vt: usize) -> &'static AtomicI32 {
     &TTY_STATES[vt_clamp(vt)].fg_pgrp
+}
+
+fn tty_vt_mode(vt: usize) -> &'static Mutex<VtMode> {
+    &TTY_STATES[vt_clamp(vt)].vt_mode
+}
+
+fn tty_kbd_mode(vt: usize) -> i32 {
+    TTY_STATES[vt_clamp(vt)].kbd_mode.load(Ordering::Relaxed)
+}
+
+/// Whether VT `vt` is translating key presses into TTY characters. False while
+/// an X server holds the keyboard in `K_RAW`/`K_OFF`/`K_MEDIUMRAW`.
+fn tty_kbd_cooked(vt: usize) -> bool {
+    matches!(tty_kbd_mode(vt), K_XLATE | K_UNICODE)
+}
+
+/// Shared TTY/console ioctl handling for every VT-backed device node
+/// (`/dev/tty`, `/dev/tty[0-9]`, `/dev/console`, stdin and stdout). `vt` is the
+/// virtual terminal the file refers to.
+fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
+    match cmd as usize {
+        TIOCGWINSZ => {
+            let winsize = data as *mut ConsoleWinSize;
+            unsafe { *winsize = console::console_win_size() };
+            Ok(0)
+        }
+        TCGETS => {
+            let termios = data as *mut Termios;
+            if termios.is_null() {
+                return Err(FsError::InvalidParam);
+            }
+            unsafe { *termios = *tty_termios(vt).lock() };
+            Ok(0)
+        }
+        TIOCSPGRP => {
+            let pgid = unsafe { *(data as *const i32) };
+            tty_fg_pgrp(vt).store(pgid, Ordering::Relaxed);
+            Ok(0)
+        }
+        TIOCGPGRP => {
+            let mut pgid = tty_fg_pgrp(vt).load(Ordering::Relaxed);
+            if pgid == 0 {
+                if let Some(arc) = kernel_hal::thread::get_current_thread() {
+                    if let Ok(thread) = arc.downcast::<Thread>() {
+                        pgid = thread.proc().id() as i32;
+                    }
+                }
+            }
+            if pgid == 0 {
+                pgid = 1;
+            }
+            unsafe { *(data as *mut i32) = pgid };
+            Ok(0)
+        }
+        TCSETS | TCSETSW => {
+            let termios = data as *const Termios;
+            if termios.is_null() {
+                return Err(FsError::InvalidParam);
+            }
+            *tty_termios(vt).lock() = unsafe { *termios };
+            Ok(0)
+        }
+        TCSETSF => {
+            let termios = data as *const Termios;
+            if termios.is_null() {
+                return Err(FsError::InvalidParam);
+            }
+            *tty_termios(vt).lock() = unsafe { *termios };
+            let sin = vt_stdin(vt);
+            sin.buf.lock().clear();
+            sin.canon_buf.lock().clear();
+            sin.eventbus.lock().clear(Event::READABLE);
+            Ok(0)
+        }
+        TCFLSH => Ok(0),
+        KDGETMODE => {
+            unsafe { *(data as *mut i32) = console::kd_mode_vt(vt) as i32 };
+            Ok(0)
+        }
+        KDSETMODE => {
+            let mode = unsafe { *(data as *const i32) } as u32;
+            console::set_kd_mode_vt(vt, mode);
+            Ok(0)
+        }
+        // X validates a console fd with KDGKBTYPE; reply with a PC keyboard.
+        KDGKBTYPE => {
+            unsafe { *(data as *mut u8) = KB_101 };
+            Ok(0)
+        }
+        KDGKBMODE => {
+            unsafe { *(data as *mut i32) = tty_kbd_mode(vt) };
+            Ok(0)
+        }
+        KDSKBMODE => {
+            let mode = unsafe { *(data as *const i32) };
+            TTY_STATES[vt_clamp(vt)]
+                .kbd_mode
+                .store(mode, Ordering::Relaxed);
+            Ok(0)
+        }
+        // VT management. VT numbers in these ioctls are 1-based (tty1 == VT 1),
+        // while the kernel tracks VTs 0-based internally.
+        VT_OPENQRY => {
+            // Hand the caller the active VT: an X server then takes over the
+            // terminal it was launched from, which always has a device node.
+            let vtno = kernel_hal::console::active_vt() as i32 + 1;
+            unsafe { *(data as *mut i32) = vtno };
+            Ok(0)
+        }
+        VT_GETMODE => {
+            unsafe { *(data as *mut VtMode) = *tty_vt_mode(vt).lock() };
+            Ok(0)
+        }
+        VT_SETMODE => {
+            let mode = data as *const VtMode;
+            if mode.is_null() {
+                return Err(FsError::InvalidParam);
+            }
+            *tty_vt_mode(vt).lock() = unsafe { *mode };
+            Ok(0)
+        }
+        VT_GETSTATE => {
+            let active = kernel_hal::console::active_vt() as u16 + 1;
+            // v_state is a bitmask of in-use VTs; bit N == VT N (bit 0 unused).
+            let in_use = (((1u32 << kernel_hal::console::NUM_VTS) - 1) << 1) as u16;
+            unsafe {
+                *(data as *mut VtStat) = VtStat {
+                    v_active: active,
+                    v_signal: 0,
+                    v_state: in_use,
+                }
+            };
+            Ok(0)
+        }
+        VT_ACTIVATE => {
+            if data >= 1 && data <= kernel_hal::console::num_vts() {
+                kernel_hal::console::switch_vt(data - 1);
+            }
+            Ok(0)
+        }
+        // Switches are synchronous, so the requested VT is already active.
+        VT_WAITACTIVE => Ok(0),
+        // No process-driven VT handshake to acknowledge, and our VTs are never
+        // freed; accept the request so X's setup/teardown proceeds.
+        VT_RELDISP | VT_DISALLOCATE => Ok(0),
+        TIOCSCTTY | TIOCNOTTY => Ok(0),
+        _ => Err(FsError::NotSupported),
+    }
 }
 
 /// Foreground process group of the *active* terminal (for signal delivery).
@@ -307,6 +463,14 @@ fn handle_key_event(event: &InputEvent) {
             kernel_hal::console::scroll_graphic_console(-1);
             return;
         }
+    }
+
+    // Si el VT activo tiene el teclado en modo raw/off (p. ej. un servidor X lo
+    // ha tomado con `KDSKBMODE`), no entregamos caracteres "cocidos" al TTY: los
+    // eventos crudos siguen llegando a userspace por `/dev/input/event*`. Las
+    // combinaciones de cambio de VT (Ctrl+Alt+F1..F6) ya se procesaron arriba.
+    if !tty_kbd_cooked(kernel_hal::console::active_vt()) {
+        return;
     }
 
     // Estado de modificadores, equivalente al `shift_state` de la capa keyboard
@@ -994,70 +1158,7 @@ impl INode for Stdin {
     }
 
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        match cmd as usize {
-            TIOCGWINSZ => {
-                let winsize = data as *mut ConsoleWinSize;
-                unsafe { *winsize = console::console_win_size() };
-                Ok(0)
-            }
-            TCGETS => {
-                let termios = data as *mut Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                unsafe { *termios = *tty_termios(self.vt).lock() };
-                Ok(0)
-            }
-            TIOCSPGRP => {
-                let pgid = unsafe { *(data as *const i32) };
-                tty_fg_pgrp(self.vt).store(pgid, Ordering::Relaxed);
-                Ok(0)
-            }
-            TIOCGPGRP => {
-                let mut pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
-                if pgid == 0 {
-                    if let Some(arc) = kernel_hal::thread::get_current_thread() {
-                        if let Ok(thread) = arc.downcast::<Thread>() {
-                            pgid = thread.proc().id() as i32;
-                        }
-                    }
-                }
-                if pgid == 0 {
-                    pgid = 1;
-                }
-                unsafe { *(data as *mut i32) = pgid };
-                Ok(0)
-            }
-            TCSETS | TCSETSW => {
-                let termios = data as *const Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                *tty_termios(self.vt).lock() = unsafe { *termios };
-                Ok(0)
-            }
-            TCSETSF => {
-                let termios = data as *const Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                *tty_termios(self.vt).lock() = unsafe { *termios };
-                self.buf.lock().clear();
-                self.canon_buf.lock().clear();
-                self.eventbus.lock().clear(Event::READABLE);
-                Ok(0)
-            }
-            KDGETMODE => {
-                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
-                Ok(0)
-            }
-            KDSETMODE => {
-                let mode = unsafe { *(data as *const i32) } as u32;
-                console::set_kd_mode(mode);
-                Ok(0)
-            }
-            _ => Err(FsError::NotSupported),
-        }
+        tty_ioctl(self.vt, cmd, data)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1105,71 +1206,7 @@ impl INode for Stdout {
     }
 
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        match cmd as usize {
-            TIOCGWINSZ => {
-                let winsize = data as *mut ConsoleWinSize;
-                unsafe { *winsize = console::console_win_size() };
-                Ok(0)
-            }
-            TCGETS => {
-                let termios = data as *mut Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                unsafe { *termios = *tty_termios(self.vt).lock() };
-                Ok(0)
-            }
-            TIOCSPGRP => {
-                let pgid = unsafe { *(data as *const i32) };
-                tty_fg_pgrp(self.vt).store(pgid, Ordering::Relaxed);
-                Ok(0)
-            }
-            TIOCGPGRP => {
-                let mut pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
-                if pgid == 0 {
-                    if let Some(arc) = kernel_hal::thread::get_current_thread() {
-                        if let Ok(thread) = arc.downcast::<Thread>() {
-                            pgid = thread.proc().id() as i32;
-                        }
-                    }
-                }
-                if pgid == 0 {
-                    pgid = 1;
-                }
-                unsafe { *(data as *mut i32) = pgid };
-                Ok(0)
-            }
-            TCSETS | TCSETSW => {
-                let termios = data as *const Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                *tty_termios(self.vt).lock() = unsafe { *termios };
-                Ok(0)
-            }
-            TCSETSF => {
-                let termios = data as *const Termios;
-                if termios.is_null() {
-                    return Err(FsError::InvalidParam);
-                }
-                *tty_termios(self.vt).lock() = unsafe { *termios };
-                let sin = vt_stdin(self.vt);
-                sin.buf.lock().clear();
-                sin.canon_buf.lock().clear();
-                sin.eventbus.lock().clear(Event::READABLE);
-                Ok(0)
-            }
-            KDGETMODE => {
-                unsafe { *(data as *mut i32) = console::kd_mode() as i32 };
-                Ok(0)
-            }
-            KDSETMODE => {
-                let mode = unsafe { *(data as *const i32) } as u32;
-                console::set_kd_mode(mode);
-                Ok(0)
-            }
-            _ => Err(FsError::NotSupported),
-        }
+        tty_ioctl(self.vt, cmd, data)
     }
 
     /// Get metadata of the INode

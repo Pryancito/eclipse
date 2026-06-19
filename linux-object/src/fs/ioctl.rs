@@ -91,3 +91,88 @@ pub const KDSETMODE: usize = 0x4B3A;
 pub const KD_TEXT: usize = 0x00;
 /// Graphics mode: userspace owns the framebuffer; the console stops drawing.
 pub const KD_GRAPHICS: usize = 0x01;
+
+/// Get keyboard type (`<linux/kd.h>`), written as a single `char`. Used by X to
+/// validate that a file descriptor is really a virtual console.
+pub const KDGKBTYPE: usize = 0x4B33;
+/// 101-key PC keyboard — the value reported by `KDGKBTYPE`.
+pub const KB_101: u8 = 0x02;
+
+/// Get keyboard translation mode (`K_RAW` / `K_XLATE` / ...) into an `int`.
+pub const KDGKBMODE: usize = 0x4B44;
+/// Set keyboard translation mode from an `int`.
+pub const KDSKBMODE: usize = 0x4B45;
+/// Raw scancodes; the kernel does no translation.
+pub const K_RAW: i32 = 0x00;
+/// Cooked mode: keycodes translated to characters (the default).
+pub const K_XLATE: i32 = 0x01;
+/// Medium-raw keycodes.
+pub const K_MEDIUMRAW: i32 = 0x02;
+/// Unicode translation.
+pub const K_UNICODE: i32 = 0x03;
+/// Keyboard input disabled — used by X/Wayland while they own input via evdev.
+pub const K_OFF: i32 = 0x04;
+
+// Virtual terminal ioctls (Linux `<linux/vt.h>`).
+/// Find the first free VT number; writes a 1-based VT index into an `int`.
+pub const VT_OPENQRY: usize = 0x5600;
+/// Get the VT switching mode into a [`VtMode`].
+pub const VT_GETMODE: usize = 0x5601;
+/// Set the VT switching mode from a [`VtMode`].
+pub const VT_SETMODE: usize = 0x5602;
+/// Get global VT state into a [`VtStat`].
+pub const VT_GETSTATE: usize = 0x5603;
+/// Acknowledge a VT release/acquire (arg by value).
+pub const VT_RELDISP: usize = 0x5605;
+/// Make the given (1-based) VT active (arg by value).
+pub const VT_ACTIVATE: usize = 0x5606;
+/// Wait until the given (1-based) VT is active (arg by value).
+pub const VT_WAITACTIVE: usize = 0x5607;
+/// Deallocate the given VT (arg by value).
+pub const VT_DISALLOCATE: usize = 0x5608;
+
+/// `mode` value: kernel handles VT switches automatically (default).
+pub const VT_AUTO: u8 = 0x00;
+/// `mode` value: the process handles VT switches via signals.
+pub const VT_PROCESS: u8 = 0x01;
+
+/// Linux `struct vt_mode` — VT switch signalling configuration.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VtMode {
+    pub mode: u8,
+    pub waitv: u8,
+    pub relsig: i16,
+    pub acqsig: i16,
+    pub frsig: i16,
+}
+
+impl VtMode {
+    /// Default mode: automatic, kernel-driven VT switching.
+    pub const fn auto() -> Self {
+        Self {
+            mode: VT_AUTO,
+            waitv: 0,
+            relsig: 0,
+            acqsig: 0,
+            frsig: 0,
+        }
+    }
+}
+
+/// Linux `struct vt_stat` — global VT state returned by `VT_GETSTATE`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VtStat {
+    pub v_active: u16,
+    pub v_signal: u16,
+    pub v_state: u16,
+}
+
+// Misc TTY control ioctls an X server may issue; accepted as no-ops.
+/// Flush the terminal queues.
+pub const TCFLSH: usize = 0x540B;
+/// Make the terminal the controlling TTY of the calling process.
+pub const TIOCSCTTY: usize = 0x540E;
+/// Give up the controlling TTY.
+pub const TIOCNOTTY: usize = 0x5422;
