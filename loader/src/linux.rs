@@ -357,6 +357,29 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr, flags, err, pid, thread.proc().name(), pc,
                 );
+                // Dump the faulting instruction bytes so a userspace crash is
+                // self-diagnosing from dmesg: decode `insn` to tell a TLS access
+                // (`%fs:` => 64 prefix), an (AVX) VEX-encoded op (c4/c5), a plain
+                // load/store, etc. If the PC itself is unmapped the process
+                // jumped through a bad pointer (e.g. a botched relocation/GOT).
+                #[cfg(not(feature = "libos"))]
+                {
+                    use kernel_hal::vm::{GenericPageTable, PageTable};
+                    let pt = PageTable::from_current();
+                    if let Ok((pa, _, _)) = pt.query(pc & !0xfff) {
+                        let kv = 0xffff_8000_0000_0000usize + (pa & !0xfff) + (pc & 0xfff);
+                        let mut insn = [0u8; 16];
+                        for (i, b) in insn.iter_mut().enumerate() {
+                            *b = unsafe { core::ptr::read_volatile((kv + i) as *const u8) };
+                        }
+                        warn!("[crash] pid={} pc={:#x} insn={:02x?}", pid, pc, insn);
+                    } else {
+                        warn!(
+                            "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
+                            pid, pc
+                        );
+                    }
+                }
                 // DEBUG: si el fault apunta a la mitad-kernel (rango physmap
                 // 0xffff8000_xxxx), apk dereferenció un puntero de kernel. Volcar
                 // el contenido del frame físico destino (el kernel SÍ lo tiene
