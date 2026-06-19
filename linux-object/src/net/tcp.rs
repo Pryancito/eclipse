@@ -162,16 +162,36 @@ impl Socket for TcpSocketState {
                         let last = LAST_LOG_US.load(Ordering::Relaxed);
                         if now_us.wrapping_sub(last) >= 3_000_000 {
                             LAST_LOG_US.store(now_us, Ordering::Relaxed);
-                            let (st, may, rq) = {
+                            let (st, may, rq, sq) = {
                                 let s = get_sockets();
                                 let mut s = s.lock();
                                 let sk = s.get::<TcpSocket>(handle);
-                                (sk.state(), sk.may_recv(), sk.recv_queue())
+                                (sk.state(), sk.may_recv(), sk.recv_queue(), sk.send_queue())
                             };
+                            // Self-classify the stall so a single photo of the
+                            // console pinpoints the cause without grepping:
+                            //   recv_queue large  -> our RX buffer is full because
+                            //     the consumer (apk) stopped reading; it is blocked
+                            //     downstream (almost always the disk write of the
+                            //     package), NOT a NIC/window bug. The closed window
+                            //     is correct; fix the consumer/disk stall.
+                            //   recv_queue == 0 & may_recv -> peer is silent with our
+                            //     window open: a lost/ungenerated ACK or window
+                            //     update -> network/TCP side.
+                            let cause = if rq > 65536 {
+                                "CONSUMER-BLOCKED (apk not reading; downstream/disk stall, window correctly closed)"
+                            } else if rq == 0 && may {
+                                "PEER-SILENT (window open, no data: lost ACK / window-update -> net side)"
+                            } else {
+                                "OTHER"
+                            };
+                            warn!("==================== [tcp read] DOWNLOAD STALL ====================");
                             warn!(
-                                "[tcp read] STALL handle={} state={:?} may_recv={} recv_queue={}",
-                                handle, st, may, rq
+                                "[tcp read] STALL handle={} state={:?} may_recv={} recv_queue={} send_queue={}",
+                                handle, st, may, rq, sq
                             );
+                            warn!("[tcp read] LIKELY CAUSE: {}", cause);
+                            warn!("==================================================================");
                         }
                     }
                     // Hard timeout: avoid blocking forever if the peer goes silent.

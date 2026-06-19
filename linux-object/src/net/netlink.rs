@@ -348,7 +348,7 @@ impl Socket for NetlinkSocketState {
                             let _ = iface.set_ipv4_address(v4);
                             crate::net::prepare_ipv4_stack();
                         }
-                        log::warn!(
+                        log::debug!(
                             "[netlink] NewAddr {} on {} ifindex={}",
                             cidr,
                             iface.get_ifname(),
