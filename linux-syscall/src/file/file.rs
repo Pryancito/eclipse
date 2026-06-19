@@ -460,7 +460,10 @@ impl Syscall<'_> {
                 "ioctl LEAVE fd={:?} request={:#x} -> Ok({})",
                 fd, request, v
             ),
-            Err(e) => kernel_hal::klog_err!(
+            // Failed/unhandled ioctls go through `error!` so they are printed on
+            // the console (and serial), not only into the dmesg ring — the same
+            // way an invalid syscall number is surfaced.
+            Err(e) => error!(
                 "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (unhandled/failed)",
                 fd, request, e
             ),
