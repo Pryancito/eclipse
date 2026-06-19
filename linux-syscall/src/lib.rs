@@ -109,6 +109,15 @@ impl Syscall<'_> {
                 return LxError::EINVAL as _;
             }
         };
+        // Trace every syscall into the dmesg ring (always recorded, never echoed
+        // to the screen). A syscall that blocks shows an ENTER with no matching
+        // LEAVE — that is where the process hangs; this is how we locate where
+        // an X server stops when it never reaches its main loop.
+        let trace_pid = self.zircon_process().id();
+        kernel_hal::klog_info!(
+            "SYS[{}] {:?}({}) args={:x?}",
+            trace_pid, sys_type, num, args
+        );
         let [a0, a1, a2, a3, a4, a5] = args;
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
@@ -345,6 +354,7 @@ impl Syscall<'_> {
             _ => self.aarch64_syscall(sys_type, args).await,
         };
         info!("<= {:?}", ret);
+        kernel_hal::klog_info!("SYS[{}] #{} => {:?}", trace_pid, num, ret);
         match ret {
             Ok(value) => value as isize,
             Err(err) => -(err as isize),

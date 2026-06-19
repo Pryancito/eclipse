@@ -46,4 +46,9 @@ timeout 150 qemu-system-x86_64 \
 
 echo "== results =="
 grep -a "XTEST" "$OUT" | tr -d '\r' || { echo "NO XTEST OUTPUT — see $OUT"; exit 1; }
-grep -aq "XTEST: done" "$OUT" && echo "BENCH OK" || { echo "BENCH FAILED"; exit 1; }
+# The init returns 0 and prints "N/N passed" only when every check passed.
+if grep -aE "XTEST: ([0-9]+)/\1 passed" "$OUT" >/dev/null && grep -aq "XTEST: done" "$OUT"; then
+    echo "BENCH OK"
+else
+    echo "BENCH FAILED"; exit 1
+fi
