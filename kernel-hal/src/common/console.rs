@@ -2,7 +2,7 @@
 
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Kernel log (dmesg) callback
@@ -169,7 +169,7 @@ cfg_if! {
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
                     let _ = g.write_str(s);
-                    if active && kd_mode() == KD_TEXT {
+                    if active && kd_mode_vt(vt) == KD_TEXT {
                         g.present();
                     }
                 }
@@ -184,7 +184,7 @@ cfg_if! {
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
                     let _ = g.write_fmt(fmt);
-                    if active && kd_mode() == KD_TEXT {
+                    if active && kd_mode_vt(vt) == KD_TEXT {
                         g.present();
                     }
                 }
@@ -198,7 +198,7 @@ cfg_if! {
                     return;
                 }
                 ACTIVE_VT.store(n, Ordering::SeqCst);
-                if kd_mode() == KD_TEXT {
+                if kd_mode_vt(n) == KD_TEXT {
                     if let Some(mut g) = v[n].try_lock() {
                         g.repaint();
                     }
@@ -249,20 +249,38 @@ pub const KD_TEXT: u32 = 0x00;
 /// Graphics mode: userspace owns the framebuffer; the console stops drawing.
 pub const KD_GRAPHICS: u32 = 0x01;
 
-static KD_MODE: AtomicUsize = AtomicUsize::new(KD_TEXT as usize);
+// KD mode is per-VT (like Linux): an X server putting *its* VT into
+// `KD_GRAPHICS` must not stop the kernel drawing the other text consoles, so
+// switching away from the graphics VT still shows a normal text terminal.
+static KD_MODES: [AtomicU32; NUM_VTS] = [const { AtomicU32::new(KD_TEXT) }; NUM_VTS];
 
-/// Set the console KD mode (`KD_TEXT` or `KD_GRAPHICS`).
-pub fn set_kd_mode(mode: u32) {
-    KD_MODE.store(mode as usize, Ordering::SeqCst);
+/// Set the KD mode of a specific VT (`KD_TEXT` or `KD_GRAPHICS`).
+pub fn set_kd_mode_vt(vt: usize, mode: u32) {
+    if let Some(m) = KD_MODES.get(vt) {
+        m.store(mode, Ordering::SeqCst);
+    }
     #[cfg(feature = "graphic")]
-    if mode == KD_TEXT {
+    if mode == KD_TEXT && vt == active_vt() {
         redraw_graphic_console_impl();
     }
 }
 
-/// Get the current console KD mode.
+/// Get the KD mode of a specific VT.
+pub fn kd_mode_vt(vt: usize) -> u32 {
+    KD_MODES
+        .get(vt)
+        .map(|m| m.load(Ordering::SeqCst))
+        .unwrap_or(KD_TEXT)
+}
+
+/// Set the KD mode of the currently active VT.
+pub fn set_kd_mode(mode: u32) {
+    set_kd_mode_vt(active_vt(), mode);
+}
+
+/// Get the KD mode of the currently active VT.
 pub fn kd_mode() -> u32 {
-    KD_MODE.load(Ordering::SeqCst) as u32
+    kd_mode_vt(active_vt())
 }
 
 // ---------------------------------------------------------------------------

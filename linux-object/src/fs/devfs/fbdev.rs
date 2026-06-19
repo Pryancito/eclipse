@@ -14,7 +14,10 @@ use crate::error::{LxError, LxResult};
 
 // IOCTLs
 const FBIOGET_VSCREENINFO: u32 = 0x4600;
+const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 const FBIOGET_FSCREENINFO: u32 = 0x4602;
+const FBIOPAN_DISPLAY: u32 = 0x4606;
+const FBIOBLANK: u32 = 0x4611;
 
 /// no hardware accelerator
 const FB_ACCEL_NONE: u32 = 0;
@@ -361,6 +364,17 @@ impl INode for FbDev {
                 *dst = self.display.info().into();
                 Ok(0)
             }
+            // The display runs at a single fixed mode, so we cannot honour an
+            // arbitrary mode change. Accept the request and report back the
+            // actual geometry, which is what X's fbdev driver needs to start.
+            FBIOPUT_VSCREENINFO => {
+                let dst = unsafe { &mut *(data as *mut FbVarScreeninfo) };
+                *dst = self.display.info().into();
+                Ok(0)
+            }
+            // Single, statically mapped framebuffer: no panning or blanking to
+            // do, but X issues these during setup — accept them as no-ops.
+            FBIOPAN_DISPLAY | FBIOBLANK => Ok(0),
             _ => {
                 warn!("use never support ioctl !");
                 Err(FsError::NotSupported)

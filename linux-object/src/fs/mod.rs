@@ -319,6 +319,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
+    // `/dev/tty0` (current VT) and `/dev/console`: an X server opens `/dev/tty0`
+    // to query/allocate a VT (VT_OPENQRY) and `deallocvt` opens the console to
+    // release it. The VT-management ioctls consult the active VT internally, so
+    // backing both by the first VT's stdin is sufficient.
+    if let Err(e) = devfs_root.add("tty0", stdio::vt_stdin(0)) {
+        warn!("failed to mknod /dev/tty0: {:?}", e);
+    }
+    if let Err(e) = devfs_root.add("console", stdio::vt_stdin(0)) {
+        warn!("failed to mknod /dev/console: {:?}", e);
+    }
     // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
     for vt in 0..kernel_hal::console::NUM_VTS {
         let name = alloc::format!("tty{}", vt + 1);
