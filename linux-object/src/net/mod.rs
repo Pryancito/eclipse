@@ -323,10 +323,19 @@ use zcore_drivers::net::get_sockets;
 /// TCP send buffer: 512 KiB — large enough that a single window fits a typical
 /// APK download chunk even at 100 ms RTT (theoretical limit ~5 MB/s vs ~640 KB/s
 /// with the old 64 KiB window).
-pub const TCP_SENDBUF: usize = 2 * 1024 * 1024;
+///
+/// MUST stay modest: the kernel heap is a FIXED 256 MiB and every TCP socket
+/// pins SENDBUF+RECVBUF up front. apk fetch opens ~30 parallel connections, so
+/// at the previous 2 MiB (×2 = 4 MiB/socket) ~30 sockets alone reserved ~120 MiB
+/// and a large download exhausted the heap mid-transfer -> kernel OOM panic.
+/// That OOM is what surfaced on real hardware as the deterministic ~16-27 MB
+/// download "stall" (apk could no longer allocate, stopped reading, the TCP
+/// window closed, and the peer went into zero-window persist). 512 KiB ×2 keeps
+/// ~30 sockets near ~30 MiB with ample headroom.
+pub const TCP_SENDBUF: usize = 512 * 1024;
 /// TCP receive buffer: 512 KiB — advertised window size to remote peers.
 /// Keeping this equal to SENDBUF avoids asymmetric flow stalls.
-pub const TCP_RECVBUF: usize = 2 * 1024 * 1024;
+pub const TCP_RECVBUF: usize = 512 * 1024;
 
 // ========UDP
 

@@ -5,14 +5,18 @@ use core::panic::PanicInfo;
 
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
+    // The heap is exhausted here, so we must NOT allocate: klog_*! use
+    // `alloc::format!` and would recursively fail. Use the spin serial writer
+    // (the same no-alloc path the panic handler uses) so the used/total numbers
+    // actually reach the console — they pinpoint whether this is a leak.
     let heap_used = crate::memory::heap_used();
     let heap_total = crate::memory::heap_total();
-    crate::klog_err!(
-        "kernel OOM: alloc {} bytes failed (heap {} / {} KiB)\n",
+    kernel_hal::console::serial_write_fmt_spin(format_args!(
+        "\nkernel OOM: alloc {} bytes failed (used {} / total {} MiB)\n",
         layout.size(),
-        heap_used / 1024,
-        heap_total / 1024
-    );
+        heap_used / 1024 / 1024,
+        heap_total / 1024 / 1024,
+    ));
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
