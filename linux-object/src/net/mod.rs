@@ -397,6 +397,7 @@ pub const SIOCGIFFLAGS: usize = 0x8913;
 pub const SIOCSIFFLAGS: usize = 0x8914;
 pub const SIOCGIFADDR: usize = 0x8915;
 pub const SIOCSIFADDR: usize = 0x8916;
+pub const SIOCGIFDSTADDR: usize = 0x8917;
 pub const SIOCGIFBRDADDR: usize = 0x8919;
 pub const SIOCSIFBRDADDR: usize = 0x891a;
 pub const SIOCGIFNETMASK: usize = 0x891b;
@@ -406,6 +407,7 @@ pub const SIOCGIFMTU: usize = 0x8921;
 pub const SIOCGIFHWADDR: usize = 0x8927;
 pub const SIOCGIFINDEX: usize = 0x8933;
 pub const SIOCGIFTXQLEN: usize = 0x8942;
+pub const SIOCGIFMAP: usize = 0x8970;
 pub const SIOCGARP: usize = 0x8954;
 pub const ARPHRD_ETHER: u16 = 1;
 pub const ARPHRD_LOOPBACK: u16 = 772;
@@ -1667,6 +1669,22 @@ pub fn handle_net_ioctl(
             Ok(0)
         }
 
+        // SIOCGIFDSTADDR: get point-to-point destination address. Our
+        // interfaces are not point-to-point, so the destination is
+        // unspecified (0.0.0.0) — exactly what Linux reports for a plain
+        // ethernet link. busybox `ifconfig` probes this for every iface;
+        // answering it (rather than ENOTTY) keeps the log clean.
+        SIOCGIFDSTADDR => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let _ = iface_by_name(ifname)?;
+            ifr.ifr_ifru = IfReqUnion {
+                addr: ipv4_sockaddr(Ipv4Address::UNSPECIFIED),
+            };
+            Ok(0)
+        }
+
         SIOCGIFNETMASK => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
@@ -1722,6 +1740,20 @@ pub fn handle_net_ioctl(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let _ = ifreq_name(&ifr.ifr_name)?;
             ifr.ifr_ifru = IfReqUnion { ifqlen: 1000 };
+            Ok(0)
+        }
+
+        // SIOCGIFMAP: get the device's hardware parameters (struct ifmap:
+        // mem_start/mem_end/base_addr/irq/dma/port). We have no such legacy
+        // ISA-style parameters to report, so we zero the whole `ifmap` (which
+        // fits in `ifru_pad`, 24 bytes). busybox `ifconfig` queries this for
+        // every interface; answering keeps the log free of ENOTTY errors.
+        SIOCGIFMAP => {
+            #[allow(unsafe_code)]
+            let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            let ifname = ifreq_name(&ifr.ifr_name)?;
+            let _ = iface_by_name(ifname)?;
+            ifr.ifr_ifru = IfReqUnion { ifru_pad: [0u64; 3] };
             Ok(0)
         }
 
