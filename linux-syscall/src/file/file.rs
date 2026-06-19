@@ -454,7 +454,16 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let ret = file_like.ioctl(request, arg1, arg2, arg3);
+        // An unhandled ioctl maps to `ENOSYS` ("function not implemented") via
+        // the generic FsError conversion, but the POSIX/Linux convention for an
+        // ioctl that does not apply to a device is `ENOTTY` ("inappropriate
+        // ioctl for device"). Returning `ENOSYS` makes some programs treat it as
+        // fatal or retry in a loop (e.g. repeated TIOCGWINSZ on a pipe), so
+        // normalise it to `ENOTTY` here.
+        let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
+            Err(LxError::ENOSYS) => Err(LxError::ENOTTY),
+            other => other,
+        };
         match &ret {
             Ok(v) => kernel_hal::klog_info!(
                 "ioctl LEAVE fd={:?} request={:#x} -> Ok({})",
