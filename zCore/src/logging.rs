@@ -5,11 +5,14 @@ use log::{self, Level, LevelFilter, Log, Metadata, Record};
 // Kernel log ring buffer  (exposed as "dmesg")
 // ---------------------------------------------------------------------------
 //
-// A fixed 256 KiB circular buffer holds all kernel log messages.
-// Access is serialized with a simple spinlock so it is safe to call from
-// any context, including interrupt handlers.
-
-const KLOG_BUF_SIZE: usize = 256 * 1024; // 256 KiB
+// A fixed circular buffer holds all kernel log messages. Access is serialized
+// with a simple spinlock so it is safe to call from any context, including
+// interrupt handlers.
+//
+// Sized to hold a full X-server startup syscall trace (tens of thousands of
+// lines) so the structurally interesting calls are not evicted before `dmesg`
+// can read them back.
+const KLOG_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 struct KlogBuf {
     buf: [u8; KLOG_BUF_SIZE],

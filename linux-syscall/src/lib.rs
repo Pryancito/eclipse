@@ -113,11 +113,23 @@ impl Syscall<'_> {
         // to the screen). A syscall that blocks shows an ENTER with no matching
         // LEAVE — that is where the process hangs; this is how we locate where
         // an X server stops when it never reaches its main loop.
-        let trace_pid = self.zircon_process().id();
-        kernel_hal::klog_info!(
-            "SYS[{}] {:?}({}) args={:x?}",
-            trace_pid, sys_type, num, args
+        //
+        // Skip the high-volume bulk-data syscalls (read/write/readv/writev/
+        // pread/pwrite): they carry little structural signal but would evict the
+        // interesting calls from the ring — and crucially, reading the log back
+        // with `dmesg | grep` (itself a storm of read/write) must not flush the
+        // very trace we want to see.
+        let trace = !matches!(
+            sys_type,
+            Sys::READ | Sys::WRITE | Sys::READV | Sys::WRITEV | Sys::PREAD64 | Sys::PWRITE64
         );
+        let trace_pid = self.zircon_process().id();
+        if trace {
+            kernel_hal::klog_info!(
+                "SYS[{}] {:?}({}) args={:x?}",
+                trace_pid, sys_type, num, args
+            );
+        }
         let [a0, a1, a2, a3, a4, a5] = args;
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
@@ -354,7 +366,9 @@ impl Syscall<'_> {
             _ => self.aarch64_syscall(sys_type, args).await,
         };
         info!("<= {:?}", ret);
-        kernel_hal::klog_info!("SYS[{}] #{} => {:?}", trace_pid, num, ret);
+        if trace {
+            kernel_hal::klog_info!("SYS[{}] #{} => {:?}", trace_pid, num, ret);
+        }
         match ret {
             Ok(value) => value as isize,
             Err(err) => -(err as isize),
