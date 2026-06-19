@@ -444,9 +444,28 @@ impl Syscall<'_> {
             "ioctl: fd={:?}, request={:#x}, args=[{:#x}, {:#x}, {:#x}]",
             fd, request, arg1, arg2, arg3
         );
+        // Trace into the dmesg ring (always recorded, never echoed to the
+        // screen). If an ioctl blocks, dmesg shows an `ENTER` with no matching
+        // `LEAVE` — that request is the one that hangs. Unhandled ioctls are
+        // recorded as errors, the same way an invalid syscall number is.
+        kernel_hal::klog_info!(
+            "ioctl ENTER fd={:?} request={:#x} arg={:#x}",
+            fd, request, arg1
+        );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        file_like.ioctl(request, arg1, arg2, arg3)
+        let ret = file_like.ioctl(request, arg1, arg2, arg3);
+        match &ret {
+            Ok(v) => kernel_hal::klog_info!(
+                "ioctl LEAVE fd={:?} request={:#x} -> Ok({})",
+                fd, request, v
+            ),
+            Err(e) => kernel_hal::klog_err!(
+                "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (unhandled/failed)",
+                fd, request, e
+            ),
+        }
+        ret
     }
 
     /// Manipulate a file descriptor.
