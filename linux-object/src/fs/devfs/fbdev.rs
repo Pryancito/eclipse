@@ -16,6 +16,8 @@ use crate::error::{LxError, LxResult};
 const FBIOGET_VSCREENINFO: u32 = 0x4600;
 const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 const FBIOGET_FSCREENINFO: u32 = 0x4602;
+const FBIOGETCMAP: u32 = 0x4604;
+const FBIOPUTCMAP: u32 = 0x4605;
 const FBIOPAN_DISPLAY: u32 = 0x4606;
 const FBIOBLANK: u32 = 0x4611;
 
@@ -375,6 +377,10 @@ impl INode for FbDev {
             // Single, statically mapped framebuffer: no panning or blanking to
             // do, but X issues these during setup — accept them as no-ops.
             FBIOPAN_DISPLAY | FBIOBLANK => Ok(0),
+            // TrueColor framebuffer: there is no hardware palette to program,
+            // but X's fbdev driver still loads a colormap during setup. Accept
+            // it so the screen comes up instead of failing the mode set.
+            FBIOGETCMAP | FBIOPUTCMAP => Ok(0),
             _ => {
                 warn!("use never support ioctl !");
                 Err(FsError::NotSupported)
