@@ -459,3 +459,90 @@ impl FileLike for UnixSocketState {
         Ok(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    /// Reproduces the X11 connection-setup race: an X client writes its first
+    /// bytes (the connection setup) immediately after `connect()`, before the
+    /// server calls `accept()`. With connect-time wiring those bytes must be
+    /// buffered for the server, not rejected with `ENOTCONN`.
+    #[test]
+    fn client_write_before_accept_is_buffered() {
+        let server = UnixSocketState::new();
+        server.inner.lock().is_listening = true;
+
+        // Simulate what sys_connect now does: create the server-side endpoint,
+        // wire it to the client, and queue it for accept().
+        let client = UnixSocketState::new();
+        let server_side = UnixSocketState::new();
+        server_side.set_path(String::from("\0/tmp/.X11-unix/X0"));
+        UnixSocketState::connect_pair(&client, &server_side);
+        server.push_accept(server_side.clone());
+
+        // Client sends the handshake before the server has accepted.
+        let n = Socket::write(&*client, b"x11-setup", None).expect("write before accept");
+        assert_eq!(n, 9);
+
+        // The bytes are waiting on the server side; the connection is queued.
+        assert_eq!(server_side.inner.lock().buffer.len(), 9);
+        assert_eq!(server.inner.lock().accept_queue.len(), 1);
+    }
+
+    /// A socket with no peer must report `ENOTCONN` on write.
+    #[test]
+    fn write_without_peer_is_enotconn() {
+        let lone = UnixSocketState::new();
+        assert!(matches!(
+            Socket::write(&*lone, b"x", None),
+            Err(LxError::ENOTCONN)
+        ));
+    }
+
+    /// bind registry: register/lookup/unregister and duplicate-bind refusal.
+    #[test]
+    fn register_lookup_roundtrip() {
+        let path = String::from("\0/tmp/.X11-unix/Xtest-reg");
+        let s = UnixSocketState::new();
+        UnixSocketState::register(path.clone(), s.clone()).unwrap();
+        assert!(UnixSocketState::lookup(&path).is_some());
+
+        let s2 = UnixSocketState::new();
+        assert!(matches!(
+            UnixSocketState::register(path.clone(), s2),
+            Err(LxError::EADDRINUSE)
+        ));
+
+        UnixSocketState::unregister(&path);
+        assert!(UnixSocketState::lookup(&path).is_none());
+    }
+
+    /// End-to-end: after the server accepts, it reads what the client wrote
+    /// before the accept, and its reply reaches the client (full duplex).
+    #[async_std::test]
+    async fn accept_then_full_duplex() {
+        let server = UnixSocketState::new();
+        server.inner.lock().is_listening = true;
+
+        let client = UnixSocketState::new();
+        let server_side = UnixSocketState::new();
+        UnixSocketState::connect_pair(&client, &server_side);
+        server.push_accept(server_side);
+        Socket::write(&*client, b"ping", None).unwrap();
+
+        let (accepted, _ep) = Socket::accept(&*server).await.unwrap();
+
+        // Server reads the bytes the client sent before accept.
+        let mut buf = [0u8; 16];
+        let n = accepted.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+
+        // Reply path: server -> client.
+        accepted.write(b"pong").unwrap();
+        let mut cbuf = [0u8; 16];
+        let (r, _) = Socket::read(&*client, &mut cbuf).await;
+        assert_eq!(&cbuf[..r.unwrap()], b"pong");
+    }
+}
