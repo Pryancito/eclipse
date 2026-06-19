@@ -105,6 +105,16 @@ impl InputCapability {
         }
         true
     }
+
+    /// Serialise the bitmap to little-endian bytes, the layout Linux uses for
+    /// the `EVIOCGBIT` family of input ioctls.
+    pub fn to_le_bytes(&self) -> [u8; 128] {
+        let mut out = [0u8; 128];
+        for (i, word) in self.bitmap.iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
 }
 
 impl fmt::Debug for InputCapability {

@@ -454,13 +454,33 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        // An unhandled ioctl maps to `ENOSYS` ("function not implemented") via
-        // the generic FsError conversion, but the POSIX/Linux convention for an
-        // ioctl that does not apply to a device is `ENOTTY` ("inappropriate
-        // ioctl for device"). Returning `ENOSYS` makes some programs treat it as
-        // fatal or retry in a loop (e.g. repeated TIOCGWINSZ on a pipe), so
-        // normalise it to `ENOTTY` here.
+        // `TIOCGWINSZ` (get terminal window size).
+        const TIOCGWINSZ: usize = 0x5413;
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
+            // Some programs (e.g. the X server and its helpers) insist on a
+            // valid window size and keep retrying `TIOCGWINSZ` in a loop when it
+            // fails — even when stdout/stderr is a pipe rather than a tty, which
+            // a real kernel answers with ENOTTY. Satisfy them by reporting the
+            // console size so the ioctl succeeds instead of spinning.
+            Err(LxError::ENOSYS) | Err(LxError::ENOTTY)
+                if request == TIOCGWINSZ && arg1 != 0 =>
+            {
+                let mut ws = kernel_hal::console::console_win_size();
+                if ws.ws_col == 0 {
+                    ws.ws_col = 80;
+                }
+                if ws.ws_row == 0 {
+                    ws.ws_row = 25;
+                }
+                let mut ptr: UserOutPtr<kernel_hal::console::ConsoleWinSize> = arg1.into();
+                ptr.write(ws)?;
+                Ok(0)
+            }
+            // An unhandled ioctl maps to `ENOSYS` ("function not implemented")
+            // via the generic FsError conversion, but the POSIX/Linux convention
+            // for an ioctl that does not apply to a device is `ENOTTY`
+            // ("inappropriate ioctl for device"). Returning `ENOSYS` makes some
+            // programs treat it as fatal or retry in a loop, so normalise it.
             Err(LxError::ENOSYS) => Err(LxError::ENOTTY),
             other => other,
         };

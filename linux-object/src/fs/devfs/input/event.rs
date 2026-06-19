@@ -4,7 +4,7 @@ use core::{any::Any, future::Future, mem::size_of, pin::Pin};
 
 use lock::Mutex;
 
-use kernel_hal::drivers::prelude::{InputEvent, InputEventType};
+use kernel_hal::drivers::prelude::{CapabilityType, InputCapability, InputEvent, InputEventType};
 use kernel_hal::drivers::scheme::InputScheme;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
@@ -103,6 +103,25 @@ impl EventDev {
     fn can_read(&self) -> bool {
         !self.inner.lock().buf.is_empty()
     }
+
+    /// Map a Linux `EV_*` event-type code to the driver capability bitmap that
+    /// `EVIOCGBIT(ev)` should report. `ev == 0` asks for the set of supported
+    /// event types themselves.
+    fn capability_for_ev(&self, ev: u16) -> InputCapability {
+        let cap_type = match ev {
+            0x00 => CapabilityType::Event, // EVIOCGBIT(0): supported event types
+            0x01 => CapabilityType::Key,   // EV_KEY
+            0x02 => CapabilityType::RelAxis, // EV_REL
+            0x03 => CapabilityType::AbsAxis, // EV_ABS
+            0x04 => CapabilityType::Misc,  // EV_MSC
+            0x05 => CapabilityType::Switch, // EV_SW
+            0x11 => CapabilityType::Led,   // EV_LED
+            0x12 => CapabilityType::Sound, // EV_SND
+            0x15 => CapabilityType::FeedBack, // EV_FF
+            _ => return InputCapability::empty(),
+        };
+        self.input.capability(cap_type)
+    }
 }
 
 impl INode for EventDev {
@@ -159,6 +178,80 @@ impl INode for EventDev {
         }
 
         Box::pin(EventFuture { dev: self })
+    }
+
+    /// Implement the `EVIOC*` ioctls (Linux `<linux/input.h>`) that
+    /// `evdev`/`libinput` issue while probing a device. The request encodes a
+    /// direction, size, type (`'E'`) and number; we decode the number and the
+    /// userspace buffer size from it.
+    #[allow(unsafe_code)]
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        if data == 0 {
+            return Err(FsError::InvalidParam);
+        }
+        let size = ((cmd >> 16) & 0x3fff) as usize;
+        let typ = (cmd >> 8) & 0xff;
+        let nr = (cmd & 0xff) as usize;
+        // Only the input ioctl group ('E').
+        if typ != 'E' as u32 {
+            return Err(FsError::NotSupported);
+        }
+        match nr {
+            // EVIOCGVERSION -> EV_VERSION (0x010001).
+            0x01 => {
+                unsafe { *(data as *mut i32) = 0x01_0001 };
+                Ok(core::mem::size_of::<i32>())
+            }
+            // EVIOCGID -> struct input_id { bustype, vendor, product, version }.
+            // Report a virtual bus; vendor/product/version are not meaningful.
+            0x02 => {
+                unsafe { *(data as *mut [u16; 4]) = [0x06, 0, 0, 0] };
+                Ok(8)
+            }
+            // EVIOCGREP -> repeat [delay_ms, period_ms].
+            0x03 => {
+                unsafe { *(data as *mut [u32; 2]) = [250, 33] };
+                Ok(8)
+            }
+            // EVIOCGNAME(len) -> device name (NUL-terminated).
+            0x06 => {
+                let name = self.input.name().as_bytes();
+                let n = (name.len() + 1).min(size);
+                if n == 0 {
+                    return Ok(0);
+                }
+                let dst = unsafe { core::slice::from_raw_parts_mut(data as *mut u8, n) };
+                let body = n - 1;
+                dst[..body].copy_from_slice(&name[..body]);
+                dst[n - 1] = 0;
+                Ok(n)
+            }
+            // EVIOCGPROP / EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: report
+            // an all-zero state (no properties, nothing currently pressed/lit).
+            0x09 | 0x18 | 0x19 | 0x1a | 0x1b => {
+                let dst = unsafe { core::slice::from_raw_parts_mut(data as *mut u8, size) };
+                dst.fill(0);
+                Ok(size)
+            }
+            // EVIOCSCLOCKID / EVIOCGRAB / EVIOCREVOKE: accept as no-ops.
+            0xa0 | 0x90 | 0x91 => Ok(0),
+            // EVIOCGBIT(ev, len): supported event types / codes bitmap.
+            0x20..=0x3f => {
+                let bytes = self.capability_for_ev((nr - 0x20) as u16).to_le_bytes();
+                let n = size.min(bytes.len());
+                let dst = unsafe { core::slice::from_raw_parts_mut(data as *mut u8, n) };
+                dst.copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            // EVIOCGABS(abs): struct input_absinfo — zeroed (no absolute axes).
+            0x40..=0x7f => {
+                let n = size.min(24);
+                let dst = unsafe { core::slice::from_raw_parts_mut(data as *mut u8, n) };
+                dst.fill(0);
+                Ok(0)
+            }
+            _ => Err(FsError::NotSupported),
+        }
     }
 
     fn metadata(&self) -> Result<Metadata> {
