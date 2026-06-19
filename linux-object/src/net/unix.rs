@@ -147,11 +147,22 @@ impl UnixSocketState {
         UNIX_SOCKETS.lock().remove(path);
     }
 
-    /// Push a pending connection from `peer` into this server's accept queue.
+    /// Push an already-wired server-side endpoint into this server's accept
+    /// queue, to be handed out by the next `accept()`.
     pub fn push_accept(self: &Arc<Self>, peer: Arc<UnixSocketState>) {
         let mut inner = self.inner.lock();
         inner.accept_queue.push_back(peer);
         inner.eventbus.set(Event::READABLE);
+    }
+
+    /// Set the local bound path (used to label the server side of a pair).
+    pub fn set_path(&self, path: String) {
+        self.inner.lock().path = path;
+    }
+
+    /// The local bound path.
+    pub fn bound_path(&self) -> String {
+        self.inner.lock().path.clone()
     }
 }
 
@@ -286,23 +297,22 @@ impl Socket for UnixSocketState {
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
         loop {
             let mut inner = self.inner.lock();
-            if let Some(peer) = inner.accept_queue.pop_front() {
+            if let Some(server_side) = inner.accept_queue.pop_front() {
                 if inner.accept_queue.is_empty() {
                     inner.eventbus.clear(Event::READABLE);
                 }
                 drop(inner);
 
-                // Create the server-side connected socket
-                let server_side = UnixSocketState::new();
-                {
-                    let mut ssi = server_side.inner.lock();
-                    ssi.path = self.inner.lock().path.clone();
-                }
-
-                // Wire server_side ↔ peer
-                UnixSocketState::connect_pair(&server_side, &peer);
-
-                let peer_path = peer.inner.lock().path.clone();
+                // `server_side` was already wired to the connecting client in
+                // `sys_connect`, so any bytes the client sent before we accepted
+                // (e.g. the X11 connection setup) are already buffered.
+                // Clone the peer weak ref without nesting locks to label the
+                // returned endpoint with the client's path.
+                let peer_weak = server_side.inner.lock().peer.clone();
+                let peer_path = peer_weak
+                    .and_then(|w| w.upgrade())
+                    .map(|p| p.lock().path.clone())
+                    .unwrap_or_default();
                 return Ok((server_side, Endpoint::Unix(peer_path)));
             }
 
