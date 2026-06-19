@@ -81,6 +81,11 @@ impl Syscall<'_> {
     /// - len – number of bytes to write
     pub fn sys_write(&self, fd: FileDesc, base: UserInPtr<u8>, len: usize) -> SysResult {
         info!("write: fd={:?}, base={:?}, len={:#x}", fd, base, len);
+        // Diagnostic: surface X-server log/error lines into the dmesg ring so the
+        // reason a graphics server aborts is visible even without its logfile.
+        if let Ok(peek) = base.as_slice(len.min(512)) {
+            tee_x_diag(peek);
+        }
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
@@ -220,6 +225,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let buf = iovs.read_to_vec()?;
+        tee_x_diag(&buf);
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let len = file_like.write(&buf)?;
@@ -798,5 +804,21 @@ numeric_enum_macro::numeric_enum! {
         SETLKW = 7,
         /// like F_DUPFD, but additionally set the close-on-exec flag
         DUPFD_CLOEXEC = F_LINUX_SPECIFIC_BASE + 6,
+    }
+}
+
+/// Tee X-server log/error lines into the dmesg ring (prefixed `XLOG:`) so the
+/// reason a graphics server (Xorg) aborts is visible via `dmesg`, even when its
+/// own logfile is unreachable. Scans a small prefix of each write for the
+/// markers Xorg uses for warnings, errors and fatals.
+fn tee_x_diag(buf: &[u8]) {
+    let scan = &buf[..buf.len().min(512)];
+    let has = |needle: &[u8]| scan.windows(needle.len()).any(|w| w == needle);
+    if has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens") || has(b"(II) ") {
+        if let Ok(s) = core::str::from_utf8(scan) {
+            for line in s.split('\n').filter(|l| !l.is_empty()).take(4) {
+                kernel_hal::klog_info!("XLOG: {}", line);
+            }
+        }
     }
 }
