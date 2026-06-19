@@ -148,6 +148,15 @@ impl WakerPage {
         self.dropped.swap(0)
     }
 
+    /// Non-destructive snapshot of `(notified, dropped, borrowed)` for diagnostics.
+    pub fn peek(&self) -> (u64, u64, u64) {
+        (
+            self.notified.load(),
+            self.dropped.load(),
+            self.borrowed.load(),
+        )
+    }
+
     pub fn clear(&self, idx: usize) {
         debug_assert!(idx < 64);
         let mask = !(1 << idx);

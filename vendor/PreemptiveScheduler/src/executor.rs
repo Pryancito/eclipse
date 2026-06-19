@@ -30,6 +30,10 @@ pub struct Executor {
     state: ExecutorState,
 }
 
+/// Idle-loop iterations since any task was last polled (hang detector; see the
+/// idle branch in `run`). Global because all executors on a CPU share progress.
+static IDLE_STREAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 const STACK_SIZE: usize = 4096 * 32;
 const STACK_LAYOUT: Layout = Layout::new::<[u8; STACK_SIZE]>();
 
@@ -150,6 +154,11 @@ impl Executor {
                 waker_ref.mark_borrowed(true);
                 self.task_id = task.id();
                 debug!("running future {}:{}", self.id(), task.id());
+                // Hang detector: a task is being polled, so clear the idle-loop
+                // streak. If the machine then spins the idle loop many times with
+                // tasks still present but nothing polled, a wake was lost (see the
+                // else-branch dump below).
+                IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
                 let ret = task.poll(&mut cx);
                 // DEBUG: did this future overflow the 128 KiB coroutine stack?
                 unsafe {
@@ -206,6 +215,24 @@ impl Executor {
                     // queue instead of halting until the next interrupt.
                     continue;
                 } else {
+                    // Hang detector (diagnostics only): the run queue is empty so
+                    // we are about to halt until the next interrupt. If tasks still
+                    // exist, count idle-loop iterations; the 250 Hz timer wakes us
+                    // ~every 4 ms, so ~750 iterations with no task polled ≈ 3 s of
+                    // a stalled machine. Dump the waker-page state once it trips:
+                    //   notified == 0  -> a wake was LOST (task asleep forever)
+                    //   notified  > 0  -> take_task is failing to pick a ready task
+                    if task_num > 0 {
+                        let s = IDLE_STREAK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if s == 750 || (s > 750 && s % 2500 == 0) {
+                            let (tn, n, d, b) = self.task_collection.debug_pending();
+                            error!(
+                                "[sched-hang] executor {} idle {} loops, tasks present but none runnable: task_num={} notified={} dropped={} borrowed={} -> {}",
+                                self.id(), s, tn, n, d, b,
+                                if n == 0 { "LOST WAKE (no task notified)" } else { "NOTIFIED-NOT-PICKED" }
+                            );
+                        }
+                    }
                     debug!("no other tasks, wait for interrupt");
                     crate::arch::wait_for_interrupt();
                 }

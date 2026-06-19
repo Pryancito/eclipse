@@ -221,6 +221,24 @@ impl TaskCollection {
         self.task_num.load(Ordering::Relaxed)
     }
 
+    /// Diagnostics: `(task_num, notified_bits, dropped_bits, borrowed_bits)`
+    /// summed across all waker pages. Used by the executor's hang detector to
+    /// tell a lost wake (tasks present, notified == 0) from a take_task bug
+    /// (notified > 0 yet nothing is polled).
+    pub fn debug_pending(&self) -> (usize, u32, u32, u32) {
+        let (mut n, mut d, mut b) = (0u32, 0u32, 0u32);
+        for fc in &self.future_collections {
+            let inner = fc.lock();
+            for page in &inner.pages {
+                let (pn, pd, pb) = page.peek();
+                n += pn.count_ones();
+                d += pd.count_ones();
+                b += pb.count_ones();
+            }
+        }
+        (self.task_num(), n, d, b)
+    }
+
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, WakerRef, DroperRef)> {
         let mut generator = self.generator.as_ref().unwrap().lock();
         match generator.as_mut().resume(()) {
