@@ -107,7 +107,22 @@ impl Syscall<'_> {
 
     /// provides a simple way of getting overall system statistics
     pub fn sys_sysinfo(&mut self, mut sys_info: UserOutPtr<SysInfo>) -> SysResult {
-        let sysinfo = SysInfo::default();
+        // `uptime` was the headline: returning the zeroed default made
+        // `uptime`/`top` always report "up 0 min". Fill the fields we can
+        // source cheaply so userspace tools show real numbers.
+        let (used, total) = kernel_hal::mem::memory_usage();
+        let sysinfo = SysInfo {
+            // Seconds since boot, from the monotonic timer (same source as
+            // /proc/uptime).
+            uptime: timer_now().as_secs(),
+            // We don't track real load averages yet; report 0 (the kernel
+            // fixed-point format is value << 16, so 0 stays 0).
+            loads: [0; 3],
+            totalram: total as u64,
+            freeram: total.saturating_sub(used) as u64,
+            mem_unit: 1,
+            ..SysInfo::default()
+        };
         sys_info.write(sysinfo)?;
         Ok(0)
     }
