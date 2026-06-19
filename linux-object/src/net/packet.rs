@@ -432,7 +432,7 @@ impl Socket for PacketSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
-        warn!(
+        trace!(
             "PacketSocket: ioctl request={:#x}, arg1={:#x}",
             request, arg1
         );

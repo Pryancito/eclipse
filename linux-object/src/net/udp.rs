@@ -359,7 +359,10 @@ impl Socket for UdpSocketState {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
-        warn!("UdpSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
+        // trace, not warn: this fires on every SIOCGIFFLAGS/ifconfig poll and
+        // floods the console during a download, burying the [tcp read] STALL
+        // diagnostic that actually matters.
+        trace!("UdpSocket: ioctl request={:#x}, arg1={:#x}", request, arg1);
         let ipv6 = self.inner.lock().ipv6;
         handle_net_ioctl(request, arg1, arg2, arg3, ipv6)
     }
