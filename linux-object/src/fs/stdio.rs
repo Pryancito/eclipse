@@ -146,6 +146,12 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             unsafe { *winsize = console::console_win_size() };
             Ok(0)
         }
+        // The console's window size is fixed by the framebuffer, so we can't
+        // honor a caller-supplied size — but accept the request instead of
+        // returning ENOTTY. bash/readline set the winsize at startup and were
+        // logging an error on every shell launch; TIOCGWINSZ still reports the
+        // real (framebuffer-derived) size.
+        TIOCSWINSZ => Ok(0),
         TCGETS => {
             let termios = data as *mut Termios;
             if termios.is_null() {

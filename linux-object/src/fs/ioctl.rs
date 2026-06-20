@@ -69,6 +69,12 @@ pub const TIOCGWINSZ: usize = 0x5413;
 pub const TIOCGWINSZ: usize = 0x4_008_74_68;
 
 #[cfg(not(target_arch = "mips"))]
+pub const TIOCSWINSZ: usize = 0x5414;
+// _IOW('t', 103, struct winsize)
+#[cfg(target_arch = "mips")]
+pub const TIOCSWINSZ: usize = 0x8_008_74_67;
+
+#[cfg(not(target_arch = "mips"))]
 pub const FIONCLEX: usize = 0x5450;
 #[cfg(target_arch = "mips")]
 pub const FIONCLEX: usize = 0x6602;
