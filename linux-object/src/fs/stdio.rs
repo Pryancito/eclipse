@@ -140,6 +140,20 @@ fn tty_kbd_cooked(vt: usize) -> bool {
     matches!(tty_kbd_mode(vt), K_XLATE | K_UNICODE)
 }
 
+/// The VT an X server is driving in `K_MEDIUMRAW`, if any. kdrive (TinyX) puts
+/// the keyboard of the VT it opened into medium-raw and reads keycodes from that
+/// VT's tty. The `VT_OPENQRY` shim can leave `active_vt()` and that VT out of
+/// sync, so route medium-raw keycodes by the mode itself: prefer the active VT
+/// when it is the one in medium-raw, otherwise fall back to the first VT that
+/// is. Returns `None` when no VT is in medium-raw (normal cooked console).
+fn medium_raw_vt() -> Option<usize> {
+    let active = vt_clamp(kernel_hal::console::active_vt());
+    if tty_kbd_mode(active) == K_MEDIUMRAW {
+        return Some(active);
+    }
+    (0..kernel_hal::console::NUM_VTS).find(|&vt| tty_kbd_mode(vt) == K_MEDIUMRAW)
+}
+
 fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
     r.map_err(|_| FsError::InvalidParam)
 }
@@ -225,6 +239,12 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // ioctl argument by value, not a pointer. X puts the keyboard into
             // K_RAW/K_OFF this way during console takeover.
             let mode = data as i32;
+            warn!(
+                "[kbd-diag] KDSKBMODE vt={} mode={} (active_vt={})",
+                vt,
+                mode,
+                kernel_hal::console::active_vt()
+            );
             TTY_STATES[vt_clamp(vt)]
                 .kbd_mode
                 .store(mode, Ordering::Relaxed);
@@ -494,6 +514,26 @@ fn handle_key_event(event: &InputEvent) {
     if event.event_type != InputEventType::Key {
         return;
     }
+    // Temporary keyboard diagnostics for the Xfbdev/kdrive medium-raw path:
+    // log the first handful of key events with the active VT and its keyboard
+    // mode. If these never appear, the USB keyboard is producing no events; if
+    // `mode` is not 2 (K_MEDIUMRAW) while X is up, kdrive's KDSKBMODE landed on
+    // a different VT than the one the keystrokes are routed to.
+    {
+        static KBD_DIAG: AtomicU8 = AtomicU8::new(0);
+        if KBD_DIAG.load(Ordering::Relaxed) < 80 {
+            KBD_DIAG.fetch_add(1, Ordering::Relaxed);
+            let avt = kernel_hal::console::active_vt();
+            warn!(
+                "[kbd-diag] code={} val={} active_vt={} mode={} medium_raw_vt={:?}",
+                event.code,
+                event.value,
+                avt,
+                tty_kbd_mode(avt),
+                medium_raw_vt()
+            );
+        }
+    }
     // Linux input: value 1 = press, 0 = release, 2 = autorepeat. Track the
     // modifier state but don't return — the medium-raw path below has to emit
     // the modifier keycodes too.
@@ -539,10 +579,10 @@ fn handle_key_event(event: &InputEvent) {
     // with bit 7 set on release. Every key matters — presses, releases and
     // modifiers — but not autorepeat (value 2): kdrive generates its own
     // repeat. Keycodes ≥ 128 don't fit kdrive's single-byte reader; skip them.
-    if tty_kbd_mode(kernel_hal::console::active_vt()) == K_MEDIUMRAW {
+    if let Some(vt) = medium_raw_vt() {
         if event.code < 0x80 && (event.value == 0 || event.value == 1) {
             let byte = (event.code as u8 & 0x7f) | if event.value == 0 { 0x80 } else { 0 };
-            active_stdin().push_bytes(&[byte]);
+            vt_stdin(vt).push_bytes(&[byte]);
         }
         return;
     }
