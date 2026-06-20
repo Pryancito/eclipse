@@ -218,19 +218,57 @@ impl Executor {
                     // Hang detector (diagnostics only): the run queue is empty so
                     // we are about to halt until the next interrupt. If tasks still
                     // exist, count idle-loop iterations; the 250 Hz timer wakes us
-                    // ~every 4 ms, so ~750 iterations with no task polled ≈ 3 s of
-                    // a stalled machine. Dump the waker-page state once it trips:
-                    //   notified == 0  -> a wake was LOST (task asleep forever)
-                    //   notified  > 0  -> take_task is failing to pick a ready task
+                    // ~every 4 ms, so ~750 iterations with no task polled ≈ 3 s.
+                    // `IDLE_STREAK` is global and reset on every real poll, so it
+                    // only climbs while *no* CPU makes progress.
+                    //
+                    // Classify before shouting — not every idle state is a hang:
+                    //   borrowed > 0 : a task is owned by an executor (being polled,
+                    //                  or preempted mid-poll and waiting to resume —
+                    //                  possibly on another CPU that stole it). That
+                    //                  is in-flight work, so an idle peer seeing it
+                    //                  is expected under SMP steal+preempt; only a
+                    //                  borrow that stays outstanding for a very long
+                    //                  time (≈20 s) is suspicious (a leaked borrow).
+                    //   notified > 0 : a task is ready but unpicked here — usually
+                    //                  CPU-affinity bound to another core, which will
+                    //                  run it. Benign; report only if it persists.
+                    //   n == 0 && b == 0 : tasks exist, none ready, none in-flight —
+                    //                  the only state that can never recover on its
+                    //                  own = a genuine lost wake. Flag promptly.
                     if task_num > 0 {
                         let s = IDLE_STREAK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if s == 750 || (s > 750 && s % 2500 == 0) {
+                        if s >= 750 {
                             let (tn, n, d, b) = self.task_collection.debug_pending();
-                            error!(
-                                "[sched-hang] executor {} idle {} loops, tasks present but none runnable: task_num={} notified={} dropped={} borrowed={} -> {}",
-                                self.id(), s, tn, n, d, b,
-                                if n == 0 { "LOST WAKE (no task notified)" } else { "NOTIFIED-NOT-PICKED" }
-                            );
+                            let genuine_stall = n == 0 && b == 0;
+                            let report = if genuine_stall {
+                                s == 750 || s % 2500 == 0
+                            } else {
+                                // In-flight / affinity: far higher bar so a
+                                // transient (a long timer wait, a task briefly
+                                // stolen+preempted) doesn't spam the console.
+                                s == 5000 || s % 5000 == 0
+                            };
+                            if report {
+                                let cause = if genuine_stall {
+                                    "LOST WAKE (no task ready or in-flight)"
+                                } else if n != 0 {
+                                    "NOTIFIED-NOT-PICKED (affinity-bound to another CPU?)"
+                                } else {
+                                    "BORROW OUTSTANDING (in-flight elsewhere, or leaked)"
+                                };
+                                if genuine_stall {
+                                    error!(
+                                        "[sched-hang] executor {} idle {} loops: task_num={} notified={} dropped={} borrowed={} -> {}",
+                                        self.id(), s, tn, n, d, b, cause
+                                    );
+                                } else {
+                                    warn!(
+                                        "[sched-hang] executor {} idle {} loops: task_num={} notified={} dropped={} borrowed={} -> {}",
+                                        self.id(), s, tn, n, d, b, cause
+                                    );
+                                }
+                            }
                         }
                     }
                     debug!("no other tasks, wait for interrupt");
