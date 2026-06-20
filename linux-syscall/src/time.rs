@@ -3,14 +3,19 @@
 //!
 use crate::Syscall;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::convert::TryFrom;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use kernel_hal::{user::UserInPtr, user::UserOutPtr};
+use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::signal::Signal;
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
-use zircon_object::object::KernelObject;
-use zircon_object::task::Thread;
+use lock::Mutex;
+use zircon_object::object::{KernelObject, KoID};
+use zircon_object::task::{Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
 
@@ -268,4 +273,220 @@ impl Syscall<'_> {
         );
         Ok(0)
     }
+
+    /// `timer_create`: create a per-process POSIX interval timer. The notify
+    /// signal comes from `sevp` (`struct sigevent`); a null `sevp` defaults to
+    /// SIGALRM, `SIGEV_NONE` delivers no signal. The new timer id is written to
+    /// `timerid` (an `int`, the kernel's `timer_t`).
+    pub fn sys_timer_create(&self, _clockid: usize, sevp: usize, timerid: usize) -> SysResult {
+        let signo = if sevp == 0 {
+            Signal::SIGALRM as usize
+        } else {
+            // struct sigevent: sigev_value (8B), sigev_signo @ +8, sigev_notify @ +12.
+            let signo_p: UserInPtr<i32> = (sevp + 8).into();
+            let notify_p: UserInPtr<i32> = (sevp + 12).into();
+            let signo = signo_p.read()?;
+            let notify = notify_p.read()?;
+            const SIGEV_NONE: i32 = 1;
+            if notify == SIGEV_NONE {
+                0
+            } else {
+                signo as usize
+            }
+        };
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner: self.zircon_process().id(),
+                signo,
+                interval: Duration::ZERO,
+                next: Duration::ZERO,
+                generation: 0,
+            },
+        );
+        let mut out: UserOutPtr<i32> = timerid.into();
+        out.write(id as i32)?;
+        Ok(0)
+    }
+
+    /// `timer_settime`: arm/disarm a timer. `it_value == 0` disarms; otherwise
+    /// the timer fires at `it_value` (relative, or absolute with TIMER_ABSTIME)
+    /// and then every `it_interval`.
+    pub fn sys_timer_settime(
+        &self,
+        id: usize,
+        flags: usize,
+        new_value: UserInPtr<ITimerSpec>,
+        mut old_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        const TIMER_ABSTIME: usize = 1;
+        let owner = self.zircon_process().id();
+        let spec = new_value.read()?;
+        let interval = timespec_to_duration(spec.interval);
+        let init = timespec_to_duration(spec.value);
+        let now = kernel_hal::timer::timer_now();
+
+        let (old, arm) = {
+            let mut timers = POSIX_TIMERS.lock();
+            let t = timers
+                .get_mut(&id)
+                .filter(|t| t.owner == owner)
+                .ok_or(LxError::EINVAL)?;
+            let remaining = t.next.checked_sub(now).unwrap_or(Duration::ZERO);
+            let old = ITimerSpec {
+                interval: TimeSpec::from_duration(t.interval),
+                value: TimeSpec::from_duration(remaining),
+            };
+            // Bump the generation so any in-flight one-shot is dropped.
+            t.generation += 1;
+            t.interval = interval;
+            let arm = if init.is_zero() {
+                t.next = Duration::ZERO;
+                None
+            } else {
+                let deadline = if flags & TIMER_ABSTIME != 0 {
+                    init
+                } else {
+                    now + init
+                };
+                t.next = deadline;
+                Some((deadline, t.generation))
+            };
+            (old, arm)
+        };
+        if !old_value.is_null() {
+            old_value.write(old)?;
+        }
+        if let Some((deadline, gen)) = arm {
+            arm_posix_timer(id, deadline, gen);
+        }
+        Ok(0)
+    }
+
+    /// `timer_gettime`: report the time until next expiration and the interval.
+    pub fn sys_timer_gettime(&self, id: usize, curr_value: usize) -> SysResult {
+        let owner = self.zircon_process().id();
+        let now = kernel_hal::timer::timer_now();
+        let out = {
+            let timers = POSIX_TIMERS.lock();
+            let t = timers
+                .get(&id)
+                .filter(|t| t.owner == owner)
+                .ok_or(LxError::EINVAL)?;
+            let remaining = if t.next.is_zero() {
+                Duration::ZERO
+            } else {
+                t.next.checked_sub(now).unwrap_or(Duration::ZERO)
+            };
+            ITimerSpec {
+                interval: TimeSpec::from_duration(t.interval),
+                value: TimeSpec::from_duration(remaining),
+            }
+        };
+        let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
+        p.write(out)?;
+        Ok(0)
+    }
+
+    /// `timer_delete`: destroy a timer (cancels any pending fire via generation).
+    pub fn sys_timer_delete(&self, id: usize) -> SysResult {
+        let owner = self.zircon_process().id();
+        let mut timers = POSIX_TIMERS.lock();
+        match timers.get(&id) {
+            Some(t) if t.owner == owner => {
+                timers.remove(&id);
+                Ok(0)
+            }
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    /// `timer_getoverrun`: we don't accumulate overruns, so report 0.
+    pub fn sys_timer_getoverrun(&self, id: usize) -> SysResult {
+        let owner = self.zircon_process().id();
+        let timers = POSIX_TIMERS.lock();
+        match timers.get(&id) {
+            Some(t) if t.owner == owner => Ok(0),
+            _ => Err(LxError::EINVAL),
+        }
+    }
+}
+
+/// A per-process POSIX interval timer (`timer_create`).
+struct PosixTimer {
+    /// Owning process KoID; a process may only operate on its own timers.
+    owner: KoID,
+    /// Signal to deliver on expiry (0 = none, e.g. SIGEV_NONE).
+    signo: usize,
+    /// Period for a periodic timer; `ZERO` = one-shot.
+    interval: Duration,
+    /// Absolute monotonic deadline of the next expiry; `ZERO` = disarmed.
+    next: Duration,
+    /// Bumped by settime/delete to invalidate an already-scheduled one-shot
+    /// (`timer_set` callbacks are not cancellable, so they check this).
+    generation: u64,
+}
+
+lazy_static! {
+    static ref POSIX_TIMERS: Mutex<BTreeMap<usize, PosixTimer>> = Mutex::new(BTreeMap::new());
+}
+static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn timespec_to_duration(ts: TimeSpec) -> Duration {
+    Duration::from_secs(ts.sec as u64) + Duration::from_nanos(ts.nsec as u64)
+}
+
+/// Deliver `signo` to every thread of process `owner` (mirrors setitimer/alarm).
+fn deliver_timer_signal(owner: KoID, signo: usize) {
+    if signo == 0 {
+        return;
+    }
+    let signal = match Signal::try_from(signo as u8) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if let Some(proc) = ROOT_JOB.find_process(owner) {
+        for tid in proc.thread_ids() {
+            if let Ok(obj) = proc.get_child(tid) {
+                if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                    thread.lock_linux().signals.insert(signal);
+                    thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+                }
+            }
+        }
+    }
+}
+
+/// Schedule the one-shot that fires timer `id` at `deadline`, valid only while
+/// the timer still exists and its generation matches `gen`. A periodic timer
+/// re-arms itself from the callback.
+fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
+    kernel_hal::timer::timer_set(
+        deadline,
+        Box::new(move |_now| {
+            let mut fire = None;
+            let mut rearm = None;
+            {
+                let mut timers = POSIX_TIMERS.lock();
+                if let Some(t) = timers.get_mut(&id) {
+                    if t.generation == gen {
+                        fire = Some((t.owner, t.signo));
+                        if t.interval.is_zero() {
+                            t.next = Duration::ZERO;
+                        } else {
+                            t.next += t.interval;
+                            rearm = Some(t.next);
+                        }
+                    }
+                }
+            }
+            if let Some((owner, signo)) = fire {
+                deliver_timer_signal(owner, signo);
+            }
+            if let Some(deadline) = rearm {
+                arm_posix_timer(id, deadline, gen);
+            }
+        }),
+    );
 }
