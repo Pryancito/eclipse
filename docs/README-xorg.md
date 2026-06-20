@@ -5,6 +5,12 @@ de Linux necesita para tomar el control de la pantalla. Este documento explica
 qué soporta el núcleo y cómo configurar el espacio de usuario (p. ej. Alpine)
 para que `startx` funcione.
 
+> **Alternativa ligera — TinyX (`Xfbdev`).** Si solo necesitas un servidor X
+> pequeño y autocontenido (un único binario que pinta en `/dev/fb0` y lee
+> `/dev/input/mice` + la VT, sin `udev`/DRM/GLX/XKB), usa **TinyX** en lugar de
+> Xorg. Está vendorizado y listo para cross-compilar en
+> [`tools/tinyx/`](../tools/tinyx/README.md).
+
 ## Qué proporciona el núcleo
 
 El núcleo implementa los dispositivos e `ioctl`s que `Xorg` usa en su rutina
