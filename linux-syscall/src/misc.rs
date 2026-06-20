@@ -129,6 +129,60 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// `membarrier` issues memory barriers across the threads of the system
+    /// (see [membarrier(2)](https://man7.org/linux/man-pages/man2/membarrier.2.html)).
+    ///
+    /// We advertise and accept the query, the global/private *expedited*
+    /// barrier commands and their SYNC_CORE variants. Registration commands are
+    /// accepted as no-ops (expedited membarrier is always permitted here).
+    ///
+    /// The barrier itself is a local sequentially-consistent fence. We do not
+    /// broadcast a cross-CPU IPI: on this kernel the IPI receive path always
+    /// flushes the whole TLB, so forcing that on every `membarrier` (a call the
+    /// runtimes that use it may issue often) would be far too costly. This is a
+    /// deliberate simplification — adequate for the userspaces that call it,
+    /// short of the full system-wide ordering guarantee.
+    pub fn sys_membarrier(&self, cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
+        use core::sync::atomic::{fence, Ordering};
+
+        const QUERY: i32 = 0;
+        const GLOBAL: i32 = 1 << 0;
+        const GLOBAL_EXPEDITED: i32 = 1 << 1;
+        const REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
+        const PRIVATE_EXPEDITED: i32 = 1 << 3;
+        const REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+        const PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
+        const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
+
+        info!("membarrier: cmd={:#x}, flags={:#x}", cmd, flags);
+
+        // The only defined flag (MEMBARRIER_CMD_FLAG_CPU) applies to the RSEQ
+        // command, which we don't advertise; reject any flag.
+        if flags != 0 {
+            return Err(LxError::EINVAL);
+        }
+
+        let supported = GLOBAL
+            | GLOBAL_EXPEDITED
+            | REGISTER_GLOBAL_EXPEDITED
+            | PRIVATE_EXPEDITED
+            | REGISTER_PRIVATE_EXPEDITED
+            | PRIVATE_EXPEDITED_SYNC_CORE
+            | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+        match cmd {
+            QUERY => Ok(supported as usize),
+            GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
+                fence(Ordering::SeqCst);
+                Ok(0)
+            }
+            REGISTER_GLOBAL_EXPEDITED
+            | REGISTER_PRIVATE_EXPEDITED
+            | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => Ok(0),
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
     /// provides a method for waiting until a certain condition becomes true.
     /// - `uaddr` - points to the futex word.
     /// - `op` -  the operation to perform on the futex
