@@ -2108,10 +2108,14 @@ impl XhciInner {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_Y,
-                            // Match the boot-mouse path's sign convention
-                            // (REL_Y is emitted negated); otherwise the tablet
-                            // moves the pointer the wrong way vertically.
-                            value: -dy,
+                            // The tablet already reports screen-space Y (0 = top,
+                            // growing downward), so `dy > 0` means the pointer
+                            // moved down. Emit it as-is: the `/dev/input/mice`
+                            // PS/2 path negates once and kdrive negates again
+                            // (PS/2 treats +Y as up), so the two cancel and the
+                            // pointer follows the motion. Negating here inverts
+                            // the vertical axis under Xfbdev.
+                            value: dy,
                         });
                     }
                     lis.trigger(InputEvent {
