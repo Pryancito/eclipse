@@ -199,8 +199,6 @@ pub const TIOCNOTTY: usize = 0x5422;
 pub const KDGETLED: usize = 0x4B11;
 /// Set keyboard LED state from an `int` (by value, not a pointer).
 pub const KDSETLED: usize = 0x4B32;
-/// Read one entry from the kernel keymap (`struct kbentry`).
-pub const KDGKBENT: usize = 0x4B46;
 /// Console bell tone (accepted as a no-op).
 pub const KDMKTONE: usize = 0x4B30;
 
