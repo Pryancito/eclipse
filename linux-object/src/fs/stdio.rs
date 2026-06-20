@@ -233,9 +233,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         KDGKBENT => {
             let mut kbe = user_copy(UserInOutPtr::<KbEntry>::from(data).read())?;
             // Empty/unmapped entries are normal while X scans the whole keymap.
-            kbe.kb_value = linux_keycode_to_evdev(kbe.kb_index)
-                .map(|evdev| kdgkbent_value(evdev, kbe.kb_table))
-                .unwrap_or(0);
+            kbe.kb_value = kdgkbent_value(kbe.kb_table, kbe.kb_index).unwrap_or(0);
             user_copy(UserInOutPtr::<KbEntry>::from(data).write(kbe))?;
             Ok(0)
         }
@@ -897,6 +895,55 @@ fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
         88 => Some(KEY_F12),
         _ => None,
     }
+}
+
+/// Build a `kb_value` for `KDGKBENT`, using the same Spanish layout as the console.
+fn kdgkbent_value(kb_table: u8, kb_index: u8) -> Result<u16> {
+    let evdev = linux_keycode_to_evdev(kb_index).ok_or(FsError::InvalidParam)?;
+    let mods = match kb_table {
+        0 => KeyMods {
+            shift: false,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        },
+        1 => KeyMods {
+            shift: true,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        },
+        2 => KeyMods {
+            shift: false,
+            altgr: true,
+            caps: false,
+            ctrl: false,
+        },
+        3 => KeyMods {
+            shift: true,
+            altgr: true,
+            caps: false,
+            ctrl: false,
+        },
+        _ => return Err(FsError::InvalidParam),
+    };
+
+    if (59..=68).contains(&kb_index) {
+        return Ok((KT_FN << 8) | u16::from(kb_index - 59));
+    }
+    if kb_index == 87 {
+        return Ok((KT_FN << 8) | 10);
+    }
+    if kb_index == 88 {
+        return Ok((KT_FN << 8) | 11);
+    }
+
+    if let Some(c) = input_event_to_char_es(evdev, mods) {
+        if c.is_ascii() {
+            return Ok(u16::from(c as u8));
+        }
+    }
+    Err(FsError::InvalidParam)
 }
 
 /// Stdin struct, for Stdin buffer.
