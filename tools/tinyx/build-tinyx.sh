@@ -23,7 +23,7 @@
 # Env knobs (all optional except XSYSROOT):
 #   ARCH        Target arch                (default: x86_64)
 #   TOOLCHAIN   musl cross toolchain dir   (default: target/$ARCH/$ARCH-linux-musl-cross)
-#   XSYSROOT    Sysroot with the X dev libs' pkg-config files (REQUIRED)
+#   XSYSROOT    Sysroot with X dev libs (default: tools/tinyx/sysroot-$ARCH)
 #   ROOTFS      Where to stage Xfbdev      (default: rootfs/$ARCH)
 #   JOBS        Parallel make jobs         (default: nproc)
 set -euo pipefail
@@ -36,6 +36,7 @@ ARCH=${ARCH:-x86_64}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 TOOLCHAIN=${TOOLCHAIN:-target/$ARCH/$ARCH-linux-musl-cross}
 ROOTFS=${ROOTFS:-rootfs/$ARCH}
+XSYSROOT=${XSYSROOT:-tools/tinyx/sysroot-$ARCH}
 HOST=$ARCH-linux-musl
 CROSS=$ROOT/$TOOLCHAIN/bin/$HOST-
 BUILD=tools/tinyx/build-$ARCH
@@ -55,24 +56,15 @@ if [ ! -x "${CROSS}gcc" ]; then
     echo "       run 'cargo rootfs --arch $ARCH' first, or set TOOLCHAIN=." >&2
     exit 1
 fi
-if [ -z "${XSYSROOT:-}" ]; then
-    cat >&2 <<'EOF'
-error: XSYSROOT is not set.
-
-Xfbdev needs the X protocol headers + a few dev libraries to compile.  Provide
-a sysroot whose lib/pkgconfig (and share/aclocal) contain, for the target arch:
-
-  xorgproto  xtrans  libXfont (version 1.x)  libfontenc
-
-On a machine with an Alpine cross-sysroot you can populate it with:
-  apk add --root "$XSYSROOT" --arch $ARCH \
-      xorgproto-dev xtrans libxfont-dev libfontenc-dev util-macros
-
-…or build libXfont v1 from https://www.x.org/archive/individual/lib/ .
-Then re-run:  XSYSROOT=/path/to/sysroot tools/tinyx/build-tinyx.sh
-EOF
-    exit 1
+if [ ! -f "$XSYSROOT/usr/lib/pkgconfig/xfont.pc" ]; then
+    echo "== populating TinyX sysroot =="
+    ARCH="$ARCH" SYSROOT="$XSYSROOT" "$ROOT/tools/tinyx/fetch-xsysroot.sh"
 fi
+XSYSROOT="$(cd "$XSYSROOT" && pwd)"
+
+echo "== building static X dependencies into sysroot =="
+ARCH="$ARCH" SYSROOT="$XSYSROOT" TOOLCHAIN="$TOOLCHAIN" JOBS="$JOBS" \
+    "$ROOT/tools/tinyx/build-xsysroot-static.sh"
 
 PKGCFG_DIR="$XSYSROOT/usr/lib/pkgconfig:$XSYSROOT/usr/share/pkgconfig:$XSYSROOT/lib/pkgconfig:$XSYSROOT/usr/lib/$HOST/pkgconfig"
 
@@ -83,40 +75,109 @@ export STRIP="${CROSS}strip"
 export PKG_CONFIG_SYSROOT_DIR="$XSYSROOT"
 export PKG_CONFIG_LIBDIR="$PKGCFG_DIR"
 export PKG_CONFIG_PATH="$PKGCFG_DIR"
+export PKG_CONFIG="$ROOT/tools/tinyx/pkg-config-static.sh"
 export ACLOCAL_PATH="$XSYSROOT/usr/share/aclocal:$XSYSROOT/share/aclocal"
 export CPPFLAGS="-I$XSYSROOT/usr/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$XSYSROOT/usr/lib ${LDFLAGS:-}"
+export LDFLAGS="-static -L$XSYSROOT/usr/lib -L$XSYSROOT/lib ${LDFLAGS:-}"
 
 # --- configure (once) -----------------------------------------------------
 echo "== generating configure (autoreconf) =="
 ( cd "$SRC" && [ -x configure ] || NOCONFIGURE=1 ./autogen.sh )
 
 echo "== configuring (Xfbdev only, kdrive, no Xvesa/xdmcp) =="
-rm -rf "$BUILD" && mkdir -p "$BUILD"
-( cd "$BUILD" && "$ROOT/$SRC/configure" \
-    --host="$HOST" \
-    --prefix=/usr \
-    --enable-static --disable-shared \
-    --enable-kdrive \
-    --enable-xfbdev \
-    --disable-xvesa \
-    --disable-xdmcp \
-    --disable-xdm-auth-1 \
-    --disable-dependency-tracking )
+NEED_CONFIGURE=1
+if [ -f "$BUILD/Makefile" ] && [ -f "$BUILD/kdrive/fbdev/Xfbdev" ]; then
+    if file "$BUILD/kdrive/fbdev/Xfbdev" 2>/dev/null | grep -q 'statically linked'; then
+        NEED_CONFIGURE=0
+    fi
+fi
+if [ "$NEED_CONFIGURE" = 1 ]; then
+    rm -rf "$BUILD" && mkdir -p "$BUILD"
+    ( cd "$BUILD" && "$ROOT/$SRC/configure" \
+        --host="$HOST" \
+        --prefix=/usr \
+        --enable-static --disable-shared \
+        --enable-kdrive \
+        --enable-xfbdev \
+        --disable-xvesa \
+        --disable-xdmcp \
+        --disable-xdm-auth-1 \
+        --disable-install-setuid \
+        --disable-dependency-tracking )
+fi
 
 echo "== building Xfbdev (-j$JOBS) =="
 make -C "$BUILD" -j"$JOBS"
 
 BIN="$BUILD/kdrive/fbdev/Xfbdev"
 [ -f "$BIN" ] || { echo "error: $BIN was not produced" >&2; exit 1; }
+
+# libtool drops -static on the final link; relink with gcc directly.
+echo "== relinking Xfbdev fully static =="
+FBDEV="$BUILD/kdrive/fbdev"
+"${CROSS}gcc" -static -no-pie \
+    -L"$XSYSROOT/usr/lib" -L"$XSYSROOT/lib" \
+    "$FBDEV/fbinit.o" "$FBDEV/libfbdev.a" \
+    "$BUILD/dix/.libs/libdix.a" \
+    "$BUILD/kdrive/src/libkdrive.a" \
+    "$BUILD/kdrive/linux/liblinux.a" \
+    "$BUILD/fb/.libs/libfb.a" \
+    "$BUILD/mi/.libs/libmi.a" \
+    "$BUILD/xfixes/.libs/libxfixes.a" \
+    "$BUILD/Xext/.libs/libXext.a" \
+    "$BUILD/dbe/.libs/libdbe.a" \
+    "$BUILD/render/.libs/librender.a" \
+    "$BUILD/randr/.libs/librandr.a" \
+    "$BUILD/damageext/.libs/libdamageext.a" \
+    "$BUILD/miext/damage/.libs/libdamage.a" \
+    "$BUILD/miext/shadow/.libs/libshadow.a" \
+    "$BUILD/os/.libs/libos.a" \
+    "$BUILD/kdrive/src/libkdrivestubs.a" \
+    -lXfont \
+    "$XSYSROOT/usr/lib/libfreetype.a" \
+    "$XSYSROOT/usr/lib/libbz2.a" \
+    "$XSYSROOT/usr/lib/libpng16.a" \
+    "$XSYSROOT/usr/lib/libbrotlidec.a" \
+    "$XSYSROOT/usr/lib/libbrotlicommon.a" \
+    "$XSYSROOT/usr/lib/libfontenc.a" \
+    -lz -lm \
+    -o "$BIN"
+
+if ! file "$BIN" 2>/dev/null | grep -q 'statically linked'; then
+    echo "error: Xfbdev relink did not produce a static binary" >&2
+    file "$BIN" >&2 || true
+    exit 1
+fi
+if "${CROSS}readelf" -d "$BIN" 2>/dev/null | grep -q NEEDED; then
+    echo "error: Xfbdev is not fully static (dynamic NEEDED entries remain):" >&2
+    "${CROSS}readelf" -d "$BIN" 2>/dev/null | grep NEEDED >&2 || true
+    exit 1
+fi
 "$STRIP" "$BIN" || true
 
 # --- stage into the rootfs ------------------------------------------------
 echo "== staging into $ROOTFS/usr/bin/Xfbdev =="
-mkdir -p "$ROOTFS/usr/bin"
+mkdir -p "$ROOTFS/usr/bin" "$ROOTFS/etc/X11" "$ROOTFS/usr/share/fonts/X11/misc"
 cp -f "$BIN" "$ROOTFS/usr/bin/Xfbdev"
-mkdir -p "$ROOTFS/etc/X11"
 cp -f tools/tinyx/eclipse/xinitrc "$ROOTFS/etc/X11/xinitrc.tinyx" 2>/dev/null || true
+cp -f tools/tinyx/eclipse/startx "$ROOTFS/usr/bin/startx" 2>/dev/null || true
+chmod +x "$ROOTFS/usr/bin/startx" 2>/dev/null || true
+
+# Bitmap fonts required at runtime (fixed, cursor).
+# Drop X runtime .so left over from older dynamic TinyX builds.
+shopt -s nullglob
+for f in "$ROOTFS/lib"/libXfont.so* "$ROOTFS/lib"/libfontenc.so* \
+         "$ROOTFS/lib"/libfreetype.so* "$ROOTFS/lib"/libpng16.so* \
+         "$ROOTFS/lib"/libbz2.so* "$ROOTFS/lib"/libbrotli*.so*
+do
+    rm -f "$f"
+done
+shopt -u nullglob
+
+# Bitmap fonts required at runtime (fixed, cursor).
+if [ -x "$ROOT/tools/tinyx/fetch-xfonts.sh" ]; then
+    ARCH="$ARCH" ROOTFS="$ROOTFS" "$ROOT/tools/tinyx/fetch-xfonts.sh"
+fi
 
 echo
 echo "Xfbdev built:  $BIN"

@@ -1,0 +1,13 @@
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlicommon.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlidec.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlienc.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlicommon-static.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlidec-static.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotlienc-static.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/brotli.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/edit_cache.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/rebuild_cache.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/list_install_components.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/install.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/install/local.dir
+/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/install/strip.dir

@@ -56,6 +56,7 @@ impl LinuxRootfs {
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
+            self.tinyx(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -366,6 +367,37 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
+        self.tinyx(&dir);
+    }
+
+    /// Cross-compile TinyX (Xfbdev) and install into the rootfs.
+    fn tinyx(&self, rootfs: &Path) {
+        if !matches!(self.0, Arch::X86_64) {
+            return;
+        }
+        // Ensure musl cross toolchain is present (build-tinyx.sh expects it).
+        let _musl = self.0.linux_musl_cross();
+        let arch = self.0.name();
+        let script = PROJECT_DIR.join("tools/tinyx/build-tinyx.sh");
+        if !script.is_file() {
+            eprintln!("warning: missing {script:?}; skipping TinyX");
+            return;
+        }
+        println!("Building TinyX (Xfbdev) for {arch}...");
+        let status = std::process::Command::new("bash")
+            .arg(&script)
+            .env("ARCH", arch)
+            .env("ROOTFS", rootfs)
+            .current_dir(&*PROJECT_DIR)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "warning: TinyX build failed (exit {}); Xfbdev not installed",
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("warning: failed to run build-tinyx.sh: {e}"),
+        }
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).

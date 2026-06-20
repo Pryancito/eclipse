@@ -2139,6 +2139,16 @@ impl XhciInner {
         let ac64 = (hcc1 & 1) != 0;
         let csz = (hcc1 & (1 << 2)) != 0;
 
+        // An all-ones USBSTS is not a real status (high bits are reserved-0):
+        // the controller stopped answering MMIO (powered down / off the bus).
+        // Decoding the "bits" would be meaningless noise, so say so plainly.
+        if sts == u32::MAX {
+            error!(
+                "[xhci] HALT diag: USBSTS=0xffffffff -> controller not responding to MMIO (powered down D3 or removed); not a real halt"
+            );
+            return;
+        }
+
         error!(
             "[xhci] HALT diag: USBSTS={:#010x} [HCH={} HSE={} EINT={} PCD={} SRE={} CNR={} HCE={}]",
             sts,
@@ -2458,11 +2468,23 @@ pub fn poll() {
             }
             xi.mmio.ack_host_interrupt();
             let sts = xi.mmio.read_op(4);
-            if sts & 1 != 0 {
-                // HCHalted: warn once and stop polling. `process_irq_events`
-                // below would only re-scan a permanently-empty event ring.
+            // `0xffffffff` is not a valid USBSTS (its high bits are reserved-0):
+            // an all-ones read means the controller stopped responding to MMIO,
+            // i.e. it powered down (D3) or fell off the bus — typical of an
+            // unused GPU USB-C / VirtualLink xHCI with nothing plugged in. Treat
+            // that distinctly from a genuine HCHalted so the log isn't a bogus
+            // "all error bits set" decode.
+            let gone = sts == u32::MAX;
+            if gone || sts & 1 != 0 {
+                // Stop polling either way: a halted/absent controller never
+                // recovers here, and `process_irq_events` would only re-scan a
+                // permanently-empty event ring.
                 if !XHCI_HALTED.swap(true, Ordering::Relaxed) {
-                    warn!("[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo");
+                    if gone {
+                        warn!("[xhci] USBSTS=0xffffffff: el controlador no responde (apagado D3 o ausente, p.ej. un puerto USB-C/VirtualLink de GPU vacío); se detiene el sondeo");
+                    } else {
+                        warn!("[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo");
+                    }
                     xi.dump_halt_diagnostics();
                 }
                 return;

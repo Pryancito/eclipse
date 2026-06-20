@@ -3,6 +3,7 @@
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
+use kernel_hal::user::{UserInOutPtr, UserInPtr, UserOutPtr, Error as UserError};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -11,7 +12,7 @@ use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 use kernel_hal::console::{self, ConsoleWinSize};
 use zcore_drivers::prelude::{InputEvent, InputEventType};
@@ -96,6 +97,8 @@ struct TtyState {
     /// sets `K_RAW`/`K_OFF`, the line discipline stops cooking key presses into
     /// this TTY (the raw events still reach userspace via `/dev/input/event*`).
     kbd_mode: AtomicI32,
+    /// Scroll/Num/Caps LED bits last set via `KDSETLED`.
+    kbd_leds: AtomicU8,
 }
 
 lazy_static! {
@@ -105,6 +108,7 @@ lazy_static! {
             fg_pgrp: AtomicI32::new(0),
             vt_mode: Mutex::new(VtMode::auto()),
             kbd_mode: AtomicI32::new(K_XLATE),
+            kbd_leds: AtomicU8::new(0),
         })
         .collect();
 }
@@ -136,14 +140,17 @@ fn tty_kbd_cooked(vt: usize) -> bool {
     matches!(tty_kbd_mode(vt), K_XLATE | K_UNICODE)
 }
 
+fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
+    r.map_err(|_| FsError::InvalidParam)
+}
+
 /// Shared TTY/console ioctl handling for every VT-backed device node
 /// (`/dev/tty`, `/dev/tty[0-9]`, `/dev/console`, stdin and stdout). `vt` is the
 /// virtual terminal the file refers to.
 fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
     match cmd as usize {
         TIOCGWINSZ => {
-            let winsize = data as *mut ConsoleWinSize;
-            unsafe { *winsize = console::console_win_size() };
+            user_copy(UserOutPtr::<ConsoleWinSize>::from(data).write(console::console_win_size()))?;
             Ok(0)
         }
         // The console's window size is fixed by the framebuffer, so we can't
@@ -153,11 +160,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         // real (framebuffer-derived) size.
         TIOCSWINSZ => Ok(0),
         TCGETS => {
-            let termios = data as *mut Termios;
-            if termios.is_null() {
-                return Err(FsError::InvalidParam);
-            }
-            unsafe { *termios = *tty_termios(vt).lock() };
+            user_copy(UserOutPtr::<Termios>::from(data).write(*tty_termios(vt).lock()))?;
             Ok(0)
         }
         TIOCSPGRP => {
@@ -177,23 +180,15 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             if pgid == 0 {
                 pgid = 1;
             }
-            unsafe { *(data as *mut i32) = pgid };
+            user_copy(UserOutPtr::<i32>::from(data).write(pgid))?;
             Ok(0)
         }
         TCSETS | TCSETSW => {
-            let termios = data as *const Termios;
-            if termios.is_null() {
-                return Err(FsError::InvalidParam);
-            }
-            *tty_termios(vt).lock() = unsafe { *termios };
+            *tty_termios(vt).lock() = user_copy(UserInPtr::<Termios>::from(data).read())?;
             Ok(0)
         }
         TCSETSF => {
-            let termios = data as *const Termios;
-            if termios.is_null() {
-                return Err(FsError::InvalidParam);
-            }
-            *tty_termios(vt).lock() = unsafe { *termios };
+            *tty_termios(vt).lock() = user_copy(UserInPtr::<Termios>::from(data).read())?;
             let sin = vt_stdin(vt);
             sin.buf.lock().clear();
             sin.canon_buf.lock().clear();
@@ -235,19 +230,26 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
                 .store(mode, Ordering::Relaxed);
             Ok(0)
         }
-        // kdrive/TinyX reads the kernel keymap entry-by-entry to map medium-raw
-        // keycodes to X keysyms. `struct kbentry { u8 kb_table; u8 kb_index;
-        // u16 kb_value; }`: the caller fills kb_table/kb_index, we fill kb_value.
         KDGKBENT => {
-            if data == 0 {
-                return Err(FsError::InvalidParam);
-            }
-            let p = data as *mut u8;
-            let (table, index) = unsafe { (*p, *p.add(1)) };
-            let value = kdgkbent_value(index as u16, table);
-            unsafe { *(p.add(2) as *mut u16) = value };
+            let mut kbe = user_copy(UserInOutPtr::<KbEntry>::from(data).read())?;
+            // Empty/unmapped entries are normal while X scans the whole keymap.
+            kbe.kb_value = kdgkbent_value(kbe.kb_table, kbe.kb_index).unwrap_or(0);
+            user_copy(UserInOutPtr::<KbEntry>::from(data).write(kbe))?;
             Ok(0)
         }
+        KDGETLED => {
+            user_copy(UserOutPtr::<i32>::from(data).write(
+                TTY_STATES[vt_clamp(vt)].kbd_leds.load(Ordering::Relaxed) as i32,
+            ))?;
+            Ok(0)
+        }
+        KDSETLED => {
+            TTY_STATES[vt_clamp(vt)]
+                .kbd_leds
+                .store(data as u8, Ordering::Relaxed);
+            Ok(0)
+        }
+        KDMKTONE => Ok(0),
         // VT management. VT numbers in these ioctls are 1-based (tty1 == VT 1),
         // while the kernel tracks VTs 0-based internally.
         VT_OPENQRY => {
@@ -346,6 +348,21 @@ pub fn get_foreground_pgrp() -> i32 {
 
 pub fn set_foreground_pgrp(pgid: i32) {
     tty_fg_pgrp(kernel_hal::console::active_vt()).store(pgid, Ordering::Relaxed);
+}
+
+/// Replace termios on the active VT (used when `TCSETS` hits a non-tty fd).
+pub fn set_active_vt_termios(termios: Termios) {
+    *tty_termios(kernel_hal::console::active_vt()).lock() = termios;
+}
+
+/// Like [`set_active_vt_termios`] plus input-buffer flush for `TCSETSF`.
+pub fn set_active_vt_termios_flush(termios: Termios) {
+    let vt = kernel_hal::console::active_vt();
+    *tty_termios(vt).lock() = termios;
+    let sin = vt_stdin(vt);
+    sin.buf.lock().clear();
+    sin.canon_buf.lock().clear();
+    sin.eventbus.lock().clear(Event::READABLE);
 }
 
 // Global Ctrl+C latch. Since many programs (e.g. udhcpc) never read stdin while running,
@@ -806,6 +823,127 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_KPPLUS => Some('+'),
         _ => None,
     }
+}
+
+/// Map a Linux VT keycode (`kb_index`) to an evdev `KEY_*` code.
+fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
+    use zcore_drivers::input::input_event_codes::key::*;
+    match kc {
+        1 => Some(KEY_ESC),
+        2 => Some(KEY_1),
+        3 => Some(KEY_2),
+        4 => Some(KEY_3),
+        5 => Some(KEY_4),
+        6 => Some(KEY_5),
+        7 => Some(KEY_6),
+        8 => Some(KEY_7),
+        9 => Some(KEY_8),
+        10 => Some(KEY_9),
+        11 => Some(KEY_0),
+        12 => Some(KEY_MINUS),
+        13 => Some(KEY_EQUAL),
+        14 => Some(KEY_BACKSPACE),
+        15 => Some(KEY_TAB),
+        16 => Some(KEY_Q),
+        17 => Some(KEY_W),
+        18 => Some(KEY_E),
+        19 => Some(KEY_R),
+        20 => Some(KEY_T),
+        21 => Some(KEY_Y),
+        22 => Some(KEY_U),
+        23 => Some(KEY_I),
+        24 => Some(KEY_O),
+        25 => Some(KEY_P),
+        26 => Some(KEY_LEFTBRACE),
+        27 => Some(KEY_RIGHTBRACE),
+        28 => Some(KEY_ENTER),
+        30 => Some(KEY_A),
+        31 => Some(KEY_S),
+        32 => Some(KEY_D),
+        33 => Some(KEY_F),
+        34 => Some(KEY_G),
+        35 => Some(KEY_H),
+        36 => Some(KEY_J),
+        37 => Some(KEY_K),
+        38 => Some(KEY_L),
+        39 => Some(KEY_SEMICOLON),
+        40 => Some(KEY_APOSTROPHE),
+        41 => Some(KEY_GRAVE),
+        43 => Some(KEY_BACKSLASH),
+        44 => Some(KEY_Z),
+        45 => Some(KEY_X),
+        46 => Some(KEY_C),
+        47 => Some(KEY_V),
+        48 => Some(KEY_B),
+        49 => Some(KEY_N),
+        50 => Some(KEY_M),
+        51 => Some(KEY_COMMA),
+        52 => Some(KEY_DOT),
+        53 => Some(KEY_SLASH),
+        57 => Some(KEY_SPACE),
+        59 => Some(KEY_F1),
+        60 => Some(KEY_F2),
+        61 => Some(KEY_F3),
+        62 => Some(KEY_F4),
+        63 => Some(KEY_F5),
+        64 => Some(KEY_F6),
+        65 => Some(KEY_F7),
+        66 => Some(KEY_F8),
+        67 => Some(KEY_F9),
+        68 => Some(KEY_F10),
+        87 => Some(KEY_F11),
+        88 => Some(KEY_F12),
+        _ => None,
+    }
+}
+
+/// Build a `kb_value` for `KDGKBENT`, using the same Spanish layout as the console.
+fn kdgkbent_value(kb_table: u8, kb_index: u8) -> Result<u16> {
+    let evdev = linux_keycode_to_evdev(kb_index).ok_or(FsError::InvalidParam)?;
+    let mods = match kb_table {
+        0 => KeyMods {
+            shift: false,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        },
+        1 => KeyMods {
+            shift: true,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        },
+        2 => KeyMods {
+            shift: false,
+            altgr: true,
+            caps: false,
+            ctrl: false,
+        },
+        3 => KeyMods {
+            shift: true,
+            altgr: true,
+            caps: false,
+            ctrl: false,
+        },
+        _ => return Err(FsError::InvalidParam),
+    };
+
+    if (59..=68).contains(&kb_index) {
+        return Ok((KT_FN << 8) | u16::from(kb_index - 59));
+    }
+    if kb_index == 87 {
+        return Ok((KT_FN << 8) | 10);
+    }
+    if kb_index == 88 {
+        return Ok((KT_FN << 8) | 11);
+    }
+
+    if let Some(c) = input_event_to_char_es(evdev, mods) {
+        if c.is_ascii() {
+            return Ok(u16::from(c as u8));
+        }
+    }
+    Err(FsError::InvalidParam)
 }
 
 /// Stdin struct, for Stdin buffer.
