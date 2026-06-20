@@ -64,22 +64,28 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
         } else if #[cfg(feature = "linux")] {
             use linux_object::process::ProcessExt;
-            let args: alloc::vec::Vec<alloc::string::String> =
-                options.root_proc.split('?').map(Into::into).collect(); // parse "arg0?arg1?arg2"
+            // The init process (PID 1) is configured by `INIT` in rboot.conf
+            // (defaults to `ROOTPROC`); the per-terminal shells come from
+            // `ROOTPROC`. Both are "arg0?arg1?arg2".
+            let init_args: alloc::vec::Vec<alloc::string::String> =
+                options.init_proc.split('?').map(Into::into).collect();
+            let shell_args: alloc::vec::Vec<alloc::string::String> =
+                options.root_proc.split('?').map(Into::into).collect();
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
             ];
             let rootfs = fs::rootfs();
             kernel_hal::console::early_progress_bar(95);
-            let proc = zcore_loader::linux::run(args.clone(), envs.clone(), rootfs.clone());
-            // Spawn an extra shell on each additional virtual terminal
-            // (tty2..ttyN, reachable via Ctrl+Alt+F2..F6), sharing the primary
-            // process's mounted root filesystem (by `Arc`, like `fork`).
+            // vt 0 runs INIT and is the only process that gets PID 1.
+            let proc = zcore_loader::linux::run(init_args, envs.clone(), rootfs.clone());
+            // Spawn a shell on each additional virtual terminal (tty2..ttyN,
+            // reachable via Ctrl+Alt+F2..F6), sharing the init's mounted root
+            // filesystem (by `Arc`, like `fork`). Each gets its own unique PID.
             let shared_root = proc.linux().root_inode().clone();
             for vt in 1..kernel_hal::console::NUM_VTS {
                 let _ = zcore_loader::linux::run_on_vt(
-                    args.clone(),
+                    shell_args.clone(),
                     envs.clone(),
                     rootfs.clone(),
                     vt,
