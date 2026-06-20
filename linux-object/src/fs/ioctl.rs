@@ -74,6 +74,12 @@ pub const TIOCSWINSZ: usize = 0x5414;
 #[cfg(target_arch = "mips")]
 pub const TIOCSWINSZ: usize = 0x8_008_74_67;
 
+/// Linux-specific console multiplexor ioctl; the subcommand is the first byte
+/// of the argument (e.g. 6 = `TIOCL_GETSHIFTSTATE`).
+pub const TIOCLINUX: usize = 0x541c;
+/// `TIOCLINUX` subcommand: read the keyboard shift/modifier state.
+pub const TIOCL_GETSHIFTSTATE: u8 = 6;
+
 #[cfg(not(target_arch = "mips"))]
 pub const FIONCLEX: usize = 0x5450;
 #[cfg(target_arch = "mips")]

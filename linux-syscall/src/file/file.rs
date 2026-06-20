@@ -497,11 +497,30 @@ impl Syscall<'_> {
             ),
             // Failed/unhandled ioctls go through `error!` so they are printed on
             // the console (and serial), not only into the dmesg ring — the same
-            // way an invalid syscall number is surfaced.
-            Err(e) => error!(
-                "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (unhandled/failed)",
-                fd, request, e
-            ),
+            // way an invalid syscall number is surfaced. But throttle a program
+            // busy-looping on the same failing ioctl (e.g. polling an unhandled
+            // request) so it can't flood the console thousands of times a
+            // second: log the first occurrence, then only every 4096th repeat.
+            Err(e) => {
+                use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+                static LAST_REQ: AtomicU64 = AtomicU64::new(u64::MAX);
+                static REPEATS: AtomicUsize = AtomicUsize::new(0);
+                let n = if LAST_REQ.swap(request as u64, Ordering::Relaxed) == request as u64 {
+                    REPEATS.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    REPEATS.store(0, Ordering::Relaxed);
+                    0
+                };
+                if n == 0 || n % 4096 == 0 {
+                    error!(
+                        "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (unhandled/failed){}",
+                        fd,
+                        request,
+                        e,
+                        if n > 0 { " [repeating, throttled]" } else { "" }
+                    );
+                }
+            }
         }
         ret
     }

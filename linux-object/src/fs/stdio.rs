@@ -272,6 +272,47 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         // freed; accept the request so X's setup/teardown proceeds.
         VT_RELDISP | VT_DISALLOCATE => Ok(0),
         TIOCSCTTY | TIOCNOTTY => Ok(0),
+        // Linux console multiplexor. The subcommand is the first byte of the
+        // argument. We implement TIOCL_GETSHIFTSTATE (read modifier state),
+        // which programs poll — sometimes in a tight loop — to read Shift/Ctrl/
+        // Alt/AltGr without an evdev device; leaving it unhandled returned
+        // ENOTTY and could spin a poller, flooding the console. Bits match
+        // Linux's `shift_state` (KG_SHIFT/ALTGR/CTRL/ALT = 0/1/2/3).
+        TIOCLINUX => {
+            let p = data as *mut u8;
+            if p.is_null() {
+                return Err(FsError::InvalidParam);
+            }
+            let subcmd = unsafe { *p };
+            match subcmd {
+                TIOCL_GETSHIFTSTATE => {
+                    let mut state = 0u8;
+                    if SHIFT_DOWN.load(Ordering::SeqCst) {
+                        state |= 1 << 0;
+                    }
+                    if ALTGR_DOWN.load(Ordering::SeqCst) {
+                        state |= 1 << 1;
+                    }
+                    if CTRL_DOWN.load(Ordering::SeqCst) {
+                        state |= 1 << 2;
+                    }
+                    if LEFT_ALT_DOWN.load(Ordering::SeqCst) {
+                        state |= 1 << 3;
+                    }
+                    unsafe { *p = state };
+                    Ok(0)
+                }
+                other => {
+                    // Surface the actual subcommand once so an unhandled poller
+                    // can be identified, then report EINVAL as Linux does.
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        warn!("TIOCLINUX: unhandled subcommand {}", other);
+                    }
+                    Err(FsError::InvalidParam)
+                }
+            }
+        }
         _ => Err(FsError::NotSupported),
     }
 }
