@@ -341,7 +341,7 @@ impl Syscall<'_> {
             Sys::SETPRIORITY => self.unimplemented("setpriority", Ok(0)),
             Sys::GETPRIORITY => self.unimplemented("getpriority", Ok(20)),
             Sys::PRCTL => self.unimplemented("prctl", Ok(0)),
-            Sys::MEMBARRIER => self.unimplemented("membarrier", Ok(0)),
+            Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1 as usize, a2 as u32),

@@ -151,7 +151,14 @@ pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
     enqueue_pending_msi(&mut MSI_PENDING.lock(), vector, &dev);
 }
 
-static XHCI_WARNED_HALTED: AtomicBool = AtomicBool::new(false);
+/// Set once the controller is observed HCHalted. A halted xHCI does not
+/// auto-recover here (HCHalted only clears via an HCRST reset, which this
+/// driver never issues), so once it trips, `poll()` short-circuits to a single
+/// atomic load instead of taking two locks and doing MMIO on every timer tick
+/// and every I/O-wait loop iteration — futile work that was adding latency to
+/// e.g. stdin reads and slowing down I/O-heavy programs. If controller reset /
+/// recovery is ever added, it must clear this flag.
+static XHCI_HALTED: AtomicBool = AtomicBool::new(false);
 
 pub fn pci_finish_msi_registrations() -> DeviceResult<()> {
     let host = MSI_IRQ_HOST.lock().clone().ok_or(DeviceError::NotReady)?;
@@ -1411,6 +1418,7 @@ impl XhciInner {
                     "[xhci] controlador no arrancó (HCHalted persiste), USBSTS={:#010x}",
                     sts
                 );
+                self.dump_halt_diagnostics();
                 return Err(DeviceError::NotReady);
             }
         }
@@ -2103,6 +2111,63 @@ impl XhciInner {
         }
     }
 
+    /// One-shot diagnostic dump when the controller halts. HCHalted (USBSTS
+    /// bit 0) is only the symptom; the *cause* is in HSE (host system / DMA
+    /// error) or HCE (internal error), and in the physical addresses we hand
+    /// the controller. On a >4 GiB-RAM machine those DMA structures can land
+    /// above 4 GiB; if the controller is not 64-bit-capable (AC64=0) — or a
+    /// pointer is truncated — that is an immediate HSE. This is exactly the
+    /// kind of fault that never reproduces under QEMU (2 GiB, low addresses).
+    fn dump_halt_diagnostics(&self) {
+        let sts = self.mmio.read_op(4);
+        let cmd = self.mmio.read_op(0);
+        let hcc1 = self.mmio.read_cap(0x10);
+        let ac64 = (hcc1 & 1) != 0;
+        let csz = (hcc1 & (1 << 2)) != 0;
+
+        error!(
+            "[xhci] HALT diag: USBSTS={:#010x} [HCH={} HSE={} EINT={} PCD={} SRE={} CNR={} HCE={}]",
+            sts,
+            sts & 1,
+            (sts >> 2) & 1,
+            (sts >> 3) & 1,
+            (sts >> 4) & 1,
+            (sts >> 10) & 1,
+            (sts >> 11) & 1,
+            (sts >> 12) & 1,
+        );
+        error!(
+            "[xhci] HALT diag: USBCMD={:#010x} [RS={} INTE={} HSEE={}] AC64={} CSZ(64B ctx)={}",
+            cmd,
+            cmd & 1,
+            (cmd >> 2) & 1,
+            (cmd >> 3) & 1,
+            ac64,
+            csz
+        );
+
+        const FOUR_GIB: u64 = 1 << 32;
+        let dcbaa = self.dcbaa.phys as u64;
+        let erst = self.ev.erst_phys();
+        let evseg = self.ev.seg.phys as u64;
+        let crcr = self.cmd.crcr() as u64;
+        let scratch = self
+            .scratch_tbl
+            .as_ref()
+            .map(|t| t.phys as u64)
+            .unwrap_or(0);
+        let any_high = [dcbaa, erst, evseg, crcr, scratch]
+            .iter()
+            .any(|&a| a >= FOUR_GIB);
+        error!(
+            "[xhci] HALT diag: DCBAA={:#x} ERST={:#x} EVSEG={:#x} CRCR={:#x} SCRATCH={:#x} -> any>4GiB={}",
+            dcbaa, erst, evseg, crcr, scratch, any_high
+        );
+        if any_high && !ac64 {
+            error!("[xhci] HALT diag: *** AC64=0 (32-bit controller) with DMA >4GiB -> very likely the HSE/halt cause ***");
+        }
+    }
+
     fn process_irq_events(&mut self, lis: Option<&EventListener<InputEvent>>) {
         for _ in 0..512 {
             if self.pop_ev(lis).is_none() {
@@ -2361,6 +2426,13 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 
 /// Respaldo periódico: drena transferencias HID sin depender de MSI (alineado al driver de referencia).
 pub fn poll() {
+    // Fast path: a halted controller has nothing to poll and never recovers
+    // on its own, so bail before any lock or MMIO. This keeps `poll()` (called
+    // from the timer and from every I/O-wait loop iteration) essentially free
+    // once USB has died, instead of dragging on stdin reads / I/O-heavy tools.
+    if XHCI_HALTED.load(Ordering::Relaxed) {
+        return;
+    }
     let inst = POLL_INSTANCE.lock();
     if let Some(d) = &*inst {
         let mut g = d.inner.lock();
@@ -2370,18 +2442,16 @@ pub fn poll() {
                 info!("[xhci] deferred boot enumeration starting");
                 xi.enumerate_root_hid();
             }
-            static mut POLL_COUNT: u64 = 0;
-            unsafe {
-                POLL_COUNT += 1;
-            }
             xi.mmio.ack_host_interrupt();
             let sts = xi.mmio.read_op(4);
             if sts & 1 != 0 {
-                if !XHCI_WARNED_HALTED.swap(true, Ordering::Relaxed) {
-                    warn!("[xhci] USBSTS: controlador detenido (HCHalted)");
+                // HCHalted: warn once and stop polling. `process_irq_events`
+                // below would only re-scan a permanently-empty event ring.
+                if !XHCI_HALTED.swap(true, Ordering::Relaxed) {
+                    warn!("[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo");
+                    xi.dump_halt_diagnostics();
                 }
-            } else {
-                XHCI_WARNED_HALTED.store(false, Ordering::Relaxed);
+                return;
             }
             xi.process_irq_events(Some(&d.listener));
         }
