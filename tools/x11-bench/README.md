@@ -6,6 +6,11 @@ drives, in one real boot, every primitive Xorg relies on:
 
 - **Framebuffer** — `open("/dev/fb0")`, `FBIOGET_VSCREENINFO`, `mmap`, draw.
 - **Input (evdev)** — `open("/dev/input/event0")`, `EVIOCGNAME`, `EVIOCGBIT`.
+- **VT graphics handoff** — the `xf86OpenConsole`/kdrive `LinuxInit` sequence:
+  `VT_OPENQRY`/`VT_GETSTATE`/`VT_ACTIVATE`/`VT_WAITACTIVE`, then
+  `KDSKBMODE(K_RAW)` and `KDSETMODE(KD_GRAPHICS)` (both pass the mode *by value*),
+  checking `KDGETMODE` reports `KD_GRAPHICS` back. This is the step that seizes
+  the console; mishandling the by-value argument faults the kernel.
 - **TTY** — `TIOCGWINSZ` on a pipe (must succeed, not `ENOTTY`).
 - **AF_UNIX** — filesystem *and* abstract (`\0/tmp/.X11-unix/Xn`, Xlib's primary
   transport): `bind`/`listen`/`connect`, a client write *before* `accept`, then
@@ -29,6 +34,7 @@ XTEST: [PASS] fb screeninfo
 XTEST: [PASS] fb mmap+draw
 XTEST: [PASS] evdev EVIOCGNAME ps2-input
 XTEST: [PASS] evdev EVIOCGBIT
+XTEST: [PASS] vt graphics handoff
 XTEST: [PASS] TIOCGWINSZ on pipe
 XTEST: [PASS] unix fs socket
 XTEST: [PASS] unix abstract socket
@@ -39,7 +45,7 @@ XTEST: [PASS] SIGALRM/setitimer
 XTEST: [PASS] pthread
 XTEST: [PASS] socketpair
 XTEST: [PASS] xauth write+rename
-XTEST: 14/14 passed
+XTEST: 15/15 passed
 XTEST: done
 ```
 

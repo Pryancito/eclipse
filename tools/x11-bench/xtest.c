@@ -24,6 +24,8 @@
 #include <sys/time.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <linux/vt.h>
+#include <linux/kd.h>
 
 static int passed = 0, total = 0;
 static void check(const char *name, int ok, const char *detail) {
@@ -66,6 +68,59 @@ static void test_unix(const char *label, const char *name, int abstract) {
     check(label, ok, "");
 }
 
+/*
+ * VT graphics handoff: the exact xf86OpenConsole / kdrive LinuxInit sequence a
+ * real X server (TinyX's Xfbdev, or Xorg) runs to seize the console. The mode
+ * ioctls (KDSETMODE / KDSKBMODE) take their argument *by value*; a server that
+ * switches to KD_GRAPHICS must see KDGETMODE report it back. This is the step
+ * the plain fb/evdev checks never touch.
+ */
+static void test_vt_handoff(void) {
+    int fd = open("/dev/tty0", O_RDWR);
+    if (fd < 0) fd = open("/dev/console", O_RDWR);
+    if (fd < 0) { check("vt graphics handoff", 0, "no console"); return; }
+
+    int ok = 1;
+    unsigned char kbtype = 0;
+    ok = ok && ioctl(fd, KDGKBTYPE, &kbtype) == 0;          /* validate console fd */
+
+    int vtno = 0;
+    ok = ok && ioctl(fd, VT_OPENQRY, &vtno) == 0 && vtno > 0;
+
+    struct vt_stat vts; memset(&vts, 0, sizeof vts);
+    ok = ok && ioctl(fd, VT_GETSTATE, &vts) == 0 && vts.v_active > 0;
+
+    struct vt_mode vtm; memset(&vtm, 0, sizeof vtm);
+    /* KDGKBMODE/KDGETMODE write an int, matching what real X passes. */
+    int kbmode = -1, kdmode = -1;
+    ok = ok && ioctl(fd, VT_GETMODE, &vtm) == 0;
+    ok = ok && ioctl(fd, KDGKBMODE, &kbmode) == 0;
+    ok = ok && ioctl(fd, KDGETMODE, &kdmode) == 0;
+
+    /* take over the VT */
+    ok = ok && ioctl(fd, VT_ACTIVATE, vtno) == 0;
+    ok = ok && ioctl(fd, VT_WAITACTIVE, vtno) == 0;
+    ok = ok && ioctl(fd, KDSKBMODE, K_RAW) == 0;            /* by value */
+    ok = ok && ioctl(fd, KDSETMODE, KD_GRAPHICS) == 0;      /* by value */
+
+    /* graphics mode must round-trip — the whole point of the handoff */
+    int now = -1;
+    ok = ok && ioctl(fd, KDGETMODE, &now) == 0 && now == KD_GRAPHICS;
+
+    /* VT_PROCESS release/acquire handshake */
+    struct vt_mode pm; memset(&pm, 0, sizeof pm);
+    pm.mode = VT_PROCESS; pm.relsig = SIGUSR1; pm.acqsig = SIGUSR2;
+    ok = ok && ioctl(fd, VT_SETMODE, &pm) == 0;
+
+    /* restore on shutdown (best effort) */
+    ioctl(fd, KDSETMODE, KD_TEXT);
+    ioctl(fd, KDSKBMODE, kbmode == -1 ? K_XLATE : kbmode);
+    struct vt_mode am; memset(&am, 0, sizeof am); am.mode = VT_AUTO;
+    ioctl(fd, VT_SETMODE, &am);
+    close(fd);
+    check("vt graphics handoff", ok, "");
+}
+
 int main(void) {
     printf("XTEST: start\n"); fflush(stdout);
 
@@ -91,6 +146,9 @@ int main(void) {
         unsigned long bits = 0;
         check("evdev EVIOCGBIT", ioctl(ev, EVIOCGBIT(0, sizeof bits), &bits) >= 0 && bits != 0, "");
     } else check("evdev open", 0, "/dev/input/event0");
+
+    /* Console takeover: the VT graphics handoff a real X server performs. */
+    test_vt_handoff();
 
     /* TTY: TIOCGWINSZ on a pipe must succeed (X probes non-tty fds). */
     int pf[2];
