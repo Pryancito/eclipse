@@ -357,22 +357,48 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr, flags, err, pid, thread.proc().name(), pc,
                 );
-                // Dump the faulting instruction bytes so a userspace crash is
-                // self-diagnosing from dmesg: decode `insn` to tell a TLS access
-                // (`%fs:` => 64 prefix), an (AVX) VEX-encoded op (c4/c5), a plain
-                // load/store, etc. If the PC itself is unmapped the process
-                // jumped through a bad pointer (e.g. a botched relocation/GOT).
+                // Make a userspace crash self-diagnosing from dmesg: dump the
+                // registers and the code bytes around the faulting PC. With the
+                // faulting instruction *and* the instructions that computed the
+                // bad pointer, plus the register values, the root cause (botched
+                // relocation/GOT, bad TLS access, AVX op, …) can be read off
+                // directly instead of guessed.
                 #[cfg(not(feature = "libos"))]
                 {
                     use kernel_hal::vm::{GenericPageTable, PageTable};
                     let pt = PageTable::from_current();
-                    if let Ok((pa, _, _)) = pt.query(pc & !0xfff) {
-                        let kv = 0xffff_8000_0000_0000usize + (pa & !0xfff) + (pc & 0xfff);
-                        let mut insn = [0u8; 16];
-                        for (i, b) in insn.iter_mut().enumerate() {
-                            *b = unsafe { core::ptr::read_volatile((kv + i) as *const u8) };
+                    // Read one user byte through the process page table (physmap).
+                    let rd = |va: usize| -> Option<u8> {
+                        pt.query(va & !0xfff).ok().map(|(pa, _, _)| {
+                            let kv = 0xffff_8000_0000_0000usize + (pa & !0xfff) + (va & 0xfff);
+                            unsafe { core::ptr::read_volatile(kv as *const u8) }
+                        })
+                    };
+                    if let Some((rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11)) = thread
+                        .with_context(|ctx| {
+                            let g = ctx.general();
+                            (g.rax, g.rbx, g.rcx, g.rdx, g.rsi, g.rdi, g.rbp, g.r8)
+                        })
+                        .ok()
+                    {
+                        warn!(
+                            "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",
+                            pid, pc, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11,
+                        );
+                    }
+                    // 16 bytes before + 32 after the PC: shows how the faulting
+                    // pointer register was loaded, and the faulting instruction.
+                    let mut code = [0u8; 48];
+                    let start = pc.wrapping_sub(16);
+                    let mut any = false;
+                    for (i, b) in code.iter_mut().enumerate() {
+                        if let Some(byte) = rd(start.wrapping_add(i)) {
+                            *b = byte;
+                            any = true;
                         }
-                        warn!("[crash] pid={} pc={:#x} insn={:02x?}", pid, pc, insn);
+                    }
+                    if any {
+                        warn!("[crash] pid={} code@{:#x} (pc-16): {:02x?}", pid, start, code);
                     } else {
                         warn!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
