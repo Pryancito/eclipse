@@ -6,8 +6,14 @@ use zircon_object::{object::KernelObject, task::Process};
 pub struct BootOptions {
     pub cmdline: String,
     pub log_level: String,
+    /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/openrc-init`. Empty
+    /// or a missing binary means the system boots without a PID 1 init.
     #[cfg(feature = "linux")]
-    pub root_proc: String,
+    pub init_proc: String,
+    /// Process run on every terminal shell (`SHELL`), with PIDs 101.. — empty
+    /// means no terminal shells (e.g. libos, where `INIT` is the one program).
+    #[cfg(feature = "linux")]
+    pub shell_proc: String,
 }
 
 fn parse_cmdline(cmdline: &str) -> BTreeMap<&str, &str> {
@@ -47,8 +53,11 @@ pub fn boot_options() -> BootOptions {
             BootOptions {
                 cmdline,
                 log_level,
+                // libos runs a single program: it is PID 1 (init), no shells.
                 #[cfg(feature = "linux")]
-                root_proc: args[1..].join("?"),
+                init_proc: args[1..].join("?"),
+                #[cfg(feature = "linux")]
+                shell_proc: String::new(),
             }
         } else {
             use alloc::string::ToString;
@@ -57,8 +66,21 @@ pub fn boot_options() -> BootOptions {
             BootOptions {
                 cmdline: cmdline.clone(),
                 log_level: options.get("LOG").unwrap_or(&"").to_string(),
+                // `INIT` selects the PID 1 process (default /sbin/openrc-init,
+                // run only if it exists). `SHELL` selects the per-terminal
+                // shells at PIDs 101.. (default busybox); `ROOTPROC` is accepted
+                // as a deprecated alias for `SHELL`.
                 #[cfg(feature = "linux")]
-                root_proc: options.get("ROOTPROC").unwrap_or(&"/bin/busybox?sh").to_string(),
+                init_proc: options
+                    .get("INIT")
+                    .unwrap_or(&"/sbin/openrc-init")
+                    .to_string(),
+                #[cfg(feature = "linux")]
+                shell_proc: options
+                    .get("SHELL")
+                    .or_else(|| options.get("ROOTPROC"))
+                    .unwrap_or(&"/bin/busybox?sh")
+                    .to_string(),
             }
         }
     }

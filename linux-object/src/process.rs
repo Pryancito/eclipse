@@ -31,12 +31,14 @@ pub use rcore_fs::vfs::FsInfo;
 
 /// Process extension for linux
 pub trait ProcessExt {
-    /// create Linux process
+    /// create Linux process with a fixed Linux PID (`pid`): 1 for init, or the
+    /// reserved 101.. range for the per-terminal shells.
     fn create_linux(
         job: &Arc<Job>,
         rootfs: Arc<dyn FileSystem>,
         vt: usize,
         shared_root: Option<Arc<dyn INode>>,
+        pid: KoID,
     ) -> ZxResult<Arc<Self>>;
     /// get linux process
     fn linux(&self) -> &LinuxProcess;
@@ -86,23 +88,18 @@ impl ProcessExt for Process {
         rootfs: Arc<dyn FileSystem>,
         vt: usize,
         shared_root: Option<Arc<dyn INode>>,
+        pid: KoID,
     ) -> ZxResult<Arc<Self>> {
         let linux_proc = match shared_root {
             Some(root) => LinuxProcess::with_root(root, vt),
             None => LinuxProcess::new(rootfs, vt),
         };
-        // Only the primary terminal's shell (vt 0) is the real init and must
-        // own the fixed Linux PID 1. The extra shells spawned on the other
-        // virtual terminals (vt 1..N) are independent top-level processes:
-        // give each a fresh unique KoID. Reusing INIT_PID for all of them made
-        // every VT shell collapse onto PID 1, so `top`/`ps` listed PID 1 N
-        // times and `find_process(1)`, signals, `kill` and `/proc/1` all
-        // resolved to whichever happened to be first.
-        let proc = if vt == 0 {
-            Process::create_init_with_ext(job, "root", linux_proc)?
-        } else {
-            Process::create_with_ext(job, "root", linux_proc)?
-        };
+        // Each process is given an explicit, stable Linux PID by the boot code:
+        // 1 for init and the reserved 101.. range for the per-terminal shells.
+        // (Reusing PID 1 for every VT shell once made `top`/`ps` list PID 1 N
+        // times and made `find_process(1)`, signals, `kill` and `/proc/1` all
+        // resolve to whichever process happened to be enumerated first.)
+        let proc = Process::create_with_fixed_id_ext(job, pid, "root", linux_proc)?;
         let weak_proc = Arc::downgrade(&proc);
         proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
