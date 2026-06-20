@@ -467,6 +467,17 @@ impl Syscall<'_> {
             "execve: path: {:?}, args: {:?}, envs: {:?}",
             path_str, args, envs
         );
+        // Record every program launch in the dmesg ring (path + argv) so a
+        // captured trace shows the exact exec chain — crucially whether the X
+        // server (`Xorg`/`X`/`Xorg.wrap`) is ever invoked and with what
+        // arguments. `info!`/`debug!` are filtered out at the default WARN
+        // level and never reach the ring, so use the unconditional klog path.
+        kernel_hal::klog_info!(
+            "EXECVE[{}] {:?} argv={:?}",
+            self.zircon_process().id(),
+            path_str,
+            args
+        );
         if args.is_empty() {
             error!("execve: args is empty");
             return Err(LxError::EINVAL);
