@@ -1120,10 +1120,17 @@ impl Stdin {
         for &b in bytes {
             buf.push_back(b as char);
         }
+        drop(buf);
         self.data_ready.store(true, Ordering::Release);
         if let Some(mut eb) = self.eventbus.try_lock() {
             self.data_ready.store(false, Ordering::Relaxed);
             eb.set(Event::READABLE);
+        } else {
+            // EventBus contended: leave `data_ready` set and nudge any waiter so
+            // the bytes don't sit in the buffer until an unrelated event runs
+            // the executor. This matters for kdrive/TinyX, whose only wakeup in
+            // medium-raw mode is the keystroke we just pushed.
+            wake_tty_intr_waiters();
         }
     }
 }
