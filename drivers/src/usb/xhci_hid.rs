@@ -1843,8 +1843,14 @@ impl XhciInner {
     ) -> DeviceResult<()> {
         let mut real_proto = proto;
         if real_proto == 0 {
-            // Heurística: si no tiene protocolo, probamos según el tipo de interfaz o por defecto ratón/teclado.
-            real_proto = HID_PROTO_MOUSE;
+            // bInterfaceProtocol 0 = "None" (non-boot HID). In the QEMU target
+            // this is the `usb-tablet`, which reports *absolute* coordinates
+            // (buttons, X16, Y16, wheel). Routing it to HID_PROTO_MOUSE made the
+            // boot-mouse parser read the high byte of the absolute X as a
+            // relative dy (always ≥0), pinning the pointer to the top of the
+            // screen. Treat protocol-less HID pointers as the absolute tablet.
+            // Real boot mice/keyboards report protocol 2/1 and are unaffected.
+            real_proto = HID_PROTO_TABLET;
         }
 
         let report_len = match real_proto {
