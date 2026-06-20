@@ -36,6 +36,23 @@ impl Syscall<'_> {
             dir_fd, path, flags, mode
         );
 
+        // Pseudo-terminals. Opening `/dev/ptmx` mints a brand-new master (each
+        // open must yield an independent PTY pair, which the generic INode open
+        // path cannot express), and `/dev/pts/N` resolves to the matching slave
+        // from the live PTY registry rather than a static device node.
+        if path == "/dev/ptmx" {
+            let inode = pty::alloc_ptmx();
+            let file = File::new(inode, flags, String::from("/dev/ptmx"));
+            let fd = proc.add_file(file)?;
+            return Ok(fd.into());
+        }
+        if let Some(id) = pty::pts_id_from_path(path) {
+            let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
+            let file = File::new(inode, flags, String::from(path));
+            let fd = proc.add_file(file)?;
+            return Ok(fd.into());
+        }
+
         let inode = if flags.contains(OpenFlags::CREATE) {
             let (dir_path, file_name) = split_path(path);
             // relative to cwd

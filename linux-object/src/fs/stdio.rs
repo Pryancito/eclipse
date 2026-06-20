@@ -3,7 +3,7 @@
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
-use kernel_hal::user::{UserInOutPtr, UserInPtr, UserOutPtr, Error as UserError};
+use kernel_hal::user::{UserInPtr, UserOutPtr, Error as UserError};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -230,11 +230,17 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
                 .store(mode, Ordering::Relaxed);
             Ok(0)
         }
+        // kdrive/TinyX reads the kernel keymap entry-by-entry to map medium-raw
+        // keycodes to X keysyms. `struct kbentry { u8 kb_table; u8 kb_index;
+        // u16 kb_value; }`: the caller fills kb_table/kb_index, we fill kb_value.
         KDGKBENT => {
-            let mut kbe = user_copy(UserInOutPtr::<KbEntry>::from(data).read())?;
-            // Empty/unmapped entries are normal while X scans the whole keymap.
-            kbe.kb_value = kdgkbent_value(kbe.kb_table, kbe.kb_index).unwrap_or(0);
-            user_copy(UserInOutPtr::<KbEntry>::from(data).write(kbe))?;
+            if data == 0 {
+                return Err(FsError::InvalidParam);
+            }
+            let p = data as *mut u8;
+            let (table, index) = unsafe { (*p, *p.add(1)) };
+            let value = kdgkbent_value(index as u16, table);
+            unsafe { *(p.add(2) as *mut u16) = value };
             Ok(0)
         }
         KDGETLED => {
@@ -823,127 +829,6 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_KPPLUS => Some('+'),
         _ => None,
     }
-}
-
-/// Map a Linux VT keycode (`kb_index`) to an evdev `KEY_*` code.
-fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
-    use zcore_drivers::input::input_event_codes::key::*;
-    match kc {
-        1 => Some(KEY_ESC),
-        2 => Some(KEY_1),
-        3 => Some(KEY_2),
-        4 => Some(KEY_3),
-        5 => Some(KEY_4),
-        6 => Some(KEY_5),
-        7 => Some(KEY_6),
-        8 => Some(KEY_7),
-        9 => Some(KEY_8),
-        10 => Some(KEY_9),
-        11 => Some(KEY_0),
-        12 => Some(KEY_MINUS),
-        13 => Some(KEY_EQUAL),
-        14 => Some(KEY_BACKSPACE),
-        15 => Some(KEY_TAB),
-        16 => Some(KEY_Q),
-        17 => Some(KEY_W),
-        18 => Some(KEY_E),
-        19 => Some(KEY_R),
-        20 => Some(KEY_T),
-        21 => Some(KEY_Y),
-        22 => Some(KEY_U),
-        23 => Some(KEY_I),
-        24 => Some(KEY_O),
-        25 => Some(KEY_P),
-        26 => Some(KEY_LEFTBRACE),
-        27 => Some(KEY_RIGHTBRACE),
-        28 => Some(KEY_ENTER),
-        30 => Some(KEY_A),
-        31 => Some(KEY_S),
-        32 => Some(KEY_D),
-        33 => Some(KEY_F),
-        34 => Some(KEY_G),
-        35 => Some(KEY_H),
-        36 => Some(KEY_J),
-        37 => Some(KEY_K),
-        38 => Some(KEY_L),
-        39 => Some(KEY_SEMICOLON),
-        40 => Some(KEY_APOSTROPHE),
-        41 => Some(KEY_GRAVE),
-        43 => Some(KEY_BACKSLASH),
-        44 => Some(KEY_Z),
-        45 => Some(KEY_X),
-        46 => Some(KEY_C),
-        47 => Some(KEY_V),
-        48 => Some(KEY_B),
-        49 => Some(KEY_N),
-        50 => Some(KEY_M),
-        51 => Some(KEY_COMMA),
-        52 => Some(KEY_DOT),
-        53 => Some(KEY_SLASH),
-        57 => Some(KEY_SPACE),
-        59 => Some(KEY_F1),
-        60 => Some(KEY_F2),
-        61 => Some(KEY_F3),
-        62 => Some(KEY_F4),
-        63 => Some(KEY_F5),
-        64 => Some(KEY_F6),
-        65 => Some(KEY_F7),
-        66 => Some(KEY_F8),
-        67 => Some(KEY_F9),
-        68 => Some(KEY_F10),
-        87 => Some(KEY_F11),
-        88 => Some(KEY_F12),
-        _ => None,
-    }
-}
-
-/// Build a `kb_value` for `KDGKBENT`, using the same Spanish layout as the console.
-fn kdgkbent_value(kb_table: u8, kb_index: u8) -> Result<u16> {
-    let evdev = linux_keycode_to_evdev(kb_index).ok_or(FsError::InvalidParam)?;
-    let mods = match kb_table {
-        0 => KeyMods {
-            shift: false,
-            altgr: false,
-            caps: false,
-            ctrl: false,
-        },
-        1 => KeyMods {
-            shift: true,
-            altgr: false,
-            caps: false,
-            ctrl: false,
-        },
-        2 => KeyMods {
-            shift: false,
-            altgr: true,
-            caps: false,
-            ctrl: false,
-        },
-        3 => KeyMods {
-            shift: true,
-            altgr: true,
-            caps: false,
-            ctrl: false,
-        },
-        _ => return Err(FsError::InvalidParam),
-    };
-
-    if (59..=68).contains(&kb_index) {
-        return Ok((KT_FN << 8) | u16::from(kb_index - 59));
-    }
-    if kb_index == 87 {
-        return Ok((KT_FN << 8) | 10);
-    }
-    if kb_index == 88 {
-        return Ok((KT_FN << 8) | 11);
-    }
-
-    if let Some(c) = input_event_to_char_es(evdev, mods) {
-        if c.is_ascii() {
-            return Ok(u16::from(c as u8));
-        }
-    }
-    Err(FsError::InvalidParam)
 }
 
 /// Stdin struct, for Stdin buffer.
