@@ -151,7 +151,14 @@ pub fn pci_note_pending_msi(vector: usize, dev: Arc<dyn Scheme>) {
     enqueue_pending_msi(&mut MSI_PENDING.lock(), vector, &dev);
 }
 
-static XHCI_WARNED_HALTED: AtomicBool = AtomicBool::new(false);
+/// Set once the controller is observed HCHalted. A halted xHCI does not
+/// auto-recover here (HCHalted only clears via an HCRST reset, which this
+/// driver never issues), so once it trips, `poll()` short-circuits to a single
+/// atomic load instead of taking two locks and doing MMIO on every timer tick
+/// and every I/O-wait loop iteration — futile work that was adding latency to
+/// e.g. stdin reads and slowing down I/O-heavy programs. If controller reset /
+/// recovery is ever added, it must clear this flag.
+static XHCI_HALTED: AtomicBool = AtomicBool::new(false);
 
 pub fn pci_finish_msi_registrations() -> DeviceResult<()> {
     let host = MSI_IRQ_HOST.lock().clone().ok_or(DeviceError::NotReady)?;
@@ -2361,6 +2368,13 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 
 /// Respaldo periódico: drena transferencias HID sin depender de MSI (alineado al driver de referencia).
 pub fn poll() {
+    // Fast path: a halted controller has nothing to poll and never recovers
+    // on its own, so bail before any lock or MMIO. This keeps `poll()` (called
+    // from the timer and from every I/O-wait loop iteration) essentially free
+    // once USB has died, instead of dragging on stdin reads / I/O-heavy tools.
+    if XHCI_HALTED.load(Ordering::Relaxed) {
+        return;
+    }
     let inst = POLL_INSTANCE.lock();
     if let Some(d) = &*inst {
         let mut g = d.inner.lock();
@@ -2370,18 +2384,15 @@ pub fn poll() {
                 info!("[xhci] deferred boot enumeration starting");
                 xi.enumerate_root_hid();
             }
-            static mut POLL_COUNT: u64 = 0;
-            unsafe {
-                POLL_COUNT += 1;
-            }
             xi.mmio.ack_host_interrupt();
             let sts = xi.mmio.read_op(4);
             if sts & 1 != 0 {
-                if !XHCI_WARNED_HALTED.swap(true, Ordering::Relaxed) {
-                    warn!("[xhci] USBSTS: controlador detenido (HCHalted)");
+                // HCHalted: warn once and stop polling. `process_irq_events`
+                // below would only re-scan a permanently-empty event ring.
+                if !XHCI_HALTED.swap(true, Ordering::Relaxed) {
+                    warn!("[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo");
                 }
-            } else {
-                XHCI_WARNED_HALTED.store(false, Ordering::Relaxed);
+                return;
             }
             xi.process_irq_events(Some(&d.listener));
         }
