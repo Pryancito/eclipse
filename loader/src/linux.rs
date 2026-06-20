@@ -179,6 +179,16 @@ fn handle_signal(
         // Minimal default dispositions: for Ctrl+C (SIGINT) terminate the process.
         // TODO: implement per-signal default table.
         let code = 128 + signal as i32;
+        // Record the death in the dmesg ring (warn! reaches it at the default
+        // level). A process that dies on a default-disposition signal — Xorg
+        // aborting in early init, say — otherwise vanishes with no trace at all.
+        warn!(
+            "[exit] pid={} killed by signal {:?} ({}) at pc={:#x} (default disposition)",
+            thread.proc().id(),
+            signal,
+            signal as i32,
+            user_pc,
+        );
         thread.proc().exit(code as i64);
         return ctx;
     }
@@ -242,6 +252,12 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             || action.handler == SIG_IGN
     };
     if undeliverable {
+        warn!(
+            "[exit] pid={} killed by fault signal {:?} ({}) — undeliverable, terminating",
+            thread.proc().id(),
+            signal,
+            signal as i32,
+        );
         thread.proc().exit(128 + signal as i64);
     } else {
         // Deliverable custom handler: unblock so it cannot be deferred and queue
