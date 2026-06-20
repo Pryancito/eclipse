@@ -812,11 +812,27 @@ numeric_enum_macro::numeric_enum! {
 /// own logfile is unreachable. Scans a small prefix of each write for the
 /// markers Xorg uses for warnings, errors and fatals.
 fn tee_x_diag(buf: &[u8]) {
-    let scan = &buf[..buf.len().min(512)];
+    let scan = &buf[..buf.len().min(1024)];
     let has = |needle: &[u8]| scan.windows(needle.len()).any(|w| w == needle);
-    if has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens") || has(b"(II) ") {
+    // Xorg's own log markers …
+    let x_marker = has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens")
+        || has(b"(II) ");
+    // … plus the messages the *dynamic linker* prints to stderr when a program
+    // dies before it ever reaches main(). Xorg pulls in far more shared
+    // libraries than a typical CLI app, so a single missing `.so` or unresolved
+    // symbol makes musl's ld abort with one of these — and that path produces
+    // no Xorg log at all, which is exactly the "X won't start, no logs"
+    // symptom. Surface those into dmesg so the failing library/symbol is named.
+    let ld_error = has(b"Error loading shared library")
+        || has(b"Error relocating")
+        || has(b"symbol not found")
+        || has(b"No such file")
+        || has(b"cannot open shared object")
+        || has(b"version `")
+        || has(b"undefined symbol");
+    if x_marker || ld_error {
         if let Ok(s) = core::str::from_utf8(scan) {
-            for line in s.split('\n').filter(|l| !l.is_empty()).take(4) {
+            for line in s.split('\n').filter(|l| !l.is_empty()).take(6) {
                 kernel_hal::klog_info!("XLOG: {}", line);
             }
         }
