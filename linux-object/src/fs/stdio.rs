@@ -488,40 +488,29 @@ fn handle_key_event(event: &InputEvent) {
     if event.event_type != InputEventType::Key {
         return;
     }
-    // Linux input: value 1 = press, 0 = release, 2 = autorepeat.
+    // Linux input: value 1 = press, 0 = release, 2 = autorepeat. Track the
+    // modifier state but don't return — the medium-raw path below has to emit
+    // the modifier keycodes too.
     match event.code {
-        KEY_LEFTCTRL | KEY_RIGHTCTRL => {
-            CTRL_DOWN.store(event.value != 0, Ordering::SeqCst);
-            return;
-        }
-        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
-            SHIFT_DOWN.store(event.value != 0, Ordering::SeqCst);
-            return;
-        }
-        KEY_RIGHTALT => {
-            ALTGR_DOWN.store(event.value != 0, Ordering::SeqCst);
-            return;
-        }
-        KEY_LEFTALT => {
-            LEFT_ALT_DOWN.store(event.value != 0, Ordering::SeqCst);
-            return;
-        }
+        KEY_LEFTCTRL | KEY_RIGHTCTRL => CTRL_DOWN.store(event.value != 0, Ordering::SeqCst),
+        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => SHIFT_DOWN.store(event.value != 0, Ordering::SeqCst),
+        KEY_RIGHTALT => ALTGR_DOWN.store(event.value != 0, Ordering::SeqCst),
+        KEY_LEFTALT => LEFT_ALT_DOWN.store(event.value != 0, Ordering::SeqCst),
         KEY_CAPSLOCK => {
             if event.value == 1 {
                 let on = CAPSLOCK_ON.load(Ordering::SeqCst);
                 CAPSLOCK_ON.store(!on, Ordering::SeqCst);
             }
-            return;
         }
         _ => {}
     }
 
-    if event.value != 1 && event.value != 2 {
-        return;
-    }
-
-    // Ctrl+Alt+F1..F6 → switch virtual terminal.
-    if CTRL_DOWN.load(Ordering::SeqCst) && LEFT_ALT_DOWN.load(Ordering::SeqCst) {
+    // Ctrl+Alt+F1..F6 → switch virtual terminal. Checked before the medium-raw
+    // hand-off below so the user can always leave an X session.
+    if (event.value == 1 || event.value == 2)
+        && CTRL_DOWN.load(Ordering::SeqCst)
+        && LEFT_ALT_DOWN.load(Ordering::SeqCst)
+    {
         let target = match event.code {
             KEY_F1 => Some(0),
             KEY_F2 => Some(1),
@@ -537,6 +526,23 @@ fn handle_key_event(event: &InputEvent) {
             }
             return;
         }
+    }
+
+    // While an X server holds the keyboard in K_MEDIUMRAW (kdrive/TinyX), feed
+    // it raw keycodes straight off the console: one byte per event, the keycode
+    // with bit 7 set on release. Every key matters — presses, releases and
+    // modifiers — but not autorepeat (value 2): kdrive generates its own
+    // repeat. Keycodes ≥ 128 don't fit kdrive's single-byte reader; skip them.
+    if tty_kbd_mode(kernel_hal::console::active_vt()) == K_MEDIUMRAW {
+        if event.code < 0x80 && (event.value == 0 || event.value == 1) {
+            let byte = (event.code as u8 & 0x7f) | if event.value == 0 { 0x80 } else { 0 };
+            active_stdin().push_bytes(&[byte]);
+        }
+        return;
+    }
+
+    if event.value != 1 && event.value != 2 {
+        return;
     }
 
     // Shift+PageUp / Shift+PageDown scrollback on the active VT.
@@ -633,6 +639,62 @@ enum KeySym {
     Cursor(u8),
     /// Cadena fija de tecla de función / navegación (KT_FN): se emite tal cual.
     Func(&'static [u8]),
+}
+
+/// Build the `kb_value` for a `KDGKBENT` query: the kernel keymap entry for
+/// keycode `keycode` in modifier table `table` (0 = plain, 1 = shift, 2 =
+/// AltGr, 3 = shift+AltGr — kdrive's `tbl[]`). kdrive decodes the value as
+/// `K(type, val)` = `(type << 8) | val`.
+///
+/// Printable keys reuse the cooked-mode Spanish keymap (`translate_key`),
+/// encoded as `KT_LATIN(char)` (kdrive maps it through its Latin-1
+/// `linux_to_x[]` table, so any code point ≤ 0xff — including `ñ`, `¡`, `¿` —
+/// works). Modifiers, Return, Escape and the arrows need explicit `KT_SHIFT` /
+/// `KT_SPEC` / `KT_CUR` encodings so kdrive recognises them.
+fn kdgkbent_value(keycode: u16, table: u8) -> u16 {
+    use zcore_drivers::input::input_event_codes::key::*;
+    const KT_LATIN: u16 = 0;
+    const KT_SPEC: u16 = 2;
+    const KT_CUR: u16 = 6;
+    const KT_SHIFT: u16 = 7;
+    const NO_SYMBOL: u16 = 0;
+    // K(type, val) = (type << 8) | val
+    const K_ENTER: u16 = (KT_SPEC << 8) | 1;
+    const K_SHIFT: u16 = (KT_SHIFT << 8) | 0; // KG_SHIFT
+    const K_ALTGR: u16 = (KT_SHIFT << 8) | 1; // KG_ALTGR
+    const K_CTRL: u16 = (KT_SHIFT << 8) | 2; // KG_CTRL (kdrive picks L/R by keycode)
+    const K_ALT: u16 = (KT_SHIFT << 8) | 3; // KG_ALT
+    const K_DOWN: u16 = (KT_CUR << 8) | 0;
+    const K_LEFT: u16 = (KT_CUR << 8) | 1;
+    const K_RIGHT: u16 = (KT_CUR << 8) | 2;
+    const K_UP: u16 = (KT_CUR << 8) | 3;
+
+    match keycode {
+        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => return K_SHIFT,
+        KEY_LEFTCTRL | KEY_RIGHTCTRL => return K_CTRL,
+        KEY_LEFTALT => return K_ALT,
+        KEY_RIGHTALT => return K_ALTGR,
+        KEY_ENTER | KEY_KPENTER => return K_ENTER,
+        KEY_ESC => return (KT_LATIN << 8) | 0x1b, // linux_to_x[0x1b] = XK_Escape
+        KEY_UP => return K_UP,
+        KEY_DOWN => return K_DOWN,
+        KEY_LEFT => return K_LEFT,
+        KEY_RIGHT => return K_RIGHT,
+        _ => {}
+    }
+
+    let mods = KeyMods {
+        shift: table & 1 != 0,
+        altgr: table & 2 != 0,
+        caps: false,
+        ctrl: false,
+    };
+    match translate_key(keycode, mods) {
+        // K(KT_LATIN, c) == c for c ≤ 0xff. Code points above Latin-1 (e.g. the
+        // euro sign) have no single-byte keymap slot, so report NoSymbol.
+        Some(KeySym::Char(c)) if (c as u32) <= 0xff => (c as u32) as u16,
+        _ => NO_SYMBOL,
+    }
 }
 
 /// Traduce un keycode + modificadores a un keysym, replicando el modelo del VT
