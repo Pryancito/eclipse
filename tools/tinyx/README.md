@@ -126,6 +126,15 @@ dmesg | grep -E 'EXECVE|XLOG'
 - `could not open default font 'fixed'` → faltan las fuentes (ver arriba).
 - pantalla en negro pero sin error → revisa `-screen` y que `/dev/fb0`
   responda a `FBIOGET_VSCREENINFO` (lo valida `tools/x11-bench`).
+- **El ratón no se mueve y el log repite `Switching to mouse protocol
+  "ms"/"msc"/"logitech"…`** → kdrive cree que el dispositivo es un puerto
+  serie. Esto ocurría porque `isatty()` daba `true` sobre `/dev/input/mice`
+  (el núcleo respondía a `TIOCGWINSZ` en cualquier fd) y porque el nodo
+  rechazaba las escrituras de `ps2Init`. Ambos se corrigieron en el núcleo de
+  Eclipse OS (`linux-syscall`/`linux-object`): `/dev/input/*` ya no finge ser
+  un tty y `/dev/input/mice` acepta (y descarta) los comandos PS/2. Con un
+  núcleo actualizado el ratón se autodetecta como PS/2. Para forzarlo
+  explícitamente: `Xfbdev :0 -mouse /dev/input/mice,5,imps/2`.
 
 ## Licencia
 

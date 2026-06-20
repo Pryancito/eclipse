@@ -123,8 +123,15 @@ impl INode for MiceDev {
         self.inner.lock().read_at(buf)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        // A PS/2 mouse multiplexer accepts command bytes (set-sample-rate,
+        // get-device-id, enable, …). We have no real device to forward them to,
+        // so accept and discard them — exactly like a mouse that ignores
+        // commands without ACKing. kdrive/TinyX writes these during protocol
+        // probing and only requires the write to succeed; it tolerates the
+        // missing ACK and falls back to plain PS/2. Rejecting the write instead
+        // makes its ps2Init() fail, so it never settles on a working protocol.
+        Ok(buf.len())
     }
 
     fn poll(&self) -> Result<PollStatus> {

@@ -231,6 +231,16 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         Err(LxError::ENOSYS)
     }
+    /// True if this fd is an input device node (`/dev/input/mice`, `event*`).
+    ///
+    /// These are char devices, not terminals, so the generic `TIOCGWINSZ`
+    /// fallback must not synthesize a window size for them — otherwise
+    /// `isatty()` (implemented in musl as a `TIOCGWINSZ` probe) wrongly
+    /// reports a tty, and kdrive/TinyX then treats the mouse as a serial
+    /// port and loops forever over serial mouse protocols.
+    fn is_input_device(&self) -> bool {
+        false
+    }
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Err(LxError::ENOSYS)

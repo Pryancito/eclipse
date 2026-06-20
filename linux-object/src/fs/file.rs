@@ -365,6 +365,12 @@ impl FileLike for File {
         Ok(0)
     }
 
+    fn is_input_device(&self) -> bool {
+        use super::devfs::{EventDev, MiceDev};
+        let inode = self.inner.read().inode.clone();
+        inode.downcast_ref::<MiceDev>().is_some() || inode.downcast_ref::<EventDev>().is_some()
+    }
+
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
         let inner = self.inner.read();
