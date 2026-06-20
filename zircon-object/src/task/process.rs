@@ -154,6 +154,31 @@ impl Process {
         Ok(proc)
     }
 
+    /// Create a process with a fixed KoID (Linux PID). Used for PID 1 (init)
+    /// and the reserved per-terminal shell range (101..). The caller is
+    /// responsible for keeping these IDs unique and out of the `new_koid`
+    /// range (which starts well above them).
+    pub fn create_with_fixed_id_ext(
+        job: &Arc<Job>,
+        id: KoID,
+        name: &str,
+        ext: impl Any + Send + Sync,
+    ) -> ZxResult<Arc<Self>> {
+        let proc = Arc::new(Process {
+            base: KObjectBase::with_id(id, name, Signal::default()),
+            _counter: CountHelper::new(),
+            job: job.clone(),
+            policy: job.policy(),
+            vmar: VmAddressRegion::new_root(),
+            ext: Box::new(ext),
+            exceptionate: Exceptionate::new(ExceptionChannelType::Process),
+            debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
+            inner: Mutex::new(ProcessInner::default()),
+        });
+        job.add_process(proc.clone())?;
+        Ok(proc)
+    }
+
     /// Create a new process with extension info and vmar.
     pub fn create_with_vmar(
         job: &Arc<Job>,

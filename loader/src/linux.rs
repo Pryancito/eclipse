@@ -15,35 +15,104 @@ use linux_object::fs::{
 use linux_object::thread::{CurrentThreadExt, ThreadExt};
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
-use zircon_object::{object::KernelObject, vm::USER_STACK_PAGES, ZxError, ZxResult};
+use zircon_object::{
+    object::{KernelObject, KoID},
+    vm::USER_STACK_PAGES,
+    ZxError, ZxResult,
+};
 
 fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Create and run the main Linux process (virtual terminal 0).
+/// Create and run a single Linux process as PID 1 on virtual terminal 0.
+///
+/// Used by the libos example/tests, where one program is the whole system.
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
-    run_on_vt(args, envs, rootfs, 0, None)
+    const INIT_PID: KoID = 1;
+    spawn(args, envs, rootfs, 0, None, INIT_PID, true).expect("run: program not found")
 }
 
-/// Create and run a Linux process bound to virtual terminal `vt`.
+/// Create and run the configured per-terminal SHELL on virtual terminal `vt`
+/// with the fixed Linux `pid` (the reserved 101.. range). The shell binary is
+/// the system default and must exist; a missing shell is fatal.
 ///
-/// `shared_root` lets extra per-VT shells reuse the primary process's mounted
-/// root filesystem (by `Arc`) instead of re-scanning disks. One-time boot work
-/// (network init, fstab mount, console clear) only runs for `vt == 0`.
-pub fn run_on_vt(
+/// `shared_root` lets extra per-VT shells reuse the primary shell's mounted
+/// root filesystem (by `Arc`) instead of re-scanning disks. The one-time boot
+/// work (network init, fstab mount, console clear) runs only for `vt == 0`.
+pub fn run_shell_on_vt(
     args: Vec<String>,
     envs: Vec<String>,
     rootfs: Arc<dyn FileSystem>,
     vt: usize,
     shared_root: Option<Arc<dyn INode>>,
+    pid: KoID,
 ) -> Arc<Process> {
-    info!("Run Linux process on vt{}: args={:?}, envs={:?}", vt, args, envs);
-    if vt == 0 {
+    spawn(args, envs, rootfs, vt, shared_root, pid, /* boot_work */ vt == 0)
+        .expect("configured SHELL not found")
+}
+
+/// Spawn the INIT process as PID 1 if its binary exists, returning `None`
+/// otherwise so the machine can boot without a PID 1 init (e.g. when
+/// `/sbin/openrc-init` is not installed). Runs on the primary console (vt 0).
+///
+/// `boot_work` should be set only when no shell has already performed the
+/// one-time boot setup (network init, fstab mount).
+pub fn run_init_if_present(
+    args: Vec<String>,
+    envs: Vec<String>,
+    rootfs: Arc<dyn FileSystem>,
+    shared_root: Option<Arc<dyn INode>>,
+    boot_work: bool,
+) -> Option<Arc<Process>> {
+    if args.is_empty() || args[0].is_empty() {
+        return None;
+    }
+    if !program_exists(&args[0], &shared_root, &rootfs) {
+        warn!(
+            "INIT {:?} not present; booting without a PID 1 init",
+            args[0]
+        );
+        return None;
+    }
+    const INIT_PID: KoID = 1;
+    spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work)
+}
+
+/// True if `path` resolves on the primary root (if any) or the initramfs.
+fn program_exists(
+    path: &str,
+    primary_root: &Option<Arc<dyn INode>>,
+    rootfs: &Arc<dyn FileSystem>,
+) -> bool {
+    if let Some(root) = primary_root {
+        if root.lookup(path).is_ok() {
+            return true;
+        }
+    }
+    rootfs.root_inode().lookup(path).is_ok()
+}
+
+/// Core process spawn. Returns `None` if `args[0]` cannot be found on the
+/// process's root or the initramfs (instead of panicking) so optional
+/// processes can be skipped gracefully. `boot_work` runs the one-time boot
+/// setup (network init, fstab mount, console clear) and must happen once.
+fn spawn(
+    args: Vec<String>,
+    envs: Vec<String>,
+    rootfs: Arc<dyn FileSystem>,
+    vt: usize,
+    shared_root: Option<Arc<dyn INode>>,
+    pid: KoID,
+    boot_work: bool,
+) -> Option<Arc<Process>> {
+    info!("spawn pid={} vt={}: args={:?}, envs={:?}", pid, vt, args, envs);
+    if boot_work {
         linux_object::net::init();
     }
     let job = zircon_object::task::ROOT_JOB.clone();
-    let proc = Process::create_linux(&job, rootfs.clone(), vt, shared_root).expect("create_linux");
+    let proc =
+        Process::create_linux(&job, rootfs.clone(), vt, shared_root, pid).expect("create_linux");
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -55,25 +124,26 @@ pub fn run_on_vt(
 
     let inode = match root_inode.lookup(&args[0]) {
         Ok(inode) => inode,
-        Err(e) => {
-            warn!(
-                "root proc {:?} missing on installed root ({:?}); trying initramfs",
-                args[0], e
-            );
-            rootfs
-                .root_inode()
-                .lookup(&args[0])
-                .expect("lookup root process on initramfs")
-        }
+        Err(e) => match rootfs.root_inode().lookup(&args[0]) {
+            Ok(inode) => inode,
+            Err(e2) => {
+                warn!(
+                    "process {:?} not found on root ({:?}) or initramfs ({:?}); skipping",
+                    args[0], e, e2
+                );
+                return None;
+            }
+        },
     };
     let vmo = inode
         .read_as_vmo()
-        .unwrap_or_else(|e| panic!("failed to read root process {:?}: {:?}", args[0], e));
+        .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
     let path = args[0].clone();
 
-    // Boot UX: clear to black right before the first graphic-console output (prompt).
-    // This call is a no-op when graphic mode is disabled. Only for the primary VT.
-    if vt == 0 {
+    // Boot UX: clear to black right before the first graphic-console output
+    // (prompt). No-op when graphic mode is disabled. Only when this process
+    // performs the one-time boot setup (the primary terminal).
+    if boot_work {
         kernel_hal::console::request_clear_graphic_on_next_write();
     }
 
@@ -82,7 +152,7 @@ pub fn run_on_vt(
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     let (entry, sp, initial_brk, execute_path) = loader
         .load(&proc.vmar(), &vmo, args.clone(), envs, path)
-        .unwrap_or_else(|e| panic!("failed to load root process {:?}: {:?}", args[0], e));
+        .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
@@ -92,17 +162,17 @@ pub fn run_on_vt(
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
 
-    // Now that init is started, mount the non-root entries from /etc/fstab
-    // (/boot/efi vfat, /home, …) as a deferred kernel task. This is done off
-    // the synchronous boot path on purpose: the blocking block-device I/O it
-    // performs would otherwise risk stalling disk boot before the shell shows.
-    if vt == 0 {
+    // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
+    // deferred kernel task, off the synchronous boot path: the blocking
+    // block-device I/O would otherwise risk stalling boot before the shell
+    // shows. Done once, by whoever performs the boot work.
+    if boot_work {
         kernel_hal::thread::spawn(async {
             linux_object::fs::mount_fstab_deferred();
         });
     }
 
-    proc
+    Some(proc)
 }
 
 fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {

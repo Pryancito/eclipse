@@ -46,14 +46,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     logging::set_max_level(&options.log_level);
     kernel_hal::console::early_progress_bar(70);
     #[cfg(feature = "linux")]
-    let root_proc = &options.root_proc;
+    let (init_proc, shell_proc): (&str, &str) = (&options.init_proc, &options.shell_proc);
     #[cfg(not(feature = "linux"))]
-    let root_proc = "N/A";
+    let (init_proc, shell_proc) = ("N/A", "N/A");
 
     klog_info!(
-        "Eclipse: boot options log_level={} root_proc={}",
+        "Eclipse: boot options log_level={} init={} shell={}",
         options.log_level,
-        root_proc
+        init_proc,
+        shell_proc
     );
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
@@ -64,32 +65,67 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
         } else if #[cfg(feature = "linux")] {
             use linux_object::process::ProcessExt;
-            let args: alloc::vec::Vec<alloc::string::String> =
-                options.root_proc.split('?').map(Into::into).collect(); // parse "arg0?arg1?arg2"
+            // Parse "arg0?arg1?arg2"; an empty string yields no program.
+            fn parse_proc(s: &str) -> alloc::vec::Vec<alloc::string::String> {
+                if s.is_empty() {
+                    alloc::vec::Vec::new()
+                } else {
+                    s.split('?').map(Into::into).collect()
+                }
+            }
+            let init_args = parse_proc(&options.init_proc);
+            let shell_args = parse_proc(&options.shell_proc);
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
             ];
             let rootfs = fs::rootfs();
             kernel_hal::console::early_progress_bar(95);
-            let proc = zcore_loader::linux::run(args.clone(), envs.clone(), rootfs.clone());
-            // Spawn an extra shell on each additional virtual terminal
-            // (tty2..ttyN, reachable via Ctrl+Alt+F2..F6), sharing the primary
-            // process's mounted root filesystem (by `Arc`, like `fork`).
-            let shared_root = proc.linux().root_inode().clone();
-            for vt in 1..kernel_hal::console::NUM_VTS {
-                let _ = zcore_loader::linux::run_on_vt(
-                    args.clone(),
+
+            // Whose exit takes the system down: INIT (PID 1) if present, else
+            // the primary terminal's shell.
+            let lifetime_proc = if !shell_args.is_empty() {
+                // Spawn the SHELL on each virtual terminal (tty1..ttyN, reachable
+                // via Ctrl+Alt+F1..F6) with a fixed PID 101.. — vt 0 is the
+                // primary terminal and does the one-time boot work; the others
+                // share its mounted root filesystem (by `Arc`, like `fork`).
+                let mut shared_root = None;
+                let mut primary_shell = None;
+                for vt in 0..kernel_hal::console::NUM_VTS {
+                    let pid = (101 + vt) as u64;
+                    let proc = zcore_loader::linux::run_shell_on_vt(
+                        shell_args.clone(),
+                        envs.clone(),
+                        rootfs.clone(),
+                        vt,
+                        shared_root.clone(),
+                        pid,
+                    );
+                    if vt == 0 {
+                        shared_root = Some(proc.linux().root_inode().clone());
+                        primary_shell = Some(proc);
+                    }
+                }
+                // Optionally run INIT as PID 1 (default /sbin/openrc-init), if it
+                // exists. The shells already did the boot work, so don't repeat.
+                let init = zcore_loader::linux::run_init_if_present(
+                    init_args,
                     envs.clone(),
                     rootfs.clone(),
-                    vt,
-                    Some(shared_root.clone()),
+                    shared_root,
+                    false,
                 );
-            }
+                init.or(primary_shell)
+            } else if !init_args.is_empty() {
+                // No shells (e.g. libos): INIT is the single PID 1 program.
+                Some(zcore_loader::linux::run(init_args, envs.clone(), rootfs.clone()))
+            } else {
+                None
+            };
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
-            utils::wait_for_exit(Some(proc))
+            utils::wait_for_exit(lifetime_proc)
         } else if #[cfg(feature = "zircon")] {
             let zbi = fs::zbi();
             kernel_hal::console::early_progress_bar(95);
