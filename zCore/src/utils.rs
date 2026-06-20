@@ -6,8 +6,13 @@ use zircon_object::{object::KernelObject, task::Process};
 pub struct BootOptions {
     pub cmdline: String,
     pub log_level: String,
+    /// Process run on every terminal shell (`ROOTPROC`).
     #[cfg(feature = "linux")]
     pub root_proc: String,
+    /// Process run as PID 1 / init on the primary terminal (`INIT`).
+    /// Defaults to [`Self::root_proc`] when `INIT` is not set in the cmdline.
+    #[cfg(feature = "linux")]
+    pub init_proc: String,
 }
 
 fn parse_cmdline(cmdline: &str) -> BTreeMap<&str, &str> {
@@ -49,16 +54,32 @@ pub fn boot_options() -> BootOptions {
                 log_level,
                 #[cfg(feature = "linux")]
                 root_proc: args[1..].join("?"),
+                // libos runs a single program; init and shell are the same.
+                #[cfg(feature = "linux")]
+                init_proc: args[1..].join("?"),
             }
         } else {
             use alloc::string::ToString;
             let cmdline = kernel_hal::boot::cmdline();
             let options = parse_cmdline(&cmdline);
+            #[cfg(feature = "linux")]
+            let root_proc = options
+                .get("ROOTPROC")
+                .unwrap_or(&"/bin/busybox?sh")
+                .to_string();
             BootOptions {
                 cmdline: cmdline.clone(),
                 log_level: options.get("LOG").unwrap_or(&"").to_string(),
+                // The PID-1 init is configurable via `INIT` in rboot.conf; when
+                // it is absent we fall back to `ROOTPROC`, so a plain config
+                // keeps booting straight into the shell as before.
                 #[cfg(feature = "linux")]
-                root_proc: options.get("ROOTPROC").unwrap_or(&"/bin/busybox?sh").to_string(),
+                init_proc: options
+                    .get("INIT")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| root_proc.clone()),
+                #[cfg(feature = "linux")]
+                root_proc,
             }
         }
     }
