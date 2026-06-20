@@ -200,7 +200,13 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         KDSETMODE => {
-            let mode = unsafe { *(data as *const i32) } as u32;
+            // `KDSETMODE` passes the mode (KD_TEXT/KD_GRAPHICS) by *value* in
+            // the ioctl argument, not via a pointer — matches Linux
+            // drivers/tty/vt/vt_ioctl.c. Dereferencing it would read a bogus
+            // user address (e.g. KD_GRAPHICS == 1 → *0x1) and fault instead of
+            // switching the console to graphics mode, which is exactly the step
+            // an X server (TinyX/Xorg) performs to seize the display.
+            let mode = data as u32;
             console::set_kd_mode_vt(vt, mode);
             Ok(0)
         }
@@ -214,7 +220,10 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         KDSKBMODE => {
-            let mode = unsafe { *(data as *const i32) };
+            // Like `KDSETMODE`, the keyboard mode (K_RAW/K_XLATE/K_OFF/…) is the
+            // ioctl argument by value, not a pointer. X puts the keyboard into
+            // K_RAW/K_OFF this way during console takeover.
+            let mode = data as i32;
             TTY_STATES[vt_clamp(vt)]
                 .kbd_mode
                 .store(mode, Ordering::Relaxed);
