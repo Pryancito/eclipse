@@ -34,6 +34,16 @@ pub struct ITimerVal {
     pub value: TimeVal,
 }
 
+/// `struct itimerspec` for `timer_settime`/`timer_gettime` (nanosecond res).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct ITimerSpec {
+    /// timer period (0 = one-shot)
+    pub interval: TimeSpec,
+    /// time until next expiration
+    pub value: TimeSpec,
+}
+
 impl TimeVal {
     /// create TimeVal
     pub fn now() -> TimeVal {

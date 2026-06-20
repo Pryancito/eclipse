@@ -279,6 +279,11 @@ impl Syscall<'_> {
             // (aarch64/riscv64) omits it in favour of setitimer/timer_*.
             #[cfg(target_arch = "x86_64")]
             Sys::ALARM => self.sys_alarm(a0),
+            Sys::TIMER_CREATE => self.sys_timer_create(a0, a1, a2),
+            Sys::TIMER_SETTIME => self.sys_timer_settime(a0, a1, a2.into(), a3.into()),
+            Sys::TIMER_GETTIME => self.sys_timer_gettime(a0, a1),
+            Sys::TIMER_DELETE => self.sys_timer_delete(a0),
+            Sys::TIMER_GETOVERRUN => self.sys_timer_getoverrun(a0),
             Sys::GETTIMEOFDAY => self.sys_gettimeofday(a0.into(), a1.into()),
             Sys::SETTIMEOFDAY => self.sys_settimeofday(a0.into(), a1.into()),
             Sys::CLOCK_GETTIME => self.sys_clock_gettime(a0, a1.into()),
