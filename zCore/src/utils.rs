@@ -165,14 +165,6 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
             let now = kernel_hal::timer::timer_now().as_millis() as u64;
             if now.wrapping_sub(LAST.load(O::Relaxed)) >= 2000 {
                 LAST.store(now, O::Relaxed);
-                let (used, total) = crate::memory::stats();
-                // Non-allocating writer: this traces memory PRESSURE, so it must
-                // not itself allocate (klog_*! use alloc::format!).
-                kernel_hal::console::serial_write_fmt_spin(format_args!(
-                    "[memstat] used={} MiB / total={} MiB\n",
-                    used / 1024 / 1024,
-                    total / 1024 / 1024
-                ));
             }
         }
         #[cfg(feature = "linux")]

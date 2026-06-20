@@ -249,26 +249,6 @@ impl Executor {
                                 // stolen+preempted) doesn't spam the console.
                                 s == 5000 || s % 5000 == 0
                             };
-                            if report {
-                                let cause = if genuine_stall {
-                                    "LOST WAKE (no task ready or in-flight)"
-                                } else if n != 0 {
-                                    "NOTIFIED-NOT-PICKED (affinity-bound to another CPU?)"
-                                } else {
-                                    "BORROW OUTSTANDING (in-flight elsewhere, or leaked)"
-                                };
-                                if genuine_stall {
-                                    error!(
-                                        "[sched-hang] executor {} idle {} loops: task_num={} notified={} dropped={} borrowed={} -> {}",
-                                        self.id(), s, tn, n, d, b, cause
-                                    );
-                                } else {
-                                    warn!(
-                                        "[sched-hang] executor {} idle {} loops: task_num={} notified={} dropped={} borrowed={} -> {}",
-                                        self.id(), s, tn, n, d, b, cause
-                                    );
-                                }
-                            }
                         }
                     }
                     debug!("no other tasks, wait for interrupt");
