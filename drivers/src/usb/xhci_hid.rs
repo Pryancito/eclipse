@@ -1856,7 +1856,12 @@ impl XhciInner {
         let report_len = match real_proto {
             HID_PROTO_KEY => 8usize,
             HID_PROTO_MOUSE => 8usize, // Soportar ratones con más botones/ruedas (boot extendido)
-            HID_PROTO_TABLET => 6usize,
+            // Read a full 8-byte report: the QEMU tablet's report is
+            // [buttons, X16, Y16, wheel] (6 bytes), but requesting only 6
+            // overruns the interrupt TRB and stalls the endpoint after the
+            // first report on devices whose wMaxPacketSize is 8 — the pointer
+            // would initialise at the centre and then freeze. 8 fits both.
+            HID_PROTO_TABLET => 8usize,
             _ => 8usize,
         };
 
