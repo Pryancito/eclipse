@@ -111,15 +111,17 @@ impl Syscall<'_> {
         // `uptime`/`top` always report "up 0 min". Fill the fields we can
         // source cheaply so userspace tools show real numbers.
         let (used, total) = kernel_hal::mem::memory_usage();
+        let (procs, _running) = linux_object::loadavg::count_processes();
         let sysinfo = SysInfo {
             // Seconds since boot, from the monotonic timer (same source as
             // /proc/uptime).
             uptime: timer_now().as_secs(),
-            // We don't track real load averages yet; report 0 (the kernel
-            // fixed-point format is value << 16, so 0 stays 0).
-            loads: [0; 3],
+            // Approximate 1/5/15-minute run-queue load averages, in the
+            // fixed point sysinfo expects (value << 16).
+            loads: linux_object::loadavg::loadavg_sysinfo(),
             totalram: total as u64,
             freeram: total.saturating_sub(used) as u64,
+            procs: procs as u16,
             mem_unit: 1,
             ..SysInfo::default()
         };

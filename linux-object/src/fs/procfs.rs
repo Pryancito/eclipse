@@ -729,7 +729,8 @@ fn proc_loadavg_content() -> String {
         .filter(|p| matches!(p.status(), Status::Running))
         .count();
     let last_pid = procs.last().map(|p| p.id()).unwrap_or(1);
-    format!("0.00 0.00 0.00 {}/{total} {last_pid}\n", running)
+    let [l1, l5, l15] = crate::loadavg::loadavg_f64();
+    format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
 
 fn proc_meminfo_content() -> String {
