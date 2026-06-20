@@ -94,6 +94,43 @@ Si quieres ver el registro del servidor para diagnosticar:
 Xorg -verbose 6 :0 vt1 2> /tmp/Xorg.log ; cat /tmp/Xorg.log
 ```
 
+## Diagnóstico: `startx` no arranca y *no aparece ningún log de X*
+
+Si `startx` termina al instante y no se genera `/tmp/Xorg.log` ni
+`/var/log/Xorg.0.log`, el servidor X probablemente **muere antes de llegar a
+`main()`**, dentro del cargador dinámico de musl (le falta una biblioteca
+compartida o un símbolo). `Xorg` enlaza con muchas más `.so` que una aplicación
+de consola, así que basta con que falte una para que aborte sin escribir nada en
+su propio log.
+
+El núcleo registra ahora en `dmesg` la cadena de `exec` y los errores del
+cargador dinámico. Tras intentar `startx`, mira el log del kernel:
+
+```sh
+dmesg | grep -E 'EXECVE|XLOG'
+```
+
+- Las líneas `EXECVE[pid] "/ruta" argv=[...]` muestran exactamente qué binarios
+  se ejecutan. Si **no** aparece ningún `EXECVE` con `Xorg`/`X`/`Xorg.wrap`, el
+  problema está en `xinit`/`startx` (no encuentra el servidor): revisa
+  `~/.xinitrc`, `$PATH` y que `/usr/bin/X` apunte al servidor.
+- Las líneas `XLOG: Error loading shared library ...` o
+  `XLOG: Error relocating ...: symbol not found` nombran la biblioteca o el
+  símbolo que falta. Instala el paquete que la aporta.
+
+También puedes ejecutar el servidor a mano para ver el error del enlazador en el
+acto (musl lo escribe en `stderr`):
+
+```sh
+Xorg -version            # si imprime versión, el enlace dinámico está bien
+LD_TRACE_LOADED_OBJECTS=1 Xorg   # lista las .so que necesita y cuáles faltan
+```
+
+Si `Xorg -version` falla con `Error loading shared library libfoo.so.N`,
+instala el paquete correspondiente (`apk add ...`) y reintenta. Cuando
+`Xorg -version` imprime la versión, el problema ya no es el enlazado y conviene
+mirar `/tmp/Xorg.log` (sección anterior) para el siguiente fallo.
+
 ## Notas y limitaciones
 
 - `VT_OPENQRY` devuelve el VT activo, de modo que X se apropia del terminal
