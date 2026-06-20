@@ -2108,10 +2108,10 @@ impl XhciInner {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_Y,
-                            // Match the boot-mouse path's sign convention
-                            // (REL_Y is emitted negated); otherwise the tablet
-                            // moves the pointer the wrong way vertically.
-                            value: -dy,
+                            // `dy` is already screen-space (sy grows downward).
+                            // MouseState::update() negates REL_Y, so emit the
+                            // raw delta here — negating it inverts the Y axis.
+                            value: dy,
                         });
                     }
                     lis.trigger(InputEvent {
