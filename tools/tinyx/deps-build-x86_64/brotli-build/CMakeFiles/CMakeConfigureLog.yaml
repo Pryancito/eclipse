@@ -1,0 +1,306 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineSystem.cmake:228 (message)"
+      - "CMakeLists.txt:7 (project)"
+    message: |
+      The target system is: Linux -  - 
+      The host system is: Linux - 7.0.11-76070011-generic - x86_64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:7 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc 
+      Build flags: -O2;-fPIC
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
+      
+      The C compiler identification is GNU, found in:
+        /home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/3.28.3/CompilerIdC/a.out
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake:57 (try_compile)"
+      - "/usr/share/cmake-3.28/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:7 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz"
+      binary: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-O2 -fPIC"
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_5af99/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_5af99.dir/build.make CMakeFiles/cmTC_5af99.dir/build
+        gmake[1]: Entering directory '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz'
+        Building C object CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc   -O2 -fPIC    -v -o CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-3.28/Modules/CMakeCCompilerABI.c
+        Using built-in specs.
+        COLLECT_GCC=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+        Target: x86_64-linux-musl
+        Configured with: ../src_gcc/configure --enable-languages=c,c++,fortran CC='gcc -static --static' CXX='g++ -static --static' FC='gfortran -static --static' CFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' CXXFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' FFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' LDFLAGS='-s -static --static' --enable-default-pie --enable-static-pie --disable-cet --disable-bootstrap --disable-assembly --disable-werror --target=x86_64-linux-musl --prefix= --libdir=/lib --disable-multilib --with-sysroot=/x86_64-linux-musl --enable-tls --disable-libmudflap --disable-libsanitizer --disable-gnu-indirect-function --disable-libmpx --enable-initfini-array --enable-libstdcxx-time=rt --enable-deterministic-archives --enable-libstdcxx-time --enable-libquadmath --enable-libquadmath-support --disable-decimal-float --with-build-sysroot=/tmp/m1132/build/local/x86_64-linux-musl/obj_sysroot AR_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ar AS_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/gas/as-new LD_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/ld/ld-new NM_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/nm-new OBJCOPY_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objcopy OBJDUMP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objdump RANLIB_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ranlib READELF_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/readelf STRIP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/strip-new --build=x86_64-pc-linux-muslx32 --host=x86_64-pc-linux-muslx32
+        Thread model: posix
+        Supported LTO compression algorithms: zlib
+        gcc version 11.2.1 20211120 (GCC) 
+        COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/'
+         /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/cc1 -quiet -v -iprefix /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/ -isysroot /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl /usr/share/cmake-3.28/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_5af99.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mtune=generic -march=x86-64 -O2 -version -fPIC -o /tmp/ccpKDcCe.s
+        GNU C17 (GCC) version 11.2.1 20211120 (x86_64-linux-musl)
+        	compiled by GNU C version 11.2.0, GMP version 6.2.1, MPFR version 4.1.0, MPC version 1.2.1, isl version none
+        GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+        ignoring nonexistent directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/usr/local/include"
+        ignoring duplicate directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/../../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include"
+        ignoring nonexistent directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/usr/include"
+        ignoring duplicate directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/../../lib/gcc/x86_64-linux-musl/11.2.1/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include
+         /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/include
+        End of search list.
+        GNU C17 (GCC) version 11.2.1 20211120 (x86_64-linux-musl)
+        	compiled by GNU C version 11.2.0, GMP version 6.2.1, MPFR version 4.1.0, MPC version 1.2.1, isl version none
+        GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+        Compiler executable checksum: dcbe288c7664616055a244c4935219e0
+        COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/'
+         /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/as -v --64 -o CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o /tmp/ccpKDcCe.s
+        GNU assembler version 2.37 (x86_64-linux-musl) using BFD version (GNU Binutils) 2.37
+        COMPILER_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/
+        LIBRARY_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib/
+        COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.'
+        Linking C executable cmTC_5af99
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5af99.dir/link.txt --verbose=1
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -O2 -fPIC   -v -rdynamic CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -o cmTC_5af99 
+        Using built-in specs.
+        COLLECT_GCC=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+        COLLECT_LTO_WRAPPER=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/lto-wrapper
+        Target: x86_64-linux-musl
+        Configured with: ../src_gcc/configure --enable-languages=c,c++,fortran CC='gcc -static --static' CXX='g++ -static --static' FC='gfortran -static --static' CFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' CXXFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' FFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' LDFLAGS='-s -static --static' --enable-default-pie --enable-static-pie --disable-cet --disable-bootstrap --disable-assembly --disable-werror --target=x86_64-linux-musl --prefix= --libdir=/lib --disable-multilib --with-sysroot=/x86_64-linux-musl --enable-tls --disable-libmudflap --disable-libsanitizer --disable-gnu-indirect-function --disable-libmpx --enable-initfini-array --enable-libstdcxx-time=rt --enable-deterministic-archives --enable-libstdcxx-time --enable-libquadmath --enable-libquadmath-support --disable-decimal-float --with-build-sysroot=/tmp/m1132/build/local/x86_64-linux-musl/obj_sysroot AR_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ar AS_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/gas/as-new LD_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/ld/ld-new NM_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/nm-new OBJCOPY_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objcopy OBJDUMP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objdump RANLIB_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ranlib READELF_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/readelf STRIP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/strip-new --build=x86_64-pc-linux-muslx32 --host=x86_64-pc-linux-muslx32
+        Thread model: posix
+        Supported LTO compression algorithms: zlib
+        gcc version 11.2.1 20211120 (GCC) 
+        COMPILER_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/
+        LIBRARY_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib/
+        COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-rdynamic' '-o' 'cmTC_5af99' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_5af99.'
+         /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/collect2 --sysroot=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl --eh-frame-hdr -m elf_x86_64 -export-dynamic -dynamic-linker /lib/ld-musl-x86_64.so.1 -pie -o cmTC_5af99 /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crti.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1 -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crtn.o
+        COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-rdynamic' '-o' 'cmTC_5af99' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_5af99.'
+        gmake[1]: Leaving directory '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake:127 (message)"
+      - "/usr/share/cmake-3.28/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:7 (project)"
+    message: |
+      Parsed C implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include]
+          add: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/include]
+        end of search list found
+        collapse include dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/include]
+        collapse include dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/include] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/include]
+        implicit include dirs: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/include;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake:159 (message)"
+      - "/usr/share/cmake-3.28/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:7 (project)"
+    message: |
+      Parsed C implicit link information:
+        link line regex: [^( *|.*[/\\])(x86_64-linux-musl-ld|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        ignore line: [Change Dir: '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_5af99/fast]
+        ignore line: [/usr/bin/gmake  -f CMakeFiles/cmTC_5af99.dir/build.make CMakeFiles/cmTC_5af99.dir/build]
+        ignore line: [gmake[1]: Entering directory '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-QHA2Qz']
+        ignore line: [Building C object CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o]
+        ignore line: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc   -O2 -fPIC    -v -o CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-3.28/Modules/CMakeCCompilerABI.c]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc]
+        ignore line: [Target: x86_64-linux-musl]
+        ignore line: [Configured with: ../src_gcc/configure --enable-languages=c,c++,fortran CC='gcc -static --static' CXX='g++ -static --static' FC='gfortran -static --static' CFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' CXXFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' FFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' LDFLAGS='-s -static --static' --enable-default-pie --enable-static-pie --disable-cet --disable-bootstrap --disable-assembly --disable-werror --target=x86_64-linux-musl --prefix= --libdir=/lib --disable-multilib --with-sysroot=/x86_64-linux-musl --enable-tls --disable-libmudflap --disable-libsanitizer --disable-gnu-indirect-function --disable-libmpx --enable-initfini-array --enable-libstdcxx-time=rt --enable-deterministic-archives --enable-libstdcxx-time --enable-libquadmath --enable-libquadmath-support --disable-decimal-float --with-build-sysroot=/tmp/m1132/build/local/x86_64-linux-musl/obj_sysroot AR_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ar AS_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/gas/as-new LD_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/ld/ld-new NM_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/nm-new OBJCOPY_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objcopy OBJDUMP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objdump RANLIB_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ranlib READELF_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/readelf STRIP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/strip-new --build=x86_64-pc-linux-muslx32 --host=x86_64-pc-linux-muslx32]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib]
+        ignore line: [gcc version 11.2.1 20211120 (GCC) ]
+        ignore line: [COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/']
+        ignore line: [ /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/cc1 -quiet -v -iprefix /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/ -isysroot /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl /usr/share/cmake-3.28/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_5af99.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mtune=generic -march=x86-64 -O2 -version -fPIC -o /tmp/ccpKDcCe.s]
+        ignore line: [GNU C17 (GCC) version 11.2.1 20211120 (x86_64-linux-musl)]
+        ignore line: [	compiled by GNU C version 11.2.0  GMP version 6.2.1  MPFR version 4.1.0  MPC version 1.2.1  isl version none]
+        ignore line: [GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072]
+        ignore line: [ignoring nonexistent directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/usr/local/include"]
+        ignore line: [ignoring duplicate directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/../../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include"]
+        ignore line: [ignoring nonexistent directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/usr/include"]
+        ignore line: [ignoring duplicate directory "/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/../../lib/gcc/x86_64-linux-musl/11.2.1/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/include]
+        ignore line: [ /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/include]
+        ignore line: [End of search list.]
+        ignore line: [GNU C17 (GCC) version 11.2.1 20211120 (x86_64-linux-musl)]
+        ignore line: [	compiled by GNU C version 11.2.0  GMP version 6.2.1  MPFR version 4.1.0  MPC version 1.2.1  isl version none]
+        ignore line: [GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072]
+        ignore line: [Compiler executable checksum: dcbe288c7664616055a244c4935219e0]
+        ignore line: [COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/']
+        ignore line: [ /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/as -v --64 -o CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o /tmp/ccpKDcCe.s]
+        ignore line: [GNU assembler version 2.37 (x86_64-linux-musl) using BFD version (GNU Binutils) 2.37]
+        ignore line: [COMPILER_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/]
+        ignore line: [LIBRARY_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-o' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o' '-c' '-mtune=generic' '-march=x86-64' '-dumpdir' 'CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.']
+        ignore line: [Linking C executable cmTC_5af99]
+        ignore line: [/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5af99.dir/link.txt --verbose=1]
+        ignore line: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -O2 -fPIC   -v -rdynamic CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -o cmTC_5af99 ]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc]
+        ignore line: [COLLECT_LTO_WRAPPER=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/lto-wrapper]
+        ignore line: [Target: x86_64-linux-musl]
+        ignore line: [Configured with: ../src_gcc/configure --enable-languages=c,c++,fortran CC='gcc -static --static' CXX='g++ -static --static' FC='gfortran -static --static' CFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' CXXFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' FFLAGS='-g0 -O2 -fno-align-functions -fno-align-jumps -fno-align-loops -fno-align-labels -Wno-error' LDFLAGS='-s -static --static' --enable-default-pie --enable-static-pie --disable-cet --disable-bootstrap --disable-assembly --disable-werror --target=x86_64-linux-musl --prefix= --libdir=/lib --disable-multilib --with-sysroot=/x86_64-linux-musl --enable-tls --disable-libmudflap --disable-libsanitizer --disable-gnu-indirect-function --disable-libmpx --enable-initfini-array --enable-libstdcxx-time=rt --enable-deterministic-archives --enable-libstdcxx-time --enable-libquadmath --enable-libquadmath-support --disable-decimal-float --with-build-sysroot=/tmp/m1132/build/local/x86_64-linux-musl/obj_sysroot AR_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ar AS_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/gas/as-new LD_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/ld/ld-new NM_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/nm-new OBJCOPY_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objcopy OBJDUMP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/objdump RANLIB_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/ranlib READELF_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/readelf STRIP_FOR_TARGET=/tmp/m1132/build/local/x86_64-linux-musl/obj_binutils/binutils/strip-new --build=x86_64-pc-linux-muslx32 --host=x86_64-pc-linux-muslx32]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib]
+        ignore line: [gcc version 11.2.1 20211120 (GCC) ]
+        ignore line: [COMPILER_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/]
+        ignore line: [LIBRARY_PATH=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/:/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-O2' '-fPIC' '-v' '-rdynamic' '-o' 'cmTC_5af99' '-mtune=generic' '-march=x86-64' '-dumpdir' 'cmTC_5af99.']
+        link line: [ /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/collect2 --sysroot=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl --eh-frame-hdr -m elf_x86_64 -export-dynamic -dynamic-linker /lib/ld-musl-x86_64.so.1 -pie -o cmTC_5af99 /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crti.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1 -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib -L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crtn.o]
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../libexec/gcc/x86_64-linux-musl/11.2.1/collect2] ==> ignore
+          arg [--sysroot=/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [-m] ==> ignore
+          arg [elf_x86_64] ==> ignore
+          arg [-export-dynamic] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib/ld-musl-x86_64.so.1] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_5af99] ==> ignore
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o] ==> obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o]
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crti.o] ==> obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crti.o]
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o] ==> obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o]
+          arg [-L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1] ==> dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1]
+          arg [-L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc] ==> dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc]
+          arg [-L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib] ==> dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib]
+          arg [-L/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib] ==> dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib]
+          arg [CMakeFiles/cmTC_5af99.dir/CMakeCCompilerABI.c.o] ==> ignore
+          arg [-lgcc] ==> lib [gcc]
+          arg [--push-state] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--pop-state] ==> ignore
+          arg [-lc] ==> lib [c]
+          arg [-lgcc] ==> lib [gcc]
+          arg [--push-state] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--pop-state] ==> ignore
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o] ==> obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o]
+          arg [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crtn.o] ==> obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crtn.o]
+        collapse obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/Scrt1.o]
+        collapse obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crti.o] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/crti.o]
+        collapse obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o]
+        collapse obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o]
+        collapse obj [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/crtn.o] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/crtn.o]
+        collapse library dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1]
+        collapse library dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc]
+        collapse library dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib]
+        collapse library dir [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../x86_64-linux-musl/lib] ==> [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib]
+        implicit libs: [gcc;gcc_s;c;gcc;gcc_s]
+        implicit objs: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/Scrt1.o;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/crti.o;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/crtbeginS.o;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1/crtendS.o;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib/crtn.o]
+        implicit dirs: [/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/lib/gcc;/home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/x86_64-linux-musl/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/usr/share/cmake-3.28/Modules/CheckCSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "CMakeLists.txt:17 (check_c_source_compiles)"
+    checks:
+      - "Performing Test BROTLI_EMSCRIPTEN"
+    directories:
+      source: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy"
+      binary: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-O2 -fPIC"
+    buildResult:
+      variable: "BROTLI_EMSCRIPTEN"
+      cached: true
+      stdout: |
+        Change Dir: '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_90441/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_90441.dir/build.make CMakeFiles/cmTC_90441.dir/build
+        gmake[1]: se entra en el directorio '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy'
+        Building C object CMakeFiles/cmTC_90441.dir/src.c.o
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -DBROTLI_EMSCRIPTEN  -O2 -fPIC  -o CMakeFiles/cmTC_90441.dir/src.c.o -c /home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy/src.c
+        Linking C executable cmTC_90441
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_90441.dir/link.txt --verbose=1
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -O2 -fPIC  -rdynamic CMakeFiles/cmTC_90441.dir/src.c.o -o cmTC_90441 
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/bin/ld: /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/../lib/gcc/x86_64-linux-musl/11.2.1/../../../../x86_64-linux-musl/lib/Scrt1.o: in function `_start_c':
+        Scrt1.c:(.text._start_c+0x1a): undefined reference to `main'
+        collect2: error: ld returned 1 exit status
+        gmake[1]: *** [CMakeFiles/cmTC_90441.dir/build.make:99: cmTC_90441] Error 1
+        gmake[1]: se sale del directorio '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-IHVKXy'
+        gmake: *** [Makefile:127: cmTC_90441/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CheckFunctionExists.cmake:86 (try_compile)"
+      - "CMakeLists.txt:113 (CHECK_FUNCTION_EXISTS)"
+    checks:
+      - "Looking for log2"
+    directories:
+      source: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh"
+      binary: "/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-O2 -fPIC"
+    buildResult:
+      variable: "LOG2_RES"
+      cached: true
+      stdout: |
+        Change Dir: '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_05283/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_05283.dir/build.make CMakeFiles/cmTC_05283.dir/build
+        gmake[1]: se entra en el directorio '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh'
+        Building C object CMakeFiles/cmTC_05283.dir/CheckFunctionExists.c.o
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc   -O2 -fPIC -DCHECK_FUNCTION_EXISTS=log2 -o CMakeFiles/cmTC_05283.dir/CheckFunctionExists.c.o -c /home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh/CheckFunctionExists.c
+        <command-line>: warning: conflicting types for built-in function ‘log2’; expected ‘double(double)’ [-Wbuiltin-declaration-mismatch]
+        /home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh/CheckFunctionExists.c:7:3: note: in expansion of macro ‘CHECK_FUNCTION_EXISTS’
+            7 |   CHECK_FUNCTION_EXISTS(void);
+              |   ^~~~~~~~~~~~~~~~~~~~~
+        /home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh/CheckFunctionExists.c:1:1: note: ‘log2’ is declared in header ‘<math.h>’
+          +++ |+#include <math.h>
+            1 | #ifdef CHECK_FUNCTION_EXISTS
+        Linking C executable cmTC_05283
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_05283.dir/link.txt --verbose=1
+        /home/moebius/eclipse2/target/x86_64/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -O2 -fPIC -DCHECK_FUNCTION_EXISTS=log2 -rdynamic CMakeFiles/cmTC_05283.dir/CheckFunctionExists.c.o -o cmTC_05283 
+        gmake[1]: se sale del directorio '/home/moebius/eclipse2/tools/tinyx/deps-build-x86_64/brotli-build/CMakeFiles/CMakeScratch/TryCompile-skOFmh'
+        
+      exitCode: 0
+...

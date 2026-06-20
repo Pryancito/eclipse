@@ -1,0 +1,58 @@
+#!/bin/sh
+# Launch TinyX (Xfbdev) on Eclipse OS and start a minimal X session.
+#
+# Uses /dev/fb0 and /dev/input/mice (same surface as tools/x11-bench).
+# Keyboard follows the active VT console keymap (TinyX has no XKB).
+
+set -e
+
+DISPLAY_NUM=${DISPLAY_NUM:-0}
+SCREEN=${TINYX_SCREEN:-1024x768}
+VT=${TINYX_VT:-1}
+MOUSE=${TINYX_MOUSE:-/dev/input/mice}
+FONT_PATH=${TINYX_FONT_PATH:-/usr/share/fonts/X11/misc}
+
+if ! command -v Xfbdev >/dev/null 2>&1; then
+    echo "startx: Xfbdev not found (build with: cargo rootfs --arch $(uname -m))" >&2
+    exit 1
+fi
+
+if [ ! -c /dev/fb0 ]; then
+    echo "startx: /dev/fb0 missing" >&2
+    exit 1
+fi
+
+# Already running?
+if [ -S "/tmp/.X11-unix/X${DISPLAY_NUM}" ] 2>/dev/null; then
+    export DISPLAY=:${DISPLAY_NUM}
+    exec sh /etc/X11/xinitrc.tinyx
+fi
+
+Xfbdev ":${DISPLAY_NUM}" \
+    -screen "$SCREEN" \
+    -mouse "$MOUSE" \
+    -fp "$FONT_PATH" \
+    "vt${VT}" &
+XPID=$!
+
+i=0
+while [ $i -lt 50 ]; do
+    if [ -S "/tmp/.X11-unix/X${DISPLAY_NUM}" ]; then
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+if ! kill -0 "$XPID" 2>/dev/null; then
+    echo "startx: Xfbdev exited early" >&2
+    exit 1
+fi
+
+export DISPLAY=:${DISPLAY_NUM}
+if [ -f /etc/X11/xinitrc.tinyx ]; then
+    sh /etc/X11/xinitrc.tinyx
+else
+    echo "startx: DISPLAY=$DISPLAY (no /etc/X11/xinitrc.tinyx)"
+    wait "$XPID"
+fi

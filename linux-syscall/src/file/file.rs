@@ -462,6 +462,10 @@ impl Syscall<'_> {
         let file_like = proc.get_file_like(fd)?;
         // `TIOCGWINSZ` (get terminal window size).
         const TIOCGWINSZ: usize = 0x5413;
+        const TCGETS: usize = 0x5401;
+        const TCSETS: usize = 0x5402;
+        const TCSETSW: usize = 0x5403;
+        const TCSETSF: usize = 0x5404;
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
             // Some programs (e.g. the X server and its helpers) insist on a
             // valid window size and keep retrying `TIOCGWINSZ` in a loop when it
@@ -481,6 +485,32 @@ impl Syscall<'_> {
                 }
                 let mut ptr: UserOutPtr<kernel_hal::console::ConsoleWinSize> = arg1.into();
                 ptr.write(ws)?;
+                Ok(0)
+            }
+            // TinyX calls `tcgetattr()` on the console fd during keyboard setup;
+            // if the fd backend rejects `TCGETS`, return sane cooked defaults.
+            Err(LxError::ENOSYS) | Err(LxError::ENOTTY) | Err(LxError::EINVAL)
+                if request == TCGETS && arg1 != 0 =>
+            {
+                use linux_object::fs::ioctl::Termios;
+                let mut ptr: UserOutPtr<Termios> = arg1.into();
+                ptr.write(Termios::default_tty())?;
+                Ok(0)
+            }
+            // TinyX puts the console in raw mode with `tcsetattr()` after reading
+            // the old settings; accept the update on the active VT even when the
+            // fd is not wired as a tty backend (e.g. fb0 / socket fd numbers).
+            Err(LxError::ENOSYS) | Err(LxError::ENOTTY) | Err(LxError::EINVAL)
+                if matches!(request, TCSETS | TCSETSW | TCSETSF) && arg1 != 0 =>
+            {
+                use linux_object::fs::ioctl::Termios;
+                use linux_object::fs::stdio;
+                let termios = UserInPtr::<Termios>::from(arg1).read()?;
+                if request == TCSETSF {
+                    stdio::set_active_vt_termios_flush(termios);
+                } else {
+                    stdio::set_active_vt_termios(termios);
+                }
                 Ok(0)
             }
             // An unhandled ioctl maps to `ENOSYS` ("function not implemented")

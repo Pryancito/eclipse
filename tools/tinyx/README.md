@@ -19,7 +19,7 @@ espera `udev`/DRM; basta con que falte una `.so` para que aborte antes de
 
 | | Xorg | TinyX `Xfbdev` |
 |---|---|---|
-| Forma | servidor + drivers + muchas `.so` | un solo binario |
+| Forma | servidor + drivers + muchas `.so` | un binario estático |
 | Vídeo | `fbdev`/DRM | `/dev/fb0` directo |
 | Entrada | `libinput`/`udev`/`evdev` | VT + `/dev/input/mice` |
 | XKB | obligatorio | **no** (usa el keymap de consola) |
@@ -32,11 +32,15 @@ es adecuado** para Eclipse OS; por eso el build solo genera `Xfbdev`.
 
 ```
 tools/tinyx/
-├── README.md            ← este documento
-├── build-tinyx.sh       ← cross-compila Xfbdev y lo copia al rootfs
+├── README.md                 ← este documento
+├── build-tinyx.sh            ← cross-compila Xfbdev estático y lo copia al rootfs
+├── build-xsysroot-static.sh  ← compila .a (fontenc, freetype, png, zlib, …)
+├── fetch-xsysroot.sh         ← sysroot Alpine con headers/libXfont 1.x
+├── fetch-xfonts.sh           ← fuentes bitmap fixed/cursor
 ├── eclipse/
-│   └── xinitrc          ← ejemplo de sesión X (xterm + WM mínimo)
-└── src/                 ← fuente de TinyX vendorizada (tinyx 1.3, kdrive)
+│   ├── startx                ← launcher
+│   └── xinitrc               ← ejemplo de sesión X
+└── src/                      ← fuente TinyX vendorizada (tinyx 1.3, kdrive)
 ```
 
 ## Dependencias
@@ -67,17 +71,23 @@ Si no encuentras `libXfont` v1 empaquetada, la fuente está en
 
 ## Compilar
 
+Con la integración en xtask (recomendado):
+
 ```sh
-# requiere la toolchain musl bajo target/$ARCH/ (la descarga `cargo rootfs`)
-XSYSROOT=/ruta/al/sysroot-x  tools/tinyx/build-tinyx.sh
+cargo rootfs --arch x86_64
 ```
 
-El script cross-compila con `--enable-kdrive --enable-xfbdev --disable-xvesa`,
-hace *strip* del binario y lo deja en `rootfs/$ARCH/usr/bin/Xfbdev`. Para
-limpiar: `tools/tinyx/build-tinyx.sh clean`.
+Eso descarga la toolchain musl, rellena el sysroot X (`tools/tinyx/fetch-xsysroot.sh`),
+compila las dependencias estáticas (`tools/tinyx/build-xsysroot-static.sh`),
+genera un **`Xfbdev` totalmente estático** (sin `.so` en runtime), instala fuentes
+bitmap y `startx` en el rootfs.
 
-Variables de entorno: `ARCH` (def. `x86_64`), `TOOLCHAIN`, `XSYSROOT`
-(obligatoria), `ROOTFS`, `JOBS`. Ver la cabecera de `build-tinyx.sh`.
+Manualmente:
+
+```sh
+tools/tinyx/build-tinyx.sh          # sysroot + build automáticos
+tools/tinyx/build-tinyx.sh clean
+```
 
 ## Fuentes en tiempo de ejecución
 
@@ -96,6 +106,8 @@ Comprueba primero que el framebuffer y la entrada existen (`/dev/fb0`,
 
 ```sh
 # servidor en :0, 1024x768, tomando la VT 1
+startx
+# o manualmente:
 Xfbdev :0 -screen 1024x768 -mouse /dev/input/mice vt1 &
 export DISPLAY=:0
 sh /etc/X11/xinitrc.tinyx        # o tus propios clientes X
@@ -122,7 +134,7 @@ dmesg | grep -E 'EXECVE|XLOG'
 ```
 
 - `XLOG: Error loading shared library …` / `Error relocating …` → falta una
-  biblioteca; instálala. (Compilado estático, esto no debería ocurrir.)
+  biblioteca (no debería ocurrir: `Xfbdev` es **estático** y no necesita `.so` X).
 - `could not open default font 'fixed'` → faltan las fuentes (ver arriba).
 - pantalla en negro pero sin error → revisa `-screen` y que `/dev/fb0`
   responda a `FBIOGET_VSCREENINFO` (lo valida `tools/x11-bench`).

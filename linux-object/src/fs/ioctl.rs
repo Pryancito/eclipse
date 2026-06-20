@@ -188,3 +188,26 @@ pub const TCFLSH: usize = 0x540B;
 pub const TIOCSCTTY: usize = 0x540E;
 /// Give up the controlling TTY.
 pub const TIOCNOTTY: usize = 0x5422;
+
+/// Get keyboard LED state (Scroll/Num/Caps) into an `int`.
+pub const KDGETLED: usize = 0x4B11;
+/// Set keyboard LED state from an `int` (by value, not a pointer).
+pub const KDSETLED: usize = 0x4B32;
+/// Read one entry from the kernel keymap (`struct kbentry`).
+pub const KDGKBENT: usize = 0x4B46;
+/// Console bell tone (accepted as a no-op).
+pub const KDMKTONE: usize = 0x4B30;
+
+/// Key-type field in a `kb_value` (`KTYP(x) == (x >> 8)`).
+pub const KT_LATIN: u16 = 0;
+pub const KT_FN: u16 = 1;
+pub const KT_SPEC: u16 = 2;
+
+/// Linux `struct kbentry` — one keymap cell for `KDGKBENT`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct KbEntry {
+    pub kb_table: u8,
+    pub kb_index: u8,
+    pub kb_value: u16,
+}

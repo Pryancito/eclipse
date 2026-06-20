@@ -13,6 +13,8 @@ libfbdev_a_SOURCES =	\
 Xfbdev_SOURCES = \
 	fbinit.c
 
+Xfbdev_LDFLAGS = -static
+
 Xfbdev_LDADD = 						\
 	libfbdev.a					\
 	@KDRIVE_LIBS@					\
