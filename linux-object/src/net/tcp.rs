@@ -333,8 +333,15 @@ impl Socket for TcpSocketState {
                     return Ok(size);
                 }
                 Err(err) => {
-                    error!("Tcp socket write error: {:?}", err);
-                    return Err(LxError::ENOBUFS);
+                    // smoltcp returns `Illegal` once the socket can no longer
+                    // send: it has left Established/CloseWait, i.e. the peer
+                    // reset or closed the connection mid-stream. The correct
+                    // errno for a write on a torn-down connection is EPIPE
+                    // ("broken pipe") — not ENOBUFS, whose "No buffer space
+                    // available" text made TLS libraries report a bogus
+                    // "handshake failed: No buffer space available".
+                    warn!("[tcp write] send failed: {:?} (connection no longer sendable)", err);
+                    return Err(LxError::EPIPE);
                 }
             }
         }

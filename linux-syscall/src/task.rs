@@ -22,7 +22,10 @@ use zircon_object::vm::USER_STACK_PAGES;
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
 const P_PGID: i32 = 2;
-const P_PIDFD: i32 = 5;
+// Linux <linux/wait.h>: P_PIDFD == 3 (this was wrongly 5, so waitid() with a
+// pidfd — as glib's g_child_watch_source_new() uses — matched no arm and
+// returned EINVAL).
+const P_PIDFD: i32 = 3;
 
 fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
     if infop.is_null() {
