@@ -125,12 +125,6 @@ pub const K_UNICODE: i32 = 0x03;
 /// Keyboard input disabled — used by X/Wayland while they own input via evdev.
 pub const K_OFF: i32 = 0x04;
 
-/// Get one entry of the kernel keymap (`<linux/kd.h>`, `struct kbentry { u8
-/// kb_table; u8 kb_index; u16 kb_value; }`). kdrive/TinyX reads the whole
-/// keymap this way to build its keycode→keysym table while it holds the
-/// keyboard in `K_MEDIUMRAW`.
-pub const KDGKBENT: usize = 0x4B46;
-
 // Virtual terminal ioctls (Linux `<linux/vt.h>`).
 /// Find the first free VT number; writes a 1-based VT index into an `int`.
 pub const VT_OPENQRY: usize = 0x5600;
