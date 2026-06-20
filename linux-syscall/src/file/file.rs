@@ -465,10 +465,11 @@ impl Syscall<'_> {
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
             // Some programs (e.g. the X server and its helpers) insist on a
             // valid window size and keep retrying `TIOCGWINSZ` in a loop when it
-            // fails — even when stdout/stderr is a pipe rather than a tty, which
-            // a real kernel answers with ENOTTY. Satisfy them by reporting the
-            // console size so the ioctl succeeds instead of spinning.
-            Err(LxError::ENOSYS) | Err(LxError::ENOTTY)
+            // fails — even when the fd is a pipe, socket or char device (DRM/fb/
+            // input) rather than a tty. Different backends reject it differently
+            // (ENOTTY, ENOSYS, or EINVAL from a device's io_control), so satisfy
+            // all of them by reporting the console size instead of failing.
+            Err(LxError::ENOSYS) | Err(LxError::ENOTTY) | Err(LxError::EINVAL)
                 if request == TIOCGWINSZ && arg1 != 0 =>
             {
                 let mut ws = kernel_hal::console::console_win_size();
