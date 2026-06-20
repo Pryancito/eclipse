@@ -22,10 +22,16 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/vt.h>
 #include <linux/kd.h>
+
+/* Unique per running instance: the bench launches one xtest per VT and they
+ * share a kernel socket namespace; the VT shells can share pid 1, so use the
+ * thread id (distinct per instance) to keep socket names from colliding. */
+static long uid(void) { return syscall(SYS_gettid); }
 
 static int passed = 0, total = 0;
 static void check(const char *name, int ok, const char *detail) {
@@ -53,7 +59,10 @@ static socklen_t fill_addr(struct sockaddr_un *sa, const char *name, int abstrac
 }
 
 static void test_unix(const char *label, const char *name, int abstract) {
-    struct sockaddr_un sa; socklen_t al = fill_addr(&sa, name, abstract);
+    /* Per-instance suffix (see uid()): one xtest runs per VT concurrently, all
+     * sharing one kernel socket namespace — fixed names would collide. */
+    char uniq[64]; snprintf(uniq, sizeof uniq, "%s.%ld", name, uid());
+    struct sockaddr_un sa; socklen_t al = fill_addr(&sa, uniq, abstract);
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     int ok = bind(srv, (void *)&sa, al) == 0 && listen(srv, 5) == 0;
     int c = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -163,7 +172,8 @@ int main(void) {
 
     /* Event loop: select / epoll / eventfd on a ready socket. */
     {
-        struct sockaddr_un sa; socklen_t al = fill_addr(&sa, "/tmp/sel.sock", 0);
+        char sel[40]; snprintf(sel, sizeof sel, "/tmp/sel.sock.%ld", uid());
+        struct sockaddr_un sa; socklen_t al = fill_addr(&sa, sel, 0);
         int srv = socket(AF_UNIX, SOCK_STREAM, 0); bind(srv,(void*)&sa,al); listen(srv,5);
         int c = socket(AF_UNIX, SOCK_STREAM, 0); connect(c,(void*)&sa,al);
         fd_set r; FD_ZERO(&r); FD_SET(srv,&r);
@@ -183,6 +193,7 @@ int main(void) {
         int ok = poll(&p, 1, 1000) == 1 && read(efd, &got, 8) == 8 && got == 1;
         check("eventfd", ok, ""); close(efd);
     }
+
 
     /* Scheduler: SIGALRM via setitimer. */
     {
