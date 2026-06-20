@@ -91,7 +91,18 @@ impl ProcessExt for Process {
             Some(root) => LinuxProcess::with_root(root, vt),
             None => LinuxProcess::new(rootfs, vt),
         };
-        let proc = Process::create_init_with_ext(job, "root", linux_proc)?;
+        // Only the primary terminal's shell (vt 0) is the real init and must
+        // own the fixed Linux PID 1. The extra shells spawned on the other
+        // virtual terminals (vt 1..N) are independent top-level processes:
+        // give each a fresh unique KoID. Reusing INIT_PID for all of them made
+        // every VT shell collapse onto PID 1, so `top`/`ps` listed PID 1 N
+        // times and `find_process(1)`, signals, `kill` and `/proc/1` all
+        // resolved to whichever happened to be first.
+        let proc = if vt == 0 {
+            Process::create_init_with_ext(job, "root", linux_proc)?
+        } else {
+            Process::create_with_ext(job, "root", linux_proc)?
+        };
         let weak_proc = Arc::downgrade(&proc);
         proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
