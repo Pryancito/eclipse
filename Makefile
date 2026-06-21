@@ -129,12 +129,15 @@ ifeq ($(ARCH), x86_64)
 	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
 	@command -v xorriso >/dev/null || (echo "falta xorriso"; exit 1)
-	@rm -f "$(ESP_IMG)"
-	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
-	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
-	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
+	@rm -f "$(ESP_IMG)"
+	@esp_mb=$$(du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
+		echo "ESP: $$esp_mb MiB"; \
+		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
+	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
+	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@mkdir -p "$(ISO_STAGING)/boot"
 	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
@@ -164,12 +167,15 @@ ifeq ($(ARCH), x86_64)
 	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
 	@command -v qemu-img >/dev/null || (echo "falta qemu-img"; exit 1)
-	@rm -f "$(ESP_IMG)"
-	@dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$(ESP_IMG_SIZE_MB) status=none
-	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
-	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
+	@rm -f "$(ESP_IMG)"
+	@esp_mb=$$(du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
+		echo "ESP: $$esp_mb MiB"; \
+		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
+	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
+	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
 	@mcopy -i "$(ESP_IMG)" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@qemu-img convert -f raw "$(ESP_IMG)" -O qcow2 "$(QCOW2_OUT)" >/dev/null
 	@echo "qcow2 generado: $(QCOW2_OUT)"
@@ -186,15 +192,19 @@ ifeq ($(ARCH), x86_64)
 	@command -v mformat >/dev/null || (echo "falta mformat (paquete: mtools)"; exit 1)
 	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
 	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
+	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
+		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@rm -f "$(DISK_IMG)"
-	@dd if=/dev/zero of="$(DISK_IMG)" bs=1M count=$(DISK_IMG_SIZE_MB) status=none
-	@sgdisk -o "$(DISK_IMG)" >/dev/null
-	@sgdisk -n 1:2048:+$(ESP_IMG_SIZE_MB)M -t 1:ef00 -c 1:EFI "$(DISK_IMG)" >/dev/null
+	@esp_mb=$$(du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
+		disk_mb=$$((esp_mb + 8)); \
+		echo "disk: $$disk_mb MiB (ESP $$esp_mb MiB)"; \
+		dd if=/dev/zero of="$(DISK_IMG)" bs=1M count=$$disk_mb status=none; \
+		sgdisk -o "$(DISK_IMG)" >/dev/null; \
+		sgdisk -n 1:2048:+$${esp_mb}M -t 1:ef00 -c 1:EFI "$(DISK_IMG)" >/dev/null
 	@# FAT32 ESP starts at 2048 * 512 = 1048576 bytes (1MiB)
 	@mformat -i "$(DISK_IMG)@@1048576" -F -v EFI :: >/dev/null
 	@mmd -i "$(DISK_IMG)@@1048576" ::/EFI ::/EFI/Boot ::/EFI/zCore >/dev/null
-	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
-		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@mcopy -i "$(DISK_IMG)@@1048576" -s "$(ESP_DIR)/EFI" ::/ >/dev/null
 	@cp -f "$(DISK_IMG)" "$(IMG_OUT)"
 	@echo "img generado: $(IMG_OUT)"
