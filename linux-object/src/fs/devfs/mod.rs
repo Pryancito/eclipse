@@ -3,6 +3,7 @@ pub mod drm;
 pub mod drm_scheme;
 mod fbdev;
 mod input;
+pub mod pty;
 mod random;
 mod uartdev;
 
@@ -10,5 +11,6 @@ pub use blockdev::BlockDev;
 pub use drm_scheme::DrmDev;
 pub use fbdev::FbDev;
 pub use input::{EventDev, MiceDev};
+pub use pty::{PtmxINode, PtsDir};
 pub use random::RandomINode;
 pub use uartdev::UartDev;

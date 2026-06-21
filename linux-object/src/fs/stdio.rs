@@ -439,7 +439,7 @@ fn register_tty_waker_once(wakers: &mut Vec<core::task::Waker>, waker: &core::ta
     wakers.push(waker.clone());
 }
 
-fn wake_tty_intr_waiters() {
+pub fn wake_tty_intr_waiters() {
     let wakers: Vec<core::task::Waker> = core::mem::take(&mut *TTY_INTR_WAKERS.lock());
     for w in wakers {
         w.wake();
@@ -685,62 +685,6 @@ enum KeySym {
     Cursor(u8),
     /// Cadena fija de tecla de función / navegación (KT_FN): se emite tal cual.
     Func(&'static [u8]),
-}
-
-/// Build the `kb_value` for a `KDGKBENT` query: the kernel keymap entry for
-/// keycode `keycode` in modifier table `table` (0 = plain, 1 = shift, 2 =
-/// AltGr, 3 = shift+AltGr — kdrive's `tbl[]`). kdrive decodes the value as
-/// `K(type, val)` = `(type << 8) | val`.
-///
-/// Printable keys reuse the cooked-mode Spanish keymap (`translate_key`),
-/// encoded as `KT_LATIN(char)` (kdrive maps it through its Latin-1
-/// `linux_to_x[]` table, so any code point ≤ 0xff — including `ñ`, `¡`, `¿` —
-/// works). Modifiers, Return, Escape and the arrows need explicit `KT_SHIFT` /
-/// `KT_SPEC` / `KT_CUR` encodings so kdrive recognises them.
-fn kdgkbent_value(keycode: u16, table: u8) -> u16 {
-    use zcore_drivers::input::input_event_codes::key::*;
-    const KT_LATIN: u16 = 0;
-    const KT_SPEC: u16 = 2;
-    const KT_CUR: u16 = 6;
-    const KT_SHIFT: u16 = 7;
-    const NO_SYMBOL: u16 = 0;
-    // K(type, val) = (type << 8) | val
-    const K_ENTER: u16 = (KT_SPEC << 8) | 1;
-    const K_SHIFT: u16 = (KT_SHIFT << 8) | 0; // KG_SHIFT
-    const K_ALTGR: u16 = (KT_SHIFT << 8) | 1; // KG_ALTGR
-    const K_CTRL: u16 = (KT_SHIFT << 8) | 2; // KG_CTRL (kdrive picks L/R by keycode)
-    const K_ALT: u16 = (KT_SHIFT << 8) | 3; // KG_ALT
-    const K_DOWN: u16 = (KT_CUR << 8) | 0;
-    const K_LEFT: u16 = (KT_CUR << 8) | 1;
-    const K_RIGHT: u16 = (KT_CUR << 8) | 2;
-    const K_UP: u16 = (KT_CUR << 8) | 3;
-
-    match keycode {
-        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => return K_SHIFT,
-        KEY_LEFTCTRL | KEY_RIGHTCTRL => return K_CTRL,
-        KEY_LEFTALT => return K_ALT,
-        KEY_RIGHTALT => return K_ALTGR,
-        KEY_ENTER | KEY_KPENTER => return K_ENTER,
-        KEY_ESC => return (KT_LATIN << 8) | 0x1b, // linux_to_x[0x1b] = XK_Escape
-        KEY_UP => return K_UP,
-        KEY_DOWN => return K_DOWN,
-        KEY_LEFT => return K_LEFT,
-        KEY_RIGHT => return K_RIGHT,
-        _ => {}
-    }
-
-    let mods = KeyMods {
-        shift: table & 1 != 0,
-        altgr: table & 2 != 0,
-        caps: false,
-        ctrl: false,
-    };
-    match translate_key(keycode, mods) {
-        // K(KT_LATIN, c) == c for c ≤ 0xff. Code points above Latin-1 (e.g. the
-        // euro sign) have no single-byte keymap slot, so report NoSymbol.
-        Some(KeySym::Char(c)) if (c as u32) <= 0xff => (c as u32) as u16,
-        _ => NO_SYMBOL,
-    }
 }
 
 /// Traduce un keycode + modificadores a un keysym, replicando el modelo del VT

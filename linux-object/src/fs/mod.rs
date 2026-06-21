@@ -2,7 +2,7 @@
 
 mod block_mount;
 mod btrfs_mount;
-mod devfs;
+pub mod devfs;
 mod epoll;
 mod eventfd;
 mod ext2_editor;
@@ -358,6 +358,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         if let Err(e) = devfs_root.add(&name, stdio::vt_stdin(vt)) {
             warn!("failed to mknod /dev/{}: {:?}", name, e);
         }
+    }
+    // Pseudo-terminals: `/dev/ptmx` (opening it clones a master) and the
+    // `/dev/pts` directory that resolves slaves on demand. This lets a terminal
+    // emulator run a real shell under TinyX/Xfbdev.
+    if let Err(e) = devfs_root.add("ptmx", Arc::new(devfs::PtmxINode::new())) {
+        warn!("failed to mknod /dev/ptmx: {:?}", e);
+    }
+    if let Err(e) = devfs_root.add("pts", Arc::new(devfs::PtsDir::new())) {
+        warn!("failed to mkdir /dev/pts: {:?}", e);
     }
     if let Some(display) = drivers::all_display().first() {
         use devfs::FbDev;

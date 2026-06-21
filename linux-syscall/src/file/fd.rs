@@ -105,6 +105,12 @@ impl Syscall<'_> {
             proc.check_access(&metadata, 0o2, true)?;
             inode.resize(0)?;
         }
+        // `/dev/ptmx` is a cloning device: each open allocates a fresh PTY
+        // master (and publishes its slave at `/dev/pts/N`).
+        let inode = match inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
+            Some(ptmx) => ptmx.open_master().map_err(LxError::from)?,
+            None => inode,
+        };
         let abs_path = proc.get_absolute_path(dir_fd, path)?;
         let file = File::new(inode, flags, abs_path);
         let fd = proc.add_file(file)?;
