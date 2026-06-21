@@ -2,8 +2,18 @@ use super::*;
 use bitflags::bitflags;
 use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject};
 
-/// Per-call cap for anonymous `mmap` / `brk` growth (uses physical frames; also limits metadata).
-const MAX_MMAP_LEN: usize = 128 * 1024 * 1024;
+/// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
+/// syscall can commit at once (physical frames + per-page VMO metadata).
+///
+/// This must be larger than the biggest shared library we expect to load in one
+/// `mmap`: the dynamic linker maps a library's whole LOAD span in a single call,
+/// and `libLLVM.so` (pulled in by `perf`) is ~150 MiB — the previous 128 MiB cap
+/// rejected it outright with ENOMEM (surfaced by musl as "Out of memory") long
+/// before the request reached the frame allocator, despite gigabytes being free.
+/// 1 GiB leaves ample headroom for real libraries while still catching runaway
+/// requests; worst-case VMO metadata for a 1 GiB mapping is a few tens of MiB,
+/// comfortably within the kernel heap.
+const MAX_MMAP_LEN: usize = 1024 * 1024 * 1024;
 
 /// Syscalls for virtual memory.
 ///
