@@ -139,16 +139,11 @@ impl Syscall<'_> {
         }
         // DIAGNOSTIC (temporal): el sistema se congela EN DURO al lanzar `perf`
         // (no se puede ni cambiar de VT), así que no podemos leer el trace del
-        // anillo de dmesg después. En su lugar, en cuanto algún proceso llama a
-        // `perf_event_open` empezamos a ECHAR cada syscall a la consola en vivo.
-        // Cuando el kernel se cuelgue, la última línea en pantalla será la
-        // syscall culpable: un ENTER (`->`) sin su LEAVE (`<-`) correspondiente.
-        static SYSCALL_ECHO: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if matches!(sys_type, Sys::PERF_EVENT_OPEN) {
-            SYSCALL_ECHO.store(true, core::sync::atomic::Ordering::Relaxed);
-        }
-        let echo = SYSCALL_ECHO.load(core::sync::atomic::Ordering::Relaxed);
+        // anillo de dmesg después. El eco en vivo se ARMA en el execve de perf
+        // (ver sys_execve) mediante la bandera global kernel_hal::diag. A partir
+        // de ahí cada syscall imprime su ENTER (`->`) y su LEAVE (`<-`); la última
+        // línea en pantalla antes del freeze es la operación culpable.
+        let echo = kernel_hal::diag::echo_on();
         if echo {
             kernel_hal::console::console_write_fmt(format_args!(
                 "TRC[{}] -> {:?}({}) args={:x?}\n",

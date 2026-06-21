@@ -83,3 +83,22 @@ pub use imp::{
 };
 pub use kernel_handler::KernelHandler;
 pub use utils::{deferred_job, lazy_init::LazyInit, mpsc_queue::MpscQueue};
+
+/// DIAGNOSTIC (temporal): bandera global "echar syscalls/faults a consola en vivo".
+///
+/// La arma `linux-syscall` al hacer `execve` de `perf`, y la leen tanto el
+/// trazador de syscalls como el manejador de page faults del run-loop. Sirve para
+/// ver en pantalla la última operación (syscall o page fault) antes de un freeze
+/// DURO de kernel, cuando ya no se puede cambiar de VT ni leer el anillo de dmesg.
+pub mod diag {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static ECHO: AtomicBool = AtomicBool::new(false);
+    /// Activa/desactiva el eco en vivo a consola.
+    pub fn set_echo(on: bool) {
+        ECHO.store(on, Ordering::Relaxed);
+    }
+    /// ¿Está activo el eco en vivo?
+    pub fn echo_on() -> bool {
+        ECHO.load(Ordering::Relaxed)
+    }
+}

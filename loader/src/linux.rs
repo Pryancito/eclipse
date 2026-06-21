@@ -456,8 +456,28 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 flags,
                 pid
             );
+            // DIAGNOSTIC (temporal): si el eco en vivo está armado (execve de
+            // perf), imprimimos el page fault ANTES de resolverlo. Si el kernel se
+            // congela DENTRO de handle_page_fault, esta línea PGF (sin un "ok"
+            // detrás) será la última en pantalla y señala el fault culpable.
+            let echo = kernel_hal::diag::echo_on();
+            if echo {
+                kernel_hal::console::console_write_fmt(format_args!(
+                    "PGF[{}] -> @ {:#x} ({:?})\n",
+                    pid, vaddr, flags
+                ));
+            }
             let vmar = thread.proc().vmar();
-            if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
+            let pgf_res = vmar.handle_page_fault(vaddr, flags);
+            if echo {
+                kernel_hal::console::console_write_fmt(format_args!(
+                    "PGF[{}] <- @ {:#x} => {}\n",
+                    pid,
+                    vaddr,
+                    if pgf_res.is_ok() { "ok" } else { "ERR" }
+                ));
+            }
+            if let Err(err) = pgf_res {
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
