@@ -385,6 +385,16 @@ impl FileLike for File {
                 // relocate. Paged frames can come from anywhere, so the same
                 // amount of RAM now satisfies the request.
                 let vmo = VmObject::new_paged(pages(len));
+                // DIAGNOSTIC: announce large file maps so we can confirm the
+                // patched (paged, non-contiguous) path is the kernel actually
+                // running. A ~150 MiB libLLVM map should show up here.
+                if len >= 16 * 1024 * 1024 {
+                    warn!(
+                        "get_vmo: paged file map len={} MiB offset={:#x}",
+                        len / (1024 * 1024),
+                        offset
+                    );
+                }
                 let mut buf = [0u8; 16384];
                 let mut done = 0;
                 while done < len {

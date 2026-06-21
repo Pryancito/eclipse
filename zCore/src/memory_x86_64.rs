@@ -135,6 +135,21 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         for i in 0..frame_count {
             track_mark_alloc(idx + i);
         }
+    } else {
+        // DIAGNOSTIC: a frame allocation failed. For a single-frame request
+        // (the paged-VMO commit path) this means physical RAM is genuinely
+        // exhausted; for a multi-frame request it may instead be fragmentation
+        // (no contiguous run). Printed unconditionally so we can tell a real
+        // shortage apart from a code path bug when something reports ENOMEM.
+        let used = FRAMES_USED.load(Ordering::Relaxed);
+        let total = TOTAL_MEMORY.load(Ordering::Relaxed);
+        crate::klog_warn!(
+            "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed",
+            frame_count,
+            align_log2,
+            used / (1024 * 1024),
+            total / (1024 * 1024),
+        );
     }
     let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
