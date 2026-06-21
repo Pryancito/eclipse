@@ -1310,9 +1310,8 @@ impl E1000eHw {
             BUF_SIZE,
             DmaSyncDir::FromDevice,
         );
-        let frag = unsafe {
-            core::slice::from_raw_parts(self.rx_buf_vaddr(head) as *const u8, len)
-        };
+        let frag =
+            unsafe { core::slice::from_raw_parts(self.rx_buf_vaddr(head) as *const u8, len) };
 
         let complete = if let Some(ref mut pending) = self.rx_pending {
             if pending.len().saturating_add(len) > BUF_SIZE {
@@ -2069,10 +2068,12 @@ pub fn init(
     // clflush only invalidates, never writes a stale line back), and
     // alloc_uninit now evicts each region's lines at allocation so it starts
     // clean.
-    let (rx_ring, rx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
-        .ok_or(DeviceError::DmaError)?;
-    let (tx_ring, tx_ring_coherent) = DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
-        .ok_or(DeviceError::DmaError)?;
+    let (rx_ring, rx_ring_coherent) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_RX * size_of::<RxDesc>())
+            .ok_or(DeviceError::DmaError)?;
+    let (tx_ring, tx_ring_coherent) =
+        DmaRegion::alloc_uninit_try_coherent(NUM_TX * size_of::<TxDesc>())
+            .ok_or(DeviceError::DmaError)?;
     let rx_buf_pool = DmaRegion::alloc_uninit(NUM_RX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
     let tx_buf_pool = DmaRegion::alloc_uninit(NUM_TX * BUF_SIZE).ok_or(DeviceError::DmaError)?;
     let rx_buf_coherent = false;
@@ -2305,17 +2306,29 @@ mod rx_ring_tests {
         unsafe { alloc_zeroed(layout) as usize }
     }
     #[no_mangle]
-    extern "C" fn drivers_dma_dealloc(_p: usize, _pages: usize) -> i32 { 0 }
+    extern "C" fn drivers_dma_dealloc(_p: usize, _pages: usize) -> i32 {
+        0
+    }
     #[no_mangle]
-    extern "C" fn drivers_phys_to_virt(p: usize) -> usize { p }
+    extern "C" fn drivers_phys_to_virt(p: usize) -> usize {
+        p
+    }
     #[no_mangle]
-    extern "C" fn drivers_virt_to_phys(v: usize) -> usize { v }
+    extern "C" fn drivers_virt_to_phys(v: usize) -> usize {
+        v
+    }
     #[no_mangle]
-    extern "C" fn drivers_dma_mark_uncached(_p: usize, _pages: usize) -> i32 { 0 }
+    extern "C" fn drivers_dma_mark_uncached(_p: usize, _pages: usize) -> i32 {
+        0
+    }
     #[no_mangle]
-    extern "C" fn drivers_dma_verify_uncached(_p: usize, _pages: usize) -> i32 { 0 }
+    extern "C" fn drivers_dma_verify_uncached(_p: usize, _pages: usize) -> i32 {
+        0
+    }
     #[no_mangle]
-    extern "C" fn drivers_timer_now_as_micros() -> u64 { 0 }
+    extern "C" fn drivers_timer_now_as_micros() -> u64 {
+        0
+    }
     #[no_mangle]
     extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
     #[no_mangle]
@@ -2323,7 +2336,9 @@ mod rx_ring_tests {
     #[no_mangle]
     extern "C" fn drivers_intr_off() {}
     #[no_mangle]
-    extern "C" fn drivers_intr_get() -> bool { false }
+    extern "C" fn drivers_intr_get() -> bool {
+        false
+    }
     #[no_mangle]
     extern "C" fn drivers_wake_net_rx_waiters() {}
     #[no_mangle]
@@ -2348,7 +2363,11 @@ mod rx_ring_tests {
 
         let mut hw = E1000eHw {
             base,
-            pci_loc: Location { bus: 0, device: 0, function: 0 },
+            pci_loc: Location {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
             device_id: 0x10d3,
             mac: [0x52, 0x54, 0, 0, 0, 1],
             rx_ring,
@@ -2408,7 +2427,9 @@ mod rx_ring_tests {
     }
 
     fn pkt(seed: u8, len: usize) -> Vec<u8> {
-        (0..len).map(|i| seed.wrapping_add(i as u8).wrapping_mul(31)).collect()
+        (0..len)
+            .map(|i| seed.wrapping_add(i as u8).wrapping_mul(31))
+            .collect()
     }
 
     #[test]
@@ -2420,7 +2441,11 @@ mod rx_ring_tests {
         assert_eq!(got, p, "frame payload mismatch");
         assert_eq!(hw.stats.rx_packets, 1);
         // The consumed slot was recycled and handed back to HW via RDT.
-        assert_eq!(reg_read(hw.base, E1000E_RDT) as usize, 0, "RDT should point at recycled slot 0");
+        assert_eq!(
+            reg_read(hw.base, E1000E_RDT) as usize,
+            0,
+            "RDT should point at recycled slot 0"
+        );
     }
 
     #[test]
@@ -2431,7 +2456,9 @@ mod rx_ring_tests {
             hw_deliver(&hw, i, &pkt(i as u8, 64 + i % 900));
         }
         for i in 0..n {
-            let got = hw.receive().unwrap_or_else(|| panic!("missing frame {}", i));
+            let got = hw
+                .receive()
+                .unwrap_or_else(|| panic!("missing frame {}", i));
             assert_eq!(got, pkt(i as u8, 64 + i % 900), "frame {i} mismatch");
         }
         assert!(hw.receive().is_none(), "no more frames expected");
@@ -2474,7 +2501,11 @@ mod rx_ring_tests {
                 produced += 1;
             }
             while let Some(got) = hw.receive() {
-                assert_eq!(got, pkt(consumed as u8, 100), "wrap frame {consumed} mismatch");
+                assert_eq!(
+                    got,
+                    pkt(consumed as u8, 100),
+                    "wrap frame {consumed} mismatch"
+                );
                 consumed += 1;
             }
         }
@@ -2517,10 +2548,10 @@ mod coherency_bench {
     }
 
     struct Model {
-        ram: Vec<D>,                              // NIC's view (DMA target)
-        cache: BTreeMap<usize, ([D; PL], bool)>,  // driver WB cache: line -> (data, dirty)
-        uc: bool,                                 // true => uncached ring (no cache)
-        rdh: usize,                               // NIC head
+        ram: Vec<D>,                             // NIC's view (DMA target)
+        cache: BTreeMap<usize, ([D; PL], bool)>, // driver WB cache: line -> (data, dirty)
+        uc: bool,                                // true => uncached ring (no cache)
+        rdh: usize,                              // NIC head
     }
     impl Model {
         fn line(i: usize) -> usize {
@@ -2609,10 +2640,7 @@ mod coherency_bench {
             }
 
             // NIC produces until it is one ahead of the driver (or ring full).
-            while produced < total
-                && nic_can_fill(m.rdh, rdt)
-                && (m.rdh + N - next) % N < 2
-            {
+            while produced < total && nic_can_fill(m.rdh, rdt) && (m.rdh + N - next) % N < 2 {
                 m.nic_fill(produced);
                 produced += 1;
             }

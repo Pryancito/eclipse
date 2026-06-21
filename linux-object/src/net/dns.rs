@@ -65,7 +65,11 @@ impl DnsFamily {
 }
 
 /// Resolve `hostname` using `/etc/hosts`, then nameservers from `/etc/resolv.conf`.
-pub fn resolve(root: &Arc<dyn INode>, hostname: &str, family: DnsFamily) -> LxResult<Vec<IpAddress>> {
+pub fn resolve(
+    root: &Arc<dyn INode>,
+    hostname: &str,
+    family: DnsFamily,
+) -> LxResult<Vec<IpAddress>> {
     if hostname.is_empty() || hostname.len() > 253 {
         return Err(LxError::EINVAL);
     }

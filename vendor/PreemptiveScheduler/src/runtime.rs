@@ -313,9 +313,7 @@ pub fn spawn_task(
             .unwrap_or(u64::MAX);
         // First CPU allowed by the mask, used as the fallback home when every
         // candidate runtime is momentarily locked.
-        let mut best = (0..online)
-            .find(|&i| (mask >> i) & 1 != 0)
-            .unwrap_or(0);
+        let mut best = (0..online).find(|&i| (mask >> i) & 1 != 0).unwrap_or(0);
         let mut best_count = usize::MAX;
         for (i, rt) in GLOBAL_RUNTIME.iter().enumerate().take(online) {
             if (mask >> i) & 1 == 0 {

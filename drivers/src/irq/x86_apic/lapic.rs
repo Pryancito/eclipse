@@ -78,7 +78,8 @@ impl LocalApic {
     fn icr_dest(dest: u32) -> u32 {
         const IA32_APIC_BASE: u32 = 0x1B;
         const EXTD: u64 = 1 << 10; // x2APIC mode enable
-        let apic_base = unsafe { x86_64::registers::model_specific::Msr::new(IA32_APIC_BASE).read() };
+        let apic_base =
+            unsafe { x86_64::registers::model_specific::Msr::new(IA32_APIC_BASE).read() };
         if apic_base & EXTD != 0 {
             dest
         } else {

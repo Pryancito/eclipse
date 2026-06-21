@@ -319,8 +319,7 @@ pub fn sockaddr_to_endpoint(addr: SockAddr, len: usize) -> Result<Endpoint, LxEr
                             .iter()
                             .position(|&b| b == 0)
                             .unwrap_or(sun_path.len());
-                        alloc::string::String::from_utf8_lossy(&sun_path[..actual_len])
-                            .into_owned()
+                        alloc::string::String::from_utf8_lossy(&sun_path[..actual_len]).into_owned()
                     }
                 };
                 Ok(Endpoint::Unix(path))

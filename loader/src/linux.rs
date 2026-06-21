@@ -48,8 +48,16 @@ pub fn run_shell_on_vt(
     shared_root: Option<Arc<dyn INode>>,
     pid: KoID,
 ) -> Arc<Process> {
-    spawn(args, envs, rootfs, vt, shared_root, pid, /* boot_work */ vt == 0)
-        .expect("configured SHELL not found")
+    spawn(
+        args,
+        envs,
+        rootfs,
+        vt,
+        shared_root,
+        pid,
+        /* boot_work */ vt == 0,
+    )
+    .expect("configured SHELL not found")
 }
 
 /// Spawn the INIT process as PID 1 if its binary exists, returning `None`
@@ -106,9 +114,13 @@ fn spawn(
     pid: KoID,
     boot_work: bool,
 ) -> Option<Arc<Process>> {
-    info!("spawn pid={} vt={}: args={:?}, envs={:?}", pid, vt, args, envs);
+    info!(
+        "spawn pid={} vt={}: args={:?}, envs={:?}",
+        pid, vt, args, envs
+    );
     if boot_work {
         linux_object::net::init();
+        hunter::init();
     }
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc =
@@ -139,6 +151,14 @@ fn spawn(
         .read_as_vmo()
         .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
     let path = args[0].clone();
+
+    // Verify binary integrity with hunter
+    let mut header = [0u8; 4];
+    let _ = vmo.read(0, &mut header);
+    if !hunter::check_elf_binary(&path, &header) {
+        warn!("spawn: binary {:?} blocked by hunter security policy", path);
+        return None;
+    }
 
     // Boot UX: clear to black right before the first graphic-console output
     // (prompt). No-op when graphic mode is disabled. Only when this process
@@ -432,7 +452,9 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             }
             trace!(
                 "page fault from user mode @ {:#x}({:?}), pid={}",
-                vaddr, flags, pid
+                vaddr,
+                flags,
+                pid
             );
             let vmar = thread.proc().vmar();
             if let Err(err) = vmar.handle_page_fault(vaddr, flags) {
@@ -441,7 +463,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     .unwrap_or(0);
                 warn!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
-                    vaddr, flags, err, pid, thread.proc().name(), pc,
+                    vaddr,
+                    flags,
+                    err,
+                    pid,
+                    thread.proc().name(),
+                    pc,
                 );
                 // Make a userspace crash self-diagnosing from dmesg: dump the
                 // registers and the code bytes around the faulting PC. With the
@@ -484,7 +511,10 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                     }
                     if any {
-                        warn!("[crash] pid={} code@{:#x} (pc-16): {:02x?}", pid, start, code);
+                        warn!(
+                            "[crash] pid={} code@{:#x} (pc-16): {:02x?}",
+                            pid, start, code
+                        );
                     } else {
                         warn!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",

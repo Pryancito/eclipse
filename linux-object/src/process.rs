@@ -407,11 +407,8 @@ impl LinuxProcess {
             OpenFlags::WRONLY,
             String::from("/dev/stdout"),
         ) as Arc<dyn FileLike>;
-        let stderr = File::new(
-            stdout_dev,
-            OpenFlags::WRONLY,
-            String::from("/dev/stderr"),
-        ) as Arc<dyn FileLike>;
+        let stderr = File::new(stdout_dev, OpenFlags::WRONLY, String::from("/dev/stderr"))
+            as Arc<dyn FileLike>;
         let mut files = HashMap::new();
         files.insert(0.into(), stdin);
         files.insert(1.into(), stdout);

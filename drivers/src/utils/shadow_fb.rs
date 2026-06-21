@@ -280,7 +280,14 @@ impl ShadowFramebuffer {
             display.blit_from(x as u32, y as u32, &tmp, w, w as u32, h as u32);
         } else {
             let start = y * width + x;
-            display.blit_from(x as u32, y as u32, &data[start..], width, w as u32, h as u32);
+            display.blit_from(
+                x as u32,
+                y as u32,
+                &data[start..],
+                width,
+                w as u32,
+                h as u32,
+            );
         }
     }
 }

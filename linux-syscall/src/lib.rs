@@ -94,6 +94,10 @@ impl Syscall<'_> {
         if let Err(err) = self.maybe_handle_tty_intr() {
             return -(err as isize);
         }
+        let pid = self.zircon_process().id();
+        if let Err(_err) = hunter::check_syscall(pid, num, &args) {
+            return -(linux_object::error::LxError::EPERM as isize);
+        }
         let sys_type = Sys::try_from(num);
         debug!(
             "pid: {} syscall: num={} ({:?}), args={:x?}",
@@ -127,7 +131,10 @@ impl Syscall<'_> {
         if trace {
             kernel_hal::klog_info!(
                 "SYS[{}] {:?}({}) args={:x?}",
-                trace_pid, sys_type, num, args
+                trace_pid,
+                sys_type,
+                num,
+                args
             );
         }
         let [a0, a1, a2, a3, a4, a5] = args;
@@ -359,9 +366,7 @@ impl Syscall<'_> {
             //            Sys::DELETE_MODULE => self.sys_delete_module(a0.into(), a1 as u32),
             #[cfg(not(target_arch = "aarch64"))]
             Sys::BLOCK_IN_KERNEL => self.sys_block_in_kernel(),
-            Sys::ECLIPSE_DNS_QUERY => {
-                self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4)
-            }
+            Sys::ECLIPSE_DNS_QUERY => self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4),
 
             #[cfg(target_arch = "x86_64")]
             _ => self.x86_64_syscall(sys_type, args).await,

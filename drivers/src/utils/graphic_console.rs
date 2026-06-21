@@ -168,7 +168,8 @@ impl LinearScrollbackBuffer {
         if let Some(offset) = self.scrollback_offset {
             let history_len = self.history.len();
             for r in 0..height {
-                let index = (history_len as isize) - (offset as isize)
+                let index = (history_len as isize)
+                    - (offset as isize)
                     - ((height as isize) - 1 - (r as isize));
                 if index < 0 {
                     let bg_cell = Cell::default();
@@ -287,8 +288,13 @@ impl TextBuffer for LinearScrollbackBuffer {
                     .copy_rect(0, CHAR_HEIGHT, 0, 0, width_px, text_h - CHAR_HEIGHT);
             }
             let bg_argb = rgb888_to_argb(cell.bg.to_rgb());
-            self.shadow
-                .fill_rect(0, (height - 1) * CHAR_HEIGHT, width_px, CHAR_HEIGHT, bg_argb);
+            self.shadow.fill_rect(
+                0,
+                (height - 1) * CHAR_HEIGHT,
+                width_px,
+                CHAR_HEIGHT,
+                bg_argb,
+            );
         }
         // After a scroll the next character lands at the bottom-left.
         self.cursor_row = height - 1;

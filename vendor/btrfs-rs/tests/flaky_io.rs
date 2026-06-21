@@ -254,7 +254,11 @@ fn device_retry_survives_transient_flush() {
 
     extract_and_sync(&mut fs, 48 * 1024 * 1024)
         .expect("device-layer retry should absorb the transient flush fault");
-    assert_eq!(flaky.injected(), 1, "the fault still fired once (then retried)");
+    assert_eq!(
+        flaky.injected(),
+        1,
+        "the fault still fired once (then retried)"
+    );
 
     // Data is intact after the retried flush.
     let root = fs.root_ino();

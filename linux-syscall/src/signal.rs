@@ -324,8 +324,7 @@ impl Syscall<'_> {
             if let Err(e) = linux_object::process::check_signals() {
                 return Err(e);
             }
-            let deadline =
-                kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
+            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
             kernel_hal::thread::sleep_until(deadline).await;
         }
     }
@@ -340,8 +339,7 @@ impl Syscall<'_> {
             if let Err(e) = linux_object::process::check_signals() {
                 return Err(e);
             }
-            let deadline =
-                kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
+            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
             kernel_hal::thread::sleep_until(deadline).await;
         }
     }

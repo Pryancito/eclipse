@@ -371,7 +371,11 @@ fn perf_fragmented_read() {
         let n = fs.read(file, off, &mut buf).unwrap();
         assert!(n > 0);
         let expect = ((off / blk as u64) & 0xff) as u8;
-        assert!(buf[..n].iter().all(|&x| x == expect), "frag data mismatch at {}", off);
+        assert!(
+            buf[..n].iter().all(|&x| x == expect),
+            "frag data mismatch at {}",
+            off
+        );
         off += n as u64;
     }
     let secs = t.elapsed().as_secs_f64();
@@ -400,7 +404,10 @@ fn perf_large_file_random() {
     let blk = 4096usize;
     let nblocks = total / blk as u64;
     let nops = 4000 * scale();
-    println!("\n[large-file-random] file = {} MiB, {} random 4K ops", mib, nops);
+    println!(
+        "\n[large-file-random] file = {} MiB, {} random 4K ops",
+        mib, nops
+    );
     let (mut fs, counters, path) = fresh("rand", img);
     let root = fs.root_ino();
     let file = fs
@@ -431,7 +438,10 @@ fn perf_large_file_random() {
         } else {
             let n = fs.read(file, off, &mut buf).unwrap();
             assert_eq!(n, blk);
-            assert!(buf.iter().all(|&b| b == model[blkno]), "random block corrupt");
+            assert!(
+                buf.iter().all(|&b| b == model[blkno]),
+                "random block corrupt"
+            );
         }
     }
     fs.sync().unwrap();
@@ -535,7 +545,10 @@ fn perf_lookup_scaling() {
     let rounds = 8u64 * scale().min(2);
     let mut created = 0u64;
     let mut rng = Lcg::new(0x2468);
-    println!("    {:>8}  {:>14}  {:>16}", "entries", "us/lookup", "dev-reads/lookup");
+    println!(
+        "    {:>8}  {:>14}  {:>16}",
+        "entries", "us/lookup", "dev-reads/lookup"
+    );
     for _ in 0..rounds {
         for i in created..created + step {
             fs.create(dir, &format!("e{:07}", i), FileKind::Regular, 0o644, 0)
@@ -579,7 +592,10 @@ fn perf_fragmentation_scaling() {
     let per_round = 1500u64;
     let mut counter = 0u64;
     let mut keep: Vec<(String, u64)> = Vec::new();
-    println!("    {:>10}  {:>12}  {:>16}", "live-files", "us/op", "dev-writes/op");
+    println!(
+        "    {:>10}  {:>12}  {:>16}",
+        "live-files", "us/op", "dev-writes/op"
+    );
     for _ in 0..rounds {
         let base = counters.snapshot();
         let t = Instant::now();
@@ -588,9 +604,7 @@ fn perf_fragmentation_scaling() {
             for _ in 0..2 {
                 let name = format!("f{:07}", counter);
                 counter += 1;
-                let f = fs
-                    .create(dir, &name, FileKind::Regular, 0o644, 0)
-                    .unwrap();
+                let f = fs.create(dir, &name, FileKind::Regular, 0o644, 0).unwrap();
                 fs.write(f, 0, &payload).unwrap();
                 keep.push((name, f));
             }
@@ -673,7 +687,10 @@ fn perf_rangemap_query_scaling() {
 #[test]
 fn perf_deep_tree() {
     let depth = 200 * scale();
-    println!("\n[deep-tree] nest {} directories deep, file at each level", depth);
+    println!(
+        "\n[deep-tree] nest {} directories deep, file at each level",
+        depth
+    );
     let (mut fs, counters, path) = fresh("deeptree", 256 * 1024 * 1024);
     let mut cur = fs.root_ino();
 
@@ -689,7 +706,11 @@ fn perf_deep_tree() {
     }
     fs.sync().unwrap();
     let secs = t.elapsed().as_secs_f64();
-    println!("    build  {:.0} dirs/s  ({:.3}s)", depth as f64 / secs, secs);
+    println!(
+        "    build  {:.0} dirs/s  ({:.3}s)",
+        depth as f64 / secs,
+        secs
+    );
     report_io("build", counters.snapshot() - base);
 
     // Walk back down from the root verifying every level resolves.
@@ -703,7 +724,11 @@ fn perf_deep_tree() {
         cur = fs.lookup(cur, "sub").unwrap();
     }
     let secs = t.elapsed().as_secs_f64();
-    println!("    walk   {:.0} levels/s  ({:.3}s)", depth as f64 / secs, secs);
+    println!(
+        "    walk   {:.0} levels/s  ({:.3}s)",
+        depth as f64 / secs,
+        secs
+    );
     report_io("walk", counters.snapshot() - base);
 
     drop(fs);
@@ -798,7 +823,10 @@ fn perf_truncate_churn() {
     fs.truncate(file, 1024 * 1024).unwrap();
     let mut buf = vec![0xffu8; 4096];
     fs.read(file, 900 * 1024, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0), "hole did not read back as zero");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "hole did not read back as zero"
+    );
 
     drop(fs);
     btrfs_check(&path);

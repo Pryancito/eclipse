@@ -22,8 +22,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use btrfs::device::BlockDevice;
 use btrfs::{mkfs, Btrfs, Error, FileKind, Result};
@@ -164,12 +164,19 @@ fn verify(fs: &mut Btrfs, ino: u64, size: u64, salt: u64) {
         let want = (chunk as u64).min(size - off) as usize;
         let mut got = 0usize;
         while got < want {
-            let n = fs.read(ino, off + got as u64, &mut rbuf[got..want]).unwrap();
+            let n = fs
+                .read(ino, off + got as u64, &mut rbuf[got..want])
+                .unwrap();
             assert!(n > 0, "zero read @{}", off + got as u64);
             got += n;
         }
         for j in 0..want {
-            assert_eq!(rbuf[j], payload_byte(salt, off + j as u64), "data mismatch @{}", off + j as u64);
+            assert_eq!(
+                rbuf[j],
+                payload_byte(salt, off + j as u64),
+                "data mismatch @{}",
+                off + j as u64
+            );
         }
         off += want as u64;
     }
@@ -184,10 +191,20 @@ const LIBLLVM: u64 = 130 * 1024 * 1024;
 fn fallocate_then_fill_then_chmod() {
     let (_dev, mut fs) = mount_real();
     let root = fs.root_ino();
-    let f = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0).unwrap();
+    let f = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fs.truncate(f, LIBLLVM).unwrap(); // fallocate / ftruncate up front
     fill(&mut fs, f, LIBLLVM, 1, 64 * 1024);
-    fs.set_attr(f, Some(0o755), Some(0), Some(0), None, Some((1_700_000_100, 0))).unwrap();
+    fs.set_attr(
+        f,
+        Some(0o755),
+        Some(0),
+        Some(0),
+        None,
+        Some((1_700_000_100, 0)),
+    )
+    .unwrap();
     fs.sync().unwrap();
     verify(&mut fs, f, LIBLLVM, 1);
 }
@@ -201,15 +218,20 @@ fn upgrade_temp_then_rename_over_existing() {
     let root = fs.root_ino();
 
     // Old version already installed.
-    let old = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0).unwrap();
+    let old = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0)
+        .unwrap();
     fill(&mut fs, old, 40 * 1024 * 1024, 7, 64 * 1024);
     fs.sync().unwrap();
 
     // New version extracted to a temp name, then renamed over the old.
-    let tmp = fs.create(root, "libLLVM.so.22.1.apk-new", FileKind::Regular, 0o644, 0).unwrap();
+    let tmp = fs
+        .create(root, "libLLVM.so.22.1.apk-new", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fill(&mut fs, tmp, LIBLLVM, 9, 64 * 1024);
     fs.sync().unwrap();
-    fs.rename(root, "libLLVM.so.22.1.apk-new", root, "libLLVM.so.22.1").unwrap();
+    fs.rename(root, "libLLVM.so.22.1.apk-new", root, "libLLVM.so.22.1")
+        .unwrap();
     fs.sync().unwrap();
 
     let now = fs.lookup(root, "libLLVM.so.22.1").unwrap();
@@ -222,7 +244,9 @@ fn upgrade_temp_then_rename_over_existing() {
 fn overwrite_in_place_truncate_zero_then_refill() {
     let (_dev, mut fs) = mount_real();
     let root = fs.root_ino();
-    let f = fs.create(root, "lib.so", FileKind::Regular, 0o644, 0).unwrap();
+    let f = fs
+        .create(root, "lib.so", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fill(&mut fs, f, 50 * 1024 * 1024, 3, 64 * 1024);
     fs.sync().unwrap();
     fs.truncate(f, 0).unwrap(); // drop all extents
@@ -246,12 +270,16 @@ fn package_many_small_plus_one_huge() {
         let f = fs.create(lib, &name, FileKind::Regular, 0o644, 0).unwrap();
         let sz = 4096 + (i * 9973) % (512 * 1024);
         fill(&mut fs, f, sz, 100 + i, 16 * 1024);
-        fs.set_attr(f, Some(0o755), Some(0), Some(0), None, None).unwrap();
+        fs.set_attr(f, Some(0o755), Some(0), Some(0), None, None)
+            .unwrap();
         smalls.push((f, sz, 100 + i));
     }
-    let big = fs.create(lib, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0).unwrap();
+    let big = fs
+        .create(lib, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fill(&mut fs, big, LIBLLVM, 42, 64 * 1024);
-    fs.set_attr(big, Some(0o755), Some(0), Some(0), None, None).unwrap();
+    fs.set_attr(big, Some(0o755), Some(0), Some(0), None, None)
+        .unwrap();
     fs.sync().unwrap();
 
     for (f, sz, salt) in smalls {
@@ -279,7 +307,9 @@ fn prefill_then_extract_huge() {
     }
     fs.sync().unwrap();
 
-    let big = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0).unwrap();
+    let big = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fill(&mut fs, big, LIBLLVM, 55, 64 * 1024);
     fs.sync().unwrap();
     verify(&mut fs, big, LIBLLVM, 55);
@@ -309,7 +339,9 @@ fn delete_to_free_then_extract_huge() {
     }
     fs.sync().unwrap();
 
-    let big = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0).unwrap();
+    let big = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0)
+        .unwrap();
     fill(&mut fs, big, LIBLLVM, 66, 64 * 1024);
     fs.sync().unwrap();
     verify(&mut fs, big, LIBLLVM, 66);
@@ -321,7 +353,9 @@ fn delete_to_free_then_extract_huge() {
 fn small_writes_periodic_fsync() {
     let (_dev, mut fs) = mount_real();
     let root = fs.root_ino();
-    let f = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0).unwrap();
+    let f = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o644, 0)
+        .unwrap();
 
     let chunk = 4096usize;
     let mut buf = vec![0u8; chunk];
@@ -360,10 +394,14 @@ fn extract_sync_remount_persists() {
         let mut fs = Btrfs::mount(arc, false).unwrap();
         let root = fs.root_ino();
         for i in 0..8u64 {
-            let f = fs.create(root, &format!("s{i}"), FileKind::Regular, 0o644, 0).unwrap();
+            let f = fs
+                .create(root, &format!("s{i}"), FileKind::Regular, 0o644, 0)
+                .unwrap();
             fill(&mut fs, f, 256 * 1024, 500 + i, 64 * 1024);
         }
-        let big = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0).unwrap();
+        let big = fs
+            .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0)
+            .unwrap();
         fill(&mut fs, big, LIBLLVM, 88, 64 * 1024);
         fs.sync().unwrap();
         // fs dropped here — nothing else flushes.
@@ -381,7 +419,11 @@ fn extract_sync_remount_persists() {
         let big = fs.lookup(root, "libLLVM.so.22.1").unwrap();
         verify(&mut fs, big, LIBLLVM, 88);
     }
-    assert_eq!(dev.oob.load(Ordering::Relaxed), 0, "out-of-bounds device access");
+    assert_eq!(
+        dev.oob.load(Ordering::Relaxed),
+        0,
+        "out-of-bounds device access"
+    );
 }
 
 /// Repeated upgrades of the same large file (install, then upgrade several
@@ -398,17 +440,22 @@ fn repeated_large_upgrades_churn() {
 
     let mut salt = 1000u64;
     // Initial install.
-    let f = fs.create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0).unwrap();
+    let f = fs
+        .create(root, "libLLVM.so.22.1", FileKind::Regular, 0o755, 0)
+        .unwrap();
     fill(&mut fs, f, LIBLLVM, salt, 64 * 1024);
     fs.sync().unwrap();
 
     // Five upgrade cycles: new temp, fill, rename over, sync.
     for _ in 0..5 {
         salt += 1;
-        let tmp = fs.create(root, "libLLVM.so.22.1.apk-new", FileKind::Regular, 0o644, 0).unwrap();
+        let tmp = fs
+            .create(root, "libLLVM.so.22.1.apk-new", FileKind::Regular, 0o644, 0)
+            .unwrap();
         fill(&mut fs, tmp, LIBLLVM, salt, 64 * 1024);
         fs.sync().unwrap();
-        fs.rename(root, "libLLVM.so.22.1.apk-new", root, "libLLVM.so.22.1").unwrap();
+        fs.rename(root, "libLLVM.so.22.1.apk-new", root, "libLLVM.so.22.1")
+            .unwrap();
         fs.sync().unwrap();
     }
     let cur = fs.lookup(root, "libLLVM.so.22.1").unwrap();
@@ -421,5 +468,9 @@ fn repeated_large_upgrades_churn() {
     let root2 = fs2.root_ino();
     let cur2 = fs2.lookup(root2, "libLLVM.so.22.1").unwrap();
     verify(&mut fs2, cur2, LIBLLVM, salt);
-    assert_eq!(dev.oob.load(Ordering::Relaxed), 0, "out-of-bounds device access");
+    assert_eq!(
+        dev.oob.load(Ordering::Relaxed),
+        0,
+        "out-of-bounds device access"
+    );
 }

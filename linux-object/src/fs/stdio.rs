@@ -3,7 +3,6 @@
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
-use kernel_hal::user::{UserInPtr, UserOutPtr, Error as UserError};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -15,10 +14,11 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 use kernel_hal::console::{self, ConsoleWinSize};
-use zcore_drivers::prelude::{InputEvent, InputEventType};
+use kernel_hal::user::{Error as UserError, UserInPtr, UserOutPtr};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
+use zcore_drivers::prelude::{InputEvent, InputEventType};
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
 
@@ -27,35 +27,35 @@ const IGNBRK: u32 = 0x0001;
 const BRKINT: u32 = 0x0002;
 const IGNPAR: u32 = 0x0004;
 const PARMRK: u32 = 0x0008;
-const INPCK: u32  = 0x0010;
+const INPCK: u32 = 0x0010;
 const ISTRIP: u32 = 0x0020;
-const INLCR: u32  = 0x0040;
-const IGNCR: u32  = 0x0080;
-const ICRNL: u32  = 0x0100;
-const IUCLC: u32  = 0x0200;
-const IXON: u32   = 0x0400;
-const IXANY: u32  = 0x0800;
-const IXOFF: u32  = 0x1000;
+const INLCR: u32 = 0x0040;
+const IGNCR: u32 = 0x0080;
+const ICRNL: u32 = 0x0100;
+const IUCLC: u32 = 0x0200;
+const IXON: u32 = 0x0400;
+const IXANY: u32 = 0x0800;
+const IXOFF: u32 = 0x1000;
 const IMAXBEL: u32 = 0x2000;
-const IUTF8: u32  = 0x4000;
+const IUTF8: u32 = 0x4000;
 
 // c_oflag
-const OPOST: u32  = 0x0001;
-const OLCUC: u32  = 0x0002;
-const ONLCR: u32  = 0x0004;
-const OCRNL: u32  = 0x0008;
-const ONOCR: u32  = 0x0010;
+const OPOST: u32 = 0x0001;
+const OLCUC: u32 = 0x0002;
+const ONLCR: u32 = 0x0004;
+const OCRNL: u32 = 0x0008;
+const ONOCR: u32 = 0x0010;
 const ONLRET: u32 = 0x0020;
-const OFILL: u32  = 0x0040;
-const OFDEL: u32  = 0x0080;
+const OFILL: u32 = 0x0040;
+const OFDEL: u32 = 0x0080;
 
 // c_lflag
-const ISIG: u32   = 0x0001;
+const ISIG: u32 = 0x0001;
 const ICANON: u32 = 0x0002;
-const XCASE: u32  = 0x0004;
-const ECHO: u32   = 0x0008;
-const ECHOE: u32  = 0x0010;
-const ECHOK: u32  = 0x0020;
+const XCASE: u32 = 0x0004;
+const ECHO: u32 = 0x0008;
+const ECHOE: u32 = 0x0010;
+const ECHOK: u32 = 0x0020;
 const ECHONL: u32 = 0x0040;
 const NOFLSH: u32 = 0x0080;
 const TOSTOP: u32 = 0x0100;
@@ -259,14 +259,17 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             }
             let p = data as *mut u8;
             let (table, index) = unsafe { (*p, *p.add(1)) };
-            let value = kdgkbent_value(index as u16, table);
+            let value = linux_keycode_to_evdev(index)
+                .map(|evdev| kdgkbent_value(evdev, table))
+                .unwrap_or(0);
             unsafe { *(p.add(2) as *mut u16) = value };
             Ok(0)
         }
         KDGETLED => {
-            user_copy(UserOutPtr::<i32>::from(data).write(
-                TTY_STATES[vt_clamp(vt)].kbd_leds.load(Ordering::Relaxed) as i32,
-            ))?;
+            user_copy(
+                UserOutPtr::<i32>::from(data)
+                    .write(TTY_STATES[vt_clamp(vt)].kbd_leds.load(Ordering::Relaxed) as i32),
+            )?;
             Ok(0)
         }
         KDSETLED => {
@@ -812,6 +815,122 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_KPMINUS => Some('-'),
         KEY_KPPLUS => Some('+'),
         _ => None,
+    }
+}
+
+/// Map a Linux VT keycode (`kb_index` in `struct kbentry`) to evdev `KEY_*`.
+fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
+    use zcore_drivers::input::input_event_codes::key::*;
+    match kc {
+        1 => Some(KEY_ESC),
+        2 => Some(KEY_1),
+        3 => Some(KEY_2),
+        4 => Some(KEY_3),
+        5 => Some(KEY_4),
+        6 => Some(KEY_5),
+        7 => Some(KEY_6),
+        8 => Some(KEY_7),
+        9 => Some(KEY_8),
+        10 => Some(KEY_9),
+        11 => Some(KEY_0),
+        12 => Some(KEY_MINUS),
+        13 => Some(KEY_EQUAL),
+        14 => Some(KEY_BACKSPACE),
+        15 => Some(KEY_TAB),
+        16 => Some(KEY_Q),
+        17 => Some(KEY_W),
+        18 => Some(KEY_E),
+        19 => Some(KEY_R),
+        20 => Some(KEY_T),
+        21 => Some(KEY_Y),
+        22 => Some(KEY_U),
+        23 => Some(KEY_I),
+        24 => Some(KEY_O),
+        25 => Some(KEY_P),
+        26 => Some(KEY_LEFTBRACE),
+        27 => Some(KEY_RIGHTBRACE),
+        28 => Some(KEY_ENTER),
+        30 => Some(KEY_A),
+        31 => Some(KEY_S),
+        32 => Some(KEY_D),
+        33 => Some(KEY_F),
+        34 => Some(KEY_G),
+        35 => Some(KEY_H),
+        36 => Some(KEY_J),
+        37 => Some(KEY_K),
+        38 => Some(KEY_L),
+        39 => Some(KEY_SEMICOLON),
+        40 => Some(KEY_APOSTROPHE),
+        41 => Some(KEY_GRAVE),
+        43 => Some(KEY_BACKSLASH),
+        44 => Some(KEY_Z),
+        45 => Some(KEY_X),
+        46 => Some(KEY_C),
+        47 => Some(KEY_V),
+        48 => Some(KEY_B),
+        49 => Some(KEY_N),
+        50 => Some(KEY_M),
+        51 => Some(KEY_COMMA),
+        52 => Some(KEY_DOT),
+        53 => Some(KEY_SLASH),
+        57 => Some(KEY_SPACE),
+        59 => Some(KEY_F1),
+        60 => Some(KEY_F2),
+        61 => Some(KEY_F3),
+        62 => Some(KEY_F4),
+        63 => Some(KEY_F5),
+        64 => Some(KEY_F6),
+        65 => Some(KEY_F7),
+        66 => Some(KEY_F8),
+        67 => Some(KEY_F9),
+        68 => Some(KEY_F10),
+        87 => Some(KEY_F11),
+        88 => Some(KEY_F12),
+        _ => None,
+    }
+}
+
+/// Build the `kb_value` for a `KDGKBENT` query (kdrive/TinyX keymap loader).
+fn kdgkbent_value(keycode: u16, table: u8) -> u16 {
+    use zcore_drivers::input::input_event_codes::key::*;
+    const KT_LATIN: u16 = 0;
+    const KT_SPEC: u16 = 2;
+    const KT_CUR: u16 = 6;
+    const KT_SHIFT: u16 = 7;
+    const NO_SYMBOL: u16 = 0;
+    const K_ENTER: u16 = (KT_SPEC << 8) | 1;
+    const K_SHIFT: u16 = (KT_SHIFT << 8) | 0;
+    const K_ALTGR: u16 = (KT_SHIFT << 8) | 1;
+    const K_CTRL: u16 = (KT_SHIFT << 8) | 2;
+    const K_ALT: u16 = (KT_SHIFT << 8) | 3;
+    const K_DOWN: u16 = (KT_CUR << 8) | 0;
+    const K_LEFT: u16 = (KT_CUR << 8) | 1;
+    const K_RIGHT: u16 = (KT_CUR << 8) | 2;
+    const K_UP: u16 = (KT_CUR << 8) | 3;
+
+    match keycode {
+        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => return K_SHIFT,
+        KEY_LEFTCTRL | KEY_RIGHTCTRL => return K_CTRL,
+        KEY_LEFTALT => return K_ALT,
+        KEY_RIGHTALT => return K_ALTGR,
+        KEY_ENTER | KEY_KPENTER => return K_ENTER,
+        KEY_ESC => return (KT_LATIN << 8) | 0x1b,
+        KEY_UP => return K_UP,
+        KEY_DOWN => return K_DOWN,
+        KEY_LEFT => return K_LEFT,
+        KEY_RIGHT => return K_RIGHT,
+        _ => {}
+    }
+
+    let mods = KeyMods {
+        shift: table & 1 != 0,
+        altgr: table & 2 != 0,
+        caps: false,
+        ctrl: false,
+    };
+    match translate_key(keycode, mods) {
+        Some(KeySym::Char(c)) if (c as u32) <= 0xff => c as u32 as u16,
+        _ => NO_SYMBOL,
     }
 }
 

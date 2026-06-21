@@ -130,7 +130,9 @@ impl Socket for TcpSocketState {
             let recv_closed = !socket.may_recv();
             trace!(
                 "[tcp read] state={:?} recv_closed={} result={:?}",
-                state, recv_closed, copied_len
+                state,
+                recv_closed,
+                copied_len
             );
             drop(socket);
             drop(sets);
@@ -340,7 +342,10 @@ impl Socket for TcpSocketState {
                     // ("broken pipe") — not ENOBUFS, whose "No buffer space
                     // available" text made TLS libraries report a bogus
                     // "handshake failed: No buffer space available".
-                    warn!("[tcp write] send failed: {:?} (connection no longer sendable)", err);
+                    warn!(
+                        "[tcp write] send failed: {:?} (connection no longer sendable)",
+                        err
+                    );
                     return Err(LxError::EPIPE);
                 }
             }

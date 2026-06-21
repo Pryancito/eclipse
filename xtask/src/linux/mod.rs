@@ -77,7 +77,7 @@ impl LinuxRootfs {
             fs::create_dir_all(&etc_apk).unwrap();
             fs::write(
                 etc_apk.join("repositories"),
-                "http://dl-cdn.alpinelinux.org/alpine/edge/main\nhttp://dl-cdn.alpinelinux.org/alpine/edge/community\n",
+                "http://dl-cdn.alpinelinux.org/alpine/v3.23/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.23/community\n",
             )
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
@@ -481,7 +481,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
               export LD_PRELOAD=/lib/libeclipse_dns.so\n\
               export HOME=/root\n\
-              export TERM=xterm-256color\n"
+              export TERM=xterm-256color\n",
         )
         .unwrap();
     }

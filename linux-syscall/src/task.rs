@@ -152,7 +152,9 @@ impl Syscall<'_> {
 
     /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.vfork_impl(newsp, newtls).await.map(|proc| proc.id() as usize)
+        self.vfork_impl(newsp, newtls)
+            .await
+            .map(|proc| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -193,7 +195,8 @@ impl Syscall<'_> {
             let pid = process.id() as usize;
 
             if clone_flags.contains(CloneFlags::PIDFD) {
-                let pidfd = linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
+                let pidfd =
+                    linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
                 let fd = self.linux_process().add_file(pidfd)?;
                 parent_tid.write(fd.into())?;
             }
@@ -345,7 +348,14 @@ impl Syscall<'_> {
         options: u32,
     ) -> SysResult {
         // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WCLONE | __WALL
-        let valid_mask = 0x0100_0000 | 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+        let valid_mask = 0x0100_0000
+            | 0x0000_0001
+            | 0x0000_0002
+            | 0x0000_0004
+            | 0x0000_0008
+            | 0x2000_0000
+            | 0x4000_0000
+            | 0x8000_0000;
         if (options & !valid_mask) != 0 {
             return Err(LxError::EINVAL);
         }
@@ -401,13 +411,11 @@ impl Syscall<'_> {
                     Err(e) => Err(e),
                 }
             }
-            P_ALL => {
-                match wait_child_any(caller, nohang, reap).await {
-                    Ok((pid, code)) => Ok((pid, code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
-                    Err(e) => Err(e),
-                }
-            }
+            P_ALL => match wait_child_any(caller, nohang, reap).await {
+                Ok((pid, code)) => Ok((pid, code)),
+                Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                Err(e) => Err(e),
+            },
             P_PGID => return Err(LxError::ENOSYS),
             _ => return Err(LxError::EINVAL),
         };
@@ -723,7 +731,9 @@ impl Syscall<'_> {
         let mask = if pid == 0 || pid as u64 == self.thread.id() {
             self.thread.affinity()
         } else {
-            self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?.affinity()
+            self.find_thread_by_tid(pid)
+                .ok_or(LxError::ESRCH)?
+                .affinity()
         } & Self::online_cpu_mask();
         // The kernel cpumask is 8 bytes wide for up to 64 CPUs; copy out at most
         // that many (libc zero-fills any remaining bytes of its cpu_set_t).

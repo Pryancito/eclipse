@@ -456,7 +456,9 @@ impl Syscall<'_> {
         // recorded as errors, the same way an invalid syscall number is.
         kernel_hal::klog_info!(
             "ioctl ENTER fd={:?} request={:#x} arg={:#x}",
-            fd, request, arg1
+            fd,
+            request,
+            arg1
         );
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
@@ -529,7 +531,9 @@ impl Syscall<'_> {
         match &ret {
             Ok(v) => kernel_hal::klog_info!(
                 "ioctl LEAVE fd={:?} request={:#x} -> Ok({})",
-                fd, request, v
+                fd,
+                request,
+                v
             ),
             // Failed/unhandled ioctls go through `error!` so they are printed on
             // the console (and serial), not only into the dmesg ring — the same
@@ -546,7 +550,9 @@ impl Syscall<'_> {
                 if request == TIOCGWINSZ {
                     kernel_hal::klog_info!(
                         "ioctl LEAVE fd={:?} request={:#x} -> ERR {:?} (not a tty)",
-                        fd, request, e
+                        fd,
+                        request,
+                        e
                     );
                 } else {
                     static LAST_REQ: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -881,8 +887,8 @@ fn tee_x_diag(buf: &[u8]) {
     let scan = &buf[..buf.len().min(1024)];
     let has = |needle: &[u8]| scan.windows(needle.len()).any(|w| w == needle);
     // Xorg's own log markers …
-    let x_marker = has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens")
-        || has(b"(II) ");
+    let x_marker =
+        has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens") || has(b"(II) ");
     // … plus the messages the *dynamic linker* prints to stderr when a program
     // dies before it ever reaches main(). Xorg pulls in far more shared
     // libraries than a typical CLI app, so a single missing `.so` or unresolved

@@ -442,7 +442,7 @@ impl INode for PtySlave {
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
         {
             let mut g = self.inner.lock();
-                g.slave_output(buf);
+            g.slave_output(buf);
         }
         wake_tty_intr_waiters();
         Ok(buf.len())

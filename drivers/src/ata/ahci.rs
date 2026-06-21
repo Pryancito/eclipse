@@ -481,7 +481,13 @@ impl AhciPort {
             };
             crate::klog_err!(
                 "[AHCI] port {} {}, TFD={:#x}, SSTS={:#x}, SERR={:#x}, IS={:#x}, CI={:#x}",
-                self.port_idx, kind, tfd, ssts, serr, is_now, ci
+                self.port_idx,
+                kind,
+                tfd,
+                ssts,
+                serr,
+                is_now,
+                ci
             );
             self.reset_port();
             return Err(DeviceError::IoError);
@@ -614,8 +620,7 @@ impl AhciPort {
             // Exponential backoff: 50ms, 100ms, 200ms, ... capped. A single
             // hiccup recovers on the first short wait; a link that is genuinely
             // struggling under load gets progressively more time to settle.
-            let settle = (RW_RETRY_SETTLE_US << (attempt - 2).min(20))
-                .min(RW_RETRY_SETTLE_MAX_US);
+            let settle = (RW_RETRY_SETTLE_US << (attempt - 2).min(20)).min(RW_RETRY_SETTLE_MAX_US);
             udelay(settle);
             if !wait_until(TFD_TIMEOUT_US, || {
                 self.read_reg(PORT_TFD) & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0
@@ -1083,7 +1088,9 @@ impl AhciInterface {
                         let bounce_end = bounce_phys as u64 + (BOUNCE_PAGES * 4096) as u64;
                         crate::klog_info!(
                             "[AHCI] port {} bounce buffer at {:#x}..{:#x} ({}-bit DMA)",
-                            i, bounce_phys, bounce_end,
+                            i,
+                            bounce_phys,
+                            bounce_end,
                             if supports_64bit { 64 } else { 32 },
                         );
                         if !supports_64bit && bounce_end > DMA_4G {

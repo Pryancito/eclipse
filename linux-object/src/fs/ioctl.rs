@@ -203,7 +203,8 @@ pub const TIOCGPTPEER: usize = 0x5441;
 pub const KDGETLED: usize = 0x4B11;
 /// Set keyboard LED state from an `int` (by value, not a pointer).
 pub const KDSETLED: usize = 0x4B32;
-// `KDGKBENT` is defined once above (next to the other keyboard ioctls).
+/// Read one keymap entry into a [`KbEntry`].
+pub const KDGKBENT: usize = 0x4B46;
 /// Console bell tone (accepted as a no-op).
 pub const KDMKTONE: usize = 0x4B30;
 

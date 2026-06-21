@@ -1753,7 +1753,9 @@ pub fn handle_net_ioctl(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let _ = iface_by_name(ifname)?;
-            ifr.ifr_ifru = IfReqUnion { ifru_pad: [0u64; 3] };
+            ifr.ifr_ifru = IfReqUnion {
+                ifru_pad: [0u64; 3],
+            };
             Ok(0)
         }
 
@@ -1995,7 +1997,10 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
             _ => false,
         };
         if !known {
-            debug!("setsockopt: accepting unhandled level={} opt={}", level, opt);
+            debug!(
+                "setsockopt: accepting unhandled level={} opt={}",
+                level, opt
+            );
         }
         Ok(0)
     }

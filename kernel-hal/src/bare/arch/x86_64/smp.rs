@@ -90,7 +90,6 @@ global_asm!(
     "  .byte 0x66, 0xea",
     "  .long ap_start64_paddr",
     "  .word 0x8",
-
     ".code64",
     "ap_trampoline64:",
     "  xor  ax, ax",

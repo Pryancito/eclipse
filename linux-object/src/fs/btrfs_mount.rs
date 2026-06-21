@@ -491,9 +491,7 @@ impl INode for BtrfsMountINode {
             FileKind::Dir => return Err(FsError::IsDir),
             FileKind::Symlink => {
                 self.fs.flush_any(&mut fs)?;
-                return fs
-                    .write_symlink(self.ino, off, buf)
-                    .map_err(map_err);
+                return fs.write_symlink(self.ino, off, buf).map_err(map_err);
             }
             _ => {}
         }

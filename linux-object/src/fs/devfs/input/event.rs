@@ -109,14 +109,14 @@ impl EventDev {
     /// event types themselves.
     fn capability_for_ev(&self, ev: u16) -> InputCapability {
         let cap_type = match ev {
-            0x00 => CapabilityType::Event, // EVIOCGBIT(0): supported event types
-            0x01 => CapabilityType::Key,   // EV_KEY
+            0x00 => CapabilityType::Event,   // EVIOCGBIT(0): supported event types
+            0x01 => CapabilityType::Key,     // EV_KEY
             0x02 => CapabilityType::RelAxis, // EV_REL
             0x03 => CapabilityType::AbsAxis, // EV_ABS
-            0x04 => CapabilityType::Misc,  // EV_MSC
-            0x05 => CapabilityType::Switch, // EV_SW
-            0x11 => CapabilityType::Led,   // EV_LED
-            0x12 => CapabilityType::Sound, // EV_SND
+            0x04 => CapabilityType::Misc,    // EV_MSC
+            0x05 => CapabilityType::Switch,  // EV_SW
+            0x11 => CapabilityType::Led,     // EV_LED
+            0x12 => CapabilityType::Sound,   // EV_SND
             0x15 => CapabilityType::FeedBack, // EV_FF
             _ => return InputCapability::empty(),
         };

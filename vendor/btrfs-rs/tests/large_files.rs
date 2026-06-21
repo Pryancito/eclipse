@@ -10,8 +10,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::{env, fs};
 
 use btrfs::device::BlockDevice;
@@ -210,7 +210,9 @@ fn run_huge_file(name: &str, dev_size: u64, file_size: u64, grow_from: Option<u6
         let want = (chunk as u64).min(file_size - off) as usize;
         let mut got = 0usize;
         while got < want {
-            let n = fs.read(file, off + got as u64, &mut rbuf[got..want]).unwrap();
+            let n = fs
+                .read(file, off + got as u64, &mut rbuf[got..want])
+                .unwrap();
             assert!(n > 0, "zero read at {}", off + got as u64);
             got += n;
         }
@@ -225,8 +227,16 @@ fn run_huge_file(name: &str, dev_size: u64, file_size: u64, grow_from: Option<u6
         off += want as u64;
     }
 
-    assert_eq!(dev.oob_writes.load(Ordering::Relaxed), 0, "out-of-bounds writes");
-    assert_eq!(dev.oob_reads.load(Ordering::Relaxed), 0, "out-of-bounds reads");
+    assert_eq!(
+        dev.oob_writes.load(Ordering::Relaxed),
+        0,
+        "out-of-bounds writes"
+    );
+    assert_eq!(
+        dev.oob_reads.load(Ordering::Relaxed),
+        0,
+        "out-of-bounds reads"
+    );
     drop(fs);
     check(&path);
     fs::remove_file(&path).ok();
@@ -282,7 +292,10 @@ fn big_file_small_chunks_scaling() {
     let mut off = 0u64;
     let mut last_mark = 0u64;
     let mut mark_t = Instant::now();
-    println!("    {:>8}  {:>12}  {:>14}", "MiB", "MiB/s (window)", "us/4KiB-write");
+    println!(
+        "    {:>8}  {:>12}  {:>14}",
+        "MiB", "MiB/s (window)", "us/4KiB-write"
+    );
     while off < total {
         fs.write(file, off, &buf).unwrap();
         off += chunk as u64;
@@ -290,7 +303,12 @@ fn big_file_small_chunks_scaling() {
             let secs = mark_t.elapsed().as_secs_f64();
             let mibps = (off - last_mark) as f64 / (1024.0 * 1024.0) / secs;
             let us = secs * 1e6 / ((off - last_mark) / chunk as u64) as f64;
-            println!("    {:>8}  {:>12.1}  {:>14.2}", off / (1024 * 1024), mibps, us);
+            println!(
+                "    {:>8}  {:>12.1}  {:>14.2}",
+                off / (1024 * 1024),
+                mibps,
+                us
+            );
             last_mark = off;
             mark_t = Instant::now();
         }
@@ -311,9 +329,7 @@ fn huge_file_truncate_up_then_write() {
     let dev_arc: Arc<dyn BlockDevice> = dev.clone();
     let mut fs = Btrfs::mount(dev_arc, false).unwrap();
     let root = fs.root_ino();
-    let file = fs
-        .create(root, "big", FileKind::Regular, 0o644, 0)
-        .unwrap();
+    let file = fs.create(root, "big", FileKind::Regular, 0o644, 0).unwrap();
 
     let size = 160 * 1024 * 1024u64;
     fs.truncate(file, size).unwrap(); // one giant hole
@@ -346,10 +362,17 @@ fn huge_file_truncate_up_then_write() {
         let want = (chunk as u64).min(size - off) as usize;
         let mut got = 0usize;
         while got < want {
-            got += fs.read(file, off + got as u64, &mut rbuf[got..want]).unwrap();
+            got += fs
+                .read(file, off + got as u64, &mut rbuf[got..want])
+                .unwrap();
         }
         for j in 0..want {
-            assert_eq!(rbuf[j], payload_byte(off + j as u64), "mismatch at {}", off + j as u64);
+            assert_eq!(
+                rbuf[j],
+                payload_byte(off + j as u64),
+                "mismatch at {}",
+                off + j as u64
+            );
         }
         off += want as u64;
     }
@@ -403,7 +426,12 @@ fn huge_file_sparse_writes() {
             got += n;
         }
         for j in 0..seg {
-            assert_eq!(rbuf[j], payload_byte(off + j as u64), "data mismatch at {}", off + j as u64);
+            assert_eq!(
+                rbuf[j],
+                payload_byte(off + j as u64),
+                "data mismatch at {}",
+                off + j as u64
+            );
         }
         // The hole following every segment except the last (which is at EOF)
         // must read back as zeros.
@@ -431,5 +459,10 @@ fn huge_file_sparse_writes() {
 /// into the second — *huge* — data chunk at ~21%, exactly where apk fails.
 #[test]
 fn repro_libllvm_real_geometry() {
-    run_huge_file("realgeom", 238 * 1024 * 1024 * 1024, 130 * 1024 * 1024, None);
+    run_huge_file(
+        "realgeom",
+        238 * 1024 * 1024 * 1024,
+        130 * 1024 * 1024,
+        None,
+    );
 }

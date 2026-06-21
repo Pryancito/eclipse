@@ -2487,7 +2487,9 @@ pub fn poll() {
                     if gone {
                         warn!("[xhci] USBSTS=0xffffffff: el controlador no responde (apagado D3 o ausente, p.ej. un puerto USB-C/VirtualLink de GPU vacío); se detiene el sondeo");
                     } else {
-                        warn!("[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo");
+                        warn!(
+                            "[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo"
+                        );
                     }
                     xi.dump_halt_diagnostics();
                 }
