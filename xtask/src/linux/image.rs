@@ -2,10 +2,49 @@ use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
 use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
-/// SFS initramfs size (live/QEMU root + apk headroom).
+/// SFS initramfs size for the *base* (efi-embedded) initramfs that does NOT
+/// carry the installer payloads. The live/QEMU initramfs is sized dynamically
+/// with [`sfs_size_for`] because it additionally embeds efi.img.gz /
+/// rootfs.btrfs.gz / home.btrfs.gz under /boot.
 const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 /// FAT32 ESP image: initramfs + zcore (~40 MiB) + boot loader + metadata.
 const EFI_FAT_BYTES: usize = 128 * 1024 * 1024;
+
+/// Installer payloads staged under the rootfs `/boot` for the live installer.
+const BOOT_PAYLOADS: [&str; 3] = ["efi.img.gz", "rootfs.btrfs.gz", "home.btrfs.gz"];
+
+/// Recursively sum the size (in bytes) of regular files under `path`.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let md = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.file_type().is_dir() {
+                total += dir_size(&p);
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// Round up to whole MiB, with `num/den` fractional headroom plus a `floor_mib`
+/// absolute floor, for FS metadata (inode table, block bitmap, directories).
+fn padded_image_size(payload_bytes: u64, num: u64, den: u64, floor_mib: u64) -> u64 {
+    let with_slack = payload_bytes + payload_bytes * num / den + floor_mib * 1024 * 1024;
+    let mib = with_slack.div_ceil(1024 * 1024);
+    mib * 1024 * 1024
+}
+
+/// SFS image size for an initramfs holding `payload_bytes` (≈40% headroom).
+fn sfs_size_for(payload_bytes: u64) -> usize {
+    padded_image_size(payload_bytes, 2, 5, 24) as usize
+}
 
 impl super::LinuxRootfs {
     /// 生成镜像。
@@ -18,6 +57,14 @@ impl super::LinuxRootfs {
             let rootfs_path = self.path();
             let boot_dir = rootfs_path.join("boot");
             fs::create_dir_all(&boot_dir).unwrap();
+
+            // Remove any installer payloads left over from a previous (possibly
+            // failed) build. `make(false)` never clears the rootfs, so without
+            // this the base initramfs / rootfs.btrfs below would be polluted
+            // with stale efi.img.gz / *.btrfs.gz and overflow their images.
+            for name in BOOT_PAYLOADS {
+                let _ = fs::remove_file(boot_dir.join(name));
+            }
 
             // 1. Build bootloader (rboot)
             println!("Building bootloader (rboot)...");
@@ -124,15 +171,22 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress efi.img");
 
-            let efi_gz = boot_dir.join("efi.img.gz");
-            fs::copy(&target_efi_gz, &efi_gz).unwrap();
+            // NOTE: the payloads (efi.img.gz / rootfs.btrfs.gz / home.btrfs.gz)
+            // are staged into the rootfs `/boot` only *after* rootfs.btrfs is
+            // built (see below), so the target root image is not polluted with
+            // the installer's own payloads and does not overflow its size.
 
-            // 5. Build rootfs.btrfs (populated with the rootfs directory)
+            // 5. Build rootfs.btrfs from the clean rootfs (no installer payloads
+            // present yet). Size it to the actual rootfs with generous headroom.
             println!("Building rootfs.btrfs...");
             let btrfs_img = TARGET.join("rootfs.btrfs");
+            let rootfs_btrfs_size = std::cmp::max(
+                96 * 1024 * 1024u64,
+                padded_image_size(dir_size(&rootfs_path), 3, 5, 32),
+            );
             super::btrfs_image::make_btrfs_image(
                 &btrfs_img,
-                96 * 1024 * 1024,
+                rootfs_btrfs_size,
                 "ECLIPSE",
                 Some(&rootfs_path),
             );
@@ -147,9 +201,6 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress rootfs.btrfs");
 
-            let btrfs_gz = boot_dir.join("rootfs.btrfs.gz");
-            fs::copy(&target_btrfs_gz, &btrfs_gz).unwrap();
-
             // 5b. Empty btrfs template used by the installer to format HOME
             // (written raw onto the partition; the kernel auto-expands it).
             println!("Building home.btrfs template...");
@@ -163,15 +214,29 @@ impl super::LinuxRootfs {
                 .status()
                 .unwrap();
             assert!(status.success(), "Failed to compress home.btrfs");
+
+            // 5c. Stage the payloads in the rootfs /boot so the live installer
+            // (which runs from this very initramfs) can find them.
+            let efi_gz = boot_dir.join("efi.img.gz");
+            let btrfs_gz = boot_dir.join("rootfs.btrfs.gz");
             let home_gz = boot_dir.join("home.btrfs.gz");
+            fs::copy(&target_efi_gz, &efi_gz).unwrap();
+            fs::copy(&target_btrfs_gz, &btrfs_gz).unwrap();
             fs::copy(&target_home_gz, &home_gz).unwrap();
 
-            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP dev
-            println!("Building final installer-enabled image...");
+            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP.
+            // Unlike the efi-embedded base initramfs, this one carries the boot
+            // payloads, so it must be sized to fit rootfs + payloads — the fixed
+            // 80 MiB base size would overflow and silently drop the larger ones.
+            let live_size = sfs_size_for(dir_size(&rootfs_path));
+            println!(
+                "Building final installer-enabled image ({} MiB)...",
+                live_size / (1024 * 1024)
+            );
             let image = PROJECT_DIR
                 .join("zCore")
                 .join(format!("{arch}.img", arch = self.0.name()));
-            fuse(&rootfs_path, &image, INITRAMFS_BYTES);
+            fuse(&rootfs_path, &image, live_size);
 
             let _ = fs::remove_file(efi_gz);
             let _ = fs::remove_file(btrfs_gz);
