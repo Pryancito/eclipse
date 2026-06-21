@@ -137,6 +137,24 @@ impl Syscall<'_> {
                 args
             );
         }
+        // DIAGNOSTIC (temporal): el sistema se congela EN DURO al lanzar `perf`
+        // (no se puede ni cambiar de VT), así que no podemos leer el trace del
+        // anillo de dmesg después. En su lugar, en cuanto algún proceso llama a
+        // `perf_event_open` empezamos a ECHAR cada syscall a la consola en vivo.
+        // Cuando el kernel se cuelgue, la última línea en pantalla será la
+        // syscall culpable: un ENTER (`->`) sin su LEAVE (`<-`) correspondiente.
+        static SYSCALL_ECHO: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if matches!(sys_type, Sys::PERF_EVENT_OPEN) {
+            SYSCALL_ECHO.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        let echo = SYSCALL_ECHO.load(core::sync::atomic::Ordering::Relaxed);
+        if echo {
+            kernel_hal::console::console_write_fmt(format_args!(
+                "TRC[{}] -> {:?}({}) args={:x?}\n",
+                trace_pid, sys_type, num, args
+            ));
+        }
         let [a0, a1, a2, a3, a4, a5] = args;
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
@@ -378,6 +396,13 @@ impl Syscall<'_> {
         info!("<= {:?}", ret);
         if trace {
             kernel_hal::klog_info!("SYS[{}] #{} => {:?}", trace_pid, num, ret);
+        }
+        // DIAGNOSTIC (temporal): LEAVE del eco en vivo (ver el ENTER de arriba).
+        if echo {
+            kernel_hal::console::console_write_fmt(format_args!(
+                "TRC[{}] <- #{} => {:?}\n",
+                trace_pid, num, ret
+            ));
         }
         match ret {
             Ok(value) => value as isize,
