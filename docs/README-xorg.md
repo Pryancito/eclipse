@@ -147,3 +147,20 @@ mirar `/tmp/Xorg.log` (sección anterior) para el siguiente fallo.
 - La aceleración por GPU no está disponible; usa el renderizado por software de
   Mesa (`llvmpipe`/`softpipe`), por eso se instalan `mesa-dri-gallium` y
   `llvm-libs`.
+
+## Pseudo-terminales (PTY)
+
+Los emuladores de terminal bajo X (xterm, st, rxvt…) necesitan pseudo-terminales
+para arrancar una shell. Eclipse OS las expone igual que Linux:
+
+- `/dev/ptmx`: abrir este nodo crea un par maestro/esclavo nuevo y devuelve el
+  *maestro*. `ptsname(3)` resuelve el número con `ioctl(TIOCGPTN)` y `unlockpt(3)`
+  usa `ioctl(TIOCSPTLCK)` (aceptado; no se exige para abrir el esclavo).
+- `/dev/pts/N`: el *esclavo*. El programa que corre en él (la shell) lo ve como
+  un terminal real: `tcgetattr`/`tcsetattr`, `TIOCGWINSZ`/`TIOCSWINSZ`,
+  grupos de proceso en primer plano (`TIOCGPGRP`/`TIOCSPGRP`) y señales
+  (`Ctrl+C`→SIGINT, `SIGWINCH` al redimensionar, `SIGHUP` al cerrar el maestro).
+
+La disciplina de línea (modo canónico/raw, eco, traducción CR/NL) corre en el
+lado del esclavo: lo que escribe el emulador en el maestro se procesa y, con eco
+activo, vuelve al maestro para que la terminal muestre lo tecleado.

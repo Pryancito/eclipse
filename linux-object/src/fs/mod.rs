@@ -18,6 +18,7 @@ mod pipe;
 mod proc_self;
 mod procfs;
 mod pseudo;
+pub mod pty;
 pub mod rcore_fs_wrapper;
 pub mod stdio;
 mod sysfs;
@@ -338,6 +339,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     }
     if let Err(e) = devfs_root.add("console", stdio::vt_stdin(0)) {
         warn!("failed to mknod /dev/console: {:?}", e);
+    }
+    // Pseudo-terminals: `/dev/ptmx` (the master multiplexer) and the `/dev/pts`
+    // directory where slaves (`/dev/pts/N`) live. Opening `/dev/ptmx` and the
+    // slave nodes is special-cased in the `openat` syscall (see
+    // `linux-syscall`), so the registered ptmx node is just a placeholder for
+    // `stat`/`ls`; the slave directory is created so `ptsname`/terminal
+    // emulators can resolve the path.
+    if let Err(e) = devfs_root.add("ptmx", Arc::new(pty::PtmxINode)) {
+        warn!("failed to mknod /dev/ptmx: {:?}", e);
+    }
+    if let Err(e) = devfs_root.add_dir("pts") {
+        warn!("failed to mkdir /dev/pts: {:?}", e);
     }
     // One device node per virtual terminal: /dev/tty1 .. /dev/ttyN.
     for vt in 0..kernel_hal::console::NUM_VTS {

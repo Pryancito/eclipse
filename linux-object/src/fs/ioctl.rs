@@ -189,12 +189,21 @@ pub const TIOCSCTTY: usize = 0x540E;
 /// Give up the controlling TTY.
 pub const TIOCNOTTY: usize = 0x5422;
 
+// Pseudo-terminal (PTY) ioctls issued on the `/dev/ptmx` master.
+/// Get the PTY number of the master (`unsigned int` out) — `ptsname(3)` uses it
+/// to build `/dev/pts/N`.
+pub const TIOCGPTN: usize = 0x8004_5430;
+/// Lock/unlock the PTY slave (`int` in); `unlockpt(3)` writes 0 here.
+pub const TIOCSPTLCK: usize = 0x4004_5431;
+/// Open the slave side of the master without a path (returns an fd). Accepted
+/// best-effort; most libcs fall back to `open("/dev/pts/N")`.
+pub const TIOCGPTPEER: usize = 0x5441;
+
 /// Get keyboard LED state (Scroll/Num/Caps) into an `int`.
 pub const KDGETLED: usize = 0x4B11;
 /// Set keyboard LED state from an `int` (by value, not a pointer).
 pub const KDSETLED: usize = 0x4B32;
-/// Read one entry from the kernel keymap (`struct kbentry`).
-pub const KDGKBENT: usize = 0x4B46;
+// `KDGKBENT` is defined once above (next to the other keyboard ioctls).
 /// Console bell tone (accepted as a no-op).
 pub const KDMKTONE: usize = 0x4B30;
 

@@ -2108,9 +2108,13 @@ impl XhciInner {
                         lis.trigger(InputEvent {
                             event_type: InputEventType::RelAxis,
                             code: REL_Y,
-                            // `dy` is already screen-space (sy grows downward).
-                            // MouseState::update() negates REL_Y, so emit the
-                            // raw delta here — negating it inverts the Y axis.
+                            // The tablet already reports screen-space Y (0 = top,
+                            // growing downward), so `dy > 0` means the pointer
+                            // moved down. Emit it as-is: the `/dev/input/mice`
+                            // PS/2 path negates once and kdrive negates again
+                            // (PS/2 treats +Y as up), so the two cancel and the
+                            // pointer follows the motion. Negating here inverts
+                            // the vertical axis under Xfbdev.
                             value: dy,
                         });
                     }

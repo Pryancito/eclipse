@@ -3,7 +3,7 @@
 
 use super::ioctl::*;
 use crate::{sync::Event, sync::EventBus};
-use kernel_hal::user::{UserInOutPtr, UserInPtr, UserOutPtr, Error as UserError};
+use kernel_hal::user::{UserInPtr, UserOutPtr, Error as UserError};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -140,6 +140,20 @@ fn tty_kbd_cooked(vt: usize) -> bool {
     matches!(tty_kbd_mode(vt), K_XLATE | K_UNICODE)
 }
 
+/// The VT an X server is driving in `K_MEDIUMRAW`, if any. kdrive (TinyX) puts
+/// the keyboard of the VT it opened into medium-raw and reads keycodes from that
+/// VT's tty. The `VT_OPENQRY` shim can leave `active_vt()` and that VT out of
+/// sync, so route medium-raw keycodes by the mode itself: prefer the active VT
+/// when it is the one in medium-raw, otherwise fall back to the first VT that
+/// is. Returns `None` when no VT is in medium-raw (normal cooked console).
+fn medium_raw_vt() -> Option<usize> {
+    let active = vt_clamp(kernel_hal::console::active_vt());
+    if tty_kbd_mode(active) == K_MEDIUMRAW {
+        return Some(active);
+    }
+    (0..kernel_hal::console::NUM_VTS).find(|&vt| tty_kbd_mode(vt) == K_MEDIUMRAW)
+}
+
 fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
     r.map_err(|_| FsError::InvalidParam)
 }
@@ -225,16 +239,28 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // ioctl argument by value, not a pointer. X puts the keyboard into
             // K_RAW/K_OFF this way during console takeover.
             let mode = data as i32;
+            warn!(
+                "[kbd-diag] KDSKBMODE vt={} mode={} (active_vt={})",
+                vt,
+                mode,
+                kernel_hal::console::active_vt()
+            );
             TTY_STATES[vt_clamp(vt)]
                 .kbd_mode
                 .store(mode, Ordering::Relaxed);
             Ok(0)
         }
+        // kdrive/TinyX reads the kernel keymap entry-by-entry to map medium-raw
+        // keycodes to X keysyms. `struct kbentry { u8 kb_table; u8 kb_index;
+        // u16 kb_value; }`: the caller fills kb_table/kb_index, we fill kb_value.
         KDGKBENT => {
-            let mut kbe = user_copy(UserInOutPtr::<KbEntry>::from(data).read())?;
-            // Empty/unmapped entries are normal while X scans the whole keymap.
-            kbe.kb_value = kdgkbent_value(kbe.kb_table, kbe.kb_index).unwrap_or(0);
-            user_copy(UserInOutPtr::<KbEntry>::from(data).write(kbe))?;
+            if data == 0 {
+                return Err(FsError::InvalidParam);
+            }
+            let p = data as *mut u8;
+            let (table, index) = unsafe { (*p, *p.add(1)) };
+            let value = kdgkbent_value(index as u16, table);
+            unsafe { *(p.add(2) as *mut u16) = value };
             Ok(0)
         }
         KDGETLED => {
@@ -488,6 +514,26 @@ fn handle_key_event(event: &InputEvent) {
     if event.event_type != InputEventType::Key {
         return;
     }
+    // Temporary keyboard diagnostics for the Xfbdev/kdrive medium-raw path:
+    // log the first handful of key events with the active VT and its keyboard
+    // mode. If these never appear, the USB keyboard is producing no events; if
+    // `mode` is not 2 (K_MEDIUMRAW) while X is up, kdrive's KDSKBMODE landed on
+    // a different VT than the one the keystrokes are routed to.
+    {
+        static KBD_DIAG: AtomicU8 = AtomicU8::new(0);
+        if KBD_DIAG.load(Ordering::Relaxed) < 80 {
+            KBD_DIAG.fetch_add(1, Ordering::Relaxed);
+            let avt = kernel_hal::console::active_vt();
+            warn!(
+                "[kbd-diag] code={} val={} active_vt={} mode={} medium_raw_vt={:?}",
+                event.code,
+                event.value,
+                avt,
+                tty_kbd_mode(avt),
+                medium_raw_vt()
+            );
+        }
+    }
     // Linux input: value 1 = press, 0 = release, 2 = autorepeat. Track the
     // modifier state but don't return — the medium-raw path below has to emit
     // the modifier keycodes too.
@@ -533,10 +579,10 @@ fn handle_key_event(event: &InputEvent) {
     // with bit 7 set on release. Every key matters — presses, releases and
     // modifiers — but not autorepeat (value 2): kdrive generates its own
     // repeat. Keycodes ≥ 128 don't fit kdrive's single-byte reader; skip them.
-    if tty_kbd_mode(kernel_hal::console::active_vt()) == K_MEDIUMRAW {
+    if let Some(vt) = medium_raw_vt() {
         if event.code < 0x80 && (event.value == 0 || event.value == 1) {
             let byte = (event.code as u8 & 0x7f) | if event.value == 0 { 0x80 } else { 0 };
-            active_stdin().push_bytes(&[byte]);
+            vt_stdin(vt).push_bytes(&[byte]);
         }
         return;
     }
@@ -767,127 +813,6 @@ fn input_event_to_char_es(code: u16, mods: KeyMods) -> Option<char> {
         KEY_KPPLUS => Some('+'),
         _ => None,
     }
-}
-
-/// Map a Linux VT keycode (`kb_index`) to an evdev `KEY_*` code.
-fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
-    use zcore_drivers::input::input_event_codes::key::*;
-    match kc {
-        1 => Some(KEY_ESC),
-        2 => Some(KEY_1),
-        3 => Some(KEY_2),
-        4 => Some(KEY_3),
-        5 => Some(KEY_4),
-        6 => Some(KEY_5),
-        7 => Some(KEY_6),
-        8 => Some(KEY_7),
-        9 => Some(KEY_8),
-        10 => Some(KEY_9),
-        11 => Some(KEY_0),
-        12 => Some(KEY_MINUS),
-        13 => Some(KEY_EQUAL),
-        14 => Some(KEY_BACKSPACE),
-        15 => Some(KEY_TAB),
-        16 => Some(KEY_Q),
-        17 => Some(KEY_W),
-        18 => Some(KEY_E),
-        19 => Some(KEY_R),
-        20 => Some(KEY_T),
-        21 => Some(KEY_Y),
-        22 => Some(KEY_U),
-        23 => Some(KEY_I),
-        24 => Some(KEY_O),
-        25 => Some(KEY_P),
-        26 => Some(KEY_LEFTBRACE),
-        27 => Some(KEY_RIGHTBRACE),
-        28 => Some(KEY_ENTER),
-        30 => Some(KEY_A),
-        31 => Some(KEY_S),
-        32 => Some(KEY_D),
-        33 => Some(KEY_F),
-        34 => Some(KEY_G),
-        35 => Some(KEY_H),
-        36 => Some(KEY_J),
-        37 => Some(KEY_K),
-        38 => Some(KEY_L),
-        39 => Some(KEY_SEMICOLON),
-        40 => Some(KEY_APOSTROPHE),
-        41 => Some(KEY_GRAVE),
-        43 => Some(KEY_BACKSLASH),
-        44 => Some(KEY_Z),
-        45 => Some(KEY_X),
-        46 => Some(KEY_C),
-        47 => Some(KEY_V),
-        48 => Some(KEY_B),
-        49 => Some(KEY_N),
-        50 => Some(KEY_M),
-        51 => Some(KEY_COMMA),
-        52 => Some(KEY_DOT),
-        53 => Some(KEY_SLASH),
-        57 => Some(KEY_SPACE),
-        59 => Some(KEY_F1),
-        60 => Some(KEY_F2),
-        61 => Some(KEY_F3),
-        62 => Some(KEY_F4),
-        63 => Some(KEY_F5),
-        64 => Some(KEY_F6),
-        65 => Some(KEY_F7),
-        66 => Some(KEY_F8),
-        67 => Some(KEY_F9),
-        68 => Some(KEY_F10),
-        87 => Some(KEY_F11),
-        88 => Some(KEY_F12),
-        _ => None,
-    }
-}
-
-/// Build a `kb_value` for `KDGKBENT`, using the same Spanish layout as the console.
-fn kdgkbent_value(kb_table: u8, kb_index: u8) -> Result<u16> {
-    let evdev = linux_keycode_to_evdev(kb_index).ok_or(FsError::InvalidParam)?;
-    let mods = match kb_table {
-        0 => KeyMods {
-            shift: false,
-            altgr: false,
-            caps: false,
-            ctrl: false,
-        },
-        1 => KeyMods {
-            shift: true,
-            altgr: false,
-            caps: false,
-            ctrl: false,
-        },
-        2 => KeyMods {
-            shift: false,
-            altgr: true,
-            caps: false,
-            ctrl: false,
-        },
-        3 => KeyMods {
-            shift: true,
-            altgr: true,
-            caps: false,
-            ctrl: false,
-        },
-        _ => return Err(FsError::InvalidParam),
-    };
-
-    if (59..=68).contains(&kb_index) {
-        return Ok((KT_FN << 8) | u16::from(kb_index - 59));
-    }
-    if kb_index == 87 {
-        return Ok((KT_FN << 8) | 10);
-    }
-    if kb_index == 88 {
-        return Ok((KT_FN << 8) | 11);
-    }
-
-    if let Some(c) = input_event_to_char_es(evdev, mods) {
-        if c.is_ascii() {
-            return Ok(u16::from(c as u8));
-        }
-    }
-    Err(FsError::InvalidParam)
 }
 
 /// Stdin struct, for Stdin buffer.
@@ -1179,10 +1104,17 @@ impl Stdin {
         for &b in bytes {
             buf.push_back(b as char);
         }
+        drop(buf);
         self.data_ready.store(true, Ordering::Release);
         if let Some(mut eb) = self.eventbus.try_lock() {
             self.data_ready.store(false, Ordering::Relaxed);
             eb.set(Event::READABLE);
+        } else {
+            // EventBus contended: leave `data_ready` set and nudge any waiter so
+            // the bytes don't sit in the buffer until an unrelated event runs
+            // the executor. This matters for kdrive/TinyX, whose only wakeup in
+            // medium-raw mode is the keystroke we just pushed.
+            wake_tty_intr_waiters();
         }
     }
 }
