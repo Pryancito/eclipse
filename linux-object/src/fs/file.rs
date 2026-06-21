@@ -12,8 +12,6 @@ use zircon_object::vm::{pages, VmObject};
 use super::FileLike;
 use crate::error::{LxError, LxResult};
 
-use zircon_object::vm::PAGE_SIZE_LOG2;
-
 bitflags::bitflags! {
     /// File open flags
     pub struct OpenFlags: usize {
@@ -376,11 +374,28 @@ impl FileLike for File {
         let inner = self.inner.read();
         match inner.inode.metadata()?.type_ {
             FileType::File => {
-                let vmo = VmObject::new_contiguous(pages(len), PAGE_SIZE_LOG2)?;
-                let (guard, buf) = vmo.as_mut_buf()?;
-                inner.inode.read_at(offset, buf)?;
-                drop(guard);
-                vmo.unset_contiguous();
+                // Back the file mapping with a *paged* (non-contiguous) VMO and
+                // fill it page-by-page. A file mapping has no contiguity
+                // requirement, and the previous `new_contiguous` allocation
+                // demanded a single physically contiguous block: once physical
+                // memory got fragmented, mapping a large library (e.g. the
+                // ~150 MiB `libLLVM.so` pulled in by `perf`) failed with ENOMEM
+                // even with plenty of free RAM, which musl surfaced as
+                // "Out of memory" followed by every LLVM symbol failing to
+                // relocate. Paged frames can come from anywhere, so the same
+                // amount of RAM now satisfies the request.
+                let vmo = VmObject::new_paged(pages(len));
+                let mut buf = [0u8; 16384];
+                let mut done = 0;
+                while done < len {
+                    let chunk = (len - done).min(buf.len());
+                    let read = inner.inode.read_at(offset + done, &mut buf[..chunk])?;
+                    if read == 0 {
+                        break;
+                    }
+                    vmo.write(done, &buf[..read])?;
+                    done += read;
+                }
                 Ok(vmo)
             }
             FileType::CharDevice => {
