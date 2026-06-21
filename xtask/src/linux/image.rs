@@ -2,10 +2,11 @@ use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
 use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{fs, path::Path};
 
-/// SFS initramfs size for the *base* (efi-embedded) initramfs that does NOT
-/// carry the installer payloads. The live/QEMU initramfs is sized dynamically
-/// with [`sfs_size_for`] because it additionally embeds efi.img.gz /
-/// rootfs.btrfs.gz / home.btrfs.gz under /boot.
+/// Fallback SFS initramfs size, only used by the `dbg_repack_initramfs` test.
+/// Production images are sized dynamically: [`sfs_size_for`] for the minimal
+/// efi-embedded bootstrap initramfs and [`live_image_size`] for the live image
+/// that additionally embeds the installer payloads under `/boot`.
+#[cfg(test)]
 const INITRAMFS_BYTES: usize = 80 * 1024 * 1024;
 /// FAT32 ESP image: initramfs + zcore (~40 MiB) + boot loader + metadata.
 const EFI_FAT_BYTES: usize = 128 * 1024 * 1024;
@@ -46,6 +47,92 @@ fn sfs_size_for(payload_bytes: u64) -> usize {
     padded_image_size(payload_bytes, 2, 5, 24) as usize
 }
 
+/// SFS size for the *live* image (minimal root + installer payloads). The whole
+/// SFS is loaded into RAM at boot, and the image is read-mostly (the installer
+/// streams the gz payloads straight to the target disk), so it uses tight
+/// headroom — 12.5% + 16 MiB — to avoid wasting RAM on the embedded payloads.
+fn live_image_size(payload_bytes: u64) -> usize {
+    padded_image_size(payload_bytes, 1, 8, 16) as usize
+}
+
+/// Largest regular file copied into the minimal live root. Acts as a safety net:
+/// a stray huge file (e.g. a `libLLVM.so` dropped into `/lib`) is left out so it
+/// can't bloat the RAM-resident initramfs. Every installer essential (busybox,
+/// apk, e2fsprogs, musl, install-eclipse, CA bundle) is comfortably under this.
+const LIVE_FILE_CAP: u64 = 16 * 1024 * 1024;
+
+/// Paths copied verbatim from the full rootfs into the minimal live root.
+/// Everything else (TinyX/Xfbdev in `usr/bin`, X fonts in `usr/share/fonts`,
+/// libc-test, `perf`/`libLLVM`, and any other heavy or user-added component)
+/// is intentionally omitted: it ships in `rootfs.btrfs.gz` and runs from the
+/// btrfs disk on the installed system, which pivots root onto it.
+const LIVE_KEEP: [&str; 8] = [
+    "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools
+    "lib",              // ld-musl + libeclipse_dns + apk db (capped: drops stray big libs)
+    "etc",              // fstab, profile, ssl certs, apk repo, machine-id, X11 configs
+    "var",              // apk dbs (small)
+    "sbin",             // openrc-init, if present (INIT)
+    "root",             // root's home / rc files (capped)
+    "usr/sbin",         // openssl -> ssl_client wrapper
+    "usr/share/udhcpc", // DHCP dispatcher scripts
+];
+
+/// Recursively copy `src` into `dst`, preserving symlinks (busybox applets are
+/// symlinks to `busybox`) and permissions. Regular files larger than
+/// [`LIVE_FILE_CAP`] are skipped. A missing `src` is a no-op.
+fn copy_tree_capped(src: &Path, dst: &Path) {
+    let md = match fs::symlink_metadata(src) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if md.file_type().is_symlink() {
+        let target = fs::read_link(src).unwrap();
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let _ = fs::remove_file(dst);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, dst).unwrap();
+        return;
+    }
+    if md.is_dir() {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap().flatten() {
+            copy_tree_capped(&entry.path(), &dst.join(entry.file_name()));
+        }
+        return;
+    }
+    if md.len() > LIVE_FILE_CAP {
+        println!(
+            "  live-rootfs: skipping large file {} ({} MiB)",
+            src.display(),
+            md.len() / (1024 * 1024)
+        );
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::copy(src, dst).unwrap();
+}
+
+/// Build the *minimal live/installer* root at `out` from the full `full` rootfs.
+/// Only the [`LIVE_KEEP`] paths are copied; empty mount points are created so
+/// boot-time fstab processing and `/dev`, `/proc`, `/sys` have somewhere to
+/// attach. The installer payloads are staged into `out/boot` by the caller.
+fn build_live_rootfs(full: &Path, out: &Path) {
+    let _ = fs::remove_dir_all(out);
+    fs::create_dir_all(out).unwrap();
+    for rel in LIVE_KEEP {
+        copy_tree_capped(&full.join(rel), &out.join(rel));
+    }
+    for d in [
+        "proc", "sys", "dev", "tmp", "run", "home", "boot", "boot/efi",
+    ] {
+        let _ = fs::create_dir_all(out.join(d));
+    }
+}
+
 impl super::LinuxRootfs {
     /// 生成镜像。
     pub fn image(&self) {
@@ -66,6 +153,16 @@ impl super::LinuxRootfs {
                 let _ = fs::remove_file(boot_dir.join(name));
             }
 
+            // Build the minimal live/installer root. Both initramfs images (the
+            // efi-embedded bootstrap and the live image) are built from THIS,
+            // not from the full rootfs: they are loaded into RAM at boot, so the
+            // heavy OS components (TinyX, perf, libLLVM, libc-test, …) must stay
+            // out of them. Those ship only in rootfs.btrfs.gz and run from the
+            // btrfs disk on the installed system (which pivots root onto it).
+            let live_root = TARGET.join("live-rootfs");
+            println!("Building minimal live/installer root...");
+            build_live_rootfs(&rootfs_path, &live_root);
+
             // 1. Build bootloader (rboot)
             println!("Building bootloader (rboot)...");
             let rboot_dir = PROJECT_DIR.join("rboot");
@@ -84,10 +181,17 @@ impl super::LinuxRootfs {
             });
             build_config.invoke(os_xtask_utils::Cargo::build);
 
-            // 3. Build initramfs SFS (x86_64.img)
-            println!("Building x86_64.img...");
+            // 3. Build the efi-embedded bootstrap initramfs SFS (x86_64.img)
+            // from the minimal root (no payloads). This is the initramfs the
+            // installer writes (inside efi.img) to the target ESP; the installed
+            // system boots it only to pivot root onto the btrfs partition.
+            let bootstrap_size = sfs_size_for(dir_size(&live_root));
+            println!(
+                "Building bootstrap initramfs x86_64.img ({} MiB)...",
+                bootstrap_size / (1024 * 1024)
+            );
             let initramfs_img = PROJECT_DIR.join("zCore").join("x86_64.img");
-            fuse(&rootfs_path, &initramfs_img, INITRAMFS_BYTES);
+            fuse(&live_root, &initramfs_img, bootstrap_size);
 
             // 4. Build efi.img (FAT32)
             println!("Building efi.img...");
@@ -172,12 +276,14 @@ impl super::LinuxRootfs {
             assert!(status.success(), "Failed to compress efi.img");
 
             // NOTE: the payloads (efi.img.gz / rootfs.btrfs.gz / home.btrfs.gz)
-            // are staged into the rootfs `/boot` only *after* rootfs.btrfs is
-            // built (see below), so the target root image is not polluted with
-            // the installer's own payloads and does not overflow its size.
+            // are staged into the minimal live root's `/boot` only *after*
+            // rootfs.btrfs is built (step 5c), so the full rootfs used for the
+            // target root image below stays clean and does not contain the
+            // installer's own payloads.
 
-            // 5. Build rootfs.btrfs from the clean rootfs (no installer payloads
-            // present yet). Size it to the actual rootfs with generous headroom.
+            // 5. Build rootfs.btrfs from the FULL rootfs (the installed system's
+            // real root, reached by pivot). Size it to the actual rootfs with
+            // generous headroom.
             println!("Building rootfs.btrfs...");
             let btrfs_img = TARGET.join("rootfs.btrfs");
             let rootfs_btrfs_size = std::cmp::max(
@@ -215,20 +321,21 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to compress home.btrfs");
 
-            // 5c. Stage the payloads in the rootfs /boot so the live installer
-            // (which runs from this very initramfs) can find them.
-            let efi_gz = boot_dir.join("efi.img.gz");
-            let btrfs_gz = boot_dir.join("rootfs.btrfs.gz");
-            let home_gz = boot_dir.join("home.btrfs.gz");
-            fs::copy(&target_efi_gz, &efi_gz).unwrap();
-            fs::copy(&target_btrfs_gz, &btrfs_gz).unwrap();
-            fs::copy(&target_home_gz, &home_gz).unwrap();
+            // 5c. Stage the payloads in the MINIMAL live root's /boot so the
+            // live installer (which runs from this very initramfs) can find
+            // them. They go into live_root — never the full rootfs — so
+            // rootfs.btrfs.gz above is not polluted with the installer's own
+            // payloads.
+            let live_boot = live_root.join("boot");
+            fs::create_dir_all(&live_boot).unwrap();
+            fs::copy(&target_efi_gz, live_boot.join("efi.img.gz")).unwrap();
+            fs::copy(&target_btrfs_gz, live_boot.join("rootfs.btrfs.gz")).unwrap();
+            fs::copy(&target_home_gz, live_boot.join("home.btrfs.gz")).unwrap();
 
-            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP.
-            // Unlike the efi-embedded base initramfs, this one carries the boot
-            // payloads, so it must be sized to fit rootfs + payloads — the fixed
-            // 80 MiB base size would overflow and silently drop the larger ones.
-            let live_size = sfs_size_for(dir_size(&rootfs_path));
+            // 6. Build the final installer-enabled x86_64.img (SFS) for QEMU/ESP
+            // from the minimal live root + payloads. Sized tightly because the
+            // whole image is loaded into RAM at boot.
+            let live_size = live_image_size(dir_size(&live_root));
             println!(
                 "Building final installer-enabled image ({} MiB)...",
                 live_size / (1024 * 1024)
@@ -236,11 +343,8 @@ impl super::LinuxRootfs {
             let image = PROJECT_DIR
                 .join("zCore")
                 .join(format!("{arch}.img", arch = self.0.name()));
-            fuse(&rootfs_path, &image, live_size);
+            fuse(&live_root, &image, live_size);
 
-            let _ = fs::remove_file(efi_gz);
-            let _ = fs::remove_file(btrfs_gz);
-            let _ = fs::remove_file(home_gz);
             println!("Build completed successfully!");
             return;
         }
