@@ -84,15 +84,52 @@ fn proc_ppid(proc: &Process) -> u64 {
     proc.linux().parent().map(|p| p.id()).unwrap_or(0)
 }
 
+/// The first (leader) thread of a process, if any, for reporting its
+/// scheduling attributes.
+fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
+    let id = *proc.thread_ids().first()?;
+    proc.get_child(id).ok()?.downcast_arc::<Thread>().ok()
+}
+
 fn proc_pid_stat(proc: &Process) -> String {
     let pid = proc.id();
     let comm = proc_comm(proc);
     let state = proc_state_char(proc.status());
     let ppid = proc_ppid(proc);
-    format!(
-        "{} ({}) {} {} 0 0 0 0 0 4194560 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid
-    )
+
+    let nthreads = proc.thread_ids().len().max(1) as i64;
+    // priority(18)/nice(19)/rt_priority(40)/policy(41) come from the leader
+    // thread. Per proc(5): for real-time policies the priority field is
+    // `-1 - rt_priority`; for the fair policies it is `20 + nice`.
+    let (priority, nice, rt_priority, policy) = match proc_first_thread(proc) {
+        Some(t) => {
+            let rt = t.sched_rt_priority() as i64;
+            let n = t.sched_nice() as i64;
+            let prio = if t.sched_is_realtime() {
+                -1 - rt
+            } else {
+                20 + n
+            };
+            (prio, n, rt, t.sched_policy() as i64)
+        }
+        None => (20, 0, 0, 0),
+    };
+
+    // Fields 5..=52 of /proc/[pid]/stat (proc(5)); 0 where not tracked. Indexed
+    // by `field - 5` to keep the field numbers obvious.
+    let mut rest = [0i64; 48];
+    rest[18 - 5] = priority;
+    rest[19 - 5] = nice;
+    rest[20 - 5] = nthreads;
+    rest[40 - 5] = rt_priority;
+    rest[41 - 5] = policy;
+
+    let mut out = format!("{} ({}) {} {}", pid, comm, state, ppid);
+    for v in rest.iter() {
+        let _ = write!(out, " {}", v);
+    }
+    out.push('\n');
+    out
 }
 
 fn proc_pid_status(proc: &Process) -> String {

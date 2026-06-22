@@ -238,6 +238,15 @@ impl Syscall<'_> {
             }
             Sys::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a0, a1, a2.into()),
             Sys::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a0, a1, a2.into()),
+            Sys::SCHED_SETSCHEDULER => self.sys_sched_setscheduler(a0, a1, a2.into()),
+            Sys::SCHED_GETSCHEDULER => self.sys_sched_getscheduler(a0),
+            Sys::SCHED_SETPARAM => self.sys_sched_setparam(a0, a1.into()),
+            Sys::SCHED_GETPARAM => self.sys_sched_getparam(a0, a1.into()),
+            Sys::SCHED_GET_PRIORITY_MAX => self.sys_sched_get_priority_max(a0),
+            Sys::SCHED_GET_PRIORITY_MIN => self.sys_sched_get_priority_min(a0),
+            Sys::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a0, a1.into()),
+            Sys::SCHED_SETATTR => self.sys_sched_setattr(a0, a1.into(), a2),
+            Sys::SCHED_GETATTR => self.sys_sched_getattr(a0, a1.into(), a2, a3),
 
             // socket
             Sys::SOCKET => self.sys_socket(a0, a1, a2),
@@ -346,12 +355,12 @@ impl Syscall<'_> {
             Sys::GETPGID => self.sys_getpgid(a0),
             Sys::GETGROUPS => self.sys_getgroups(a0, a1.into()),
             Sys::SETGROUPS => self.sys_setgroups(a0, a1.into()),
-            // Scheduling priority (nice). We do not implement priority
-            // scheduling, so accept setpriority as a no-op and report the
-            // default nice value (0) for getpriority. getpriority returns
-            // `20 - nice` so that valid values stay non-negative.
-            Sys::SETPRIORITY => self.unimplemented("setpriority", Ok(0)),
-            Sys::GETPRIORITY => self.unimplemented("getpriority", Ok(20)),
+            // Scheduling priority (nice). Backed by the thread's stored nice
+            // value, which also biases its timeslice (see
+            // `Thread::tick_should_preempt`). getpriority returns `20 - nice`
+            // so that valid values stay non-negative.
+            Sys::SETPRIORITY => self.sys_setpriority(a0, a1, a2 as i32),
+            Sys::GETPRIORITY => self.sys_getpriority(a0, a1),
             Sys::PRCTL => self.unimplemented("prctl", Ok(0)),
             Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),

@@ -409,13 +409,13 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         TrapReason::Interrupt(vector) => {
             kernel_hal::interrupt::handle_irq(vector);
             #[cfg(not(feature = "libos"))]
-            if vector == kernel_hal::context::TIMER_INTERRUPT_VEC
-                && kernel_hal::percpu::tick_should_preempt()
-            {
-                // Preempt on a multiple-of-tick quantum (≈ 20 ms at 250 Hz)
-                // instead of every raw tick. Cuts executor churn on
-                // CPU-bound workloads where the same task would otherwise
-                // be re-selected immediately.
+            if vector == kernel_hal::context::TIMER_INTERRUPT_VEC && thread.tick_should_preempt() {
+                // Preempt once the running thread's timeslice elapses rather
+                // than on every raw tick. The slice length comes from the
+                // thread's Linux scheduling policy / nice value (see
+                // `Thread::tick_should_preempt`), so `nice` and `SCHED_*`
+                // policies give a real, observable bias in CPU share while
+                // still cutting executor churn on CPU-bound workloads.
                 kernel_hal::thread::yield_now().await;
             }
             Ok(())
