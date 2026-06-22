@@ -16,7 +16,10 @@ use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
 use zircon_object::object::{KernelObject, KoID, Signal};
-use zircon_object::task::Status;
+use zircon_object::task::{
+    Status, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
+    SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+};
 use zircon_object::vm::USER_STACK_PAGES;
 
 const P_ALL: i32 = 0;
@@ -26,6 +29,39 @@ const P_PGID: i32 = 2;
 // pidfd — as glib's g_child_watch_source_new() uses — matched no arm and
 // returned EINVAL).
 const P_PIDFD: i32 = 3;
+
+/// `SCHED_RESET_ON_FORK`: OR-ed into the policy by `sched_setscheduler` /
+/// `sched_setattr`. Accepted but not modelled (we never fork-reset).
+const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
+/// `setpriority`/`getpriority` `which`: operate on a process (by PID).
+const PRIO_PROCESS: usize = 0;
+/// `setpriority`/`getpriority` `which`: operate on a process group.
+const PRIO_PGRP: usize = 1;
+/// `setpriority`/`getpriority` `which`: operate on a user (by UID).
+const PRIO_USER: usize = 2;
+
+/// Linux `struct sched_attr` (the v0 / 48-byte layout) used by
+/// `sched_setattr(2)` / `sched_getattr(2)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchedAttr {
+    /// Size of this structure in bytes.
+    pub size: u32,
+    /// Scheduling policy (a `SCHED_*` constant).
+    pub sched_policy: u32,
+    /// Scheduling flags (e.g. `SCHED_FLAG_RESET_ON_FORK`).
+    pub sched_flags: u64,
+    /// Nice value for the fair policies (-20..=19).
+    pub sched_nice: i32,
+    /// Static priority for the real-time policies (1..=99).
+    pub sched_priority: u32,
+    /// `SCHED_DEADLINE` runtime in nanoseconds (unused here).
+    pub sched_runtime: u64,
+    /// `SCHED_DEADLINE` relative deadline in nanoseconds (unused here).
+    pub sched_deadline: u64,
+    /// `SCHED_DEADLINE` period in nanoseconds (unused here).
+    pub sched_period: u64,
+}
 
 fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
     if infop.is_null() {
@@ -741,6 +777,257 @@ impl Syscall<'_> {
         let bytes = mask.to_le_bytes();
         mask_ptr.write_array(&bytes[..n])?;
         Ok(n)
+    }
+
+    /// Resolve the thread targeted by a `sched_*` / `*priority` call.
+    ///
+    /// `pid == 0` (or the caller's own TID) selects the calling thread; any
+    /// other value is looked up with [`find_thread_by_tid`](Self::find_thread_by_tid),
+    /// which also accepts a process id for single-threaded programs. Missing
+    /// targets yield `ESRCH`, matching Linux.
+    fn sched_target(&self, pid: usize) -> Result<Arc<Thread>, LxError> {
+        if pid == 0 || pid as u64 == self.thread.id() {
+            Ok(self.thread.inner())
+        } else {
+            self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)
+        }
+    }
+
+    /// Validate a `(policy, sched_priority, nice)` triple against Linux's rules
+    /// and return the normalised `(policy, rt_priority, nice)` to store.
+    ///
+    /// Real-time policies require `sched_priority` in `1..=99`; the fair
+    /// policies require it to be `0`. The nice value is clamped to `-20..=19`.
+    fn sched_validate(policy: u8, sched_priority: i32, nice: i32) -> Result<(u8, u8, i8), LxError> {
+        let nice = nice.clamp(MIN_NICE as i32, MAX_NICE as i32) as i8;
+        match policy {
+            SCHED_FIFO | SCHED_RR => {
+                if !(MIN_RT_PRIO as i32..=MAX_RT_PRIO as i32).contains(&sched_priority) {
+                    return Err(LxError::EINVAL);
+                }
+                Ok((policy, sched_priority as u8, nice))
+            }
+            SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => {
+                if sched_priority != 0 {
+                    return Err(LxError::EINVAL);
+                }
+                Ok((policy, 0, nice))
+            }
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    /// `(min, max)` `sched_priority` for `policy`, or `EINVAL` for an unknown one.
+    fn rt_priority_bounds(policy: usize) -> Result<(u8, u8), LxError> {
+        if policy == SCHED_FIFO as usize || policy == SCHED_RR as usize {
+            Ok((MIN_RT_PRIO, MAX_RT_PRIO))
+        } else if policy == SCHED_NORMAL as usize
+            || policy == SCHED_BATCH as usize
+            || policy == SCHED_IDLE as usize
+        {
+            Ok((0, 0))
+        } else {
+            Err(LxError::EINVAL)
+        }
+    }
+
+    /// `sched_setscheduler` sets both the scheduling policy and (real-time)
+    /// priority of thread `pid`. The thread's nice value is preserved.
+    ///
+    /// See [linux man sched_setscheduler(2)](https://www.man7.org/linux/man-pages/man2/sched_setscheduler.2.html).
+    pub fn sys_sched_setscheduler(
+        &self,
+        pid: usize,
+        policy: usize,
+        param: UserInPtr<i32>,
+    ) -> SysResult {
+        // The high SCHED_RESET_ON_FORK bit is accepted but not modelled.
+        let base = policy & !SCHED_RESET_ON_FORK;
+        if base > u8::MAX as usize {
+            return Err(LxError::EINVAL);
+        }
+        let sched_priority = param.read()?;
+        info!(
+            "sched_setscheduler: pid={} policy={} priority={}",
+            pid, base, sched_priority
+        );
+        let thread = self.sched_target(pid)?;
+        let (p, rt, nice) =
+            Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
+        thread.set_sched(p, nice, rt);
+        Ok(0)
+    }
+
+    /// `sched_getscheduler` returns the scheduling policy of thread `pid`.
+    ///
+    /// See [linux man sched_getscheduler(2)](https://www.man7.org/linux/man-pages/man2/sched_getscheduler.2.html).
+    pub fn sys_sched_getscheduler(&self, pid: usize) -> SysResult {
+        let thread = self.sched_target(pid)?;
+        Ok(thread.sched_policy() as usize)
+    }
+
+    /// `sched_setparam` sets the (real-time) priority of thread `pid` without
+    /// changing its policy.
+    ///
+    /// See [linux man sched_setparam(2)](https://www.man7.org/linux/man-pages/man2/sched_setparam.2.html).
+    pub fn sys_sched_setparam(&self, pid: usize, param: UserInPtr<i32>) -> SysResult {
+        let sched_priority = param.read()?;
+        let thread = self.sched_target(pid)?;
+        let (p, rt, nice) = Self::sched_validate(
+            thread.sched_policy(),
+            sched_priority,
+            thread.sched_nice() as i32,
+        )?;
+        thread.set_sched(p, nice, rt);
+        Ok(0)
+    }
+
+    /// `sched_getparam` writes the (real-time) priority of thread `pid` into the
+    /// user-supplied `struct sched_param`.
+    ///
+    /// See [linux man sched_getparam(2)](https://www.man7.org/linux/man-pages/man2/sched_getparam.2.html).
+    pub fn sys_sched_getparam(&self, pid: usize, mut param: UserOutPtr<i32>) -> SysResult {
+        let thread = self.sched_target(pid)?;
+        param.write(thread.sched_rt_priority() as i32)?;
+        Ok(0)
+    }
+
+    /// `sched_get_priority_max` returns the maximum `sched_priority` usable with
+    /// `policy` (99 for FIFO/RR, 0 for the fair policies).
+    pub fn sys_sched_get_priority_max(&self, policy: usize) -> SysResult {
+        Ok(Self::rt_priority_bounds(policy)?.1 as usize)
+    }
+
+    /// `sched_get_priority_min` returns the minimum `sched_priority` usable with
+    /// `policy` (1 for FIFO/RR, 0 for the fair policies).
+    pub fn sys_sched_get_priority_min(&self, policy: usize) -> SysResult {
+        Ok(Self::rt_priority_bounds(policy)?.0 as usize)
+    }
+
+    /// `sched_rr_get_interval` writes the round-robin timeslice of thread `pid`
+    /// into `interval`. Non-`SCHED_RR` threads report a zero interval.
+    ///
+    /// See [linux man sched_rr_get_interval(2)](https://www.man7.org/linux/man-pages/man2/sched_rr_get_interval.2.html).
+    pub fn sys_sched_rr_get_interval(
+        &self,
+        pid: usize,
+        mut interval: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
+        let thread = self.sched_target(pid)?;
+        let ts = if thread.sched_policy() == SCHED_RR {
+            TimeSpec {
+                sec: 0,
+                nsec: 100_000_000,
+            }
+        } else {
+            TimeSpec { sec: 0, nsec: 0 }
+        };
+        interval.write(ts)?;
+        Ok(0)
+    }
+
+    /// `sched_setattr` sets policy, nice and real-time priority of thread `pid`
+    /// from a `struct sched_attr`. `SCHED_DEADLINE` is rejected (`EINVAL`) since
+    /// this scheduler has no deadline runqueue.
+    ///
+    /// See [linux man sched_setattr(2)](https://www.man7.org/linux/man-pages/man2/sched_setattr.2.html).
+    pub fn sys_sched_setattr(
+        &self,
+        pid: usize,
+        attr: UserInPtr<SchedAttr>,
+        flags: usize,
+    ) -> SysResult {
+        if flags != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let a = attr.read()?;
+        if (a.size as usize) < size_of::<SchedAttr>() {
+            return Err(LxError::EINVAL);
+        }
+        let policy = (a.sched_policy & !(SCHED_RESET_ON_FORK as u32)) as usize;
+        if policy == SCHED_DEADLINE as usize || policy > u8::MAX as usize {
+            return Err(LxError::EINVAL);
+        }
+        info!(
+            "sched_setattr: pid={} policy={} nice={}",
+            pid, policy, a.sched_nice
+        );
+        let thread = self.sched_target(pid)?;
+        let (p, rt, nice) =
+            Self::sched_validate(policy as u8, a.sched_priority as i32, a.sched_nice)?;
+        thread.set_sched(p, nice, rt);
+        Ok(0)
+    }
+
+    /// `sched_getattr` writes thread `pid`'s scheduling attributes into a
+    /// caller-supplied `struct sched_attr` of `size` bytes.
+    ///
+    /// See [linux man sched_getattr(2)](https://www.man7.org/linux/man-pages/man2/sched_getattr.2.html).
+    pub fn sys_sched_getattr(
+        &self,
+        pid: usize,
+        mut attr: UserOutPtr<SchedAttr>,
+        size: usize,
+        flags: usize,
+    ) -> SysResult {
+        if flags != 0 {
+            return Err(LxError::EINVAL);
+        }
+        if size < size_of::<SchedAttr>() {
+            return Err(LxError::EINVAL);
+        }
+        let thread = self.sched_target(pid)?;
+        let a = SchedAttr {
+            size: size_of::<SchedAttr>() as u32,
+            sched_policy: thread.sched_policy() as u32,
+            sched_flags: 0,
+            sched_nice: thread.sched_nice() as i32,
+            sched_priority: thread.sched_rt_priority() as u32,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        attr.write(a)?;
+        Ok(0)
+    }
+
+    /// `setpriority` sets the nice value of the target selected by `which`/`who`.
+    ///
+    /// Only `PRIO_PROCESS` resolves to a specific task; `PRIO_PGRP` / `PRIO_USER`
+    /// are accepted and applied to the calling thread so `nice(1)` / `renice`
+    /// behave sensibly. `prio` is clamped to the nice range `-20..=19`.
+    ///
+    /// See [linux man setpriority(2)](https://www.man7.org/linux/man-pages/man2/setpriority.2.html).
+    pub fn sys_setpriority(&self, which: usize, who: usize, prio: i32) -> SysResult {
+        if which != PRIO_PROCESS && which != PRIO_PGRP && which != PRIO_USER {
+            return Err(LxError::EINVAL);
+        }
+        let nice = prio.clamp(MIN_NICE as i32, MAX_NICE as i32) as i8;
+        let thread = if which == PRIO_PROCESS {
+            self.sched_target(who)?
+        } else {
+            self.thread.inner()
+        };
+        info!("setpriority: which={} who={} nice={}", which, who, nice);
+        thread.set_sched(thread.sched_policy(), nice, thread.sched_rt_priority());
+        Ok(0)
+    }
+
+    /// `getpriority` returns the nice value of the target selected by
+    /// `which`/`who`, encoded as `20 - nice` so the raw syscall return stays
+    /// non-negative (glibc converts it back to the user-visible nice value).
+    ///
+    /// See [linux man getpriority(2)](https://www.man7.org/linux/man-pages/man2/getpriority.2.html).
+    pub fn sys_getpriority(&self, which: usize, who: usize) -> SysResult {
+        if which != PRIO_PROCESS && which != PRIO_PGRP && which != PRIO_USER {
+            return Err(LxError::EINVAL);
+        }
+        let thread = if which == PRIO_PROCESS {
+            self.sched_target(who)?
+        } else {
+            self.thread.inner()
+        };
+        Ok((20 - thread.sched_nice() as isize) as usize)
     }
 
     /// `set_tid_address` sets the clear_child_tid value for the calling thread to `tidptr`,

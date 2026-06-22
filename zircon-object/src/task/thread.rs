@@ -3,7 +3,7 @@ mod thread_state;
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use core::{any::Any, future::Future, pin::Pin};
@@ -83,6 +83,93 @@ use crate::{define_count_helper, impl_kobject, ZxError, ZxResult};
 /// [`THREAD_TERMINATED`]: crate::object::Signal::THREAD_TERMINATED
 /// [`THREAD_SUSPENDED`]: crate::object::Signal::THREAD_SUSPENDED
 /// [`THREAD_RUNNING`]: crate::object::Signal::THREAD_RUNNING
+/// Linux scheduling policy: time-sharing fair scheduling (a.k.a. `SCHED_OTHER`).
+pub const SCHED_NORMAL: u8 = 0;
+/// Linux scheduling policy: first-in-first-out real-time scheduling.
+pub const SCHED_FIFO: u8 = 1;
+/// Linux scheduling policy: round-robin real-time scheduling.
+pub const SCHED_RR: u8 = 2;
+/// Linux scheduling policy: "batch" fair scheduling (treated like `SCHED_NORMAL`).
+pub const SCHED_BATCH: u8 = 3;
+/// Linux scheduling policy: very-low-priority background fair scheduling.
+pub const SCHED_IDLE: u8 = 5;
+/// Linux scheduling policy: sporadic-task deadline scheduling. Accepted by the
+/// ABI but not honoured by this scheduler.
+pub const SCHED_DEADLINE: u8 = 6;
+
+/// Smallest (highest-priority) nice value.
+pub const MIN_NICE: i8 = -20;
+/// Largest (lowest-priority) nice value.
+pub const MAX_NICE: i8 = 19;
+/// Lowest real-time static priority for `SCHED_FIFO` / `SCHED_RR`.
+pub const MIN_RT_PRIO: u8 = 1;
+/// Highest real-time static priority for `SCHED_FIFO` / `SCHED_RR`.
+pub const MAX_RT_PRIO: u8 = 99;
+
+/// CFS load weight of a nice-0 task (`sched_prio_to_weight[20]` in Linux).
+const WEIGHT_NICE0: u32 = 1024;
+
+/// Linux's `sched_prio_to_weight[]`: the load weight for nice values -20..=19.
+/// Adjacent levels differ by ~25%, i.e. one nice step is roughly 10% of CPU —
+/// exactly the design described in
+/// `Documentation/scheduler/sched-nice-design.rst`.
+const SCHED_PRIO_TO_WEIGHT: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, // nice -20..=-16
+    29154, 23254, 18705, 14949, 11916, // nice -15..=-11
+    9548, 7620, 6100, 4904, 3906, //      nice -10..=-6
+    3121, 2501, 1991, 1586, 1277, //      nice  -5..=-1
+    1024, 820, 655, 526, 423, //          nice   0..=4
+    335, 272, 215, 172, 137, //           nice   5..=9
+    110, 87, 70, 56, 45, //               nice  10..=14
+    36, 29, 23, 18, 15, //                nice  15..=19
+];
+
+/// Map a nice value to its CFS load weight.
+fn nice_to_weight(nice: i8) -> u32 {
+    let clamped = nice.clamp(MIN_NICE, MAX_NICE);
+    SCHED_PRIO_TO_WEIGHT[(clamped as i32 + 20) as usize]
+}
+
+/// Base timeslice (in 250 Hz timer ticks) for a nice-0 fair task: ~20 ms.
+const BASE_TIMESLICE_TICKS: u32 = 5;
+/// Timeslice for `SCHED_RR` tasks: ~100 ms, matching Linux's default RR quantum.
+const RR_TIMESLICE_TICKS: u32 = 25;
+/// Never give a runnable task a slice shorter than this (one ~4 ms tick).
+const MIN_TIMESLICE_TICKS: u32 = 1;
+/// Cap a fair task's slice so a very negative nice can't monopolise a CPU
+/// (~120 ms).
+const MAX_TIMESLICE_TICKS: u32 = 30;
+
+/// Per-thread Linux-compatible scheduling attributes.
+///
+/// The kernel core is an async per-CPU executor, not a Linux runqueue, so these
+/// attributes do not select *which* runnable task runs next. They are honoured
+/// for the *length* of a task's timeslice (see [`Thread::tick_should_preempt`])
+/// so that `nice` and the scheduling policy have a real, observable effect on
+/// CPU share, and they are reported faithfully through the `sched_*` /
+/// `setpriority` syscalls and procfs.
+struct SchedAttr {
+    /// Scheduling policy (one of the `SCHED_*` constants).
+    policy: AtomicU8,
+    /// Nice value (-20..=19); only meaningful for the fair policies.
+    nice: AtomicI8,
+    /// Static real-time priority (1..=99 for FIFO/RR, else 0).
+    rt_priority: AtomicU8,
+    /// Timer ticks left in the current slice; 0 means "refill on the next tick".
+    quantum: AtomicU32,
+}
+
+impl Default for SchedAttr {
+    fn default() -> Self {
+        Self {
+            policy: AtomicU8::new(SCHED_NORMAL),
+            nice: AtomicI8::new(0),
+            rt_priority: AtomicU8::new(0),
+            quantum: AtomicU32::new(0),
+        }
+    }
+}
+
 pub struct Thread {
     base: KObjectBase,
     _counter: CountHelper,
@@ -95,6 +182,8 @@ pub struct Thread {
     /// so `set_affinity` takes effect on a running thread. Defaults to
     /// "all CPUs" (`u64::MAX`).
     affinity: Arc<AtomicU64>,
+    /// Linux-compatible scheduling attributes (policy / nice / RT priority).
+    sched: SchedAttr,
 }
 
 impl_kobject!(Thread
@@ -234,6 +323,7 @@ impl Thread {
                 ..Default::default()
             }),
             affinity: Arc::new(AtomicU64::new(u64::MAX)),
+            sched: SchedAttr::default(),
         });
         proc.add_thread(thread.clone())?;
         Ok(thread)
@@ -312,6 +402,88 @@ impl Thread {
         }
         self.affinity.store(mask, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The thread's current scheduling policy (one of the `SCHED_*` constants).
+    pub fn sched_policy(&self) -> u8 {
+        self.sched.policy.load(Ordering::Relaxed)
+    }
+
+    /// The thread's nice value (-20..=19).
+    pub fn sched_nice(&self) -> i8 {
+        self.sched.nice.load(Ordering::Relaxed)
+    }
+
+    /// The thread's static real-time priority (1..=99 for FIFO/RR, else 0).
+    pub fn sched_rt_priority(&self) -> u8 {
+        self.sched.rt_priority.load(Ordering::Relaxed)
+    }
+
+    /// Whether the thread runs under a real-time policy (`SCHED_FIFO` /
+    /// `SCHED_RR`).
+    pub fn sched_is_realtime(&self) -> bool {
+        matches!(self.sched_policy(), SCHED_FIFO | SCHED_RR)
+    }
+
+    /// Replace the thread's scheduling attributes.
+    ///
+    /// The `sched_*` / `setpriority` syscalls are responsible for validating the
+    /// values against Linux's rules before calling this; it just stores them and
+    /// forces the next timer tick to recompute the timeslice so the change takes
+    /// effect promptly.
+    pub fn set_sched(&self, policy: u8, nice: i8, rt_priority: u8) {
+        self.sched.policy.store(policy, Ordering::Relaxed);
+        self.sched.nice.store(nice, Ordering::Relaxed);
+        self.sched.rt_priority.store(rt_priority, Ordering::Relaxed);
+        // Drop the remainder of the old slice; the next tick refills from the
+        // new policy/nice (see `tick_should_preempt`).
+        self.sched.quantum.store(0, Ordering::Relaxed);
+    }
+
+    /// Length of this thread's timeslice in 250 Hz timer ticks.
+    ///
+    /// `SCHED_FIFO` returns [`u32::MAX`] (it is never time-sliced); `SCHED_RR`
+    /// returns a fixed ~100 ms quantum; `SCHED_IDLE` the minimum; and the fair
+    /// policies scale [`BASE_TIMESLICE_TICKS`] by the nice→weight ratio so each
+    /// nice step is worth roughly 10% more/less CPU.
+    fn timeslice_ticks(&self) -> u32 {
+        match self.sched_policy() {
+            SCHED_FIFO => u32::MAX,
+            SCHED_RR => RR_TIMESLICE_TICKS,
+            SCHED_IDLE => MIN_TIMESLICE_TICKS,
+            _ => {
+                let w = nice_to_weight(self.sched_nice()) as u64;
+                let t = (BASE_TIMESLICE_TICKS as u64 * w + WEIGHT_NICE0 as u64 / 2)
+                    / WEIGHT_NICE0 as u64;
+                (t as u32).clamp(MIN_TIMESLICE_TICKS, MAX_TIMESLICE_TICKS)
+            }
+        }
+    }
+
+    /// Account one timer tick to the running thread and report whether its
+    /// timeslice has elapsed and it should be preempted.
+    ///
+    /// Called from the timer-interrupt path of the user-trap handler for the
+    /// thread currently executing on this CPU. A `SCHED_FIFO` thread is never
+    /// preempted here (it yields the CPU only by blocking or calling
+    /// `sched_yield`); every other policy is preempted once its nice/policy
+    /// derived slice is exhausted. The countdown lives in the thread (not the
+    /// CPU), so it survives the executor migrating the thread between cores.
+    pub fn tick_should_preempt(&self) -> bool {
+        let slice = self.timeslice_ticks();
+        if slice == u32::MAX {
+            return false;
+        }
+        let q = &self.sched.quantum;
+        let mut n = q.load(Ordering::Relaxed);
+        // Refill at the start of a slice, and also if a `set_sched` shrank the
+        // slice below the in-flight countdown.
+        if n == 0 || n > slice {
+            n = slice;
+        }
+        n -= 1;
+        q.store(n, Ordering::Relaxed);
+        n == 0
     }
 
     /// Setup the instruction and stack pointer, then tart execution on the thread
