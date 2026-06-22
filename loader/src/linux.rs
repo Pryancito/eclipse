@@ -421,62 +421,14 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             Ok(())
         }
         TrapReason::PageFault(vaddr, flags) => {
-            // DEBUG: comprobar (cada 256 faults) si el ZERO_FRAME compartido se ha
-            // corrompido -> confirmaría que alguna página se mapeó ESCRIBIBLE al
-            // frame cero global (COW-break fallido) y las escrituras lo pisan.
-            #[cfg(not(feature = "libos"))]
-            {
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static FC: AtomicUsize = AtomicUsize::new(0);
-                if FC.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
-                    let zp = kernel_hal::mem::ZERO_FRAME.paddr();
-                    let kv = 0xffff_8000_0000_0000usize + zp;
-                    let mut nz = 0usize;
-                    let mut first = 0usize;
-                    for i in 0..512 {
-                        let w = unsafe { core::ptr::read_volatile((kv + i * 8) as *const u64) };
-                        if w != 0 {
-                            nz += 1;
-                            if first == 0 {
-                                first = i * 8;
-                            }
-                        }
-                    }
-                    if nz != 0 {
-                        warn!(
-                            "[zerocheck] !!! ZERO_FRAME CORRUPTO: {}/512 words no-cero, primer off={:#x} (paddr={:#x})",
-                            nz, first, zp
-                        );
-                    }
-                }
-            }
             trace!(
                 "page fault from user mode @ {:#x}({:?}), pid={}",
                 vaddr,
                 flags,
                 pid
             );
-            // DIAGNOSTIC (temporal): si el eco en vivo está armado (execve de
-            // perf), imprimimos el page fault ANTES de resolverlo. Si el kernel se
-            // congela DENTRO de handle_page_fault, esta línea PGF (sin un "ok"
-            // detrás) será la última en pantalla y señala el fault culpable.
-            let echo = kernel_hal::diag::echo_on();
-            if echo {
-                kernel_hal::console::console_write_fmt(format_args!(
-                    "PGF[{}] -> @ {:#x} ({:?})\n",
-                    pid, vaddr, flags
-                ));
-            }
             let vmar = thread.proc().vmar();
             let pgf_res = vmar.handle_page_fault(vaddr, flags);
-            if echo {
-                kernel_hal::console::console_write_fmt(format_args!(
-                    "PGF[{}] <- @ {:#x} => {}\n",
-                    pid,
-                    vaddr,
-                    if pgf_res.is_ok() { "ok" } else { "ERR" }
-                ));
-            }
             if let Err(err) = pgf_res {
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))

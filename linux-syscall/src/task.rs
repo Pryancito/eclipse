@@ -489,17 +489,6 @@ impl Syscall<'_> {
             path_str,
             args
         );
-        // DIAGNOSTIC (temporal): el sistema se congela EN DURO al lanzar `perf`
-        // antes incluso de llegar a perf_event_open, así que armamos aquí (en el
-        // execve de perf) el eco en vivo de syscalls + page faults a consola. La
-        // última línea en pantalla antes del freeze será la operación culpable.
-        if path_str.contains("perf") || args.iter().any(|a| a.contains("perf")) {
-            kernel_hal::diag::set_echo(true);
-            kernel_hal::console::console_write_fmt(format_args!(
-                "TRC: echo ARMADO por execve {:?}\n",
-                path_str
-            ));
-        }
         if args.is_empty() {
             error!("execve: args is empty");
             return Err(LxError::EINVAL);

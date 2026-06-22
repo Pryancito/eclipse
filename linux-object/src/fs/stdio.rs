@@ -250,12 +250,6 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // ioctl argument by value, not a pointer. X puts the keyboard into
             // K_RAW/K_OFF this way during console takeover.
             let mode = data as i32;
-            warn!(
-                "[kbd-diag] KDSKBMODE vt={} mode={} (active_vt={})",
-                vt,
-                mode,
-                kernel_hal::console::active_vt()
-            );
             TTY_STATES[vt_clamp(vt)]
                 .kbd_mode
                 .store(mode, Ordering::Relaxed);
@@ -562,26 +556,6 @@ fn handle_key_event(event: &InputEvent) {
     use zcore_drivers::input::input_event_codes::key::*;
     if event.event_type != InputEventType::Key {
         return;
-    }
-    // Temporary keyboard diagnostics for the Xfbdev/kdrive medium-raw path:
-    // log the first handful of key events with the active VT and its keyboard
-    // mode. If these never appear, the USB keyboard is producing no events; if
-    // `mode` is not 2 (K_MEDIUMRAW) while X is up, kdrive's KDSKBMODE landed on
-    // a different VT than the one the keystrokes are routed to.
-    {
-        static KBD_DIAG: AtomicU8 = AtomicU8::new(0);
-        if KBD_DIAG.load(Ordering::Relaxed) < 80 {
-            KBD_DIAG.fetch_add(1, Ordering::Relaxed);
-            let avt = kernel_hal::console::active_vt();
-            warn!(
-                "[kbd-diag] code={} val={} active_vt={} mode={} medium_raw_vt={:?}",
-                event.code,
-                event.value,
-                avt,
-                tty_kbd_mode(avt),
-                medium_raw_vt()
-            );
-        }
     }
     // Linux input: value 1 = press, 0 = release, 2 = autorepeat. Track the
     // modifier state but don't return — the medium-raw path below has to emit
