@@ -18,6 +18,40 @@ pub fn timer_now() -> Duration {
     Duration::from_nanos(prev.max(ns))
 }
 
+// ---------------------------------------------------------------------------
+// Tickless-idle LAPIC timer re-arming
+// ---------------------------------------------------------------------------
+// The LAPIC timer counts raw CPU cycles: boot programs `TimerDivide::Div256`,
+// which on this hardware behaves as divide-by-1 (see `drivers.rs`). So the
+// initial-count register is just `cycles`. We modulate that count to stretch
+// the periodic tick when a CPU goes idle, then restore it on resume.
+
+use super::super::timer::TICKS_PER_SEC;
+use zcore_drivers::irq::x86::Apic;
+
+/// LAPIC timer initial count for the normal full-rate scheduler tick (4 ms at
+/// 250 Hz). Mirrors the value programmed in `drivers.rs` at boot.
+pub fn fast_tick_count() -> u32 {
+    (super::cpu::cpu_frequency() as u64 * 1_000_000 / TICKS_PER_SEC) as u32
+}
+
+/// Convert a now-relative nanosecond span to LAPIC timer cycles. `cpu_frequency`
+/// is in MHz (= cycles per microsecond). Clamped to a non-zero `u32`: a count of
+/// 0 stops the timer, and counts above `u32::MAX` are not representable.
+pub fn ns_to_tick_count(ns: u64) -> u32 {
+    let cycles = (super::cpu::cpu_frequency() as u64).saturating_mul(ns) / 1000;
+    cycles.clamp(1, u32::MAX as u64) as u32
+}
+
+/// Reprogram this CPU's LAPIC timer initial count (the period, in periodic
+/// mode). Safe from any CPU: the LAPIC registers are per-CPU hardware reached
+/// through the local MMIO window / MSRs.
+pub fn set_tick_count(count: u32) {
+    if Apic::local_apic_ready() {
+        Apic::local_apic().set_timer_initial(count);
+    }
+}
+
 static WALL_CLOCK_INIT: Once = Once::new();
 
 pub fn init() {

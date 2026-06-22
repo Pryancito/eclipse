@@ -832,6 +832,10 @@ impl Future for ThreadSwitchFuture {
                 kernel_hal::vm::activate_paging(self.thread.proc().vmar().table_phys());
             }
         }
+        // Resuming real work on this CPU: undo any tickless-idle tick stretch so
+        // preemption/HID polling run at full rate again. Cheap no-op (one
+        // per-CPU flag read) unless this is the first poll after an idle stretch.
+        kernel_hal::timer::timer_idle_exit();
         kernel_hal::thread::set_current_thread(Some(self.thread.clone()));
         let ret = {
             // Count this thread as running only while it is actually being
