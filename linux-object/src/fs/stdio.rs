@@ -1191,6 +1191,14 @@ impl Stdin {
 
         // 2. Signals
         if lflag & ISIG != 0 {
+            // A job-control signal (Ctrl-C/Ctrl-\/Ctrl-Z) also lifts an IXON
+            // output freeze, so the signalled process can run, print, or die
+            // instead of staying blocked behind a Ctrl-S.
+            if c as u8 == c_cc[VINTR] || c as u8 == c_cc[VQUIT] || c as u8 == c_cc[VSUSP] {
+                TTY_STATES[vt_clamp(self.vt)]
+                    .flow_stopped
+                    .store(false, Ordering::Relaxed);
+            }
             if c as u8 == c_cc[VINTR] {
                 ctrl_c_pending_set();
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
@@ -1403,8 +1411,13 @@ impl Stdin {
 fn tty_write_out(vt: usize, buf: &[u8]) {
     // Honor software flow control: while output is stopped by VSTOP (Ctrl-S),
     // block here until a VSTART (Ctrl-Q) keystroke clears the flag. Keyboard
-    // IRQs keep firing while we spin, so the flag can still be cleared.
+    // IRQs keep firing while we spin, so the flag can still be cleared. Bail out
+    // on a pending Ctrl-C so a process blocked on a frozen terminal stays
+    // killable (the SIGINT will be handled once this syscall returns).
     while tty_flow_stopped(vt) {
+        if ctrl_c_pending_peek() {
+            break;
+        }
         core::hint::spin_loop();
     }
     let termios = tty_termios(vt).lock();

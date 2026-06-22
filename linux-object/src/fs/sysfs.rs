@@ -1608,19 +1608,20 @@ impl INode for PmAttrINode {
                 // Validate against the advertised states; we don't actually
                 // suspend, so a successful write is a logged no-op.
                 if POWER_STATES.split_whitespace().any(|st| st == s) || s == "standby" {
-                    warn!("/sys/power/state: '{}' requested (suspend not implemented)", s);
+                    warn!(
+                        "/sys/power/state: '{}' requested (suspend not implemented)",
+                        s
+                    );
                 } else {
                     return Err(FsError::InvalidParam);
                 }
             }
-            PmAttr::PowerDisk => {
-                match s {
-                    "platform" | "shutdown" | "reboot" | "suspend" => {
-                        PM.lock().disk_mode = String::from(s)
-                    }
-                    _ => return Err(FsError::InvalidParam),
+            PmAttr::PowerDisk => match s {
+                "platform" | "shutdown" | "reboot" | "suspend" => {
+                    PM.lock().disk_mode = String::from(s)
                 }
-            }
+                _ => return Err(FsError::InvalidParam),
+            },
             PmAttr::CpuOnline(i) => {
                 let on: u32 = s.parse().map_err(|_| FsError::InvalidParam)?;
                 if i == 0 && on == 0 {
@@ -1761,7 +1762,10 @@ impl INode for SysDevicesSystemCpuDirINode {
         match name {
             "." => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
             ".." => Ok(Arc::new(SysDevicesSystemDirINode)),
-            "online" => Ok(Arc::new(Pseudo::new(&online_cpu_list(count), FileType::File))),
+            "online" => Ok(Arc::new(Pseudo::new(
+                &online_cpu_list(count),
+                FileType::File,
+            ))),
             "present" | "possible" => Ok(Arc::new(Pseudo::new(&cpu_range(count), FileType::File))),
             "kernel_max" => Ok(Arc::new(Pseudo::new(
                 &format!("{}\n", count.saturating_sub(1)),
@@ -1769,7 +1773,10 @@ impl INode for SysDevicesSystemCpuDirINode {
             ))),
             _ => {
                 // cpuN directories.
-                if let Some(idx) = name.strip_prefix("cpu").and_then(|n| n.parse::<usize>().ok()) {
+                if let Some(idx) = name
+                    .strip_prefix("cpu")
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
                     if idx < count {
                         return Ok(Arc::new(SysCpuNDirINode { cpu: idx }));
                     }

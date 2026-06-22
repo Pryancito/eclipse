@@ -216,6 +216,12 @@ impl Pty {
                             inner.input.clear();
                             inner.canon.clear();
                         }
+                        // Resume any output frozen by Ctrl-S so the signalled
+                        // program isn't left blocked behind a stopped terminal.
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake_master = true;
+                        }
                         if lflag & ECHO != 0 {
                             inner.output.extend(label.as_bytes());
                             inner.output.extend(b"\r\n");
@@ -255,7 +261,8 @@ impl Pty {
                                 inner.output.extend(b"^R");
                             }
                             inner.output.extend(b"\r\n");
-                            let pending: alloc::vec::Vec<u8> = inner.canon.iter().copied().collect();
+                            let pending: alloc::vec::Vec<u8> =
+                                inner.canon.iter().copied().collect();
                             for b in pending {
                                 echo_byte(&mut inner.output, b, lflag, oflag);
                             }
