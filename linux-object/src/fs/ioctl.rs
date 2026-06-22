@@ -40,9 +40,12 @@ impl Termios {
             // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
             c_lflag: 0x803b,
             c_line: 0,
+            // Matches Linux `INIT_C_CC` (include/linux/tty.h): VINTR=^C, VQUIT=^\,
+            // VERASE=DEL, VKILL=^U, VEOF=^D, VMIN=1, VSTART=^Q, VSTOP=^S, VSUSP=^Z,
+            // VREPRINT=^R(18), VDISCARD=^O(15), VWERASE=^W(23), VLNEXT=^V(22).
             c_cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
             ],
             ispeed: 15, // B38400
             ospeed: 15,

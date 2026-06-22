@@ -952,6 +952,9 @@ pub struct Stdin {
     /// Atomic flag set by `push()` so `SerialFuture` can detect new data
     /// without requiring `eventbus.lock()` from the IRQ path.
     data_ready: core::sync::atomic::AtomicBool,
+    /// `VLNEXT` (literal-next, Ctrl-V) latch: when set, the next character is
+    /// inserted verbatim, bypassing signal and line-editing processing.
+    lnext: core::sync::atomic::AtomicBool,
 }
 
 impl Stdin {
@@ -962,6 +965,7 @@ impl Stdin {
             canon_buf: Mutex::new(VecDeque::new()),
             eventbus: Mutex::new(EventBus::default()),
             data_ready: core::sync::atomic::AtomicBool::new(false),
+            lnext: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1013,6 +1017,73 @@ impl Stdin {
         }
     }
 
+    /// Mark new data available and wake any blocked reader / poller. Mirrors the
+    /// notification dance used by the canonical/raw paths in [`push`].
+    fn wake_readers(&self) {
+        self.data_ready.store(true, Ordering::Release);
+        if let Some(mut eb) = self.eventbus.try_lock() {
+            self.data_ready.store(false, Ordering::Relaxed);
+            eb.set(Event::READABLE);
+        } else {
+            wake_tty_intr_waiters();
+        }
+    }
+
+    /// `VWERASE` (word erase, Ctrl-W): drop trailing whitespace, then the
+    /// preceding word, from the pending canonical line, echoing the erase.
+    fn word_erase(&self, lflag: u32) {
+        let echo = lflag & ECHO != 0;
+        let mut canon = self.canon_buf.lock();
+        // Skip any trailing blanks first.
+        while matches!(canon.back(), Some(' ') | Some('\t')) {
+            canon.pop_back();
+            if echo {
+                self.echo("\x08 \x08");
+            }
+        }
+        // Then erase the word itself, up to (not including) the next blank.
+        while let Some(&ch) = canon.back() {
+            if ch == ' ' || ch == '\t' {
+                break;
+            }
+            canon.pop_back();
+            if echo {
+                self.echo("\x08 \x08");
+            }
+        }
+    }
+
+    /// `VREPRINT` (reprint, Ctrl-R): redraw the pending canonical line on a
+    /// fresh line so the user can see input after noise (e.g. a kernel message).
+    fn reprint(&self, lflag: u32) {
+        if lflag & ECHO == 0 {
+            return;
+        }
+        if lflag & ECHOCTL != 0 {
+            self.echo("^R");
+        }
+        self.echo("\r\n");
+        let canon = self.canon_buf.lock();
+        let mut buf = [0u8; 4];
+        for &ch in canon.iter() {
+            self.echo(ch.encode_utf8(&mut buf));
+        }
+    }
+
+    /// Insert a character verbatim (used after `VLNEXT`): no signal/edit
+    /// interpretation. In canonical mode it joins the pending line; in raw mode
+    /// it becomes immediately readable.
+    fn input_literal(&self, c: char, lflag: u32) {
+        if lflag & ICANON != 0 {
+            self.canon_buf.lock().push_back(c);
+            self.echo_char(c);
+        } else {
+            self.buf.lock().push_back(c);
+            self.echo_char(c);
+            self.wake_readers();
+        }
+    }
+
     /// Push a char into the Stdin buffer.
     ///
     /// Safe to call from IRQ context: acquires `buf` lock briefly (with
@@ -1038,6 +1109,13 @@ impl Stdin {
             if iflag & INLCR != 0 {
                 c = '\r';
             }
+        }
+
+        // 1b. Literal-next (VLNEXT): the previous keystroke was Ctrl-V, so take
+        // this character verbatim, bypassing signal and line-editing handling.
+        if self.lnext.swap(false, Ordering::Relaxed) {
+            self.input_literal(c, lflag);
+            return;
         }
 
         // 2. Signals
@@ -1119,7 +1197,21 @@ impl Stdin {
 
         // 3. Canon vs Raw mode
         if lflag & ICANON != 0 {
-            if c as u8 == c_cc[VERASE] {
+            // Extended line editing (VWERASE / VREPRINT / VLNEXT) is gated on
+            // IEXTEN, as in Linux n_tty. A c_cc of 0 means the char is disabled.
+            let iexten = lflag & IEXTEN != 0;
+            if iexten && c_cc[VWERASE] != 0 && c as u8 == c_cc[VWERASE] {
+                self.word_erase(lflag);
+            } else if iexten && c_cc[VREPRINT] != 0 && c as u8 == c_cc[VREPRINT] {
+                self.reprint(lflag);
+            } else if iexten && c_cc[VLNEXT] != 0 && c as u8 == c_cc[VLNEXT] {
+                self.lnext.store(true, Ordering::Relaxed);
+                if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
+                    // Show "^" with the cursor parked on it until the quoted
+                    // char arrives (Linux echoes ^ then a backspace).
+                    self.echo("^\x08");
+                }
+            } else if c as u8 == c_cc[VERASE] {
                 let mut canon = self.canon_buf.lock();
                 if let Some(_popped) = canon.pop_back() {
                     if lflag & ECHO != 0 {
@@ -1162,20 +1254,18 @@ impl Stdin {
             } else {
                 self.canon_buf.lock().push_back(c);
                 self.echo_char(c);
-                if c == '\n' {
+                // A line is delivered to readers on newline or on either of the
+                // configurable end-of-line delimiters (VEOL / VEOL2).
+                let is_eol = c == '\n'
+                    || (c_cc[VEOL] != 0 && c as u8 == c_cc[VEOL])
+                    || (c_cc[VEOL2] != 0 && c as u8 == c_cc[VEOL2]);
+                if is_eol {
                     let mut canon = self.canon_buf.lock();
                     let mut buf = self.buf.lock();
                     while let Some(ch) = canon.pop_front() {
                         buf.push_back(ch);
                     }
-                    // Wake readers
-                    self.data_ready.store(true, Ordering::Release);
-                    if let Some(mut eb) = self.eventbus.try_lock() {
-                        self.data_ready.store(false, Ordering::Relaxed);
-                        eb.set(Event::READABLE);
-                    } else {
-                        wake_tty_intr_waiters();
-                    }
+                    self.wake_readers();
                 }
             }
         } else {

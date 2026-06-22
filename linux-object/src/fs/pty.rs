@@ -43,6 +43,7 @@ const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
 const NOFLSH: u32 = 0x0080;
 const ECHOCTL: u32 = 0x0200;
+const IEXTEN: u32 = 0x8000;
 // c_cc indices
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
@@ -50,6 +51,11 @@ const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
 const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VWERASE: usize = 14;
+const VLNEXT: usize = 15;
+const VEOL2: usize = 16;
 
 /// Mutable, lock-protected state shared by a master/slave pair.
 struct PtyInner {
@@ -57,6 +63,9 @@ struct PtyInner {
     input: VecDeque<u8>,
     /// Canonical-mode line being assembled before it is committed to `input`.
     canon: VecDeque<u8>,
+    /// `VLNEXT` latch: the next input byte is taken verbatim. Persisted here (not
+    /// a loop-local) so Ctrl-V and its quoted char may arrive in separate writes.
+    lnext: bool,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
     termios: Termios,
@@ -131,6 +140,25 @@ impl Pty {
                     c = b'\r';
                 }
 
+                // Literal-next (VLNEXT, Ctrl-V): the previous byte armed it, so
+                // insert this one verbatim, skipping signal/edit interpretation.
+                if inner.lnext {
+                    inner.lnext = false;
+                    if lflag & ICANON != 0 {
+                        inner.canon.push_back(c);
+                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                            wake_master = true;
+                        }
+                    } else {
+                        inner.input.push_back(c);
+                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                            wake_master = true;
+                        }
+                        wake_slave = true;
+                    }
+                    continue;
+                }
+
                 // Signal-generating characters.
                 if lflag & ISIG != 0 {
                     let sig = if c == cc[VINTR] {
@@ -158,7 +186,47 @@ impl Pty {
                 }
 
                 if lflag & ICANON != 0 {
-                    if c == cc[VERASE] {
+                    let iexten = lflag & IEXTEN != 0;
+                    if iexten && cc[VWERASE] != 0 && c == cc[VWERASE] {
+                        // Word erase: drop trailing blanks, then the word.
+                        let echo = lflag & (ECHO | ECHOE) != 0;
+                        while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
+                            inner.canon.pop_back();
+                            if echo {
+                                inner.output.extend(b"\x08 \x08");
+                                wake_master = true;
+                            }
+                        }
+                        while let Some(&b) = inner.canon.back() {
+                            if b == b' ' || b == b'\t' {
+                                break;
+                            }
+                            inner.canon.pop_back();
+                            if echo {
+                                inner.output.extend(b"\x08 \x08");
+                                wake_master = true;
+                            }
+                        }
+                    } else if iexten && cc[VREPRINT] != 0 && c == cc[VREPRINT] {
+                        // Reprint the pending line on a fresh line.
+                        if lflag & ECHO != 0 {
+                            if lflag & ECHOCTL != 0 {
+                                inner.output.extend(b"^R");
+                            }
+                            inner.output.extend(b"\r\n");
+                            let pending: alloc::vec::Vec<u8> = inner.canon.iter().copied().collect();
+                            for b in pending {
+                                echo_byte(&mut inner.output, b, lflag, oflag);
+                            }
+                            wake_master = true;
+                        }
+                    } else if iexten && cc[VLNEXT] != 0 && c == cc[VLNEXT] {
+                        inner.lnext = true;
+                        if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
+                            inner.output.extend(b"^\x08");
+                            wake_master = true;
+                        }
+                    } else if c == cc[VERASE] {
                         if inner.canon.pop_back().is_some() && lflag & (ECHO | ECHOE) != 0 {
                             inner.output.extend(b"\x08 \x08");
                             wake_master = true;
@@ -184,7 +252,11 @@ impl Pty {
                         if echo_byte(&mut inner.output, c, lflag, oflag) {
                             wake_master = true;
                         }
-                        if c == b'\n' {
+                        // Commit the line on newline or a configured EOL delimiter.
+                        let is_eol = c == b'\n'
+                            || (cc[VEOL] != 0 && c == cc[VEOL])
+                            || (cc[VEOL2] != 0 && c == cc[VEOL2]);
+                        if is_eol {
                             while let Some(ch) = inner.canon.pop_front() {
                                 inner.input.push_back(ch);
                             }
@@ -394,6 +466,7 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
         inner: Mutex::new(PtyInner {
             input: VecDeque::new(),
             canon: VecDeque::new(),
+            lnext: false,
             output: VecDeque::new(),
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {
