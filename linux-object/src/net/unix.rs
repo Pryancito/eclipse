@@ -212,7 +212,14 @@ impl Socket for UnixSocketState {
             }
 
             drop(inner);
-            kernel_hal::thread::yield_now().await;
+            // Throttle the blocking retry to ~200 Hz instead of busy-spinning
+            // with yield_now, which pegged a core. This loop doesn't subscribe
+            // to the eventbus, so the 5 ms timer bounds worst-case latency; a
+            // proper eventbus park (like stdin) could drop it further later.
+            kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
+                core::time::Duration::from_millis(5),
+            ))
+            .await;
         }
     }
 
@@ -320,7 +327,14 @@ impl Socket for UnixSocketState {
                 return Err(LxError::EAGAIN);
             }
             drop(inner);
-            kernel_hal::thread::yield_now().await;
+            // Throttle the blocking retry to ~200 Hz instead of busy-spinning
+            // with yield_now, which pegged a core. This loop doesn't subscribe
+            // to the eventbus, so the 5 ms timer bounds worst-case latency; a
+            // proper eventbus park (like stdin) could drop it further later.
+            kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
+                core::time::Duration::from_millis(5),
+            ))
+            .await;
         }
     }
 
@@ -444,7 +458,13 @@ impl FileLike for UnixSocketState {
                         break;
                     }
                 }
-                kernel_hal::thread::yield_now().await;
+                // Throttle the blocking retry to ~200 Hz instead of busy-spinning with
+                // yield_now (which pegs a core). A peer write also sets the eventbus,
+                // so latency stays low; the timer just bounds the idle spin.
+                kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
+                    core::time::Duration::from_millis(5),
+                ))
+                .await;
             }
         }
         let (read, write, error) = Socket::poll(self, events);
