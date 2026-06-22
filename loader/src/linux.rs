@@ -188,18 +188,6 @@ fn spawn(
     // shows. Done once, by whoever performs the boot work.
     if boot_work {
         kernel_hal::thread::spawn(async {
-            // Hold off until the per-VT shells have started and parked on their
-            // blocking stdin read. The mount traverses *and writes* the shared
-            // root fs (`resolve_or_create_dir` mkdir's /boot/efi, /home) while
-            // doing long, blocking AHCI I/O; running that concurrently with the
-            // shells' own root-fs reads during startup intermittently left some
-            // shells failing to come up. The non-root mounts aren't needed early,
-            // so a short settle window removes the overlap. (The deeper fix is
-            // full fs/block-driver concurrency safety.)
-            kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
-                core::time::Duration::from_millis(1500),
-            ))
-            .await;
             linux_object::fs::mount_fstab_deferred();
         });
     }
