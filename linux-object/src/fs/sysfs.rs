@@ -108,8 +108,8 @@ fn block_size_sectors(index: usize) -> Option<usize> {
 struct SysRootINode;
 
 impl SysRootINode {
-    fn entries() -> [&'static str; 4] {
-        ["class", "block", "bus", "devices"]
+    fn entries() -> [&'static str; 5] {
+        ["class", "block", "bus", "devices", "power"]
     }
 }
 
@@ -149,6 +149,7 @@ impl INode for SysRootINode {
             "block" => Ok(Arc::new(SysBlockDirINode)),
             "bus" => Ok(Arc::new(SysBusDirINode)),
             "devices" => Ok(Arc::new(SysDevicesDirINode)),
+            "power" => Ok(Arc::new(SysPowerDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -496,14 +497,15 @@ impl INode for SysDevicesSystemDirINode {
             "." => Ok(Arc::new(SysDevicesSystemDirINode)),
             ".." => Ok(Arc::new(SysDevicesDirINode)),
             "node" => Ok(Arc::new(SysDevicesSystemNodeDirINode)),
+            "cpu" => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("node".into())
-        } else {
-            Err(FsError::EntryNotFound)
+        match id {
+            0 => Ok("node".into()),
+            1 => Ok("cpu".into()),
+            _ => Err(FsError::EntryNotFound),
         }
     }
 }
@@ -1503,6 +1505,339 @@ impl INode for SysThermalCoolingDirINode {
             return Err(FsError::EntryNotFound);
         }
         Ok(entries[id].into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System power management: `/sys/power` (system sleep) and
+// `/sys/devices/system/cpu` (CPU hotplug).
+//
+// These mirror the userspace ABI described in
+// Documentation/{driver-api/pm,power} and the suspend/CPU-hotplug docs: a
+// thermal/power manager writes "mem"/"disk" to /sys/power/state and toggles
+// CPUs via /sys/devices/system/cpu/cpuN/online. eclipse does not actually
+// enter ACPI sleep states or park CPUs, so writes are validated and recorded
+// (a compatibility shim) rather than driving real hardware transitions.
+// ---------------------------------------------------------------------------
+
+/// System sleep states advertised by `/sys/power/state`.
+const POWER_STATES: &str = "freeze mem disk";
+
+/// Mutable PM state shared by the (stateless) sysfs INodes.
+struct PmState {
+    /// Per-CPU online bitmask (bit N set ⇒ CPU N online). Boot CPU stays online.
+    cpu_online: u64,
+    /// Hibernation mode reported by `/sys/power/disk`.
+    disk_mode: String,
+}
+
+lazy_static! {
+    static ref PM: Mutex<PmState> = Mutex::new(PmState {
+        cpu_online: u64::MAX,
+        disk_mode: String::from("platform"),
+    });
+}
+
+/// Comma-separated list of currently-online CPUs (e.g. "0,1,3").
+fn online_cpu_list(count: usize) -> String {
+    let mask = PM.lock().cpu_online;
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..count.min(64) {
+        if mask & (1u64 << i) != 0 {
+            parts.push(format!("{}", i));
+        }
+    }
+    format!("{}\n", parts.join(","))
+}
+
+/// `0` or `0-(count-1)` range string used by present/possible CPU masks.
+fn cpu_range(count: usize) -> String {
+    if count <= 1 {
+        String::from("0\n")
+    } else {
+        format!("0-{}\n", count - 1)
+    }
+}
+
+/// A writable power-management sysfs attribute.
+#[derive(Clone, Copy)]
+enum PmAttr {
+    /// `/sys/power/state`.
+    PowerState,
+    /// `/sys/power/disk`.
+    PowerDisk,
+    /// `/sys/devices/system/cpu/cpuN/online` for the given CPU index.
+    CpuOnline(usize),
+}
+
+struct PmAttrINode {
+    attr: PmAttr,
+}
+
+impl PmAttrINode {
+    fn value(&self) -> String {
+        match self.attr {
+            PmAttr::PowerState => format!("{}\n", POWER_STATES),
+            PmAttr::PowerDisk => format!("{}\n", PM.lock().disk_mode),
+            PmAttr::CpuOnline(i) => {
+                let online = PM.lock().cpu_online & (1u64 << (i.min(63))) != 0;
+                format!("{}\n", if online { 1 } else { 0 })
+            }
+        }
+    }
+}
+
+impl INode for PmAttrINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = self.value();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let s = core::str::from_utf8(buf)
+            .map_err(|_| FsError::InvalidParam)?
+            .trim();
+        match self.attr {
+            PmAttr::PowerState => {
+                // Validate against the advertised states; we don't actually
+                // suspend, so a successful write is a logged no-op.
+                if POWER_STATES.split_whitespace().any(|st| st == s) || s == "standby" {
+                    warn!("/sys/power/state: '{}' requested (suspend not implemented)", s);
+                } else {
+                    return Err(FsError::InvalidParam);
+                }
+            }
+            PmAttr::PowerDisk => {
+                match s {
+                    "platform" | "shutdown" | "reboot" | "suspend" => {
+                        PM.lock().disk_mode = String::from(s)
+                    }
+                    _ => return Err(FsError::InvalidParam),
+                }
+            }
+            PmAttr::CpuOnline(i) => {
+                let on: u32 = s.parse().map_err(|_| FsError::InvalidParam)?;
+                if i == 0 && on == 0 {
+                    // The boot CPU cannot be taken offline.
+                    return Err(FsError::NotSupported);
+                }
+                if i >= 64 {
+                    return Err(FsError::InvalidParam);
+                }
+                let mut pm = PM.lock();
+                if on != 0 {
+                    pm.cpu_online |= 1u64 << i;
+                } else {
+                    pm.cpu_online &= !(1u64 << i);
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 0,
+            inode: 0,
+            size: self.value().len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
+
+struct SysPowerDirINode;
+
+impl SysPowerDirINode {
+    fn entries() -> [&'static str; 3] {
+        ["state", "disk", "wakeup_count"]
+    }
+}
+
+impl INode for SysPowerDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(140))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysPowerDirINode)),
+            ".." => Ok(SYS_ROOT.clone()),
+            "state" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::PowerState,
+            })),
+            "disk" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::PowerDisk,
+            })),
+            "wakeup_count" => Ok(Arc::new(Pseudo::new("0\n", FileType::File))),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysDevicesSystemCpuDirINode;
+
+impl INode for SysDevicesSystemCpuDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(150))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        let count = kernel_hal::cpu::cpu_count() as usize;
+        match name {
+            "." => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
+            ".." => Ok(Arc::new(SysDevicesSystemDirINode)),
+            "online" => Ok(Arc::new(Pseudo::new(&online_cpu_list(count), FileType::File))),
+            "present" | "possible" => Ok(Arc::new(Pseudo::new(&cpu_range(count), FileType::File))),
+            "kernel_max" => Ok(Arc::new(Pseudo::new(
+                &format!("{}\n", count.saturating_sub(1)),
+                FileType::File,
+            ))),
+            _ => {
+                // cpuN directories.
+                if let Some(idx) = name.strip_prefix("cpu").and_then(|n| n.parse::<usize>().ok()) {
+                    if idx < count {
+                        return Ok(Arc::new(SysCpuNDirINode { cpu: idx }));
+                    }
+                }
+                Err(FsError::EntryNotFound)
+            }
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let count = kernel_hal::cpu::cpu_count() as usize;
+        // Aggregate files first, then one entry per CPU.
+        const AGG: [&str; 4] = ["online", "present", "possible", "kernel_max"];
+        if id < AGG.len() {
+            return Ok(AGG[id].into());
+        }
+        let cpu_idx = id - AGG.len();
+        if cpu_idx < count {
+            return Ok(format!("cpu{}", cpu_idx));
+        }
+        Err(FsError::EntryNotFound)
+    }
+}
+
+struct SysCpuNDirINode {
+    cpu: usize,
+}
+
+impl INode for SysCpuNDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(151))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysCpuNDirINode { cpu: self.cpu })),
+            ".." => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
+            "online" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::CpuOnline(self.cpu),
+            })),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        // The boot CPU has no `online` toggle in Linux, but exposing it for all
+        // CPUs keeps the shim uniform and simple.
+        if id == 0 {
+            Ok("online".into())
+        } else {
+            Err(FsError::EntryNotFound)
+        }
     }
 }
 
