@@ -157,16 +157,6 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         if had_jobs {
             kernel_hal::deferred_job::drain_deferred_jobs();
         }
-        // DIAGNOSTIC: throttled memory-usage trace to catch the leak that
-        // exhausts the shared heap/frame pool during a large download.
-        {
-            use core::sync::atomic::{AtomicU64, Ordering as O};
-            static LAST: AtomicU64 = AtomicU64::new(0);
-            let now = kernel_hal::timer::timer_now().as_millis() as u64;
-            if now.wrapping_sub(LAST.load(O::Relaxed)) >= 2000 {
-                LAST.store(now, O::Relaxed);
-            }
-        }
         #[cfg(feature = "linux")]
         {
             use linux_object::fs::stdio::STDIN;

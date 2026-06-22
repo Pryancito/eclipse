@@ -433,35 +433,6 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             Ok(())
         }
         TrapReason::PageFault(vaddr, flags) => {
-            // DEBUG: comprobar (cada 256 faults) si el ZERO_FRAME compartido se ha
-            // corrompido -> confirmaría que alguna página se mapeó ESCRIBIBLE al
-            // frame cero global (COW-break fallido) y las escrituras lo pisan.
-            #[cfg(not(feature = "libos"))]
-            {
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static FC: AtomicUsize = AtomicUsize::new(0);
-                if FC.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
-                    let zp = kernel_hal::mem::ZERO_FRAME.paddr();
-                    let kv = 0xffff_8000_0000_0000usize + zp;
-                    let mut nz = 0usize;
-                    let mut first = 0usize;
-                    for i in 0..512 {
-                        let w = unsafe { core::ptr::read_volatile((kv + i * 8) as *const u64) };
-                        if w != 0 {
-                            nz += 1;
-                            if first == 0 {
-                                first = i * 8;
-                            }
-                        }
-                    }
-                    if nz != 0 {
-                        warn!(
-                            "[zerocheck] !!! ZERO_FRAME CORRUPTO: {}/512 words no-cero, primer off={:#x} (paddr={:#x})",
-                            nz, first, zp
-                        );
-                    }
-                }
-            }
             trace!(
                 "page fault from user mode @ {:#x}({:?}), pid={}",
                 vaddr,
