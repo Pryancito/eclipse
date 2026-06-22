@@ -48,6 +48,20 @@ static WALL_CLOCK_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 /// the timer mutex 250 times a second.
 static NEXT_DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Most recent monotonic time (ns) at which the shared xHCI controller was
+/// polled from a timer tick. Used to rate-limit the background HID poll across
+/// all CPUs (see `timer_tick`). Only meaningful on x86_64 with PCI/USB.
+#[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
+static XHCI_LAST_POLL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum spacing between background xHCI HID polls (~125 Hz). `timer_tick`
+/// runs on every CPU at up to 250 Hz, but the single shared controller only
+/// needs HID-rate sampling, so this bounds the aggregate poll rate regardless
+/// of CPU count. Active stdin reads still poll at full rate via the io_wait
+/// path, so this does not add key latency.
+#[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
+const XHCI_POLL_INTERVAL_NS: u64 = 8_000_000;
+
 #[inline]
 fn duration_to_ns(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -100,16 +114,32 @@ hal_fn_impl! {
             // keeps blinking while the system is idle with no pending timers.
             crate::console::cursor_blink_tick();
 
-            #[cfg(all(
-                target_arch = "x86_64",
-                not(feature = "no-pci")
-            ))]
-            zcore_drivers::usb::xhci_hid::poll();
+            let now = timer_now();
+
+            // Background USB-HID poll. `timer_tick` fires on *every* CPU at up to
+            // 250 Hz, but the single shared xHCI controller only needs HID-rate
+            // sampling, so rate-limit the poll to ~125 Hz across all CPUs: the
+            // first CPU to see the interval elapse claims the slot via CAS and
+            // polls; the others skip it. This collapses ~250 Hz × N_CPU MMIO
+            // polls — plus contention on the two global xHCI spinlocks — into
+            // ~125 Hz total. Active stdin reads still poll input at full rate
+            // through the io_wait path, so key latency is unaffected.
+            #[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
+            {
+                let now_ns = duration_to_ns(now);
+                let last = XHCI_LAST_POLL_NS.load(Ordering::Relaxed);
+                if now_ns.saturating_sub(last) >= XHCI_POLL_INTERVAL_NS
+                    && XHCI_LAST_POLL_NS
+                        .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    zcore_drivers::usb::xhci_hid::poll();
+                }
+            }
             // Lock-free fast path: if the earliest pending deadline hasn't
             // arrived yet, skip the mutex entirely. Saves a spinlock acquire
             // per CPU per tick (250 Hz × N CPUs), which is the dominant
             // contention on the timer mutex under SMP.
-            let now = timer_now();
             if duration_to_ns(now) < NEXT_DEADLINE_NS.load(Ordering::Acquire) {
                 return;
             }
