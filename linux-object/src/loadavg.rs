@@ -14,7 +14,7 @@ use kernel_hal::timer::timer_now;
 use lazy_static::lazy_static;
 use lock::Mutex;
 use zircon_object::object::KernelObject;
-use zircon_object::task::{Job, Process, Status, ROOT_JOB};
+use zircon_object::task::{running_thread_count, Job, Process, Status, ROOT_JOB};
 
 /// Fixed-point shift used by the EWMA math (matches Linux `FSHIFT`).
 const FSHIFT: u32 = 11;
@@ -64,16 +64,31 @@ fn collect(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
     }
 }
 
-/// Count of `(live processes, currently-running processes)` across all jobs.
+/// Count of `(live processes, currently-runnable threads)` across all jobs.
+///
+/// "Live" is every process that has started and not yet exited. "Runnable" is
+/// *not* the same as "live": a process is alive for its whole lifetime even
+/// while every one of its threads sits blocked in a syscall, so counting live
+/// processes makes an idle box report a load average equal to its process
+/// count. Instead we ask the executor how many threads are actually executing
+/// right now ([`running_thread_count`]) and subtract one for the sampler thread
+/// itself (the caller is, by definition, running while it reads this).
 pub fn count_processes() -> (usize, usize) {
     let mut procs = Vec::new();
     collect(&ROOT_JOB, &mut procs);
     let total = procs.len();
-    let running = procs
-        .iter()
-        .filter(|p| matches!(p.status(), Status::Running))
-        .count();
+    let running = runnable_count();
     (total, running)
+}
+
+/// Number of threads currently runnable on a CPU, excluding the caller.
+///
+/// On a fully idle system every thread is parked on a pending future, so the
+/// only thread executing is whoever is reading this — giving 0, matching a real
+/// Linux idle box. Under load the threads concurrently executing on other CPUs
+/// are counted.
+pub fn runnable_count() -> usize {
+    running_thread_count().saturating_sub(1)
 }
 
 /// Linux's `calc_load`: decay `load` toward `active` by factor `exp`.

@@ -3,7 +3,7 @@ mod thread_state;
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use core::{any::Any, future::Future, pin::Pin};
@@ -757,6 +757,48 @@ pub struct ThreadInfo {
     cpu_affinity_mask: [u64; 8],
 }
 
+/// Number of threads currently inside the executor's `poll` — i.e. actually
+/// occupying a CPU right now. It is bracketed around [`ThreadSwitchFuture::poll`]
+/// (the single point every scheduled thread is polled through).
+///
+/// This is the instantaneous run count the load-average sampler wants: a thread
+/// parked on a `Poll::Pending` future is *not* inside `poll`, so it does not
+/// count. That is exactly correct for a Linux-style load average — idle/blocked
+/// tasks (a shell in `read`, `top` in `nanosleep`, a daemon waiting on the
+/// network) must not inflate the average, even though their `Process` is still
+/// `Status::Running` (alive). The previous accounting counted every live
+/// process as runnable, so the load average climbed toward the live-process
+/// count on a fully idle box.
+static RUNNING_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that marks the calling thread as running for the span of one
+/// `poll`, decrementing again even if the inner future panics.
+struct RunningGuard;
+
+impl RunningGuard {
+    #[inline]
+    fn new() -> Self {
+        RUNNING_THREADS.fetch_add(1, Ordering::Relaxed);
+        RunningGuard
+    }
+}
+
+impl Drop for RunningGuard {
+    #[inline]
+    fn drop(&mut self) {
+        RUNNING_THREADS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Number of threads currently executing on a CPU (being polled right now).
+///
+/// A thread blocked on a pending future is not counted. The sampler that reads
+/// this is itself running inside a `poll`, so it should subtract its own
+/// contribution to recover the count of *other* runnable threads.
+pub fn running_thread_count() -> usize {
+    RUNNING_THREADS.load(Ordering::Relaxed)
+}
+
 struct ThreadSwitchFuture {
     thread: Arc<Thread>,
     // Plain spin mutex (NOT `lock::Mutex`): this guard is held across the inner
@@ -791,7 +833,13 @@ impl Future for ThreadSwitchFuture {
             }
         }
         kernel_hal::thread::set_current_thread(Some(self.thread.clone()));
-        let ret = self.future.lock().as_mut().poll(cx);
+        let ret = {
+            // Count this thread as running only while it is actually being
+            // polled; the guard drops (decrementing) as soon as the poll
+            // returns, so a thread that parks on `Pending` stops counting.
+            let _running = RunningGuard::new();
+            self.future.lock().as_mut().poll(cx)
+        };
         kernel_hal::thread::set_current_thread(None);
         // Lazy-TLB: keep the process CR3 active after the poll instead of
         // reloading the kernel CR3 every time. A CR3 reload flushes the TLB,

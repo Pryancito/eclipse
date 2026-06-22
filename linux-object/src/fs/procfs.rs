@@ -703,10 +703,7 @@ fn proc_uptime_content() -> String {
 /// `/proc/stat` — aggregate CPU counters (BusyBox `top` reads this after chdir to `/proc`).
 fn proc_stat_content() -> String {
     let procs = all_processes();
-    let running = procs
-        .iter()
-        .filter(|p| matches!(p.status(), Status::Running))
-        .count();
+    let running = crate::loadavg::runnable_count();
     format!(
         "cpu  0 0 0 1 0 0 0 0\n\
          intr 0\n\
@@ -724,10 +721,11 @@ fn proc_stat_content() -> String {
 fn proc_loadavg_content() -> String {
     let procs = all_processes();
     let total = procs.len().max(1);
-    let running = procs
-        .iter()
-        .filter(|p| matches!(p.status(), Status::Running))
-        .count();
+    // Runnable count (excludes idle/blocked tasks), not the live-process count —
+    // see `loadavg::runnable_count`. `+1` so the field is never below 1: the
+    // process reading `/proc/loadavg` is itself runnable but is excluded by the
+    // sampler's self-subtraction, and Linux always reports at least 1 here.
+    let running = crate::loadavg::runnable_count() + 1;
     let last_pid = procs.last().map(|p| p.id()).unwrap_or(1);
     let [l1, l5, l15] = crate::loadavg::loadavg_f64();
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
