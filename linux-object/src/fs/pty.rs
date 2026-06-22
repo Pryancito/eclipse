@@ -66,6 +66,9 @@ struct PtyInner {
     /// `VLNEXT` latch: the next input byte is taken verbatim. Persisted here (not
     /// a loop-local) so Ctrl-V and its quoted char may arrive in separate writes.
     lnext: bool,
+    /// Virtual modem control lines (`TIOCM_*`) reported by `TIOCMGET`. A PTY has
+    /// no real lines; this just remembers what a program set via `TIOCMSET`.
+    modem: i32,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
     termios: Termios,
@@ -365,8 +368,9 @@ impl Pty {
         Ok(n)
     }
 
-    /// Shared ioctl handling for both ends.
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize> {
+    /// Shared ioctl handling for both ends. `is_master` selects the queue a
+    /// count ioctl (`FIONREAD`/`TIOCOUTQ`) reports on.
+    fn ioctl(&self, cmd: u32, data: usize, is_master: bool) -> Result<usize> {
         match cmd as usize {
             TIOCGPTN => {
                 unsafe { *(data as *mut u32) = self.id };
@@ -414,6 +418,57 @@ impl Pty {
                 Ok(0)
             }
             TCFLSH | TIOCSCTTY | TIOCNOTTY => Ok(0),
+            // Bytes readable at this end: the master reads program output, the
+            // slave reads cooked input.
+            FIONREAD => {
+                let inner = self.inner.lock();
+                let n = if is_master {
+                    inner.output.len()
+                } else {
+                    inner.input.len()
+                } as i32;
+                unsafe { *(data as *mut i32) = n };
+                Ok(0)
+            }
+            // Bytes still queued toward the other end.
+            TIOCOUTQ => {
+                let inner = self.inner.lock();
+                let n = if is_master {
+                    inner.input.len() + inner.canon.len()
+                } else {
+                    inner.output.len()
+                } as i32;
+                unsafe { *(data as *mut i32) = n };
+                Ok(0)
+            }
+            TIOCGSID => {
+                let mut sid = self.fg_pgrp.load(Ordering::Relaxed);
+                if sid <= 0 {
+                    sid = 1;
+                }
+                unsafe { *(data as *mut i32) = sid };
+                Ok(0)
+            }
+            // Virtual modem control lines (no real hardware behind a PTY).
+            TIOCMGET => {
+                unsafe { *(data as *mut i32) = self.inner.lock().modem };
+                Ok(0)
+            }
+            TIOCMSET => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem = v;
+                Ok(0)
+            }
+            TIOCMBIS => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem |= v;
+                Ok(0)
+            }
+            TIOCMBIC => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem &= !v;
+                Ok(0)
+            }
             _ => Err(FsError::NotSupported),
         }
     }
@@ -467,6 +522,7 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
             input: VecDeque::new(),
             canon: VecDeque::new(),
             lnext: false,
+            modem: TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR,
             output: VecDeque::new(),
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {
@@ -602,7 +658,7 @@ impl INode for PtyMaster {
         readable_future(&self.pty, self.pty.master_bus.clone(), Pty::master_readable)
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        self.pty.ioctl(cmd, data)
+        self.pty.ioctl(cmd, data, true)
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(pty_metadata(make_rdev(5, 2)))
@@ -632,7 +688,7 @@ impl INode for PtySlave {
         readable_future(&self.pty, self.pty.slave_bus.clone(), Pty::slave_readable)
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        self.pty.ioctl(cmd, data)
+        self.pty.ioctl(cmd, data, false)
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(pty_metadata(make_rdev(136, self.pty.id as usize)))

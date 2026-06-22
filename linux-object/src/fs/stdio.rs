@@ -325,6 +325,36 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         // freed; accept the request so X's setup/teardown proceeds.
         VT_RELDISP | VT_DISALLOCATE => Ok(0),
         TIOCSCTTY | TIOCNOTTY => Ok(0),
+        // Bytes available to read: the cooked input queue for this VT.
+        FIONREAD => {
+            let n = vt_stdin(vt).buf.lock().len() as i32;
+            user_copy(UserOutPtr::<i32>::from(data).write(n))?;
+            Ok(0)
+        }
+        // Console output is drawn synchronously, so nothing is ever queued.
+        TIOCOUTQ => {
+            user_copy(UserOutPtr::<i32>::from(data).write(0))?;
+            Ok(0)
+        }
+        // Session ID of the terminal. We don't track sessions separately, so
+        // report the foreground process group (same fallback as TIOCGPGRP).
+        TIOCGSID => {
+            let mut sid = tty_fg_pgrp(vt).load(Ordering::Relaxed);
+            if sid <= 0 {
+                sid = 1;
+            }
+            user_copy(UserOutPtr::<i32>::from(data).write(sid))?;
+            Ok(0)
+        }
+        // Modem control lines. A VT has no real RS-232 lines, so report a
+        // permanently-connected local terminal (DTR/RTS asserted, carrier up)
+        // and accept writes as no-ops — matching how Linux treats a console.
+        TIOCMGET => {
+            let lines = TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR;
+            user_copy(UserOutPtr::<i32>::from(data).write(lines))?;
+            Ok(0)
+        }
+        TIOCMSET | TIOCMBIS | TIOCMBIC => Ok(0),
         // Linux console multiplexor. The subcommand is the first byte of the
         // argument. We implement TIOCL_GETSHIFTSTATE (read modifier state),
         // which programs poll — sometimes in a tight loop — to read Shift/Ctrl/
