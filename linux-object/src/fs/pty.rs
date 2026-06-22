@@ -33,6 +33,8 @@ use rcore_fs::vfs::*;
 const IGNCR: u32 = 0x0080;
 const ICRNL: u32 = 0x0100;
 const INLCR: u32 = 0x0040;
+const IXON: u32 = 0x0400;
+const IXANY: u32 = 0x0800;
 // termios c_oflag bits
 const OPOST: u32 = 0x0001;
 const ONLCR: u32 = 0x0004;
@@ -50,9 +52,12 @@ const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
 const VSUSP: usize = 10;
 const VEOL: usize = 11;
 const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
 const VWERASE: usize = 14;
 const VLNEXT: usize = 15;
 const VEOL2: usize = 16;
@@ -69,6 +74,9 @@ struct PtyInner {
     /// Virtual modem control lines (`TIOCM_*`) reported by `TIOCMGET`. A PTY has
     /// no real lines; this just remembers what a program set via `TIOCMSET`.
     modem: i32,
+    /// Software flow control (IXON): when set by a `VSTOP` (Ctrl-S) from the
+    /// master, program output is held in `output` until a `VSTART` (Ctrl-Q).
+    stopped: bool,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
     termios: Termios,
@@ -107,9 +115,12 @@ impl Pty {
 
     /// Master read side is satisfiable now (data ready, or hangup → EOF).
     fn master_readable(&self) -> bool {
-        if !self.inner.lock().output.is_empty() {
+        let inner = self.inner.lock();
+        // Output paused by flow control (Ctrl-S) is withheld from the master.
+        if !inner.stopped && !inner.output.is_empty() {
             return true;
         }
+        drop(inner);
         self.slave_ever_open.load(Ordering::Relaxed) && self.slave_open.load(Ordering::Relaxed) <= 0
     }
 
@@ -159,6 +170,33 @@ impl Pty {
                         }
                         wake_slave = true;
                     }
+                    continue;
+                }
+
+                // Software flow control (IXON): VSTOP (Ctrl-S) holds program
+                // output bound for the master; VSTART (Ctrl-Q) releases it. With
+                // IXANY, any byte releases. These control bytes are consumed.
+                if iflag & IXON != 0 {
+                    if c == cc[VSTOP] {
+                        inner.stopped = true;
+                        continue;
+                    }
+                    if c == cc[VSTART] {
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake_master = true;
+                        }
+                        continue;
+                    }
+                    if iflag & IXANY != 0 && inner.stopped {
+                        inner.stopped = false;
+                        wake_master = true;
+                    }
+                }
+
+                // Discard (VDISCARD, Ctrl-O): no separate output queue to flush,
+                // so just consume the byte under IEXTEN.
+                if lflag & IEXTEN != 0 && cc[VDISCARD] != 0 && c == cc[VDISCARD] {
                     continue;
                 }
 
@@ -312,7 +350,9 @@ impl Pty {
 
     fn master_read(&self, buf: &mut [u8]) -> Result<usize> {
         let mut inner = self.inner.lock();
-        if inner.output.is_empty() {
+        // While stopped by flow control (Ctrl-S), hold output back from the
+        // master, but still surface EOF if the slave has hung up.
+        if inner.output.is_empty() || inner.stopped {
             drop(inner);
             if self.slave_ever_open.load(Ordering::Relaxed)
                 && self.slave_open.load(Ordering::Relaxed) <= 0
@@ -469,6 +509,11 @@ impl Pty {
                 self.inner.lock().modem &= !v;
                 Ok(0)
             }
+            // No real UART behind a PTY, so all serial line counters are zero.
+            TIOCGICOUNT => {
+                unsafe { *(data as *mut SerialIcounter) = SerialIcounter::default() };
+                Ok(0)
+            }
             _ => Err(FsError::NotSupported),
         }
     }
@@ -523,6 +568,7 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
             canon: VecDeque::new(),
             lnext: false,
             modem: TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR,
+            stopped: false,
             output: VecDeque::new(),
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {

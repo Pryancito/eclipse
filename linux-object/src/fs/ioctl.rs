@@ -106,6 +106,28 @@ pub const TIOCINQ: usize = FIONREAD;
 pub const TIOCOUTQ: usize = 0x5411;
 /// Get the session ID of the terminal; written as a `pid_t` (`int`).
 pub const TIOCGSID: usize = 0x5429;
+/// Get serial line interrupt counters into a [`SerialIcounter`].
+pub const TIOCGICOUNT: usize = 0x545D;
+
+/// Linux `struct serial_icounter_struct` — cumulative serial line event
+/// counters reported by `TIOCGICOUNT`. Virtual TTYs have no real UART, so all
+/// fields are reported as zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SerialIcounter {
+    pub cts: i32,
+    pub dsr: i32,
+    pub rng: i32,
+    pub dcd: i32,
+    pub rx: i32,
+    pub tx: i32,
+    pub frame: i32,
+    pub overrun: i32,
+    pub parity: i32,
+    pub brk: i32,
+    pub buf_overrun: i32,
+    pub reserved: [i32; 9],
+}
 
 // Modem control line ioctls (`<asm-generic/termios.h>`). The argument is an
 // `int` bitmask of the `TIOCM_*` flags below.

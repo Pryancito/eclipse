@@ -99,6 +99,9 @@ struct TtyState {
     kbd_mode: AtomicI32,
     /// Scroll/Num/Caps LED bits last set via `KDSETLED`.
     kbd_leds: AtomicU8,
+    /// Software flow control (IXON): output to this VT is paused after a `VSTOP`
+    /// (Ctrl-S) and resumed by `VSTART` (Ctrl-Q).
+    flow_stopped: AtomicBool,
 }
 
 lazy_static! {
@@ -109,6 +112,7 @@ lazy_static! {
             vt_mode: Mutex::new(VtMode::auto()),
             kbd_mode: AtomicI32::new(K_XLATE),
             kbd_leds: AtomicU8::new(0),
+            flow_stopped: AtomicBool::new(false),
         })
         .collect();
 }
@@ -132,6 +136,13 @@ fn tty_vt_mode(vt: usize) -> &'static Mutex<VtMode> {
 
 fn tty_kbd_mode(vt: usize) -> i32 {
     TTY_STATES[vt_clamp(vt)].kbd_mode.load(Ordering::Relaxed)
+}
+
+/// Whether output to `vt` is currently paused by software flow control (IXON).
+fn tty_flow_stopped(vt: usize) -> bool {
+    TTY_STATES[vt_clamp(vt)]
+        .flow_stopped
+        .load(Ordering::Relaxed)
 }
 
 /// Whether VT `vt` is translating key presses into TTY characters. False while
@@ -355,6 +366,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         TIOCMSET | TIOCMBIS | TIOCMBIC => Ok(0),
+        // No real UART behind a VT, so all serial line counters are zero.
+        TIOCGICOUNT => {
+            user_copy(UserOutPtr::<SerialIcounter>::from(data).write(SerialIcounter::default()))?;
+            Ok(0)
+        }
         // Linux console multiplexor. The subcommand is the first byte of the
         // argument. We implement TIOCL_GETSHIFTSTATE (read modifier state),
         // which programs poll — sometimes in a tight loop — to read Shift/Ctrl/
@@ -1148,6 +1164,31 @@ impl Stdin {
             return;
         }
 
+        // 1c. Software flow control (IXON): VSTOP (Ctrl-S) pauses console output
+        // and VSTART (Ctrl-Q) resumes it. These bytes are consumed, never
+        // delivered. With IXANY, any input byte resumes paused output.
+        if iflag & IXON != 0 {
+            let state = &TTY_STATES[vt_clamp(self.vt)].flow_stopped;
+            if c as u8 == c_cc[VSTOP] {
+                state.store(true, Ordering::Relaxed);
+                return;
+            }
+            if c as u8 == c_cc[VSTART] {
+                state.store(false, Ordering::Relaxed);
+                return;
+            }
+            if iflag & IXANY != 0 && state.swap(false, Ordering::Relaxed) {
+                // Resumed by this byte; fall through to process it normally.
+            }
+        }
+
+        // 1d. Discard (VDISCARD, Ctrl-O): toggles output flushing. The console
+        // has no output queue to drop, so just consume the byte when IEXTEN is
+        // on so it doesn't leak into the cooked line.
+        if lflag & IEXTEN != 0 && c_cc[VDISCARD] != 0 && c as u8 == c_cc[VDISCARD] {
+            return;
+        }
+
         // 2. Signals
         if lflag & ISIG != 0 {
             if c as u8 == c_cc[VINTR] {
@@ -1360,6 +1401,12 @@ impl Stdin {
 
 /// Helper function to post-process output data (e.g. translating \n to \r\n if OPOST and ONLCR are set)
 fn tty_write_out(vt: usize, buf: &[u8]) {
+    // Honor software flow control: while output is stopped by VSTOP (Ctrl-S),
+    // block here until a VSTART (Ctrl-Q) keystroke clears the flag. Keyboard
+    // IRQs keep firing while we spin, so the flag can still be cleared.
+    while tty_flow_stopped(vt) {
+        core::hint::spin_loop();
+    }
     let termios = tty_termios(vt).lock();
     let opost = termios.c_oflag & OPOST != 0;
     let onlcr = termios.c_oflag & ONLCR != 0;
