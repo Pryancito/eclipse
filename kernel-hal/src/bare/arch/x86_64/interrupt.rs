@@ -11,11 +11,11 @@ use x86_64::instructions::interrupts;
 hal_fn_impl! {
     impl mod crate::hal_fn::interrupt {
         fn wait_for_interrupt() {
-            let enable = interrupts::are_enabled();
-            interrupts::enable_and_hlt();
-            if !enable {
-                interrupts::disable();
-            }
+            // Park this CPU until the next interrupt. `cpu_idle` uses
+            // MONITOR/MWAIT (C1E) when the hardware supports it — cooler than a
+            // bare `hlt` (C1) — and falls back to `sti; hlt` otherwise, while
+            // preserving the caller's interrupt-enable state. See `super::power`.
+            super::power::cpu_idle();
         }
 
         fn is_valid_irq(gsi: usize) -> bool {

@@ -1,6 +1,7 @@
 mod drivers;
 #[cfg(feature = "graphic")]
 mod early_fb_console;
+mod power;
 mod smp;
 mod trap;
 
@@ -74,6 +75,10 @@ pub fn primary_init() {
         // enable global page
         Cr4::update(|f| f.insert(Cr4Flags::PAGE_GLOBAL));
     }
+    // Scale the BSP's P-state and pick its idle C-state before bringing up the
+    // APs (each AP runs the same per-CPU setup from `secondary_init`). This is
+    // what keeps the CPU from running hot at idle on real hardware.
+    power::init();
     smp::start_application_processors();
     warn!("[boot] smp init complete");
 }
@@ -84,6 +89,8 @@ pub fn timer_init() {
 
 pub fn secondary_init() {
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
+    // P-state/idle setup is per-logical-CPU, so every AP must run it too.
+    power::init();
     smp::ap_signal_online();
 }
 
