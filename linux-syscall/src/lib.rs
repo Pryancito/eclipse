@@ -137,19 +137,6 @@ impl Syscall<'_> {
                 args
             );
         }
-        // DIAGNOSTIC (temporal): el sistema se congela EN DURO al lanzar `perf`
-        // (no se puede ni cambiar de VT), así que no podemos leer el trace del
-        // anillo de dmesg después. El eco en vivo se ARMA en el execve de perf
-        // (ver sys_execve) mediante la bandera global kernel_hal::diag. A partir
-        // de ahí cada syscall imprime su ENTER (`->`) y su LEAVE (`<-`); la última
-        // línea en pantalla antes del freeze es la operación culpable.
-        let echo = kernel_hal::diag::echo_on();
-        if echo {
-            kernel_hal::console::console_write_fmt(format_args!(
-                "TRC[{}] -> {:?}({}) args={:x?}\n",
-                trace_pid, sys_type, num, args
-            ));
-        }
         let [a0, a1, a2, a3, a4, a5] = args;
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
@@ -391,13 +378,6 @@ impl Syscall<'_> {
         info!("<= {:?}", ret);
         if trace {
             kernel_hal::klog_info!("SYS[{}] #{} => {:?}", trace_pid, num, ret);
-        }
-        // DIAGNOSTIC (temporal): LEAVE del eco en vivo (ver el ENTER de arriba).
-        if echo {
-            kernel_hal::console::console_write_fmt(format_args!(
-                "TRC[{}] <- #{} => {:?}\n",
-                trace_pid, num, ret
-            ));
         }
         match ret {
             Ok(value) => value as isize,
