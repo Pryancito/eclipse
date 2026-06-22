@@ -6,6 +6,7 @@ use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
 
+use delegate::delegate;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, MMapArea, Metadata, PollStatus, Result,
 };
@@ -26,19 +27,20 @@ struct FlaggedFs {
 }
 
 impl FileSystem for FlaggedFs {
-    fn sync(&self) -> Result<()> {
-        self.inner.sync()
+    // Pure pass-throughs to the wrapped filesystem.
+    delegate! {
+        to self.inner {
+            fn sync(&self) -> Result<()>;
+            fn info(&self) -> FsInfo;
+        }
     }
 
+    // root_inode must re-wrap so the flags propagate to the returned inode.
     fn root_inode(&self) -> Arc<dyn INode> {
         Arc::new(FlaggedINode {
             inner: self.inner.root_inode(),
             state: self.state.clone(),
         })
-    }
-
-    fn info(&self) -> FsInfo {
-        self.inner.info()
     }
 }
 
@@ -64,10 +66,33 @@ impl FlaggedINode {
 }
 
 impl INode for FlaggedINode {
-    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        self.inner.read_at(offset, buf)
+    // Read-only / metadata operations forward straight to the inner inode.
+    delegate! {
+        to self.inner {
+            fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize>;
+            fn metadata(&self) -> Result<Metadata>;
+            fn sync_all(&self) -> Result<()>;
+            fn sync_data(&self) -> Result<()>;
+            fn get_entry(&self, id: usize) -> Result<alloc::string::String>;
+            fn get_entry_with_metadata(
+                &self,
+                id: usize,
+            ) -> Result<(Metadata, alloc::string::String)>;
+            fn io_control(&self, cmd: u32, data: usize) -> Result<usize>;
+            fn mmap(&self, area: MMapArea) -> Result<()>;
+            fn fs(&self) -> Arc<dyn FileSystem>;
+        }
     }
 
+    // `async_poll` ties the returned future's lifetime to `&self`; kept explicit
+    // rather than delegated so the borrow plumbing stays obvious.
+    fn async_poll<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
+        self.inner.async_poll()
+    }
+
+    // Mutating operations are gated on the read-only flag.
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
         self.check_write()?;
         self.inner.write_at(offset, buf)
@@ -81,27 +106,9 @@ impl INode for FlaggedINode {
         Ok(status)
     }
 
-    fn async_poll<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
-        self.inner.async_poll()
-    }
-
-    fn metadata(&self) -> Result<Metadata> {
-        self.inner.metadata()
-    }
-
     fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
         self.check_write()?;
         self.inner.set_metadata(metadata)
-    }
-
-    fn sync_all(&self) -> Result<()> {
-        self.inner.sync_all()
-    }
-
-    fn sync_data(&self) -> Result<()> {
-        self.inner.sync_data()
     }
 
     fn resize(&self, len: usize) -> Result<()> {
@@ -140,28 +147,9 @@ impl INode for FlaggedINode {
         self.inner.move_(old_name, target, new_name)
     }
 
+    // find re-wraps so the returned child also carries the mount flags.
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         Ok(self.wrap(self.inner.find(name)?))
-    }
-
-    fn get_entry(&self, id: usize) -> Result<alloc::string::String> {
-        self.inner.get_entry(id)
-    }
-
-    fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, alloc::string::String)> {
-        self.inner.get_entry_with_metadata(id)
-    }
-
-    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        self.inner.io_control(cmd, data)
-    }
-
-    fn mmap(&self, area: MMapArea) -> Result<()> {
-        self.inner.mmap(area)
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        self.inner.fs()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
