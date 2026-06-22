@@ -6,6 +6,7 @@ use core::any::Any;
 use kernel_hal::drivers;
 use kernel_hal::net::get_net_device;
 use lazy_static::lazy_static;
+use lock::Mutex;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -164,8 +165,8 @@ impl INode for SysRootINode {
 struct SysClassINode;
 
 impl SysClassINode {
-    fn entries() -> [&'static str; 4] {
-        ["block", "drm", "net", "power_supply"]
+    fn entries() -> [&'static str; 5] {
+        ["block", "drm", "net", "power_supply", "thermal"]
     }
 }
 
@@ -206,6 +207,7 @@ impl INode for SysClassINode {
             "drm" => Ok(Arc::new(SysClassDrmDirINode)),
             "net" => Ok(Arc::new(SysClassNetDirINode)),
             "power_supply" => Ok(Arc::new(SysClassPowerSupplyDirINode)),
+            "thermal" => Ok(Arc::new(SysClassThermalDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1188,6 +1190,319 @@ impl INode for SysClassPowerSupplyDirINode {
     }
     fn get_entry(&self, _id: usize) -> Result<String> {
         Err(FsError::EntryNotFound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/class/thermal` — minimal thermal zone + cooling device interface.
+//
+// Models a single CPU package thermal zone (`thermal_zone0`, type
+// "x86_pkg_temp") with two user-configurable trip points, plus one cooling
+// device (`cooling_device0`, type "Processor"). This mirrors the ABI described
+// in Documentation/driver-api/thermal/{sysfs-api,x86_pkg_temperature_thermal}.rst
+// so userspace thermal tooling can probe and configure trip points / policy.
+// ---------------------------------------------------------------------------
+
+/// Static zone type reported by `thermal_zone0/type`.
+const THERMAL_ZONE_TYPE: &str = "x86_pkg_temp";
+/// Trip-point types: a passive (throttling) trip and a critical (shutdown) trip.
+const THERMAL_TRIP_TYPES: [&str; 2] = ["passive", "critical"];
+/// Maximum cooling-device state advertised by `cooling_device0/max_state`.
+const COOLING_MAX_STATE: u32 = 10;
+
+/// Mutable state shared by all (stateless) thermal sysfs INodes. `find()` mints
+/// fresh INodes on every lookup, so the configurable values must live here for
+/// writes to persist across reopen.
+struct ThermalState {
+    /// Current package temperature, in milli-degrees Celsius.
+    temp_mc: i32,
+    /// Active governor policy (`thermal_zone0/policy`).
+    policy: String,
+    /// Trip-point temperatures in milli-degrees Celsius; 0 disables the trip.
+    trip_temp: [i32; 2],
+    /// Current cooling-device state (`cooling_device0/cur_state`).
+    cooling_cur: u32,
+}
+
+lazy_static! {
+    static ref THERMAL: Mutex<ThermalState> = Mutex::new(ThermalState {
+        temp_mc: 45000,
+        policy: String::from("step_wise"),
+        trip_temp: [0, 0],
+        cooling_cur: 0,
+    });
+}
+
+/// One writable thermal attribute. Read renders the current value; write parses
+/// and stores it in [`THERMAL`].
+#[derive(Clone, Copy)]
+enum ThermalAttr {
+    Policy,
+    Trip0,
+    Trip1,
+    CoolingCur,
+}
+
+struct ThermalAttrINode {
+    attr: ThermalAttr,
+}
+
+impl ThermalAttrINode {
+    fn value(&self) -> String {
+        let t = THERMAL.lock();
+        match self.attr {
+            ThermalAttr::Policy => format!("{}\n", t.policy),
+            ThermalAttr::Trip0 => format!("{}\n", t.trip_temp[0]),
+            ThermalAttr::Trip1 => format!("{}\n", t.trip_temp[1]),
+            ThermalAttr::CoolingCur => format!("{}\n", t.cooling_cur),
+        }
+    }
+}
+
+impl INode for ThermalAttrINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = self.value();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let s = core::str::from_utf8(buf)
+            .map_err(|_| FsError::InvalidParam)?
+            .trim();
+        let mut t = THERMAL.lock();
+        match self.attr {
+            ThermalAttr::Policy => t.policy = String::from(s),
+            ThermalAttr::Trip0 => t.trip_temp[0] = s.parse().map_err(|_| FsError::InvalidParam)?,
+            ThermalAttr::Trip1 => t.trip_temp[1] = s.parse().map_err(|_| FsError::InvalidParam)?,
+            ThermalAttr::CoolingCur => {
+                let v: u32 = s.parse().map_err(|_| FsError::InvalidParam)?;
+                t.cooling_cur = v.min(COOLING_MAX_STATE);
+            }
+        }
+        // Report the whole buffer consumed so the writer doesn't loop.
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 0,
+            inode: 0,
+            size: self.value().len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
+
+/// Read-only static file helper for thermal attributes.
+fn thermal_ro(content: &str) -> Arc<dyn INode> {
+    Arc::new(Pseudo::new(content, FileType::File))
+}
+
+struct SysClassThermalDirINode;
+
+impl SysClassThermalDirINode {
+    fn entries() -> [&'static str; 2] {
+        ["thermal_zone0", "cooling_device0"]
+    }
+}
+
+impl INode for SysClassThermalDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(40))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassThermalDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            "thermal_zone0" => Ok(Arc::new(SysThermalZoneDirINode)),
+            "cooling_device0" => Ok(Arc::new(SysThermalCoolingDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysThermalZoneDirINode;
+
+impl SysThermalZoneDirINode {
+    fn entries() -> [&'static str; 10] {
+        [
+            "type",
+            "temp",
+            "policy",
+            "available_policies",
+            "mode",
+            "trip_point_0_temp",
+            "trip_point_0_type",
+            "trip_point_1_temp",
+            "trip_point_1_type",
+            "uevent",
+        ]
+    }
+}
+
+impl INode for SysThermalZoneDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(41))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysThermalZoneDirINode)),
+            ".." => Ok(Arc::new(SysClassThermalDirINode)),
+            "type" => Ok(thermal_ro(&format!("{}\n", THERMAL_ZONE_TYPE))),
+            "temp" => Ok(thermal_ro(&format!("{}\n", THERMAL.lock().temp_mc))),
+            "policy" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Policy,
+            })),
+            "available_policies" => Ok(thermal_ro("step_wise user_space\n")),
+            "mode" => Ok(thermal_ro("enabled\n")),
+            "trip_point_0_temp" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Trip0,
+            })),
+            "trip_point_0_type" => Ok(thermal_ro(&format!("{}\n", THERMAL_TRIP_TYPES[0]))),
+            "trip_point_1_temp" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Trip1,
+            })),
+            "trip_point_1_type" => Ok(thermal_ro(&format!("{}\n", THERMAL_TRIP_TYPES[1]))),
+            "uevent" => Ok(thermal_ro("")),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysThermalCoolingDirINode;
+
+impl SysThermalCoolingDirINode {
+    fn entries() -> [&'static str; 4] {
+        ["type", "max_state", "cur_state", "uevent"]
+    }
+}
+
+impl INode for SysThermalCoolingDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(42))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysThermalCoolingDirINode)),
+            ".." => Ok(Arc::new(SysClassThermalDirINode)),
+            "type" => Ok(thermal_ro("Processor\n")),
+            "max_state" => Ok(thermal_ro(&format!("{}\n", COOLING_MAX_STATE))),
+            "cur_state" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::CoolingCur,
+            })),
+            "uevent" => Ok(thermal_ro("")),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
     }
 }
 
