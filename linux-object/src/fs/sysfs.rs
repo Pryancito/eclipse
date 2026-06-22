@@ -6,6 +6,7 @@ use core::any::Any;
 use kernel_hal::drivers;
 use kernel_hal::net::get_net_device;
 use lazy_static::lazy_static;
+use lock::Mutex;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -107,8 +108,8 @@ fn block_size_sectors(index: usize) -> Option<usize> {
 struct SysRootINode;
 
 impl SysRootINode {
-    fn entries() -> [&'static str; 4] {
-        ["class", "block", "bus", "devices"]
+    fn entries() -> [&'static str; 5] {
+        ["class", "block", "bus", "devices", "power"]
     }
 }
 
@@ -148,6 +149,7 @@ impl INode for SysRootINode {
             "block" => Ok(Arc::new(SysBlockDirINode)),
             "bus" => Ok(Arc::new(SysBusDirINode)),
             "devices" => Ok(Arc::new(SysDevicesDirINode)),
+            "power" => Ok(Arc::new(SysPowerDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -164,8 +166,8 @@ impl INode for SysRootINode {
 struct SysClassINode;
 
 impl SysClassINode {
-    fn entries() -> [&'static str; 4] {
-        ["block", "drm", "net", "power_supply"]
+    fn entries() -> [&'static str; 5] {
+        ["block", "drm", "net", "power_supply", "thermal"]
     }
 }
 
@@ -206,6 +208,7 @@ impl INode for SysClassINode {
             "drm" => Ok(Arc::new(SysClassDrmDirINode)),
             "net" => Ok(Arc::new(SysClassNetDirINode)),
             "power_supply" => Ok(Arc::new(SysClassPowerSupplyDirINode)),
+            "thermal" => Ok(Arc::new(SysClassThermalDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -494,14 +497,15 @@ impl INode for SysDevicesSystemDirINode {
             "." => Ok(Arc::new(SysDevicesSystemDirINode)),
             ".." => Ok(Arc::new(SysDevicesDirINode)),
             "node" => Ok(Arc::new(SysDevicesSystemNodeDirINode)),
+            "cpu" => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("node".into())
-        } else {
-            Err(FsError::EntryNotFound)
+        match id {
+            0 => Ok("node".into()),
+            1 => Ok("cpu".into()),
+            _ => Err(FsError::EntryNotFound),
         }
     }
 }
@@ -1188,6 +1192,659 @@ impl INode for SysClassPowerSupplyDirINode {
     }
     fn get_entry(&self, _id: usize) -> Result<String> {
         Err(FsError::EntryNotFound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/class/thermal` — minimal thermal zone + cooling device interface.
+//
+// Models a single CPU package thermal zone (`thermal_zone0`, type
+// "x86_pkg_temp") with two user-configurable trip points, plus one cooling
+// device (`cooling_device0`, type "Processor"). This mirrors the ABI described
+// in Documentation/driver-api/thermal/{sysfs-api,x86_pkg_temperature_thermal}.rst
+// so userspace thermal tooling can probe and configure trip points / policy.
+// ---------------------------------------------------------------------------
+
+/// Static zone type reported by `thermal_zone0/type`.
+const THERMAL_ZONE_TYPE: &str = "x86_pkg_temp";
+/// Trip-point types: a passive (throttling) trip and a critical (shutdown) trip.
+const THERMAL_TRIP_TYPES: [&str; 2] = ["passive", "critical"];
+/// Maximum cooling-device state advertised by `cooling_device0/max_state`.
+const COOLING_MAX_STATE: u32 = 10;
+
+/// Mutable state shared by all (stateless) thermal sysfs INodes. `find()` mints
+/// fresh INodes on every lookup, so the configurable values must live here for
+/// writes to persist across reopen.
+struct ThermalState {
+    /// Current package temperature, in milli-degrees Celsius.
+    temp_mc: i32,
+    /// Active governor policy (`thermal_zone0/policy`).
+    policy: String,
+    /// Trip-point temperatures in milli-degrees Celsius; 0 disables the trip.
+    trip_temp: [i32; 2],
+    /// Current cooling-device state (`cooling_device0/cur_state`).
+    cooling_cur: u32,
+}
+
+lazy_static! {
+    static ref THERMAL: Mutex<ThermalState> = Mutex::new(ThermalState {
+        temp_mc: 45000,
+        policy: String::from("step_wise"),
+        trip_temp: [0, 0],
+        cooling_cur: 0,
+    });
+}
+
+/// One writable thermal attribute. Read renders the current value; write parses
+/// and stores it in [`THERMAL`].
+#[derive(Clone, Copy)]
+enum ThermalAttr {
+    Policy,
+    Trip0,
+    Trip1,
+    CoolingCur,
+}
+
+struct ThermalAttrINode {
+    attr: ThermalAttr,
+}
+
+impl ThermalAttrINode {
+    fn value(&self) -> String {
+        let t = THERMAL.lock();
+        match self.attr {
+            ThermalAttr::Policy => format!("{}\n", t.policy),
+            ThermalAttr::Trip0 => format!("{}\n", t.trip_temp[0]),
+            ThermalAttr::Trip1 => format!("{}\n", t.trip_temp[1]),
+            ThermalAttr::CoolingCur => format!("{}\n", t.cooling_cur),
+        }
+    }
+}
+
+impl INode for ThermalAttrINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = self.value();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let s = core::str::from_utf8(buf)
+            .map_err(|_| FsError::InvalidParam)?
+            .trim();
+        let mut t = THERMAL.lock();
+        match self.attr {
+            ThermalAttr::Policy => t.policy = String::from(s),
+            ThermalAttr::Trip0 => t.trip_temp[0] = s.parse().map_err(|_| FsError::InvalidParam)?,
+            ThermalAttr::Trip1 => t.trip_temp[1] = s.parse().map_err(|_| FsError::InvalidParam)?,
+            ThermalAttr::CoolingCur => {
+                let v: u32 = s.parse().map_err(|_| FsError::InvalidParam)?;
+                t.cooling_cur = v.min(COOLING_MAX_STATE);
+            }
+        }
+        // Report the whole buffer consumed so the writer doesn't loop.
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 0,
+            inode: 0,
+            size: self.value().len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
+
+/// Read-only static file helper for thermal attributes.
+fn thermal_ro(content: &str) -> Arc<dyn INode> {
+    Arc::new(Pseudo::new(content, FileType::File))
+}
+
+struct SysClassThermalDirINode;
+
+impl SysClassThermalDirINode {
+    fn entries() -> [&'static str; 2] {
+        ["thermal_zone0", "cooling_device0"]
+    }
+}
+
+impl INode for SysClassThermalDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(40))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassThermalDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            "thermal_zone0" => Ok(Arc::new(SysThermalZoneDirINode)),
+            "cooling_device0" => Ok(Arc::new(SysThermalCoolingDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysThermalZoneDirINode;
+
+impl SysThermalZoneDirINode {
+    fn entries() -> [&'static str; 10] {
+        [
+            "type",
+            "temp",
+            "policy",
+            "available_policies",
+            "mode",
+            "trip_point_0_temp",
+            "trip_point_0_type",
+            "trip_point_1_temp",
+            "trip_point_1_type",
+            "uevent",
+        ]
+    }
+}
+
+impl INode for SysThermalZoneDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(41))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysThermalZoneDirINode)),
+            ".." => Ok(Arc::new(SysClassThermalDirINode)),
+            "type" => Ok(thermal_ro(&format!("{}\n", THERMAL_ZONE_TYPE))),
+            "temp" => Ok(thermal_ro(&format!("{}\n", THERMAL.lock().temp_mc))),
+            "policy" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Policy,
+            })),
+            "available_policies" => Ok(thermal_ro("step_wise user_space\n")),
+            "mode" => Ok(thermal_ro("enabled\n")),
+            "trip_point_0_temp" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Trip0,
+            })),
+            "trip_point_0_type" => Ok(thermal_ro(&format!("{}\n", THERMAL_TRIP_TYPES[0]))),
+            "trip_point_1_temp" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::Trip1,
+            })),
+            "trip_point_1_type" => Ok(thermal_ro(&format!("{}\n", THERMAL_TRIP_TYPES[1]))),
+            "uevent" => Ok(thermal_ro("")),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysThermalCoolingDirINode;
+
+impl SysThermalCoolingDirINode {
+    fn entries() -> [&'static str; 4] {
+        ["type", "max_state", "cur_state", "uevent"]
+    }
+}
+
+impl INode for SysThermalCoolingDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(42))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysThermalCoolingDirINode)),
+            ".." => Ok(Arc::new(SysClassThermalDirINode)),
+            "type" => Ok(thermal_ro("Processor\n")),
+            "max_state" => Ok(thermal_ro(&format!("{}\n", COOLING_MAX_STATE))),
+            "cur_state" => Ok(Arc::new(ThermalAttrINode {
+                attr: ThermalAttr::CoolingCur,
+            })),
+            "uevent" => Ok(thermal_ro("")),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System power management: `/sys/power` (system sleep) and
+// `/sys/devices/system/cpu` (CPU hotplug).
+//
+// These mirror the userspace ABI described in
+// Documentation/{driver-api/pm,power} and the suspend/CPU-hotplug docs: a
+// thermal/power manager writes "mem"/"disk" to /sys/power/state and toggles
+// CPUs via /sys/devices/system/cpu/cpuN/online. eclipse does not actually
+// enter ACPI sleep states or park CPUs, so writes are validated and recorded
+// (a compatibility shim) rather than driving real hardware transitions.
+// ---------------------------------------------------------------------------
+
+/// System sleep states advertised by `/sys/power/state`.
+const POWER_STATES: &str = "freeze mem disk";
+
+/// Mutable PM state shared by the (stateless) sysfs INodes.
+struct PmState {
+    /// Per-CPU online bitmask (bit N set ⇒ CPU N online). Boot CPU stays online.
+    cpu_online: u64,
+    /// Hibernation mode reported by `/sys/power/disk`.
+    disk_mode: String,
+}
+
+lazy_static! {
+    static ref PM: Mutex<PmState> = Mutex::new(PmState {
+        cpu_online: u64::MAX,
+        disk_mode: String::from("platform"),
+    });
+}
+
+/// Comma-separated list of currently-online CPUs (e.g. "0,1,3").
+fn online_cpu_list(count: usize) -> String {
+    let mask = PM.lock().cpu_online;
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..count.min(64) {
+        if mask & (1u64 << i) != 0 {
+            parts.push(format!("{}", i));
+        }
+    }
+    format!("{}\n", parts.join(","))
+}
+
+/// `0` or `0-(count-1)` range string used by present/possible CPU masks.
+fn cpu_range(count: usize) -> String {
+    if count <= 1 {
+        String::from("0\n")
+    } else {
+        format!("0-{}\n", count - 1)
+    }
+}
+
+/// A writable power-management sysfs attribute.
+#[derive(Clone, Copy)]
+enum PmAttr {
+    /// `/sys/power/state`.
+    PowerState,
+    /// `/sys/power/disk`.
+    PowerDisk,
+    /// `/sys/devices/system/cpu/cpuN/online` for the given CPU index.
+    CpuOnline(usize),
+}
+
+struct PmAttrINode {
+    attr: PmAttr,
+}
+
+impl PmAttrINode {
+    fn value(&self) -> String {
+        match self.attr {
+            PmAttr::PowerState => format!("{}\n", POWER_STATES),
+            PmAttr::PowerDisk => format!("{}\n", PM.lock().disk_mode),
+            PmAttr::CpuOnline(i) => {
+                let online = PM.lock().cpu_online & (1u64 << (i.min(63))) != 0;
+                format!("{}\n", if online { 1 } else { 0 })
+            }
+        }
+    }
+}
+
+impl INode for PmAttrINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = self.value();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        let s = core::str::from_utf8(buf)
+            .map_err(|_| FsError::InvalidParam)?
+            .trim();
+        match self.attr {
+            PmAttr::PowerState => {
+                // Validate against the advertised states; we don't actually
+                // suspend, so a successful write is a logged no-op.
+                if POWER_STATES.split_whitespace().any(|st| st == s) || s == "standby" {
+                    warn!(
+                        "/sys/power/state: '{}' requested (suspend not implemented)",
+                        s
+                    );
+                } else {
+                    return Err(FsError::InvalidParam);
+                }
+            }
+            PmAttr::PowerDisk => match s {
+                "platform" | "shutdown" | "reboot" | "suspend" => {
+                    PM.lock().disk_mode = String::from(s)
+                }
+                _ => return Err(FsError::InvalidParam),
+            },
+            PmAttr::CpuOnline(i) => {
+                let on: u32 = s.parse().map_err(|_| FsError::InvalidParam)?;
+                if i == 0 && on == 0 {
+                    // The boot CPU cannot be taken offline.
+                    return Err(FsError::NotSupported);
+                }
+                if i >= 64 {
+                    return Err(FsError::InvalidParam);
+                }
+                let mut pm = PM.lock();
+                if on != 0 {
+                    pm.cpu_online |= 1u64 << i;
+                } else {
+                    pm.cpu_online &= !(1u64 << i);
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: 0,
+            inode: 0,
+            size: self.value().len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
+
+struct SysPowerDirINode;
+
+impl SysPowerDirINode {
+    fn entries() -> [&'static str; 3] {
+        ["state", "disk", "wakeup_count"]
+    }
+}
+
+impl INode for SysPowerDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(140))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysPowerDirINode)),
+            ".." => Ok(SYS_ROOT.clone()),
+            "state" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::PowerState,
+            })),
+            "disk" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::PowerDisk,
+            })),
+            "wakeup_count" => Ok(Arc::new(Pseudo::new("0\n", FileType::File))),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+struct SysDevicesSystemCpuDirINode;
+
+impl INode for SysDevicesSystemCpuDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(150))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        let count = kernel_hal::cpu::cpu_count() as usize;
+        match name {
+            "." => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
+            ".." => Ok(Arc::new(SysDevicesSystemDirINode)),
+            "online" => Ok(Arc::new(Pseudo::new(
+                &online_cpu_list(count),
+                FileType::File,
+            ))),
+            "present" | "possible" => Ok(Arc::new(Pseudo::new(&cpu_range(count), FileType::File))),
+            "kernel_max" => Ok(Arc::new(Pseudo::new(
+                &format!("{}\n", count.saturating_sub(1)),
+                FileType::File,
+            ))),
+            _ => {
+                // cpuN directories.
+                if let Some(idx) = name
+                    .strip_prefix("cpu")
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
+                    if idx < count {
+                        return Ok(Arc::new(SysCpuNDirINode { cpu: idx }));
+                    }
+                }
+                Err(FsError::EntryNotFound)
+            }
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let count = kernel_hal::cpu::cpu_count() as usize;
+        // Aggregate files first, then one entry per CPU.
+        const AGG: [&str; 4] = ["online", "present", "possible", "kernel_max"];
+        if id < AGG.len() {
+            return Ok(AGG[id].into());
+        }
+        let cpu_idx = id - AGG.len();
+        if cpu_idx < count {
+            return Ok(format!("cpu{}", cpu_idx));
+        }
+        Err(FsError::EntryNotFound)
+    }
+}
+
+struct SysCpuNDirINode {
+    cpu: usize,
+}
+
+impl INode for SysCpuNDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(151))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysCpuNDirINode { cpu: self.cpu })),
+            ".." => Ok(Arc::new(SysDevicesSystemCpuDirINode)),
+            "online" => Ok(Arc::new(PmAttrINode {
+                attr: PmAttr::CpuOnline(self.cpu),
+            })),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        // The boot CPU has no `online` toggle in Linux, but exposing it for all
+        // CPUs keeps the shim uniform and simple.
+        if id == 0 {
+            Ok("online".into())
+        } else {
+            Err(FsError::EntryNotFound)
+        }
     }
 }
 

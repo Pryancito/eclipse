@@ -40,9 +40,12 @@ impl Termios {
             // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
             c_lflag: 0x803b,
             c_line: 0,
+            // Matches Linux `INIT_C_CC` (include/linux/tty.h): VINTR=^C, VQUIT=^\,
+            // VERASE=DEL, VKILL=^U, VEOF=^D, VMIN=1, VSTART=^Q, VSTOP=^S, VSUSP=^Z,
+            // VREPRINT=^R(18), VDISCARD=^O(15), VWERASE=^W(23), VLNEXT=^V(22).
             c_cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
             ],
             ispeed: 15, // B38400
             ospeed: 15,
@@ -93,6 +96,60 @@ pub const FIOCLEX: usize = 0x6601;
 // rustc using pipe and ioctl pipe file with this request id
 // for non-blocking/blocking IO control setting
 pub const FIONBIO: usize = 0x5421;
+
+// Queue / session ioctls (`<asm-generic/ioctls.h>`).
+/// Bytes available to read (a.k.a. `TIOCINQ`); written as an `int`.
+pub const FIONREAD: usize = 0x541B;
+/// Alias of [`FIONREAD`] — bytes waiting in the TTY input queue.
+pub const TIOCINQ: usize = FIONREAD;
+/// Bytes still queued in the TTY output buffer; written as an `int`.
+pub const TIOCOUTQ: usize = 0x5411;
+/// Get the session ID of the terminal; written as a `pid_t` (`int`).
+pub const TIOCGSID: usize = 0x5429;
+/// Get serial line interrupt counters into a [`SerialIcounter`].
+pub const TIOCGICOUNT: usize = 0x545D;
+
+/// Linux `struct serial_icounter_struct` — cumulative serial line event
+/// counters reported by `TIOCGICOUNT`. Virtual TTYs have no real UART, so all
+/// fields are reported as zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SerialIcounter {
+    pub cts: i32,
+    pub dsr: i32,
+    pub rng: i32,
+    pub dcd: i32,
+    pub rx: i32,
+    pub tx: i32,
+    pub frame: i32,
+    pub overrun: i32,
+    pub parity: i32,
+    pub brk: i32,
+    pub buf_overrun: i32,
+    pub reserved: [i32; 9],
+}
+
+// Modem control line ioctls (`<asm-generic/termios.h>`). The argument is an
+// `int` bitmask of the `TIOCM_*` flags below.
+/// Read the state of the modem control lines into an `int`.
+pub const TIOCMGET: usize = 0x5415;
+/// Set the modem control lines to the given bitmask.
+pub const TIOCMSET: usize = 0x5418;
+/// Set (OR in) the given modem control line bits.
+pub const TIOCMBIS: usize = 0x5416;
+/// Clear (AND out) the given modem control line bits.
+pub const TIOCMBIC: usize = 0x5417;
+
+/// DTR (Data Terminal Ready) output line.
+pub const TIOCM_DTR: i32 = 0x002;
+/// RTS (Request To Send) output line.
+pub const TIOCM_RTS: i32 = 0x004;
+/// CTS (Clear To Send) input line.
+pub const TIOCM_CTS: i32 = 0x020;
+/// Carrier Detect input line (a.k.a. `TIOCM_CD`).
+pub const TIOCM_CAR: i32 = 0x040;
+/// DSR (Data Set Ready) input line.
+pub const TIOCM_DSR: i32 = 0x100;
 
 // VT / KD console ioctls (Linux `<linux/kd.h>`).
 /// Get console mode (`KD_TEXT` / `KD_GRAPHICS`) into an `int`.

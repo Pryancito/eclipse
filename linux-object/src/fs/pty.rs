@@ -33,6 +33,8 @@ use rcore_fs::vfs::*;
 const IGNCR: u32 = 0x0080;
 const ICRNL: u32 = 0x0100;
 const INLCR: u32 = 0x0040;
+const IXON: u32 = 0x0400;
+const IXANY: u32 = 0x0800;
 // termios c_oflag bits
 const OPOST: u32 = 0x0001;
 const ONLCR: u32 = 0x0004;
@@ -43,13 +45,22 @@ const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
 const NOFLSH: u32 = 0x0080;
 const ECHOCTL: u32 = 0x0200;
+const IEXTEN: u32 = 0x8000;
 // c_cc indices
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
 const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
+const VWERASE: usize = 14;
+const VLNEXT: usize = 15;
+const VEOL2: usize = 16;
 
 /// Mutable, lock-protected state shared by a master/slave pair.
 struct PtyInner {
@@ -57,6 +68,15 @@ struct PtyInner {
     input: VecDeque<u8>,
     /// Canonical-mode line being assembled before it is committed to `input`.
     canon: VecDeque<u8>,
+    /// `VLNEXT` latch: the next input byte is taken verbatim. Persisted here (not
+    /// a loop-local) so Ctrl-V and its quoted char may arrive in separate writes.
+    lnext: bool,
+    /// Virtual modem control lines (`TIOCM_*`) reported by `TIOCMGET`. A PTY has
+    /// no real lines; this just remembers what a program set via `TIOCMSET`.
+    modem: i32,
+    /// Software flow control (IXON): when set by a `VSTOP` (Ctrl-S) from the
+    /// master, program output is held in `output` until a `VSTART` (Ctrl-Q).
+    stopped: bool,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
     termios: Termios,
@@ -95,9 +115,12 @@ impl Pty {
 
     /// Master read side is satisfiable now (data ready, or hangup → EOF).
     fn master_readable(&self) -> bool {
-        if !self.inner.lock().output.is_empty() {
+        let inner = self.inner.lock();
+        // Output paused by flow control (Ctrl-S) is withheld from the master.
+        if !inner.stopped && !inner.output.is_empty() {
             return true;
         }
+        drop(inner);
         self.slave_ever_open.load(Ordering::Relaxed) && self.slave_open.load(Ordering::Relaxed) <= 0
     }
 
@@ -131,6 +154,52 @@ impl Pty {
                     c = b'\r';
                 }
 
+                // Literal-next (VLNEXT, Ctrl-V): the previous byte armed it, so
+                // insert this one verbatim, skipping signal/edit interpretation.
+                if inner.lnext {
+                    inner.lnext = false;
+                    if lflag & ICANON != 0 {
+                        inner.canon.push_back(c);
+                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                            wake_master = true;
+                        }
+                    } else {
+                        inner.input.push_back(c);
+                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                            wake_master = true;
+                        }
+                        wake_slave = true;
+                    }
+                    continue;
+                }
+
+                // Software flow control (IXON): VSTOP (Ctrl-S) holds program
+                // output bound for the master; VSTART (Ctrl-Q) releases it. With
+                // IXANY, any byte releases. These control bytes are consumed.
+                if iflag & IXON != 0 {
+                    if c == cc[VSTOP] {
+                        inner.stopped = true;
+                        continue;
+                    }
+                    if c == cc[VSTART] {
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake_master = true;
+                        }
+                        continue;
+                    }
+                    if iflag & IXANY != 0 && inner.stopped {
+                        inner.stopped = false;
+                        wake_master = true;
+                    }
+                }
+
+                // Discard (VDISCARD, Ctrl-O): no separate output queue to flush,
+                // so just consume the byte under IEXTEN.
+                if lflag & IEXTEN != 0 && cc[VDISCARD] != 0 && c == cc[VDISCARD] {
+                    continue;
+                }
+
                 // Signal-generating characters.
                 if lflag & ISIG != 0 {
                     let sig = if c == cc[VINTR] {
@@ -147,6 +216,12 @@ impl Pty {
                             inner.input.clear();
                             inner.canon.clear();
                         }
+                        // Resume any output frozen by Ctrl-S so the signalled
+                        // program isn't left blocked behind a stopped terminal.
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake_master = true;
+                        }
                         if lflag & ECHO != 0 {
                             inner.output.extend(label.as_bytes());
                             inner.output.extend(b"\r\n");
@@ -158,7 +233,48 @@ impl Pty {
                 }
 
                 if lflag & ICANON != 0 {
-                    if c == cc[VERASE] {
+                    let iexten = lflag & IEXTEN != 0;
+                    if iexten && cc[VWERASE] != 0 && c == cc[VWERASE] {
+                        // Word erase: drop trailing blanks, then the word.
+                        let echo = lflag & (ECHO | ECHOE) != 0;
+                        while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
+                            inner.canon.pop_back();
+                            if echo {
+                                inner.output.extend(b"\x08 \x08");
+                                wake_master = true;
+                            }
+                        }
+                        while let Some(&b) = inner.canon.back() {
+                            if b == b' ' || b == b'\t' {
+                                break;
+                            }
+                            inner.canon.pop_back();
+                            if echo {
+                                inner.output.extend(b"\x08 \x08");
+                                wake_master = true;
+                            }
+                        }
+                    } else if iexten && cc[VREPRINT] != 0 && c == cc[VREPRINT] {
+                        // Reprint the pending line on a fresh line.
+                        if lflag & ECHO != 0 {
+                            if lflag & ECHOCTL != 0 {
+                                inner.output.extend(b"^R");
+                            }
+                            inner.output.extend(b"\r\n");
+                            let pending: alloc::vec::Vec<u8> =
+                                inner.canon.iter().copied().collect();
+                            for b in pending {
+                                echo_byte(&mut inner.output, b, lflag, oflag);
+                            }
+                            wake_master = true;
+                        }
+                    } else if iexten && cc[VLNEXT] != 0 && c == cc[VLNEXT] {
+                        inner.lnext = true;
+                        if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
+                            inner.output.extend(b"^\x08");
+                            wake_master = true;
+                        }
+                    } else if c == cc[VERASE] {
                         if inner.canon.pop_back().is_some() && lflag & (ECHO | ECHOE) != 0 {
                             inner.output.extend(b"\x08 \x08");
                             wake_master = true;
@@ -184,7 +300,11 @@ impl Pty {
                         if echo_byte(&mut inner.output, c, lflag, oflag) {
                             wake_master = true;
                         }
-                        if c == b'\n' {
+                        // Commit the line on newline or a configured EOL delimiter.
+                        let is_eol = c == b'\n'
+                            || (cc[VEOL] != 0 && c == cc[VEOL])
+                            || (cc[VEOL2] != 0 && c == cc[VEOL2]);
+                        if is_eol {
                             while let Some(ch) = inner.canon.pop_front() {
                                 inner.input.push_back(ch);
                             }
@@ -237,7 +357,9 @@ impl Pty {
 
     fn master_read(&self, buf: &mut [u8]) -> Result<usize> {
         let mut inner = self.inner.lock();
-        if inner.output.is_empty() {
+        // While stopped by flow control (Ctrl-S), hold output back from the
+        // master, but still surface EOF if the slave has hung up.
+        if inner.output.is_empty() || inner.stopped {
             drop(inner);
             if self.slave_ever_open.load(Ordering::Relaxed)
                 && self.slave_open.load(Ordering::Relaxed) <= 0
@@ -293,8 +415,9 @@ impl Pty {
         Ok(n)
     }
 
-    /// Shared ioctl handling for both ends.
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize> {
+    /// Shared ioctl handling for both ends. `is_master` selects the queue a
+    /// count ioctl (`FIONREAD`/`TIOCOUTQ`) reports on.
+    fn ioctl(&self, cmd: u32, data: usize, is_master: bool) -> Result<usize> {
         match cmd as usize {
             TIOCGPTN => {
                 unsafe { *(data as *mut u32) = self.id };
@@ -342,6 +465,62 @@ impl Pty {
                 Ok(0)
             }
             TCFLSH | TIOCSCTTY | TIOCNOTTY => Ok(0),
+            // Bytes readable at this end: the master reads program output, the
+            // slave reads cooked input.
+            FIONREAD => {
+                let inner = self.inner.lock();
+                let n = if is_master {
+                    inner.output.len()
+                } else {
+                    inner.input.len()
+                } as i32;
+                unsafe { *(data as *mut i32) = n };
+                Ok(0)
+            }
+            // Bytes still queued toward the other end.
+            TIOCOUTQ => {
+                let inner = self.inner.lock();
+                let n = if is_master {
+                    inner.input.len() + inner.canon.len()
+                } else {
+                    inner.output.len()
+                } as i32;
+                unsafe { *(data as *mut i32) = n };
+                Ok(0)
+            }
+            TIOCGSID => {
+                let mut sid = self.fg_pgrp.load(Ordering::Relaxed);
+                if sid <= 0 {
+                    sid = 1;
+                }
+                unsafe { *(data as *mut i32) = sid };
+                Ok(0)
+            }
+            // Virtual modem control lines (no real hardware behind a PTY).
+            TIOCMGET => {
+                unsafe { *(data as *mut i32) = self.inner.lock().modem };
+                Ok(0)
+            }
+            TIOCMSET => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem = v;
+                Ok(0)
+            }
+            TIOCMBIS => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem |= v;
+                Ok(0)
+            }
+            TIOCMBIC => {
+                let v = unsafe { *(data as *const i32) };
+                self.inner.lock().modem &= !v;
+                Ok(0)
+            }
+            // No real UART behind a PTY, so all serial line counters are zero.
+            TIOCGICOUNT => {
+                unsafe { *(data as *mut SerialIcounter) = SerialIcounter::default() };
+                Ok(0)
+            }
             _ => Err(FsError::NotSupported),
         }
     }
@@ -394,6 +573,9 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
         inner: Mutex::new(PtyInner {
             input: VecDeque::new(),
             canon: VecDeque::new(),
+            lnext: false,
+            modem: TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR,
+            stopped: false,
             output: VecDeque::new(),
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {
@@ -529,7 +711,7 @@ impl INode for PtyMaster {
         readable_future(&self.pty, self.pty.master_bus.clone(), Pty::master_readable)
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        self.pty.ioctl(cmd, data)
+        self.pty.ioctl(cmd, data, true)
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(pty_metadata(make_rdev(5, 2)))
@@ -559,7 +741,7 @@ impl INode for PtySlave {
         readable_future(&self.pty, self.pty.slave_bus.clone(), Pty::slave_readable)
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        self.pty.ioctl(cmd, data)
+        self.pty.ioctl(cmd, data, false)
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(pty_metadata(make_rdev(136, self.pty.id as usize)))

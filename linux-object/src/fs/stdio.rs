@@ -99,6 +99,9 @@ struct TtyState {
     kbd_mode: AtomicI32,
     /// Scroll/Num/Caps LED bits last set via `KDSETLED`.
     kbd_leds: AtomicU8,
+    /// Software flow control (IXON): output to this VT is paused after a `VSTOP`
+    /// (Ctrl-S) and resumed by `VSTART` (Ctrl-Q).
+    flow_stopped: AtomicBool,
 }
 
 lazy_static! {
@@ -109,6 +112,7 @@ lazy_static! {
             vt_mode: Mutex::new(VtMode::auto()),
             kbd_mode: AtomicI32::new(K_XLATE),
             kbd_leds: AtomicU8::new(0),
+            flow_stopped: AtomicBool::new(false),
         })
         .collect();
 }
@@ -132,6 +136,13 @@ fn tty_vt_mode(vt: usize) -> &'static Mutex<VtMode> {
 
 fn tty_kbd_mode(vt: usize) -> i32 {
     TTY_STATES[vt_clamp(vt)].kbd_mode.load(Ordering::Relaxed)
+}
+
+/// Whether output to `vt` is currently paused by software flow control (IXON).
+fn tty_flow_stopped(vt: usize) -> bool {
+    TTY_STATES[vt_clamp(vt)]
+        .flow_stopped
+        .load(Ordering::Relaxed)
 }
 
 /// Whether VT `vt` is translating key presses into TTY characters. False while
@@ -325,6 +336,41 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         // freed; accept the request so X's setup/teardown proceeds.
         VT_RELDISP | VT_DISALLOCATE => Ok(0),
         TIOCSCTTY | TIOCNOTTY => Ok(0),
+        // Bytes available to read: the cooked input queue for this VT.
+        FIONREAD => {
+            let n = vt_stdin(vt).buf.lock().len() as i32;
+            user_copy(UserOutPtr::<i32>::from(data).write(n))?;
+            Ok(0)
+        }
+        // Console output is drawn synchronously, so nothing is ever queued.
+        TIOCOUTQ => {
+            user_copy(UserOutPtr::<i32>::from(data).write(0))?;
+            Ok(0)
+        }
+        // Session ID of the terminal. We don't track sessions separately, so
+        // report the foreground process group (same fallback as TIOCGPGRP).
+        TIOCGSID => {
+            let mut sid = tty_fg_pgrp(vt).load(Ordering::Relaxed);
+            if sid <= 0 {
+                sid = 1;
+            }
+            user_copy(UserOutPtr::<i32>::from(data).write(sid))?;
+            Ok(0)
+        }
+        // Modem control lines. A VT has no real RS-232 lines, so report a
+        // permanently-connected local terminal (DTR/RTS asserted, carrier up)
+        // and accept writes as no-ops — matching how Linux treats a console.
+        TIOCMGET => {
+            let lines = TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR;
+            user_copy(UserOutPtr::<i32>::from(data).write(lines))?;
+            Ok(0)
+        }
+        TIOCMSET | TIOCMBIS | TIOCMBIC => Ok(0),
+        // No real UART behind a VT, so all serial line counters are zero.
+        TIOCGICOUNT => {
+            user_copy(UserOutPtr::<SerialIcounter>::from(data).write(SerialIcounter::default()))?;
+            Ok(0)
+        }
         // Linux console multiplexor. The subcommand is the first byte of the
         // argument. We implement TIOCL_GETSHIFTSTATE (read modifier state),
         // which programs poll — sometimes in a tight loop — to read Shift/Ctrl/
@@ -952,6 +998,9 @@ pub struct Stdin {
     /// Atomic flag set by `push()` so `SerialFuture` can detect new data
     /// without requiring `eventbus.lock()` from the IRQ path.
     data_ready: core::sync::atomic::AtomicBool,
+    /// `VLNEXT` (literal-next, Ctrl-V) latch: when set, the next character is
+    /// inserted verbatim, bypassing signal and line-editing processing.
+    lnext: core::sync::atomic::AtomicBool,
 }
 
 impl Stdin {
@@ -962,6 +1011,7 @@ impl Stdin {
             canon_buf: Mutex::new(VecDeque::new()),
             eventbus: Mutex::new(EventBus::default()),
             data_ready: core::sync::atomic::AtomicBool::new(false),
+            lnext: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1013,6 +1063,73 @@ impl Stdin {
         }
     }
 
+    /// Mark new data available and wake any blocked reader / poller. Mirrors the
+    /// notification dance used by the canonical/raw paths in [`push`].
+    fn wake_readers(&self) {
+        self.data_ready.store(true, Ordering::Release);
+        if let Some(mut eb) = self.eventbus.try_lock() {
+            self.data_ready.store(false, Ordering::Relaxed);
+            eb.set(Event::READABLE);
+        } else {
+            wake_tty_intr_waiters();
+        }
+    }
+
+    /// `VWERASE` (word erase, Ctrl-W): drop trailing whitespace, then the
+    /// preceding word, from the pending canonical line, echoing the erase.
+    fn word_erase(&self, lflag: u32) {
+        let echo = lflag & ECHO != 0;
+        let mut canon = self.canon_buf.lock();
+        // Skip any trailing blanks first.
+        while matches!(canon.back(), Some(' ') | Some('\t')) {
+            canon.pop_back();
+            if echo {
+                self.echo("\x08 \x08");
+            }
+        }
+        // Then erase the word itself, up to (not including) the next blank.
+        while let Some(&ch) = canon.back() {
+            if ch == ' ' || ch == '\t' {
+                break;
+            }
+            canon.pop_back();
+            if echo {
+                self.echo("\x08 \x08");
+            }
+        }
+    }
+
+    /// `VREPRINT` (reprint, Ctrl-R): redraw the pending canonical line on a
+    /// fresh line so the user can see input after noise (e.g. a kernel message).
+    fn reprint(&self, lflag: u32) {
+        if lflag & ECHO == 0 {
+            return;
+        }
+        if lflag & ECHOCTL != 0 {
+            self.echo("^R");
+        }
+        self.echo("\r\n");
+        let canon = self.canon_buf.lock();
+        let mut buf = [0u8; 4];
+        for &ch in canon.iter() {
+            self.echo(ch.encode_utf8(&mut buf));
+        }
+    }
+
+    /// Insert a character verbatim (used after `VLNEXT`): no signal/edit
+    /// interpretation. In canonical mode it joins the pending line; in raw mode
+    /// it becomes immediately readable.
+    fn input_literal(&self, c: char, lflag: u32) {
+        if lflag & ICANON != 0 {
+            self.canon_buf.lock().push_back(c);
+            self.echo_char(c);
+        } else {
+            self.buf.lock().push_back(c);
+            self.echo_char(c);
+            self.wake_readers();
+        }
+    }
+
     /// Push a char into the Stdin buffer.
     ///
     /// Safe to call from IRQ context: acquires `buf` lock briefly (with
@@ -1040,8 +1157,48 @@ impl Stdin {
             }
         }
 
+        // 1b. Literal-next (VLNEXT): the previous keystroke was Ctrl-V, so take
+        // this character verbatim, bypassing signal and line-editing handling.
+        if self.lnext.swap(false, Ordering::Relaxed) {
+            self.input_literal(c, lflag);
+            return;
+        }
+
+        // 1c. Software flow control (IXON): VSTOP (Ctrl-S) pauses console output
+        // and VSTART (Ctrl-Q) resumes it. These bytes are consumed, never
+        // delivered. With IXANY, any input byte resumes paused output.
+        if iflag & IXON != 0 {
+            let state = &TTY_STATES[vt_clamp(self.vt)].flow_stopped;
+            if c as u8 == c_cc[VSTOP] {
+                state.store(true, Ordering::Relaxed);
+                return;
+            }
+            if c as u8 == c_cc[VSTART] {
+                state.store(false, Ordering::Relaxed);
+                return;
+            }
+            if iflag & IXANY != 0 && state.swap(false, Ordering::Relaxed) {
+                // Resumed by this byte; fall through to process it normally.
+            }
+        }
+
+        // 1d. Discard (VDISCARD, Ctrl-O): toggles output flushing. The console
+        // has no output queue to drop, so just consume the byte when IEXTEN is
+        // on so it doesn't leak into the cooked line.
+        if lflag & IEXTEN != 0 && c_cc[VDISCARD] != 0 && c as u8 == c_cc[VDISCARD] {
+            return;
+        }
+
         // 2. Signals
         if lflag & ISIG != 0 {
+            // A job-control signal (Ctrl-C/Ctrl-\/Ctrl-Z) also lifts an IXON
+            // output freeze, so the signalled process can run, print, or die
+            // instead of staying blocked behind a Ctrl-S.
+            if c as u8 == c_cc[VINTR] || c as u8 == c_cc[VQUIT] || c as u8 == c_cc[VSUSP] {
+                TTY_STATES[vt_clamp(self.vt)]
+                    .flow_stopped
+                    .store(false, Ordering::Relaxed);
+            }
             if c as u8 == c_cc[VINTR] {
                 ctrl_c_pending_set();
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
@@ -1119,7 +1276,21 @@ impl Stdin {
 
         // 3. Canon vs Raw mode
         if lflag & ICANON != 0 {
-            if c as u8 == c_cc[VERASE] {
+            // Extended line editing (VWERASE / VREPRINT / VLNEXT) is gated on
+            // IEXTEN, as in Linux n_tty. A c_cc of 0 means the char is disabled.
+            let iexten = lflag & IEXTEN != 0;
+            if iexten && c_cc[VWERASE] != 0 && c as u8 == c_cc[VWERASE] {
+                self.word_erase(lflag);
+            } else if iexten && c_cc[VREPRINT] != 0 && c as u8 == c_cc[VREPRINT] {
+                self.reprint(lflag);
+            } else if iexten && c_cc[VLNEXT] != 0 && c as u8 == c_cc[VLNEXT] {
+                self.lnext.store(true, Ordering::Relaxed);
+                if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
+                    // Show "^" with the cursor parked on it until the quoted
+                    // char arrives (Linux echoes ^ then a backspace).
+                    self.echo("^\x08");
+                }
+            } else if c as u8 == c_cc[VERASE] {
                 let mut canon = self.canon_buf.lock();
                 if let Some(_popped) = canon.pop_back() {
                     if lflag & ECHO != 0 {
@@ -1162,20 +1333,18 @@ impl Stdin {
             } else {
                 self.canon_buf.lock().push_back(c);
                 self.echo_char(c);
-                if c == '\n' {
+                // A line is delivered to readers on newline or on either of the
+                // configurable end-of-line delimiters (VEOL / VEOL2).
+                let is_eol = c == '\n'
+                    || (c_cc[VEOL] != 0 && c as u8 == c_cc[VEOL])
+                    || (c_cc[VEOL2] != 0 && c as u8 == c_cc[VEOL2]);
+                if is_eol {
                     let mut canon = self.canon_buf.lock();
                     let mut buf = self.buf.lock();
                     while let Some(ch) = canon.pop_front() {
                         buf.push_back(ch);
                     }
-                    // Wake readers
-                    self.data_ready.store(true, Ordering::Release);
-                    if let Some(mut eb) = self.eventbus.try_lock() {
-                        self.data_ready.store(false, Ordering::Relaxed);
-                        eb.set(Event::READABLE);
-                    } else {
-                        wake_tty_intr_waiters();
-                    }
+                    self.wake_readers();
                 }
             }
         } else {
@@ -1240,6 +1409,17 @@ impl Stdin {
 
 /// Helper function to post-process output data (e.g. translating \n to \r\n if OPOST and ONLCR are set)
 fn tty_write_out(vt: usize, buf: &[u8]) {
+    // Honor software flow control: while output is stopped by VSTOP (Ctrl-S),
+    // block here until a VSTART (Ctrl-Q) keystroke clears the flag. Keyboard
+    // IRQs keep firing while we spin, so the flag can still be cleared. Bail out
+    // on a pending Ctrl-C so a process blocked on a frozen terminal stays
+    // killable (the SIGINT will be handled once this syscall returns).
+    while tty_flow_stopped(vt) {
+        if ctrl_c_pending_peek() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     let termios = tty_termios(vt).lock();
     let opost = termios.c_oflag & OPOST != 0;
     let onlcr = termios.c_oflag & ONLCR != 0;
