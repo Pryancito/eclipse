@@ -172,6 +172,12 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
             use linux_object::fs::stdio::STDIN;
             STDIN.flush_ready_flag();
         }
+        if !had_jobs {
+            // No work and about to halt: stretch this CPU's scheduler tick to
+            // the next pending timer (capped) so an idle CPU stops taking the
+            // full 250 Hz tick. `timer_idle_exit` (on the next poll) restores it.
+            kernel_hal::timer::timer_idle_enter();
+        }
         had_jobs
     });
     info!("executor run!");

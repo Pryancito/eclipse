@@ -27,6 +27,9 @@ pub struct PercpuBlock {
     /// Remaining timer ticks before the current task must yield.
     /// See [`tick_should_preempt`].
     tick_quantum: PerCpuCell<u32>,
+    /// Whether this CPU's LAPIC timer has been stretched for tickless idle
+    /// (see `timer::timer_idle_enter`). Touched only by its owning CPU.
+    timer_idle_armed: PerCpuCell<bool>,
 }
 
 impl PercpuBlock {
@@ -35,6 +38,7 @@ impl PercpuBlock {
             cpu_id: AtomicU32::new(u32::MAX),
             current_thread: PerCpuCell::new(None),
             tick_quantum: PerCpuCell::new(0),
+            timer_idle_armed: PerCpuCell::new(false),
         }
     }
 
@@ -71,6 +75,19 @@ pub fn tick_should_preempt() -> bool {
         *cell.get_mut() = n - 1;
         false
     }
+}
+
+/// Whether the current CPU's LAPIC timer is currently stretched for tickless
+/// idle. Only ever read/written by the owning CPU.
+#[inline]
+pub fn timer_idle_armed() -> bool {
+    *current().timer_idle_armed.get()
+}
+
+/// Record whether the current CPU's LAPIC timer is stretched for tickless idle.
+#[inline]
+pub fn set_timer_idle_armed(armed: bool) {
+    *current().timer_idle_armed.get_mut() = armed;
 }
 
 /// Backing storage for every CPU's block, indexed by dense logical CPU id.

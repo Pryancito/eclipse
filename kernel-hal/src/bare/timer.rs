@@ -13,6 +13,21 @@ use naive_timer::Timer;
 /// workload. (Previous value was 100 Hz / 10 ms which caused noticeable lag.)
 pub(super) const TICKS_PER_SEC: u64 = 250;
 
+/// Master switch for tickless idle. Set to `false` to fall back to the plain
+/// full-rate periodic tick everywhere (the pre-tickless behaviour), e.g. to
+/// bisect a suspected timer regression. Only consumed on arches with a
+/// re-armable per-CPU timer (x86_64 today).
+#[allow(dead_code)]
+const TICKLESS_IDLE: bool = true;
+
+/// Upper bound on how long an idle CPU may sleep between scheduler ticks, in
+/// nanoseconds (50 ms ≈ 20 Hz). Nearer pending timers are always honoured; this
+/// only bounds the "nothing pending" case so USB-HID polling and the cursor
+/// blink keep running, and so a timer *set* after a CPU has already halted is
+/// serviced within this bound. Lowering it trades idle CPU for responsiveness.
+#[allow(dead_code)]
+const IDLE_TICK_CAP_NS: u64 = 50_000_000;
+
 lazy_static::lazy_static! {
     static ref NAIVE_TIMER: Mutex<Timer> = Mutex::new(Timer::default());
 }
@@ -102,6 +117,31 @@ hal_fn_impl! {
             t.expire(now);
             let next = t.next().map(duration_to_ns).unwrap_or(u64::MAX);
             NEXT_DEADLINE_NS.store(next, Ordering::Release);
+        }
+
+        fn timer_idle_enter() {
+            #[cfg(target_arch = "x86_64")]
+            if TICKLESS_IDLE {
+                // Stretch this CPU's tick to the next pending timer deadline,
+                // capped, so a fully idle CPU stops taking the 250 Hz tick. The
+                // periodic timer keeps firing at the stretched period; on the
+                // next wake `timer_idle_exit` restores the fast tick.
+                let now = duration_to_ns(timer_now());
+                let next = NEXT_DEADLINE_NS.load(Ordering::Acquire);
+                let span = next.saturating_sub(now).min(IDLE_TICK_CAP_NS);
+                super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(span));
+                super::percpu::set_timer_idle_armed(true);
+            }
+        }
+
+        fn timer_idle_exit() {
+            #[cfg(target_arch = "x86_64")]
+            if TICKLESS_IDLE && super::percpu::timer_idle_armed() {
+                // Resuming real work: restore the full-rate scheduler tick so
+                // preemption and HID polling run at their normal cadence.
+                super::arch::timer::set_tick_count(super::arch::timer::fast_tick_count());
+                super::percpu::set_timer_idle_armed(false);
+            }
         }
     }
 }

@@ -203,6 +203,17 @@ hal_fn_def! {
 
         /// Check timers, call when timer interrupt happened.
         pub(crate) fn timer_tick();
+
+        /// Tickless-idle hook: called on a CPU that is about to halt with no
+        /// runnable work. Implementations may stretch the periodic timer to the
+        /// next pending deadline (capped) so a fully idle CPU stops taking the
+        /// full-rate scheduler tick. Default: no-op (keep the periodic tick).
+        pub fn timer_idle_enter() {}
+
+        /// Tickless-idle hook: called when a CPU resumes real work, to restore
+        /// the full-rate scheduler tick stretched by [`timer_idle_enter`].
+        /// Default: no-op.
+        pub fn timer_idle_exit() {}
     }
 
     /// Random number generator.
