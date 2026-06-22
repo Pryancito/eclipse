@@ -25,11 +25,12 @@
 //! bring-up:
 //!
 //! * **Hardware-autonomous P-states.** On Intel via HWP ("Speed Shift"), on AMD
-//!   via CPPC. Enable the feature and let the CPU range from its *lowest* to its
-//!   *highest* performance on its own, biased by the Energy-Performance
-//!   Preference (EPP). An idle core then settles at its lowest voltage/frequency
-//!   (cool); a busy core still ramps to full speed by itself — with no per-tick
-//!   MSR pokes from the kernel.
+//!   via CPPC. Enable the feature and let the CPU scale on its own between its
+//!   lowest P-state and a ceiling, biased hard toward power saving (EPP). This
+//!   kernel favours a cool CPU over peak speed, so the ceiling is set to the
+//!   base (guaranteed/nominal) clock — turbo/boost, the hottest and highest-
+//!   voltage bins, is left off — while an idle core still settles at its lowest
+//!   voltage/frequency. No per-tick MSR pokes from the kernel.
 //! * **Energy-Performance Bias.** The legacy pre-HWP Intel hint (Sandy Bridge …
 //!   Broadwell, and HWP parts that lack the EPP field) nudges the package's
 //!   internal P-state and turbo decisions toward efficiency.
@@ -68,21 +69,31 @@ const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_02B1;
 /// MSR_AMD_CPPC_REQUEST — Max[7:0] | Min[15:8] | Desired[23:16] | EPP[31:24].
 const MSR_AMD_CPPC_REQUEST: u32 = 0xC001_02B2;
 
-// ── Tunables ────────────────────────────────────────────────────────────────
+// ── Tunables — cooling-first policy ─────────────────────────────────────────
+//
+// This kernel deliberately prioritises a cool, low-power CPU over peak speed.
+// The three knobs below set how hard. To trade some heat back for performance:
+// lower `EPP_POWER_SAVE` toward 0x80 (balanced) or 0x00 (max performance), and/
+// or set `CAP_AT_BASE_CLOCK = false` to re-enable turbo/boost.
 //
 // Energy-Performance Preference written into the HWP/CPPC request [31:24]:
 //   0x00 = maximum performance … 0xFF = maximum power saving.
-// 0x80 is the "balanced" value used by most operating systems. The idle-heat
-// win does NOT come from EPP — at idle the core parks at the *minimum*
-// performance set below (its lowest P-state), independent of EPP — so 0x80
-// captures essentially all of the cooling while keeping interactive ramp-up
-// snappy. Raise toward 0xC0/0xFF for a more aggressive power/heat bias at the
-// cost of some throughput under sustained load; lower toward 0x00 for more
-// performance.
-const EPP_BALANCED: u64 = 0x80;
+// 0xFF biases the hardware to keep voltage/frequency as low as the workload
+// allows (lazy to ramp, avoids opportunistic boosts). The idle-heat win comes
+// from the *minimum* field (lowest P-state) regardless; this governs behaviour
+// under load.
+const EPP_POWER_SAVE: u64 = 0xFF;
 
-// IA32_ENERGY_PERF_BIAS[3:0]: 0 = performance … 15 = power saving; 7 = balanced.
-const EPB_BALANCED: u64 = 7;
+// IA32_ENERGY_PERF_BIAS[3:0]: 0 = performance … 15 = power saving (max).
+const EPB_POWER_SAVE: u64 = 15;
+
+// Cap the maximum P-state at the CPU's *guaranteed* (base) clock instead of its
+// *highest* (turbo) clock. Turbo/boost bins run at the highest voltage and
+// frequency and are by far the largest heat source, so disabling them is the
+// single biggest, most deterministic lever for keeping the package cool under
+// sustained load — the core still drops to its lowest P-state at idle either
+// way. Set to `false` to allow turbo (cooler-at-idle, full heat under load).
+const CAP_AT_BASE_CLOCK: bool = true;
 
 // MWAIT idle hints (EAX). Bits [7:4] select the C-state, [3:0] the sub-state.
 // 0x00 = C1, 0x01 = C1E. We deliberately go no deeper than C1E: C3+ can gate
@@ -163,28 +174,34 @@ fn amd_has_cppc() -> bool {
 ///
 /// SAFETY: writes IA32_PM_ENABLE / IA32_HWP_REQUEST, valid only when HWP is
 /// supported (checked by the caller).
-unsafe fn enable_hwp(has_epp: bool) -> (u8, u8) {
+unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
     // Turn HWP on (idempotent / sticky); IA32_HWP_REQUEST is only meaningful
     // once this bit is set.
     Msr::new(IA32_PM_ENABLE).write(HWP_ENABLE);
 
     let caps = Msr::new(IA32_HWP_CAPABILITIES).read();
-    let highest = (caps & 0xff) as u8; // [7:0]   Highest_Performance
+    let highest = (caps & 0xff) as u8; // [7:0]   Highest_Performance (turbo)
+    let guaranteed = ((caps >> 8) & 0xff) as u8; // [15:8]  Guaranteed_Performance (base)
     let lowest = ((caps >> 24) & 0xff) as u8; // [31:24] Lowest_Performance
 
-    // Minimum = lowest  → an idle core may drop to its lowest P-state (coolest).
-    // Maximum = highest → a busy core may still reach full/turbo speed.
-    // Desired = 0       → hardware chooses the operating point autonomously.
+    // Cap the ceiling at the base clock to disable turbo, unless `guaranteed` is
+    // unreported (0) or nonsensical, in which case keep the full range.
+    let cap = CAP_AT_BASE_CLOCK && guaranteed >= lowest && guaranteed > 0;
+    let max = if cap { guaranteed } else { highest };
+
+    // Minimum = lowest → an idle core may drop to its lowest P-state (coolest).
+    // Maximum = max    → the ceiling (base clock when turbo is capped).
+    // Desired = 0      → hardware chooses the operating point autonomously.
     // EPP only exists when CPUID.06H:EAX[10] is set; otherwise bits [31:24] are
     // reserved-zero and IA32_ENERGY_PERF_BIAS provides the bias instead.
-    let epp = if has_epp { EPP_BALANCED } else { 0 };
+    let epp = if has_epp { EPP_POWER_SAVE } else { 0 };
     let request = (lowest as u64)
-        | ((highest as u64) << 8)
+        | ((max as u64) << 8)
         | (0u64 << 16)
         | (epp << 24);
     Msr::new(IA32_HWP_REQUEST).write(request);
 
-    (lowest, highest)
+    (lowest, max, cap)
 }
 
 /// Enable AMD CPPC on this CPU and request hardware-autonomous scaling across
@@ -192,22 +209,28 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8) {
 ///
 /// SAFETY: writes the MSR_AMD_CPPC_* registers, valid only when CPPC is present
 /// (checked by the caller). Note the field order differs from Intel HWP.
-unsafe fn enable_amd_cppc() -> (u8, u8) {
+unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
     Msr::new(MSR_AMD_CPPC_ENABLE).write(1);
 
     let cap1 = Msr::new(MSR_AMD_CPPC_CAP1).read();
-    let highest = ((cap1 >> 24) & 0xff) as u8; // [31:24] Highest_Performance
+    let highest = ((cap1 >> 24) & 0xff) as u8; // [31:24] Highest_Performance (boost)
+    let nominal = ((cap1 >> 16) & 0xff) as u8; // [23:16] Nominal_Performance (base)
     let lowest = (cap1 & 0xff) as u8; // [7:0]    Lowest_Performance
 
-    // REQUEST: Max[7:0]=highest, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
+    // Cap the ceiling at nominal (base) to disable Precision Boost, unless it is
+    // unreported (0) or nonsensical.
+    let cap = CAP_AT_BASE_CLOCK && nominal >= lowest && nominal > 0;
+    let max = if cap { nominal } else { highest };
+
+    // REQUEST: Max[7:0]=max, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
     // EPP[31:24]. Out-of-range fields are clamped by hardware to [lowest,highest].
-    let request = (highest as u64)
+    let request = (max as u64)
         | ((lowest as u64) << 8)
         | (0u64 << 16)
-        | (EPP_BALANCED << 24);
+        | (EPP_POWER_SAVE << 24);
     Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
 
-    (lowest, highest)
+    (lowest, max, cap)
 }
 
 /// Set the legacy Intel Energy-Performance Bias hint, preserving reserved bits.
@@ -216,7 +239,7 @@ unsafe fn enable_amd_cppc() -> (u8, u8) {
 /// set (checked by the caller).
 unsafe fn set_energy_perf_bias() {
     let mut msr = Msr::new(IA32_ENERGY_PERF_BIAS);
-    let value = (msr.read() & !0xf) | EPB_BALANCED;
+    let value = (msr.read() & !0xf) | EPB_POWER_SAVE;
     msr.write(value);
 }
 
@@ -278,12 +301,13 @@ pub(super) fn init() {
 
     log_summary_once(|| {
         match pstate {
-            Some((mech, (lo, hi))) => info!(
-                "power: {} enabled — hardware-autonomous P-state, perf range {}..={}, EPP=balanced{}",
+            Some((mech, (lo, hi, capped))) => info!(
+                "power: {} enabled — autonomous P-state {}..={}{}, EPP=power-save{}",
                 mech.label(),
                 lo,
                 hi,
-                if has_epb { " (+EPB)" } else { "" },
+                if capped { " (turbo/boost disabled)" } else { "" },
+                if has_epb { " +EPB" } else { "" },
             ),
             None => info!(
                 "power: no OS P-state control ({}); left to firmware{}",
@@ -294,7 +318,7 @@ pub(super) fn init() {
                 } else {
                     "unknown CPU vendor"
                 },
-                if has_epb { ", EPB=balanced" } else { "" },
+                if has_epb { ", EPB=power-save" } else { "" },
             ),
         }
         if mwait_on {
