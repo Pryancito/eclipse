@@ -7,7 +7,6 @@ use alloc::{boxed::Box, sync::Arc, vec};
 use async_trait::async_trait;
 // use core::{mem::size_of, slice};
 // use kernel_hal::net::get_net_device;
-use kernel_hal::thread;
 use lock::Mutex;
 use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
@@ -129,7 +128,9 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::yield_now().await;
+            // Park on the RX IRQ waker (5 ms fallback) instead of busy-spinning
+            // — an idle udhcpc blocked on recvfrom otherwise pegs a core.
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
@@ -169,7 +170,9 @@ impl Socket for UdpSocketState {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             kernel_hal::deferred_job::drain_deferred_jobs();
-            thread::yield_now().await;
+            // Park on the RX IRQ waker (5 ms fallback) instead of busy-spinning
+            // — an idle udhcpc blocked on recvfrom otherwise pegs a core.
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     /// write from buffer

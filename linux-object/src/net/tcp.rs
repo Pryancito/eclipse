@@ -224,14 +224,13 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            // Re-queue immediately instead of timer-sleeping. The timer-backed
-            // wake (sleep_until / NetRxOrTimeoutFuture) does NOT resume a
-            // blocking socket read in this executor — the task is parked and
-            // never re-polled, which froze every TLS handshake (the client
-            // sends ClientHello, then blocks reading ServerHello forever).
-            // yield_now keeps the task runnable so the loop keeps driving
-            // poll_ifaces and picks up RX data as soon as it lands.
-            thread::yield_now().await;
+            // Park until the NIC's RX IRQ wakes us (immediate on data) or a
+            // short fallback timer fires, instead of busy-spinning with
+            // yield_now — which pegged a core at 100% for any socket blocked in
+            // recv (e.g. an idle irssi). The 5 ms fallback still drives
+            // poll_ifaces if a wake is ever missed, so a stalled wake can never
+            // freeze the op the way a pure timer/IRQ park once did.
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
@@ -246,19 +245,12 @@ impl Socket for TcpSocketState {
             let sets = get_sockets();
             let mut sets = sets.lock();
             let mut socket = sets.get::<TcpSocket>(handle);
-            let state = socket.state();
             let mut copied_len = socket.peek_slice(data);
             if let Ok(0) = copied_len {
                 if !data.is_empty() {
                     copied_len = Err(smoltcp::Error::Exhausted);
                 }
             }
-            log::warn!(
-                "[tcp peek debug] data.len()={}, state={:?}, result={:?}",
-                data.len(),
-                state,
-                copied_len
-            );
             drop(socket);
             drop(sets);
             match copied_len {
@@ -288,9 +280,8 @@ impl Socket for TcpSocketState {
             if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
-            // See read(): timer-backed wakes don't resume a blocking socket op
-            // in this executor, so keep the task runnable via yield_now.
-            thread::yield_now().await;
+            // Park on the RX IRQ waker with a 5 ms fallback — see read().
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     /// write from buffer
@@ -430,7 +421,9 @@ impl Socket for TcpSocketState {
                 return Err(LxError::ETIMEDOUT);
             }
 
-            thread::yield_now().await;
+            // Park on the RX IRQ waker (5 ms fallback) while the handshake
+            // completes, rather than busy-spinning — see read().
+            kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
         }
     }
     /// wait for some event on a file descriptor
