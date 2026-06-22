@@ -59,6 +59,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // DIAGNOSTIC (temporal): banner de versión IMPOSIBLE de ignorar, escrito a la
+    // consola gráfica (pantalla) — no al anillo de dmesg. Si tras reconstruir y
+    // redesplegar NO ves esta línea en el arranque, el kernel que corre NO es el
+    // que acabas de compilar (hueco de despliegue). Sube el tag en cada build.
+    kernel_hal::console::console_write_fmt(format_args!(
+        "\n\n==================================================\n\
+           ECLIPSE DIAG BUILD: perf-freeze-r3 (4bfc73a+)\n\
+         ==================================================\n\n"
+    ));
     kernel_hal::console::early_progress_bar(90);
     cfg_if! {
         if #[cfg(all(feature = "linux", feature = "zircon"))] {
