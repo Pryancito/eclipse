@@ -96,6 +96,11 @@ struct VMObjectPagedInner {
     self_ref: WeakRef,
     /// Sum of pin_count
     pin_count: usize,
+    /// Optional lazy backing source (demand paging). When set, a page that is
+    /// committed for the first time on this (root) node is filled from the
+    /// source instead of being left zero. Carried to the hidden parent on
+    /// `create_child` (fork) so it keeps resolving for both children.
+    source: Option<Arc<dyn FrameFiller>>,
 }
 
 /// Page state in VMO.
@@ -175,6 +180,29 @@ impl VMObjectPaged {
                 contiguous: false,
                 self_ref: Default::default(),
                 pin_count: 0,
+                source: None,
+            },
+            None,
+        )
+    }
+
+    /// Create a new paged VMO demand-paged from `source` (see [`FrameFiller`]).
+    pub fn new_with_source(pages: usize, source: Arc<dyn FrameFiller>) -> Arc<Self> {
+        VMObjectPaged::wrap(
+            VMObjectPagedInner {
+                owner: new_owner_id(),
+                type_: VMOType::Origin,
+                parent: None,
+                parent_offset: 0usize,
+                parent_limit: 0usize,
+                size: pages * PAGE_SIZE,
+                frames: BTreeMap::new(),
+                mappings: Vec::new(),
+                cache_policy: CachePolicy::Cached,
+                contiguous: false,
+                self_ref: Default::default(),
+                pin_count: 0,
+                source: Some(source),
             },
             None,
         )
@@ -546,13 +574,31 @@ impl VMObjectPagedInner {
         if no_frame {
             // if out_of_range
             if out_of_range || no_parent {
-                if !flags.contains(MMUFlags::WRITE) {
+                // Demand paging: if this root node is file-backed and the page
+                // lies within the source, it must be filled from the file — even
+                // on a read fault, since a shared zero page would expose zeros
+                // instead of the file's contents.
+                let from_source = self
+                    .source
+                    .as_ref()
+                    .map_or(false, |s| page_idx * PAGE_SIZE < s.source_len());
+                if !flags.contains(MMUFlags::WRITE) && !from_source {
                     // read-only, just return zero frame
                     return Ok(CommitResult::Ref(kernel_hal::mem::ZERO_FRAME.paddr()));
                 }
                 // lazy allocate zero frame
                 // 这里会调用HAL层的hal_frame_alloc, 请注意实现该函数时参数要一样
                 let target_frame = PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?;
+                if from_source {
+                    // Read the page from the backing file into the fresh frame.
+                    // The frame is already zeroed, so bytes past end-of-file stay
+                    // zero (BSS tail of the mapping).
+                    let source = self.source.as_ref().unwrap();
+                    let vaddr = phys_to_virt(target_frame.paddr());
+                    let buf =
+                        unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, PAGE_SIZE) };
+                    source.fill_page(page_idx * PAGE_SIZE, buf);
+                }
                 if out_of_range {
                     // can never be a hidden vmo
                     assert!(!self.type_.is_hidden());
@@ -761,6 +807,11 @@ impl VMObjectPagedInner {
                 Some((child.parent_offset, child.parent_limit)),
             );
         }
+        // The surviving child takes over as root; carry the demand-paging source
+        // along so its still-uncommitted pages keep resolving from the file.
+        if child.source.is_none() {
+            child.source = self.source.take();
+        }
         child.parent = self.parent.take();
     }
 
@@ -794,6 +845,9 @@ impl VMObjectPagedInner {
                 contiguous: false,
                 self_ref: Default::default(),
                 pin_count: 0,
+                // The new snapshot child resolves uncommitted pages through the
+                // shared hidden parent (which carries the source), not directly.
+                source: None,
             },
             Some(lock_ref.clone()),
         );
@@ -815,6 +869,9 @@ impl VMObjectPagedInner {
                 contiguous: self.contiguous,
                 self_ref: Default::default(),
                 pin_count: self.pin_count,
+                // The hidden node becomes the shared root for both children, so
+                // it must keep demand-paging the file: hand the source over to it.
+                source: self.source.take(),
             },
             Some(lock_ref.clone()),
         );

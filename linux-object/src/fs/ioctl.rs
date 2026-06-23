@@ -13,7 +13,18 @@ pub const TCSETS: usize = 0x5402;
 pub const TCSETSW: usize = 0x5403;
 pub const TCSETSF: usize = 0x5404;
 
-/// musl/glibc `struct termios` on Linux x86_64 (60 bytes).
+/// The Linux **kernel ABI** `struct termios` exchanged by `TCGETS`/`TCSETS`
+/// (asm-generic/termbits.h): `NCCS = 19`, no separate `c_ispeed`/`c_ospeed`
+/// (the line speed lives in the `CBAUD` bits of `c_cflag`). This is exactly 36
+/// bytes.
+///
+/// This MUST match the kernel ABI struct, not libc's larger userspace `struct
+/// termios` (60 bytes, `NCCS = 32` + speed fields). glibc's `tcgetattr` passes
+/// a kernel-sized stack buffer to `TCGETS` and expects ≤36 bytes back; writing
+/// 60 bytes overran that buffer, clobbering the saved frame pointer and return
+/// address and crashing the process on return (SIGSEGV, `pc=0xf`) — which made
+/// every glibc `exec` flaky. musl passes its own 60-byte struct, so it happened
+/// to survive, masking the bug.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Termios {
@@ -22,9 +33,7 @@ pub struct Termios {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 32],
-    pub ispeed: u32,
-    pub ospeed: u32,
+    pub c_cc: [u8; 19],
 }
 
 impl Termios {
@@ -40,15 +49,14 @@ impl Termios {
             // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
             c_lflag: 0x803b,
             c_line: 0,
-            // Matches Linux `INIT_C_CC` (include/linux/tty.h): VINTR=^C, VQUIT=^\,
-            // VERASE=DEL, VKILL=^U, VEOF=^D, VMIN=1, VSTART=^Q, VSTOP=^S, VSUSP=^Z,
-            // VREPRINT=^R(18), VDISCARD=^O(15), VWERASE=^W(23), VLNEXT=^V(22).
+            // Matches Linux `INIT_C_CC` (include/linux/tty.h), one entry per
+            // NCCS=19 control char: VINTR=^C, VQUIT=^\, VERASE=DEL, VKILL=^U,
+            // VEOF=^D, VTIME=0, VMIN=1, VSWTC=0, VSTART=^Q, VSTOP=^S, VSUSP=^Z,
+            // VEOL=0, VREPRINT=^R, VDISCARD=^O, VWERASE=^W, VLNEXT=^V, VEOL2=0.
             c_cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0,
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
             ],
-            ispeed: 15, // B38400
-            ospeed: 15,
+            // Line speed is carried in the CBAUD bits of c_cflag (B38400 above).
         }
     }
 }

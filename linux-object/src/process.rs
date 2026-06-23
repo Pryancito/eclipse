@@ -130,6 +130,7 @@ impl ProcessExt for Process {
         let new_linux_proc = LinuxProcess {
             root_inode: linux_parent.root_inode.clone(),
             parent: Arc::downgrade(parent),
+            perf: crate::perf::ProcPerf::new(),
             inner: Mutex::new(LinuxProcessInner {
                 execute_path: linux_parent_inner.execute_path.clone(),
                 cmdline: linux_parent_inner.cmdline.clone(),
@@ -297,6 +298,8 @@ pub struct LinuxProcess {
     parent: Weak<Process>,
     /// Inner
     inner: Mutex<LinuxProcessInner>,
+    /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
+    perf: crate::perf::ProcPerf,
 }
 
 /// Linux process mut inner data
@@ -417,11 +420,17 @@ impl LinuxProcess {
         LinuxProcess {
             root_inode,
             parent: Weak::default(),
+            perf: crate::perf::ProcPerf::new(),
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 ..Default::default()
             }),
         }
+    }
+
+    /// Per-process syscall accounting (see [`crate::perf`]).
+    pub fn perf(&self) -> &crate::perf::ProcPerf {
+        &self.perf
     }
 
     /// Get the parent zircon process.

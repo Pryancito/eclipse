@@ -24,6 +24,26 @@ pub fn vmo_page_bytes() -> usize {
     (VMO_PAGE_ALLOC.get() - VMO_PAGE_DEALLOC.get()) * PAGE_SIZE
 }
 
+/// A lazy backing source for a paged VMO (demand paging).
+///
+/// Lets a file-backed `mmap` be paged in on demand: instead of eagerly reading
+/// the whole file into the VMO at map time (which, for a ~150 MiB library like
+/// `libLLVM.so` pulled in by `perf`, stalls the machine reading hundreds of MiB
+/// synchronously), each page is read from the source the first time it is
+/// committed — i.e. on the page fault that first touches it. A process only
+/// pays for the pages it actually uses.
+pub trait FrameFiller: Send + Sync {
+    /// Number of source bytes available from the start of the VMO. Pages whose
+    /// start offset is `>= source_len()` are plain zero pages (e.g. the BSS tail
+    /// of a file mapping that extends past end-of-file).
+    fn source_len(&self) -> usize;
+
+    /// Fill `buf` (exactly one page) with the source bytes starting at byte
+    /// `offset` within the VMO. The buffer is pre-zeroed; any bytes past
+    /// `source_len()` must be left as zero.
+    fn fill_page(&self, offset: usize, buf: &mut [u8]);
+}
+
 /// Virtual Memory Object Trait
 #[allow(clippy::len_without_is_empty)]
 pub trait VMObjectTrait: Sync + Send {
@@ -148,6 +168,23 @@ impl VmObject {
             resizable,
             _counter: CountHelper::new(),
             trait_: VMObjectPaged::new(pages),
+            inner: Mutex::new(VmObjectInner::default()),
+            base,
+        })
+    }
+
+    /// Create a new paged VMO that is demand-paged from `source`.
+    ///
+    /// The VMO has `pages` pages; touching a page for the first time reads its
+    /// contents from `source` (see [`FrameFiller`]) instead of returning zeros.
+    /// Used for file-backed `mmap` so a large mapping is not read into memory up
+    /// front.
+    pub fn new_paged_with_source(pages: usize, source: Arc<dyn FrameFiller>) -> Arc<Self> {
+        let base = KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN);
+        Arc::new(VmObject {
+            resizable: false,
+            _counter: CountHelper::new(),
+            trait_: VMObjectPaged::new_with_source(pages, source),
             inner: Mutex::new(VmObjectInner::default()),
             base,
         })

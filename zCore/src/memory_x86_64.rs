@@ -169,9 +169,14 @@ pub fn frame_dealloc(target: PhysAddr) {
     // DEBUG: envenenar el frame con 0x5A al liberarlo. Si un proceso lee este
     // patrón en su memoria (fault a una dirección ~0x5a5a5a5a...), está leyendo
     // un frame YA LIBERADO -> PTE rancia (free-sin-unmap / use-after-free).
+    //
+    // Resolver la dirección del frame con `phys_to_virt` en lugar de la base
+    // physmap hardcodeada: en bare-metal es el mismo offset, pero en libos la
+    // "memoria física" es un mmap del proceso anfitrión en otra base — escribir
+    // a `0xffff_8000_…` allí provoca un SIGSEGV del propio anfitrión.
     unsafe {
         core::ptr::write_bytes(
-            (0xffff_8000_0000_0000usize + target) as *mut u8,
+            kernel_hal::mem::phys_to_virt(target) as *mut u8,
             0x5A,
             1 << PAGE_BITS,
         );
