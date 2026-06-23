@@ -978,6 +978,11 @@ pub struct Stdin {
 }
 
 impl Stdin {
+    /// The virtual terminal this stdin is bound to.
+    pub fn vt(&self) -> usize {
+        self.vt
+    }
+
     fn new(vt: usize) -> Self {
         Self {
             vt,

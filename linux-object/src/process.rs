@@ -130,6 +130,7 @@ impl ProcessExt for Process {
         let new_linux_proc = LinuxProcess {
             root_inode: linux_parent.root_inode.clone(),
             parent: Arc::downgrade(parent),
+            vt: linux_parent.vt,
             perf: crate::perf::ProcPerf::new(),
             inner: Mutex::new(LinuxProcessInner {
                 execute_path: linux_parent_inner.execute_path.clone(),
@@ -296,6 +297,10 @@ pub struct LinuxProcess {
     root_inode: Arc<dyn INode>,
     /// Parent process
     parent: Weak<Process>,
+    /// Virtual terminal this process is attached to (its stdin/stdout VT).
+    /// Used to keep background (inactive-VT) shells from busy-polling stdin for
+    /// input that can only arrive on the active terminal.
+    vt: usize,
     /// Inner
     inner: Mutex<LinuxProcessInner>,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
@@ -420,6 +425,7 @@ impl LinuxProcess {
         LinuxProcess {
             root_inode,
             parent: Weak::default(),
+            vt,
             perf: crate::perf::ProcPerf::new(),
             inner: Mutex::new(LinuxProcessInner {
                 files,
@@ -431,6 +437,11 @@ impl LinuxProcess {
     /// Per-process syscall accounting (see [`crate::perf`]).
     pub fn perf(&self) -> &crate::perf::ProcPerf {
         &self.perf
+    }
+
+    /// The virtual terminal this process is attached to.
+    pub fn vt(&self) -> usize {
+        self.vt
     }
 
     /// Get the parent zircon process.
