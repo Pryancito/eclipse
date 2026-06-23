@@ -127,6 +127,15 @@ impl ProcessExt for Process {
     fn fork_from(parent: &Arc<Self>, _vfork: bool) -> ZxResult<Arc<Self>> {
         let linux_parent = parent.linux();
         let mut linux_parent_inner = linux_parent.inner.lock();
+        // Child joins the parent's process group: copy the parent's *effective*
+        // pgid so the inherited value is concrete even if the parent never
+        // called setpgid (raw 0 → own pid). This is what makes a Ctrl-C reach a
+        // child like `ping` that the shell spawned without job control.
+        let parent_pgid = if linux_parent_inner.pgid == 0 {
+            parent.id()
+        } else {
+            linux_parent_inner.pgid
+        };
         let new_linux_proc = LinuxProcess {
             root_inode: linux_parent.root_inode.clone(),
             parent: Arc::downgrade(parent),
@@ -139,6 +148,7 @@ impl ProcessExt for Process {
                 files: linux_parent_inner.files.clone(),
                 signal_actions: linux_parent_inner.signal_actions.clone(),
                 credentials: linux_parent_inner.credentials.clone(),
+                pgid: parent_pgid,
                 ..Default::default()
             }),
         };
@@ -332,6 +342,13 @@ struct LinuxProcessInner {
     children: HashMap<KoID, Arc<Process>>,
     /// Exit codes for children already detached (freed `Arc<Process>` at exit).
     reaped_children: HashMap<KoID, i64>,
+    /// Process group id (job control). `0` means "unset" and resolves to the
+    /// process's own pid, so a fresh session/group leader is its own group.
+    /// `fork` copies the parent's *effective* pgid (children join the parent's
+    /// group); `setpgid` overrides it. Terminal-generated signals (Ctrl-C/\\/Z)
+    /// go to every process whose effective pgid matches the tty's foreground
+    /// group — see [`send_signal_to_pgrp`].
+    pgid: u64,
     /// Signal actions
     signal_actions: SignalActions,
     /// Program break (top of heap).
@@ -442,6 +459,17 @@ impl LinuxProcess {
     /// The virtual terminal this process is attached to.
     pub fn vt(&self) -> usize {
         self.vt
+    }
+
+    /// Raw process-group id (`0` = unset → resolves to the process's own pid).
+    pub fn pgid_raw(&self) -> u64 {
+        self.inner.lock().pgid
+    }
+
+    /// Set this process's group id (`setpgid`). A `0` argument is stored as-is
+    /// and resolves to the own pid; callers normally pass a concrete pgid.
+    pub fn set_pgid_raw(&self, pgid: u64) {
+        self.inner.lock().pgid = pgid;
     }
 
     /// Get the parent zircon process.
@@ -1198,7 +1226,7 @@ impl LinuxProcessInner {
 pub fn deliver_sigint_to_foreground() {
     let pgid = crate::fs::stdio::get_foreground_pgrp();
     if pgid > 0 {
-        let _ = send_signal_to_process(pgid as usize, LinuxSignal::SIGINT);
+        let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGINT);
         return;
     }
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
@@ -1206,6 +1234,59 @@ pub fn deliver_sigint_to_foreground() {
             let _ = send_signal_to_process(thread.proc().id() as usize, LinuxSignal::SIGINT);
         }
     }
+}
+
+/// This process's effective process-group id: its raw pgid, or its own pid when
+/// the raw value is unset (`0`).
+fn effective_pgid(proc: &Arc<Process>) -> KoID {
+    let raw = proc.linux().pgid_raw();
+    if raw == 0 {
+        proc.id()
+    } else {
+        raw
+    }
+}
+
+/// Deliver `signal` to every live process in process group `pgid`. This is the
+/// POSIX behaviour for terminal-generated signals (Ctrl-C → SIGINT, Ctrl-\\ →
+/// SIGQUIT, Ctrl-Z → SIGTSTP): the whole foreground group is signalled, not
+/// just the group leader, so a shell's foreground child (e.g. `ping`) actually
+/// receives it. `ESRCH` if the group has no members.
+pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
+    let pgid = pgid as KoID;
+    let mut any = false;
+    for proc in all_live_processes() {
+        if effective_pgid(&proc) == pgid
+            && send_signal_to_process(proc.id() as usize, signal).is_ok()
+        {
+            any = true;
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err(LxError::ESRCH)
+    }
+}
+
+/// `setpgid`: set process `pid`'s group to `pgid`. Permissive (no session/leader
+/// checks): enough for a shell to put a job into its own group.
+pub fn set_process_pgid(pid: KoID, pgid: KoID) -> LxResult<()> {
+    let proc = all_live_processes()
+        .into_iter()
+        .find(|p| p.id() == pid)
+        .ok_or(LxError::ESRCH)?;
+    proc.linux().set_pgid_raw(pgid);
+    Ok(())
+}
+
+/// `getpgid`: the effective process-group id of process `pid`.
+pub fn get_process_pgid(pid: KoID) -> LxResult<KoID> {
+    let proc = all_live_processes()
+        .into_iter()
+        .find(|p| p.id() == pid)
+        .ok_or(LxError::ESRCH)?;
+    Ok(effective_pgid(&proc))
 }
 
 pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {

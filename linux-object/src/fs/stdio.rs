@@ -1200,7 +1200,9 @@ impl Stdin {
                 ctrl_c_pending_set();
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 if pgid > 0 {
-                    let _ = crate::process::send_signal_to_process(
+                    // Whole foreground group, not just the leader — otherwise a
+                    // shell child like `ping` never sees the Ctrl-C.
+                    let _ = crate::process::send_signal_to_pgrp(
                         pgid as usize,
                         crate::signal::Signal::SIGINT,
                     );
@@ -1224,7 +1226,7 @@ impl Stdin {
             if c as u8 == c_cc[VQUIT] {
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 if pgid > 0 {
-                    let _ = crate::process::send_signal_to_process(
+                    let _ = crate::process::send_signal_to_pgrp(
                         pgid as usize,
                         crate::signal::Signal::SIGQUIT,
                     );
@@ -1248,7 +1250,7 @@ impl Stdin {
             if c as u8 == c_cc[VSUSP] {
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 if pgid > 0 {
-                    let _ = crate::process::send_signal_to_process(
+                    let _ = crate::process::send_signal_to_pgrp(
                         pgid as usize,
                         crate::signal::Signal::SIGTSTP,
                     );
