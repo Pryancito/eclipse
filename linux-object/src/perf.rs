@@ -182,8 +182,14 @@ pub fn kernel_report() -> String {
     let ks = kernel_hal::kstats::snapshot();
     let uptime_ns = kernel_hal::timer::timer_now().as_nanos() as u64;
     let uptime_s = uptime_ns as f64 / 1e9;
-    let cpus = kernel_hal::cpu::cpu_count().max(1) as u64;
-    let capacity_ns = uptime_ns.saturating_mul(cpus);
+    let total_cpus = kernel_hal::cpu::cpu_count().max(1) as u64;
+    // Average busy% over the cores that actually came online, NOT the configured
+    // CPU count: an AP that failed SMP bring-up never runs the idle loop, so
+    // counting it in the denominator would charge its idle time as "busy" and
+    // inflate the figure (a partial bring-up under QEMU/TCG is common). On a
+    // healthy boot online == total and this is identical to before.
+    let online_cpus = (kernel_hal::online_cpu_count() as u64).clamp(1, total_cpus);
+    let capacity_ns = uptime_ns.saturating_mul(online_cpus);
     let idle_pct = if capacity_ns > 0 {
         (ks.idle_ns as f64 * 100.0 / capacity_ns as f64).min(100.0)
     } else {
@@ -203,11 +209,15 @@ pub fn kernel_report() -> String {
             let _ = writeln!(out, "cpu temp:     n/a (no sensor or running in a VM)");
         }
     }
-    let _ = writeln!(out, "uptime:       {:.2} s   cpus: {}", uptime_s, cpus);
     let _ = writeln!(
         out,
-        "cpu idle:     {:.1}%   busy: {:.1}%   (averaged over {} cpu(s))",
-        idle_pct, busy_pct, cpus
+        "uptime:       {:.2} s   cpus: {} online ({} configured)",
+        uptime_s, online_cpus, total_cpus
+    );
+    let _ = writeln!(
+        out,
+        "cpu idle:     {:.1}%   busy: {:.1}%   (averaged over {} online cpu(s))",
+        idle_pct, busy_pct, online_cpus
     );
     let avg_nap_us = if ks.idle_entries > 0 {
         ks.idle_ns as f64 / ks.idle_entries as f64 / 1000.0
@@ -235,6 +245,25 @@ pub fn kernel_report() -> String {
             rate(*naps),
             avg_us
         );
+    }
+    // [diag] Per-CPU tick context: of the scheduler ticks that hit each core, how
+    // many interrupted user mode (a ring-3 thread burning CPU) vs kernel mode. A
+    // pegged core with a high user% is running a CPU-bound user thread; a high
+    // kernel% on a pegged core points at a kernel-side spin (lock / poll loop).
+    if !ks.tick_percpu.is_empty() {
+        let _ = writeln!(out, "tick ctx (user/total, last rip):");
+        for (cpu, total, user, rip) in &ks.tick_percpu {
+            let pct = if *total > 0 {
+                *user as f64 * 100.0 / *total as f64
+            } else {
+                0.0
+            };
+            let _ = writeln!(
+                out,
+                "  cpu{}: {}/{} ({:.0}% user) rip={:#x}",
+                cpu, user, total, pct, rip
+            );
+        }
     }
     // [diag] xHCI HID poll rate by path. Input is delivered from these polls;
     // when idle, `iowait` falls to ~0 and `timer` alone must keep input alive.

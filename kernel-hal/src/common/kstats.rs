@@ -93,6 +93,32 @@ pub fn note_timer_tick() {
     TIMER_TICKS.fetch_add(1, Relaxed);
 }
 
+/// [diag] Per-CPU timer ticks, split by whether the tick interrupted user mode
+/// (a thread burning CPU in ring 3) or kernel mode (idle `hlt`, a syscall, or a
+/// kernel busy-spin). A core that is pegged with mostly *user* ticks is running
+/// a CPU-bound user thread; mostly *kernel* ticks on a pegged core points at a
+/// kernel-side spin (lock / poll loop). Used to locate the source of idle heat.
+static TICK_TOTAL_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static TICK_USER_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+/// [diag] Most recent RIP observed when a tick interrupted this CPU. For a core
+/// wedged in an interrupts-off spin (no more ticks) this stays frozen at the RIP
+/// it had on its last tick — i.e. near where it entered the spin — so it can be
+/// resolved to a symbol with addr2line.
+static TICK_LAST_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// [diag] Account one timer tick by the context it interrupted, recording the
+/// interrupted instruction pointer.
+pub fn note_tick_context(from_user: bool, rip: u64) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        TICK_TOTAL_PERCPU[cpu].fetch_add(1, Relaxed);
+        if from_user {
+            TICK_USER_PERCPU[cpu].fetch_add(1, Relaxed);
+        }
+        TICK_LAST_RIP_PERCPU[cpu].store(rip, Relaxed);
+    }
+}
+
 /// Account one hardware interrupt on `vector`.
 pub fn note_irq(vector: usize) {
     IRQ_TOTAL.fetch_add(1, Relaxed);
@@ -124,6 +150,11 @@ pub struct KStats {
     pub hid_poll_timer: u64,
     /// [diag] xHCI HID polls issued from I/O-wait loops.
     pub hid_poll_iowait: u64,
+    /// [diag] Per-CPU `(total_ticks, user_ticks, last_rip)` for cores that took
+    /// at least one tick, indexed by dense logical CPU id. `user/total` localises
+    /// a pegged core's busy time to ring 3 (user thread) vs ring 0 (kernel);
+    /// `last_rip` is frozen at the spin entry for a wedged (no-tick) core.
+    pub tick_percpu: Vec<(u16, u64, u64, u64)>,
 }
 
 /// Read the current counters.
@@ -142,6 +173,18 @@ pub fn snapshot() -> KStats {
             idle_percpu.push((cpu as u16, n, IDLE_NS_PERCPU[cpu].load(Relaxed)));
         }
     }
+    let mut tick_percpu = Vec::new();
+    for cpu in 0..MAX_CORE_NUM {
+        let t = TICK_TOTAL_PERCPU[cpu].load(Relaxed);
+        if t != 0 {
+            tick_percpu.push((
+                cpu as u16,
+                t,
+                TICK_USER_PERCPU[cpu].load(Relaxed),
+                TICK_LAST_RIP_PERCPU[cpu].load(Relaxed),
+            ));
+        }
+    }
     KStats {
         idle_ns: IDLE_NS.load(Relaxed),
         idle_entries: IDLE_ENTRIES.load(Relaxed),
@@ -153,5 +196,6 @@ pub fn snapshot() -> KStats {
         idle_percpu,
         hid_poll_timer: HID_POLL_TIMER.load(Relaxed),
         hid_poll_iowait: HID_POLL_IOWAIT.load(Relaxed),
+        tick_percpu,
     }
 }

@@ -61,6 +61,13 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         TrapReason::HardwareBreakpoint | TrapReason::SoftwareBreakpoint => breakpoint(),
         TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),
         TrapReason::Interrupt(vector) => {
+            // [diag] Attribute the scheduler tick to the context it interrupted:
+            // ring 3 (CS low 2 bits == 3) means a user thread was running; ring 0
+            // means kernel (idle hlt / syscall / kernel spin). Localises a pegged
+            // core's busy time to user vs kernel for /proc/perf.
+            if vector == X86_INT_APIC_TIMER {
+                crate::kstats::note_tick_context(tf.cs & 0b11 == 0b11, tf.rip as u64);
+            }
             crate::interrupt::handle_irq(vector);
             // Timer preemption is handled in the thread trap path (e.g.
             // `loader/src/linux.rs` calls `yield_now` on TIMER). Never call
