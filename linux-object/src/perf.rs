@@ -229,6 +229,54 @@ pub fn kernel_report() -> String {
         "idle naps:    {}  (avg {:.1} us/nap)",
         ks.idle_entries, avg_nap_us
     );
+    // [diag] Busy attribution — kept HIGH in the report, *before* the per-CPU
+    // breakdowns. With many cores those lists are 20+ lines each and push the
+    // attribution counters (idle-callback %, sched polls, tick ctx, NMI rip) past
+    // the first screenful, so a `head -30` or a phone photo of the console shows
+    // 100% busy with no hint of *why*. This single line names the dominant
+    // non-halting path so even a truncated capture localises the spin; the
+    // per-CPU tick ctx (%user) and NMI rip lines below pin it exactly.
+    let cb_work_pct = if ks.idle_cb_total > 0 {
+        ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
+    } else {
+        0.0
+    };
+    let (sched_polled, sched_weak) = kernel_hal::kstats::sched_stats();
+    let polls_per_s = rate(sched_polled);
+    let weak_per_s = rate(sched_weak);
+    // Aggregate ring-3 share of scheduler ticks across all cores: a high figure
+    // on a pegged box means a *user* thread is busy-spinning (a runaway process);
+    // a low figure points the spin at kernel code (a poll/lock loop).
+    let (tick_user, tick_total) = ks
+        .tick_percpu
+        .iter()
+        .fold((0u64, 0u64), |(u, t), (_, total, user, _)| {
+            (u + *user, t + *total)
+        });
+    let user_pct = if tick_total > 0 {
+        tick_user as f64 * 100.0 / tick_total as f64
+    } else {
+        0.0
+    };
+    let suspect = if busy_pct < 50.0 {
+        "none — cores mostly reach halt"
+    } else if cb_work_pct > 50.0 {
+        "deferred-job drain — idle callback keeps finding work, cores never halt"
+    } else if weak_per_s > 100.0 {
+        "weak-executor yields — long futures preempted, scheduler re-spins (kernel)"
+    } else if user_pct > 60.0 {
+        "user thread busy-spin — a process is pegging the cpu (see tick ctx below)"
+    } else if polls_per_s > 5000.0 {
+        "task busy-poll — a coroutine re-polled without ever sleeping (kernel)"
+    } else {
+        "unclear — read tick ctx (%user) and nmi probe rip below"
+    };
+    let _ = writeln!(out, "busy attribution: {}", suspect);
+    let _ = writeln!(
+        out,
+        "  (idle-cb work {:.0}%, weak-yield {:.0}/s, task-polls {:.0}/s, tick {:.0}% user)",
+        cb_work_pct, weak_per_s, polls_per_s, user_pct
+    );
     // [diag] Per-CPU nap breakdown: a core driving the HID poll should show many
     // short naps (low avg us); a deeply-idle core shows few long naps.
     for (cpu, naps, ns) in &ks.idle_percpu {
@@ -300,32 +348,28 @@ pub fn kernel_report() -> String {
     );
     // Idle-callback hit rate: the scheduler only halts when this finds no
     // deferred work, so a high "had work" share means the CPUs busy-spin
-    // draining jobs (the heat signature) rather than sleeping.
-    let cb_busy_pct = if ks.idle_cb_total > 0 {
-        ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
-    } else {
-        0.0
-    };
+    // draining jobs (the heat signature) rather than sleeping. `cb_work_pct` is
+    // computed above for the busy-attribution summary.
     let _ = writeln!(
         out,
         "idle callback: {} calls ({:.0}/s), {:.1}% found deferred work",
         ks.idle_cb_total,
         rate(ks.idle_cb_total),
-        cb_busy_pct
+        cb_work_pct
     );
     let _ = writeln!(
         out,
         "deferred jobs pending now: {}",
         kernel_hal::deferred_job::pending_deferred_jobs()
     );
-    let (polled, weak_yield) = kernel_hal::kstats::sched_stats();
+    // `sched_polled`/`sched_weak` were sampled above for the attribution summary.
     let _ = writeln!(
         out,
         "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
-        polled,
-        rate(polled),
-        weak_yield,
-        rate(weak_yield)
+        sched_polled,
+        polls_per_s,
+        sched_weak,
+        weak_per_s
     );
     let _ = writeln!(out);
     if busy_pct > 50.0 {
