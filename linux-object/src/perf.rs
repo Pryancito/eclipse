@@ -258,6 +258,18 @@ pub fn kernel_report() -> String {
     } else {
         0.0
     };
+    // Off-scheduler wedge detector: the box is pegged but *every* scheduler/idle
+    // counter is ~zero AND timers barely tick. That means the busy time is spent
+    // OUTSIDE the run loop entirely — almost always a spin with interrupts
+    // disabled (a kernel livelock/deadlock), which also explains the stalled
+    // timer. Only the NMI probe (delivered even with IRQs off) can see it, so
+    // capture it now and surface the spin RIPs up here — the full per-CPU probe
+    // is far below the per-core lists, off the first screenful.
+    let timer_per_s = rate(ks.timer_ticks);
+    let scheduler_quiet = cb_work_pct < 1.0 && weak_per_s < 1.0 && polls_per_s < 1.0;
+    let off_sched_wedge = busy_pct > 50.0 && scheduler_quiet && timer_per_s < 50.0;
+    kernel_hal::kstats::capture_cpu_rips();
+    let nmi = kernel_hal::kstats::nmi_rips();
     let suspect = if busy_pct < 50.0 {
         "none — cores mostly reach halt"
     } else if cb_work_pct > 50.0 {
@@ -268,15 +280,35 @@ pub fn kernel_report() -> String {
         "user thread busy-spin — a process is pegging the cpu (see tick ctx below)"
     } else if polls_per_s > 5000.0 {
         "task busy-poll — a coroutine re-polled without ever sleeping (kernel)"
+    } else if off_sched_wedge {
+        "OFF-SCHEDULER spin — pegged with no run-loop activity and timers stalled: \
+         interrupts-disabled kernel livelock (see wedge rips)"
     } else {
         "unclear — read tick ctx (%user) and nmi probe rip below"
     };
     let _ = writeln!(out, "busy attribution: {}", suspect);
     let _ = writeln!(
         out,
-        "  (idle-cb work {:.0}%, weak-yield {:.0}/s, task-polls {:.0}/s, tick {:.0}% user)",
-        cb_work_pct, weak_per_s, polls_per_s, user_pct
+        "  (idle-cb work {:.0}%, weak-yield {:.0}/s, task-polls {:.0}/s, tick {:.0}% user, timer {:.0}/s)",
+        cb_work_pct, weak_per_s, polls_per_s, user_pct, timer_per_s
     );
+    if off_sched_wedge && !nmi.is_empty() {
+        // Distinct current RIPs across cores. A single shared value means every
+        // wedged core is stuck at the same spin site (one lock / one loop);
+        // resolve it with addr2line against the kernel image.
+        let mut rips: Vec<u64> = nmi.iter().map(|(_, r)| *r).collect();
+        rips.sort_unstable();
+        rips.dedup();
+        let _ = write!(out, "  wedge rips ({} core(s),", nmi.len());
+        let _ = write!(out, " {} distinct):", rips.len());
+        for r in rips.iter().take(6) {
+            let _ = write!(out, " {:#x}", r);
+        }
+        if rips.len() > 6 {
+            let _ = write!(out, " (+{} more)", rips.len() - 6);
+        }
+        let _ = writeln!(out);
+    }
     // [diag] Per-CPU nap breakdown: a core driving the HID poll should show many
     // short naps (low avg us); a deeply-idle core shows few long naps.
     for (cpu, naps, ns) in &ks.idle_percpu {
@@ -315,9 +347,8 @@ pub fn kernel_report() -> String {
     }
     // [diag] NMI probe: interrupt every other CPU (delivered even with IRQs off)
     // and report its *current* RIP. For a core wedged in an interrupts-disabled
-    // spin this is the actual spin site — resolve with addr2line.
-    kernel_hal::kstats::capture_cpu_rips();
-    let nmi = kernel_hal::kstats::nmi_rips();
+    // spin this is the actual spin site — resolve with addr2line. `nmi` was
+    // captured once up in the busy-attribution block; reuse it here.
     if !nmi.is_empty() {
         let _ = writeln!(out, "nmi probe (current rip per cpu):");
         for (cpu, rip) in &nmi {
