@@ -164,21 +164,29 @@ const IA32_THERM_STATUS: u32 = 0x19C;
 /// MSR: IA32_TEMPERATURE_TARGET — TjMax (throttle temperature) in bits [23:16].
 const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
 
-/// This CPU's temperature in milli-degrees Celsius, read from the Intel digital
-/// thermal sensor (same source as the `coretemp` driver), or `None` when the
-/// hardware doesn't expose it.
-///
-/// The MSR read is gated on CPUID so it never #GPs: only on a real (non-
-/// hypervisor) "GenuineIntel" part advertising the DTS (CPUID.06H:EAX[0]). The
-/// sensor reports degrees *below* TjMax; the absolute temperature is
-/// `TjMax - readout`.
+/// This CPU's temperature in milli-degrees Celsius, or `None` when the hardware
+/// doesn't expose it. Dispatches to the Intel (DTS via MSR) or AMD (SMN via the
+/// Data Fabric) sensor. Skipped under a hypervisor: a VM may advertise the
+/// sensor without implementing the backing MSR (which would #GP → panic), and
+/// it never reports a real temperature anyway.
 pub(crate) fn cpu_temperature_mc() -> Option<i32> {
+    if hypervisor_present() {
+        return None;
+    }
+    if is_intel() {
+        intel_temperature_mc()
+    } else if is_amd() {
+        amd_temperature_mc()
+    } else {
+        None
+    }
+}
+
+/// Intel digital thermal sensor (same source as the `coretemp` driver). The
+/// sensor reports degrees *below* TjMax; the absolute temperature is
+/// `TjMax - readout`. Gated on CPUID.06H:EAX[0] so the MSR read never #GPs.
+fn intel_temperature_mc() -> Option<i32> {
     unsafe {
-        // A VM may advertise the DTS in CPUID without implementing the MSR,
-        // which would #GP → kernel panic. Restrict to real hardware.
-        if hypervisor_present() || !is_intel() {
-            return None;
-        }
         if __cpuid(6).eax & 1 == 0 {
             return None; // no Digital Thermal Sensor
         }
@@ -196,6 +204,79 @@ pub(crate) fn cpu_temperature_mc() -> Option<i32> {
             }
         };
         Some((tjmax - below_tjmax) * 1000)
+    }
+}
+
+// ── AMD temperature (k10temp-style SMN read) ────────────────────────────────
+/// SMN address of the reported-temperature control register on Family 17h+.
+const ZEN_REPORTED_TEMP_CTRL: u32 = 0x0005_9800;
+/// `CurTmp` field starts at bit 21 (each step is 0.125 °C = 125 m°C).
+const ZEN_CUR_TEMP_SHIFT: u32 = 21;
+/// When set, `CurTmp` uses the extended range and is offset by -49 °C.
+const ZEN_CUR_TEMP_RANGE_SEL: u32 = 1 << 19;
+
+/// Read a 32-bit PCI config dword via the legacy 0xCF8/0xCFC mechanism, with
+/// interrupts masked so the address→data pair can't be torn by a local IRQ that
+/// touches PCI config space.
+unsafe fn pci_cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+    use x86_64::instructions::interrupts;
+    use zcore_drivers::io::{Io, Pmio};
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((off as u32) & 0xFC);
+    interrupts::without_interrupts(|| {
+        Pmio::<u32>::new(0xCF8).write(addr);
+        Pmio::<u32>::new(0xCFC).read()
+    })
+}
+
+/// Write `addr` to the Data Fabric SMN index register then read the data
+/// register (D18F0, offsets 0x60/0x64) — the standard AMD SMN indirect access.
+unsafe fn amd_smn_read(smn_addr: u32) -> u32 {
+    use x86_64::instructions::interrupts;
+    use zcore_drivers::io::{Io, Pmio};
+    let index = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x60;
+    let data = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x64;
+    interrupts::without_interrupts(|| {
+        // index register (0x60)
+        Pmio::<u32>::new(0xCF8).write(index);
+        Pmio::<u32>::new(0xCFC).write(smn_addr);
+        // data register (0x64)
+        Pmio::<u32>::new(0xCF8).write(data);
+        Pmio::<u32>::new(0xCFC).read()
+    })
+}
+
+/// AMD core temperature (`Tctl`), Family 17h (Zen) and later, read from the SMU
+/// over the Data Fabric SMN — the mechanism the Linux `k10temp` driver uses.
+/// Returns `Tctl` in milli-degrees C (the per-model `Tdie` offset some Ryzen /
+/// Threadripper parts apply is not subtracted).
+fn amd_temperature_mc() -> Option<i32> {
+    unsafe {
+        let eax = __cpuid(1).eax;
+        let base_family = (eax >> 8) & 0xf;
+        let ext_family = (eax >> 20) & 0xff;
+        let family = if base_family == 0xf {
+            base_family + ext_family
+        } else {
+            base_family
+        };
+        if family < 0x17 {
+            return None; // pre-Zen uses a different (older) path; not supported
+        }
+        // Confirm the Data Fabric function 0 really is an AMD device before
+        // trusting the SMN window (vendor id 0x1022 in the low 16 bits).
+        if pci_cfg_read32(0, 0x18, 0, 0x00) & 0xFFFF != 0x1022 {
+            return None;
+        }
+        let regval = amd_smn_read(ZEN_REPORTED_TEMP_CTRL);
+        let mut temp = ((regval >> ZEN_CUR_TEMP_SHIFT) as i32) * 125;
+        if regval & ZEN_CUR_TEMP_RANGE_SEL != 0 {
+            temp -= 49_000;
+        }
+        Some(temp)
     }
 }
 
