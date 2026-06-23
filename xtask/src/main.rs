@@ -228,6 +228,9 @@ enum Commands {
     /// ```
     Image(ArchArg),
 
+    /// Build an SFS image from a directory (temporary helper for testing).
+    MkSfs(MkSfsArg),
+
     /// 构造 libos 需要的 rootfs 并放入 libc test。Builds the libos rootfs and puts it into libc test.
     ///
     /// > **注意** 这可能不是这个命令的最终形态，因此这个命令没有别名。
@@ -272,6 +275,16 @@ struct LinuxLibosArg {
     pub args: String,
 }
 
+#[derive(Args)]
+struct MkSfsArg {
+    #[clap(long)]
+    dir: String,
+    #[clap(long)]
+    image: String,
+    #[clap(long)]
+    size: usize,
+}
+
 fn main() {
     use Commands::*;
     match Cli::parse().command {
@@ -298,6 +311,25 @@ fn main() {
         LibcTest(arg) => arg.linux_rootfs().put_libc_test(),
         OtherTest(arg) => arg.linux_rootfs().put_other_test(),
         Image(arg) => arg.linux_rootfs().image(),
+        MkSfs(arg) => {
+            use rcore_fs::vfs::FileSystem;
+            use rcore_fs_fuse::zip::zip_dir;
+            use rcore_fs_sfs::SimpleFileSystem;
+            use std::sync::{Arc, Mutex};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&arg.image)
+                .expect("open image");
+            file.set_len(arg.size as u64).expect("set_len");
+            let fs =
+                SimpleFileSystem::create(Arc::new(Mutex::new(file)), arg.size).expect("create sfs");
+            zip_dir(std::path::Path::new(&arg.dir), fs.root_inode()).expect("zip");
+            fs.sync().expect("sync");
+            println!("SFS image {} ({} bytes) from {}", arg.image, arg.size, arg.dir);
+        }
 
         Asm(args) => args.asm(),
         Bin(args) => {

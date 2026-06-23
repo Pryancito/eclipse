@@ -375,7 +375,20 @@ impl Syscall<'_> {
             // so that valid values stay non-negative.
             Sys::SETPRIORITY => self.sys_setpriority(a0, a1, a2 as i32),
             Sys::GETPRIORITY => self.sys_getpriority(a0, a1),
-            Sys::PRCTL => self.unimplemented("prctl", Ok(0)),
+            // prctl: accept-and-ignore. glibc issues several prctls per thread
+            // start (PR_SET_NAME, etc.); returning 0 quietly keeps exec-heavy
+            // workloads from flooding the log (a `warn!` per call was very loud
+            // under `perf`). Trace-level only for when it is actually needed.
+            Sys::PRCTL => {
+                trace!("prctl(a0={:#x}) ignored -> 0", a0);
+                Ok(0)
+            }
+            // `rseq` (restartable sequences) is optional: glibc probes it on
+            // every thread start and silently falls back when it is missing.
+            // Return ENOSYS quietly so we don't (a) advertise a feature we don't
+            // implement, nor (b) flood the log with "unknown syscall: RSEQ" on
+            // every process spawn (very visible under `perf`/exec-heavy loads).
+            Sys::RSEQ => Err(LxError::ENOSYS),
             Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),
