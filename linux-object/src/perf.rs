@@ -163,6 +163,100 @@ pub fn global_report() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel runtime stats, surfaced at `/proc/perf/kernel` (heat / busy-spin
+// debugging). Counters live in `kernel_hal::kstats`.
+// ---------------------------------------------------------------------------
+
+fn irq_note(vector: u16) -> &'static str {
+    // LAPIC vectors use base 0xf0 on x86_64 (see kernel-hal x86_64 trap.rs).
+    match vector {
+        0xf0 => "LAPIC spurious",
+        0xf1 => "LAPIC timer",
+        0xf2 => "LAPIC error",
+        _ => "",
+    }
+}
+
+/// Render `/proc/perf/kernel`: idle vs busy, timer ticks and per-vector IRQs.
+pub fn kernel_report() -> String {
+    let ks = kernel_hal::kstats::snapshot();
+    let uptime_ns = kernel_hal::timer::timer_now().as_nanos() as u64;
+    let uptime_s = uptime_ns as f64 / 1e9;
+    let cpus = kernel_hal::cpu::cpu_count().max(1) as u64;
+    let capacity_ns = uptime_ns.saturating_mul(cpus);
+    let idle_pct = if capacity_ns > 0 {
+        (ks.idle_ns as f64 * 100.0 / capacity_ns as f64).min(100.0)
+    } else {
+        0.0
+    };
+    let busy_pct = (100.0 - idle_pct).max(0.0);
+    let rate = |n: u64| if uptime_s > 0.0 { n as f64 / uptime_s } else { 0.0 };
+
+    let mut out = String::new();
+    let _ = writeln!(out, "eclipse perf — kernel runtime stats");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "uptime:       {:.2} s   cpus: {}", uptime_s, cpus);
+    let _ = writeln!(
+        out,
+        "cpu idle:     {:.1}%   busy: {:.1}%   (averaged over {} cpu(s))",
+        idle_pct, busy_pct, cpus
+    );
+    let avg_nap_us = if ks.idle_entries > 0 {
+        ks.idle_ns as f64 / ks.idle_entries as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        out,
+        "idle naps:    {}  (avg {:.1} us/nap)",
+        ks.idle_entries, avg_nap_us
+    );
+    let _ = writeln!(
+        out,
+        "timer ticks:  {}  ({:.0}/s)",
+        ks.timer_ticks,
+        rate(ks.timer_ticks)
+    );
+    let _ = writeln!(
+        out,
+        "interrupts:   {}  ({:.0}/s)",
+        ks.irq_total,
+        rate(ks.irq_total)
+    );
+    let _ = writeln!(out);
+    if busy_pct > 50.0 {
+        let _ = writeln!(
+            out,
+            "note: CPUs are busy >50% while you read this — if the system looks idle,",
+        );
+        let _ = writeln!(
+            out,
+            "      something is busy-spinning (a likely source of heat). The busiest",
+        );
+        let _ = writeln!(out, "      IRQ vectors below hint at runaway interrupt sources.");
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(
+        out,
+        "  {:>8}  {:>12}  {:>10}  {}",
+        "VECTOR", "COUNT", "PER SEC", "NOTE"
+    );
+    let mut irqs = ks.irqs;
+    irqs.sort_by(|a, b| b.1.cmp(&a.1));
+    for (v, c) in irqs {
+        let _ = writeln!(
+            out,
+            "  {:>#8x}  {:>12}  {:>10.0}  {}",
+            v,
+            c,
+            rate(c),
+            irq_note(v)
+        );
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Sampling profiler ("our own perf top"), surfaced at `/proc/perf/top`.
 // ---------------------------------------------------------------------------
 
