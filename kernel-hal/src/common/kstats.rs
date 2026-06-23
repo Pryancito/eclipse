@@ -8,7 +8,7 @@
 
 use crate::config::MAX_CORE_NUM;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// Number of interrupt vectors tracked individually (x86 IDT is 256 wide).
 const NVEC: usize = 256;
@@ -86,6 +86,26 @@ pub fn note_idle(ns: u64) {
         IDLE_NS_PERCPU[cpu].fetch_add(ns, Relaxed);
         IDLE_ENTRIES_PERCPU[cpu].fetch_add(1, Relaxed);
     }
+}
+
+/// [diag] Whether each logical CPU is *currently* parked in its idle `hlt`/
+/// `mwait`. Set immediately before the halt and cleared right after it wakes, so
+/// a reader can tell a genuinely-idle core (halted now) from a busy-spinning one
+/// — the distinction the lifetime busy% average cannot make. This is the robust,
+/// build-independent version of "is the captured RIP the post-`hlt` instruction".
+static CPU_IN_IDLE: [AtomicBool; MAX_CORE_NUM] = [const { AtomicBool::new(false) }; MAX_CORE_NUM];
+
+/// Mark the calling CPU as entering (`true`) or leaving (`false`) idle halt.
+pub fn set_cpu_idle(in_idle: bool) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        CPU_IN_IDLE[cpu].store(in_idle, Relaxed);
+    }
+}
+
+/// Number of logical CPUs currently parked in idle halt (best-effort snapshot).
+pub fn cpus_idle_now() -> usize {
+    CPU_IN_IDLE.iter().filter(|c| c.load(Relaxed)).count()
 }
 
 /// Account one timer tick.

@@ -180,6 +180,7 @@ fn irq_note(vector: u16) -> &'static str {
 /// Render `/proc/perf/kernel`: idle vs busy, timer ticks and per-vector IRQs.
 pub fn kernel_report() -> String {
     let ks = kernel_hal::kstats::snapshot();
+    let (sched_polled, sched_weak) = kernel_hal::kstats::sched_stats();
     let uptime_ns = kernel_hal::timer::timer_now().as_nanos() as u64;
     let uptime_s = uptime_ns as f64 / 1e9;
     let total_cpus = kernel_hal::cpu::cpu_count().max(1) as u64;
@@ -189,14 +190,98 @@ pub fn kernel_report() -> String {
     // inflate the figure (a partial bring-up under QEMU/TCG is common). On a
     // healthy boot online == total and this is identical to before.
     let online_cpus = (kernel_hal::online_cpu_count() as u64).clamp(1, total_cpus);
-    let capacity_ns = uptime_ns.saturating_mul(online_cpus);
-    let idle_pct = if capacity_ns > 0 {
-        (ks.idle_ns as f64 * 100.0 / capacity_ns as f64).min(100.0)
+
+    // idle% over a span: idle_ns against (span × online cpus) of capacity.
+    fn pct_idle(idle_ns: u64, span_ns: u64, cpus: u64) -> f64 {
+        let cap = span_ns.saturating_mul(cpus);
+        if cap > 0 {
+            (idle_ns as f64 * 100.0 / cap as f64).min(100.0)
+        } else {
+            0.0
+        }
+    }
+
+    // ── Lifetime (since boot) figures ──
+    let life_idle_pct = pct_idle(ks.idle_ns, uptime_ns, online_cpus);
+    let life_busy_pct = (100.0 - life_idle_pct).max(0.0);
+    let rate = |n: u64| if uptime_s > 0.0 { n as f64 / uptime_s } else { 0.0 };
+    let life_cb_work_pct = if ks.idle_cb_total > 0 {
+        ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
     } else {
         0.0
     };
-    let busy_pct = (100.0 - idle_pct).max(0.0);
-    let rate = |n: u64| if uptime_s > 0.0 { n as f64 / uptime_s } else { 0.0 };
+
+    // ── Windowed figures (delta since the previous read of this file) ──
+    // A lifetime average is useless for "is the box busy *now*": on a long uptime
+    // an early busy spell (boot, or a since-fixed busy-spin) keeps it pegged near
+    // 100% even when every core is currently halted in `hlt`. The NMI probe sees
+    // the truth (all cores caught at the post-`hlt` RIP) but the headline didn't.
+    // Diff against the last snapshot so a second `cat` a moment later reports the
+    // live figure. First read after boot has no previous sample and falls back to
+    // the lifetime numbers.
+    struct Prev {
+        uptime_ns: u64,
+        idle_ns: u64,
+        idle_cb_total: u64,
+        idle_cb_busy: u64,
+        polled: u64,
+        weak: u64,
+        timer_ticks: u64,
+    }
+    static LAST: Mutex<Option<Prev>> = Mutex::new(None);
+    let cur = Prev {
+        uptime_ns,
+        idle_ns: ks.idle_ns,
+        idle_cb_total: ks.idle_cb_total,
+        idle_cb_busy: ks.idle_cb_busy,
+        polled: sched_polled,
+        weak: sched_weak,
+        timer_ticks: ks.timer_ticks,
+    };
+    let prev = LAST.lock().replace(cur);
+    let win = prev.filter(|p| uptime_ns > p.uptime_ns).map(|p| {
+        let d_ns = uptime_ns - p.uptime_ns;
+        let d_s = d_ns as f64 / 1e9;
+        let wr = move |now: u64, then: u64| {
+            if d_s > 0.0 {
+                now.saturating_sub(then) as f64 / d_s
+            } else {
+                0.0
+            }
+        };
+        let idle_pct = pct_idle(ks.idle_ns.saturating_sub(p.idle_ns), d_ns, online_cpus);
+        let d_cb_total = ks.idle_cb_total.saturating_sub(p.idle_cb_total);
+        let cb_work_pct = if d_cb_total > 0 {
+            ks.idle_cb_busy.saturating_sub(p.idle_cb_busy) as f64 * 100.0 / d_cb_total as f64
+        } else {
+            0.0
+        };
+        (
+            d_s,
+            idle_pct,
+            (100.0 - idle_pct).max(0.0),
+            cb_work_pct,
+            wr(sched_polled, p.polled),
+            wr(sched_weak, p.weak),
+            wr(ks.timer_ticks, p.timer_ticks),
+        )
+    });
+    // "Current" view drives the busy/attribution logic and the per-second rates;
+    // falls back to lifetime on the first read after boot.
+    let (win_s, idle_pct, busy_pct, cb_work_pct, polls_per_s, weak_per_s, timer_per_s, have_window) =
+        match win {
+            Some((s, i, b, cb, p, w, t)) => (s, i, b, cb, p, w, t, true),
+            None => (
+                0.0,
+                life_idle_pct,
+                life_busy_pct,
+                life_cb_work_pct,
+                rate(sched_polled),
+                rate(sched_weak),
+                rate(ks.timer_ticks),
+                false,
+            ),
+        };
 
     let mut out = String::new();
     let _ = writeln!(out, "eclipse perf — kernel runtime stats");
@@ -214,11 +299,24 @@ pub fn kernel_report() -> String {
         "uptime:       {:.2} s   cpus: {} online ({} configured)",
         uptime_s, online_cpus, total_cpus
     );
-    let _ = writeln!(
-        out,
-        "cpu idle:     {:.1}%   busy: {:.1}%   (averaged over {} online cpu(s))",
-        idle_pct, busy_pct, online_cpus
-    );
+    if have_window {
+        let _ = writeln!(
+            out,
+            "cpu idle:     {:.1}%   busy: {:.1}%   (last {:.2}s window over {} online cpu(s))",
+            idle_pct, busy_pct, win_s, online_cpus
+        );
+        let _ = writeln!(
+            out,
+            "  lifetime:   idle {:.1}%   busy {:.1}%   (since boot — skewed by past load)",
+            life_idle_pct, life_busy_pct
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "cpu idle:     {:.1}%   busy: {:.1}%   (lifetime since boot — run `cat` again for a recent-window figure)",
+            idle_pct, busy_pct
+        );
+    }
     let avg_nap_us = if ks.idle_entries > 0 {
         ks.idle_ns as f64 / ks.idle_entries as f64 / 1000.0
     } else {
@@ -226,7 +324,7 @@ pub fn kernel_report() -> String {
     };
     let _ = writeln!(
         out,
-        "idle naps:    {}  (avg {:.1} us/nap)",
+        "idle naps:    {}  (avg {:.1} us/nap, lifetime)",
         ks.idle_entries, avg_nap_us
     );
     // [diag] Busy attribution — kept HIGH in the report, *before* the per-CPU
@@ -235,15 +333,9 @@ pub fn kernel_report() -> String {
     // the first screenful, so a `head -30` or a phone photo of the console shows
     // 100% busy with no hint of *why*. This single line names the dominant
     // non-halting path so even a truncated capture localises the spin; the
-    // per-CPU tick ctx (%user) and NMI rip lines below pin it exactly.
-    let cb_work_pct = if ks.idle_cb_total > 0 {
-        ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
-    } else {
-        0.0
-    };
-    let (sched_polled, sched_weak) = kernel_hal::kstats::sched_stats();
-    let polls_per_s = rate(sched_polled);
-    let weak_per_s = rate(sched_weak);
+    // per-CPU tick ctx (%user) and NMI rip lines below pin it exactly. All the
+    // figures here are the windowed ones (or lifetime on the first read), so the
+    // verdict matches what the box is doing *now*, not its lifetime average.
     // Aggregate ring-3 share of scheduler ticks across all cores: a high figure
     // on a pegged box means a *user* thread is busy-spinning (a runaway process);
     // a low figure points the spin at kernel code (a poll/lock loop).
@@ -265,13 +357,27 @@ pub fn kernel_report() -> String {
     // timer. Only the NMI probe (delivered even with IRQs off) can see it, so
     // capture it now and surface the spin RIPs up here — the full per-CPU probe
     // is far below the per-core lists, off the first screenful.
-    let timer_per_s = rate(ks.timer_ticks);
     let scheduler_quiet = cb_work_pct < 1.0 && weak_per_s < 1.0 && polls_per_s < 1.0;
     let off_sched_wedge = busy_pct > 50.0 && scheduler_quiet && timer_per_s < 50.0;
     kernel_hal::kstats::capture_cpu_rips();
     let nmi = kernel_hal::kstats::nmi_rips();
+    // How many cores are parked in idle `hlt` *right now* (robust per-CPU flag set
+    // around enable_and_hlt — not a build-dependent RIP match). The core rendering
+    // this report is itself busy, so a fully-idle box shows online-1 here. If
+    // essentially every other core is halted, a high busy% is a lifetime-average
+    // artifact, not a live spin.
+    let idle_now = kernel_hal::kstats::cpus_idle_now() as u64;
+    let all_halted = online_cpus > 1 && idle_now >= online_cpus - 1;
+    let _ = writeln!(
+        out,
+        "cores idle now: {}/{} parked in hlt this instant",
+        idle_now, online_cpus
+    );
     let suspect = if busy_pct < 50.0 {
         "none — cores mostly reach halt"
+    } else if all_halted {
+        "NONE NOW — every core is halted in hlt this instant; high busy% is a \
+         lifetime-average artifact (read again for the windowed figure above)"
     } else if cb_work_pct > 50.0 {
         "deferred-job drain — idle callback keeps finding work, cores never halt"
     } else if weak_per_s > 100.0 {
@@ -289,10 +395,11 @@ pub fn kernel_report() -> String {
     let _ = writeln!(out, "busy attribution: {}", suspect);
     let _ = writeln!(
         out,
-        "  (idle-cb work {:.0}%, weak-yield {:.0}/s, task-polls {:.0}/s, tick {:.0}% user, timer {:.0}/s)",
-        cb_work_pct, weak_per_s, polls_per_s, user_pct, timer_per_s
+        "  (idle-cb work {:.0}%, weak-yield {:.0}/s, task-polls {:.0}/s, tick {:.0}% user, timer {:.0}/s{})",
+        cb_work_pct, weak_per_s, polls_per_s, user_pct, timer_per_s,
+        if have_window { "" } else { " — lifetime" }
     );
-    if off_sched_wedge && !nmi.is_empty() {
+    if off_sched_wedge && !all_halted && !nmi.is_empty() {
         // Distinct current RIPs across cores. A single shared value means every
         // wedged core is stuck at the same spin site (one lock / one loop);
         // resolve it with addr2line against the kernel image.

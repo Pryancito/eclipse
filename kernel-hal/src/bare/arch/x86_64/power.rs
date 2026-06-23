@@ -479,6 +479,7 @@ pub(super) fn cpu_idle() {
 
     let was_enabled = interrupts::are_enabled();
     let idle_start = crate::hal_fn::timer::timer_now();
+    crate::kstats::set_cpu_idle(true);
 
     if IDLE_USE_MWAIT.load(Ordering::Relaxed) {
         let hint = IDLE_MWAIT_HINT.load(Ordering::Relaxed);
@@ -511,6 +512,7 @@ pub(super) fn cpu_idle() {
     if !was_enabled {
         interrupts::disable();
     }
+    crate::kstats::set_cpu_idle(false);
 
     let idle_ns = crate::hal_fn::timer::timer_now()
         .checked_sub(idle_start)
@@ -536,10 +538,12 @@ extern "C" fn hal_cpu_idle() {
 
     let was_enabled = interrupts::are_enabled();
     let start = crate::hal_fn::timer::timer_now();
+    crate::kstats::set_cpu_idle(true);
     interrupts::enable_and_hlt();
     if !was_enabled {
         interrupts::disable();
     }
+    crate::kstats::set_cpu_idle(false);
     let ns = crate::hal_fn::timer::timer_now()
         .checked_sub(start)
         .unwrap_or_default()
