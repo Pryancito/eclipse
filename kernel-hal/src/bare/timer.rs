@@ -14,11 +14,22 @@ use naive_timer::Timer;
 pub(super) const TICKS_PER_SEC: u64 = 250;
 
 /// Master switch for tickless idle. Set to `false` to fall back to the plain
-/// full-rate periodic tick everywhere (the pre-tickless behaviour), e.g. to
-/// bisect a suspected timer regression. Only consumed on arches with a
-/// re-armable per-CPU timer (x86_64 today).
+/// full-rate periodic tick everywhere. Only consumed on arches with a re-armable
+/// per-CPU timer (x86_64 today).
+///
+/// Currently DISABLED: stretching the LAPIC count in `timer_idle_enter` was
+/// observed to stop the timer from firing once a CPU actually halts — pending
+/// timers (the poll/select 4 ms re-arm, socket fallbacks, scheduled wakeups)
+/// then never expire. A net busy-spin had been masking this by keeping the CPUs
+/// awake and the LAPIC at its full-rate count; the moment the spin was removed
+/// (so the cores genuinely halted) all timers stalled, which froze the shell's
+/// `poll(stdin)` re-poll loop and with it the xHCI HID polling — i.e. the
+/// keyboard/mouse went dead. With tickless off the LAPIC keeps its 250 Hz
+/// periodic count, so timers fire reliably; an idle CPU still halts via `hlt`
+/// between ticks (≈99 % idle), it just wakes every 4 ms. Re-enabling tickless
+/// needs the re-arm path fixed so a halted CPU's timer still expires.
 #[allow(dead_code)]
-const TICKLESS_IDLE: bool = true;
+const TICKLESS_IDLE: bool = false;
 
 /// Upper bound on how long an idle CPU may sleep between scheduler ticks, in
 /// nanoseconds (50 ms ≈ 20 Hz). Nearer pending timers are always honoured; this
