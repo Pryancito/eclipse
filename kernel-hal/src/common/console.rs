@@ -165,13 +165,6 @@ cfg_if! {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
                 maybe_clear_graphic_before_write(vt);
-                // [bootdiag] TEMPORARY: mirror active-VT output to the EARLY
-                // framebuffer console. On real hardware the native graphic
-                // console does not paint, so the shell prompt (and kernel logs)
-                // are invisible even though the shell runs. This makes that
-                // output visible to confirm whether the prompt is emitted.
-                // Remove once the display path is fixed.
-                crate::hal_fn::console::console_write_early(s);
             }
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
@@ -187,9 +180,6 @@ cfg_if! {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
                 maybe_clear_graphic_before_write(vt);
-                // [bootdiag] TEMPORARY: see vt_write_str_impl. Format to a String
-                // so the early console (which takes &str) can mirror it.
-                crate::hal_fn::console::console_write_early(&alloc::format!("{}", fmt));
             }
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
@@ -425,15 +415,6 @@ pub fn debug_write_fmt(fmt: Arguments) {
 /// This is intended for very early boot stages before the native graphic driver exists.
 pub fn early_progress_bar(progress: u32) {
     crate::hal_fn::console::console_progress_early(progress);
-}
-
-/// Write text to the very early boot framebuffer console (UEFI GOP) — the same
-/// surface that renders the splash logo and progress bar — bypassing the native
-/// graphic console / VT layer. Intended for boot diagnostics around the first
-/// userspace output, when a `warn!` to the native console may not yet paint.
-/// No-op on non-graphic / non-bare builds.
-pub fn early_console_write_str(s: &str) {
-    crate::hal_fn::console::console_write_early(s);
 }
 
 /// Scrolls the graphic console history up (direction > 0) or down (direction < 0).

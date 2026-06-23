@@ -133,12 +133,11 @@ impl Syscall<'_> {
             pid,
             signal
         );
-        warn!(
-            "The sys_kill only supports killing a process (SIGKILL) or sending a signal to
-            an arbitrary thread of a process within the same job as the calling thread. 
-            As for the latter, the signal will be delivered to an arbitrarily selected thread 
-            in the target process that is not blocking the signal."
-        );
+        // NOTE: process-group sends use a minimal "pgid == leader pid" model and
+        // a signal is delivered to one not-blocking thread of the target process
+        // (see `send_to_pid`). This is sufficient for the shells/job-control we
+        // run; it is intentionally not a full POSIX implementation. (Previously a
+        // warn! fired on every kill() to say so, which only spammed the log.)
         enum SendTarget {
             EveryProcessInGroup,
             EveryProcess,

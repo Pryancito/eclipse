@@ -25,16 +25,6 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// [bootdiag] TEMPORARY: emit a diagnostic line on the EARLY framebuffer console
-/// (the splash-logo surface), which paints reliably even when the native graphic
-/// console does not yet. Used to trace the real-hardware boot hang where busybox
-/// `sh` is spawned but never prints a prompt. Remove once diagnosed.
-#[allow(dead_code)]
-fn bootdiag(s: &str) {
-    kernel_hal::console::early_console_write_str(s);
-    kernel_hal::console::early_console_write_str("\n");
-}
-
 /// Create and run a single Linux process as PID 1 on virtual terminal 0.
 ///
 /// Used by the libos example/tests, where one program is the whole system.
@@ -179,20 +169,10 @@ fn spawn(
 
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
-    // [bootdiag] TEMPORARY: print to the EARLY framebuffer console (the surface
-    // showing the splash logo), not warn!: on real hardware the native graphic
-    // console does not paint at this stage, so warn! markers were invisible. The
-    // early console always paints (it is drawing the logo right now). Pinpoints
-    // whether boot reaches/clears the ELF load. Remove once the hang is found.
-    bootdiag(&alloc::format!("[bd] vt={} pid={} loading ELF {:?}", vt, pid, args.get(0)));
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     let (entry, sp, initial_brk, execute_path) = loader
         .load(&proc.vmar(), &vmo, args.clone(), envs, path)
         .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
-    bootdiag(&alloc::format!(
-        "[bd] vt={} pid={} ELF loaded entry={:#x} sp={:#x}",
-        vt, pid, entry, sp
-    ));
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
@@ -201,9 +181,6 @@ fn spawn(
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
-
-    // [bootdiag] TEMPORARY: shell main thread created and queued on the executor.
-    bootdiag(&alloc::format!("[bd] vt={} pid={} thread queued", vt, pid));
 
     // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
     // deferred kernel task, off the synchronous boot path: the blocking
@@ -232,13 +209,6 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
-    // [bootdiag] TEMPORARY: confirm the executor actually polled this thread.
-    #[cfg(not(feature = "libos"))]
-    bootdiag(&alloc::format!(
-        "[bd] run_user entered pid={} tid={}",
-        thread.proc().id(),
-        thread.id()
-    ));
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -296,8 +266,34 @@ fn handle_signal(
         return ctx;
     }
     if action.handler == SIG_DFL {
-        // Minimal default dispositions: for Ctrl+C (SIGINT) terminate the process.
-        // TODO: implement per-signal default table.
+        // Per-signal default disposition. Linux's default for the job-control and
+        // a few status signals is NOT to terminate: SIGCHLD/SIGURG/SIGWINCH are
+        // ignored, and SIGTSTP/SIGTTIN/SIGTTOU/SIGSTOP stop the process while
+        // SIGCONT resumes it. This kernel has no job-control stop state, so it
+        // approximates all of those as "ignore" — crucially this stops an
+        // interactive `sh` from being *killed* by the SIGTTIN it sends itself
+        // during job-control setup (the cause of the per-VT shells dying and the
+        // terminal never reaching a usable prompt). Everything else still
+        // terminates, as before.
+        match signal {
+            Signal::SIGCHLD
+            | Signal::SIGURG
+            | Signal::SIGWINCH
+            | Signal::SIGCONT
+            | Signal::SIGSTOP
+            | Signal::SIGTSTP
+            | Signal::SIGTTIN
+            | Signal::SIGTTOU => {
+                trace!(
+                    "default-ignore signal {:?} for pid={}",
+                    signal,
+                    thread.proc().id()
+                );
+                thread.inner().lock_linux().handling_signal = None;
+                return ctx;
+            }
+            _ => {}
+        }
         let code = 128 + signal as i32;
         // Record the death in the dmesg ring (warn! reaches it at the default
         // level). A process that dies on a default-disposition signal — Xorg
@@ -416,19 +412,6 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
     if let TrapReason::Syscall = reason {
         let num = syscall_num(&ctx);
         let args = syscall_args(&ctx);
-        // [bootdiag] TEMPORARY: trace the primary shell's (pid 101) first syscalls
-        // so a real-hardware boot photo shows exactly where busybox `sh` blocks
-        // before printing its prompt. Bounded so it can't flood the console.
-        // Remove once the hang is diagnosed.
-        #[cfg(not(feature = "libos"))]
-        if thread.proc().id() == 101 {
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 200 {
-                bootdiag(&alloc::format!("[bd] pid101 sc#{} num={}", n, num as u32));
-            }
-        }
         ctx.advance_pc(reason);
         thread.put_context(ctx);
         let mut syscall = linux_syscall::Syscall {
