@@ -165,6 +165,13 @@ cfg_if! {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
                 maybe_clear_graphic_before_write(vt);
+                // [bootdiag] TEMPORARY: mirror active-VT output to the EARLY
+                // framebuffer console. On real hardware the native graphic
+                // console does not paint, so the shell prompt (and kernel logs)
+                // are invisible even though the shell runs. This makes that
+                // output visible to confirm whether the prompt is emitted.
+                // Remove once the display path is fixed.
+                crate::hal_fn::console::console_write_early(s);
             }
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
@@ -180,6 +187,9 @@ cfg_if! {
             let active = vt == ACTIVE_VT.load(Ordering::SeqCst);
             if active {
                 maybe_clear_graphic_before_write(vt);
+                // [bootdiag] TEMPORARY: see vt_write_str_impl. Format to a String
+                // so the early console (which takes &str) can mirror it.
+                crate::hal_fn::console::console_write_early(&alloc::format!("{}", fmt));
             }
             if let Some(cons) = vt_mutex(vt) {
                 if let Some(mut g) = cons.try_lock() {
