@@ -110,6 +110,46 @@ pub struct File {
 
 impl_kobject!(File);
 
+/// Demand-paging source for a file-backed `mmap` (see [`get_vmo`]).
+///
+/// Reads one page from the backing inode the first time that page is touched,
+/// so a large mapping (e.g. `libLLVM.so`) is paged in lazily instead of being
+/// read into memory in full at map time.
+///
+/// [`get_vmo`]: File::get_vmo
+struct FileFrameFiller {
+    inode: Arc<dyn INode>,
+    /// File offset that VMO offset 0 maps to.
+    file_offset: usize,
+    /// Number of readable bytes from `file_offset` within the mapping. Pages
+    /// past this are left zero (the BSS tail of the mapping).
+    source_len: usize,
+}
+
+impl zircon_object::vm::FrameFiller for FileFrameFiller {
+    fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    fn fill_page(&self, offset: usize, buf: &mut [u8]) {
+        if offset >= self.source_len {
+            return;
+        }
+        let want = (self.source_len - offset).min(buf.len());
+        let file_pos = self.file_offset + offset;
+        let mut done = 0;
+        while done < want {
+            match self.inode.read_at(file_pos + done, &mut buf[done..want]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                // A read error mid-mapping leaves the rest zero-filled; the
+                // faulting access proceeds rather than wedging the kernel.
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 impl FileInner {
     /// write to file
     fn write(&mut self, buf: &[u8]) -> LxResult<usize> {
@@ -374,39 +414,38 @@ impl FileLike for File {
         let inner = self.inner.read();
         match inner.inode.metadata()?.type_ {
             FileType::File => {
-                // Back the file mapping with a *paged* (non-contiguous) VMO and
-                // fill it page-by-page. A file mapping has no contiguity
-                // requirement, and the previous `new_contiguous` allocation
-                // demanded a single physically contiguous block: once physical
-                // memory got fragmented, mapping a large library (e.g. the
-                // ~150 MiB `libLLVM.so` pulled in by `perf`) failed with ENOMEM
-                // even with plenty of free RAM, which musl surfaced as
-                // "Out of memory" followed by every LLVM symbol failing to
-                // relocate. Paged frames can come from anywhere, so the same
-                // amount of RAM now satisfies the request.
-                let vmo = VmObject::new_paged(pages(len));
-                // DIAGNOSTIC: announce large file maps so we can confirm the
-                // patched (paged, non-contiguous) path is the kernel actually
-                // running. A ~150 MiB libLLVM map should show up here.
+                // Back the file mapping with a *paged* (non-contiguous) VMO that
+                // is demand-paged from the file: each page is read in on the
+                // page fault that first touches it, instead of reading the whole
+                // mapping up front.
+                //
+                // Eagerly reading the whole mapping used to stall the machine:
+                // the dynamic linker maps a library's entire LOAD span in one
+                // `mmap`, and the ~150 MiB `libLLVM.so` pulled in by `perf`
+                // forced ~9.6k synchronous 16 KiB reads plus a full commit of
+                // every page before the syscall returned — on real hardware that
+                // looked like a hard freeze (couldn't even switch VT). A non-PIE
+                // program only touches a fraction of such a library, so paging it
+                // in on demand reads (and commits) only what is actually used.
+                //
+                // The source captures the file inode and the file offset; bytes
+                // past end-of-file stay zero (the BSS tail of a file mapping).
+                let file_size = inner.inode.metadata()?.size;
+                let source_len = file_size.saturating_sub(offset).min(len);
                 if len >= 16 * 1024 * 1024 {
-                    warn!(
-                        "get_vmo: paged file map len={} MiB offset={:#x}",
+                    info!(
+                        "get_vmo: demand-paged file map len={} MiB offset={:#x} source={} MiB",
                         len / (1024 * 1024),
-                        offset
+                        offset,
+                        source_len / (1024 * 1024),
                     );
                 }
-                let mut buf = [0u8; 16384];
-                let mut done = 0;
-                while done < len {
-                    let chunk = (len - done).min(buf.len());
-                    let read = inner.inode.read_at(offset + done, &mut buf[..chunk])?;
-                    if read == 0 {
-                        break;
-                    }
-                    vmo.write(done, &buf[..read])?;
-                    done += read;
-                }
-                Ok(vmo)
+                let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
+                    inode: inner.inode.clone(),
+                    file_offset: offset,
+                    source_len,
+                });
+                Ok(VmObject::new_paged_with_source(pages(len), source))
             }
             FileType::CharDevice => {
                 use super::devfs::{DrmDev, FbDev};

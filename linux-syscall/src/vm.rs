@@ -118,7 +118,21 @@ impl Syscall<'_> {
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
             let vmo = file_like.get_vmo(offset as usize, len)?;
-            let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())?;
+            // Map without committing the range up front (`map_range = false`):
+            // the VMO returned by `get_vmo` is demand-paged from the file, so its
+            // pages are read in on the faults that first touch them. Eagerly
+            // mapping the whole range here would defeat that and re-introduce the
+            // full-file read that froze the machine on `perf` (libLLVM ~150 MiB).
+            let addr = vmar.map_ext(
+                vmar_offset,
+                vmo.clone(),
+                0,
+                vmo.len(),
+                MMUFlags::RXW,
+                prot.to_flags(),
+                false,
+                false,
+            )?;
             Ok(addr)
         }
     }
