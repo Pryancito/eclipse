@@ -219,6 +219,26 @@ pub(super) fn init() -> DeviceResult {
 
     drivers::klog_graphics_device_summary(graphics_console_note.as_deref());
 
+    // [bootdiag] TEMPORARY: surface, on the EARLY framebuffer console (which is
+    // known to paint on this hardware), exactly which display the native graphic
+    // console bound to and the framebuffer geometry it will write to. If the
+    // native console is invisible while the early console works, this tells us
+    // whether the two target the same framebuffer. Remove once diagnosed.
+    #[cfg(feature = "graphic")]
+    {
+        use crate::KCONFIG;
+        let (w, h) = KCONFIG.fb_mode.resolution();
+        crate::console::early_console_write_str(&alloc::format!(
+            "\n[bd] gfx console = {} | GOP fb_addr={:#x} size={:#x} {}x{} stride={}\n",
+            graphics_console_note.as_deref().unwrap_or("<none>"),
+            KCONFIG.fb_addr,
+            KCONFIG.fb_size,
+            w,
+            h,
+            KCONFIG.fb_mode.stride(),
+        ));
+    }
+
     use crate::net;
     net::init();
 
