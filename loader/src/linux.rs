@@ -217,7 +217,17 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // check the signal and handle
-        if let Some((signal, sigmask)) = thread.inner().lock_linux().handle_signal() {
+        //
+        // Bind the result to a local FIRST so the `lock_linux()` temporary guard
+        // is dropped at the end of this statement. Inlining it into the `if let`
+        // scrutinee keeps the guard alive for the whole `if let` body (Rust
+        // temporary scoping), and `handle_signal` re-locks the same per-thread
+        // `LinuxThread` mutex — a self-deadlock on the non-reentrant TicketMutex.
+        // It fires whenever a thread has a pending signal (e.g. the job-control
+        // SIGTTIN a shell sends itself), wedging that core in an interrupts-off
+        // spin forever: the silent multi-core busy/heat (and a hang risk).
+        let pending_signal = thread.inner().lock_linux().handle_signal();
+        if let Some((signal, sigmask)) = pending_signal {
             ctx = handle_signal(&thread, ctx, signal, sigmask);
         }
         if thread.state() == ThreadState::Dying {
