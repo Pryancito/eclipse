@@ -1,5 +1,6 @@
 use x2apic::lapic::{
-    xapic_base, LocalApic as LocalApicInner, LocalApicBuilder, TimerDivide, TimerMode,
+    xapic_base, IpiAllShorthand, LocalApic as LocalApicInner, LocalApicBuilder, TimerDivide,
+    TimerMode,
 };
 
 use super::{consts, Phys2VirtFn};
@@ -97,6 +98,13 @@ impl LocalApic {
 
     pub fn send_ipi_to(&mut self, vector: u8, dest: u32) {
         unsafe { self.inner.send_ipi(vector, Self::icr_dest(dest)) }
+    }
+
+    /// [diag] Send an NMI to every other CPU. NMIs are delivered even to a core
+    /// running with interrupts disabled (e.g. spinning on a lock), so this is the
+    /// way to interrupt a wedged core and capture where it is stuck.
+    pub fn send_nmi_all_others(&mut self) {
+        unsafe { self.inner.send_nmi_all(IpiAllShorthand::AllExcludingSelf) }
     }
 
     pub fn eoi(&mut self) {

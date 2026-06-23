@@ -265,6 +265,17 @@ pub fn kernel_report() -> String {
             );
         }
     }
+    // [diag] NMI probe: interrupt every other CPU (delivered even with IRQs off)
+    // and report its *current* RIP. For a core wedged in an interrupts-disabled
+    // spin this is the actual spin site — resolve with addr2line.
+    kernel_hal::kstats::capture_cpu_rips();
+    let nmi = kernel_hal::kstats::nmi_rips();
+    if !nmi.is_empty() {
+        let _ = writeln!(out, "nmi probe (current rip per cpu):");
+        for (cpu, rip) in &nmi {
+            let _ = writeln!(out, "  cpu{}: {:#x}", cpu, rip);
+        }
+    }
     // [diag] xHCI HID poll rate by path. Input is delivered from these polls;
     // when idle, `iowait` falls to ~0 and `timer` alone must keep input alive.
     let _ = writeln!(

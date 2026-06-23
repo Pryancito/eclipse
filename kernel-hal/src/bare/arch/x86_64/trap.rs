@@ -57,6 +57,14 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         super::cpu::cpu_id()
     );
 
+    // [diag] NMI (vector 2) is used only as a "where are you stuck?" probe: it is
+    // delivered even to a core spinning with interrupts disabled. Record the
+    // interrupted RIP and return — do NOT fall through to the GernelFault panic.
+    if tf.trap_num == 2 {
+        crate::kstats::note_nmi_rip(tf.rip as u64);
+        return;
+    }
+
     match TrapReason::from(tf.trap_num, tf.error_code) {
         TrapReason::HardwareBreakpoint | TrapReason::SoftwareBreakpoint => breakpoint(),
         TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),

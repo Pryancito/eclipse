@@ -119,6 +119,48 @@ pub fn note_tick_context(from_user: bool, rip: u64) {
     }
 }
 
+/// [diag] Per-CPU RIP captured by the NMI handler. An NMI is delivered even to a
+/// core spinning with interrupts disabled, so broadcasting one and reading these
+/// slots gives the *current* instruction pointer of an otherwise-wedged core —
+/// unlike the last-tick RIP, which freezes one tick *before* the spin begins.
+static NMI_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// [diag] Record the interrupted RIP from the NMI handler (current CPU).
+pub fn note_nmi_rip(rip: u64) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        NMI_RIP_PERCPU[cpu].store(rip, Relaxed);
+    }
+}
+
+/// [diag] Broadcast an NMI to all other CPUs and busy-wait briefly so their NMI
+/// handlers record their current RIP via `note_nmi_rip`. Call immediately before
+/// `nmi_rips()`. No-op off bare x86_64.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn capture_cpu_rips() {
+    zcore_drivers::irq::x86::Apic::send_nmi_all_others();
+    let start = crate::timer::timer_now();
+    while crate::timer::timer_now() < start + core::time::Duration::from_millis(2) {
+        core::hint::spin_loop();
+    }
+}
+
+/// [diag] No-op stub for non-bare / non-x86_64 targets.
+#[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
+pub fn capture_cpu_rips() {}
+
+/// [diag] Read the per-CPU RIPs captured by the last NMI broadcast.
+pub fn nmi_rips() -> Vec<(u16, u64)> {
+    let mut v = Vec::new();
+    for cpu in 0..MAX_CORE_NUM {
+        let rip = NMI_RIP_PERCPU[cpu].load(Relaxed);
+        if rip != 0 {
+            v.push((cpu as u16, rip));
+        }
+    }
+    v
+}
+
 /// Account one hardware interrupt on `vector`.
 pub fn note_irq(vector: usize) {
     IRQ_TOTAL.fetch_add(1, Relaxed);
