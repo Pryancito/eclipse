@@ -125,6 +125,13 @@ fn spawn(
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc =
         Process::create_linux(&job, rootfs.clone(), vt, shared_root, pid).expect("create_linux");
+    // Make this shell the foreground process group of its own tty from the
+    // start. `getpgid` reports each process's pgrp as its own pid, so seeding
+    // the VT's foreground pgrp to `pid` makes `tcgetpgrp == getpgrp` for the
+    // shell; otherwise it starts at 0, the shell concludes it is a background
+    // job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning enter_uspace
+    // loop that was previously hidden behind the handle_signal self-deadlock).
+    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -217,7 +224,17 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // check the signal and handle
-        if let Some((signal, sigmask)) = thread.inner().lock_linux().handle_signal() {
+        //
+        // Bind the result to a local FIRST so the `lock_linux()` temporary guard
+        // is dropped at the end of this statement. Inlining it into the `if let`
+        // scrutinee keeps the guard alive for the whole `if let` body (Rust
+        // temporary scoping), and `handle_signal` re-locks the same per-thread
+        // `LinuxThread` mutex — a self-deadlock on the non-reentrant TicketMutex.
+        // It fires whenever a thread has a pending signal (e.g. the job-control
+        // SIGTTIN a shell sends itself), wedging that core in an interrupts-off
+        // spin forever: the silent multi-core busy/heat (and a hang risk).
+        let pending_signal = thread.inner().lock_linux().handle_signal();
+        if let Some((signal, sigmask)) = pending_signal {
             ctx = handle_signal(&thread, ctx, signal, sigmask);
         }
         if thread.state() == ThreadState::Dying {

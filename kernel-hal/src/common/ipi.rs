@@ -48,6 +48,15 @@ pub fn mark_cpu_online(logical_id: usize) {
     }
 }
 
+/// Number of logical CPUs that actually came online (BSP + every AP that
+/// reached `secondary_init`). May be less than the detected/configured CPU
+/// count when SMP bring-up is partial — useful for accounting that must not
+/// divide by cores that never ran (e.g. the `/proc/perf` busy% denominator,
+/// which would otherwise count a never-started AP as 100% busy).
+pub fn online_cpu_count() -> usize {
+    CPU_ONLINE.load(Ordering::Acquire).count_ones() as usize
+}
+
 /// Receiver side of the TLB shootdown: flush this CPU's whole TLB. The queue
 /// payload is irrelevant — a full flush covers every pending request — so it is
 /// just drained and discarded; this also makes the path robust to IPI-queue

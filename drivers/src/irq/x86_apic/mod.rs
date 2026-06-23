@@ -66,6 +66,14 @@ impl Apic {
         }
     }
 
+    /// [diag] Broadcast an NMI to every other CPU (reaches cores spinning with
+    /// interrupts disabled).
+    pub fn send_nmi_all_others() {
+        if LocalApic::is_initialized() {
+            Self::local_apic().send_nmi_all_others();
+        }
+    }
+
     pub fn init_local_apic_bsp(phys_to_virt: Phys2VirtFn) {
         unsafe { LocalApic::init_bsp(phys_to_virt) }
     }

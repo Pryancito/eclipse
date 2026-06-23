@@ -419,6 +419,15 @@ pub fn set_foreground_pgrp(pgid: i32) {
     tty_fg_pgrp(kernel_hal::console::active_vt()).store(pgid, Ordering::Relaxed);
 }
 
+/// Seed a *specific* VT's foreground process group. Called when a per-VT shell
+/// is spawned so it starts as the foreground job of its own tty. Without this
+/// the VT's `fg_pgrp` stays 0 while the shell's pgrp is its pid, so `tcgetpgrp`
+/// != `getpgrp`: an interactive `sh` then believes it is a *background* job and
+/// spins sending itself `SIGTTIN` (a tight enter_uspace loop = wasted CPU/heat).
+pub fn set_vt_foreground_pgrp(vt: usize, pgid: i32) {
+    tty_fg_pgrp(vt).store(pgid, Ordering::Relaxed);
+}
+
 /// Replace termios on the active VT (used when `TCSETS` hits a non-tty fd).
 pub fn set_active_vt_termios(termios: Termios) {
     *tty_termios(kernel_hal::console::active_vt()).lock() = termios;
