@@ -450,12 +450,21 @@ pub(super) fn init() {
                 if has_epb { ", EPB=power-save" } else { "" },
             ),
         }
-        if mwait_on {
+        // Report the idle path that is *actually* used, not merely what the CPU
+        // could do. MWAIT/C1E is currently force-disabled (`IDLE_USE_MWAIT` is
+        // never set) because the deeper C-state stops the LAPIC on some real
+        // hardware and the tickless-idle wake is then lost (boot hangs right
+        // after the splash logo). Logging "MONITOR/MWAIT" while really halting
+        // via `hlt` would send any boot-hang investigation down the wrong path,
+        // so key the message on the live flag.
+        if IDLE_USE_MWAIT.load(Ordering::Relaxed) {
             let hint = IDLE_MWAIT_HINT.load(Ordering::Relaxed);
             info!(
                 "power: idle via MONITOR/MWAIT ({})",
                 if hint == MWAIT_HINT_C1E { "C1E" } else { "C1" },
             );
+        } else if mwait_on {
+            info!("power: idle via HLT (C1) — MWAIT/C1E available but disabled (LAPIC-safe)");
         } else {
             info!("power: idle via HLT (C1)");
         }
