@@ -45,6 +45,11 @@ hal_fn_def! {
         /// thermal sensor, or `None` when the hardware doesn't expose it.
         pub fn cpu_temperature_mc() -> Option<i32> { None }
 
+        /// Adaptive P-state governor summary: `(throttled core count, cpu0's
+        /// current P-state ceiling, cpu0's base ceiling)`, or `None` when no OS
+        /// P-state control is active (non-HWP/CPPC parts, or under a hypervisor).
+        pub fn pstate_governor_summary() -> Option<(u32, u8, u8)> { None }
+
         /// Shutdown/reboot the machine.
         pub fn reset() -> !;
     }
