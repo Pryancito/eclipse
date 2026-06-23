@@ -149,6 +149,14 @@ hal_fn_impl! {
                     zcore_drivers::usb::xhci_hid::poll();
                 }
             }
+            // Adaptive thermal P-state governor: each CPU samples its own
+            // temperature and nudges its HWP/CPPC ceiling to stay cool. Self
+            // rate-limited to ~1 Hz per core, so cheap to call every tick; runs
+            // before the deadline fast-path so it ticks under load too (when the
+            // package is hot but there are no expiring timers).
+            #[cfg(target_arch = "x86_64")]
+            super::arch::power::thermal_governor_tick();
+
             // Lock-free fast path: if the earliest pending deadline hasn't
             // arrived yet, skip the mutex entirely. Saves a spinlock acquire
             // per CPU per tick (250 Hz × N CPUs), which is the dominant

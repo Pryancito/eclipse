@@ -46,7 +46,8 @@
 //! implement the backing MSR.
 
 use core::arch::x86_64::__cpuid;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use lock::Mutex;
 use x86_64::registers::model_specific::Msr;
 
 // ── Intel HWP / EPB MSRs ────────────────────────────────────────────────────
@@ -195,15 +196,21 @@ fn intel_temperature_mc() -> Option<i32> {
             return None; // reading not valid
         }
         let below_tjmax = ((status >> 16) & 0x7f) as i32;
-        let tjmax = {
-            let t = ((Msr::new(MSR_TEMPERATURE_TARGET).read() >> 16) & 0xff) as i32;
-            if t > 0 {
-                t
-            } else {
-                100 // sane default when the target MSR reads back zero
-            }
-        };
-        Some((tjmax - below_tjmax) * 1000)
+        Some((intel_tjmax_c() - below_tjmax) * 1000)
+    }
+}
+
+/// TjMax (throttle/junction temperature) in whole °C for an Intel part, falling
+/// back to a sane 100 °C when `MSR_TEMPERATURE_TARGET` reads back zero.
+///
+/// SAFETY: reads `MSR_TEMPERATURE_TARGET`; only valid on a part with the DTS
+/// (CPUID.06H:EAX[0]) — gated by the callers.
+unsafe fn intel_tjmax_c() -> i32 {
+    let t = ((Msr::new(MSR_TEMPERATURE_TARGET).read() >> 16) & 0xff) as i32;
+    if t > 0 {
+        t
+    } else {
+        100
     }
 }
 
@@ -249,35 +256,56 @@ unsafe fn amd_smn_read(smn_addr: u32) -> u32 {
     })
 }
 
+/// Serializes the legacy 0xCF8/0xCFC PCI-config address→data pair used for the
+/// AMD SMN temperature read. A single shared register pair means two CPUs
+/// reading the package `Tctl` concurrently (e.g. the per-core thermal governor
+/// firing on several cores at once, or a `/sys/class/thermal` read racing it)
+/// could interleave one core's index write with another's data read and return
+/// garbage. `without_interrupts` inside the read only stops *local* reentrancy,
+/// so a cross-core lock is required.
+static AMD_SMN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Inner AMD `Tctl` read, in milli-°C. Caller must hold [`AMD_SMN_LOCK`].
+unsafe fn amd_temperature_raw() -> Option<i32> {
+    let eax = __cpuid(1).eax;
+    let base_family = (eax >> 8) & 0xf;
+    let ext_family = (eax >> 20) & 0xff;
+    let family = if base_family == 0xf {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+    if family < 0x17 {
+        return None; // pre-Zen uses a different (older) path; not supported
+    }
+    // Confirm the Data Fabric function 0 really is an AMD device before
+    // trusting the SMN window (vendor id 0x1022 in the low 16 bits).
+    if pci_cfg_read32(0, 0x18, 0, 0x00) & 0xFFFF != 0x1022 {
+        return None;
+    }
+    let regval = amd_smn_read(ZEN_REPORTED_TEMP_CTRL);
+    let mut temp = ((regval >> ZEN_CUR_TEMP_SHIFT) as i32) * 125;
+    if regval & ZEN_CUR_TEMP_RANGE_SEL != 0 {
+        temp -= 49_000;
+    }
+    Some(temp)
+}
+
 /// AMD core temperature (`Tctl`), Family 17h (Zen) and later, read from the SMU
 /// over the Data Fabric SMN — the mechanism the Linux `k10temp` driver uses.
 /// Returns `Tctl` in milli-degrees C (the per-model `Tdie` offset some Ryzen /
-/// Threadripper parts apply is not subtracted).
+/// Threadripper parts apply is not subtracted). Blocks on [`AMD_SMN_LOCK`].
 fn amd_temperature_mc() -> Option<i32> {
-    unsafe {
-        let eax = __cpuid(1).eax;
-        let base_family = (eax >> 8) & 0xf;
-        let ext_family = (eax >> 20) & 0xff;
-        let family = if base_family == 0xf {
-            base_family + ext_family
-        } else {
-            base_family
-        };
-        if family < 0x17 {
-            return None; // pre-Zen uses a different (older) path; not supported
-        }
-        // Confirm the Data Fabric function 0 really is an AMD device before
-        // trusting the SMN window (vendor id 0x1022 in the low 16 bits).
-        if pci_cfg_read32(0, 0x18, 0, 0x00) & 0xFFFF != 0x1022 {
-            return None;
-        }
-        let regval = amd_smn_read(ZEN_REPORTED_TEMP_CTRL);
-        let mut temp = ((regval >> ZEN_CUR_TEMP_SHIFT) as i32) * 125;
-        if regval & ZEN_CUR_TEMP_RANGE_SEL != 0 {
-            temp -= 49_000;
-        }
-        Some(temp)
-    }
+    let _guard = AMD_SMN_LOCK.lock();
+    unsafe { amd_temperature_raw() }
+}
+
+/// Like [`amd_temperature_mc`] but never blocks: returns `None` if the SMN lock
+/// is contended. Used by the governor, which runs in timer-IRQ context where it
+/// must not spin waiting on a `/sys` reader (and can simply skip this sample).
+fn amd_temperature_mc_try() -> Option<i32> {
+    let _guard = AMD_SMN_LOCK.try_lock()?;
+    unsafe { amd_temperature_raw() }
 }
 
 /// `true` if AMD Collaborative Processor Performance Control is present
@@ -316,10 +344,7 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
     // EPP only exists when CPUID.06H:EAX[10] is set; otherwise bits [31:24] are
     // reserved-zero and IA32_ENERGY_PERF_BIAS provides the bias instead.
     let epp = if has_epp { EPP_POWER_SAVE } else { 0 };
-    let request = (lowest as u64)
-        | ((max as u64) << 8)
-        | (0u64 << 16)
-        | (epp << 24);
+    let request = (lowest as u64) | ((max as u64) << 8) | (0u64 << 16) | (epp << 24);
     Msr::new(IA32_HWP_REQUEST).write(request);
 
     (lowest, max, cap)
@@ -345,10 +370,7 @@ unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
 
     // REQUEST: Max[7:0]=max, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
     // EPP[31:24]. Out-of-range fields are clamped by hardware to [lowest,highest].
-    let request = (max as u64)
-        | ((lowest as u64) << 8)
-        | (0u64 << 16)
-        | (EPP_POWER_SAVE << 24);
+    let request = (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_POWER_SAVE << 24);
     Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
 
     (lowest, max, cap)
@@ -402,6 +424,10 @@ pub(super) fn init() {
         unsafe { set_energy_perf_bias() };
     }
 
+    // Record this CPU's P-state bounds so the adaptive thermal governor can
+    // walk its ceiling down/up at runtime (see `thermal_governor_tick`).
+    governor_init_cpu(pstate, has_hwp_epp);
+
     // --- Idle C-state via MONITOR/MWAIT (cross-vendor) ---
     let has_monitor = (leaf1.ecx & (1 << 3)) != 0;
     let leaf5 = __cpuid(5);
@@ -435,7 +461,11 @@ pub(super) fn init() {
                 mech.label(),
                 lo,
                 hi,
-                if capped { " (turbo/boost disabled)" } else { "" },
+                if capped {
+                    " (turbo/boost disabled)"
+                } else {
+                    ""
+                },
                 if has_epb { " +EPB" } else { "" },
             ),
             None => info!(
@@ -549,6 +579,214 @@ extern "C" fn hal_cpu_idle() {
         .unwrap_or_default()
         .as_nanos() as u64;
     crate::kstats::note_idle(ns);
+}
+
+// ── Thermal-adaptive P-state governor ───────────────────────────────────────
+//
+// The init-time P-state policy is static: ceiling = base clock, floor = lowest.
+// That keeps an idle core cool, but under sustained load the package can still
+// climb. This governor closes the loop: each logical CPU samples its own
+// temperature ~1 Hz from the timer tick and walks its HWP/CPPC *ceiling* down
+// (below base, toward lowest) as it nears TjMax, then back up to base as it
+// cools — proactive, gradual throttling that engages before the hardware's hard
+// PROCHOT wall and smooths thermal cycling. It never touches C-states or the
+// LAPIC (so it can't reintroduce the deep-idle boot hang), and only writes the
+// per-CPU request MSR when the chosen ceiling actually changes; the steady-state
+// cost is one cheap temperature read per second per core.
+
+/// Master switch. With it off, the static init-time P-state policy stands.
+const GOVERNOR_ENABLED: bool = true;
+/// Minimum spacing between governor evaluations on a given logical CPU.
+const GOV_INTERVAL_NS: u64 = 1_000_000_000; // 1 s
+/// Logical CPUs the per-core governor tracks. Cores past this keep their
+/// init-time ceiling (no adaptive throttling); the array index just bails.
+const GOV_MAX_CPUS: usize = 256;
+/// AMD `Tctl` throttle band, milli-°C (Zen exposes no fixed TjMax MSR).
+const GOV_AMD_HOT_MC: i32 = 88_000;
+const GOV_AMD_COOL_MC: i32 = 78_000;
+/// Intel band as a °C offset below TjMax.
+const GOV_INTEL_HOT_BELOW_TJMAX: i32 = 12;
+const GOV_INTEL_COOL_BELOW_TJMAX: i32 = 22;
+
+/// P-state mechanism in use: 0 = none, 1 = Intel HWP, 2 = AMD CPPC.
+static GOV_MECH: AtomicU8 = AtomicU8::new(0);
+/// Whether the HWP request carries an EPP field (mirrors `enable_hwp`).
+static GOV_HAS_EPP: AtomicBool = AtomicBool::new(false);
+
+// Per-logical-CPU state. Separate atomic arrays avoid a non-`Copy` struct-array
+// initializer in a `static`.
+static GOV_VALID: [AtomicBool; GOV_MAX_CPUS] = [const { AtomicBool::new(false) }; GOV_MAX_CPUS];
+static GOV_LOWEST: [AtomicU8; GOV_MAX_CPUS] = [const { AtomicU8::new(0) }; GOV_MAX_CPUS];
+/// The normal (init-time) ceiling — base clock when turbo is capped.
+static GOV_CEIL_MAX: [AtomicU8; GOV_MAX_CPUS] = [const { AtomicU8::new(0) }; GOV_MAX_CPUS];
+/// The currently programmed ceiling (GOV_LOWEST ..= GOV_CEIL_MAX).
+static GOV_CEILING: [AtomicU8; GOV_MAX_CPUS] = [const { AtomicU8::new(0) }; GOV_MAX_CPUS];
+static GOV_LAST_NS: [AtomicU64; GOV_MAX_CPUS] = [const { AtomicU64::new(0) }; GOV_MAX_CPUS];
+static GOV_THROTTLED: [AtomicBool; GOV_MAX_CPUS] = [const { AtomicBool::new(false) }; GOV_MAX_CPUS];
+
+/// Record the calling CPU's P-state bounds so the governor can scale its
+/// ceiling. Called once per logical CPU from `init`, after HWP/CPPC is set.
+fn governor_init_cpu(pstate: Option<(PStateMech, (u8, u8, bool))>, has_epp: bool) {
+    let (mech, (lowest, max, _capped)) = match pstate {
+        Some(p) => p,
+        None => return, // no OS P-state control → governor inert
+    };
+    let cpu = lock::current_cpu_id() as usize;
+    if cpu < GOV_MAX_CPUS {
+        GOV_LOWEST[cpu].store(lowest, Ordering::Relaxed);
+        GOV_CEIL_MAX[cpu].store(max, Ordering::Relaxed);
+        GOV_CEILING[cpu].store(max, Ordering::Relaxed);
+        GOV_LAST_NS[cpu].store(0, Ordering::Relaxed);
+        GOV_THROTTLED[cpu].store(false, Ordering::Relaxed);
+        GOV_VALID[cpu].store(true, Ordering::Release);
+    }
+    GOV_HAS_EPP.store(has_epp, Ordering::Relaxed);
+    GOV_MECH.store(
+        match mech {
+            PStateMech::IntelHwp => 1,
+            PStateMech::AmdCppc => 2,
+        },
+        Ordering::Release,
+    );
+}
+
+/// `(cool_mc, hot_mc)` governor hysteresis band for the running vendor.
+fn governor_band_mc() -> (i32, i32) {
+    if is_intel() {
+        let tjmax = unsafe { intel_tjmax_c() };
+        let cool = (tjmax - GOV_INTEL_COOL_BELOW_TJMAX).max(40) * 1000;
+        let hot = (tjmax - GOV_INTEL_HOT_BELOW_TJMAX).max(50) * 1000;
+        (cool, hot)
+    } else {
+        (GOV_AMD_COOL_MC, GOV_AMD_HOT_MC)
+    }
+}
+
+/// Non-blocking temperature read for the governor (timer-IRQ context).
+fn governor_temperature_mc() -> Option<i32> {
+    if is_intel() {
+        intel_temperature_mc()
+    } else if is_amd() {
+        amd_temperature_mc_try()
+    } else {
+        None
+    }
+}
+
+/// Program a new P-state ceiling (max field) on the calling CPU, keeping the
+/// floor at `lowest` and the power-save EPP — same request layout as
+/// `enable_hwp` / `enable_amd_cppc`, just with an adjusted maximum.
+///
+/// SAFETY: writes IA32_HWP_REQUEST / MSR_AMD_CPPC_REQUEST; valid only when the
+/// matching mechanism is active (gated via `GOV_MECH` by the caller).
+unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
+    match mech {
+        1 => {
+            let epp = if GOV_HAS_EPP.load(Ordering::Relaxed) {
+                EPP_POWER_SAVE
+            } else {
+                0
+            };
+            let request = (lowest as u64) | ((max as u64) << 8) | (0u64 << 16) | (epp << 24);
+            Msr::new(IA32_HWP_REQUEST).write(request);
+        }
+        2 => {
+            let request =
+                (max as u64) | ((lowest as u64) << 8) | (0u64 << 16) | (EPP_POWER_SAVE << 24);
+            Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
+        }
+        _ => {}
+    }
+}
+
+/// One adaptive-governor step for the calling CPU. Cheap and self-rate-limited
+/// to `GOV_INTERVAL_NS`, so it is safe to call from every timer tick. No-ops
+/// under a hypervisor or where no OS P-state control was enabled.
+pub(crate) fn thermal_governor_tick() {
+    if !GOVERNOR_ENABLED {
+        return;
+    }
+    let mech = GOV_MECH.load(Ordering::Acquire);
+    if mech == 0 {
+        return; // no P-state control (or pre-init / hypervisor)
+    }
+    let cpu = lock::current_cpu_id() as usize;
+    if cpu >= GOV_MAX_CPUS || !GOV_VALID[cpu].load(Ordering::Acquire) {
+        return;
+    }
+
+    // Self-rate-limit. This slot is only ever touched by its own CPU, and a
+    // timer tick can't re-enter itself, so a plain load/store is race-free.
+    let now = crate::hal_fn::timer::timer_now().as_nanos() as u64;
+    if now.wrapping_sub(GOV_LAST_NS[cpu].load(Ordering::Relaxed)) < GOV_INTERVAL_NS {
+        return;
+    }
+    GOV_LAST_NS[cpu].store(now, Ordering::Relaxed);
+
+    let lowest = GOV_LOWEST[cpu].load(Ordering::Relaxed);
+    let ceil_max = GOV_CEIL_MAX[cpu].load(Ordering::Relaxed);
+    if ceil_max <= lowest {
+        return; // no room to scale
+    }
+    let temp = match governor_temperature_mc() {
+        Some(t) => t,
+        None => return,
+    };
+    let (cool, hot) = governor_band_mc();
+
+    let ceiling = GOV_CEILING[cpu].load(Ordering::Relaxed);
+    // One step ≈ 1/8 of the dynamic range → a full swing takes ~8 s: gentle
+    // enough to avoid oscillation, quick enough to react before PROCHOT.
+    let step = core::cmp::max(1, (ceil_max - lowest) / 8);
+    let new_ceiling = if temp >= hot {
+        ceiling.saturating_sub(step).max(lowest)
+    } else if temp <= cool {
+        core::cmp::min(ceil_max, ceiling.saturating_add(step))
+    } else {
+        return; // inside the hysteresis band: hold
+    };
+    if new_ceiling == ceiling {
+        return;
+    }
+
+    unsafe { governor_program_ceiling(mech, lowest, new_ceiling) };
+    GOV_CEILING[cpu].store(new_ceiling, Ordering::Relaxed);
+
+    let now_throttled = new_ceiling < ceil_max;
+    let was_throttled = GOV_THROTTLED[cpu].swap(now_throttled, Ordering::Relaxed);
+    if now_throttled != was_throttled {
+        info!(
+            "power: cpu{} thermal governor {} — ceiling {}/{} (~{}.{} C)",
+            cpu,
+            if now_throttled {
+                "throttling"
+            } else {
+                "released"
+            },
+            new_ceiling,
+            ceil_max,
+            temp / 1000,
+            (temp % 1000).abs() / 100,
+        );
+    }
+}
+
+/// Adaptive-governor summary for `/proc/perf`: `(throttled core count, cpu0's
+/// current ceiling, cpu0's base ceiling)`, or `None` when the governor is inert.
+pub(crate) fn governor_summary() -> Option<(u32, u8, u8)> {
+    if GOV_MECH.load(Ordering::Acquire) == 0 || !GOV_VALID[0].load(Ordering::Acquire) {
+        return None;
+    }
+    let throttled = (0..GOV_MAX_CPUS)
+        .filter(|&c| {
+            GOV_VALID[c].load(Ordering::Relaxed) && GOV_THROTTLED[c].load(Ordering::Relaxed)
+        })
+        .count() as u32;
+    Some((
+        throttled,
+        GOV_CEILING[0].load(Ordering::Relaxed),
+        GOV_CEIL_MAX[0].load(Ordering::Relaxed),
+    ))
 }
 
 /// Run `f` only on the first CPU to reach it; the APs run identical hardware, so

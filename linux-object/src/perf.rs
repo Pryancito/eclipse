@@ -294,6 +294,19 @@ pub fn kernel_report() -> String {
             let _ = writeln!(out, "cpu temp:     n/a (no sensor or running in a VM)");
         }
     }
+    // Adaptive P-state governor (bare metal only): shows whether any core is
+    // currently throttled for heat, and cpu0's live ceiling vs its base.
+    if let Some((throttled, ceiling, base)) = kernel_hal::cpu::pstate_governor_summary() {
+        if throttled > 0 {
+            let _ = writeln!(
+                out,
+                "pstate gov:   {} core(s) throttling — cpu0 ceiling {}/{}",
+                throttled, ceiling, base
+            );
+        } else {
+            let _ = writeln!(out, "pstate gov:   nominal — cpu0 ceiling {}/{}", ceiling, base);
+        }
+    }
     let _ = writeln!(
         out,
         "uptime:       {:.2} s   cpus: {} online ({} configured)",

@@ -124,6 +124,10 @@ hal_fn_impl! {
             super::power::cpu_temperature_mc()
         }
 
+        fn pstate_governor_summary() -> Option<(u32, u8, u8)> {
+            super::power::governor_summary()
+        }
+
         fn reset() -> ! {
             info!("resetting/shutting down...");
             use zcore_drivers::io::{Io, Pmio};
