@@ -461,9 +461,6 @@ pub(super) fn cpu_idle() {
     use x86_64::instructions::interrupts;
 
     let was_enabled = interrupts::are_enabled();
-    // Time the nap so `/proc/perf/kernel` can report the real idle fraction —
-    // the key signal for "is the CPU actually halting or busy-spinning (warm)?".
-    let idle_start = crate::hal_fn::timer::timer_now();
 
     if IDLE_USE_MWAIT.load(Ordering::Relaxed) {
         let hint = IDLE_MWAIT_HINT.load(Ordering::Relaxed);
@@ -496,22 +493,34 @@ pub(super) fn cpu_idle() {
     if !was_enabled {
         interrupts::disable();
     }
-
-    let idle_ns = crate::hal_fn::timer::timer_now()
-        .checked_sub(idle_start)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    crate::kstats::note_idle(idle_ns);
 }
 
 /// FFI entry used by the scheduler (`PreemptiveScheduler`) to idle the CPU. The
 /// scheduler can't depend on `kernel-hal` (that would be circular), so it calls
-/// this symbol — the same pattern as the `drivers_*` shims. Routing the main
-/// idle loop here means it gets the cooler C1E idle and idle-time accounting
-/// instead of a bare `hlt`.
+/// this symbol — the same pattern as the `drivers_*` shims.
+///
+/// This deliberately parks in **C1 via a plain `sti; hlt`**, NOT the MONITOR/
+/// MWAIT C1E path: on some real hardware the deeper C-state MWAIT can enter
+/// stops the LAPIC, and with tickless idle a timer-only wake is then lost — the
+/// machine hangs at boot right after the splash logo, before the shell prompt
+/// ever appears (QEMU never hit this because it idles via `hlt`). C1 never stops
+/// the LAPIC, so the tickless wake is always delivered. Idle time is still
+/// accounted for `/proc/perf/kernel`.
 #[no_mangle]
 extern "C" fn hal_cpu_idle() {
-    cpu_idle();
+    use x86_64::instructions::interrupts;
+
+    let was_enabled = interrupts::are_enabled();
+    let start = crate::hal_fn::timer::timer_now();
+    interrupts::enable_and_hlt();
+    if !was_enabled {
+        interrupts::disable();
+    }
+    let ns = crate::hal_fn::timer::timer_now()
+        .checked_sub(start)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    crate::kstats::note_idle(ns);
 }
 
 /// Run `f` only on the first CPU to reach it; the APs run identical hardware, so
