@@ -29,6 +29,27 @@ fn schedule_poll_wakeup(cx: &mut Context, after: Duration) {
 /// Wakeup granularity for select/poll/epoll (IRQ wakes can arrive earlier).
 const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::IO_WAIT_TICK_MS);
 
+/// Slow re-poll granularity for an interactive wait whose terminal is NOT the
+/// active VT. A background-VT shell sits in poll(stdin) for keyboard input that
+/// can only ever arrive on the *active* terminal, so re-polling it at the fast
+/// 4 ms tick just burns CPU (the busy/heat with several spare VT shells). Poll
+/// it slowly instead; it still wakes immediately on a real event, and within
+/// this bound it notices its VT becoming active and resumes fast polling.
+const SLOW_IO_WAIT_TICK: Duration = Duration::from_millis(100);
+
+/// Pick the io-wait re-poll interval: the fast tick when there is real work to
+/// watch for (a socket, or an interactive fd on the *active* VT), else the slow
+/// tick so background-VT shells don't busy-poll.
+fn io_wait_interval(s: &Syscall, watch_net: bool, watch_interactive: bool) -> Duration {
+    let active_interactive = watch_interactive
+        && s.linux_process().vt() == kernel_hal::console::active_vt();
+    if watch_net || active_interactive {
+        IO_WAIT_TICK
+    } else {
+        SLOW_IO_WAIT_TICK
+    }
+}
+
 fn arm_io_wait(cx: &mut Context, watch_net: bool, watch_interactive: bool, io_armed: &mut bool) {
     if *io_armed {
         linux_object::net::retain_io_wait_wakers(cx.waker(), watch_net, watch_interactive);
@@ -146,13 +167,15 @@ impl Syscall<'_> {
                             return Poll::Ready(Ok(0));
                         }
                         let remaining = deadline.saturating_sub(mono_now());
-                        let wake_in = remaining.min(IO_WAIT_TICK);
+                        let tick = io_wait_interval(self.syscall, watch_net, watch_interactive);
+                        let wake_in = remaining.min(tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
+                        let tick = io_wait_interval(self.syscall, watch_net, watch_interactive);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
-                        schedule_poll_wakeup(cx, IO_WAIT_TICK);
+                        schedule_poll_wakeup(cx, tick);
                     }
                     _ => {
                         info!("No waker. timeout: {:?}", self.timeout_msecs);
@@ -342,13 +365,15 @@ impl Syscall<'_> {
                             return Poll::Ready(Ok(0));
                         }
                         let remaining = deadline.saturating_sub(mono_now());
-                        let wake_in = remaining.min(IO_WAIT_TICK);
+                        let tick = io_wait_interval(self.syscall, watch_net, watch_interactive);
+                        let wake_in = remaining.min(tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
                         schedule_poll_wakeup(cx, wake_in);
                     }
                     -1 => {
+                        let tick = io_wait_interval(self.syscall, watch_net, watch_interactive);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut self.io_armed);
-                        schedule_poll_wakeup(cx, IO_WAIT_TICK);
+                        schedule_poll_wakeup(cx, tick);
                     }
                     _ => {}
                 }
