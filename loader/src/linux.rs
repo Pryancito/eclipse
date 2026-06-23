@@ -182,6 +182,17 @@ fn spawn(
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
 
+    // [bootdiag] TEMPORARY: confirm each per-VT shell's main thread was created
+    // and queued on the executor. Real-hardware boots hang with the splash logo
+    // still showing (no shell prompt, no kernel error) — i.e. the shell is
+    // spawned but produces no output. These warn!-level markers are always
+    // visible (and clear the logo themselves), so the last one printed pinpoints
+    // how far boot got. Remove once the hang is diagnosed.
+    warn!(
+        "[bootdiag] vt={} pid={} shell main thread queued (entry={:#x} sp={:#x})",
+        vt, pid, entry, sp
+    );
+
     // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
     // deferred kernel task, off the synchronous boot path: the blocking
     // block-device I/O would otherwise risk stalling boot before the shell
@@ -209,6 +220,15 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
+    // [bootdiag] TEMPORARY: confirm the executor actually polled this thread (so
+    // the shell is not merely queued but running). One line per thread. Remove
+    // once the real-hardware boot hang is diagnosed.
+    #[cfg(not(feature = "libos"))]
+    warn!(
+        "[bootdiag] run_user entered: pid={} tid={}",
+        thread.proc().id(),
+        thread.id()
+    );
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -386,6 +406,22 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
     if let TrapReason::Syscall = reason {
         let num = syscall_num(&ctx);
         let args = syscall_args(&ctx);
+        // [bootdiag] TEMPORARY: trace the primary shell's (pid 101) first syscalls
+        // so a real-hardware boot photo shows exactly where busybox `sh` blocks
+        // before printing its prompt. Bounded so it can't flood the console.
+        // Remove once the hang is diagnosed.
+        #[cfg(not(feature = "libos"))]
+        if thread.proc().id() == 101 {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 160 {
+                warn!(
+                    "[bootdiag] pid101 syscall#{} num={} args={:x?}",
+                    n, num as u32, args
+                );
+            }
+        }
         ctx.advance_pc(reason);
         thread.put_context(ctx);
         let mut syscall = linux_syscall::Syscall {
