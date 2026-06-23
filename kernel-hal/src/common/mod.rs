@@ -11,4 +11,5 @@ pub mod boot_logo;
 pub mod console;
 pub mod context;
 pub mod ipi;
+pub mod kstats;
 pub mod user;

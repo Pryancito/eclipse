@@ -120,6 +120,10 @@ hal_fn_impl! {
             super::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as u8
         }
 
+        fn cpu_temperature_mc() -> Option<i32> {
+            super::power::cpu_temperature_mc()
+        }
+
         fn reset() -> ! {
             info!("resetting/shutting down...");
             use zcore_drivers::io::{Io, Pmio};

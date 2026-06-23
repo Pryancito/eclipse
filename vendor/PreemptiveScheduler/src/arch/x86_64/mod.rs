@@ -42,12 +42,19 @@ pub(crate) fn pg_base_register() -> usize {
 
 use x86_64::instructions::interrupts;
 
+extern "C" {
+    /// Provided by `kernel-hal`: park the CPU until the next interrupt using the
+    /// coolest available C-state (C1E via MONITOR/MWAIT, falling back to `hlt`)
+    /// and account the idle time for `/proc/perf/kernel`. A bare `sti; hlt` here
+    /// only reaches C1 and bypassed that power management, keeping the CPU
+    /// warmer than necessary while idle.
+    fn hal_cpu_idle();
+}
+
 pub(crate) fn wait_for_interrupt() {
-    let enable = interrupts::are_enabled();
-    interrupts::enable_and_hlt();
-    if !enable {
-        interrupts::disable();
-    }
+    // `hal_cpu_idle` preserves the caller's interrupt-enable state itself, the
+    // same contract as the previous `enable_and_hlt` + restore did.
+    unsafe { hal_cpu_idle() }
 }
 
 pub(crate) fn intr_on() {

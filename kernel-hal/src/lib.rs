@@ -75,7 +75,7 @@ pub(crate) use kernel_handler::KHANDLER;
 
 #[cfg(feature = "graphic")]
 pub use common::boot_logo;
-pub use common::{addr, console, context, defs::*, ipi::*, user};
+pub use common::{addr, console, context, defs::*, ipi::*, kstats, user};
 pub use config::KernelConfig;
 pub use imp::{
     boot::{primary_init, primary_init_early, secondary_init},

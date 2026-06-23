@@ -109,6 +109,7 @@ hal_fn_impl! {
         }
 
         fn timer_tick() {
+            crate::kstats::note_timer_tick();
             // Blink the framebuffer text cursor. Cheap (one atomic load) on most
             // ticks; must run before the lock-free deadline fast-path below so it
             // keeps blinking while the system is idle with no pending timers.

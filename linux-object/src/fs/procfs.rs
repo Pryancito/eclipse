@@ -582,6 +582,10 @@ fn proc_perf_top_content() -> String {
     crate::perf::top_report()
 }
 
+fn proc_perf_kernel_content() -> String {
+    crate::perf::kernel_report()
+}
+
 fn proc_perf_tasks_content() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "eclipse perf — tasks (processes / kernel threads)");
@@ -646,6 +650,7 @@ impl INode for ProcPerfDirINode {
             "syscalls" => Ok(PROC_PERF_SYSCALLS.clone()),
             "tasks" => Ok(PROC_PERF_TASKS.clone()),
             "top" => Ok(PROC_PERF_TOP.clone()),
+            "kernel" => Ok(PROC_PERF_KERNEL.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -656,6 +661,7 @@ impl INode for ProcPerfDirINode {
             2 => Ok("syscalls".into()),
             3 => Ok("tasks".into()),
             4 => Ok("top".into()),
+            5 => Ok("kernel".into()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1159,6 +1165,10 @@ lazy_static! {
     static ref PROC_PERF_TOP: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 47,
         generate: proc_perf_top_content,
+    });
+    static ref PROC_PERF_KERNEL: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 48,
+        generate: proc_perf_kernel_content,
     });
     static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {

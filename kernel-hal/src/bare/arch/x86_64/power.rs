@@ -159,6 +159,127 @@ fn is_amd() -> bool {
     r.ebx == 0x6874_7541 && r.edx == 0x6974_6e65 && r.ecx == 0x444d_4163
 }
 
+/// MSR: IA32_THERM_STATUS — per-core digital thermal sensor (DTS).
+const IA32_THERM_STATUS: u32 = 0x19C;
+/// MSR: IA32_TEMPERATURE_TARGET — TjMax (throttle temperature) in bits [23:16].
+const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
+
+/// This CPU's temperature in milli-degrees Celsius, or `None` when the hardware
+/// doesn't expose it. Dispatches to the Intel (DTS via MSR) or AMD (SMN via the
+/// Data Fabric) sensor. Skipped under a hypervisor: a VM may advertise the
+/// sensor without implementing the backing MSR (which would #GP → panic), and
+/// it never reports a real temperature anyway.
+pub(crate) fn cpu_temperature_mc() -> Option<i32> {
+    if hypervisor_present() {
+        return None;
+    }
+    if is_intel() {
+        intel_temperature_mc()
+    } else if is_amd() {
+        amd_temperature_mc()
+    } else {
+        None
+    }
+}
+
+/// Intel digital thermal sensor (same source as the `coretemp` driver). The
+/// sensor reports degrees *below* TjMax; the absolute temperature is
+/// `TjMax - readout`. Gated on CPUID.06H:EAX[0] so the MSR read never #GPs.
+fn intel_temperature_mc() -> Option<i32> {
+    unsafe {
+        if __cpuid(6).eax & 1 == 0 {
+            return None; // no Digital Thermal Sensor
+        }
+        let status = Msr::new(IA32_THERM_STATUS).read();
+        if status & (1 << 31) == 0 {
+            return None; // reading not valid
+        }
+        let below_tjmax = ((status >> 16) & 0x7f) as i32;
+        let tjmax = {
+            let t = ((Msr::new(MSR_TEMPERATURE_TARGET).read() >> 16) & 0xff) as i32;
+            if t > 0 {
+                t
+            } else {
+                100 // sane default when the target MSR reads back zero
+            }
+        };
+        Some((tjmax - below_tjmax) * 1000)
+    }
+}
+
+// ── AMD temperature (k10temp-style SMN read) ────────────────────────────────
+/// SMN address of the reported-temperature control register on Family 17h+.
+const ZEN_REPORTED_TEMP_CTRL: u32 = 0x0005_9800;
+/// `CurTmp` field starts at bit 21 (each step is 0.125 °C = 125 m°C).
+const ZEN_CUR_TEMP_SHIFT: u32 = 21;
+/// When set, `CurTmp` uses the extended range and is offset by -49 °C.
+const ZEN_CUR_TEMP_RANGE_SEL: u32 = 1 << 19;
+
+/// Read a 32-bit PCI config dword via the legacy 0xCF8/0xCFC mechanism, with
+/// interrupts masked so the address→data pair can't be torn by a local IRQ that
+/// touches PCI config space.
+unsafe fn pci_cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+    use x86_64::instructions::interrupts;
+    use zcore_drivers::io::{Io, Pmio};
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((off as u32) & 0xFC);
+    interrupts::without_interrupts(|| {
+        Pmio::<u32>::new(0xCF8).write(addr);
+        Pmio::<u32>::new(0xCFC).read()
+    })
+}
+
+/// Write `addr` to the Data Fabric SMN index register then read the data
+/// register (D18F0, offsets 0x60/0x64) — the standard AMD SMN indirect access.
+unsafe fn amd_smn_read(smn_addr: u32) -> u32 {
+    use x86_64::instructions::interrupts;
+    use zcore_drivers::io::{Io, Pmio};
+    let index = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x60;
+    let data = 0x8000_0000u32 | (0x18 << 11) | (0 << 8) | 0x64;
+    interrupts::without_interrupts(|| {
+        // index register (0x60)
+        Pmio::<u32>::new(0xCF8).write(index);
+        Pmio::<u32>::new(0xCFC).write(smn_addr);
+        // data register (0x64)
+        Pmio::<u32>::new(0xCF8).write(data);
+        Pmio::<u32>::new(0xCFC).read()
+    })
+}
+
+/// AMD core temperature (`Tctl`), Family 17h (Zen) and later, read from the SMU
+/// over the Data Fabric SMN — the mechanism the Linux `k10temp` driver uses.
+/// Returns `Tctl` in milli-degrees C (the per-model `Tdie` offset some Ryzen /
+/// Threadripper parts apply is not subtracted).
+fn amd_temperature_mc() -> Option<i32> {
+    unsafe {
+        let eax = __cpuid(1).eax;
+        let base_family = (eax >> 8) & 0xf;
+        let ext_family = (eax >> 20) & 0xff;
+        let family = if base_family == 0xf {
+            base_family + ext_family
+        } else {
+            base_family
+        };
+        if family < 0x17 {
+            return None; // pre-Zen uses a different (older) path; not supported
+        }
+        // Confirm the Data Fabric function 0 really is an AMD device before
+        // trusting the SMN window (vendor id 0x1022 in the low 16 bits).
+        if pci_cfg_read32(0, 0x18, 0, 0x00) & 0xFFFF != 0x1022 {
+            return None;
+        }
+        let regval = amd_smn_read(ZEN_REPORTED_TEMP_CTRL);
+        let mut temp = ((regval >> ZEN_CUR_TEMP_SHIFT) as i32) * 125;
+        if regval & ZEN_CUR_TEMP_RANGE_SEL != 0 {
+            temp -= 49_000;
+        }
+        Some(temp)
+    }
+}
+
 /// `true` if AMD Collaborative Processor Performance Control is present
 /// (CPUID Fn8000_0008_EBX[27]). Guards access to the MSR_AMD_CPPC_* registers.
 fn amd_has_cppc() -> bool {
@@ -340,6 +461,9 @@ pub(super) fn cpu_idle() {
     use x86_64::instructions::interrupts;
 
     let was_enabled = interrupts::are_enabled();
+    // Time the nap so `/proc/perf/kernel` can report the real idle fraction —
+    // the key signal for "is the CPU actually halting or busy-spinning (warm)?".
+    let idle_start = crate::hal_fn::timer::timer_now();
 
     if IDLE_USE_MWAIT.load(Ordering::Relaxed) {
         let hint = IDLE_MWAIT_HINT.load(Ordering::Relaxed);
@@ -372,6 +496,22 @@ pub(super) fn cpu_idle() {
     if !was_enabled {
         interrupts::disable();
     }
+
+    let idle_ns = crate::hal_fn::timer::timer_now()
+        .checked_sub(idle_start)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    crate::kstats::note_idle(idle_ns);
+}
+
+/// FFI entry used by the scheduler (`PreemptiveScheduler`) to idle the CPU. The
+/// scheduler can't depend on `kernel-hal` (that would be circular), so it calls
+/// this symbol — the same pattern as the `drivers_*` shims. Routing the main
+/// idle loop here means it gets the cooler C1E idle and idle-time accounting
+/// instead of a bare `hlt`.
+#[no_mangle]
+extern "C" fn hal_cpu_idle() {
+    cpu_idle();
 }
 
 /// Run `f` only on the first CPU to reach it; the APs run identical hardware, so
