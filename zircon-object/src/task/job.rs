@@ -247,7 +247,16 @@ impl Job {
         self.debug_exceptionate.shutdown();
         self.base.signal_set(Signal::JOB_TERMINATED);
         if let Some(parent) = self.parent.as_ref() {
-            parent.remove_child(&self.inner.lock().self_ref)
+            // Clone the self-ref and DROP our own `inner` lock before locking the
+            // parent's. Holding `self.inner` (child) across `parent.remove_child`
+            // (which locks `parent.inner`) takes the two job locks in child→parent
+            // order, the exact reverse of `find_process` (parent→child). Under SMP
+            // a process exiting here while another core walks the job tree
+            // (`find_process`/`ps`/signal delivery) is an AB-BA deadlock: both
+            // cores then spin forever with interrupts disabled — two pegged cores,
+            // i.e. silent heat. Taking only one job lock at a time breaks the cycle.
+            let self_ref = self.inner.lock().self_ref.clone();
+            parent.remove_child(&self_ref)
         }
     }
 }
