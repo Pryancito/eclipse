@@ -379,24 +379,96 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _musl = self.0.linux_musl_cross();
         let arch = self.0.name();
         let script = PROJECT_DIR.join("tools/tinyx/build-tinyx.sh");
-        if !script.is_file() {
-            eprintln!("warning: missing {script:?}; skipping TinyX");
+        if script.is_file() {
+            println!("Building TinyX (Xfbdev) for {arch}...");
+            let status = std::process::Command::new("bash")
+                .arg(&script)
+                .env("ARCH", arch)
+                .env("ROOTFS", rootfs)
+                .current_dir(&*PROJECT_DIR)
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => eprintln!(
+                    "warning: TinyX build failed (exit {}); using prebuilt Xfbdev",
+                    s.code().unwrap_or(-1)
+                ),
+                Err(e) => eprintln!("warning: failed to run build-tinyx.sh: {e}; using prebuilt Xfbdev"),
+            }
+        } else {
+            eprintln!("warning: missing {script:?}; using prebuilt TinyX");
+        }
+        // The from-source build needs the musl toolchain and (first time) network
+        // for the X dev sysroot + fonts; when any of that is unavailable it fails
+        // with only a warning and the rootfs is left without an X server — the
+        // "Xfbdev/startx missing" symptom. A static Xfbdev plus startx/xinitrc and
+        // the bitmap fonts are committed under tools/tinyx/, so stage those as a
+        // fallback whenever the build did not produce the binary.
+        if !rootfs.join("usr/bin/Xfbdev").is_file() {
+            self.stage_prebuilt_tinyx(rootfs);
+        }
+    }
+
+    /// Stage the committed prebuilt TinyX artifacts (static `Xfbdev`, the
+    /// `startx`/`xinitrc` helpers and the bitmap fonts) into `rootfs`. Used as a
+    /// fallback when `build-tinyx.sh` can't run (no toolchain / no network).
+    fn stage_prebuilt_tinyx(&self, rootfs: &Path) {
+        let arch = self.0.name();
+        let tinyx = PROJECT_DIR.join("tools/tinyx");
+        let xfbdev = tinyx.join(format!("build-{arch}/kdrive/fbdev/Xfbdev"));
+        if !xfbdev.is_file() {
+            eprintln!(
+                "warning: no prebuilt Xfbdev at {xfbdev:?}; TinyX will be unavailable"
+            );
             return;
         }
-        println!("Building TinyX (Xfbdev) for {arch}...");
-        let status = std::process::Command::new("bash")
-            .arg(&script)
-            .env("ARCH", arch)
-            .env("ROOTFS", rootfs)
-            .current_dir(&*PROJECT_DIR)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!(
-                "warning: TinyX build failed (exit {}); Xfbdev not installed",
-                s.code().unwrap_or(-1)
-            ),
-            Err(e) => eprintln!("warning: failed to run build-tinyx.sh: {e}"),
+        println!("Staging prebuilt TinyX (Xfbdev) into rootfs...");
+        let copy_exec = |src: &Path, dst: PathBuf| {
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = dir::rm(&dst);
+            if let Err(e) = fs::copy(src, &dst) {
+                eprintln!("warning: failed to stage {dst:?}: {e}");
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+            }
+        };
+        copy_exec(&xfbdev, rootfs.join("usr/bin/Xfbdev"));
+
+        let startx = tinyx.join("eclipse/startx");
+        if startx.is_file() {
+            copy_exec(&startx, rootfs.join("usr/bin/startx"));
+        }
+        let xinitrc = tinyx.join("eclipse/xinitrc");
+        if xinitrc.is_file() {
+            let dst = rootfs.join("etc/X11/xinitrc.tinyx");
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = dir::rm(&dst);
+            if let Err(e) = fs::copy(&xinitrc, &dst) {
+                eprintln!("warning: failed to stage {dst:?}: {e}");
+            }
+        }
+
+        // Bitmap fonts (fixed/cursor/…) that libXfont loads at runtime; startx
+        // points `-fp` at /usr/share/fonts/X11/misc.
+        let font_src = tinyx.join(format!("font-staging-{arch}/usr/share/fonts/misc"));
+        let font_dst = rootfs.join("usr/share/fonts/X11/misc");
+        if font_src.is_dir() && !font_dst.join("fonts.dir").is_file() {
+            let _ = fs::create_dir_all(&font_dst);
+            if let Ok(entries) = fs::read_dir(&font_src) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        let _ = fs::copy(entry.path(), font_dst.join(entry.file_name()));
+                    }
+                }
+            }
         }
     }
 
