@@ -78,6 +78,7 @@ pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
 // E1000eInterface::poll() calls wake_net_rx_waiters() after iface.poll()
 // so any task waiting for RX data is woken immediately instead of after 5 ms.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Waker;
 use lazy_static::lazy_static;
 
@@ -108,8 +109,37 @@ pub fn retain_net_rx_waker(waker: &Waker) {
     NET_RX_WAKERS.lock().retain(|w| w.will_wake(waker));
 }
 
-/// Wake tasks registered for TCP/UDP RX.
+/// Minimum spacing (in nanoseconds) between net-waiter wakeups. smoltcp's
+/// `iface.poll()` reports "did work" for its perpetual TX / protocol-timer
+/// housekeeping, not just reception, and every wake makes the registered waiters
+/// re-poll — which re-does that housekeeping and reports work again. Left
+/// unbounded that is a tight wake -> re-poll -> wake loop that keeps the CPUs
+/// from ever halting (the "warm while idle" heat) the whole time a NIC is
+/// attached. Coalescing the wakeups to at most one per this interval breaks the
+/// loop while still delivering every kind of progress — RX, TX completion,
+/// connect, DHCP — within the interval. A coalesced wake is never lost: the
+/// waiters also arm their own short fallback timers, so the worst case is a
+/// wake deferred by at most this interval.
+///
+/// (Safe to let the CPU halt now that input no longer depends on the busy-spin:
+/// the idle tick is capped at ~8 ms so HID stays polled at ~125 Hz — see
+/// `IDLE_TICK_CAP_NS` in `super::timer`.)
+const NET_WAKE_MIN_INTERVAL_NS: u64 = 1_000_000; // 1 ms => ≤ 1 kHz
+static LAST_NET_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Wake tasks registered for TCP/UDP RX (and any other net progress).
+///
+/// Rate-limited to one wake per [`NET_WAKE_MIN_INTERVAL_NS`] to break the
+/// smoltcp housekeeping busy-spin (see that constant). When a wake is coalesced
+/// the registered wakers are intentionally left in place so the *next* allowed
+/// wake (or their fallback timer) still delivers them.
 pub fn wake_net_rx_waiters() {
+    let now = crate::timer::timer_now().as_nanos() as u64;
+    let last = LAST_NET_WAKE_NS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < NET_WAKE_MIN_INTERVAL_NS {
+        return;
+    }
+    LAST_NET_WAKE_NS.store(now, Ordering::Relaxed);
     let wakers: Vec<Waker> = core::mem::take(&mut *NET_RX_WAKERS.lock());
     for w in wakers {
         w.wake();
