@@ -25,78 +25,6 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// [bootdiag] TEMPORARY: emit a diagnostic line on the EARLY framebuffer console
-/// (the splash-logo surface), which paints reliably even when the native graphic
-/// console does not yet. Used to trace the real-hardware boot hang where busybox
-/// `sh` is spawned but never prints a prompt. Remove once diagnosed.
-#[allow(dead_code)]
-fn bootdiag(s: &str) {
-    // Early framebuffer console (visible on real hardware where the native
-    // console does not paint) AND serial (so a QEMU run captures the trace in
-    // /tmp/serial.out without needing a screen photo).
-    kernel_hal::console::early_console_write_str(s);
-    kernel_hal::console::early_console_write_str("\n");
-    kernel_hal::console::serial_write_str(s);
-    kernel_hal::console::serial_write_str("\n");
-}
-
-/// [bootdiag] TEMPORARY: short name for common x86_64 syscall numbers, so the
-/// blocking syscall is recognizable in a (possibly mirrored) boot photo.
-#[allow(dead_code)]
-fn sc_name(num: u32) -> &'static str {
-    match num {
-        0 => "read",
-        1 => "write",
-        2 => "open",
-        3 => "close",
-        4 => "stat",
-        5 => "fstat",
-        7 => "poll",
-        9 => "mmap",
-        10 => "mprot",
-        11 => "munmap",
-        12 => "brk",
-        13 => "rt_sigaction",
-        14 => "rt_sigprocmask",
-        16 => "ioctl",
-        20 => "writev",
-        21 => "access",
-        35 => "nanosleep",
-        39 => "getpid",
-        59 => "execve",
-        60 => "exit",
-        61 => "wait4",
-        63 => "uname",
-        72 => "fcntl",
-        79 => "getcwd",
-        89 => "readlink",
-        97 => "getrlimit",
-        102 => "getuid",
-        104 => "getgid",
-        107 => "geteuid",
-        108 => "getegid",
-        110 => "getppid",
-        111 => "getpgrp",
-        157 => "prctl",
-        158 => "arch_prctl",
-        202 => "futex",
-        217 => "getdents64",
-        218 => "set_tid_address",
-        228 => "clock_gettime",
-        231 => "exit_group",
-        257 => "openat",
-        262 => "newfstatat",
-        270 => "pselect6",
-        271 => "ppoll",
-        273 => "set_robust_list",
-        290 => "eventfd2",
-        302 => "prlimit64",
-        318 => "getrandom",
-        332 => "statx",
-        _ => "?",
-    }
-}
-
 /// Create and run a single Linux process as PID 1 on virtual terminal 0.
 ///
 /// Used by the libos example/tests, where one program is the whole system.
@@ -241,20 +169,10 @@ fn spawn(
 
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
-    // [bootdiag] TEMPORARY: print to the EARLY framebuffer console (the surface
-    // showing the splash logo), not warn!: on real hardware the native graphic
-    // console does not paint at this stage, so warn! markers were invisible. The
-    // early console always paints (it is drawing the logo right now). Pinpoints
-    // whether boot reaches/clears the ELF load. Remove once the hang is found.
-    bootdiag(&alloc::format!("[bd] vt={} pid={} loading ELF {:?}", vt, pid, args.get(0)));
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     let (entry, sp, initial_brk, execute_path) = loader
         .load(&proc.vmar(), &vmo, args.clone(), envs, path)
         .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
-    bootdiag(&alloc::format!(
-        "[bd] vt={} pid={} ELF loaded entry={:#x} sp={:#x}",
-        vt, pid, entry, sp
-    ));
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
@@ -263,9 +181,6 @@ fn spawn(
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
-
-    // [bootdiag] TEMPORARY: shell main thread created and queued on the executor.
-    bootdiag(&alloc::format!("[bd] vt={} pid={} thread queued", vt, pid));
 
     // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
     // deferred kernel task, off the synchronous boot path: the blocking
@@ -294,13 +209,6 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
-    // [bootdiag] TEMPORARY: confirm the executor actually polled this thread.
-    #[cfg(not(feature = "libos"))]
-    bootdiag(&alloc::format!(
-        "[bd] run_user entered pid={} tid={}",
-        thread.proc().id(),
-        thread.id()
-    ));
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -504,29 +412,6 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
     if let TrapReason::Syscall = reason {
         let num = syscall_num(&ctx);
         let args = syscall_args(&ctx);
-        // [bootdiag] TEMPORARY: trace the primary shell's (pid 101) first syscalls
-        // so a real-hardware boot photo shows exactly where busybox `sh` blocks
-        // before printing its prompt. Prints an "enter" before the call and a
-        // "ret" after, so the last "enter" with no matching "ret" is the syscall
-        // that never returned (the hang). Bounded so it can't flood. Remove once
-        // the hang is diagnosed.
-        #[cfg(not(feature = "libos"))]
-        let diag_n: Option<usize> = if thread.proc().id() == 101 {
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 120 {
-                bootdiag(&alloc::format!(
-                    "[bd] sc#{} {} a0={:x} a1={:x} ENTER",
-                    n, sc_name(num as u32), args[0], args[1]
-                ));
-                Some(n)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         ctx.advance_pc(reason);
         thread.put_context(ctx);
         let mut syscall = linux_syscall::Syscall {
@@ -538,11 +423,6 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         let ret = run_with_irq_enable! {
             syscall.syscall(num as u32, args).await as usize
         };
-        // [bootdiag] TEMPORARY: matching "ret" for the enter above.
-        #[cfg(not(feature = "libos"))]
-        if let Some(n) = diag_n {
-            bootdiag(&alloc::format!("[bd] sc#{} ret={:x}", n, ret));
-        }
         trace!("Syscall ret: {} -> {:x}", num as u32, ret);
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
         return Ok(());
