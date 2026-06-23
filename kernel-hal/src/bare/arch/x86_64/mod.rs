@@ -89,6 +89,12 @@ pub fn timer_init() {
 
 pub fn secondary_init() {
     zcore_drivers::irq::x86::Apic::init_local_apic_ap();
+    // The LAPIC timer's mode/divide/initial-count registers are per-CPU and are
+    // only programmed on the BSP (in `drivers.rs`). Replicate that here so this
+    // AP actually receives the 250 Hz scheduler tick; without it the AP's timer
+    // stays stopped (initial count 0) and the core never preempts or idles
+    // cleanly. The unmask itself happens later via `timer_enable()`.
+    timer::program_periodic_tick();
     // P-state/idle setup is per-logical-CPU, so every AP must run it too.
     power::init();
     smp::ap_signal_online();
