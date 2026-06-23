@@ -116,6 +116,20 @@ fn copy_tree_capped(src: &Path, dst: &Path) {
     fs::copy(src, dst).unwrap();
 }
 
+/// TinyX paths pulled into the live image on top of [`LIVE_KEEP`]. The bulk of
+/// `usr/bin` and `usr/share/fonts` is intentionally left out of the RAM-resident
+/// live root, but `make qemu` boots that live image directly (never installs to
+/// btrfs), so without these the X server isn't reachable there. Xfbdev is ~2 MB
+/// and the misc bitmap fonts ~5 MB — negligible for a 2 GiB VM, and copying the
+/// whole `misc` dir avoids a fragile curated subset where the `fixed`/`cursor`
+/// aliases could resolve to an omitted font and Xfbdev would fail to start.
+/// `etc/X11/xinitrc.tinyx` rides along via the `etc` entry in [`LIVE_KEEP`].
+const LIVE_TINYX: [&str; 3] = [
+    "usr/bin/Xfbdev",
+    "usr/bin/startx",
+    "usr/share/fonts/X11/misc",
+];
+
 /// Build the *minimal live/installer* root at `out` from the full `full` rootfs.
 /// Only the [`LIVE_KEEP`] paths are copied; empty mount points are created so
 /// boot-time fstab processing and `/dev`, `/proc`, `/sys` have somewhere to
@@ -124,6 +138,10 @@ fn build_live_rootfs(full: &Path, out: &Path) {
     let _ = fs::remove_dir_all(out);
     fs::create_dir_all(out).unwrap();
     for rel in LIVE_KEEP {
+        copy_tree_capped(&full.join(rel), &out.join(rel));
+    }
+    // TinyX (Xfbdev) so `make qemu`, which boots the live image, has an X server.
+    for rel in LIVE_TINYX {
         copy_tree_capped(&full.join(rel), &out.join(rel));
     }
     for d in [
