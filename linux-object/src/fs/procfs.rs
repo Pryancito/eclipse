@@ -14,8 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 10] = [
+const PROC_ROOT_STATIC: [&str; 11] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
+    "perf",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -273,6 +274,7 @@ impl INode for ProcRootINode {
             "stat" => Ok(PROC_STAT.clone()),
             "loadavg" => Ok(PROC_LOADAVG.clone()),
             "sys" => Ok(PROC_SYS_DIR.clone()),
+            "perf" => Ok(PROC_PERF.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -300,8 +302,8 @@ impl ProcPidDirINode {
         ROOT_JOB.find_process(self.pid as _)
     }
 
-    fn entries() -> [&'static str; 5] {
-        [".", "..", "stat", "cmdline", "status"]
+    fn entries() -> [&'static str; 6] {
+        [".", "..", "stat", "cmdline", "status", "perf"]
     }
 }
 
@@ -367,6 +369,10 @@ impl INode for ProcPidDirINode {
             "status" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Status,
+            })),
+            "perf" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Perf,
             })),
             _ => Err(FsError::EntryNotFound),
         }
@@ -568,6 +574,10 @@ fn proc_perf_event_paranoid_content() -> String {
     String::from("-1\n")
 }
 
+fn proc_perf_content() -> String {
+    crate::perf::global_report()
+}
+
 fn proc_kptr_restrict_content() -> String {
     String::from("0\n")
 }
@@ -700,6 +710,7 @@ enum ProcPidFileKind {
     Stat,
     Cmdline,
     Status,
+    Perf,
 }
 
 /// `/proc/<pid>/{stat,cmdline,status}` without snapshotting at lookup time.
@@ -717,6 +728,7 @@ impl ProcPidFileINode {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
             ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
             ProcPidFileKind::Status => proc_pid_status(&proc).into_bytes(),
+            ProcPidFileKind::Perf => crate::perf::proc_report(proc.linux(), self.pid).into_bytes(),
         })
     }
 }
@@ -1051,6 +1063,10 @@ lazy_static! {
     static ref PROC_KPTR_RESTRICT: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 43,
         generate: proc_kptr_restrict_content,
+    });
+    static ref PROC_PERF: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 44,
+        generate: proc_perf_content,
     });
     static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {

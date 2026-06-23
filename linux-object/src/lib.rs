@@ -27,6 +27,7 @@ pub mod ipc;
 pub mod loadavg;
 pub mod loader;
 pub mod net;
+pub mod perf;
 pub mod process;
 pub mod signal;
 pub mod sync;

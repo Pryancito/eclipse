@@ -41,6 +41,38 @@ mod consts {
     // generated from syscall.h.in
     include!(concat!(env!("OUT_DIR"), "/consts.rs"));
 }
+
+/// Glue for Eclipse's own perf accounting (`/proc/perf`, `/proc/<pid>/perf`).
+///
+/// Resolves a syscall number to its name via the generated [`Sys`] enum and
+/// registers that resolver with `linux-object` (which owns the `/proc` files
+/// but not the syscall table) the first time a syscall runs.
+mod perf_accounting {
+    use super::Sys;
+    use alloc::string::{String, ToString};
+    use core::convert::TryFrom;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    fn resolve(num: u32) -> Option<String> {
+        // `Sys` is `#[derive(Debug)]`; its variant name is the uppercase
+        // syscall name. Lower-case it to match the conventional spelling.
+        Sys::try_from(num)
+            .ok()
+            .map(|s| alloc::format!("{:?}", s).to_lowercase())
+            .or_else(|| Some(num.to_string()))
+    }
+
+    /// Register the name resolver exactly once.
+    pub fn ensure_registered() {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            linux_object::perf::set_name_resolver(resolve);
+        }
+    }
+}
 /// Max kernel buffer for one read/write/recv/send syscall. Bare-metal zCore uses
 /// a fixed kernel heap; large transient allocations (e.g. 1 MiB recv buffers)
 /// exhaust or fragment it after long network sessions.
@@ -114,6 +146,12 @@ impl Syscall<'_> {
             }
         };
         let [a0, a1, a2, a3, a4, a5] = args;
+        // Eclipse's own perf accounting: time every syscall and attribute it to
+        // both the system-wide and per-process tables (surfaced at `/proc/perf`
+        // and `/proc/<pid>/perf`). The name resolver is registered lazily here
+        // so `linux-object` can render numbers as names without an arch table.
+        perf_accounting::ensure_registered();
+        let perf_start = kernel_hal::timer::timer_now();
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
             Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2),
@@ -363,6 +401,14 @@ impl Syscall<'_> {
             #[cfg(target_arch = "aarch64")]
             _ => self.aarch64_syscall(sys_type, args).await,
         };
+        // `checked_sub` (not `-`): an async syscall can migrate CPUs across an
+        // await, and with unsynchronised TSCs the end can read before the start,
+        // which would panic on a plain `Duration` subtraction.
+        let elapsed_ns = kernel_hal::timer::timer_now()
+            .checked_sub(perf_start)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        linux_object::perf::record(self.linux_process(), num, elapsed_ns);
         info!("<= {:?}", ret);
         match ret {
             Ok(value) => value as isize,
