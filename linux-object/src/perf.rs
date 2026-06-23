@@ -219,6 +219,33 @@ pub fn kernel_report() -> String {
         "idle naps:    {}  (avg {:.1} us/nap)",
         ks.idle_entries, avg_nap_us
     );
+    // [diag] Per-CPU nap breakdown: a core driving the HID poll should show many
+    // short naps (low avg us); a deeply-idle core shows few long naps.
+    for (cpu, naps, ns) in &ks.idle_percpu {
+        let avg_us = if *naps > 0 {
+            *ns as f64 / *naps as f64 / 1000.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            out,
+            "  cpu{}: {} naps ({:.0}/s), avg {:.0} us/nap",
+            cpu,
+            naps,
+            rate(*naps),
+            avg_us
+        );
+    }
+    // [diag] xHCI HID poll rate by path. Input is delivered from these polls;
+    // when idle, `iowait` falls to ~0 and `timer` alone must keep input alive.
+    let _ = writeln!(
+        out,
+        "hid polls:    timer {} ({:.0}/s), iowait {} ({:.0}/s)",
+        ks.hid_poll_timer,
+        rate(ks.hid_poll_timer),
+        ks.hid_poll_iowait,
+        rate(ks.hid_poll_iowait)
+    );
     let _ = writeln!(
         out,
         "timer ticks:  {}  ({:.0}/s)",

@@ -22,24 +22,11 @@ const TICKLESS_IDLE: bool = true;
 
 /// Upper bound on how long an idle CPU may sleep between scheduler ticks, in
 /// nanoseconds (50 ms ≈ 20 Hz). Nearer pending timers are always honoured; this
-/// only bounds the "nothing pending" case so a timer *set* after a CPU has
-/// already halted is serviced within this bound. Used by every CPU except the
-/// one that drives HID polling (see [`HID_IDLE_TICK_CAP_NS`]).
+/// only bounds the "nothing pending" case so USB-HID polling and the cursor
+/// blink keep running, and so a timer *set* after a CPU has already halted is
+/// serviced within this bound. Lowering it trades idle CPU for responsiveness.
 #[allow(dead_code)]
 const IDLE_TICK_CAP_NS: u64 = 50_000_000;
-
-/// Idle cap for the single CPU that services background USB-HID polling (the
-/// dense logical CPU 0). Keyboard and mouse input is delivered from the
-/// timer-tick xHCI poll, not from a (currently unreliable) xHCI interrupt, so
-/// the idle cap is what bounds input latency. At 50 ms an otherwise-idle machine
-/// polled HID only ~20 Hz and the keyboard felt dead once the net busy-spin
-/// (which had been keeping a CPU awake) was fixed. Pin CPU 0's cap to the xHCI
-/// poll period (~8 ms ≈ 125 Hz) so input stays responsive while that CPU is
-/// still ~99 % idle (it sleeps 8 ms, wakes to read HID in microseconds, halts
-/// again). Only CPU 0 takes the short cap, so the other cores still sleep deeply
-/// — the cooling win is kept and the extra wakeups are confined to one core.
-#[allow(dead_code)]
-const HID_IDLE_TICK_CAP_NS: u64 = 8_000_000;
 
 lazy_static::lazy_static! {
     static ref NAIVE_TIMER: Mutex<Timer> = Mutex::new(Timer::default());
@@ -147,6 +134,7 @@ hal_fn_impl! {
                         .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                 {
+                    crate::kstats::note_hid_poll_timer(); // [diag]
                     zcore_drivers::usb::xhci_hid::poll();
                 }
             }
@@ -172,15 +160,7 @@ hal_fn_impl! {
                 // next wake `timer_idle_exit` restores the fast tick.
                 let now = duration_to_ns(timer_now());
                 let next = NEXT_DEADLINE_NS.load(Ordering::Acquire);
-                // CPU 0 keeps a short cap so background HID polling stays at
-                // ~125 Hz (responsive keyboard/mouse) even when fully idle; the
-                // other cores sleep up to 50 ms so they still halt deeply.
-                let cap = if crate::cpu::cpu_id() == 0 {
-                    HID_IDLE_TICK_CAP_NS
-                } else {
-                    IDLE_TICK_CAP_NS
-                };
-                let span = next.saturating_sub(now).min(cap);
+                let span = next.saturating_sub(now).min(IDLE_TICK_CAP_NS);
                 super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(span));
                 super::percpu::set_timer_idle_armed(true);
             }

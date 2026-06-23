@@ -6,6 +6,7 @@
 //! behind unexpected heat). Everything here is lock-free atomic counters bumped
 //! from the bare-metal idle / IRQ / timer paths; on libos they stay zero.
 
+use crate::config::MAX_CORE_NUM;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -14,6 +15,33 @@ const NVEC: usize = 256;
 
 static IDLE_NS: AtomicU64 = AtomicU64::new(0);
 static IDLE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// [diag] Per-CPU idle nap accounting (ns halted, and nap count), indexed by the
+/// dense logical CPU id. Shows whether a *specific* core keeps a short idle cap
+/// (frequent short naps → it is the one driving the background HID poll) or
+/// sleeps long (deep idle). Used to debug input-responsiveness-vs-heat.
+static IDLE_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static IDLE_ENTRIES_PERCPU: [AtomicU64; MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// [diag] xHCI HID poll invocations split by the path that issued them: the
+/// timer tick (`timer`) vs an I/O-wait loop (`iowait`). Keyboard/mouse input is
+/// delivered from these polls, so their combined rate IS the input
+/// responsiveness. When the CPUs halt and the net busy-spin is gone, `iowait`
+/// drops to ~0 and only `timer` keeps input alive — its rate then says whether
+/// idle HID polling is fast enough.
+static HID_POLL_TIMER: AtomicU64 = AtomicU64::new(0);
+static HID_POLL_IOWAIT: AtomicU64 = AtomicU64::new(0);
+
+/// [diag] Account one xHCI HID poll issued from the timer tick.
+pub fn note_hid_poll_timer() {
+    HID_POLL_TIMER.fetch_add(1, Relaxed);
+}
+
+/// [diag] Account one xHCI HID poll issued from an I/O-wait loop.
+pub fn note_hid_poll_iowait() {
+    HID_POLL_IOWAIT.fetch_add(1, Relaxed);
+}
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static IRQ_TOTAL: AtomicU64 = AtomicU64::new(0);
 static IRQ_COUNTS: [AtomicU64; NVEC] = [const { AtomicU64::new(0) }; NVEC];
@@ -52,6 +80,12 @@ pub fn note_idle_callback(had_work: bool) {
 pub fn note_idle(ns: u64) {
     IDLE_NS.fetch_add(ns, Relaxed);
     IDLE_ENTRIES.fetch_add(1, Relaxed);
+    // [diag] per-CPU breakdown (cpu_id is 0 on libos, real on bare).
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        IDLE_NS_PERCPU[cpu].fetch_add(ns, Relaxed);
+        IDLE_ENTRIES_PERCPU[cpu].fetch_add(1, Relaxed);
+    }
 }
 
 /// Account one timer tick.
@@ -83,6 +117,13 @@ pub struct KStats {
     pub idle_cb_busy: u64,
     /// `(vector, count)` for every vector that fired at least once.
     pub irqs: Vec<(u16, u64)>,
+    /// [diag] Per-CPU `(nap_count, total_nap_ns)` for cores that napped at least
+    /// once, indexed by dense logical CPU id.
+    pub idle_percpu: Vec<(u16, u64, u64)>,
+    /// [diag] xHCI HID polls issued from the timer tick.
+    pub hid_poll_timer: u64,
+    /// [diag] xHCI HID polls issued from I/O-wait loops.
+    pub hid_poll_iowait: u64,
 }
 
 /// Read the current counters.
@@ -94,6 +135,13 @@ pub fn snapshot() -> KStats {
             irqs.push((v as u16, n));
         }
     }
+    let mut idle_percpu = Vec::new();
+    for cpu in 0..MAX_CORE_NUM {
+        let n = IDLE_ENTRIES_PERCPU[cpu].load(Relaxed);
+        if n != 0 {
+            idle_percpu.push((cpu as u16, n, IDLE_NS_PERCPU[cpu].load(Relaxed)));
+        }
+    }
     KStats {
         idle_ns: IDLE_NS.load(Relaxed),
         idle_entries: IDLE_ENTRIES.load(Relaxed),
@@ -102,5 +150,8 @@ pub fn snapshot() -> KStats {
         idle_cb_total: IDLE_CB_TOTAL.load(Relaxed),
         idle_cb_busy: IDLE_CB_BUSY.load(Relaxed),
         irqs,
+        idle_percpu,
+        hid_poll_timer: HID_POLL_TIMER.load(Relaxed),
+        hid_poll_iowait: HID_POLL_IOWAIT.load(Relaxed),
     }
 }
