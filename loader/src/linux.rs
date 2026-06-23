@@ -35,6 +35,63 @@ fn bootdiag(s: &str) {
     kernel_hal::console::early_console_write_str("\n");
 }
 
+/// [bootdiag] TEMPORARY: short name for common x86_64 syscall numbers, so the
+/// blocking syscall is recognizable in a (possibly mirrored) boot photo.
+#[allow(dead_code)]
+fn sc_name(num: u32) -> &'static str {
+    match num {
+        0 => "read",
+        1 => "write",
+        2 => "open",
+        3 => "close",
+        4 => "stat",
+        5 => "fstat",
+        7 => "poll",
+        9 => "mmap",
+        10 => "mprot",
+        11 => "munmap",
+        12 => "brk",
+        13 => "rt_sigaction",
+        14 => "rt_sigprocmask",
+        16 => "ioctl",
+        20 => "writev",
+        21 => "access",
+        35 => "nanosleep",
+        39 => "getpid",
+        59 => "execve",
+        60 => "exit",
+        61 => "wait4",
+        63 => "uname",
+        72 => "fcntl",
+        79 => "getcwd",
+        89 => "readlink",
+        97 => "getrlimit",
+        102 => "getuid",
+        104 => "getgid",
+        107 => "geteuid",
+        108 => "getegid",
+        110 => "getppid",
+        111 => "getpgrp",
+        157 => "prctl",
+        158 => "arch_prctl",
+        202 => "futex",
+        217 => "getdents64",
+        218 => "set_tid_address",
+        228 => "clock_gettime",
+        231 => "exit_group",
+        257 => "openat",
+        262 => "newfstatat",
+        270 => "pselect6",
+        271 => "ppoll",
+        273 => "set_robust_list",
+        290 => "eventfd2",
+        302 => "prlimit64",
+        318 => "getrandom",
+        332 => "statx",
+        _ => "?",
+    }
+}
+
 /// Create and run a single Linux process as PID 1 on virtual terminal 0.
 ///
 /// Used by the libos example/tests, where one program is the whole system.
@@ -418,17 +475,27 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         let args = syscall_args(&ctx);
         // [bootdiag] TEMPORARY: trace the primary shell's (pid 101) first syscalls
         // so a real-hardware boot photo shows exactly where busybox `sh` blocks
-        // before printing its prompt. Bounded so it can't flood the console.
-        // Remove once the hang is diagnosed.
+        // before printing its prompt. Prints an "enter" before the call and a
+        // "ret" after, so the last "enter" with no matching "ret" is the syscall
+        // that never returned (the hang). Bounded so it can't flood. Remove once
+        // the hang is diagnosed.
         #[cfg(not(feature = "libos"))]
-        if thread.proc().id() == 101 {
+        let diag_n: Option<usize> = if thread.proc().id() == 101 {
             use core::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 200 {
-                bootdiag(&alloc::format!("[bd] pid101 sc#{} num={}", n, num as u32));
+            if n < 120 {
+                bootdiag(&alloc::format!(
+                    "[bd] sc#{} {} a0={:x} a1={:x} ENTER",
+                    n, sc_name(num as u32), args[0], args[1]
+                ));
+                Some(n)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         ctx.advance_pc(reason);
         thread.put_context(ctx);
         let mut syscall = linux_syscall::Syscall {
@@ -440,6 +507,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         let ret = run_with_irq_enable! {
             syscall.syscall(num as u32, args).await as usize
         };
+        // [bootdiag] TEMPORARY: matching "ret" for the enter above.
+        #[cfg(not(feature = "libos"))]
+        if let Some(n) = diag_n {
+            bootdiag(&alloc::format!("[bd] sc#{} ret={:x}", n, ret));
+        }
         trace!("Syscall ret: {} -> {:x}", num as u32, ret);
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
         return Ok(());
