@@ -808,6 +808,28 @@ const HID_PROTO_TABLET: u8 = 3;
 const TABLET_RANGE: u32 = 32767;
 const NO_MSI_VECTOR: usize = 0;
 
+/// Number of TRBs (and report buffers) kept queued on every interrupt-IN HID
+/// endpoint. A single in-flight TRB is fragile: if one transfer-completion
+/// event is ever missed (event-ring race, lost MSI, idle-induced timer stall)
+/// the endpoint goes silent forever — that's the "input dies after a few
+/// seconds" symptom on real HW. Keeping a small ring of TRBs (each pointing at
+/// its own buffer) means the controller can still satisfy several more
+/// transfers before silence, and the resubmit on every event keeps the depth
+/// constant. Buffers are tiny (≤ 64 B each) so the cost is negligible.
+const HID_QUEUE_DEPTH: usize = 4;
+
+/// Soft-recovery policy for an HCHalted controller. The driver used to set
+/// `XHCI_HALTED` once and short-circuit `poll()` forever after, meaning a
+/// single transient bus error killed input until reboot. Instead, the first
+/// few times we observe HCHalted we now try a soft restart (clear sticky
+/// USBSTS errors, write RS=1, wait briefly for HCH to drop). If that
+/// recovers the controller, attempts reset; if every attempt fails we latch
+/// `XHCI_HALTED` (genuinely dead silicon). Backoff stops the recovery from
+/// hammering the controller on every io-wait iteration.
+const MAX_HALT_RECOVERY_ATTEMPTS: u8 = 8;
+const HALT_RECOVERY_BACKOFF_US: u64 = 500_000;
+const HALT_RECOVERY_WAIT_US: u64 = 50_000;
+
 pub struct XhciInner {
     pub mmio: XhciMmio,
     cmd: CmdRing,
@@ -830,6 +852,12 @@ pub struct XhciInner {
     pending_port_changes: Vec<u8>,
     /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
     boot_enum_pending: bool,
+    /// Number of consecutive soft-recovery attempts since the controller last
+    /// responded normally. Reset to 0 on every successful, non-halted poll.
+    halt_attempts: u8,
+    /// Monotonic timestamp (µs) of the last soft-recovery attempt; used to
+    /// back off so we don't bang on the controller every io-wait iteration.
+    halt_last_attempt_us: u64,
 }
 
 struct HidDev {
@@ -839,7 +867,16 @@ struct HidDev {
     ring_idx: usize,
     protocol: u8,
     report_len: usize,
-    buf: DmaBuf,
+    /// Round-robin ring of report buffers, one per pre-queued TRB on this
+    /// endpoint (see [`HID_QUEUE_DEPTH`]). The controller fills them in
+    /// enqueue order; we drain in the same order.
+    bufs: Vec<DmaBuf>,
+    /// Index into `bufs` of the next buffer whose transfer event will be
+    /// dispatched. Advances after every consumed completion.
+    dispatch_idx: usize,
+    /// Index into `bufs` of the next buffer to be re-armed with a fresh TRB.
+    /// Advances after every resubmit.
+    enqueue_idx: usize,
     last_mods: u8,
     last_keys: [u8; 6],
     tab_x: u16,
@@ -878,6 +915,8 @@ impl XhciInner {
             fb_height: 768,
             pending_port_changes: Vec::new(),
             boot_enum_pending: true,
+            halt_attempts: 0,
+            halt_last_attempt_us: 0,
         })
     }
 
@@ -987,7 +1026,13 @@ impl XhciInner {
         if lis.is_none() {}
         let (ridx, blen, buf_phys) = {
             let h = &self.hids[idx];
-            (h.ring_idx, (h.report_len.min(64)) as u16, h.buf.sub_phys(0))
+            // Re-arm with the buffer at the enqueue head of the round-robin
+            // ring (its TRB is the one we're about to push back into the
+            // ring). dispatch_hid drains from a separate head so reads see
+            // the report whose event we're processing, not the one the
+            // controller might be writing next.
+            let buf_phys = h.bufs[h.enqueue_idx].sub_phys(0);
+            (h.ring_idx, (h.report_len.min(64)) as u16, buf_phys)
         };
         if let Some(l) = lis {
             self.dispatch_hid(idx, l);
@@ -996,6 +1041,9 @@ impl XhciInner {
             r.advance_dequeue(1);
         }
         self.resubmit_hid_normal_trb(ridx, buf_phys, blen, i as u8, dci);
+        if let Some(h) = self.hids.get_mut(idx) {
+            h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
+        }
         true
     }
 
@@ -1941,14 +1989,24 @@ impl XhciInner {
         self.mmio.ring_db(0, 0);
         self.wait_cmd_phys(p)?;
 
-        let rbuf = DmaBuf::new(report_len, 64)?;
-        let norm = trb_normal(rbuf.sub_phys(0), report_len as u16, true);
-        let ring = self
-            .xfer_rings
-            .get_mut(ridx)
-            .and_then(|o| o.as_mut())
-            .ok_or(DeviceError::NotSupported)?;
-        let _ = ring.push(norm)?;
+        // Allocate one report buffer per pre-queued TRB so the controller can
+        // race ahead by HID_QUEUE_DEPTH transfers without overwriting a buffer
+        // we haven't dispatched yet. See HID_QUEUE_DEPTH docs for the why.
+        let mut bufs = Vec::with_capacity(HID_QUEUE_DEPTH);
+        for _ in 0..HID_QUEUE_DEPTH {
+            bufs.push(DmaBuf::new(report_len, 64)?);
+        }
+        {
+            let ring = self
+                .xfer_rings
+                .get_mut(ridx)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            for buf in &bufs {
+                let norm = trb_normal(buf.sub_phys(0), report_len as u16, true);
+                let _ = ring.push(norm)?;
+            }
+        }
         self.mmio.ring_db(slot, dci as u8);
 
         self.hids.push(HidDev {
@@ -1958,7 +2016,9 @@ impl XhciInner {
             ring_idx: ridx,
             protocol: real_proto,
             report_len,
-            buf: rbuf,
+            bufs,
+            dispatch_idx: 0,
+            enqueue_idx: 0,
             last_mods: 0,
             last_keys: [0; 6],
             tab_x: 0,
@@ -1973,16 +2033,22 @@ impl XhciInner {
             Some(h) => h,
             None => return,
         };
-        let v = phys_to_virt(h.buf.phys);
+        // Read from the buffer at the dispatch head of the round-robin ring,
+        // then advance — the next event will dispatch the next buffer.
+        let dispatch_idx = h.dispatch_idx;
+        let report_len = h.report_len;
+        h.dispatch_idx = (dispatch_idx + 1) % HID_QUEUE_DEPTH;
+        let buf_phys = h.bufs[dispatch_idx].phys;
+        let v = phys_to_virt(buf_phys);
         let mut tmp = [0u8; 8];
-        let n = h.report_len.min(tmp.len()).min(8);
+        let n = report_len.min(tmp.len()).min(8);
         tmp[..n].fill(0);
         // Asegurar consistencia de datos en arquitecturas con caché no coherente o mapeos WB.
         // Se debe invalidar ANTES de copiar los datos para que la CPU lea de la RAM (DMA).
         #[cfg(target_arch = "x86_64")]
         {
             let mut addr = v;
-            let end = v + h.report_len as usize;
+            let end = v + report_len as usize;
             while addr < end {
                 unsafe {
                     _mm_clflush(addr as *const u8);
@@ -2205,6 +2271,62 @@ impl XhciInner {
         // En modo poll/IRQ, procesar los cambios de puerto diferidos ahora que
         // no estamos en medio de enumeración.
         self.drain_pending_port_changes();
+    }
+
+    /// Best-effort recovery from an HCHalted controller without a full HCRST
+    /// (which would tear down enumerated devices). Clears the sticky USBSTS
+    /// error bits and re-asserts Run/Stop. Returns `true` if the controller
+    /// observably un-halted (USBSTS.HCH cleared); the caller can then resume
+    /// normal polling. Rate-limited by a backoff window so we don't pound the
+    /// MMIO when the halt is genuine.
+    fn try_soft_recover(&mut self) -> bool {
+        let now = timer_now_us();
+        if self.halt_last_attempt_us != 0
+            && now.wrapping_sub(self.halt_last_attempt_us) < HALT_RECOVERY_BACKOFF_US
+        {
+            return false;
+        }
+        self.halt_last_attempt_us = now;
+        self.halt_attempts = self.halt_attempts.saturating_add(1);
+
+        let sts = self.mmio.read_op(4);
+        // PCI / D3: not recoverable from this driver.
+        if sts == u32::MAX {
+            return false;
+        }
+        // Not actually halted anymore? Treat as recovered.
+        if sts & 1 == 0 {
+            self.halt_attempts = 0;
+            return true;
+        }
+        // Clear sticky / W1C bits: HSE (bit 2), EINT (3), PCD (4), SRE (10).
+        self.mmio.write_op(4, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 10));
+        // Re-assert RS=1. If INTE was on before, preserve it; if MSI is wired,
+        // make sure it stays enabled.
+        let mut cmd = self.mmio.read_op(0);
+        cmd |= 1;
+        if self.msi_vector > 0 {
+            cmd |= 1 << 2;
+        }
+        self.mmio.write_op(0, cmd);
+
+        // Brief wait for HCH to drop. A genuinely dead controller will time
+        // out here; a transient bus error usually clears within a few µs.
+        let start = timer_now_us();
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, HALT_RECOVERY_WAIT_US, spins) {
+            if self.mmio.read_op(4) & 1 == 0 {
+                warn!(
+                    "[xhci] HCHalted recovered after soft restart (attempt {})",
+                    self.halt_attempts
+                );
+                self.halt_attempts = 0;
+                return true;
+            }
+            spins = spins.saturating_add(1);
+            spin_loop();
+        }
+        false
     }
 
     fn handle_port_status_change(&mut self, port_id: u8) -> DeviceResult<()> {
@@ -2454,10 +2576,11 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 
 /// Respaldo periódico: drena transferencias HID sin depender de MSI (alineado al driver de referencia).
 pub fn poll() {
-    // Fast path: a halted controller has nothing to poll and never recovers
-    // on its own, so bail before any lock or MMIO. This keeps `poll()` (called
-    // from the timer and from every I/O-wait loop iteration) essentially free
-    // once USB has died, instead of dragging on stdin reads / I/O-heavy tools.
+    // Fast path: a controller we have given up on (latched halt) has nothing
+    // to poll, so bail before any lock or MMIO. Unlike the old code we only
+    // reach this latch after MAX_HALT_RECOVERY_ATTEMPTS soft recoveries have
+    // all failed — so a transient HSE no longer kills input forever on real
+    // hardware.
     if XHCI_HALTED.load(Ordering::Relaxed) {
         return;
     }
@@ -2475,25 +2598,49 @@ pub fn poll() {
             // `0xffffffff` is not a valid USBSTS (its high bits are reserved-0):
             // an all-ones read means the controller stopped responding to MMIO,
             // i.e. it powered down (D3) or fell off the bus — typical of an
-            // unused GPU USB-C / VirtualLink xHCI with nothing plugged in. Treat
-            // that distinctly from a genuine HCHalted so the log isn't a bogus
-            // "all error bits set" decode.
-            let gone = sts == u32::MAX;
-            if gone || sts & 1 != 0 {
-                // Stop polling either way: a halted/absent controller never
-                // recovers here, and `process_irq_events` would only re-scan a
-                // permanently-empty event ring.
+            // unused GPU USB-C / VirtualLink xHCI with nothing plugged in. That
+            // is not recoverable from this driver: latch hard.
+            if sts == u32::MAX {
                 if !XHCI_HALTED.swap(true, Ordering::Relaxed) {
-                    if gone {
-                        warn!("[xhci] USBSTS=0xffffffff: el controlador no responde (apagado D3 o ausente, p.ej. un puerto USB-C/VirtualLink de GPU vacío); se detiene el sondeo");
-                    } else {
-                        warn!(
-                            "[xhci] USBSTS: controlador detenido (HCHalted); se detiene el sondeo"
-                        );
-                    }
+                    warn!("[xhci] USBSTS=0xffffffff: el controlador no responde (apagado D3 o ausente, p.ej. un puerto USB-C/VirtualLink de GPU vacío); se detiene el sondeo");
                     xi.dump_halt_diagnostics();
                 }
                 return;
+            }
+            if sts & 1 != 0 {
+                // Genuine HCHalted. Don't give up: try a soft recovery (clear
+                // sticky USBSTS errors + re-assert RS) up to a few times before
+                // permanently latching. Most real-HW halts seen so far are
+                // transient HSE bursts that clear with a single restart, but
+                // latching forever would make input dead until reboot — exactly
+                // the "TinyX kills the keyboard after a few seconds" symptom.
+                let attempts = xi.halt_attempts;
+                if attempts < MAX_HALT_RECOVERY_ATTEMPTS {
+                    if attempts == 0 {
+                        warn!(
+                            "[xhci] USBSTS=HCHalted; intentando recuperación suave (attempt {}/{})",
+                            attempts + 1,
+                            MAX_HALT_RECOVERY_ATTEMPTS
+                        );
+                        xi.dump_halt_diagnostics();
+                    }
+                    if !xi.try_soft_recover() {
+                        return;
+                    }
+                    // Fall through to normal event drain.
+                } else {
+                    if !XHCI_HALTED.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            "[xhci] HCHalted no se recupera tras {} intentos; se detiene el sondeo",
+                            MAX_HALT_RECOVERY_ATTEMPTS
+                        );
+                    }
+                    return;
+                }
+            } else if xi.halt_attempts != 0 {
+                // Controller is healthy again — clear the soft-recovery
+                // budget so the next halt (if any) gets its own fresh shot.
+                xi.halt_attempts = 0;
             }
             xi.process_irq_events(Some(&d.listener));
         }

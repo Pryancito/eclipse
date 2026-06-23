@@ -157,9 +157,16 @@ impl INode for MiceDev {
                 if self.dev.can_read() {
                     return Poll::Ready(self.dev.poll());
                 }
+                // Register the waker BEFORE the second can_read() check to close
+                // the TOCTOU race: a packet that lands between the first check
+                // and subscribe() would otherwise fire no waker, and the task
+                // would sleep until the next packet. (Matches EventDev.)
                 for m in &self.dev.mice {
                     let waker = cx.waker().clone();
                     m.subscribe(Box::new(move |_| waker.wake_by_ref()), true);
+                }
+                if self.dev.can_read() {
+                    return Poll::Ready(self.dev.poll());
                 }
                 Poll::Pending
             }
