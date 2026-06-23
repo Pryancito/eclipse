@@ -14,6 +14,7 @@
 //! arch-specific name table.
 
 use crate::process::LinuxProcess;
+use alloc::collections::BTreeMap;
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -60,7 +61,10 @@ pub fn record(proc: &LinuxProcess, num: u32, ns: u64) {
 pub struct ProcPerf {
     count: AtomicU64,
     ns: AtomicU64,
+    /// Per-syscall call count.
     per: Box<[AtomicU32]>,
+    /// Per-syscall cumulative time (ns), so `/proc/<pid>/perf` shows latency.
+    per_ns: Box<[AtomicU64]>,
 }
 
 impl Default for ProcPerf {
@@ -73,13 +77,16 @@ impl ProcPerf {
     /// Create a zeroed per-process accounting table.
     pub fn new() -> Self {
         let mut per = Vec::with_capacity(PERF_NR);
+        let mut per_ns = Vec::with_capacity(PERF_NR);
         for _ in 0..PERF_NR {
             per.push(AtomicU32::new(0));
+            per_ns.push(AtomicU64::new(0));
         }
         ProcPerf {
             count: AtomicU64::new(0),
             ns: AtomicU64::new(0),
             per: per.into_boxed_slice(),
+            per_ns: per_ns.into_boxed_slice(),
         }
     }
 
@@ -88,6 +95,7 @@ impl ProcPerf {
         self.ns.fetch_add(ns, Relaxed);
         if (num as usize) < self.per.len() {
             self.per[num as usize].fetch_add(1, Relaxed);
+            self.per_ns[num as usize].fetch_add(ns, Relaxed);
         }
     }
 
@@ -154,6 +162,94 @@ pub fn global_report() -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Sampling profiler ("our own perf top"), surfaced at `/proc/perf/top`.
+// ---------------------------------------------------------------------------
+
+/// Cluster sampled instruction pointers into 64-byte buckets so a hot function
+/// aggregates instead of scattering across every instruction.
+const PC_BUCKET: u64 = 64;
+/// Cap on distinct buckets tracked, to bound memory and lock time. Once full,
+/// new addresses are counted as "dropped" rather than inserted.
+const TOP_MAX: usize = 4096;
+
+struct SampleState {
+    total: u64,
+    dropped: u64,
+    map: BTreeMap<u64, u64>,
+}
+
+static SAMPLES: Mutex<SampleState> = Mutex::new(SampleState {
+    total: 0,
+    dropped: 0,
+    map: BTreeMap::new(),
+});
+
+/// Per-timer-tick hook: record one user-space sample and forward it to any
+/// active Linux-`perf` ring buffer. Cheap; called from the timer-interrupt
+/// return path while a user thread was running.
+pub fn tick(pid: i32, tid: i32, cpu: u32, pc: u64) {
+    sample_pc(pc);
+    crate::fs::perf_sample_user(pid, tid, cpu, pc);
+}
+
+/// Add one instruction-pointer sample to the global histogram.
+fn sample_pc(pc: u64) {
+    if pc == 0 {
+        return;
+    }
+    let key = pc & !(PC_BUCKET - 1);
+    let mut s = SAMPLES.lock();
+    s.total += 1;
+    if let Some(c) = s.map.get_mut(&key) {
+        *c += 1;
+    } else if s.map.len() < TOP_MAX {
+        s.map.insert(key, 1);
+    } else {
+        s.dropped += 1;
+    }
+}
+
+/// Render `/proc/perf/top`: hottest sampled instruction-pointer buckets.
+pub fn top_report() -> String {
+    let (total, dropped, mut rows) = {
+        let s = SAMPLES.lock();
+        let rows: Vec<(u64, u64)> = s.map.iter().map(|(&k, &v)| (k, v)).collect();
+        (s.total, s.dropped, rows)
+    };
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut out = String::new();
+    let _ = writeln!(out, "eclipse perf — sampled CPU profile (user space)");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "samples: {}   tracked buckets: {}   dropped (table full): {}",
+        total,
+        rows.len(),
+        dropped
+    );
+    let _ = writeln!(out, "bucket granularity: {} bytes", PC_BUCKET);
+    let _ = writeln!(out);
+    if total == 0 {
+        let _ = writeln!(
+            out,
+            "(no samples yet — a user process must be running on a timer tick)"
+        );
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "  {:>7}  {:>10}  {:<18}",
+        "OVERHEAD", "SAMPLES", "IP (bucket)"
+    );
+    for (addr, count) in rows.into_iter().take(40) {
+        let pct = count as f64 * 100.0 / total as f64;
+        let _ = writeln!(out, "  {:>6.2}%  {:>10}  {:#018x}", pct, count, addr);
+    }
+    out
+}
+
 /// Render `/proc/<pid>/perf`: one process's syscall accounting.
 pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
     let perf = proc.perf();
@@ -162,7 +258,7 @@ pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
     for i in 0..perf.per.len() {
         let calls = perf.per[i].load(Relaxed) as u64;
         if calls != 0 {
-            rows.push((i as u32, calls, 0));
+            rows.push((i as u32, calls, perf.per_ns[i].load(Relaxed)));
         }
     }
     let mut out = String::new();
@@ -177,13 +273,6 @@ pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
         ns as f64 / 1_000_000.0
     );
     let _ = writeln!(out);
-    // Per-process timing is not tracked per-syscall (only totals), so the
-    // TOTAL/AVG columns are left blank here; the CALLS breakdown is what
-    // distinguishes processes.
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
-    let _ = writeln!(out, "  {:<20} {:>12}", "SYSCALL", "CALLS");
-    for (num, calls, _) in rows {
-        let _ = writeln!(out, "  {:<20} {:>12}", name_of(num), calls);
-    }
+    fmt_table(&mut out, rows);
     out
 }

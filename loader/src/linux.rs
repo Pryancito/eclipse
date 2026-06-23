@@ -9,7 +9,6 @@ use linux_object::signal::{
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 use kernel_hal::interrupt::intr_on;
 use linux_object::fs::{
-    perf_sample_user,
     vfs::{FileSystem, INode},
     INodeExt,
 };
@@ -420,7 +419,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
                 if pc != 0 {
-                    perf_sample_user(
+                    linux_object::perf::tick(
                         thread.proc().id() as i32,
                         thread.id() as i32,
                         kernel_hal::cpu::cpu_id() as u32,

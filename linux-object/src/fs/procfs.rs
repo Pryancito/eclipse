@@ -274,7 +274,7 @@ impl INode for ProcRootINode {
             "stat" => Ok(PROC_STAT.clone()),
             "loadavg" => Ok(PROC_LOADAVG.clone()),
             "sys" => Ok(PROC_SYS_DIR.clone()),
-            "perf" => Ok(PROC_PERF.clone()),
+            "perf" => Ok(PROC_PERF_DIR.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -574,8 +574,91 @@ fn proc_perf_event_paranoid_content() -> String {
     String::from("-1\n")
 }
 
-fn proc_perf_content() -> String {
+fn proc_perf_syscalls_content() -> String {
     crate::perf::global_report()
+}
+
+fn proc_perf_top_content() -> String {
+    crate::perf::top_report()
+}
+
+fn proc_perf_tasks_content() -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "eclipse perf — tasks (processes / kernel threads)");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {:>5} {:>4} {:<16} {:<2} {:>10} {:>12}",
+        "PID", "THR", "NAME", "ST", "SYSCALLS", "TIME ms"
+    );
+    let mut procs = all_processes();
+    procs.sort_by_key(|p| p.id());
+    for proc in procs {
+        let pid = proc.id();
+        let comm = proc_comm(&proc);
+        let state = proc_state_char(proc.status());
+        let nthr = proc.thread_ids().len().max(1);
+        let (calls, ns) = proc.linux().perf().totals();
+        let _ = writeln!(
+            out,
+            "  {:>5} {:>4} {:<16} {:<2} {:>10} {:>12.3}",
+            pid,
+            nthr,
+            comm,
+            state,
+            calls,
+            ns as f64 / 1_000_000.0
+        );
+    }
+    out
+}
+
+/// `/proc/perf` — a directory holding Eclipse's own observability views.
+struct ProcPerfDirINode;
+
+impl INode for ProcPerfDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(45))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(PROC_PERF_DIR.clone()),
+            ".." => Ok(PROC_ROOT.clone()),
+            "syscalls" => Ok(PROC_PERF_SYSCALLS.clone()),
+            "tasks" => Ok(PROC_PERF_TASKS.clone()),
+            "top" => Ok(PROC_PERF_TOP.clone()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok(".".into()),
+            1 => Ok("..".into()),
+            2 => Ok("syscalls".into()),
+            3 => Ok("tasks".into()),
+            4 => Ok("top".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
 }
 
 fn proc_kptr_restrict_content() -> String {
@@ -1064,9 +1147,18 @@ lazy_static! {
         inode: 43,
         generate: proc_kptr_restrict_content,
     });
-    static ref PROC_PERF: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_PERF_DIR: Arc<dyn INode> = Arc::new(ProcPerfDirINode);
+    static ref PROC_PERF_SYSCALLS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 44,
-        generate: proc_perf_content,
+        generate: proc_perf_syscalls_content,
+    });
+    static ref PROC_PERF_TASKS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 46,
+        generate: proc_perf_tasks_content,
+    });
+    static ref PROC_PERF_TOP: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 47,
+        generate: proc_perf_top_content,
     });
     static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
