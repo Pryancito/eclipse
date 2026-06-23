@@ -154,6 +154,10 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         // a concurrent process exit might later free.
         kernel_hal::vm::activate_kernel_paging();
         let had_jobs = kernel_hal::deferred_job::pending_deferred_jobs() > 0;
+        // Record the idle-callback hit rate so `/proc/perf/kernel` can show
+        // whether the CPUs keep finding deferred work (busy-spin = heat) or
+        // actually reach the halt below.
+        kernel_hal::kstats::note_idle_callback(had_jobs);
         if had_jobs {
             kernel_hal::deferred_job::drain_deferred_jobs();
         }

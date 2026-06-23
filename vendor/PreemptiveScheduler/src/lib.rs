@@ -32,6 +32,7 @@ mod runtime;
 mod task_collection;
 mod waker_page;
 
+pub use executor::sched_stats;
 pub use runtime::{
     handle_timeout, run_until_idle, sched_yield, set_idle_callback, spawn, spawn_with_affinity,
 };

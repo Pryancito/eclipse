@@ -231,6 +231,35 @@ pub fn kernel_report() -> String {
         ks.irq_total,
         rate(ks.irq_total)
     );
+    // Idle-callback hit rate: the scheduler only halts when this finds no
+    // deferred work, so a high "had work" share means the CPUs busy-spin
+    // draining jobs (the heat signature) rather than sleeping.
+    let cb_busy_pct = if ks.idle_cb_total > 0 {
+        ks.idle_cb_busy as f64 * 100.0 / ks.idle_cb_total as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        out,
+        "idle callback: {} calls ({:.0}/s), {:.1}% found deferred work",
+        ks.idle_cb_total,
+        rate(ks.idle_cb_total),
+        cb_busy_pct
+    );
+    let _ = writeln!(
+        out,
+        "deferred jobs pending now: {}",
+        kernel_hal::deferred_job::pending_deferred_jobs()
+    );
+    let (polled, weak_yield) = kernel_hal::kstats::sched_stats();
+    let _ = writeln!(
+        out,
+        "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
+        polled,
+        rate(polled),
+        weak_yield,
+        rate(weak_yield)
+    );
     let _ = writeln!(out);
     if busy_pct > 50.0 {
         let _ = writeln!(

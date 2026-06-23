@@ -34,6 +34,22 @@ pub struct Executor {
 /// idle branch in `run`). Global because all executors on a CPU share progress.
 static IDLE_STREAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Scheduler-loop branch counters, surfaced via [`sched_stats`] for
+// `/proc/perf/kernel` so a busy-spin can be attributed: `polled` = a task was
+// available to run, `weak_yield` = no task but a weak executor outstanding so we
+// spun via `sched_yield` instead of halting.
+static SCHED_POLLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SCHED_WEAK_YIELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(tasks polled, weak-executor yields)` since boot.
+pub fn sched_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        SCHED_POLLED.load(Relaxed),
+        SCHED_WEAK_YIELD.load(Relaxed),
+    )
+}
+
 const STACK_SIZE: usize = 4096 * 32;
 const STACK_LAYOUT: Layout = Layout::new::<[u8; STACK_SIZE]>();
 
@@ -159,6 +175,7 @@ impl Executor {
                 // tasks still present but nothing polled, a wake was lost (see the
                 // else-branch dump below).
                 IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
+                SCHED_POLLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let ret = task.poll(&mut cx);
                 // DEBUG: did this future overflow the 128 KiB coroutine stack?
                 unsafe {
@@ -208,6 +225,7 @@ impl Executor {
                     crate::runtime::sched_yield();
                 } else if weak_executor != 0 {
                     debug!("return to runtime and run weak executor");
+                    SCHED_WEAK_YIELD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     crate::runtime::sched_yield();
                 } else if crate::runtime::run_idle_callback() {
                     // The idle callback made progress (e.g. drained deferred

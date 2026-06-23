@@ -17,6 +17,35 @@ static IDLE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static IRQ_TOTAL: AtomicU64 = AtomicU64::new(0);
 static IRQ_COUNTS: [AtomicU64; NVEC] = [const { AtomicU64::new(0) }; NVEC];
+/// Idle-callback invocations and how many found deferred work pending. The
+/// scheduler only halts when the callback finds nothing, so a high "busy" ratio
+/// here means the idle path keeps finding work and the CPUs never sleep — the
+/// signature of a busy-spin (and the heat that comes with it).
+static IDLE_CB_TOTAL: AtomicU64 = AtomicU64::new(0);
+static IDLE_CB_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// `(tasks polled, weak-executor yields)` from the scheduler loop — to attribute
+/// a busy-spin: a high `polled` rate means a task keeps re-readying itself; a
+/// high `weak_yield` rate means the CPUs spin on an outstanding weak executor.
+/// (The scheduler only exists on bare metal; libos reports zeros.)
+#[cfg(target_os = "none")]
+pub fn sched_stats() -> (u64, u64) {
+    executor::sched_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_stats() -> (u64, u64) {
+    (0, 0)
+}
+
+/// Account one idle-callback invocation; `had_work` is whether it found deferred
+/// jobs (and so kept the CPU from halting).
+pub fn note_idle_callback(had_work: bool) {
+    IDLE_CB_TOTAL.fetch_add(1, Relaxed);
+    if had_work {
+        IDLE_CB_BUSY.fetch_add(1, Relaxed);
+    }
+}
 
 /// Account `ns` of wall-clock spent halted in one idle nap. Called by the
 /// per-CPU idle routine around its `hlt`/`mwait`.
@@ -48,6 +77,10 @@ pub struct KStats {
     pub timer_ticks: u64,
     /// Total interrupts handled.
     pub irq_total: u64,
+    /// Idle-callback invocations.
+    pub idle_cb_total: u64,
+    /// Idle-callback invocations that found deferred work (kept the CPU awake).
+    pub idle_cb_busy: u64,
     /// `(vector, count)` for every vector that fired at least once.
     pub irqs: Vec<(u16, u64)>,
 }
@@ -66,6 +99,8 @@ pub fn snapshot() -> KStats {
         idle_entries: IDLE_ENTRIES.load(Relaxed),
         timer_ticks: TIMER_TICKS.load(Relaxed),
         irq_total: IRQ_TOTAL.load(Relaxed),
+        idle_cb_total: IDLE_CB_TOTAL.load(Relaxed),
+        idle_cb_busy: IDLE_CB_BUSY.load(Relaxed),
         irqs,
     }
 }

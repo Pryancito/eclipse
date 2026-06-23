@@ -461,6 +461,7 @@ pub(super) fn cpu_idle() {
     use x86_64::instructions::interrupts;
 
     let was_enabled = interrupts::are_enabled();
+    let idle_start = crate::hal_fn::timer::timer_now();
 
     if IDLE_USE_MWAIT.load(Ordering::Relaxed) {
         let hint = IDLE_MWAIT_HINT.load(Ordering::Relaxed);
@@ -493,6 +494,12 @@ pub(super) fn cpu_idle() {
     if !was_enabled {
         interrupts::disable();
     }
+
+    let idle_ns = crate::hal_fn::timer::timer_now()
+        .checked_sub(idle_start)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    crate::kstats::note_idle(idle_ns);
 }
 
 /// FFI entry used by the scheduler (`PreemptiveScheduler`) to idle the CPU. The
