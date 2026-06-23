@@ -52,6 +52,27 @@ pub fn set_tick_count(count: u32) {
     }
 }
 
+/// Program *this* CPU's LAPIC timer for the periodic scheduler tick.
+///
+/// The BSP does this inline during primary init (`drivers.rs`). Each AP must
+/// repeat it: the LAPIC timer's mode / divide / initial-count registers are
+/// per-CPU hardware and are NOT inherited from the BSP — only the shared cached
+/// config (vector) is. An AP that skips this is left with an initial count of 0,
+/// i.e. a *stopped* timer, so it never takes the 250 Hz tick: no preemption, no
+/// idle accounting, and the whole system's `naive_timer` heap ends up serviced
+/// by the BSP alone — which shows up as a lopsided per-CPU busy split and an
+/// inflated `/proc/perf/kernel` busy%. Leaves the timer masked; the unmask
+/// happens later via `apic_timer_enable()` (same ordering as the BSP).
+pub fn program_periodic_tick() {
+    use x2apic::lapic::{TimerDivide, TimerMode};
+    if Apic::local_apic_ready() {
+        let lapic = Apic::local_apic();
+        lapic.set_timer_mode(TimerMode::Periodic);
+        lapic.set_timer_divide(TimerDivide::Div256); // actually Div1 (crate naming quirk)
+        lapic.set_timer_initial(fast_tick_count());
+    }
+}
+
 static WALL_CLOCK_INIT: Once = Once::new();
 
 pub fn init() {
