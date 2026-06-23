@@ -120,6 +120,10 @@ pub fn retain_net_rx_waker(waker: &Waker) {
 /// connect, DHCP — within the interval. A coalesced wake is never lost: the
 /// waiters also arm their own short fallback timers, so the worst case is a
 /// wake deferred by at most this interval.
+///
+/// (Safe to let the CPU halt now that input no longer depends on the busy-spin:
+/// the idle tick is capped at ~8 ms so HID stays polled at ~125 Hz — see
+/// `IDLE_TICK_CAP_NS` in `super::timer`.)
 const NET_WAKE_MIN_INTERVAL_NS: u64 = 1_000_000; // 1 ms => ≤ 1 kHz
 static LAST_NET_WAKE_NS: AtomicU64 = AtomicU64::new(0);
 
