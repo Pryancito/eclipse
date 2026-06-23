@@ -417,7 +417,15 @@ pub(super) fn init() {
             MWAIT_HINT_C1
         };
         IDLE_MWAIT_HINT.store(hint, Ordering::Relaxed);
-        IDLE_USE_MWAIT.store(true, Ordering::Relaxed);
+        // MWAIT idle is left DISABLED: on real hardware the C-state it enters has
+        // been observed to stop the LAPIC, and with the kernel's tickless idle a
+        // timer-only wake is then lost — the machine hangs at boot right after
+        // the splash logo, before the shell prompt (QEMU never hit this because
+        // it idles via `hlt`). All idle paths therefore park in C1 via `hlt`,
+        // which never stops the LAPIC. Re-enabling MWAIT/C1E needs per-machine
+        // validation that the LAPIC keeps ticking.
+        //
+        // IDLE_USE_MWAIT.store(true, Ordering::Relaxed);  // intentionally off
     }
 
     log_summary_once(|| {
