@@ -134,6 +134,7 @@ hal_fn_impl! {
                         .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                 {
+                    crate::kstats::note_hid_poll_timer(); // [diag]
                     zcore_drivers::usb::xhci_hid::poll();
                 }
             }

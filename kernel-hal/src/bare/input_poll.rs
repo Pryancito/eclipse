@@ -3,6 +3,9 @@ pub fn poll_input_devices() {
     #[cfg(all(target_arch = "x86_64", not(feature = "no-pci")))]
     {
         #[cfg(feature = "xhci-usb-hid")]
-        zcore_drivers::usb::xhci_hid::poll();
+        {
+            crate::kstats::note_hid_poll_iowait(); // [diag]
+            zcore_drivers::usb::xhci_hid::poll();
+        }
     }
 }
