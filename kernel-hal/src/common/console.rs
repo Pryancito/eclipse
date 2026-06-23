@@ -417,6 +417,15 @@ pub fn early_progress_bar(progress: u32) {
     crate::hal_fn::console::console_progress_early(progress);
 }
 
+/// Write text to the very early boot framebuffer console (UEFI GOP) — the same
+/// surface that renders the splash logo and progress bar — bypassing the native
+/// graphic console / VT layer. Intended for boot diagnostics around the first
+/// userspace output, when a `warn!` to the native console may not yet paint.
+/// No-op on non-graphic / non-bare builds.
+pub fn early_console_write_str(s: &str) {
+    crate::hal_fn::console::console_write_early(s);
+}
+
 /// Scrolls the graphic console history up (direction > 0) or down (direction < 0).
 #[allow(unused_variables)]
 pub fn scroll_graphic_console(direction: i32) {

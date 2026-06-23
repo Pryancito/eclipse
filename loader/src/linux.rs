@@ -25,6 +25,16 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// [bootdiag] TEMPORARY: emit a diagnostic line on the EARLY framebuffer console
+/// (the splash-logo surface), which paints reliably even when the native graphic
+/// console does not yet. Used to trace the real-hardware boot hang where busybox
+/// `sh` is spawned but never prints a prompt. Remove once diagnosed.
+#[allow(dead_code)]
+fn bootdiag(s: &str) {
+    kernel_hal::console::early_console_write_str(s);
+    kernel_hal::console::early_console_write_str("\n");
+}
+
 /// Create and run a single Linux process as PID 1 on virtual terminal 0.
 ///
 /// Used by the libos example/tests, where one program is the whole system.
@@ -169,10 +179,20 @@ fn spawn(
 
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
+    // [bootdiag] TEMPORARY: print to the EARLY framebuffer console (the surface
+    // showing the splash logo), not warn!: on real hardware the native graphic
+    // console does not paint at this stage, so warn! markers were invisible. The
+    // early console always paints (it is drawing the logo right now). Pinpoints
+    // whether boot reaches/clears the ELF load. Remove once the hang is found.
+    bootdiag(&alloc::format!("[bd] vt={} pid={} loading ELF {:?}", vt, pid, args.get(0)));
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     let (entry, sp, initial_brk, execute_path) = loader
         .load(&proc.vmar(), &vmo, args.clone(), envs, path)
         .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
+    bootdiag(&alloc::format!(
+        "[bd] vt={} pid={} ELF loaded entry={:#x} sp={:#x}",
+        vt, pid, entry, sp
+    ));
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
@@ -182,16 +202,8 @@ fn spawn(
         .start_with_entry(entry, sp, 0, 0, thread_fn)
         .expect("failed to start main thread");
 
-    // [bootdiag] TEMPORARY: confirm each per-VT shell's main thread was created
-    // and queued on the executor. Real-hardware boots hang with the splash logo
-    // still showing (no shell prompt, no kernel error) — i.e. the shell is
-    // spawned but produces no output. These warn!-level markers are always
-    // visible (and clear the logo themselves), so the last one printed pinpoints
-    // how far boot got. Remove once the hang is diagnosed.
-    warn!(
-        "[bootdiag] vt={} pid={} shell main thread queued (entry={:#x} sp={:#x})",
-        vt, pid, entry, sp
-    );
+    // [bootdiag] TEMPORARY: shell main thread created and queued on the executor.
+    bootdiag(&alloc::format!("[bd] vt={} pid={} thread queued", vt, pid));
 
     // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
     // deferred kernel task, off the synchronous boot path: the blocking
@@ -220,15 +232,13 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
-    // [bootdiag] TEMPORARY: confirm the executor actually polled this thread (so
-    // the shell is not merely queued but running). One line per thread. Remove
-    // once the real-hardware boot hang is diagnosed.
+    // [bootdiag] TEMPORARY: confirm the executor actually polled this thread.
     #[cfg(not(feature = "libos"))]
-    warn!(
-        "[bootdiag] run_user entered: pid={} tid={}",
+    bootdiag(&alloc::format!(
+        "[bd] run_user entered pid={} tid={}",
         thread.proc().id(),
         thread.id()
-    );
+    ));
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -415,11 +425,8 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             use core::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 160 {
-                warn!(
-                    "[bootdiag] pid101 syscall#{} num={} args={:x?}",
-                    n, num as u32, args
-                );
+            if n < 200 {
+                bootdiag(&alloc::format!("[bd] pid101 sc#{} num={}", n, num as u32));
             }
         }
         ctx.advance_pc(reason);
