@@ -31,8 +31,13 @@ fn comm_from_path(path: &str) -> &str {
 /// `sh` is spawned but never prints a prompt. Remove once diagnosed.
 #[allow(dead_code)]
 fn bootdiag(s: &str) {
+    // Early framebuffer console (visible on real hardware where the native
+    // console does not paint) AND serial (so a QEMU run captures the trace in
+    // /tmp/serial.out without needing a screen photo).
     kernel_hal::console::early_console_write_str(s);
     kernel_hal::console::early_console_write_str("\n");
+    kernel_hal::console::serial_write_str(s);
+    kernel_hal::console::serial_write_str("\n");
 }
 
 /// [bootdiag] TEMPORARY: short name for common x86_64 syscall numbers, so the
@@ -353,8 +358,34 @@ fn handle_signal(
         return ctx;
     }
     if action.handler == SIG_DFL {
-        // Minimal default dispositions: for Ctrl+C (SIGINT) terminate the process.
-        // TODO: implement per-signal default table.
+        // Per-signal default disposition. Linux's default for the job-control and
+        // a few status signals is NOT to terminate: SIGCHLD/SIGURG/SIGWINCH are
+        // ignored, and SIGTSTP/SIGTTIN/SIGTTOU/SIGSTOP stop the process while
+        // SIGCONT resumes it. This kernel has no job-control stop state, so it
+        // approximates all of those as "ignore" — crucially this stops an
+        // interactive `sh` from being *killed* by the SIGTTIN it sends itself
+        // during job-control setup (the cause of the per-VT shells dying and the
+        // terminal never reaching a usable prompt). Everything else still
+        // terminates, as before.
+        match signal {
+            Signal::SIGCHLD
+            | Signal::SIGURG
+            | Signal::SIGWINCH
+            | Signal::SIGCONT
+            | Signal::SIGSTOP
+            | Signal::SIGTSTP
+            | Signal::SIGTTIN
+            | Signal::SIGTTOU => {
+                trace!(
+                    "default-ignore signal {:?} for pid={}",
+                    signal,
+                    thread.proc().id()
+                );
+                thread.inner().lock_linux().handling_signal = None;
+                return ctx;
+            }
+            _ => {}
+        }
         let code = 128 + signal as i32;
         // Record the death in the dmesg ring (warn! reaches it at the default
         // level). A process that dies on a default-disposition signal — Xorg

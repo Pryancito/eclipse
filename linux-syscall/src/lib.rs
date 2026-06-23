@@ -367,6 +367,11 @@ impl Syscall<'_> {
             Sys::GETPPID => self.sys_getppid(),
             Sys::SETSID => self.sys_setsid(),
             Sys::GETPGID => self.sys_getpgid(a0),
+            // getpgrp() is the legacy no-argument form of getpgid(0). Without it
+            // an interactive busybox `sh` cannot determine its own process group
+            // during job-control setup, takes the "I am a background job" branch
+            // and `kill(0, SIGTTIN)`s itself — which then terminated the shell.
+            Sys::GETPGRP => self.sys_getpgid(0),
             Sys::GETGROUPS => self.sys_getgroups(a0, a1.into()),
             Sys::SETGROUPS => self.sys_setgroups(a0, a1.into()),
             // Scheduling priority (nice). Backed by the thread's stored nice
