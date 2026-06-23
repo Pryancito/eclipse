@@ -153,16 +153,25 @@ fn tty_kbd_cooked(vt: usize) -> bool {
 
 /// The VT an X server is driving in `K_MEDIUMRAW`, if any. kdrive (TinyX) puts
 /// the keyboard of the VT it opened into medium-raw and reads keycodes from that
-/// VT's tty. The `VT_OPENQRY` shim can leave `active_vt()` and that VT out of
-/// sync, so route medium-raw keycodes by the mode itself: prefer the active VT
-/// when it is the one in medium-raw, otherwise fall back to the first VT that
-/// is. Returns `None` when no VT is in medium-raw (normal cooked console).
+/// VT's tty. Routing is strictly by the *active* VT: medium-raw keycodes are
+/// only delivered to the foreground VT when that VT is the one in medium-raw.
+///
+/// Earlier this fell back to "the first VT in medium-raw" whenever the active VT
+/// wasn't, to paper over a feared `VT_OPENQRY`/`active_vt()` desync. But X takes
+/// over the VT it was launched on (`VT_OPENQRY` returns the active VT and X sets
+/// that same VT to medium-raw, so they are always in sync), and the fallback had
+/// a nasty side effect: after the user switched to a text VT with Ctrl+Alt+Fx,
+/// the X VT was still in medium-raw, so *every* keystroke kept being swallowed
+/// into X's tty and the text console could never be typed into. Gating on the
+/// active VT fixes that — keys go to X only while X is foreground, and to the
+/// cooked console otherwise. Returns `None` for a normal cooked console.
 fn medium_raw_vt() -> Option<usize> {
     let active = vt_clamp(kernel_hal::console::active_vt());
     if tty_kbd_mode(active) == K_MEDIUMRAW {
-        return Some(active);
+        Some(active)
+    } else {
+        None
     }
-    (0..kernel_hal::console::NUM_VTS).find(|&vt| tty_kbd_mode(vt) == K_MEDIUMRAW)
 }
 
 fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
