@@ -266,6 +266,21 @@ mod drivers_ffi_libos {
     extern "C" fn drivers_timer_now_as_micros() -> u64 {
         timer_now().as_micros() as _
     }
+
+    // `zcore_drivers` always links its kernel-log helper; provide the emitter in
+    // libos too (forwards to the registered dmesg sink, or a no-op if none),
+    // otherwise the hosted build fails to link with `undefined: drivers_klog_emit`.
+    use crate::console::klog_emit;
+    #[no_mangle]
+    extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
+        if msg.is_null() || len == 0 {
+            return;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
+        if let Ok(s) = core::str::from_utf8(slice) {
+            klog_emit(priority, s);
+        }
+    }
 }
 
 #[cfg(not(feature = "libos"))]
