@@ -1207,6 +1207,13 @@ impl INode for SysClassPowerSupplyDirINode {
 
 /// Static zone type reported by `thermal_zone0/type`.
 const THERMAL_ZONE_TYPE: &str = "x86_pkg_temp";
+
+/// Current CPU temperature in milli-degrees Celsius: the real digital thermal
+/// sensor when the hardware exposes it (bare metal Intel), else the static
+/// placeholder so VMs / unsupported parts still present a plausible value.
+pub(crate) fn current_temp_mc() -> i32 {
+    kernel_hal::cpu::cpu_temperature_mc().unwrap_or_else(|| THERMAL.lock().temp_mc)
+}
 /// Trip-point types: a passive (throttling) trip and a critical (shutdown) trip.
 const THERMAL_TRIP_TYPES: [&str; 2] = ["passive", "critical"];
 /// Maximum cooling-device state advertised by `cooling_device0/max_state`.
@@ -1428,7 +1435,7 @@ impl INode for SysThermalZoneDirINode {
             "." => Ok(Arc::new(SysThermalZoneDirINode)),
             ".." => Ok(Arc::new(SysClassThermalDirINode)),
             "type" => Ok(thermal_ro(&format!("{}\n", THERMAL_ZONE_TYPE))),
-            "temp" => Ok(thermal_ro(&format!("{}\n", THERMAL.lock().temp_mc))),
+            "temp" => Ok(thermal_ro(&format!("{}\n", current_temp_mc()))),
             "policy" => Ok(Arc::new(ThermalAttrINode {
                 attr: ThermalAttr::Policy,
             })),

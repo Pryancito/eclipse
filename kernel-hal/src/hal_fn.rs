@@ -41,6 +41,10 @@ hal_fn_def! {
         /// Get the number of online CPU cores.
         pub fn cpu_count() -> u8 { 1 }
 
+        /// This CPU's temperature in milli-degrees Celsius, read from the digital
+        /// thermal sensor, or `None` when the hardware doesn't expose it.
+        pub fn cpu_temperature_mc() -> Option<i32> { None }
+
         /// Shutdown/reboot the machine.
         pub fn reset() -> !;
     }

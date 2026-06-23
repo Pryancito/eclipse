@@ -159,6 +159,46 @@ fn is_amd() -> bool {
     r.ebx == 0x6874_7541 && r.edx == 0x6974_6e65 && r.ecx == 0x444d_4163
 }
 
+/// MSR: IA32_THERM_STATUS — per-core digital thermal sensor (DTS).
+const IA32_THERM_STATUS: u32 = 0x19C;
+/// MSR: IA32_TEMPERATURE_TARGET — TjMax (throttle temperature) in bits [23:16].
+const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
+
+/// This CPU's temperature in milli-degrees Celsius, read from the Intel digital
+/// thermal sensor (same source as the `coretemp` driver), or `None` when the
+/// hardware doesn't expose it.
+///
+/// The MSR read is gated on CPUID so it never #GPs: only on a real (non-
+/// hypervisor) "GenuineIntel" part advertising the DTS (CPUID.06H:EAX[0]). The
+/// sensor reports degrees *below* TjMax; the absolute temperature is
+/// `TjMax - readout`.
+pub(crate) fn cpu_temperature_mc() -> Option<i32> {
+    unsafe {
+        // A VM may advertise the DTS in CPUID without implementing the MSR,
+        // which would #GP → kernel panic. Restrict to real hardware.
+        if hypervisor_present() || !is_intel() {
+            return None;
+        }
+        if __cpuid(6).eax & 1 == 0 {
+            return None; // no Digital Thermal Sensor
+        }
+        let status = Msr::new(IA32_THERM_STATUS).read();
+        if status & (1 << 31) == 0 {
+            return None; // reading not valid
+        }
+        let below_tjmax = ((status >> 16) & 0x7f) as i32;
+        let tjmax = {
+            let t = ((Msr::new(MSR_TEMPERATURE_TARGET).read() >> 16) & 0xff) as i32;
+            if t > 0 {
+                t
+            } else {
+                100 // sane default when the target MSR reads back zero
+            }
+        };
+        Some((tjmax - below_tjmax) * 1000)
+    }
+}
+
 /// `true` if AMD Collaborative Processor Performance Control is present
 /// (CPUID Fn8000_0008_EBX[27]). Guards access to the MSR_AMD_CPPC_* registers.
 fn amd_has_cppc() -> bool {

@@ -195,6 +195,14 @@ pub fn kernel_report() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "eclipse perf — kernel runtime stats");
     let _ = writeln!(out);
+    match kernel_hal::cpu::cpu_temperature_mc() {
+        Some(mc) => {
+            let _ = writeln!(out, "cpu temp:     {}.{} C", mc / 1000, (mc % 1000) / 100);
+        }
+        None => {
+            let _ = writeln!(out, "cpu temp:     n/a (no sensor or running in a VM)");
+        }
+    }
     let _ = writeln!(out, "uptime:       {:.2} s   cpus: {}", uptime_s, cpus);
     let _ = writeln!(
         out,
