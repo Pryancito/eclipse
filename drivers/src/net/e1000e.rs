@@ -344,13 +344,6 @@ unsafe fn mmio_write(base: usize, reg: usize, val: u32) {
 /// corrupted before smoltcp could parse them. Surfaced in the watchdog.
 static RX_CSUM_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Monotonic count of frames actually pulled off the RX ring. Used to tell a
-/// poll that *received data* apart from one where smoltcp merely did TX /
-/// protocol-timer work: waking the global net-RX waiters on the latter creates
-/// a wake→re-poll→wake feedback loop that pins every CPU at 100% (no idle, hence
-/// heat) whenever a NIC is present and smoltcp has perpetual housekeeping.
-static RX_DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// Count of outgoing frames smoltcp handed us that we had to DROP because the TX
 /// ring stayed full past [`TX_SEND_SPIN_LIMIT`]. Any non-zero value means a pure
 /// ACK / window-update was lost — the exact cause of the silent download
@@ -1365,7 +1358,6 @@ impl E1000eHw {
                 if rx_ipv4_hdr_csum_bad(&pkt) {
                     RX_CSUM_BAD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                RX_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return Some(pkt);
             }
             if self.rx_next_to_clean == self.rx_rdh() || self.rx_next_to_clean == head_before {
@@ -1668,24 +1660,15 @@ impl E1000eInterface {
             super::intr_off();
         }
         let sockets = get_sockets();
-        // Wake the global net-RX waiters only on *actual* receive, not whenever
-        // smoltcp reports it did some work: `iface.poll()` returns `Ok(true)`
-        // for TX and protocol-timer activity too, and waking RX waiters on that
-        // makes them re-poll, which re-enters this poll, which (still having
-        // housekeeping to do) reports work again — a tight wake→poll→wake loop
-        // that busy-spins every CPU (0% idle → heat) while a NIC is attached.
-        // `RX_DELIVERED` only moves when a frame is pulled off the RX ring.
-        let rx_before = RX_DELIVERED.load(core::sync::atomic::Ordering::Relaxed);
-        let irq_says_rx = (irq_icr & ICR_RX_ANY) != 0;
+        let mut had_rx = (irq_icr & ICR_RX_ANY) != 0;
         {
             let mut sockets = sockets.lock();
             match self.iface.lock().poll(&mut sockets, ts) {
-                Ok(_) => {}
+                Ok(true) => had_rx = true,
+                Ok(false) => {}
                 Err(e) => warn!("e1000e smoltcp poll: {:?}", e),
             }
         }
-        let had_rx =
-            irq_says_rx || RX_DELIVERED.load(core::sync::atomic::Ordering::Relaxed) != rx_before;
         if intr_was_on {
             super::intr_on();
         }
