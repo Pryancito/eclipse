@@ -125,6 +125,13 @@ fn spawn(
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc =
         Process::create_linux(&job, rootfs.clone(), vt, shared_root, pid).expect("create_linux");
+    // Make this shell the foreground process group of its own tty from the
+    // start. `getpgid` reports each process's pgrp as its own pid, so seeding
+    // the VT's foreground pgrp to `pid` makes `tcgetpgrp == getpgrp` for the
+    // shell; otherwise it starts at 0, the shell concludes it is a background
+    // job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning enter_uspace
+    // loop that was previously hidden behind the handle_signal self-deadlock).
+    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();

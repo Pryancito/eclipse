@@ -52,6 +52,20 @@ impl Syscall<'_> {
             let fd = proc.add_file(file)?;
             return Ok(fd.into());
         }
+        // `/dev/tty` is the *controlling terminal* of the calling process, which
+        // for our per-VT shells is that process's own virtual terminal. Resolve
+        // it per-caller instead of through a single shared node: otherwise a
+        // background-VT shell's job-control query — `tcgetpgrp("/dev/tty")` —
+        // returns the *active* VT's foreground pgrp, never equals its own pgrp,
+        // and busybox spins forever on `killpg(0, SIGTTIN)` (a CPU-burning busy
+        // loop on every spare VT — the dominant idle heat once the signal
+        // self-deadlock is fixed).
+        if path == "/dev/tty" {
+            let inode = linux_object::fs::stdio::vt_stdin(proc.vt());
+            let file = File::new(inode, flags, String::from("/dev/tty"));
+            let fd = proc.add_file(file)?;
+            return Ok(fd.into());
+        }
 
         let inode = if flags.contains(OpenFlags::CREATE) {
             let (dir_path, file_name) = split_path(path);
