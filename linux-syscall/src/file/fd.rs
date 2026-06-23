@@ -229,4 +229,33 @@ impl Syscall<'_> {
         let fd = proc.add_file(eventfd)?;
         Ok(fd.into())
     }
+
+    /// `perf_event_open(2)`: open a performance-monitoring file descriptor.
+    ///
+    /// Implements software CPU-clock sampling (no hardware PMU). The returned fd
+    /// supports `mmap` (ring buffer), `ioctl(ENABLE/DISABLE/...)`, `poll` and
+    /// `read`; the timer tick feeds `PERF_RECORD_SAMPLE` records into the ring.
+    pub fn sys_perf_event_open(
+        &self,
+        attr_ptr: usize,
+        pid: i32,
+        cpu: i32,
+        group_fd: i32,
+        flags: usize,
+    ) -> SysResult {
+        info!(
+            "perf_event_open: attr={:#x} pid={} cpu={} group_fd={} flags={:#x}",
+            attr_ptr, pid, cpu, group_fd, flags
+        );
+        if attr_ptr == 0 {
+            return Err(LxError::EFAULT);
+        }
+        // `attr.size` is the u32 at byte offset 4; clamp to a sane window.
+        let attr_size = UserInPtr::<u32>::from(attr_ptr + 4).read()? as usize;
+        let attr_size = attr_size.clamp(64, 4096);
+        let attr_bytes = UserInPtr::<u8>::from(attr_ptr).read_array(attr_size)?;
+        let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
+        let fd = self.linux_process().add_file(event)?;
+        Ok(fd.into())
+    }
 }

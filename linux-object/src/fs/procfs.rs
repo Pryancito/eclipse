@@ -14,8 +14,8 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 9] = [
-    "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg",
+const PROC_ROOT_STATIC: [&str; 10] = [
+    "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -272,6 +272,7 @@ impl INode for ProcRootINode {
             "mounts" => Ok(PROC_MOUNTS.clone()),
             "stat" => Ok(PROC_STAT.clone()),
             "loadavg" => Ok(PROC_LOADAVG.clone()),
+            "sys" => Ok(PROC_SYS_DIR.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -451,6 +452,124 @@ impl INode for ProcNetDirINode {
         }
         Ok(entries[id].into())
     }
+}
+
+/// `/proc/sys` — only the `kernel/` subtree is populated (enough for `perf`).
+struct ProcSysDirINode;
+
+impl INode for ProcSysDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(40))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(PROC_SYS_DIR.clone()),
+            ".." => Ok(PROC_ROOT.clone()),
+            "kernel" => Ok(PROC_SYS_KERNEL_DIR.clone()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok(".".into()),
+            1 => Ok("..".into()),
+            2 => Ok("kernel".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+}
+
+/// `/proc/sys/kernel` — the few knobs `perf` probes before profiling.
+struct ProcSysKernelDirINode;
+
+impl INode for ProcSysKernelDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(41))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(PROC_SYS_KERNEL_DIR.clone()),
+            ".." => Ok(PROC_SYS_DIR.clone()),
+            // -1 = no restrictions: let `perf` open kernel/CPU-wide events.
+            "perf_event_paranoid" => Ok(PROC_PERF_PARANOID.clone()),
+            "kptr_restrict" => Ok(PROC_KPTR_RESTRICT.clone()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok(".".into()),
+            1 => Ok("..".into()),
+            2 => Ok("perf_event_paranoid".into()),
+            3 => Ok("kptr_restrict".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+}
+
+fn dir_metadata(inode: usize) -> Metadata {
+    Metadata {
+        dev: 0,
+        inode,
+        size: 0,
+        blk_size: 0,
+        blocks: 0,
+        atime: Timespec { sec: 0, nsec: 0 },
+        mtime: Timespec { sec: 0, nsec: 0 },
+        ctime: Timespec { sec: 0, nsec: 0 },
+        type_: FileType::Dir,
+        mode: 0o555,
+        nlinks: 0,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+    }
+}
+
+fn proc_perf_event_paranoid_content() -> String {
+    String::from("-1\n")
+}
+
+fn proc_kptr_restrict_content() -> String {
+    String::from("0\n")
 }
 
 /// Proc file that regenerates text on each read (no snapshot in `find()`).
@@ -923,6 +1042,16 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
 lazy_static! {
     static ref PROC_ROOT: Arc<dyn INode> = Arc::new(ProcRootINode);
     static ref PROC_NET_DIR: Arc<dyn INode> = Arc::new(ProcNetDirINode);
+    static ref PROC_SYS_DIR: Arc<dyn INode> = Arc::new(ProcSysDirINode);
+    static ref PROC_SYS_KERNEL_DIR: Arc<dyn INode> = Arc::new(ProcSysKernelDirINode);
+    static ref PROC_PERF_PARANOID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 42,
+        generate: proc_perf_event_paranoid_content,
+    });
+    static ref PROC_KPTR_RESTRICT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 43,
+        generate: proc_kptr_restrict_content,
+    });
     static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 11,

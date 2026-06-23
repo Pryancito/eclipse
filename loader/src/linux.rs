@@ -9,6 +9,7 @@ use linux_object::signal::{
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 use kernel_hal::interrupt::intr_on;
 use linux_object::fs::{
+    perf_sample_user,
     vfs::{FileSystem, INode},
     INodeExt,
 };
@@ -408,6 +409,25 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
     match reason {
         TrapReason::Interrupt(vector) => {
             kernel_hal::interrupt::handle_irq(vector);
+            #[cfg(not(feature = "libos"))]
+            if vector == kernel_hal::context::TIMER_INTERRUPT_VEC {
+                // perf software sampling: the timer fired while this thread was
+                // in user mode, so its saved PC is the interrupted user
+                // instruction. Feed it to any enabled perf event (cheap no-op
+                // when nothing is profiling). This gives `perf top` a live
+                // user-space profile without a hardware PMU.
+                let pc = thread
+                    .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                    .unwrap_or(0);
+                if pc != 0 {
+                    perf_sample_user(
+                        thread.proc().id() as i32,
+                        thread.id() as i32,
+                        kernel_hal::cpu::cpu_id() as u32,
+                        pc as u64,
+                    );
+                }
+            }
             #[cfg(not(feature = "libos"))]
             if vector == kernel_hal::context::TIMER_INTERRUPT_VEC && thread.tick_should_preempt() {
                 // Preempt once the running thread's timeslice elapses rather
