@@ -267,6 +267,14 @@ mod drivers_ffi_libos {
         timer_now().as_micros() as _
     }
 
+    // The scheduler's `wait_for_interrupt` calls `hal_cpu_idle`. On bare metal
+    // that halts the CPU; under libos we run in a host user process where `hlt`
+    // would fault, so just spin briefly and let the host scheduler reclaim us.
+    #[no_mangle]
+    extern "C" fn hal_cpu_idle() {
+        core::hint::spin_loop();
+    }
+
     // `zcore_drivers` always links its kernel-log helper; provide the emitter in
     // libos too (forwards to the registered dmesg sink, or a no-op if none),
     // otherwise the hosted build fails to link with `undefined: drivers_klog_emit`.
