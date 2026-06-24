@@ -7,7 +7,7 @@
 
 use super::*;
 use alloc::string::String;
-use linux_object::fs::TimerFd;
+use linux_object::fs::{SignalFd, TimerFd};
 use linux_object::time::TimeSpec;
 
 /// `struct itimerspec` for `timerfd_settime`/`timerfd_gettime`.
@@ -98,6 +98,46 @@ impl Syscall<'_> {
         let (iv, rem) = tfd.get_time();
         curr_value.write(ITimerSpec::from_ns(iv, rem))?;
         Ok(0)
+    }
+
+    /// `signalfd4(2)`: accept the signals in `mask` through a readable fd. With
+    /// `fd == -1` a new signalfd is created; otherwise the existing fd's mask is
+    /// replaced. The caller is expected to also block those signals
+    /// (`sigprocmask`) so they stay pending for the fd — which libwayland does.
+    pub fn sys_signalfd4(
+        &self,
+        fd: FileDesc,
+        mask: UserInPtr<u64>,
+        _sizemask: usize,
+        flags: usize,
+    ) -> SysResult {
+        const SFD_CLOEXEC: usize = 0x80000;
+        const SFD_NONBLOCK: usize = 0x800;
+        let sigmask = mask.read()?;
+        info!(
+            "signalfd4: fd={:?}, mask={:#x}, flags={:#x}",
+            fd, sigmask, flags
+        );
+        let proc = self.linux_process();
+        if <FileDesc as Into<i32>>::into(fd) >= 0 {
+            // Update an existing signalfd's accepted-signal set.
+            let file_like = proc.get_file_like(fd)?;
+            let sfd = file_like
+                .downcast_ref::<SignalFd>()
+                .ok_or(LxError::EINVAL)?;
+            sfd.set_mask(sigmask);
+            return Ok(fd.into());
+        }
+        let mut open_flags = OpenFlags::empty();
+        if flags & SFD_CLOEXEC != 0 {
+            open_flags |= OpenFlags::CLOEXEC;
+        }
+        if flags & SFD_NONBLOCK != 0 {
+            open_flags |= OpenFlags::NON_BLOCK;
+        }
+        let sfd = SignalFd::new(sigmask, open_flags);
+        let new_fd = proc.add_file(sfd)?;
+        Ok(new_fd.into())
     }
     /// Opens or creates a file, depending on the flags passed to the call. Returns an integer with the file descriptor.
     pub fn sys_open(&self, path: UserInPtr<u8>, flags: usize, mode: usize) -> SysResult {

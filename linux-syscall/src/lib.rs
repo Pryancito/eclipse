@@ -218,6 +218,8 @@ impl Syscall<'_> {
             Sys::TIMERFD_CREATE => self.sys_timerfd_create(a0, a1),
             Sys::TIMERFD_SETTIME => self.sys_timerfd_settime(a0.into(), a1, a2.into(), a3.into()),
             Sys::TIMERFD_GETTIME => self.sys_timerfd_gettime(a0.into(), a1.into()),
+            Sys::SIGNALFD4 => self.sys_signalfd4(a0.into(), a1.into(), a2, a3),
+            Sys::SIGNALFD => self.sys_signalfd4(a0.into(), a1.into(), a2, 0),
 
             Sys::SOCKETPAIR => self.sys_socketpair(a0, a1, a2, a3.into()),
             // file system

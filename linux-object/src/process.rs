@@ -1361,21 +1361,33 @@ pub fn check_signals() -> LxResult<()> {
 
 /// Send a signal to a process by its KoID.
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
+    use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
         let tids = process.thread_ids();
+        // Prefer a thread that has the signal *unblocked* — it can act on it
+        // right away — and deliver there.
+        let mut first: Option<Arc<Thread>> = None;
         for tid in tids {
             if let Ok(thread_obj) = process.get_child(tid) {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    use crate::thread::ThreadExt;
-                    let mut thread_linux = thread.lock_linux();
-                    if thread_linux.signal_mask.contains(signal) {
-                        continue;
-                    } else {
-                        thread_linux.signals.insert(signal);
-                        break;
+                    let blocked = thread.lock_linux().signal_mask.contains(signal);
+                    if !blocked {
+                        thread.lock_linux().signals.insert(signal);
+                        return Ok(());
+                    }
+                    if first.is_none() {
+                        first = Some(thread);
                     }
                 }
             }
+        }
+        // Every thread has the signal blocked: it must still become *pending*
+        // (POSIX — masking only delays delivery, it does not discard the
+        // signal), so it is delivered once unblocked or consumed via signalfd.
+        // The old code dropped it here, which is why a Wayland compositor that
+        // blocks SIGINT for its signalfd never saw Ctrl-C.
+        if let Some(thread) = first {
+            thread.lock_linux().signals.insert(signal);
         }
         Ok(())
     } else {

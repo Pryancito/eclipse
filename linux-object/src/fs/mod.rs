@@ -21,6 +21,7 @@ mod procfs;
 mod pseudo;
 pub mod pty;
 pub mod rcore_fs_wrapper;
+mod signalfd;
 pub mod stdio;
 mod sysfs;
 mod timerfd;
@@ -76,6 +77,7 @@ pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
 pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
+pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};
 pub use timerfd::TimerFd;
 
