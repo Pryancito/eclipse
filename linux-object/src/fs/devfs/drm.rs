@@ -357,9 +357,19 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     // CRTC + connector over the framebuffer so `drmIsKMS()` (CRTCs>0 &&
     // connectors>0) passes and wlroots can drive the output.
     if (crtcs.is_empty() || connectors.is_empty()) && primary_display().is_some() {
+        warn!(
+            "[drm] GETRESOURCES: software KMS fallback -> 1 crtc, 1 connector ({:?})",
+            display_mode()
+        );
         return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
     }
 
+    warn!(
+        "[drm] GETRESOURCES: crtcs={} connectors={} fbs={} (driver-provided)",
+        crtcs.len(),
+        connectors.len(),
+        fbs.len()
+    );
     (fbs, crtcs, connectors)
 }
 
