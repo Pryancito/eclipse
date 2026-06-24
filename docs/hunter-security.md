@@ -75,6 +75,68 @@ defenses, all preserving the conservative-default contract:
 - **Per-architecture syscall tables** (x86_64 + asm-generic for aarch64/riscv64)
   and a **system-wide fork-rate** signal for distributed fork bombs.
 
+## Trusted-program allowlist + blacklist (application control)
+
+The `exec` domain combines a **learning allowlist** (a whitelist that never
+denies) with an operator **blacklist** (the only hard deny), plus the existing
+location denylist. Order of precedence at every `execve` — and for the dynamic
+linker and `#!` interpreters, which pass through the same gate:
+
+1. **Blacklist** — a program matching `/etc/hunter/blacklist` is always blocked
+   (`EACCES`) while the `exec` domain is active. This is the deny half.
+2. **Learning (trust-on-first-use)** — when enabled, a *safe* program (a valid
+   ELF/script, not blacklisted, not from a world-writable location such as
+   `/tmp`, `/var/tmp`, `/dev/shm` or a `/proc/*/fd/*` magic-link) is
+   automatically added to the allowlist and **allowed without denial**. Merely
+   relative paths (e.g. a package manager exec'ing `lib/apk/.../busybox`) are
+   *not* treated as unsafe, so they are learned rather than warned about.
+3. **Denylist + allowlist** — anything left is checked against the untrusted
+   locations and, if the allowlist is active, the trusted set. Under `Report`
+   this only logs; under `Enforce` a non-trusted program is blocked.
+
+Canonicalization runs first, so a traversal like `/bin/../opt/evil` cannot
+masquerade as a trusted program.
+
+### `/etc/hunter/` configuration
+
+At boot the kernel **reads** (never writes) two optional newline-delimited
+files from the root filesystem and enables learning:
+
+| File                      | Effect                                         |
+|---------------------------|------------------------------------------------|
+| `/etc/hunter/whitelist`   | trusted programs that may always run           |
+| `/etc/hunter/blacklist`   | denied programs that must never run            |
+
+Each non-empty, non-`#` line is one entry; a trailing `/` makes it a directory
+prefix, otherwise it is an exact program path. Missing files are fine (the
+lists stay empty). Example `/etc/hunter/whitelist`:
+
+```
+# trusted directories
+/bin/
+/usr/bin/
+# one exact extra binary
+/opt/myapp/bin/agent
+```
+
+### Persistence of learned programs
+
+Learned entries live in kernel memory and are surfaced at `/proc/hunter` under
+a `learned-programs (N):` block. The kernel deliberately does **not** write the
+filesystem; a userspace helper is expected to read that block and append new
+programs to `/etc/hunter/whitelist`, so the learned set survives a reboot.
+
+### Programmatic control
+
+```rust
+use hunter::{policy, Mode};
+
+policy::set_exec_learning(true);                              // whitelist learns, never denies
+policy::add_blacklisted_exec_prefix(String::from("/tmp/"));  // hard-deny a location
+policy::add_trusted_exec_path(String::from("/srv/agent"));   // pre-trust a program
+policy::set_exec_mode(Mode::Enforce);                        // also deny non-trusted execs
+```
+
 ## Intrusion detection (heuristics)
 
 Two signals are produced on the syscall hot path, *after* the policy check so
@@ -102,10 +164,11 @@ event counters, active syscall policies) followed by the recent event ring.
 Example:
 
 ```
-hunter security subsystem v0.3.0
+hunter security subsystem v0.4.0
 enforcement: syscall=enforce wx=report exec=report anomaly=report
 events: total=3 blocked=0 warnings=1 reported=1 critical=0 dropped=0 critical_dropped=0
 active syscall policies: 0
+trusted-program allowlist: inactive (0 entries)
 
 recent events (oldest first):
 [     0] +         0.000s pid=0     INFO   SYSTEM    INIT: hunter security subsystem v0.3.0 initialized (...)

@@ -97,6 +97,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "ENV=/etc/profile".into(),
             ];
             let rootfs = fs::rootfs();
+            // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
+            // and enable exec learning (trust-on-first-use). Safe if absent.
+            linux_object::fs::hunter_config::load(&rootfs.root_inode());
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else
