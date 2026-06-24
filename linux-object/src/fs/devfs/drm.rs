@@ -25,6 +25,8 @@ const SYNTH_CRTC_ID: u32 = 1;
 const SYNTH_CONNECTOR_ID: u32 = 1;
 /// Encoder id exposed to userspace for the synthetic output.
 pub const SYNTH_ENCODER_ID: u32 = 1;
+/// Primary plane id exposed to userspace for the synthetic output.
+pub const SYNTH_PLANE_ID: u32 = 1;
 
 /// Sequence counter for delivered page-flip / vblank events.
 static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -415,6 +417,10 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
 }
 
 pub fn get_planes() -> Vec<u32> {
+    if software_kms_active() {
+        // One synthetic primary plane bound to the synthetic CRTC.
+        return vec![SYNTH_PLANE_ID];
+    }
     let state = DRM_STATE.lock();
     let mut planes = Vec::new();
     for driver in &state.drivers {
@@ -424,11 +430,22 @@ pub fn get_planes() -> Vec<u32> {
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    let state = DRM_STATE.lock();
-    for driver in &state.drivers {
-        if let Some(plane) = driver.get_plane(id) {
-            return Some(plane);
+    {
+        let state = DRM_STATE.lock();
+        for driver in &state.drivers {
+            if let Some(plane) = driver.get_plane(id) {
+                return Some(plane);
+            }
         }
+    }
+    if software_kms_active() && id == SYNTH_PLANE_ID {
+        return Some(DrmPlane {
+            id: SYNTH_PLANE_ID,
+            crtc_id: SYNTH_CRTC_ID,
+            fb_id: 0,
+            possible_crtcs: 1, // bitmask: CRTC index 0
+            plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
+        });
     }
     None
 }
