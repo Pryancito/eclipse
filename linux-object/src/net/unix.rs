@@ -57,6 +57,10 @@ struct UnixInner {
     peer_closed: bool,
     read_closed: bool,
     write_closed: bool,
+    /// PID of the process that created this socket, reported to the *peer* via
+    /// `SO_PEERCRED` (seatd reads it to authorize a Wayland client). `0` until
+    /// set by `sys_socket`.
+    owner_pid: i32,
 }
 
 impl Default for UnixSocketState {
@@ -75,6 +79,7 @@ impl Default for UnixSocketState {
                 peer_closed: false,
                 read_closed: false,
                 write_closed: false,
+                owner_pid: 0,
             })),
         }
     }
@@ -84,6 +89,12 @@ impl UnixSocketState {
     /// Create a new Unix socket wrapped in Arc (needed everywhere).
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Record the PID of the process that created this socket, so the peer can
+    /// read it via `SO_PEERCRED` (used by seatd to authorize a client).
+    pub fn set_owner_pid(&self, pid: i32) {
+        self.inner.lock().owner_pid = pid;
     }
 
     /// Wire two sockets together bidirectionally.
@@ -377,6 +388,17 @@ impl Socket for UnixSocketState {
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
         Ok(0)
+    }
+
+    fn peer_pid(&self) -> Option<i32> {
+        // The connected peer's `owner_pid` — i.e. the process on the other end.
+        // Release our own lock before taking the peer's to avoid holding both.
+        let peer = {
+            let inner = self.inner.lock();
+            inner.peer.as_ref()?.upgrade()?
+        };
+        let pid = peer.lock().owner_pid;
+        Some(pid)
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {

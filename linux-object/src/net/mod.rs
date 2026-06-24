@@ -1972,6 +1972,11 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         None
     }
+    /// PID of the process connected to the other end (`SO_PEERCRED`), if this
+    /// socket type tracks it. Only AF_UNIX does; the rest return `None`.
+    fn peer_pid(&self) -> Option<i32> {
+        None
+    }
     /// Set a socket option.
     ///
     /// We don't yet plumb most options into the smoltcp sockets, but the common

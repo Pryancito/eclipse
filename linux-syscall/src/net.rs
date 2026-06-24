@@ -134,7 +134,13 @@ impl Syscall<'_> {
                 PacketSocketState::new(socket_type, u16::from_be(protocol_num as u16))?
             }
             // AF_UNIX sockets
-            (Domain::AF_UNIX, _, _) => UnixSocketState::new(),
+            (Domain::AF_UNIX, _, _) => {
+                let s = UnixSocketState::new();
+                // Record our PID so a peer (e.g. seatd) can read it via
+                // SO_PEERCRED when it accepts our connection.
+                s.set_owner_pid(self.zircon_process().id() as i32);
+                s
+            }
             (_, _, _) => {
                 info!(
                     "sys_socket: unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
@@ -239,6 +245,25 @@ impl Syscall<'_> {
         }
         match level {
             Level::SOL_SOCKET => {
+                // SO_PEERCRED (17): `struct ucred { pid_t pid; uid_t uid;
+                // gid_t gid; }` — the credentials of the process on the other end
+                // of a connected (unix) socket. seatd reads this to authorize a
+                // Wayland client (labwc); without it the call returned ENOPROTOOPT
+                // ("invalid optname: 17") and seatd refused the client. Eclipse is
+                // single-user root, so report root uid/gid (which is what seatd
+                // checks) and the peer's pid when the socket tracks it.
+                const SO_PEERCRED: usize = 17;
+                if optname == SO_PEERCRED {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let pid = file_like
+                        .as_socket()
+                        .ok()
+                        .and_then(|s| s.peer_pid())
+                        .unwrap_or(1);
+                    optval.write_array(&[pid as u32, 0u32, 0u32])?;
+                    optlen.write(12)?; // sizeof(struct ucred)
+                    return Ok(0);
+                }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
