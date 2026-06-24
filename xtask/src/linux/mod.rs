@@ -133,6 +133,7 @@ impl LinuxRootfs {
             Self::write_hosts(&etc);
         }
         Self::write_profile(&etc);
+        Self::write_passwd(&etc, &dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -1002,6 +1003,38 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export TERM=xterm-256color\n",
         )
         .unwrap();
+    }
+
+    /// Ensure the root user's home (`/root`) exists and that `/etc/passwd` and
+    /// `/etc/group` carry a usable `root` entry. bash resolves `~`/the home
+    /// directory via `getpwuid(geteuid())`, i.e. /etc/passwd — without a valid
+    /// entry (and an existing home) it greets "I can't find my home directory!".
+    /// Only writes the files when absent, so a package-provided passwd/group is
+    /// left untouched.
+    fn write_passwd(etc: &Path, rootfs: &Path) {
+        // Root's home directory must exist for `cd ~` / login to succeed.
+        let _ = fs::create_dir_all(rootfs.join("root"));
+
+        let passwd = etc.join("passwd");
+        if !passwd.exists() {
+            fs::write(
+                &passwd,
+                b"root:x:0:0:root:/root:/bin/sh\n\
+                  nobody:x:65534:65534:nobody:/:/sbin/nologin\n",
+            )
+            .unwrap();
+        }
+        let group = etc.join("group");
+        if !group.exists() {
+            fs::write(
+                &group,
+                b"root:x:0:\n\
+                  nogroup:x:65534:\n\
+                  tty:x:5:\n\
+                  video:x:28:\n",
+            )
+            .unwrap();
+        }
     }
 
     /// Creates symlinks in `bin/` for every busybox applet.
