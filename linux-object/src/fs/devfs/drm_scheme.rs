@@ -352,6 +352,7 @@ impl INode for DrmDev {
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd {
             DRM_IOCTL_VERSION => {
+                log::warn!("[drm] VERSION ioctl — /dev/dri/card0 opened by userspace");
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
                 v.version_major = 1;
                 v.version_minor = 0;
@@ -590,8 +591,19 @@ impl INode for DrmDev {
                         conn_res.count_modes = 0;
                     }
                     conn_res.count_props = 0;
+                    log::warn!(
+                        "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
+                        conn_res.connector_id,
+                        conn.connected,
+                        conn_res.count_modes,
+                        drm::display_mode()
+                    );
                     Ok(0)
                 } else {
+                    log::warn!(
+                        "[drm] GETCONNECTOR id={} -> NOT FOUND",
+                        conn_res.connector_id
+                    );
                     Err(FsError::InvalidParam)
                 }
             }
@@ -643,6 +655,21 @@ impl INode for DrmDev {
                 }
             }
             _ => {
+                // Reverse-engineering hook: log every DRM ioctl wlroots/labwc
+                // issues that we do not handle. The DRM nr (`(cmd >> 8) & 0xff`)
+                // maps to a DRM_IOCTL_* command, so a photo of this line tells us
+                // exactly what labwc wants next. `dir` 1=W 2=R 3=RW, `size` is the
+                // arg struct length.
+                let nr = (cmd >> 8) & 0xff;
+                let size = (cmd >> 16) & 0x3fff;
+                let dir = cmd >> 30;
+                log::warn!(
+                    "[drm] UNHANDLED ioctl cmd={:#010x} (drm nr={:#04x} size={} dir={})",
+                    cmd,
+                    nr,
+                    size,
+                    dir
+                );
                 if let Some(driver) = drm::get_primary_driver() {
                     driver.ioctl(cmd, data).map_err(|e| match e {
                         38 => FsError::NotSupported, // ENOSYS

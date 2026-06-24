@@ -461,14 +461,23 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // scanout) so wlroots/labwc can drive the framebuffer via legacy KMS.
         let have_drm = !drivers::all_drm().as_vec().is_empty();
         let have_display = drivers::all_display().first().is_some();
+        warn!(
+            "[drm] graphics inventory: drm_drivers={} display={}",
+            drivers::all_drm().as_vec().len(),
+            have_display
+        );
         if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
                     warn!("failed to mknod /dev/dri/card0: {:?}", e);
+                } else {
+                    warn!("[drm] /dev/dri/card0 created (sw_kms path available)");
                 }
             } else {
                 warn!("failed to mkdir /dev/dri");
             }
+        } else {
+            warn!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
         }
     }
 
