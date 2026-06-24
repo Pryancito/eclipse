@@ -10,6 +10,7 @@ mod ext2_mount;
 mod fat_mount;
 mod file;
 mod flagged_fs;
+pub mod hunter_config;
 pub mod ioctl;
 mod mount_ops;
 mod mount_state;

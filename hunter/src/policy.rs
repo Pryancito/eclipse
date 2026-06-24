@@ -37,6 +37,26 @@ lazy_static::lazy_static! {
     pub static ref UNTRUSTED_EXEC_PREFIXES: Mutex<Vec<String>> =
         Mutex::new(default_untrusted_prefixes());
 
+    /// Allowlist of trusted programs: exact canonical executable paths that are
+    /// explicitly permitted to run. Empty by default (allowlist inactive).
+    pub static ref TRUSTED_EXEC_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Allowlist of trusted directories: any executable whose canonical path
+    /// starts with one of these prefixes is permitted. Empty by default.
+    pub static ref TRUSTED_EXEC_PREFIXES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Programs auto-learned at runtime (trust-on-first-use). Kept separate from
+    /// the operator-configured allowlist so a userspace helper can read them
+    /// from `/proc/hunter` and persist them to `/etc/hunter/whitelist`.
+    pub static ref LEARNED_EXEC_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Blacklist of denied programs: exact canonical paths that must never run.
+    pub static ref BLACKLISTED_EXEC_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Blacklist of denied directories: any executable under one of these
+    /// prefixes is denied.
+    pub static ref BLACKLISTED_EXEC_PREFIXES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
     /// Optional default whitelist applied to new images at exec time. `None`
     /// keeps the seccomp domain opt-in (default-permissive), preserving boot.
     pub static ref DEFAULT_WHITELIST: Mutex<Option<Vec<u32>>> = Mutex::new(None);
@@ -88,6 +108,15 @@ static ANOMALY_MODE: AtomicU8 = AtomicU8::new(1); // Report
 
 /// One-way latch: once set, modes may only move towards stricter enforcement.
 static TIGHTEN_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Whether exec learning (trust-on-first-use) is enabled: safe programs are
+/// auto-added to the allowlist and never denied. Off by default (the crate
+/// changes nothing until the kernel opts in at boot).
+static EXEC_LEARN: AtomicBool = AtomicBool::new(false);
+
+/// Cap on auto-learned entries, bounding kernel memory if exec churns through
+/// many distinct binaries.
+const MAX_LEARNED_EXEC: usize = 8192;
 
 fn default_untrusted_prefixes() -> Vec<String> {
     vec![
@@ -306,4 +335,189 @@ pub fn is_untrusted_exec_path(path: &str) -> bool {
     let canon = canonicalize(path);
     let list = UNTRUSTED_EXEC_PREFIXES.lock();
     list.iter().any(|p| canon.starts_with(p.as_str()))
+}
+
+// ---- Trusted-program allowlist (application allow-listing) ----------------
+//
+// An *allowlist* inverts the deny-by-location model into deny-by-default: when
+// active, only programs whose canonical path is explicitly trusted (an exact
+// match, or under a trusted directory) may execute; everything else is a
+// violation handled by `exec_mode` (logged in Report, blocked in Enforce).
+//
+// The allowlist is **inactive** while both trusted sets are empty, so by
+// default nothing changes — an operator opts in by registering trusted
+// programs (and typically raising `exec_mode` to `Enforce`).
+
+/// Adds an exact canonical executable path to the trusted-program allowlist.
+pub fn add_trusted_exec_path(path: String) {
+    let canon = canonicalize(&path);
+    let mut list = TRUSTED_EXEC_PATHS.lock();
+    if !list.iter().any(|p| *p == canon) {
+        record(
+            0,
+            Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            format!("trusted program added: {}", canon),
+        );
+        list.push(canon);
+    }
+}
+
+/// Adds a trusted directory prefix: any executable under it is allowed.
+pub fn add_trusted_exec_prefix(prefix: String) {
+    let mut list = TRUSTED_EXEC_PREFIXES.lock();
+    if !list.iter().any(|p| *p == prefix) {
+        record(
+            0,
+            Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            format!("trusted exec directory added: {}", prefix),
+        );
+        list.push(prefix);
+    }
+}
+
+/// Seeds the allowlist with the standard read-only system program directories,
+/// so the base system keeps working when an operator flips `exec_mode` to
+/// `Enforce`. Not called by default — opt-in.
+pub fn install_default_trusted_exec() {
+    for d in [
+        "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/local/sbin/",
+        "/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/",
+    ] {
+        add_trusted_exec_prefix(String::from(d));
+    }
+}
+
+/// Clears the trusted-program allowlist, deactivating it.
+pub fn clear_trusted_exec() {
+    TRUSTED_EXEC_PATHS.lock().clear();
+    TRUSTED_EXEC_PREFIXES.lock().clear();
+}
+
+/// Number of trusted entries (exact paths + directory prefixes).
+pub fn trusted_exec_count() -> usize {
+    TRUSTED_EXEC_PATHS.lock().len() + TRUSTED_EXEC_PREFIXES.lock().len()
+}
+
+/// Whether the allowlist is active (any configured or learned entry). While
+/// inactive, [`is_exec_allowed`] permits everything, preserving default boot.
+pub fn exec_allowlist_active() -> bool {
+    !TRUSTED_EXEC_PATHS.lock().is_empty()
+        || !TRUSTED_EXEC_PREFIXES.lock().is_empty()
+        || !LEARNED_EXEC_PATHS.lock().is_empty()
+}
+
+/// Explicit membership test (no "inactive ⇒ allow" shortcut): `true` only if
+/// `path` actually matches a configured or learned trusted entry. The path is
+/// canonicalized first so a traversal cannot masquerade as a trusted program.
+pub fn is_exec_listed(path: &str) -> bool {
+    let canon = canonicalize(path);
+    TRUSTED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
+        || TRUSTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
+        || LEARNED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
+}
+
+/// Returns `true` if `path` is trusted, or the allowlist is inactive.
+pub fn is_exec_allowed(path: &str) -> bool {
+    if !exec_allowlist_active() {
+        return true;
+    }
+    is_exec_listed(path)
+}
+
+// ---- Exec learning (trust-on-first-use) -----------------------------------
+
+/// Enables or disables exec learning. When enabled, a *safe* program (valid
+/// format, not blacklisted, not from a world-writable location) seen at exec is
+/// auto-added to the allowlist and never denied — a learning allowlist that
+/// builds itself without breaking anything.
+pub fn set_exec_learning(enabled: bool) {
+    if EXEC_LEARN.swap(enabled, Ordering::SeqCst) != enabled {
+        record(
+            0,
+            Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            format!("exec learning {}", if enabled { "enabled" } else { "disabled" }),
+        );
+    }
+}
+/// Whether exec learning is enabled.
+pub fn exec_learning_enabled() -> bool {
+    EXEC_LEARN.load(Ordering::SeqCst)
+}
+
+/// Number of auto-learned programs.
+pub fn learned_exec_count() -> usize {
+    LEARNED_EXEC_PATHS.lock().len()
+}
+
+/// Snapshot of the learned programs, for `/proc/hunter` so a userspace helper
+/// can persist them to `/etc/hunter/whitelist`.
+pub fn learned_exec_paths() -> Vec<String> {
+    LEARNED_EXEC_PATHS.lock().clone()
+}
+
+/// Adds `path` to the learned set if not already trusted and the cap allows.
+/// Returns `true` if a new entry was learned (so the caller can log it once).
+pub fn learn_exec_path(path: &str) -> bool {
+    if is_exec_listed(path) {
+        return false;
+    }
+    let canon = canonicalize(path);
+    let mut learned = LEARNED_EXEC_PATHS.lock();
+    if learned.len() >= MAX_LEARNED_EXEC || learned.iter().any(|p| *p == canon) {
+        return false;
+    }
+    learned.push(canon);
+    true
+}
+
+// ---- Exec blacklist (operator-curated hard deny) --------------------------
+
+/// Adds an exact canonical program path to the exec blacklist.
+pub fn add_blacklisted_exec_path(path: String) {
+    let canon = canonicalize(&path);
+    let mut list = BLACKLISTED_EXEC_PATHS.lock();
+    if !list.iter().any(|p| *p == canon) {
+        record(0, Severity::Notice, "CONTROL", "CONFIG", format!("blacklisted program: {}", canon));
+        list.push(canon);
+    }
+}
+
+/// Adds a denied directory prefix to the exec blacklist.
+pub fn add_blacklisted_exec_prefix(prefix: String) {
+    let mut list = BLACKLISTED_EXEC_PREFIXES.lock();
+    if !list.iter().any(|p| *p == prefix) {
+        record(0, Severity::Notice, "CONTROL", "CONFIG", format!("blacklisted directory: {}", prefix));
+        list.push(prefix);
+    }
+}
+
+/// Number of blacklist entries (exact paths + directory prefixes).
+pub fn blacklisted_exec_count() -> usize {
+    BLACKLISTED_EXEC_PATHS.lock().len() + BLACKLISTED_EXEC_PREFIXES.lock().len()
+}
+
+/// Returns `true` if `path` is on the exec blacklist (canonicalized first).
+pub fn is_exec_blacklisted(path: &str) -> bool {
+    let canon = canonicalize(path);
+    BLACKLISTED_EXEC_PATHS.lock().iter().any(|p| *p == canon)
+        || BLACKLISTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
+}
+
+/// Returns `true` when `path` is in a world-writable location (`/tmp`,
+/// `/var/tmp`, `/dev/shm`) or a `/proc/*/fd/*` magic-link — i.e. unsafe to
+/// auto-trust. Unlike [`is_untrusted_exec_path`] this does *not* flag merely
+/// relative paths, so a package manager exec'ing `lib/apk/.../busybox` with a
+/// relative path is still learnable.
+pub fn is_world_writable_exec_path(path: &str) -> bool {
+    if path.starts_with("/proc/") && path.contains("/fd/") {
+        return true;
+    }
+    let canon = canonicalize(path);
+    UNTRUSTED_EXEC_PREFIXES.lock().iter().any(|p| canon.starts_with(p.as_str()))
 }

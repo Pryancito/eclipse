@@ -188,18 +188,64 @@ pub fn check_elf_binary(path: &str, elf_data: &[u8]) -> bool {
 /// from `path` may proceed under the current [`policy::exec_mode`].
 pub fn check_exec_path(path: &str) -> bool {
     let exec_mode = policy::exec_mode();
-    if exec_mode == Mode::Off || !policy::is_untrusted_exec_path(path) {
+    if exec_mode == Mode::Off {
         return true;
     }
+
+    // 1. Blacklist — operator-curated hard deny, highest precedence. A
+    //    blacklisted program is always blocked while the exec domain is active
+    //    (this is the deny half of the "whitelist that never denies" model).
+    if policy::is_exec_blacklisted(path) {
+        event_log::record(
+            0,
+            Severity::Critical,
+            "EXEC",
+            "BLOCKED",
+            format!("blacklisted program: {}", path),
+        );
+        warn!("hunter: BLOCKED blacklisted program: {}", path);
+        return false;
+    }
+
+    // 2. Learning (trust-on-first-use) — never denies. A safe program (already
+    //    proven a valid ELF/script by the caller, not blacklisted, not from a
+    //    world-writable location) is auto-added to the allowlist and allowed.
+    if policy::exec_learning_enabled() {
+        if policy::is_exec_listed(path) {
+            return true;
+        }
+        if !policy::is_world_writable_exec_path(path) {
+            if policy::learn_exec_path(path) {
+                event_log::record(
+                    0,
+                    Severity::Notice,
+                    "EXEC",
+                    "LEARN",
+                    format!("learned trusted program: {}", policy::canonicalize(path)),
+                );
+            }
+            return true;
+        }
+        // World-writable and not yet trusted: fall through to the mode policy.
+    }
+
+    // 3. Denylist of untrusted locations + optional deny-by-default allowlist.
+    let reason = if policy::is_untrusted_exec_path(path) {
+        "untrusted path"
+    } else if policy::exec_allowlist_active() && !policy::is_exec_allowed(path) {
+        "not on trusted-program allowlist"
+    } else {
+        return true;
+    };
     if exec_mode == Mode::Enforce {
         event_log::record(
             0,
             Severity::Critical,
             "EXEC",
             "BLOCKED",
-            format!("blocked exec from untrusted path: {}", path),
+            format!("blocked exec ({}): {}", reason, path),
         );
-        warn!("hunter: BLOCKED exec from untrusted path: {}", path);
+        warn!("hunter: BLOCKED exec ({}): {}", reason, path);
         return false;
     }
     event_log::record(
@@ -207,9 +253,9 @@ pub fn check_exec_path(path: &str) -> bool {
         Severity::Warning,
         "EXEC",
         "WARNING",
-        format!("exec from untrusted path: {}", path),
+        format!("exec policy violation ({}): {}", reason, path),
     );
-    warn!("hunter: exec from untrusted path (report): {}", path);
+    warn!("hunter: exec policy violation ({}, report): {}", reason, path);
     true
 }
 
@@ -354,6 +400,33 @@ pub fn render_report() -> String {
         "active syscall policies: {}\n",
         policy::active_policy_count()
     ));
+    out.push_str(&format!(
+        "exec allowlist: {} (configured={}, learned={}); blacklist={}; learning={}\n",
+        if policy::exec_allowlist_active() {
+            "active"
+        } else {
+            "inactive"
+        },
+        policy::trusted_exec_count(),
+        policy::learned_exec_count(),
+        policy::blacklisted_exec_count(),
+        if policy::exec_learning_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+    ));
+    // Machine-readable dump of learned programs so a userspace helper can
+    // persist them to /etc/hunter/whitelist (kernel never writes the FS).
+    let learned = policy::learned_exec_paths();
+    if !learned.is_empty() {
+        out.push_str(&format!("learned-programs ({}):\n", learned.len()));
+        for p in &learned {
+            out.push_str("  ");
+            out.push_str(p);
+            out.push('\n');
+        }
+    }
     out.push_str("\nrecent events (oldest first):\n");
     out.push_str(&event_log::render());
     out
@@ -374,6 +447,7 @@ mod tests {
         elf_validation_section();
         elf_integrity_section();
         wx_section();
+        allowlist_section();
         tighten_only_section();
     }
 
@@ -463,6 +537,55 @@ mod tests {
         task_exit(7);
         task_exit(8);
         task_exit(9);
+    }
+
+    fn allowlist_section() {
+        // --- deny-by-default allowlist (learning off) ---
+        policy::set_exec_learning(false);
+        policy::set_exec_mode(Mode::Enforce);
+        assert!(!policy::exec_allowlist_active());
+        assert!(check_elf_binary("/opt/app/foo", b"\x7fELF")); // inactive -> allowed
+
+        policy::add_trusted_exec_path(String::from("/usr/bin/bash"));
+        policy::add_trusted_exec_prefix(String::from("/bin/"));
+        assert!(policy::exec_allowlist_active());
+        assert!(check_elf_binary("/usr/bin/bash", b"\x7fELF")); // exact trusted
+        assert!(check_elf_binary("/bin/ls", b"\x7fELF")); // under trusted dir
+        assert!(!check_elf_binary("/opt/app/foo", b"\x7fELF")); // untrusted -> blocked
+        assert!(!check_elf_binary("/bin/../opt/evil", b"\x7fELF")); // traversal
+
+        policy::set_exec_mode(Mode::Report);
+        assert!(check_elf_binary("/opt/app/foo", b"\x7fELF")); // report: allowed
+        policy::clear_trusted_exec();
+        assert!(!policy::exec_allowlist_active());
+
+        // --- blacklist: hard deny even in Report (domain active) ---
+        policy::add_blacklisted_exec_path(String::from("/usr/bin/evil"));
+        policy::add_blacklisted_exec_prefix(String::from("/opt/danger/"));
+        assert!(!check_elf_binary("/usr/bin/evil", b"\x7fELF"));
+        assert!(!check_elf_binary("/opt/danger/x", b"\x7fELF"));
+        assert!(check_elf_binary("/usr/bin/ok", b"\x7fELF")); // not blacklisted
+
+        // --- learning: never denies, auto-adds safe programs ---
+        policy::set_exec_learning(true);
+        assert_eq!(policy::learned_exec_count(), 0);
+        // A relative apk-style path is safe (not world-writable) -> learned.
+        assert!(check_elf_binary("lib/apk/exec/busybox-1.37.0-r", b"\x7fELF"));
+        assert!(policy::is_exec_listed("/lib/apk/exec/busybox-1.37.0-r"));
+        assert_eq!(policy::learned_exec_count(), 1);
+        // Re-exec does not double-learn.
+        assert!(check_elf_binary("/lib/apk/exec/busybox-1.37.0-r", b"\x7fELF"));
+        assert_eq!(policy::learned_exec_count(), 1);
+        // World-writable programs are not auto-learned.
+        assert!(!policy::is_world_writable_exec_path("/lib/apk/exec/busybox-1.37.0-r"));
+        assert!(policy::is_world_writable_exec_path("/tmp/payload"));
+        // Blacklist still wins under learning.
+        assert!(!check_elf_binary("/usr/bin/evil", b"\x7fELF"));
+
+        // reset
+        policy::set_exec_learning(false);
+        policy::clear_trusted_exec();
+        policy::set_exec_mode(Mode::Off);
     }
 
     fn tighten_only_section() {
