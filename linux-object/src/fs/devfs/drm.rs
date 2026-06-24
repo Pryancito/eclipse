@@ -35,6 +35,10 @@ pub const SYNTH_PLANE_ID: u32 = 4;
 /// Sequence counter for delivered page-flip / vblank events.
 static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// One-shot guard so the first scanout logs (every-frame logging would spam).
+static SCANOUT_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Return the primary framebuffer display, if any.
 fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
     drivers::all_display().first()
@@ -218,15 +222,34 @@ pub fn scanout(fb_id: u32) -> bool {
         let state = DRM_STATE.lock();
         match state.framebuffers.iter().find(|f| f.id == fb_id) {
             Some(f) => *f,
-            None => return false,
+            None => {
+                warn!("[drm] scanout: fb_id={} not found", fb_id);
+                return false;
+            }
         }
     };
     let display = match primary_display() {
         Some(d) => d,
-        None => return false,
+        None => {
+            warn!("[drm] scanout: no display");
+            return false;
+        }
     };
     if fb.phys_addr == 0 || fb.size == 0 {
         return false;
+    }
+    // Log the first scanout so a console photo confirms pixels are flowing.
+    if !SCANOUT_LOGGED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "[drm] scanout: fb={} {}x{} pitch={} phys={:#x} -> display {}x{}",
+            fb_id,
+            fb.width,
+            fb.height,
+            fb.pitch,
+            fb.phys_addr,
+            display.info().width,
+            display.info().height
+        );
     }
     let info = display.info();
     let vaddr = phys_to_virt(fb.phys_addr as usize);
@@ -239,6 +262,9 @@ pub fn scanout(fb_id: u32) -> bool {
     let height = fb.height.min(info.height);
     display.blit_from(0, 0, pixels, src_stride, width, height);
     let _ = display.flush();
+    // A DRM client owns the framebuffer now: stop the kernel text console from
+    // drawing over it (like fbcon yielding to KMS). Restored on DROP_MASTER.
+    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
     true
 }
 
