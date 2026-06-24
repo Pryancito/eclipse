@@ -27,6 +27,12 @@ struct Cursor {
     col: usize,
 }
 
+/// Saved main screen contents while the alternate screen buffer is active.
+struct AltScreen {
+    cells: alloc::vec::Vec<alloc::vec::Vec<Cell>>,
+    cursor: Cursor,
+}
+
 struct ConsoleInner<T: TextBuffer> {
     /// cursor
     cursor: Cursor,
@@ -40,6 +46,16 @@ struct ConsoleInner<T: TextBuffer> {
     auto_wrap: bool,
     /// Reported data for CSI Device Status Report
     report: VecDeque<u8>,
+    /// Scroll region `(top, bottom)` inclusive, 0-indexed. `None` = whole
+    /// screen, in which case scrolling uses the buffer's fast `new_line` path
+    /// (which also feeds the scrollback history).
+    scroll_region: Option<(usize, usize)>,
+    /// Cursor visibility (DECTCEM, `?25`). Full-screen apps hide it while
+    /// redrawing; the renderer consults this so a hidden cursor never blinks.
+    cursor_visible: bool,
+    /// Saved main screen while the alternate screen buffer is active (`?1049`,
+    /// `?1047`, `?47`). `Some` means we are currently on the alternate screen.
+    alt_saved: Option<AltScreen>,
 }
 
 /// Console on top of a frame buffer
@@ -72,6 +88,9 @@ impl<T: TextBuffer> Console<T> {
                 buf: buffer,
                 auto_wrap: true,
                 report: VecDeque::new(),
+                scroll_region: None,
+                cursor_visible: true,
+                alt_saved: None,
             },
         }
     }
@@ -92,7 +111,6 @@ impl<T: TextBuffer> Console<T> {
         &mut self.inner.buf
     }
 
-
     /// Number of rows
     pub fn rows(&self) -> usize {
         self.inner.buf.height()
@@ -111,6 +129,13 @@ impl<T: TextBuffer> Console<T> {
     pub fn cursor(&self) -> (usize, usize) {
         (self.inner.cursor.row, self.inner.cursor.col)
     }
+
+    /// Whether the text cursor should be drawn (DECTCEM / `?25`). Full-screen
+    /// TUIs (nano, vim, htop) hide the cursor while repainting; the renderer
+    /// passes this to `present` so a hidden cursor is not drawn or blinked.
+    pub fn cursor_visible(&self) -> bool {
+        self.inner.cursor_visible
+    }
 }
 
 impl<T: TextBuffer> fmt::Write for Console<T> {
@@ -119,6 +144,119 @@ impl<T: TextBuffer> fmt::Write for Console<T> {
             self.write_byte(byte);
         }
         Ok(())
+    }
+}
+
+impl<T: TextBuffer> ConsoleInner<T> {
+    /// The active scroll region `(top, bottom)` inclusive (0-indexed). Defaults
+    /// to the whole screen when no region has been set.
+    #[inline]
+    fn region(&self) -> (usize, usize) {
+        match self.scroll_region {
+            Some((t, b)) => (t, b),
+            None => (0, self.buf.height().saturating_sub(1)),
+        }
+    }
+
+    /// Scroll the active region up by `count` lines (content moves up, blank
+    /// lines appear at the bottom). When the region spans the whole screen this
+    /// uses the buffer's fast `new_line` (which also records scrollback), so the
+    /// normal shell-output path is byte-for-byte unchanged.
+    fn scroll_region_up(&mut self, count: usize) {
+        let (top, bottom) = self.region();
+        if bottom < top {
+            return;
+        }
+        if top == 0 && bottom == self.buf.height().saturating_sub(1) {
+            for _ in 0..count {
+                self.buf.new_line(self.temp);
+            }
+            return;
+        }
+        let width = self.buf.width();
+        let bg = self.temp.bg();
+        let count = count.min(bottom - top + 1);
+        for r in top..=bottom {
+            let src = r + count;
+            for c in 0..width {
+                let cell = if src <= bottom {
+                    self.buf.read(src, c)
+                } else {
+                    bg
+                };
+                self.buf.write(r, c, cell);
+            }
+        }
+    }
+
+    /// Scroll the active region down by `count` lines (content moves down, blank
+    /// lines appear at the top). Always cell-by-cell — there is no history
+    /// equivalent for downward scrolling.
+    fn scroll_region_down(&mut self, count: usize) {
+        let (top, bottom) = self.region();
+        if bottom < top {
+            return;
+        }
+        let width = self.buf.width();
+        let bg = self.temp.bg();
+        let count = count.min(bottom - top + 1);
+        for r in (top..=bottom).rev() {
+            for c in 0..width {
+                let cell = if r >= top + count {
+                    self.buf.read(r - count, c)
+                } else {
+                    bg
+                };
+                self.buf.write(r, c, cell);
+            }
+        }
+    }
+
+    /// Switch to a blank alternate screen, saving the current screen and cursor.
+    /// The scrollback history is left intact (we clear cells in place rather than
+    /// via `buf.clear`, which would wipe history).
+    fn enter_alt_screen(&mut self) {
+        if self.alt_saved.is_some() {
+            return;
+        }
+        let h = self.buf.height();
+        let w = self.buf.width();
+        let mut cells = alloc::vec::Vec::with_capacity(h);
+        for r in 0..h {
+            let mut row = alloc::vec::Vec::with_capacity(w);
+            for c in 0..w {
+                row.push(self.buf.read(r, c));
+            }
+            cells.push(row);
+        }
+        self.alt_saved = Some(AltScreen {
+            cells,
+            cursor: self.cursor,
+        });
+        let bg = self.temp.bg();
+        for r in 0..h {
+            for c in 0..w {
+                self.buf.write(r, c, bg);
+            }
+        }
+        self.scroll_region = None;
+        self.cursor = Cursor::default();
+    }
+
+    /// Restore the main screen and cursor saved by `enter_alt_screen`.
+    fn exit_alt_screen(&mut self) {
+        if let Some(saved) = self.alt_saved.take() {
+            let h = self.buf.height().min(saved.cells.len());
+            for r in 0..h {
+                let row = &saved.cells[r];
+                let w = self.buf.width().min(row.len());
+                for c in 0..w {
+                    self.buf.write(r, c, row[c]);
+                }
+            }
+            self.cursor = saved.cursor;
+            self.scroll_region = None;
+        }
     }
 }
 
@@ -232,21 +370,101 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
     fn linefeed(&mut self) {
         trace!("Linefeed");
         self.cursor.col = 0;
-        if self.cursor.row < self.buf.height() - 1 {
+        let (_, bottom) = self.region();
+        if self.cursor.row == bottom {
+            // At the bottom of the scroll region: scroll it up by one. With the
+            // default (full-screen) region this is exactly the old `new_line`.
+            self.scroll_region_up(1);
+        } else if self.cursor.row + 1 < self.buf.height() {
             self.cursor.row += 1;
-        } else {
-            self.buf.new_line(self.temp);
         }
     }
 
     #[inline]
     fn scroll_up(&mut self, rows: usize) {
-        debug!("[Unhandled CSI] scroll_up {:?}", rows);
+        self.scroll_region_up(rows);
     }
 
     #[inline]
     fn scroll_down(&mut self, rows: usize) {
-        debug!("[Unhandled CSI] scroll_down {:?}", rows);
+        self.scroll_region_down(rows);
+    }
+
+    #[inline]
+    fn insert_blank(&mut self, count: usize) {
+        let width = self.buf.width();
+        let row = self.cursor.row;
+        let col = self.cursor.col;
+        if col >= width {
+            return;
+        }
+        let bg = self.temp.bg();
+        let count = count.min(width - col);
+        for c in (col..width).rev() {
+            let cell = if c >= col + count {
+                self.buf.read(row, c - count)
+            } else {
+                bg
+            };
+            self.buf.write(row, c, cell);
+        }
+    }
+
+    #[inline]
+    fn insert_blank_lines(&mut self, count: usize) {
+        let (top, bottom) = self.region();
+        let row = self.cursor.row;
+        if row < top || row > bottom {
+            return;
+        }
+        let width = self.buf.width();
+        let bg = self.temp.bg();
+        let count = count.min(bottom - row + 1);
+        for r in (row..=bottom).rev() {
+            for c in 0..width {
+                let cell = if r >= row + count {
+                    self.buf.read(r - count, c)
+                } else {
+                    bg
+                };
+                self.buf.write(r, c, cell);
+            }
+        }
+        self.cursor.col = 0;
+    }
+
+    #[inline]
+    fn delete_lines(&mut self, count: usize) {
+        let (top, bottom) = self.region();
+        let row = self.cursor.row;
+        if row < top || row > bottom {
+            return;
+        }
+        let width = self.buf.width();
+        let bg = self.temp.bg();
+        let count = count.min(bottom - row + 1);
+        for r in row..=bottom {
+            let src = r + count;
+            for c in 0..width {
+                let cell = if src <= bottom {
+                    self.buf.read(src, c)
+                } else {
+                    bg
+                };
+                self.buf.write(r, c, cell);
+            }
+        }
+        self.cursor.col = 0;
+    }
+
+    #[inline]
+    fn reverse_index(&mut self) {
+        let (top, _) = self.region();
+        if self.cursor.row == top {
+            self.scroll_region_down(1);
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
+        }
     }
 
     #[inline]
@@ -377,29 +595,40 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
 
     #[inline]
     fn set_mode(&mut self, mode: Mode) {
-        if mode == Mode::LineWrap {
-            self.auto_wrap = true;
-        } else {
-            debug!("[Unhandled CSI] Setting mode: {:?}", mode);
+        match mode {
+            Mode::LineWrap => self.auto_wrap = true,
+            Mode::ShowCursor => self.cursor_visible = true,
+            Mode::SwapScreenAndSetRestoreCursor | Mode::SwapScreenBuffer | Mode::SwapScreenOld => {
+                self.enter_alt_screen()
+            }
+            _ => debug!("[Unhandled CSI] Setting mode: {:?}", mode),
         }
     }
 
     #[inline]
     fn unset_mode(&mut self, mode: Mode) {
-        if mode == Mode::LineWrap {
-            self.auto_wrap = false;
-        } else {
-            debug!("[Unhandled CSI] Setting mode: {:?}", mode);
+        match mode {
+            Mode::LineWrap => self.auto_wrap = false,
+            Mode::ShowCursor => self.cursor_visible = false,
+            Mode::SwapScreenAndSetRestoreCursor | Mode::SwapScreenBuffer | Mode::SwapScreenOld => {
+                self.exit_alt_screen()
+            }
+            _ => debug!("[Unhandled CSI] Unsetting mode: {:?}", mode),
         }
     }
 
     #[inline]
     fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
-        let bottom = bottom.unwrap_or_else(|| self.buf.height());
-        debug!(
-            "[Unhandled CSI] Setting scrolling region: ({};{})",
-            top, bottom
-        );
+        // Params are 1-indexed; `top` is already defaulted to 1 by the parser.
+        let height = self.buf.height();
+        let bottom = bottom.unwrap_or(height);
+        let t = top.saturating_sub(1);
+        let b = bottom.saturating_sub(1).min(height.saturating_sub(1));
+        // A valid region needs at least two lines; anything else resets to the
+        // whole screen (matching xterm).
+        self.scroll_region = if t < b { Some((t, b)) } else { None };
+        // DECSTBM homes the cursor.
+        self.cursor = Cursor::default();
     }
 
     #[inline]
