@@ -56,6 +56,8 @@ impl LinuxRootfs {
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
+            // INIT (PID 1): instalar y configurar OpenRC (idempotente).
+            self.install_openrc(&dir, &musl);
             return;
         }
         // 准备最小系统需要的资源
@@ -366,6 +368,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
+        // INIT (PID 1): instalar y configurar OpenRC como gestor de servicios.
+        self.install_openrc(&dir, &musl);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
@@ -383,6 +387,118 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 }
             }
         }
+    }
+
+    /// Install OpenRC (the `openrc-init` PID 1 + service manager) into the
+    /// rootfs and lay down a minimal, Eclipse-tailored configuration.
+    ///
+    /// The Eclipse kernel itself owns the virtual terminals (it spawns the
+    /// per-VT shells at PIDs 101..), so OpenRC is used purely as a *service
+    /// manager*: `openrc-init` runs the `sysinit`/`boot`/`default` runlevels
+    /// and then reaps children — it does not, and must not, spawn `getty`.
+    ///
+    /// Binaries come from Alpine's `openrc` package, installed with the static
+    /// host `apk` straight into the rootfs (`--root`). The whole step is
+    /// best-effort: if `apk` is unavailable, the host arch cannot run it, or the
+    /// install fails (e.g. no network), it logs a warning and the system simply
+    /// boots without a PID 1 init, exactly as before.
+    fn install_openrc(&self, rootfs: &Path, musl: &Path) {
+        // The static `apk` is the host-arch binary; it can only run on the build
+        // host when the target arch matches it. The supported desktop target is
+        // x86_64, so restrict the host install to that (other arches boot
+        // without PID 1 until cross-install is wired up).
+        if !matches!(self.0, Arch::X86_64) {
+            return;
+        }
+        let apk = self.apk(musl);
+        if !apk.is_file() {
+            eprintln!("warning: openrc: static apk not found; booting without a PID 1 init");
+            return;
+        }
+        println!("Installing OpenRC (openrc-init) into the rootfs via apk...");
+        // `--root` installs into the rootfs (reading its /etc/apk config).
+        // `--no-scripts`: post-install triggers are target shell scripts that
+        // cannot run on the host. `--no-cache` keeps the rootfs apk cache clean.
+        // `--no-cache` fetches a fresh package index without polluting the
+        // rootfs apk cache; `--no-scripts` skips target post-install triggers
+        // that cannot run on the build host.
+        let status = Ext::new(&apk)
+            .arg("--root")
+            .arg(rootfs)
+            .arg("--no-cache")
+            .arg("--no-scripts")
+            .arg("add")
+            .arg("openrc")
+            .status();
+        if !status.success() {
+            eprintln!(
+                "warning: openrc: `apk add openrc` failed (no network / repo / keys?); \
+                 booting without a PID 1 init. Re-run with network to enable it."
+            );
+            return;
+        }
+        // `apk add openrc` installs `/sbin/openrc-init` only on some Alpine
+        // versions; on others the supervisor entry point is `/sbin/init` ->
+        // openrc. Verify the path the kernel boots (INIT=/sbin/openrc-init).
+        if !rootfs.join("sbin/openrc-init").is_file() {
+            eprintln!(
+                "warning: openrc: /sbin/openrc-init missing after install; \
+                 the kernel's default INIT=/sbin/openrc-init will not match"
+            );
+        }
+        self.configure_openrc(rootfs);
+    }
+
+    /// Lay down the minimal OpenRC configuration Eclipse needs once the package
+    /// is installed: the four runlevel directories must exist (an empty runlevel
+    /// is a valid, fast no-op), `rc.conf` is tuned so OpenRC does not fight the
+    /// kernel over cgroups/containers, and an `/etc/inittab` is written for the
+    /// benefit of a busybox-`init` fallback (openrc-init ignores it).
+    fn configure_openrc(&self, rootfs: &Path) {
+        let etc = rootfs.join("etc");
+
+        // OpenRC stores live state under /run; make sure the mount point exists.
+        let _ = fs::create_dir_all(rootfs.join("run"));
+
+        // The runlevels openrc-init drives. Created if absent; existing
+        // package-provided runlevels (and their service symlinks) are kept.
+        for rl in ["sysinit", "boot", "default", "shutdown"] {
+            let _ = fs::create_dir_all(etc.join("runlevels").join(rl));
+        }
+
+        // rc.conf: disable the cgroup/container machinery OpenRC would otherwise
+        // probe for — this kernel is not a Linux host and those checks just
+        // generate noise/failures. Only written if the package didn't ship one.
+        let rc_conf = etc.join("rc.conf");
+        if !rc_conf.is_file() {
+            fs::create_dir_all(&etc).unwrap();
+            fs::write(
+                &rc_conf,
+                b"# Eclipse OS minimal OpenRC config.\n\
+                  # The kernel owns the TTYs; OpenRC is only a service manager.\n\
+                  rc_sys=\"\"\n\
+                  rc_controller_cgroups=\"NO\"\n\
+                  rc_cgroup_mode=\"none\"\n\
+                  rc_depend_strict=\"NO\"\n\
+                  rc_logger=\"NO\"\n\
+                  rc_parallel=\"NO\"\n",
+            )
+            .unwrap();
+        }
+
+        // /etc/inittab — openrc-init does NOT read it, but a busybox-`init`
+        // fallback would. NO getty lines: the kernel already provides the
+        // per-VT shells, so init only drives the runlevels.
+        fs::write(
+            etc.join("inittab"),
+            b"# Eclipse OS - the kernel owns the virtual terminals (per-VT shells),\n\
+              # so there are NO getty lines here; init only runs the runlevels.\n\
+              ::sysinit:/sbin/openrc sysinit\n\
+              ::wait:/sbin/openrc boot\n\
+              ::wait:/sbin/openrc default\n\
+              ::shutdown:/sbin/openrc shutdown\n",
+        )
+        .unwrap();
     }
 
     /// Compila thr3 con gcc del host (bare metal, sin libc).
