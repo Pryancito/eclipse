@@ -65,6 +65,19 @@ const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
 const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+
+// DRM object types (drm_mode_obj_get_properties.obj_type).
+const DRM_MODE_OBJECT_CRTC: u32 = 0xCCCC_CCCC;
+const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xC0C0_C0C0;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xEEEE_EEEE;
+
+// Synthetic property ids (software KMS). Only the plane "type" is mandatory for
+// wlroots' legacy backend to classify the primary plane.
+const PROP_TYPE: u32 = 10;
+
+// drm_mode_modeinfo flags helper already defined above.
 
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
@@ -227,6 +240,35 @@ struct DrmModeGetPlane {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+struct DrmModeObjGetProperties {
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_props: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeGetProperty {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    prop_id: u32,
+    flags: u32,
+    name: [u8; 32],
+    count_values: u32,
+    count_enum_blobs: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModePropertyEnum {
+    value: u64,
+    name: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct DrmModeCrtcPageFlip {
     crtc_id: u32,
     fb_id: u32,
@@ -245,6 +287,10 @@ const _: () = {
     assert!(size_of::<DrmModeFbCmd2>() == 104); // DRM_IOCTL_MODE_ADDFB2      0x..68..
     assert!(size_of::<DrmModeGetCrtc>() == 104); // DRM_IOCTL_MODE_{GET,SET}CRTC 0x..68..
     assert!(size_of::<DrmModeCrtcPageFlip>() == 24); // DRM_IOCTL_MODE_PAGE_FLIP 0x..18..
+    assert!(size_of::<DrmModeObjGetProperties>() == 32); // OBJ_GETPROPERTIES 0x..20..
+    assert!(size_of::<DrmModeGetProperty>() == 64); // GETPROPERTY        0x..40..
+    assert!(size_of::<DrmModePropertyEnum>() == 40);
+    assert!(size_of::<DrmModeGetPlane>() == 32); // DRM_IOCTL_MODE_GETPLANE 0x..20..
 };
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
@@ -402,6 +448,9 @@ impl INode for DrmDev {
                     0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
                     0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
                     0x10 => cap.value = 1, // DRM_CAP_ADDFB2_MODIFIERS
+                    // DRM_CAP_CRTC_IN_VBLANK_EVENT: our page-flip event carries
+                    // the crtc_id, so report support (wlroots requires it).
+                    0x12 => cap.value = 1,
                     _ => cap.value = 0,
                 }
                 Ok(0)
@@ -648,10 +697,95 @@ impl INode for DrmDev {
                     res.crtc_id = plane.crtc_id;
                     res.fb_id = plane.fb_id;
                     res.possible_crtcs = plane.possible_crtcs;
-                    res.count_format_types = 0;
+                    // Advertise the formats the software scanout consumes, via
+                    // the two-call pattern (count first, then fill).
+                    const FORMATS: [u32; 2] = [
+                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
+                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
+                    ];
+                    if res.format_type_ptr != 0
+                        && res.count_format_types >= FORMATS.len() as u32
+                    {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                FORMATS.as_ptr(),
+                                res.format_type_ptr as *mut u32,
+                                FORMATS.len(),
+                            );
+                        }
+                    }
+                    res.count_format_types = FORMATS.len() as u32;
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                let res = unsafe { &mut *(data as *mut DrmModeObjGetProperties) };
+                // Only the plane "type" property is mandatory (wlroots uses it to
+                // find the primary plane). Connectors/CRTCs report no properties;
+                // the legacy backend tolerates their absence.
+                let props: &[(u32, u64)] = if res.obj_type == DRM_MODE_OBJECT_PLANE {
+                    &[(PROP_TYPE, 1)] // value 1 = DRM_PLANE_TYPE_PRIMARY
+                } else {
+                    &[]
+                };
+                let _ = (DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_CONNECTOR);
+                let n = props.len();
+                if n > 0 && res.props_ptr != 0 && (res.count_props as usize) >= n {
+                    for (i, (pid, val)) in props.iter().enumerate() {
+                        unsafe {
+                            *(res.props_ptr as *mut u32).add(i) = *pid;
+                            *(res.prop_values_ptr as *mut u64).add(i) = *val;
+                        }
+                    }
+                }
+                res.count_props = n as u32;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETPROPERTY => {
+                let res = unsafe { &mut *(data as *mut DrmModeGetProperty) };
+                match res.prop_id {
+                    PROP_TYPE => {
+                        // Immutable enum "type" with {Overlay, Primary, Cursor}.
+                        res.flags = 8 | 4; // DRM_MODE_PROP_ENUM | IMMUTABLE
+                        let mut name = [0u8; 32];
+                        name[..4].copy_from_slice(b"type");
+                        res.name = name;
+
+                        const ENUMS: [(u64, &[u8]); 3] = [
+                            (0, b"Overlay"),
+                            (1, b"Primary"),
+                            (2, b"Cursor"),
+                        ];
+                        if res.enum_blob_ptr != 0
+                            && (res.count_enum_blobs as usize) >= ENUMS.len()
+                        {
+                            for (i, (val, nm)) in ENUMS.iter().enumerate() {
+                                let mut e = DrmModePropertyEnum {
+                                    value: *val,
+                                    name: [0u8; 32],
+                                };
+                                e.name[..nm.len()].copy_from_slice(nm);
+                                unsafe {
+                                    *(res.enum_blob_ptr as *mut DrmModePropertyEnum).add(i) = e;
+                                }
+                            }
+                        }
+                        res.count_enum_blobs = ENUMS.len() as u32;
+                        // Enum properties also expose their raw value list.
+                        const VALUES: [u64; 3] = [0, 1, 2];
+                        if res.values_ptr != 0 && (res.count_values as usize) >= VALUES.len() {
+                            for (i, v) in VALUES.iter().enumerate() {
+                                unsafe {
+                                    *(res.values_ptr as *mut u64).add(i) = *v;
+                                }
+                            }
+                        }
+                        res.count_values = VALUES.len() as u32;
+                        Ok(0)
+                    }
+                    _ => Err(FsError::InvalidParam),
                 }
             }
             _ => {
