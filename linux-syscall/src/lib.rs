@@ -411,6 +411,18 @@ impl Syscall<'_> {
             Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
             Sys::RT_SIGQUEUEINFO => self.unimplemented("rt_sigqueueinfo", Ok(0)),
 
+            // Extended attributes: this kernel's filesystems do not implement
+            // xattrs. Answer the standard "no xattr support" way and quietly —
+            // letting these fall through to `unknown_syscall` returned ENOSYS
+            // but logged an `error!` per call, which floods the console (e.g.
+            // busybox init probing files: `unknown syscall: LISTXATTR`).
+            // `listxattr` -> 0 (empty name list); `getxattr` -> ENODATA (no such
+            // attribute); `setxattr` -> EOPNOTSUPP; `removexattr` -> ENODATA.
+            Sys::LISTXATTR | Sys::LLISTXATTR | Sys::FLISTXATTR => Ok(0),
+            Sys::GETXATTR | Sys::LGETXATTR | Sys::FGETXATTR => Err(LxError::ENODATA),
+            Sys::SETXATTR | Sys::LSETXATTR | Sys::FSETXATTR => Err(LxError::EOPNOTSUPP),
+            Sys::REMOVEXATTR | Sys::LREMOVEXATTR | Sys::FREMOVEXATTR => Err(LxError::ENODATA),
+
             // kernel module
             //            Sys::INIT_MODULE => self.sys_init_module(a0.into(), a1 as usize, a2.into()),
             Sys::FINIT_MODULE => self.unimplemented("finit_module", Err(LxError::ENOSYS)),
