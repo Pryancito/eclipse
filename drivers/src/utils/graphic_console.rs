@@ -338,17 +338,22 @@ impl GraphicConsole {
     /// the GPU in one bulk transfer. Call it after a batch of writes.
     pub fn present(&mut self) {
         let (row, col) = self.inner.cursor();
+        // Honor DECTCEM (`?25`): a hidden cursor (full-screen TUIs while
+        // repainting) is never drawn.
+        let visible = self.inner.cursor_visible();
         let buf = self.inner.buf_mut();
         buf.set_cursor(row, col);
-        buf.present(true);
+        buf.present(visible);
     }
 
     /// Redraw only the blinking cursor with the given visibility.
     ///
     /// Called from the timer tick (~2 Hz) so the cursor blinks while idle,
-    /// without touching the text content.
+    /// without touching the text content. A cursor the application has hidden
+    /// (`?25l`) must never blink back into view.
     pub fn set_cursor_blink(&mut self, visible: bool) {
         let (row, col) = self.inner.cursor();
+        let visible = visible && self.inner.cursor_visible();
         let buf = self.inner.buf_mut();
         buf.set_cursor(row, col);
         buf.present(visible);
