@@ -59,7 +59,7 @@ const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC02064B2;
 const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
 const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC00464B4;
 const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
-const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06464B8;
+const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06864B8;
 const DRM_IOCTL_MODE_RMFB: u32 = 0xC00464AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 
@@ -234,6 +234,18 @@ struct DrmModeCrtcPageFlip {
     reserved: u32,
     user_data: u64,
 }
+
+// Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
+// _IOC size field, so a wrong struct layout silently mismatches the ioctl and
+// the handler never fires. Assert the sizes that the constants above depend on.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<DrmModeGetConnector>() == 80); // DRM_IOCTL_MODE_GETCONNECTOR 0x..50..
+    assert!(size_of::<DrmModeGetEncoder>() == 20); // DRM_IOCTL_MODE_GETENCODER  0x..14..
+    assert!(size_of::<DrmModeFbCmd2>() == 104); // DRM_IOCTL_MODE_ADDFB2      0x..68..
+    assert!(size_of::<DrmModeGetCrtc>() == 104); // DRM_IOCTL_MODE_{GET,SET}CRTC 0x..68..
+    assert!(size_of::<DrmModeCrtcPageFlip>() == 24); // DRM_IOCTL_MODE_PAGE_FLIP 0x..18..
+};
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
 /// `w`x`h`. Timings are nominal — a software framebuffer never programs real CRT
