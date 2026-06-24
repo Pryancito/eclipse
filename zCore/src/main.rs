@@ -106,6 +106,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "TERM=xterm-256color".into(),
                 "USER=root".into(),
                 "LOGNAME=root".into(),
+                // UTF-8 locale so ncurses/readline use Unicode box-drawing and
+                // compute character widths correctly (the console renders the
+                // box-drawing/block code points procedurally).
+                "LANG=C.UTF-8".into(),
+                "LC_ALL=C.UTF-8".into(),
             ];
             let rootfs = fs::rootfs();
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs

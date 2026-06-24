@@ -294,6 +294,10 @@ pub trait Handler {
     /// DECSTBM - Set the terminal scrolling region.
     fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) {}
 
+    /// Select the G0 charset: DEC Special Graphics (`ESC ( 0`) when `dec` is
+    /// true, ASCII (`ESC ( B`) otherwise.
+    fn set_g0_charset(&mut self, _dec: bool) {}
+
     /// Report device status.
     fn device_status(&mut self, _arg: usize) {}
 }
@@ -504,6 +508,11 @@ impl<'a, H: Handler> Perform for Performer<'a, H> {
             }
             // RI (Reverse Index): move up one line, scrolling at the region top.
             (b'M', []) => self.handler.reverse_index(),
+            // G0 charset: DEC Special Graphics (line drawing) vs ASCII.
+            (b'0', [b'(']) => self.handler.set_g0_charset(true),
+            (b'B', [b'(']) => self.handler.set_g0_charset(false),
+            // G1 charset (`ESC ) x`) is accepted but unused (apps draw via G0).
+            (b'0', [b')']) | (b'B', [b')']) => {}
             _ => unhandled!(),
         }
     }
