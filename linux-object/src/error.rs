@@ -97,10 +97,14 @@ pub enum LxError {
     ELOOP = 40,
     /// Identifier removed
     EIDRM = 43,
+    /// No data available (e.g. no such extended attribute)
+    ENODATA = 61,
     /// Socket operation on non-socket
     ENOTSOCK = 88,
     /// Protocol not available
     ENOPROTOOPT = 92,
+    /// Operation not supported
+    EOPNOTSUPP = 95,
     /// Protocol family not supported
     EPFNOSUPPORT = 96,
     /// Address family not supported by protocol
@@ -167,8 +171,10 @@ impl fmt::Display for LxError {
             ENOTEMPTY => "Directory not empty",
             ELOOP => "Too many symbolic links encountered",
             EIDRM => "Identifier removed",
+            ENODATA => "No data available",
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
+            EOPNOTSUPP => "Operation not supported",
             EPFNOSUPPORT => "Protocol family not supported",
             EAFNOSUPPORT => "Address family not supported by protocol",
             ENOBUFS => "No buffer space available",
