@@ -931,12 +931,17 @@ impl XhciInner {
             self.mmio.write_rt64(0x38, (erdp as u64 & !0xf) | 0x8);
 
             if etype == 32 {
-                // TRB_EVT_TRANSFER — solo despachar si tenemos listener (modo poll/IRQ).
-                // Durante enumeración (lis=None desde wait_ep0*) no llamamos a
-                // handle_hid_transfer_side para evitar confundir el state machine.
-                if lis.is_some() {
-                    self.handle_hid_transfer_side(&trb, lis);
-                }
+                // TRB_EVT_TRANSFER. Always run the transfer-side handler, even
+                // during enumeration (lis=None from wait_ep0*): it re-arms the
+                // completed HID interrupt endpoint (advance dequeue + resubmit)
+                // and only *dispatches* a report when `lis` is Some. Skipping it
+                // for lis=None (the old behaviour) left an already-enumerated
+                // keyboard/mouse endpoint's ring un-advanced whenever a report
+                // landed mid-enumeration of another device — a permanent 1-slot
+                // desync per drop. Control (EP0, dci=1) transfer events match no
+                // HID endpoint, so the handler is a no-op for them and the EP0
+                // waiter still receives the TRB.
+                self.handle_hid_transfer_side(&trb, lis);
             } else if etype == 34 {
                 // TRB_EVT_PORT_STATUS: diferir para evitar re-entrada recursiva
                 // durante la enumeración (pop_ev -> try_port_hid -> pop_ev).
@@ -2300,7 +2305,8 @@ impl XhciInner {
             return true;
         }
         // Clear sticky / W1C bits: HSE (bit 2), EINT (3), PCD (4), SRE (10).
-        self.mmio.write_op(4, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 10));
+        self.mmio
+            .write_op(4, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 10));
         // Re-assert RS=1. If INTE was on before, preserve it; if MSI is wired,
         // make sure it stays enabled.
         let mut cmd = self.mmio.read_op(0);

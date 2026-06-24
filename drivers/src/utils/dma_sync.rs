@@ -29,7 +29,13 @@ pub fn dma_sync_region(
     len: usize,
     dir: DmaSyncDir,
 ) {
-    if len == 0 || byte_off + len > region.byte_len() {
+    // Use checked arithmetic: `byte_off + len` could wrap `usize` and slip past
+    // the bound, then `region.vaddr() + byte_off` would clflush out-of-region.
+    if len == 0
+        || byte_off
+            .checked_add(len)
+            .map_or(true, |end| end > region.byte_len())
+    {
         return;
     }
     if coherent {

@@ -62,20 +62,29 @@ impl PciDriver for VirtIoPciDriver {
 
             if let Some((bar, offset, _len)) = common_cfg {
                 if let Some(BAR::Memory(addr, bar_len, _, _)) = dev.bars[bar as usize] {
-                    // Map the entire BAR to avoid overlapping mappings for different capabilities
-                    if let Some(m) = mapper {
-                        m.query_or_map(addr as usize, bar_len as usize);
-                    }
-                    let common_vaddr = phys_to_virt(addr as usize + offset as usize);
+                    // Resolve a capability's MMIO virtual address through the
+                    // *returned* mapper base, not `phys_to_virt`: on riscv a high
+                    // BAR is mapped at a non-linear sv39 vaddr, so `phys_to_virt`
+                    // would point at unmapped memory and every MMIO access would
+                    // fault. `query_or_map` is idempotent (it queries an existing
+                    // mapping first), so calling it per capability is safe even
+                    // when several share one BAR. On x86 it returns the linear
+                    // `phys_to_virt`, so `base + offset` is identical there.
+                    let resolve = |pa: usize, len: usize, off: usize| -> usize {
+                        match mapper {
+                            Some(m) => m
+                                .query_or_map(pa, len)
+                                .map(|base| base + off)
+                                .unwrap_or_else(|| phys_to_virt(pa + off)),
+                            None => phys_to_virt(pa + off),
+                        }
+                    };
+
+                    let common_vaddr = resolve(addr as usize, bar_len as usize, offset as usize);
 
                     let device_vaddr = if let Some((d_bar, d_offset, _)) = device_cfg {
                         if let Some(BAR::Memory(d_addr, d_len, _, _)) = dev.bars[d_bar as usize] {
-                            if d_bar != bar {
-                                if let Some(m) = mapper {
-                                    m.query_or_map(d_addr as usize, d_len as usize);
-                                }
-                            }
-                            phys_to_virt(d_addr as usize + d_offset as usize)
+                            resolve(d_addr as usize, d_len as usize, d_offset as usize)
                         } else {
                             0
                         }
@@ -85,14 +94,7 @@ impl PciDriver for VirtIoPciDriver {
 
                     let notify_vaddr = if let Some((n_bar, n_offset, _)) = notify_cfg {
                         if let Some(BAR::Memory(n_addr, n_len, _, _)) = dev.bars[n_bar as usize] {
-                            if n_bar != bar
-                                && n_bar != (device_cfg.map(|(b, _, _)| b).unwrap_or(255))
-                            {
-                                if let Some(m) = mapper {
-                                    m.query_or_map(n_addr as usize, n_len as usize);
-                                }
-                            }
-                            phys_to_virt(n_addr as usize + n_offset as usize)
+                            resolve(n_addr as usize, n_len as usize, n_offset as usize)
                         } else {
                             0
                         }
@@ -102,10 +104,10 @@ impl PciDriver for VirtIoPciDriver {
 
                     let (fb_vaddr, fb_size) =
                         if let Some(BAR::Memory(fb_addr, fb_len, _, _)) = dev.bars[0] {
-                            if let Some(m) = mapper {
-                                m.query_or_map(fb_addr as usize, fb_len as usize);
-                            }
-                            (phys_to_virt(fb_addr as usize), fb_len as usize)
+                            (
+                                resolve(fb_addr as usize, fb_len as usize, 0),
+                                fb_len as usize,
+                            )
                         } else {
                             (0, 0)
                         };

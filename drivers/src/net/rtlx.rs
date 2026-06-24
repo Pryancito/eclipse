@@ -252,9 +252,13 @@ impl NetScheme for RTLxInterface {
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
         if self.driver.0.lock().can_recv() {
-            let (vec_recv, rxcount) = self.driver.0.lock().geth_recv(1);
-            buf.copy_from_slice(&vec_recv);
-            Ok(rxcount as usize)
+            let (vec_recv, _rxcount) = self.driver.0.lock().geth_recv(1);
+            // `copy_from_slice` panics unless the lengths match; the caller's
+            // buffer is MTU-sized while `vec_recv` is the actual frame, so copy
+            // only the received bytes and return that count (cf. e1000e::recv).
+            let n = vec_recv.len().min(buf.len());
+            buf[..n].copy_from_slice(&vec_recv[..n]);
+            Ok(n)
         } else {
             Err(DeviceError::NotReady)
         }

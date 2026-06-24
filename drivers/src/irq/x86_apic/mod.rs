@@ -215,7 +215,10 @@ impl IrqScheme for Apic {
     }
 
     fn msi_free_block(&self, block: Range<usize>) -> DeviceResult {
-        self.manager_lapic
+        // Must mirror `msi_alloc_block`, which allocates from `manager_ioapic`;
+        // freeing to `manager_lapic` leaked the IOAPIC vectors and corrupted the
+        // 16-entry LAPIC allocator.
+        self.manager_ioapic
             .lock()
             .free_block(block.start, block.len())
     }
