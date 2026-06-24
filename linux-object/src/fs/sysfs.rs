@@ -166,8 +166,8 @@ impl INode for SysRootINode {
 struct SysClassINode;
 
 impl SysClassINode {
-    fn entries() -> [&'static str; 5] {
-        ["block", "drm", "net", "power_supply", "thermal"]
+    fn entries() -> [&'static str; 6] {
+        ["block", "drm", "input", "net", "power_supply", "thermal"]
     }
 }
 
@@ -206,6 +206,7 @@ impl INode for SysClassINode {
             ".." => Ok(Arc::new(SysRootINode)),
             "block" => Ok(Arc::new(SysBlockDirINode)),
             "drm" => Ok(Arc::new(SysClassDrmDirINode)),
+            "input" => Ok(Arc::new(SysClassInputDirINode)),
             "net" => Ok(Arc::new(SysClassNetDirINode)),
             "power_supply" => Ok(Arc::new(SysClassPowerSupplyDirINode)),
             "thermal" => Ok(Arc::new(SysClassThermalDirINode)),
@@ -876,6 +877,20 @@ fn display_pci_index() -> Option<usize> {
         .or_else(|| (!devs.is_empty()).then_some(0))
 }
 
+/// Whether `/sys/class/drm/card0` should be exposed, and which PCI device (if
+/// any) backs it. card0 exists whenever `/dev/dri/card0` does — i.e. there is a
+/// real PCI GPU, a registered framebuffer display (UEFI GOP has no PCI GPU
+/// node), or a DRM driver. The PCI index is best-effort, used only for the
+/// `device`/`modalias` attributes.
+fn drm_card0_pci_index() -> Option<usize> {
+    if let Some(idx) = display_pci_index() {
+        return Some(idx);
+    }
+    let have_fb =
+        drivers::all_display().first().is_some() || !drivers::all_drm().as_vec().is_empty();
+    have_fb.then_some(0)
+}
+
 fn list_net_ifnames() -> Vec<String> {
     let ifaces = get_net_device();
     if ifaces.is_empty() {
@@ -914,14 +929,14 @@ impl INode for SysClassDrmDirINode {
         match name {
             "." => Ok(Arc::new(SysClassDrmDirINode)),
             ".." => Ok(Arc::new(SysClassINode)),
-            "card0" => display_pci_index()
+            "card0" => drm_card0_pci_index()
                 .map(|idx| Arc::new(SysDrmCardINode { pci_index: idx }) as Arc<dyn INode>)
                 .ok_or(FsError::EntryNotFound),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 && display_pci_index().is_some() {
+        if id == 0 && drm_card0_pci_index().is_some() {
             Ok("card0".into())
         } else {
             Err(FsError::EntryNotFound)
@@ -934,8 +949,8 @@ struct SysDrmCardINode {
 }
 
 impl SysDrmCardINode {
-    fn entries() -> [&'static str; 1] {
-        ["device"]
+    fn entries() -> [&'static str; 4] {
+        ["dev", "uevent", "device", "subsystem"]
     }
 }
 
@@ -968,6 +983,19 @@ impl INode for SysDrmCardINode {
                 pci_index: self.pci_index,
             })),
             ".." => Ok(Arc::new(SysClassDrmDirINode)),
+            // What libudev reads to recognize the DRM device and resolve its
+            // node: `dev` (major:minor) and `uevent` (DEVNAME/MAJOR/MINOR). DRM
+            // major is 226; card0 is minor 0 → /dev/dri/card0.
+            "dev" => Ok(Arc::new(Pseudo::new("226:0\n", FileType::File))),
+            "uevent" => Ok(Arc::new(Pseudo::new(
+                "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n",
+                FileType::File,
+            ))),
+            // Subsystem link so libudev classifies this device as "drm".
+            "subsystem" => Ok(Arc::new(Pseudo::new(
+                "../../../class/drm",
+                FileType::SymLink,
+            ))),
             "device" => Ok(Arc::new(SysDrmCardDeviceINode {
                 pci_index: self.pci_index,
             })),
@@ -1033,6 +1061,178 @@ impl INode for SysDrmCardDeviceINode {
         } else {
             Err(FsError::EntryNotFound)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/class/input` — make evdev nodes discoverable by libinput's udev
+// backend (used by wlroots/labwc). Linux's evdev nodes are major 13, with the
+// event devices at minor 64+. libinput's udev backend ignores a device unless
+// it carries the `ID_INPUT*` properties that udevd's `input_id` builtin would
+// normally add; we synthesize those into the `uevent` file (libudev exposes
+// uevent keys as device properties), so input works without a running udevd.
+// ---------------------------------------------------------------------------
+
+const EVDEV_MAJOR: usize = 13;
+const EVDEV_EVENT_MINOR_BASE: usize = 64;
+
+/// Number of input event devices (one `eventN` per registered input device),
+/// matching the `/dev/input/eventN` numbering in `create_root_fs`.
+fn input_event_count() -> usize {
+    drivers::all_input().as_vec().len()
+}
+
+/// `ID_INPUT*` udev properties for input device `id`, derived from its evdev
+/// capability bitmaps (the same classification udev's `input_id` performs).
+fn input_id_props(id: usize) -> String {
+    use kernel_hal::drivers::prelude::CapabilityType;
+    let devs = drivers::all_input().as_vec();
+    let Some(dev) = devs.get(id) else {
+        return String::from("ID_INPUT=1\n");
+    };
+    let key = dev.capability(CapabilityType::Key);
+    let rel = dev.capability(CapabilityType::RelAxis);
+    let abs = dev.capability(CapabilityType::AbsAxis);
+
+    // Linux input-event-codes: REL_X=0 REL_Y=1; BTN_LEFT=0x110 BTN_TOUCH=0x14a;
+    // KEY_ESC=1 KEY_SPACE=57; ABS_X=0.
+    let is_mouse = rel.contains(0) || rel.contains(1) || key.contains(0x110);
+    let is_touch = abs.contains(0) && key.contains(0x14a);
+    let is_keyboard = key.contains(1) && key.contains(57);
+
+    let mut s = String::from("ID_INPUT=1\n");
+    if is_keyboard {
+        s.push_str("ID_INPUT_KEYBOARD=1\n");
+    }
+    if is_mouse {
+        s.push_str("ID_INPUT_MOUSE=1\n");
+    }
+    if is_touch {
+        s.push_str("ID_INPUT_TOUCHSCREEN=1\n");
+    }
+    // If nothing matched but the device has keys, mark it a key device so
+    // libinput still assigns it a capability instead of ignoring it.
+    if !is_keyboard && !is_mouse && !is_touch && key.contains(1) {
+        s.push_str("ID_INPUT_KEY=1\n");
+    }
+    s
+}
+
+struct SysClassInputDirINode;
+
+impl INode for SysClassInputDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(27))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassInputDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            _ => {
+                if let Some(id) = name
+                    .strip_prefix("event")
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
+                    if id < input_event_count() {
+                        return Ok(Arc::new(SysInputEventINode { id }));
+                    }
+                }
+                Err(FsError::EntryNotFound)
+            }
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        if id >= input_event_count() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(format!("event{}", id))
+    }
+}
+
+struct SysInputEventINode {
+    id: usize,
+}
+
+impl SysInputEventINode {
+    fn entries() -> [&'static str; 3] {
+        ["dev", "uevent", "subsystem"]
+    }
+}
+
+impl INode for SysInputEventINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(28))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        let minor = EVDEV_EVENT_MINOR_BASE + self.id;
+        match name {
+            "." => Ok(Arc::new(SysInputEventINode { id: self.id })),
+            ".." => Ok(Arc::new(SysClassInputDirINode)),
+            "dev" => Ok(Arc::new(Pseudo::new(
+                &format!("{}:{}\n", EVDEV_MAJOR, minor),
+                FileType::File,
+            ))),
+            "uevent" => {
+                let content = format!(
+                    "MAJOR={}\nMINOR={}\nDEVNAME=input/event{}\n{}",
+                    EVDEV_MAJOR,
+                    minor,
+                    self.id,
+                    input_id_props(self.id),
+                );
+                Ok(Arc::new(Pseudo::new(&content, FileType::File)))
+            }
+            "subsystem" => Ok(Arc::new(Pseudo::new(
+                "../../../class/input",
+                FileType::SymLink,
+            ))),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
     }
 }
 
