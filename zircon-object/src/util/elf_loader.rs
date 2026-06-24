@@ -182,55 +182,98 @@ impl ElfExt for ElfFile<'_> {
 
     #[allow(unsafe_code)]
     fn relocate(&self, vmar: Arc<VmAddressRegion>) -> Result<(), &'static str> {
-        let data = self
-            .find_section_by_name(".rela.dyn")
-            .ok_or(".rela.dyn not found")?
-            .get_data(self)
-            .map_err(|_| "corrupted .rela.dyn")?;
-        let entries = match data {
-            SectionData::Rela64(entries) => entries,
-            _ => return Err("bad .rela.dyn"),
-        };
-        let base = vmar.addr();
-        let dynsym = self.dynsym()?;
-        for entry in entries.iter() {
-            // x86_64
-            const REL_GOT: u32 = 6;
-            const REL_PLT: u32 = 7;
-            const REL_RELATIVE: u32 = 8;
-            // riscv64
-            const R_RISCV_64: u32 = 2;
-            const R_RISCV_RELATIVE: u32 = 3;
-            // aarch64
-            const R_AARCH64_RELATIVE: u32 = 0x403;
-            const R_AARCH64_GLOBAL_DATA: u32 = 0x401;
+        // Symbol-resolving relocations (write `S + A`).
+        // x86_64
+        const REL_GOT: u32 = 6; // R_X86_64_GLOB_DAT
+        const REL_PLT: u32 = 7; // R_X86_64_JUMP_SLOT
+        const R_X86_64_64: u32 = 1;
+        // riscv64
+        const R_RISCV_64: u32 = 2;
+        // aarch64
+        const R_AARCH64_GLOBAL_DATA: u32 = 0x401;
+        const R_AARCH64_JUMP_SLOT: u32 = 0x402;
 
-            match entry.get_type() {
-                REL_GOT | REL_PLT | R_RISCV_64 | R_AARCH64_GLOBAL_DATA => {
-                    let dynsym = &dynsym[entry.get_symbol_table_index() as usize];
-                    let symval = if dynsym.shndx() == 0 {
-                        let name = dynsym.get_name(self)?;
-                        panic!("need to find symbol: {:?}", name);
-                    } else {
-                        base + dynsym.value() as usize
-                    };
-                    let value = symval + entry.get_addend() as usize;
-                    let addr = base + entry.get_offset() as usize;
-                    trace!("GOT write: {:#x} @ {:#x}", value, addr);
-                    vmar.write_memory(addr, &value.to_ne_bytes())
-                        .map_err(|_| "Invalid Vmar")?;
+        // Base-relative relocations (write `B + A`).
+        // x86_64
+        const REL_RELATIVE: u32 = 8; // R_X86_64_RELATIVE
+        // riscv64
+        const R_RISCV_RELATIVE: u32 = 3;
+        // aarch64
+        const R_AARCH64_RELATIVE: u32 = 0x403;
+
+        let base = vmar.addr();
+        // `.dynsym` may be absent for binaries that only carry RELATIVE
+        // relocations; resolve it lazily so those still get applied.
+        let dynsym = self.dynsym().ok();
+        let mut found_any = false;
+
+        // Apply both the general dynamic relocations (`.rela.dyn`) and the PLT
+        // relocations (`.rela.plt`). The latter holds the JUMP_SLOT entries that
+        // back the procedure linkage table; skipping it leaves call targets
+        // pointing at unrelocated stubs (observed as a jump to a low address and
+        // an Invalid Opcode #UD fault).
+        for &sec_name in [".rela.dyn", ".rela.plt"].iter() {
+            let section = match self.find_section_by_name(sec_name) {
+                Some(section) => section,
+                None => continue,
+            };
+            let entries = match section.get_data(self).map_err(|_| "corrupted relocation section")? {
+                SectionData::Rela64(entries) => entries,
+                _ => continue,
+            };
+            found_any = true;
+            for entry in entries.iter() {
+                match entry.get_type() {
+                    REL_GOT | REL_PLT | R_X86_64_64 | R_RISCV_64 | R_AARCH64_GLOBAL_DATA
+                    | R_AARCH64_JUMP_SLOT => {
+                        let dynsym = match dynsym {
+                            Some(dynsym) => dynsym,
+                            None => {
+                                warn!("relocate: symbol relocation but no .dynsym; skipping");
+                                continue;
+                            }
+                        };
+                        let sym = &dynsym[entry.get_symbol_table_index() as usize];
+                        // An undefined symbol (shndx == 0) is resolved later by the
+                        // dynamic linker in user space (or is simply unavailable to
+                        // the in-kernel loader). Skip it instead of panicking — a
+                        // user binary must never be able to crash the kernel.
+                        if sym.shndx() == 0 {
+                            let name = sym.get_name(self).unwrap_or("<unknown>");
+                            warn!("relocate: undefined symbol {:?}, skipping", name);
+                            continue;
+                        }
+                        let symval = base + sym.value() as usize;
+                        let value = symval + entry.get_addend() as usize;
+                        let addr = base + entry.get_offset() as usize;
+                        trace!("GOT write: {:#x} @ {:#x}", value, addr);
+                        vmar.write_memory(addr, &value.to_ne_bytes())
+                            .map_err(|_| "Invalid Vmar")?;
+                    }
+                    REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
+                        let value = base + entry.get_addend() as usize;
+                        let addr = base + entry.get_offset() as usize;
+                        trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);
+                        vmar.write_memory(addr, &value.to_ne_bytes())
+                            .map_err(|_| "Invalid Vmar")?;
+                    }
+                    // Unsupported relocation type (e.g. TLS or IFUNC relocations).
+                    // Log and skip rather than `unimplemented!()`, which would
+                    // panic the whole kernel because of one user program.
+                    other => {
+                        warn!(
+                            "relocate: skipping unsupported relocation type {} in {}",
+                            other, sec_name
+                        );
+                    }
                 }
-                REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
-                    let value = base + entry.get_addend() as usize;
-                    let addr = base + entry.get_offset() as usize;
-                    trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);
-                    vmar.write_memory(addr, &value.to_ne_bytes())
-                        .map_err(|_| "Invalid Vmar")?;
-                }
-                t => unimplemented!("unknown type: {}", t),
             }
         }
-        // panic!("STOP");
-        Ok(())
+
+        if found_any {
+            Ok(())
+        } else {
+            Err(".rela.dyn not found")
+        }
     }
 }
