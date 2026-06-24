@@ -425,7 +425,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               ::sysinit:/etc/init.d/rcS\n\
               ::ctrlaltdel:/bin/busybox reboot\n\
               ::shutdown:/bin/busybox swapoff -a\n\
-              ::restart:/sbin/init\n",
+              ::restart:/bin/busybox init\n",
         )
         .unwrap();
 

@@ -6,7 +6,7 @@ use zircon_object::{object::KernelObject, task::Process};
 pub struct BootOptions {
     pub cmdline: String,
     pub log_level: String,
-    /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/init` (busybox). Empty
+    /// Process run as PID 1 / init (`INIT`), e.g. `/bin/busybox?init`. Empty
     /// or a missing binary means the system boots without a PID 1 init.
     #[cfg(feature = "linux")]
     pub init_proc: String,
@@ -66,14 +66,15 @@ pub fn boot_options() -> BootOptions {
             BootOptions {
                 cmdline: cmdline.clone(),
                 log_level: options.get("LOG").unwrap_or(&"").to_string(),
-                // `INIT` selects the PID 1 process (default /sbin/init, i.e.
-                // busybox init, run only if it exists). `SHELL` selects the
+                // `INIT` selects the PID 1 process (default `/bin/busybox?init`,
+                // i.e. busybox's init applet run from the real binary, no
+                // symlink; run only if it exists). `SHELL` selects the
                 // per-terminal shells at PIDs 101.. (default busybox);
                 // `ROOTPROC` is accepted as a deprecated alias for `SHELL`.
                 #[cfg(feature = "linux")]
                 init_proc: options
                     .get("INIT")
-                    .unwrap_or(&"/sbin/init")
+                    .unwrap_or(&"/bin/busybox?init")
                     .to_string(),
                 #[cfg(feature = "linux")]
                 shell_proc: options
