@@ -161,7 +161,9 @@ impl<T: TextBuffer> ConsoleInner<T> {
     /// Scroll the active region up by `count` lines (content moves up, blank
     /// lines appear at the bottom). When the region spans the whole screen this
     /// uses the buffer's fast `new_line` (which also records scrollback), so the
-    /// normal shell-output path is byte-for-byte unchanged.
+    /// normal shell-output path is byte-for-byte unchanged. A partial region is
+    /// delegated to the buffer's `scroll_region_up`, which a framebuffer backend
+    /// can implement as a bulk pixel copy rather than cell-by-cell.
     fn scroll_region_up(&mut self, count: usize) {
         let (top, bottom) = self.region();
         if bottom < top {
@@ -171,45 +173,21 @@ impl<T: TextBuffer> ConsoleInner<T> {
             for _ in 0..count {
                 self.buf.new_line(self.temp);
             }
-            return;
-        }
-        let width = self.buf.width();
-        let bg = self.temp.bg();
-        let count = count.min(bottom - top + 1);
-        for r in top..=bottom {
-            let src = r + count;
-            for c in 0..width {
-                let cell = if src <= bottom {
-                    self.buf.read(src, c)
-                } else {
-                    bg
-                };
-                self.buf.write(r, c, cell);
-            }
+        } else {
+            let blank = self.temp.bg();
+            self.buf.scroll_region_up(top, bottom, count, blank);
         }
     }
 
     /// Scroll the active region down by `count` lines (content moves down, blank
-    /// lines appear at the top). Always cell-by-cell — there is no history
-    /// equivalent for downward scrolling.
+    /// lines appear at the top).
     fn scroll_region_down(&mut self, count: usize) {
         let (top, bottom) = self.region();
         if bottom < top {
             return;
         }
-        let width = self.buf.width();
-        let bg = self.temp.bg();
-        let count = count.min(bottom - top + 1);
-        for r in (top..=bottom).rev() {
-            for c in 0..width {
-                let cell = if r >= top + count {
-                    self.buf.read(r - count, c)
-                } else {
-                    bg
-                };
-                self.buf.write(r, c, cell);
-            }
-        }
+        let blank = self.temp.bg();
+        self.buf.scroll_region_down(top, bottom, count, blank);
     }
 
     /// Switch to a blank alternate screen, saving the current screen and cursor.
@@ -412,48 +390,29 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
 
     #[inline]
     fn insert_blank_lines(&mut self, count: usize) {
+        // IL opens `count` blank lines at the cursor: scroll the rows from the
+        // cursor to the region bottom *down* by `count`.
         let (top, bottom) = self.region();
         let row = self.cursor.row;
         if row < top || row > bottom {
             return;
         }
-        let width = self.buf.width();
-        let bg = self.temp.bg();
-        let count = count.min(bottom - row + 1);
-        for r in (row..=bottom).rev() {
-            for c in 0..width {
-                let cell = if r >= row + count {
-                    self.buf.read(r - count, c)
-                } else {
-                    bg
-                };
-                self.buf.write(r, c, cell);
-            }
-        }
+        let blank = self.temp.bg();
+        self.buf.scroll_region_down(row, bottom, count, blank);
         self.cursor.col = 0;
     }
 
     #[inline]
     fn delete_lines(&mut self, count: usize) {
+        // DL removes `count` lines at the cursor: scroll the rows from the
+        // cursor to the region bottom *up* by `count`.
         let (top, bottom) = self.region();
         let row = self.cursor.row;
         if row < top || row > bottom {
             return;
         }
-        let width = self.buf.width();
-        let bg = self.temp.bg();
-        let count = count.min(bottom - row + 1);
-        for r in row..=bottom {
-            let src = r + count;
-            for c in 0..width {
-                let cell = if src <= bottom {
-                    self.buf.read(src, c)
-                } else {
-                    bg
-                };
-                self.buf.write(r, c, cell);
-            }
-        }
+        let blank = self.temp.bg();
+        self.buf.scroll_region_up(row, bottom, count, blank);
         self.cursor.col = 0;
     }
 

@@ -319,6 +319,100 @@ impl TextBuffer for LinearScrollbackBuffer {
         self.cursor_row = 0;
         self.cursor_col = 0;
     }
+
+    /// Scroll a sub-region up by `n` lines, moving the surviving pixel band in
+    /// one bulk `copy_rect` (cached RAM) instead of re-rendering every glyph —
+    /// the fast path for full-screen TUIs (irssi/htop) that scroll a window.
+    fn scroll_region_up(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        let height = self.height();
+        let width = self.width();
+        if top > bottom || bottom >= height || n == 0 {
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        let blank_cell = Cell {
+            c: ' ',
+            bg: blank.bg,
+            fg: blank.fg,
+            flags: Flags::empty(),
+        };
+        // Shift the backing cells up within the region.
+        for r in top..=bottom {
+            self.buf[r] = if r + n <= bottom {
+                self.buf[r + n].clone()
+            } else {
+                vec![blank_cell; width]
+            };
+        }
+        if self.scrollback_offset.is_some() {
+            self.redraw();
+            return;
+        }
+        // Move the surviving pixels up, then clear the vacated band.
+        let width_px = self.shadow.width();
+        let survivors = (bottom - top + 1) - n;
+        if survivors > 0 {
+            self.shadow.copy_rect(
+                0,
+                (top + n) * CHAR_HEIGHT,
+                0,
+                top * CHAR_HEIGHT,
+                width_px,
+                survivors * CHAR_HEIGHT,
+            );
+        }
+        let bg_argb = rgb888_to_argb(blank.bg.to_rgb());
+        self.shadow.fill_rect(
+            0,
+            (bottom + 1 - n) * CHAR_HEIGHT,
+            width_px,
+            n * CHAR_HEIGHT,
+            bg_argb,
+        );
+    }
+
+    /// Scroll a sub-region down by `n` lines (bulk pixel copy + clear the top).
+    fn scroll_region_down(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        let height = self.height();
+        let width = self.width();
+        if top > bottom || bottom >= height || n == 0 {
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        let blank_cell = Cell {
+            c: ' ',
+            bg: blank.bg,
+            fg: blank.fg,
+            flags: Flags::empty(),
+        };
+        // Shift the backing cells down within the region (high rows first).
+        for r in (top..=bottom).rev() {
+            self.buf[r] = if r >= top + n {
+                self.buf[r - n].clone()
+            } else {
+                vec![blank_cell; width]
+            };
+        }
+        if self.scrollback_offset.is_some() {
+            self.redraw();
+            return;
+        }
+        let width_px = self.shadow.width();
+        let survivors = (bottom - top + 1) - n;
+        if survivors > 0 {
+            self.shadow.copy_rect(
+                0,
+                top * CHAR_HEIGHT,
+                0,
+                (top + n) * CHAR_HEIGHT,
+                width_px,
+                survivors * CHAR_HEIGHT,
+            );
+        }
+        let bg_argb = rgb888_to_argb(blank.bg.to_rgb());
+        self.shadow
+            .fill_rect(0, top * CHAR_HEIGHT, width_px, n * CHAR_HEIGHT, bg_argb);
+    }
 }
 
 pub struct GraphicConsole {
