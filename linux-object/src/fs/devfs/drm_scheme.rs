@@ -450,7 +450,16 @@ impl INode for DrmDev {
             }
             // A single DRM client on the primary node is implicitly master;
             // accept (drop-)master so seatd/wlroots session activation succeeds.
-            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
+            // Master = the client owns the display: leave/restore the kernel text
+            // console accordingly (KD_GRAPHICS while a compositor is scanning out).
+            DRM_IOCTL_SET_MASTER => {
+                kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
+                Ok(0)
+            }
+            DRM_IOCTL_DROP_MASTER => {
+                kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+                Ok(0)
+            }
             DRM_IOCTL_SET_CLIENT_CAP => {
                 // struct drm_set_client_cap { __u64 capability; __u64 value; }
                 let cap = unsafe { *(data as *const u64) };
@@ -518,6 +527,14 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                log::warn!(
+                    "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
+                    req.crtc_id,
+                    req.fb_id,
+                    req.x,
+                    req.y,
+                    req.mode_valid
+                );
                 if req.fb_id != 0 {
                     drm::set_crtc_fb(req.crtc_id, req.fb_id);
                     drm::scanout(req.fb_id);
