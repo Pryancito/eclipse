@@ -82,6 +82,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
         } else if #[cfg(feature = "linux")] {
             use linux_object::process::ProcessExt;
+            use zircon_object::object::KernelObject;
             // Parse "arg0?arg1?arg2"; an empty string yields no program.
             fn parse_proc(s: &str) -> alloc::vec::Vec<alloc::string::String> {
                 if s.is_empty() {
@@ -142,6 +143,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             } else {
                 None
             };
+            // Make the outcome of PID 1 / base-program startup observable: log
+            // which process the system's lifetime is now tied to (the PID 1
+            // init when it came up, otherwise the fallback terminal shell).
+            match &lifetime_proc {
+                Some(p) => klog_info!(
+                    "Eclipse: lifetime process pid={} name={:?}",
+                    p.id(),
+                    p.name()
+                ),
+                None => klog_info!("Eclipse: no lifetime process spawned"),
+            }
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);

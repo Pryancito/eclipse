@@ -84,7 +84,20 @@ pub fn run_init_if_present(
         return None;
     }
     const INIT_PID: KoID = 1;
-    spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work)
+    let init = args[0].clone();
+    let proc = spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work);
+    if proc.is_none() {
+        // The binary exists but could not be started (unreadable, malformed
+        // ELF, or blocked by policy). Don't silently end up with no PID 1:
+        // make the fallback to the terminal shell explicit in the log.
+        warn!(
+            "INIT {:?} present but failed to start; falling back to the shell as the lifetime process",
+            init
+        );
+    } else {
+        info!("INIT {:?} started as PID {}", init, INIT_PID);
+    }
+    proc
 }
 
 /// True if `path` resolves on the primary root (if any) or the initramfs.
@@ -125,13 +138,6 @@ fn spawn(
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc =
         Process::create_linux(&job, rootfs.clone(), vt, shared_root, pid).expect("create_linux");
-    // Make this shell the foreground process group of its own tty from the
-    // start. `getpgid` reports each process's pgrp as its own pid, so seeding
-    // the VT's foreground pgrp to `pid` makes `tcgetpgrp == getpgrp` for the
-    // shell; otherwise it starts at 0, the shell concludes it is a background
-    // job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning enter_uspace
-    // loop that was previously hidden behind the handle_signal self-deadlock).
-    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -154,9 +160,16 @@ fn spawn(
             }
         },
     };
-    let vmo = inode
-        .read_as_vmo()
-        .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
+    // A PID 1 / base program whose binary is present but unreadable must not
+    // take the whole kernel down: degrade gracefully (skip → caller falls back
+    // to the shell) instead of panicking.
+    let vmo = match inode.read_as_vmo() {
+        Ok(vmo) => vmo,
+        Err(e) => {
+            warn!("failed to read process {:?}: {:?}; skipping", args[0], e);
+            return None;
+        }
+    };
     let path = args[0].clone();
 
     // hunter P8: verify binary integrity + path policy using a full 64-byte
@@ -179,13 +192,31 @@ fn spawn(
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    let (entry, sp, initial_brk, execute_path) = loader
-        .load(&proc.vmar(), &vmo, args.clone(), envs, path)
-        .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
+    // Likewise, a malformed/incompatible ELF for the base program must fall
+    // back rather than panic the kernel.
+    let (entry, sp, initial_brk, execute_path) =
+        match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                warn!("failed to load process {:?}: {:?}; skipping", args[0], e);
+                return None;
+            }
+        };
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
     proc.set_name(comm_from_path(&execute_path));
+
+    // Make this process the foreground process group of its own tty before it
+    // ever runs in user mode. `getpgid` reports each process's pgrp as its own
+    // pid, so seeding the VT's foreground pgrp to `pid` makes
+    // `tcgetpgrp == getpgrp`; otherwise it starts at 0, the shell concludes it
+    // is a background job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning
+    // enter_uspace loop that was previously hidden behind the handle_signal
+    // self-deadlock). Seed it only here — after every fallible step has
+    // succeeded — so a process that fails to load never leaves the VT pointing
+    // at a pid that never started.
+    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
 
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
