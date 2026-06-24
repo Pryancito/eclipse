@@ -157,11 +157,17 @@ impl NvmeInterface {
                 unsafe { write_volatile(cq_db as *mut u32, queue.cq_head as u32) }
 
                 if entry.command_id != cid {
+                    // A completion for a *different* CID than the one we're
+                    // awaiting: the command we want may still be in flight, so
+                    // consume this stale CQE (head/phase/doorbell already
+                    // advanced) and keep polling instead of abandoning ours —
+                    // returning here desynced and could wedge the queue. Still
+                    // bounded by the timeout / CFS checks below.
                     warn!(
-                        "[nvme] unexpected completion cid {:#x} (wanted {:#x}) for {}",
+                        "[nvme] stale completion cid {:#x} (wanted {:#x}) for {}; continuing",
                         entry.command_id, cid, context
                     );
-                    return Err(DeviceError::IoError);
+                    continue;
                 }
 
                 let sc = (entry.status >> 1) & 0xff;

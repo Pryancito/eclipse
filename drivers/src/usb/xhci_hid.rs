@@ -850,6 +850,11 @@ pub struct XhciInner {
     pub fb_height: u32,
     /// Cambios de puerto diferidos para evitar re-entrada recursiva en pop_ev.
     pending_port_changes: Vec<u8>,
+    /// HID interrupt endpoints (slot, dci) that completed a transfer with an
+    /// error (Stall/Babble/…) and need a Reset Endpoint + re-arm. Deferred for
+    /// the same reason as `pending_port_changes`: the recovery issues commands
+    /// and waits on the event ring, which must not run nested inside `pop_ev`.
+    pending_ep_resets: Vec<(u8, u8)>,
     /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
     boot_enum_pending: bool,
     /// Number of consecutive soft-recovery attempts since the controller last
@@ -914,6 +919,7 @@ impl XhciInner {
             fb_width: 1024,
             fb_height: 768,
             pending_port_changes: Vec::new(),
+            pending_ep_resets: Vec::new(),
             boot_enum_pending: true,
             halt_attempts: 0,
             halt_last_attempt_us: 0,
@@ -931,12 +937,17 @@ impl XhciInner {
             self.mmio.write_rt64(0x38, (erdp as u64 & !0xf) | 0x8);
 
             if etype == 32 {
-                // TRB_EVT_TRANSFER — solo despachar si tenemos listener (modo poll/IRQ).
-                // Durante enumeración (lis=None desde wait_ep0*) no llamamos a
-                // handle_hid_transfer_side para evitar confundir el state machine.
-                if lis.is_some() {
-                    self.handle_hid_transfer_side(&trb, lis);
-                }
+                // TRB_EVT_TRANSFER. Always run the transfer-side handler, even
+                // during enumeration (lis=None from wait_ep0*): it re-arms the
+                // completed HID interrupt endpoint (advance dequeue + resubmit)
+                // and only *dispatches* a report when `lis` is Some. Skipping it
+                // for lis=None (the old behaviour) left an already-enumerated
+                // keyboard/mouse endpoint's ring un-advanced whenever a report
+                // landed mid-enumeration of another device — a permanent 1-slot
+                // desync per drop. Control (EP0, dci=1) transfer events match no
+                // HID endpoint, so the handler is a no-op for them and the EP0
+                // waiter still receives the TRB.
+                self.handle_hid_transfer_side(&trb, lis);
             } else if etype == 34 {
                 // TRB_EVT_PORT_STATUS: diferir para evitar re-entrada recursiva
                 // durante la enumeración (pop_ev -> try_port_hid -> pop_ev).
@@ -1008,7 +1019,28 @@ impl XhciInner {
         }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
-            if cc == 0x0d { // Stall
+            // Transfer error. Stall (0x0d) halts the endpoint outright; Babble /
+            // Transaction Error can too. Doing nothing (the old behaviour) left
+            // the endpoint dead until the user unplugged and replugged the
+            // device. Skip the failed TRB and queue a deferred Reset Endpoint +
+            // re-arm (commands must not run nested inside this event drain).
+            if let Some(idx) = self
+                .hids
+                .iter()
+                .position(|h| h.slot_id == i as u8 && h.ep_dci == dci)
+            {
+                let ridx = self.hids[idx].ring_idx;
+                if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+                    r.advance_dequeue(1);
+                }
+                // No report dispatched for the errored transfer: advance the
+                // dispatch head too, keeping it in lockstep with the enqueue
+                // head (which the deferred re-arm advances).
+                self.hids[idx].dispatch_idx = (self.hids[idx].dispatch_idx + 1) % HID_QUEUE_DEPTH;
+                let key = (i as u8, dci);
+                if !self.pending_ep_resets.contains(&key) {
+                    self.pending_ep_resets.push(key);
+                }
             }
             return false;
         }
@@ -2271,6 +2303,46 @@ impl XhciInner {
         // En modo poll/IRQ, procesar los cambios de puerto diferidos ahora que
         // no estamos en medio de enumeración.
         self.drain_pending_port_changes();
+        // Recover any HID endpoint that stalled during the drain above.
+        self.drain_pending_ep_resets();
+    }
+
+    /// Reset and re-arm every HID interrupt endpoint that errored during the
+    /// last event drain (see `pending_ep_resets`). Runs outside `pop_ev`, so the
+    /// Reset Endpoint / Set TR Dequeue commands (which spin on the event ring)
+    /// don't recurse into the drain loop.
+    fn drain_pending_ep_resets(&mut self) {
+        let resets: Vec<(u8, u8)> = self.pending_ep_resets.drain(..).collect();
+        for (slot, dci) in resets {
+            // Reset the halted endpoint and point its TR dequeue past the failed
+            // TRB (already skipped via advance_dequeue), then re-arm one TRB and
+            // ring the doorbell so interrupt transfers resume.
+            if self.reset_endpoint_and_dequeue(slot, dci).is_err() {
+                continue;
+            }
+            if let Some(idx) = self
+                .hids
+                .iter()
+                .position(|h| h.slot_id == slot && h.ep_dci == dci)
+            {
+                let (ridx, blen, buf_phys) = {
+                    let h = &self.hids[idx];
+                    (
+                        h.ring_idx,
+                        (h.report_len.min(64)) as u16,
+                        h.bufs[h.enqueue_idx].sub_phys(0),
+                    )
+                };
+                self.resubmit_hid_normal_trb(ridx, buf_phys, blen, slot, dci);
+                if let Some(h) = self.hids.get_mut(idx) {
+                    h.enqueue_idx = (h.enqueue_idx + 1) % HID_QUEUE_DEPTH;
+                }
+                warn!(
+                    "[xhci] recovered HID endpoint slot={} dci={} after a transfer error",
+                    slot, dci
+                );
+            }
+        }
     }
 
     /// Best-effort recovery from an HCHalted controller without a full HCRST
@@ -2300,7 +2372,8 @@ impl XhciInner {
             return true;
         }
         // Clear sticky / W1C bits: HSE (bit 2), EINT (3), PCD (4), SRE (10).
-        self.mmio.write_op(4, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 10));
+        self.mmio
+            .write_op(4, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 10));
         // Re-assert RS=1. If INTE was on before, preserve it; if MSI is wired,
         // make sure it stays enabled.
         let mut cmd = self.mmio.read_op(0);

@@ -76,7 +76,7 @@ impl InputCapability {
         let mut cap = Self::empty();
         let bitcount = bitmap.len() as u16 * 8;
         for i in 0..bitcount as usize {
-            if bitmap[i / 8] & (1 << (i % 64)) != 0 {
+            if bitmap[i / 8] & (1u8 << (i % 8)) != 0 {
                 cap.set(i as u16);
             }
         }

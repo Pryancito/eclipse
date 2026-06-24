@@ -144,6 +144,11 @@ const PHY_POWERDOWN: u32 = 0x0080;
 const PHY_NEG_EN: u32 = 0x1000;
 
 const MII_BUSY: u32 = 0x00000001;
+/// Upper bound on MDIO/PHY/reset busy-wait polls. The MDIO clock and PHY can be
+/// misconfigured (or no cable present), in which case these registers never
+/// clear; without a cap the kernel busy-spins forever and wedges boot. ~1e6
+/// MMIO reads is far longer than any real completion yet still bounded.
+const MDIO_MAX_SPINS: u32 = 1_000_000;
 const MII_WRITE: u32 = 0x00000002;
 const MII_PHY_MASK: u32 = 0x0000FFC0;
 const MII_CR_MASK: u32 = 0x0000001C;
@@ -383,8 +388,14 @@ where
         // #define PHY_MAX_ADDR 32
         let phyaddr = 0;
         self.mdio_write(phyaddr, MII_BMCR, BMCR_RESET);
+        let mut reset_spins = 0u32;
         while (BMCR_RESET & self.mdio_read(phyaddr, MII_BMCR)) != 0 {
             //sleep(30);  // sleep 30 milliseconds
+            reset_spins += 1;
+            if reset_spins >= MDIO_MAX_SPINS {
+                warn!("[rtl8211f] PHY BMCR reset did not clear; continuing");
+                break;
+            }
         }
 
         let mii_bmcr_value = self.mdio_read(phyaddr, MII_BMCR);
@@ -621,6 +632,7 @@ where
         info!("DUPLEX: {}, SPEED: {}", duplex, speed);
 
         info!("Waiting for link ...");
+        let mut link_spins = 0u32;
         loop {
             // Read link status
             let status = self.mdio_read(phyaddr, MII_BMSR);
@@ -628,6 +640,12 @@ where
 
             if link == BMSR_LSTATUS {
                 info!("Link is up! status: {:#x}", status);
+                break;
+            }
+            // Don't wedge boot forever when no cable / link partner is present.
+            link_spins += 1;
+            if link_spins >= MDIO_MAX_SPINS {
+                warn!("[rtl8211f] no link (no cable?); continuing without link");
                 break;
             }
         }
@@ -833,15 +851,24 @@ where
         // linux驱动中的skb_headlen是什么?
         let mut len = send_buff.len() as u32;
 
+        // Reject oversized frames BEFORE copying: each TX buffer is only
+        // MAX_BUF_SZ bytes, but the copy below is sized to `send_buff.len()`, so
+        // a frame larger than MAX_BUF_SZ would overflow the buffer (and the
+        // multi-descriptor split that follows never fills the extra descriptors'
+        // own buffers anyway). At a normal MTU this never triggers.
+        if len > MAX_BUF_SZ {
+            error!(
+                "[rtl8211f] TX frame {} > {} (MAX_BUF_SZ); dropping",
+                len, MAX_BUF_SZ
+            );
+            return Err("tx frame too large");
+        }
+
         // send buffer长度需要注意下, 应该2k左右
         let target = unsafe {
             slice::from_raw_parts_mut(self.send_buffers[entry] as *mut u8, send_buff.len())
         };
         target.copy_from_slice(send_buff);
-
-        if len > MAX_BUF_SZ {
-            error!("The packet: {} to be send is TOO LARGE !", len);
-        }
 
         info!("========== TX PKT DATA: >>>>>>>>>>");
         print_hex_dump(target, 64);
@@ -1029,6 +1056,7 @@ where
 
         let phyaddr = 0;
         let mut autoneg_complete: u32 = 0;
+        let mut aneg_spins = 0u32;
         loop {
             // Read link and autonegotiation status
             let status = self.mdio_read(phyaddr, MII_BMSR);
@@ -1040,6 +1068,12 @@ where
                     "Autonegotiation is completed ! autoneg_complete: {:#x}",
                     autoneg_complete
                 );
+                break;
+            }
+            // Bounded: a missing link partner never completes autoneg.
+            aneg_spins += 1;
+            if aneg_spins >= MDIO_MAX_SPINS {
+                warn!("[rtl8211f] autonegotiation did not complete; continuing");
                 break;
             }
         }
@@ -1187,24 +1221,21 @@ where
     }
 
     pub fn desc_tx_close(&mut self, first: usize, end: usize, csum_insert: usize) {
-        let mut count = first;
-        let mut desc = (&mut self.send_ring[first]) as *mut DmaDesc;
-        //let mut desc = first as *mut dma_desc;
-
         self.send_ring[first].desc1 |= 1 << 29; //First Segment,
         self.send_ring[end].desc1 |= 0b11 << 30; // Last Segment, Interrupt on completion
 
         if csum_insert != 0 {
-            loop {
-                unsafe {
-                    (*desc).desc1 |= 0b11 << 27;
-                    desc = desc.add(1);
-                }
-                count += 1;
-
-                if count > end {
+            // Walk first..=end through the ring with modular indexing, bounded to
+            // one full ring. The old version advanced a raw `*mut DmaDesc` with
+            // `.add(1)`, which walked off the end of `send_ring` whenever the
+            // segment wrapped (`end < first`) or `end` was the last index.
+            let mut i = first;
+            for _ in 0..DMA_DESC_TX {
+                self.send_ring[i].desc1 |= 0b11 << 27;
+                if i == end {
                     break;
                 }
+                i = (i + 1) % DMA_DESC_TX;
             }
         }
     }
@@ -1232,7 +1263,16 @@ where
 
         // 原子上下文的等待
         //udelay(10000);
-        while (SOFT_RST & read_volatile((self.base + GETH_BASIC_CTL1) as *mut u32)) != 0 {}
+        {
+            let mut spins = 0u32;
+            while (SOFT_RST & read_volatile((self.base + GETH_BASIC_CTL1) as *mut u32)) != 0 {
+                spins += 1;
+                if spins >= MDIO_MAX_SPINS {
+                    warn!("[rtl8211f] GMAC soft reset did not clear; continuing");
+                    break;
+                }
+            }
+        }
 
         let value = read_volatile((self.base + GETH_BASIC_CTL1) as *mut u32);
         info!("Read BASIC CTL1: {:#x}", value);
@@ -1494,11 +1534,27 @@ where
 
         value |= ((phyaddr << 12) & (0x0001F000)) | ((phyreg << 4) & (0x000007F0)) | MII_BUSY;
 
-        while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {}
+        {
+            let mut spins = 0u32;
+            while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {
+                spins += 1;
+                if spins >= MDIO_MAX_SPINS {
+                    break;
+                }
+            }
+        }
 
         write_volatile((self.base + GETH_MDIO_ADDR) as *mut u32, value);
 
-        while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {}
+        {
+            let mut spins = 0u32;
+            while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {
+                spins += 1;
+                if spins >= MDIO_MAX_SPINS {
+                    break;
+                }
+            }
+        }
 
         //16位有效
         let ret = read_volatile((self.base + GETH_MDIO_DATA) as *mut u32);
@@ -1515,12 +1571,28 @@ where
             | MII_WRITE
             | MII_BUSY;
 
-        while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {}
+        {
+            let mut spins = 0u32;
+            while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {
+                spins += 1;
+                if spins >= MDIO_MAX_SPINS {
+                    break;
+                }
+            }
+        }
 
         write_volatile((self.base + GETH_MDIO_DATA) as *mut u32, data);
         write_volatile((self.base + GETH_MDIO_ADDR) as *mut u32, value);
 
-        while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {}
+        {
+            let mut spins = 0u32;
+            while (read_volatile((self.base + GETH_MDIO_ADDR) as *mut u32) & MII_BUSY) == 1 {
+                spins += 1;
+                if spins >= MDIO_MAX_SPINS {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn mdio_reset(&mut self) {

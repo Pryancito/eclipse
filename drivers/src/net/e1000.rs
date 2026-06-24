@@ -66,7 +66,6 @@ pub struct E1000 {
     tx_ring: DmaRegion,
     tx_bufs: Vec<DmaRegion>,
     tx_next_to_use: usize,
-    first_trans: bool,
 }
 
 #[inline]
@@ -151,7 +150,12 @@ impl E1000 {
             desc.len = 0;
             desc.cso = 0;
             desc.cmd = 0;
-            desc.status = 0;
+            // DD (Descriptor Done) set: a fresh, never-used TX slot must read as
+            // "done/free" so `can_send`/`send` can gate on the real ownership bit
+            // from the very first transmit. Initializing it clear forced a
+            // `first_trans` flag that blanket-skipped the ownership check for the
+            // first ring lap, which could overwrite an in-flight descriptor.
+            desc.status = 1;
             desc.css = 0;
             desc.special = 0;
         }
@@ -239,9 +243,9 @@ impl E1000 {
             rx_bufs,
             rx_next_to_clean: 0,
             tx_ring,
+            // (descriptors pre-initialized with DD set above)
             tx_bufs,
             tx_next_to_use: 0,
-            first_trans: true,
         })
     }
 
@@ -301,9 +305,6 @@ impl E1000 {
     }
 
     pub fn can_send(&self) -> bool {
-        if self.first_trans {
-            return true;
-        }
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
         let desc_addr = unsafe { ring.add(self.tx_next_to_use) };
         let status = unsafe { core::ptr::read_volatile(&((*desc_addr).status)) };
@@ -315,10 +316,9 @@ impl E1000 {
         let ring = self.tx_ring.as_ptr::<E1000SendDesc>();
         let desc_addr = unsafe { ring.add(index) };
 
-        assert!(
-            self.first_trans
-                || unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 }
-        );
+        // The caller (`NetScheme::send`) gates this on `can_send()` under the
+        // same lock, so the descriptor is guaranteed free (DD set) here.
+        debug_assert!(unsafe { (core::ptr::read_volatile(&((*desc_addr).status)) & 1) != 0 });
 
         // The TX buffer is a single page; never copy more than it can hold,
         // otherwise we would overflow into adjacent DMA buffers.
@@ -346,10 +346,6 @@ impl E1000 {
         }
 
         fence(Ordering::SeqCst);
-
-        if self.tx_next_to_use == 0 {
-            self.first_trans = false;
-        }
     }
 }
 
@@ -480,8 +476,11 @@ impl NetScheme for E1000Interface {
     }
 
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
-        if self.driver.hw.lock().can_send() {
-            let mut driver = self.driver.hw.lock();
+        // Hold the lock across the check and the send: dropping it between
+        // `can_send()` and `send()` let another CPU claim the slot, after which
+        // `send()` would post into a still-in-flight descriptor.
+        let mut driver = self.driver.hw.lock();
+        if driver.can_send() {
             driver.send(data);
             Ok(data.len())
         } else {

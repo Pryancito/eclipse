@@ -161,7 +161,7 @@ impl IoApic {
         entry.set_dest(dest);
 
         let mut flags = IrqFlags::MASKED; // destination mode: physical
-        if matches!(tm, IrqTriggerMode::Edge) {
+        if matches!(tm, IrqTriggerMode::Level) {
             flags |= IrqFlags::LEVEL_TRIGGERED;
         }
         if matches!(pol, IrqPolarity::ActiveLow) {

@@ -1157,22 +1157,31 @@ impl Syscall<'_> {
     }
 
     /// `setpgid` sets the PGID of the process specified by pid to pgid.
+    /// `pid == 0` targets the caller; `pgid == 0` makes the target its own
+    /// group leader. Job-control shells rely on this to put each foreground job
+    /// into its own process group so a Ctrl-C reaches the job, not the shell.
     pub fn sys_setpgid(&self, pid: usize, pgid: usize) -> SysResult {
         debug!("setpgid: pid={}, pgid={}", pid, pgid);
-        // Stub: return success
+        let target = if pid == 0 {
+            self.zircon_process().id()
+        } else {
+            pid as u64
+        };
+        let new_pgid = if pgid == 0 { target } else { pgid as u64 };
+        linux_object::process::set_process_pgid(target, new_pgid)?;
         Ok(0)
     }
 
     /// `getpgid` returns the PGID of the process specified by pid.
     pub fn sys_getpgid(&self, pid: usize) -> SysResult {
         debug!("getpgid: pid={}", pid);
-        // Stub: return pid as its own pgid
-        let proc = if pid == 0 {
+        let target = if pid == 0 {
             self.zircon_process().id()
         } else {
             pid as u64
         };
-        Ok(proc as usize)
+        let pgid = linux_object::process::get_process_pgid(target)?;
+        Ok(pgid as usize)
     }
 
     /// `setsid` creates a new session if the calling process is not a process group leader.
