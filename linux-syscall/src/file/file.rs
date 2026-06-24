@@ -583,8 +583,17 @@ impl Syscall<'_> {
     /// - arg – additional parameters based on cmd
     pub fn sys_fcntl(&self, fd: FileDesc, cmd: usize, arg: usize) -> SysResult {
         info!("fcntl: fd={:?}, cmd={}, arg={}", fd, cmd, arg);
+        // memfd file seals (`F_LINUX_SPECIFIC_BASE + 9/10`). We don't enforce
+        // seals — there is a single trusted address space — but Wayland/wlroots
+        // add `F_SEAL_SHRINK` to keymap memfds and abort if the call fails, so
+        // accept additions as a no-op and report "no seals set".
+        const F_ADD_SEALS: usize = 1033;
+        const F_GET_SEALS: usize = 1034;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
+            return Ok(0);
+        }
         if let Ok(cmd) = FcntlCmd::try_from(cmd) {
             match cmd {
                 FcntlCmd::GETFD => Ok(file_like.flags().close_on_exec() as usize),

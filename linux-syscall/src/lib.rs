@@ -214,6 +214,10 @@ impl Syscall<'_> {
                     .await
             }
             Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
+            Sys::MEMFD_CREATE => self.sys_memfd_create(a0.into(), a1),
+            Sys::TIMERFD_CREATE => self.sys_timerfd_create(a0, a1),
+            Sys::TIMERFD_SETTIME => self.sys_timerfd_settime(a0.into(), a1, a2.into(), a3.into()),
+            Sys::TIMERFD_GETTIME => self.sys_timerfd_gettime(a0.into(), a1.into()),
 
             Sys::SOCKETPAIR => self.sys_socketpair(a0, a1, a2, a3.into()),
             // file system

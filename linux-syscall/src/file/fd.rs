@@ -7,8 +7,98 @@
 
 use super::*;
 use alloc::string::String;
+use linux_object::fs::TimerFd;
+use linux_object::time::TimeSpec;
+
+/// `struct itimerspec` for `timerfd_settime`/`timerfd_gettime`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ITimerSpec {
+    it_interval: TimeSpec,
+    it_value: TimeSpec,
+}
+
+impl ITimerSpec {
+    fn value_ns(&self) -> u64 {
+        self.it_value.sec as u64 * 1_000_000_000 + self.it_value.nsec as u64
+    }
+    fn interval_ns(&self) -> u64 {
+        self.it_interval.sec as u64 * 1_000_000_000 + self.it_interval.nsec as u64
+    }
+    fn from_ns(interval_ns: u64, value_ns: u64) -> Self {
+        let ts = |ns: u64| TimeSpec {
+            sec: (ns / 1_000_000_000) as usize,
+            nsec: (ns % 1_000_000_000) as usize,
+        };
+        ITimerSpec {
+            it_interval: ts(interval_ns),
+            it_value: ts(value_ns),
+        }
+    }
+}
 
 impl Syscall<'_> {
+    /// `timerfd_create(2)`: a timer delivered through a readable fd. The
+    /// `wl_event_loop` (libwayland) arms one for all its timers.
+    pub fn sys_timerfd_create(&self, clockid: usize, flags: usize) -> SysResult {
+        info!("timerfd_create: clockid={}, flags={:#x}", clockid, flags);
+        const TFD_CLOEXEC: usize = 0x80000;
+        const TFD_NONBLOCK: usize = 0x800;
+        let mut open_flags = OpenFlags::empty();
+        if flags & TFD_CLOEXEC != 0 {
+            open_flags |= OpenFlags::CLOEXEC;
+        }
+        if flags & TFD_NONBLOCK != 0 {
+            open_flags |= OpenFlags::NON_BLOCK;
+        }
+        let tfd = TimerFd::new(open_flags);
+        let fd = self.linux_process().add_file(tfd)?;
+        Ok(fd.into())
+    }
+
+    /// `timerfd_settime(2)`: arm/disarm the timer (`TFD_TIMER_ABSTIME` = bit 0).
+    pub fn sys_timerfd_settime(
+        &self,
+        fd: FileDesc,
+        flags: usize,
+        new_value: UserInPtr<ITimerSpec>,
+        mut old_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        const TFD_TIMER_ABSTIME: usize = 1;
+        let file_like = self.linux_process().get_file_like(fd)?;
+        let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
+        if !old_value.is_null() {
+            let (iv, rem) = tfd.get_time();
+            old_value.write(ITimerSpec::from_ns(iv, rem))?;
+        }
+        let v = new_value.read()?;
+        info!(
+            "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
+            fd,
+            flags,
+            v.value_ns(),
+            v.interval_ns()
+        );
+        tfd.set_time(
+            v.value_ns(),
+            v.interval_ns(),
+            flags & TFD_TIMER_ABSTIME != 0,
+        );
+        Ok(0)
+    }
+
+    /// `timerfd_gettime(2)`: report the time until the next expiration.
+    pub fn sys_timerfd_gettime(
+        &self,
+        fd: FileDesc,
+        mut curr_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        let file_like = self.linux_process().get_file_like(fd)?;
+        let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
+        let (iv, rem) = tfd.get_time();
+        curr_value.write(ITimerSpec::from_ns(iv, rem))?;
+        Ok(0)
+    }
     /// Opens or creates a file, depending on the flags passed to the call. Returns an integer with the file descriptor.
     pub fn sys_open(&self, path: UserInPtr<u8>, flags: usize, mode: usize) -> SysResult {
         self.sys_openat(FileDesc::CWD, path, flags, mode)
@@ -232,6 +322,18 @@ impl Syscall<'_> {
 
         proc.get_file(fd)?;
         Ok(0)
+    }
+
+    /// `memfd_create(2)`: create an anonymous in-RAM file referred to by the
+    /// returned fd. Supports `ftruncate`, `mmap` and `read`/`write`; seals
+    /// (`fcntl` `F_ADD_SEALS`) are accepted as no-ops. Wayland/wlroots/Mesa use
+    /// it to share xkb keymaps and shm pools.
+    pub fn sys_memfd_create(&self, name: UserInPtr<u8>, flags: usize) -> SysResult {
+        let name = name.as_c_str().unwrap_or("memfd");
+        info!("memfd_create: name={:?}, flags={:#x}", name, flags);
+        let file = linux_object::fs::new_memfd(name, flags)?;
+        let fd = self.linux_process().add_file(file)?;
+        Ok(fd.into())
     }
 
     /// creates an eventfd object that can be used as an event notification mechanism by user-space applications,
