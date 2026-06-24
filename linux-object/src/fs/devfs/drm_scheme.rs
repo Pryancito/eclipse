@@ -46,6 +46,8 @@ const DRM_IOCTL_GET_UNIQUE: u32 = 0xC0106401;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
+const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
 const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
@@ -391,6 +393,9 @@ impl INode for DrmDev {
                 }
                 Ok(0)
             }
+            // A single DRM client on the primary node is implicitly master;
+            // accept (drop-)master so seatd/wlroots session activation succeeds.
+            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
             DRM_IOCTL_SET_CLIENT_CAP => {
                 // struct drm_set_client_cap { __u64 capability; __u64 value; }
                 let cap = unsafe { *(data as *const u64) };
