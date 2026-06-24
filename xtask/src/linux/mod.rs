@@ -56,6 +56,8 @@ impl LinuxRootfs {
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
+            // INIT (PID 1): busybox init (idempotente).
+            self.install_busybox_init(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -366,6 +368,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
+        // INIT (PID 1): busybox init (/sbin/init -> busybox) + inittab + rcS.
+        self.install_busybox_init(&dir);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
@@ -382,6 +386,70 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
                 }
             }
+        }
+    }
+
+    /// Wire up busybox `init` as the PID 1 base program.
+    ///
+    /// busybox already ships in the rootfs (with an `init` applet), so no
+    /// package install / network is needed: this only lays down `/sbin/init`
+    /// (-> `/bin/busybox`), a minimal `/etc/inittab`, and the `/etc/init.d/rcS`
+    /// sysinit hook. The Eclipse kernel owns the virtual terminals (it spawns
+    /// the per-VT shells itself), so the inittab has NO `getty`/`askfirst`
+    /// lines — `init` runs the sysinit hook once and then reaps orphaned
+    /// children as PID 1.
+    fn install_busybox_init(&self, rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
+
+        // /sbin/init -> /bin/busybox. busybox selects its applet from
+        // basename(argv[0]), so exec'ing /sbin/init runs the `init` applet
+        // regardless of the symlink target. (The kernel boots INIT=/sbin/init.)
+        let sbin = rootfs.join("sbin");
+        let _ = fs::create_dir_all(&sbin);
+        let init_link = sbin.join("init");
+        let _ = fs::remove_file(&init_link);
+        #[cfg(unix)]
+        {
+            let _ = unix::fs::symlink("/bin/busybox", &init_link);
+        }
+
+        // Minimal inittab. NO getty/askfirst: the kernel already provides the
+        // per-VT shells. busybox init runs the sysinit hook, then idles handling
+        // Ctrl-Alt-Del / shutdown / restart while reaping orphaned children.
+        fs::write(
+            etc.join("inittab"),
+            b"# Eclipse OS - busybox init. The kernel owns the virtual terminals\n\
+              # (it spawns the per-VT shells), so there are NO getty lines here;\n\
+              # init runs the sysinit hook once and then reaps orphaned children.\n\
+              ::sysinit:/etc/init.d/rcS\n\
+              ::ctrlaltdel:/bin/busybox reboot\n\
+              ::shutdown:/bin/busybox swapoff -a\n\
+              ::restart:/sbin/init\n",
+        )
+        .unwrap();
+
+        // /etc/init.d/rcS — the sysinit hook. The kernel already mounts the root
+        // fs, brings up the network and spawns the shells, so this is just a
+        // place to start optional background services. Safe by default (no-op);
+        // a commented example shows how to launch the seatd seat manager.
+        let initd = etc.join("init.d");
+        let _ = fs::create_dir_all(&initd);
+        let rcs = initd.join("rcS");
+        fs::write(
+            &rcs,
+            b"#!/bin/sh\n\
+              # Eclipse OS sysinit hook (busybox init). Add boot-time services\n\
+              # here; the kernel already handles root mount, networking and the\n\
+              # per-TTY shells. Example - start the Wayland/X seat manager:\n\
+              #   [ -x /usr/bin/seatd ] && /usr/bin/seatd >/dev/null 2>&1 &\n\
+              exit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rcs, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
@@ -664,7 +732,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                   s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/;\
                   s/.*CONFIG_FEATURE_IPV6.*/CONFIG_FEATURE_IPV6=y/;\
                   s/.*CONFIG_UDHCPC6.*/CONFIG_UDHCPC6=y/;\
-                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/",
+                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/;\
+                  s/^# CONFIG_INIT is not set$/CONFIG_INIT=y/;\
+                  s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/",
             )
             .arg(".config")
             .invoke();
