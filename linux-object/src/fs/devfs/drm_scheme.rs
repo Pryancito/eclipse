@@ -43,6 +43,8 @@ impl DrmDev {
 // DRM IOCTL numbers (Linux x86_64)
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 const DRM_IOCTL_GET_UNIQUE: u32 = 0xC0106401;
+const DRM_IOCTL_GET_MAGIC: u32 = 0xC0046402;
+const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
@@ -452,6 +454,16 @@ impl INode for DrmDev {
             // accept (drop-)master so seatd/wlroots session activation succeeds.
             // Master = the client owns the display: leave/restore the kernel text
             // console accordingly (KD_GRAPHICS while a compositor is scanning out).
+            // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
+            // success as "this fd is DRM master". wlroots' dumb-buffer allocator
+            // (pixman path) requires master, so always succeed — the single
+            // client on the primary node is implicitly master here.
+            DRM_IOCTL_GET_MAGIC => {
+                // struct drm_auth { __u32 magic; }
+                unsafe { *(data as *mut u32) = 1 };
+                Ok(0)
+            }
+            DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_SET_MASTER => {
                 kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
                 Ok(0)
