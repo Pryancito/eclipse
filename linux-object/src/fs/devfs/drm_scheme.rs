@@ -68,16 +68,9 @@ const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
 
-// DRM object types (drm_mode_obj_get_properties.obj_type).
-const DRM_MODE_OBJECT_CRTC: u32 = 0xCCCC_CCCC;
-const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xC0C0_C0C0;
-const DRM_MODE_OBJECT_PLANE: u32 = 0xEEEE_EEEE;
-
 // Synthetic property ids (software KMS). Only the plane "type" is mandatory for
 // wlroots' legacy backend to classify the primary plane.
 const PROP_TYPE: u32 = 10;
-
-// drm_mode_modeinfo flags helper already defined above.
 
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
@@ -722,15 +715,14 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
                 let res = unsafe { &mut *(data as *mut DrmModeObjGetProperties) };
-                // Only the plane "type" property is mandatory (wlroots uses it to
-                // find the primary plane). Connectors/CRTCs report no properties;
-                // the legacy backend tolerates their absence.
-                let props: &[(u32, u64)] = if res.obj_type == DRM_MODE_OBJECT_PLANE {
+                // Identify the object by id (libdrm often passes obj_type=ANY).
+                // Only the plane "type" property is mandatory; connectors/CRTCs
+                // report none (the legacy backend tolerates their absence).
+                let props: &[(u32, u64)] = if res.obj_id == drm::SYNTH_PLANE_ID {
                     &[(PROP_TYPE, 1)] // value 1 = DRM_PLANE_TYPE_PRIMARY
                 } else {
                     &[]
                 };
-                let _ = (DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_CONNECTOR);
                 let n = props.len();
                 if n > 0 && res.props_ptr != 0 && (res.count_props as usize) >= n {
                     for (i, (pid, val)) in props.iter().enumerate() {
@@ -741,6 +733,12 @@ impl INode for DrmDev {
                     }
                 }
                 res.count_props = n as u32;
+                log::warn!(
+                    "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
+                    res.obj_id,
+                    res.obj_type,
+                    n
+                );
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETPROPERTY => {

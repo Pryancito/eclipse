@@ -21,12 +21,16 @@ use zircon_object::vm::{pages, MMUFlags, VmObject};
 /// wlroots' legacy modeset path needs at least one CRTC, connector and encoder
 /// to drive an output; we synthesize them around the framebuffer and scan dumb
 /// buffers out via [`DisplayScheme::blit_from`].
+///
+/// The ids must be **distinct across object types**: libdrm identifies objects
+/// (for OBJ_GETPROPERTIES etc.) by id alone, often passing obj_type=ANY, so
+/// reusing one id for CRTC/connector/plane makes them indistinguishable.
 const SYNTH_CRTC_ID: u32 = 1;
-const SYNTH_CONNECTOR_ID: u32 = 1;
+const SYNTH_CONNECTOR_ID: u32 = 2;
 /// Encoder id exposed to userspace for the synthetic output.
-pub const SYNTH_ENCODER_ID: u32 = 1;
+pub const SYNTH_ENCODER_ID: u32 = 3;
 /// Primary plane id exposed to userspace for the synthetic output.
-pub const SYNTH_PLANE_ID: u32 = 1;
+pub const SYNTH_PLANE_ID: u32 = 4;
 
 /// Sequence counter for delivered page-flip / vblank events.
 static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
