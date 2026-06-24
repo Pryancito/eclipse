@@ -876,6 +876,20 @@ fn display_pci_index() -> Option<usize> {
         .or_else(|| (!devs.is_empty()).then_some(0))
 }
 
+/// Whether `/sys/class/drm/card0` should be exposed, and which PCI device (if
+/// any) backs it. card0 exists whenever `/dev/dri/card0` does — i.e. there is a
+/// real PCI GPU, a registered framebuffer display (UEFI GOP has no PCI GPU
+/// node), or a DRM driver. The PCI index is best-effort, used only for the
+/// `device`/`modalias` attributes.
+fn drm_card0_pci_index() -> Option<usize> {
+    if let Some(idx) = display_pci_index() {
+        return Some(idx);
+    }
+    let have_fb =
+        drivers::all_display().first().is_some() || !drivers::all_drm().as_vec().is_empty();
+    have_fb.then_some(0)
+}
+
 fn list_net_ifnames() -> Vec<String> {
     let ifaces = get_net_device();
     if ifaces.is_empty() {
@@ -914,14 +928,14 @@ impl INode for SysClassDrmDirINode {
         match name {
             "." => Ok(Arc::new(SysClassDrmDirINode)),
             ".." => Ok(Arc::new(SysClassINode)),
-            "card0" => display_pci_index()
+            "card0" => drm_card0_pci_index()
                 .map(|idx| Arc::new(SysDrmCardINode { pci_index: idx }) as Arc<dyn INode>)
                 .ok_or(FsError::EntryNotFound),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 && display_pci_index().is_some() {
+        if id == 0 && drm_card0_pci_index().is_some() {
             Ok("card0".into())
         } else {
             Err(FsError::EntryNotFound)
@@ -934,8 +948,8 @@ struct SysDrmCardINode {
 }
 
 impl SysDrmCardINode {
-    fn entries() -> [&'static str; 1] {
-        ["device"]
+    fn entries() -> [&'static str; 4] {
+        ["dev", "uevent", "device", "subsystem"]
     }
 }
 
@@ -968,6 +982,19 @@ impl INode for SysDrmCardINode {
                 pci_index: self.pci_index,
             })),
             ".." => Ok(Arc::new(SysClassDrmDirINode)),
+            // What libudev reads to recognize the DRM device and resolve its
+            // node: `dev` (major:minor) and `uevent` (DEVNAME/MAJOR/MINOR). DRM
+            // major is 226; card0 is minor 0 → /dev/dri/card0.
+            "dev" => Ok(Arc::new(Pseudo::new("226:0\n", FileType::File))),
+            "uevent" => Ok(Arc::new(Pseudo::new(
+                "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n",
+                FileType::File,
+            ))),
+            // Subsystem link so libudev classifies this device as "drm".
+            "subsystem" => Ok(Arc::new(Pseudo::new(
+                "../../../class/drm",
+                FileType::SymLink,
+            ))),
             "device" => Ok(Arc::new(SysDrmCardDeviceINode {
                 pci_index: self.pci_index,
             })),
