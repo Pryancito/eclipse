@@ -56,8 +56,12 @@ impl LinuxRootfs {
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
-            // INIT (PID 1): busybox init (idempotente).
+            // INIT (PID 1): OpenRC by default, with busybox init as a resilient
+            // fallback. `install_busybox_init` runs first so `/sbin/init` always
+            // resolves to *some* PID 1; `install_openrc` then repoints it at
+            // `openrc-init` when the (best-effort) OpenRC build is available.
             self.install_busybox_init(&dir);
+            self.install_openrc(&dir, &musl);
             return;
         }
         // 准备最小系统需要的资源
@@ -368,8 +372,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
-        // INIT (PID 1): busybox init (/sbin/init -> busybox) + inittab + rcS.
+        // INIT (PID 1): OpenRC by default; busybox init kept as a resilient
+        // fallback. busybox lays down `/sbin/init` -> busybox (+ inittab + rcS)
+        // first, then OpenRC repoints `/sbin/init` -> `openrc-init` and installs
+        // its userland when the (best-effort) cross build succeeds.
         self.install_busybox_init(&dir);
+        self.install_openrc(&dir, &musl);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
@@ -451,6 +459,228 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rcs, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// Cross-compile the latest OpenRC with the musl toolchain (best-effort) and
+    /// return the staging directory (a `DESTDIR`-style tree) ready to be mirrored
+    /// into the rootfs, or `None` if the build is unavailable.
+    ///
+    /// Mirrors the busybox / e2fsprogs conventions: the source is cloned on first
+    /// use, built in a separate tree, and the staged install is cached (a
+    /// subsequent build returns immediately once `sbin/openrc-init` is present).
+    ///
+    /// OpenRC (≥0.54) builds with meson + ninja. We generate a meson cross-file
+    /// pointing at the musl toolchain and let meson auto-disable every optional
+    /// feature (pam / selinux / audit / …): the bare musl sysroot ships none of
+    /// those libraries, and `PKG_CONFIG_LIBDIR` is pinned to the (empty) sysroot
+    /// `pkgconfig` dir so host packages can't leak wrong-arch deps into the cross
+    /// build. No `-D` options are passed, so the invocation stays robust across
+    /// upstream option renames.
+    fn openrc(&self, musl: &Path) -> Option<PathBuf> {
+        let staging = self.0.target().join("openrc-install");
+        let init_bin = staging.join("sbin").join("openrc-init");
+        if init_bin.is_file() {
+            return Some(staging);
+        }
+
+        // meson + ninja are required. ninja ships in CI (apt `ninja-build`);
+        // meson is installed best-effort via pip3 when missing.
+        if !host_tool_exists("ninja") {
+            eprintln!(
+                "warning: ninja not found; skipping OpenRC build (busybox init remains PID 1)"
+            );
+            return None;
+        }
+        if !host_tool_exists("meson") {
+            println!("OpenRC: meson not found, attempting `pip3 install --user meson`...");
+            let _ = Ext::new("pip3")
+                .arg("install")
+                .arg("--user")
+                .arg("-q")
+                .arg("meson")
+                .status();
+        }
+        if !host_tool_exists("meson") {
+            eprintln!(
+                "warning: meson unavailable; skipping OpenRC build (busybox init remains PID 1)"
+            );
+            return None;
+        }
+
+        // Source (shallow clone of the canonical upstream repo).
+        let source = REPOS.join("openrc");
+        if !source.is_dir() {
+            fetch_online!(source, |tmp| {
+                Git::clone("https://github.com/OpenRC/openrc.git")
+                    .dir(tmp)
+                    .single_branch()
+                    .depth(1)
+                    .done()
+            });
+        }
+
+        let musl = musl.canonicalize().unwrap();
+        let arch = self.0.name();
+        let musl_bin = musl.join("bin");
+        let cc = format!("{}/{}-linux-musl-gcc", musl_bin.display(), arch);
+        let ar = format!("{}/{}-linux-musl-ar", musl_bin.display(), arch);
+        let strip_tool = format!("{}/{}-linux-musl-strip", musl_bin.display(), arch);
+        let cpu_family = match self.0 {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+            Arch::Riscv64 => "riscv64",
+        };
+
+        // meson cross-file describing the musl toolchain and the target machine.
+        fs::create_dir_all(self.0.target()).unwrap();
+        let cross = self.0.target().join("openrc-cross.ini");
+        fs::write(
+            &cross,
+            format!(
+                "[binaries]\n\
+                 c = '{cc}'\n\
+                 ar = '{ar}'\n\
+                 strip = '{strip_tool}'\n\
+                 \n\
+                 [host_machine]\n\
+                 system = 'linux'\n\
+                 cpu_family = '{cpu_family}'\n\
+                 cpu = '{arch}'\n\
+                 endian = 'little'\n",
+            ),
+        )
+        .unwrap();
+
+        // Keep host pkg-config from leaking wrong-arch libpam / libselinux /
+        // libaudit into the cross build: point it at the (empty) musl sysroot
+        // pkgconfig dir so every optional `dependency()` auto-disables.
+        let pkgconfig_libdir = musl
+            .join(format!("{arch}-linux-musl"))
+            .join("lib")
+            .join("pkgconfig");
+
+        // Fresh build tree. prefix=/ with a single `/lib` (no `/usr` split, the
+        // busybox-style layout the rootfs already uses) and the libexec helpers
+        // under `/lib/rc`.
+        let build = self.0.target().join("openrc-build");
+        dir::rm(&build).unwrap();
+        let status = Ext::new("meson")
+            .arg("setup")
+            .arg(&build)
+            .arg(&source)
+            .arg(format!("--cross-file={}", cross.display()))
+            .arg("--prefix=/")
+            .arg("--sysconfdir=/etc")
+            .arg("--bindir=bin")
+            .arg("--sbindir=sbin")
+            .arg("--libdir=lib")
+            .arg("--libexecdir=lib")
+            .arg("--buildtype=release")
+            .env("PKG_CONFIG_LIBDIR", &pkgconfig_libdir)
+            .env("PKG_CONFIG_PATH", "")
+            .status();
+        if !status.success() {
+            eprintln!("warning: OpenRC meson setup failed; busybox init remains PID 1");
+            return None;
+        }
+        let status = Ext::new("ninja").arg("-C").arg(&build).status();
+        if !status.success() {
+            eprintln!("warning: OpenRC ninja build failed; busybox init remains PID 1");
+            return None;
+        }
+        dir::rm(&staging).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let status = Ext::new("ninja")
+            .arg("-C")
+            .arg(&build)
+            .arg("install")
+            .env("DESTDIR", &staging)
+            .status();
+        if !status.success() {
+            eprintln!("warning: OpenRC install failed; busybox init remains PID 1");
+            return None;
+        }
+        if init_bin.is_file() {
+            println!("Built OpenRC -> {}", staging.display());
+            Some(staging)
+        } else {
+            eprintln!("warning: OpenRC build produced no openrc-init; busybox init remains PID 1");
+            None
+        }
+    }
+
+    /// Install OpenRC as the default init system (PID 1) in `rootfs`
+    /// (best-effort); returns `true` on success, `false` if OpenRC is
+    /// unavailable and the busybox init fallback should stand.
+    ///
+    /// The staged `DESTDIR` tree from [`openrc`](Self::openrc) is mirrored into
+    /// the rootfs verbatim (the `openrc-init` / `openrc` / `rc-*` binaries into
+    /// `/sbin` and `/bin`, the `librc` / `libeinfo` shared libs and the `/lib/rc`
+    /// libexec helpers into `/lib`, and the stock service scripts and config into
+    /// `/etc/init.d`, `/etc/conf.d`, `/etc/rc.conf`). `/sbin/init` is repointed
+    /// at `openrc-init`.
+    ///
+    /// The active runlevels (`sysinit` / `boot` / `default` / `shutdown`) are
+    /// provisioned **empty**: the Eclipse kernel already mounts the root fs,
+    /// brings up the network and spawns the per-VT shells, so the stock
+    /// mount / hostname / getty services would only fight it. The full OpenRC
+    /// userland is still present, so an operator can `rc-update add <svc>
+    /// default` to wire real services later.
+    fn install_openrc(&self, rootfs: &Path, musl: &Path) -> bool {
+        let staging = match self.openrc(musl) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Mirror the staged tree (sbin/bin/lib/etc/…) into the rootfs, preserving
+        // symlinks and permissions. Robust to upstream path tweaks.
+        copy_tree(&staging, rootfs);
+
+        // /sbin/init -> openrc-init (PID 1). The kernel boots INIT=/sbin/init by
+        // default; this makes that resolve to OpenRC, overriding the busybox
+        // fallback symlink laid down by `install_busybox_init`.
+        let sbin = rootfs.join("sbin");
+        let _ = fs::create_dir_all(&sbin);
+        let init_link = sbin.join("init");
+        let _ = fs::remove_file(&init_link);
+        #[cfg(unix)]
+        {
+            let _ = unix::fs::symlink("openrc-init", &init_link);
+        }
+
+        // Minimal runlevels: just the directories, empty by default. openrc-init
+        // runs through sysinit/boot/default launching nothing (so it never
+        // duplicates the kernel's own boot work), then idles as PID 1 reaping
+        // orphaned children — the same lean contract as the busybox inittab.
+        let runlevels = rootfs.join("etc").join("runlevels");
+        for rl in ["sysinit", "boot", "default", "shutdown"] {
+            let _ = fs::create_dir_all(runlevels.join(rl));
+        }
+
+        // /etc/rc.conf tuned for Eclipse: keep OpenRC lean and out of the
+        // kernel's way (no parallel start, no cgroup management, no syslog
+        // dependency). `rc_sys=""` = bare-metal/no-container heuristics.
+        fs::write(
+            rootfs.join("etc").join("rc.conf"),
+            b"# Eclipse OS - OpenRC global config.\n\
+              # The kernel already mounts root, configures the network and spawns\n\
+              # the per-VT shells, so OpenRC runs as a lean PID 1 supervisor: the\n\
+              # default runlevels are empty and you opt services in explicitly\n\
+              # with `rc-update add <service> default`.\n\
+              rc_sys=\"\"\n\
+              rc_parallel=\"NO\"\n\
+              rc_cgroup_mode=\"none\"\n\
+              rc_logger=\"NO\"\n\
+              unicode=\"YES\"\n",
+        )
+        .unwrap();
+
+        // /run/openrc is created on the runtime tmpfs; ensure the mount point and
+        // /run exist so OpenRC's state dir has somewhere to attach.
+        let _ = fs::create_dir_all(rootfs.join("run").join("openrc"));
+
+        println!("Installed OpenRC as the default init system (PID 1).");
+        true
     }
 
     /// Compila thr3 con gcc del host (bare metal, sin libc).
@@ -1278,6 +1508,56 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     Ext::new(&strip).arg("-s").arg(target).status();
                 }
             });
+    }
+}
+
+/// True if a host build tool can be executed (probed via `--version`). Used to
+/// gate the best-effort OpenRC build on meson / ninja being installed.
+fn host_tool_exists(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Recursively copy `src` into `dst`, **merging** into existing directories and
+/// preserving symlinks and unix permissions. Used to mirror the staged OpenRC
+/// `DESTDIR` tree into the rootfs without clobbering sibling files already
+/// present there (unlike `dircpy`, which expects a fresh destination).
+fn copy_tree(src: &Path, dst: &Path) {
+    let md = match fs::symlink_metadata(src) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if md.file_type().is_symlink() {
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let target = fs::read_link(src).unwrap();
+        let _ = fs::remove_file(dst);
+        #[cfg(unix)]
+        let _ = unix::fs::symlink(target, dst);
+        return;
+    }
+    if md.is_dir() {
+        let _ = fs::create_dir_all(dst);
+        for entry in fs::read_dir(src).unwrap().flatten() {
+            copy_tree(&entry.path(), &dst.join(entry.file_name()));
+        }
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::remove_file(dst);
+    fs::copy(src, dst).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = fs::metadata(src) {
+            let _ = fs::set_permissions(dst, fs::Permissions::from_mode(m.permissions().mode()));
+        }
     }
 }
 

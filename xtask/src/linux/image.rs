@@ -67,11 +67,11 @@ const LIVE_FILE_CAP: u64 = 16 * 1024 * 1024;
 /// ships in `rootfs.btrfs.gz` and runs from the btrfs disk on the installed
 /// system, which pivots root onto it.
 const LIVE_KEEP: [&str; 8] = [
-    "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools
-    "lib",              // ld-musl + libeclipse_dns + apk db (capped: drops stray big libs)
-    "etc",              // fstab, profile, ssl certs, apk repo, machine-id, X11 configs
+    "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools + rc-*
+    "lib",              // ld-musl + libeclipse_dns + apk db + librc/libeinfo + /lib/rc (capped)
+    "etc",              // fstab, profile, ssl certs, apk repo, machine-id, X11, OpenRC (init.d/conf.d/runlevels/rc.conf)
     "var",              // apk dbs (small)
-    "sbin",             // openrc-init, if present (INIT)
+    "sbin",             // openrc-init / openrc / rc-* + /sbin/init -> openrc-init (INIT)
     "root",             // root's home / rc files (capped)
     "usr/sbin",         // openssl -> ssl_client wrapper
     "usr/share/udhcpc", // DHCP dispatcher scripts

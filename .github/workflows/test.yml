@@ -101,8 +101,8 @@ jobs:
           path: qemu-${{ env.qemu_version }}
           key: qemu-${{ env.qemu_version }}
 
-      - name: Install ninja-build
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install ninja-build and meson
+        run: sudo apt-get update && sudo apt-get install -y ninja-build meson
 
       - name: Download and Compile QEMU
         if: steps.cache-qemu.outputs.cache-hit != 'true'
@@ -177,8 +177,8 @@ jobs:
           path: qemu-${{ env.qemu_version }}
           key: qemu-${{ env.qemu_version }}
 
-      - name: Install ninja-build
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install ninja-build and meson
+        run: sudo apt-get update && sudo apt-get install -y ninja-build meson
 
       - name: Download and Compile QEMU
         if: steps.cache-qemu.outputs.cache-hit != 'true'
@@ -234,8 +234,8 @@ jobs:
           path: qemu-${{ env.qemu_version }}
           key: qemu-${{ env.qemu_version }}
 
-      - name: Install ninja-build
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install ninja-build and meson
+        run: sudo apt-get update && sudo apt-get install -y ninja-build meson
 
       - name: Download and Compile QEMU
         if: steps.cache-qemu.outputs.cache-hit != 'true'
