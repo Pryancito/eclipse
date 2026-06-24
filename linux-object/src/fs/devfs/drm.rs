@@ -34,6 +34,28 @@ fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
     drivers::all_display().first()
 }
 
+/// Whether any registered DRM driver exposes a usable KMS configuration
+/// (at least one CRTC *and* one connector). A driver that returns nothing
+/// (or no driver at all) cannot drive a modeset.
+fn drivers_have_kms(drivers: &[Arc<dyn DrmScheme>]) -> bool {
+    drivers.iter().any(|d| {
+        let (_, crtcs, conns) = d.get_resources();
+        !crtcs.is_empty() && !conns.is_empty()
+    })
+}
+
+/// Whether the software KMS path should drive the output: there is a
+/// framebuffer display and no DRM driver provides a usable KMS config. This
+/// covers both "no GPU driver" and "a driver is registered but exposes no
+/// CRTC/connector" (e.g. a GPU we can't modeset) — in either case we synthesize
+/// a CRTC/connector/encoder over the framebuffer and scan dumb buffers out.
+pub fn software_kms_active() -> bool {
+    if primary_display().is_none() {
+        return false;
+    }
+    !drivers_have_kms(&DRM_STATE.lock().drivers)
+}
+
 /// A DRM Framebuffer object
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -227,7 +249,10 @@ pub fn scanout(fb_id: u32) -> bool {
 /// `crtc_id`/`user_data` come from the page-flip request and are echoed back in
 /// the `drm_event_vblank` so libdrm's event loop can match the flip.
 pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
-    let flipped = if let Some(driver) = get_primary_driver() {
+    let flipped = if software_kms_active() {
+        // No usable hardware KMS: blit the dumb buffer to the framebuffer.
+        scanout(fb_id)
+    } else if let Some(driver) = get_primary_driver() {
         // Hardware driver owns scanout; fall back to a software blit if it
         // declines (e.g. a framebuffer-only "simplefb" DRM shim).
         driver.page_flip(fb_id) || scanout(fb_id)
@@ -283,8 +308,10 @@ pub fn has_events() -> bool {
 }
 
 pub fn get_caps() -> Option<DrmCaps> {
-    if let Some(d) = get_primary_driver() {
-        return Some(d.get_caps());
+    if !software_kms_active() {
+        if let Some(d) = get_primary_driver() {
+            return Some(d.get_caps());
+        }
     }
     // Software framebuffer fallback.
     let (w, h, _) = display_mode()?;
@@ -317,21 +344,20 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let state = DRM_STATE.lock();
     let fbs: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
 
-    if state.drivers.is_empty() {
-        // Software framebuffer fallback: one synthetic CRTC + connector.
-        drop(state);
-        if primary_display().is_some() {
-            return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
-        }
-        return (fbs, Vec::new(), Vec::new());
-    }
-
     let mut crtcs = Vec::new();
     let mut connectors = Vec::new();
     for driver in &state.drivers {
         let (_, d_crtcs, d_conns) = driver.get_resources();
         crtcs.extend(d_crtcs);
         connectors.extend(d_conns);
+    }
+    drop(state);
+
+    // If no driver exposes a usable KMS config, fall back to a synthetic
+    // CRTC + connector over the framebuffer so `drmIsKMS()` (CRTCs>0 &&
+    // connectors>0) passes and wlroots can drive the output.
+    if (crtcs.is_empty() || connectors.is_empty()) && primary_display().is_some() {
+        return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
     }
 
     (fbs, crtcs, connectors)
@@ -345,11 +371,8 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
                 return Some(conn);
             }
         }
-        if !state.drivers.is_empty() {
-            return None;
-        }
     }
-    // Software framebuffer fallback.
+    // Software framebuffer fallback (no driver, or driver without KMS).
     if id != SYNTH_CONNECTOR_ID {
         return None;
     }
@@ -371,11 +394,8 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
                 return Some(crtc);
             }
         }
-        if !state.drivers.is_empty() {
-            return None;
-        }
     }
-    // Software framebuffer fallback.
+    // Software framebuffer fallback (no driver, or driver without KMS).
     if id != SYNTH_CRTC_ID {
         return None;
     }
