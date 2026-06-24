@@ -148,6 +148,10 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
+        // hunter: inherit the parent's syscall whitelist into the child so a
+        // process cannot shed its policy merely by forking, and seed a fresh
+        // anomaly window for the new pid.
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok(new_proc)
     }
@@ -168,6 +172,8 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
+        // hunter: same lifecycle hook as fork (see fork_impl).
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -541,6 +547,19 @@ impl Syscall<'_> {
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
         let vmo = inode.read_as_vmo()?;
+        // hunter: validate ELF integrity and executable-path policy before we
+        // destroy the old address space. The header is read from the SAME VMO
+        // that is about to be mapped (not a second inode read), so there is no
+        // TOCTOU window where a racing writer could swap the file between the
+        // integrity check and execution. A rejection aborts with EACCES;
+        // report-only mode merely records an audit event.
+        {
+            let mut header = [0u8; 64];
+            let _ = vmo.read(0, &mut header);
+            if !hunter::check_elf_binary(path_str, &header) {
+                return Err(LxError::EACCES);
+            }
+        }
 
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across
@@ -570,6 +589,10 @@ impl Syscall<'_> {
         proc.apply_exec_metadata(&metadata);
         self.zircon_process()
             .set_name(comm_from_path(&execute_path));
+        // hunter: a new image is now in place — re-apply any default syscall
+        // whitelist and reset the anomaly window so a benign-then-malicious
+        // exec cannot launder accumulated detection state.
+        hunter::task_exec(self.zircon_process().id(), &execute_path);
 
         self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
@@ -635,6 +658,9 @@ impl Syscall<'_> {
     pub fn sys_exit_group(&mut self, exit_code: i32) -> SysResult {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
+        // hunter state is released centrally in zircon Process::terminate so it
+        // covers every teardown path (signal-kill, exception, _exit), not just
+        // exit_group — see zircon-object/src/task/process.rs.
         proc.exit(exit_code as i64);
         Ok(0)
     }

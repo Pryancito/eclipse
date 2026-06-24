@@ -59,6 +59,23 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // Bring up the hunter security subsystem. Register the monotonic clock
+    // first so the very first recorded event carries a real timestamp, then a
+    // durable sink that streams high-severity (Warning+) events to the kernel
+    // log before any in-memory ring eviction can erase them, then initialize
+    // the policy/IDS engine.
+    hunter::set_time_source(|| kernel_hal::timer::timer_now().as_nanos() as u64);
+    hunter::set_sink(|e: &hunter::event_log::LogEntry| {
+        kernel_hal::klog_info!(
+            "hunter[{}] {} {} pid={} {}",
+            e.severity.as_str(),
+            e.category,
+            e.action,
+            e.pid,
+            e.description
+        );
+    });
+    hunter::init();
     kernel_hal::console::early_progress_bar(90);
     cfg_if! {
         if #[cfg(all(feature = "linux", feature = "zircon"))] {
