@@ -104,6 +104,10 @@ impl ProcessExt for Process {
         proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
                 if let Some(proc) = weak_proc.upgrade() {
+                    // Reparent any still-live children to INIT before tearing
+                    // this process down, so they are not stranded on a dead
+                    // parent that will never `wait` for them.
+                    reparent_live_children_to_init(&proc);
                     let mut inner = proc.linux().inner.lock();
                     inner.files.clear();
                     inner.futexes.clear();
@@ -159,17 +163,20 @@ impl ProcessExt for Process {
             .children
             .insert(new_proc.id(), new_proc.clone());
 
-        // notify parent on terminated
+        // On termination: reparent this process's own still-live children to
+        // INIT, then notify whoever reaps *this* process — its real parent
+        // while alive, otherwise INIT (orphan reparenting). See `reaper_for` /
+        // `reparent_live_children_to_init`.
         let parent = parent.clone();
         let weak_proc = Arc::downgrade(&new_proc);
         new_proc.add_signal_callback(Box::new(move |signal| {
             if signal.contains(Signal::PROCESS_TERMINATED) {
-                parent.signal_set(Signal::SIGCHLD);
                 if let Some(child) = weak_proc.upgrade() {
                     let exit_code = match child.status() {
                         Status::Exited(code) => code,
                         _ => 0,
                     };
+                    reparent_live_children_to_init(&child);
                     {
                         let mut inner = child.linux().inner.lock();
                         inner.files.clear();
@@ -177,7 +184,10 @@ impl ProcessExt for Process {
                         inner.semaphores = Default::default();
                         inner.shm_identifiers = Default::default();
                     }
-                    parent.linux().record_child_exit(child.id(), exit_code);
+                    if let Some(reaper) = reaper_for(&parent) {
+                        reaper.signal_set(Signal::SIGCHLD);
+                        reaper.linux().record_child_exit(child.id(), exit_code);
+                    }
                 }
                 return true;
             }
@@ -1319,6 +1329,84 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
     let mut processes = Vec::new();
     collect_live_processes(&ROOT_JOB, &mut processes);
     processes
+}
+
+/// Linux PID of the `init` process (the base program). The system's reaper of
+/// last resort for orphaned children.
+const INIT_PID: KoID = 1;
+
+/// Live INIT (PID 1) process, or `None` if there is no running init.
+fn live_init() -> Option<Arc<Process>> {
+    let init = ROOT_JOB.find_process(INIT_PID)?;
+    if matches!(init.status(), Status::Exited(_)) {
+        None
+    } else {
+        Some(init)
+    }
+}
+
+/// Choose who reaps a terminating child: its real parent while that parent is
+/// still alive, otherwise INIT (PID 1) — orphan reparenting. Returns `None`
+/// when neither can take it (no living parent and no init), so the exit status
+/// is dropped instead of being leaked onto a dead process that will never
+/// `wait` for it.
+fn reaper_for(parent: &Arc<Process>) -> Option<Arc<Process>> {
+    if !matches!(parent.status(), Status::Exited(_)) {
+        return Some(parent.clone());
+    }
+    // Parent already gone: hand the child to PID 1 (init), unless the parent
+    // *is* init (it is exiting → the system is going down anyway).
+    let init = live_init()?;
+    if init.id() == parent.id() {
+        None
+    } else {
+        Some(init)
+    }
+}
+
+/// Reparent a terminating process's children to INIT (PID 1) so they are not
+/// stranded on a dead parent that will never `wait` for them. Both still-live
+/// children and any already-collected (zombie) exit statuses the dying process
+/// never reaped are moved to INIT, and INIT is woken so a blocked `wait(-1)`
+/// observes the adopted zombies at once. No-op when the dying process is INIT
+/// itself or no init is running (the orphans' exits then auto-reap via
+/// [`reaper_for`]).
+fn reparent_live_children_to_init(dying: &Arc<Process>) {
+    if dying.id() == INIT_PID {
+        return;
+    }
+    let init = match live_init() {
+        Some(init) => init,
+        None => return,
+    };
+    let (orphans, zombies): (Vec<Arc<Process>>, Vec<(KoID, i64)>) = {
+        let mut inner = dying.linux().inner.lock();
+        let live_ids: Vec<KoID> = inner
+            .children
+            .iter()
+            .filter(|(_, c)| !matches!(c.status(), Status::Exited(_)))
+            .map(|(&id, _)| id)
+            .collect();
+        let orphans = live_ids
+            .iter()
+            .filter_map(|id| inner.children.remove(id))
+            .collect();
+        let zombies = inner.reaped_children.drain().collect();
+        (orphans, zombies)
+    };
+    if orphans.is_empty() && zombies.is_empty() {
+        return;
+    }
+    {
+        let mut init_inner = init.linux().inner.lock();
+        for orphan in orphans {
+            init_inner.children.insert(orphan.id(), orphan);
+        }
+        for (pid, code) in zombies {
+            init_inner.reaped_children.insert(pid, code);
+        }
+    }
+    init.signal_set(Signal::SIGCHLD);
 }
 
 /// Insert `signal` into one unmasked thread of each live process under `ROOT_JOB`.
