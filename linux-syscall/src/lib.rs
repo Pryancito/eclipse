@@ -248,6 +248,10 @@ impl Syscall<'_> {
             Sys::RT_SIGPROCMASK => self.sys_rt_sigprocmask(a0 as _, a1.into(), a2.into(), a3),
             Sys::RT_SIGRETURN => self.sys_rt_sigreturn(),
             Sys::RT_SIGSUSPEND => self.sys_rt_sigsuspend(a0.into(), a1).await,
+            Sys::RT_SIGTIMEDWAIT => {
+                self.sys_rt_sigtimedwait(a0.into(), a1.into(), a2.into(), a3)
+                    .await
+            }
             Sys::SIGALTSTACK => self.sys_sigaltstack(a0.into(), a1.into()),
             Sys::KILL => self.sys_kill(a0 as isize, a1),
 

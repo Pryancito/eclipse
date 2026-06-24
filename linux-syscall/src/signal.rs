@@ -3,13 +3,15 @@
 //! - rt_sigaction
 //! - rt_sigreturn
 //! - rt_sigprocmask
+//! - rt_sigtimedwait
 //! - kill
 //! - tkill
 //! - sigaltstack
 
 use super::*;
-use linux_object::signal::{Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
+use linux_object::signal::{SigInfo, Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
 use linux_object::thread::ThreadExt;
+use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
 use zircon_object::object::KernelObject;
 use zircon_object::task::ROOT_JOB;
@@ -340,6 +342,78 @@ impl Syscall<'_> {
             }
             let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
             kernel_hal::thread::sleep_until(deadline).await;
+        }
+    }
+
+    /// Synchronously wait for one of the signals in `set` to become pending,
+    /// dequeue it, and return its number — *without* invoking its handler.
+    ///
+    /// The caller is expected (POSIX) to have blocked the signals in `set`; a
+    /// blocked signal is still queued to the thread's pending set when sent, and
+    /// this call is what consumes it. Returns the signal number on success,
+    /// `-EAGAIN` if `timeout` elapses with nothing delivered, and `-EINTR` if an
+    /// unblocked signal *outside* `set` interrupts the wait.
+    ///
+    /// busybox `init` (PID 1) parks here between reaping children; while this
+    /// was unimplemented it spun, flooding the log with
+    /// `unknown syscall: RT_SIGTIMEDWAIT`.
+    pub async fn sys_rt_sigtimedwait(
+        &mut self,
+        set: UserInPtr<Sigset>,
+        mut info: UserOutPtr<SigInfo>,
+        timeout: UserInPtr<TimeSpec>,
+        sigsetsize: usize,
+    ) -> SysResult {
+        if sigsetsize != core::mem::size_of::<Sigset>() {
+            return Err(LxError::EINVAL);
+        }
+        let mut waitset = set.read()?;
+        // SIGKILL/SIGSTOP can never be caught or waited for.
+        waitset.remove(Signal::SIGKILL);
+        waitset.remove(Signal::SIGSTOP);
+        // A null `timeout` means wait indefinitely; otherwise resolve the
+        // monotonic deadline once, up front.
+        let deadline = if timeout.is_null() {
+            None
+        } else {
+            let dur = core::time::Duration::from(timeout.read()?);
+            Some(kernel_hal::timer::timer_now() + dur)
+        };
+        info!(
+            "rt_sigtimedwait: set={:#x}, timeout={:?}, thread={}",
+            waitset.val(),
+            deadline,
+            self.thread.id()
+        );
+        loop {
+            // A waited-for signal already pending? Dequeue and return it. We do
+            // not have per-signal queued `siginfo` (pending signals are a plain
+            // bitmask), so only `si_signo` is reported — enough for callers like
+            // busybox init that follow up with `waitpid`.
+            {
+                let mut thread = self.thread.lock_linux();
+                let ready = Sigset::new(thread.signals.val() & waitset.val());
+                if let Some(sig) = ready.find_first_signal() {
+                    thread.signals.remove(sig);
+                    drop(thread);
+                    if !info.is_null() {
+                        let mut si = SigInfo::default();
+                        si.signo = sig as i32;
+                        info.write(si)?;
+                    }
+                    return Ok(sig as usize);
+                }
+            }
+            // An unblocked signal *outside* `set` interrupts the wait (EINTR).
+            linux_object::process::check_signals()?;
+            // Timed out with nothing delivered.
+            if let Some(end) = deadline {
+                if kernel_hal::timer::timer_now() >= end {
+                    return Err(LxError::EAGAIN);
+                }
+            }
+            let next = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
+            kernel_hal::thread::sleep_until(next).await;
         }
     }
 }
