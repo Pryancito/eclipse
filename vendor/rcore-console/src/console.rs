@@ -56,6 +56,31 @@ struct ConsoleInner<T: TextBuffer> {
     /// Saved main screen while the alternate screen buffer is active (`?1049`,
     /// `?1047`, `?47`). `Some` means we are currently on the alternate screen.
     alt_saved: Option<AltScreen>,
+    /// G0 charset is the DEC Special Graphics set (`ESC ( 0`). While active the
+    /// VT100 line-drawing letters (`q`,`x`,`l`,…) map to Unicode box-drawing
+    /// characters, the fallback for apps that draw borders without UTF-8.
+    g0_dec: bool,
+}
+
+/// Map a VT100 DEC Special Graphics byte to its Unicode box-drawing/block
+/// character (only the line-drawing and block subset that matters for TUIs).
+fn dec_special_char(c: char) -> Option<char> {
+    Some(match c {
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'q' | 'o' | 'p' | 'r' | 's' => '─',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'a' => '▒',
+        '0' => '█',
+        _ => return None,
+    })
 }
 
 /// Console on top of a frame buffer
@@ -91,6 +116,7 @@ impl<T: TextBuffer> Console<T> {
                 scroll_region: None,
                 cursor_visible: true,
                 alt_saved: None,
+                g0_dec: false,
             },
         }
     }
@@ -241,6 +267,12 @@ impl<T: TextBuffer> ConsoleInner<T> {
 impl<T: TextBuffer> Handler for ConsoleInner<T> {
     #[inline]
     fn input(&mut self, c: char) {
+        // DEC Special Graphics: translate VT100 line-drawing bytes to Unicode.
+        let c = if self.g0_dec {
+            dec_special_char(c).unwrap_or(c)
+        } else {
+            c
+        };
         trace!("  [input]: {:?} @ {:?}", c, self.cursor);
         if self.cursor.col >= self.buf.width() {
             if !self.auto_wrap {
@@ -588,6 +620,11 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
         self.scroll_region = if t < b { Some((t, b)) } else { None };
         // DECSTBM homes the cursor.
         self.cursor = Cursor::default();
+    }
+
+    #[inline]
+    fn set_g0_charset(&mut self, dec: bool) {
+        self.g0_dec = dec;
     }
 
     #[inline]
