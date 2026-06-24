@@ -532,7 +532,20 @@ impl INode for DrmDev {
                 res.count_fbs = fbs.len() as u32;
                 res.count_crtcs = crtcs.len() as u32;
                 res.count_connectors = connectors.len() as u32;
-                res.count_encoders = 0;
+
+                // Software framebuffer path: expose the one synthetic encoder
+                // here too, consistent with GETCONNECTOR/GETENCODER. With a real
+                // driver we don't enumerate encoders (the trait has none).
+                if drm::get_primary_driver().is_none() && !connectors.is_empty() {
+                    if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
+                        unsafe {
+                            *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
+                        }
+                    }
+                    res.count_encoders = 1;
+                } else {
+                    res.count_encoders = 0;
+                }
 
                 if let Some(caps) = drm::get_caps() {
                     res.max_width = caps.max_width;
