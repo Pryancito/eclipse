@@ -269,18 +269,41 @@ pub fn add_untrusted_exec_prefix(prefix: String) {
     }
 }
 
+/// Lexically canonicalizes an absolute path: collapses `//`, drops `.`, and
+/// resolves `..` against earlier components (without touching the filesystem).
+/// `/bin/../tmp/x` becomes `/tmp/x`, so a traversal cannot smuggle an execution
+/// past the untrusted-prefix check (P6, finding ELF-3).
+pub fn canonicalize(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            c => stack.push(c),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&stack.join("/"));
+    out
+}
+
 /// Returns `true` when executing from `path` should be treated as untrusted:
-/// a world-writable location, a path-traversal attempt, or a `/proc/*/fd/*`
+/// a world-writable location (after canonicalization) or a `/proc/*/fd/*`
 /// magic-link that smuggles past prefix matching (P6, finding ELF-2/ELF-3).
 pub fn is_untrusted_exec_path(path: &str) -> bool {
-    if path.contains("../") || path.contains("/./") {
-        return true;
-    }
     // /proc/self/fd/N and /proc/<pid>/fd/N resolve to an arbitrary opened
     // inode, defeating textual prefix checks — always treat as untrusted.
     if path.starts_with("/proc/") && path.contains("/fd/") {
         return true;
     }
+    // A relative exec path is resolved against cwd at the FS layer; without that
+    // context we cannot prove it lands somewhere trusted, so flag it.
+    if !path.starts_with('/') {
+        return true;
+    }
+    let canon = canonicalize(path);
     let list = UNTRUSTED_EXEC_PREFIXES.lock();
-    list.iter().any(|p| path.starts_with(p.as_str()))
+    list.iter().any(|p| canon.starts_with(p.as_str()))
 }
