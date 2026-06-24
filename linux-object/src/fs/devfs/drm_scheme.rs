@@ -49,15 +49,24 @@ const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
 
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
 const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
+const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
 
 const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC02064B2;
 const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC00464B4;
 const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
+const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06464B8;
+const DRM_IOCTL_MODE_RMFB: u32 = 0xC00464AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
 const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
+
+// DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +155,7 @@ struct DrmModeGetConnector {
     count_modes: u32,
     count_props: u32,
     count_encoders: u32,
+    encoder_id: u32, // current encoder
     connector_id: u32,
     connector_type: u32,
     connector_type_id: u32,
@@ -154,6 +164,30 @@ struct DrmModeGetConnector {
     mm_height: u32,
     subpixel: u32,
     pad: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeGetEncoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeFbCmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
 }
 
 #[repr(C)]
@@ -199,9 +233,74 @@ struct DrmModeCrtcPageFlip {
     user_data: u64,
 }
 
+/// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
+/// `w`x`h`. Timings are nominal — a software framebuffer never programs real CRT
+/// timings — but wlroots needs a populated, "preferred" mode to drive output.
+fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
+    let mut m = [0u8; 68];
+    let refresh: u32 = 60;
+    let clock = ((w as u64 * h as u64 * refresh as u64) / 1000) as u32; // kHz, nominal
+    m[0..4].copy_from_slice(&clock.to_ne_bytes());
+    let wh = w as u16;
+    m[4..6].copy_from_slice(&wh.to_ne_bytes()); // hdisplay
+    m[6..8].copy_from_slice(&wh.to_ne_bytes()); // hsync_start
+    m[8..10].copy_from_slice(&wh.to_ne_bytes()); // hsync_end
+    m[10..12].copy_from_slice(&wh.to_ne_bytes()); // htotal
+                                                  // hskew @12..14 = 0
+    let hh = h as u16;
+    m[14..16].copy_from_slice(&hh.to_ne_bytes()); // vdisplay
+    m[16..18].copy_from_slice(&hh.to_ne_bytes()); // vsync_start
+    m[18..20].copy_from_slice(&hh.to_ne_bytes()); // vsync_end
+    m[20..22].copy_from_slice(&hh.to_ne_bytes()); // vtotal
+                                                  // vscan @22..24 = 0
+    m[24..28].copy_from_slice(&refresh.to_ne_bytes()); // vrefresh
+                                                       // flags @28..32 = 0
+    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
+    m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
+    // name @36..68 ("WxH")
+    let mut name = [0u8; 32];
+    let mut i = 0;
+    let put = |buf: &mut [u8; 32], i: &mut usize, val: u32| {
+        if val == 0 {
+            if *i < buf.len() {
+                buf[*i] = b'0';
+                *i += 1;
+            }
+            return;
+        }
+        let mut digits = [0u8; 10];
+        let mut n = 0;
+        let mut v = val;
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        while n > 0 && *i < buf.len() {
+            n -= 1;
+            buf[*i] = digits[n];
+            *i += 1;
+        }
+    };
+    put(&mut name, &mut i, w);
+    if i < name.len() {
+        name[i] = b'x';
+        i += 1;
+    }
+    put(&mut name, &mut i, h);
+    m[36..68].copy_from_slice(&name);
+    m
+}
+
 impl INode for DrmDev {
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
-        Ok(0)
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
+        // Deliver queued DRM events (page-flip completions). When none are
+        // pending report `Again` so a non-blocking reader gets EAGAIN and an
+        // epoll/poll waiter re-checks on the next tick.
+        match drm::read_event(buf) {
+            Some(n) => Ok(n),
+            None => Err(FsError::Again),
+        }
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
@@ -210,7 +309,7 @@ impl INode for DrmDev {
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
-            read: true,
+            read: drm::has_events(),
             write: true,
             error: false,
         })
@@ -292,7 +391,20 @@ impl INode for DrmDev {
                 }
                 Ok(0)
             }
-            DRM_IOCTL_SET_CLIENT_CAP => Ok(0),
+            DRM_IOCTL_SET_CLIENT_CAP => {
+                // struct drm_set_client_cap { __u64 capability; __u64 value; }
+                let cap = unsafe { *(data as *const u64) };
+                match cap {
+                    // Reject atomic modesetting and writeback so wlroots falls
+                    // back to the legacy KMS path, which the software
+                    // framebuffer scanout implements.
+                    DRM_CLIENT_CAP_ATOMIC | DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
+                        Err(FsError::InvalidParam)
+                    }
+                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
+                    _ => Ok(0),
+                }
+            }
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
                 let bpp = info.bpp.max(32);
@@ -317,14 +429,44 @@ impl INode for DrmDev {
                     Err(FsError::DeviceError)
                 }
             }
+            DRM_IOCTL_MODE_ADDFB2 => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Some(fb_id) =
+                    drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
+                {
+                    cmd.fb_id = fb_id;
+                    Ok(0)
+                } else {
+                    Err(FsError::DeviceError)
+                }
+            }
+            DRM_IOCTL_MODE_RMFB => {
+                let fb_id = unsafe { *(data as *const u32) };
+                drm::rmfb(fb_id);
+                Ok(0)
+            }
             DRM_IOCTL_MODE_MAP_DUMB => {
                 let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
                 map.offset = map.handle as u64;
                 Ok(0)
             }
+            DRM_IOCTL_MODE_DESTROY_DUMB => {
+                let handle = unsafe { *(data as *const u32) };
+                drm::gem_close(handle);
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_SETCRTC => {
+                // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
+                let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                if req.fb_id != 0 {
+                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
+                    drm::scanout(req.fb_id);
+                }
+                Ok(0)
+            }
             DRM_IOCTL_MODE_PAGE_FLIP => {
                 let flip = unsafe { *(data as *const DrmModeCrtcPageFlip) };
-                if drm::page_flip(flip.fb_id) {
+                if drm::page_flip(flip.fb_id, flip.crtc_id, flip.user_data) {
                     Ok(0)
                 } else {
                     Err(FsError::DeviceError)
@@ -389,12 +531,48 @@ impl INode for DrmDev {
                     conn_res.mm_height = conn.mm_height;
                     conn_res.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
                     conn_res.connector_type_id = 1;
-                    conn_res.count_modes = 0;
-                    conn_res.count_encoders = 0;
+                    conn_res.encoder_id = drm::SYNTH_ENCODER_ID;
+                    conn_res.subpixel = 0; // SubPixelUnknown
+
+                    // Report exactly one encoder. wlroots calls this twice: once
+                    // to learn the counts, then again with allocated arrays.
+                    if conn_res.encoders_ptr != 0 && conn_res.count_encoders >= 1 {
+                        unsafe {
+                            *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
+                        }
+                    }
+                    conn_res.count_encoders = 1;
+
+                    // Report exactly one mode: the display's native resolution.
+                    if let Some((w, h, _)) = drm::display_mode() {
+                        if conn_res.modes_ptr != 0 && conn_res.count_modes >= 1 {
+                            let mode = make_modeinfo(w, h);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    mode.as_ptr(),
+                                    conn_res.modes_ptr as *mut u8,
+                                    mode.len(),
+                                );
+                            }
+                        }
+                        conn_res.count_modes = 1;
+                    } else {
+                        conn_res.count_modes = 0;
+                    }
+                    conn_res.count_props = 0;
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)
                 }
+            }
+            DRM_IOCTL_MODE_GETENCODER => {
+                let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
+                enc.encoder_id = drm::SYNTH_ENCODER_ID;
+                enc.encoder_type = 0; // DRM_MODE_ENCODER_NONE
+                enc.crtc_id = 1; // synthetic CRTC
+                enc.possible_crtcs = 1; // bitmask: CRTC index 0
+                enc.possible_clones = 0;
+                Ok(0)
             }
             DRM_IOCTL_MODE_GETCRTC => {
                 let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };

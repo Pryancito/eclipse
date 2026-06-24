@@ -455,7 +455,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             devfs::drm::register_driver(drm.clone());
         }
 
-        if !drivers::all_drm().as_vec().is_empty() {
+        // Expose /dev/dri/card0 when there is a real DRM/GPU driver OR just a
+        // framebuffer display. In the latter case the DRM scheme provides a
+        // software KMS path (synthetic CRTC/connector/encoder + dumb-buffer
+        // scanout) so wlroots/labwc can drive the framebuffer via legacy KMS.
+        let have_drm = !drivers::all_drm().as_vec().is_empty();
+        let have_display = drivers::all_display().first().is_some();
+        if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
                     warn!("failed to mknod /dev/dri/card0: {:?}", e);
