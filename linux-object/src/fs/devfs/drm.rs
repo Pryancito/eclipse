@@ -34,26 +34,18 @@ fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
     drivers::all_display().first()
 }
 
-/// Whether any registered DRM driver exposes a usable KMS configuration
-/// (at least one CRTC *and* one connector). A driver that returns nothing
-/// (or no driver at all) cannot drive a modeset.
-fn drivers_have_kms(drivers: &[Arc<dyn DrmScheme>]) -> bool {
-    drivers.iter().any(|d| {
-        let (_, crtcs, conns) = d.get_resources();
-        !crtcs.is_empty() && !conns.is_empty()
-    })
-}
-
-/// Whether the software KMS path should drive the output: there is a
-/// framebuffer display and no DRM driver provides a usable KMS config. This
-/// covers both "no GPU driver" and "a driver is registered but exposes no
-/// CRTC/connector" (e.g. a GPU we can't modeset) — in either case we synthesize
-/// a CRTC/connector/encoder over the framebuffer and scan dumb buffers out.
+/// Whether the software KMS path should drive the output.
+///
+/// True whenever a framebuffer display exists. The only DRM drivers in this
+/// tree (the nvidia stub, virtio-gpu) cannot drive a real legacy-KMS scanout
+/// for wlroots' dumb-buffer + pixman path — the nvidia driver in particular
+/// advertises a CRTC/connector but its `page_flip`/`create_fb` are no-ops, so
+/// deferring to it leaves the screen black. Scanning the dumb buffer out to the
+/// framebuffer display (`blit_from`) is the authoritative output on every
+/// machine that has a framebuffer, so we always prefer it. (virtio-gpu also
+/// registers a framebuffer display, so its host-shared buffer still updates.)
 pub fn software_kms_active() -> bool {
-    if primary_display().is_none() {
-        return false;
-    }
-    !drivers_have_kms(&DRM_STATE.lock().drivers)
+    primary_display().is_some()
 }
 
 /// A DRM Framebuffer object
@@ -353,19 +345,22 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     }
     drop(state);
 
-    // If no driver exposes a usable KMS config, fall back to a synthetic
-    // CRTC + connector over the framebuffer so `drmIsKMS()` (CRTCs>0 &&
-    // connectors>0) passes and wlroots can drive the output.
-    if (crtcs.is_empty() || connectors.is_empty()) && primary_display().is_some() {
+    // Prefer the software framebuffer KMS path: synthesize one CRTC + connector
+    // so `drmIsKMS()` passes and wlroots drives the output through our scanout
+    // (the hardware DRM stubs here cannot). Falls through to driver-provided
+    // resources only when there is no framebuffer display at all.
+    if software_kms_active() {
         warn!(
-            "[drm] GETRESOURCES: software KMS fallback -> 1 crtc, 1 connector ({:?})",
-            display_mode()
+            "[drm] GETRESOURCES: software KMS -> 1 crtc, 1 connector ({:?}) [drivers offered crtcs={} conns={}]",
+            display_mode(),
+            crtcs.len(),
+            connectors.len()
         );
         return (fbs, vec![SYNTH_CRTC_ID], vec![SYNTH_CONNECTOR_ID]);
     }
 
     warn!(
-        "[drm] GETRESOURCES: crtcs={} connectors={} fbs={} (driver-provided)",
+        "[drm] GETRESOURCES: crtcs={} connectors={} fbs={} (driver-provided, no display)",
         crtcs.len(),
         connectors.len(),
         fbs.len()
