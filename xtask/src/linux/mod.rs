@@ -446,7 +446,36 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                  the kernel's default INIT=/sbin/openrc-init will not match"
             );
         }
+        // seatd: the seat manager Eclipse's Wayland/X stack relies on. Installed
+        // separately so an openrc that installed fine is not undone by a seatd
+        // hiccup; its Alpine package ships the matching /etc/init.d/seatd that
+        // `configure_openrc` then enables in the default runlevel.
+        let _ = Ext::new(&apk)
+            .arg("--root")
+            .arg(rootfs)
+            .arg("--no-cache")
+            .arg("--no-scripts")
+            .arg("add")
+            .arg("seatd")
+            .status();
         self.configure_openrc(rootfs);
+    }
+
+    /// Enable an OpenRC service in a runlevel by symlinking its `init.d` script
+    /// into `/etc/runlevels/<runlevel>` — but only if the service script is
+    /// actually present (i.e. its package was installed). The symlink target is
+    /// the absolute on-target path, so it resolves on the booted system even
+    /// though it dangles on the build host.
+    fn enable_service(etc: &Path, service: &str, runlevel: &str) {
+        if !etc.join("init.d").join(service).is_file() {
+            return;
+        }
+        let link = etc.join("runlevels").join(runlevel).join(service);
+        let _ = fs::remove_file(&link);
+        #[cfg(unix)]
+        {
+            let _ = unix::fs::symlink(format!("/etc/init.d/{service}"), &link);
+        }
     }
 
     /// Lay down the minimal OpenRC configuration Eclipse needs once the package
@@ -499,6 +528,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               ::shutdown:/sbin/openrc shutdown\n",
         )
         .unwrap();
+
+        // Enable the services Eclipse wants managed at boot, each only if its
+        // package-provided init.d script exists: `seatd` (seat manager for the
+        // Wayland/X stack) and `local` (runs /etc/local.d/*.start — a generic
+        // user extension point for one-off boot commands).
+        Self::enable_service(&etc, "seatd", "default");
+        Self::enable_service(&etc, "local", "default");
     }
 
     /// Compila thr3 con gcc del host (bare metal, sin libc).
