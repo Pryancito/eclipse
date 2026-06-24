@@ -1,37 +1,55 @@
-//! Forensic event log for the hunter security subsystem.
+//! Tamper-evident forensic event log for the hunter security subsystem.
 //!
 //! Every security-relevant decision (a blocked syscall, a suspicious exec, a
-//! W^X violation, a detected anomaly) is recorded here as a structured
-//! [`LogEntry`] in a bounded ring buffer, and accounted in cheap lock-free
-//! [`Stats`] counters. The ring is rendered as human-readable text through
-//! [`render`] and surfaced to userspace at `/proc/hunter`.
+//! W^X violation, a detected anomaly) is recorded as a structured [`LogEntry`]
+//! and accounted in cheap lock-free [`Stats`] counters.
+//!
+//! Hardening (P10/P11): a single evictable ring let an attacker flood benign
+//! events to silently evict attack evidence (finding IDS-1/EVADE-1). The log is
+//! now split into **two severity-segregated rings** — a large evictable ring
+//! for `Info`/`Notice` and a separate reserve for `Warning`/`Critical` — so a
+//! flood of low-severity noise can never evict high-severity evidence. Eviction
+//! is surfaced per-severity (`critical_dropped`) so an operator can never miss
+//! that high-severity events were lost. An optional [`set_sink`] callback lets
+//! the kernel stream `Warning`+ events to a durable off-ring sink (serial /
+//! console) before any eviction can erase them.
 
 extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use lock::Mutex;
 
 use crate::clock;
 
 lazy_static::lazy_static! {
-    /// Global ring buffer of security incidents.
-    pub static ref GLOBAL_LOG: Mutex<IntrusionLog> = Mutex::new(IntrusionLog::new(512));
+    /// Evictable ring for routine `Info`/`Notice` events.
+    static ref GENERAL_LOG: Mutex<IntrusionLog> = Mutex::new(IntrusionLog::new(512));
+    /// Reserved ring for `Warning`/`Critical` evidence; far slower to evict
+    /// because low-severity noise cannot land here.
+    static ref PRIORITY_LOG: Mutex<IntrusionLog> = Mutex::new(IntrusionLog::new(256));
 }
 
 /// Monotonic sequence number handed to every recorded event.
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Lock-free running totals, so a `/proc/hunter` read or a quick health check
-/// never needs to walk (or lock) the whole ring.
+// Lock-free running totals, so a `/proc/hunter` read or a health check never
+// needs to walk (or lock) either ring.
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static WARNINGS: AtomicU64 = AtomicU64::new(0);
+/// Report-mode violations that were logged but allowed to proceed.
+static WARNINGS_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static CRITICALS: AtomicU64 = AtomicU64::new(0);
-/// Number of events dropped because the ring wrapped (oldest evicted).
-static DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// Low-severity events evicted from the general ring.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// High-severity events evicted from the priority ring (should stay ~0).
+static CRITICAL_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Optional durable sink for `Warning`+ events, stored as an erased pointer.
+static SINK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Severity of a security event, ordered from least to most urgent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,6 +73,10 @@ impl Severity {
             Severity::Warning => "WARN",
             Severity::Critical => "CRIT",
         }
+    }
+    /// High-severity events go to the reserved ring and the durable sink.
+    fn is_priority(self) -> bool {
+        matches!(self, Severity::Warning | Severity::Critical)
     }
 }
 
@@ -94,15 +116,16 @@ impl IntrusionLog {
         }
     }
 
-    /// Appends an entry, evicting the oldest if the ring is full.
-    pub fn push(&mut self, entry: LogEntry) {
+    /// Appends an entry. Returns `true` if an older entry was evicted.
+    pub fn push(&mut self, entry: LogEntry) -> bool {
         if self.entries.len() < self.max_size {
             self.entries.push(entry);
+            false
         } else {
             // Overwrite in place so we never re-shift the whole Vec (O(1)).
             self.entries[self.head] = entry;
             self.head = (self.head + 1) % self.max_size;
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 
@@ -124,8 +147,10 @@ pub struct Stats {
     pub total: u64,
     pub blocked: u64,
     pub warnings: u64,
+    pub warnings_allowed: u64,
     pub criticals: u64,
-    pub dropped: usize,
+    pub dropped: u64,
+    pub critical_dropped: u64,
 }
 
 /// Returns a snapshot of the global event counters.
@@ -134,9 +159,18 @@ pub fn stats() -> Stats {
         total: TOTAL.load(Ordering::Relaxed),
         blocked: BLOCKED.load(Ordering::Relaxed),
         warnings: WARNINGS.load(Ordering::Relaxed),
+        warnings_allowed: WARNINGS_ALLOWED.load(Ordering::Relaxed),
         criticals: CRITICALS.load(Ordering::Relaxed),
         dropped: DROPPED.load(Ordering::Relaxed),
+        critical_dropped: CRITICAL_DROPPED.load(Ordering::Relaxed),
     }
+}
+
+/// Registers a durable sink invoked (outside all ring locks) for every
+/// `Warning`/`Critical` event, so evidence reaches serial/console before any
+/// in-memory eviction can erase it.
+pub fn set_sink(sink: fn(&LogEntry)) {
+    SINK.store(sink as *mut (), Ordering::SeqCst);
 }
 
 /// Records a fully-specified security event.
@@ -157,9 +191,13 @@ pub fn record(
         }
         _ => {}
     }
+    // An action hunter actively blocked vs. merely reported-and-allowed.
     if action == "BLOCKED" {
         BLOCKED.fetch_add(1, Ordering::Relaxed);
+    } else if action == "WARNING" {
+        WARNINGS_ALLOWED.fetch_add(1, Ordering::Relaxed);
     }
+
     let entry = LogEntry {
         seq: SEQ.fetch_add(1, Ordering::Relaxed),
         ts_ns: clock::now_ns(),
@@ -169,13 +207,32 @@ pub fn record(
         action,
         description,
     };
-    GLOBAL_LOG.lock().push(entry);
+
+    let evicted = if severity.is_priority() {
+        PRIORITY_LOG.lock().push(entry.clone())
+    } else {
+        GENERAL_LOG.lock().push(entry.clone())
+    };
+    if evicted {
+        if severity.is_priority() {
+            CRITICAL_DROPPED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Stream high-severity evidence to the durable sink outside the lock.
+    if severity.is_priority() {
+        let p = SINK.load(Ordering::Acquire);
+        if !p.is_null() {
+            // SAFETY: `p` is a valid `fn(&LogEntry)` sealed by `set_sink`.
+            let sink: fn(&LogEntry) = unsafe { core::mem::transmute(p) };
+            sink(&entry);
+        }
+    }
 }
 
 /// Back-compat helper: appends an event without explicit severity/category.
-///
-/// The severity is inferred from the legacy `action` string so existing
-/// call sites keep working while new code uses [`record`].
 pub fn log_event(pid: u64, action: &'static str, description: String) {
     let severity = match action {
         "BLOCKED" => Severity::Critical,
@@ -192,9 +249,12 @@ fn fmt_ts(ts_ns: u64) -> String {
     format!("{}.{:03}", secs, millis)
 }
 
-/// Renders the recent event ring as human-readable text for `/proc/hunter`.
+/// Renders both rings, merged into chronological order, for `/proc/hunter`.
 pub fn render() -> String {
-    let entries = GLOBAL_LOG.lock().get_entries();
+    let mut entries = GENERAL_LOG.lock().get_entries();
+    entries.extend(PRIORITY_LOG.lock().get_entries());
+    entries.sort_by_key(|e| e.seq);
+
     let mut out = String::new();
     if entries.is_empty() {
         out.push_str("(no security events recorded)\n");

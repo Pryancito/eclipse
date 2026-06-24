@@ -159,8 +159,10 @@ fn spawn(
         .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
     let path = args[0].clone();
 
-    // Verify binary integrity with hunter
-    let mut header = [0u8; 4];
+    // hunter P8: verify binary integrity + path policy using a full 64-byte
+    // header (e_ident/e_type/e_machine), matching the runtime execve gate
+    // rather than the old 4-byte magic-only check.
+    let mut header = [0u8; 64];
     let _ = vmo.read(0, &mut header);
     if !hunter::check_elf_binary(&path, &header) {
         warn!("spawn: binary {:?} blocked by hunter security policy", path);

@@ -37,14 +37,43 @@ There are three independently-tunable enforcement domains, each with its own
 | `syscall` | Per-process syscall whitelists (lightweight seccomp) | `Enforce` |
 | `wx`      | Write-xor-execute memory (`mmap` / `mprotect`)    | `Report`  |
 | `exec`    | Executable path policy (untrusted/world-writable) | `Report`  |
+| `anomaly` | Block (vs. only log) detected floods / fork bombs | `Report`  |
 
 The defaults are deliberately conservative. The syscall domain is `Enforce`
 because whitelists are opt-in per process (no policy registered ⇒ permissive),
-so it cannot break a process that didn't ask for filtering. The W^X and
-exec-path domains default to `Report` because real dynamic linkers / JITs
+so it cannot break a process that didn't ask for filtering. The W^X, exec-path
+and anomaly domains default to `Report` because real dynamic linkers / JITs
 transiently create `W+X` mappings and the base system legitimately execs from a
 variety of paths — blocking by default would risk breaking userspace. Operators
-opt into `Enforce` (`policy::set_wx_mode`, `policy::set_exec_mode`).
+opt into `Enforce` per domain (`policy::set_wx_mode`, `set_exec_mode`,
+`set_anomaly_mode`). The control plane can be sealed **tighten-only**
+(`policy::seal_tighten_only`) so that, after boot, no domain can be relaxed —
+only moved towards stricter enforcement.
+
+### Hardening (v0.3.0)
+
+A multi-agent adversarial red-team (see `docs/hunter-hardening.md`) drove these
+defenses, all preserving the conservative-default contract:
+
+- **W^X is structural, not per-call.** File-backed `mmap` is capped to a
+  W^X-preserving permission *ceiling* (no execute on writable file pages, no
+  write on executable ones) instead of the old blanket `RXW`, and a per-process
+  *ever-writable region* map catches the two-step `mmap(W)`→`mprotect(X)`
+  bypass. Under enforcement, `mprotect` no longer swallows a failed narrowing.
+- **Exec gate hardened.** Full ELF `e_ident`/`e_type`/`e_machine` validation
+  (foreign-arch images rejected); `#!` scripts recognised as valid; the integrity
+  check reads the *same VMO bytes* that get mapped (no TOCTOU); `/proc/*/fd/*`
+  magic-links and path-traversal treated as untrusted; the dynamic linker and
+  shebang interpreter audited through the same gate.
+- **Forensics tamper-evident.** Severity-segregated rings so a flood of benign
+  events cannot evict `Warning`/`Critical` evidence; per-severity drop counters;
+  an optional durable sink streams high-severity events to the kernel log.
+- **State lifecycle fixed.** Cleanup runs from the central `Process::terminate`
+  (every exit path, not just `exit_group`); per-pid maps are LRU-capped; the
+  monotonic clock is sealed and the IDS window has a count backstop so a frozen
+  clock cannot silence detection.
+- **Per-architecture syscall tables** (x86_64 + asm-generic for aarch64/riscv64)
+  and a **system-wide fork-rate** signal for distributed fork bombs.
 
 ## Intrusion detection (heuristics)
 
@@ -55,11 +84,15 @@ they only ever observe calls that were allowed to run:
    against a small table of security-relevant operations (kernel module
    loading, `ptrace`, `bpf`, credential changes, namespace escapes, `kexec`,
    cross-process writes, …). Matches are recorded as audit events; they are
-   never blocked here. The table is the Linux x86_64 ABI.
+   never blocked here unless the optional privileged-deny latch is engaged. The
+   table is selected per architecture (x86_64, and asm-generic for
+   aarch64/riscv64).
 
 2. **Rate anomalies** — cheap per-process sliding-window counters that flag
-   syscall **floods** (possible DoS) and **fork bombs**. Each anomaly is
-   reported at most once per window to avoid log storms. Toggle with
+   syscall **floods** (possible DoS) and **fork bombs**, plus a system-wide
+   fork-rate signal for *distributed* fork bombs. Each anomaly is reported at
+   most once per window to avoid log storms; under the `anomaly` domain's
+   `Enforce` mode the offending syscall is denied. Toggle with
    `heuristics::set_anomaly_detection`.
 
 ## `/proc/hunter`
@@ -69,13 +102,13 @@ event counters, active syscall policies) followed by the recent event ring.
 Example:
 
 ```
-hunter security subsystem v0.2.0
-enforcement: syscall=enforce wx=report exec=report
-events: total=3 blocked=0 warnings=1 critical=0 dropped=0
+hunter security subsystem v0.3.0
+enforcement: syscall=enforce wx=report exec=report anomaly=report
+events: total=3 blocked=0 warnings=1 reported=1 critical=0 dropped=0 critical_dropped=0
 active syscall policies: 0
 
 recent events (oldest first):
-[     0] +         0.000s pid=0     INFO   SYSTEM    INIT: hunter security subsystem v0.2.0 initialized (...)
+[     0] +         0.000s pid=0     INFO   SYSTEM    INIT: hunter security subsystem v0.3.0 initialized (...)
 [     1] +         4.512s pid=142   NOTICE PRIVILEGE WATCH: sensitive syscall #101 (ptrace)
 [     2] +         5.001s pid=142   WARN   ANOMALY   WARNING: possible fork bomb: >200 clone/fork within 1000ms
 ```
