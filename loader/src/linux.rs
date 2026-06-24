@@ -62,7 +62,7 @@ pub fn run_shell_on_vt(
 
 /// Spawn the INIT process as PID 1 if its binary exists, returning `None`
 /// otherwise so the machine can boot without a PID 1 init (e.g. when
-/// `/sbin/openrc-init` is not installed). Runs on the primary console (vt 0).
+/// `/sbin/init` is not installed). Runs on the primary console (vt 0).
 ///
 /// `boot_work` should be set only when no shell has already performed the
 /// one-time boot setup (network init, fstab mount).
@@ -78,7 +78,7 @@ pub fn run_init_if_present(
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
         kernel_hal::klog_warn!(
-            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Install it (e.g. `apk add openrc`) or set INIT= in rboot.conf.",
+            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init -> /bin/busybox; rebuild the rootfs or set INIT= in rboot.conf.",
             args[0]
         );
         return None;

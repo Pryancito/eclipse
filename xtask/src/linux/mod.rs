@@ -56,8 +56,8 @@ impl LinuxRootfs {
             // resize2fs/e2fsck/mke2fs (para expandir ROOT y formatear HOME).
             self.install_e2fsprogs_bins(&musl, &bin);
             self.install_thread_tests(&dir);
-            // INIT (PID 1): instalar y configurar OpenRC (idempotente).
-            self.install_openrc(&dir, &musl);
+            // INIT (PID 1): busybox init (idempotente).
+            self.install_busybox_init(&dir);
             return;
         }
         // 准备最小系统需要的资源
@@ -368,8 +368,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // 拷贝 resize2fs/e2fsck/mke2fs (e2fsprogs) para el instalador.
         self.install_e2fsprogs_bins(&musl, &bin);
         self.install_thread_tests(&dir);
-        // INIT (PID 1): instalar y configurar OpenRC como gestor de servicios.
-        self.install_openrc(&dir, &musl);
+        // INIT (PID 1): busybox init (/sbin/init -> busybox) + inittab + rcS.
+        self.install_busybox_init(&dir);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
@@ -389,152 +389,68 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
     }
 
-    /// Install OpenRC (the `openrc-init` PID 1 + service manager) into the
-    /// rootfs and lay down a minimal, Eclipse-tailored configuration.
+    /// Wire up busybox `init` as the PID 1 base program.
     ///
-    /// The Eclipse kernel itself owns the virtual terminals (it spawns the
-    /// per-VT shells at PIDs 101..), so OpenRC is used purely as a *service
-    /// manager*: `openrc-init` runs the `sysinit`/`boot`/`default` runlevels
-    /// and then reaps children — it does not, and must not, spawn `getty`.
-    ///
-    /// Binaries come from Alpine's `openrc` package, installed with the static
-    /// host `apk` straight into the rootfs (`--root`). The whole step is
-    /// best-effort: if `apk` is unavailable, the host arch cannot run it, or the
-    /// install fails (e.g. no network), it logs a warning and the system simply
-    /// boots without a PID 1 init, exactly as before.
-    fn install_openrc(&self, rootfs: &Path, musl: &Path) {
-        // The static `apk` is the host-arch binary; it can only run on the build
-        // host when the target arch matches it. The supported desktop target is
-        // x86_64, so restrict the host install to that (other arches boot
-        // without PID 1 until cross-install is wired up).
-        if !matches!(self.0, Arch::X86_64) {
-            return;
-        }
-        let apk = self.apk(musl);
-        if !apk.is_file() {
-            eprintln!("warning: openrc: static apk not found; booting without a PID 1 init");
-            return;
-        }
-        println!("Installing OpenRC (openrc-init) into the rootfs via apk...");
-        // `--root` installs into the rootfs (reading its /etc/apk config).
-        // `--no-scripts`: post-install triggers are target shell scripts that
-        // cannot run on the host. `--no-cache` keeps the rootfs apk cache clean.
-        // `--no-cache` fetches a fresh package index without polluting the
-        // rootfs apk cache; `--no-scripts` skips target post-install triggers
-        // that cannot run on the build host.
-        let status = Ext::new(&apk)
-            .arg("--root")
-            .arg(rootfs)
-            .arg("--no-cache")
-            .arg("--no-scripts")
-            .arg("add")
-            .arg("openrc")
-            .status();
-        if !status.success() {
-            eprintln!(
-                "warning: openrc: `apk add openrc` failed (no network / repo / keys?); \
-                 booting without a PID 1 init. Re-run with network to enable it."
-            );
-            return;
-        }
-        // `apk add openrc` installs `/sbin/openrc-init` only on some Alpine
-        // versions; on others the supervisor entry point is `/sbin/init` ->
-        // openrc. Verify the path the kernel boots (INIT=/sbin/openrc-init).
-        if !rootfs.join("sbin/openrc-init").is_file() {
-            eprintln!(
-                "warning: openrc: /sbin/openrc-init missing after install; \
-                 the kernel's default INIT=/sbin/openrc-init will not match"
-            );
-        }
-        // seatd: the seat manager Eclipse's Wayland/X stack relies on. Installed
-        // separately so an openrc that installed fine is not undone by a seatd
-        // hiccup; its Alpine package ships the matching /etc/init.d/seatd that
-        // `configure_openrc` then enables in the default runlevel.
-        let _ = Ext::new(&apk)
-            .arg("--root")
-            .arg(rootfs)
-            .arg("--no-cache")
-            .arg("--no-scripts")
-            .arg("add")
-            .arg("seatd")
-            .status();
-        self.configure_openrc(rootfs);
-    }
+    /// busybox already ships in the rootfs (with an `init` applet), so no
+    /// package install / network is needed: this only lays down `/sbin/init`
+    /// (-> `/bin/busybox`), a minimal `/etc/inittab`, and the `/etc/init.d/rcS`
+    /// sysinit hook. The Eclipse kernel owns the virtual terminals (it spawns
+    /// the per-VT shells itself), so the inittab has NO `getty`/`askfirst`
+    /// lines — `init` runs the sysinit hook once and then reaps orphaned
+    /// children as PID 1.
+    fn install_busybox_init(&self, rootfs: &Path) {
+        let etc = rootfs.join("etc");
+        let _ = fs::create_dir_all(&etc);
 
-    /// Enable an OpenRC service in a runlevel by symlinking its `init.d` script
-    /// into `/etc/runlevels/<runlevel>` — but only if the service script is
-    /// actually present (i.e. its package was installed). The symlink target is
-    /// the absolute on-target path, so it resolves on the booted system even
-    /// though it dangles on the build host.
-    fn enable_service(etc: &Path, service: &str, runlevel: &str) {
-        if !etc.join("init.d").join(service).is_file() {
-            return;
-        }
-        let link = etc.join("runlevels").join(runlevel).join(service);
-        let _ = fs::remove_file(&link);
+        // /sbin/init -> /bin/busybox. busybox selects its applet from
+        // basename(argv[0]), so exec'ing /sbin/init runs the `init` applet
+        // regardless of the symlink target. (The kernel boots INIT=/sbin/init.)
+        let sbin = rootfs.join("sbin");
+        let _ = fs::create_dir_all(&sbin);
+        let init_link = sbin.join("init");
+        let _ = fs::remove_file(&init_link);
         #[cfg(unix)]
         {
-            let _ = unix::fs::symlink(format!("/etc/init.d/{service}"), &link);
-        }
-    }
-
-    /// Lay down the minimal OpenRC configuration Eclipse needs once the package
-    /// is installed: the four runlevel directories must exist (an empty runlevel
-    /// is a valid, fast no-op), `rc.conf` is tuned so OpenRC does not fight the
-    /// kernel over cgroups/containers, and an `/etc/inittab` is written for the
-    /// benefit of a busybox-`init` fallback (openrc-init ignores it).
-    fn configure_openrc(&self, rootfs: &Path) {
-        let etc = rootfs.join("etc");
-
-        // OpenRC stores live state under /run; make sure the mount point exists.
-        let _ = fs::create_dir_all(rootfs.join("run"));
-
-        // The runlevels openrc-init drives. Created if absent; existing
-        // package-provided runlevels (and their service symlinks) are kept.
-        for rl in ["sysinit", "boot", "default", "shutdown"] {
-            let _ = fs::create_dir_all(etc.join("runlevels").join(rl));
+            let _ = unix::fs::symlink("/bin/busybox", &init_link);
         }
 
-        // rc.conf: disable the cgroup/container machinery OpenRC would otherwise
-        // probe for — this kernel is not a Linux host and those checks just
-        // generate noise/failures. Only written if the package didn't ship one.
-        let rc_conf = etc.join("rc.conf");
-        if !rc_conf.is_file() {
-            fs::create_dir_all(&etc).unwrap();
-            fs::write(
-                &rc_conf,
-                b"# Eclipse OS minimal OpenRC config.\n\
-                  # The kernel owns the TTYs; OpenRC is only a service manager.\n\
-                  rc_sys=\"\"\n\
-                  rc_controller_cgroups=\"NO\"\n\
-                  rc_cgroup_mode=\"none\"\n\
-                  rc_depend_strict=\"NO\"\n\
-                  rc_logger=\"NO\"\n\
-                  rc_parallel=\"NO\"\n",
-            )
-            .unwrap();
-        }
-
-        // /etc/inittab — openrc-init does NOT read it, but a busybox-`init`
-        // fallback would. NO getty lines: the kernel already provides the
-        // per-VT shells, so init only drives the runlevels.
+        // Minimal inittab. NO getty/askfirst: the kernel already provides the
+        // per-VT shells. busybox init runs the sysinit hook, then idles handling
+        // Ctrl-Alt-Del / shutdown / restart while reaping orphaned children.
         fs::write(
             etc.join("inittab"),
-            b"# Eclipse OS - the kernel owns the virtual terminals (per-VT shells),\n\
-              # so there are NO getty lines here; init only runs the runlevels.\n\
-              ::sysinit:/sbin/openrc sysinit\n\
-              ::wait:/sbin/openrc boot\n\
-              ::wait:/sbin/openrc default\n\
-              ::shutdown:/sbin/openrc shutdown\n",
+            b"# Eclipse OS - busybox init. The kernel owns the virtual terminals\n\
+              # (it spawns the per-VT shells), so there are NO getty lines here;\n\
+              # init runs the sysinit hook once and then reaps orphaned children.\n\
+              ::sysinit:/etc/init.d/rcS\n\
+              ::ctrlaltdel:/bin/busybox reboot\n\
+              ::shutdown:/bin/busybox swapoff -a\n\
+              ::restart:/sbin/init\n",
         )
         .unwrap();
 
-        // Enable the services Eclipse wants managed at boot, each only if its
-        // package-provided init.d script exists: `seatd` (seat manager for the
-        // Wayland/X stack) and `local` (runs /etc/local.d/*.start — a generic
-        // user extension point for one-off boot commands).
-        Self::enable_service(&etc, "seatd", "default");
-        Self::enable_service(&etc, "local", "default");
+        // /etc/init.d/rcS — the sysinit hook. The kernel already mounts the root
+        // fs, brings up the network and spawns the shells, so this is just a
+        // place to start optional background services. Safe by default (no-op);
+        // a commented example shows how to launch the seatd seat manager.
+        let initd = etc.join("init.d");
+        let _ = fs::create_dir_all(&initd);
+        let rcs = initd.join("rcS");
+        fs::write(
+            &rcs,
+            b"#!/bin/sh\n\
+              # Eclipse OS sysinit hook (busybox init). Add boot-time services\n\
+              # here; the kernel already handles root mount, networking and the\n\
+              # per-TTY shells. Example - start the Wayland/X seat manager:\n\
+              #   [ -x /usr/bin/seatd ] && /usr/bin/seatd >/dev/null 2>&1 &\n\
+              exit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rcs, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Compila thr3 con gcc del host (bare metal, sin libc).
@@ -816,7 +732,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                   s/.*CONFIG_SSL_CLIENT.*/CONFIG_SSL_CLIENT=y/;\
                   s/.*CONFIG_FEATURE_IPV6.*/CONFIG_FEATURE_IPV6=y/;\
                   s/.*CONFIG_UDHCPC6.*/CONFIG_UDHCPC6=y/;\
-                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/",
+                  s/.*CONFIG_FEATURE_UDHCPC6_RFC3646.*/CONFIG_FEATURE_UDHCPC6_RFC3646=y/;\
+                  s/^# CONFIG_INIT is not set$/CONFIG_INIT=y/;\
+                  s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/",
             )
             .arg(".config")
             .invoke();
