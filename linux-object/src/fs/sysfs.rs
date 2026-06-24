@@ -108,8 +108,8 @@ fn block_size_sectors(index: usize) -> Option<usize> {
 struct SysRootINode;
 
 impl SysRootINode {
-    fn entries() -> [&'static str; 5] {
-        ["class", "block", "bus", "devices", "power"]
+    fn entries() -> [&'static str; 6] {
+        ["class", "block", "bus", "dev", "devices", "power"]
     }
 }
 
@@ -148,6 +148,7 @@ impl INode for SysRootINode {
             "class" => Ok(Arc::new(SysClassINode)),
             "block" => Ok(Arc::new(SysBlockDirINode)),
             "bus" => Ok(Arc::new(SysBusDirINode)),
+            "dev" => Ok(Arc::new(SysDevDirINode)),
             "devices" => Ok(Arc::new(SysDevicesDirINode)),
             "power" => Ok(Arc::new(SysPowerDirINode)),
             _ => Err(FsError::EntryNotFound),
@@ -1039,15 +1040,25 @@ impl INode for SysDrmCardDeviceINode {
         Arc::new(SysFS)
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => {
+                return Ok(Arc::new(SysDrmCardDeviceINode {
+                    pci_index: self.pci_index,
+                }))
+            }
+            ".." => {
+                return Ok(Arc::new(SysDrmCardINode {
+                    pci_index: self.pci_index,
+                }))
+            }
+            // libdrm's drmNodeIsDRM() stats `<dev>/device/drm` to confirm this
+            // is a DRM device; an empty directory is enough for the check.
+            "drm" => return Ok(Arc::new(SysEmptyDirINode)),
+            _ => {}
+        }
         let devs = get_pci_devices();
         let pci = devs.get(self.pci_index).ok_or(FsError::EntryNotFound)?;
         match name {
-            "." => Ok(Arc::new(SysDrmCardDeviceINode {
-                pci_index: self.pci_index,
-            })),
-            ".." => Ok(Arc::new(SysDrmCardINode {
-                pci_index: self.pci_index,
-            })),
             "modalias" => Ok(Arc::new(Pseudo::new(
                 &pci_modalias(&pci.vendor, &pci.device, &pci.class),
                 FileType::File,
@@ -1056,11 +1067,162 @@ impl INode for SysDrmCardDeviceINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok("drm".into()),
+            1 => Ok("modalias".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+}
+
+/// A minimal empty sysfs directory (used where userspace only needs the path to
+/// exist, e.g. libdrm's `drmNodeIsDRM` stat of `<dev>/device/drm`).
+struct SysEmptyDirINode;
+
+impl INode for SysEmptyDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(29))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." | ".." => Ok(Arc::new(SysEmptyDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, _id: usize) -> Result<String> {
+        Err(FsError::EntryNotFound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/dev/char/<major>:<minor>` — the reverse map from a device number to its
+// sysfs node. libdrm's drmGetDeviceNameFromFd2() fstat()s the card fd and reads
+// `/sys/dev/char/226:0/uevent` for DEVNAME; without this it fails with ENOENT
+// ("drmGetDeviceNameFromFd2() failed: No such file or directory") and wlroots
+// cannot create the DRM backend. We map the relevant device numbers onto the
+// existing class nodes (which already carry uevent/dev/subsystem).
+// ---------------------------------------------------------------------------
+
+struct SysDevDirINode;
+
+impl INode for SysDevDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(160))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." | ".." => Ok(Arc::new(SysDevDirINode)),
+            "char" => Ok(Arc::new(SysDevCharDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
         if id == 0 {
-            Ok("modalias".into())
+            Ok("char".into())
         } else {
             Err(FsError::EntryNotFound)
         }
+    }
+}
+
+struct SysDevCharDirINode;
+
+impl INode for SysDevCharDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(161))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        if name == "." || name == ".." {
+            return Ok(Arc::new(SysDevCharDirINode));
+        }
+        // DRM card: 226:0 -> /sys/class/drm/card0
+        if name == "226:0" {
+            if let Some(idx) = drm_card0_pci_index() {
+                return Ok(Arc::new(SysDrmCardINode { pci_index: idx }));
+            }
+        }
+        // evdev: 13:<64+N> -> /sys/class/input/eventN
+        if let Some(rest) = name.strip_prefix("13:") {
+            if let Ok(minor) = rest.parse::<usize>() {
+                if minor >= EVDEV_EVENT_MINOR_BASE {
+                    let id = minor - EVDEV_EVENT_MINOR_BASE;
+                    if id < input_event_count() {
+                        return Ok(Arc::new(SysInputEventINode { id }));
+                    }
+                }
+            }
+        }
+        Err(FsError::EntryNotFound)
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        // 226:0 (card0, if present) first, then evdev nodes 13:64..
+        let have_card = drm_card0_pci_index().is_some();
+        let base = have_card as usize;
+        if have_card && id == 0 {
+            return Ok("226:0".into());
+        }
+        let ev = id - base;
+        if ev < input_event_count() {
+            return Ok(format!("13:{}", EVDEV_EVENT_MINOR_BASE + ev));
+        }
+        Err(FsError::EntryNotFound)
     }
 }
 
