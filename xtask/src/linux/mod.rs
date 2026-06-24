@@ -131,6 +131,7 @@ impl LinuxRootfs {
         }
         Self::write_profile(&etc);
         Self::write_passwd(&etc, &dir);
+        Self::write_console_configs(&etc, &dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory"
@@ -553,6 +554,46 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             )
             .unwrap();
         }
+    }
+
+    /// Lay down configuration that console programs need to behave well:
+    ///
+    /// - `/root/.bashrc`: bash, unlike POSIX sh, does NOT read `/etc/profile`
+    ///   for non-login interactive shells, so source it here to inherit the
+    ///   system PATH, the DNS resolver shim (`LD_PRELOAD`) and the SSL cert
+    ///   locations. Also sets a readable prompt.
+    /// - `/etc/nanorc`: a minimal, option-only nano config (no `include` of the
+    ///   syntax files, whose directives trip "Mistakes in '/etc/nanorc'" on some
+    ///   nano builds). Written unconditionally so the OS default wins over a
+    ///   package file; users can re-add `include` lines for syntax highlighting.
+    fn write_console_configs(etc: &Path, rootfs: &Path) {
+        let bashrc = rootfs.join("root").join(".bashrc");
+        if let Some(parent) = bashrc.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(
+            &bashrc,
+            b"# Eclipse OS - bash config for the root account.\n\
+              # bash ignores /etc/profile for non-login interactive shells, so\n\
+              # source it here to inherit PATH, the DNS resolver shim and the\n\
+              # SSL certificate locations.\n\
+              [ -r /etc/profile ] && . /etc/profile\n\
+              export PS1='\\[\\e[1;32m\\]Eclipse\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ '\n\
+              alias ll='ls -la'\n",
+        )
+        .unwrap();
+
+        fs::write(
+            etc.join("nanorc"),
+            b"# Eclipse OS - minimal nano configuration.\n\
+              # Option-only (no syntax `include`s) so it loads cleanly across\n\
+              # nano versions. Add `include \"/usr/share/nano/*.nanorc\"` yourself\n\
+              # for syntax highlighting.\n\
+              set tabsize 4\n\
+              set tabstospaces\n\
+              set autoindent\n",
+        )
+        .unwrap();
     }
 
     /// Creates symlinks in `bin/` for every busybox applet.
