@@ -391,7 +391,7 @@ impl INode for DrmDev {
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd {
             DRM_IOCTL_VERSION => {
-                log::warn!("[drm] VERSION ioctl — /dev/dri/card0 opened by userspace");
+                log::error!("[drm] VERSION ioctl — /dev/dri/card0 opened by userspace");
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
                 v.version_major = 1;
                 v.version_minor = 0;
@@ -527,7 +527,7 @@ impl INode for DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                log::warn!(
+                log::error!(
                     "[drm] SETCRTC crtc={} fb={} ({}x{}+{})",
                     req.crtc_id,
                     req.fb_id,
@@ -650,7 +650,7 @@ impl INode for DrmDev {
                         conn_res.count_modes = 0;
                     }
                     conn_res.count_props = 0;
-                    log::warn!(
+                    log::error!(
                         "[drm] GETCONNECTOR id={} connected={} modes={} mode={:?}",
                         conn_res.connector_id,
                         conn.connected,
@@ -659,7 +659,7 @@ impl INode for DrmDev {
                     );
                     Ok(0)
                 } else {
-                    log::warn!(
+                    log::error!(
                         "[drm] GETCONNECTOR id={} -> NOT FOUND",
                         conn_res.connector_id
                     );
@@ -750,7 +750,7 @@ impl INode for DrmDev {
                     }
                 }
                 res.count_props = n as u32;
-                log::warn!(
+                log::error!(
                     "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
                     res.obj_id,
                     res.obj_type,
@@ -812,7 +812,7 @@ impl INode for DrmDev {
                 let nr = (cmd >> 8) & 0xff;
                 let size = (cmd >> 16) & 0x3fff;
                 let dir = cmd >> 30;
-                log::warn!(
+                log::error!(
                     "[drm] UNHANDLED ioctl cmd={:#010x} (drm nr={:#04x} size={} dir={})",
                     cmd,
                     nr,
