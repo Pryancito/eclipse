@@ -23,6 +23,7 @@ pub mod pty;
 pub mod rcore_fs_wrapper;
 pub mod stdio;
 mod sysfs;
+mod timerfd;
 
 #[cfg(feature = "mock-disk")]
 pub mod mock;
@@ -76,6 +77,7 @@ pub use pidfd::{PidFd, PIDFD_THREAD};
 pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use stdio::{STDIN, STDOUT};
+pub use timerfd::TimerFd;
 
 #[derive(Clone)]
 struct MountEntry {
@@ -88,6 +90,45 @@ struct MountEntry {
 
 lazy_static! {
     static ref MOUNT_TABLE: Mutex<Vec<MountEntry>> = Mutex::new(Vec::new());
+}
+
+lazy_static! {
+    /// Dedicated, never-mounted ramfs backing `memfd_create(2)`. Kept alive for
+    /// the kernel's lifetime so the anonymous inodes' `Weak<RamFS>` back-refs
+    /// always upgrade (rcore-fs ramfs panics on a dropped fs).
+    static ref MEMFD_FS: Arc<RamFS> = RamFS::new();
+}
+static MEMFD_SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Create an anonymous in-RAM file for `memfd_create(2)`. The inode lives in a
+/// hidden ramfs and is immediately unlinked, so it has no name in any mounted
+/// namespace and is freed once the last fd referring to it closes — while
+/// `mmap`/`ftruncate`/`read`/`write` reuse the regular-file machinery. Wayland
+/// (`os_create_anonymous_file`), wlroots and Mesa use this to share xkb keymaps
+/// and shm pools.
+pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
+    use rcore_fs::vfs::FileType;
+    /// `MFD_CLOEXEC` (the only flag we act on; `MFD_ALLOW_SEALING` is accepted
+    /// and seals are no-ops, `MFD_HUGETLB` is ignored).
+    const MFD_CLOEXEC: usize = 0x0001;
+
+    let root = MEMFD_FS.root_inode();
+    let seq = MEMFD_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let backing = alloc::format!(".memfd.{}.{}", seq, name);
+    let inode = root.create(&backing, FileType::File, 0o600)?;
+    // Detach the directory entry: the open fd is the sole owner now, so a close
+    // frees the RAM and nothing can resolve the (hidden) name.
+    let _ = root.unlink(&backing);
+
+    let mut open_flags = OpenFlags::RDWR;
+    if flags & MFD_CLOEXEC != 0 {
+        open_flags |= OpenFlags::CLOEXEC;
+    }
+    Ok(File::new(
+        inode,
+        open_flags,
+        alloc::format!("/memfd:{name}"),
+    ))
 }
 
 fn reset_mount_table() {
