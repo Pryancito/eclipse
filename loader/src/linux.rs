@@ -30,7 +30,7 @@ fn comm_from_path(path: &str) -> &str {
 /// Used by the libos example/tests, where one program is the whole system.
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
     const INIT_PID: KoID = 1;
-    spawn(args, envs, rootfs, 0, None, INIT_PID, true).expect("run: program not found")
+    spawn(args, envs, rootfs, 0, None, INIT_PID, true, true).expect("run: program not found")
 }
 
 /// Create and run the configured per-terminal SHELL on virtual terminal `vt`
@@ -56,13 +56,14 @@ pub fn run_shell_on_vt(
         shared_root,
         pid,
         /* boot_work */ vt == 0,
+        /* foreground */ true,
     )
     .expect("configured SHELL not found")
 }
 
 /// Spawn the INIT process as PID 1 if its binary exists, returning `None`
 /// otherwise so the machine can boot without a PID 1 init (e.g. when
-/// `/sbin/init` is not installed). Runs on the primary console (vt 0).
+/// `/bin/busybox` is not installed). Runs on the primary console (vt 0).
 ///
 /// `boot_work` should be set only when no shell has already performed the
 /// one-time boot setup (network init, fstab mount).
@@ -78,14 +79,25 @@ pub fn run_init_if_present(
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
         kernel_hal::klog_warn!(
-            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init -> /bin/busybox; rebuild the rootfs or set INIT= in rboot.conf.",
+            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /bin/busybox (default INIT=/bin/busybox?init); rebuild the rootfs or set INIT= in rboot.conf.",
             args[0]
         );
         return None;
     }
     const INIT_PID: KoID = 1;
     let init = args[0].clone();
-    let proc = spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work);
+    // `foreground = false`: init shares vt 0 with the primary shell and must not
+    // seize its foreground process group (that would wedge the shell on SIGTTIN).
+    let proc = spawn(
+        args,
+        envs,
+        rootfs,
+        0,
+        shared_root,
+        INIT_PID,
+        boot_work,
+        false,
+    );
     if proc.is_none() {
         // The binary exists but could not be started (unreadable, malformed
         // ELF, or blocked by the hunter exec policy — see the preceding
@@ -102,23 +114,38 @@ pub fn run_init_if_present(
 }
 
 /// True if `path` resolves on the primary root (if any) or the initramfs.
+/// Symlinks are followed (e.g. `/sbin/init` -> `/bin/busybox`), matching how
+/// `spawn` loads the binary.
 fn program_exists(
     path: &str,
     primary_root: &Option<Arc<dyn INode>>,
     rootfs: &Arc<dyn FileSystem>,
 ) -> bool {
     if let Some(root) = primary_root {
-        if root.lookup(path).is_ok() {
+        if root.lookup_follow(path, FOLLOW_LINK_DEPTH).is_ok() {
             return true;
         }
     }
-    rootfs.root_inode().lookup(path).is_ok()
+    rootfs
+        .root_inode()
+        .lookup_follow(path, FOLLOW_LINK_DEPTH)
+        .is_ok()
 }
+
+/// Max symlink hops to follow when resolving an exec target (e.g.
+/// `/sbin/init` -> `/bin/busybox`). A small bound prevents loops.
+const FOLLOW_LINK_DEPTH: usize = 8;
 
 /// Core process spawn. Returns `None` if `args[0]` cannot be found on the
 /// process's root or the initramfs (instead of panicking) so optional
 /// processes can be skipped gracefully. `boot_work` runs the one-time boot
 /// setup (network init, fstab mount, console clear) and must happen once.
+///
+/// `foreground` seeds the VT's foreground process group with this process so an
+/// interactive shell does not conclude it is backgrounded. It must be `false`
+/// for a non-interactive PID 1 init that shares vt 0 with the primary shell —
+/// otherwise init would steal vt 0's foreground group and wedge that shell on
+/// `SIGTTIN`.
 fn spawn(
     args: Vec<String>,
     envs: Vec<String>,
@@ -127,6 +154,7 @@ fn spawn(
     shared_root: Option<Arc<dyn INode>>,
     pid: KoID,
     boot_work: bool,
+    foreground: bool,
 ) -> Option<Arc<Process>> {
     info!(
         "spawn pid={} vt={}: args={:?}, envs={:?}",
@@ -148,9 +176,14 @@ fn spawn(
         root_inode: root_inode.clone(),
     };
 
-    let inode = match root_inode.lookup(&args[0]) {
+    // Follow symlinks so a symlinked entry point (e.g. /sbin/init ->
+    // /bin/busybox) loads the real ELF instead of the symlink's path text.
+    let inode = match root_inode.lookup_follow(&args[0], FOLLOW_LINK_DEPTH) {
         Ok(inode) => inode,
-        Err(e) => match rootfs.root_inode().lookup(&args[0]) {
+        Err(e) => match rootfs
+            .root_inode()
+            .lookup_follow(&args[0], FOLLOW_LINK_DEPTH)
+        {
             Ok(inode) => inode,
             Err(e2) => {
                 warn!(
@@ -216,8 +249,11 @@ fn spawn(
     // enter_uspace loop that was previously hidden behind the handle_signal
     // self-deadlock). Seed it only here — after every fallible step has
     // succeeded — so a process that fails to load never leaves the VT pointing
-    // at a pid that never started.
-    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
+    // at a pid that never started. Skipped for a non-interactive init that
+    // shares vt 0 with the primary shell (see `foreground` above).
+    if foreground {
+        linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
+    }
 
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
