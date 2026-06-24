@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 11] = [
+const PROC_ROOT_STATIC: [&str; 12] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf",
+    "perf", "hunter",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -275,6 +275,7 @@ impl INode for ProcRootINode {
             "loadavg" => Ok(PROC_LOADAVG.clone()),
             "sys" => Ok(PROC_SYS_DIR.clone()),
             "perf" => Ok(PROC_PERF_DIR.clone()),
+            "hunter" => Ok(PROC_HUNTER.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -988,6 +989,12 @@ fn proc_loadavg_content() -> String {
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
 
+/// `/proc/hunter` — security subsystem status and recent intrusion-detection
+/// event ring, rendered on each read by the `hunter` crate.
+fn proc_hunter_content() -> String {
+    hunter::render_report()
+}
+
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let free = total.saturating_sub(used);
@@ -1198,6 +1205,10 @@ lazy_static! {
     static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 16,
         generate: proc_loadavg_content,
+    });
+    static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 17,
+        generate: proc_hunter_content,
     });
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,

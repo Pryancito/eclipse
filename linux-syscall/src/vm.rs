@@ -102,6 +102,14 @@ impl Syscall<'_> {
         if len == 0 || len > MAX_MMAP_LEN {
             return Err(LxError::ENOMEM);
         }
+        // hunter W^X: reject (or audit) simultaneously writable+executable maps.
+        if !hunter::check_mmap(
+            self.zircon_process().id(),
+            prot.contains(MmapProt::WRITE),
+            prot.contains(MmapProt::EXEC),
+        ) {
+            return Err(LxError::EACCES);
+        }
 
         let proc = self.zircon_process();
         let vmar = proc.vmar();
@@ -273,6 +281,14 @@ impl Syscall<'_> {
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
         );
+        // hunter W^X: reject (or audit) transitions to writable+executable.
+        if !hunter::check_mprotect(
+            self.zircon_process().id(),
+            prot.contains(MmapProt::WRITE),
+            prot.contains(MmapProt::EXEC),
+        ) {
+            return Err(LxError::EACCES);
+        }
         let proc = self.zircon_process();
         let vmar = proc.vmar();
         let flags = prot.to_flags();

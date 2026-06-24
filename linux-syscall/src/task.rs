@@ -540,6 +540,16 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
+        // hunter: validate ELF integrity (magic) and executable-path policy
+        // before we destroy the old address space. A rejection aborts the exec
+        // with EACCES; in report-only mode this just records an audit event.
+        {
+            let mut header = [0u8; 64];
+            let n = inode.read_at(0, &mut header).unwrap_or(0);
+            if !hunter::check_elf_binary(path_str, &header[..n]) {
+                return Err(LxError::EACCES);
+            }
+        }
         let vmo = inode.read_as_vmo()?;
 
         proc.remove_cloexec_files();
@@ -635,6 +645,9 @@ impl Syscall<'_> {
     pub fn sys_exit_group(&mut self, exit_code: i32) -> SysResult {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
+        // hunter: release this process's security state (syscall whitelist,
+        // anomaly counters) so a recycled pid never inherits stale policy.
+        hunter::task_exit(proc.id());
         proc.exit(exit_code as i64);
         Ok(0)
     }
