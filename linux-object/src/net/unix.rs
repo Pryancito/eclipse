@@ -9,6 +9,7 @@ use alloc::{
     collections::VecDeque,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use async_trait::async_trait;
 use hashbrown::HashMap;
@@ -61,6 +62,10 @@ struct UnixInner {
     /// `SO_PEERCRED` (seatd reads it to authorize a Wayland client). `0` until
     /// set by `sys_socket`.
     owner_pid: i32,
+    /// File descriptors handed to us by the peer via `SCM_RIGHTS`, one batch per
+    /// `sendmsg`, delivered FIFO to our `recvmsg`. This is how seatd passes the
+    /// opened DRM/input device fd to a Wayland compositor.
+    pending_fds: VecDeque<Vec<Arc<dyn FileLike>>>,
 }
 
 impl Default for UnixSocketState {
@@ -80,6 +85,7 @@ impl Default for UnixSocketState {
                 read_closed: false,
                 write_closed: false,
                 owner_pid: 0,
+                pending_fds: VecDeque::new(),
             })),
         }
     }
@@ -399,6 +405,39 @@ impl Socket for UnixSocketState {
         };
         let pid = peer.lock().owner_pid;
         Some(pid)
+    }
+
+    fn send_fds(&self, fds: Vec<Arc<dyn FileLike>>) -> SysResult {
+        if fds.is_empty() {
+            return Ok(0);
+        }
+        // Append to the *peer's* queue, mirroring how `write` appends bytes to
+        // the peer's buffer.
+        let peer = {
+            let inner = self.inner.lock();
+            inner.peer.as_ref().and_then(|w| w.upgrade())
+        };
+        match peer {
+            Some(peer) => {
+                peer.lock().pending_fds.push_back(fds);
+                Ok(0)
+            }
+            None => Err(LxError::ENOTCONN),
+        }
+    }
+
+    fn recv_fds(&self, max: usize) -> Vec<Arc<dyn FileLike>> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock();
+        match inner.pending_fds.pop_front() {
+            Some(mut batch) => {
+                batch.truncate(max);
+                batch
+            }
+            None => Vec::new(),
+        }
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {

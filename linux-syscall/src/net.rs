@@ -1,4 +1,6 @@
 use super::*;
+use alloc::vec::Vec;
+use core::convert::TryInto;
 use core::mem::size_of;
 use kernel_hal::user::UserInOutPtr;
 use linux_object::{
@@ -421,6 +423,39 @@ impl Syscall<'_> {
         }
     }
 
+    /// Parse `SCM_RIGHTS` ancillary data and resolve the carried fd numbers to
+    /// the sender's open files, ready to be queued on the peer. `struct cmsghdr`
+    /// is `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }` (16 bytes on
+    /// x86_64), followed by the fd array; entries are `CMSG_ALIGN`ed to 8.
+    fn collect_scm_rights_fds(&self, ctrl: &[u8]) -> Vec<Arc<dyn FileLike>> {
+        const CMSG_HDR_LEN: usize = 16;
+        const SOL_SOCKET_LEVEL: i32 = 1;
+        const SCM_RIGHTS: i32 = 1;
+        let mut fds = Vec::new();
+        let proc = self.linux_process();
+        let mut off = 0usize;
+        while off + CMSG_HDR_LEN <= ctrl.len() {
+            let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
+            let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+            if cmsg_len < CMSG_HDR_LEN || off + cmsg_len > ctrl.len() {
+                break;
+            }
+            if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
+                for chunk in ctrl[off + CMSG_HDR_LEN..off + cmsg_len].chunks_exact(4) {
+                    let raw = i32::from_ne_bytes(chunk.try_into().unwrap());
+                    if raw >= 0 {
+                        if let Ok(fl) = proc.get_file_like(FileDesc::from(raw as usize)) {
+                            fds.push(fl);
+                        }
+                    }
+                }
+            }
+            off += (cmsg_len + 7) & !7; // CMSG_ALIGN
+        }
+        fds
+    }
+
     /// transmit a message to another socket
     #[allow(unsafe_code)]
     pub fn sys_sendmsg(
@@ -442,6 +477,14 @@ impl Syscall<'_> {
         }
         let data = iovs.read_to_vec()?;
 
+        // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
+        let passed_fds = if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
+            let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
+            self.collect_scm_rights_fds(&ctrl)
+        } else {
+            Vec::new()
+        };
+
         let endpoint = if !hdr.msg_name.is_null() {
             let namelen = hdr.msg_namelen as usize;
             let endpoint =
@@ -452,7 +495,13 @@ impl Syscall<'_> {
         };
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like.clone().as_socket()?.write(&data, endpoint)?;
+        let socket_fl = file_like.clone();
+        let socket = socket_fl.as_socket()?;
+        socket.write(&data, endpoint)?;
+        if !passed_fds.is_empty() {
+            // Hand the fds to the peer (delivered with its next recvmsg).
+            let _ = socket.send_fds(passed_fds);
+        }
         Ok(data.len())
     }
 
@@ -467,7 +516,9 @@ impl Syscall<'_> {
             "sys_recvmsg: sockfd:{}, msg:{:?}, flags:{}",
             sockfd, msg, flags
         );
-        let hdr = msg.read()?;
+        let mut hdr = msg.read()?;
+        // Capture the user address before `msg` may be moved by `write_to_msg`.
+        let msg_addr = msg.as_addr();
 
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
@@ -498,6 +549,31 @@ impl Syscall<'_> {
             if !addr.is_null() {
                 let sockaddr_in = SockAddr::from(endpoint);
                 sockaddr_in.write_to_msg(msg)?;
+            }
+            // SCM_RIGHTS: install any fds the peer attached and emit a cmsg.
+            if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
+                let max_fds = (hdr.msg_controllen - 16) / 4;
+                let fds = socket.recv_fds(max_fds);
+                if !fds.is_empty() {
+                    let cmsg_len = 16 + fds.len() * 4;
+                    let mut cbuf = Vec::with_capacity(cmsg_len);
+                    cbuf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
+                    cbuf.extend_from_slice(&1i32.to_ne_bytes()); // SOL_SOCKET
+                    cbuf.extend_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
+                    let proc = self.linux_process();
+                    for fl in fds {
+                        let newfd = proc.add_file(fl)?;
+                        let raw: i32 = newfd.into();
+                        cbuf.extend_from_slice(&raw.to_ne_bytes());
+                    }
+                    let towrite = cbuf.len().min(hdr.msg_controllen);
+                    hdr.msg_control.write_array(&cbuf[..towrite])?;
+                    // Update msg_controllen so the receiver's CMSG_*HDR macros
+                    // walk exactly our ancillary data and no further.
+                    let controllen_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_controllen);
+                    let mut p = UserOutPtr::<usize>::from(controllen_addr);
+                    p.write(towrite)?;
+                }
             }
         }
 
