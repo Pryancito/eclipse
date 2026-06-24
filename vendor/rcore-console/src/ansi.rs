@@ -44,6 +44,8 @@ pub enum Mode {
     LineFeedNewLine = 20,
     /// ?25
     ShowCursor = 25,
+    /// ?47 - use the alternate screen buffer (legacy, no cursor save/clear).
+    SwapScreenOld = 47,
     /// ?1000
     ReportMouseClicks = 1000,
     /// ?1002
@@ -60,6 +62,8 @@ pub enum Mode {
     AlternateScroll = 1007,
     /// ?1042
     UrgencyHints = 1042,
+    /// ?1047 - use the alternate screen buffer.
+    SwapScreenBuffer = 1047,
     /// ?1049
     SwapScreenAndSetRestoreCursor = 1049,
     /// ?2004
@@ -83,6 +87,7 @@ impl Mode {
                 7 => Mode::LineWrap,
                 12 => Mode::BlinkingCursor,
                 25 => Mode::ShowCursor,
+                47 => Mode::SwapScreenOld,
                 1000 => Mode::ReportMouseClicks,
                 1002 => Mode::ReportCellMouseMotion,
                 1003 => Mode::ReportAllMouseMotion,
@@ -91,6 +96,7 @@ impl Mode {
                 1006 => Mode::SgrMouse,
                 1007 => Mode::AlternateScroll,
                 1042 => Mode::UrgencyHints,
+                1047 => Mode::SwapScreenBuffer,
                 1049 => Mode::SwapScreenAndSetRestoreCursor,
                 2004 => Mode::BracketedPaste,
                 _ => {
@@ -236,6 +242,22 @@ pub trait Handler {
     /// Scroll down `rows` rows.
     fn scroll_down(&mut self, _rows: usize) {}
 
+    /// Insert `count` blank characters at the cursor, shifting the rest of the
+    /// line right (ICH, `CSI @`).
+    fn insert_blank(&mut self, _count: usize) {}
+
+    /// Insert `count` blank lines at the cursor, pushing lines below down within
+    /// the scroll region (IL, `CSI L`).
+    fn insert_blank_lines(&mut self, _count: usize) {}
+
+    /// Delete `count` lines at the cursor, pulling lines below up within the
+    /// scroll region (DL, `CSI M`).
+    fn delete_lines(&mut self, _count: usize) {}
+
+    /// Reverse Index (RI, `ESC M`): move the cursor up one line, scrolling the
+    /// scroll region down when already at its top.
+    fn reverse_index(&mut self) {}
+
     /// Erase `count` chars in current line following cursor.
     ///
     /// Erase means resetting to the default state (default colors, no content,
@@ -271,6 +293,10 @@ pub trait Handler {
 
     /// DECSTBM - Set the terminal scrolling region.
     fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) {}
+
+    /// Select the G0 charset: DEC Special Graphics (`ESC ( 0`) when `dec` is
+    /// true, ASCII (`ESC ( B`) otherwise.
+    fn set_g0_charset(&mut self, _dec: bool) {}
 
     /// Report device status.
     fn device_status(&mut self, _arg: usize) {}
@@ -409,6 +435,9 @@ impl<'a, H: Handler> Perform for Performer<'a, H> {
 
                 handler.clear_line(mode);
             }
+            ('@', []) => handler.insert_blank(next_param_or(1) as usize),
+            ('L', []) => handler.insert_blank_lines(next_param_or(1) as usize),
+            ('M', []) => handler.delete_lines(next_param_or(1) as usize),
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('S', []) => handler.scroll_up(next_param_or(1) as usize),
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
@@ -468,6 +497,22 @@ impl<'a, H: Handler> Perform for Performer<'a, H> {
         match (byte, intermediates) {
             (b'7', []) => self.handler.save_cursor_position(),
             (b'8', []) => self.handler.restore_cursor_position(),
+            // IND (Index): move down one line, scrolling at the region bottom.
+            // Our `linefeed` already does this (column reset is harmless for the
+            // ncurses callers that emit it after a carriage return).
+            (b'D', []) => self.handler.linefeed(),
+            // NEL (Next Line): CR + LF.
+            (b'E', []) => {
+                self.handler.carriage_return();
+                self.handler.linefeed();
+            }
+            // RI (Reverse Index): move up one line, scrolling at the region top.
+            (b'M', []) => self.handler.reverse_index(),
+            // G0 charset: DEC Special Graphics (line drawing) vs ASCII.
+            (b'0', [b'(']) => self.handler.set_g0_charset(true),
+            (b'B', [b'(']) => self.handler.set_g0_charset(false),
+            // G1 charset (`ESC ) x`) is accepted but unused (apps draw via G0).
+            (b'0', [b')']) | (b'B', [b')']) => {}
             _ => unhandled!(),
         }
     }
