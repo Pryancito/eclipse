@@ -93,9 +93,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
             let init_args = parse_proc(&options.init_proc);
             let shell_args = parse_proc(&options.shell_proc);
+            // Base environment for the shells and PID 1 init. `HOME`/`TERM`/
+            // `USER`/`LOGNAME` are set HERE (not just in /etc/profile) because
+            // bash, unlike POSIX sh, ignores `ENV` and only sources /etc/profile
+            // as a *login* shell — without these in the real environment bash
+            // greets with "I can't find my home directory!" and readline (tab
+            // completion) misbehaves for lack of `TERM`.
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
+                "HOME=/root".into(),
+                "TERM=xterm-256color".into(),
+                "USER=root".into(),
+                "LOGNAME=root".into(),
             ];
             let rootfs = fs::rootfs();
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
