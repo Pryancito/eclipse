@@ -471,14 +471,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// only by `#ifdef __linux__`, which the musl cross-compiler defines), and
     /// the meson build hard-requires `dependency('libcap', version: '>=2.33')`
     /// with no option to turn it off. The bare musl sysroot ships no libcap, so
-    /// it must be built and exposed (headers + `libcap.pc` + `libcap.so`) before
-    /// OpenRC can configure or link. libcap builds from a plain Makefile, so this
-    /// just cross-compiles the library (no Go bindings, no PAM module) and
-    /// installs it — with its pkg-config file — under a private sysroot.
+    /// it must be built and exposed (headers + `libcap.pc` + `libcap.a`) before
+    /// OpenRC can configure or link. The shared `libcap.so*` is removed after
+    /// install so OpenRC's static link resolves `-lcap` to `libcap.a` (OpenRC is
+    /// built fully static — see [`openrc`](Self::openrc) — so nothing needs the
+    /// shared object at runtime).
     fn libcap(&self, musl: &Path) -> Option<PathBuf> {
         const VERSION: &str = "2.69";
         let sysroot = self.0.target().join("libcap-sysroot");
-        if sysroot.join("lib").join("libcap.so.2").exists() {
+        if sysroot.join("lib").join("libcap.a").exists() {
             return Some(sysroot);
         }
 
@@ -555,17 +556,28 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: libcap install failed; OpenRC build skipped");
             return None;
         }
-        if sysroot.join("lib").join("libcap.so.2").exists() {
+        // Drop the shared objects so OpenRC's `-static` link picks `libcap.a`
+        // (and the installed system needs no libcap.so at runtime).
+        if let Ok(entries) = fs::read_dir(sysroot.join("lib")) {
+            for entry in entries.flatten() {
+                let n = entry.file_name();
+                let n = n.to_string_lossy();
+                if n.starts_with("libcap.so") || n.starts_with("libpsx.so") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        if sysroot.join("lib").join("libcap.a").exists() {
             Some(sysroot)
         } else {
-            eprintln!("warning: libcap produced no libcap.so.2; OpenRC build skipped");
+            eprintln!("warning: libcap produced no libcap.a; OpenRC build skipped");
             None
         }
     }
 
     /// Cross-compile the latest OpenRC with the musl toolchain (best-effort) and
-    /// return `(staging, libcap_sysroot)` ready to be mirrored into the rootfs,
-    /// or `None` if the build is unavailable.
+    /// return the staging directory ready to be mirrored into the rootfs, or
+    /// `None` if the build is unavailable.
     ///
     /// Mirrors the busybox / e2fsprogs conventions: the source is cloned on first
     /// use, built in a separate tree, and the staged install is cached (a
@@ -580,15 +592,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     ///      meson reports "Found pkg-config: NO" and every dependency lookup dies.
     ///   3. `-Dpam=false`: the `pam` option DEFAULTS to true and musl ships no
     ///      libpam, so the default build fails at `cc.find_library('pam')`.
-    ///   4. A `-no-pie` gcc wrapper forces ET_EXEC executables (the kernel/loader
-    ///      prefers EXEC over PIE, as the busybox build already does) WITHOUT
-    ///      poisoning the shared-library links (`-no-pie -shared` is an error).
-    fn openrc(&self, musl: &Path) -> Option<(PathBuf, PathBuf)> {
+    ///   4. A FULLY STATIC, non-PIE link (`default_library=static`, `-static`,
+    ///      `-no-pie`): the binaries come out as static ET_EXEC, exactly like
+    ///      busybox / apk / e2fsprogs. This is not just convention — a *dynamic*
+    ///      OpenRC (interpreter + librc/libcap in their own sub-VMARs) drove the
+    ///      kernel through the `fork`-time sub-VMAR clone path that static
+    ///      binaries never exercise, which corrupted memory under the heavy
+    ///      fork/exec churn of `openrc sysinit` (one CPU faulted with a mangled
+    ///      frame pointer). Static binaries reuse busybox's proven fork path and
+    ///      need no librc/libcap/ld-musl at runtime.
+    fn openrc(&self, musl: &Path) -> Option<PathBuf> {
         let libcap_sysroot = self.libcap(musl)?;
         let staging = self.0.target().join("openrc-install");
         let init_bin = staging.join("sbin").join("openrc-init");
         if init_bin.is_file() {
-            return Some((staging, libcap_sysroot));
+            return Some(staging);
         }
 
         // meson + ninja + pkg-config are required. ninja/pkg-config ship in CI;
@@ -630,7 +648,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let musl = musl.canonicalize().unwrap();
         let arch = self.0.name();
         let musl_bin = musl.join("bin");
-        let real_cc = format!("{}/{}-linux-musl-gcc", musl_bin.display(), arch);
+        let cc = format!("{}/{}-linux-musl-gcc", musl_bin.display(), arch);
         let ar = format!("{}/{}-linux-musl-ar", musl_bin.display(), arch);
         let strip_tool = format!("{}/{}-linux-musl-strip", musl_bin.display(), arch);
         let cpu_family = match self.0 {
@@ -641,48 +659,29 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         fs::create_dir_all(self.0.target()).unwrap();
 
-        // gcc wrapper: append `-no-pie` only when linking an EXECUTABLE (i.e. the
-        // args carry neither `-shared` nor a compile-only flag), so executables
-        // come out ET_EXEC while librc/libeinfo stay valid shared objects.
-        let wrapper = self.0.target().join("musl-gcc-nopie");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\n\
-                 REAL='{real_cc}'\n\
-                 for a in \"$@\"; do\n\
-                 \tcase \"$a\" in\n\
-                 \t-shared|-c|-E|-S) exec \"$REAL\" \"$@\" ;;\n\
-                 \tesac\n\
-                 done\n\
-                 exec \"$REAL\" \"$@\" -no-pie\n",
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        // meson cross-file: the no-pie wrapper as the C compiler, the musl ar /
-        // strip, and a `pkg-config` so libcap (and any auto feature) resolves.
+        // meson cross-file: the musl toolchain, a `pkg-config` so libcap resolves,
+        // and `[built-in options]` forcing a static, non-PIE link for every
+        // executable (`default_library=static` already drops the shared libs, so
+        // `-static -no-pie` is safe globally — no shared-object link to break).
         let cross = self.0.target().join("openrc-cross.ini");
         fs::write(
             &cross,
             format!(
                 "[binaries]\n\
-                 c = '{wrapper}'\n\
+                 c = '{cc}'\n\
                  ar = '{ar}'\n\
                  strip = '{strip_tool}'\n\
                  pkg-config = 'pkg-config'\n\
+                 \n\
+                 [built-in options]\n\
+                 c_args = ['-fno-PIE']\n\
+                 c_link_args = ['-static', '-no-pie']\n\
                  \n\
                  [host_machine]\n\
                  system = 'linux'\n\
                  cpu_family = '{cpu_family}'\n\
                  cpu = '{arch}'\n\
                  endian = 'little'\n",
-                wrapper = wrapper.display(),
             ),
         )
         .unwrap();
@@ -709,6 +708,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("--libdir=lib")
             .arg("--libexecdir=lib")
             .arg("--buildtype=release")
+            .arg("-Ddefault_library=static")
             .arg("-Dpam=false")
             .arg("-Dbash-completions=false")
             .arg("-Dzsh-completions=false")
@@ -738,8 +738,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             return None;
         }
         if init_bin.is_file() {
-            println!("Built OpenRC -> {}", staging.display());
-            Some((staging, libcap_sysroot))
+            println!("Built OpenRC (static) -> {}", staging.display());
+            Some(staging)
         } else {
             eprintln!("warning: OpenRC build produced no openrc-init; busybox init remains PID 1");
             None
@@ -754,9 +754,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// the rootfs verbatim (the `openrc-init` / `openrc` / `rc-*` binaries into
     /// `/sbin` and `/bin`, the `librc` / `libeinfo` shared libs and the `/lib/rc`
     /// libexec helpers into `/lib`, and the stock service scripts and config into
-    /// `/etc/init.d`, `/etc/conf.d`, `/etc/rc.conf`). The musl-built `libcap.so`
-    /// (a runtime `NEEDED` of start-stop-daemon / supervise-daemon) is copied
-    /// into `/lib`, and `/sbin/init` is repointed at `openrc-init`.
+    /// `/etc/init.d`, `/etc/conf.d`, `/etc/rc.conf`), and `/sbin/init` is
+    /// repointed at `openrc-init`. The binaries are fully static, so nothing
+    /// extra (librc/libcap/ld-musl) is needed in `/lib` at runtime.
     ///
     /// The active runlevels (`sysinit` / `boot` / `default` / `shutdown`) are
     /// reset to **empty**: the stock install seeds ~30 service symlinks (mount,
@@ -765,27 +765,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// only fight it. The full OpenRC userland is still present, so an operator
     /// can `rc-update add <svc> default` to wire real services later.
     fn install_openrc(&self, rootfs: &Path, musl: &Path) -> bool {
-        let (staging, libcap_sysroot) = match self.openrc(musl) {
-            Some(x) => x,
+        let staging = match self.openrc(musl) {
+            Some(s) => s,
             None => return false,
         };
 
         // Mirror the staged tree (sbin/bin/lib/etc/…) into the rootfs, preserving
         // symlinks and permissions. Robust to upstream path tweaks.
         copy_tree(&staging, rootfs);
-
-        // Copy the musl-built libcap runtime libs (libcap.so, libcap.so.2 ->
-        // libcap.so.2.x) into /lib so the daemons that link it resolve at boot.
-        let lib = rootfs.join("lib");
-        let _ = fs::create_dir_all(&lib);
-        if let Ok(entries) = fs::read_dir(libcap_sysroot.join("lib")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("libcap.so") {
-                    copy_tree(&entry.path(), &lib.join(&name));
-                }
-            }
-        }
 
         // /sbin/init -> openrc-init (PID 1). The kernel boots INIT=/sbin/init by
         // default; this makes that resolve to OpenRC, overriding the busybox

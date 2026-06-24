@@ -68,7 +68,7 @@ const LIVE_FILE_CAP: u64 = 16 * 1024 * 1024;
 /// system, which pivots root onto it.
 const LIVE_KEEP: [&str; 8] = [
     "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools + rc-*
-    "lib",              // ld-musl + libeclipse_dns + apk db + librc/libeinfo + /lib/rc (capped)
+    "lib",              // ld-musl + libeclipse_dns + apk db + OpenRC /lib/rc helpers (capped)
     "etc",              // fstab, profile, ssl certs, apk repo, machine-id, X11, OpenRC (init.d/conf.d/runlevels/rc.conf)
     "var",              // apk dbs (small)
     "sbin",             // openrc-init / openrc / rc-* + /sbin/init -> openrc-init (INIT)
