@@ -77,8 +77,8 @@ pub fn run_init_if_present(
         return None;
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
-        warn!(
-            "INIT {:?} not present; booting without a PID 1 init",
+        kernel_hal::klog_warn!(
+            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Install it (e.g. `apk add openrc`) or set INIT= in rboot.conf.",
             args[0]
         );
         return None;
@@ -88,14 +88,15 @@ pub fn run_init_if_present(
     let proc = spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work);
     if proc.is_none() {
         // The binary exists but could not be started (unreadable, malformed
-        // ELF, or blocked by policy). Don't silently end up with no PID 1:
-        // make the fallback to the terminal shell explicit in the log.
-        warn!(
-            "INIT {:?} present but failed to start; falling back to the shell as the lifetime process",
+        // ELF, or blocked by the hunter exec policy — see the preceding
+        // `spawn:`/`hunter:` console line for which). Don't silently end up
+        // with no PID 1: make the fallback to the terminal shell explicit.
+        kernel_hal::klog_warn!(
+            "INIT {:?} present but FAILED to start (see the spawn/hunter line above); falling back to the shell as the lifetime process",
             init
         );
     } else {
-        info!("INIT {:?} started as PID {}", init, INIT_PID);
+        kernel_hal::klog_info!("INIT {:?} started as PID {}", init, INIT_PID);
     }
     proc
 }
@@ -166,7 +167,7 @@ fn spawn(
     let vmo = match inode.read_as_vmo() {
         Ok(vmo) => vmo,
         Err(e) => {
-            warn!("failed to read process {:?}: {:?}; skipping", args[0], e);
+            kernel_hal::klog_warn!("spawn: failed to read {:?}: {:?}; skipping", args[0], e);
             return None;
         }
     };
@@ -178,7 +179,7 @@ fn spawn(
     let mut header = [0u8; 64];
     let _ = vmo.read(0, &mut header);
     if !hunter::check_elf_binary(&path, &header) {
-        warn!("spawn: binary {:?} blocked by hunter security policy", path);
+        kernel_hal::klog_warn!("spawn: binary {:?} blocked by hunter security policy", path);
         return None;
     }
 
@@ -198,7 +199,7 @@ fn spawn(
         match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
             Ok(loaded) => loaded,
             Err(e) => {
-                warn!("failed to load process {:?}: {:?}; skipping", args[0], e);
+                kernel_hal::klog_warn!("spawn: failed to load {:?}: {:?}; skipping", args[0], e);
                 return None;
             }
         };
