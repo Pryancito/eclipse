@@ -931,31 +931,55 @@ impl INode for SysClassDrmDirINode {
             "." => Ok(Arc::new(SysClassDrmDirINode)),
             ".." => Ok(Arc::new(SysClassINode)),
             "card0" => drm_card0_pci_index()
-                .map(|idx| Arc::new(SysDrmCardINode { pci_index: idx }) as Arc<dyn INode>)
+                .map(|idx| Arc::new(SysDrmNodeINode::card(idx)) as Arc<dyn INode>)
+                .ok_or(FsError::EntryNotFound),
+            "renderD128" => drm_card0_pci_index()
+                .map(|idx| Arc::new(SysDrmNodeINode::render(idx)) as Arc<dyn INode>)
                 .ok_or(FsError::EntryNotFound),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 && drm_card0_pci_index().is_some() {
-            Ok("card0".into())
-        } else {
-            Err(FsError::EntryNotFound)
+        if drm_card0_pci_index().is_none() {
+            return Err(FsError::EntryNotFound);
+        }
+        match id {
+            0 => Ok("card0".into()),
+            1 => Ok("renderD128".into()),
+            _ => Err(FsError::EntryNotFound),
         }
     }
 }
 
-struct SysDrmCardINode {
+/// A DRM device node in sysfs: the primary node `card0` (minor 0) or the render
+/// node `renderD128` (minor 128). Both share the same backing PCI device.
+struct SysDrmNodeINode {
     pci_index: usize,
+    minor: u32,
+    devname: &'static str,
 }
 
-impl SysDrmCardINode {
+impl SysDrmNodeINode {
+    fn card(pci_index: usize) -> Self {
+        Self {
+            pci_index,
+            minor: 0,
+            devname: "card0",
+        }
+    }
+    fn render(pci_index: usize) -> Self {
+        Self {
+            pci_index,
+            minor: 128,
+            devname: "renderD128",
+        }
+    }
     fn entries() -> [&'static str; 4] {
         ["dev", "uevent", "device", "subsystem"]
     }
 }
 
-impl INode for SysDrmCardINode {
+impl INode for SysDrmNodeINode {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         Ok(0)
     }
@@ -980,19 +1004,25 @@ impl INode for SysDrmCardINode {
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." => Ok(Arc::new(SysDrmCardINode {
+            "." => Ok(Arc::new(SysDrmNodeINode {
                 pci_index: self.pci_index,
+                minor: self.minor,
+                devname: self.devname,
             })),
             ".." => Ok(Arc::new(SysClassDrmDirINode)),
-            // What libudev reads to recognize the DRM device and resolve its
-            // node: `dev` (major:minor) and `uevent` (DEVNAME/MAJOR/MINOR). DRM
-            // major is 226; card0 is minor 0 → /dev/dri/card0.
-            "dev" => Ok(Arc::new(Pseudo::new("226:0\n", FileType::File))),
-            "uevent" => Ok(Arc::new(Pseudo::new(
-                "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n",
+            // libdrm/libudev read `dev` (major:minor) and `uevent`
+            // (DEVNAME/MAJOR/MINOR). DRM major is 226.
+            "dev" => Ok(Arc::new(Pseudo::new(
+                &format!("226:{}\n", self.minor),
                 FileType::File,
             ))),
-            // Subsystem link so libudev classifies this device as "drm".
+            "uevent" => Ok(Arc::new(Pseudo::new(
+                &format!(
+                    "MAJOR=226\nMINOR={}\nDEVNAME=dri/{}\n",
+                    self.minor, self.devname
+                ),
+                FileType::File,
+            ))),
             "subsystem" => Ok(Arc::new(Pseudo::new(
                 "../../../class/drm",
                 FileType::SymLink,
@@ -1047,13 +1077,16 @@ impl INode for SysDrmCardDeviceINode {
                 }))
             }
             ".." => {
-                return Ok(Arc::new(SysDrmCardINode {
+                return Ok(Arc::new(SysDrmNodeINode::card(self.pci_index)));
+            }
+            // `<dev>/device/drm/` lists this device's DRM nodes. libdrm's
+            // drmNodeIsDRM() stat()s the dir; drmGetRenderDeviceNameFromFd()
+            // scans it for a `renderD*` entry to resolve the render node.
+            "drm" => {
+                return Ok(Arc::new(SysDrmDeviceDrmDirINode {
                     pci_index: self.pci_index,
                 }))
             }
-            // libdrm's drmNodeIsDRM() stats `<dev>/device/drm` to confirm this
-            // is a DRM device; an empty directory is enough for the check.
-            "drm" => return Ok(Arc::new(SysEmptyDirINode)),
             _ => {}
         }
         let devs = get_pci_devices();
@@ -1075,11 +1108,14 @@ impl INode for SysDrmCardDeviceINode {
     }
 }
 
-/// A minimal empty sysfs directory (used where userspace only needs the path to
-/// exist, e.g. libdrm's `drmNodeIsDRM` stat of `<dev>/device/drm`).
-struct SysEmptyDirINode;
+/// `<pci-dev>/device/drm/` — lists this device's DRM nodes (`card0`,
+/// `renderD128`). libdrm's drmGetRenderDeviceNameFromFd() scans it for the
+/// `renderD*` entry to resolve the render node path.
+struct SysDrmDeviceDrmDirINode {
+    pci_index: usize,
+}
 
-impl INode for SysEmptyDirINode {
+impl INode for SysDrmDeviceDrmDirINode {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         Ok(0)
     }
@@ -1104,12 +1140,20 @@ impl INode for SysEmptyDirINode {
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." | ".." => Ok(Arc::new(SysEmptyDirINode)),
+            "." | ".." => Ok(Arc::new(SysDrmDeviceDrmDirINode {
+                pci_index: self.pci_index,
+            })),
+            "card0" => Ok(Arc::new(SysDrmNodeINode::card(self.pci_index))),
+            "renderD128" => Ok(Arc::new(SysDrmNodeINode::render(self.pci_index))),
             _ => Err(FsError::EntryNotFound),
         }
     }
-    fn get_entry(&self, _id: usize) -> Result<String> {
-        Err(FsError::EntryNotFound)
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok("card0".into()),
+            1 => Ok("renderD128".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
     }
 }
 
@@ -1192,10 +1236,15 @@ impl INode for SysDevCharDirINode {
         if name == "." || name == ".." {
             return Ok(Arc::new(SysDevCharDirINode));
         }
-        // DRM card: 226:0 -> /sys/class/drm/card0
+        // DRM nodes: 226:0 -> card0, 226:128 -> renderD128.
         if name == "226:0" {
             if let Some(idx) = drm_card0_pci_index() {
-                return Ok(Arc::new(SysDrmCardINode { pci_index: idx }));
+                return Ok(Arc::new(SysDrmNodeINode::card(idx)));
+            }
+        }
+        if name == "226:128" {
+            if let Some(idx) = drm_card0_pci_index() {
+                return Ok(Arc::new(SysDrmNodeINode::render(idx)));
             }
         }
         // evdev: 13:<64+N> -> /sys/class/input/eventN
@@ -1212,11 +1261,16 @@ impl INode for SysDevCharDirINode {
         Err(FsError::EntryNotFound)
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        // 226:0 (card0, if present) first, then evdev nodes 13:64..
+        // 226:0 (card0) and 226:128 (renderD128) first, then evdev 13:64..
         let have_card = drm_card0_pci_index().is_some();
-        let base = have_card as usize;
-        if have_card && id == 0 {
-            return Ok("226:0".into());
+        let base = if have_card { 2 } else { 0 };
+        if have_card {
+            if id == 0 {
+                return Ok("226:0".into());
+            }
+            if id == 1 {
+                return Ok("226:128".into());
+            }
         }
         let ev = id - base;
         if ev < input_event_count() {
