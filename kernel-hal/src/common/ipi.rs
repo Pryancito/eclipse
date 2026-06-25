@@ -87,6 +87,26 @@ pub fn mark_cpu_ipi_ready(logical_id: usize) {
 const ZERO_SEQ: AtomicU64 = AtomicU64::new(0);
 static SHOOTDOWN_SEQ: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
 
+/// Diagnostics for the synchronous shootdown wait. `total` counts shootdowns
+/// that had at least one target; `giveups` counts those that exhausted the spin
+/// budget (a target — typically an idle core — never acked, so we fell back to
+/// fire-and-forget); `spins` is the total spin iterations burned waiting.
+/// Surfaced at `/proc/perf/kernel` to confirm whether this wait is the source of
+/// the fork/exec latency seen on real multi-core hardware (where idle cores are
+/// slow to ack), which is invisible in single-core / always-awake QEMU.
+static TLB_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_GIVEUPS: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_SPINS: AtomicU64 = AtomicU64::new(0);
+
+/// `(total shootdowns, budget-exhausted give-ups, total spin iterations)`.
+pub fn tlb_shootdown_stats() -> (u64, u64, u64) {
+    (
+        TLB_SHOOTDOWNS.load(Ordering::Relaxed),
+        TLB_SHOOTDOWN_GIVEUPS.load(Ordering::Relaxed),
+        TLB_SHOOTDOWN_SPINS.load(Ordering::Relaxed),
+    )
+}
+
 /// Receiver side of the TLB shootdown: flush this CPU's whole TLB. The queue
 /// payload is irrelevant — a full flush covers every pending request — so it is
 /// just drained and discarded; this also makes the path robust to IPI-queue
@@ -134,6 +154,7 @@ pub fn remote_flush_tlb(_vaddr: Option<usize>) {
     if targets == 0 {
         return; // nobody else is servicing IPIs yet
     }
+    TLB_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
     let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
     // Snapshot each target's ack counter BEFORE signalling it, then signal.
     let mut snapshot = [0u64; MAX_CORE_NUM];
@@ -169,10 +190,12 @@ pub fn remote_flush_tlb(_vaddr: Option<usize>) {
         }
         spins += 1;
         if spins >= SPIN_BUDGET {
+            TLB_SHOOTDOWN_GIVEUPS.fetch_add(1, Ordering::Relaxed);
             break; // bounded fallback to fire-and-forget, never a hang
         }
         core::hint::spin_loop();
     }
+    TLB_SHOOTDOWN_SPINS.fetch_add(spins, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
