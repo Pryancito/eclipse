@@ -389,11 +389,36 @@ impl FileLike for File {
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
-        Ok(self.inner.read().inode.poll()?)
+        let inner = self.inner.read();
+        let meta = inner.inode.metadata()?;
+        if meta.type_ == FileType::NamedPipe {
+            // A FIFO node opened from the fs has no pipe-buffer / writer tracking
+            // here, so a reader polling an empty FIFO (e.g. openrc-init's control
+            // FIFO, which never gets a writer) would spin: the node reads as an
+            // empty regular file (0 bytes = EOF) yet polls "readable". Treat it as
+            // readable only when it actually holds bytes, so the reader blocks
+            // instead of busy-looping on repeated 0-byte reads.
+            return Ok(PollStatus {
+                read: meta.size > 0,
+                write: true,
+                error: false,
+            });
+        }
+        Ok(inner.inode.poll()?)
     }
 
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inode = self.inner.read().inode.clone();
+        let meta = inode.metadata()?;
+        if meta.type_ == FileType::NamedPipe {
+            // See `poll`: an empty FIFO must block, not report readable, or a
+            // reader (openrc-init) spins forever on 0-byte EOF reads.
+            return Ok(PollStatus {
+                read: meta.size > 0,
+                write: true,
+                error: false,
+            });
+        }
         Ok(inode.async_poll().await?)
     }
 
