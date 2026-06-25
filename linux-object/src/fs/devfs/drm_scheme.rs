@@ -448,6 +448,12 @@ impl INode for DrmDev {
                     0x12 => cap.value = 1,
                     _ => cap.value = 0,
                 }
+                log::error!(
+                    "[drm] GET_CAP minor={} cap={:#x} -> {}",
+                    self.minor,
+                    cap.capability,
+                    cap.value
+                );
                 Ok(0)
             }
             // A single DRM client on the primary node is implicitly master;
