@@ -78,7 +78,7 @@ pub fn run_init_if_present(
         return None;
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
-        kernel_hal::klog_warn!(
+        warn!(
             "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init (default INIT=/sbin/init -> openrc-init, busybox init fallback); rebuild the rootfs or set INIT= in rboot.conf.",
             args[0]
         );
@@ -103,12 +103,12 @@ pub fn run_init_if_present(
         // ELF, or blocked by the hunter exec policy — see the preceding
         // `spawn:`/`hunter:` console line for which). Don't silently end up
         // with no PID 1: make the fallback to the terminal shell explicit.
-        kernel_hal::klog_warn!(
+        warn!(
             "INIT {:?} present but FAILED to start (see the spawn/hunter line above); falling back to the shell as the lifetime process",
             init
         );
     } else {
-        kernel_hal::klog_info!("INIT {:?} started as PID {}", init, INIT_PID);
+        info!("INIT {:?} started as PID {}", init, INIT_PID);
     }
     proc
 }
@@ -218,7 +218,7 @@ fn spawn(
     let mut header = [0u8; 64];
     let _ = vmo.read(0, &mut header);
     if !hunter::check_elf_binary(&path, &header) {
-        kernel_hal::klog_warn!("spawn: binary {:?} blocked by hunter security policy", path);
+        warn!("spawn: binary {:?} blocked by hunter security policy", path);
         return None;
     }
 
@@ -238,7 +238,7 @@ fn spawn(
         match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
             Ok(loaded) => loaded,
             Err(e) => {
-                kernel_hal::klog_warn!("spawn: failed to load {:?}: {:?}; skipping", args[0], e);
+                warn!("spawn: failed to load {:?}: {:?}; skipping", args[0], e);
                 return None;
             }
         };
@@ -391,7 +391,7 @@ fn handle_signal(
         // Record the death in the dmesg ring (warn! reaches it at the default
         // level). A process that dies on a default-disposition signal — Xorg
         // aborting in early init, say — otherwise vanishes with no trace at all.
-        error!(
+        warn!(
             "[exit] pid={} killed by signal {:?} ({}) at pc={:#x} (default disposition)",
             thread.proc().id(),
             signal,
@@ -461,7 +461,7 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             || action.handler == SIG_IGN
     };
     if undeliverable {
-        error!(
+        warn!(
             "[exit] pid={} killed by fault signal {:?} ({}) — undeliverable, terminating",
             thread.proc().id(),
             signal,
@@ -571,7 +571,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
-                error!(
+                warn!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr,
                     flags,
@@ -580,11 +580,6 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     thread.proc().name(),
                     pc,
                 );
-                // [diag] Dump the VMAR tree at error! level: shows whether the
-                // faulting address is actually covered by a mapping (and in which
-                // VMAR / child) — the key question for the deterministic brk
-                // NOT_FOUND fault in musl's __malloc_alloc_meta.
-                thread.proc().vmar().dump_error();
                 // Make a userspace crash self-diagnosing from dmesg: dump the
                 // registers and the code bytes around the faulting PC. With the
                 // faulting instruction *and* the instructions that computed the
@@ -609,7 +604,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         })
                         .ok()
                     {
-                        error!(
+                        warn!(
                             "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",
                             pid, pc, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11,
                         );
@@ -626,12 +621,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                     }
                     if any {
-                        error!(
+                        warn!(
                             "[crash] pid={} code@{:#x} (pc-16): {:02x?}",
                             pid, start, code
                         );
                     } else {
-                        error!(
+                        warn!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
                             pid, pc
                         );

@@ -465,7 +465,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // scanout) so wlroots/labwc can drive the framebuffer via legacy KMS.
         let have_drm = !drivers::all_drm().as_vec().is_empty();
         let have_display = drivers::all_display().first().is_some();
-        error!(
+        debug!(
             "[drm] graphics inventory: drm_drivers={} display={}",
             drivers::all_drm().as_vec().len(),
             have_display
@@ -475,20 +475,20 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
                     warn!("failed to mknod /dev/dri/card0: {:?}", e);
                 } else {
-                    error!("[drm] /dev/dri/card0 created (sw_kms path available)");
+                    debug!("[drm] /dev/dri/card0 created (sw_kms path available)");
                 }
                 // Render node (major 226, minor 128) — Mesa/EGL opens this for
                 // GPU-less GL/Vulkan (llvmpipe/lavapipe via the swrast DRI).
                 if let Err(e) = dri_dev.add("renderD128", Arc::new(devfs::DrmDev::new(128))) {
                     warn!("failed to mknod /dev/dri/renderD128: {:?}", e);
                 } else {
-                    error!("[drm] /dev/dri/renderD128 created (render node)");
+                    debug!("[drm] /dev/dri/renderD128 created (render node)");
                 }
             } else {
                 warn!("failed to mkdir /dev/dri");
             }
         } else {
-            error!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
+            warn!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
         }
     }
 
