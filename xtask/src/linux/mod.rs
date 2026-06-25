@@ -862,8 +862,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         if let Ok(entries) = fs::read_dir(&initd) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let is_helper = name.to_string_lossy().ends_with(".sh");
-                if !is_helper {
+                let name = name.to_string_lossy();
+                // Drop the stock service scripts (no `.sh`) — they fight the
+                // kernel's own boot work. Also drop `functions.sh`: it is a zsh
+                // compat shim that runs `emulate sh` (a zsh-only builtin) which
+                // busybox `ash` cannot parse, so OpenRC's depscan/boot aborts on
+                // it. The real helper library lives at `/lib/rc/sh/functions.sh`,
+                // which OpenRC sources directly, so removing the `/etc/init.d`
+                // copy is harmless on the empty-runlevel Eclipse boot.
+                let keep = name.ends_with(".sh") && name != "functions.sh";
+                if !keep {
                     let _ = fs::remove_file(entry.path());
                 }
             }
