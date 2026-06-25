@@ -577,8 +577,17 @@ impl VmAddressRegion {
         if !self.contains(vaddr) {
             return Err(ZxError::NOT_FOUND);
         }
+        // Prefer a child sub-VMAR that owns this address — but if the child can
+        // NOT resolve the fault (no mapping there), fall through to this VMAR's
+        // own mappings instead of returning the child's NOT_FOUND. A mapping
+        // placed in the parent must not be shadowed into a spurious SIGSEGV just
+        // because some child sub-region's address *range* happens to cover
+        // `vaddr` while owning no mapping for it.
         if let Some(child) = inner.children.iter().find(|ch| ch.contains(vaddr)) {
-            return child.handle_page_fault(vaddr, flags);
+            match child.handle_page_fault(vaddr, flags) {
+                Err(ZxError::NOT_FOUND) => {}
+                res => return res,
+            }
         }
         if let Some(mapping) = inner.mappings.iter().find(|map| map.contains(vaddr)) {
             return mapping.handle_page_fault(vaddr, flags);
