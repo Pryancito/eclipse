@@ -519,12 +519,13 @@ impl INode for DrmDev {
                 let cap = unsafe { &mut *(data as *mut DrmGetCap) };
                 match cap.capability {
                     0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
-                    // DRM_CAP_PRIME: we expose dumb buffers via mmap, not
-                    // dma-buf fds (no PRIME_HANDLE_TO_FD/FD_TO_HANDLE), so report
-                    // 0. Advertising PRIME would steer GBM-based clients (e.g.
-                    // wlroots' GBM allocator) down a path we cannot service;
-                    // with 0 they fall back to the dumb-buffer/pixman path.
-                    0x5 => cap.value = 0,
+                    // DRM_CAP_PRIME: IMPORT|EXPORT. wlroots' check_drm_features
+                    // *requires* DRM_PRIME_CAP_IMPORT or the whole DRM backend
+                    // fails ("PRIME import not supported") — it is mandatory for
+                    // any output (pixman or GL), not just GBM clients. We now
+                    // implement PRIME_HANDLE_TO_FD / FD_TO_HANDLE (dma-buf), so
+                    // advertise it.
+                    0x5 => cap.value = 3,
                     0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
                     0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
                     0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
