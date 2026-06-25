@@ -577,8 +577,17 @@ impl VmAddressRegion {
         if !self.contains(vaddr) {
             return Err(ZxError::NOT_FOUND);
         }
+        // Prefer a child sub-VMAR that owns this address — but if the child can
+        // NOT resolve the fault (no mapping there), fall through to this VMAR's
+        // own mappings instead of returning the child's NOT_FOUND. A mapping
+        // placed in the parent must not be shadowed into a spurious SIGSEGV just
+        // because some child sub-region's address *range* happens to cover
+        // `vaddr` while owning no mapping for it.
         if let Some(child) = inner.children.iter().find(|ch| ch.contains(vaddr)) {
-            return child.handle_page_fault(vaddr, flags);
+            match child.handle_page_fault(vaddr, flags) {
+                Err(ZxError::NOT_FOUND) => {}
+                res => return res,
+            }
         }
         if let Some(mapping) = inner.mappings.iter().find(|map| map.contains(vaddr)) {
             return mapping.handle_page_fault(vaddr, flags);
@@ -632,6 +641,45 @@ impl VmAddressRegion {
             for child in inner.children.iter() {
                 child.dump_impl(depth + 1);
             }
+        }
+    }
+
+    /// Like [`dump`](Self::dump) but at `error!` level so it is visible under
+    /// `LOG=error`. Used by the page-fault crash dump to show the VMAR tree at
+    /// the moment of an unhandled fault — in particular whether the faulting
+    /// address is covered by a mapping (and in which VMAR).
+    pub fn dump_error(&self) {
+        self.dump_error_impl(0);
+    }
+
+    fn dump_error_impl(&self, depth: usize) {
+        let children = {
+            let guard = self.inner.lock();
+            let inner = match guard.as_ref() {
+                Some(inner) => inner,
+                None => return,
+            };
+            error!(
+                "[vmardump] VMAR d{}: {:#x}-{:#x} (size={:#x})",
+                depth,
+                self.addr,
+                self.addr + self.size,
+                self.size
+            );
+            for map in inner.mappings.iter() {
+                error!(
+                    "[vmardump]   map d{}: {:#x}-{:#x} (size={:#x}) vmo={}",
+                    depth,
+                    map.addr(),
+                    map.addr() + map.size(),
+                    map.size(),
+                    map.vmo.name()
+                );
+            }
+            inner.children.iter().cloned().collect::<alloc::vec::Vec<_>>()
+        };
+        for child in children {
+            child.dump_error_impl(depth + 1);
         }
     }
 
@@ -890,7 +938,7 @@ impl VmMapping {
                 .unmap_cont(begin, cut_len)
                 .expect("failed to unmap");
             inner.size = new_len;
-            inner.flags.truncate(new_len);
+            inner.flags.truncate(pages(new_len));
             None
         } else {
             // superset: [---xxxx---]
@@ -913,7 +961,7 @@ impl VmMapping {
                 }),
             });
             inner.size = new_len1;
-            inner.flags.truncate(new_len1);
+            inner.flags.truncate(pages(new_len1));
             Some(new_mapping)
         }
     }
@@ -1031,10 +1079,32 @@ impl VmMapping {
         Ok(())
     }
 
-    /// Clone VMO and map it to a new page table. (For Linux)
+    /// Clone VMO and map it to a new page table. (For Linux fork)
+    ///
+    /// Eager full copy — NOT copy-on-write. The Zircon-style hidden-node COW
+    /// tree mis-replicated the address space for a process that *runs* (rather
+    /// than immediately `execve`s) after `fork`: openrc-init and its forked
+    /// children faulted with SIGSEGV on writes to pages that fork should have
+    /// provided (NULL / unmapped heap-BSS writes, and writes to pages whose COW
+    /// copy never happened), while busybox — which always fork+exec's — never
+    /// exercised it. We give the child a straight, independent copy of the
+    /// parent VMO's current contents instead. It costs more memory and copy time
+    /// than COW, but it is correct, and it leaves the PARENT completely untouched
+    /// (no COW write-protect of its pages), so the forking process keeps writing
+    /// to its own frames without faulting.
     fn clone_map(&self, page_table: Arc<Mutex<dyn GenericPageTable>>) -> ZxResult<Arc<Self>> {
-        //这里调用 hal protect 后, protect() 好像会破坏页表
-        let new_vmo = self.vmo.create_child(false, 0, self.vmo.len())?;
+        let len = self.vmo.len();
+        let new_vmo = VmObject::new_paged(len / PAGE_SIZE);
+        // Copy the parent's current contents page by page. `read` commits /
+        // fills-from-source as needed (so file-backed .text and demand-zero BSS
+        // come through correctly); `write` commits the fresh child frames.
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut off = 0;
+        while off < len {
+            self.vmo.read(off, &mut buf)?;
+            new_vmo.write(off, &buf)?;
+            off += PAGE_SIZE;
+        }
         let mapping = Arc::new(VmMapping {
             inner: Mutex::new(self.inner.lock().clone()),
             permissions: self.permissions,

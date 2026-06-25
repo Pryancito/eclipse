@@ -6,7 +6,7 @@ use zircon_object::{object::KernelObject, task::Process};
 pub struct BootOptions {
     pub cmdline: String,
     pub log_level: String,
-    /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/openrc-init`. Empty
+    /// Process run as PID 1 / init (`INIT`), e.g. `/sbin/init`. Empty
     /// or a missing binary means the system boots without a PID 1 init.
     #[cfg(feature = "linux")]
     pub init_proc: String,
@@ -66,15 +66,15 @@ pub fn boot_options() -> BootOptions {
             BootOptions {
                 cmdline: cmdline.clone(),
                 log_level: options.get("LOG").unwrap_or(&"").to_string(),
-                // `INIT` selects the PID 1 process (default /sbin/openrc-init,
-                // run only if it exists). `SHELL` selects the per-terminal
-                // shells at PIDs 101.. (default busybox); `ROOTPROC` is accepted
-                // as a deprecated alias for `SHELL`.
+                // `INIT` selects the PID 1 process. Default `/sbin/init`, which
+                // the rootfs points at OpenRC's `openrc-init` (the default init
+                // system); if the OpenRC cross-build was unavailable the same
+                // `/sbin/init` symlink falls back to busybox's `init` applet.
+                // Run only if it exists. `SHELL` selects the per-terminal shells
+                // at PIDs 101.. (default busybox); `ROOTPROC` is accepted as a
+                // deprecated alias for `SHELL`.
                 #[cfg(feature = "linux")]
-                init_proc: options
-                    .get("INIT")
-                    .unwrap_or(&"/sbin/openrc-init")
-                    .to_string(),
+                init_proc: options.get("INIT").unwrap_or(&"/sbin/init").to_string(),
                 #[cfg(feature = "linux")]
                 shell_proc: options
                     .get("SHELL")
@@ -175,6 +175,11 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         had_jobs
     });
     info!("executor run!");
+    // This CPU is now entering the executor loop, where it runs with interrupts
+    // enabled and will service TLB-shootdown IPIs. Announce it as a valid
+    // shootdown target: until now an AP spins on `STARTED` with IRQs off and
+    // could not ack, so a shootdown that waited on it would stall.
+    kernel_hal::mark_cpu_ipi_ready(kernel_hal::cpu::cpu_id() as usize);
     loop {
         // In normal builds `run_until_idle` never returns (idle work happens in
         // the callback above); it only returns under `baremetal-test` when the

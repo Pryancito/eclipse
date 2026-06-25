@@ -185,6 +185,16 @@ pub fn get_handle(handle_id: u32) -> Option<GemHandle> {
         .map(|(h, _)| *h)
 }
 
+/// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
+pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
+    DRM_STATE
+        .lock()
+        .framebuffers
+        .iter()
+        .find(|f| f.id == fb_id)
+        .copied()
+}
+
 /// Create a framebuffer from a GEM handle
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
     let handle = get_handle(handle_id)?;
@@ -316,16 +326,17 @@ pub fn page_flip(fb_id: u32, crtc_id: u32, user_data: u64) -> bool {
     flipped
 }
 
-/// Encode and enqueue a `struct drm_event_vblank` (DRM_EVENT_FLIP_COMPLETE).
-fn queue_flip_event(crtc_id: u32, user_data: u64) {
-    const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+/// Encode and enqueue a `struct drm_event_vblank` for the card fd.
+///
+/// Shared by page-flip completions (`DRM_EVENT_FLIP_COMPLETE`) and vblank waits
+/// (`DRM_EVENT_VBLANK`), which use the identical 32-byte wire layout — only the
+/// `type` field distinguishes them for libdrm's event dispatcher.
+fn push_drm_event(ev_type: u32, crtc_id: u32, seq: u32, user_data: u64) {
     let now = kernel_hal::timer::timer_now();
-    let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
-
     // struct drm_event_vblank { u32 type; u32 length; u64 user_data;
     //   u32 tv_sec; u32 tv_usec; u32 sequence; u32 crtc_id; }  (32 bytes)
     let mut ev = Vec::with_capacity(32);
-    ev.extend_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_ne_bytes());
+    ev.extend_from_slice(&ev_type.to_ne_bytes());
     ev.extend_from_slice(&32u32.to_ne_bytes());
     ev.extend_from_slice(&user_data.to_ne_bytes());
     ev.extend_from_slice(&(now.as_secs() as u32).to_ne_bytes());
@@ -333,6 +344,30 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     ev.extend_from_slice(&seq.to_ne_bytes());
     ev.extend_from_slice(&crtc_id.to_ne_bytes());
     DRM_STATE.lock().events.push_back(ev);
+}
+
+/// Enqueue a `DRM_EVENT_FLIP_COMPLETE` for a completed page flip.
+fn queue_flip_event(crtc_id: u32, user_data: u64) {
+    const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+    let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed);
+    push_drm_event(DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
+}
+
+/// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
+/// event (`_DRM_VBLANK_EVENT`) instead of blocking.
+pub fn queue_vblank_event(seq: u32, user_data: u64) {
+    const DRM_EVENT_VBLANK: u32 = 1;
+    push_drm_event(DRM_EVENT_VBLANK, SYNTH_CRTC_ID, seq, user_data);
+}
+
+/// Synthetic ~60 Hz vertical-blank counter derived from the monotonic clock.
+///
+/// A software framebuffer has no real vblank interrupt, but `WAIT_VBLANK`
+/// callers expect a monotonically increasing sequence; deriving one from time
+/// keeps both absolute and relative queries sane.
+pub fn vblank_seq_now() -> u32 {
+    let now = kernel_hal::timer::timer_now();
+    (now.as_nanos() * 60 / 1_000_000_000) as u32
 }
 
 /// Pop one pending DRM event into `buf`, returning the number of bytes copied,

@@ -67,8 +67,21 @@ const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5;
 const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;
+const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC03064B7;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC01864BA;
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;
+
+// Core (non-MODE) vblank wait.
+const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
+// Query an existing framebuffer object.
+const DRM_IOCTL_MODE_GETFB: u32 = 0xC01C64AD;
+const DRM_IOCTL_MODE_GETFB2: u32 = 0xC06864CE;
+// Flush framebuffer damage to the display.
+const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
+
+// WAIT_VBLANK request type flags (`<drm/drm.h>`).
+const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
 
 // Synthetic property ids (software KMS). Only the plane "type" is mandatory for
 // wlroots' legacy backend to classify the primary plane.
@@ -272,6 +285,61 @@ struct DrmModeCrtcPageFlip {
     user_data: u64,
 }
 
+/// `union drm_wait_vblank` (24 bytes). The request side is `{ type, sequence,
+/// signal }`; the reply side reuses the trailing 16 bytes as `{ tval_sec,
+/// tval_usec }`. We model the union as one struct and read/write the overlap by
+/// field.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmWaitVblank {
+    typ: u32,
+    sequence: u32,
+    /// request: `signal`; reply: `tval_sec`.
+    val1: u64,
+    /// request: unused; reply: `tval_usec`.
+    val2: u64,
+}
+
+/// `struct drm_mode_set_plane` (48 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeSetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    crtc_x: i32,
+    crtc_y: i32,
+    crtc_w: u32,
+    crtc_h: u32,
+    // Source values are 16.16 fixed point.
+    src_x: u32,
+    src_y: u32,
+    src_h: u32,
+    src_w: u32,
+}
+
+/// `struct drm_mode_obj_set_property` (24 bytes after u64 alignment padding).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeObjSetProperty {
+    value: u64,
+    prop_id: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+/// `struct drm_mode_fb_dirty_cmd` (24 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeFbDirtyCmd {
+    fb_id: u32,
+    flags: u32,
+    color: u32,
+    num_clips: u32,
+    clips_ptr: u64,
+}
+
 // Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
 // _IOC size field, so a wrong struct layout silently mismatches the ioctl and
 // the handler never fires. Assert the sizes that the constants above depend on.
@@ -286,6 +354,10 @@ const _: () = {
     assert!(size_of::<DrmModeGetProperty>() == 64); // GETPROPERTY        0x..40..
     assert!(size_of::<DrmModePropertyEnum>() == 40);
     assert!(size_of::<DrmModeGetPlane>() == 32); // DRM_IOCTL_MODE_GETPLANE 0x..20..
+    assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
+    assert!(size_of::<DrmModeSetPlane>() == 48); // DRM_IOCTL_MODE_SETPLANE 0x..30..
+    assert!(size_of::<DrmModeObjSetProperty>() == 24); // OBJ_SETPROPERTY  0x..18..
+    assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
 };
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
@@ -393,7 +465,16 @@ impl INode for DrmDev {
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         match cmd {
             DRM_IOCTL_VERSION => {
-                log::error!("[drm] VERSION ioctl — /dev/dri/card0 opened by userspace");
+                let node = if self.minor >= 128 {
+                    "renderD128"
+                } else {
+                    "card0"
+                };
+                log::error!(
+                    "[drm] VERSION — /dev/dri/{} opened by userspace (minor={})",
+                    node,
+                    self.minor
+                );
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
                 v.version_major = 1;
                 v.version_minor = 0;
@@ -437,8 +518,13 @@ impl INode for DrmDev {
             DRM_IOCTL_GET_CAP => {
                 let cap = unsafe { &mut *(data as *mut DrmGetCap) };
                 match cap.capability {
-                    0x1 => cap.value = 1,  // DRM_CAP_DUMB_BUFFER
-                    0x5 => cap.value = 3,  // DRM_CAP_PRIME: IMPORT|EXPORT
+                    0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
+                    // DRM_CAP_PRIME: we expose dumb buffers via mmap, not
+                    // dma-buf fds (no PRIME_HANDLE_TO_FD/FD_TO_HANDLE), so report
+                    // 0. Advertising PRIME would steer GBM-based clients (e.g.
+                    // wlroots' GBM allocator) down a path we cannot service;
+                    // with 0 they fall back to the dumb-buffer/pixman path.
+                    0x5 => cap.value = 0,
                     0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
                     0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
                     0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
@@ -458,8 +544,6 @@ impl INode for DrmDev {
             }
             // A single DRM client on the primary node is implicitly master;
             // accept (drop-)master so seatd/wlroots session activation succeeds.
-            // Master = the client owns the display: leave/restore the kernel text
-            // console accordingly (KD_GRAPHICS while a compositor is scanning out).
             // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
             // success as "this fd is DRM master". wlroots' dumb-buffer allocator
             // (pixman path) requires master, so always succeed — the single
@@ -471,10 +555,19 @@ impl INode for DrmDev {
             }
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_SET_MASTER => {
-                kernel_hal::console::set_kd_mode(kernel_hal::console::KD_GRAPHICS);
+                // Become DRM master, but do NOT switch the console to graphics
+                // yet: defer that to the first real scanout (`drm::scanout`). If
+                // the client stalls before presenting a frame (e.g. its renderer
+                // fails to init), the kernel text console stays usable and its
+                // logs visible instead of freezing on a black screen.
+                log::error!("[drm] SET_MASTER (minor={})", self.minor);
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
+                log::error!(
+                    "[drm] DROP_MASTER (minor={}) — restoring text console",
+                    self.minor
+                );
                 kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
                 Ok(0)
             }
@@ -486,10 +579,17 @@ impl INode for DrmDev {
                     // back to the legacy KMS path, which the software
                     // framebuffer scanout implements.
                     DRM_CLIENT_CAP_ATOMIC | DRM_CLIENT_CAP_WRITEBACK_CONNECTORS => {
+                        log::error!(
+                            "[drm] SET_CLIENT_CAP cap={} -> rejected (force legacy KMS)",
+                            cap
+                        );
                         Err(FsError::InvalidParam)
                     }
                     // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
-                    _ => Ok(0),
+                    _ => {
+                        log::error!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
+                        Ok(0)
+                    }
                 }
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
@@ -502,8 +602,23 @@ impl INode for DrmDev {
                     info.handle = handle.id;
                     info.pitch = pitch;
                     info.size = size as u64;
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> handle={} pitch={} size={}",
+                        info.width,
+                        info.height,
+                        bpp,
+                        handle.id,
+                        pitch,
+                        size
+                    );
                     Ok(0)
                 } else {
+                    log::error!(
+                        "[drm] CREATE_DUMB {}x{} bpp={} -> alloc failed",
+                        info.width,
+                        info.height,
+                        bpp
+                    );
                     Err(FsError::NoDeviceSpace)
                 }
             }
@@ -566,6 +681,95 @@ impl INode for DrmDev {
                 } else {
                     Err(FsError::DeviceError)
                 }
+            }
+            DRM_IOCTL_WAIT_VBLANK => {
+                // union drm_wait_vblank. A software framebuffer has no real
+                // vblank, so synthesize the next sequence from the monotonic
+                // clock. If the caller asked for an event (`_DRM_VBLANK_EVENT`)
+                // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
+                // reply and return immediately instead of blocking.
+                let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
+                let typ = req.typ;
+                let signal = req.val1;
+                let seq = drm::vblank_seq_now().wrapping_add(1);
+                if typ & _DRM_VBLANK_EVENT != 0 {
+                    drm::queue_vblank_event(seq, signal);
+                } else {
+                    let now = kernel_hal::timer::timer_now();
+                    req.typ = 0; // _DRM_VBLANK_ABSOLUTE
+                    req.sequence = seq;
+                    req.val1 = now.as_secs(); // tval_sec
+                    req.val2 = now.subsec_micros() as u64; // tval_usec
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_SETPLANE => {
+                // Software KMS: a primary-plane update is equivalent to scanning
+                // the framebuffer out (the legacy SETCRTC path). fb_id == 0
+                // disables the plane, which we treat as a no-op.
+                let req = unsafe { *(data as *const DrmModeSetPlane) };
+                if req.fb_id != 0 {
+                    drm::set_crtc_fb(req.crtc_id, req.fb_id);
+                    drm::scanout(req.fb_id);
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_GETFB => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
+                if let Some(fb) = drm::get_fb(cmd.fb_id) {
+                    cmd.width = fb.width;
+                    cmd.height = fb.height;
+                    cmd.pitch = fb.pitch;
+                    cmd.bpp = 32;
+                    cmd.depth = 24;
+                    // A single client is implicitly DRM master on the primary
+                    // node here, so handing back the backing GEM handle is safe.
+                    cmd.handle = fb.gem_handle_id;
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_GETFB2 => {
+                let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
+                if let Some(fb) = drm::get_fb(cmd.fb_id) {
+                    cmd.width = fb.width;
+                    cmd.height = fb.height;
+                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
+                    cmd.flags = 0;
+                    cmd.handles = [fb.gem_handle_id, 0, 0, 0];
+                    cmd.pitches = [fb.pitch, 0, 0, 0];
+                    cmd.offsets = [0; 4];
+                    cmd.modifier = [0; 4];
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
+            DRM_IOCTL_MODE_DIRTYFB => {
+                // Flush accumulated damage by re-scanning the framebuffer out.
+                // Clients that keep one persistent FB and signal damage with
+                // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
+                // to update the screen.
+                let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                if drm::software_kms_active() {
+                    drm::scanout(cmd.fb_id);
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                // Legacy property writes (connector DPMS, plane rotation, …).
+                // The software scanout has no programmable object state, so
+                // accept and ignore rather than failing the client's modeset.
+                let req = unsafe { *(data as *const DrmModeObjSetProperty) };
+                log::error!(
+                    "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
+                    req.obj_id,
+                    req.obj_type,
+                    req.prop_id,
+                    req.value
+                );
+                Ok(0)
             }
             DRM_IOCTL_GEM_CLOSE => {
                 let handle = unsafe { *(data as *const u32) };

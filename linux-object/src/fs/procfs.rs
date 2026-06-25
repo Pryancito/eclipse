@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 11] = [
+const PROC_ROOT_STATIC: [&str; 13] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf",
+    "perf", "hunter", "filesystems",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -73,7 +73,10 @@ fn proc_state_char(status: Status) -> char {
 }
 
 fn proc_comm(proc: &Process) -> String {
-    let path = proc.linux().execute_path();
+    // try_linux: /proc readers run on processes looked up by pid, which may be
+    // tearing down concurrently. Fall back to the kobject name on a miss rather
+    // than panicking the reader.
+    let path = proc.try_linux().map(|lp| lp.execute_path()).unwrap_or_default();
     if !path.is_empty() {
         let base = path.rsplit('/').next().unwrap_or(&path);
         return sanitize_comm(base);
@@ -82,7 +85,10 @@ fn proc_comm(proc: &Process) -> String {
 }
 
 fn proc_ppid(proc: &Process) -> u64 {
-    proc.linux().parent().map(|p| p.id()).unwrap_or(0)
+    proc.try_linux()
+        .and_then(|lp| lp.parent())
+        .map(|p| p.id())
+        .unwrap_or(0)
 }
 
 /// The first (leader) thread of a process, if any, for reporting its
@@ -149,7 +155,11 @@ fn proc_pid_status(proc: &Process) -> String {
 }
 
 fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
-    let args = proc.linux().cmdline();
+    let lp = match proc.try_linux() {
+        Some(lp) => lp,
+        None => return Vec::new(),
+    };
+    let args = lp.cmdline();
     if !args.is_empty() {
         let mut out = Vec::new();
         for arg in args {
@@ -158,7 +168,7 @@ fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
         }
         return out;
     }
-    let path = proc.linux().execute_path();
+    let path = lp.execute_path();
     let mut out = path.into_bytes();
     out.push(0);
     out
@@ -275,6 +285,8 @@ impl INode for ProcRootINode {
             "loadavg" => Ok(PROC_LOADAVG.clone()),
             "sys" => Ok(PROC_SYS_DIR.clone()),
             "perf" => Ok(PROC_PERF_DIR.clone()),
+            "hunter" => Ok(PROC_HUNTER.clone()),
+            "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -602,7 +614,10 @@ fn proc_perf_tasks_content() -> String {
         let comm = proc_comm(&proc);
         let state = proc_state_char(proc.status());
         let nthr = proc.thread_ids().len().max(1);
-        let (calls, ns) = proc.linux().perf().totals();
+        let (calls, ns) = proc
+            .try_linux()
+            .map(|lp| lp.perf().totals())
+            .unwrap_or((0, 0));
         let _ = writeln!(
             out,
             "  {:>5} {:>4} {:<16} {:<2} {:>10} {:>12.3}",
@@ -817,7 +832,10 @@ impl ProcPidFileINode {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
             ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
             ProcPidFileKind::Status => proc_pid_status(&proc).into_bytes(),
-            ProcPidFileKind::Perf => crate::perf::proc_report(proc.linux(), self.pid).into_bytes(),
+            ProcPidFileKind::Perf => match proc.try_linux() {
+                Some(lp) => crate::perf::proc_report(lp, self.pid).into_bytes(),
+                None => Vec::new(),
+            },
         })
     }
 }
@@ -988,6 +1006,12 @@ fn proc_loadavg_content() -> String {
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
 
+/// `/proc/hunter` — security subsystem status and recent intrusion-detection
+/// event ring, rendered on each read by the `hunter` crate.
+fn proc_hunter_content() -> String {
+    hunter::render_report()
+}
+
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let free = total.saturating_sub(used);
@@ -1053,6 +1077,24 @@ fn proc_swaps_content() -> String {
 
 fn proc_mounts_content() -> String {
     super::proc_mounts_content()
+}
+
+/// `/proc/filesystems` — the filesystem types the kernel can mount. Each line is
+/// an optional `nodev` (the fs needs no backing block device) followed by a TAB
+/// and the type name. Userland (openrc's sysinit, `mount`, `grep`) probes this
+/// before mounting; a missing file made openrc log
+/// `grep: /proc/filesystems: No such file or directory`.
+fn proc_filesystems_content() -> String {
+    "nodev\tsysfs\n\
+     nodev\tproc\n\
+     nodev\ttmpfs\n\
+     nodev\tdevtmpfs\n\
+     nodev\tramfs\n\
+     nodev\tdevpts\n\
+     \text2\n\
+     \tbtrfs\n\
+     \tvfat\n"
+        .into()
 }
 
 fn proc_net_arp_content() -> String {
@@ -1198,6 +1240,14 @@ lazy_static! {
     static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 16,
         generate: proc_loadavg_content,
+    });
+    static ref PROC_FILESYSTEMS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 49,
+        generate: proc_filesystems_content,
+    });
+    static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 17,
+        generate: proc_hunter_content,
     });
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,

@@ -30,7 +30,7 @@ fn comm_from_path(path: &str) -> &str {
 /// Used by the libos example/tests, where one program is the whole system.
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
     const INIT_PID: KoID = 1;
-    spawn(args, envs, rootfs, 0, None, INIT_PID, true).expect("run: program not found")
+    spawn(args, envs, rootfs, 0, None, INIT_PID, true, true).expect("run: program not found")
 }
 
 /// Create and run the configured per-terminal SHELL on virtual terminal `vt`
@@ -56,13 +56,14 @@ pub fn run_shell_on_vt(
         shared_root,
         pid,
         /* boot_work */ vt == 0,
+        /* foreground */ true,
     )
     .expect("configured SHELL not found")
 }
 
 /// Spawn the INIT process as PID 1 if its binary exists, returning `None`
 /// otherwise so the machine can boot without a PID 1 init (e.g. when
-/// `/sbin/openrc-init` is not installed). Runs on the primary console (vt 0).
+/// `/bin/busybox` is not installed). Runs on the primary console (vt 0).
 ///
 /// `boot_work` should be set only when no shell has already performed the
 /// one-time boot setup (network init, fstab mount).
@@ -77,34 +78,74 @@ pub fn run_init_if_present(
         return None;
     }
     if !program_exists(&args[0], &shared_root, &rootfs) {
-        warn!(
-            "INIT {:?} not present; booting without a PID 1 init",
+        kernel_hal::klog_warn!(
+            "INIT {:?} not present on root or initramfs; booting WITHOUT a PID 1 init (only the per-terminal shells run). Expected /sbin/init (default INIT=/sbin/init -> openrc-init, busybox init fallback); rebuild the rootfs or set INIT= in rboot.conf.",
             args[0]
         );
         return None;
     }
     const INIT_PID: KoID = 1;
-    spawn(args, envs, rootfs, 0, shared_root, INIT_PID, boot_work)
+    let init = args[0].clone();
+    // `foreground = false`: init shares vt 0 with the primary shell and must not
+    // seize its foreground process group (that would wedge the shell on SIGTTIN).
+    let proc = spawn(
+        args,
+        envs,
+        rootfs,
+        0,
+        shared_root,
+        INIT_PID,
+        boot_work,
+        false,
+    );
+    if proc.is_none() {
+        // The binary exists but could not be started (unreadable, malformed
+        // ELF, or blocked by the hunter exec policy — see the preceding
+        // `spawn:`/`hunter:` console line for which). Don't silently end up
+        // with no PID 1: make the fallback to the terminal shell explicit.
+        kernel_hal::klog_warn!(
+            "INIT {:?} present but FAILED to start (see the spawn/hunter line above); falling back to the shell as the lifetime process",
+            init
+        );
+    } else {
+        kernel_hal::klog_info!("INIT {:?} started as PID {}", init, INIT_PID);
+    }
+    proc
 }
 
 /// True if `path` resolves on the primary root (if any) or the initramfs.
+/// Symlinks are followed (e.g. `/sbin/init` -> `/bin/busybox`), matching how
+/// `spawn` loads the binary.
 fn program_exists(
     path: &str,
     primary_root: &Option<Arc<dyn INode>>,
     rootfs: &Arc<dyn FileSystem>,
 ) -> bool {
     if let Some(root) = primary_root {
-        if root.lookup(path).is_ok() {
+        if root.lookup_follow(path, FOLLOW_LINK_DEPTH).is_ok() {
             return true;
         }
     }
-    rootfs.root_inode().lookup(path).is_ok()
+    rootfs
+        .root_inode()
+        .lookup_follow(path, FOLLOW_LINK_DEPTH)
+        .is_ok()
 }
+
+/// Max symlink hops to follow when resolving an exec target (e.g.
+/// `/sbin/init` -> `/bin/busybox`). A small bound prevents loops.
+const FOLLOW_LINK_DEPTH: usize = 8;
 
 /// Core process spawn. Returns `None` if `args[0]` cannot be found on the
 /// process's root or the initramfs (instead of panicking) so optional
 /// processes can be skipped gracefully. `boot_work` runs the one-time boot
 /// setup (network init, fstab mount, console clear) and must happen once.
+///
+/// `foreground` seeds the VT's foreground process group with this process so an
+/// interactive shell does not conclude it is backgrounded. It must be `false`
+/// for a non-interactive PID 1 init that shares vt 0 with the primary shell —
+/// otherwise init would steal vt 0's foreground group and wedge that shell on
+/// `SIGTTIN`.
 fn spawn(
     args: Vec<String>,
     envs: Vec<String>,
@@ -113,6 +154,7 @@ fn spawn(
     shared_root: Option<Arc<dyn INode>>,
     pid: KoID,
     boot_work: bool,
+    foreground: bool,
 ) -> Option<Arc<Process>> {
     info!(
         "spawn pid={} vt={}: args={:?}, envs={:?}",
@@ -125,13 +167,6 @@ fn spawn(
     let job = zircon_object::task::ROOT_JOB.clone();
     let proc =
         Process::create_linux(&job, rootfs.clone(), vt, shared_root, pid).expect("create_linux");
-    // Make this shell the foreground process group of its own tty from the
-    // start. `getpgid` reports each process's pgrp as its own pid, so seeding
-    // the VT's foreground pgrp to `pid` makes `tcgetpgrp == getpgrp` for the
-    // shell; otherwise it starts at 0, the shell concludes it is a background
-    // job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning enter_uspace
-    // loop that was previously hidden behind the handle_signal self-deadlock).
-    linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
     let thread = Thread::create_linux(&proc).expect("create_linux thread");
     // Use the pivoted root (e.g. installed btrfs/ext2), not the initramfs SFS passed in.
     let root_inode = proc.linux().root_inode().clone();
@@ -141,9 +176,14 @@ fn spawn(
         root_inode: root_inode.clone(),
     };
 
-    let inode = match root_inode.lookup(&args[0]) {
+    // Follow symlinks so a symlinked entry point (e.g. /sbin/init ->
+    // /bin/busybox) loads the real ELF instead of the symlink's path text.
+    let inode = match root_inode.lookup_follow(&args[0], FOLLOW_LINK_DEPTH) {
         Ok(inode) => inode,
-        Err(e) => match rootfs.root_inode().lookup(&args[0]) {
+        Err(e) => match rootfs
+            .root_inode()
+            .lookup_follow(&args[0], FOLLOW_LINK_DEPTH)
+        {
             Ok(inode) => inode,
             Err(e2) => {
                 warn!(
@@ -155,15 +195,17 @@ fn spawn(
         },
     };
     let vmo = inode
-        .read_as_vmo()
+        .read_as_vmo_cached()
         .unwrap_or_else(|e| panic!("failed to read process {:?}: {:?}", args[0], e));
     let path = args[0].clone();
 
-    // Verify binary integrity with hunter
-    let mut header = [0u8; 4];
+    // hunter P8: verify binary integrity + path policy using a full 64-byte
+    // header (e_ident/e_type/e_machine), matching the runtime execve gate
+    // rather than the old 4-byte magic-only check.
+    let mut header = [0u8; 64];
     let _ = vmo.read(0, &mut header);
     if !hunter::check_elf_binary(&path, &header) {
-        warn!("spawn: binary {:?} blocked by hunter security policy", path);
+        kernel_hal::klog_warn!("spawn: binary {:?} blocked by hunter security policy", path);
         return None;
     }
 
@@ -177,13 +219,34 @@ fn spawn(
     let pg_token = kernel_hal::vm::current_vmtoken();
     debug!("current pgt = {:#x}", pg_token);
     //调用zircon-object/src/task/thread.start设置好要执行的thread
-    let (entry, sp, initial_brk, execute_path) = loader
-        .load(&proc.vmar(), &vmo, args.clone(), envs, path)
-        .unwrap_or_else(|e| panic!("failed to load process {:?}: {:?}", args[0], e));
+    // Likewise, a malformed/incompatible ELF for the base program must fall
+    // back rather than panic the kernel.
+    let (entry, sp, initial_brk, execute_path) =
+        match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                kernel_hal::klog_warn!("spawn: failed to load {:?}: {:?}; skipping", args[0], e);
+                return None;
+            }
+        };
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
     proc.linux().set_brk(initial_brk);
     proc.set_name(comm_from_path(&execute_path));
+
+    // Make this process the foreground process group of its own tty before it
+    // ever runs in user mode. `getpgid` reports each process's pgrp as its own
+    // pid, so seeding the VT's foreground pgrp to `pid` makes
+    // `tcgetpgrp == getpgrp`; otherwise it starts at 0, the shell concludes it
+    // is a background job and spins on `kill(0, SIGTTIN)` (a tight, CPU-burning
+    // enter_uspace loop that was previously hidden behind the handle_signal
+    // self-deadlock). Seed it only here — after every fallible step has
+    // succeeded — so a process that fails to load never leaves the VT pointing
+    // at a pid that never started. Skipped for a non-interactive init that
+    // shares vt 0 with the primary shell (see `foreground` above).
+    if foreground {
+        linux_object::fs::stdio::set_vt_foreground_pgrp(vt, pid as i32);
+    }
 
     thread
         .start_with_entry(entry, sp, 0, 0, thread_fn)
@@ -315,7 +378,7 @@ fn handle_signal(
         // Record the death in the dmesg ring (warn! reaches it at the default
         // level). A process that dies on a default-disposition signal — Xorg
         // aborting in early init, say — otherwise vanishes with no trace at all.
-        warn!(
+        error!(
             "[exit] pid={} killed by signal {:?} ({}) at pc={:#x} (default disposition)",
             thread.proc().id(),
             signal,
@@ -385,7 +448,7 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             || action.handler == SIG_IGN
     };
     if undeliverable {
-        warn!(
+        error!(
             "[exit] pid={} killed by fault signal {:?} ({}) — undeliverable, terminating",
             thread.proc().id(),
             signal,
@@ -495,7 +558,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 let pc = thread
                     .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                     .unwrap_or(0);
-                warn!(
+                error!(
                     "unhandled page fault @ {:#x}({:?}): {:?}, pid={} proc={} pc={:#x} -> SIGSEGV",
                     vaddr,
                     flags,
@@ -504,6 +567,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     thread.proc().name(),
                     pc,
                 );
+                // [diag] Dump the VMAR tree at error! level: shows whether the
+                // faulting address is actually covered by a mapping (and in which
+                // VMAR / child) — the key question for the deterministic brk
+                // NOT_FOUND fault in musl's __malloc_alloc_meta.
+                thread.proc().vmar().dump_error();
                 // Make a userspace crash self-diagnosing from dmesg: dump the
                 // registers and the code bytes around the faulting PC. With the
                 // faulting instruction *and* the instructions that computed the
@@ -528,7 +596,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         })
                         .ok()
                     {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x}",
                             pid, pc, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8to11,
                         );
@@ -545,12 +613,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                         }
                     }
                     if any {
-                        warn!(
+                        error!(
                             "[crash] pid={} code@{:#x} (pc-16): {:02x?}",
                             pid, start, code
                         );
                     } else {
-                        warn!(
+                        error!(
                             "[crash] pid={} pc={:#x} UNMAPPED (jumped through a bad pointer)",
                             pid, pc
                         );

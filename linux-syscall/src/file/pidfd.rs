@@ -72,7 +72,11 @@ impl Syscall<'_> {
         if matches!(target_proc.status(), Status::Exited(_)) {
             return Err(LxError::ESRCH);
         }
-        let file = target_proc.linux().get_file_like(targetfd.into())?.dup();
+        let file = target_proc
+            .try_linux()
+            .ok_or(LxError::ESRCH)?
+            .get_file_like(targetfd.into())?
+            .dup();
         let mut open_flags = file.flags();
         open_flags |= OpenFlags::CLOEXEC;
         file.set_flags(open_flags)?;

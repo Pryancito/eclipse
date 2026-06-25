@@ -312,6 +312,11 @@ impl Process {
         self.debug_exceptionate.shutdown();
 
         self.job.remove_process(self.base.id);
+        // hunter: central teardown hook — releases this process's security
+        // state (syscall whitelist, anomaly counters, W^X region history) on
+        // EVERY exit path (normal, exit_group, signal-kill, exception), so a
+        // recycled pid can never inherit stale policy or pre-charged counters.
+        hunter::task_exit(self.base.id);
         let inner = self.inner.lock();
         // If we are critical to a job, we need to take action.
         if let Some((job, retcode_nonzero)) = &inner.critical_to_job {

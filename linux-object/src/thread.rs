@@ -16,6 +16,12 @@ pub trait ThreadExt {
     fn create_linux(proc: &Arc<Process>) -> ZxResult<Arc<Self>>;
     /// lock and get Linux thread
     fn lock_linux(&self) -> MutexGuard<'_, LinuxThread>;
+    /// Like [`lock_linux`](Self::lock_linux) but returns `None` instead of
+    /// panicking when the extension is not a `Mutex<LinuxThread>`. Use this when
+    /// walking another process's threads (signal delivery, enumeration): a
+    /// thread observed mid-teardown during SMP churn must be skipped, not bring
+    /// down the kernel.
+    fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>>;
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserOutPtr<i32>);
     /// Get robust list.
@@ -54,6 +60,10 @@ impl ThreadExt for Thread {
             .downcast_ref::<Mutex<LinuxThread>>()
             .unwrap()
             .lock()
+    }
+
+    fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>> {
+        Some(self.ext().downcast_ref::<Mutex<LinuxThread>>()?.lock())
     }
 
     /// Set pointer to thread ID.

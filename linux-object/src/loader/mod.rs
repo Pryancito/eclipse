@@ -122,12 +122,19 @@ impl LinuxElfLoader {
                 "shebang: interp={:?}, arg={:?}, script={:?}",
                 interp, interp_arg, path
             );
+            // hunter P7: audit the shebang interpreter through the exec-path
+            // policy so `#!/tmp/evil` is recorded (or blocked in Enforce). Use
+            // the path-only check — the interpreter may itself be a script, for
+            // which ELF-magic validation would be inappropriate.
+            if !hunter::check_exec_path(interp) {
+                return Err(ZxError::ACCESS_DENIED.into());
+            }
             let interp_rel = interp.trim_start_matches('/');
             let inode = self.root_inode.lookup_follow(interp_rel, 1).map_err(|e| {
                 error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
-            let interp_vmo = inode.read_as_vmo().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
                 e
             })?;
@@ -210,6 +217,12 @@ impl LinuxElfLoader {
             // the already-kernel-mapped binary via AT_PHDR / AT_ENTRY instead of calling
             // mmap() from user space to re-load it – which is the path that breaks in the
             // fork+execve case and causes a page fault at the raw e_entry (e.g. 0x423a7).
+            // hunter P7: audit the dynamic linker (PT_INTERP) through the
+            // exec-path policy so a `/tmp/ld.so` interpreter is recorded (or
+            // blocked in Enforce) before it is mapped and executed.
+            if !hunter::check_exec_path(interp) {
+                return Err(ZxError::ACCESS_DENIED.into());
+            }
             let interp_rel = interp.trim_start_matches('/');
             let inode = self.root_inode.lookup_follow(interp_rel, 4).map_err(|e| {
                 error!(
@@ -218,7 +231,7 @@ impl LinuxElfLoader {
                 );
                 e
             })?;
-            let interp_vmo = inode.read_as_vmo().map_err(|e| {
+            let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;
