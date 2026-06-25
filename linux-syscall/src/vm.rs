@@ -117,13 +117,6 @@ impl Syscall<'_> {
         let want_write = prot.contains(MmapProt::WRITE);
 
         if flags.contains(MmapFlags::FIXED) {
-            // [mmapdiag] visible at LOG=error: the guard mmap that musl places
-            // inside the brk reservation is the prime suspect for the lost brk
-            // postfix.
-            error!(
-                "[mmapdiag] FIXED mmap addr={:#x} len={:#x} prot={:?} -> unmap+map",
-                addr, len, prot
-            );
             // unmap first
             vmar.unmap(addr, len)?;
             // hunter: the old contents are gone, so drop any W^X bookkeeping.
@@ -255,19 +248,16 @@ impl Syscall<'_> {
                 Ok(_) => {
                     proc.set_brk(new_brk_aligned);
                     proc.set_mapped_brk(new_mapped_brk);
-                    // [brkdiag] error! so it is visible at LOG=error alongside the
-                    // sh crash: shows whether the 1 MiB reservation was actually
-                    // created (and at what addr/size).
-                    error!(
-                        "[brkdiag] extend OK: map_at addr={:#x} size={:#x} -> reserved {:#x}..{:#x}, brk={:#x}",
-                        mapped_brk, size, mapped_brk, new_mapped_brk, new_brk_aligned
+                    info!(
+                        "brk: extended to {:#x}, mapping reserved up to {:#x}",
+                        new_brk_aligned, new_mapped_brk
                     );
                     Ok(new_brk_aligned)
                 }
                 Err(e) => {
-                    error!(
-                        "[brkdiag] extend FAILED: map_at addr={:#x} size={:#x}: {:?} -> musl will fall back to mmap",
-                        mapped_brk, size, e
+                    warn!(
+                        "brk: failed to map {:#x} bytes at {:#x}: {:?}",
+                        size, mapped_brk, e
                     );
                     // Return current break on failure (Linux semantics).
                     Ok(current_brk)
