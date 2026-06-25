@@ -59,12 +59,30 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // Bring up the hunter security subsystem. Register the monotonic clock
+    // first so the very first recorded event carries a real timestamp, then a
+    // durable sink that streams high-severity (Warning+) events to the kernel
+    // log before any in-memory ring eviction can erase them, then initialize
+    // the policy/IDS engine.
+    hunter::set_time_source(|| kernel_hal::timer::timer_now().as_nanos() as u64);
+    hunter::set_sink(|e: &hunter::event_log::LogEntry| {
+        kernel_hal::klog_info!(
+            "hunter[{}] {} {} pid={} {}",
+            e.severity.as_str(),
+            e.category,
+            e.action,
+            e.pid,
+            e.description
+        );
+    });
+    hunter::init();
     kernel_hal::console::early_progress_bar(90);
     cfg_if! {
         if #[cfg(all(feature = "linux", feature = "zircon"))] {
             panic!("Feature `linux` and `zircon` cannot be enabled at the same time!");
         } else if #[cfg(feature = "linux")] {
             use linux_object::process::ProcessExt;
+            use zircon_object::object::KernelObject;
             // Parse "arg0?arg1?arg2"; an empty string yields no program.
             fn parse_proc(s: &str) -> alloc::vec::Vec<alloc::string::String> {
                 if s.is_empty() {
@@ -75,11 +93,29 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
             let init_args = parse_proc(&options.init_proc);
             let shell_args = parse_proc(&options.shell_proc);
+            // Base environment for the shells and PID 1 init. `HOME`/`TERM`/
+            // `USER`/`LOGNAME` are set HERE (not just in /etc/profile) because
+            // bash, unlike POSIX sh, ignores `ENV` and only sources /etc/profile
+            // as a *login* shell — without these in the real environment bash
+            // greets with "I can't find my home directory!" and readline (tab
+            // completion) misbehaves for lack of `TERM`.
             let envs: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                 "PATH=/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "ENV=/etc/profile".into(),
+                "HOME=/root".into(),
+                "TERM=xterm-256color".into(),
+                "USER=root".into(),
+                "LOGNAME=root".into(),
+                // UTF-8 locale so ncurses/readline use Unicode box-drawing and
+                // compute character widths correctly (the console renders the
+                // box-drawing/block code points procedurally).
+                "LANG=C.UTF-8".into(),
+                "LC_ALL=C.UTF-8".into(),
             ];
             let rootfs = fs::rootfs();
+            // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
+            // and enable exec learning (trust-on-first-use). Safe if absent.
+            linux_object::fs::hunter_config::load(&rootfs.root_inode());
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else
@@ -106,8 +142,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                         primary_shell = Some(proc);
                     }
                 }
-                // Optionally run INIT as PID 1 (default /sbin/openrc-init), if it
-                // exists. The shells already did the boot work, so don't repeat.
+                // Optionally run INIT as PID 1 (default /sbin/init -> openrc-init,
+                // busybox init fallback), if it exists. The shells already did
+                // the boot work, so don't repeat.
                 let init = zcore_loader::linux::run_init_if_present(
                     init_args,
                     envs.clone(),
@@ -122,6 +159,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             } else {
                 None
             };
+            // Make the outcome of PID 1 / base-program startup observable: log
+            // which process the system's lifetime is now tied to (the PID 1
+            // init when it came up, otherwise the fallback terminal shell).
+            match &lifetime_proc {
+                Some(p) => klog_info!(
+                    "Eclipse: lifetime process pid={} name={:?}",
+                    p.id(),
+                    p.name()
+                ),
+                None => klog_info!("Eclipse: no lifetime process spawned"),
+            }
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);

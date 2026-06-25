@@ -44,4 +44,48 @@ pub trait TextBuffer {
             }
         }
     }
+
+    /// Scroll rows `top..=bottom` (inclusive) up by `n` lines; the vacated rows
+    /// at the bottom of the region are filled with `blank`.
+    ///
+    /// The default moves cells one by one. A framebuffer-backed implementation
+    /// should override this to bulk-copy the corresponding pixel band (much
+    /// faster for full-screen TUIs that scroll a sub-region).
+    fn scroll_region_up(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        if top > bottom || bottom >= self.height() {
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        let width = self.width();
+        for r in top..=bottom {
+            for c in 0..width {
+                let cell = if r + n <= bottom {
+                    self.read(r + n, c)
+                } else {
+                    blank
+                };
+                self.write(r, c, cell);
+            }
+        }
+    }
+
+    /// Scroll rows `top..=bottom` (inclusive) down by `n` lines; the vacated
+    /// rows at the top of the region are filled with `blank`.
+    fn scroll_region_down(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+        if top > bottom || bottom >= self.height() {
+            return;
+        }
+        let n = n.min(bottom - top + 1);
+        let width = self.width();
+        for r in (top..=bottom).rev() {
+            for c in 0..width {
+                let cell = if r >= top + n {
+                    self.read(r - n, c)
+                } else {
+                    blank
+                };
+                self.write(r, c, cell);
+            }
+        }
+    }
 }

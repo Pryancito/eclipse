@@ -148,6 +148,10 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
+        // hunter: inherit the parent's syscall whitelist into the child so a
+        // process cannot shed its policy merely by forking, and seed a fresh
+        // anomaly window for the new pid.
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok(new_proc)
     }
@@ -168,6 +172,8 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
+        // hunter: same lifecycle hook as fork (see fork_impl).
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -567,9 +573,22 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_cmdline(args);
         proc.set_brk(initial_brk);
+        // CRUCIAL: reset the heap's *mapped* upper bound too. `execve` replaced
+        // the whole address space (`vmar.clear()` above), so the previous image's
+        // heap-chunk reservation is gone. Leaving `mapped_brk` stale (e.g.
+        // 0x8d1000 from the old image) makes the next `sys_brk` believe the chunk
+        // is still "within the reserved mapping" and skip the real `map_at` — so
+        // musl writes into an unmapped heap and SIGSEGVs. This is the
+        // deterministic `sh` crash in musl mallocng's __malloc_alloc_meta seen
+        // when `sh -c gendepends.sh` re-execs into the script.
+        proc.set_mapped_brk(initial_brk);
         proc.apply_exec_metadata(&metadata);
         self.zircon_process()
             .set_name(comm_from_path(&execute_path));
+        // hunter: a new image is now in place — re-apply any default syscall
+        // whitelist and reset the anomaly window so a benign-then-malicious
+        // exec cannot launder accumulated detection state.
+        hunter::task_exec(self.zircon_process().id(), &execute_path);
 
         self.zircon_process().signal_set(Signal::USER_SIGNAL_0);
         self.thread.with_context(|ctx| {
@@ -635,6 +654,9 @@ impl Syscall<'_> {
     pub fn sys_exit_group(&mut self, exit_code: i32) -> SysResult {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
+        // hunter state is released centrally in zircon Process::terminate so it
+        // covers every teardown path (signal-kill, exception, _exit), not just
+        // exit_group — see zircon-object/src/task/process.rs.
         proc.exit(exit_code as i64);
         Ok(0)
     }

@@ -102,22 +102,49 @@ impl Syscall<'_> {
         if len == 0 || len > MAX_MMAP_LEN {
             return Err(LxError::ENOMEM);
         }
+        // hunter W^X: reject (or audit) simultaneously writable+executable maps.
+        if !hunter::check_mmap(
+            self.zircon_process().id(),
+            prot.contains(MmapProt::WRITE),
+            prot.contains(MmapProt::EXEC),
+        ) {
+            return Err(LxError::EACCES);
+        }
 
         let proc = self.zircon_process();
+        let pid = proc.id();
         let vmar = proc.vmar();
+        let want_write = prot.contains(MmapProt::WRITE);
 
         if flags.contains(MmapFlags::FIXED) {
             // unmap first
             vmar.unmap(addr, len)?;
+            // hunter: the old contents are gone, so drop any W^X bookkeeping.
+            hunter::check_munmap(pid, addr, len);
         }
         let vmar_offset = flags.contains(MmapFlags::FIXED).then(|| addr - vmar.addr());
         if flags.contains(MmapFlags::ANONYMOUS) {
             let vmo = VmObject::new_paged(pages(len));
             let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), prot.to_flags())?;
+            // hunter P3: remember a writable mapping so a later mprotect(EXEC)
+            // over it is recognised as the two-step W^X bypass.
+            hunter::record_mapping(pid, addr, len, want_write);
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
             let vmo = file_like.get_vmo(offset as usize, len)?;
+            // hunter P1: cap the file-backed mapping's *permission ceiling* to a
+            // W^X-preserving set instead of the old blanket `RXW`, so a later
+            // mprotect cannot turn writable file pages executable. Executable
+            // maps never gain WRITE; non-executable maps may gain WRITE (for
+            // COW / relocations) but never EXECUTE.
+            let mut ceiling = prot.to_flags() | MMUFlags::READ | MMUFlags::USER;
+            if prot.contains(MmapProt::EXEC) {
+                ceiling.remove(MMUFlags::WRITE);
+            } else {
+                ceiling |= MMUFlags::WRITE;
+                ceiling.remove(MMUFlags::EXECUTE);
+            }
             // Map without committing the range up front (`map_range = false`):
             // the VMO returned by `get_vmo` is demand-paged from the file, so its
             // pages are read in on the faults that first touch them. Eagerly
@@ -128,11 +155,12 @@ impl Syscall<'_> {
                 vmo.clone(),
                 0,
                 vmo.len(),
-                MMUFlags::RXW,
+                ceiling,
                 prot.to_flags(),
                 false,
                 false,
             )?;
+            hunter::record_mapping(pid, addr, len, want_write);
             Ok(addr)
         }
     }
@@ -273,15 +301,37 @@ impl Syscall<'_> {
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
         );
+        // hunter W^X: reject (or audit) transitions to writable+executable,
+        // including the two-step mmap(W)-then-mprotect(X) bypass (it tracks the
+        // ever-writable history of this exact range).
+        let pid = self.zircon_process().id();
+        if !hunter::check_mprotect(
+            pid,
+            addr,
+            len,
+            prot.contains(MmapProt::WRITE),
+            prot.contains(MmapProt::EXEC),
+        ) {
+            return Err(LxError::EACCES);
+        }
         let proc = self.zircon_process();
         let vmar = proc.vmar();
         let flags = prot.to_flags();
-        // Attempt real permission change; fall back to Ok(0) if the range overlaps
-        // sub-regions (Zircon's protect() restriction) — the kernel already mapped
-        // segments with liberal permissions, so a benign no-op is acceptable there.
+        // Attempt the real permission change. Normally a range that overlaps
+        // sub-regions (Zircon's protect() restriction) is treated as a benign
+        // no-op. But under W^X *enforcement* a failed *narrowing* that leaves
+        // pages more permissive than requested would be a silent bypass, so we
+        // surface the error instead of swallowing it.
         match vmar.protect(addr, len, flags) {
             Ok(()) => Ok(0),
             Err(e) => {
+                if hunter::policy::wx_mode() == hunter::Mode::Enforce {
+                    warn!(
+                        "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (rejected under W^X enforce)",
+                        addr, len, flags, e
+                    );
+                    return Err(LxError::EINVAL);
+                }
                 warn!(
                     "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (ignored)",
                     addr, len, flags, e
@@ -307,6 +357,8 @@ impl Syscall<'_> {
     pub fn sys_munmap(&self, addr: usize, len: usize) -> SysResult {
         info!("munmap: addr={:#x}, size={:#x}", addr, len);
         let proc = self.thread.proc();
+        // hunter P3: the range is gone, so drop its W^X writable-history.
+        hunter::check_munmap(proc.id(), addr, len);
         let vmar = proc.vmar();
         vmar.unmap(addr, len)?;
         Ok(0)

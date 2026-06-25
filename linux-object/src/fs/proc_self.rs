@@ -57,7 +57,8 @@ impl INode for ProcSelfFdDir {
                 let fd = name.parse::<i32>().map_err(|_| FsError::EntryNotFound)?;
                 let file = self
                     .process
-                    .linux()
+                    .try_linux()
+                    .ok_or(FsError::EntryNotFound)?
                     .get_file(fd.into())
                     .map_err(|_| FsError::EntryNotFound)?;
                 Ok(Arc::new(Pseudo::new(file.path(), FileType::SymLink)))
@@ -67,7 +68,8 @@ impl INode for ProcSelfFdDir {
     fn get_entry(&self, id: usize) -> Result<String> {
         let files = self
             .process
-            .linux()
+            .try_linux()
+            .ok_or(FsError::DeviceError)?
             .get_files()
             .map_err(|_| FsError::DeviceError)?;
         let mut keys: Vec<_> = files.keys().collect();

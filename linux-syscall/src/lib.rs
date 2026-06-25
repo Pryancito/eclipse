@@ -218,6 +218,8 @@ impl Syscall<'_> {
             Sys::TIMERFD_CREATE => self.sys_timerfd_create(a0, a1),
             Sys::TIMERFD_SETTIME => self.sys_timerfd_settime(a0.into(), a1, a2.into(), a3.into()),
             Sys::TIMERFD_GETTIME => self.sys_timerfd_gettime(a0.into(), a1.into()),
+            Sys::SIGNALFD4 => self.sys_signalfd4(a0.into(), a1.into(), a2, a3),
+            Sys::SIGNALFD => self.sys_signalfd4(a0.into(), a1.into(), a2, 0),
 
             Sys::SOCKETPAIR => self.sys_socketpair(a0, a1, a2, a3.into()),
             // file system
@@ -246,6 +248,10 @@ impl Syscall<'_> {
             Sys::RT_SIGPROCMASK => self.sys_rt_sigprocmask(a0 as _, a1.into(), a2.into(), a3),
             Sys::RT_SIGRETURN => self.sys_rt_sigreturn(),
             Sys::RT_SIGSUSPEND => self.sys_rt_sigsuspend(a0.into(), a1).await,
+            Sys::RT_SIGTIMEDWAIT => {
+                self.sys_rt_sigtimedwait(a0.into(), a1.into(), a2.into(), a3)
+                    .await
+            }
             Sys::SIGALTSTACK => self.sys_sigaltstack(a0.into(), a1.into()),
             Sys::KILL => self.sys_kill(a0 as isize, a1),
 
@@ -404,6 +410,18 @@ impl Syscall<'_> {
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1 as usize, a2 as u32),
             Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
             Sys::RT_SIGQUEUEINFO => self.unimplemented("rt_sigqueueinfo", Ok(0)),
+
+            // Extended attributes: this kernel's filesystems do not implement
+            // xattrs. Answer the standard "no xattr support" way and quietly —
+            // letting these fall through to `unknown_syscall` returned ENOSYS
+            // but logged an `error!` per call, which floods the console (e.g.
+            // busybox init probing files: `unknown syscall: LISTXATTR`).
+            // `listxattr` -> 0 (empty name list); `getxattr` -> ENODATA (no such
+            // attribute); `setxattr` -> EOPNOTSUPP; `removexattr` -> ENODATA.
+            Sys::LISTXATTR | Sys::LLISTXATTR | Sys::FLISTXATTR => Ok(0),
+            Sys::GETXATTR | Sys::LGETXATTR | Sys::FGETXATTR => Err(LxError::ENODATA),
+            Sys::SETXATTR | Sys::LSETXATTR | Sys::FSETXATTR => Err(LxError::EOPNOTSUPP),
+            Sys::REMOVEXATTR | Sys::LREMOVEXATTR | Sys::FREMOVEXATTR => Err(LxError::ENODATA),
 
             // kernel module
             //            Sys::INIT_MODULE => self.sys_init_module(a0.into(), a1 as usize, a2.into()),

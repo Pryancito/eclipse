@@ -1972,6 +1972,22 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         None
     }
+    /// PID of the process connected to the other end (`SO_PEERCRED`), if this
+    /// socket type tracks it. Only AF_UNIX does; the rest return `None`.
+    fn peer_pid(&self) -> Option<i32> {
+        None
+    }
+    /// Queue file descriptors to be received by the peer (`SCM_RIGHTS` ancillary
+    /// data over a unix socket). Only AF_UNIX supports it. This is how seatd
+    /// hands an opened DRM/input device to a Wayland compositor and how clients
+    /// pass shm/dmabuf buffers back.
+    fn send_fds(&self, _fds: alloc::vec::Vec<Arc<dyn FileLike>>) -> SysResult {
+        Err(LxError::ENOSYS)
+    }
+    /// Take up to `_max` file descriptors the peer attached via `SCM_RIGHTS`.
+    fn recv_fds(&self, _max: usize) -> alloc::vec::Vec<Arc<dyn FileLike>> {
+        alloc::vec::Vec::new()
+    }
     /// Set a socket option.
     ///
     /// We don't yet plumb most options into the smoltcp sockets, but the common

@@ -10,6 +10,7 @@ mod ext2_mount;
 mod fat_mount;
 mod file;
 mod flagged_fs;
+pub mod hunter_config;
 pub mod ioctl;
 mod mount_ops;
 mod mount_state;
@@ -21,6 +22,7 @@ mod procfs;
 mod pseudo;
 pub mod pty;
 pub mod rcore_fs_wrapper;
+mod signalfd;
 pub mod stdio;
 mod sysfs;
 mod timerfd;
@@ -79,6 +81,7 @@ pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
 pub use pipe::Pipe;
 pub use rcore_fs::vfs::{self, PollStatus};
+pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};
 pub use timerfd::TimerFd;
 
@@ -456,14 +459,36 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             devfs::drm::register_driver(drm.clone());
         }
 
-        if !drivers::all_drm().as_vec().is_empty() {
+        // Expose /dev/dri/card0 when there is a real DRM/GPU driver OR just a
+        // framebuffer display. In the latter case the DRM scheme provides a
+        // software KMS path (synthetic CRTC/connector/encoder + dumb-buffer
+        // scanout) so wlroots/labwc can drive the framebuffer via legacy KMS.
+        let have_drm = !drivers::all_drm().as_vec().is_empty();
+        let have_display = drivers::all_display().first().is_some();
+        error!(
+            "[drm] graphics inventory: drm_drivers={} display={}",
+            drivers::all_drm().as_vec().len(),
+            have_display
+        );
+        if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {
                     warn!("failed to mknod /dev/dri/card0: {:?}", e);
+                } else {
+                    error!("[drm] /dev/dri/card0 created (sw_kms path available)");
+                }
+                // Render node (major 226, minor 128) — Mesa/EGL opens this for
+                // GPU-less GL/Vulkan (llvmpipe/lavapipe via the swrast DRI).
+                if let Err(e) = dri_dev.add("renderD128", Arc::new(devfs::DrmDev::new(128))) {
+                    warn!("failed to mknod /dev/dri/renderD128: {:?}", e);
+                } else {
+                    error!("[drm] /dev/dri/renderD128 created (render node)");
                 }
             } else {
                 warn!("failed to mkdir /dev/dri");
             }
+        } else {
+            error!("[drm] no display and no DRM driver — /dev/dri/card0 NOT created");
         }
     }
 
