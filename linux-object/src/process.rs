@@ -1488,10 +1488,19 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         for tid in tids {
             if let Ok(thread_obj) = process.get_child(tid) {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    let blocked = thread.lock_linux().signal_mask.contains(signal);
+                    // try_lock_linux: this walks another process's threads, which
+                    // may be tearing down concurrently under SMP churn. Skip any
+                    // thread whose extension can no longer be resolved.
+                    let blocked = match thread.try_lock_linux() {
+                        Some(lt) => lt.signal_mask.contains(signal),
+                        None => continue,
+                    };
                     if !blocked {
-                        thread.lock_linux().signals.insert(signal);
-                        return Ok(());
+                        if let Some(mut lt) = thread.try_lock_linux() {
+                            lt.signals.insert(signal);
+                            return Ok(());
+                        }
+                        continue;
                     }
                     if first.is_none() {
                         first = Some(thread);
@@ -1505,7 +1514,9 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // The old code dropped it here, which is why a Wayland compositor that
         // blocks SIGINT for its signalfd never saw Ctrl-C.
         if let Some(thread) = first {
-            thread.lock_linux().signals.insert(signal);
+            if let Some(mut lt) = thread.try_lock_linux() {
+                lt.signals.insert(signal);
+            }
         }
         Ok(())
     } else {
