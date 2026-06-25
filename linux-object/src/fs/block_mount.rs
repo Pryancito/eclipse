@@ -217,6 +217,15 @@ const SECTOR: usize = 512;
 /// staying well under the per-mount budget the exec/VMO cache already spends.
 const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
 
+/// Forward read-ahead window. On a cache miss for a request smaller than this,
+/// the backing device is read this far past the request in one command and the
+/// extra sectors are cached. Sequential access — the dominant pattern during
+/// OpenRC boot (scripts, configs) and demand-paging of executables/libraries —
+/// then hits the cache instead of issuing one synchronous device command per
+/// piece, which is the dominant cost on high-latency media (USB/SATA, polled
+/// AHCI). Sized to roughly one AHCI command so the prefetch is ~free latency-wise.
+const READAHEAD_BYTES: usize = 64 * 1024;
+
 /// One cached 512-byte sector plus its LRU timestamp.
 struct CacheLine {
     data: Box<[u8; SECTOR]>,
@@ -347,17 +356,22 @@ impl BlockCache {
 pub struct CachedDevice {
     inner: Arc<dyn Device>,
     cache: Mutex<BlockCache>,
+    /// One past the last addressable byte, rounded up to a sector. Read-ahead is
+    /// clamped to this so a prefetch never runs off the end of the device.
+    dev_end: usize,
 }
 
 impl CachedDevice {
-    pub fn new(inner: Arc<dyn Device>) -> Self {
-        Self::with_capacity(inner, CACHE_CAPACITY_SECTORS)
+    pub fn new(inner: Arc<dyn Device>, size_bytes: usize) -> Self {
+        Self::with_capacity(inner, size_bytes, CACHE_CAPACITY_SECTORS)
     }
 
-    fn with_capacity(inner: Arc<dyn Device>, capacity_sectors: usize) -> Self {
+    fn with_capacity(inner: Arc<dyn Device>, size_bytes: usize, capacity_sectors: usize) -> Self {
+        let dev_end = ((size_bytes + SECTOR - 1) / SECTOR) * SECTOR;
         Self {
             inner,
             cache: Mutex::new(BlockCache::new(capacity_sectors)),
+            dev_end,
         }
     }
 
@@ -409,19 +423,30 @@ impl Device for CachedDevice {
 
         let aligned_start = (first as usize) * SECTOR;
         let aligned_end = (last as usize + 1) * SECTOR;
-        let aligned_len = aligned_end - aligned_start;
 
-        // When the request is already sector-aligned we can read straight into
-        // the caller's buffer and cache from it — no temporary allocation.
-        if offset == aligned_start && buf.len() == aligned_len {
+        // Extend the read forward by the read-ahead window for smallish requests
+        // (clamped to the device, and never below the requested span). Large
+        // requests are already efficient sequential transfers and get no extra.
+        let read_end = if buf.len() < READAHEAD_BYTES {
+            (aligned_end + READAHEAD_BYTES)
+                .min(self.dev_end)
+                .max(aligned_end)
+        } else {
+            aligned_end
+        };
+        let read_len = read_end - aligned_start;
+
+        // No read-ahead and already sector-aligned: read straight into the
+        // caller's buffer and cache from it — no temporary allocation.
+        if read_end == aligned_end && offset == aligned_start && buf.len() == read_len {
             let n = self.inner.read_at(aligned_start, buf)?;
             self.populate(first, buf, n);
             return Ok(n);
         }
 
-        // Unaligned head/tail: read the aligned span once, cache whole sectors,
-        // then hand back just the requested slice.
-        let mut tmp = vec![0u8; aligned_len];
+        // Otherwise read the (possibly read-ahead-extended) span once, cache
+        // whole sectors, then return just the requested slice.
+        let mut tmp = vec![0u8; read_len];
         let n = self.inner.read_at(aligned_start, &mut tmp)?;
         self.populate(first, &tmp, n);
         let skip = offset - aligned_start;
@@ -475,14 +500,22 @@ impl Device for CachedDevice {
 }
 
 pub fn device_from_backend(backend: &MountBackend) -> VfsResult<Arc<dyn Device>> {
-    let raw: Arc<dyn Device> = match backend {
-        MountBackend::Block(block) => Arc::new(BlockByteDevice::new(block.clone())),
-        MountBackend::File(file) => Arc::new(FileByteDevice::new(file.clone())?),
+    let (raw, size_bytes): (Arc<dyn Device>, usize) = match backend {
+        MountBackend::Block(block) => (
+            Arc::new(BlockByteDevice::new(block.clone())) as Arc<dyn Device>,
+            block.block_count() * 512,
+        ),
+        MountBackend::File(file) => {
+            let dev = FileByteDevice::new(file.clone())?;
+            let size = dev.len;
+            (Arc::new(dev) as Arc<dyn Device>, size)
+        }
     };
     // Wrap every mount's backing device in the buffer cache. ext2 and btrfs both
     // reach disk exclusively through this handle, so the cache accelerates all
-    // of their metadata and data traffic transparently.
-    Ok(Arc::new(CachedDevice::new(raw)))
+    // of their metadata and data traffic transparently, and read-ahead collapses
+    // sequential boot/exec reads into far fewer (synchronous) device commands.
+    Ok(Arc::new(CachedDevice::new(raw, size_bytes)))
 }
 
 /// ext2 superblock magic (`0xEF53`) at byte offset 56 within the superblock.
@@ -687,7 +720,38 @@ mod block_byte_tests {
 
     /// Build a buffer-cached device over a fresh `BlockByteDevice` on `dev`.
     fn cached(dev: Arc<MockBlock>, cap_sectors: usize) -> CachedDevice {
-        CachedDevice::with_capacity(Arc::new(BlockByteDevice::new(dev)), cap_sectors)
+        let size = dev.block_count() * 512;
+        CachedDevice::with_capacity(Arc::new(BlockByteDevice::new(dev)), size, cap_sectors)
+    }
+
+    /// A small cold read must prefetch ahead, so a following sequential read is
+    /// served from cache with no further device I/O.
+    #[test]
+    fn cache_readahead_prefetches_sequential() {
+        let dev = MockBlock::new(2048); // 1 MiB
+        let raw = BlockByteDevice::new(dev.clone());
+        let total = 2048 * 512;
+        let data: Vec<u8> = (0..total).map(pat).collect();
+        raw.write_at(0, &data).unwrap();
+
+        let cache = cached(dev.clone(), 4096);
+        let mut b0 = [0u8; 512];
+        cache.read_at(0, &mut b0).unwrap();
+        assert_eq!(&b0[..], &data[0..512]);
+        let after_first = dev.sectors_read();
+        assert!(
+            after_first > 1,
+            "a small cold read should prefetch more than the one requested sector"
+        );
+        // Sequential follow-up within the prefetched window: cache hit, correct.
+        let mut b1 = [0u8; 512];
+        cache.read_at(512, &mut b1).unwrap();
+        assert_eq!(&b1[..], &data[512..1024]);
+        assert_eq!(
+            dev.sectors_read(),
+            after_first,
+            "sequential read within the prefetch window must not touch the device"
+        );
     }
 
     /// Once a span is resident, repeat reads must not touch the device at all.
