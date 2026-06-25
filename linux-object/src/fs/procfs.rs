@@ -14,9 +14,9 @@ use zircon_object::task::{Job, Process, Status, Thread, ROOT_JOB};
 use crate::process::ProcessExt;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 12] = [
+const PROC_ROOT_STATIC: [&str; 13] = [
     "net", "meminfo", "cpuinfo", "swaps", "uptime", "mounts", "self", "stat", "loadavg", "sys",
-    "perf", "hunter",
+    "perf", "hunter", "filesystems",
 ];
 
 fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
@@ -276,6 +276,7 @@ impl INode for ProcRootINode {
             "sys" => Ok(PROC_SYS_DIR.clone()),
             "perf" => Ok(PROC_PERF_DIR.clone()),
             "hunter" => Ok(PROC_HUNTER.clone()),
+            "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
@@ -1062,6 +1063,24 @@ fn proc_mounts_content() -> String {
     super::proc_mounts_content()
 }
 
+/// `/proc/filesystems` — the filesystem types the kernel can mount. Each line is
+/// an optional `nodev` (the fs needs no backing block device) followed by a TAB
+/// and the type name. Userland (openrc's sysinit, `mount`, `grep`) probes this
+/// before mounting; a missing file made openrc log
+/// `grep: /proc/filesystems: No such file or directory`.
+fn proc_filesystems_content() -> String {
+    "nodev\tsysfs\n\
+     nodev\tproc\n\
+     nodev\ttmpfs\n\
+     nodev\tdevtmpfs\n\
+     nodev\tramfs\n\
+     nodev\tdevpts\n\
+     \text2\n\
+     \tbtrfs\n\
+     \tvfat\n"
+        .into()
+}
+
 fn proc_net_arp_content() -> String {
     let mut s = String::new();
     let _ = writeln!(
@@ -1205,6 +1224,10 @@ lazy_static! {
     static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 16,
         generate: proc_loadavg_content,
+    });
+    static ref PROC_FILESYSTEMS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 49,
+        generate: proc_filesystems_content,
     });
     static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 17,
